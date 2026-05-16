@@ -354,6 +354,28 @@ pub const ComponentInstance = struct {
         allocator: std.mem.Allocator,
     ) void = null,
 
+    /// Optional host hook invoked from the `canon resource.drop`
+    /// canon-builtin (`dispatchCanonBuiltin.resource_drop`) after the
+    /// per-type resource table entry is removed. Host adapters that
+    /// keep kernel-side state for imported resources (e.g. POSIX fds
+    /// behind a `wasi:sockets/types.tcp-socket` handle) install this
+    /// hook so the kernel fd is released as soon as the guest drops
+    /// the wit-resource — matching wit-bindgen's expectation that
+    /// `[resource-drop]X` runs synchronously on guest drop. Without
+    /// the hook, host fds linger until the adapter's `deinit`, which
+    /// breaks tests like `sockets-tcp-bind::test_reuseaddr` that
+    /// rebind to the freshly-released ephemeral port. The hook
+    /// receives the same `(resource_idx, handle)` pair the canon
+    /// builtin was invoked with so the adapter can route to the
+    /// correct per-type cleanup. (#575)
+    on_resource_drop: ?*const fn (
+        ctx: ?*anyopaque,
+        ci: *ComponentInstance,
+        resource_idx: u32,
+        handle: u32,
+    ) void = null,
+    on_resource_drop_ctx: ?*anyopaque = null,
+
     /// Cached `ExecEnv` for `cabi_realloc` (#538). The wasi:http@0.3.0
     /// fixtures allocate guest-side scratch buffers many thousand
     /// times per `wamr run`; recreating a 96 KiB `ExecEnv` on every

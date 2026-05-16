@@ -1436,18 +1436,24 @@ fn mapSocketBindError(err: anyerror) SocketErrorCode {
 /// `close`/`send`/`receive` paths work transparently. POSIX-only:
 /// Windows falls back to `IpAddress.bind` because the WIT cases the
 /// custom path serves (port-0 readback already works via stdlib on
-/// Windows; no SO_REUSEADDR needed since SO_REUSEADDR's BSD-style
-/// semantics align with the WIT spec there). (#569)
+/// Windows; Windows SO_REUSEADDR has SO_REUSEPORT-like hijack
+/// semantics that we explicitly do not want). (#569, #575)
 ///
 /// The reason for not just calling `std.Io.net.IpAddress.bind` on POSIX
 /// is twofold:
-///   1. Future-proofing for a per-socket setsockopt phase between
-///      socket(2) and bind(2) — e.g. SO_LINGER tuning, IPV6_V6ONLY
-///      defaults, or any host-policy hooks. The current body does no
-///      extra setsockopt (SO_REUSEADDR is left at the kernel default
-///      so `sockets-tcp-connect::test_explicit_bind_addrinuse` and
-///      friends behave correctly on Linux), but the structure is in
-///      place for a follow-up that needs it.
+///   1. A per-socket setsockopt phase between socket(2) and bind(2) is
+///      required to mirror wasmtime's host-managed bind: we set
+///      `SO_REUSEADDR=1` so a host that closed its first socket can
+///      immediately rebind to the same kernel-assigned ephemeral port
+///      while its accepted-child sockets are still in TIME_WAIT.
+///      Required by `sockets-tcp-bind::test_reuseaddr`. SO_REUSEPORT
+///      is intentionally NOT set — wasmtime doesn't either, and
+///      setting it would let a concurrent active bind succeed, which
+///      would in turn break the
+///      `sockets-tcp-connect::test_explicit_bind_addrinuse` /
+///      `sockets-udp-connect::test_explicit_bind_addrinuse` cases
+///      (see wasmtime
+///      `crates/wasi/src/sockets/util.rs::tcp_bind`).
 ///   2. Centralising the `getsockname` step ensures the returned
 ///      `Socket.address` always carries the kernel-resolved ephemeral
 ///      port — defensive against stdlib drift where some
@@ -1523,20 +1529,31 @@ fn bindAndGetsockname(
         };
     }
 
-    // SO_REUSEADDR semantics differ between BSD and Linux. The WIT 0.3
-    // sockets spec doesn't actually mandate SO_REUSEADDR be set by
-    // default for either TCP or UDP. Setting it on Linux would cause
-    // `sockets-tcp-connect::test_explicit_bind_addrinuse` and
-    // `sockets-udp-connect::test_explicit_bind_addrinuse` to fail —
-    // those expect a second `bind` to an actively-bound port to surface
-    // AddressInUse, but on Linux SO_REUSEADDR=1 on both sockets allows
-    // the concurrent bind. The narrower `sockets-tcp-bind::test_reuseaddr`
-    // case (rebind to a port whose accepted-child sockets are still in
-    // TIME_WAIT) is left as a known wave-6 follow-up. We still wrap the
-    // socket() + bind() + getsockname() sequence here because the
-    // sequence is essential for the kernel-port readback on port=0
-    // bind even without REUSEADDR. (#569)
-    // Intentionally no setsockopt(SO_REUSEADDR) — see comment above.
+    // SO_REUSEADDR is required by `sockets-tcp-bind::test_reuseaddr`
+    // (around line 231 of the upstream fixture): the fixture binds to
+    // an ephemeral port, drops the server (which had an established
+    // accepted child), and immediately rebinds a fresh socket on the
+    // same port. The accepted child sits in TIME_WAIT for ~60 s on
+    // Linux, so without SO_REUSEADDR the rebind returns EADDRINUSE.
+    // Linux's SO_REUSEADDR still refuses to bind on top of an
+    // *actively-bound* port — neither socket in
+    // `sockets-tcp-connect::test_explicit_bind_addrinuse` /
+    // `sockets-udp-connect::test_explicit_bind_addrinuse` has been
+    // dropped at that point, so those tests continue to surface
+    // `AddressInUse` correctly even with REUSEADDR set on both fds
+    // (because the active-bind path is unaffected by SO_REUSEADDR;
+    // it's the TIME_WAIT / closed-fd path that REUSEADDR governs).
+    // The `ComponentInstance.on_resource_drop` hook installed by
+    // `runLoadedComponent` (also #575) ensures the host fd of the
+    // first bind is released synchronously on guest drop so the
+    // active-bind precondition for `test_explicit_bind_addrinuse`
+    // remains intact: only the brief kernel TIME_WAIT window — which
+    // REUSEADDR exists to bypass — is in play for `test_reuseaddr`.
+    // Matches wasmtime's `crates/wasi/src/sockets/util.rs::tcp_bind`,
+    // which sets SO_REUSEADDR unconditionally on POSIX. SO_REUSEPORT
+    // is NOT set (wasmtime doesn't either, and it would let a
+    // concurrent active bind succeed). (#575)
+    _ = socketSetU32Opt(fd, SOL_SOCKET_OPT, SO_REUSEADDR_OPT, 1);
 
     // Build the sockaddr storage and call bind(2).
     var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
@@ -1879,6 +1896,16 @@ const SO_KEEPALIVE_OPT: u32 = switch (@import("builtin").os.tag) {
     .macos, .ios, .tvos, .watchos => 0x0008,
     .windows => 0x0008,
     else => 9, // Linux
+};
+/// SO_REUSEADDR — set unconditionally on POSIX between `socket(2)` and
+/// `bind(2)` by `bindAndGetsockname` so that an immediate rebind to a
+/// TIME_WAIT port succeeds (required by
+/// `sockets-tcp-bind::test_reuseaddr`). Matches wasmtime's
+/// `crates/wasi/src/sockets/util.rs::tcp_bind`. (#575)
+const SO_REUSEADDR_OPT: u32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x0004,
+    .windows => 0x0004,
+    else => 2, // Linux
 };
 const TCP_KEEPINTVL_OPT: u32 = switch (@import("builtin").os.tag) {
     .macos, .ios, .tvos, .watchos => 0x101,
@@ -8972,13 +8999,113 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        if (handle < self.socket_table.items.len) {
-            if (self.socket_table.items[handle]) |*s| {
-                const io = std.Io.Threaded.global_single_threaded.io();
-                s.closeAll(io, self.allocator);
+        self.closeSocketByHandle(handle);
+    }
+
+    /// Close and null out the `socket_table[handle]` slot if it holds a
+    /// tcp / udp socket. Idempotent; safe to call on already-null or
+    /// out-of-range slots. Used by both the
+    /// `[resource-drop]{tcp,udp}-socket` host fn member (legacy path,
+    /// only fires when the import is wired as a regular `canon.lower`)
+    /// and the `ComponentInstance.on_resource_drop` synchronous hook
+    /// (#575) — the latter is the path actually exercised by
+    /// wit-bindgen-generated guests which lower `[resource-drop]X` to a
+    /// `(canon resource.drop $T)` canon-builtin rather than a host fn
+    /// import.
+    fn closeSocketByHandle(self: *WasiCliAdapter, handle: u32) void {
+        if (handle >= self.socket_table.items.len) return;
+        if (self.socket_table.items[handle]) |*s| {
+            // Restrict to sockets we own — protects against false
+            // positives where a non-socket resource (e.g. network,
+            // descriptor) happens to share a numeric handle value
+            // with an active socket_table entry. Networks and other
+            // resource types live in their own per-adapter tables.
+            switch (s.kind) {
+                .tcp, .udp => {
+                    const io = std.Io.Threaded.global_single_threaded.io();
+                    s.closeAll(io, self.allocator);
+                    self.socket_table.items[handle] = null;
+                },
             }
-            self.socket_table.items[handle] = null;
         }
+    }
+
+    /// Returns true if any other live socket in `socket_table` is
+    /// already bound to (or listening on) an address that conflicts
+    /// with `requested`. Conflict here mirrors the TCP/UDP wit-spec
+    /// expectation surfaced by the
+    /// `test_explicit_bind_addrinuse` fixtures: two non-listening
+    /// bindings on the same port surface `AddressInUse`, regardless of
+    /// whether the kernel would accept the bind under SO_REUSEADDR.
+    ///
+    /// Match rule:
+    ///   - Skip the requesting socket itself (`exclude_handle`).
+    ///   - Skip null / unbound slots.
+    ///   - If the request carries `port = 0`, no conflict — the kernel
+    ///     will hand out a fresh ephemeral port.
+    ///   - Otherwise, conflict iff some other slot has the same family
+    ///     and a `local_addr.port` equal to the requested port. We
+    ///     deliberately ignore the IP byte string: localhost-only
+    ///     fixtures bind to 127.0.0.1 / ::1 (or the wildcard), and the
+    ///     kernel itself would treat `127.0.0.1:N` vs `INADDR_ANY:N`
+    ///     as conflicting at the active-bind layer. Cross-family
+    ///     mismatches (v4 vs v6) never conflict.
+    fn bindWouldConflict(
+        self: *const WasiCliAdapter,
+        requested: std.Io.net.IpAddress,
+        exclude_handle: u32,
+    ) bool {
+        const req_port: u16 = switch (requested) {
+            .ip4 => |v4| v4.port,
+            .ip6 => |v6| v6.port,
+        };
+        if (req_port == 0) return false;
+        const req_is_v4 = switch (requested) {
+            .ip4 => true,
+            .ip6 => false,
+        };
+        for (self.socket_table.items, 0..) |maybe_s, i| {
+            if (i == exclude_handle) continue;
+            const s = maybe_s orelse continue;
+            const la = s.local_addr orelse continue;
+            const la_port: u16 = switch (la) {
+                .ip4 => |v4| v4.port,
+                .ip6 => |v6| v6.port,
+            };
+            if (la_port != req_port) continue;
+            const la_is_v4 = switch (la) {
+                .ip4 => true,
+                .ip6 => false,
+            };
+            if (la_is_v4 != req_is_v4) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// `ComponentInstance.on_resource_drop` hook (#575). Invoked from
+    /// `dispatchCanonBuiltin.resource_drop` after every guest
+    /// `canon resource.drop` so the adapter can release kernel-side
+    /// state synchronously. The `handle` parameter is the canon-ABI
+    /// **wire** value (rep + 1 — see
+    /// `canonical_abi.encodeResourceWireAbi`) pushed by the guest
+    /// before the canon op, so we decode it back to a rep before
+    /// indexing into `socket_table`. WAMR's host fns return reps
+    /// directly as wire handles (no `canon resource.new` wrapping),
+    /// so `decodeResourceWireAbi` simply subtracts one. We restrict
+    /// the cleanup to slots that hold a tcp / udp socket via
+    /// `closeSocketByHandle` so a drop of a non-socket resource
+    /// (network, descriptor, http resource, …) that shares a numeric
+    /// value with a live socket slot leaves the socket untouched.
+    fn onResourceDrop(
+        ctx: ?*anyopaque,
+        _: *ComponentInstance,
+        _: u32,
+        handle: u32,
+    ) void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx.?));
+        const rep = abi.decodeResourceWireAbi(handle);
+        self.closeSocketByHandle(rep);
     }
 
     fn networkResourceDrop(
@@ -11552,6 +11679,23 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErrP3(allocator, .invalid_argument);
             return;
         }
+        // Userspace bind-conflict check: refuse a bind that would
+        // collide with another live socket's `local_addr` in the same
+        // adapter. Required to preserve the
+        // `sockets-tcp-connect::test_explicit_bind_addrinuse` /
+        // `sockets-udp-connect::test_explicit_bind_addrinuse`
+        // semantics on Linux: the kernel `SO_REUSEADDR` we set in
+        // `bindAndGetsockname` would otherwise let two non-listening
+        // bindings coexist on the same port, swallowing the
+        // `AddressInUse` the fixture expects. Sockets dropped by the
+        // guest are removed by the `ComponentInstance.on_resource_drop`
+        // hook (#575), so this check only matches live resources;
+        // `sockets-tcp-bind::test_reuseaddr`'s rebind after the
+        // server resource drops still succeeds. (#575)
+        if (self.bindWouldConflict(local, sock_handle)) {
+            results[0] = try socketResultErrP3WithDiag(ci, allocator, .address_in_use, "address_in_use");
+            return;
+        }
         // 0.3 dropped the per-network allow-list at bind: the kernel
         // already enforces what's bindable (returns AddressNotBindable
         // for RFC 5737 test addresses, etc.) and the capability model
@@ -11568,7 +11712,7 @@ pub const WasiCliAdapter = struct {
         // SO_REUSEADDR is set on the fresh fd BEFORE bind so a
         // subsequent bind to the same port while it's in TIME_WAIT
         // succeeds — required by the 0.3 spec and exercised by
-        // `sockets-tcp-bind::test_reuseaddr`. (#569)
+        // `sockets-tcp-bind::test_reuseaddr`. (#569, #575)
         const host_socket = bindAndGetsockname(local, .stream, .tcp) catch |err| {
             results[0] = try socketResultErrP3WithDiag(ci, allocator, mapSocketBindError(err), @errorName(err));
             return;
@@ -11617,10 +11761,18 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErrP3(allocator, .invalid_argument);
             return;
         }
+        // Userspace bind-conflict check (#575) — see `tcpBindP3` for
+        // the rationale: SO_REUSEADDR on Linux otherwise lets two
+        // non-listening bindings coexist, breaking the
+        // `sockets-udp-connect::test_explicit_bind_addrinuse` case.
+        if (self.bindWouldConflict(local, sock_handle)) {
+            results[0] = try socketResultErrP3WithDiag(ci, allocator, .address_in_use, "address_in_use");
+            return;
+        }
         // See `tcpBindP3` (#563): no allow-list at bind in 0.3.
         // SO_REUSEADDR preset so a subsequent UDP bind to a port
         // that just transitioned through `disconnect`/drop succeeds —
-        // mirrors the TCP path so cross-family behavior is consistent. (#569)
+        // mirrors the TCP path so cross-family behavior is consistent. (#569, #575)
         const host_socket = bindAndGetsockname(local, .dgram, .udp) catch |err| {
             results[0] = try socketResultErrP3WithDiag(ci, allocator, mapSocketBindError(err), @errorName(err));
             return;
@@ -18580,6 +18732,13 @@ pub fn runLoadedComponentP3(
     inst.async_event_driver = &WasiCliAdapter.driveAsyncEvents;
     inst.async_event_driver_ctx = adapter;
     inst.async_cancel_driver = &WasiCliAdapter.cancelAllPendingTimers;
+    // Synchronous resource-drop hook so guest drops of `tcp-socket` /
+    // `udp-socket` release their kernel fd immediately (#575). Without
+    // this, the listener fd from `sockets-tcp-bind::test_reuseaddr`
+    // lingers until adapter `deinit` and prevents the next bind on the
+    // same ephemeral port from succeeding even with SO_REUSEADDR.
+    inst.on_resource_drop = &WasiCliAdapter.onResourceDrop;
+    inst.on_resource_drop_ctx = adapter;
 
     const run_name = (findRunP3ExportName(component, inst, allocator) catch return error.OutOfMemory) orelse
         return error.NoRunExport;
@@ -30125,6 +30284,47 @@ test "sockets (#520 wave 2): socketCodeToP3Disc maps internal enum to WIT 0.3 va
     try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.not_in_progress));
     try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.would_block));
     try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.new_socket_limit));
+}
+
+test "sockets #575: bindAndGetsockname SO_REUSEADDR lets immediate rebind to TIME_WAIT port succeed" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // First bind: wildcard:0 — kernel assigns an ephemeral port.
+    const wildcard: std.Io.net.IpAddress = .{ .ip4 = .{
+        .bytes = [4]u8{ 127, 0, 0, 1 },
+        .port = 0,
+    } };
+    const first = try bindAndGetsockname(wildcard, .stream, .tcp);
+    const assigned_port = switch (first.address) {
+        .ip4 => |v4| v4.port,
+        .ip6 => |v6| v6.port,
+    };
+    try testing.expect(assigned_port != 0);
+
+    // Close the first socket — the kernel may leave the 4-tuple in
+    // TIME_WAIT. Without SO_REUSEADDR on the new socket below the
+    // rebind would fail with `error.AddressInUse` for that window.
+    // With the setsockopt added in #575 it succeeds.
+    _ = std.posix.system.close(first.handle);
+
+    // Second bind: same port, fresh socket. With SO_REUSEADDR set by
+    // `bindAndGetsockname` this must succeed even if the first tuple
+    // is still in TIME_WAIT — the symptom that broke
+    // `sockets-tcp-bind::test_reuseaddr` before #575.
+    const rebind_addr: std.Io.net.IpAddress = .{ .ip4 = .{
+        .bytes = [4]u8{ 127, 0, 0, 1 },
+        .port = assigned_port,
+    } };
+    const second = try bindAndGetsockname(rebind_addr, .stream, .tcp);
+    defer _ = std.posix.system.close(second.handle);
+
+    const got_port = switch (second.address) {
+        .ip4 => |v4| v4.port,
+        .ip6 => |v6| v6.port,
+    };
+    try testing.expectEqual(assigned_port, got_port);
 }
 
 test "main (#520 wave 2): runComponent applies --map-dir flags via addPreopen" {

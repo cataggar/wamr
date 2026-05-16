@@ -1380,6 +1380,17 @@ pub fn dispatchCanonBuiltinWithCtx(
                 return error.FunctionNotFound;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             _ = canonResourceDrop(rt, handle, allocator);
+            // Notify the host adapter so it can release any kernel-
+            // side state attached to the dropped handle. WAMR's host
+            // fns return reps directly as wire handles (no automatic
+            // `canon resource.new` wrapping), so the per-type
+            // resource table at `resource_idx` is typically empty
+            // here; we still forward the raw `(resource_idx, handle)`
+            // pair so adapters that maintain their own rep tables can
+            // clean up synchronously. (#575)
+            if (comp_inst.on_resource_drop) |hook| {
+                hook(comp_inst.on_resource_drop_ctx, comp_inst, resource_idx, handle);
+            }
         },
         .resource_rep => |resource_idx| {
             const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch

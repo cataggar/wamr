@@ -1,6 +1,4 @@
 {
     "_comment": "Skip-list for `zig build wasi-p3-testsuite` (issue #489). Mirrors the format of `tests/wasi-testsuite-skip.json` consumed by `wasi-testsuite/test-runner/wasi_test_runner.py`. Each entry MUST carry a rationale + tracking issue. Remove entries as the corresponding P3 adapter PRs land. Suite key matches `tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/manifest.json` `name`.",
-    "WASI Rust tests [wasm32-wasip3]": {
-        "sockets-tcp-bind": "wasi:sockets@0.3.0 sockets-tcp-bind: most subtests pass; test_reuseaddr (line 231) fails because Linux SO_REUSEADDR semantics conflict with test_explicit_bind_addrinuse — rebind to TIME_WAIT port without REUSEADDR returns EADDRINUSE. Needs SO_LINGER tuning or kernel-state inspection — tracking wave-6 follow-up #569"
-    }
+    "WASI Rust tests [wasm32-wasip3]": {}
 }
