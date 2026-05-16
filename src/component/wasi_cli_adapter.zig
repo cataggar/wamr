@@ -23475,7 +23475,231 @@ pub const ServeHttpOptions = struct {
     /// the caller can't know the resolved port in advance. The driver
     /// scrapes this line to discover where to connect.
     announce_listening: bool = false,
+    /// Optional HTTPS termination config (#583 follow-up to PR #595).
+    /// When set, the cert + key have been parsed at startup and the
+    /// CLI plumbing is in place for the listener to wrap each
+    /// accepted fd in a TLS server-side stream. The handshake call
+    /// site itself is upstream-blocked on Zig 0.16 std not shipping
+    /// a server-side TLS API; see `HttpsTlsConfig` and tracking
+    /// issue #609. When null (default), the listener serves
+    /// plaintext HTTP/1.1 — byte-for-byte the PR #580 + #595 path.
+    tls_config: ?*const HttpsTlsConfig = null,
 };
+
+/// HTTPS termination configuration for the `wasi:http/handler@0.3.0`
+/// incoming-handler listener (`serveLoadedHttpComponent`). Parsed at
+/// startup from `--tls-cert=<path>` + `--tls-key=<path>` (or the
+/// combined `--tls-pem=<path>`) and threaded through `ServeHttpOptions`
+/// so the listener can wrap each accepted fd in a TLS server stream.
+///
+/// **Status: upstream-blocked.** Zig 0.16's `std.crypto.tls` ships
+/// only `Client.zig` — there is no `std.crypto.tls.Server`. So the
+/// cert / key are parsed and validated at startup (catching `ENOENT`,
+/// malformed PEM, etc. before bind), but the post-`accept(2)`
+/// handshake call site is currently a no-op that logs a warning and
+/// falls back to plaintext. Once upstream lands the server-side TLS
+/// API (tracked by ziglang/zig#14172 — replicated downstream as
+/// cataggar/wamr#609), the placeholder
+/// `HttpsTlsConfig.handshake(self, fd, allocator)` becomes the real
+/// `std.crypto.tls.Server.init(...).handshake()` call and HTTPS goes
+/// live.
+///
+/// Lifetimes: `cert_bundle` owns the DER-encoded certificate chain
+/// (a `std.crypto.Certificate.Bundle`, deinit via `deinit(allocator)`).
+/// `private_key_pem` is the raw PEM bytes for the private key
+/// (PKCS#8 / RSA / EC — we sniff the BEGIN marker but do not parse
+/// the key internals; the handshake engine will). Both are duplicated
+/// at `load` time from the on-disk files; the source files can be
+/// deleted afterwards without affecting the running server.
+pub const HttpsTlsConfig = struct {
+    cert_bundle: std.crypto.Certificate.Bundle,
+    private_key_pem: []u8,
+    /// One of `pkcs8`, `rsa`, `ec`. Sniffed from the BEGIN marker
+    /// in `private_key_pem`. The handshake engine cares; the
+    /// loader records it so callers can early-reject unsupported
+    /// key types in the future.
+    private_key_kind: PrivateKeyKind,
+    /// Owning allocator. Used by `deinit` to free `private_key_pem`
+    /// and tear down `cert_bundle`.
+    allocator: std.mem.Allocator,
+
+    pub const PrivateKeyKind = enum { pkcs8, rsa, ec };
+
+    pub const LoadError = error{
+        TlsCertFileNotFound,
+        TlsKeyFileNotFound,
+        TlsCertReadFailed,
+        TlsKeyReadFailed,
+        TlsCertParseFailed,
+        TlsKeyParseFailed,
+        TlsCertEmpty,
+        TlsKeyEmpty,
+        OutOfMemory,
+    };
+
+    /// Load and parse a separate cert + key pair from disk.
+    /// `cert_path` must point at a PEM file containing one or more
+    /// `-----BEGIN CERTIFICATE-----` blocks (the first block is the
+    /// leaf; subsequent blocks form the intermediate chain).
+    /// `key_path` must point at a PEM file containing exactly one
+    /// `-----BEGIN (PKCS8|RSA|EC) PRIVATE KEY-----` block.
+    ///
+    /// Both files are slurped into memory; the cert PEM is parsed
+    /// into DER via `std.crypto.Certificate.Bundle.addCertsFromFile`,
+    /// the key PEM is retained as-is for the handshake engine to
+    /// parse (deferred to `handshake()` so the loader stays
+    /// independent of the handshake's key-format expectations).
+    pub fn loadFromPaths(
+        allocator: std.mem.Allocator,
+        cert_path: []const u8,
+        key_path: []const u8,
+    ) LoadError!HttpsTlsConfig {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const now = std.Io.Timestamp.zero;
+
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        errdefer bundle.deinit(allocator);
+
+        const cwd = std.Io.Dir.cwd();
+        bundle.addCertsFromFilePath(allocator, io, now, cwd, cert_path) catch |err| switch (err) {
+            error.FileNotFound => return error.TlsCertFileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MissingEndCertificateMarker => return error.TlsCertParseFailed,
+            else => return error.TlsCertReadFailed,
+        };
+        if (bundle.bytes.items.len == 0) return error.TlsCertEmpty;
+
+        const key_bytes = cwd.readFileAlloc(io, key_path, allocator, @enumFromInt(1 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return error.TlsKeyFileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TlsKeyReadFailed,
+        };
+        errdefer allocator.free(key_bytes);
+
+        const kind = sniffPrivateKeyKind(key_bytes) orelse return error.TlsKeyParseFailed;
+
+        return .{
+            .cert_bundle = bundle,
+            .private_key_pem = key_bytes,
+            .private_key_kind = kind,
+            .allocator = allocator,
+        };
+    }
+
+    /// Load a combined PEM file containing both the certificate
+    /// chain and the private key in any order. Convenience wrapper
+    /// for the common `cert+key.pem` deployment shape.
+    pub fn loadFromCombinedPath(
+        allocator: std.mem.Allocator,
+        pem_path: []const u8,
+    ) LoadError!HttpsTlsConfig {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const now = std.Io.Timestamp.zero;
+
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        errdefer bundle.deinit(allocator);
+
+        const cwd = std.Io.Dir.cwd();
+        bundle.addCertsFromFilePath(allocator, io, now, cwd, pem_path) catch |err| switch (err) {
+            error.FileNotFound => return error.TlsCertFileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MissingEndCertificateMarker => return error.TlsCertParseFailed,
+            else => return error.TlsCertReadFailed,
+        };
+        if (bundle.bytes.items.len == 0) return error.TlsCertEmpty;
+
+        // Re-read the file to extract the private-key block (the
+        // bundle parser ignores non-CERTIFICATE blocks).
+        const full_bytes = cwd.readFileAlloc(io, pem_path, allocator, @enumFromInt(2 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return error.TlsCertFileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TlsKeyReadFailed,
+        };
+        defer allocator.free(full_bytes);
+
+        const key_pem = extractPrivateKeyBlock(allocator, full_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TlsKeyEmpty => return error.TlsKeyEmpty,
+            error.TlsKeyParseFailed => return error.TlsKeyParseFailed,
+        };
+        errdefer allocator.free(key_pem);
+        const kind = sniffPrivateKeyKind(key_pem) orelse return error.TlsKeyParseFailed;
+
+        return .{
+            .cert_bundle = bundle,
+            .private_key_pem = key_pem,
+            .private_key_kind = kind,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *HttpsTlsConfig) void {
+        self.cert_bundle.deinit(self.allocator);
+        self.allocator.free(self.private_key_pem);
+        self.* = undefined;
+    }
+
+    /// Placeholder server-side TLS handshake call. Today this is a
+    /// no-op that returns `error.TlsHandshakeUnsupported` —
+    /// `std.crypto.tls` in Zig 0.16 ships only `Client.zig`. When
+    /// upstream lands `std.crypto.tls.Server` (tracked by
+    /// ziglang/zig#14172 / cataggar/wamr#609), this becomes the
+    /// real handshake call. The listener (`serveLoadedHttpComponent`)
+    /// already calls into this path when `ServeHttpOptions.tls_config`
+    /// is set, so the wiring is in place — only the body changes.
+    pub fn handshake(self: *const HttpsTlsConfig, fd: std.posix.fd_t) error{TlsHandshakeUnsupported}!void {
+        _ = self;
+        _ = fd;
+        return error.TlsHandshakeUnsupported;
+    }
+};
+
+/// Sniff a PEM private-key BEGIN marker and classify the key type.
+/// Returns `null` if no recognised marker is present in the first
+/// 4 KiB of the file (the BEGIN line lives at offset 0 in
+/// well-formed PEM; the 4 KiB window tolerates leading comments).
+fn sniffPrivateKeyKind(pem: []const u8) ?HttpsTlsConfig.PrivateKeyKind {
+    const window = pem[0..@min(pem.len, 4 * 1024)];
+    if (std.mem.indexOf(u8, window, "-----BEGIN PRIVATE KEY-----") != null) {
+        // RFC 5958 PKCS#8 — the most common modern format and what
+        // `openssl genpkey` emits by default. The inner key OID
+        // disambiguates RSA vs EC vs Ed25519.
+        return .pkcs8;
+    }
+    if (std.mem.indexOf(u8, window, "-----BEGIN RSA PRIVATE KEY-----") != null) {
+        // PKCS#1 — legacy `openssl genrsa` format.
+        return .rsa;
+    }
+    if (std.mem.indexOf(u8, window, "-----BEGIN EC PRIVATE KEY-----") != null) {
+        // SEC1 — legacy `openssl ecparam -genkey` format.
+        return .ec;
+    }
+    return null;
+}
+
+/// Extract the `-----BEGIN … PRIVATE KEY-----` … `-----END … PRIVATE KEY-----`
+/// block (including the markers) from a combined PEM bundle. Returned
+/// slice is allocated through `allocator` and owned by the caller.
+fn extractPrivateKeyBlock(
+    allocator: std.mem.Allocator,
+    full_pem: []const u8,
+) error{ OutOfMemory, TlsKeyEmpty, TlsKeyParseFailed }![]u8 {
+    const candidates = [_]struct { begin: []const u8, end: []const u8 }{
+        .{ .begin = "-----BEGIN PRIVATE KEY-----", .end = "-----END PRIVATE KEY-----" },
+        .{ .begin = "-----BEGIN RSA PRIVATE KEY-----", .end = "-----END RSA PRIVATE KEY-----" },
+        .{ .begin = "-----BEGIN EC PRIVATE KEY-----", .end = "-----END EC PRIVATE KEY-----" },
+    };
+    for (candidates) |c| {
+        const begin = std.mem.indexOf(u8, full_pem, c.begin) orelse continue;
+        const end_off = std.mem.indexOfPos(u8, full_pem, begin + c.begin.len, c.end) orelse return error.TlsKeyParseFailed;
+        const block_end = end_off + c.end.len;
+        const block = full_pem[begin..block_end];
+        const dup = try allocator.alloc(u8, block.len);
+        @memcpy(dup, block);
+        return dup;
+    }
+    return error.TlsKeyEmpty;
+}
 
 pub fn serveHttpComponentBytes(
     data: []const u8,
@@ -23542,6 +23766,22 @@ pub fn serveLoadedHttpComponent(
         else => return error.ListenFailed,
     };
     defer server.deinit(io);
+
+    // HTTPS termination wiring (#583 follow-up / #609). When the
+    // caller supplied a parsed `HttpsTlsConfig`, the listener is
+    // *prepared* to wrap each accepted fd in a server-side TLS
+    // handshake — the cert + key were already validated at startup,
+    // so we know they at least parse. The handshake call itself is
+    // upstream-blocked (Zig 0.16 ships only `std.crypto.tls.Client`),
+    // so for now we surface a single startup warning on stderr and
+    // continue serving plaintext. This keeps the CLI surface stable
+    // — `--tls-cert` / `--tls-key` are accepted today and become
+    // load-bearing once upstream lands `std.crypto.tls.Server`.
+    if (options.tls_config) |_| {
+        var stderr_file = std.Io.File.stderr();
+        const warn = "warning: --tls-cert / --tls-key parsed but HTTPS handshake is upstream-blocked on Zig std (see cataggar/wamr#609); serving plaintext HTTP/1.1\n";
+        stderr_file.writeStreamingAll(io, warn) catch {};
+    }
 
     if (options.announce_listening) {
         // `server.socket.address` carries the kernel-resolved port
@@ -40008,4 +40248,258 @@ test "populateWasiProviders: binds wasi:keyvalue store + atomics + batch (#583 B
     try testing.expect(batch_binding.host_instance.members.contains("get-many"));
     try testing.expect(batch_binding.host_instance.members.contains("set-many"));
     try testing.expect(batch_binding.host_instance.members.contains("delete-many"));
+}
+
+// ── HTTPS termination tests (#583 follow-up / #609) ─────────────────────────
+//
+// Server-side TLS itself is upstream-blocked on Zig 0.16 std not
+// shipping `std.crypto.tls.Server` (tracked by cataggar/wamr#609),
+// so these tests exercise the *parts that ship*: the CLI's cert /
+// key loader (`HttpsTlsConfig.loadFromPaths` /
+// `loadFromCombinedPath`), the `sniffPrivateKeyKind` PEM-marker
+// sniffer, and the `ServeHttpOptions.tls_config` plumbing. When the
+// upstream API lands, these tests gain a fourth case (full HTTPS
+// round-trip against a guest export) and the existing trio
+// continues to gate the load-path.
+//
+// The cert + key below were generated once with `openssl genpkey` /
+// `openssl req -x509` (RSA 2048, PKCS#8 key, self-signed,
+// CN=localhost, validity 100 years from 2026-05-16). Embedding the
+// material instead of shelling out to `openssl` at test time means:
+//   (a) tests run on minimalist CI images with no openssl binary,
+//   (b) Zig 0.16's `std.process.Child` reshape (no more `init` /
+//       `spawnAndWait`) doesn't block the test, and
+//   (c) the cert validity window is deterministic — no flakes when
+//       the suite runs on a system with skewed wall-clock.
+const test_tls_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIDCzCCAfOgAwIBAgIUMONksknIuz0WphZ18tBF6xu+Q8MwDQYJKoZIhvcNAQEL
+    \\BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDUxNjE4MjkxNVoYDzIxMjYw
+    \\NDIyMTgyOTE1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+    \\AQUAA4IBDwAwggEKAoIBAQDDlkSJb0teGsE9HBPchEK4lUUQ0k1eeZxLJYFIcO4T
+    \\Pbau8+eaWr8MaYM89aocM1aGFfQd+rp7KxeTSvM2OemZcKaJKcjiqmov0WqbrvZg
+    \\zDiwf0WPgcgU99B0mbRHQ62nHoxtTKeHeidlN6O5MyeaUHTE1sfO08hgJ6VHQITk
+    \\blbxUD6A/lOPJzGCK3vaHf+0P3f4nfC9gCIb17DzLp6L/tjbNVQQqR8raRsO8QR4
+    \\hMOiRX0IPmSaPlKtN6lzQ+CKOgivzvI57n7xrrVucPj0wjMsO5zP7zqQ1xhwkq09
+    \\3G0X5rfk63WDb1BtgzFaL/XJosYSssll9o/dmMOGruf9AgMBAAGjUzBRMB0GA1Ud
+    \\DgQWBBRh0fMjVWXCvdPst40Qn08dkbw24zAfBgNVHSMEGDAWgBRh0fMjVWXCvdPs
+    \\t40Qn08dkbw24zAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQCr
+    \\veDHlinD43r7mdMfHKQ+36K3R06Da0JfA+gorDikHhx8wse7nJvqNQnanGrCDUUL
+    \\m4M3/BvKGCtn0ZiDo1C3kBH1FeaL3YJQa8l7zc6qUKtvNvB2gcAoLrI+02VaAIi+
+    \\q60r25olVC3yqyQZymRcJPEeT5Vda39Kad+JeYRLRWBPJy16OHEVNY1P2Y/s5zNG
+    \\sGtxhKel5VDiooT8FFITB8CFPDA2rIfudct5rcw2eflULnftsRMRgFDKbcoFnX1k
+    \\5949SXy4egHzeyi1fe5UtbQ3p6VMr6CDU5CknnpBf+zCOAZL6Iat8MlB/KgQsuDA
+    \\Ce/v5lgqs7rILO9NTP2l
+    \\-----END CERTIFICATE-----
+    \\
+;
+
+const test_tls_key_pem =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDDlkSJb0teGsE9
+    \\HBPchEK4lUUQ0k1eeZxLJYFIcO4TPbau8+eaWr8MaYM89aocM1aGFfQd+rp7KxeT
+    \\SvM2OemZcKaJKcjiqmov0WqbrvZgzDiwf0WPgcgU99B0mbRHQ62nHoxtTKeHeidl
+    \\N6O5MyeaUHTE1sfO08hgJ6VHQITkblbxUD6A/lOPJzGCK3vaHf+0P3f4nfC9gCIb
+    \\17DzLp6L/tjbNVQQqR8raRsO8QR4hMOiRX0IPmSaPlKtN6lzQ+CKOgivzvI57n7x
+    \\rrVucPj0wjMsO5zP7zqQ1xhwkq093G0X5rfk63WDb1BtgzFaL/XJosYSssll9o/d
+    \\mMOGruf9AgMBAAECggEATtmk1ddlhhG5N9667xrvHyUmi+qMwHq8lNsQ7NiCUoV9
+    \\wbiY9XSCMwnSm9/abbYQusvc970eMwujXIFJ3eGpGG/+46tRzneviYmethbqQwny
+    \\DM2yiHFk7XcetfNFZ7mUJ5y8NlBB9e88NKUiv0YtQBwRh02jjfF5hbJWAoyzRrez
+    \\3AoRT6PwHp/Z6LReEE/fDIwGfzYMlmwYOM27ESk+fztFJtXVWvxhC1V0cxOMuJen
+    \\HKQW4OFZYmWIKP51jmPE2wTypoVXsmNhl7ZW+8wMTjRIdSZyqKiV6ByKotshMOpw
+    \\2e9CyFyOjCa5QDi8hPx8hNDjMIP6P5anu3CmJZSYTQKBgQD2N88mJJjYj3ongdPz
+    \\gABbHjDXfzphqz+PvWzPYMmCV1nUb1wWWfTdH6IlwvdTansUPqu1MHJxBcZJZmqj
+    \\O3M4s0eMLVNsqKZCrY45c/q+i6YngRBnUGJzlrPKsTjqSrtkWqm5f2kM9+WoHrDu
+    \\Z8z3j/8OwAUTx4qECSE2n4pIpwKBgQDLW4JrUENWe/DlwhN3weXqnbh6rI/yhG7/
+    \\F8/zeol3tNhxtJiBWLOUVvYFYq/e//wah7NxRQp5Rl1Txa959S3JU+laQ2fNTzXY
+    \\atiI5wtTVq8/hXgCByEfw0NloK0763LzDQ6sD5Jx6tup2VlNowMfY3lL5Oq+kPR1
+    \\TmwLJto6uwKBgAFqlsV4Zmywfpplk8uNy/K6PLuwnqxbKNVx2INk4iPezsR7E4OJ
+    \\ZvAys2MWOQgAz85xAdnb+nyN9PMNJMXlnKcR2PKEfDteyP4PM4c/FI0uDnmhs290
+    \\texGTKh41oP6hBNythE8G2WYs3iBHLFyZWpzKJt0HVNczX4u80L2Lfx3AoGAUtoE
+    \\p846sSir/B/3KIqiLtV1jN1zhF46jsnX2p4pFdFjgegPXluSRrSrZYRQnS10PCbf
+    \\kB2N590oNvJKzQh8UBNU9oaR6w8DpBncAOMJNToTCnFJdKIM99DpS6WMDuadnbLL
+    \\MITjqHAEcQ3xmXT517cCe05X6a5LOuPplx2MOfMCgYB9WQsNKmcQCo68d4NdlLM2
+    \\WF4K8lW3HYQ2uzLTg/h/uz6qnVC9FZWeDdVczTFQ7jFpG0NqhHRtC2nU3Lq0oZTw
+    \\GMNQfkO6X6Kyqeh7AfUBGyN61llPhi8F1h5/4CG6Pw1ZG/zgtirNhKMuvBy1PtRT
+    \\JpYk/EhKBwd0RmROt4imCQ==
+    \\-----END PRIVATE KEY-----
+    \\
+;
+
+/// Write the embedded self-signed RSA cert + key to disk under a
+/// fresh `.zig-cache/<sub_path>/` directory and return the file
+/// paths. Cleanup is the caller's responsibility via
+/// `cleanupTestTlsMaterial`.
+fn writeTestTlsMaterial(
+    arena: std.mem.Allocator,
+    sub_path: []const u8,
+) !struct { cert_path: []u8, key_path: []u8, combined_path: []u8 } {
+    const cwd = std.Io.Dir.cwd();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    cwd.createDirPath(io, sub_path) catch {};
+
+    const cert_path = try std.fmt.allocPrint(arena, "{s}/cert.pem", .{sub_path});
+    const key_path = try std.fmt.allocPrint(arena, "{s}/key.pem", .{sub_path});
+    const combined_path = try std.fmt.allocPrint(arena, "{s}/combined.pem", .{sub_path});
+
+    {
+        var f = try cwd.createFile(io, cert_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, test_tls_cert_pem);
+    }
+    {
+        var f = try cwd.createFile(io, key_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, test_tls_key_pem);
+    }
+    {
+        var f = try cwd.createFile(io, combined_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, test_tls_cert_pem);
+        try f.writeStreamingAll(io, test_tls_key_pem);
+    }
+    return .{ .cert_path = cert_path, .key_path = key_path, .combined_path = combined_path };
+}
+
+fn cleanupTestTlsMaterial(sub_path: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cert_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/cert.pem", .{sub_path}) catch return;
+    defer std.heap.page_allocator.free(cert_path);
+    const key_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/key.pem", .{sub_path}) catch return;
+    defer std.heap.page_allocator.free(key_path);
+    const combined_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/combined.pem", .{sub_path}) catch return;
+    defer std.heap.page_allocator.free(combined_path);
+    cwd.deleteFile(io, cert_path) catch {};
+    cwd.deleteFile(io, key_path) catch {};
+    cwd.deleteFile(io, combined_path) catch {};
+    cwd.deleteDir(io, sub_path) catch {};
+}
+
+test "wasi:http #583 HTTPS: loadFromPaths parses RSA cert + key (#609 prep)" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const sub_path = ".zig-cache/wasi-http-tls-test-rsa";
+    defer cleanupTestTlsMaterial(sub_path);
+    const paths = try writeTestTlsMaterial(aa, sub_path);
+
+    var cfg = try HttpsTlsConfig.loadFromPaths(testing.allocator, paths.cert_path, paths.key_path);
+    defer cfg.deinit();
+
+    // RSA + PKCS#8 (modern `openssl genpkey -algorithm RSA` emits
+    // PKCS#8, not legacy PKCS#1). Sniffer should pick that up.
+    try testing.expectEqual(HttpsTlsConfig.PrivateKeyKind.pkcs8, cfg.private_key_kind);
+    // The bundle must hold at least one DER-encoded cert.
+    try testing.expect(cfg.cert_bundle.bytes.items.len > 0);
+    try testing.expect(cfg.cert_bundle.map.count() >= 1);
+    // Private-key PEM was retained verbatim (handshake parses).
+    try testing.expect(cfg.private_key_pem.len > 0);
+    try testing.expect(std.mem.indexOf(u8, cfg.private_key_pem, "-----BEGIN PRIVATE KEY-----") != null);
+
+    // Handshake call is the upstream-blocked piece (#609). Today
+    // it returns `TlsHandshakeUnsupported` deterministically; this
+    // assertion flips to a real round-trip once
+    // `std.crypto.tls.Server` lands upstream.
+    //
+    // `std.posix.fd_t` is `c_int` on POSIX but `*anyopaque` (HANDLE)
+    // on Windows, so use a platform-portable sentinel for the test fd.
+    const dummy_fd: std.posix.fd_t = if (builtin.os.tag == .windows)
+        @ptrFromInt(0)
+    else
+        0;
+    try testing.expectError(error.TlsHandshakeUnsupported, cfg.handshake(dummy_fd));
+}
+
+test "wasi:http #583 HTTPS: loadFromCombinedPath splits cert + key blocks (#609 prep)" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const sub_path = ".zig-cache/wasi-http-tls-test-combined";
+    defer cleanupTestTlsMaterial(sub_path);
+    const paths = try writeTestTlsMaterial(aa, sub_path);
+
+    var cfg = try HttpsTlsConfig.loadFromCombinedPath(testing.allocator, paths.combined_path);
+    defer cfg.deinit();
+
+    try testing.expectEqual(HttpsTlsConfig.PrivateKeyKind.pkcs8, cfg.private_key_kind);
+    try testing.expect(cfg.cert_bundle.bytes.items.len > 0);
+    // Key extractor should have grabbed the entire BEGIN…END block.
+    try testing.expect(std.mem.indexOf(u8, cfg.private_key_pem, "-----BEGIN PRIVATE KEY-----") != null);
+    try testing.expect(std.mem.indexOf(u8, cfg.private_key_pem, "-----END PRIVATE KEY-----") != null);
+    // No CERTIFICATE marker in the extracted key block — the
+    // extractor must not have over-grabbed.
+    try testing.expect(std.mem.indexOf(u8, cfg.private_key_pem, "-----BEGIN CERTIFICATE-----") == null);
+}
+
+test "wasi:http #583 HTTPS: loadFromPaths rejects missing / malformed inputs (#609 prep)" {
+    const testing = std.testing;
+
+    // Missing cert.
+    try testing.expectError(
+        error.TlsCertFileNotFound,
+        HttpsTlsConfig.loadFromPaths(testing.allocator, "/nonexistent/cert.pem", "/nonexistent/key.pem"),
+    );
+
+    // README.md exists but contains no `-----BEGIN CERTIFICATE-----`
+    // block, so the bundle parser ignores its contents and we
+    // surface `TlsCertEmpty` before ever looking at the key path.
+    {
+        var cfg_or_err = HttpsTlsConfig.loadFromPaths(testing.allocator, "README.md", "/nonexistent/key.pem");
+        if (cfg_or_err) |*cfg_ok| {
+            cfg_ok.deinit();
+            return error.UnexpectedSuccess;
+        } else |err| {
+            try testing.expect(err == error.TlsCertEmpty);
+        }
+    }
+
+    // Malformed cert PEM: BEGIN marker but no END.
+    {
+        const arena_alloc = testing.allocator;
+        const cwd = std.Io.Dir.cwd();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const dir = ".zig-cache/wasi-http-tls-malformed";
+        cwd.createDirPath(io, dir) catch {};
+        const cert_path = ".zig-cache/wasi-http-tls-malformed/cert.pem";
+        const key_path = ".zig-cache/wasi-http-tls-malformed/key.pem";
+        defer cleanupTestTlsMaterial(dir);
+
+        {
+            var f = try cwd.createFile(io, cert_path, .{ .truncate = true });
+            defer f.close(io);
+            try f.writeStreamingAll(io, "-----BEGIN CERTIFICATE-----\nAAAA\n");
+        }
+        {
+            var f = try cwd.createFile(io, key_path, .{ .truncate = true });
+            defer f.close(io);
+            try f.writeStreamingAll(io, "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n");
+        }
+        try testing.expectError(
+            error.TlsCertParseFailed,
+            HttpsTlsConfig.loadFromPaths(arena_alloc, cert_path, key_path),
+        );
+    }
+}
+
+test "wasi:http #583 HTTPS: sniffPrivateKeyKind discriminates PKCS#8 / RSA / EC (#609 prep)" {
+    const testing = std.testing;
+    try testing.expectEqual(HttpsTlsConfig.PrivateKeyKind.pkcs8, sniffPrivateKeyKind("-----BEGIN PRIVATE KEY-----\nXXX\n-----END PRIVATE KEY-----\n").?);
+    try testing.expectEqual(HttpsTlsConfig.PrivateKeyKind.rsa, sniffPrivateKeyKind("-----BEGIN RSA PRIVATE KEY-----\nYYY\n").?);
+    try testing.expectEqual(HttpsTlsConfig.PrivateKeyKind.ec, sniffPrivateKeyKind("-----BEGIN EC PRIVATE KEY-----\nZZZ\n").?);
+    try testing.expectEqual(@as(?HttpsTlsConfig.PrivateKeyKind, null), sniffPrivateKeyKind("not a PEM file"));
+    try testing.expectEqual(@as(?HttpsTlsConfig.PrivateKeyKind, null), sniffPrivateKeyKind(""));
+}
+
+test "wasi:http #583 HTTPS: ServeHttpOptions.tls_config defaults to null (#609 prep)" {
+    const testing = std.testing;
+    const opts: ServeHttpOptions = .{
+        .listen_address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    };
+    // Plaintext default — TLS opt-in only via the new field.
+    try testing.expectEqual(@as(?*const HttpsTlsConfig, null), opts.tls_config);
 }

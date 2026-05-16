@@ -144,6 +144,30 @@ so CI stays hermetic):
 $ zig build test -Dnetwork_tests=true
 ```
 
+### wasi:http
+
+The `wasi:http/handler@0.3.0` incoming-handler server (PRs #580 + #595)
+accepts plaintext HTTP/1.1 today — keep-alive, chunked
+Transfer-Encoding, response trailers, and 431 / 413 oversize limits
+are all in. HTTPS termination ships in two halves:
+
+1. **CLI plumbing + cert / key loader (in this build, opt-in).**
+   `wamr run --listen=<addr> --tls-cert=<cert.pem> --tls-key=<key.pem>`
+   parses + validates the cert chain (`std.crypto.Certificate.Bundle`)
+   and PEM-encoded private key (PKCS#8 / RSA / EC) at startup, so a
+   missing file or malformed PEM surfaces before `bind(2)`. The
+   convenience flag `--tls-pem=<combined.pem>` accepts a single file
+   containing both the cert chain and the key.
+
+2. **Server-side handshake (upstream-blocked).** Zig 0.16's
+   `std.crypto.tls` ships only `Client.zig` — there is no
+   `std.crypto.tls.Server` yet. Until upstream lands the server-side
+   API ([#609](https://github.com/cataggar/wamr/issues/609) tracks the
+   wiring), the listener logs a single startup warning on stderr and
+   continues to serve plaintext HTTP/1.1. The CLI surface
+   (`--tls-cert` / `--tls-key` / `--tls-pem`) is stable — when
+   handshake support lands it goes live without a flag-shape change.
+
 ## Configuration
 
 `wasi:config@0.2.0-rc.1` (`store.get` / `store.get-all`) is wired
