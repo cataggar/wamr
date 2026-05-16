@@ -324,6 +324,9 @@ of scope.
 * [`tests/wasi-conformance-audit.md`](../tests/wasi-conformance-audit.md)
   — date-stamped audit log behind the empty `tests/wasi-testsuite-skip.json`
   (Preview 1 + 2; #583 C2 / PR #584).
+* [`wasi-impl-audit.md`](wasi-impl-audit.md) — per-interface,
+  per-method audit of every registered WIT method vs. upstream
+  (#583 D / PR follows this one).
 * [`src/component/wasi_cli_adapter.zig`](../src/component/wasi_cli_adapter.zig)
   — the production host adapter; `populateWasiProviders` is the
   registration seam.
