@@ -6239,7 +6239,6 @@ test "compileFunctionRA: caller passes >3 args via stack on Win64" {
     });
     try caller.getBlock(0).append(.{ .op = .{ .ret = r } });
     _ = try ir_module.addFunction(caller);
-    defer allocator.free(args);
 
     const result = try compileModule(&ir_module, allocator);
     defer allocator.free(result.code);
@@ -6462,7 +6461,6 @@ test "compileModule: regression #406 — vmctx → rdi setup deferred past arg m
     try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = a1, .type = .i32 });
     try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = a2, .type = .i32 });
     const args = try allocator.alloc(ir.VReg, 3);
-    defer allocator.free(args);
     args[0] = a0;
     args[1] = a1;
     args[2] = a2;
@@ -6684,7 +6682,6 @@ test "compileModule: regalloc hints — leaf 2-arg call emits no inter-vreg shuf
     try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a0, .type = .i32 });
     try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = a1, .type = .i32 });
     const args = try allocator.alloc(ir.VReg, 2);
-    defer allocator.free(args);
     args[0] = a0;
     args[1] = a1;
     try caller.getBlock(0).append(.{

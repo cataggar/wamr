@@ -5425,6 +5425,11 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
                 }
             }
 
+            // The original call inst was dropped from caller via
+            // `shrinkRetainingCapacity(ci)` above, so BasicBlock.deinit
+            // can no longer free its args slice; release it here.
+            if (call_args.len > 0) caller.allocator.free(call_args);
+
             inlined_count += 1;
         }
     }
@@ -6928,7 +6933,6 @@ test "DCE: preserves call argument VRegs" {
     const arg0 = func.newVReg();
     const arg1 = func.newVReg();
     const args = try allocator.dupe(ir.VReg, &[_]ir.VReg{ arg0, arg1 });
-    defer allocator.free(args);
     try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = arg0 });
     try block.append(.{ .op = .{ .iconst_32 = 20 }, .dest = arg1 });
     try block.append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } } });
@@ -6949,7 +6953,6 @@ test "DCE: preserves call_indirect elem_idx and arg VRegs" {
     const elem = func.newVReg();
     const arg = func.newVReg();
     const call_args = try allocator.dupe(ir.VReg, &[_]ir.VReg{arg});
-    defer allocator.free(call_args);
     try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = elem });
     try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = arg });
     try block.append(.{ .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = elem, .args = call_args } } });
@@ -6970,7 +6973,6 @@ test "DCE: preserves call_ref func_ref and arg VRegs" {
     const fref = func.newVReg();
     const arg = func.newVReg();
     const call_args = try allocator.dupe(ir.VReg, &[_]ir.VReg{arg});
-    defer allocator.free(call_args);
     try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = fref });
     try block.append(.{ .op = .{ .iconst_32 = 9 }, .dest = arg });
     try block.append(.{ .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = fref, .args = call_args } } });
@@ -6991,7 +6993,6 @@ test "DCE: preserves ret_multi VRegs" {
     const v0 = func.newVReg();
     const v1 = func.newVReg();
     const ret_vals = try allocator.dupe(ir.VReg, &[_]ir.VReg{ v0, v1 });
-    defer allocator.free(ret_vals);
     try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
     try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1 });
     try block.append(.{ .op = .{ .ret_multi = ret_vals } });
@@ -9593,7 +9594,6 @@ test "inlineSmallFunctions: leaf with param-return is inlined" {
     // Caller: fn main() -> i32   { i32.const 42; call 0; return }
     try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
     {
         const caller = &module.functions.items[1];
         const mb = try caller.newBlock();
@@ -9692,7 +9692,6 @@ test "inlineSmallFunctions: multi-block if/else callee is inlined" {
     // Caller: fn main(p, a, b) -> i32  { call 0(p, a, b); return }
     try module.functions.append(allocator, ir.IrFunction.init(allocator, 3, 1, 3));
     const args = try allocator.alloc(ir.VReg, 3);
-    defer allocator.free(args);
     {
         const caller = &module.functions.items[1];
         const mb = try caller.newBlock();
@@ -9750,7 +9749,6 @@ test "inlineSmallFunctions: local_set callee gets inlined with synthetic local r
     // Caller has one original local; the inlined callee must not reuse local 0.
     try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
     const caller_original_locals = module.functions.items[1].local_count;
     {
         const caller = &module.functions.items[1];
@@ -9809,7 +9807,6 @@ test "inlineSmallFunctions: multi-block callee with declared locals zero-inits s
 
     try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
     const caller_original_locals = module.functions.items[1].local_count;
     {
         const caller = &module.functions.items[1];
@@ -9875,7 +9872,6 @@ test "inlineSmallFunctions: br_table callee gets inlined with remapped targets" 
 
     try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
     {
         const caller = &module.functions.items[1];
         const mb = try caller.newBlock();
@@ -9934,7 +9930,6 @@ test "runPasses: re-runs inlining after first per-function fixpoint" {
     // inlines f1 into f2.
     try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
     const f1_args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(f1_args);
     {
         const f = &module.functions.items[1];
         const cb = try f.newBlock();
@@ -9950,7 +9945,6 @@ test "runPasses: re-runs inlining after first per-function fixpoint" {
     // f2 (caller): fn main() -> i32 { call middle(42); ret }.
     try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
     const f2_args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(f2_args);
     {
         const f = &module.functions.items[2];
         const cb = try f.newBlock();

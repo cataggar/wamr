@@ -892,6 +892,10 @@ pub const BasicBlock = struct {
             switch (inst.op) {
                 .phi => |edges| self.allocator.free(edges),
                 .parallel_copy => |pairs| self.allocator.free(pairs),
+                .call => |cl| if (cl.args.len > 0) self.allocator.free(cl.args),
+                .call_indirect => |ci| if (ci.args.len > 0) self.allocator.free(ci.args),
+                .call_ref => |cr| if (cr.args.len > 0) self.allocator.free(cr.args),
+                .ret_multi => |vregs| if (vregs.len > 0) self.allocator.free(vregs),
                 else => {},
             }
         }

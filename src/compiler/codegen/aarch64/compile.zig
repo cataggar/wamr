@@ -9247,7 +9247,6 @@ test "compileModule: direct v128 call stages q0" {
 
     var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
     {
         const b = try f1.newBlock();
         const v = f1.newVReg();
@@ -9291,7 +9290,6 @@ test "compileModule: mixed scalar and v128 direct call uses independent banks" {
 
     var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
     const args = try allocator.alloc(ir.VReg, 3);
-    defer allocator.free(args);
     {
         const b = try f1.newBlock();
         const s0 = f1.newVReg();
@@ -9339,7 +9337,6 @@ test "compileModule: excess v128 args use outgoing stack" {
 
     var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
     const args = try allocator.alloc(ir.VReg, 9);
-    defer allocator.free(args);
     {
         const b = try f1.newBlock();
         for (args, 0..) |*slot, idx| {
@@ -9368,7 +9365,6 @@ test "compileFunction: indirect v128 call stages q0 and emits BLR" {
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
 
     const b = try func.newBlock();
     const v = func.newVReg();
@@ -9391,7 +9387,6 @@ test "compileFunction: call_ref v128 call stages q0 and emits BLR" {
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
 
     const b = try func.newBlock();
     const v = func.newVReg();
@@ -9494,7 +9489,6 @@ test "compileModule: v128 primary and aligned v128 extra multi-result" {
 
     var f0 = ir.IrFunction.init(allocator, 0, 3, 0);
     const ret_vals = try allocator.alloc(ir.VReg, 3);
-    defer allocator.free(ret_vals);
     {
         const b = try f0.newBlock();
         const primary = f0.newVReg();
@@ -13052,7 +13046,6 @@ test "compileModule: direct tail call emits B (not BL) to target" {
     // f1: (i32) -> i32 that `return_call f0(x)` — a direct tail call.
     var f1 = ir.IrFunction.init(allocator, 1, 1, 1);
     const args = try allocator.alloc(ir.VReg, 1);
-    defer allocator.free(args);
     {
         const b = try f1.newBlock();
         const p = f1.newVReg();
@@ -13110,7 +13103,6 @@ test "compileModule: multi-result call (ret_multi + call_result)" {
     // f0: () -> (i32, i32, i32) returning (10, 20, 30)
     var f0 = ir.IrFunction.init(allocator, 0, 3, 0);
     const rets = try allocator.alloc(ir.VReg, 3);
-    defer allocator.free(rets);
     {
         const b = try f0.newBlock();
         const v0 = f0.newVReg();
@@ -13936,7 +13928,6 @@ test "compileModule: regalloc hints — leaf 2-arg call places args directly int
     try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a0, .type = .i32 });
     try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = a1, .type = .i32 });
     const args = try allocator.alloc(ir.VReg, 2);
-    defer allocator.free(args);
     args[0] = a0;
     args[1] = a1;
     try caller.getBlock(0).append(.{
