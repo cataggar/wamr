@@ -106,21 +106,21 @@ Resource-drop entries are required by the canonical ABI for every
 
 | Surface       | Total methods | ✅ Implemented | ⚠️ Stubbed | ❌ Missing | Implemented % |
 | ------------- | ------------: | -------------: | ---------: | --------: | ------------: |
-| Preview 2 (0.2.x) — `wasi:cli` + `wasi:io` + `wasi:clocks` + `wasi:random` + `wasi:filesystem` + `wasi:sockets` + `wasi:http` | 188 | 173 | — | 15 | 92.0 % |
+| Preview 2 (0.2.x) — `wasi:cli` + `wasi:io` + `wasi:clocks` + `wasi:random` + `wasi:filesystem` + `wasi:sockets` + `wasi:http` | 188 | 180 | — | 8 | 95.7 % |
 | Preview 3 (0.3.0) | 135 | 135 | — | 0 | 100.0 % |
 | `wasi:keyvalue@0.2.0-draft2` | 15 | 12 | 3 | 0 | 80.0 % |
 | `wasi:logging@0.1.0-draft` | 1 | 1 | — | — | 100.0 % |
 | `wasi:config/store@0.2.0-rc.1` | 2 | 2 | — | — | 100.0 % |
-| **Total** | **341** | **323** | **3** | **15** | **94.7 %** |
+| **Total** | **341** | **330** | **3** | **8** | **96.8 %** |
 
-Stubbed %: 0.9 %. Missing %: 4.4 %. (Type-only WIT instances —
+Stubbed %: 0.9 %. Missing %: 2.3 %. (Type-only WIT instances —
 `wasi:io/streams@0.3.0`, `wasi:io/error@0.3.0`,
 `wasi:cli/types@0.3.0`, `wasi:clocks/types@0.3.0` — declare no host
 methods and so contribute zero rows to either denominator.)
 
 ## Findings: ❌ Missing arms
 
-Fifteen WIT methods are declared upstream but not registered by
+Eight WIT methods are declared upstream but not registered by
 `populateWasi*`. None are exercised by today's `wasi-testsuite` or
 `wasi-p3-testsuite` fixtures (both gates pass 100 %), but a guest
 component that imports any of them would fail at `linkImports`
@@ -162,33 +162,28 @@ trivial to wire — bind to a helper that maps the existing
 `socketResultErr` codes. Recommend a new tracking child of
 [#583](https://github.com/cataggar/wamr/issues/583) (section A).
 
-### `wasi:http/types@0.2.x` — 7 missing methods (1 free fn + 6 unstable / spec-evolved)
+### `wasi:http/types@0.2.x` — closed in W11-2 (PR feat/audit-p2-http-types)
 
 [`http-0.2-types.wit`](https://github.com/WebAssembly/wasi-http/blob/main/wit/types.wit)
 
-| WIT method | Why missing |
-| --- | --- |
-| `http-error-code` (free fn) | Downcasts an `io-error` borrow to an HTTP `error-code` — symmetric with `wasi:sockets/network-error-code` above. |
-| `[method]request-options.connect-timeout` | wamr registers only `[constructor]request-options` + `[resource-drop]request-options`; the six timeout getters/setters are not bound — the host honours its own internal defaults (`std.http.Client.fetch` timeouts) but cannot read or override them via the WIT surface. |
-| `[method]request-options.set-connect-timeout` | Same as above. |
-| `[method]request-options.first-byte-timeout` | Same as above. |
-| `[method]request-options.set-first-byte-timeout` | Same as above. |
-| `[method]request-options.between-bytes-timeout` | Same as above. |
-| `[method]request-options.set-between-bytes-timeout` | Same as above. |
+All seven previously-missing arms (1 free fn + 6 `request-options`
+timeout getters/setters) are now bound. The 0.2 spec uses the
+unprefixed getter names (`connect-timeout` etc.) while 0.3 uses
+`get-connect-timeout` etc.; both surfaces share the `RequestOptions`
+rep struct and the `HttpErrorCode` enum (the 0.2 and 0.3
+`error-code` variants happen to share WIT-declaration order). See
+the `wasi:http/types` row table below for per-method line refs.
 
-**Note:** `[method]response-outparam.send-informational` is
-`@unstable(feature = informational-outbound-responses)` upstream;
-wamr unconditionally omits it. The 0.3 `wasi:http/types@0.3.0`
-surface (registered in `populateWasiHttpTypesP3`) **does** bind all
-six `request-options` timeout accessors as well as `request-options.clone`,
-so the gap is 0.2-only.
+`[method]response-outparam.send-informational` remains the only
+unbound member: it is `@unstable(feature = informational-outbound-responses)`
+upstream and wamr unconditionally omits it (tracked under
+[#583 A5](https://github.com/cataggar/wamr/issues/583)).
 
-**Follow-up cluster:** *wasi:http/types@0.2.x request-options
-timeouts.* Plumb the host's `std.http.Client` request timeouts
-through the canonical-ABI lift so 0.2 guests can observe / mutate
-them symmetrically with 0.3. Track under
-[#583 A5](https://github.com/cataggar/wamr/issues/583)
-(incoming-handler robustness umbrella) or a new child issue.
+Timeout values are advisory in this PR — the worker reads them off
+the rep struct but `std.http.Client.fetch` in
+`httpOutgoingHandlerHandle` does not yet thread them through to
+the underlying TCP/TLS handshake. Future work under #583 A5 wires
+them into `std.http.Client.Request`'s timeout options.
 
 ## Findings: ⚠️ Stubbed arms
 
@@ -560,7 +555,7 @@ Upstream WIT: [`types.wit`](https://github.com/WebAssembly/wasi-http/blob/main/w
 
 | WIT method | Status | Adapter location | Notes |
 | --- | :-: | --- | --- |
-| `http-error-code` (free fn) | ❌ | — | Not registered. |
+| `http-error-code` (free fn) | ✅ | wasi_cli_adapter.zig:20919 | Cross-references the borrowed `io-error` handle against `WasiCliAdapter.http_io_errors`; returns `some(error-code)` for HTTP-origin errors, `none` otherwise. |
 | `[constructor]fields` | ✅ | wasi_cli_adapter.zig:20370 | — |
 | `[static]fields.from-list` | ✅ | :20371 | — |
 | `[method]fields.entries` | ✅ | :20372 | — |
@@ -612,19 +607,19 @@ Upstream WIT: [`types.wit`](https://github.com/WebAssembly/wasi-http/blob/main/w
 | `[method]future-trailers.subscribe` | ✅ | :20424 | — |
 | `[method]future-trailers.get` | ✅ | :20425 | — |
 | `[resource-drop]future-trailers` | ✅ | :20426 | — |
-| `[constructor]request-options` | ✅ | :20428 | — |
-| `[method]request-options.connect-timeout` | ❌ | — | Not registered. |
-| `[method]request-options.set-connect-timeout` | ❌ | — | Not registered. |
-| `[method]request-options.first-byte-timeout` | ❌ | — | Not registered. |
-| `[method]request-options.set-first-byte-timeout` | ❌ | — | Not registered. |
-| `[method]request-options.between-bytes-timeout` | ❌ | — | Not registered. |
-| `[method]request-options.set-between-bytes-timeout` | ❌ | — | Not registered. |
-| `[resource-drop]request-options` | ✅ | :20429 | — |
+| `[constructor]request-options` | ✅ | :20906 | — |
+| `[method]request-options.connect-timeout` | ✅ | :20909 | 0.2-style unprefixed getter name (`get-` prefix only in 0.3). Stored on the `RequestOptions` rep struct (`connect_timeout_ns`); advisory today (`std.http.Client.fetch` does not yet thread it through to the TCP handshake). |
+| `[method]request-options.set-connect-timeout` | ✅ | :20910 | Stores `option<duration>` (nanoseconds). Returns `result` ok unconditionally. |
+| `[method]request-options.first-byte-timeout` | ✅ | :20911 | Same as above; field `first_byte_timeout_ns`. |
+| `[method]request-options.set-first-byte-timeout` | ✅ | :20912 | Same as above. |
+| `[method]request-options.between-bytes-timeout` | ✅ | :20913 | Same as above; field `between_bytes_timeout_ns`. |
+| `[method]request-options.set-between-bytes-timeout` | ✅ | :20914 | Same as above. |
+| `[resource-drop]request-options` | ✅ | :20915 | — |
 | `[method]response-outparam.send-informational` (`@unstable`) | N/A | — | Unstable feature; not yet registered. Tracked under [#583 A5](https://github.com/cataggar/wamr/issues/583). |
-| `[static]response-outparam.set` | ✅ | :20430 | — |
-| `[resource-drop]response-outparam` | ✅ | :20431 | — |
+| `[static]response-outparam.set` | ✅ | :20916 | — |
+| `[resource-drop]response-outparam` | ✅ | :20917 | — |
 
-55/62 stable (88.7 %). `send-informational` is the only
+62/62 stable (100 %). `send-informational` is the only
 `@unstable` feature and is excluded from the implemented %.
 
 ### `wasi:http/outgoing-handler`
