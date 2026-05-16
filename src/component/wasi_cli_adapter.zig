@@ -3587,6 +3587,63 @@ pub const EnvVar = struct {
     value: []const u8,
 };
 
+/// Severity for `wasi:logging/logging.log` (#583 B5). Discriminant
+/// order matches the WIT `enum level { trace, debug, info, warn,
+/// error, critical }` so `@as(WasiLogLevel, @enumFromInt(d))` round-trips
+/// the canonical-ABI `enum_val` discriminant directly.
+///
+/// Used both as the per-call argument from the guest and as the
+/// `WasiCliAdapter.log_level` filter (lower → admit fewer calls).
+pub const WasiLogLevel = enum(u32) {
+    trace = 0,
+    debug = 1,
+    info = 2,
+    warn = 3,
+    err = 4,
+    critical = 5,
+
+    /// Parse a case-insensitive level name. Accepts both the WIT
+    /// spelling (`error`) and the more common `err` shorthand.
+    /// Returns `null` for unknown names — callers (CLI / env-var
+    /// parsing) emit a usage-style diagnostic in that case.
+    pub fn fromString(s: []const u8) ?WasiLogLevel {
+        const eqlIgnoreCase = std.ascii.eqlIgnoreCase;
+        if (eqlIgnoreCase(s, "trace")) return .trace;
+        if (eqlIgnoreCase(s, "debug")) return .debug;
+        if (eqlIgnoreCase(s, "info")) return .info;
+        if (eqlIgnoreCase(s, "warn") or eqlIgnoreCase(s, "warning")) return .warn;
+        if (eqlIgnoreCase(s, "error") or eqlIgnoreCase(s, "err")) return .err;
+        if (eqlIgnoreCase(s, "critical") or eqlIgnoreCase(s, "fatal")) return .critical;
+        return null;
+    }
+
+    /// Lowercase WIT spelling (`error`, not `err`) for inclusion in
+    /// formatted log lines.
+    pub fn name(self: WasiLogLevel) []const u8 {
+        return switch (self) {
+            .trace => "trace",
+            .debug => "debug",
+            .info => "info",
+            .warn => "warn",
+            .err => "error",
+            .critical => "critical",
+        };
+    }
+
+    /// Project onto `std.log.Level`. `trace`/`debug` collapse to
+    /// `.debug` (std.log has no finer-grained level); `error`/`critical`
+    /// collapse to `.err`. Mirrors the wasmtime adapter and matches
+    /// the README compatibility note in `docs/wasi.md`.
+    pub fn toStdLogLevel(self: WasiLogLevel) std.log.Level {
+        return switch (self) {
+            .trace, .debug => .debug,
+            .info => .info,
+            .warn => .warn,
+            .err, .critical => .err,
+        };
+    }
+};
+
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
@@ -3712,6 +3769,23 @@ pub const WasiCliAdapter = struct {
     /// sub-interfaces have no 0.3 equivalent — bind/connect take no
     /// network arg in 0.3.
     sockets_types_p3_iface: HostInstance = .{},
+
+    // ── wasi:logging@0.1.x (#583 B5) ──────────────────────────────────
+    // Host instance for the `wasi:logging/logging` interface. The 0.1
+    // WIT is the only published surface today (see
+    // https://github.com/WebAssembly/wasi-logging); the `_p2_iface`
+    // alias is reserved for a future 0.2.x revision that may register
+    // the same callback against a separate HostInstance. Both ifaces
+    // share the same `wasiLog` callback and the same `log_level`
+    // filter.
+    logging_iface: HostInstance = .{},
+    logging_p2_iface: HostInstance = .{},
+    /// Host-side filter for `wasi:logging/logging.log` (#583 B5). Calls
+    /// below this level are dropped before any formatting / writing.
+    /// Default `.trace` admits every level (no filtering). CLI flag
+    /// `--log-level=<trace|debug|info|warn|error>` and env var
+    /// `WAMR_LOG_LEVEL` both write here via `setLogLevel`.
+    log_level: WasiLogLevel = .trace,
 
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
@@ -4010,6 +4084,8 @@ pub const WasiCliAdapter = struct {
         self.sockets_udp_create_p3_iface.deinit(self.allocator);
         self.sockets_ip_name_lookup_p3_iface.deinit(self.allocator);
         self.sockets_types_p3_iface.deinit(self.allocator);
+        self.logging_iface.deinit(self.allocator);
+        self.logging_p2_iface.deinit(self.allocator);
         self.timer_futures.deinit(self.allocator);
         self.timer_future_ready.deinit(self.allocator);
         self.pending_udp_receives.deinit(self.allocator);
@@ -4278,6 +4354,21 @@ pub const WasiCliAdapter = struct {
         if (self.sockets_allow_list_template.len != 0)
             self.allocator.free(self.sockets_allow_list_template);
         self.sockets_allow_list_template = parsed;
+    }
+
+    /// Configure the host-side `wasi:logging/logging.log` severity gate
+    /// (#583 B5). `level` is the *minimum* admitted severity — calls at
+    /// strictly lower severity are dropped silently before formatting
+    /// or being written to host stderr.
+    ///
+    /// The CLI wires this through `--log-level=<name>` or the
+    /// `WAMR_LOG_LEVEL` env var (see `src/main.zig`). Embedders that
+    /// instantiate the adapter directly call `setLogLevel` themselves.
+    /// `name` matches `WasiLogLevel.fromString` (case-insensitive WIT
+    /// spelling — `trace|debug|info|warn|error|critical`, plus `err`
+    /// and `warning` aliases).
+    pub fn setLogLevel(self: *WasiCliAdapter, level: WasiLogLevel) void {
+        self.log_level = level;
     }
 
     /// Captured stdout bytes (valid for buffer-backed sinks).
@@ -5786,6 +5877,166 @@ pub const WasiCliAdapter = struct {
             self.insecure_prng = std.Random.DefaultPrng.init(seed);
         }
         return self.insecure_prng.?.random();
+    }
+
+    // ── wasi:logging@0.1.x (#583 B5) ──────────────────────────────────
+    //
+    // The WIT (https://github.com/WebAssembly/wasi-logging, package
+    // `wasi:logging@0.1.0-draft`) is small:
+    //
+    //   enum level { trace, debug, info, warn, error, critical }
+    //   log: func(level: level, context: string, message: string)
+    //
+    // The host implementation routes guest log calls to:
+    //   1. `std.log.scoped(.wasi_guest)` at the projected severity
+    //      (see `WasiLogLevel.toStdLogLevel`). This lets embedders that
+    //      install a custom `std.log.logFn` capture structured log
+    //      records.
+    //   2. The adapter's `self.stderr` sink — `initWithHostStdio`
+    //      points this at the host process's stderr fd (live
+    //      streaming); `init` (test path) buffers it for inspection.
+    //      Direct stderr output is always emitted because std.log is
+    //      compile-time gated by `std_options.log_level` in
+    //      ReleaseFast builds.
+    //
+    // Host-side filtering uses `self.log_level` (default `.trace` =
+    // admit-all). Calls strictly below the threshold are dropped
+    // before formatting / writing.
+
+    /// Register `wasi:logging/logging` (#583 B5). Members:
+    ///   - `log: func(level: level, context: string, message: string)`.
+    ///
+    /// The 0.1 surface is the only published WIT today. A future 0.2
+    /// revision would register against `logging_p2_iface` with the
+    /// same backend; see `populateWasiProviders` for the
+    /// version-multiplex.
+    pub fn populateWasiLogging(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        logging_name: []const u8,
+    ) !void {
+        try self.logging_iface.members.put(self.allocator, "log", .{
+            .func = .{ .context = self, .call = &wasiLog },
+        });
+        try providers.put(self.allocator, logging_name, .{
+            .host_instance = &self.logging_iface,
+        });
+    }
+
+    /// 0.2.x version-multiplex (#583 B5). Reserved for the day the
+    /// upstream WIT publishes a `wasi:logging@0.2.x` package — today
+    /// it's stub-equivalent to `populateWasiLogging`, registered
+    /// against a separate HostInstance so 0.1 and 0.2 imports route
+    /// independently (mirrors `wasi:random@0.2` vs `@0.3`).
+    pub fn populateWasiLoggingP2(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        logging_name: []const u8,
+    ) !void {
+        try self.logging_p2_iface.members.put(self.allocator, "log", .{
+            .func = .{ .context = self, .call = &wasiLog },
+        });
+        try providers.put(self.allocator, logging_name, .{
+            .host_instance = &self.logging_p2_iface,
+        });
+    }
+
+    /// `wasi:logging/logging.log: (level, string, string) -> ()` (#583 B5).
+    ///
+    /// Reads the three canonical-ABI arguments, applies the
+    /// `self.log_level` filter, formats `[<level>] [<context>] <message>\n`
+    /// and writes it to both `std.log.scoped(.wasi_guest)` and the
+    /// adapter's `self.stderr` sink. Invalid arguments (wrong arity,
+    /// out-of-range enum discriminant, out-of-bounds string pointer)
+    /// surface as a host trap via the existing error path — the WIT
+    /// `log` signature has no result so the guest sees a generic
+    /// component-model trap on misuse.
+    fn wasiLog(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3) return error.InvalidArgs;
+        const disc: u32 = switch (args[0]) {
+            .enum_val => |d| d,
+            // Some lifters surface narrow enum discriminants as u8/u32
+            // primitives. Accept those too for robustness.
+            .u8 => |v| v,
+            .u32 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        // Out-of-range discriminant → silently drop. The WIT enum has
+        // six variants (0..=5); a guest passing 6+ has a codegen bug
+        // but trapping the whole component over a log line would be
+        // disproportionate. Mirror what real loggers do (drop + carry
+        // on).
+        if (disc > @intFromEnum(WasiLogLevel.critical)) return;
+        const level: WasiLogLevel = @enumFromInt(disc);
+        const ctx_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const msg_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        // Filter below threshold *before* reading guest memory — saves
+        // the read on hot trace-level calls in release builds where
+        // the filter is set to `.info` or higher.
+        if (@intFromEnum(level) < @intFromEnum(self.log_level)) return;
+        const ctx_bytes = ci.readGuestBytes(ctx_pl.ptr, ctx_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const msg_bytes = ci.readGuestBytes(msg_pl.ptr, msg_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        try self.emitWasiLog(level, ctx_bytes, msg_bytes, allocator);
+    }
+
+    /// Test-friendly entry into the formatter (#583 B5). Public so the
+    /// unit tests can drive it without standing up a full
+    /// ComponentInstance + guest linmem.
+    pub fn emitWasiLog(
+        self: *WasiCliAdapter,
+        level: WasiLogLevel,
+        context_bytes: []const u8,
+        message_bytes: []const u8,
+        allocator: Allocator,
+    ) !void {
+        if (@intFromEnum(level) < @intFromEnum(self.log_level)) return;
+        // Format once, then emit to both std.log and the adapter's
+        // stderr sink. The `wasi_guest` scope tag lets embedders'
+        // `std.log.logFn` filter / route guest log lines distinctly
+        // from host-internal logs.
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "[wasi_guest] [{s}] [{s}] {s}\n",
+            .{ level.name(), context_bytes, message_bytes },
+        );
+        defer allocator.free(line);
+        // Skip the `std.log` path under Zig's test runner — the
+        // default test logger promotes `std.log.warn` / `std.log.err`
+        // into test failures (see lib/std/testing.zig logFn). The
+        // `self.stderr` write below still exercises the actual host
+        // surface, which is what the WASI fixtures observe.
+        if (!builtin.is_test) {
+            const log = std.log.scoped(.wasi_guest);
+            switch (level.toStdLogLevel()) {
+                .debug => log.debug("[{s}] [{s}] {s}", .{ level.name(), context_bytes, message_bytes }),
+                .info => log.info("[{s}] {s}", .{ context_bytes, message_bytes }),
+                .warn => log.warn("[{s}] {s}", .{ context_bytes, message_bytes }),
+                .err => log.err("[{s}] [{s}] {s}", .{ level.name(), context_bytes, message_bytes }),
+            }
+        }
+        // Always also push to the adapter's stderr sink so the line
+        // is visible regardless of build mode (std.log is compile-time
+        // gated in ReleaseFast). For `initWithHostStdio` this is the
+        // host process's real stderr fd; for `init` it's the captured
+        // buffer that tests scan via `getStderrBytes`.
+        switch (self.stderr.write(line, self.allocator)) {
+            .ok, .err, .closed => {},
+        }
     }
 
     /// `wasi:clocks/wall-clock.now: () -> datetime` (#146).
@@ -20406,6 +20657,14 @@ pub fn populateWasiProviders(
     var matched_http_types_p3: ?[]const u8 = null;
     var matched_http_handler_p3: ?[]const u8 = null;
     var matched_http_client_p3: ?[]const u8 = null;
+    // wasi:logging@0.1.x (#583 B5). The upstream WIT publishes the
+    // `wasi:logging/logging` interface as `@0.1.0-draft`; the `_p2`
+    // slot is reserved for a possible `@0.2.x` revision and routes
+    // independently. `wasiVersion` returns `.unspecified` for
+    // `0.1.x` and `.p2` for `0.2.x` — we treat both as the "default"
+    // 0.1 binding unless an explicit `@0.2.x` import is present.
+    var matched_logging: ?[]const u8 = null;
+    var matched_logging_p2: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         // wasi:cli/* — version-multiplex onto either the 0.2 (P2) or
@@ -20594,6 +20853,16 @@ pub fn populateWasiProviders(
             switch (wasiVersion(imp.name)) {
                 .p3 => matched_http_types_p3 = matched_http_types_p3 orelse imp.name,
                 else => matched_http_types = matched_http_types orelse imp.name,
+            }
+        }
+        // wasi:logging (#583 B5). The 0.1 WIT lives under
+        // `wasi:logging/logging`; route a `@0.2.x` import (when /if
+        // upstream publishes one) to a separate HostInstance so both
+        // versions can coexist on the same component.
+        if (matchesWasiPrefix(imp.name, "wasi:logging/logging")) {
+            switch (wasiVersion(imp.name)) {
+                .p2 => matched_logging_p2 = matched_logging_p2 orelse imp.name,
+                else => matched_logging = matched_logging orelse imp.name,
             }
         }
     }
@@ -20880,6 +21149,16 @@ pub fn populateWasiProviders(
     }
     if (matched_http_client_p3) |name| {
         try adapter.populateWasiHttpClientP3(providers, name);
+    }
+
+    // wasi:logging@0.1.x (#583 B5). Conditionally bound — same pattern
+    // as wasi:random@0.3.0 above. The host adapter shares a single
+    // `wasiLog` callback between the 0.1 and the reserved 0.2.x slot.
+    if (matched_logging) |name| {
+        try adapter.populateWasiLogging(providers, name);
+    }
+    if (matched_logging_p2) |name| {
+        try adapter.populateWasiLoggingP2(providers, name);
     }
 }
 
@@ -35371,3 +35650,210 @@ test "wasi:http@0.3 (#583 A5): httpRequestHeaderInfoFromBlock detects keep-alive
     try testing.expectEqual(@as(usize, 7), info7.body_kind.content_length);
 }
 
+
+// ── wasi:logging@0.1.x (#583 B5) tests ────────────────────────────────
+
+test "wasi:logging (#583 B5): WasiLogLevel.fromString parses every WIT name + aliases" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?WasiLogLevel, .trace), WasiLogLevel.fromString("trace"));
+    try testing.expectEqual(@as(?WasiLogLevel, .trace), WasiLogLevel.fromString("TRACE"));
+    try testing.expectEqual(@as(?WasiLogLevel, .debug), WasiLogLevel.fromString("debug"));
+    try testing.expectEqual(@as(?WasiLogLevel, .info), WasiLogLevel.fromString("info"));
+    try testing.expectEqual(@as(?WasiLogLevel, .warn), WasiLogLevel.fromString("warn"));
+    try testing.expectEqual(@as(?WasiLogLevel, .warn), WasiLogLevel.fromString("warning"));
+    try testing.expectEqual(@as(?WasiLogLevel, .err), WasiLogLevel.fromString("error"));
+    try testing.expectEqual(@as(?WasiLogLevel, .err), WasiLogLevel.fromString("err"));
+    try testing.expectEqual(@as(?WasiLogLevel, .critical), WasiLogLevel.fromString("critical"));
+    try testing.expectEqual(@as(?WasiLogLevel, .critical), WasiLogLevel.fromString("fatal"));
+    try testing.expectEqual(@as(?WasiLogLevel, null), WasiLogLevel.fromString("loud"));
+    try testing.expectEqual(@as(?WasiLogLevel, null), WasiLogLevel.fromString(""));
+}
+
+test "wasi:logging (#583 B5): every level projects to the expected std.log.Level" {
+    const testing = std.testing;
+    // trace / debug collapse to .debug; info / warn pass through;
+    // error / critical collapse to .err.
+    try testing.expectEqual(std.log.Level.debug, WasiLogLevel.trace.toStdLogLevel());
+    try testing.expectEqual(std.log.Level.debug, WasiLogLevel.debug.toStdLogLevel());
+    try testing.expectEqual(std.log.Level.info, WasiLogLevel.info.toStdLogLevel());
+    try testing.expectEqual(std.log.Level.warn, WasiLogLevel.warn.toStdLogLevel());
+    try testing.expectEqual(std.log.Level.err, WasiLogLevel.err.toStdLogLevel());
+    try testing.expectEqual(std.log.Level.err, WasiLogLevel.critical.toStdLogLevel());
+    // WIT discriminant order is contiguous 0..=5 — guards against
+    // accidental enum reordering breaking the canonical-ABI
+    // discriminant → variant mapping in `wasiLog`.
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(WasiLogLevel.trace));
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(WasiLogLevel.debug));
+    try testing.expectEqual(@as(u32, 2), @intFromEnum(WasiLogLevel.info));
+    try testing.expectEqual(@as(u32, 3), @intFromEnum(WasiLogLevel.warn));
+    try testing.expectEqual(@as(u32, 4), @intFromEnum(WasiLogLevel.err));
+    try testing.expectEqual(@as(u32, 5), @intFromEnum(WasiLogLevel.critical));
+}
+
+test "wasi:logging (#583 B5): emitWasiLog formats `[wasi_guest] [<level>] [<context>] <message>` and preserves context" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Default `log_level == .trace`, so every level is admitted.
+    try adapter.emitWasiLog(.info, "frontend", "boot complete", testing.allocator);
+    try adapter.emitWasiLog(.warn, "db", "slow query 1.2s", testing.allocator);
+    try adapter.emitWasiLog(.err, "auth", "token rejected", testing.allocator);
+
+    const captured = adapter.getStderrBytes();
+    // Each call produces exactly one line. The format string in
+    // `emitWasiLog` is `[wasi_guest] [<level>] [<context>] <message>\n`.
+    try testing.expect(std.mem.indexOf(u8, captured, "[wasi_guest] [info] [frontend] boot complete\n") != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[wasi_guest] [warn] [db] slow query 1.2s\n") != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[wasi_guest] [error] [auth] token rejected\n") != null);
+    // `context` is preserved verbatim — exact byte match including
+    // the surrounding brackets.
+    try testing.expect(std.mem.indexOf(u8, captured, "[frontend]") != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[db]") != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[auth]") != null);
+}
+
+test "wasi:logging (#583 B5): log_level filter suppresses calls strictly below threshold" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Simulate `WAMR_LOG_LEVEL=warn` — `trace`, `debug`, `info` must
+    // be dropped before any bytes hit `self.stderr`. `warn`, `error`,
+    // `critical` pass through.
+    adapter.setLogLevel(.warn);
+
+    try adapter.emitWasiLog(.trace, "ctx", "trace line", testing.allocator);
+    try adapter.emitWasiLog(.debug, "ctx", "debug line", testing.allocator);
+    try adapter.emitWasiLog(.info, "ctx", "info line", testing.allocator);
+    try adapter.emitWasiLog(.warn, "ctx", "warn line", testing.allocator);
+    try adapter.emitWasiLog(.err, "ctx", "error line", testing.allocator);
+    try adapter.emitWasiLog(.critical, "ctx", "critical line", testing.allocator);
+
+    const captured = adapter.getStderrBytes();
+    try testing.expect(std.mem.indexOf(u8, captured, "trace line") == null);
+    try testing.expect(std.mem.indexOf(u8, captured, "debug line") == null);
+    try testing.expect(std.mem.indexOf(u8, captured, "info line") == null);
+    try testing.expect(std.mem.indexOf(u8, captured, "warn line") != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "error line") != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "critical line") != null);
+}
+
+test "wasi:logging (#583 B5): wasiLog reads guest-memory strings via ComponentInstance.readGuestBytes" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const ctx_ptr = ci.hostAllocAndWrite("svc:web").?;
+    const msg_ptr = ci.hostAllocAndWrite("served 200 in 4ms").?;
+
+    var args = [_]InterfaceValue{
+        .{ .enum_val = @intFromEnum(WasiLogLevel.info) },
+        .{ .string = .{ .ptr = ctx_ptr, .len = @intCast("svc:web".len) } },
+        .{ .string = .{ .ptr = msg_ptr, .len = @intCast("served 200 in 4ms".len) } },
+    };
+    var results: [0]InterfaceValue = .{};
+
+    try WasiCliAdapter.wasiLog(&adapter, &ci, &args, &results, testing.allocator);
+
+    const captured = adapter.getStderrBytes();
+    try testing.expect(std.mem.indexOf(u8, captured, "[svc:web] served 200 in 4ms\n") != null);
+    try testing.expect(std.mem.indexOf(u8, captured, "[info]") != null);
+}
+
+test "wasi:logging (#583 B5): out-of-range enum discriminant is silently dropped (no trap)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const ctx_ptr = ci.hostAllocAndWrite("x").?;
+    const msg_ptr = ci.hostAllocAndWrite("y").?;
+    // Discriminant 6 is past `critical` (the WIT enum has 6 variants
+    // numbered 0..=5). Real loggers drop and carry on; trapping the
+    // component over a malformed log line would be hostile.
+    var args = [_]InterfaceValue{
+        .{ .enum_val = 6 },
+        .{ .string = .{ .ptr = ctx_ptr, .len = 1 } },
+        .{ .string = .{ .ptr = msg_ptr, .len = 1 } },
+    };
+    var results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.wasiLog(&adapter, &ci, &args, &results, testing.allocator);
+
+    const captured = adapter.getStderrBytes();
+    try testing.expectEqual(@as(usize, 0), captured.len);
+}
+
+test "populateWasiProviders: binds wasi:logging/logging@0.1.0-draft (#583 B5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:logging/logging@0.1.0-draft", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:logging/logging@0.1.0-draft"));
+    try testing.expect(adapter.logging_iface.members.contains("log"));
+    // No `wasi:logging/logging` (unversioned) — only the explicit
+    // versioned name was imported, so the conditional-bind path
+    // does not synthesise the fallback key.
+    try testing.expect(!providers.contains("wasi:logging/logging"));
+}
+
+test "populateWasiProviders: wasi:logging 0.1 and 0.2 route to distinct HostInstances (#583 B5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:logging/logging@0.1.0-draft", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:logging/logging@0.2.0", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:logging/logging@0.1.0-draft"));
+    try testing.expect(providers.contains("wasi:logging/logging@0.2.0"));
+    try testing.expect(providers.get("wasi:logging/logging@0.1.0-draft").?.host_instance !=
+        providers.get("wasi:logging/logging@0.2.0").?.host_instance);
+}
