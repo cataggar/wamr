@@ -3754,6 +3754,16 @@ pub const KeyvalueErrorTag = enum(u32) {
     other = 2,
 };
 
+/// `wasi:keyvalue/atomics.cas-error` variant discriminants in
+/// WIT-declaration order (#583 B4 follow-up). `store-error` carries
+/// the inner `keyvalue/store.error`; `cas-failed` carries a fresh
+/// `own<cas>` handle with an updated snapshot so the guest can
+/// retry without re-issuing `cas.new`.
+pub const KeyvalueCasErrorTag = enum(u32) {
+    store_error = 0,
+    cas_failed = 1,
+};
+
 /// Cap on a single bucket's key count — `list-keys` paginates above
 /// this. The chosen value is small enough that exhausting it in a
 /// single call is cheap and large enough that the pagination path is
@@ -3761,6 +3771,61 @@ pub const KeyvalueErrorTag = enum(u32) {
 /// and a fresh `list-keys(none)` call work correctly across paging
 /// boundaries.
 const KEYVALUE_LIST_KEYS_PAGE_SIZE: usize = 128;
+
+/// `wasi:keyvalue/atomics.cas` resource rep (#583 B4 follow-up).
+///
+/// A CAS handle captures the bucket identifier + key + a snapshot of
+/// the value at construction time. `atomics.swap` consumes the handle:
+/// if the bucket's current value matches the snapshot, the new value
+/// is written and the call returns `ok`; otherwise the handle is
+/// re-snapshotted to the *current* value (per the WIT contract:
+/// "Implementors MUST return a CAS handle that has been updated to
+/// the latest version") and the same handle is lifted as the
+/// `cas-error::cas-failed` payload so guests can retry without going
+/// back through `cas.new`.
+///
+/// Lifetime: `key` and `observed` (when `is_observed` is true) are
+/// owned by the adapter's allocator; `Cas.deinit` frees both. The
+/// `bucket_handle` is the *guest* handle into `keyvalue_buckets`. If
+/// the bucket is dropped while a CAS handle still points at it, the
+/// CAS becomes stale — `swap` resolves the bucket via the table at
+/// call time and lifts `no-such-store` if the slot is null.
+pub const Cas = struct {
+    bucket_handle: u32,
+    key: []const u8,
+    observed: []const u8,
+    is_observed: bool,
+
+    pub fn deinit(self: *Cas, allocator: Allocator) void {
+        allocator.free(self.key);
+        if (self.is_observed) allocator.free(self.observed);
+    }
+};
+
+/// `wasi:keyvalue` persistence-layer snapshot (#583 B4 follow-up).
+///
+/// Mirrors the JSON file at `WasiCliAdapter.keyvalue_store_path` —
+/// keyed by bucket identifier, each entry holds the bucket's
+/// key/value pairs as adapter-allocator-owned slices. The snapshot
+/// is loaded eagerly in `setKeyvalueStorePath` and updated through
+/// `persistedStoreEntry` / `persistedRemoveEntry` on every mutation;
+/// `flushKeyvalueStore` then re-serialises the entire snapshot.
+///
+/// The default in-memory adapter never touches this map — it's only
+/// populated when the CLI passes `--keyvalue-store=<path>` (or an
+/// embedder calls `setKeyvalueStorePath` directly).
+pub const PersistedBucket = struct {
+    entries: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *PersistedBucket, allocator: Allocator) void {
+        var it = self.entries.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        self.entries.deinit(allocator);
+    }
+};
 
 /// `(string, string)` pair forwarded to
 /// `wasi:config/store@0.2.0-rc.1.{get, get-all}` (#583 B6). Same lifetime
@@ -4079,6 +4144,29 @@ pub const WasiCliAdapter = struct {
     /// byte slices. Slots are nulled on `[resource-drop]bucket`;
     /// `deinit` frees any slots the guest leaked.
     keyvalue_buckets: std.ArrayListUnmanaged(?*KeyvalueBucket) = .empty,
+
+    /// `wasi:keyvalue/atomics.cas` resource table (#583 B4
+    /// follow-up). Slot index = guest handle. Each live slot owns a
+    /// heap-allocated `Cas` whose `key` + optional `observed` byte
+    /// slices are allocator-owned. Slots are nulled on
+    /// `[resource-drop]cas` / on a successful `swap`; `deinit` frees
+    /// any slots the guest leaked.
+    cas_table: std.ArrayListUnmanaged(?*Cas) = .empty,
+
+    /// `wasi:keyvalue` persistence-layer snapshot (#583 B4
+    /// follow-up). Keyed by bucket identifier — owns the inner
+    /// `PersistedBucket`. Empty + ignored when
+    /// `keyvalue_store_path == null` (the default in-memory mode);
+    /// loaded eagerly from disk when `setKeyvalueStorePath` is
+    /// called and rewritten on every mutation.
+    keyvalue_persisted: std.StringHashMapUnmanaged(*PersistedBucket) = .empty,
+
+    /// Path to the on-disk JSON file backing `keyvalue_persisted`
+    /// (`--keyvalue-store=<path>`). `null` ⇒ in-memory only (the
+    /// default). Owned by the adapter's allocator when set;
+    /// `deinit` frees it. File format documented in
+    /// `setKeyvalueStorePath`.
+    keyvalue_store_path: ?[]const u8 = null,
     /// `wasi:io/poll.pollable` table. Pollables borrow their source
     /// resources and become ready if that source is dropped/closed, so the
     /// guest can observe the underlying closed/error condition without UAF.
@@ -4473,6 +4561,31 @@ pub const WasiCliAdapter = struct {
             }
         }
         self.keyvalue_buckets.deinit(self.allocator);
+
+        // #583 B4 follow-up: same lifecycle as `keyvalue_buckets` —
+        // every live `Cas` owns its `key` + optional `observed`
+        // snapshot slices, which must be freed before destroying
+        // the heap rep.
+        for (self.cas_table.items) |maybe| {
+            if (maybe) |c| {
+                c.deinit(self.allocator);
+                self.allocator.destroy(c);
+            }
+        }
+        self.cas_table.deinit(self.allocator);
+
+        // #583 B4 follow-up: persistence snapshot. Each entry owns
+        // its (identifier) key + the `PersistedBucket` (whose
+        // `entries` owns its own keys/values). `deinit` then frees
+        // the map's own backing storage.
+        var pit = self.keyvalue_persisted.iterator();
+        while (pit.next()) |kv| {
+            self.allocator.free(kv.key_ptr.*);
+            kv.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(kv.value_ptr.*);
+        }
+        self.keyvalue_persisted.deinit(self.allocator);
+        if (self.keyvalue_store_path) |p| self.allocator.free(p);
 
         self.pollable_table.deinit(self.allocator);
     }
@@ -20482,12 +20595,15 @@ pub const WasiCliAdapter = struct {
     // on `delete` / `[resource-drop]bucket` / `WasiCliAdapter.deinit`.
     //
     // The three interfaces (`store`, `atomics`, `batch`) share the
-    // same bucket table and the same error type. The `cas` resource
-    // on `atomics` is registered as no-op stubs (so guests that
-    // incidentally import them link cleanly) but `cas.new` /
-    // `cas.current` / `swap` return `error::other("…")`; only the
-    // `increment` free function carries a real implementation. See
-    // `docs/wasi-keyvalue-wit-vendored/README.md` for the pinned WIT.
+    // same bucket table and the same error type. `atomics.cas` is a
+    // first-class resource (#583 B4 follow-up): `cas.new` snapshots
+    // the bucket+key, `cas.current` lifts the snapshot, and `swap`
+    // is the atomic conditional — match ⇒ write + ok, mismatch ⇒
+    // re-snapshot + `cas-error::cas-failed(cas)`. Persistence is
+    // opt-in via `--keyvalue-store=<path>` (JSON file with
+    // base64-encoded values); the default mode is in-memory. See
+    // `docs/wasi-keyvalue-wit-vendored/README.md` for the pinned
+    // WIT.
 
     /// Register `wasi:keyvalue/store@0.2.x` (#583 B4).
     ///
@@ -20529,12 +20645,14 @@ pub const WasiCliAdapter = struct {
     ///   - `increment: (borrow<bucket>, string, s64) -> result<s64, error>` —
     ///     read-modify-write the bucket's value. Missing keys are
     ///     created with the delta as the initial value (per WIT).
-    ///   - `[static]cas.new` / `[method]cas.current` / `swap` /
-    ///     `[resource-drop]cas` — registered as stubs that return
-    ///     `error::other(...)` to satisfy guests that import the
-    ///     symbol but never actually invoke a CAS round-trip. The
-    ///     adapter doesn't ship a real CAS implementation; see
-    ///     `docs/wasi.md` for the limitations section.
+    ///   - `[static]cas.new: (borrow<bucket>, string) -> result<own<cas>, error>` —
+    ///     snapshot the (bucket, key) pair at construction time.
+    ///   - `[method]cas.current: () -> result<option<list<u8>>, error>` —
+    ///     lift the snapshot captured by `cas.new`.
+    ///   - `swap: (own<cas>, list<u8>) -> result<_, cas-error>` —
+    ///     atomic test-and-set: ok on match, `cas-error::cas-failed(cas)`
+    ///     with a re-snapshotted handle on mismatch.
+    ///   - `[resource-drop]cas` — free the CAS rep + owned slices.
     pub fn populateWasiKeyvalueAtomics(
         self: *WasiCliAdapter,
         providers: *std.StringHashMapUnmanaged(ImportBinding),
@@ -20605,6 +20723,29 @@ pub const WasiCliAdapter = struct {
         }
         const idx: u32 = @intCast(self.keyvalue_buckets.items.len);
         try self.keyvalue_buckets.append(self.allocator, b);
+        return idx;
+    }
+
+    /// Lookup a `Cas` by guest handle. Returns `null` if the slot
+    /// index is out of range or the CAS has been dropped / consumed
+    /// by a successful `swap`.
+    fn lookupCas(self: *WasiCliAdapter, handle: u32) ?*Cas {
+        if (handle >= self.cas_table.items.len) return null;
+        return self.cas_table.items[handle];
+    }
+
+    /// Insert a fresh `Cas` into the table. Reuses a nulled slot if
+    /// any exists, otherwise appends. Returns the slot index
+    /// (== guest handle).
+    fn pushCas(self: *WasiCliAdapter, c: *Cas) !u32 {
+        for (self.cas_table.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.cas_table.items[i] = c;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.cas_table.items.len);
+        try self.cas_table.append(self.allocator, c);
         return idx;
     }
 
@@ -20687,6 +20828,39 @@ pub const WasiCliAdapter = struct {
         const bucket = try self.allocator.create(KeyvalueBucket);
         errdefer self.allocator.destroy(bucket);
         bucket.* = .{ .identifier = ident_copy };
+
+        // Persistence mode (#583 B4 follow-up): if a snapshot for
+        // this identifier exists, hydrate the bucket's `entries`
+        // from it. Both keys and values are duplicated so the
+        // bucket and the persistence layer have independent
+        // ownership — `bucket.deinit` frees the bucket side,
+        // `keyvalue_persisted.deinit` frees the snapshot side.
+        if (self.keyvalue_persisted.get(ident_bytes)) |snap| {
+            bucket.entries.ensureTotalCapacity(self.allocator, snap.entries.count()) catch {
+                bucket.deinit(self.allocator);
+                self.allocator.destroy(bucket);
+                results[0] = try keyvalueResultErrOther(ci, allocator, "insufficient memory");
+                return;
+            };
+            var it = snap.entries.iterator();
+            while (it.next()) |e| {
+                const k_dup = self.allocator.dupe(u8, e.key_ptr.*) catch {
+                    bucket.deinit(self.allocator);
+                    self.allocator.destroy(bucket);
+                    results[0] = try keyvalueResultErrOther(ci, allocator, "insufficient memory");
+                    return;
+                };
+                const v_dup = self.allocator.dupe(u8, e.value_ptr.*) catch {
+                    self.allocator.free(k_dup);
+                    bucket.deinit(self.allocator);
+                    self.allocator.destroy(bucket);
+                    results[0] = try keyvalueResultErrOther(ci, allocator, "insufficient memory");
+                    return;
+                };
+                bucket.entries.putAssumeCapacity(k_dup, v_dup);
+            }
+        }
+
         const handle = self.pushKeyvalueBucket(bucket) catch {
             bucket.deinit(self.allocator);
             self.allocator.destroy(bucket);
@@ -20784,7 +20958,9 @@ pub const WasiCliAdapter = struct {
 
     /// Insert `key` → `value` into `bucket`, replacing any existing
     /// entry. Both inputs are duplicated through the adapter's
-    /// allocator; the previous key+value (if any) are freed.
+    /// allocator; the previous key+value (if any) are freed. Also
+    /// mirrors the write into the persistence snapshot (if any) +
+    /// flushes the snapshot to disk (#583 B4 follow-up).
     fn bucketStoreEntry(
         self: *WasiCliAdapter,
         bucket: *KeyvalueBucket,
@@ -20805,19 +20981,26 @@ pub const WasiCliAdapter = struct {
             gop.key_ptr.* = key_copy;
             gop.value_ptr.* = new_value;
         }
+        try self.persistedStoreEntry(bucket.identifier, key, value);
     }
 
     /// Remove `key` from `bucket`, freeing the owned key and value
-    /// byte slices. Returns whether the entry was present.
+    /// byte slices. Returns whether the entry was present. Also
+    /// mirrors the removal into the persistence snapshot (#583 B4
+    /// follow-up) — persistence flush is invoked unconditionally
+    /// so a no-op delete still produces a stable on-disk view.
     fn bucketRemoveEntry(
         self: *WasiCliAdapter,
         bucket: *KeyvalueBucket,
         key: []const u8,
     ) bool {
-        const entry = bucket.entries.fetchRemove(key) orelse return false;
-        self.allocator.free(entry.key);
-        self.allocator.free(entry.value);
-        return true;
+        const present = if (bucket.entries.fetchRemove(key)) |entry| blk: {
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value);
+            break :blk true;
+        } else false;
+        self.persistedRemoveEntry(bucket.identifier, key) catch {};
+        return present;
     }
 
     /// `[method]bucket.delete: (borrow<bucket>, key: string) -> result<_, error>`.
@@ -21083,23 +21266,13 @@ pub const WasiCliAdapter = struct {
         results[0] = try keyvalueResultOk(allocator, .{ .s64 = next });
     }
 
-    /// `wasi:keyvalue/atomics.swap: (cas, list<u8>) -> result<_, cas-error>`.
-    ///
-    /// CAS isn't implemented in the memory store — the adapter has
-    /// no CAS resource table. Return the `cas-error::store-error`
-    /// arm with the inner `error::other` payload so guests get a
-    /// well-typed failure rather than a host trap.
-    fn keyvalueAtomicsSwap(
-        _: ?*anyopaque,
+    /// Build a `cas-error::store-error(error::other(string))` lift.
+    /// Owned by `allocator` (the per-call canon-ABI allocator).
+    fn keyvalueCasErrStoreOther(
         ci: *ComponentInstance,
-        _: []const InterfaceValue,
-        results: []InterfaceValue,
         allocator: Allocator,
-    ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        // `cas-error::store-error(error)` — discriminant 0, payload
-        // is the inner `error::other(string)`.
-        const message = "compare-and-swap not implemented in memory store";
+        message: []const u8,
+    ) !InterfaceValue {
         const ptr = ci.hostAllocAndWrite(message) orelse return error.OutOfMemory;
         const string_val = try allocator.create(InterfaceValue);
         string_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(message.len) } };
@@ -21110,58 +21283,261 @@ pub const WasiCliAdapter = struct {
         } };
         const cas_err = try allocator.create(InterfaceValue);
         cas_err.* = .{ .variant_val = .{
-            .discriminant = 0, // store-error
+            .discriminant = @intFromEnum(KeyvalueCasErrorTag.store_error),
             .payload = inner_err,
+        } };
+        return .{ .result_val = .{ .is_ok = false, .payload = cas_err } };
+    }
+
+    /// Build a `cas-error::store-error(error::<simple-tag>)` lift
+    /// (i.e. `no-such-store` / `access-denied`).
+    fn keyvalueCasErrStoreSimple(
+        allocator: Allocator,
+        tag: KeyvalueErrorTag,
+    ) !InterfaceValue {
+        std.debug.assert(tag != .other);
+        const inner_err = try allocator.create(InterfaceValue);
+        inner_err.* = .{ .variant_val = .{
+            .discriminant = @intFromEnum(tag),
+            .payload = null,
+        } };
+        const cas_err = try allocator.create(InterfaceValue);
+        cas_err.* = .{ .variant_val = .{
+            .discriminant = @intFromEnum(KeyvalueCasErrorTag.store_error),
+            .payload = inner_err,
+        } };
+        return .{ .result_val = .{ .is_ok = false, .payload = cas_err } };
+    }
+
+    /// `wasi:keyvalue/atomics.swap: (own<cas>, list<u8>) -> result<_, cas-error>`.
+    ///
+    /// Atomic test-and-set against the in-memory bucket entry:
+    ///
+    ///   - If the bucket's current value byte-for-byte matches the
+    ///     snapshot captured at `cas.new` time, the bucket is
+    ///     updated with the new value, the persistence layer is
+    ///     flushed (when `--keyvalue-store=<path>` is in effect),
+    ///     the CAS handle is consumed (slot nulled, rep freed) and
+    ///     the call lifts `result::ok`.
+    ///   - On mismatch the CAS rep is *not* freed — its snapshot
+    ///     is re-bound to the *current* bucket value (per the WIT:
+    ///     "Implementors MUST return a CAS handle that has been
+    ///     updated to the latest version") and the same handle is
+    ///     lifted under the `cas-error::cas-failed(cas)` arm so
+    ///     guests can retry without going through `cas.new` again.
+    ///   - If the CAS handle is invalid (out-of-range / already
+    ///     consumed) or its bucket has been dropped, the call lifts
+    ///     `cas-error::store-error(error)` (#583 B4 follow-up).
+    fn keyvalueAtomicsSwap(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const cas_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const value_pl = switch (args[1]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const cas_rep = self.lookupCas(cas_handle) orelse {
+            results[0] = try keyvalueCasErrStoreOther(ci, allocator, "invalid cas handle");
+            return;
+        };
+        const bucket = self.lookupKeyvalueBucket(cas_rep.bucket_handle) orelse {
+            results[0] = try keyvalueCasErrStoreSimple(allocator, .no_such_store);
+            return;
+        };
+        const new_value_bytes = if (value_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(value_pl.ptr, value_pl.len) orelse
+                return error.OutOfBoundsMemory;
+
+        const current_opt: ?[]const u8 = bucket.entries.get(cas_rep.key);
+        const matches = blk: {
+            if (cas_rep.is_observed) {
+                const cur = current_opt orelse break :blk false;
+                break :blk std.mem.eql(u8, cur, cas_rep.observed);
+            } else {
+                break :blk (current_opt == null);
+            }
+        };
+
+        if (matches) {
+            // Atomic write — also mirrors into the persistence
+            // snapshot via `bucketStoreEntry`.
+            try bucketStoreEntry(self, bucket, cas_rep.key, new_value_bytes);
+            // Consume the CAS handle.
+            self.cas_table.items[cas_handle] = null;
+            cas_rep.deinit(self.allocator);
+            self.allocator.destroy(cas_rep);
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        }
+
+        // Mismatch: re-snapshot the CAS to the current bucket value
+        // and lift it under `cas-error::cas-failed(cas)`.
+        if (cas_rep.is_observed) {
+            self.allocator.free(cas_rep.observed);
+            cas_rep.is_observed = false;
+            cas_rep.observed = "";
+        }
+        if (current_opt) |cur| {
+            const dup = self.allocator.dupe(u8, cur) catch {
+                results[0] = try keyvalueCasErrStoreOther(ci, allocator, "insufficient memory");
+                return;
+            };
+            cas_rep.observed = dup;
+            cas_rep.is_observed = true;
+        }
+        const new_cas_handle = try allocator.create(InterfaceValue);
+        new_cas_handle.* = .{ .handle = cas_handle };
+        const cas_err = try allocator.create(InterfaceValue);
+        cas_err.* = .{ .variant_val = .{
+            .discriminant = @intFromEnum(KeyvalueCasErrorTag.cas_failed),
+            .payload = new_cas_handle,
         } };
         results[0] = .{ .result_val = .{ .is_ok = false, .payload = cas_err } };
     }
 
-    /// `[static]cas.new: (borrow<bucket>, key: string) -> result<own<cas>, error>` —
-    /// stub return: `error::other("…")`. The adapter doesn't have a
-    /// `cas` resource table; guests that import this without ever
-    /// calling it link cleanly via the registration.
+    /// `[static]cas.new: (borrow<bucket>, key: string) -> result<own<cas>, error>`.
+    ///
+    /// Snapshot the bucket's value at `key` (or `null` if absent)
+    /// and return a fresh CAS handle. The snapshot is byte-stable
+    /// across other guests' writes — `atomics.swap` then compares
+    /// the bucket's *current* value to this snapshot to decide
+    /// whether the test-and-set succeeds. (#583 B4 follow-up)
     fn keyvalueCasNew(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        results[0] = try keyvalueResultErrOther(
-            ci,
-            allocator,
-            "compare-and-swap not implemented in memory store",
-        );
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const bucket_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const key_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(bucket_handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+        const key_bytes = if (key_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(key_pl.ptr, key_pl.len) orelse
+                return error.OutOfBoundsMemory;
+
+        const key_copy = try self.allocator.dupe(u8, key_bytes);
+        errdefer self.allocator.free(key_copy);
+
+        var observed_copy: []u8 = &.{};
+        var is_observed = false;
+        if (bucket.entries.get(key_bytes)) |existing| {
+            observed_copy = try self.allocator.dupe(u8, existing);
+            is_observed = true;
+        }
+        errdefer if (is_observed) self.allocator.free(observed_copy);
+
+        const cas_rep = try self.allocator.create(Cas);
+        errdefer self.allocator.destroy(cas_rep);
+        cas_rep.* = .{
+            .bucket_handle = bucket_handle,
+            .key = key_copy,
+            .observed = if (is_observed) observed_copy else "",
+            .is_observed = is_observed,
+        };
+        const handle = self.pushCas(cas_rep) catch {
+            cas_rep.deinit(self.allocator);
+            self.allocator.destroy(cas_rep);
+            results[0] = try keyvalueResultErrOther(ci, allocator, "insufficient memory");
+            return;
+        };
+        results[0] = try keyvalueResultOk(allocator, .{ .handle = handle });
     }
 
-    /// `[method]cas.current: () -> result<option<list<u8>>, error>` —
-    /// stub return: `error::other("…")`. See `keyvalueCasNew`.
+    /// `[method]cas.current: (borrow<cas>) -> result<option<list<u8>>, error>`.
+    ///
+    /// Lift the snapshot captured by `cas.new` — `option::some(bytes)`
+    /// if the key was present at constructor time, `option::none`
+    /// otherwise. Stays stable across other writes to the same
+    /// bucket; `swap` is the only call that mutates the snapshot
+    /// (on CAS-failed retry). (#583 B4 follow-up)
     fn keyvalueCasCurrent(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        results[0] = try keyvalueResultErrOther(
-            ci,
-            allocator,
-            "compare-and-swap not implemented in memory store",
-        );
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const cas_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const cas_rep = self.lookupCas(cas_handle) orelse {
+            results[0] = try keyvalueResultErrOther(ci, allocator, "invalid cas handle");
+            return;
+        };
+        if (!cas_rep.is_observed) {
+            results[0] = try keyvalueResultOk(allocator, .{ .option_val = .{
+                .is_some = false,
+                .payload = null,
+            } });
+            return;
+        }
+        const observed = cas_rep.observed;
+        const guest_ptr: u32 = if (observed.len == 0)
+            (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
+        else
+            (ci.hostAllocAndWrite(observed) orelse return error.OutOfMemory);
+        const list_val = try allocator.create(InterfaceValue);
+        list_val.* = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(observed.len) } };
+        results[0] = try keyvalueResultOk(allocator, .{ .option_val = .{
+            .is_some = true,
+            .payload = list_val,
+        } });
     }
 
-    /// `[resource-drop]cas: (own<cas>) -> ()` — no-op. CAS handles
-    /// are never produced by `cas.new` (it always errors) so a drop
-    /// can only happen on an invalid wire handle; swallow it.
+    /// `[resource-drop]cas: (own<cas>) -> ()`.
+    ///
+    /// Frees the CAS rep + its owned key/snapshot slices and nulls
+    /// the table slot. Idempotent — drops on already-consumed (e.g.
+    /// after a successful `swap`) or invalid handles are silently
+    /// ignored. (#583 B4 follow-up)
     fn keyvalueCasDrop(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         _: []InterfaceValue,
         _: Allocator,
-    ) anyerror!void {}
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.cas_table.items.len) return;
+        if (self.cas_table.items[handle]) |c| {
+            c.deinit(self.allocator);
+            self.allocator.destroy(c);
+            self.cas_table.items[handle] = null;
+        }
+    }
 
     /// `wasi:keyvalue/batch.get-many: (borrow<bucket>, list<string>) -> result<list<option<tuple<string, list<u8>>>>, error>`.
     fn keyvalueBatchGetMany(
@@ -21347,6 +21723,224 @@ pub const WasiCliAdapter = struct {
             _ = bucketRemoveEntry(self, bucket, k_bytes);
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    // ── wasi:keyvalue persistence layer (#583 B4 follow-up) ─────────────
+    //
+    // Optional file-backed snapshot of every `KeyvalueBucket`. Enabled
+    // by `setKeyvalueStorePath` (wired to the `--keyvalue-store=<path>`
+    // CLI flag in `main.zig`). When disabled (`keyvalue_store_path ==
+    // null`, the default), `persistedStoreEntry` / `persistedRemoveEntry`
+    // / `flushKeyvalueStore` are all no-ops and the runtime behaves
+    // exactly like PR #601 (in-memory only).
+    //
+    // File format — JSON object whose top-level keys are bucket
+    // identifiers; each value is itself an object mapping key strings
+    // to **base64-encoded** value bytes (so binary values survive a
+    // round-trip without forcing UTF-8 on the wire). Empty buckets are
+    // serialised as `"name": {}`.
+    //
+    //   ```json
+    //   {
+    //     "primary":  { "alpha": "dmFsdWU=", "beta": "YnVm" },
+    //     "counters": { "hits":  "AwAAAAAAAAA=" }
+    //   }
+    //   ```
+    //
+    // The serialiser writes the entire JSON document on every mutation
+    // — `set` / `delete` / successful `swap` / `increment` /
+    // `batch.set-many` / `batch.delete-many` all flush. This is the
+    // simplest correct MVP; an atomic-rename (write to `<path>.tmp`,
+    // then `rename`) is documented in `docs/wasi.md` as future
+    // hardening.
+
+    /// Lookup or lazily create a `PersistedBucket` for `identifier`.
+    /// The identifier slice is copied into the adapter's allocator
+    /// on first insert (so the caller can pass borrowed bytes); the
+    /// returned pointer is stable for the lifetime of the adapter.
+    fn persistedBucketGetOrCreate(self: *WasiCliAdapter, identifier: []const u8) !*PersistedBucket {
+        const gop = try self.keyvalue_persisted.getOrPut(self.allocator, identifier);
+        if (!gop.found_existing) {
+            const key_dup = self.allocator.dupe(u8, identifier) catch |err| {
+                _ = self.keyvalue_persisted.remove(identifier);
+                return err;
+            };
+            const bucket = self.allocator.create(PersistedBucket) catch |err| {
+                self.allocator.free(key_dup);
+                _ = self.keyvalue_persisted.remove(identifier);
+                return err;
+            };
+            bucket.* = .{};
+            gop.key_ptr.* = key_dup;
+            gop.value_ptr.* = bucket;
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// Mirror a `bucketStoreEntry` write into the persistence
+    /// snapshot. No-op when `keyvalue_store_path == null`. Synchronously
+    /// rewrites the file via `flushKeyvalueStore`.
+    fn persistedStoreEntry(
+        self: *WasiCliAdapter,
+        identifier: []const u8,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        if (self.keyvalue_store_path == null) return;
+        const bucket = try self.persistedBucketGetOrCreate(identifier);
+        const new_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(new_value);
+        const gop = try bucket.entries.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = new_value;
+        } else {
+            const key_copy = self.allocator.dupe(u8, key) catch |err| {
+                _ = bucket.entries.remove(key);
+                return err;
+            };
+            gop.key_ptr.* = key_copy;
+            gop.value_ptr.* = new_value;
+        }
+        try self.flushKeyvalueStore();
+    }
+
+    /// Mirror a `bucketRemoveEntry` into the persistence snapshot.
+    /// No-op when `keyvalue_store_path == null`. Synchronously
+    /// rewrites the file via `flushKeyvalueStore`.
+    fn persistedRemoveEntry(
+        self: *WasiCliAdapter,
+        identifier: []const u8,
+        key: []const u8,
+    ) !void {
+        if (self.keyvalue_store_path == null) return;
+        if (self.keyvalue_persisted.get(identifier)) |bucket| {
+            if (bucket.entries.fetchRemove(key)) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value);
+            }
+        }
+        try self.flushKeyvalueStore();
+    }
+
+    /// Serialise `keyvalue_persisted` to `keyvalue_store_path` as
+    /// the JSON object documented above. Synchronous + non-atomic —
+    /// the file may be observed in a half-written state if the host
+    /// crashes mid-write; that's the documented MVP trade-off.
+    /// No-op when `keyvalue_store_path == null`.
+    fn flushKeyvalueStore(self: *WasiCliAdapter) !void {
+        const path = self.keyvalue_store_path orelse return;
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        try stringify.beginObject();
+
+        // Stable iteration order isn't promised by the underlying
+        // HashMap; that's fine for the JSON consumer (we don't claim
+        // line-stable diffs as an MVP feature).
+        var bit = self.keyvalue_persisted.iterator();
+        while (bit.next()) |bkv| {
+            try stringify.objectField(bkv.key_ptr.*);
+            try stringify.beginObject();
+            var eit = bkv.value_ptr.*.entries.iterator();
+            while (eit.next()) |ekv| {
+                try stringify.objectField(ekv.key_ptr.*);
+                const value_bytes = ekv.value_ptr.*;
+                const enc_len = std.base64.standard.Encoder.calcSize(value_bytes.len);
+                const enc_buf = try self.allocator.alloc(u8, enc_len);
+                defer self.allocator.free(enc_buf);
+                const encoded = std.base64.standard.Encoder.encode(enc_buf, value_bytes);
+                try stringify.write(encoded);
+            }
+            try stringify.endObject();
+        }
+        try stringify.endObject();
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = path,
+            .data = aw.written(),
+        });
+    }
+
+    /// Enable the file-backed persistence layer (`--keyvalue-store=<path>`).
+    ///
+    /// If `path` already exists, its JSON contents are parsed and
+    /// loaded into `keyvalue_persisted` so subsequent `open` calls
+    /// hydrate from the snapshot. A missing file is *not* an error —
+    /// the persistence layer is activated empty and the file is
+    /// created on the first flush. The path slice is duplicated
+    /// into the adapter's allocator. (#583 B4 follow-up)
+    ///
+    /// Errors:
+    ///   - `error.KeyvalueStoreInvalidJson` — file is not valid JSON
+    ///   - `error.KeyvalueStoreInvalidRoot` — root is not an object
+    ///   - `error.KeyvalueStoreInvalidBucket` — a bucket entry is
+    ///     not an object
+    ///   - `error.KeyvalueStoreInvalidValueType` — a value is not a
+    ///     string
+    ///   - `error.KeyvalueStoreInvalidBase64` — a value isn't valid
+    ///     base64
+    ///   - allocator failures bubble up unchanged.
+    pub fn setKeyvalueStorePath(self: *WasiCliAdapter, path: []const u8) !void {
+        const path_dup = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_dup);
+        if (self.keyvalue_store_path) |old| self.allocator.free(old);
+        self.keyvalue_store_path = path_dup;
+
+        const cwd = std.Io.Dir.cwd();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const bytes = cwd.readFileAlloc(io, path, self.allocator, @enumFromInt(8 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return, // first run — leave snapshot empty
+            else => return err,
+        };
+        defer self.allocator.free(bytes);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch {
+            return error.KeyvalueStoreInvalidJson;
+        };
+        defer parsed.deinit();
+
+        switch (parsed.value) {
+            .object => |obj| {
+                var bit = obj.iterator();
+                while (bit.next()) |bkv| {
+                    const inner = switch (bkv.value_ptr.*) {
+                        .object => |o| o,
+                        else => return error.KeyvalueStoreInvalidBucket,
+                    };
+                    const bucket = try self.persistedBucketGetOrCreate(bkv.key_ptr.*);
+                    var eit = inner.iterator();
+                    while (eit.next()) |ekv| {
+                        const value_str = switch (ekv.value_ptr.*) {
+                            .string => |s| s,
+                            else => return error.KeyvalueStoreInvalidValueType,
+                        };
+                        const dec_len = std.base64.standard.Decoder.calcSizeForSlice(value_str) catch {
+                            return error.KeyvalueStoreInvalidBase64;
+                        };
+                        const value_dup = try self.allocator.alloc(u8, dec_len);
+                        errdefer self.allocator.free(value_dup);
+                        std.base64.standard.Decoder.decode(value_dup, value_str) catch {
+                            return error.KeyvalueStoreInvalidBase64;
+                        };
+                        const key_dup = try self.allocator.dupe(u8, ekv.key_ptr.*);
+                        errdefer self.allocator.free(key_dup);
+                        const gop = try bucket.entries.getOrPut(self.allocator, key_dup);
+                        if (gop.found_existing) {
+                            self.allocator.free(key_dup);
+                            self.allocator.free(gop.value_ptr.*);
+                            gop.value_ptr.* = value_dup;
+                        } else {
+                            gop.key_ptr.* = key_dup;
+                            gop.value_ptr.* = value_dup;
+                        }
+                    }
+                }
+            },
+            else => return error.KeyvalueStoreInvalidRoot,
+        }
     }
 
     // ── wasi:config/store@0.2.0-rc.1 — adapter (#583 B6) ────────────────
@@ -38382,6 +38976,554 @@ test "wasi:keyvalue/batch: get-many + set-many + delete-many round-trip (#583 B4
     }
 }
 
+// ── wasi:keyvalue/atomics.cas tests (#583 B4 follow-up) ──────────────
+//
+// Tests exercise the host-side `keyvalueCas{New, Current, Drop}` +
+// `keyvalueAtomicsSwap` callbacks directly. The CAS resource table
+// lives on the `WasiCliAdapter` alongside the bucket table; tests
+// rely on `deinit` cleanup to verify both audits.
+
+test "wasi:keyvalue/atomics.cas: constructor + current snapshot (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    // open("cas-bucket")
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "cas-bucket")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // set(handle, "k1", "v0").
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+            try testKeyvalueListArg(&ci, "v0"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+    }
+
+    // cas.new(bucket, "k1") → some snapshot.
+    const cas_new_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "k1"),
+    };
+    var cas_new_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasNew(&adapter, &ci, &cas_new_args, &cas_new_results, testing.allocator);
+    defer cas_new_results[0].deinit(testing.allocator);
+    try testing.expect(cas_new_results[0].result_val.is_ok);
+    const cas_handle = cas_new_results[0].result_val.payload.?.handle;
+
+    // cas.current() → option::some(list)::"v0".
+    const cas_cur_args = [_]InterfaceValue{.{ .handle = cas_handle }};
+    var cas_cur_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasCurrent(&adapter, &ci, &cas_cur_args, &cas_cur_results, testing.allocator);
+    defer cas_cur_results[0].deinit(testing.allocator);
+    try testing.expect(cas_cur_results[0].result_val.is_ok);
+    const some = cas_cur_results[0].result_val.payload.?.option_val;
+    try testing.expect(some.is_some);
+    const list_pl = some.payload.?.list;
+    const read_back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
+    try testing.expectEqualSlices(u8, "v0", read_back);
+
+    // Mutating the bucket *after* cas.new must NOT change cas.current's
+    // snapshot (the snapshot is bound at construction time).
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+            try testKeyvalueListArg(&ci, "later"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+    }
+    {
+        var cur2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueCasCurrent(&adapter, &ci, &cas_cur_args, &cur2_results, testing.allocator);
+        defer cur2_results[0].deinit(testing.allocator);
+        const some2 = cur2_results[0].result_val.payload.?.option_val;
+        try testing.expect(some2.is_some);
+        const list2 = some2.payload.?.list;
+        const back2 = ci.readGuestBytes(list2.ptr, list2.len) orelse return error.IoError;
+        try testing.expectEqualSlices(u8, "v0", back2);
+    }
+
+    // Drop the CAS handle — `deinit` would catch a leak otherwise.
+    const drop_args = [_]InterfaceValue{.{ .handle = cas_handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.keyvalueCasDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+}
+
+test "wasi:keyvalue/atomics.cas: absent key snapshots option::none (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 16 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "cas-absent")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // cas.new on an absent key — snapshot is option::none.
+    const cas_new_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "ghost"),
+    };
+    var cas_new_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasNew(&adapter, &ci, &cas_new_args, &cas_new_results, testing.allocator);
+    defer cas_new_results[0].deinit(testing.allocator);
+    try testing.expect(cas_new_results[0].result_val.is_ok);
+    const cas_handle = cas_new_results[0].result_val.payload.?.handle;
+
+    const cas_cur_args = [_]InterfaceValue{.{ .handle = cas_handle }};
+    var cas_cur_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasCurrent(&adapter, &ci, &cas_cur_args, &cas_cur_results, testing.allocator);
+    defer cas_cur_results[0].deinit(testing.allocator);
+    try testing.expect(cas_cur_results[0].result_val.is_ok);
+    try testing.expect(!cas_cur_results[0].result_val.payload.?.option_val.is_some);
+
+    const drop_args = [_]InterfaceValue{.{ .handle = cas_handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.keyvalueCasDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+}
+
+test "wasi:keyvalue/atomics.swap: success when value unchanged (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 32 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "swap-ok")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // Seed: "k" = "old".
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k"),
+            try testKeyvalueListArg(&ci, "old"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+    }
+
+    // cas.new(bucket, "k") snapshots "old".
+    const cas_new_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "k"),
+    };
+    var cas_new_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasNew(&adapter, &ci, &cas_new_args, &cas_new_results, testing.allocator);
+    defer cas_new_results[0].deinit(testing.allocator);
+    const cas_handle = cas_new_results[0].result_val.payload.?.handle;
+
+    // swap(cas, "new") — value hasn't changed, so success.
+    const swap_args = [_]InterfaceValue{
+        .{ .handle = cas_handle },
+        try testKeyvalueListArg(&ci, "new"),
+    };
+    var swap_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueAtomicsSwap(&adapter, &ci, &swap_args, &swap_results, testing.allocator);
+    defer swap_results[0].deinit(testing.allocator);
+    try testing.expect(swap_results[0].result_val.is_ok);
+
+    // The CAS slot should now be null (handle consumed by swap).
+    try testing.expect(adapter.cas_table.items[cas_handle] == null);
+
+    // Bucket's value is now "new".
+    {
+        const get_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k"),
+        };
+        var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+        defer get_results[0].deinit(testing.allocator);
+        const list_pl = get_results[0].result_val.payload.?.option_val.payload.?.list;
+        const back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
+        try testing.expectEqualSlices(u8, "new", back);
+    }
+}
+
+test "wasi:keyvalue/atomics.swap: cas-failed when value changed (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 32 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "swap-fail")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // Seed: "k" = "v0".
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k"),
+            try testKeyvalueListArg(&ci, "v0"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+    }
+
+    // cas.new(bucket, "k") snapshots "v0".
+    const cas_new_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "k"),
+    };
+    var cas_new_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasNew(&adapter, &ci, &cas_new_args, &cas_new_results, testing.allocator);
+    defer cas_new_results[0].deinit(testing.allocator);
+    const cas_handle = cas_new_results[0].result_val.payload.?.handle;
+
+    // Concurrent writer mutates the value (out-of-band).
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k"),
+            try testKeyvalueListArg(&ci, "racer-won"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+    }
+
+    // swap fails — snapshot ("v0") ≠ current ("racer-won").
+    const swap_args = [_]InterfaceValue{
+        .{ .handle = cas_handle },
+        try testKeyvalueListArg(&ci, "doomed"),
+    };
+    var swap_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueAtomicsSwap(&adapter, &ci, &swap_args, &swap_results, testing.allocator);
+    defer swap_results[0].deinit(testing.allocator);
+    try testing.expect(!swap_results[0].result_val.is_ok);
+
+    // cas-error discriminant is `cas-failed` (= 1), payload is the
+    // re-snapshotted handle (same handle, new snapshot).
+    const cas_err = swap_results[0].result_val.payload.?.variant_val;
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(KeyvalueCasErrorTag.cas_failed)),
+        cas_err.discriminant,
+    );
+    const returned_handle = cas_err.payload.?.handle;
+    try testing.expectEqual(cas_handle, returned_handle);
+
+    // The CAS slot is still live (not consumed), and its snapshot is
+    // now "racer-won". cas.current confirms.
+    try testing.expect(adapter.cas_table.items[cas_handle] != null);
+    {
+        const cas_cur_args = [_]InterfaceValue{.{ .handle = cas_handle }};
+        var cur_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueCasCurrent(&adapter, &ci, &cas_cur_args, &cur_results, testing.allocator);
+        defer cur_results[0].deinit(testing.allocator);
+        const some = cur_results[0].result_val.payload.?.option_val;
+        try testing.expect(some.is_some);
+        const list_pl = some.payload.?.list;
+        const back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
+        try testing.expectEqualSlices(u8, "racer-won", back);
+    }
+
+    // The bucket retained the racer's value — the failed swap was a
+    // no-op on the bucket side.
+    {
+        const get_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k"),
+        };
+        var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+        defer get_results[0].deinit(testing.allocator);
+        const list_pl = get_results[0].result_val.payload.?.option_val.payload.?.list;
+        const back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
+        try testing.expectEqualSlices(u8, "racer-won", back);
+    }
+
+    // Drop the CAS so deinit doesn't see a leak.
+    const drop_args = [_]InterfaceValue{.{ .handle = cas_handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.keyvalueCasDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+}
+
+test "wasi:keyvalue/atomics.swap: multi-CAS — first-swap-wins, second sees mismatch (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 32 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "race")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // Seed.
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k"),
+            try testKeyvalueListArg(&ci, "v0"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+    }
+
+    // Two CAS handles on the same key — both snapshot "v0".
+    const cas_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "k"),
+    };
+    var cas1_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasNew(&adapter, &ci, &cas_args, &cas1_results, testing.allocator);
+    defer cas1_results[0].deinit(testing.allocator);
+    const cas1 = cas1_results[0].result_val.payload.?.handle;
+
+    var cas2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasNew(&adapter, &ci, &cas_args, &cas2_results, testing.allocator);
+    defer cas2_results[0].deinit(testing.allocator);
+    const cas2 = cas2_results[0].result_val.payload.?.handle;
+    try testing.expect(cas1 != cas2);
+
+    // cas1.swap → ok. cas2.swap then sees the bucket-value-changed
+    // condition (snapshot "v0" vs current "by-cas1") → cas-failed.
+    {
+        const sa = [_]InterfaceValue{
+            .{ .handle = cas1 },
+            try testKeyvalueListArg(&ci, "by-cas1"),
+        };
+        var sr: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueAtomicsSwap(&adapter, &ci, &sa, &sr, testing.allocator);
+        defer sr[0].deinit(testing.allocator);
+        try testing.expect(sr[0].result_val.is_ok);
+    }
+    {
+        const sa = [_]InterfaceValue{
+            .{ .handle = cas2 },
+            try testKeyvalueListArg(&ci, "by-cas2"),
+        };
+        var sr: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueAtomicsSwap(&adapter, &ci, &sa, &sr, testing.allocator);
+        defer sr[0].deinit(testing.allocator);
+        try testing.expect(!sr[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(KeyvalueCasErrorTag.cas_failed)),
+            sr[0].result_val.payload.?.variant_val.discriminant,
+        );
+    }
+
+    // Drop the still-live cas2 (cas1 was consumed by its successful swap).
+    const drop_args = [_]InterfaceValue{.{ .handle = cas2 }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.keyvalueCasDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+    try testing.expect(adapter.cas_table.items[cas2] == null);
+}
+
+test "wasi:keyvalue/atomics.cas: [resource-drop]cas frees the slot (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 8 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "drop-cas")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    const cas_new_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "k"),
+    };
+    var cas_new_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueCasNew(&adapter, &ci, &cas_new_args, &cas_new_results, testing.allocator);
+    defer cas_new_results[0].deinit(testing.allocator);
+    const cas_handle = cas_new_results[0].result_val.payload.?.handle;
+    try testing.expect(adapter.cas_table.items[cas_handle] != null);
+
+    const drop_args = [_]InterfaceValue{.{ .handle = cas_handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.keyvalueCasDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+    try testing.expect(adapter.cas_table.items[cas_handle] == null);
+
+    // A second drop on the same handle is a no-op (idempotent).
+    try WasiCliAdapter.keyvalueCasDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+    try testing.expect(adapter.cas_table.items[cas_handle] == null);
+}
+
+// ── wasi:keyvalue persistence-layer tests (#583 B4 follow-up) ───────
+//
+// Tests exercise the `--keyvalue-store=<path>` round-trip end-to-end:
+// `setKeyvalueStorePath` parses an existing file into the persisted
+// snapshot, every mutation flushes back, and a second adapter
+// instance can pick up where the first left off.
+
+test "wasi:keyvalue persistence: file-load → open + get returns snapshot (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // Pre-populate the JSON file: `{"primary":{"alpha":"<b64 of 'value-bytes-here'>"}}`.
+    const value = "value-bytes-here";
+    const enc_len = std.base64.standard.Encoder.calcSize(value.len);
+    const enc_buf = try testing.allocator.alloc(u8, enc_len);
+    defer testing.allocator.free(enc_buf);
+    const encoded = std.base64.standard.Encoder.encode(enc_buf, value);
+    const json_payload = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"primary\":{{\"alpha\":\"{s}\"}}}}",
+        .{encoded},
+    );
+    defer testing.allocator.free(json_payload);
+    try tmp.dir.writeFile(io, .{ .sub_path = "kv-store.json", .data = json_payload });
+
+    // Path relative to the test's cwd — `tmpDir` puts the file at
+    // `.zig-cache/tmp/<sub>/kv-store.json`.
+    const rel_path = try std.fmt.allocPrint(
+        testing.allocator,
+        ".zig-cache/tmp/{s}/kv-store.json",
+        .{tmp.sub_path[0..]},
+    );
+    defer testing.allocator.free(rel_path);
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setKeyvalueStorePath(rel_path);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 16 * 1024);
+    defer ci.disableTestMem();
+
+    // open("primary") then get("alpha") — value should match the
+    // pre-populated payload.
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "primary")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    const get_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "alpha"),
+    };
+    var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueBucketGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+    defer get_results[0].deinit(testing.allocator);
+
+    try testing.expect(get_results[0].result_val.is_ok);
+    const some = get_results[0].result_val.payload.?.option_val;
+    try testing.expect(some.is_some);
+    const list_pl = some.payload.?.list;
+    const back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
+    try testing.expectEqualSlices(u8, value, back);
+}
+
+test "wasi:keyvalue persistence: set flushes through; second adapter reads it back (#583 B4 follow-up)" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(
+        testing.allocator,
+        ".zig-cache/tmp/{s}/kv-store.json",
+        .{tmp.sub_path[0..]},
+    );
+    defer testing.allocator.free(rel_path);
+
+    // Pass 1: a fresh adapter writes through to the missing file.
+    {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        try adapter.setKeyvalueStorePath(rel_path);
+
+        var ci: ComponentInstance = undefined;
+        try ci.enableTestMem(testing.allocator, 16 * 1024);
+        defer ci.disableTestMem();
+
+        const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "sessions")};
+        var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+        defer open_results[0].deinit(testing.allocator);
+        const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "user-42"),
+            try testKeyvalueListArg(&ci, "token-abcdef\x00\x01\x02"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+        try testing.expect(set_results[0].result_val.is_ok);
+    }
+
+    // Pass 2: a brand-new adapter (simulating a second process)
+    // reads the file back via `setKeyvalueStorePath`.
+    {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        try adapter.setKeyvalueStorePath(rel_path);
+
+        var ci: ComponentInstance = undefined;
+        try ci.enableTestMem(testing.allocator, 16 * 1024);
+        defer ci.disableTestMem();
+
+        const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "sessions")};
+        var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+        defer open_results[0].deinit(testing.allocator);
+        const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+        const get_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "user-42"),
+        };
+        var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+        defer get_results[0].deinit(testing.allocator);
+
+        try testing.expect(get_results[0].result_val.is_ok);
+        const some = get_results[0].result_val.payload.?.option_val;
+        try testing.expect(some.is_some);
+        const list_pl = some.payload.?.list;
+        const back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
+        try testing.expectEqualSlices(u8, "token-abcdef\x00\x01\x02", back);
+    }
+}
+
 test "populateWasiProviders: binds wasi:keyvalue store + atomics + batch (#583 B4)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -38427,6 +39569,10 @@ test "populateWasiProviders: binds wasi:keyvalue store + atomics + batch (#583 B
 
     const atomics_binding = providers.get("wasi:keyvalue/atomics@0.2.0-draft2").?;
     try testing.expect(atomics_binding.host_instance.members.contains("increment"));
+    try testing.expect(atomics_binding.host_instance.members.contains("swap"));
+    try testing.expect(atomics_binding.host_instance.members.contains("[static]cas.new"));
+    try testing.expect(atomics_binding.host_instance.members.contains("[method]cas.current"));
+    try testing.expect(atomics_binding.host_instance.members.contains("[resource-drop]cas"));
 
     const batch_binding = providers.get("wasi:keyvalue/batch@0.2.0-draft2").?;
     try testing.expect(batch_binding.host_instance.members.contains("get-many"));

@@ -89,6 +89,12 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // layer-1 backing. Combined with the `WAMR_CONFIG_*` env vars (layer
     // 2) in `runComponent`. Null when not provided.
     var config_store_path: ?[]const u8 = null;
+    // `--keyvalue-store=<path>` (#583 B4 follow-up): path to a JSON
+    // file whose `{"bucket-name": {"key": "<base64-value>", ...}, ...}`
+    // object backs the `wasi:keyvalue` adapter. Reads on startup,
+    // rewrites synchronously after every mutation. Null ⇒ in-memory
+    // only (default, behaviour-compatible with PR #601).
+    var keyvalue_store_path: ?[]const u8 = null;
     var listen_address: ?std.Io.net.IpAddress = null;
     var stack_size: u32 = 64 * 1024;
     // `--log-level=<name>` (#583 B5). Sets the host-side
@@ -200,6 +206,24 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     return 2;
                 }
                 config_store_path = spec;
+            } else if (std.mem.eql(u8, arg, "--keyvalue-store") or std.mem.startsWith(u8, arg, "--keyvalue-store=")) {
+                if (keyvalue_store_path != null) {
+                    std.debug.print("error: --keyvalue-store specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--keyvalue-store")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --keyvalue-store requires a path to a JSON file\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--keyvalue-store=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --keyvalue-store path is empty\n", .{});
+                    return 2;
+                }
+                keyvalue_store_path = spec;
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
@@ -288,7 +312,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             if (listen_address) |addr| {
                 return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level);
             }
-            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path);
         }
     }
 
@@ -439,6 +463,7 @@ fn runComponent(
     allow_net_cidrs: []const []const u8,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
     config_store: []const wamr.wasi_cli_adapter.ConfigEntry,
+    keyvalue_store_path: ?[]const u8,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     // Wire the adapter's stdio directly to the host process's
@@ -464,6 +489,17 @@ fn runComponent(
     // slice means no config source was provided and the guest sees
     // an empty store.
     adapter.setConfigStore(config_store);
+
+    // `--keyvalue-store=<path>` (#583 B4 follow-up): activate the
+    // file-backed persistence layer for `wasi:keyvalue`. The flag
+    // is null by default — guest sees the in-memory store from PR
+    // #601, byte-for-byte unchanged.
+    if (keyvalue_store_path) |p| {
+        adapter.setKeyvalueStorePath(p) catch |err| {
+            std.debug.print("Error: --keyvalue-store '{s}': {}\n", .{ p, err });
+            return 1;
+        };
+    }
 
     // `--log-level=<name>` / `WAMR_LOG_LEVEL=<name>` host-side
     // `wasi:logging/logging.log` severity filter (#583 B5). Default
@@ -946,6 +982,12 @@ const run_usage =
     \\                           env vars matching `WAMR_CONFIG_<KEY>=<value>`
     \\                           (key lower-cased, prefix stripped). File
     \\                           overrides env when a key is set by both.
+    \\  --keyvalue-store PATH    For components: back the `wasi:keyvalue`
+    \\                           adapter with a JSON file. Format:
+    \\                           {"bucket":{"key":"<base64-value>",...},...}.
+    \\                           Loads on startup (missing file is OK),
+    \\                           rewrites synchronously on every mutation.
+    \\                           Omit to keep the default in-memory store.
     \\
 ;
 
