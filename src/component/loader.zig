@@ -420,11 +420,33 @@ fn resolveTopLevelTypeAliases(
             ) orelse continue;
 
             // Materialize the resolved TypeDef in the parent's type
-            // pool. For primitive `TypeDef.val` we can copy directly;
-            // any compound shape would require deep-copy + type_idx
-            // rewriting, which this pass leaves for a future slice.
+            // pool. Primitive `TypeDef.val` can be copied directly.
+            //
+            // For structural compounds (`.record` / `.variant` / etc.)
+            // we accept only the "safe" subset where every nested
+            // ValType is a primitive — no `.type_idx` / `.record` /
+            // `.variant` / `.list` / ... references whose meaning is
+            // local to the source instance-type body. This covers
+            // `wasi:clocks/wall-clock` `datetime = record { seconds:
+            // u64, nanoseconds: u32 }` (the 0.2 shape) and
+            // `wasi:clocks/system-clock` `record instant { seconds:
+            // s64, nanoseconds: u32 }` (the 0.3 shape), which
+            // `wasi:filesystem` aliases via `(alias outer 1 K (type))`
+            // for `new-timestamp`'s `timestamp(datetime)` case
+            // payload. (`#571`.)
+            //
+            // Compound types whose nested references would need
+            // remapping into the parent indexspace are still skipped —
+            // that remains future work.
             switch (resolved) {
                 .val => {
+                    const new_idx: u32 = @intCast(type_defs.items.len);
+                    try type_defs.append(allocator, resolved);
+                    type_indexspace[slot] = new_idx;
+                    any_change = true;
+                },
+                .record, .variant, .tuple, .flags, .enum_, .option, .result, .list => {
+                    if (!typeDefHasOnlyPrimitiveRefs(resolved)) continue;
                     const new_idx: u32 = @intCast(type_defs.items.len);
                     try type_defs.append(allocator, resolved);
                     type_indexspace[slot] = new_idx;
@@ -435,6 +457,63 @@ fn resolveTopLevelTypeAliases(
         }
         if (!any_change) return;
     }
+}
+
+/// True iff `td` references only primitive ValTypes (no `.type_idx`
+/// indirection into another indexspace, no nested `.record` / `.variant`
+/// / `.list` / etc. structural refs). Used by `resolveTopLevelTypeAliases`
+/// (#571) to gate which structural typedefs are safe to materialize
+/// across instance-type-body boundaries without a remap pass — typically
+/// `wasi:clocks/wall-clock` `datetime = record { seconds: u64,
+/// nanoseconds: u32 }` and similar primitive-only records.
+fn typeDefHasOnlyPrimitiveRefs(td: ctypes.TypeDef) bool {
+    return switch (td) {
+        .val => |v| isPrimitiveValType(v),
+        .record => |r| blk: {
+            for (r.fields) |f| if (!isPrimitiveValType(f.type)) break :blk false;
+            break :blk true;
+        },
+        .tuple => |t| blk: {
+            for (t.fields) |f| if (!isPrimitiveValType(f)) break :blk false;
+            break :blk true;
+        },
+        .variant => |v| blk: {
+            for (v.cases) |c| if (c.type) |ct| {
+                if (!isPrimitiveValType(ct)) break :blk false;
+            };
+            break :blk true;
+        },
+        .option => |o| isPrimitiveValType(o.inner),
+        .result => |r| blk: {
+            if (r.ok) |t| if (!isPrimitiveValType(t)) break :blk false;
+            if (r.err) |t| if (!isPrimitiveValType(t)) break :blk false;
+            break :blk true;
+        },
+        .list => |l| isPrimitiveValType(l.element),
+        // `.flags` / `.enum_` carry only name lists — always safe.
+        .flags, .enum_ => true,
+        else => false,
+    };
+}
+
+fn isPrimitiveValType(vt: ctypes.ValType) bool {
+    return switch (vt) {
+        .bool,
+        .s8,
+        .u8,
+        .s16,
+        .u16,
+        .s32,
+        .u32,
+        .s64,
+        .u64,
+        .f32,
+        .f64,
+        .char,
+        .string,
+        => true,
+        else => false,
+    };
 }
 
 /// Resolve `(alias <inst_ci_idx> "<name>" (type …))` to the exported
@@ -1747,4 +1826,76 @@ test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
             return err;
         };
     }
+}
+
+test "loader #571: typeDefHasOnlyPrimitiveRefs accepts primitive-only compounds" {
+    const testing = std.testing;
+
+    // `datetime` from `wasi:clocks/wall-clock` / `system-clock.instant`:
+    // record { seconds: s64, nanoseconds: u32 } — primitives only.
+    const datetime_fields = [_]ctypes.Field{
+        .{ .name = "seconds", .type = .s64 },
+        .{ .name = "nanoseconds", .type = .u32 },
+    };
+    const datetime_td: ctypes.TypeDef = .{ .record = .{ .fields = &datetime_fields } };
+    try testing.expect(typeDefHasOnlyPrimitiveRefs(datetime_td));
+
+    // Flags / enum — always safe (name lists, no nested ValType refs).
+    const flags_names = [_][]const u8{ "a", "b" };
+    const flags_td: ctypes.TypeDef = .{ .flags = .{ .names = &flags_names } };
+    try testing.expect(typeDefHasOnlyPrimitiveRefs(flags_td));
+
+    const enum_names = [_][]const u8{ "x", "y" };
+    const enum_td: ctypes.TypeDef = .{ .enum_ = .{ .names = &enum_names } };
+    try testing.expect(typeDefHasOnlyPrimitiveRefs(enum_td));
+
+    // option<u64> and result<u32, string> are primitive-only.
+    const opt_td: ctypes.TypeDef = .{ .option = .{ .inner = .u64 } };
+    try testing.expect(typeDefHasOnlyPrimitiveRefs(opt_td));
+
+    const res_td: ctypes.TypeDef = .{ .result = .{ .ok = .u32, .err = .string } };
+    try testing.expect(typeDefHasOnlyPrimitiveRefs(res_td));
+}
+
+test "loader #571: typeDefHasOnlyPrimitiveRefs rejects records with structural ref fields" {
+    const testing = std.testing;
+
+    // Record whose field is `.type_idx = 7` — a parent indexspace
+    // reference. `resolveTopLevelTypeAliases` must NOT auto-materialize
+    // these because the index is local to the source instance-type body
+    // and would mean nothing in the parent's pool.
+    const fields = [_]ctypes.Field{
+        .{ .name = "inner", .type = .{ .type_idx = 7 } },
+    };
+    const td: ctypes.TypeDef = .{ .record = .{ .fields = &fields } };
+    try testing.expect(!typeDefHasOnlyPrimitiveRefs(td));
+
+    // Record whose field is a structural `.record` ref by index — also
+    // unsafe to direct-materialize without remapping.
+    const fields2 = [_]ctypes.Field{
+        .{ .name = "nested", .type = .{ .record = 3 } },
+    };
+    const td2: ctypes.TypeDef = .{ .record = .{ .fields = &fields2 } };
+    try testing.expect(!typeDefHasOnlyPrimitiveRefs(td2));
+}
+
+test "loader #571: isPrimitiveValType discriminates primitives vs compound refs" {
+    const testing = std.testing;
+
+    try testing.expect(isPrimitiveValType(.bool));
+    try testing.expect(isPrimitiveValType(.u8));
+    try testing.expect(isPrimitiveValType(.s8));
+    try testing.expect(isPrimitiveValType(.u32));
+    try testing.expect(isPrimitiveValType(.s64));
+    try testing.expect(isPrimitiveValType(.u64));
+    try testing.expect(isPrimitiveValType(.f32));
+    try testing.expect(isPrimitiveValType(.f64));
+    try testing.expect(isPrimitiveValType(.char));
+    try testing.expect(isPrimitiveValType(.string));
+
+    try testing.expect(!isPrimitiveValType(.{ .record = 0 }));
+    try testing.expect(!isPrimitiveValType(.{ .variant = 0 }));
+    try testing.expect(!isPrimitiveValType(.{ .type_idx = 0 }));
+    try testing.expect(!isPrimitiveValType(.{ .list = 0 }));
+    try testing.expect(!isPrimitiveValType(.{ .own = 0 }));
 }

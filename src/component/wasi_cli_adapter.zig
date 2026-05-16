@@ -6247,6 +6247,16 @@ pub const WasiCliAdapter = struct {
         }
 
         const io = std.Io.Threaded.global_single_threaded.io();
+        // Pre-check path existence: Zig stdlib's `Dir.setTimestamps`
+        // error set has no `FileNotFound` variant, so the kernel
+        // `ENOENT` on `utimensat` falls into `error.Unexpected` and
+        // we'd return `.io` instead of the spec-required `.no_entry`.
+        // Probe with `statFile` (which does have `FileNotFound`) and
+        // map kernel errors here. (#571.)
+        _ = base_dir.statFile(io, path_bytes, .{ .follow_symlinks = follow_symlinks }) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
         base_dir.setTimestamps(io, path_bytes, .{
             .follow_symlinks = follow_symlinks,
             .access_timestamp = ats,
@@ -17056,16 +17066,23 @@ fn liftNewTimestamp(arg: InterfaceValue) !std.Io.File.SetTimestamp {
                 else => return error.InvalidArgs,
             };
             if (record.len < 2) return error.InvalidArgs;
-            const secs_u64: u64 = switch (record[0]) {
-                .u64 => |x| x,
+            // `seconds` is `s64` in `wasi:clocks@0.3.0-rc-2026-03-15`
+            // `system-clock.instant` (negative pre-epoch instants are
+            // representable); the older 0.2 `wall-clock.datetime` shape
+            // declared it as `u64`. Accept either tag so the lift works
+            // regardless of which wit-bindgen vintage produced the
+            // component (the wasi-testsuite `filesystem-stat` fixture
+            // builds against the 0.3 shape, exercising `.s64`). (`#571`.)
+            const secs_i96: i96 = switch (record[0]) {
+                .s64 => |x| @intCast(x),
+                .u64 => |x| @intCast(x),
                 else => return error.InvalidArgs,
             };
             const nsec_u32: u32 = switch (record[1]) {
                 .u32 => |x| x,
+                .s32 => |x| @bitCast(x),
                 else => return error.InvalidArgs,
             };
-            // Clamp seconds into i96 range — i96 easily holds u64.
-            const secs_i96: i96 = @intCast(secs_u64);
             const nsec_i96: i96 = @intCast(nsec_u32);
             return .{ .new = .{ .nanoseconds = secs_i96 * 1_000_000_000 + nsec_i96 } };
         },
@@ -20331,6 +20348,46 @@ test "filesystem: liftNewTimestamp covers all three variants (#177)" {
     try testing.expectError(error.InvalidArgs, liftNewTimestamp(.{ .variant_val = .{ .discriminant = 7, .payload = null } }));
 }
 
+test "filesystem #571: liftNewTimestamp accepts s64-encoded seconds (system-clock.instant)" {
+    // The wit-bindgen-emitted component encodes
+    // `wasi:clocks/system-clock.instant.seconds` as `s64` (signed —
+    // pre-epoch instants are representable). The 0.2 `wall-clock.datetime`
+    // shape used `u64`. liftNewTimestamp must accept either tag so the
+    // wasi-testsuite `filesystem-stat` fixture's `set-times-at` call
+    // lifts correctly regardless of which wit-bindgen vintage the
+    // component was built with.
+    const testing = std.testing;
+
+    var dt_fields_s64 = [_]InterfaceValue{
+        .{ .s64 = 42 },
+        .{ .u32 = 0 },
+    };
+    const dt_iv_s64 = InterfaceValue{ .record_val = &dt_fields_s64 };
+    const ts_s64 = try liftNewTimestamp(.{ .variant_val = .{ .discriminant = 2, .payload = &dt_iv_s64 } });
+    try testing.expect(ts_s64 == .new);
+    try testing.expectEqual(@as(i96, 42 * 1_000_000_000), ts_s64.new.nanoseconds);
+
+    // Negative pre-epoch seconds round-trip correctly through i96.
+    var dt_fields_neg = [_]InterfaceValue{
+        .{ .s64 = -3 },
+        .{ .u32 = 250_000_000 },
+    };
+    const dt_iv_neg = InterfaceValue{ .record_val = &dt_fields_neg };
+    const ts_neg = try liftNewTimestamp(.{ .variant_val = .{ .discriminant = 2, .payload = &dt_iv_neg } });
+    try testing.expect(ts_neg == .new);
+    try testing.expectEqual(@as(i96, -3 * 1_000_000_000 + 250_000_000), ts_neg.new.nanoseconds);
+
+    // u64 seconds still work (back-compat with 0.2 wall-clock.datetime).
+    var dt_fields_u64 = [_]InterfaceValue{
+        .{ .u64 = 99 },
+        .{ .u32 = 0 },
+    };
+    const dt_iv_u64 = InterfaceValue{ .record_val = &dt_fields_u64 };
+    const ts_u64 = try liftNewTimestamp(.{ .variant_val = .{ .discriminant = 2, .payload = &dt_iv_u64 } });
+    try testing.expect(ts_u64 == .new);
+    try testing.expectEqual(@as(i96, 99 * 1_000_000_000), ts_u64.new.nanoseconds);
+}
+
 test "filesystem: stat returns mtime/ctime as option::some (#177)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -20445,6 +20502,62 @@ test "filesystem: set-times on dir descriptor returns not_permitted (#177)" {
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
         @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #571: set-times-at on missing path returns no-entry" {
+    // Before #571 the host adapter called `Dir.setTimestamps` directly
+    // and surfaced the kernel `ENOENT` as `error.Unexpected`, which
+    // `mapFsError` collapsed to `.io`. The wasi-testsuite
+    // `filesystem-stat` fixture asserts that
+    // `set_times_at(no_flags, "z.txt", atime, mtime)` returns
+    // `Err(NoEntry)`. Pre-check via `statFile` (which has a
+    // `FileNotFound` error in its set) and map cleanly.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const handle = try adapter.addPreopen("/sb", tmp.dir);
+    adapter.fs_descriptor_table.items[handle] = null;
+    const reused = try adapter.pushFsDescriptor(.{ .preopen = .{ .dir = tmp.dir, .flags = .{ .read = true, .write = true, .mutate_directory = true } } });
+
+    // Build the new-timestamp arg — s64 seconds (the
+    // wit-bindgen-emitted system-clock.instant encoding).
+    var dt_fields = [_]InterfaceValue{
+        .{ .s64 = 42 },
+        .{ .u32 = 0 },
+    };
+    const dt_iv = InterfaceValue{ .record_val = &dt_fields };
+    const ts_arg = InterfaceValue{ .variant_val = .{ .discriminant = 2, .payload = &dt_iv } };
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64);
+    defer ci.disableTestMem();
+    const path_ptr = ci.hostAllocAndWrite("z.txt") orelse return error.OutOfMemory;
+
+    var empty_flags = [_]u32{0};
+    var args = [_]InterfaceValue{
+        .{ .handle = reused },
+        .{ .flags_val = &empty_flags },
+        .{ .string = .{ .ptr = path_ptr, .len = 5 } },
+        ts_arg,
+        ts_arg,
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSetTimesAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    // Hand the slot back so adapter.deinit doesn't re-close tmp.dir.
+    adapter.fs_descriptor_table.items[reused] = null;
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.no_entry)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
