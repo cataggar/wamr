@@ -86,6 +86,13 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     defer allow_net.deinit(allocator);
     var listen_address: ?std.Io.net.IpAddress = null;
     var stack_size: u32 = 64 * 1024;
+    // `--log-level=<name>` (#583 B5). Sets the host-side
+    // `wasi:logging/logging.log` severity filter. The CLI flag wins
+    // over the `WAMR_LOG_LEVEL` env var, which is consulted at the
+    // run-component step when no CLI flag is set. Default `null` →
+    // no override (adapter keeps its built-in default of `.trace`,
+    // which admits every level).
+    var log_level: ?wamr.wasi_cli_adapter.WasiLogLevel = null;
     var past_options = false;
 
     var i: usize = 0;
@@ -154,6 +161,22 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     break :blk run_args[i];
                 } else arg["--allow-net=".len..];
                 try allow_net.append(allocator, spec);
+            } else if (std.mem.eql(u8, arg, "--log-level") or std.mem.startsWith(u8, arg, "--log-level=")) {
+                const spec = if (std.mem.eql(u8, arg, "--log-level")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --log-level requires <trace|debug|info|warn|error|critical>\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--log-level=".len..];
+                log_level = wamr.wasi_cli_adapter.WasiLogLevel.fromString(spec) orelse {
+                    std.debug.print(
+                        "error: --log-level value '{s}' is not one of trace|debug|info|warn|error|critical\n",
+                        .{spec},
+                    );
+                    return 2;
+                };
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
@@ -210,10 +233,25 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     env_list.append(allocator, .{ .name = kv.key_ptr.*, .value = kv.value_ptr.* }) catch {};
                 }
             }
+            // `WAMR_LOG_LEVEL` is consulted only when `--log-level` was
+            // not passed on the command line; the CLI flag wins. Mirrors
+            // RUST_LOG / similar conventions. (#583 B5)
+            const effective_log_level: ?wamr.wasi_cli_adapter.WasiLogLevel = log_level orelse blk: {
+                const raw = init.environ_map.get("WAMR_LOG_LEVEL") orelse break :blk null;
+                if (raw.len == 0) break :blk null;
+                const parsed = wamr.wasi_cli_adapter.WasiLogLevel.fromString(raw) orelse {
+                    std.debug.print(
+                        "warning: WAMR_LOG_LEVEL='{s}' is not one of trace|debug|info|warn|error|critical; ignoring\n",
+                        .{raw},
+                    );
+                    break :blk null;
+                };
+                break :blk parsed;
+            };
             if (listen_address) |addr| {
-                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr);
+                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level);
             }
-            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level);
         }
     }
 
@@ -270,6 +308,7 @@ fn runComponent(
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
     map_dirs: []const MapDir,
     allow_net_cidrs: []const []const u8,
+    log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     // Wire the adapter's stdio directly to the host process's
@@ -290,6 +329,12 @@ fn runComponent(
     for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);
+
+    // `--log-level=<name>` / `WAMR_LOG_LEVEL=<name>` host-side
+    // `wasi:logging/logging.log` severity filter (#583 B5). Default
+    // (`null` here) leaves the adapter at `.trace`, which admits
+    // every level — matches the README "verbose by default" stance.
+    if (log_level) |lvl| adapter.setLogLevel(lvl);
 
     // Seed the WASI sockets allow-list from `--allow-net=CIDR` flags
     // (default deny-all). (#520 wave 2)
@@ -390,6 +435,7 @@ fn runHttpComponent(
     wasm_args: []const []const u8,
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
     listen_address: std.Io.net.IpAddress,
+    log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
@@ -402,6 +448,7 @@ fn runHttpComponent(
     for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);
+    if (log_level) |lvl| adapter.setLogLevel(lvl);
 
     // See `runComponent` for the rationale behind the arena wrapper —
     // same loader/instance allocation story applies on the HTTP path.
@@ -753,6 +800,11 @@ const run_usage =
     \\                           connect / DNS to addresses inside CIDR
     \\                           (e.g. `127.0.0.0/8`). Default deny-all.
     \\                           Repeatable.
+    \\  --log-level NAME         For components: filter `wasi:logging` calls
+    \\                           below NAME. One of trace|debug|info|warn|
+    \\                           error|critical (default: trace = admit all).
+    \\                           Falls back to the WAMR_LOG_LEVEL env var
+    \\                           when this flag is absent.
     \\
 ;
 
