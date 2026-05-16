@@ -144,6 +144,39 @@ so CI stays hermetic):
 $ zig build test -Dnetwork_tests=true
 ```
 
+## Configuration
+
+`wasi:config@0.2.0-rc.1` (`store.get` / `store.get-all`) is wired
+through a layered host adapter (#583 B6). Guest components import
+`wasi:config/store@0.2.0-rc.1` and read `string → string` pairs from
+two sources:
+
+1. **Environment variables** prefixed with `WAMR_CONFIG_`. The
+   prefix is stripped and the remainder lower-cased ASCII
+   (`WAMR_CONFIG_API_KEY=secret` → `api_key=secret`).
+2. **JSON file** passed via `--config-store=PATH`. The file must
+   be a flat object of string values (`{"key":"value", …}`); nested
+   objects, arrays, or non-string scalars are rejected at startup.
+
+**Precedence: file overrides env.** When the same lower-cased key
+appears in both layers, the env entry is dropped and the file value
+wins. Surviving env-only entries are appended after the file entries.
+
+```console
+$ cat config.json
+{ "host": "api.example.com", "timeout_ms": "5000" }
+
+$ WAMR_CONFIG_HOST=localhost WAMR_CONFIG_DEBUG=1 \
+    wamr run --config-store=config.json my-component.wasm
+# Guest sees: host=api.example.com (file wins), timeout_ms=5000 (file),
+#             debug=1 (env-only).
+```
+
+The in-memory store never surfaces the `error` arms (`upstream` /
+`io`) defined by `wasi:config@0.2.0-rc.1` — every lookup returns
+`Ok(Some)` or `Ok(None)`. Those arms are reserved for future Vault /
+Kubernetes ConfigMaps / etc. back-ends.
+
 ## License
 
 [Apache 2.0](LICENSE)

@@ -44,7 +44,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:sockets`     | ✅ | ✅ | TCP + UDP + DNS; allow-list gated; SO_REUSEADDR; Windows + POSIX parity. |
 | `wasi:keyvalue`    | ✅ | — | Memory-store host adapter — `store` + `atomics` + `batch` (#583 B4). |
 | `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
-| `wasi:config`      | — | — | Not implemented (#583 B6). |
+| `wasi:config`      | ✅ (rc.1) | — | Layered env (`WAMR_CONFIG_*`) + `--config-store=PATH.json` host adapter (#583 B6). |
 | `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
 | `wasi:threads`     | — | — | Not implemented (#583 B3). |
 
@@ -91,6 +91,7 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:keyvalue/atomics@0.2.0-draft2`   |  5 | unit tests (`#583 B4`) | `increment` (real); `cas` resource + `swap` registered as `error::other` stubs. |
 | `wasi:keyvalue/batch@0.2.0-draft2`     |  3 | unit tests (`#583 B4`) | `get-many`, `set-many`, `delete-many` over the same bucket table. |
 | `wasi:logging/logging@0.1.0-draft` |  1 | unit tests | Host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`. No structured-logging backends yet (#583 B5). |
+| `wasi:config/store@0.2.0-rc.1`     |  2 | Adapter unit tests (#583 B6) | `get` / `get-all`. Layered backing: env vars matching `WAMR_CONFIG_<KEY>=<value>` (prefix stripped, key lower-cased ASCII) plus an optional `--config-store=PATH.json` flat object. **File overrides env** on duplicate keys. In-memory store never surfaces the `error` arms (`upstream` / `io`) — reserved for future Vault / Kubernetes / etc. backends. Pinned to upstream `wasi:config@0.2.0-rc.1` ([WebAssembly/wasi-config](https://github.com/WebAssembly/wasi-config)); the version-multiplex in `populateWasiProviders` accepts any `wasi:config/store@…` import so future revisions that keep the method shape work without code changes. |
 
 ### WASI Preview 3 (0.3.0)
 
