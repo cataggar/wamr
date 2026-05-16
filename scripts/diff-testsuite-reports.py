@@ -17,6 +17,7 @@ Usage
     diff-testsuite-reports.py WAMR.json WASMTIME.json
         [--label-a wamr]
         [--label-b wasmtime]
+        [--parity-skip PATH]
         [--strict]
         [--json OUTPUT.json]
 
@@ -26,14 +27,36 @@ Exit codes
 * 0 — no true regressions (parity-runtime failures on fixtures wamr
   also fails, or parity-runtime failures on fixtures wamr passes,
   are classified as *fixture/runtime bugs* and downgraded to
-  warnings on stderr).
+  warnings on stderr — or to *documented* deltas when the fixture
+  is listed in `--parity-skip`).
 * 1 — at least one true regression detected: wamr fails a fixture
-  the parity runtime still passes.
+  the parity runtime still passes. Also returned when a fixture in
+  the `--parity-skip` list is no longer a fixture-bug (wamr-pass /
+  parity-fail) so the skip-list does not silently rot.
 * 2 — usage / input error.
 
 `--strict` upgrades fixture/runtime-bug warnings to hard failures so
 the parity gate can also enforce wasmtime-side hygiene once the
 wasm32-wasip3 baseline ships its own conformance-runtime tests.
+Entries in `--parity-skip` are exempt from `--strict`: they are
+treated as already-tracked work and never fail the gate as long as
+the wamr-pass / parity-fail shape still holds.
+
+`--parity-skip PATH` consumes a JSON file mapping a fixture's
+`test_name` to a human-readable tracking pointer (typically the URL
+of an upstream issue):
+
+    {
+      "_comment": "Wasmtime parity-skip — fixtures wamr passes but wasmtime fails. Keyed by fixture name (matches `<test>.wasm` under `tests/rust/testsuite/wasm32-wasip3/`).",
+      "http-service": "tracking https://github.com/WebAssembly/wasi-testsuite/issues/228",
+      "sockets-tcp-connect": "tracking https://github.com/bytecodealliance/wasmtime/issues/13396"
+    }
+
+Keys starting with `_` (e.g. `_comment`) are ignored so the file
+can carry its own documentation. The skip list lives at
+`tests/wasi-p3-parity-skip.json` in this repo and is the
+authoritative inventory of known-tracked wasmtime / fixture-side
+deltas.
 
 The two reports must come from `wasi_test_runner --json-output-location
 <path>` against the *same* test-suite paths (the suite name is used
@@ -114,6 +137,52 @@ def _format_failures(failures: List[str], limit: int = 1) -> str:
     return f" — {head}"
 
 
+def _load_parity_skip(path: Path) -> Dict[str, str]:
+    """Load a `--parity-skip` JSON map of `test_name → tracking pointer`.
+
+    Keys starting with `_` (e.g. `_comment`) are filtered out so the
+    file can carry inline documentation. Returns an empty dict when
+    `path` is `None`.
+    """
+    if path is None:
+        return {}
+    try:
+        with path.open(encoding="UTF-8") as fp:
+            doc = json.load(fp)
+    except OSError as exc:
+        print(
+            f"error: cannot open parity-skip file {path}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except json.JSONDecodeError as exc:
+        print(
+            f"error: parity-skip file {path} is not valid JSON: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not isinstance(doc, dict):
+        print(
+            f"error: parity-skip file {path} must be a JSON object "
+            "(`{\"<fixture>\": \"<tracking pointer>\"}`).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    skip: Dict[str, str] = {}
+    for k, v in doc.items():
+        if isinstance(k, str) and k.startswith("_"):
+            continue
+        if not isinstance(k, str) or not isinstance(v, str):
+            print(
+                f"error: parity-skip entry {k!r}={v!r} in {path} is not "
+                "a `<fixture>: <tracking pointer>` string pair.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        skip[k] = v
+    return skip
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -144,11 +213,26 @@ def main() -> int:
         help="Override the runtime label inferred from report_b.",
     )
     parser.add_argument(
+        "--parity-skip",
+        type=Path,
+        help=(
+            "Path to a JSON file listing fixtures whose wasmtime "
+            "failure is documented under a tracking issue. Each entry "
+            "is `\"<fixture>\": \"<tracking pointer>\"`. Matched "
+            "fixture-bugs are downgraded to *documented* deltas that "
+            "never fail the gate (even with --strict). If a fixture "
+            "listed here is no longer in the wamr-pass / parity-fail "
+            "shape, the gate fails so the list cannot rot."
+        ),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help=(
             "Treat fixture/runtime-bug-class deltas (parity runtime "
-            "fails a fixture wamr passes) as hard failures."
+            "fails a fixture wamr passes) as hard failures. Fixtures "
+            "listed in --parity-skip are exempt — they are tracked "
+            "via the cited issue and never fail the gate."
         ),
     )
     parser.add_argument(
@@ -160,6 +244,7 @@ def main() -> int:
 
     fixtures_a = _load_report(args.report_a)
     fixtures_b = _load_report(args.report_b)
+    parity_skip = _load_parity_skip(args.parity_skip)
 
     label_a = args.label_a or _runtime_label(args.report_a)
     label_b = args.label_b or _runtime_label(args.report_b)
@@ -173,6 +258,7 @@ def main() -> int:
 
     regressions: List[FixtureKey] = []
     fixture_bugs: List[FixtureKey] = []
+    documented: List[FixtureKey] = []
     shared_failures: List[FixtureKey] = []
 
     for key in common:
@@ -186,7 +272,43 @@ def main() -> int:
         if not a["passed"] and b["passed"]:
             regressions.append(key)
         else:  # a passed, b failed
-            fixture_bugs.append(key)
+            if key[1] in parity_skip:
+                documented.append(key)
+            else:
+                fixture_bugs.append(key)
+
+    # Fixtures listed in the skip-list that are *not* currently in
+    # the documented shape (wamr-pass / parity-fail) are stale — fail
+    # the gate so the list cannot rot. Two sub-cases:
+    #
+    #   * wamr fails (`regressions` or `shared_failures`) — would have
+    #     been caught above as a regression / shared failure;
+    #     additionally call out the entry so the maintainer knows the
+    #     skip-list entry can be retired.
+    #   * both wamr and the parity runtime now pass — the upstream
+    #     wasmtime / fixture fix has landed; remove the entry.
+    stale_skip: List[Tuple[str, str]] = []
+    documented_test_names = {k[1] for k in documented}
+    for test_name, tracking in sorted(parity_skip.items()):
+        if test_name in documented_test_names:
+            continue
+        # Resolve the matching fixture key (skip-list is keyed by
+        # test_name only; resolve the full (suite, test) key from the
+        # reports so the operator sees the same identity as elsewhere
+        # in the diff output).
+        matching_keys = [k for k in common if k[1] == test_name]
+        if not matching_keys:
+            stale_skip.append(
+                (test_name, "fixture not present in either report")
+            )
+            continue
+        # If the parity runtime now passes the listed fixture too the
+        # entry is stale and the upstream bug is fixed.
+        k = matching_keys[0]
+        if fixtures_a[k]["passed"] and fixtures_b[k]["passed"]:
+            stale_skip.append(
+                (test_name, "both runtimes now pass — drop entry")
+            )
 
     def _emit_section(title: str, items: List[FixtureKey], src) -> None:
         if not items:
@@ -253,6 +375,36 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    if documented:
+        print(
+            f"\ndocumented fixture/runtime bugs ({len(documented)}): "
+            f"{label_b} fails but {label_a} passes — tracked under the "
+            "cited upstream issue(s):",
+            file=sys.stderr,
+        )
+        for suite_name, test_name in documented:
+            failures = fixtures_b[(suite_name, test_name)]["failures"]
+            tracking = parity_skip.get(test_name, "<no tracking>")
+            print(
+                f"  • {suite_name} :: {test_name} [{tracking}]"
+                + _format_failures(failures),
+                file=sys.stderr,
+            )
+
+    if stale_skip:
+        print(
+            f"\nstale parity-skip entries ({len(stale_skip)}): listed "
+            "in the skip-list but the fixture is no longer in the "
+            "wamr-pass / parity-fail shape:",
+            file=sys.stderr,
+        )
+        for test_name, why in stale_skip:
+            tracking = parity_skip.get(test_name, "<no tracking>")
+            print(
+                f"  • {test_name} [{tracking}] — {why}",
+                file=sys.stderr,
+            )
+
     if shared_failures:
         print(
             f"\nshared failures ({len(shared_failures)}): both runtimes "
@@ -268,6 +420,14 @@ def main() -> int:
         "only_in_b": [list(k) for k in only_in_b],
         "regressions": [list(k) for k in regressions],
         "fixture_bugs": [list(k) for k in fixture_bugs],
+        "documented": [
+            {"suite": k[0], "test": k[1], "tracking": parity_skip.get(k[1], "")}
+            for k in documented
+        ],
+        "stale_skip": [
+            {"test": t, "why": w, "tracking": parity_skip.get(t, "")}
+            for t, w in stale_skip
+        ],
         "shared_failures": [list(k) for k in shared_failures],
     }
     if args.json is not None:
@@ -283,17 +443,27 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if stale_skip:
+        print(
+            f"\n::error::Wasmtime parity diff: {len(stale_skip)} stale "
+            "parity-skip entry(ies) — update tests/wasi-p3-parity-skip.json.",
+            file=sys.stderr,
+        )
+        return 1
     if args.strict and fixture_bugs:
         print(
             f"\n::error::Wasmtime parity diff (strict): "
-            f"{len(fixture_bugs)} fixture/runtime bug(s) detected.",
+            f"{len(fixture_bugs)} undocumented fixture/runtime bug(s) "
+            "detected (add to tests/wasi-p3-parity-skip.json with a "
+            "tracking issue, or fix upstream).",
             file=sys.stderr,
         )
         return 1
 
     print(
         f"\nWasmtime parity diff: 0 regressions, "
-        f"{len(fixture_bugs)} fixture/runtime-bug warning(s), "
+        f"{len(fixture_bugs)} undocumented fixture/runtime-bug warning(s), "
+        f"{len(documented)} documented fixture/runtime-bug(s), "
         f"{len(shared_failures)} shared failure(s).",
         file=sys.stderr,
     )

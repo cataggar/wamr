@@ -41,10 +41,15 @@ jobs:
   wasi-p3-parity:
     name: Wasmtime parity (wasm32-wasip3)
     runs-on: ubuntu-22.04
-    # Informational while the parity infra beds in. Once the wasmtime
-    # baseline + wamr-side flake handling are nailed down, move this
-    # into the `ci-summary` blocking set in `.github/workflows/ci.yml`.
-    continue-on-error: true
+    # Required: a green run means either every fixture matches between
+    # wamr and wasmtime, or every wamr-pass / wasmtime-fail delta is
+    # documented under `tests/wasi-p3-parity-skip.json` with an
+    # upstream tracking issue (the gate flips red on any *new* such
+    # delta, and on any wamr regression that wasmtime still passes).
+    # Used to run with `continue-on-error: true` while the wasmtime
+    # baseline was being characterised (PR #592); flipped to required
+    # in PR #583 C1 follow-up once the 4 v44.0.1 deltas were filed
+    # upstream and skip-listed.
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
