@@ -218,9 +218,17 @@ pub fn build(b: *std.Build) void {
     // `tests/wasi-testsuite-skip.json`. Not wired into the default `test`
     // aggregate (it requires Python 3 + the runner's deps), but the CI job
     // gates regressions on every PR. Run locally with `zig build wasi-testsuite`.
+    // The runner entry point is wrapped through
+    // `tests/wasi-testsuite-runner-patch/wasi_test_runner.py`, which
+    // imports the upstream package unmodified and monkey-patches
+    // `TestCaseRunner.do_wait` to honour the `WAMR_TESTSUITE_TIMEOUT`
+    // env var (seconds; defaults to upstream's hard-coded 5s when
+    // unset). Without that override, slow developer VMs flake on
+    // `http-fields` and other fixtures whose runtime drifts past 5s.
+    // See #583 A7 + the wrapper's module docstring for rationale.
     const wasi_runner = b.addSystemCommand(&.{
         "python3",
-        "tests/wasi-testsuite/test-runner/wasi_test_runner.py",
+        "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
         "--test-suite",
         "tests/wasi-testsuite/tests/c/testsuite/wasm32-wasip1",
         "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip1",
@@ -253,7 +261,7 @@ pub fn build(b: *std.Build) void {
     // locally with `zig build wasi-p3-testsuite`.
     const wasi_p3_runner = b.addSystemCommand(&.{
         "python3",
-        "tests/wasi-testsuite/test-runner/wasi_test_runner.py",
+        "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
         "--test-suite",
         "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
         "--runtime-adapter",

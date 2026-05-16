@@ -67,6 +67,13 @@ $ zig build wasi-testsuite      # WASI Preview 1 + Preview 2 — passing
 $ zig build wasi-p3-testsuite   # WASI Preview 3 (wasm32-wasip3) — 40 / 40 passing
 ```
 
+The upstream `do_wait` timeout is 5s; that matches GitHub Actions runner
+timings but is tight on slow developer VMs (e.g. `http-fields` takes
+~11s on the project Azure dev VM). Set `WAMR_TESTSUITE_TIMEOUT=<seconds>`
+to override it — see
+[`tests/wasi-testsuite-runner-patch/`](tests/wasi-testsuite-runner-patch/wasi_test_runner.py)
+([#583](https://github.com/cataggar/wamr/issues/583) A7).
+
 The suite drives the freshly-built `wamr` CLI through the in-tree adapter at
 [`tests/wasi-testsuite-adapter/wamr-zig.py`](tests/wasi-testsuite-adapter/wamr-zig.py)
 and applies the curated skiplists at
@@ -102,8 +109,20 @@ are mapped onto specific `error-code` variants per the 0.3 WIT
 unclassified failures fall through to `error-code::internal-error`
 (see [#583](https://github.com/cataggar/wamr/issues/583) A3). Response
 headers are not yet surfaced (a `std.http.Client` limitation:
-`FetchResult` only exposes the status line) and incoming-handler
-server semantics remain a stub.
+`FetchResult` only exposes the status line). Incoming-handler dispatch
+(`wasi:http/handler@0.3.0`) is wired end-to-end against the TCP
+listener for HTTP/1.1
+([#580](https://github.com/cataggar/wamr/pull/580)) — `Connection: close`
+only; keep-alive, chunked transfer-encoding, and trailers are tracked
+under the post-Preview-3 follow-up
+[#583](https://github.com/cataggar/wamr/issues/583).
+
+The 0.3.0 interface surface shipped by `wamr` covers
+`wasi:cli`, `wasi:clocks`, `wasi:filesystem`, `wasi:http`, `wasi:random`,
+and `wasi:sockets`; the
+[`wasi-p3-testsuite`](tests/wasi-p3-testsuite-skip.json) gate passes
+40 / 40 `wasm32-wasip3` fixtures. Remaining hardening items are tracked
+under [#583](https://github.com/cataggar/wamr/issues/583).
 
 The earlier `error-code::HTTP_protocol_error` short-circuit on `https://`
 (introduced in [#477](https://github.com/cataggar/wamr/issues/477) /
