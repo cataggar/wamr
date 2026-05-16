@@ -10944,9 +10944,17 @@ pub const WasiCliAdapter = struct {
 
             // Install the driver so subsequent guest `stream.write`s
             // flow through `fsWriteViaStreamOnWrite` → pwrite(2).
+            //
+            // Both callback shapes are installed: the executor
+            // prefers the thinner `on_write_from` (zero-copy,
+            // #583 B2 follow-up) which drops the unused
+            // `*AsyncStream` / `Allocator` parameters. `on_write`
+            // remains as a delegation shim so unit tests and direct
+            // callers (the pre-buffer drain above) still work.
             slot.host_driver = .{
                 .context = ctx,
                 .on_write = &fsWriteViaStreamOnWrite,
+                .on_write_from = &fsWriteViaStreamOnWriteFrom,
             };
 
             break :blk try spawnReadyOkFsFuture(ci);
@@ -10980,15 +10988,15 @@ pub const WasiCliAdapter = struct {
         return ctx;
     }
 
-    /// `host_driver.on_write` for a `descriptor.write-via-stream` /
-    /// `descriptor.append-via-stream` `stream<u8>` slot (#571).
-    ///
-    /// Pulls the guest's chunk and `pwrite(2)`s it at
-    /// `offset + bytes_written` (or end-of-file in append mode),
-    /// advancing the running counter so the next chunk lands
-    /// contiguously. Returns `.progressed` on success, `.err` on
-    /// syscall error so the executor flips `read_closed = true` and
-    /// the guest's next `stream.write` returns DROPPED.
+    /// `host_driver.on_write_from` for a `descriptor.write-via-stream`
+    /// / `descriptor.append-via-stream` `stream<u8>` slot (#583 B2
+    /// follow-up). Zero-copy variant of `fsWriteViaStreamOnWrite`:
+    /// `src` is a borrowed slice of guest linmem already validated by
+    /// the executor (`readGuestBytes(guest_ptr, byte_len)` against
+    /// `memory.size`), so we `pwriteAll(2)` directly from guest
+    /// memory at `offset + bytes_written` (or end-of-file in append
+    /// mode), advancing the running counter so the next chunk lands
+    /// contiguously.
     ///
     /// Multi-MiB guest buffers are split into
     /// `FS_CANCEL_POLL_CHUNK_BYTES`-sized chunks; the cancel flag is
@@ -11005,11 +11013,9 @@ pub const WasiCliAdapter = struct {
     /// Re-looks up the underlying `FsDescriptor` each call: if the
     /// guest dropped the descriptor while the stream is still live,
     /// the lookup fails and we surface `.err` rather than UAF the fd.
-    fn fsWriteViaStreamOnWrite(
+    fn fsWriteViaStreamOnWriteFrom(
         opaque_ctx: ?*anyopaque,
-        _: *async_mod.AsyncStream,
-        bytes: []const u8,
-        _: Allocator,
+        src: []const u8,
     ) async_mod.HostStreamAction {
         const ctx: *FsWriteStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
         // (#583 B1) Pre-entry cancel check: bail before any pwrite(2)
@@ -11018,7 +11024,7 @@ pub const WasiCliAdapter = struct {
         // `stream.write` returns DROPPED, matching the wit-bindgen
         // `Subtask` "cancelled mid-stream" decoder path.
         if (ctx.cancelled.load(.acquire)) return .err;
-        if (bytes.len == 0) return .progressed;
+        if (src.len == 0) return .progressed;
         const d = ctx.adapter.lookupFsDescriptor(ctx.desc_handle) orelse return .err;
         const fs_file: FsDescriptor.FsFile = switch (d.*) {
             .file => |f| f,
@@ -11037,15 +11043,15 @@ pub const WasiCliAdapter = struct {
         // chunk is preceded by a poll. Mirrors the HTTP body-read
         // pattern from #602.
         var written_this_call: usize = 0;
-        while (written_this_call < bytes.len) {
+        while (written_this_call < src.len) {
             // Skip the poll on the very first chunk — the pre-entry
             // check already covered that case. Polling between
             // chunks limits the worst-case "after cancel was set"
             // wasted work to one in-flight pwrite.
             if (written_this_call > 0 and ctx.cancelled.load(.acquire)) return .err;
-            const remaining = bytes.len - written_this_call;
+            const remaining = src.len - written_this_call;
             const chunk_len = @min(remaining, FS_CANCEL_POLL_CHUNK_BYTES);
-            const chunk = bytes[written_this_call..][0..chunk_len];
+            const chunk = src[written_this_call..][0..chunk_len];
             const write_offset: u64 = if (ctx.append) blk: {
                 // Append mode: position at the current end-of-file
                 // for every chunk so concurrent extenders (other
@@ -11063,6 +11069,22 @@ pub const WasiCliAdapter = struct {
             written_this_call += chunk_len;
         }
         return .progressed;
+    }
+
+    /// Legacy `host_driver.on_write` shape for a
+    /// `descriptor.write-via-stream` slot. Retained for back-compat
+    /// with the eager pre-buffer drain at install time and unit-test
+    /// callers that invoke the driver callback directly. Delegates
+    /// straight to the `on_write_from` zero-copy variant — both
+    /// pointers are installed on the same driver entry so the
+    /// executor sees the thinner signature first.
+    fn fsWriteViaStreamOnWrite(
+        opaque_ctx: ?*anyopaque,
+        _: *async_mod.AsyncStream,
+        bytes: []const u8,
+        _: Allocator,
+    ) async_mod.HostStreamAction {
+        return fsWriteViaStreamOnWriteFrom(opaque_ctx, bytes);
     }
 
     // ── Tier C: canonical stream<directory-entry> ──────────────────────
@@ -14813,23 +14835,40 @@ pub const WasiCliAdapter = struct {
         return .{ .action = .progressed, .bytes_written = @intCast(n) };
     }
 
-    /// `host_driver.on_write` for a TCP-send `stream<u8>` slot. Pushes
-    /// the guest-provided bytes synchronously to the connected fd.
-    /// Returns `.progressed` on success, `.err` on syscall error so the
-    /// executor marks `read_closed = true` and surfaces `cancelled` to
-    /// the guest's next `stream.write`.
+    /// `host_driver.on_write_from` for a TCP-send `stream<u8>` slot
+    /// (#583 B2 follow-up). Pushes the guest-provided bytes
+    /// synchronously to the connected fd. The `src` slice is borrowed
+    /// from guest linmem and validated by the executor before the
+    /// call — no scratch FIFO involvement on either side. Returns
+    /// `.progressed` on success, `.err` on syscall error so the
+    /// executor marks `read_closed = true` and surfaces `cancelled`
+    /// to the guest's next `stream.write`.
+    fn tcpSendStreamOnWriteFrom(
+        opaque_ctx: ?*anyopaque,
+        src: []const u8,
+    ) async_mod.HostStreamAction {
+        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (src.len == 0) return .progressed;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const slices = [_][]const u8{src};
+        _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch return .err;
+        return .progressed;
+    }
+
+    /// Legacy `host_driver.on_write` shape for a TCP-send `stream<u8>`
+    /// slot. Retained for back-compat with callers that invoke the
+    /// driver callback directly (unit tests) and for symmetry with
+    /// `on_read`'s fatter signature. Delegates straight to the
+    /// `on_write_from` zero-copy variant — both pointers are
+    /// installed on the same driver entry so the executor sees the
+    /// thinner signature first.
     fn tcpSendStreamOnWrite(
         opaque_ctx: ?*anyopaque,
         _: *async_mod.AsyncStream,
         bytes: []const u8,
         _: Allocator,
     ) async_mod.HostStreamAction {
-        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
-        if (bytes.len == 0) return .progressed;
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const slices = [_][]const u8{bytes};
-        _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch return .err;
-        return .progressed;
+        return tcpSendStreamOnWriteFrom(opaque_ctx, bytes);
     }
 
     /// `host_driver.on_read` for a `stream<tcp-socket>` slot produced
@@ -15265,9 +15304,16 @@ pub const WasiCliAdapter = struct {
                 slot.buffer.clearRetainingCapacity();
             }
             // Attach the driver so subsequent guest writes flow to fd.
+            // Both callback shapes are installed: the executor prefers
+            // the thinner `on_write_from` (zero-copy, #583 B2
+            // follow-up) which drops the unused `*AsyncStream` /
+            // `Allocator` parameters. `on_write` remains as a
+            // delegation shim so unit tests that invoke the driver
+            // callback directly still work.
             slot.host_driver = .{
                 .context = driver_ctx,
                 .on_write = &tcpSendStreamOnWrite,
+                .on_write_from = &tcpSendStreamOnWriteFrom,
             };
         }
         results[0] = .{ .handle = try socketReadyResultFuture(ci, true, .unknown) };

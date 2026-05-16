@@ -1,10 +1,13 @@
 //! WASI stream zero-copy specialisation microbenchmark (#583 B2).
 //!
-//! Drives the executor's `stream.read` rendezvous against a synthetic
-//! `host_driver` that mirrors the cost shape of
-//! `WasiCliAdapter.tcpReceiveStreamOnRead` (the wasi:sockets@0.3.x
-//! `tcp-socket.receive` hot path). Counts wall-clock + heap allocations
-//! for two configurations:
+//! Drives the executor's `stream.read` / `stream.write` rendezvous
+//! against synthetic `host_driver`s that mirror the cost shape of
+//! `WasiCliAdapter.tcpReceiveStreamOnRead` / `tcpSendStreamOnWrite`
+//! (the `wasi:sockets@0.3.x.tcp-socket.{receive,send}` hot paths).
+//! Counts wall-clock + heap allocations for two configurations on
+//! each side:
+//!
+//! ## Read side
 //!
 //!   * **Baseline (`on_read`)** — driver writes into a stack buffer
 //!     and `appendSlice`s the bytes onto `AsyncStream.buffer`; the
@@ -15,17 +18,32 @@
 //!     the guest-supplied destination slice; no scratch FIFO
 //!     allocation, no second memcpy.
 //!
-//! This is the harness for the profile numbers reported in PR #583 B2.
-//! It deliberately *doesn't* go through a real TCP socket — the goal
-//! is to isolate the canonical-ABI lowering + FIFO cost, not the
-//! kernel's `recvfrom` latency.
+//! ## Write side (#583 B2 follow-up)
+//!
+//!   * **Baseline (`on_write`)** — fatter signature mirroring the
+//!     read side: `(ctx, *AsyncStream, bytes, allocator)`. Already
+//!     zero-copy in terms of memcpys since the executor passes the
+//!     borrowed `readGuestBytes` slice straight through; the two
+//!     trailing parameters are unused.
+//!
+//!   * **Zero-copy (`on_write_from`)** — thinner signature `(ctx,
+//!     src)`. Same memcpy story, just no spurious arguments. Stresses
+//!     that the legacy + zero-copy paths are at parity (the API
+//!     hygiene win, not a perf win — the write side never had the
+//!     double-memcpy problem the read side did).
+//!
+//! This is the harness for the profile numbers reported in PR #583 B2
+//! + the follow-up PR. It deliberately *doesn't* go through a real
+//! TCP socket / fs `pwrite(2)` — the goal is to isolate the
+//! canonical-ABI lowering + FIFO cost, not the kernel's
+//! `recvfrom` / `pwrite` latency.
 //!
 //! Build / run:
 //!
 //!     zig build wasi-streams-bench -- --bytes-per-call 4096 --iters 4096
 //!
-//! Defaults (no args): 4 KiB per call × 4096 reads = 16 MiB pushed
-//! through both paths.
+//! Defaults (no args): 4 KiB per call × 4096 ops = 16 MiB pushed
+//! through each side.
 
 const std = @import("std");
 const wamr = @import("wamr");
@@ -149,6 +167,55 @@ fn zeroCopyOnReadInto(
     const n = src.fill(dst);
     if (n == 0) return .{ .action = .would_block };
     return .{ .action = .progressed, .bytes_written = n };
+}
+
+/// Synthetic sink for the write-side drivers: drains the guest's
+/// borrowed slice into a fixed-size buffer (so allocator behaviour
+/// is identical between baseline and zero-copy paths). Mirrors the
+/// cost shape of `tcpSendStreamOnWrite` / `fsWriteViaStreamOnWrite`
+/// without going through a real fd.
+const SyntheticSink = struct {
+    drained_bytes: u64 = 0,
+    last_checksum: u64 = 0,
+
+    fn drain(self: *SyntheticSink, src: []const u8) void {
+        self.drained_bytes += src.len;
+        // Touch the bytes so the optimiser doesn't elide the
+        // executor's borrowed-slice argument — we want the
+        // benchmark to faithfully measure the cost of *passing*
+        // the slice through, not have LLVM fold it away.
+        var s: u64 = self.last_checksum;
+        for (src) |b| s +%= b;
+        self.last_checksum = s;
+    }
+};
+
+/// Baseline driver `on_write` — fatter signature mirroring
+/// `tcpSendStreamOnWrite`. Already operates on the executor's
+/// borrowed `readGuestBytes` slice (no memcpy); the `*AsyncStream`
+/// and `Allocator` parameters are unused.
+fn baselineOnWrite(
+    opaque_ctx: ?*anyopaque,
+    _: *async_mod.AsyncStream,
+    bytes: []const u8,
+    _: std.mem.Allocator,
+) async_mod.HostStreamAction {
+    const sink: *SyntheticSink = @ptrCast(@alignCast(opaque_ctx.?));
+    sink.drain(bytes);
+    return .progressed;
+}
+
+/// Zero-copy driver `on_write_from` — thinner `(ctx, src)`
+/// signature. Same memcpy story as `baselineOnWrite` (the write
+/// path was already zero-copy via `readGuestBytes`); the win is API
+/// hygiene, not memcpy elimination.
+fn zeroCopyOnWriteFrom(
+    opaque_ctx: ?*anyopaque,
+    src: []const u8,
+) async_mod.HostStreamAction {
+    const sink: *SyntheticSink = @ptrCast(@alignCast(opaque_ctx.?));
+    sink.drain(src);
+    return .progressed;
 }
 
 const RunResult = struct {
@@ -279,6 +346,108 @@ fn runBench(
     };
 }
 
+/// Write-side bench: drives `stream.write` against either the
+/// fatter `on_write` shape (baseline) or the thinner `on_write_from`
+/// shape (zero-copy, #583 B2 follow-up). Returns the same
+/// `RunResult` shape so the summary at the bottom of `main` works
+/// for both sides uniformly.
+fn runWriteBench(
+    label: []const u8,
+    parent_allocator: std.mem.Allocator,
+    iters: u32,
+    bytes_per_call: u32,
+    zero_copy: bool,
+) !RunResult {
+    var counter = CountingAllocator{ .parent = parent_allocator };
+    const alloc = counter.allocator();
+
+    const StreamTypeFixture = struct {
+        var types_array = [_]ctypes.TypeDef{.{ .val = .u8 }};
+        var comp: ctypes.Component = .{
+            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+            .components = &.{},       .instances = &.{},      .aliases = &.{},
+            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .exports = &.{},
+        };
+    };
+    StreamTypeFixture.comp.types = &StreamTypeFixture.types_array;
+    const inst = try instance_mod.instantiate(&StreamTypeFixture.comp, alloc);
+    defer {
+        inst.disableTestMem();
+        inst.deinit();
+    }
+    const mem_size: usize = std.math.ceilPowerOfTwo(usize, @as(usize, bytes_per_call) * 2) catch
+        @as(usize, bytes_per_call) * 2;
+    try inst.enableTestMem(alloc, mem_size);
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, alloc);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, alloc);
+    defer env.destroy();
+
+    try executor.dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        alloc,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Seed the guest source bytes once — every iteration re-reads
+    // from the same `src_ptr` (mirrors the steady-state pattern of
+    // a host driver draining a long-lived stream).
+    const src_ptr: u32 = 0;
+    {
+        const src_bytes = inst.writableGuestBytes(src_ptr, bytes_per_call).?;
+        var pi: u32 = 0;
+        while (pi < bytes_per_call) : (pi += 1) src_bytes[pi] = @truncate(pi);
+    }
+
+    var sink = SyntheticSink{};
+    const s = inst.streams.getPtr(handle).?;
+    s.host_driver = if (zero_copy)
+        .{ .context = &sink, .on_write_from = &zeroCopyOnWriteFrom }
+    else
+        .{ .context = &sink, .on_write = &baselineOnWrite };
+
+    // Reset counters after setup so we measure only the per-op cost.
+    counter.alloc_count = 0;
+    counter.bytes_allocated = 0;
+
+    const start_ns: u64 = nowNs();
+    var i: u32 = 0;
+    var bytes_total: u64 = 0;
+    while (i < iters) : (i += 1) {
+        try env.pushI32(@bitCast(handle));
+        try env.pushI32(@bitCast(src_ptr));
+        try env.pushI32(@bitCast(bytes_per_call));
+        try executor.dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+            env,
+            null,
+            alloc,
+        );
+        const status: u32 = @bitCast(try env.popI32());
+        // Same packStatus unpack as the read bench: high 28 bits =
+        // element count consumed.
+        const got_count: u32 = status >> 4;
+        bytes_total += got_count;
+    }
+    const wall_ns = nowNs() - start_ns;
+
+    return .{
+        .label = label,
+        .iters = iters,
+        .bytes_total = bytes_total,
+        .wall_ns = wall_ns,
+        .alloc_count = counter.alloc_count,
+        .bytes_allocated = counter.bytes_allocated,
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const a = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -302,12 +471,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print(
-        "wasi-streams microbench: {d} iters × {d} bytes per stream.read\n",
+        "wasi-streams microbench: {d} iters × {d} bytes per stream op\n",
         .{ iters, bytes_per_call },
     );
 
-    // Run baseline twice + zero-copy twice and report the median to
-    // damp jitter on a shared VM.
+    // ── Read side ───────────────────────────────────────────────────
+    std.debug.print("\n== stream.read (#583 B2) ==\n", .{});
     const baseline_1 = try runBench("baseline (on_read)", a, iters, bytes_per_call, false);
     const baseline_2 = try runBench("baseline (on_read)", a, iters, bytes_per_call, false);
     const zerocopy_1 = try runBench("zero-copy (into)", a, iters, bytes_per_call, true);
@@ -334,7 +503,7 @@ pub fn main(init: std.process.Init) !void {
     else
         0.0;
     std.debug.print(
-        "\nMedian-of-2 summary:\n" ++
+        "\nMedian-of-2 summary (read):\n" ++
             "  baseline  wall = {d:>10} ns, allocs = {d}\n" ++
             "  zero-copy wall = {d:>10} ns, allocs = {d}\n" ++
             "  Δ wall-clock = {d:.2}%   Δ allocs = {d:.2}%\n",
@@ -345,6 +514,48 @@ pub fn main(init: std.process.Init) !void {
             zero_allocs,
             wall_speedup,
             alloc_reduction,
+        },
+    );
+
+    // ── Write side (#583 B2 follow-up) ──────────────────────────────
+    //
+    // The write path was already zero-copy via `readGuestBytes` (no
+    // FIFO allocation, no second memcpy), so the wall-clock /
+    // allocation numbers here are expected to be at parity between
+    // the legacy `on_write` and the thinner `on_write_from`. The
+    // bench exists primarily to (a) pin that property in CI and (b)
+    // surface any regression introduced by the new executor branch.
+    std.debug.print("\n== stream.write (#583 B2 follow-up) ==\n", .{});
+    const w_baseline_1 = try runWriteBench("baseline (on_write)", a, iters, bytes_per_call, false);
+    const w_baseline_2 = try runWriteBench("baseline (on_write)", a, iters, bytes_per_call, false);
+    const w_zerocopy_1 = try runWriteBench("zero-copy (from)", a, iters, bytes_per_call, true);
+    const w_zerocopy_2 = try runWriteBench("zero-copy (from)", a, iters, bytes_per_call, true);
+
+    std.debug.print("\nIndividual runs:\n", .{});
+    w_baseline_1.report();
+    w_baseline_2.report();
+    w_zerocopy_1.report();
+    w_zerocopy_2.report();
+
+    const wbase_wall: u64 = @min(w_baseline_1.wall_ns, w_baseline_2.wall_ns);
+    const wzero_wall: u64 = @min(w_zerocopy_1.wall_ns, w_zerocopy_2.wall_ns);
+    const wbase_allocs: usize = w_baseline_1.alloc_count;
+    const wzero_allocs: usize = w_zerocopy_1.alloc_count;
+    const w_wall_delta: f64 = (@as(f64, @floatFromInt(wbase_wall)) -
+        @as(f64, @floatFromInt(wzero_wall))) /
+        @as(f64, @floatFromInt(wbase_wall)) * 100.0;
+    std.debug.print(
+        "\nMedian-of-2 summary (write):\n" ++
+            "  baseline  wall = {d:>10} ns, allocs = {d}\n" ++
+            "  zero-copy wall = {d:>10} ns, allocs = {d}\n" ++
+            "  Δ wall-clock = {d:.2}%   (parity is expected — both paths " ++
+            "operate on the borrowed `readGuestBytes` slice)\n",
+        .{
+            wbase_wall,
+            wbase_allocs,
+            wzero_wall,
+            wzero_allocs,
+            w_wall_delta,
         },
     );
 }

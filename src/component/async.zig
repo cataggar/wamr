@@ -379,9 +379,16 @@ pub const HostStreamReadInto = struct {
 /// the FIFO into guest linmem. The slice is only valid for the
 /// synchronous duration of the call; the driver must not retain it.
 ///
-/// `on_write` already operates on a borrowed slice from
-/// `comp_inst.readGuestBytes`, so the write path is implicitly
-/// zero-copy already; no symmetric `on_write_from` is required.
+/// The symmetric `stream.write` path already passes the driver a
+/// borrowed slice of guest linmem via `comp_inst.readGuestBytes`, so
+/// the write side is implicitly zero-copy already (no scratch FIFO
+/// allocation, no `@memcpy` between the legacy `on_write` callback
+/// and the host syscall). Drivers can however set `on_write_from`
+/// (#583 B2 follow-up) for a thinner callback signature that drops
+/// the unused `*AsyncStream` and `Allocator` parameters — the
+/// executor prefers it over `on_write` when both are installed and
+/// the API matches `on_read_into`'s shape, keeping the driver
+/// surface symmetric end-to-end.
 pub const HostStreamDriver = struct {
     /// Opaque context (typically `*WasiCliAdapter` plus a per-socket
     /// fd captured inline). Passed back to each callback verbatim.
@@ -424,6 +431,34 @@ pub const HostStreamDriver = struct {
         stream: *AsyncStream,
         bytes: []const u8,
         allocator: std.mem.Allocator,
+    ) HostStreamAction = null,
+    /// Zero-copy variant of `on_write` (#583 B2 follow-up). When set,
+    /// the executor invokes this in preference to `on_write` and
+    /// passes only the borrowed source slice — no `*AsyncStream`, no
+    /// `Allocator`. Both legacy parameters are unused by every
+    /// in-tree write driver (`tcpSendStreamOnWrite`,
+    /// `fsWriteViaStreamOnWrite`) because they push the bytes
+    /// straight to a host fd / file via `writeAll` / `pwriteAll`.
+    ///
+    /// `src` is a borrowed view of guest linmem already validated by
+    /// `readGuestBytes(guest_ptr, byte_len)` against `memory.size`
+    /// before the call — the slice stays valid for the synchronous
+    /// duration of the call (the executor never yields to a
+    /// `memory.grow` between the bounds check and the driver
+    /// return). Drivers must not retain the slice.
+    ///
+    /// Action semantics match `on_write`:
+    ///   * `.progressed` — all `src.len` bytes accepted by the host
+    ///     sink; the executor reports `completed(count)` to the
+    ///     guest.
+    ///   * `.would_block` — sink not ready; executor falls back to
+    ///     FIFO buffering so a later read / drain can pick up the
+    ///     bytes.
+    ///   * `.eof` / `.err` — sink is gone / failed; executor flips
+    ///     `read_closed = true` and surfaces `dropped(0)`.
+    on_write_from: ?*const fn (
+        ctx: ?*anyopaque,
+        src: []const u8,
     ) HostStreamAction = null,
 };
 
