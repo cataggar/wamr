@@ -921,14 +921,14 @@ pub fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
                 if (arg.* == old) arg.* = new;
             }
         },
-        .call_indirect => |ci| {
-            if (ci.elem_idx == old) @constCast(&ci.elem_idx).* = new;
+        .call_indirect => |*ci| {
+            if (ci.elem_idx == old) ci.elem_idx = new;
             for (@constCast(ci.args)) |*arg| {
                 if (arg.* == old) arg.* = new;
             }
         },
-        .call_ref => |cr| {
-            if (cr.func_ref == old) @constCast(&cr.func_ref).* = new;
+        .call_ref => |*cr| {
+            if (cr.func_ref == old) cr.func_ref = new;
             for (@constCast(cr.args)) |*arg| {
                 if (arg.* == old) arg.* = new;
             }
@@ -5743,14 +5743,14 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                         .call => |cl| for (@constCast(cl.args)) |*a| {
                             if (rename_map.get(a.*)) |r| a.* = r;
                         },
-                        .call_indirect => |ci| {
-                            if (rename_map.get(ci.elem_idx)) |r| @constCast(&ci.elem_idx).* = r;
+                        .call_indirect => |*ci| {
+                            if (rename_map.get(ci.elem_idx)) |r| ci.elem_idx = r;
                             for (@constCast(ci.args)) |*a| {
                                 if (rename_map.get(a.*)) |r| a.* = r;
                             }
                         },
-                        .call_ref => |cr| {
-                            if (rename_map.get(cr.func_ref)) |r| @constCast(&cr.func_ref).* = r;
+                        .call_ref => |*cr| {
+                            if (rename_map.get(cr.func_ref)) |r| cr.func_ref = r;
                             for (@constCast(cr.args)) |*a| {
                                 if (rename_map.get(a.*)) |r| a.* = r;
                             }
@@ -11886,6 +11886,59 @@ test "foldLoadStoreOffset: adjusts checked_end when folding a widened access" {
     try std.testing.expectEqual(v_base, ld.base);
     try std.testing.expectEqual(@as(u32, 16), ld.offset);
     try std.testing.expectEqual(@as(u64, 32), ld.checked_end);
+}
+
+test "replaceInInst rewrites call_indirect.elem_idx" {
+    // Regression for #617: `.call_indirect => |ci|` captured the payload
+    // by value, so `@constCast(&ci.elem_idx).* = new` wrote into a stack
+    // copy and left the IR field unchanged. The same bug fired in
+    // `promoteLocalsToSSA`'s rename pass, leaving `elem_idx` referencing
+    // a vreg whose defining `local_get` had been rewritten away — which
+    // surfaced at codegen as `error.UnboundVReg`.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const v_old = func.newVReg();
+    const v_new = func.newVReg();
+    const args = try allocator.alloc(ir.VReg, 1);
+    args[0] = v_old;
+    try func.getBlock(b0).append(.{
+        .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = v_old, .args = args } },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+
+    replaceVReg(&func, v_old, v_new);
+
+    const ci = func.getBlock(b0).instructions.items[0].op.call_indirect;
+    try std.testing.expectEqual(v_new, ci.elem_idx);
+    try std.testing.expectEqual(v_new, ci.args[0]);
+}
+
+test "replaceInInst rewrites call_ref.func_ref" {
+    // Mirror of the call_indirect regression for `call_ref`.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const v_old = func.newVReg();
+    const v_new = func.newVReg();
+    const args = try allocator.alloc(ir.VReg, 1);
+    args[0] = v_old;
+    try func.getBlock(b0).append(.{
+        .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = v_old, .args = args } },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+
+    replaceVReg(&func, v_old, v_new);
+
+    const cr = func.getBlock(b0).instructions.items[0].op.call_ref;
+    try std.testing.expectEqual(v_new, cr.func_ref);
+    try std.testing.expectEqual(v_new, cr.args[0]);
 }
 
 test "promoteLocalsToSSA: simple countdown loop" {
