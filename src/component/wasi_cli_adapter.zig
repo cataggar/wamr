@@ -1574,13 +1574,16 @@ fn isTransportManagedHeader(name: []const u8) bool {
 /// then publishes via `done.store(true, .release)`; the adapter checks
 /// `done.load(.acquire)` from `drainPendingHttpFetches` and only frees
 /// the struct after `thread.join()` returns, guaranteeing no UAF even
-/// when the worker is still mid-`std.http.Client.fetch`.
+/// when the worker is still mid-fetch.
 ///
-/// `cancelled` is an adapter → worker advisory: today's blocking
-/// `std.http.Client.fetch` can't observe it mid-fetch, but the drain
-/// side checks it on completion so a guest `task.cancel` issued
-/// before the worker returns is still honoured by the future the
-/// guest awaits (#488 cancel-propagation pattern). (#583 A2)
+/// `cancelled` is an adapter → worker advisory polled by the worker
+/// at every `std.http.Client.Request` phase boundary in
+/// `httpClientLowLevelFetch` — pre-connect, pre-send, pre-receive-head,
+/// pre-body-read, and per `http_cancel_body_chunk_bytes` body chunk
+/// (#583 B1 follow-up). The drain side ALSO checks the flag post-
+/// completion so a guest `task.cancel` that races a worker publish
+/// is still honoured by surfacing `HTTP_request_denied` to the
+/// future the guest awaits (#488 cancel-propagation pattern). (#583 A2)
 pub const PendingHttpFetchShared = struct {
     done: std.atomic.Value(bool) = .{ .raw = false },
     cancelled: std.atomic.Value(bool) = .{ .raw = false },
@@ -2899,6 +2902,30 @@ const HttpLowLevelFetchResult = struct {
     body: []u8,
 };
 
+/// Per-chunk granularity for cancel polling inside the outbound body-
+/// read loop (#583 B1 follow-up). The worker performs a
+/// `cancelled.load(.acquire)` check before pumping each chunk, so a
+/// guest-issued `task.cancel` is observed within at most one chunk's
+/// I/O latency once body-streaming has begun. 64 KiB matches the
+/// typical TCP receive-window granularity and keeps the syscall
+/// overhead negligible relative to the cancel-observability win.
+const http_cancel_body_chunk_bytes: usize = 64 * 1024;
+
+/// Phase-boundary cancel check used by `httpClientLowLevelFetch`.
+/// Returns `error.HttpFetchCancelled` if the worker's
+/// `PendingHttpFetchShared.cancelled` advisory flag has been flipped
+/// by the adapter's `cancelAllPendingAsyncOps` driver
+/// (`task.cancel` propagation, #583 B1). `cancelled == null` (used
+/// by call-sites that have no shared block, e.g. unit-tests that
+/// drive the helper directly without spawning a worker) short-
+/// circuits to success so the helper can still be exercised
+/// out-of-band.
+fn checkHttpCancel(cancelled: ?*std.atomic.Value(bool)) error{HttpFetchCancelled}!void {
+    if (cancelled) |c| {
+        if (c.load(.acquire)) return error.HttpFetchCancelled;
+    }
+}
+
 /// Drive a single outbound HTTP request through the lower-level
 /// `std.http.Client.request` / `Request.receiveHead` /
 /// `Response.readerDecompressing` API and capture the full
@@ -2919,6 +2946,21 @@ const HttpLowLevelFetchResult = struct {
 /// Transfer-Encoding, Connection, Keep-Alive, Trailer, TE, Upgrade,
 /// Host) are stripped so the lifted `incoming-response` exposes only
 /// the application-level headers per the wasi:http WIT spec (#583 A4).
+///
+/// `cancelled` is an optional pointer into a worker-shared
+/// `PendingHttpFetchShared.cancelled` atomic. When non-null the
+/// helper polls `.load(.acquire)` at every phase boundary —
+/// pre-connect, pre-send, pre-receive-head, pre-body-read, and
+/// before each `http_cancel_body_chunk_bytes`-sized body chunk — so a
+/// `task.cancel` issued by the guest is observed within at most one
+/// I/O-syscall's latency rather than only at the worker's pre-fetch
+/// check. Cancel surfaces as `error.HttpFetchCancelled`; callers in
+/// the worker thread translate that to `HTTP_request_denied` (the
+/// canonical "request was not delivered" 0.3 error-code) before
+/// publishing the outcome. Connection / response cleanup on cancel
+/// is handled by the existing `defer req.deinit()` chain — no
+/// explicit close needed. Pass `null` if the caller has no shared
+/// block (e.g. direct unit-test invocations). (#583 B1 follow-up)
 fn httpClientLowLevelFetch(
     allocator: Allocator,
     io: std.Io,
@@ -2926,7 +2968,12 @@ fn httpClientLowLevelFetch(
     method: std.http.Method,
     extra_headers: []const std.http.Header,
     payload: ?[]const u8,
+    cancelled: ?*std.atomic.Value(bool),
 ) anyerror!HttpLowLevelFetchResult {
+    // Pre-connect sync point: bail before issuing any syscall if the
+    // guest cancelled while the request was queued on the worker.
+    try checkHttpCancel(cancelled);
+
     var client: std.http.Client = .{
         .allocator = allocator,
         .io = io,
@@ -2949,6 +2996,11 @@ fn httpClientLowLevelFetch(
     });
     defer req.deinit();
 
+    // Pre-send sync point: connect / TLS handshake already done; bail
+    // before pushing the request head + body on the wire if the
+    // guest cancelled.
+    try checkHttpCancel(cancelled);
+
     if (payload) |p| {
         req.transfer_encoding = .{ .content_length = p.len };
         var body_writer = try req.sendBodyUnflushed(&.{});
@@ -2958,6 +3010,10 @@ fn httpClientLowLevelFetch(
     } else {
         try req.sendBodiless();
     }
+
+    // Pre-receive-head sync point: request fully on the wire; bail
+    // before blocking on the response.
+    try checkHttpCancel(cancelled);
 
     // RFC 9110 recommends ≥ 8000 bytes for the redirect / merged-URI
     // buffer; the spec ceiling on a header section is `max_http_header_bytes`.
@@ -2993,6 +3049,12 @@ fn httpClientLowLevelFetch(
 
     const status_code: u16 = @intFromEnum(response.head.status);
 
+    // Pre-body-read sync point: response head + headers captured;
+    // bail before draining the body if the guest cancelled. Any
+    // bytes the kernel has already buffered are abandoned by the
+    // deferred `req.deinit()` close.
+    try checkHttpCancel(cancelled);
+
     // Drain the body. HEAD / 1xx / 204 / 304 responses have no body
     // per RFC 9110; `Request.receiveHead` leaves the reader in `.ready`
     // for those and `response.reader(...)` short-circuits to `.ending`.
@@ -3011,10 +3073,22 @@ fn httpClientLowLevelFetch(
     var decompress: std.http.Decompress = undefined;
     const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
-    _ = body_reader.streamRemaining(&aw.writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
-        else => |e| return e,
-    };
+    // Chunked body-read loop with per-chunk cancel polling. Equivalent
+    // to `Reader.streamRemaining` but interleaves a
+    // `cancelled.load(.acquire)` check at each
+    // `http_cancel_body_chunk_bytes` boundary so a `task.cancel`
+    // issued mid-body is observed within one chunk's latency. On
+    // cancel the partial `aw` buffer is freed by its `errdefer`, so
+    // any bytes already streamed are discarded cleanly.
+    const chunk_limit: std.Io.Limit = .limited(http_cancel_body_chunk_bytes);
+    while (true) {
+        try checkHttpCancel(cancelled);
+        _ = body_reader.stream(&aw.writer, chunk_limit) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return response.bodyErr().?,
+            else => |e| return e,
+        };
+    }
 
     var body_al = aw.toArrayList();
     const body = try body_al.toOwnedSlice(allocator);
@@ -6559,6 +6633,19 @@ pub const WasiCliAdapter = struct {
     /// unclassified failures fall through to `internal_error`). The
     /// `httpClientSendP3` synchronous path uses the same helper, so
     /// both surfaces produce identical discriminants AND header sets.
+    ///
+    /// Cancel propagation (#583 B1 follow-up): the worker passes
+    /// `&shared.cancelled` into `httpClientLowLevelFetch`; the helper
+    /// polls that flag at every phase boundary (pre-connect,
+    /// pre-send, pre-receive-head, pre-body-read, and on every
+    /// `http_cancel_body_chunk_bytes`-sized body chunk) and surfaces
+    /// cancellation as `error.HttpFetchCancelled`. We translate that
+    /// sentinel to the `HTTP_request_denied` 0.3 error-code variant
+    /// — the same discriminant the drainer surfaces when it observes
+    /// `shared.cancelled` post-completion — so worker-side and
+    /// drainer-side cancel paths produce identical guest-visible
+    /// outcomes regardless of when in the fetch lifecycle the
+    /// cancel landed.
     fn httpFetchWorker(req: *HttpFetchRequest) void {
         // Worker owns its *HttpFetchRequest — free both the inner
         // resources and the heap struct itself before returning.
@@ -6568,6 +6655,10 @@ pub const WasiCliAdapter = struct {
         const shared = req.shared;
 
         // Honor a pre-fetch cancel before doing any network work.
+        // `httpClientLowLevelFetch`'s pre-connect check below would
+        // catch this too, but bailing here saves the
+        // `std.http.Client` init + URI parse on a guaranteed-cancel
+        // outcome.
         if (shared.cancelled.load(.acquire)) {
             shared.outcome = .{ .failure = .HTTP_request_denied };
             shared.done.store(true, .release);
@@ -6583,14 +6674,26 @@ pub const WasiCliAdapter = struct {
             req.method,
             req.headers_buf,
             req.payload,
-        ) catch |err| {
+            &shared.cancelled,
+        ) catch |err| switch (err) {
+            // Phase-boundary cancel: surface as `HTTP_request_denied`,
+            // mirroring the drainer's post-completion cancel arm so
+            // guest observability is uniform regardless of which
+            // side noticed cancellation first.
+            error.HttpFetchCancelled => {
+                shared.outcome = .{ .failure = .HTTP_request_denied };
+                shared.done.store(true, .release);
+                return;
+            },
             // Funnel through the same error-mapping table the
             // synchronous P3 `client.send` path uses (#583 A3) so the
             // worker and the in-thread `httpClientSendP3` produce
             // identical `error-code` discriminants.
-            shared.outcome = .{ .failure = mapHttpFetchError(err) };
-            shared.done.store(true, .release);
-            return;
+            else => |e| {
+                shared.outcome = .{ .failure = mapHttpFetchError(e) };
+                shared.done.store(true, .release);
+                return;
+            },
         };
 
         shared.outcome = .{ .success = .{
@@ -7262,17 +7365,24 @@ pub const WasiCliAdapter = struct {
     ///     (currently armed-but-dormant) `fsReadViaStreamOnRead`
     ///     short-circuits with `.eof` if ever invoked.
     ///   * **Pending outbound HTTP fetches** — flip the per-fetch
-    ///     `shared.cancelled` atomic. Cancel is *best-effort*: the
-    ///     blocking `std.http.Client.fetch` running on the worker
-    ///     thread cannot be interrupted from another thread cleanly,
-    ///     so the worker observes cancel at its next synchronisation
-    ///     point (today: only the pre-fetch check). On fetch return
-    ///     the drainer (`settlePendingHttpFetch`) sees `cancelled =
-    ///     true` and surfaces `HTTP_request_denied` to the guest
-    ///     regardless of the wire outcome. A follow-up will switch
-    ///     to the lower-level `std.http.Client.Request` API so the
-    ///     worker can poll cancellation between connect, send-head,
-    ///     and read-body phases.
+    ///     `shared.cancelled` atomic. The worker polls this flag at
+    ///     every `std.http.Client.Request` phase boundary
+    ///     (pre-connect, pre-send, pre-receive-head, pre-body-read,
+    ///     and on every `http_cancel_body_chunk_bytes`-sized body
+    ///     chunk) and surfaces cancellation as
+    ///     `error.HttpFetchCancelled`, which it then translates to
+    ///     the `HTTP_request_denied` 0.3 error-code variant. Cancel
+    ///     is still best-effort *within* a phase — a blocking
+    ///     `recv(2)` waiting for the next header byte is not
+    ///     interrupted from another thread — but observability is
+    ///     bounded to one phase's I/O latency rather than the whole
+    ///     fetch. As a belt-and-braces, the drainer
+    ///     (`settlePendingHttpFetch`) also checks `shared.cancelled`
+    ///     post-completion and overrides a wire-success outcome
+    ///     with `HTTP_request_denied` if the cancel signal landed
+    ///     after the worker had already published `done` (#583 B1
+    ///     follow-up; the original #583 B1 landing observed cancel
+    ///     only at the pre-fetch check).
     ///
     /// The `task_handle` argument is reserved for a future per-task
     /// owner-tracking refactor; today we cancel every pending op the
@@ -7345,13 +7455,14 @@ pub const WasiCliAdapter = struct {
 
         // ── Outbound HTTP fetches (#583 B1) ───────────────────────
         // `shared.cancelled` is an `Atomic.Value(bool)` so the worker
-        // thread can read it lock-free at its next synchronisation
-        // point. The pre-fetch check at the top of `httpFetchWorker`
-        // already honours this for cancels issued before the fetch
-        // begins; the drainer (`settlePendingHttpFetch`) honours it
-        // on every worker completion. Note: an in-flight blocking
-        // `std.http.Client.fetch` can NOT observe this — see the
-        // doc-comment caveat at the top of this function.
+        // thread can read it lock-free at every `std.http.Client.Request`
+        // phase boundary — `httpClientLowLevelFetch` calls
+        // `checkHttpCancel` pre-connect, pre-send, pre-receive-head,
+        // pre-body-read, and on every `http_cancel_body_chunk_bytes`
+        // body chunk (#583 B1 follow-up). The drainer
+        // (`settlePendingHttpFetch`) re-checks the flag as a belt-
+        // and-braces, so even a cancel that races a worker
+        // completion still surfaces as `HTTP_request_denied`.
         for (self.pending_http_fetches.items) |entry| {
             entry.shared.cancelled.store(true, .release);
         }
@@ -33578,6 +33689,451 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: outbound HTTP fetch flips shared.
         ),
         else => return error.UnexpectedHttpFutureState,
     }
+}
+
+test "wasi:http #583 B1 follow-up: httpClientLowLevelFetch observes pre-connect cancel without syscall" {
+    // Phase-by-phase cancel polling, pre-connect arm. With
+    // `cancelled` pre-set, the helper's first synchronisation
+    // point (top-of-function `checkHttpCancel`) fires BEFORE
+    // `std.http.Client.request` issues any connect/TLS syscall —
+    // verified indirectly by passing a non-listening 127.0.0.1
+    // address: if the helper had attempted the connect we'd
+    // observe `error.ConnectionRefused`. Getting
+    // `error.HttpFetchCancelled` instead is the proof of "no
+    // syscall issued".
+    const testing = std.testing;
+    var cancelled: std.atomic.Value(bool) = .{ .raw = true };
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const result = httpClientLowLevelFetch(
+        testing.allocator,
+        io,
+        "http://127.0.0.1:1/",
+        .GET,
+        &.{},
+        null,
+        &cancelled,
+    );
+    try testing.expectError(error.HttpFetchCancelled, result);
+}
+
+test "wasi:http #583 B1 follow-up: httpFetchWorker translates Cancelled to HTTP_request_denied (end-to-end)" {
+    // Spawn the real worker against an unrouted address with the
+    // shared cancel flag pre-flipped. The worker's top-of-function
+    // pre-fetch guard catches the cancel; the drainer settles the
+    // future with `HTTP_request_denied`. End-to-end coverage of
+    // worker → drainer → future-settle pipeline. No network
+    // dependency because the helper bails before connect.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // 127.0.0.0/8 allow-list — irrelevant since we never reach
+    // connect, but `spawnHttpFetchPending` doesn't consult it
+    // anyway (the deny path is in the `outgoing-handler.handle`
+    // surface).
+    const fh = try adapter.spawnHttpFetchPending(
+        "http://127.0.0.1:1/",
+        .GET,
+        &.{},
+        null,
+    );
+    try testing.expectEqual(@as(usize, 1), adapter.pending_http_fetches.items.len);
+    // Pre-flip cancel BEFORE the worker has a chance to fail-
+    // connect. The worker's pre-fetch guard observes this on its
+    // first synchronisation point and publishes
+    // `HTTP_request_denied` without invoking the network stack.
+    adapter.pending_http_fetches.items[0].shared.cancelled.store(true, .release);
+
+    // Drive the drainer until the worker publishes. The settle
+    // path either picks up `cancelled = true` directly (drainer
+    // override arm) or the worker has already published
+    // `HTTP_request_denied` via the helper's pre-connect bail —
+    // both arms emit the same `error-code` to the guest.
+    var attempts: usize = 0;
+    while (attempts < 10_000 and adapter.pending_http_fetches.items.len > 0) : (attempts += 1) {
+        adapter.drainPendingHttpFetches();
+        if (adapter.pending_http_fetches.items.len == 0) break;
+        const drv_io = std.Io.Threaded.global_single_threaded.io();
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(drv_io) catch {};
+    }
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches.items.len);
+
+    const settled = adapter.lookupFutureResponse(fh).?;
+    switch (settled.state) {
+        .ready_err => |code| try testing.expectEqual(
+            @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+            code,
+        ),
+        else => return error.UnexpectedHttpFutureState,
+    }
+}
+
+/// Loopback HTTP server with explicit phase signalling used by the
+/// #583 B1 follow-up phase-boundary cancel tests. Exposes:
+///   * `request_received`: flipped after reading the request head.
+///   * `unblock_response`: caller flips this to let the server
+///     proceed to writing the response.
+///   * `chunk_sent`: flipped after writing the first body chunk
+///     (mid-body cancel test only — set to `null` to skip).
+///   * `unblock_body`: caller flips this to let the server write
+///     the rest of the body (mid-body cancel test only).
+const TestHttpPhaseServer = struct {
+    thread: std.Thread,
+    port: u16,
+    ctx: *TestHttpPhaseServerCtx,
+
+    fn serveLoopback(
+        allocator: Allocator,
+        head: []const u8,
+        body_part1: []const u8,
+        body_part2: []const u8,
+        request_received: *std.atomic.Value(bool),
+        unblock_response: *std.atomic.Value(bool),
+        chunk_sent: ?*std.atomic.Value(bool),
+        unblock_body: ?*std.atomic.Value(bool),
+    ) !TestHttpPhaseServer {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var any: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+        const server = try std.Io.net.IpAddress.listen(&any, io, .{
+            .kernel_backlog = 1,
+        });
+        const bound = switch (server.socket.address) {
+            .ip4 => |v4| v4.port,
+            else => {
+                var srv_mut = server;
+                srv_mut.deinit(io);
+                return error.SkipZigTest;
+            },
+        };
+        const head_copy = try allocator.dupe(u8, head);
+        errdefer allocator.free(head_copy);
+        const body1_copy = try allocator.dupe(u8, body_part1);
+        errdefer allocator.free(body1_copy);
+        const body2_copy = try allocator.dupe(u8, body_part2);
+        errdefer allocator.free(body2_copy);
+        const ctx = try allocator.create(TestHttpPhaseServerCtx);
+        ctx.* = .{
+            .allocator = allocator,
+            .server = server,
+            .head = head_copy,
+            .body_part1 = body1_copy,
+            .body_part2 = body2_copy,
+            .request_received = request_received,
+            .unblock_response = unblock_response,
+            .chunk_sent = chunk_sent,
+            .unblock_body = unblock_body,
+        };
+        const t = try std.Thread.spawn(.{}, TestHttpPhaseServerCtx.run, .{ctx});
+        return .{ .thread = t, .port = bound, .ctx = ctx };
+    }
+};
+
+const TestHttpPhaseServerCtx = struct {
+    allocator: Allocator,
+    server: std.Io.net.Server,
+    head: []u8,
+    body_part1: []u8,
+    body_part2: []u8,
+    request_received: *std.atomic.Value(bool),
+    unblock_response: *std.atomic.Value(bool),
+    chunk_sent: ?*std.atomic.Value(bool),
+    unblock_body: ?*std.atomic.Value(bool),
+
+    fn run(self: *TestHttpPhaseServerCtx) void {
+        defer {
+            self.allocator.free(self.head);
+            self.allocator.free(self.body_part1);
+            self.allocator.free(self.body_part2);
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var srv = self.server;
+            srv.deinit(io);
+            self.allocator.destroy(self);
+        }
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const stream = self.server.accept(io) catch return;
+        defer stream.close(io);
+
+        // Drain request head.
+        var req_buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < req_buf.len) {
+            var dests = [_][]u8{req_buf[total..]};
+            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            if (n == 0) break;
+            total += n;
+            if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
+        }
+        // Signal: request fully received.
+        self.request_received.store(true, .release);
+
+        // Block until the test thread says "go". Polled at 1ms
+        // intervals — the test thread flips cancel before
+        // signalling so the helper's next phase-check observes
+        // it whenever the helper is unblocked.
+        while (!self.unblock_response.load(.acquire)) {
+            const dur: std.Io.Clock.Duration = .{
+                .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+                .clock = .awake,
+            };
+            dur.sleep(io) catch {};
+        }
+
+        const head_slices = [_][]const u8{self.head};
+        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        if (self.body_part1.len > 0) {
+            const body_slices = [_][]const u8{self.body_part1};
+            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+        }
+
+        // Mid-body cancel test only: signal that the first chunk
+        // has been sent, then block until the test thread says
+        // "send the rest". The mid-body test never sets
+        // `unblock_body`, so the server effectively hangs —
+        // intentional, because the helper bails out at the next
+        // cancel-check before reading more bytes.
+        if (self.chunk_sent) |ev| ev.store(true, .release);
+        if (self.unblock_body) |ev| {
+            while (!ev.load(.acquire)) {
+                const dur: std.Io.Clock.Duration = .{
+                    .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+                    .clock = .awake,
+                };
+                dur.sleep(io) catch {};
+            }
+            if (self.body_part2.len > 0) {
+                const body_slices = [_][]const u8{self.body_part2};
+                _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+            }
+        }
+    }
+};
+
+/// Worker-thread harness invoked by the #583 B1 follow-up tests:
+/// drives `httpClientLowLevelFetch` to completion against a caller-
+/// supplied URL, writes the resulting status / `error.HttpFetchCancelled`
+/// flag into the supplied out-params. Keeps the test thread free to
+/// flip `cancelled` mid-fetch and observe the helper's response.
+const TestHttpFetchWorkerCtx = struct {
+    allocator: Allocator,
+    url: []const u8,
+    cancelled: *std.atomic.Value(bool),
+    out_was_cancelled: *std.atomic.Value(bool),
+    out_done: *std.atomic.Value(bool),
+
+    fn run(self: *TestHttpFetchWorkerCtx) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const result = httpClientLowLevelFetch(
+            self.allocator,
+            io,
+            self.url,
+            .GET,
+            &.{},
+            null,
+            self.cancelled,
+        );
+        if (result) |r| {
+            self.allocator.free(r.body);
+            freeOwnedHttpHeaders(self.allocator, r.headers);
+        } else |err| {
+            if (err == error.HttpFetchCancelled) {
+                self.out_was_cancelled.store(true, .release);
+            }
+        }
+        self.out_done.store(true, .release);
+    }
+};
+
+test "wasi:http #583 B1 follow-up: httpClientLowLevelFetch observes cancel between send-head and receive-head (#583)" {
+    // Phase-boundary cancel test. Server accepts + reads the
+    // request head, then blocks until the test thread says
+    // "respond". The test thread flips cancel BEFORE unblocking
+    // the server, so by the time the helper has connected and
+    // sent the request head, the cancel flag is already set
+    // when its pre-receive-head (and any subsequent) sync point
+    // is reached. The helper bails with
+    // `error.HttpFetchCancelled` and `errdefer` chains in the
+    // helper release any partial-state allocations — verified
+    // by `testing.allocator`'s leak detector.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var request_received: std.atomic.Value(bool) = .{ .raw = false };
+    var unblock_response: std.atomic.Value(bool) = .{ .raw = false };
+    var server = TestHttpPhaseServer.serveLoopback(
+        testing.allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+        "hello",
+        "",
+        &request_received,
+        &unblock_response,
+        null,
+        null,
+    ) catch return error.SkipZigTest;
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/", .{server.port});
+    defer testing.allocator.free(url);
+
+    var cancelled: std.atomic.Value(bool) = .{ .raw = false };
+    var was_cancelled: std.atomic.Value(bool) = .{ .raw = false };
+    var done: std.atomic.Value(bool) = .{ .raw = false };
+    const worker_ctx = try testing.allocator.create(TestHttpFetchWorkerCtx);
+    defer testing.allocator.destroy(worker_ctx);
+    worker_ctx.* = .{
+        .allocator = testing.allocator,
+        .url = url,
+        .cancelled = &cancelled,
+        .out_was_cancelled = &was_cancelled,
+        .out_done = &done,
+    };
+    const worker_thread = try std.Thread.spawn(.{}, TestHttpFetchWorkerCtx.run, .{worker_ctx});
+
+    // Wait for the server to acknowledge that the request head
+    // has been received — at this point the helper is past
+    // `client.request(...)` + `sendBodiless()` and headed for
+    // (or already inside) `receiveHead(...)`.
+    const drv_io = std.Io.Threaded.global_single_threaded.io();
+    var spin: usize = 0;
+    while (spin < 10_000 and !request_received.load(.acquire)) : (spin += 1) {
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(drv_io) catch {};
+    }
+    try testing.expect(request_received.load(.acquire));
+
+    // Flip cancel BEFORE letting the server respond.
+    cancelled.store(true, .release);
+    // Unblock the server so the helper's `receiveHead` returns —
+    // its pre-body-read cancel check then observes the flag.
+    unblock_response.store(true, .release);
+
+    worker_thread.join();
+    server.thread.join();
+
+    try testing.expect(done.load(.acquire));
+    try testing.expect(was_cancelled.load(.acquire));
+}
+
+test "wasi:http #583 B1 follow-up: httpClientLowLevelFetch observes cancel mid-body-read at chunk boundary (#583)" {
+    // Mid-body cancel test. Server sends the response head plus a
+    // first 32 KiB body chunk (well under the helper's 64 KiB
+    // `http_cancel_body_chunk_bytes`), signals `chunk_sent`, and
+    // then blocks waiting for `unblock_body`. The test thread
+    // flips cancel AND releases `unblock_body` so the server
+    // proceeds to send the remainder of `Content-Length` worth of
+    // bytes: any helper that was blocked in
+    // `body_reader.stream(...)` waiting for more data unblocks,
+    // reads, and hits its next per-chunk cancel check —
+    // observing `cancelled = true` and bailing with
+    // `error.HttpFetchCancelled`. Partial body bytes accumulated
+    // in `aw` are released by the helper's errdefer chain;
+    // `testing.allocator`'s leak detector catches any regression.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+
+    // Body framed by Content-Length. First chunk is 32 KiB so
+    // helper iter 1 reads a single sub-chunk-limit pump. The
+    // remaining 96 KiB forces helper to keep iterating past
+    // chunk 1 — and lets the per-chunk cancel check at iter 2
+    // (or iter 3 if helper raced past iter 2) fire deterministically.
+    const part1_len: usize = 32 * 1024;
+    const part2_len: usize = 96 * 1024;
+    const total_len: usize = part1_len + part2_len;
+    const part1 = try testing.allocator.alloc(u8, part1_len);
+    defer testing.allocator.free(part1);
+    @memset(part1, 'A');
+    const part2 = try testing.allocator.alloc(u8, part2_len);
+    defer testing.allocator.free(part2);
+    @memset(part2, 'B');
+
+    var head_buf: [128]u8 = undefined;
+    const head = try std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{total_len},
+    );
+
+    var request_received: std.atomic.Value(bool) = .{ .raw = false };
+    var unblock_response: std.atomic.Value(bool) = .{ .raw = false };
+    var chunk_sent: std.atomic.Value(bool) = .{ .raw = false };
+    var unblock_body: std.atomic.Value(bool) = .{ .raw = false };
+
+    var server = TestHttpPhaseServer.serveLoopback(
+        testing.allocator,
+        head,
+        part1,
+        part2,
+        &request_received,
+        &unblock_response,
+        &chunk_sent,
+        &unblock_body,
+    ) catch return error.SkipZigTest;
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/", .{server.port});
+    defer testing.allocator.free(url);
+
+    var cancelled: std.atomic.Value(bool) = .{ .raw = false };
+    var was_cancelled: std.atomic.Value(bool) = .{ .raw = false };
+    var done: std.atomic.Value(bool) = .{ .raw = false };
+    const worker_ctx = try testing.allocator.create(TestHttpFetchWorkerCtx);
+    defer testing.allocator.destroy(worker_ctx);
+    worker_ctx.* = .{
+        .allocator = testing.allocator,
+        .url = url,
+        .cancelled = &cancelled,
+        .out_was_cancelled = &was_cancelled,
+        .out_done = &done,
+    };
+    const worker_thread = try std.Thread.spawn(.{}, TestHttpFetchWorkerCtx.run, .{worker_ctx});
+
+    // Wait for the server to acknowledge request received, then
+    // release the response head + first body chunk.
+    const drv_io = std.Io.Threaded.global_single_threaded.io();
+    var spin: usize = 0;
+    while (spin < 10_000 and !request_received.load(.acquire)) : (spin += 1) {
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(drv_io) catch {};
+    }
+    try testing.expect(request_received.load(.acquire));
+    unblock_response.store(true, .release);
+
+    // Wait until the server has sent the first body chunk —
+    // the helper is now either mid-iteration on chunk 1 or
+    // about to enter its iteration 2 cancel check.
+    spin = 0;
+    while (spin < 10_000 and !chunk_sent.load(.acquire)) : (spin += 1) {
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(drv_io) catch {};
+    }
+    try testing.expect(chunk_sent.load(.acquire));
+
+    // Flip cancel AND signal the server to send the rest of
+    // the body. Doing both atomically avoids a deadlock: if the
+    // helper has already iterated past the first chunk and is
+    // blocked in `body_reader.stream(...)` waiting for more
+    // bytes, releasing `unblock_body` lets it unblock and reach
+    // its next per-chunk cancel check (which observes the flag
+    // and bails). If the helper hasn't iterated yet, the iter-2
+    // check fires immediately on its first loop-back.
+    cancelled.store(true, .release);
+    unblock_body.store(true, .release);
+
+    worker_thread.join();
+    server.thread.join();
+    try testing.expect(done.load(.acquire));
+    try testing.expect(was_cancelled.load(.acquire));
 }
 
 test "wasi:clocks/monotonic-clock@0.3 polyfill: subscribe-duration pollable fires via P3 timer (#483)" {
