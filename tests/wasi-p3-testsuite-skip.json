@@ -1,7 +1,6 @@
 {
     "_comment": "Skip-list for `zig build wasi-p3-testsuite` (issue #489). Mirrors the format of `tests/wasi-testsuite-skip.json` consumed by `wasi-testsuite/test-runner/wasi_test_runner.py`. Each entry MUST carry a rationale + tracking issue. Remove entries as the corresponding P3 adapter PRs land. Suite key matches `tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/manifest.json` `name`.",
     "WASI Rust tests [wasm32-wasip3]": {
-        "http-service": "wasi:http@0.3.0 incoming-handler trampoline + async-lower + wire offset all merged; needs the dispatch glue (TCP listener \u2192 guest export \u2192 response writeback) \u2014 tracking #570",
         "sockets-tcp-bind": "wasi:sockets@0.3.0 sockets-tcp-bind: most subtests pass; test_reuseaddr (line 231) fails because Linux SO_REUSEADDR semantics conflict with test_explicit_bind_addrinuse \u2014 rebind to TIME_WAIT port without REUSEADDR returns EADDRINUSE. Needs SO_LINGER tuning or kernel-state inspection \u2014 tracking wave-6 follow-up #569",
         "sockets-udp-receive": "wasi:sockets@0.3.0 sockets-udp-receive: test_not_bound passes (#569 fixed err-future encoding); test_receive_data needs a host-driver poll mechanism on Future so that an unsettled receive future can be re-polled after the peer send writes to the kernel queue \u2014 tracking wave-6 async-future-driver follow-up #569"
     }

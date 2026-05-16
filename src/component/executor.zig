@@ -1349,6 +1349,24 @@ pub fn dispatchCanonBuiltin(
     task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
+    return dispatchCanonBuiltinWithCtx(comp_inst, canon, null, env, task_manager, allocator);
+}
+
+/// `dispatchCanonBuiltin` variant that threads the trampoline ctx
+/// through to dispatch handlers that need it (today: `task.return`,
+/// which needs the importing module's flat-param count to drain the
+/// guest's flat-lowered results when the result type's inner variant
+/// can't be flattened from the parent type pool). The ctx may be
+/// null for call-sites that synthesize a `Canon` decl without going
+/// through the import-link path (unit tests). (#570)
+pub fn dispatchCanonBuiltinWithCtx(
+    comp_inst: *ComponentInstance,
+    canon: ctypes.Canon,
+    ctx: ?*const CanonBuiltinTrampolineCtx,
+    env: *ExecEnv,
+    task_manager: ?*async_mod.TaskManager,
+    allocator: Allocator,
+) ExecutionError!void {
     switch (canon) {
         .resource_new => |resource_idx| {
             const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
@@ -1413,20 +1431,50 @@ pub fn dispatchCanonBuiltin(
         .task_return => |info| {
             // `canon task.return rs:<resultlist> opts:<opts>` — Binary.md
             // tag 0x09. Pops the lifted-callee's results off the env stack
-            // (flat i32 representation per the Canonical ABI), stores them
-            // on the current task, and notifies the parent waitable.
-            // Caller without a task manager is malformed (a sync lift
-            // never emits task.return).
+            // (flat i32/i64/f32/f64 representation per the Canonical ABI),
+            // stores them on the current task, and notifies the parent
+            // waitable. Caller without a task manager is malformed (a
+            // sync lift never emits task.return).
             const tm = task_manager orelse return error.FunctionNotFound;
             const handle = tm.current_task orelse return error.FunctionNotFound;
-            const flat_count: usize = switch (info.results) {
-                .none => 0,
-                .unnamed => 1,
-                .named => |named| named.len,
+            // Prefer the link-time-snapshotted core wasm import flat
+            // param count (`ctx.core_flat_param_count`) — this is the
+            // authoritative truth of how many typed slots the guest
+            // pushed onto the operand stack, regardless of whether the
+            // canon ABI result type's inner variant cases can be
+            // flattened from the parent component's local type pool.
+            // (Today's loader only materialises primitive aliased types;
+            // a `result<own<response>, error-code>` whose `error-code`
+            // is alias-imported from a sub-component falls through to
+            // `flattenCount` → 1, which would under-drain the stack —
+            // see #570.) Fall back to `flattenCount` for hand-authored
+            // dispatch tests that synthesize a `Canon.task_return`
+            // without going through `linkImports`.
+            const registry = TypeRegistry.init(comp_inst.component);
+            const flat_count: usize = blk: {
+                if (ctx) |c| if (c.core_flat_param_count) |n| break :blk n;
+                break :blk switch (info.results) {
+                    .none => 0,
+                    .unnamed => |vt| abi.flattenCount(registry, vt),
+                    .named => |named| nb: {
+                        var n: u32 = 0;
+                        for (named) |nv| n += abi.flattenCount(registry, nv.type);
+                        break :nb n;
+                    },
+                };
             };
             const flat = allocator.alloc(u32, flat_count) catch return error.OutOfMemory;
-            // The Canonical ABI pushes results left-to-right, so the last
-            // result is on top — pop in reverse.
+            // Pop `flat_count` typed wasm operand slots in reverse
+            // (Canonical ABI pushes left-to-right). Each slot is one
+            // `Value` on the operand stack — popI32 silently truncates
+            // i64/f64 to their low 32 bits, which is sufficient for
+            // our `[]u32` storage shape (i64 result slots in async
+            // result types are only used for payload-bearing variant
+            // cases the http-service fixture never produces). Long-term
+            // a typed flat storage will let us preserve i64 fidelity
+            // round-trip; for now we just need to keep the stack
+            // balanced and the first two i32 slots (disc + first-arm
+            // handle) intact.
             var i: usize = flat_count;
             while (i > 0) {
                 i -= 1;
@@ -5247,6 +5295,18 @@ fn trampolineTrap(
 pub const CanonBuiltinTrampolineCtx = struct {
     comp_inst: *ComponentInstance,
     canon: ctypes.Canon,
+    /// Number of flat (typed) wasm params declared by the importing
+    /// module for this canon-builtin slot. For `canon task.return`,
+    /// this is the count of i32/i64/f32/f64 values the guest pushes
+    /// onto the operand stack before invoking the host trampoline —
+    /// which is exactly the canon-ABI flat lowering of the result
+    /// type. We snapshot this at link time because flattening a
+    /// `result<own<response>, error-code>` via `TypeRegistry` requires
+    /// the inner variant payload types to be materialised in the
+    /// parent component's type pool — the loader only materialises
+    /// primitives today, so a runtime-only `flattenCount` would
+    /// underflow the stack pop. (#570)
+    core_flat_param_count: ?u32 = null,
 };
 
 /// Trampoline entry-point installed on a core wasm import that was
@@ -5258,9 +5318,10 @@ pub const CanonBuiltinTrampolineCtx = struct {
 pub fn canonBuiltinTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const ctx: *CanonBuiltinTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
-    dispatchCanonBuiltin(
+    dispatchCanonBuiltinWithCtx(
         ctx.comp_inst,
         ctx.canon,
+        ctx,
         env,
         ctx.comp_inst.current_task_manager,
         ctx.comp_inst.allocator,

@@ -1556,6 +1556,20 @@ pub fn instantiate(
                                             inst.canon_builtin_ctx_by_canon_idx.put(allocator, canon_idx_b, new_ctx) catch {};
                                             break :ctx_blk new_ctx;
                                         };
+                                        // Snapshot the core wasm import's flat param count
+                                        // so the canon-builtin dispatcher (specifically
+                                        // `task.return`) knows how many typed stack slots
+                                        // the guest pushed before invoking us — independent
+                                        // of whether the canon result type's inner variant
+                                        // can be flattened from the parent type pool. (#570)
+                                        if (ctx_b.core_flat_param_count == null) {
+                                            if (imp.func_type_idx) |fti| {
+                                                if (fti < module_ptr.types.len) {
+                                                    const ft = module_ptr.types[fti];
+                                                    ctx_b.core_flat_param_count = @intCast(ft.params.len);
+                                                }
+                                            }
+                                        }
                                         entries[imp_func_idx] = .{
                                             .func = &executor_mod.canonBuiltinTrampoline,
                                             .ctx = @ptrCast(ctx_b),

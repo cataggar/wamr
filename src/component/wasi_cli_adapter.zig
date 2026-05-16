@@ -16694,32 +16694,417 @@ pub const WasiCliAdapter = struct {
         results[0] = .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
     }
 
-    /// Drive a guest-exported `wasi:http/handler@0.3.0.handle: async
-    /// func(request) -> result<response, error-code>` via the
-    /// async-lifted canonical ABI (#487 / #538). Used by the host
-    /// server dispatch path — the wasi-p3-testsuite `http-service`
-    /// fixture invokes this from inside the TCP-accept loop (which
-    /// itself is gated on #535 sockets host-driven streams). Exposed
-    /// at module scope so the unit tests can exercise the request
-    /// → response round-trip without standing up a real socket.
+    /// Result of dispatching a guest-exported `incoming-handler.handle`.
+    /// Flat lowering of `result<own<response>, error-code>` is
+    /// `[discriminant, payload]` — 0 → ok with response handle, 1 →
+    /// err with error-code discriminant. (#570 / #487)
+    pub const HandleP3Outcome = struct {
+        is_ok: bool,
+        /// When `is_ok` is true this is the response handle; when
+        /// false it is the `error-code` enum discriminant.
+        payload: u32,
+
+        /// Decode a canonical-ABI flat result tuple deposited on a
+        /// task by `canon task.return` into a typed `HandleP3Outcome`.
+        ///
+        /// The flat representation produced by wit-bindgen ≥ 0.45 for
+        /// `result<own<response>, error-code>` is `[disc, payload, ...]`:
+        ///
+        ///   * `disc`: 0 for Ok, 1 for Err.
+        ///   * `payload`: for Ok, the canon-ABI wire-encoded
+        ///     `own<response>` handle (`slot + 1`, see #562); for Err,
+        ///     the `error-code` variant discriminant (plain i32).
+        ///
+        /// Any trailing slots are the variant-join padding for the
+        /// (much wider) `error-code` arm — ignored by this decoder
+        /// since the relevant data is always in the first two slots.
+        /// Defensive fallbacks: empty `flat` → `(is_ok=false,
+        /// internal_error)`; len==1 → `(is_ok=disc==0, internal_error)`.
+        /// Factored out of `dispatchHttpHandlerP3` so the decode is
+        /// unit-testable in isolation (#570).
+        pub fn fromTaskReturnValues(flat: []const u32) HandleP3Outcome {
+            const disc: u32 = if (flat.len > 0) flat[0] else 1;
+            const raw_payload: u32 = if (flat.len > 1)
+                flat[1]
+            else
+                @intFromEnum(HttpErrorCode.internal_error);
+            const is_ok = disc == 0;
+            const payload: u32 = if (is_ok)
+                executor_root.decodeResourceWire(raw_payload)
+            else
+                raw_payload;
+            return .{ .is_ok = is_ok, .payload = payload };
+        }
+    };
+
+    /// Drive a guest-exported `wasi:http/incoming-handler@0.3.0.handle:
+    /// async func(request) -> result<response, error-code>` via the
+    /// async-lifted canonical ABI (#487 / #538 / #570). Used by the
+    /// host server dispatch path — the wasi-p3-testsuite `http-service`
+    /// fixture invokes this from inside the TCP-accept loop. Exposed
+    /// at module scope so the unit tests can exercise the request →
+    /// response round-trip without standing up a real socket.
+    ///
+    /// The guest delivers its result via `canon task.return` which
+    /// deposits the lowered flat values on the owning task; this
+    /// function reads them back out of `task.return_values`.
     pub fn dispatchHttpHandlerP3(
         _: *WasiCliAdapter,
         ci: *ComponentInstance,
         export_dotted_name: []const u8,
         request_handle: u32,
         allocator: Allocator,
-    ) !u32 {
+    ) !HandleP3Outcome {
+        // Validate the export resolves to a callable local first so
+        // unit tests get a precise error rather than a generic
+        // FunctionNotFound from inside the async dispatcher.
         const exported = ci.getExport(export_dotted_name) orelse return error.NoHandleExport;
-        const local = switch (exported) {
-            .local => |l| l,
+        switch (exported) {
+            .local => {},
             else => return error.ForwardedExportUnsupported,
-        };
+        }
+
+        var task_mgr = async_mod.TaskManager{};
+        defer task_mgr.deinit(allocator);
+
         const args: [1]InterfaceValue = .{ .{ .handle = request_handle } };
-        var status: u32 = 0;
-        try executor_root.callComponentFuncByLocalAsyncLifted(
-            ci, local, &args, &status, allocator,
+        const task_handle = executor_root.callComponentFuncAsync(
+            ci, export_dotted_name, &args, &task_mgr, null, allocator,
+        ) catch |e| return e;
+
+        if (task_handle >= task_mgr.tasks.items.len) return error.NoHandleExport;
+        const task = &task_mgr.tasks.items[task_handle];
+        return HandleP3Outcome.fromTaskReturnValues(task.return_values);
+    }
+
+    /// Build a `HttpRequestP3` from a complete HTTP/1.1 request byte
+    /// buffer (`request_bytes`) and register it in the adapter's P3
+    /// request table. The request body (if any) is materialised as a
+    /// `stream<u8>` handle in `ci.streams` so the guest can read it
+    /// through the canonical-ABI rendezvous. Trailers and transmission
+    /// futures are pre-settled (ready/unit) — the wasi-testsuite
+    /// `http-service` fixture's handler does not surface trailers.
+    /// Mirrors `createIncomingRequestFromHttpBytes` for the unified
+    /// 0.3 resource. (#570)
+    pub fn createIncomingRequestP3FromHttpBytes(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        request_bytes: []const u8,
+    ) !u32 {
+        const header_end = httpHeaderEnd(request_bytes) orelse return error.HttpBadRequest;
+        if (header_end > max_http_header_bytes) return error.HttpRequestHeaderTooLarge;
+        const header_block = request_bytes[0..header_end];
+        const body_len = try httpContentLengthFromHeaderBlock(header_block);
+        if (body_len > max_http_body_bytes) return error.HttpRequestBodyTooLarge;
+        const total_len = std.math.add(usize, header_end, body_len) catch return error.HttpRequestBodyTooLarge;
+        if (request_bytes.len < total_len) return error.HttpBadRequest;
+
+        // The header block (everything up through the final `\r\n\r\n`)
+        // is `header_block`; strip the trailing blank line before
+        // splitting so the headers loop doesn't observe an empty
+        // sentinel entry. Mirrors `createIncomingRequestFromHttpBytes`.
+        var lines = std.mem.splitSequence(u8, header_block[0 .. header_end - 4], "\r\n");
+        const request_line = lines.next() orelse return error.HttpBadRequest;
+        var tokens = std.mem.tokenizeScalar(u8, request_line, ' ');
+        const method = tokens.next() orelse return error.HttpBadRequest;
+        const target = tokens.next() orelse return error.HttpBadRequest;
+        const version = tokens.next() orelse return error.HttpBadRequest;
+        if (tokens.next() != null) return error.HttpBadRequest;
+        if (method.len == 0 or target.len == 0) return error.HttpBadRequest;
+        if (target.len > max_http_target_bytes) return error.HttpRequestUriTooLong;
+        if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.HttpBadRequest;
+
+        const target_parts = splitHttpTarget(target);
+        var host_header: ?[]const u8 = null;
+
+        const fields = try self.allocator.create(HttpFields);
+        fields.* = .{ .immutable = true };
+        var fields_owned = true;
+        errdefer if (fields_owned) {
+            fields.deinit(self.allocator);
+            self.allocator.destroy(fields);
+        };
+
+        while (lines.next()) |line| {
+            if (line.len == 0) break;
+            if (line[0] == ' ' or line[0] == '\t') return error.HttpBadRequest;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.HttpBadRequest;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (name.len == 0) return error.HttpBadRequest;
+            const name_copy = try self.allocator.dupe(u8, name);
+            const value_copy = self.allocator.dupe(u8, value) catch |err| {
+                self.allocator.free(name_copy);
+                return err;
+            };
+            fields.entries.append(self.allocator, .{ .name = name_copy, .value = value_copy }) catch |err| {
+                self.allocator.free(name_copy);
+                self.allocator.free(value_copy);
+                return err;
+            };
+            if (std.ascii.eqlIgnoreCase(name, "host") and host_header == null) {
+                host_header = value_copy;
+            }
+        }
+
+        var method_other: ?[]u8 = null;
+        errdefer if (method_other) |s| self.allocator.free(s);
+        const method_disc = httpMethodDiscriminant(method);
+        if (method_disc == 9) method_other = try self.allocator.dupe(u8, method);
+
+        const path_copy = try self.allocator.dupe(u8, target_parts.path_with_query);
+        var path_owned: ?[]u8 = path_copy;
+        errdefer if (path_owned) |s| self.allocator.free(s);
+
+        var authority_copy: ?[]u8 = null;
+        errdefer if (authority_copy) |s| self.allocator.free(s);
+        const authority = target_parts.authority orelse host_header;
+        if (authority) |a| authority_copy = try self.allocator.dupe(u8, a);
+
+        const fields_handle = try self.pushHttpFields(fields);
+        fields_owned = false;
+        errdefer {
+            if (fields_handle < self.http_fields_table.items.len and
+                self.http_fields_table.items[fields_handle] == fields)
+            {
+                fields.deinit(self.allocator);
+                self.allocator.destroy(fields);
+                self.http_fields_table.items[fields_handle] = null;
+            }
+        }
+
+        // Materialise the body as a stream<u8> in `ci.streams`. Even
+        // empty bodies allocate a stream so the guest can call
+        // `request.consume-body` without conditional logic. `write_closed`
+        // = true signals EOF so the first read returns 0 bytes.
+        const body_handle = ci.allocAsyncHandle();
+        var body_stream: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+        if (body_len > 0) {
+            body_stream.buffer.appendSlice(ci.allocator, request_bytes[header_end..total_len]) catch |e| {
+                body_stream.deinit(ci.allocator);
+                return e;
+            };
+        }
+        body_stream.write_closed = true;
+        ci.streams.put(ci.allocator, body_handle, body_stream) catch |e| {
+            body_stream.deinit(ci.allocator);
+            return e;
+        };
+
+        const trailers_handle = try allocReadyUnitFuture(ci);
+        const tx_handle = try allocReadyUnitFuture(ci);
+
+        const r = try self.allocator.create(HttpRequestP3);
+        r.* = .{
+            .method_disc = method_disc,
+            .method_other = method_other,
+            .path_with_query = path_owned,
+            .scheme_disc = target_parts.scheme_disc, // default 0 (http)
+            .authority = authority_copy,
+            .headers_handle = fields_handle,
+            .body_stream_handle = body_handle,
+            .trailers_future_handle = trailers_handle,
+            .transmission_future_handle = tx_handle,
+        };
+        method_other = null;
+        path_owned = null;
+        authority_copy = null;
+        return try self.pushHttpRequestP3(r);
+    }
+
+    /// Serialize an `HttpResponseP3` (handle) as HTTP/1.1 over the
+    /// given output stream. Drains the body `stream<u8>` (if any) into
+    /// a contiguous Content-Length response. Trailers are not yet
+    /// emitted on the wire — the wasi-testsuite `http-service`
+    /// fixture's responses don't carry any. (#570)
+    pub fn writeHttpResponseP3FromHandle(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        ci: *ComponentInstance,
+        response_handle: u32,
+    ) !void {
+        const response = self.lookupHttpResponseP3(response_handle) orelse {
+            return self.writeHttpSimpleResponse(out, 500, "invalid response handle\n");
+        };
+
+        const status: u16 = if (response.status >= 100 and response.status <= 999) response.status else 500;
+
+        // Drain the body stream<u8> if present. Empty streams (no
+        // contents pushed by the guest) yield a zero-length body
+        // without a Content-Length error.
+        var body_owned: ?[]u8 = null;
+        defer if (body_owned) |b| self.allocator.free(b);
+        if (response.body_stream_handle) |sh| {
+            body_owned = self.drainByteStream(ci, sh) catch null;
+        }
+        const body: []const u8 = if (body_owned) |b| b else "";
+
+        // Validate response header name/value bytes before emitting.
+        // Skip transport-managed headers (we set Content-Length and
+        // Connection: close ourselves).
+        const response_fields = self.lookupHttpFields(response.headers_handle);
+        if (response_fields) |fields| {
+            for (fields.entries.items) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.name, "content-length") or
+                    std.ascii.eqlIgnoreCase(entry.name, "connection"))
+                {
+                    continue;
+                }
+                if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
+                    return self.writeHttpSimpleResponse(out, 500, "invalid response header\n");
+                }
+            }
+        }
+
+        const status_line = try std.fmt.allocPrint(
+            self.allocator,
+            "HTTP/1.1 {d} {s}\r\n",
+            .{ status, httpResponseStatusReason(status) },
         );
-        return status;
+        defer self.allocator.free(status_line);
+        try self.writeAllOutputStream(out, status_line);
+
+        if (response_fields) |fields| {
+            for (fields.entries.items) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.name, "content-length") or
+                    std.ascii.eqlIgnoreCase(entry.name, "connection"))
+                {
+                    continue;
+                }
+                const line = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}: {s}\r\n",
+                    .{ entry.name, entry.value },
+                );
+                defer self.allocator.free(line);
+                try self.writeAllOutputStream(out, line);
+            }
+        }
+
+        const trailer = try std.fmt.allocPrint(
+            self.allocator,
+            "Content-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{body.len},
+        );
+        defer self.allocator.free(trailer);
+        try self.writeAllOutputStream(out, trailer);
+        try self.writeAllOutputStream(out, body);
+    }
+
+    /// Read a complete HTTP request from `stream`, build an
+    /// `HttpRequestP3`, and return its handle. Used by both the live
+    /// accept loop (`serveOneHttpConnectionP3`) and unit tests.
+    /// Bounded by `max_http_header_bytes` / `max_http_body_bytes` —
+    /// oversized requests trap with the corresponding error so the
+    /// caller can lower a 413/431 response without dispatching the
+    /// guest. (#570)
+    pub fn readIncomingRequestP3FromStream(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        stream: *streams.InputStream,
+    ) !u32 {
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(self.allocator);
+
+        var header_end: ?usize = null;
+        var tmp: [4096]u8 = undefined;
+        while (header_end == null) {
+            const n = switch (stream.read(&tmp)) {
+                .ok => |count| count,
+                .closed => return error.HttpBadRequest,
+                .err => return error.IoError,
+            };
+            try bytes.appendSlice(self.allocator, tmp[0..n]);
+            if (bytes.items.len > max_http_header_bytes) return error.HttpRequestHeaderTooLarge;
+            header_end = httpHeaderEnd(bytes.items);
+        }
+
+        const end = header_end.?;
+        const body_len = try httpContentLengthFromHeaderBlock(bytes.items[0..end]);
+        if (body_len > max_http_body_bytes) return error.HttpRequestBodyTooLarge;
+        const total_len = std.math.add(usize, end, body_len) catch return error.HttpRequestBodyTooLarge;
+        while (bytes.items.len < total_len) {
+            const n = switch (stream.read(&tmp)) {
+                .ok => |count| count,
+                .closed => return error.HttpBadRequest,
+                .err => return error.IoError,
+            };
+            try bytes.appendSlice(self.allocator, tmp[0..n]);
+            if (bytes.items.len > total_len) break;
+        }
+        if (bytes.items.len < total_len) return error.HttpBadRequest;
+        return self.createIncomingRequestP3FromHttpBytes(ci, bytes.items[0..total_len]);
+    }
+
+    /// Free every per-connection P3 resource (`HttpRequestP3`,
+    /// `HttpResponseP3`, `RequestOptions`) and reset the handle
+    /// tables. Mirrors `cleanupHttpResources` for the 0.2 surface.
+    /// The connection-scoped invariant: each accepted socket owns
+    /// its own request/response pair and the streams/futures held in
+    /// `ci.streams` / `ci.futures`; clearing the adapter side ensures
+    /// the next connection starts from a clean handle namespace.
+    /// (#570)
+    fn cleanupHttpResourcesP3(self: *WasiCliAdapter) void {
+        for (self.http_requests_p3.items) |*maybe| {
+            if (maybe.*) |r| {
+                r.deinit(self.allocator);
+                self.allocator.destroy(r);
+                maybe.* = null;
+            }
+        }
+        for (self.http_responses_p3.items) |*maybe| {
+            if (maybe.*) |r| {
+                self.allocator.destroy(r);
+                maybe.* = null;
+            }
+        }
+        for (self.http_request_options_p3.items) |*maybe| {
+            if (maybe.*) |r| {
+                self.allocator.destroy(r);
+                maybe.* = null;
+            }
+        }
+    }
+
+    /// Per-connection cleanup for the P3 dispatch path: drops the 0.3
+    /// resource tables and the shared `HttpFields` / 0.2 leftovers.
+    pub fn cleanupHttpResourcesAllVersions(self: *WasiCliAdapter) void {
+        self.cleanupHttpResources();
+        self.cleanupHttpResourcesP3();
+    }
+
+    /// Drive a single accepted connection through the P3 incoming
+    /// handler. Parses the HTTP/1.1 request bytes into an
+    /// `HttpRequestP3`, dispatches `incoming-handler.handle` via
+    /// the async-lifted ABI, then serializes the resulting
+    /// `result<response, error-code>` back to the socket and closes
+    /// it. (#570)
+    pub fn serveOneHttpConnectionP3Stream(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        handler_name: []const u8,
+        input: *streams.InputStream,
+        output: *streams.OutputStream,
+    ) void {
+        defer self.cleanupHttpResourcesAllVersions();
+
+        const request_handle = self.readIncomingRequestP3FromStream(ci, input) catch |err| {
+            self.writeHttpSimpleResponse(output, statusForRequestReadError(err), "bad request\n") catch {};
+            return;
+        };
+
+        const outcome = self.dispatchHttpHandlerP3(ci, handler_name, request_handle, self.allocator) catch {
+            self.writeHttpSimpleResponse(output, 500, "handler trapped\n") catch {};
+            return;
+        };
+
+        if (!outcome.is_ok) {
+            const code: u16 = httpStatusFromError(outcome.payload);
+            self.writeHttpSimpleResponse(output, code, "handler returned error\n") catch {};
+            return;
+        }
+
+        self.writeHttpResponseP3FromHandle(output, ci, outcome.payload) catch {};
     }
 
     /// Register `wasi:http/types@0.3.0-*` (#487).
@@ -17235,6 +17620,37 @@ pub fn findHttpIncomingHandlerExportName(
     for (component.exports) |exp| {
         if (exp.desc != .instance) continue;
         if (!matchesWasiPrefix(exp.name, "wasi:http/incoming-handler")) continue;
+        const dotted = try std.fmt.allocPrint(allocator, "{s}/handle", .{exp.name});
+        if (inst.getExport(dotted) != null) return dotted;
+        allocator.free(dotted);
+    }
+    return null;
+}
+
+/// P3 variant of `findHttpIncomingHandlerExportName` — returns the
+/// `@0.3.x`-versioned (or unversioned, for hand-authored test
+/// fixtures) `wasi:http/handler.handle` export. `wasi:http@0.3.0`
+/// collapsed 0.2's `incoming-handler` / `outgoing-handler` into a
+/// single `wasi:http/handler` interface (#487), so the export shape
+/// for a server is `wasi:http/handler@0.3.0-rc-…/handle`. A 0.2
+/// `wasi:http/incoming-handler` export falls through to the legacy
+/// synchronous handler dispatch path (`serveOneHttpConnection`).
+/// Allocator-owned string. (#570 / #538 — http-service end-to-end.)
+pub fn findHttpIncomingHandlerExportNameP3(
+    component: *const ctypes_root.Component,
+    inst: *const ComponentInstance,
+    allocator: Allocator,
+) !?[]const u8 {
+    // Match either `wasi:http/handler` (0.3 unified) or
+    // `wasi:http/incoming-handler` (transitional / hand-authored
+    // test fixtures) at the @0.3.x version band.
+    for (component.exports) |exp| {
+        if (exp.desc != .instance) continue;
+        const is_handler = matchesWasiPrefix(exp.name, "wasi:http/handler");
+        const is_incoming = matchesWasiPrefix(exp.name, "wasi:http/incoming-handler");
+        if (!is_handler and !is_incoming) continue;
+        const v = wasiVersion(exp.name);
+        if (v != .p3 and v != .unspecified) continue;
         const dotted = try std.fmt.allocPrint(allocator, "{s}/handle", .{exp.name});
         if (inst.getExport(dotted) != null) return dotted;
         allocator.free(dotted);
@@ -18042,9 +18458,26 @@ pub fn serveLoadedHttpComponent(
         else => return error.LinkFailed,
     };
 
-    const handler_name = (try findHttpIncomingHandlerExportName(component, inst, allocator)) orelse
-        return error.NoIncomingHandlerExport;
+    // Mirror the P3 cli/run path so `incoming-handler.handle` can use
+    // `wasi:clocks` timers / cancel propagation while servicing a
+    // request — the http-service fixture's handler does not exercise
+    // either today, but the wiring is essentially free and keeps the
+    // two dispatchers behaviourally aligned. (#570 / #551.)
+    inst.async_event_driver = &WasiCliAdapter.driveAsyncEvents;
+    inst.async_event_driver_ctx = adapter;
+    inst.async_cancel_driver = &WasiCliAdapter.cancelAllPendingTimers;
+
+    // Prefer the P3 (`@0.3.x`) export when present; fall back to the
+    // legacy 0.2 dispatch otherwise. The P3 path goes through
+    // `serveOneHttpConnectionP3` → `dispatchHttpHandlerP3` (async-lifted
+    // `result<response, error-code>`); the 0.2 path uses the
+    // `response-outparam`-based ABI. (#570)
+    const handler_name_p3 = (try findHttpIncomingHandlerExportNameP3(component, inst, allocator));
+    const handler_name = handler_name_p3 orelse
+        ((try findHttpIncomingHandlerExportName(component, inst, allocator)) orelse
+        return error.NoIncomingHandlerExport);
     defer allocator.free(handler_name);
+    const dispatch_p3 = handler_name_p3 != null;
 
     const io = std.Io.Threaded.global_single_threaded.io();
     // Exclusive bind: leave `reuse_address` at its `false` default so a
@@ -18063,12 +18496,35 @@ pub fn serveLoadedHttpComponent(
 
     if (options.announce_listening) {
         // `server.socket.address` carries the kernel-resolved port
-        // (matches what `getsockname(2)` would report). Print it to
-        // stdout so a parent test driver can scrape the ephemeral port.
+        // (matches what `getsockname(2)` would report). Emit two
+        // distinct lines:
+        //   - stdout: `Listening on <ip:port>` (legacy CLI feedback,
+        //     used by non-suite drivers / humans).
+        //   - stderr: `http://<host>:<port>` (wasi-testsuite
+        //     `TestCaseRunner.get_http_server` scans stderr's first
+        //     line for the `http://` prefix; without this the
+        //     `http-service` fixture fails on `do_request`). (#570)
+        var buf: [192]u8 = undefined;
+        const stdout_line = std.fmt.bufPrint(&buf, "Listening on {f}\n", .{server.socket.address}) catch buf[0..0];
         var stdout_file = std.Io.File.stdout();
-        var buf: [128]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "Listening on {f}\n", .{server.socket.address}) catch buf[0..0];
-        stdout_file.writeStreamingAll(io, line) catch {};
+        stdout_file.writeStreamingAll(io, stdout_line) catch {};
+
+        var stderr_buf: [192]u8 = undefined;
+        const stderr_line = std.fmt.bufPrint(&stderr_buf, "http://{f}\n", .{server.socket.address}) catch stderr_buf[0..0];
+        var stderr_file = std.Io.File.stderr();
+        stderr_file.writeStreamingAll(io, stderr_line) catch {};
+    }
+
+    // Install a SIGINT/SIGTERM handler that exits cleanly with code 0
+    // — the wasi-testsuite `http-service` fixture issues
+    // `{ "type": "kill", "signal": "SIGINT" }` followed by
+    // `{ "type": "wait" }` (default exit_code 0). Without a handler
+    // the default disposition is process-terminate with a non-zero
+    // signal status, which the runner reports as a failure. Linux
+    // only — the conformance suite isn't run on Windows or macOS in
+    // CI, and the stdlib Sigaction shape differs per-platform. (#570)
+    if (builtin.target.os.tag == .linux) {
+        installHttpShutdownHandler();
     }
 
     var served: usize = 0;
@@ -18076,10 +18532,38 @@ pub fn serveLoadedHttpComponent(
         const accepted = server.accept(io) catch return error.AcceptFailed;
         {
             defer accepted.close(io);
-            serveOneHttpConnection(adapter, inst, handler_name, accepted);
+            if (dispatch_p3) {
+                serveOneHttpConnectionP3(adapter, inst, handler_name, accepted);
+            } else {
+                serveOneHttpConnection(adapter, inst, handler_name, accepted);
+            }
         }
         served += 1;
     }
+}
+
+/// SIGINT/SIGTERM handler: exit the process with code 0. Used by the
+/// wasi:http/service event loop so a `kill` operation from the
+/// conformance test driver doesn't surface a non-zero exit status to
+/// the runner's `wait` check. `std.process.exit` lowers to
+/// `exit_group` on Linux — async-signal-safe. Linux-only — the
+/// conformance suite isn't run on Windows or macOS in CI, and the
+/// stdlib's Sigaction shape varies across platforms (Linux uses
+/// `u32` mask, BSD uses `[N]c_ulong`). (#570)
+fn httpShutdownSignalHandler(_: std.os.linux.SIG) callconv(.c) void {
+    std.process.exit(0);
+}
+
+fn installHttpShutdownHandler() void {
+    if (builtin.target.os.tag != .linux) return;
+    const linux = std.os.linux;
+    var act: linux.Sigaction = .{
+        .handler = .{ .handler = httpShutdownSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(linux.SIG.INT, &act, null);
+    std.posix.sigaction(linux.SIG.TERM, &act, null);
 }
 
 fn statusForRequestReadError(err: anyerror) u16 {
@@ -18130,6 +18614,23 @@ fn serveOneHttpConnection(
     };
 
     adapter.writeHttpResponseFromOutparam(&output, outparam_handle) catch {};
+}
+
+/// P3 (`@0.3.x`) variant of `serveOneHttpConnection`. Dispatches
+/// `wasi:http/incoming-handler@0.3.0.handle` through the async-lifted
+/// canonical ABI and writes the resulting `result<response,
+/// error-code>` back to the socket. Connection is closed by the
+/// caller (`defer accepted.close(io)` in `serveLoadedHttpComponent`)
+/// once this function returns. (#570)
+fn serveOneHttpConnectionP3(
+    adapter: *WasiCliAdapter,
+    inst: *ComponentInstance,
+    handler_name: []const u8,
+    accepted: std.Io.net.Stream,
+) void {
+    var input = streams.InputStream.fromTcpStream(accepted.socket.handle);
+    var output = streams.OutputStream.toTcpStream(accepted.socket.handle);
+    adapter.serveOneHttpConnectionP3Stream(inst, handler_name, &input, &output);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -29381,3 +29882,427 @@ test "http (#562): slot-reuse stays within the 1-based range after a drop" {
     try testing.expectEqual(@as(u32, 2), s4);
     try testing.expectEqual(@as(?*OutgoingResponse, null), adapter.http_outgoing_responses.items[0]);
 }
+
+// ───────────────────────────────────────────────────────────────────
+// wasi:http@0.3.0 http-service end-to-end (#570) unit tests
+// ───────────────────────────────────────────────────────────────────
+
+test "wasi:http@0.3 (#570): createIncomingRequestP3FromHttpBytes parses GET line + headers + empty body" {
+    // Synthetic HTTP/1.1 request → `HttpRequestP3` round-trip. Mirrors
+    // the wasi-testsuite `http-service` driver path: an accepted TCP
+    // socket's bytes get parsed into a P3 request resource without
+    // needing the dispatcher to actually invoke a guest export.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const request_bytes =
+        "GET /hello?x=1 HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "User-Agent: wamr-test\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n";
+    const req_handle = try adapter.createIncomingRequestP3FromHttpBytes(&ci, request_bytes);
+    try testing.expect(req_handle > 0); // slot 0 is reserved (#562)
+
+    const r = adapter.lookupHttpRequestP3(req_handle) orelse return error.TestFailed;
+    // GET → method discriminant 0.
+    try testing.expectEqual(@as(u32, 0), r.method_disc);
+    try testing.expectEqualStrings("/hello?x=1", r.path_with_query.?);
+    try testing.expectEqualStrings("example.com", r.authority.?);
+    // Default scheme is http (#570 — `splitHttpTarget` returns 0
+    // when no `http(s)://` prefix is present in the origin-form target).
+    try testing.expectEqual(@as(?u32, 0), r.scheme_disc);
+
+    // Headers are interned as an immutable HttpFields. The two
+    // user-supplied headers + the `host` echo land here.
+    const fields = adapter.lookupHttpFields(r.headers_handle) orelse return error.TestFailed;
+    try testing.expect(fields.immutable);
+    try testing.expect(fields.entries.items.len >= 3);
+
+    // Body stream<u8> is pre-EOF for a zero-length request — the guest
+    // can read once and immediately observe write-closed semantics.
+    const body_handle = r.body_stream_handle orelse return error.TestFailed;
+    const body_stream = ci.streams.getPtr(body_handle) orelse return error.TestFailed;
+    try testing.expectEqual(@as(usize, 0), body_stream.buffer.items.len);
+    try testing.expect(body_stream.write_closed);
+
+    // Trailers + transmission futures must be ready-settled so the
+    // guest's `.await` resolves synchronously on the first poll.
+    const trailers_fut = ci.futures.getPtr(r.trailers_future_handle) orelse return error.TestFailed;
+    try testing.expectEqual(async_mod.Future.State.ready, trailers_fut.state);
+    const tx_fut = ci.futures.getPtr(r.transmission_future_handle) orelse return error.TestFailed;
+    try testing.expectEqual(async_mod.Future.State.ready, tx_fut.state);
+}
+
+test "wasi:http@0.3 (#570): createIncomingRequestP3FromHttpBytes preserves POST body in stream" {
+    // POST with `Content-Length: <n>` and an `<n>`-byte body. The body
+    // bytes must land in the per-instance `stream<u8>` so the guest's
+    // `request.consume-body` rendezvous can hand them back unmodified.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const body_payload = "hello body";
+    const request_bytes =
+        "POST /submit HTTP/1.1\r\n" ++
+        "Host: api.example\r\n" ++
+        "Content-Length: 10\r\n" ++
+        "\r\n" ++
+        body_payload;
+    const req_handle = try adapter.createIncomingRequestP3FromHttpBytes(&ci, request_bytes);
+
+    const r = adapter.lookupHttpRequestP3(req_handle) orelse return error.TestFailed;
+    // POST → method discriminant 2 (per `httpMethodDiscriminant`).
+    try testing.expectEqual(@as(u32, 2), r.method_disc);
+    try testing.expectEqualStrings("/submit", r.path_with_query.?);
+    const body_stream = ci.streams.getPtr(r.body_stream_handle.?) orelse return error.TestFailed;
+    try testing.expectEqualStrings(body_payload, body_stream.buffer.items);
+    try testing.expect(body_stream.write_closed);
+}
+
+test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle emits status line + headers + body" {
+    // Synthetic `HttpResponseP3` lifted via the same constructor the
+    // dispatch path uses. The streaming writer renders it as
+    // HTTP/1.1 over a backing in-memory sink so the wasi-testsuite
+    // `requests.request(...)` driver receives the expected status +
+    // body. Matches the JSON expectations of `http-service.json`:
+    // `200 + content-type: text/plain + "hey\n"`.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    // Set up a response with `content-type: text/plain` header and a
+    // pre-filled body stream containing "hey\n".
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const name = try testing.allocator.dupe(u8, "content-type");
+    const value = try testing.allocator.dupe(u8, "text/plain");
+    try fields.entries.append(testing.allocator, .{ .name = name, .value = value });
+    const fields_handle = try adapter.pushHttpFields(fields);
+
+    const body_handle = ci.allocAsyncHandle();
+    var body: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+    try body.buffer.appendSlice(testing.allocator, "hey\n");
+    body.write_closed = true;
+    try ci.streams.put(testing.allocator, body_handle, body);
+
+    // Allocate ready-settled trailers + transmission futures so the
+    // writer can reason about their state without driving any
+    // additional canon ops.
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+    const tx_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, tx_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const resp = try testing.allocator.create(HttpResponseP3);
+    resp.* = .{
+        .status = 200,
+        .headers_handle = fields_handle,
+        .body_stream_handle = body_handle,
+        .trailers_future_handle = trailers_h,
+        .transmission_future_handle = tx_h,
+    };
+    const resp_handle = try adapter.pushHttpResponseP3(resp);
+
+    // Drive `writeHttpResponseP3FromHandle` into a buffer-backed sink
+    // so the test can assert the exact wire format.
+    var out = streams.OutputStream.toBuffer();
+    defer out.deinit(testing.allocator);
+
+    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle);
+
+    const written = out.getBufferContents();
+    // Status-line + standard headers + body.
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, written, "content-type: text/plain\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "Content-Length: 4\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhey\n"));
+}
+
+test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle handles 404 + empty body" {
+    // The `/whatever` arm of `http-service` returns status 404 with an
+    // empty body. The writer must emit a `Content-Length: 0` and no
+    // body bytes after the header block — the wasi-testsuite driver
+    // reads exactly that and validates.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fields_handle = try adapter.pushHttpFields(fields);
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+    const tx_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, tx_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const resp = try testing.allocator.create(HttpResponseP3);
+    resp.* = .{
+        .status = 404,
+        .headers_handle = fields_handle,
+        .body_stream_handle = null,
+        .trailers_future_handle = trailers_h,
+        .transmission_future_handle = tx_h,
+    };
+    const resp_handle = try adapter.pushHttpResponseP3(resp);
+
+    var out = streams.OutputStream.toBuffer();
+    defer out.deinit(testing.allocator);
+
+    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle);
+
+    const written = out.getBufferContents();
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expect(std.mem.indexOf(u8, written, "Content-Length: 0\r\n") != null);
+    // No body bytes after `\r\n\r\n`.
+    try testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
+}
+
+test "wasi:http@0.3 (#570): findHttpIncomingHandlerExportNameP3 selects 0.3 over 0.2" {
+    // The P3 driver must dispatch through `wasi:http/handler@0.3.x`
+    // (unified handler — `wasi:http@0.3.0` collapsed
+    // incoming/outgoing). A component exporting only the legacy
+    // `wasi:http/incoming-handler@0.2.x` falls through to the sync
+    // P2 dispatch path; the P3 finder must therefore return null for
+    // 0.2-only exports and the P3 export name (with `/handle`) when
+    // a 0.3 export is present.
+    const testing = std.testing;
+
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // function section: 1 fn of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "handle" -> func 0
+        0x07, 0x0a, 0x01, 0x06, 'h', 'a', 'n', 'd', 'l', 'e', 0x00, 0x00,
+        // code section: empty body
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &.{}, .results = .none } },
+    };
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+    const aliases_decl = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = 0,
+            .name = "handle",
+        } },
+    };
+    const canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 0, .type_idx = 0, .opts = &.{} } },
+    };
+    const inline_exp = [_]ctypes.InlineExport{
+        .{ .name = "handle", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &inline_exp },
+    };
+
+    // Case 1: component exports `wasi:http/handler@0.3.0` (P3 unified).
+    const exports_p3 = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:http/handler@0.3.0-rc-2026-03-15",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+    const component_p3 = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &aliases_decl,
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports_p3,
+    };
+    const inst_p3 = try instance_mod.instantiate(&component_p3, testing.allocator);
+    defer inst_p3.deinit();
+    const name_p3 = (try findHttpIncomingHandlerExportNameP3(&component_p3, inst_p3, testing.allocator)) orelse
+        return error.TestFailed;
+    defer testing.allocator.free(name_p3);
+    try testing.expectEqualStrings(
+        "wasi:http/handler@0.3.0-rc-2026-03-15/handle",
+        name_p3,
+    );
+
+    // Case 2: component exports only `wasi:http/incoming-handler@0.2.6` —
+    // P3 finder should return null so the dispatcher falls through to
+    // the P2 sync path (`serveOneHttpConnection`).
+    const exports_p2 = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:http/incoming-handler@0.2.6",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+    const component_p2 = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &aliases_decl,
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports_p2,
+    };
+    const inst_p2 = try instance_mod.instantiate(&component_p2, testing.allocator);
+    defer inst_p2.deinit();
+    const name_p2 = try findHttpIncomingHandlerExportNameP3(&component_p2, inst_p2, testing.allocator);
+    try testing.expect(name_p2 == null);
+}
+
+test "wasi:http@0.3 (#570): cleanupHttpResourcesAllVersions clears P3 + P2 handle tables" {
+    // The per-connection cleanup hook must reset every http resource
+    // table the dispatch may have touched so the next accepted socket
+    // sees a fresh 1-based handle namespace (#562). This guards
+    // against handle-reuse confusion between requests served on the
+    // same listening socket.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Populate one entry in each P3 table (1-based — slot 0 reserved).
+    const r = try testing.allocator.create(HttpRequestP3);
+    r.* = .{};
+    const rh = try adapter.pushHttpRequestP3(r);
+    try testing.expectEqual(@as(u32, 1), rh);
+
+    const resp = try testing.allocator.create(HttpResponseP3);
+    resp.* = .{};
+    const resp_h = try adapter.pushHttpResponseP3(resp);
+    try testing.expectEqual(@as(u32, 1), resp_h);
+
+    adapter.cleanupHttpResourcesAllVersions();
+
+    // After cleanup, slot 1 is null (entry freed) and slot 0 is still
+    // the reserved null sentinel.
+    try testing.expectEqual(@as(?*HttpRequestP3, null), adapter.http_requests_p3.items[0]);
+    try testing.expectEqual(@as(?*HttpRequestP3, null), adapter.http_requests_p3.items[1]);
+    try testing.expectEqual(@as(?*HttpResponseP3, null), adapter.http_responses_p3.items[0]);
+    try testing.expectEqual(@as(?*HttpResponseP3, null), adapter.http_responses_p3.items[1]);
+}
+
+test "wasi:http@0.3 (#570): HandleP3Outcome.fromTaskReturnValues decodes Ok branch (disc=0 → wire-decoded handle)" {
+    // Round-trip the dispatch-glue's `task.return_values` shape. The
+    // guest pushes `[disc, wire_handle, ... padding ...]` for the Ok
+    // arm of `result<own<response>, error-code>`. The wire handle is
+    // canon-ABI `slot + 1` (#562 / `encodeResourceWireAbi`); the
+    // outcome decoder must `decodeResourceWire` it back to the
+    // 0-based slot before the host writes the response.
+    const testing = std.testing;
+    const HandleP3Outcome = WasiCliAdapter.HandleP3Outcome;
+
+    // Ok branch with wire-encoded slot 1 → decoded payload 1.
+    const flat_ok = [_]u32{ 0, 2 };
+    const out_ok = HandleP3Outcome.fromTaskReturnValues(&flat_ok);
+    try testing.expect(out_ok.is_ok);
+    try testing.expectEqual(@as(u32, 1), out_ok.payload);
+
+    // Wire 0 (sentinel "no resource") stays 0 after decode — the
+    // host's `lookupHttpResponseP3(0)` then surfaces "invalid response
+    // handle" cleanly rather than crashing.
+    const flat_ok_zero = [_]u32{ 0, 0 };
+    const out_ok_zero = HandleP3Outcome.fromTaskReturnValues(&flat_ok_zero);
+    try testing.expect(out_ok_zero.is_ok);
+    try testing.expectEqual(@as(u32, 0), out_ok_zero.payload);
+
+    // Trailing variant-join padding (wit-bindgen 0.45 produces 7 i32s
+    // + 1 i64 = 8 slots for the joined `error-code` arm) is ignored —
+    // only `flat[0..2]` is consulted.
+    const flat_ok_padded = [_]u32{ 0, 4, 0, 0, 0, 0, 0, 0 };
+    const out_ok_padded = HandleP3Outcome.fromTaskReturnValues(&flat_ok_padded);
+    try testing.expect(out_ok_padded.is_ok);
+    try testing.expectEqual(@as(u32, 3), out_ok_padded.payload); // wire 4 → slot 3
+}
+
+test "wasi:http@0.3 (#570): HandleP3Outcome.fromTaskReturnValues decodes Err branch (disc=1 → raw error-code disc)" {
+    // The Err arm payload is an `error-code` variant discriminant —
+    // a plain i32 with no resource-wire offset. The decoder must NOT
+    // wire-decode it; otherwise a guest-returned `HTTP_request_denied`
+    // (disc 15) would silently surface as `14` to the host.
+    const testing = std.testing;
+    const HandleP3Outcome = WasiCliAdapter.HandleP3Outcome;
+
+    const flat_err = [_]u32{ 1, @intFromEnum(HttpErrorCode.HTTP_request_denied) };
+    const out = HandleP3Outcome.fromTaskReturnValues(&flat_err);
+    try testing.expect(!out.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        out.payload,
+    );
+
+    // Defensive fallbacks: missing payload → internal_error.
+    const flat_err_short = [_]u32{1};
+    const out_short = HandleP3Outcome.fromTaskReturnValues(&flat_err_short);
+    try testing.expect(!out_short.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        out_short.payload,
+    );
+
+    // Empty return_values → empty task (task.return never invoked,
+    // e.g. the guest trapped before completing) → reported as Err.
+    const out_empty = HandleP3Outcome.fromTaskReturnValues(&.{});
+    try testing.expect(!out_empty.is_ok);
+}
+
+test "wasi:http@0.3 (#570): readIncomingRequestP3FromStream parses an HTTP/1.1 request off a buffered stream" {
+    // End-to-end variant of the `createIncomingRequestP3FromHttpBytes`
+    // tests above: drives the same wire bytes through
+    // `InputStream.fromBuffer` to confirm the stream-read framing
+    // (header-end detection, body-length read) keeps the parser
+    // happy. Mirrors the live TCP-accept path used by
+    // `serveOneHttpConnectionP3` without standing up a real socket.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const wire = "GET /probe HTTP/1.1\r\nHost: example.com\r\nUser-Agent: probe/1\r\n\r\n";
+    var input = streams.InputStream.fromBuffer(wire);
+    const rh = try adapter.readIncomingRequestP3FromStream(&ci, &input);
+    try testing.expectEqual(@as(u32, 1), rh);
+
+    const req = adapter.lookupHttpRequestP3(rh).?;
+    try testing.expectEqual(@as(u8, 0), req.method_disc); // GET
+    try testing.expectEqualStrings("/probe", req.path_with_query.?);
+    try testing.expectEqualStrings("example.com", req.authority.?);
+
+    // Body stream is allocated even for an empty body — write_closed
+    // ensures the guest's first read observes EOF without blocking.
+    const body_h = req.body_stream_handle.?;
+    const body = ci.streams.getPtr(body_h).?;
+    try testing.expect(body.write_closed);
+    try testing.expectEqual(@as(usize, 0), body.buffer.items.len);
+}
+
