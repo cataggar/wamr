@@ -101,48 +101,19 @@ runs the gate on push to `main` and nightly.
 
 [wts]: https://github.com/WebAssembly/wasi-testsuite
 
-## WASI limitations
+## WASI
 
-### `wasi:http` — outbound HTTP and HTTPS
+`wamr` ships the WASI 0.2.x **and** 0.3.0 interface surface (`wasi:cli`,
+`wasi:clocks`, `wasi:filesystem`, `wasi:http`, `wasi:io`, `wasi:random`,
+`wasi:sockets`); both gates are green (`zig build wasi-testsuite` —
+**72 / 72** Preview 1 fixtures; `zig build wasi-p3-testsuite` —
+**40 / 40** Preview 3 fixtures). Outbound HTTP and HTTPS issue real
+requests via `std.http.Client` and Zig 0.16's `std.crypto.tls`.
 
-`wamr`'s `wasi:http/outgoing-handler.handle` (Preview 2) and
-`wasi:http/client.send` (Preview 3) issue real outbound HTTP and **HTTPS**
-requests via `std.http.Client.fetch`. TLS is delegated to Zig 0.16's
-[`std.crypto.tls`](https://ziglang.org/documentation/master/std/#std.crypto.tls)
-client — system root certificates are loaded via
-`std.crypto.Certificate.Bundle.rescan` (see
-[#521](https://github.com/cataggar/wamr/issues/521)). Both `http://` and
-`https://` schemes are accepted when `sockets_allow_list_template` is
-non-empty; the empty allow-list still surfaces
-`error-code::HTTP_request_denied`.
-
-Transport, TLS handshake, DNS resolution, and HTTP/1.1 framing failures
-are mapped onto specific `error-code` variants per the 0.3 WIT
-(`connection-refused`, `connection-terminated`, `TLS-protocol-error`,
-`TLS-certificate-error`, `DNS-error`, `HTTP-protocol-error`,
-`HTTP-response-header-section-size`, etc.); only genuinely
-unclassified failures fall through to `error-code::internal-error`
-(see [#583](https://github.com/cataggar/wamr/issues/583) A3). Response
-headers are not yet surfaced (a `std.http.Client` limitation:
-`FetchResult` only exposes the status line). Incoming-handler dispatch
-(`wasi:http/handler@0.3.0`) is wired end-to-end against the TCP
-listener for HTTP/1.1
-([#580](https://github.com/cataggar/wamr/pull/580)) — `Connection: close`
-only; keep-alive, chunked transfer-encoding, and trailers are tracked
-under the post-Preview-3 follow-up
-[#583](https://github.com/cataggar/wamr/issues/583).
-
-The 0.3.0 interface surface shipped by `wamr` covers
-`wasi:cli`, `wasi:clocks`, `wasi:filesystem`, `wasi:http`, `wasi:random`,
-and `wasi:sockets`; the
-[`wasi-p3-testsuite`](tests/wasi-p3-testsuite-skip.json) gate passes
-40 / 40 `wasm32-wasip3` fixtures. Remaining hardening items are tracked
-under [#583](https://github.com/cataggar/wamr/issues/583).
-
-The earlier `error-code::HTTP_protocol_error` short-circuit on `https://`
-(introduced in [#477](https://github.com/cataggar/wamr/issues/477) /
-[#501](https://github.com/cataggar/wamr/pull/501)) was removed once we
-confirmed Zig 0.16 ships a working TLS client in `std.crypto.tls`.
+See **[`docs/wasi.md`](docs/wasi.md)** for the full feature matrix —
+interface → version → method count → fixture pass-rate → known
+limitations — and [#583](https://github.com/cataggar/wamr/issues/583)
+for post-Preview-3 hardening items.
 
 To exercise the real outbound HTTPS path in unit tests (off by default
 so CI stays hermetic):
