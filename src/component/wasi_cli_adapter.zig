@@ -3718,6 +3718,50 @@ pub const WasiLogLevel = enum(u32) {
     }
 };
 
+/// `wasi:keyvalue/store@0.2.0-draft2` `bucket` resource (#583 B4).
+///
+/// A memory-store backed bucket. The `identifier` field is the name
+/// the guest passed to `store.open(...)` — kept around so future
+/// snapshot / debug logging surfaces can identify the bucket.
+///
+/// `entries` is a `std.StringHashMapUnmanaged([]const u8)` whose
+/// keys and values are both owned by the adapter's allocator — `set`
+/// duplicates both sides, `delete` frees both sides, and `deinit`
+/// mops up any leftover entries when the bucket is dropped or when
+/// the whole adapter tears down. The map's iteration order is
+/// unspecified, which matches the WIT contract for `list-keys`.
+pub const KeyvalueBucket = struct {
+    identifier: []const u8,
+    entries: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *KeyvalueBucket, allocator: Allocator) void {
+        var it = self.entries.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        self.entries.deinit(allocator);
+        allocator.free(self.identifier);
+    }
+};
+
+/// `wasi:keyvalue/store.error` variant discriminants in WIT-declaration
+/// order. The `other` arm carries a `string` payload; the other two are
+/// unit-typed.
+pub const KeyvalueErrorTag = enum(u32) {
+    no_such_store = 0,
+    access_denied = 1,
+    other = 2,
+};
+
+/// Cap on a single bucket's key count — `list-keys` paginates above
+/// this. The chosen value is small enough that exhausting it in a
+/// single call is cheap and large enough that the pagination path is
+/// rarely exercised in practice. Both `cursor`-driven continuation
+/// and a fresh `list-keys(none)` call work correctly across paging
+/// boundaries.
+const KEYVALUE_LIST_KEYS_PAGE_SIZE: usize = 128;
+
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
@@ -3773,6 +3817,16 @@ pub const WasiCliAdapter = struct {
     http_types_iface: HostInstance = .{},
     http_outgoing_handler_iface: HostInstance = .{},
     http_incoming_handler_iface: HostInstance = .{},
+
+    // ── wasi:keyvalue@0.2.0-draft2 host instances (#583 B4) ──────────
+    // Memory-store host adapter. Same HostInstance is reused for the
+    // 0.3.x version band — the WIT shape carries over verbatim, so
+    // version-multiplex in `populateWasiProviders` routes both to
+    // these single iface values rather than duplicating them. See
+    // `docs/wasi-keyvalue-wit-vendored/README.md` for the WIT pin.
+    keyvalue_store_iface: HostInstance = .{},
+    keyvalue_atomics_iface: HostInstance = .{},
+    keyvalue_batch_iface: HostInstance = .{},
 
     // ── WASIp3 stub host instances (#481 wave A) ─────────────────────
     // These fields exist so wave B/C PRs (#482-#487) only need to add
@@ -3991,6 +4045,13 @@ pub const WasiCliAdapter = struct {
     /// from the 0.2 `http_request_options` to avoid index aliasing
     /// across surfaces; the rep struct is the same.
     http_request_options_p3: std.ArrayListUnmanaged(?*RequestOptions) = .empty,
+
+    /// `wasi:keyvalue/store.bucket` resource table (#583 B4). Slot
+    /// index = guest handle. Each live slot owns a heap-allocated
+    /// `KeyvalueBucket` whose `entries` HashMap holds owned key/value
+    /// byte slices. Slots are nulled on `[resource-drop]bucket`;
+    /// `deinit` frees any slots the guest leaked.
+    keyvalue_buckets: std.ArrayListUnmanaged(?*KeyvalueBucket) = .empty,
     /// `wasi:io/poll.pollable` table. Pollables borrow their source
     /// resources and become ready if that source is dropped/closed, so the
     /// guest can observe the underlying closed/error condition without UAF.
@@ -4123,6 +4184,9 @@ pub const WasiCliAdapter = struct {
         self.http_types_iface.deinit(self.allocator);
         self.http_outgoing_handler_iface.deinit(self.allocator);
         self.http_incoming_handler_iface.deinit(self.allocator);
+        self.keyvalue_store_iface.deinit(self.allocator);
+        self.keyvalue_atomics_iface.deinit(self.allocator);
+        self.keyvalue_batch_iface.deinit(self.allocator);
 
         // P3 stub interfaces (#481).
         self.cli_stdout_p3_iface.deinit(self.allocator);
@@ -4367,6 +4431,19 @@ pub const WasiCliAdapter = struct {
             if (maybe) |r| self.allocator.destroy(r);
         }
         self.http_request_options_p3.deinit(self.allocator);
+
+        // #583 B4: any `wasi:keyvalue/store.bucket` slot the guest
+        // leaked owns the bucket's identifier, every stored key, and
+        // every stored value. Free the entries map first (via
+        // `KeyvalueBucket.deinit`), then destroy the heap rep.
+        for (self.keyvalue_buckets.items) |maybe| {
+            if (maybe) |b| {
+                b.deinit(self.allocator);
+                self.allocator.destroy(b);
+            }
+        }
+        self.keyvalue_buckets.deinit(self.allocator);
+
         self.pollable_table.deinit(self.allocator);
     }
 
@@ -20355,6 +20432,882 @@ pub const WasiCliAdapter = struct {
             .host_instance = &self.http_incoming_handler_iface,
         });
     }
+
+    // ── wasi:keyvalue@0.2.0-draft2 (#583 B4) ─────────────────────────
+    //
+    // Memory-store host adapter. Each `KeyvalueBucket` is a
+    // heap-allocated record holding the bucket's identifier and a
+    // `std.StringHashMapUnmanaged([]const u8)` whose keys and values
+    // are duplicated into the adapter's allocator on `set` and freed
+    // on `delete` / `[resource-drop]bucket` / `WasiCliAdapter.deinit`.
+    //
+    // The three interfaces (`store`, `atomics`, `batch`) share the
+    // same bucket table and the same error type. The `cas` resource
+    // on `atomics` is registered as no-op stubs (so guests that
+    // incidentally import them link cleanly) but `cas.new` /
+    // `cas.current` / `swap` return `error::other("…")`; only the
+    // `increment` free function carries a real implementation. See
+    // `docs/wasi-keyvalue-wit-vendored/README.md` for the pinned WIT.
+
+    /// Register `wasi:keyvalue/store@0.2.x` (#583 B4).
+    ///
+    /// Members:
+    ///   - `open: (string) -> result<own<bucket>, error>` — opens (or
+    ///     creates on first access) the bucket named `identifier`.
+    ///   - `[method]bucket.get / set / delete / exists / list-keys` —
+    ///     CRUD over the bucket's memory map.
+    ///   - `[resource-drop]bucket` — frees the bucket and every
+    ///     owned key/value byte slice.
+    pub fn populateWasiKeyvalueStore(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]M{
+            .{ .name = "open", .call = &keyvalueStoreOpen },
+            .{ .name = "[method]bucket.get", .call = &keyvalueBucketGet },
+            .{ .name = "[method]bucket.set", .call = &keyvalueBucketSet },
+            .{ .name = "[method]bucket.delete", .call = &keyvalueBucketDelete },
+            .{ .name = "[method]bucket.exists", .call = &keyvalueBucketExists },
+            .{ .name = "[method]bucket.list-keys", .call = &keyvalueBucketListKeys },
+            .{ .name = "[resource-drop]bucket", .call = &keyvalueBucketDrop },
+        };
+        for (members) |m| {
+            try self.keyvalue_store_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.keyvalue_store_iface,
+        });
+    }
+
+    /// Register `wasi:keyvalue/atomics@0.2.x` (#583 B4).
+    ///
+    /// Members:
+    ///   - `increment: (borrow<bucket>, string, s64) -> result<s64, error>` —
+    ///     read-modify-write the bucket's value. Missing keys are
+    ///     created with the delta as the initial value (per WIT).
+    ///   - `[static]cas.new` / `[method]cas.current` / `swap` /
+    ///     `[resource-drop]cas` — registered as stubs that return
+    ///     `error::other(...)` to satisfy guests that import the
+    ///     symbol but never actually invoke a CAS round-trip. The
+    ///     adapter doesn't ship a real CAS implementation; see
+    ///     `docs/wasi.md` for the limitations section.
+    pub fn populateWasiKeyvalueAtomics(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]M{
+            .{ .name = "increment", .call = &keyvalueAtomicsIncrement },
+            .{ .name = "swap", .call = &keyvalueAtomicsSwap },
+            .{ .name = "[static]cas.new", .call = &keyvalueCasNew },
+            .{ .name = "[method]cas.current", .call = &keyvalueCasCurrent },
+            .{ .name = "[resource-drop]cas", .call = &keyvalueCasDrop },
+        };
+        for (members) |m| {
+            try self.keyvalue_atomics_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.keyvalue_atomics_iface,
+        });
+    }
+
+    /// Register `wasi:keyvalue/batch@0.2.x` (#583 B4).
+    ///
+    /// Members:
+    ///   - `get-many: (borrow<bucket>, list<string>) -> result<list<option<tuple<string, list<u8>>>>, error>` —
+    ///     bulk get; absent keys lift as `option::none`.
+    ///   - `set-many: (borrow<bucket>, list<tuple<string, list<u8>>>) -> result<_, error>`.
+    ///   - `delete-many: (borrow<bucket>, list<string>) -> result<_, error>`.
+    pub fn populateWasiKeyvalueBatch(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]M{
+            .{ .name = "get-many", .call = &keyvalueBatchGetMany },
+            .{ .name = "set-many", .call = &keyvalueBatchSetMany },
+            .{ .name = "delete-many", .call = &keyvalueBatchDeleteMany },
+        };
+        for (members) |m| {
+            try self.keyvalue_batch_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.keyvalue_batch_iface,
+        });
+    }
+
+    /// Lookup a `KeyvalueBucket` by guest handle. Returns `null` if
+    /// the slot index is out of range or has been dropped.
+    fn lookupKeyvalueBucket(self: *WasiCliAdapter, handle: u32) ?*KeyvalueBucket {
+        if (handle >= self.keyvalue_buckets.items.len) return null;
+        return self.keyvalue_buckets.items[handle];
+    }
+
+    /// Insert a fresh `KeyvalueBucket` into the table. Reuses a
+    /// nulled slot if any exists, otherwise appends. Returns the
+    /// slot index (== guest handle).
+    fn pushKeyvalueBucket(self: *WasiCliAdapter, b: *KeyvalueBucket) !u32 {
+        for (self.keyvalue_buckets.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.keyvalue_buckets.items[i] = b;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.keyvalue_buckets.items.len);
+        try self.keyvalue_buckets.append(self.allocator, b);
+        return idx;
+    }
+
+    /// Build a `result<X, keyvalue/store.error>` err lift with the
+    /// unit-typed `no-such-store` or `access-denied` variant. The
+    /// returned `InterfaceValue` is allocator-owned.
+    fn keyvalueResultErrSimple(allocator: Allocator, tag: KeyvalueErrorTag) !InterfaceValue {
+        std.debug.assert(tag != .other);
+        const err_payload = try allocator.create(InterfaceValue);
+        err_payload.* = .{ .variant_val = .{
+            .discriminant = @intFromEnum(tag),
+            .payload = null,
+        } };
+        return .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+    }
+
+    /// Build a `result<X, keyvalue/store.error>` err lift with the
+    /// `other(string)` payload. The string is `hostAllocAndWrite`'d
+    /// into guest linear memory through `ci`.
+    fn keyvalueResultErrOther(
+        ci: *ComponentInstance,
+        allocator: Allocator,
+        message: []const u8,
+    ) !InterfaceValue {
+        const ptr = ci.hostAllocAndWrite(message) orelse return error.OutOfMemory;
+        const string_val = try allocator.create(InterfaceValue);
+        string_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(message.len) } };
+        const err_payload = try allocator.create(InterfaceValue);
+        err_payload.* = .{ .variant_val = .{
+            .discriminant = @intFromEnum(KeyvalueErrorTag.other),
+            .payload = string_val,
+        } };
+        return .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+    }
+
+    /// Build a `result<X, error>` ok lift carrying `value`. Moves the
+    /// caller-supplied `value` into a fresh `*InterfaceValue` payload.
+    fn keyvalueResultOk(allocator: Allocator, value: InterfaceValue) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = value;
+        return .{ .result_val = .{ .is_ok = true, .payload = payload } };
+    }
+
+    /// `wasi:keyvalue/store.open: (identifier: string) -> result<own<bucket>, error>`.
+    ///
+    /// Opens (or creates on first access) the bucket named
+    /// `identifier`. Identifiers are case-sensitive and the same
+    /// identifier may be opened multiple times — each call returns a
+    /// fresh handle, with all opens sharing the same backing storage
+    /// keyed by identifier. The bucket lives until every handle to it
+    /// is dropped *and* the adapter itself tears down; we don't
+    /// proactively GC empty buckets.
+    fn keyvalueStoreOpen(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const ident_pl = switch (args[0]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const ident_bytes = if (ident_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(ident_pl.ptr, ident_pl.len) orelse
+                return error.OutOfBoundsMemory;
+
+        // The bucket's identifier + all entries are owned by the
+        // adapter's allocator so `bucket.deinit(self.allocator)`
+        // (called by `keyvalueBucketDrop` and `WasiCliAdapter.deinit`)
+        // matches the alloc side. Don't reuse the canon-ABI
+        // `allocator` parameter here — it's per-call and would
+        // produce a cross-allocator free.
+        const ident_copy = try self.allocator.dupe(u8, ident_bytes);
+        errdefer self.allocator.free(ident_copy);
+        const bucket = try self.allocator.create(KeyvalueBucket);
+        errdefer self.allocator.destroy(bucket);
+        bucket.* = .{ .identifier = ident_copy };
+        const handle = self.pushKeyvalueBucket(bucket) catch {
+            bucket.deinit(self.allocator);
+            self.allocator.destroy(bucket);
+            results[0] = try keyvalueResultErrOther(ci, allocator, "insufficient memory");
+            return;
+        };
+        results[0] = try keyvalueResultOk(allocator, .{ .handle = handle });
+    }
+
+    /// `[method]bucket.get: (borrow<bucket>, key: string) -> result<option<list<u8>>, error>`.
+    fn keyvalueBucketGet(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const key_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+        const key_bytes = if (key_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(key_pl.ptr, key_pl.len) orelse
+                return error.OutOfBoundsMemory;
+        if (bucket.entries.get(key_bytes)) |val| {
+            const guest_ptr: u32 = if (val.len == 0)
+                (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
+            else
+                (ci.hostAllocAndWrite(val) orelse return error.OutOfMemory);
+            const list_val = try allocator.create(InterfaceValue);
+            list_val.* = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(val.len) } };
+            results[0] = try keyvalueResultOk(allocator, .{ .option_val = .{
+                .is_some = true,
+                .payload = list_val,
+            } });
+        } else {
+            results[0] = try keyvalueResultOk(allocator, .{ .option_val = .{
+                .is_some = false,
+                .payload = null,
+            } });
+        }
+    }
+
+    /// `[method]bucket.set: (borrow<bucket>, key: string, value: list<u8>) -> result<_, error>`.
+    fn keyvalueBucketSet(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const key_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const value_pl = switch (args[2]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+        const key_bytes = if (key_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(key_pl.ptr, key_pl.len) orelse
+                return error.OutOfBoundsMemory;
+        const value_bytes = if (value_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(value_pl.ptr, value_pl.len) orelse
+                return error.OutOfBoundsMemory;
+        try bucketStoreEntry(self, bucket, key_bytes, value_bytes);
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// Insert `key` → `value` into `bucket`, replacing any existing
+    /// entry. Both inputs are duplicated through the adapter's
+    /// allocator; the previous key+value (if any) are freed.
+    fn bucketStoreEntry(
+        self: *WasiCliAdapter,
+        bucket: *KeyvalueBucket,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        const new_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(new_value);
+        const gop = try bucket.entries.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = new_value;
+        } else {
+            const key_copy = self.allocator.dupe(u8, key) catch |err| {
+                _ = bucket.entries.remove(key);
+                return err;
+            };
+            gop.key_ptr.* = key_copy;
+            gop.value_ptr.* = new_value;
+        }
+    }
+
+    /// Remove `key` from `bucket`, freeing the owned key and value
+    /// byte slices. Returns whether the entry was present.
+    fn bucketRemoveEntry(
+        self: *WasiCliAdapter,
+        bucket: *KeyvalueBucket,
+        key: []const u8,
+    ) bool {
+        const entry = bucket.entries.fetchRemove(key) orelse return false;
+        self.allocator.free(entry.key);
+        self.allocator.free(entry.value);
+        return true;
+    }
+
+    /// `[method]bucket.delete: (borrow<bucket>, key: string) -> result<_, error>`.
+    fn keyvalueBucketDelete(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const key_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+        const key_bytes = if (key_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(key_pl.ptr, key_pl.len) orelse
+                return error.OutOfBoundsMemory;
+        // Per WIT: "If the key does not exist in the store, it does
+        // nothing." — succeed either way.
+        _ = bucketRemoveEntry(self, bucket, key_bytes);
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]bucket.exists: (borrow<bucket>, key: string) -> result<bool, error>`.
+    fn keyvalueBucketExists(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const key_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+        const key_bytes = if (key_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(key_pl.ptr, key_pl.len) orelse
+                return error.OutOfBoundsMemory;
+        const present = bucket.entries.contains(key_bytes);
+        results[0] = try keyvalueResultOk(allocator, .{ .bool = present });
+    }
+
+    /// `[method]bucket.list-keys: (borrow<bucket>, cursor: option<string>) -> result<key-response, error>`.
+    ///
+    /// `key-response` is a record `{ keys: list<string>, cursor: option<string> }`.
+    /// Pagination uses a base-10 ASCII u64 cursor in `cursor` —
+    /// it's the index of the *next* key in the bucket's iteration
+    /// order. Iteration order is the HashMap's natural order, which
+    /// is unspecified per WIT.
+    fn keyvalueBucketListKeys(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const cursor_opt = switch (args[1]) {
+            .option_val => |o| o,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+
+        var start_index: usize = 0;
+        if (cursor_opt.is_some) {
+            const cursor_val = cursor_opt.payload orelse {
+                results[0] = try keyvalueResultErrOther(ci, allocator, "malformed cursor");
+                return;
+            };
+            const cursor_pl = switch (cursor_val.*) {
+                .string => |pl| pl,
+                else => {
+                    results[0] = try keyvalueResultErrOther(ci, allocator, "malformed cursor");
+                    return;
+                },
+            };
+            const cursor_bytes = if (cursor_pl.len == 0)
+                @as([]const u8, "")
+            else
+                ci.readGuestBytes(cursor_pl.ptr, cursor_pl.len) orelse
+                    return error.OutOfBoundsMemory;
+            start_index = std.fmt.parseInt(usize, cursor_bytes, 10) catch {
+                results[0] = try keyvalueResultErrOther(ci, allocator, "malformed cursor");
+                return;
+            };
+        }
+
+        // Snapshot the current key set in iteration order so the
+        // cursor index has a stable meaning across the page boundary.
+        // This is O(n) per `list-keys` call but the spec already
+        // warns that the operation is expensive and the memory store
+        // is bounded by the adapter's lifetime.
+        var all_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer all_keys.deinit(allocator);
+        try all_keys.ensureTotalCapacityPrecise(allocator, bucket.entries.count());
+        var it = bucket.entries.keyIterator();
+        while (it.next()) |k| try all_keys.append(allocator, k.*);
+
+        const total = all_keys.items.len;
+        if (start_index > total) start_index = total;
+        const end_index = @min(total, start_index +| KEYVALUE_LIST_KEYS_PAGE_SIZE);
+        const page = all_keys.items[start_index..end_index];
+
+        // Build `list<string>` for `keys` by writing the page into
+        // guest linear memory: a `string` element is 8 bytes
+        // (ptr + len), packed contiguously.
+        const stride: u32 = 8;
+        const list_ptr: u32 = if (page.len == 0)
+            0
+        else
+            (ci.hostAllocGuest(@intCast(page.len * stride), 4) orelse return error.OutOfMemory);
+        if (page.len != 0) {
+            const dst = ci.writableGuestBytes(list_ptr, @intCast(page.len * stride)) orelse
+                return error.OutOfMemory;
+            var off: u32 = 0;
+            for (page) |k| {
+                const key_ptr: u32 = if (k.len == 0)
+                    (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
+                else
+                    (ci.hostAllocAndWrite(k) orelse return error.OutOfMemory);
+                std.mem.writeInt(u32, dst[off..][0..4], key_ptr, .little);
+                std.mem.writeInt(u32, dst[off + 4 ..][0..4], @intCast(k.len), .little);
+                off += stride;
+            }
+        }
+
+        const cursor_field: InterfaceValue = if (end_index < total) blk: {
+            // Lift the next-page cursor as a decimal-ASCII string.
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{end_index}) catch unreachable;
+            const ptr = ci.hostAllocAndWrite(s) orelse return error.OutOfMemory;
+            const some_val = try allocator.create(InterfaceValue);
+            some_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(s.len) } };
+            break :blk .{ .option_val = .{ .is_some = true, .payload = some_val } };
+        } else .{ .option_val = .{ .is_some = false, .payload = null } };
+
+        const record_fields = try allocator.alloc(InterfaceValue, 2);
+        record_fields[0] = .{ .list = .{ .ptr = list_ptr, .len = @intCast(page.len) } };
+        record_fields[1] = cursor_field;
+        results[0] = try keyvalueResultOk(allocator, .{ .record_val = record_fields });
+    }
+
+    /// `[resource-drop]bucket: (own<bucket>) -> ()`.
+    fn keyvalueBucketDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.keyvalue_buckets.items.len) return;
+        if (self.keyvalue_buckets.items[handle]) |b| {
+            b.deinit(self.allocator);
+            self.allocator.destroy(b);
+            self.keyvalue_buckets.items[handle] = null;
+        }
+    }
+
+    /// `wasi:keyvalue/atomics.increment: (borrow<bucket>, key: string, delta: s64) -> result<s64, error>`.
+    ///
+    /// Atomic read-modify-write of the s64 at `key`. The host-side
+    /// "atomicity" is trivial: the adapter is single-threaded with
+    /// respect to component-instance dispatch, so the whole call
+    /// happens between executor ticks and no other guest can
+    /// interleave.
+    ///
+    /// Missing-key semantics per WIT: "creates a new key-value pair
+    /// with the value set to the given delta". The value is stored
+    /// as a little-endian s64 byte array so a subsequent `bucket.get`
+    /// can read it back (callers that mix `set` and `increment` on
+    /// the same key SHOULD use the same encoding — the adapter
+    /// doesn't validate the existing bytes beyond requiring exactly
+    /// 8 bytes).
+    fn keyvalueAtomicsIncrement(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const key_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const delta = switch (args[2]) {
+            .s64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+        const key_bytes = if (key_pl.len == 0)
+            @as([]const u8, "")
+        else
+            ci.readGuestBytes(key_pl.ptr, key_pl.len) orelse
+                return error.OutOfBoundsMemory;
+
+        const current: i64 = if (bucket.entries.get(key_bytes)) |existing| blk: {
+            if (existing.len != 8) {
+                results[0] = try keyvalueResultErrOther(
+                    ci,
+                    allocator,
+                    "existing value is not an 8-byte little-endian s64",
+                );
+                return;
+            }
+            break :blk std.mem.readInt(i64, existing[0..8], .little);
+        } else 0;
+
+        const next = std.math.add(i64, current, delta) catch {
+            results[0] = try keyvalueResultErrOther(ci, allocator, "increment overflow");
+            return;
+        };
+
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(i64, &encoded, next, .little);
+        try bucketStoreEntry(self, bucket, key_bytes, &encoded);
+        results[0] = try keyvalueResultOk(allocator, .{ .s64 = next });
+    }
+
+    /// `wasi:keyvalue/atomics.swap: (cas, list<u8>) -> result<_, cas-error>`.
+    ///
+    /// CAS isn't implemented in the memory store — the adapter has
+    /// no CAS resource table. Return the `cas-error::store-error`
+    /// arm with the inner `error::other` payload so guests get a
+    /// well-typed failure rather than a host trap.
+    fn keyvalueAtomicsSwap(
+        _: ?*anyopaque,
+        ci: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        // `cas-error::store-error(error)` — discriminant 0, payload
+        // is the inner `error::other(string)`.
+        const message = "compare-and-swap not implemented in memory store";
+        const ptr = ci.hostAllocAndWrite(message) orelse return error.OutOfMemory;
+        const string_val = try allocator.create(InterfaceValue);
+        string_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(message.len) } };
+        const inner_err = try allocator.create(InterfaceValue);
+        inner_err.* = .{ .variant_val = .{
+            .discriminant = @intFromEnum(KeyvalueErrorTag.other),
+            .payload = string_val,
+        } };
+        const cas_err = try allocator.create(InterfaceValue);
+        cas_err.* = .{ .variant_val = .{
+            .discriminant = 0, // store-error
+            .payload = inner_err,
+        } };
+        results[0] = .{ .result_val = .{ .is_ok = false, .payload = cas_err } };
+    }
+
+    /// `[static]cas.new: (borrow<bucket>, key: string) -> result<own<cas>, error>` —
+    /// stub return: `error::other("…")`. The adapter doesn't have a
+    /// `cas` resource table; guests that import this without ever
+    /// calling it link cleanly via the registration.
+    fn keyvalueCasNew(
+        _: ?*anyopaque,
+        ci: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = try keyvalueResultErrOther(
+            ci,
+            allocator,
+            "compare-and-swap not implemented in memory store",
+        );
+    }
+
+    /// `[method]cas.current: () -> result<option<list<u8>>, error>` —
+    /// stub return: `error::other("…")`. See `keyvalueCasNew`.
+    fn keyvalueCasCurrent(
+        _: ?*anyopaque,
+        ci: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = try keyvalueResultErrOther(
+            ci,
+            allocator,
+            "compare-and-swap not implemented in memory store",
+        );
+    }
+
+    /// `[resource-drop]cas: (own<cas>) -> ()` — no-op. CAS handles
+    /// are never produced by `cas.new` (it always errors) so a drop
+    /// can only happen on an invalid wire handle; swallow it.
+    fn keyvalueCasDrop(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {}
+
+    /// `wasi:keyvalue/batch.get-many: (borrow<bucket>, list<string>) -> result<list<option<tuple<string, list<u8>>>>, error>`.
+    fn keyvalueBatchGetMany(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const keys_pl = switch (args[1]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+
+        // Each `string` element is 8 bytes (ptr + len) in linear memory.
+        const stride: u32 = 8;
+        const keys_count = keys_pl.len;
+        const keys_bytes: []const u8 = if (keys_count == 0)
+            &.{}
+        else
+            (ci.readGuestBytes(keys_pl.ptr, keys_count * stride) orelse
+                return error.OutOfBoundsMemory);
+
+        // `list<option<tuple<string, list<u8>>>>` in linear memory.
+        // Per the canonical ABI each `option<T>` is `1 + sizeof(T)`
+        // bytes with alignment max(1, align(T)). The inner tuple is
+        // `{ string (8B), list<u8> (8B) }` with 4-byte alignment, so
+        // the option is laid out as: discriminant @0:u8, padding to
+        // @4, tuple_str_ptr @4:u32, tuple_str_len @8:u32, tuple_list_ptr
+        // @12:u32, tuple_list_len @16:u32 — 20 bytes total. Align 4.
+        const opt_stride: u32 = 20;
+        const out_total: u32 = @intCast(keys_count * opt_stride);
+        const out_ptr: u32 = if (keys_count == 0)
+            0
+        else
+            (ci.hostAllocGuest(out_total, 4) orelse return error.OutOfMemory);
+        if (keys_count > 0) {
+            const dst = ci.writableGuestBytes(out_ptr, out_total) orelse
+                return error.OutOfMemory;
+            @memset(dst, 0);
+            var idx: u32 = 0;
+            while (idx < keys_count) : (idx += 1) {
+                const in_off = idx * stride;
+                const k_ptr = std.mem.readInt(u32, keys_bytes[in_off..][0..4], .little);
+                const k_len = std.mem.readInt(u32, keys_bytes[in_off + 4 ..][0..4], .little);
+                const k_bytes = if (k_len == 0)
+                    @as([]const u8, "")
+                else
+                    ci.readGuestBytes(k_ptr, k_len) orelse return error.OutOfBoundsMemory;
+                const out_off = idx * opt_stride;
+                if (bucket.entries.getEntry(k_bytes)) |entry| {
+                    const stored_value = entry.value_ptr.*;
+                    // Re-emit the key as a fresh `hostAllocAndWrite`
+                    // so the lifted tuple is self-contained (the
+                    // guest's input pointer might get freed before
+                    // the result is read).
+                    const k_out_ptr: u32 = if (k_bytes.len == 0)
+                        (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
+                    else
+                        (ci.hostAllocAndWrite(k_bytes) orelse return error.OutOfMemory);
+                    const v_out_ptr: u32 = if (stored_value.len == 0)
+                        (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
+                    else
+                        (ci.hostAllocAndWrite(stored_value) orelse return error.OutOfMemory);
+                    dst[out_off] = 1; // option::some discriminant.
+                    std.mem.writeInt(u32, dst[out_off + 4 ..][0..4], k_out_ptr, .little);
+                    std.mem.writeInt(u32, dst[out_off + 8 ..][0..4], @intCast(k_bytes.len), .little);
+                    std.mem.writeInt(u32, dst[out_off + 12 ..][0..4], v_out_ptr, .little);
+                    std.mem.writeInt(u32, dst[out_off + 16 ..][0..4], @intCast(stored_value.len), .little);
+                } else {
+                    // option::none — discriminant 0, rest is undefined
+                    // but cleared by the @memset above.
+                    dst[out_off] = 0;
+                }
+            }
+        }
+        results[0] = try keyvalueResultOk(allocator, .{ .list = .{
+            .ptr = out_ptr,
+            .len = @intCast(keys_count),
+        } });
+    }
+
+    /// `wasi:keyvalue/batch.set-many: (borrow<bucket>, list<tuple<string, list<u8>>>) -> result<_, error>`.
+    fn keyvalueBatchSetMany(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const list_pl = switch (args[1]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+
+        // Each `tuple<string, list<u8>>` is 16 bytes in linear memory.
+        const stride: u32 = 16;
+        const count = list_pl.len;
+        const list_bytes: []const u8 = if (count == 0)
+            &.{}
+        else
+            (ci.readGuestBytes(list_pl.ptr, count * stride) orelse
+                return error.OutOfBoundsMemory);
+
+        var idx: u32 = 0;
+        while (idx < count) : (idx += 1) {
+            const off = idx * stride;
+            const k_ptr = std.mem.readInt(u32, list_bytes[off..][0..4], .little);
+            const k_len = std.mem.readInt(u32, list_bytes[off + 4 ..][0..4], .little);
+            const v_ptr = std.mem.readInt(u32, list_bytes[off + 8 ..][0..4], .little);
+            const v_len = std.mem.readInt(u32, list_bytes[off + 12 ..][0..4], .little);
+            const k_bytes = if (k_len == 0)
+                @as([]const u8, "")
+            else
+                ci.readGuestBytes(k_ptr, k_len) orelse return error.OutOfBoundsMemory;
+            const v_bytes = if (v_len == 0)
+                @as([]const u8, "")
+            else
+                ci.readGuestBytes(v_ptr, v_len) orelse return error.OutOfBoundsMemory;
+            try bucketStoreEntry(self, bucket, k_bytes, v_bytes);
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `wasi:keyvalue/batch.delete-many: (borrow<bucket>, list<string>) -> result<_, error>`.
+    fn keyvalueBatchDeleteMany(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const keys_pl = switch (args[1]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const bucket = self.lookupKeyvalueBucket(handle) orelse {
+            results[0] = try keyvalueResultErrSimple(allocator, .no_such_store);
+            return;
+        };
+        const stride: u32 = 8;
+        const count = keys_pl.len;
+        const keys_bytes: []const u8 = if (count == 0)
+            &.{}
+        else
+            (ci.readGuestBytes(keys_pl.ptr, count * stride) orelse
+                return error.OutOfBoundsMemory);
+        var idx: u32 = 0;
+        while (idx < count) : (idx += 1) {
+            const off = idx * stride;
+            const k_ptr = std.mem.readInt(u32, keys_bytes[off..][0..4], .little);
+            const k_len = std.mem.readInt(u32, keys_bytes[off + 4 ..][0..4], .little);
+            const k_bytes = if (k_len == 0)
+                @as([]const u8, "")
+            else
+                ci.readGuestBytes(k_ptr, k_len) orelse return error.OutOfBoundsMemory;
+            _ = bucketRemoveEntry(self, bucket, k_bytes);
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
 };
 
 /// `wasi:clocks/wall-clock.datetime`: a record of `(seconds: u64, nanoseconds: u32)`.
@@ -20776,6 +21729,14 @@ pub fn populateWasiProviders(
     // 0.1 binding unless an explicit `@0.2.x` import is present.
     var matched_logging: ?[]const u8 = null;
     var matched_logging_p2: ?[]const u8 = null;
+    // #583 B4: wasi:keyvalue@0.2.x interfaces. No 0.3 namespace yet —
+    // upstream still ships only `@0.2.0-draft2`. When 0.3 lands we'll
+    // split the matched names by `wasiVersion` like the other
+    // version-multiplexed families above; for now both 0.2 and any
+    // future 0.3 imports route to the same HostInstance values.
+    var matched_keyvalue_store: ?[]const u8 = null;
+    var matched_keyvalue_atomics: ?[]const u8 = null;
+    var matched_keyvalue_batch: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         // wasi:cli/* — version-multiplex onto either the 0.2 (P2) or
@@ -20976,6 +21937,16 @@ pub fn populateWasiProviders(
                 else => matched_logging = matched_logging orelse imp.name,
             }
         }
+        // #583 B4: wasi:keyvalue/* — `store`, `atomics`, `batch`. The
+        // memory-store backend handles every supported version band;
+        // any version routes to the same HostInstance. Probe more-
+        // specific names first so `atomics` doesn't alias `store`.
+        if (matched_keyvalue_atomics == null and matchesWasiPrefix(imp.name, "wasi:keyvalue/atomics"))
+            matched_keyvalue_atomics = imp.name;
+        if (matched_keyvalue_batch == null and matchesWasiPrefix(imp.name, "wasi:keyvalue/batch"))
+            matched_keyvalue_batch = imp.name;
+        if (matched_keyvalue_store == null and matchesWasiPrefix(imp.name, "wasi:keyvalue/store"))
+            matched_keyvalue_store = imp.name;
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -21270,6 +22241,22 @@ pub fn populateWasiProviders(
     }
     if (matched_logging_p2) |name| {
         try adapter.populateWasiLoggingP2(providers, name);
+    }
+
+    // wasi:keyvalue@0.2.x (#583 B4). Memory-store backed; one
+    // HostInstance per `{store, atomics, batch}` interface, routed
+    // by exact import name. No 0.3 namespace yet — upstream still
+    // ships `@0.2.0-draft2`. When 0.3 lands the same HostInstance
+    // values can serve both, mirroring how the `wasi:cli/run` block
+    // shares state across versions.
+    if (matched_keyvalue_store) |name| {
+        try adapter.populateWasiKeyvalueStore(providers, name);
+    }
+    if (matched_keyvalue_atomics) |name| {
+        try adapter.populateWasiKeyvalueAtomics(providers, name);
+    }
+    if (matched_keyvalue_batch) |name| {
+        try adapter.populateWasiKeyvalueBatch(providers, name);
     }
 }
 
@@ -36206,7 +37193,6 @@ test "wasi:http@0.3 (#583 A5): httpRequestHeaderInfoFromBlock detects keep-alive
     try testing.expectEqual(@as(usize, 7), info7.body_kind.content_length);
 }
 
-
 // ── wasi:logging@0.1.x (#583 B5) tests ────────────────────────────────
 
 test "wasi:logging (#583 B5): WasiLogLevel.fromString parses every WIT name + aliases" {
@@ -36412,4 +37398,630 @@ test "populateWasiProviders: wasi:logging 0.1 and 0.2 route to distinct HostInst
     try testing.expect(providers.contains("wasi:logging/logging@0.2.0"));
     try testing.expect(providers.get("wasi:logging/logging@0.1.0-draft").?.host_instance !=
         providers.get("wasi:logging/logging@0.2.0").?.host_instance);
+}
+
+// ── wasi:keyvalue@0.2.x tests (#583 B4) ──────────────────────────────
+//
+// Tests exercise the host-side `keyvalue*` callbacks directly, the same
+// way the random / fs adapter tests do. Each test stamps a fresh
+// `TestGuestMem` so `readGuestBytes` / `hostAllocAndWrite` round-trip
+// through a real backing buffer without needing a live `cabi_realloc`
+// export. The bucket table itself lives on the `WasiCliAdapter`; tests
+// rely on `deinit` cleanup to verify the resource-table audit.
+
+/// Lift a host `[]const u8` into a guest `string`-shaped
+/// `InterfaceValue` via the test guest memory. Returns the lifted
+/// value; caller writes it into an args slot. Allocator-free — the
+/// guest-side bytes outlive the test through `TestGuestMem.deinit`.
+fn testKeyvalueStringArg(ci: *ComponentInstance, bytes: []const u8) !InterfaceValue {
+    const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+    return .{ .string = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
+}
+
+/// Lift a host `[]const u8` into a guest `list<u8>`-shaped
+/// `InterfaceValue` via the test guest memory.
+fn testKeyvalueListArg(ci: *ComponentInstance, bytes: []const u8) !InterfaceValue {
+    const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+    return .{ .list = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
+}
+
+test "wasi:keyvalue/store: open + set + get round-trip (#583 B4)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    // open("primary") → result<own<bucket>, error>::ok(handle).
+    const open_args = [_]InterfaceValue{
+        try testKeyvalueStringArg(&ci, "primary"),
+    };
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+
+    try testing.expect(open_results[0] == .result_val);
+    try testing.expect(open_results[0].result_val.is_ok);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // set(handle, "alpha", "value-bytes-here") → result::ok.
+    const set_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "alpha"),
+        try testKeyvalueListArg(&ci, "value-bytes-here"),
+    };
+    var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+    defer set_results[0].deinit(testing.allocator);
+    try testing.expect(set_results[0] == .result_val);
+    try testing.expect(set_results[0].result_val.is_ok);
+
+    // get(handle, "alpha") → result::ok(option::some(list)).
+    const get_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "alpha"),
+    };
+    var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueBucketGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+    defer get_results[0].deinit(testing.allocator);
+
+    try testing.expect(get_results[0] == .result_val);
+    try testing.expect(get_results[0].result_val.is_ok);
+    const some = get_results[0].result_val.payload.?.option_val;
+    try testing.expect(some.is_some);
+    const list_pl = some.payload.?.list;
+    const read_back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
+    try testing.expectEqualSlices(u8, "value-bytes-here", read_back);
+
+    // Set on the same key replaces the value (no leak).
+    const set2_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "alpha"),
+        try testKeyvalueListArg(&ci, "shorter"),
+    };
+    var set2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set2_args, &set2_results, testing.allocator);
+    defer set2_results[0].deinit(testing.allocator);
+    try testing.expect(set2_results[0].result_val.is_ok);
+
+    // get on a missing key → result::ok(option::none).
+    const miss_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "ghost"),
+    };
+    var miss_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueBucketGet(&adapter, &ci, &miss_args, &miss_results, testing.allocator);
+    defer miss_results[0].deinit(testing.allocator);
+    try testing.expect(miss_results[0].result_val.is_ok);
+    try testing.expect(!miss_results[0].result_val.payload.?.option_val.is_some);
+}
+
+test "wasi:keyvalue/store: delete + exists semantics (#583 B4)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{
+        try testKeyvalueStringArg(&ci, "sessions"),
+    };
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // set + exists:true.
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+            try testKeyvalueListArg(&ci, "v1"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+    }
+    {
+        const exists_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+        };
+        var exists_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketExists(&adapter, &ci, &exists_args, &exists_results, testing.allocator);
+        defer exists_results[0].deinit(testing.allocator);
+        try testing.expect(exists_results[0].result_val.is_ok);
+        try testing.expectEqual(true, exists_results[0].result_val.payload.?.bool);
+    }
+    // delete on present key → ok.
+    {
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketDelete(&adapter, &ci, &del_args, &del_results, testing.allocator);
+        defer del_results[0].deinit(testing.allocator);
+        try testing.expect(del_results[0].result_val.is_ok);
+    }
+    // exists is now false.
+    {
+        const exists_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+        };
+        var exists_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketExists(&adapter, &ci, &exists_args, &exists_results, testing.allocator);
+        defer exists_results[0].deinit(testing.allocator);
+        try testing.expectEqual(false, exists_results[0].result_val.payload.?.bool);
+    }
+    // delete on an absent key is also ok per WIT contract.
+    {
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketDelete(&adapter, &ci, &del_args, &del_results, testing.allocator);
+        defer del_results[0].deinit(testing.allocator);
+        try testing.expect(del_results[0].result_val.is_ok);
+    }
+    // get on a non-existent store-handle → no-such-store.
+    {
+        const get_args = [_]InterfaceValue{
+            .{ .handle = 9999 },
+            try testKeyvalueStringArg(&ci, "k1"),
+        };
+        var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+        defer get_results[0].deinit(testing.allocator);
+        try testing.expect(!get_results[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(KeyvalueErrorTag.no_such_store)),
+            get_results[0].result_val.payload.?.variant_val.discriminant,
+        );
+    }
+}
+
+test "wasi:keyvalue/store: list-keys pagination across the page boundary (#583 B4)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 256 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "bulk")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // Populate one more entry than the page size so list-keys must
+    // return a non-empty cursor at the first call. Each key is
+    // unique so the set count == the bucket-entries count.
+    const total: usize = KEYVALUE_LIST_KEYS_PAGE_SIZE + 5;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| testing.allocator.free(k.*);
+        seen.deinit(testing.allocator);
+    }
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const key_bytes = try std.fmt.bufPrint(&buf, "k-{d:0>4}", .{i});
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, key_bytes),
+            try testKeyvalueListArg(&ci, "v"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        set_results[0].deinit(testing.allocator);
+    }
+
+    // First page: cursor = none.
+    var page1_keys: usize = 0;
+    var page1_cursor_bytes: ?[]u8 = null;
+    defer if (page1_cursor_bytes) |b| testing.allocator.free(b);
+    {
+        const list_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .option_val = .{ .is_some = false, .payload = null } },
+        };
+        var list_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketListKeys(&adapter, &ci, &list_args, &list_results, testing.allocator);
+        defer list_results[0].deinit(testing.allocator);
+        try testing.expect(list_results[0].result_val.is_ok);
+        const rec = list_results[0].result_val.payload.?.record_val;
+        page1_keys = rec[0].list.len;
+        try testing.expectEqual(KEYVALUE_LIST_KEYS_PAGE_SIZE, page1_keys);
+        try testing.expect(rec[1].option_val.is_some);
+        const cursor_pl = rec[1].option_val.payload.?.string;
+        const cursor_view = ci.readGuestBytes(cursor_pl.ptr, cursor_pl.len) orelse return error.IoError;
+        page1_cursor_bytes = try testing.allocator.dupe(u8, cursor_view);
+    }
+
+    // Second page: pass the cursor from the first page; expect 5
+    // more keys, then a none cursor.
+    {
+        const cursor_arg_ptr = try testing.allocator.create(InterfaceValue);
+        defer testing.allocator.destroy(cursor_arg_ptr);
+        cursor_arg_ptr.* = try testKeyvalueStringArg(&ci, page1_cursor_bytes.?);
+        const list_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .option_val = .{ .is_some = true, .payload = cursor_arg_ptr } },
+        };
+        var list_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketListKeys(&adapter, &ci, &list_args, &list_results, testing.allocator);
+        defer list_results[0].deinit(testing.allocator);
+        try testing.expect(list_results[0].result_val.is_ok);
+        const rec = list_results[0].result_val.payload.?.record_val;
+        try testing.expectEqual(@as(u32, 5), rec[0].list.len);
+        try testing.expect(!rec[1].option_val.is_some);
+    }
+
+    // Reading the page-1 keys back into a host set confirms we got
+    // a *page-size* slice of distinct entries (not duplicates).
+    {
+        const list_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .option_val = .{ .is_some = false, .payload = null } },
+        };
+        var list_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketListKeys(&adapter, &ci, &list_args, &list_results, testing.allocator);
+        defer list_results[0].deinit(testing.allocator);
+        const rec = list_results[0].result_val.payload.?.record_val;
+        const list_ptr = rec[0].list.ptr;
+        const list_len = rec[0].list.len;
+        const stride: u32 = 8;
+        const bytes = ci.readGuestBytes(list_ptr, list_len * stride) orelse return error.IoError;
+        var idx: u32 = 0;
+        while (idx < list_len) : (idx += 1) {
+            const off = idx * stride;
+            const kp = std.mem.readInt(u32, bytes[off..][0..4], .little);
+            const kl = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
+            const k_view = ci.readGuestBytes(kp, kl) orelse return error.IoError;
+            const owned = try testing.allocator.dupe(u8, k_view);
+            const gop = try seen.getOrPut(testing.allocator, owned);
+            if (gop.found_existing) {
+                testing.allocator.free(owned);
+                try testing.expect(false); // duplicate key in page
+            }
+        }
+        try testing.expectEqual(KEYVALUE_LIST_KEYS_PAGE_SIZE, seen.count());
+    }
+}
+
+test "wasi:keyvalue/atomics: increment positive / negative / overflow (#583 B4)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "counters")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // First increment on a missing key creates it with the delta.
+    {
+        const inc_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "hits"),
+            .{ .s64 = 10 },
+        };
+        var inc_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueAtomicsIncrement(&adapter, &ci, &inc_args, &inc_results, testing.allocator);
+        defer inc_results[0].deinit(testing.allocator);
+        try testing.expect(inc_results[0].result_val.is_ok);
+        try testing.expectEqual(@as(i64, 10), inc_results[0].result_val.payload.?.s64);
+    }
+    // Positive delta accumulates.
+    {
+        const inc_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "hits"),
+            .{ .s64 = 32 },
+        };
+        var inc_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueAtomicsIncrement(&adapter, &ci, &inc_args, &inc_results, testing.allocator);
+        defer inc_results[0].deinit(testing.allocator);
+        try testing.expectEqual(@as(i64, 42), inc_results[0].result_val.payload.?.s64);
+    }
+    // Negative delta subtracts.
+    {
+        const inc_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "hits"),
+            .{ .s64 = -50 },
+        };
+        var inc_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueAtomicsIncrement(&adapter, &ci, &inc_args, &inc_results, testing.allocator);
+        defer inc_results[0].deinit(testing.allocator);
+        try testing.expectEqual(@as(i64, -8), inc_results[0].result_val.payload.?.s64);
+    }
+    // Overflow → error::other("increment overflow").
+    {
+        // First force the value up to s64::max - 1.
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "near-max"),
+            try testKeyvalueListArg(&ci, &([_]u8{ 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F })),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+
+        const inc_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "near-max"),
+            .{ .s64 = 100 },
+        };
+        var inc_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueAtomicsIncrement(&adapter, &ci, &inc_args, &inc_results, testing.allocator);
+        defer inc_results[0].deinit(testing.allocator);
+        try testing.expect(!inc_results[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(KeyvalueErrorTag.other)),
+            inc_results[0].result_val.payload.?.variant_val.discriminant,
+        );
+    }
+    // Existing value with the wrong byte length → error::other.
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "ascii"),
+            try testKeyvalueListArg(&ci, "not-a-number"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+        const inc_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "ascii"),
+            .{ .s64 = 1 },
+        };
+        var inc_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueAtomicsIncrement(&adapter, &ci, &inc_args, &inc_results, testing.allocator);
+        defer inc_results[0].deinit(testing.allocator);
+        try testing.expect(!inc_results[0].result_val.is_ok);
+    }
+}
+
+test "wasi:keyvalue/store: bucket-drop frees the resource slot (#583 B4)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "drop-test")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // Put a few entries so the drop has owned bytes to free.
+    const set_args = [_]InterfaceValue{
+        .{ .handle = bucket_handle },
+        try testKeyvalueStringArg(&ci, "kkk"),
+        try testKeyvalueListArg(&ci, "vvv"),
+    };
+    var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+    defer set_results[0].deinit(testing.allocator);
+
+    // Slot is occupied.
+    try testing.expect(adapter.keyvalue_buckets.items[bucket_handle] != null);
+
+    // Drop the bucket.
+    const drop_args = [_]InterfaceValue{.{ .handle = bucket_handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.keyvalueBucketDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+
+    // Slot is nulled. `WasiCliAdapter.deinit` won't see a leaked
+    // bucket — verified end-to-end by the testing allocator's
+    // leak check at scope exit.
+    try testing.expect(adapter.keyvalue_buckets.items[bucket_handle] == null);
+}
+
+test "wasi:keyvalue/batch: get-many + set-many + delete-many round-trip (#583 B4)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 128 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "batch")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // Lay out a `list<tuple<string, list<u8>>>` of 3 entries in
+    // guest memory: each tuple element is 16 bytes (ptr+len pairs).
+    const tuples: u32 = 3;
+    const stride: u32 = 16;
+    const tup_ptr = ci.hostAllocGuest(tuples * stride, 4) orelse return error.OutOfMemory;
+    {
+        const dst = ci.writableGuestBytes(tup_ptr, tuples * stride) orelse return error.OutOfMemory;
+        const k1_ptr = ci.hostAllocAndWrite("a") orelse return error.OutOfMemory;
+        const v1_ptr = ci.hostAllocAndWrite("apple") orelse return error.OutOfMemory;
+        const k2_ptr = ci.hostAllocAndWrite("b") orelse return error.OutOfMemory;
+        const v2_ptr = ci.hostAllocAndWrite("banana") orelse return error.OutOfMemory;
+        const k3_ptr = ci.hostAllocAndWrite("c") orelse return error.OutOfMemory;
+        const v3_ptr = ci.hostAllocAndWrite("cherry") orelse return error.OutOfMemory;
+        const entries = [_]struct { kp: u32, kl: u32, vp: u32, vl: u32 }{
+            .{ .kp = k1_ptr, .kl = 1, .vp = v1_ptr, .vl = 5 },
+            .{ .kp = k2_ptr, .kl = 1, .vp = v2_ptr, .vl = 6 },
+            .{ .kp = k3_ptr, .kl = 1, .vp = v3_ptr, .vl = 6 },
+        };
+        for (entries, 0..) |e, i| {
+            const off = i * stride;
+            std.mem.writeInt(u32, dst[off..][0..4], e.kp, .little);
+            std.mem.writeInt(u32, dst[off + 4 ..][0..4], e.kl, .little);
+            std.mem.writeInt(u32, dst[off + 8 ..][0..4], e.vp, .little);
+            std.mem.writeInt(u32, dst[off + 12 ..][0..4], e.vl, .little);
+        }
+    }
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = tup_ptr, .len = tuples } },
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBatchSetMany(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+        try testing.expect(set_results[0].result_val.is_ok);
+    }
+    // get-many over ["b", "missing", "a"] — middle slot is option::none.
+    var get_keys_ptr: u32 = 0;
+    {
+        const list_stride: u32 = 8;
+        const keys_len: u32 = 3;
+        get_keys_ptr = ci.hostAllocGuest(keys_len * list_stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(get_keys_ptr, keys_len * list_stride) orelse return error.OutOfMemory;
+        const kb_ptr = ci.hostAllocAndWrite("b") orelse return error.OutOfMemory;
+        const km_ptr = ci.hostAllocAndWrite("missing") orelse return error.OutOfMemory;
+        const ka_ptr = ci.hostAllocAndWrite("a") orelse return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[0..4], kb_ptr, .little);
+        std.mem.writeInt(u32, dst[4..8], 1, .little);
+        std.mem.writeInt(u32, dst[8..12], km_ptr, .little);
+        std.mem.writeInt(u32, dst[12..16], 7, .little);
+        std.mem.writeInt(u32, dst[16..20], ka_ptr, .little);
+        std.mem.writeInt(u32, dst[20..24], 1, .little);
+        const get_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = get_keys_ptr, .len = keys_len } },
+        };
+        var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBatchGetMany(&adapter, &ci, &get_args, &get_results, testing.allocator);
+        defer get_results[0].deinit(testing.allocator);
+        try testing.expect(get_results[0].result_val.is_ok);
+        const out = get_results[0].result_val.payload.?.list;
+        try testing.expectEqual(@as(u32, 3), out.len);
+        const opt_stride: u32 = 20;
+        const out_bytes = ci.readGuestBytes(out.ptr, out.len * opt_stride) orelse return error.IoError;
+        try testing.expectEqual(@as(u8, 1), out_bytes[0]); // "b" → some
+        try testing.expectEqual(@as(u8, 0), out_bytes[opt_stride]); // "missing" → none
+        try testing.expectEqual(@as(u8, 1), out_bytes[2 * opt_stride]); // "a" → some
+
+        // Verify the "a" entry payload roundtrips as "apple".
+        const a_off: u32 = 2 * opt_stride;
+        const a_str_ptr = std.mem.readInt(u32, out_bytes[a_off + 4 ..][0..4], .little);
+        const a_str_len = std.mem.readInt(u32, out_bytes[a_off + 8 ..][0..4], .little);
+        const a_val_ptr = std.mem.readInt(u32, out_bytes[a_off + 12 ..][0..4], .little);
+        const a_val_len = std.mem.readInt(u32, out_bytes[a_off + 16 ..][0..4], .little);
+        const a_key = ci.readGuestBytes(a_str_ptr, a_str_len) orelse return error.IoError;
+        const a_val = ci.readGuestBytes(a_val_ptr, a_val_len) orelse return error.IoError;
+        try testing.expectEqualSlices(u8, "a", a_key);
+        try testing.expectEqualSlices(u8, "apple", a_val);
+    }
+    // delete-many ["a", "c"]; afterwards only "b" remains.
+    {
+        const list_stride: u32 = 8;
+        const dk_ptr = ci.hostAllocGuest(2 * list_stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(dk_ptr, 2 * list_stride) orelse return error.OutOfMemory;
+        const ka_ptr = ci.hostAllocAndWrite("a") orelse return error.OutOfMemory;
+        const kc_ptr = ci.hostAllocAndWrite("c") orelse return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[0..4], ka_ptr, .little);
+        std.mem.writeInt(u32, dst[4..8], 1, .little);
+        std.mem.writeInt(u32, dst[8..12], kc_ptr, .little);
+        std.mem.writeInt(u32, dst[12..16], 1, .little);
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = dk_ptr, .len = 2 } },
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBatchDeleteMany(&adapter, &ci, &del_args, &del_results, testing.allocator);
+        defer del_results[0].deinit(testing.allocator);
+        try testing.expect(del_results[0].result_val.is_ok);
+    }
+    {
+        const ex_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "a"),
+        };
+        var ex_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketExists(&adapter, &ci, &ex_args, &ex_results, testing.allocator);
+        defer ex_results[0].deinit(testing.allocator);
+        try testing.expectEqual(false, ex_results[0].result_val.payload.?.bool);
+    }
+    {
+        const ex_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "b"),
+        };
+        var ex_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketExists(&adapter, &ci, &ex_args, &ex_results, testing.allocator);
+        defer ex_results[0].deinit(testing.allocator);
+        try testing.expectEqual(true, ex_results[0].result_val.payload.?.bool);
+    }
+}
+
+test "populateWasiProviders: binds wasi:keyvalue store + atomics + batch (#583 B4)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:keyvalue/store@0.2.0-draft2", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:keyvalue/atomics@0.2.0-draft2", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:keyvalue/batch@0.2.0-draft2", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:keyvalue/store@0.2.0-draft2"));
+    try testing.expect(providers.contains("wasi:keyvalue/atomics@0.2.0-draft2"));
+    try testing.expect(providers.contains("wasi:keyvalue/batch@0.2.0-draft2"));
+
+    // Spot-check the member registration so a stale `populateWasiKeyvalueStore`
+    // doesn't silently miss a method.
+    const store_binding = providers.get("wasi:keyvalue/store@0.2.0-draft2").?;
+    try testing.expect(store_binding.host_instance.members.contains("open"));
+    try testing.expect(store_binding.host_instance.members.contains("[method]bucket.get"));
+    try testing.expect(store_binding.host_instance.members.contains("[method]bucket.set"));
+    try testing.expect(store_binding.host_instance.members.contains("[method]bucket.delete"));
+    try testing.expect(store_binding.host_instance.members.contains("[method]bucket.exists"));
+    try testing.expect(store_binding.host_instance.members.contains("[method]bucket.list-keys"));
+    try testing.expect(store_binding.host_instance.members.contains("[resource-drop]bucket"));
+
+    const atomics_binding = providers.get("wasi:keyvalue/atomics@0.2.0-draft2").?;
+    try testing.expect(atomics_binding.host_instance.members.contains("increment"));
+
+    const batch_binding = providers.get("wasi:keyvalue/batch@0.2.0-draft2").?;
+    try testing.expect(batch_binding.host_instance.members.contains("get-many"));
+    try testing.expect(batch_binding.host_instance.members.contains("set-many"));
+    try testing.expect(batch_binding.host_instance.members.contains("delete-many"));
 }
