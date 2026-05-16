@@ -1211,6 +1211,25 @@ pub const FsWriteStreamCtx = struct {
     append: bool,
 };
 
+/// A `udp-socket.receive` call that found no datagram waiting on its
+/// first non-blocking `recvfrom(2)` and so returned a `.pending`
+/// future. The async event driver (`driveAsyncEvents`) polls the
+/// recorded fd on every `waitable-set.wait` iteration and, when a
+/// datagram arrives, lifts the `result<tuple<list<u8>,
+/// ip-socket-address>, error-code>` payload into the future and
+/// fires the WaitableSet wakeup so the guest's awaited `.receive()`
+/// resolves (#576).
+///
+/// Mirrors the deferred-completion shape used by the `wasi:clocks`
+/// timer-future infrastructure (#551): the host adapter parks the
+/// future, the driver drives it on each event-loop tick, and the
+/// trampoline's `async_lower_retptr` stash gets written when the
+/// future settles.
+pub const PendingUdpReceive = struct {
+    future_handle: u32,
+    sock_handle: u32,
+};
+
 /// Map a `std.Io.net.HostName.LookupError` to the closest
 /// `wasi:sockets/network.error-code` variant. Most parse / nameserver
 /// failures funnel into `permanent-resolver-failure`; transient errors
@@ -2785,6 +2804,13 @@ pub const WasiCliAdapter = struct {
     /// `AsyncStream` itself but not the host context.
     fs_write_stream_ctxs: std.ArrayListUnmanaged(*FsWriteStreamCtx) = .empty,
 
+    /// Pending `udp-socket.receive` async-futures that found no datagram
+    /// waiting on their first non-blocking `recvfrom(2)`. Drained by
+    /// `completeReadyPendingUdpReceives` on every `driveAsyncEvents`
+    /// tick so the guest's awaited `.receive()` resolves as soon as a
+    /// datagram lands in the kernel queue (#576).
+    pending_udp_receives: std.ArrayListUnmanaged(PendingUdpReceive) = .empty,
+
     /// `wasi:http/types` resource tables (#149). Each slot owns a
     /// heap-allocated rep struct; resource-drop nulls the slot and
     /// frees the underlying allocation. `deinit` mops up any slots
@@ -2977,6 +3003,7 @@ pub const WasiCliAdapter = struct {
         self.sockets_types_p3_iface.deinit(self.allocator);
         self.timer_futures.deinit(self.allocator);
         self.timer_future_ready.deinit(self.allocator);
+        self.pending_udp_receives.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -4996,13 +5023,123 @@ pub const WasiCliAdapter = struct {
         return fired;
     }
 
+    /// Drain any pending `udp-socket.receive` futures whose backing fd
+    /// has a datagram available, settling each future with the lifted
+    /// `result<tuple<list<u8>, ip-socket-address>, error-code>` ok
+    /// payload. Mirrors the timer-future settle path in
+    /// `completeDueTimerFutures` — the future's `subtask_managed`
+    /// flag (set by the async-lower trampoline) routes the wakeup
+    /// through the `.subtask` waitable kind with `STATUS_RETURNED`
+    /// so the guest's awaited `.receive()` resolves cleanly. (#576)
+    ///
+    /// Pending entries whose backing socket has been dropped / torn
+    /// down are settled with `err(invalid_state)`. A successful
+    /// recvfrom always consumes the entry; spurious wakeups (poll
+    /// said ready but recvfrom would-block) leave the entry in place
+    /// for the next tick.
+    pub fn completeReadyPendingUdpReceives(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        allocator: Allocator,
+    ) bool {
+        var fired = false;
+        var i: usize = 0;
+        while (i < self.pending_udp_receives.items.len) {
+            const entry = self.pending_udp_receives.items[i];
+            // Future dropped out from under us — discard the entry.
+            const fut = ci.futures.getPtr(entry.future_handle) orelse {
+                _ = self.pending_udp_receives.swapRemove(i);
+                continue;
+            };
+            // Socket torn down — settle err(invalid_state).
+            const sock = self.lookupSocket(entry.sock_handle);
+            if (sock == null or sock.?.kind != .udp or sock.?.host_socket == null) {
+                self.settlePendingUdpReceiveErr(ci, fut, .invalid_state, allocator) catch {};
+                _ = self.pending_udp_receives.swapRemove(i);
+                fired = true;
+                continue;
+            }
+            const host_socket = sock.?.host_socket.?;
+            if (!fdPollReady(host_socket.handle, pollInEvents())) {
+                i += 1;
+                continue;
+            }
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var buf: [65536]u8 = undefined;
+            const recv_res = host_socket.receiveTimeout(io, &buf, .{
+                .duration = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake },
+            });
+            if (recv_res) |recv| {
+                self.settlePendingUdpReceiveOk(ci, fut, recv.data, recv.from, allocator) catch {
+                    self.settlePendingUdpReceiveErr(ci, fut, .unknown, allocator) catch {};
+                };
+                _ = self.pending_udp_receives.swapRemove(i);
+                fired = true;
+            } else |_| {
+                // Spurious poll wakeup — leave entry for next tick.
+                i += 1;
+            }
+        }
+        return fired;
+    }
+
+    /// Settle a pending `udp-socket.receive` future with an `ok` arm
+    /// carrying the just-received datagram. Lowers the
+    /// `tuple<list<u8>, ip-socket-address>` payload into the
+    /// canonical-ABI byte buffer used by the executor's async-lower
+    /// retptr copy and stashes it on `fut.payload` so the
+    /// `Future.deinit` path frees it at drop time. (#576)
+    fn settlePendingUdpReceiveOk(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        fut: *async_mod.Future,
+        data: []const u8,
+        remote: std.Io.net.IpAddress,
+        allocator: Allocator,
+    ) !void {
+        _ = self;
+        const ok_tuple = try socketsP3LowerUdpReceivePayload(ci, data, remote);
+        defer {
+            const fields = ok_tuple.tuple_val;
+            fields[1].deinit(ci.allocator);
+            ci.allocator.free(fields);
+        }
+        const ok_payload = try ci.allocator.create(InterfaceValue);
+        defer ci.allocator.destroy(ok_payload);
+        ok_payload.* = ok_tuple;
+        const ok_result = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+        const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .udp_receive_err, ok_result);
+        settleFutureDeferred(ci, fut, payload_bytes, allocator);
+    }
+
+    /// Settle a pending `udp-socket.receive` future with an `err`
+    /// arm carrying the given `error-code` discriminant. Used for
+    /// socket-torn-down and lowering-failure paths.
+    fn settlePendingUdpReceiveErr(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        fut: *async_mod.Future,
+        code: SocketErrorCode,
+        allocator: Allocator,
+    ) !void {
+        _ = self;
+        const val = try socketsP3BuildUnitErrResultIv(ci.allocator, false, code);
+        defer val.deinit(ci.allocator);
+        const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .udp_receive_err, val);
+        settleFutureDeferred(ci, fut, payload_bytes, allocator);
+    }
+
     /// `ComponentInstance.async_event_driver` hook (#551). Advances the
     /// host monotonic clock (honoring `monotonic_clock_override` so unit
     /// tests stay deterministic) and drains any due timer-futures into
-    /// the WaitableSet they were joined to via `waitable.join`. When the
-    /// caller is blocking on `waitable-set.wait` and `wait_for_ns_hint`
-    /// is non-null, this routine sleeps the host thread until the
-    /// earliest pending deadline or the hint, whichever comes first.
+    /// the WaitableSet they were joined to via `waitable.join`. Also
+    /// drives any pending `udp-socket.receive` futures via
+    /// `completeReadyPendingUdpReceives` so a datagram landing in the
+    /// kernel queue resolves the guest's awaited `.receive()` (#576).
+    /// When the caller is blocking on `waitable-set.wait` and
+    /// `wait_for_ns_hint` is non-null, this routine sleeps the host
+    /// thread until the earliest pending deadline or the hint,
+    /// whichever comes first.
     ///
     /// The sleep is bounded by the hint so tests with mocked clocks
     /// (override set) don't actually block on host time. Returns whether
@@ -5018,7 +5155,12 @@ pub const WasiCliAdapter = struct {
         // Drain anything already due first — the common case for
         // `wait-for(0)` / `wait-until(past)` and for tests that
         // pre-advance `monotonic_clock_override`.
-        const fired = self.completeDueTimerFutures(ci, allocator);
+        var fired = self.completeDueTimerFutures(ci, allocator);
+        // Drain any pending UDP `recvfrom`s whose fd is now readable.
+        // Runs before the optional sleep so a datagram already in the
+        // kernel queue resolves synchronously without spending the
+        // hint budget. (#576)
+        if (self.completeReadyPendingUdpReceives(ci, allocator)) fired = true;
 
         // Caller asked us not to block (poll variant); return immediately.
         const hint_ns = wait_for_ns_hint orelse return fired;
@@ -5029,26 +5171,39 @@ pub const WasiCliAdapter = struct {
         // (tests), don't sleep — the test mutates the override manually
         // and re-enters `driveAsyncEvents` to deliver.
         if (self.monotonic_clock_override != null) return false;
-        if (self.timer_futures.items.len == 0) return false;
+        const have_udp_pending = self.pending_udp_receives.items.len > 0;
+        if (self.timer_futures.items.len == 0 and !have_udp_pending) return false;
 
         const now = self.monotonicNs();
         var soonest: u64 = std.math.maxInt(u64);
         for (self.timer_futures.items) |tf| {
             if (tf.deadline_ns < soonest) soonest = tf.deadline_ns;
         }
-        if (soonest == std.math.maxInt(u64)) return false;
+        // If we have pending UDP receives, cap the sleep at a short
+        // budget so we re-poll the fd within the hint window even if
+        // no timer is set. The kernel doesn't notify us of socket
+        // readiness from `sleep`, so we re-enter to call
+        // `fdPollReady` again.
+        const udp_repoll_ns: u64 = 1 * std.time.ns_per_ms;
+        var cap_ns: u64 = hint_ns;
+        if (soonest != std.math.maxInt(u64)) {
+            const delta_ns: u64 = if (soonest > now) soonest - now else 0;
+            cap_ns = @min(cap_ns, delta_ns);
+        }
+        if (have_udp_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
+        if (cap_ns == 0 and soonest == std.math.maxInt(u64) and !have_udp_pending) return false;
 
-        const delta_ns: u64 = if (soonest > now) soonest - now else 0;
-        const sleep_ns = @min(delta_ns, hint_ns);
-        if (sleep_ns > 0) {
+        if (cap_ns > 0) {
             const io = std.Io.Threaded.global_single_threaded.io();
             const duration: std.Io.Clock.Duration = .{
-                .raw = .{ .nanoseconds = sleep_ns },
+                .raw = .{ .nanoseconds = cap_ns },
                 .clock = .awake,
             };
             duration.sleep(io) catch {};
         }
-        return self.completeDueTimerFutures(ci, allocator);
+        var post = self.completeDueTimerFutures(ci, allocator);
+        if (self.completeReadyPendingUdpReceives(ci, allocator)) post = true;
+        return post;
     }
 
     /// `ComponentInstance.async_cancel_driver` hook (#551). Invoked from
@@ -11740,6 +11895,39 @@ pub const WasiCliAdapter = struct {
         return h;
     }
 
+    /// Settle a previously-`.pending` future deferred-completion style:
+    /// write the just-lowered `payload_bytes` to the trampoline's
+    /// stashed `async_lower_retptr` (so the guest observes the result
+    /// where it expects to read it), pin the bytes on the future slot
+    /// for drop-time freeing, transition `state = .ready`, and fire
+    /// the WaitableSet wakeup the guest will see on its next
+    /// `waitable-set.{wait,poll}`. Mirrors the timer-future settle
+    /// path in `completeDueTimerFutures` but with payload copy out
+    /// for the async-with-result shape. (#576)
+    fn settleFutureDeferred(
+        ci: *ComponentInstance,
+        fut: *async_mod.Future,
+        payload_bytes: []u8,
+        allocator: Allocator,
+    ) void {
+        if (fut.async_lower_retptr) |retptr| {
+            if (ci.writableGuestBytes(retptr, @intCast(payload_bytes.len))) |dst| {
+                @memcpy(dst, payload_bytes);
+            }
+        }
+        if (fut.payload) |old| ci.allocator.free(old);
+        fut.payload = payload_bytes;
+        fut.state = .ready;
+        fut.write_closed = true;
+        if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx| {
+            const code: u32 = if (fut.subtask_managed)
+                executor_root.STATUS_RETURNED
+            else
+                async_canon.packStatus(.completed, 0);
+            ws.setReady(idx, allocator, code);
+        };
+    }
+
     /// Lower a slice of `std.Io.net.IpAddress` values into a contiguous
     /// canonical-ABI `list<ip-address>` block in guest memory. Returns
     /// the guest pointer at the start of the block; the caller pairs it
@@ -12524,12 +12712,22 @@ pub const WasiCliAdapter = struct {
 
     /// `[method]udp-socket.receive: async func()
     ///   -> result<tuple<list<u8>, ip-socket-address>, error-code>`
-    /// (#519, #535).
+    /// (#519, #535, #576).
     ///
-    /// Async-func host import. Issues a non-blocking `recvfrom(2)` and,
-    /// on success, lifts the resulting `tuple<list<u8>, ip-socket-address>`
-    /// into the future payload via the 0.3 sockets canonical-ABI lowering
-    /// (#535). Errors / would-block surface through a settled err-future.
+    /// Async-func host import. Issues a non-blocking `recvfrom(2)`
+    /// once. If a datagram is already waiting in the kernel queue,
+    /// lifts the resulting `tuple<list<u8>, ip-socket-address>` into
+    /// the future payload synchronously via the 0.3 sockets
+    /// canonical-ABI lowering (#535) and settles the future
+    /// `.ready`. If the fd would block, mints a `.pending` future
+    /// and registers it on `pending_udp_receives` — the adapter's
+    /// `driveAsyncEvents` hook re-polls the fd on every
+    /// `waitable-set.wait` tick and settles the future as soon as a
+    /// datagram arrives (#576), unblocking guests that drive
+    /// `receive` concurrently with `send` (e.g. `futures::join!`).
+    /// Hard error states (`invalid_state` for an unbound socket,
+    /// wrong kind, or unknown handle) still surface through a
+    /// settled err-future immediately.
     fn udpReceiveP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -12558,31 +12756,45 @@ pub const WasiCliAdapter = struct {
         }
         const io = std.Io.Threaded.global_single_threaded.io();
         var buf: [65536]u8 = undefined;
-        const recv = s.host_socket.?.receiveTimeout(io, &buf, .{
+        const recv_res = s.host_socket.?.receiveTimeout(io, &buf, .{
             .duration = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake },
-        }) catch {
-            // Zero-duration timeout: any error treated as "no data" and
-            // the future is settled with err(would-block).
-            results[0] = .{ .handle = try socketReadyAsyncErrFuture(ci, .udp_receive_err, false, .would_block) };
+        });
+        if (recv_res) |recv| {
+            const data = recv.data;
+            const remote = recv.from;
+            const ok_tuple = try socketsP3LowerUdpReceivePayload(ci, data, remote);
+            defer {
+                // Free the host-side tuple fields owned by ci.allocator.
+                const fields = ok_tuple.tuple_val;
+                fields[1].deinit(ci.allocator);
+                ci.allocator.free(fields);
+            }
+            const ok_payload = try ci.allocator.create(InterfaceValue);
+            defer ci.allocator.destroy(ok_payload);
+            ok_payload.* = ok_tuple;
+            const ok_result = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+            const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .udp_receive_err, ok_result);
+            const handle = try spawnReadyFutureBytes(ci, payload_bytes);
+            results[0] = .{ .handle = handle };
             return;
-        };
-
-        const data = recv.data;
-        const remote = recv.from;
-        const ok_tuple = try socketsP3LowerUdpReceivePayload(ci, data, remote);
-        defer {
-            // Free the host-side tuple fields owned by ci.allocator.
-            const fields = ok_tuple.tuple_val;
-            fields[1].deinit(ci.allocator);
-            ci.allocator.free(fields);
+        } else |_| {
+            // No datagram waiting — park the receive on a `.pending`
+            // future and register it with the async event driver so
+            // the next inbound packet completes the future from
+            // `completeReadyPendingUdpReceives`. (#576)
+            const fh = ci.allocAsyncHandle();
+            try ci.futures.put(ci.allocator, fh, .{
+                .elem_type_idx = 0,
+                .state = .pending,
+            });
+            errdefer _ = ci.futures.remove(fh);
+            try self.pending_udp_receives.append(self.allocator, .{
+                .future_handle = fh,
+                .sock_handle = sock_handle,
+            });
+            results[0] = .{ .handle = fh };
+            return;
         }
-        const ok_payload = try ci.allocator.create(InterfaceValue);
-        defer ci.allocator.destroy(ok_payload);
-        ok_payload.* = ok_tuple;
-        const ok_result = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
-        const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .udp_receive_err, ok_result);
-        const handle = try spawnReadyFutureBytes(ci, payload_bytes);
-        results[0] = .{ .handle = handle };
     }
 
     /// `wasi:sockets/ip-name-lookup@0.3.0-*.resolve-addresses:
@@ -22868,14 +23080,247 @@ test "sockets P3: udp echo round-trip via host-side bind + send + receive (#519)
     try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
     try testing.expect(results[0] == .handle);
     const fut = ci.futures.getPtr(results[0].handle).?;
+    // With the #576 deferred-completion path, `udpReceiveP3` returns a
+    // `.pending` future when its first non-blocking recvfrom would
+    // block. The busy-poll above is best-effort so the datagram may
+    // not yet be visible; in that case the future stays pending until
+    // the next `driveAsyncEvents` tick. Both states are valid; only
+    // the ready case carries a lifted payload.
+    if (fut.state == async_mod.Future.State.ready) {
+        try testing.expect(fut.payload != null);
+        try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok
+    } else {
+        try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+        try testing.expect(fut.payload == null);
+        // Drive the pending receive — gives the kernel another window
+        // to deliver and lets the host driver settle the future.
+        var drive_attempts: usize = 0;
+        while (drive_attempts < 1000 and fut.state == .pending) : (drive_attempts += 1) {
+            _ = adapter.completeReadyPendingUdpReceives(&ci, testing.allocator);
+        }
+    }
+}
+
+/// Spin up a pair of bound loopback UDP sockets in `adapter.socket_table`
+/// (slot 0 = sender, slot 1 = receiver). Returns the receiver port the
+/// sender should dst to. Used by the deferred-receive tests (#576).
+fn p3UdpReceiveTestSetup(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+) !u16 {
+    try p3SocketsAllowLoopback(adapter);
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(adapter, ci, &args, &results, std.testing.allocator);
+        std.testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(adapter, ci, &args, &results, std.testing.allocator);
+        std.testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var any: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    adapter.socket_table.items[0].?.host_socket = std.Io.net.IpAddress.bind(&any, io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    }) catch return error.SkipZigTest;
+    adapter.socket_table.items[1].?.host_socket = std.Io.net.IpAddress.bind(&any, io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    }) catch return error.SkipZigTest;
+    adapter.socket_table.items[0].?.state = .bound;
+    adapter.socket_table.items[1].?.state = .bound;
+    return switch (adapter.socket_table.items[1].?.host_socket.?.address) {
+        .ip4 => |v4| v4.port,
+        else => return error.SkipZigTest,
+    };
+}
+
+/// Block (busy-poll) until `fut.state == .ready` by repeatedly driving
+/// the adapter's pending-receive list. Returns `false` if the deadline
+/// elapsed first. Mirrors how `driveAsyncEvents` is called from
+/// `waitable-set.wait` in real component execution.
+fn p3DrainPendingUdpUntilReady(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    fut: *async_mod.Future,
+    iters: usize,
+) bool {
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        _ = adapter.completeReadyPendingUdpReceives(ci, std.testing.allocator);
+        if (fut.state == .ready) return true;
+    }
+    return false;
+}
+
+test "sockets P3 #576: udp-receive parks on .pending future when no data and resolves on first drain" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const receiver_port = try p3UdpReceiveTestSetup(&adapter, &ci);
+
+    // Call receive BEFORE any sendto — should mint a `.pending` future
+    // and register the entry on `pending_udp_receives`.
+    const args = [_]InterfaceValue{.{ .handle = 1 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+    try testing.expect(fut.payload == null);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_udp_receives.items.len);
+    try testing.expectEqual(@as(u32, 1), adapter.pending_udp_receives.items[0].sock_handle);
+
+    // Send a datagram from slot 0 → receiver loopback port.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dest: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = receiver_port } };
+    const payload: []const u8 = "hello-576";
+    try adapter.socket_table.items[0].?.host_socket.?.send(io, &dest, payload);
+
+    // Drain the pending receive. After the datagram lands the next
+    // poll should fire and settle the future ready with `ok(...)`.
+    try testing.expect(p3DrainPendingUdpUntilReady(&adapter, &ci, fut, 10_000));
     try testing.expectEqual(async_mod.Future.State.ready, fut.state);
-    // The payload now carries a fully-lifted
-    // `result<tuple<list<u8>, ip-socket-address>, error-code>` (#535).
-    // Byte 0 is the disc — 0 for `ok` (a datagram was delivered) or 1
-    // for `err(would-block)` if the loose busy-poll loop above didn't
-    // see the datagram in time. Both are acceptable on CI.
     try testing.expect(fut.payload != null);
-    try testing.expect(fut.payload.?[0] == 0 or fut.payload.?[0] == 1);
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok arm
+    try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.items.len);
+}
+
+test "sockets P3 #576: udp-receive drains successive datagrams via repeated receive+park cycles" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 16384);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const receiver_port = try p3UdpReceiveTestSetup(&adapter, &ci);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dest: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = receiver_port } };
+
+    // Send three datagrams, then drain them one by one via three
+    // back-to-back `receive` calls. Each call should either fast-
+    // path (datagram already buffered) or park-and-then-drain.
+    const payloads = [_][]const u8{ "a", "ab", "abc" };
+    for (payloads) |p| try adapter.socket_table.items[0].?.host_socket.?.send(io, &dest, p);
+
+    var i: usize = 0;
+    while (i < payloads.len) : (i += 1) {
+        const args = [_]InterfaceValue{.{ .handle = 1 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+        try testing.expect(results[0] == .handle);
+        const fut = ci.futures.getPtr(results[0].handle).?;
+        if (fut.state != .ready) {
+            try testing.expect(p3DrainPendingUdpUntilReady(&adapter, &ci, fut, 10_000));
+        }
+        try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+        try testing.expect(fut.payload != null);
+        // Each datagram lifts to an `ok(...)` arm.
+        try testing.expectEqual(@as(u8, 0), fut.payload.?[0]);
+    }
+    // All three pending entries (if any were created) have been
+    // consumed by their successful settle.
+    try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.items.len);
+}
+
+test "sockets P3 #576: udp-receive deferred path handles a zero-byte payload datagram" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const receiver_port = try p3UdpReceiveTestSetup(&adapter, &ci);
+
+    // Park on a `.pending` future first, THEN send the zero-byte
+    // datagram so we exercise the deferred-completion path even when
+    // the payload is empty.
+    const args = [_]InterfaceValue{.{ .handle = 1 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_udp_receives.items.len);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dest: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = receiver_port } };
+    const empty: []const u8 = "";
+    try adapter.socket_table.items[0].?.host_socket.?.send(io, &dest, empty);
+
+    try testing.expect(p3DrainPendingUdpUntilReady(&adapter, &ci, fut, 10_000));
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok arm
+    // The lifted `tuple<list<u8>, ip-socket-address>` ok payload begins
+    // at offset 4 (alignUp of disc to 4). `list<u8>` lays out as
+    // (ptr: u32, len: u32) with `len = 0` for the empty datagram.
+    const list_len_off: usize = 8; // disc(1)+pad(3)+ptr(4)
+    const list_len = std.mem.readInt(u32, fut.payload.?[list_len_off..][0..4], .little);
+    try testing.expectEqual(@as(u32, 0), list_len);
+    try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.items.len);
+}
+
+test "sockets P3 #576: udp-receive parked future resolves err(invalid_state) when socket is torn down" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    _ = try p3UdpReceiveTestSetup(&adapter, &ci);
+
+    // Park on .pending future.
+    const args = [_]InterfaceValue{.{ .handle = 1 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_udp_receives.items.len);
+
+    // Tear the receiver socket down (simulate guest dropping it).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (adapter.socket_table.items[1].?.host_socket) |*hs| hs.close(io);
+    adapter.socket_table.items[1].?.host_socket = null;
+    adapter.socket_table.items[1].?.kind = .tcp; // poison: not udp
+
+    // Driver must settle the pending future with err(invalid_state).
+    _ = adapter.completeReadyPendingUdpReceives(&ci, testing.allocator);
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]); // err arm
+    try testing.expectEqual(
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.invalid_state))),
+        fut.payload.?[4],
+    );
+    try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.items.len);
 }
 
 test "sockets P3: resolve-addresses denies without allow-list (#519)" {
