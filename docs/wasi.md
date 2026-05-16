@@ -324,6 +324,37 @@ on every supported platform.
 
 Re-adding an entry requires a one-line rationale + tracking issue.
 
+### Updating the `wasi-microbench` budget
+
+`zig build wasi-microbench` is a host-path regression detector
+(parallel to the CoreMark + cold-start benches) that drives
+`executor.dispatchCanonBuiltin` → `AsyncStream` → host_driver across
+four hot Preview-3 paths — HTTP keep-alive RT, UDP receive, fs
+read/write-via-stream — and fails when the median sample exceeds the
+per-scenario budget in
+[`tests/benchmarks/wasi-microbench/budget.json`](../tests/benchmarks/wasi-microbench/budget.json)
+by more than the regression threshold (default +10 %). CI lives at
+[`.github/workflows/wasi-microbench.yml`](../.github/workflows/wasi-microbench.yml)
+(currently `continue-on-error: true` while the hosted-x86_64 baseline
+stabilises).
+
+To accept an intentional perf change (refactor, new API, etc.):
+
+```console
+$ zig build wasi-microbench -- --no-budget --samples 20 --warmup 5
+```
+
+Take the reported `median_ns` for each scenario, multiply by ~1.5
+(headroom for runner jitter), and edit `budget.json`. Include the
+ratio + rationale in the PR description so future budget-bumps can
+distinguish "intentional regression" from "platform drift".
+
+The bench is intentionally synthetic: it stubs out real sockets /
+`pwrite(2)` to isolate the canonical-ABI lowering + host_driver
+dispatch cost (i.e. the WAMR-side surface), so kernel jitter doesn't
+swamp the signal. Real-network coverage stays under the conformance
+gates (`wasi-testsuite`, `wasi-p3-testsuite`).
+
 ## Roadmap
 
 The post-Preview-3 hardening tracker is

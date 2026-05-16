@@ -718,6 +718,35 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_wasi_streams_bench.addArgs(args);
     wasi_streams_bench_step.dependOn(&run_wasi_streams_bench.step);
 
+    // ── WASI host-path micro-bench / regression detector (#583 W11-6) ─
+    // Drives `executor.dispatchCanonBuiltin` → `AsyncStream` →
+    // host_driver across the four hot Preview-3 host paths
+    // (http-service keep-alive RTs, UDP receive, fs read/write-via-
+    // stream) with synthetic drivers shaped like the production
+    // `wasi_cli_adapter` callbacks. Runs `--samples` rounds, reports
+    // median + p95 + RSS-peak, and compares medians against
+    // `tests/benchmarks/wasi-microbench/budget.json` (default
+    // regression threshold +10 %). See
+    // `tests/benchmarks/wasi-microbench/microbench.zig`.
+    const wasi_microbench_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmarks/wasi-microbench/microbench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    wasi_microbench_module.addImport("wamr", lib_module);
+    const wasi_microbench_exe = b.addExecutable(.{
+        .name = "wasi-microbench",
+        .root_module = wasi_microbench_module,
+    });
+    b.installArtifact(wasi_microbench_exe);
+    const wasi_microbench_step = b.step(
+        "wasi-microbench",
+        "Run the WASI host-path microbench + regression check (#583 W11-6)",
+    );
+    const run_wasi_microbench = b.addRunArtifact(wasi_microbench_exe);
+    if (b.args) |args| run_wasi_microbench.addArgs(args);
+    wasi_microbench_step.dependOn(&run_wasi_microbench.step);
+
     const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, component-loader, interp, aot, diff, canon, wasi)");
     inline for (.{
         .{ .name = "loader", .file = "loader.zig", .needs_aot = false },
