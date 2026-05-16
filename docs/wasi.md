@@ -39,7 +39,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:cli`         | ✅ | ✅ | Real stdio capture, env / args / exit / terminal stubs. |
 | `wasi:clocks`      | ✅ | ✅ | Monotonic + wall / system clock; `wait-for` / `wait-until` host-driven. |
 | `wasi:filesystem`  | ✅ | ✅ | Full descriptor + preopens surface; sandboxed by `--preopen`. |
-| `wasi:http`        | ✅ | ✅ | Real outbound HTTP/HTTPS via `std.http.Client`; incoming-handler HTTP/1.1 (`Connection: close`). |
+| `wasi:http`        | ✅ | ✅ | Real outbound HTTP/HTTPS via `std.http.Client`; incoming-handler HTTP/1.1 (keep-alive / chunked / trailers / limits). HTTPS termination CLI plumbing landed (`--tls-cert` / `--tls-key` / `--tls-pem` + cert / key load); server-side handshake upstream-blocked on Zig 0.16 std ([#609](https://github.com/cataggar/wamr/issues/609)). |
 | `wasi:io`          | ✅ | ✅ | `poll` / `error` / `streams`; P3 stream/future plumbing lives in the canonical ABI. |
 | `wasi:random`      | ✅ | ✅ | OS CSPRNG (`std.crypto.random`) + insecure variants + 128-bit seed. |
 | `wasi:sockets`     | ✅ | ✅ | TCP + UDP + DNS; allow-list gated; SO_REUSEADDR; Windows + POSIX parity. |
@@ -115,7 +115,7 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:sockets/types@0.3.0`               | 43 | `wasi-p3-testsuite` (`sockets-*`) | Unified TCP + UDP resource surface (#486 / #544 / #565). |
 | `wasi:sockets/ip-name-lookup@0.3.0`      |  1 | `wasi-p3-testsuite` | — |
 | `wasi:http/types@0.3.0`                  | 40 | `wasi-p3-testsuite` (`http-*`) | Unified `request` / `response` resource (#487 / #568). |
-| `wasi:http/handler@0.3.0`                |  1 | `wasi-p3-testsuite` (`http-service`) | Incoming-handler trampoline (#549 / #580). |
+| `wasi:http/handler@0.3.0`                |  1 | `wasi-p3-testsuite` (`http-service`) | Incoming-handler trampoline (#549 / #580); HTTP/1.1 keep-alive + chunked + trailers + 431/413 limits (#595); HTTPS termination CLI plumbing in (cert + key loaded at startup) but handshake upstream-blocked on `std.crypto.tls.Server` ([#609](https://github.com/cataggar/wamr/issues/609)). |
 | `wasi:http/client@0.3.0`                 |  1 | `wasi-p3-testsuite` (`http-request`, `http-fields`) | Outbound; async state machine (#583 A2 / #590). |
 
 Both `wasi-testsuite-skip.json` and `wasi-p3-testsuite-skip.json` are

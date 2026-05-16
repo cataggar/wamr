@@ -96,6 +96,20 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // only (default, behaviour-compatible with PR #601).
     var keyvalue_store_path: ?[]const u8 = null;
     var listen_address: ?std.Io.net.IpAddress = null;
+    // `--tls-cert=<path>` + `--tls-key=<path>` (or the combined
+    // `--tls-pem=<path>`) (#583 follow-up to #595): when both cert
+    // and key (or just the combined PEM) are provided alongside
+    // `--listen`, the HTTP service is *prepared* to terminate TLS
+    // on each accepted connection. Today the actual handshake call
+    // is upstream-blocked on Zig 0.16 std not shipping a server-side
+    // TLS API (only `std.crypto.tls.Client`). The cert + key are
+    // still loaded + validated at startup so the CLI surface is
+    // stable; once upstream lands `std.crypto.tls.Server` (tracked
+    // by cataggar/wamr#609) the handshake goes live without
+    // breaking the existing flag shape. Null when not provided.
+    var tls_cert_path: ?[]const u8 = null;
+    var tls_key_path: ?[]const u8 = null;
+    var tls_pem_path: ?[]const u8 = null;
     var stack_size: u32 = 64 * 1024;
     // `--log-level=<name>` (#583 B5). Sets the host-side
     // `wasi:logging/logging.log` severity filter. The CLI flag wins
@@ -134,6 +148,60 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 }
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
                 // Reserved for future WASI heap allocation
+            } else if (std.mem.eql(u8, arg, "--tls-cert") or std.mem.startsWith(u8, arg, "--tls-cert=")) {
+                if (tls_cert_path != null) {
+                    std.debug.print("error: --tls-cert specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--tls-cert")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --tls-cert requires a path to a PEM file\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--tls-cert=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --tls-cert path is empty\n", .{});
+                    return 2;
+                }
+                tls_cert_path = spec;
+            } else if (std.mem.eql(u8, arg, "--tls-key") or std.mem.startsWith(u8, arg, "--tls-key=")) {
+                if (tls_key_path != null) {
+                    std.debug.print("error: --tls-key specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--tls-key")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --tls-key requires a path to a PEM file\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--tls-key=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --tls-key path is empty\n", .{});
+                    return 2;
+                }
+                tls_key_path = spec;
+            } else if (std.mem.eql(u8, arg, "--tls-pem") or std.mem.startsWith(u8, arg, "--tls-pem=")) {
+                if (tls_pem_path != null) {
+                    std.debug.print("error: --tls-pem specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--tls-pem")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --tls-pem requires a path to a combined PEM file\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--tls-pem=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --tls-pem path is empty\n", .{});
+                    return 2;
+                }
+                tls_pem_path = spec;
             } else if (std.mem.eql(u8, arg, "--env") or std.mem.startsWith(u8, arg, "--env=")) {
                 const spec = if (std.mem.eql(u8, arg, "--env")) blk: {
                     i += 1;
@@ -243,6 +311,28 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         return 2;
     };
 
+    // ── TLS flag validation (#583 follow-up / #609) ──────────────────────
+    // Disallowed combinations:
+    //   * `--tls-cert` without `--tls-key` (or vice versa) — the pair is
+    //     load-bearing together.
+    //   * `--tls-pem` combined with either `--tls-cert` or `--tls-key` —
+    //     pick one of the two input shapes.
+    //   * Any of the TLS flags without `--listen` — TLS termination only
+    //     makes sense on the HTTP service path.
+    if (tls_pem_path != null and (tls_cert_path != null or tls_key_path != null)) {
+        std.debug.print("error: --tls-pem is mutually exclusive with --tls-cert / --tls-key\n", .{});
+        return 2;
+    }
+    if ((tls_cert_path == null) != (tls_key_path == null)) {
+        std.debug.print("error: --tls-cert and --tls-key must be specified together\n", .{});
+        return 2;
+    }
+    const tls_requested = tls_cert_path != null or tls_pem_path != null;
+    if (tls_requested and listen_address == null) {
+        std.debug.print("error: --tls-cert / --tls-key / --tls-pem require --listen\n", .{});
+        return 2;
+    }
+
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
     const wasm_data = cwd.readFileAlloc(io, path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
@@ -310,7 +400,25 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 return 2;
             };
             if (listen_address) |addr| {
-                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level);
+                // Load + parse the TLS cert + key at startup, so a
+                // missing file / malformed PEM surfaces before `bind`
+                // (matches the documented startup-validation rule for
+                // every other host-config flag).
+                var tls_config: ?wamr.wasi_cli_adapter.HttpsTlsConfig = null;
+                if (tls_pem_path) |p| {
+                    tls_config = wamr.wasi_cli_adapter.HttpsTlsConfig.loadFromCombinedPath(allocator, p) catch |err| {
+                        std.debug.print("Error: --tls-pem '{s}': {s}\n", .{ p, tlsLoadErrorMessage(err) });
+                        return 2;
+                    };
+                } else if (tls_cert_path) |cp| {
+                    const kp = tls_key_path.?;
+                    tls_config = wamr.wasi_cli_adapter.HttpsTlsConfig.loadFromPaths(allocator, cp, kp) catch |err| {
+                        std.debug.print("Error: --tls-cert '{s}' / --tls-key '{s}': {s}\n", .{ cp, kp, tlsLoadErrorMessage(err) });
+                        return 2;
+                    };
+                }
+                defer if (tls_config) |*c| c.deinit();
+                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level, if (tls_config) |*c| c else null);
             }
             return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path);
         }
@@ -607,6 +715,7 @@ fn runHttpComponent(
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
     listen_address: std.Io.net.IpAddress,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
+    tls_config: ?*const wamr.wasi_cli_adapter.HttpsTlsConfig,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
@@ -630,6 +739,7 @@ fn runHttpComponent(
     adapter_mod.serveHttpComponentBytes(data, arena_alloc, &adapter, .{
         .listen_address = listen_address,
         .announce_listening = listen_address.getPort() == 0,
+        .tls_config = tls_config,
     }) catch |err| {
         switch (err) {
             error.NoIncomingHandlerExport => std.debug.print(
@@ -936,6 +1046,23 @@ fn writeStdout(io: std.Io, text: []const u8) void {
     stdout_file.writeStreamingAll(io, text) catch {};
 }
 
+/// Map an `HttpsTlsConfig.LoadError` to a short, user-facing
+/// diagnostic string. Used by `runRun` to surface cert / key load
+/// failures before bind in a uniform format.
+fn tlsLoadErrorMessage(err: wamr.wasi_cli_adapter.HttpsTlsConfig.LoadError) []const u8 {
+    return switch (err) {
+        error.TlsCertFileNotFound => "certificate file not found",
+        error.TlsKeyFileNotFound => "private-key file not found",
+        error.TlsCertReadFailed => "failed to read certificate file",
+        error.TlsKeyReadFailed => "failed to read private-key file",
+        error.TlsCertParseFailed => "certificate PEM did not parse (missing END marker or malformed base64)",
+        error.TlsKeyParseFailed => "private-key PEM did not parse (unrecognised BEGIN marker — expected PRIVATE KEY, RSA PRIVATE KEY, or EC PRIVATE KEY)",
+        error.TlsCertEmpty => "certificate file did not contain any PEM blocks",
+        error.TlsKeyEmpty => "private-key block missing from combined PEM file",
+        error.OutOfMemory => "out of memory while loading TLS material",
+    };
+}
+
 const top_usage =
     \\wamr - WebAssembly Micro Runtime
     \\
@@ -988,6 +1115,21 @@ const run_usage =
     \\                           Loads on startup (missing file is OK),
     \\                           rewrites synchronously on every mutation.
     \\                           Omit to keep the default in-memory store.
+    \\  --tls-cert PATH          For components serving HTTP: PEM-encoded
+    \\                           certificate chain (leaf first). Requires
+    \\                           --listen and a matching --tls-key. Today
+    \\                           the cert + key are parsed + validated at
+    \\                           startup but the handshake is upstream-
+    \\                           blocked on Zig std (see cataggar/wamr#609);
+    \\                           the listener serves plaintext with a
+    \\                           single stderr warning.
+    \\  --tls-key PATH           For components serving HTTP: PEM-encoded
+    \\                           private key (PKCS#8, RSA, or EC). Pairs
+    \\                           with --tls-cert.
+    \\  --tls-pem PATH           For components serving HTTP: combined PEM
+    \\                           file containing both certificate chain
+    \\                           and private key. Mutually exclusive with
+    \\                           --tls-cert / --tls-key.
     \\
 ;
 
@@ -1192,4 +1334,28 @@ test "loadComponentConfigStore: rejects non-string values and non-object roots (
         error.ConfigStoreNotFound,
         loadComponentConfigStore(arena.allocator(), &env_map, ".zig-cache/wasi-config-test-does-not-exist.json"),
     );
+}
+
+test "tlsLoadErrorMessage covers every load-error arm (#583 follow-up / #609)" {
+    // Each arm of `HttpsTlsConfig.LoadError` must have a unique
+    // user-facing diagnostic string. A new arm added upstream
+    // without a matching switch arm here causes a Zig compile
+    // error (`error.X is not handled`), which is the safety net.
+    const testing = std.testing;
+    try testing.expect(tlsLoadErrorMessage(error.TlsCertFileNotFound).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.TlsKeyFileNotFound).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.TlsCertReadFailed).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.TlsKeyReadFailed).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.TlsCertParseFailed).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.TlsKeyParseFailed).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.TlsCertEmpty).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.TlsKeyEmpty).len > 0);
+    try testing.expect(tlsLoadErrorMessage(error.OutOfMemory).len > 0);
+    // Make sure two distinct arms produce distinct messages —
+    // catches accidental copy-paste collapses in the switch.
+    try testing.expect(!std.mem.eql(
+        u8,
+        tlsLoadErrorMessage(error.TlsCertFileNotFound),
+        tlsLoadErrorMessage(error.TlsKeyFileNotFound),
+    ));
 }
