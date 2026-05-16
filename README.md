@@ -63,14 +63,17 @@ WASI conformance ([WebAssembly/wasi-testsuite][wts]):
 ```console
 $ git submodule update --init tests/wasi-testsuite
 $ pip install -r tests/wasi-testsuite/test-runner/requirements.txt
-$ zig build wasi-testsuite
+$ zig build wasi-testsuite      # WASI Preview 1 + Preview 2 — passing
+$ zig build wasi-p3-testsuite   # WASI Preview 3 (wasm32-wasip3) — 40 / 40 passing
 ```
 
 The suite drives the freshly-built `wamr` CLI through the in-tree adapter at
 [`tests/wasi-testsuite-adapter/wamr-zig.py`](tests/wasi-testsuite-adapter/wamr-zig.py)
-and applies the curated skiplist at
-[`tests/wasi-testsuite-skip.json`](tests/wasi-testsuite-skip.json). Every entry
-in the skiplist must carry a one-line rationale and a follow-up issue number.
+and applies the curated skiplists at
+[`tests/wasi-testsuite-skip.json`](tests/wasi-testsuite-skip.json) (Preview 1 / 2)
+and [`tests/wasi-p3-testsuite-skip.json`](tests/wasi-p3-testsuite-skip.json)
+(Preview 3 — currently empty: every `wasm32-wasip3` fixture passes). Every entry
+in either skiplist must carry a one-line rationale and a follow-up issue number.
 When a previously-skipped test starts passing, delete the entry — the suite is
 the gate against regressions in already-shipped WASI host functions.
 
