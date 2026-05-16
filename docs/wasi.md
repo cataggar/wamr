@@ -29,6 +29,7 @@ seam where each interface name is version-multiplexed onto the matching
 - [Known limitations](#known-limitations)
 - [Build & test](#build--test)
 - [Roadmap](#roadmap)
+- [wasi:blobstore — deferred (#583 B7)](#wasiblobstore--deferred-583-b7)
 - [See also](#see-also)
 
 ## Status overview
@@ -232,8 +233,12 @@ in that tracker.
   integration yet — future work.
 * **`wasi:config@0.2.x`** — not implemented; would read from env / CLI /
   config-store file. ([#583 B6](https://github.com/cataggar/wamr/issues/583))
-* **`wasi:blobstore`, `wasi:cli/run-with-server`** — pending upstream WIT
-  pin. ([#583 B7](https://github.com/cataggar/wamr/issues/583))
+* **`wasi:blobstore`, `wasi:cli/run-with-server`** — deferred. The
+  upstream WIT is still WASI Phase 1 (Feasibility) with active rename
+  proposals and no wasmtime baseline; `run-with-server` has no upstream
+  WIT at all. See [`wasi:blobstore — deferred`](#wasiblobstore--deferred-583-b7)
+  below for the full status check, concrete blockers, and acceptance
+  criteria. ([#583 B7](https://github.com/cataggar/wamr/issues/583))
 
 ### Conformance & CI (section C)
 
@@ -314,12 +319,143 @@ additions (one PR per interface, gated behind the existing
 * ~~**`wasi:logging@0.1.x`**~~ — host adapter shipped (#583 B5); see the
   Preview-2 detail table for the registered methods.
 * **`wasi:config@0.2.x`** — [#583 B6](https://github.com/cataggar/wamr/issues/583).
-* **`wasi:blobstore`, `wasi:cli/run-with-server`** — [#583 B7](https://github.com/cataggar/wamr/issues/583).
+* **`wasi:blobstore`, `wasi:cli/run-with-server`** — deferred. See
+  [`wasi:blobstore — deferred (#583 B7)`](#wasiblobstore--deferred-583-b7)
+  for the upstream status check and acceptance criteria
+  ([#583 B7](https://github.com/cataggar/wamr/issues/583)).
 
 Performance work is tracked separately under
 [#393](https://github.com/cataggar/wamr/issues/393); TLS in Zig std and
 Linux/macOS-specific async I/O (`io_uring`, `kqueue`) are explicitly out
 of scope.
+
+## wasi:blobstore — deferred (#583 B7)
+
+[`#583 B7`](https://github.com/cataggar/wamr/issues/583) groups two
+interfaces whose host adapters are explicitly _not_ being landed in this
+wave: `wasi:blobstore` and the speculative `wasi:cli/run-with-server`
+world. Status as of wave 10 (Nov 2025):
+
+### Upstream snapshot
+
+| Repo / interface | Latest pin | Wasmtime crate | Fixtures | Phase |
+| ---------------- | ---------- | -------------- | -------- | ----- |
+| [`WebAssembly/wasi-blobstore`](https://github.com/WebAssembly/wasi-blobstore) | `v0.2.0-draft` ([commit `005c425`](https://github.com/WebAssembly/wasi-blobstore/tree/v0.2.0-draft), Feb 2024 — re-tagged of the same commit Feb 2024; only chore commits since) | _none_ | _none_ | Phase 1 (Feasibility) |
+| `wasi:cli/run-with-server` (per [#583](https://github.com/cataggar/wamr/issues/583)) | _does not exist upstream_ — no interface in [`WebAssembly/wasi-cli`](https://github.com/WebAssembly/wasi-cli) (`wit/` or `wit-0.3.0-draft/`), no tracking issue, no draft PR | n/a | n/a | n/a |
+
+The `wasi-blobstore` interface surface (summarised here rather than
+vendored under `docs/wasi-blobstore-wit-vendored/`, because we are
+intentionally not shipping host code yet) covers:
+
+* `wasi:blobstore/blobstore` — `create-container`, `get-container`,
+  `delete-container`, `container-exists`, `copy-object`, `move-object`.
+* `wasi:blobstore/container` — `container` and `stream-object-names`
+  resources (`name`, `info`, `get-data`, `write-data`, `list-objects`,
+  `delete-object`, `delete-objects`, `has-object`, `object-info`,
+  `clear`; plus `read-stream-object-names` / `skip-stream-object-names`).
+* `wasi:blobstore/types` — `container-metadata`, `object-metadata`,
+  `object-id`, plus `outgoing-value` / `incoming-value` resources
+  bridging to `wasi:io/streams@0.2.1`.
+
+### Concrete blockers
+
+1. **No wasmtime baseline.** `bytecodealliance/wasmtime` has zero
+   references to `blobstore` in its source tree — there is no
+   `crates/wasi-blobstore`, no host trait, and no commit history
+   suggesting one is imminent. Without a reference host we cannot align
+   `populateWasiProviders` registration, behavioural semantics
+   (`copy-object` cross-container, `delete-objects` partial-failure,
+   `get-data` start/end inclusivity past end-of-blob), or canonicalised
+   `error` strings.
+2. **No conformance fixtures.** The proposal repo ships an empty
+   `test/` directory, and `WebAssembly/wasi-testsuite` contains zero
+   blobstore fixtures. We would have to author the entire conformance
+   suite ourselves, which both burns engineering budget and risks
+   shipping semantics that diverge from whatever the upstream test
+   suite eventually mandates.
+3. **Active design churn — likely breaking changes pending.** Open PRs
+   and issues on the proposal repo (as of Nov 2025):
+   * [PR #26](https://github.com/WebAssembly/wasi-blobstore/pull/26) —
+     rename `wasi:blobstore/blobstore` → `wasi:blob/store` (package
+     rename; would force a re-vendor + every adapter import path
+     change).
+   * [PR #23](https://github.com/WebAssembly/wasi-blobstore/pull/23) —
+     "Reorganizes the blobstore interface" (still open since 2024).
+   * [Issue #32](https://github.com/WebAssembly/wasi-blobstore/issues/32) —
+     rename `container` → `bucket` (resource name).
+   * [Issue #33](https://github.com/WebAssembly/wasi-blobstore/issues/33) —
+     consistency-guarantee semantics still undefined.
+   * [Issue #30](https://github.com/WebAssembly/wasi-blobstore/issues/30) —
+     `container.delete-objects` semantics undefined.
+   * [Issue #29](https://github.com/WebAssembly/wasi-blobstore/issues/29) —
+     `stream-object-names.skip` required-behaviour gap.
+   * [Issue #27](https://github.com/WebAssembly/wasi-blobstore/issues/27) —
+     intended multi-store usage pattern (no concept of store handle).
+   * [Issue #7](https://github.com/WebAssembly/wasi-blobstore/issues/7) —
+     `timestamp` should be a richer type than `u64`.
+   Any one of these landing would invalidate a shipped wamr adapter.
+4. **No Preview-3 async story.** The current WIT targets
+   `wasi:io/streams@0.2.1` synchronous streams. The proposal repo has
+   no `wit-0.3.0-draft/` tree and PR #38 ("Make selected methods
+   async") was closed unmerged. Anything we ship today would have to be
+   re-plumbed onto the P3 `stream<u8>` / `future<...>` lifted forms
+   when the proposal eventually adopts them, mirroring the
+   `wasi:io@0.2 → @0.3` rework that just landed across our other
+   adapters.
+5. **Phase 4 advancement criteria explicitly unmet.** The proposal's
+   own README lists, as preconditions for Phase 4: "At least two
+   independent production implementations", "At least two cloud
+   provider implementations", a cross-platform test suite. None of
+   these exist yet.
+6. **`wasi:cli/run-with-server` does not exist upstream.** The name
+   appears in our [#583](https://github.com/cataggar/wamr/issues/583)
+   tracker as a placeholder for a hypothetical world that fuses
+   `wasi:cli/run` with `wasi:http/incoming-handler` for long-lived
+   server components, but no such world is drafted in
+   [`WebAssembly/wasi-cli`](https://github.com/WebAssembly/wasi-cli),
+   including its `wit-0.3.0-draft/` tree at the
+   [`v0.3.0-rc-2025-09-16`](https://github.com/WebAssembly/wasi-cli/tree/v0.3.0-rc-2025-09-16)
+   tag, and there is no tracking issue. There is nothing to implement
+   against until the upstream world is drafted.
+
+### Acceptance criteria for wamr to implement
+
+We will re-evaluate B7 once **all** of the following are true:
+
+1. **Tagged, non-draft WIT** at `wasi:blobstore@0.2.x` (or successor
+   package name) with rename churn settled — i.e. PRs #26 and #23 on
+   the proposal repo are either merged or formally closed/withdrawn,
+   and the proposal has advanced to WASI Phase 2 (Proposed Spec Text)
+   or higher.
+2. **Upstream host baseline.** Either a `wasi-blobstore` crate landed
+   in `bytecodealliance/wasmtime` (with a tagged release we can target,
+   mirroring our `wasi:keyvalue` / `wasi:config` cadence), _or_ another
+   recognised runtime (jco / wasm-tools) ships a maintained host
+   adapter we can spec-align against.
+3. **Conformance fixtures.** Blobstore fixtures present in
+   `WebAssembly/wasi-testsuite` (or the proposal repo's own
+   `test/` directory), so the wamr adapter can be gated under
+   `zig build wasi-testsuite` / `wasi-p3-testsuite` like every other
+   shipped interface.
+4. **P3 async story decided.** Either a `wit-0.3.0-draft/` tree exists
+   in the proposal repo binding to `wasi:io@0.3` `stream` / `future`
+   primitives, or the WASI subgroup explicitly resolves that
+   `wasi:blobstore` stays on `wasi:io@0.2.1` semantics for the
+   foreseeable future.
+5. **`wasi:cli/run-with-server`**: a draft world (or issue with
+   accepted API sketch) exists in `WebAssembly/wasi-cli`. Until then
+   we treat the `run-with-server` half of B7 as a documentation entry
+   only.
+
+When all five hold, the implementation plan mirrors
+[PR #601](https://github.com/cataggar/wamr/pull/601) (wasi:keyvalue
+memory-store host adapter): vendor the pinned WIT under
+`docs/wasi-blobstore-wit-vendored/`, ship a memory-backed
+`StringHashMapUnmanaged(StringHashMapUnmanaged([]const u8))` adapter in
+`src/component/wasi_cli_adapter.zig`, register through
+`populateWasiProviders`, add unit tests for container/object lifecycle
++ `list-objects`, and bump the Detail-table / Status-overview rows
+above.
 
 ## See also
 
