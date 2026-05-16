@@ -666,6 +666,216 @@ fn socketsP3LowerAsyncPayload(
     return buf;
 }
 
+// ── wasi:http@0.3.0 async-payload type registry (#589) ─────────────────────
+//
+// The P3 `wasi:http/client.send` and `wasi:http/handler.handle` host-imports
+// settle their `result<own<response>, error-code>` return asynchronously via
+// `canon.lower (async)` (#551 / #564). The executor's async-lower trampoline
+// (`executor.zig` ~ line 5183) copies `Future.payload` bytes into the
+// guest's `retptr`; the host must therefore pre-encode the canonical-ABI
+// byte layout of `result<own<response>, error-code>` ahead of the settle.
+//
+// Naively assuming "result discriminant + 4-byte handle" underwrites the
+// destination by 36 bytes (envelope is 40 bytes — see below) and a guest
+// reading the response handle observes whatever uninitialised bytes land
+// at the wrong offset. Routing through this type registry produces the
+// same bytes wit-bindgen ≥ 0.45 would lower on the export side.
+//
+// Indices (consult `http_p3_local_types` below):
+//    0: option<string>                                — internal-error etc.
+//    1: option<u8>                                    — TLS-alert-id
+//    2: option<u16>                                   — DNS info-code
+//    3: option<u32>                                   — header/trailer-section-size
+//    4: option<u64>                                   — body-size
+//    5: record DNS-error-payload
+//    6: record TLS-alert-received-payload
+//    7: record field-size-payload
+//    8: option<field-size-payload>                    — request/header-size arms
+//    9: variant error-code                            (39 cases; matches 0.3 WIT)
+//   10: result<own<response>, error-code>             — client.send / handler.handle ok arm
+//   11: result<_, error-code>                         — unit-ok arms (future-trailers, transmission)
+//
+// The 39-case `error-code` variant is shape-equivalent to the 0.2 enum but
+// with payloads on certain arms (DNS-error, TLS-alert-received, the various
+// body / header / trailer-size arms, internal-error). The variant payload
+// alignment is bumped to **8** by `option<u64>`; combined with the maximum
+// payload size of 24 (`option<field-size-payload>`) the variant envelope is
+// `alignUp(alignUp(1, 8) + 24, 8) = 32` bytes. Wrapping that in
+// `result<own<response>, error-code>` yields a 40-byte envelope
+// (`alignUp(alignUp(1, 8) + max(4, 32), 8) = 40`).
+//
+// The `mapHttpFetchError` table (#586) covers 17 distinct unit-payload
+// codes; the payload-bearing arms (DNS-error etc.) are still emitted with
+// `payload=null` and rely on the @memset(buf, 0) of the lower buffer to
+// produce a semantically-valid "no diagnostic info" payload (zeroed
+// `option<*>` == `none`). Declaring the payload arm types in this
+// registry is what keeps the envelope size matching wit-bindgen.
+
+const http_p3_dns_error_payload_fields = [_]ctypes.Field{
+    .{ .name = "rcode", .type = .{ .option = 0 } },
+    .{ .name = "info-code", .type = .{ .option = 2 } },
+};
+
+const http_p3_tls_alert_payload_fields = [_]ctypes.Field{
+    .{ .name = "alert-id", .type = .{ .option = 1 } },
+    .{ .name = "alert-message", .type = .{ .option = 0 } },
+};
+
+const http_p3_field_size_payload_fields = [_]ctypes.Field{
+    .{ .name = "field-name", .type = .{ .option = 0 } },
+    .{ .name = "field-size", .type = .{ .option = 3 } },
+};
+
+/// `wasi:http/types.error-code` (39 cases). WIT-declaration order so the
+/// numeric discriminant matches `HttpErrorCode` (the 0.3 ordering, which
+/// happens to coincide with 0.2's). Several arms carry payloads in the
+/// 0.3 WIT — declared here so the variant envelope size matches what
+/// wit-bindgen produces; the host only ever emits unit-payload codes and
+/// relies on `@memset(buf, 0)` to leave the payload arm zeroed
+/// (option<*> = none, record { option<*> = none } etc.).
+const http_p3_error_code_cases = [_]ctypes.Case{
+    .{ .name = "DNS-timeout", .type = null }, // 0
+    .{ .name = "DNS-error", .type = .{ .record = 5 } }, // 1
+    .{ .name = "destination-not-found", .type = null }, // 2
+    .{ .name = "destination-unavailable", .type = null }, // 3
+    .{ .name = "destination-IP-prohibited", .type = null }, // 4
+    .{ .name = "destination-IP-unroutable", .type = null }, // 5
+    .{ .name = "connection-refused", .type = null }, // 6
+    .{ .name = "connection-terminated", .type = null }, // 7
+    .{ .name = "connection-timeout", .type = null }, // 8
+    .{ .name = "connection-read-timeout", .type = null }, // 9
+    .{ .name = "connection-write-timeout", .type = null }, // 10
+    .{ .name = "connection-limit-reached", .type = null }, // 11
+    .{ .name = "TLS-protocol-error", .type = null }, // 12
+    .{ .name = "TLS-certificate-error", .type = null }, // 13
+    .{ .name = "TLS-alert-received", .type = .{ .record = 6 } }, // 14
+    .{ .name = "HTTP-request-denied", .type = null }, // 15
+    .{ .name = "HTTP-request-length-required", .type = null }, // 16
+    .{ .name = "HTTP-request-body-size", .type = .{ .option = 4 } }, // 17
+    .{ .name = "HTTP-request-method-invalid", .type = null }, // 18
+    .{ .name = "HTTP-request-URI-invalid", .type = null }, // 19
+    .{ .name = "HTTP-request-URI-too-long", .type = null }, // 20
+    .{ .name = "HTTP-request-header-section-size", .type = .{ .option = 3 } }, // 21
+    .{ .name = "HTTP-request-header-size", .type = .{ .option = 8 } }, // 22
+    .{ .name = "HTTP-request-trailer-section-size", .type = .{ .option = 3 } }, // 23
+    .{ .name = "HTTP-request-trailer-size", .type = .{ .record = 7 } }, // 24
+    .{ .name = "HTTP-response-incomplete", .type = null }, // 25
+    .{ .name = "HTTP-response-header-section-size", .type = .{ .option = 3 } }, // 26
+    .{ .name = "HTTP-response-header-size", .type = .{ .record = 7 } }, // 27
+    .{ .name = "HTTP-response-body-size", .type = .{ .option = 4 } }, // 28
+    .{ .name = "HTTP-response-trailer-section-size", .type = .{ .option = 3 } }, // 29
+    .{ .name = "HTTP-response-trailer-size", .type = .{ .record = 7 } }, // 30
+    .{ .name = "HTTP-response-transfer-coding", .type = .{ .option = 0 } }, // 31
+    .{ .name = "HTTP-response-content-coding", .type = .{ .option = 0 } }, // 32
+    .{ .name = "HTTP-response-timeout", .type = null }, // 33
+    .{ .name = "HTTP-upgrade-failed", .type = null }, // 34
+    .{ .name = "HTTP-protocol-error", .type = null }, // 35
+    .{ .name = "loop-detected", .type = null }, // 36
+    .{ .name = "configuration-error", .type = null }, // 37
+    .{ .name = "internal-error", .type = .{ .option = 0 } }, // 38
+};
+
+const http_p3_local_types = [_]ctypes.TypeDef{
+    .{ .option = .{ .inner = .string } }, // 0: option<string>
+    .{ .option = .{ .inner = .u8 } }, // 1: option<u8>
+    .{ .option = .{ .inner = .u16 } }, // 2: option<u16>
+    .{ .option = .{ .inner = .u32 } }, // 3: option<u32>
+    .{ .option = .{ .inner = .u64 } }, // 4: option<u64>
+    .{ .record = .{ .fields = &http_p3_dns_error_payload_fields } }, // 5: DNS-error-payload
+    .{ .record = .{ .fields = &http_p3_tls_alert_payload_fields } }, // 6: TLS-alert-received-payload
+    .{ .record = .{ .fields = &http_p3_field_size_payload_fields } }, // 7: field-size-payload
+    .{ .option = .{ .inner = .{ .type_idx = 7 } } }, // 8: option<field-size-payload>
+    .{ .variant = .{ .cases = &http_p3_error_code_cases } }, // 9: error-code
+    // The `own<response>` resource type index passed to `.own` here is
+    // not consulted by `sizeOfType` / `alignOfType` / `storeValReg` —
+    // those treat every `.own` / `.borrow` as a 4-byte canonical handle
+    // (see `canonical_abi.zig:247,265,824`). Any value works.
+    .{ .result = .{ .ok = .{ .own = 0 }, .err = .{ .variant = 9 } } }, // 10: result<own<response>, error-code>
+    .{ .result = .{ .ok = null, .err = .{ .variant = 9 } } }, // 11: result<_, error-code>
+};
+
+const HTTP_P3_ERROR_CODE_VARIANT_IDX: u32 = 9;
+const HTTP_P3_RESULT_CLIENT_SEND_IDX: u32 = 10;
+const HTTP_P3_RESULT_UNIT_ERR_IDX: u32 = 11;
+
+fn httpP3TypeRegistry() abi.TypeRegistry {
+    return abi.TypeRegistry.fromTypes(&http_p3_local_types);
+}
+
+/// 0.3 HTTP async-func return shapes that `httpP3LowerAsyncPayload`
+/// knows how to lower. Mirrors `SocketsP3AsyncReturn`.
+///
+/// Both `client_send_ok` and `client_send_err` lower into the same
+/// `result<own<response>, error-code>` envelope (40 bytes; see
+/// the registry comment above) — the variants name the active arm
+/// at the call site so the build helpers stay self-documenting.
+const HttpP3AsyncReturn = enum {
+    /// `result<own<response>, error-code>` — `client.send` /
+    /// `handler.handle` ok arm.
+    client_send_ok,
+    /// `result<own<response>, error-code>` — `client.send` /
+    /// `handler.handle` err arm.
+    client_send_err,
+
+    pub fn valType(self: HttpP3AsyncReturn) ctypes.ValType {
+        return switch (self) {
+            .client_send_ok, .client_send_err => .{ .result = HTTP_P3_RESULT_CLIENT_SEND_IDX },
+        };
+    }
+};
+
+/// Lower a fully-lifted `InterfaceValue` for the requested 0.3 HTTP
+/// async-func return shape into a canonical-ABI byte buffer suitable
+/// for installation on `async_mod.Future.payload`. Owned by `allocator`;
+/// the executor's `future_read` rendezvous (or the async-lower
+/// retptr copy on `settleFutureDeferred`) frees it after the guest
+/// reads. Mirrors `socketsP3LowerAsyncPayload` (#535 / PR #578).
+fn httpP3LowerAsyncPayload(
+    allocator: Allocator,
+    kind: HttpP3AsyncReturn,
+    val: InterfaceValue,
+) ![]u8 {
+    const reg = httpP3TypeRegistry();
+    const vt = kind.valType();
+    const size = abi.sizeOfType(reg, vt);
+    if (size == 0) return error.LowerError;
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    @memset(buf, 0);
+    try abi.storeValReg(buf, 0, vt, val, reg);
+    return buf;
+}
+
+/// Build a `result<own<response>, error-code>` ok-arm InterfaceValue
+/// wrapping `response_handle`. Caller owns the returned tree and must
+/// `deinit` it after passing through `httpP3LowerAsyncPayload`.
+fn httpP3BuildClientSendOkIv(
+    allocator: Allocator,
+    response_handle: u32,
+) !InterfaceValue {
+    const ok_payload = try allocator.create(InterfaceValue);
+    ok_payload.* = .{ .handle = response_handle };
+    return InterfaceValue{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+}
+
+/// Build a `result<own<response>, error-code>` err-arm InterfaceValue
+/// carrying the given 0.3 `error-code` discriminant. `payload=null`
+/// on the variant — the lowered buffer is `@memset(0)` first, so
+/// payload-bearing arms (DNS-error, internal-error, etc.) get a
+/// valid all-zero payload (`option<*>` = none, record { option<*>
+/// = none } etc.). Caller owns the returned tree and must `deinit`
+/// it after lowering.
+fn httpP3BuildClientSendErrIv(
+    allocator: Allocator,
+    code: HttpErrorCode,
+) !InterfaceValue {
+    const err_payload = try allocator.create(InterfaceValue);
+    err_payload.* = .{
+        .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null },
+    };
+    return InterfaceValue{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+}
+
 const streams = @import("../wasi/preview2/streams.zig");
 const wasi_p2_core = @import("../wasi/preview2/core.zig");
 
@@ -1357,6 +1567,38 @@ pub const PendingHttpFetch = struct {
     /// itself. (#583 A2)
     guest_dropped: bool = false,
 };
+
+/// One in-flight outbound HTTP fetch backing a P3 `client.send` /
+/// `handler.handle` async-func call (#589). Mirrors `PendingHttpFetch`
+/// but settles a `async_mod.Future` slot on the guest's
+/// `ComponentInstance.futures` table (rather than the adapter-owned
+/// `FutureIncomingResponse`) with canonical-ABI-lowered
+/// `result<own<response>, error-code>` bytes via
+/// `httpP3LowerAsyncPayload` + `settleFutureDeferred`.
+///
+/// The worker thread (`httpFetchWorker`) and the shared coordination
+/// block (`PendingHttpFetchShared`) are reused unchanged from the
+/// P2 path; only the settle side differs.
+pub const PendingHttpFetchP3 = struct {
+    /// Handle into `ComponentInstance.futures` of the async-future
+    /// the guest is awaiting via `canon.lower (async)`.
+    future_handle: u32,
+    /// `ComponentInstance` that owns the future slot. Stored so the
+    /// drainer can write the canonical-ABI bytes back to the guest's
+    /// `async_lower_retptr` and fire its WaitableSet wakeup. Borrowed
+    /// — the adapter is registered as the `async_event_driver` on
+    /// the same `ComponentInstance`, so this pointer outlives the
+    /// pending entry.
+    ci: *ComponentInstance,
+    /// Worker thread executing the blocking `std.http.Client.fetch`.
+    /// Joined exactly once by the adapter — either at drain time
+    /// when `shared.done` is observed, or at adapter teardown.
+    thread: std.Thread,
+    /// Heap-allocated coordination block — outlives both threads up
+    /// to the post-join free in `drainPendingHttpFetchesP3` / `deinit`.
+    shared: *PendingHttpFetchShared,
+};
+
 
 /// Snapshot of an `OutgoingRequest` plus body bytes that the worker
 /// thread needs to perform a `std.http.Client.fetch` independently
@@ -3491,6 +3733,17 @@ pub const WasiCliAdapter = struct {
     /// `future-incoming-response` resolves once the fetch finishes.
     pending_http_fetches: std.ArrayListUnmanaged(PendingHttpFetch) = .empty,
 
+    /// Pending P3 `wasi:http/client.send` / `wasi:http/handler.handle`
+    /// async-func fetches (#589). Each entry owns a worker thread
+    /// driving the same blocking `std.http.Client.fetch` the P2 path
+    /// uses; the settle side differs — these resolve a
+    /// `ComponentInstance.futures` slot (the guest's
+    /// `canon.lower (async)` future) with canonical-ABI-lowered
+    /// `result<own<response>, error-code>` bytes via
+    /// `httpP3LowerAsyncPayload` + `settleFutureDeferred`. Drained
+    /// alongside the P2 list on every `driveAsyncEvents` tick.
+    pending_http_fetches_p3: std.ArrayListUnmanaged(PendingHttpFetchP3) = .empty,
+
     /// `wasi:http/types` resource tables (#149). Each slot owns a
     /// heap-allocated rep struct; resource-drop nulls the slot and
     /// frees the underlying allocation. `deinit` mops up any slots
@@ -3711,6 +3964,27 @@ pub const WasiCliAdapter = struct {
             }
         }
         self.pending_http_fetches.deinit(self.allocator);
+
+        // Same shape as the P2 list above, but settling the P3
+        // future requires the `ComponentInstance` reference the
+        // entry carries — at adapter teardown we don't try to
+        // settle anything (the host process is exiting), we just
+        // cancel + join + free the shared block so a still-running
+        // `std.http.Client.fetch` cannot UAF. (#589)
+        for (self.pending_http_fetches_p3.items) |entry| {
+            entry.shared.cancelled.store(true, .release);
+            entry.thread.join();
+            switch (entry.shared.outcome) {
+                .success => |s| {
+                    self.allocator.free(s.body);
+                    freeOwnedHttpHeaders(self.allocator, s.headers);
+                },
+                .failure => {},
+            }
+            self.allocator.destroy(entry.shared);
+        }
+        self.pending_http_fetches_p3.deinit(self.allocator);
+
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -6116,6 +6390,329 @@ pub const WasiCliAdapter = struct {
         return fh;
     }
 
+    /// Mint a `.pending` `async_mod.Future` on `ci.futures`, snapshot
+    /// the outgoing request into worker-owned memory, and spawn a
+    /// worker thread that drives `std.http.Client.fetch` to
+    /// completion (#589). Returns the future handle the guest
+    /// observes in `results[0]` of the `canon.lower (async)`
+    /// trampoline; the executor stashes its `async_lower_retptr`
+    /// onto the same slot if the trampoline observes the future
+    /// `.pending`, and `drainPendingHttpFetchesP3` writes the
+    /// canonical-ABI-lowered `result<own<response>, error-code>`
+    /// bytes back to that retptr when the worker publishes its
+    /// outcome.
+    ///
+    /// Mirrors `spawnHttpFetchPending` but for the P3 path; the
+    /// worker thread / coordination block are reused verbatim.
+    fn spawnHttpFetchPendingP3(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        url: []const u8,
+        method: std.http.Method,
+        headers: []const std.http.Header,
+        payload: ?[]const u8,
+    ) !u32 {
+        const url_copy = try self.allocator.dupe(u8, url);
+        errdefer self.allocator.free(url_copy);
+
+        const names = try self.allocator.alloc([]u8, headers.len);
+        errdefer self.allocator.free(names);
+        const values = try self.allocator.alloc([]u8, headers.len);
+        errdefer self.allocator.free(values);
+        const header_buf = try self.allocator.alloc(std.http.Header, headers.len);
+        errdefer self.allocator.free(header_buf);
+
+        var dup_filled: usize = 0;
+        errdefer {
+            for (names[0..dup_filled]) |n| self.allocator.free(n);
+            for (values[0..dup_filled]) |v| self.allocator.free(v);
+        }
+        while (dup_filled < headers.len) : (dup_filled += 1) {
+            names[dup_filled] = try self.allocator.dupe(u8, headers[dup_filled].name);
+            values[dup_filled] = try self.allocator.dupe(u8, headers[dup_filled].value);
+            header_buf[dup_filled] = .{
+                .name = names[dup_filled],
+                .value = values[dup_filled],
+            };
+        }
+
+        const payload_copy: ?[]u8 = if (payload) |p|
+            try self.allocator.dupe(u8, p)
+        else
+            null;
+        errdefer if (payload_copy) |p| self.allocator.free(p);
+
+        const shared = try self.allocator.create(PendingHttpFetchShared);
+        errdefer self.allocator.destroy(shared);
+        shared.* = .{};
+
+        const req = try self.allocator.create(HttpFetchRequest);
+        errdefer self.allocator.destroy(req);
+        req.* = .{
+            .allocator = self.allocator,
+            .url = url_copy,
+            .method = method,
+            .headers_buf = header_buf,
+            .headers_names = names,
+            .headers_values = values,
+            .payload = payload_copy,
+            .shared = shared,
+        };
+
+        // Mint the `.pending` async future on `ci.futures` first so a
+        // thread-spawn failure doesn't strand the shared struct.
+        const fh = ci.allocAsyncHandle();
+        try ci.futures.put(ci.allocator, fh, .{
+            .elem_type_idx = 0,
+            .state = .pending,
+        });
+        errdefer _ = ci.futures.remove(fh);
+
+        const thread = std.Thread.spawn(.{}, httpFetchWorker, .{req}) catch |err| {
+            return err;
+        };
+        try self.pending_http_fetches_p3.append(self.allocator, .{
+            .future_handle = fh,
+            .ci = ci,
+            .thread = thread,
+            .shared = shared,
+        });
+        return fh;
+    }
+
+    /// Drain any pending P3 outbound HTTP fetches whose worker thread
+    /// has published an outcome. Lowers the
+    /// `result<own<response>, error-code>` envelope via
+    /// `httpP3LowerAsyncPayload` and settles the `ci.futures` slot
+    /// via `settleFutureDeferred` — the executor's stashed
+    /// `async_lower_retptr` is written, the future transitions to
+    /// `.ready`, and the WaitableSet wakeup fires. The worker
+    /// thread is `join()`ed before the shared heap struct is
+    /// freed. (#589)
+    pub fn drainPendingHttpFetchesP3(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        allocator: Allocator,
+    ) void {
+        var i: usize = 0;
+        while (i < self.pending_http_fetches_p3.items.len) {
+            const entry = self.pending_http_fetches_p3.items[i];
+            // Only drain entries that belong to the `ComponentInstance`
+            // currently driving — `pending_http_fetches_p3` is a single
+            // adapter-level list shared across CIs (today's adapter
+            // serves one CI at a time, but the guardrail is cheap).
+            if (entry.ci != ci) {
+                i += 1;
+                continue;
+            }
+            if (!entry.shared.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            // Worker has published — join is non-blocking.
+            entry.thread.join();
+            self.settlePendingHttpFetchP3(entry, allocator);
+            self.allocator.destroy(entry.shared);
+            _ = self.pending_http_fetches_p3.swapRemove(i);
+        }
+    }
+
+    /// Translate a worker-published `HttpFetchOutcome` into the
+    /// canonical-ABI lowered envelope and settle the future via
+    /// `settleFutureDeferred`. On success this also builds the host
+    /// `HttpResponseP3` resource, body stream, headers, and
+    /// trailers/transmission futures so the guest can consume the
+    /// response normally; on failure the envelope just carries the
+    /// error-code variant. (#589)
+    ///
+    /// Both `success.body` and `success.headers` are worker-owned
+    /// (allocated via `httpClientLowLevelFetch` per #583 A4) and
+    /// transfer into the response resources on the happy path. On
+    /// any failure path along the way both are freed here so the
+    /// shared block can be torn down without leaks.
+    fn settlePendingHttpFetchP3(
+        self: *WasiCliAdapter,
+        entry: PendingHttpFetchP3,
+        allocator: Allocator,
+    ) void {
+        const ci = entry.ci;
+        const fut = ci.futures.getPtr(entry.future_handle) orelse {
+            // Future slot already gone (guest dropped). Discard
+            // outcome resources and bail.
+            switch (entry.shared.outcome) {
+                .success => |s| {
+                    self.allocator.free(s.body);
+                    freeOwnedHttpHeaders(self.allocator, s.headers);
+                },
+                .failure => {},
+            }
+            return;
+        };
+
+        // task.cancel mid-fetch: settle as HTTP_request_denied, the
+        // closest WIT discriminant for "request was not delivered".
+        // Mirrors `settlePendingHttpFetch` for the P2 path.
+        if (entry.shared.cancelled.load(.acquire)) {
+            switch (entry.shared.outcome) {
+                .success => |s| {
+                    self.allocator.free(s.body);
+                    freeOwnedHttpHeaders(self.allocator, s.headers);
+                },
+                .failure => {},
+            }
+            const bytes = self.lowerHttpP3ClientSendErr(.HTTP_request_denied) catch {
+                fut.state = .ready;
+                fut.write_closed = true;
+                return;
+            };
+            settleFutureDeferred(ci, fut, bytes, allocator);
+            return;
+        }
+
+        switch (entry.shared.outcome) {
+            .success => |s| {
+                const resp_h = self.buildHttpResponseP3FromBody(ci, s.status, s.body, s.headers) catch {
+                    self.allocator.free(s.body);
+                    freeOwnedHttpHeaders(self.allocator, s.headers);
+                    const bytes = self.lowerHttpP3ClientSendErr(.internal_error) catch {
+                        fut.state = .ready;
+                        fut.write_closed = true;
+                        return;
+                    };
+                    settleFutureDeferred(ci, fut, bytes, allocator);
+                    return;
+                };
+                // Ownership of `s.body` and `s.headers` transferred
+                // into the response resources by
+                // `buildHttpResponseP3FromBody` — do NOT free here.
+                const bytes = self.lowerHttpP3ClientSendOk(resp_h) catch {
+                    const bytes_err = self.lowerHttpP3ClientSendErr(.internal_error) catch {
+                        fut.state = .ready;
+                        fut.write_closed = true;
+                        return;
+                    };
+                    settleFutureDeferred(ci, fut, bytes_err, allocator);
+                    return;
+                };
+                settleFutureDeferred(ci, fut, bytes, allocator);
+            },
+            .failure => |code| {
+                const bytes = self.lowerHttpP3ClientSendErr(code) catch {
+                    fut.state = .ready;
+                    fut.write_closed = true;
+                    return;
+                };
+                settleFutureDeferred(ci, fut, bytes, allocator);
+            },
+        }
+    }
+
+    /// Build an `HttpResponseP3` resource plus its body stream,
+    /// headers, and trailers/transmission futures from the worker's
+    /// published outcome. On success both `body` and `headers`
+    /// ownership transfers into the response resources — caller must
+    /// NOT free them on the happy path. On failure the caller is
+    /// responsible for freeing both. (#589 / #583 A4)
+    fn buildHttpResponseP3FromBody(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        status: u16,
+        body: []u8,
+        headers: []HttpFieldEntry,
+    ) !u32 {
+        // Body stream — pre-filled + write-closed (guest reads to EOF).
+        const body_stream_h = ci.allocAsyncHandle();
+        var body_stream: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+        body_stream.buffer = std.ArrayListUnmanaged(u8).fromOwnedSlice(body);
+        body_stream.write_closed = true;
+        try ci.streams.put(ci.allocator, body_stream_h, body_stream);
+        errdefer {
+            if (ci.streams.getPtr(body_stream_h)) |s| s.deinit(ci.allocator);
+            _ = ci.streams.remove(body_stream_h);
+        }
+
+        // Trailers future — settled to `ok(none)`; the lower-level
+        // outbound path does not surface trailers yet.
+        const trailers_h = try allocReadyUnitFuture(ci);
+        errdefer _ = ci.futures.remove(trailers_h);
+
+        // Lift response headers into an `HttpFields` resource (#583 A4).
+        // `headers` was allocated with `self.allocator` by
+        // `httpClientLowLevelFetch`, so it splices directly as the
+        // field's backing storage; transport-managed headers
+        // (Content-Length, Connection, …) are already stripped by
+        // `isTransportManagedHeader`.
+        const resp_fields = try self.allocator.create(HttpFields);
+        resp_fields.* = .{
+            .entries = std.ArrayListUnmanaged(HttpFieldEntry).fromOwnedSlice(headers),
+        };
+        const resp_fields_h = self.pushHttpFields(resp_fields) catch |err| {
+            resp_fields.deinit(self.allocator);
+            self.allocator.destroy(resp_fields);
+            return err;
+        };
+
+        const tx_h = try allocReadyUnitFuture(ci);
+        errdefer _ = ci.futures.remove(tx_h);
+
+        const resp = try self.allocator.create(HttpResponseP3);
+        errdefer self.allocator.destroy(resp);
+        resp.* = .{
+            .status = status,
+            .headers_handle = resp_fields_h,
+            .body_stream_handle = body_stream_h,
+            .trailers_future_handle = trailers_h,
+            .transmission_future_handle = tx_h,
+        };
+        const resp_h = try self.pushHttpResponseP3(resp);
+        return resp_h;
+    }
+
+    /// Lower a `result<own<response>, error-code>` ok-arm envelope for
+    /// `response_handle`. Owned by `self.allocator`; the executor
+    /// frees the bytes on future-slot deinit. (#589)
+    fn lowerHttpP3ClientSendOk(self: *WasiCliAdapter, response_handle: u32) ![]u8 {
+        const val = try httpP3BuildClientSendOkIv(self.allocator, response_handle);
+        defer val.deinit(self.allocator);
+        return try httpP3LowerAsyncPayload(self.allocator, .client_send_ok, val);
+    }
+
+    /// Lower a `result<own<response>, error-code>` err-arm envelope
+    /// for `code`. Owned by `self.allocator`; the executor frees the
+    /// bytes on future-slot deinit. (#589)
+    fn lowerHttpP3ClientSendErr(self: *WasiCliAdapter, code: HttpErrorCode) ![]u8 {
+        const val = try httpP3BuildClientSendErrIv(self.allocator, code);
+        defer val.deinit(self.allocator);
+        return try httpP3LowerAsyncPayload(self.allocator, .client_send_err, val);
+    }
+
+    /// Mint an already-settled P3 future whose payload is the
+    /// canonical-ABI envelope for a `result<own<response>,
+    /// error-code>` err-arm. Used by the synchronous deny paths
+    /// (`httpClientSendP3` empty-allow-list / bad-URI rejections)
+    /// so they return `.handle` like the deferred path — the
+    /// `canon.lower (async)` trampoline collapses ready futures
+    /// to `STATUS_RETURNED` with `mem[retptr..] := payload` so
+    /// the guest observes the error synchronously. (#589)
+    fn spawnReadyHttpP3ClientSendErrFuture(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        code: HttpErrorCode,
+    ) !u32 {
+        const bytes = try self.lowerHttpP3ClientSendErr(code);
+        const fh = ci.allocAsyncHandle();
+        ci.futures.put(ci.allocator, fh, .{
+            .elem_type_idx = 0,
+            .payload = bytes,
+            .state = .ready,
+            .write_closed = true,
+        }) catch |err| {
+            self.allocator.free(bytes);
+            return err;
+        };
+        return fh;
+    }
+
     /// `ComponentInstance.async_event_driver` hook (#551). Advances the
     /// host monotonic clock (honoring `monotonic_clock_override` so unit
     /// tests stay deterministic) and drains any due timer-futures into
@@ -6156,12 +6753,14 @@ pub const WasiCliAdapter = struct {
         const hint_ns = wait_for_ns_hint orelse {
             // Drain pending HTTP fetches whose worker has finished —
             // the poll-variant caller wants any already-settled
-            // futures observed before it returns. (#583 A2)
+            // futures observed before it returns. (#583 A2 / #589)
             self.drainPendingHttpFetches();
+            self.drainPendingHttpFetchesP3(ci, allocator);
             return fired;
         };
         if (fired) {
             self.drainPendingHttpFetches();
+            self.drainPendingHttpFetchesP3(ci, allocator);
             return fired;
         }
 
@@ -6171,10 +6770,12 @@ pub const WasiCliAdapter = struct {
         // and re-enters `driveAsyncEvents` to deliver.
         if (self.monotonic_clock_override != null) {
             self.drainPendingHttpFetches();
+            self.drainPendingHttpFetchesP3(ci, allocator);
             return false;
         }
         const have_udp_pending = self.pending_udp_receives.items.len > 0;
-        const have_http_pending = self.pending_http_fetches.items.len > 0;
+        const have_http_pending = self.pending_http_fetches.items.len > 0 or
+            self.pending_http_fetches_p3.items.len > 0;
         if (self.timer_futures.items.len == 0 and !have_udp_pending and !have_http_pending) {
             return false;
         }
@@ -6214,8 +6815,9 @@ pub const WasiCliAdapter = struct {
         var post = self.completeDueTimerFutures(ci, allocator);
         if (self.completeReadyPendingUdpReceives(ci, allocator)) post = true;
         // Drain HTTP last so worker outcomes published during the
-        // sleep window are observed on this same tick. (#583 A2)
+        // sleep window are observed on this same tick. (#583 A2 / #589)
         self.drainPendingHttpFetches();
+        self.drainPendingHttpFetchesP3(ci, allocator);
         return post;
     }
 
@@ -17909,14 +18511,33 @@ pub const WasiCliAdapter = struct {
 
     // --- client.send (P3) — host-provided outbound HTTP ---
 
-    /// `wasi:http/client.send: async func(request) -> result<response, error-code>` (#487).
-    /// Synchronous HTTP/1.1 implementation via the lower-level
-    /// `std.http.Client.request` / `Request.receiveHead` API (#583 A4
-    /// — formerly `std.http.Client.fetch`, which discarded the response
-    /// header list). The async lift on the guest side observes a
-    /// value-ready return. Both `http://` and `https://` are accepted
-    /// — TLS is provided by `std.crypto.tls` (#521 — replaces the
-    /// `HTTP_protocol_error` gate originally added in #477 / #501).
+    /// `wasi:http/client.send: async func(request) -> result<response, error-code>`
+    /// (#487 / #589). Deferred-completion implementation built on top
+    /// of the lower-level `std.http.Client.request` /
+    /// `Request.receiveHead` outbound path (#583 A4):
+    ///
+    /// 1. The synchronous deny paths (no allow-list, bad request handle,
+    ///    bad URI, allocation failure) mint a settled future whose
+    ///    payload is the canonical-ABI-lowered err-arm envelope so the
+    ///    `canon.lower (async)` trampoline still sees a `.handle` in
+    ///    `results[0]` (the `STATUS_RETURNED` fast path copies the
+    ///    bytes straight into the guest's `retptr`).
+    /// 2. The real-fetch path mints a `.pending` future via
+    ///    `spawnHttpFetchPendingP3`; the worker thread drives the
+    ///    blocking `httpClientLowLevelFetch` (the same helper #594
+    ///    introduced for the P2 path) and publishes its outcome —
+    ///    status + body + response headers — via the
+    ///    `PendingHttpFetchShared` block. The drainer
+    ///    (`drainPendingHttpFetchesP3`, invoked from `driveAsyncEvents`)
+    ///    lowers the `result<own<response>, error-code>` envelope
+    ///    into the future's payload and calls `settleFutureDeferred`,
+    ///    which copies the bytes to the trampoline's stashed
+    ///    `async_lower_retptr` and fires the WaitableSet wakeup.
+    ///
+    /// Both `http://` and `https://` are accepted — TLS is provided by
+    /// `std.crypto.tls` (#521). Connect/TLS/parse failures are mapped
+    /// onto specific 0.3 `error-code` variants by `mapHttpFetchError`
+    /// (#586) on the worker thread.
     fn httpClientSendP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -17924,18 +18545,20 @@ pub const WasiCliAdapter = struct {
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
+        _ = allocator;
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
 
         const req_handle: u32 = if (args.len > 0) switch (args[0]) {
-            .handle => |h| h, else => 0,
+            .handle => |h| h,
+            else => 0,
         } else 0;
         const r = self.lookupHttpRequestP3(req_handle) orelse {
-            return httpClientDenyP3(results, allocator, .HTTP_request_denied);
+            return self.httpClientSendP3DenyDeferred(ci, results, .HTTP_request_denied);
         };
 
         if (self.sockets_allow_list_template.len == 0) {
-            return httpClientDenyP3(results, allocator, .HTTP_request_denied);
+            return self.httpClientSendP3DenyDeferred(ci, results, .HTTP_request_denied);
         }
 
         // Scheme — `http` and `https` are both supported (#521).
@@ -17947,12 +18570,12 @@ pub const WasiCliAdapter = struct {
         } else "https";
 
         const authority = r.authority orelse {
-            return httpClientDenyP3(results, allocator, .HTTP_request_URI_invalid);
+            return self.httpClientSendP3DenyDeferred(ci, results, .HTTP_request_URI_invalid);
         };
         const path = r.path_with_query orelse "/";
 
         const url = std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, path }) catch {
-            return httpClientDenyP3(results, allocator, .internal_error);
+            return self.httpClientSendP3DenyDeferred(ci, results, .internal_error);
         };
         defer self.allocator.free(url);
 
@@ -17970,7 +18593,8 @@ pub const WasiCliAdapter = struct {
             }
         }
 
-        // Drain the body stream (if any) into a contiguous buffer.
+        // Drain the body stream (if any) into a contiguous buffer; the
+        // worker dupes it into its own owned snapshot below.
         var body_buf: ?[]u8 = null;
         defer if (body_buf) |b| self.allocator.free(b);
         if (r.body_stream_handle) |sh| {
@@ -17978,92 +18602,50 @@ pub const WasiCliAdapter = struct {
         }
         const payload: ?[]const u8 = if (body_buf) |b| (if (b.len > 0) b else null) else null;
 
-        const io = std.Io.Threaded.global_single_threaded.io();
-
-        // Drive the lower-level request/response API so we capture the
-        // response headers alongside the status line (#583 A4). The
-        // worker thread used by the P2 `outgoing-handler.handle` path
-        // calls the same helper, so the two outbound surfaces produce
-        // identical lifted `incoming-response` resources.
-        const fetched = httpClientLowLevelFetch(
-            self.allocator,
-            io,
-            url,
-            method,
-            extra_hdrs.items,
-            payload,
-        ) catch |err| {
-            return httpClientDenyP3(results, allocator, mapHttpFetchError(err));
-        };
-        // From here on, `fetched.headers` / `fetched.body` are owned
-        // by us until they are spliced into the response resources
-        // below. Use `errdefer` so an OOM during resource construction
-        // doesn't leak.
-        var fetched_headers = fetched.headers;
-        var fetched_body = fetched.body;
-        errdefer {
-            freeOwnedHttpHeaders(self.allocator, fetched_headers);
-            self.allocator.free(fetched_body);
-        }
-
-        // Mark transmission future as ready (request was sent).
+        // Mark the request's transmission future ready synchronously —
+        // we've snapshotted the body for transport. (Mirrors the
+        // pre-#589 synchronous behaviour so guests awaiting this
+        // future on the request side still resolve.)
         if (ci.futures.getPtr(r.transmission_future_handle)) |tx| {
             tx.state = .ready;
             tx.write_closed = true;
         }
 
-        // Build response body stream prefilled + write-closed (EOF).
-        const body_stream_h = ci.allocAsyncHandle();
-        var body_stream: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
-        body_stream.buffer = std.ArrayListUnmanaged(u8).fromOwnedSlice(fetched_body);
-        // Ownership of `fetched_body` has been transferred into the
-        // body stream's buffer — clear the errdefer'd guard.
-        fetched_body = &.{};
-        body_stream.write_closed = true;
-        try ci.streams.put(ci.allocator, body_stream_h, body_stream);
-
-        // Trailers future: ready with `ok(none)` — the lower-level
-        // outbound path does not surface trailers yet. Unit-payload
-        // fast-path in executor.future_read drains it.
-        const trailers_h = try allocReadyUnitFuture(ci);
-
-        // Lift response headers into a `HttpFields` resource (#583 A4).
-        // `fetched_headers` was allocated with `self.allocator`, so we
-        // can splice it directly as the field's backing storage.
-        const resp_fields = try self.allocator.create(HttpFields);
-        resp_fields.* = .{
-            .entries = std.ArrayListUnmanaged(HttpFieldEntry).fromOwnedSlice(fetched_headers),
+        const fh = self.spawnHttpFetchPendingP3(ci, url, method, extra_hdrs.items, payload) catch {
+            return self.httpClientSendP3DenyDeferred(ci, results, .internal_error);
         };
-        // Ownership of `fetched_headers` has been transferred into the
-        // HttpFields resource — clear the errdefer'd guard.
-        fetched_headers = &.{};
-        const resp_fields_h = try self.pushHttpFields(resp_fields);
-
-        const tx_h_resp = try allocReadyUnitFuture(ci);
-
-        const resp = try self.allocator.create(HttpResponseP3);
-        resp.* = .{
-            .status = fetched.status,
-            .headers_handle = resp_fields_h,
-            .body_stream_handle = body_stream_h,
-            .trailers_future_handle = trailers_h,
-            .transmission_future_handle = tx_h_resp,
-        };
-        const resp_h = try self.pushHttpResponseP3(resp);
-
-        const ok_payload = try allocator.create(InterfaceValue);
-        ok_payload.* = .{ .handle = resp_h };
-        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+        results[0] = .{ .handle = fh };
     }
 
-    fn httpClientDenyP3(
+    /// Synchronous deny path for `httpClientSendP3`: mint a settled
+    /// P3 future whose payload is the canonical-ABI-lowered err
+    /// envelope, return `.handle` so the trampoline observes the
+    /// same shape as the deferred path. On lowering failure falls
+    /// through to a `.result_val` so the host caller's path still
+    /// completes (the trampoline degrades to `STATUS_RETURNED`
+    /// with handle=0 and the guest reads zeroed memory — better
+    /// than a trap on a default-deny rejection). (#589)
+    fn httpClientSendP3DenyDeferred(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
         results: []InterfaceValue,
-        allocator: Allocator,
         code: HttpErrorCode,
     ) anyerror!void {
-        const err_payload = try allocator.create(InterfaceValue);
-        err_payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
-        results[0] = .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+        const fh = self.spawnReadyHttpP3ClientSendErrFuture(ci, code) catch {
+            // Lowering / allocation failure — fall back to the legacy
+            // `.result_val` shape so non-trampoline callers (the unit
+            // tests pre-#589) still see a usable shape. The trampoline
+            // collapses this to `STATUS_RETURNED` handle=0, which is
+            // observably a denied request — acceptable for an
+            // exceptional code path. The deferred-completion
+            // trampoline-shape requirement still holds for the
+            // happy-deny path above.
+            const err_payload = try self.allocator.create(InterfaceValue);
+            err_payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+            return;
+        };
+        results[0] = .{ .handle = fh };
     }
 
     /// Result of dispatching a guest-exported `incoming-handler.handle`.
@@ -31497,6 +32079,55 @@ fn p3HttpTestCiDeinit(ci: *ComponentInstance) void {
     ci.futures.deinit(ci.allocator);
 }
 
+/// Decode a `result<own<response>, error-code>` canonical-ABI lowered
+/// byte buffer (40 bytes — produced by `httpP3LowerAsyncPayload`) into
+/// a `(is_ok, payload)` pair. On `is_ok` the payload is the
+/// response-resource slot index (post-`decodeResourceWireAbi`); on
+/// !is_ok the payload is the `error-code` variant discriminant. Used
+/// by the post-#589 unit tests to inspect the bytes wit-bindgen
+/// would lower into the guest's `retptr` destination.
+fn decodeP3ClientSendBytes(bytes: []const u8) struct { is_ok: bool, payload: u32 } {
+    // result disc at offset 0, payload at offset 8 (payload_align = 8
+    // because option<u64> on the error-code arm forces 8-byte
+    // alignment).
+    const is_ok = bytes[0] == 0;
+    if (is_ok) {
+        const wire = std.mem.readInt(u32, bytes[8..12], .little);
+        return .{ .is_ok = true, .payload = abi.decodeResourceWireAbi(wire) };
+    } else {
+        // Variant discriminant is 1 byte (39 ≤ 256 cases) at offset 8.
+        return .{ .is_ok = false, .payload = bytes[8] };
+    }
+}
+
+/// Spin the adapter's P3 HTTP drainer until the named future on `ci`
+/// transitions out of `.pending`, capped at `iters` 1 ms polls.
+/// Test-side counterpart of `p3DrainPendingHttpUntilSettled` for the
+/// post-#589 deferred-completion path that settles
+/// `ComponentInstance.futures` slots rather than the adapter-owned
+/// `FutureIncomingResponse`.
+fn p3DrainPendingHttpP3UntilSettled(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    future_handle: u32,
+    iters: usize,
+) void {
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        const fut = ci.futures.getPtr(future_handle) orelse return;
+        if (fut.state != .pending) return;
+        adapter.drainPendingHttpFetchesP3(ci, ci.allocator);
+        if (fut.state != .pending) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(io) catch {};
+    }
+}
+
+
 test "wasi:http@0.3 (#487): request.new + consume-body returns body stream + trailers future" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -31584,18 +32215,198 @@ test "wasi:http@0.3 (#487): client.send denies when allow-list empty" {
     defer new_results[0].deinit(testing.allocator);
     const req_handle = new_results[0].tuple_val[0].handle;
 
-    // Empty allow-list (default) → HTTP_request_denied.
+    // Empty allow-list (default) → HTTP_request_denied. Post-#589 the
+    // host fn returns a `.handle` future whose payload is the
+    // canonical-ABI err-arm envelope (the trampoline-shape requirement
+    // for `canon.lower (async)`); the future is already `.ready` for
+    // synchronous deny paths so no drain is needed.
     const send_args = [_]InterfaceValue{.{ .handle = req_handle }};
     var send_results: [1]InterfaceValue = undefined;
     try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
     defer send_results[0].deinit(testing.allocator);
 
-    try testing.expect(send_results[0] == .result_val);
-    try testing.expect(!send_results[0].result_val.is_ok);
+    try testing.expect(send_results[0] == .handle);
+    const fh = send_results[0].handle;
+    const fut = ci.futures.getPtr(fh).?;
+    try testing.expect(fut.state == .ready);
+    const decoded = decodeP3ClientSendBytes(fut.payload.?);
+    try testing.expect(!decoded.is_ok);
     try testing.expectEqual(
         @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
-        send_results[0].result_val.payload.?.variant_val.discriminant,
+        decoded.payload,
     );
+}
+
+test "wasi:http@0.3 #589: P3 client.send ok-arm lowered bytes match canonical-ABI envelope" {
+    // Confirms that `httpP3LowerAsyncPayload(.client_send_ok, ...)`
+    // produces exactly the bytes wit-bindgen would lower for a
+    // `result<own<response>, error-code>` ok-arm carrying a
+    // representative resource handle.
+    //
+    // Expected envelope shape (computed from the registry):
+    //   * result disc-size = 1, payload align = 8 (option<u64> on the
+    //     err arm forces 8-byte align), result payload offset = 8,
+    //     max payload size = 32 (variant) → total = 40 bytes.
+    //   * bytes[0]      = 0           (result disc — ok)
+    //   * bytes[1..8]   = padding     (alignUp(1, 8) = 8)
+    //   * bytes[8..12]  = LE wire     (own<response> = rep + 1 per
+    //                                  `encodeResourceWireAbi`)
+    //   * bytes[12..40] = zeroed      (variant tail unused on ok arm)
+    const testing = std.testing;
+    const response_handle: u32 = 5;
+    const val = try httpP3BuildClientSendOkIv(testing.allocator, response_handle);
+    defer val.deinit(testing.allocator);
+    const bytes = try httpP3LowerAsyncPayload(testing.allocator, .client_send_ok, val);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqual(@as(usize, 40), bytes.len);
+    try testing.expectEqual(@as(u8, 0), bytes[0]); // ok disc
+    // Result padding (bytes 1..8) is zeroed.
+    for (bytes[1..8]) |b| try testing.expectEqual(@as(u8, 0), b);
+    // Own-handle wire = rep + 1.
+    const wire = std.mem.readInt(u32, bytes[8..12], .little);
+    try testing.expectEqual(@as(u32, response_handle + 1), wire);
+    // Variant-arm padding (bytes 12..40) is zeroed because we wrote
+    // the ok arm.
+    for (bytes[12..40]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "wasi:http@0.3 #589: P3 client.send err-arm lowered bytes match wit-bindgen for connection-refused" {
+    // Confirms that `httpP3LowerAsyncPayload(.client_send_err, ...)`
+    // for `Err(connection-refused)` produces the same canonical-ABI
+    // bytes wit-bindgen would emit:
+    //   * bytes[0]      = 1     (result disc — err)
+    //   * bytes[1..8]   = pad   (result payload align = 8)
+    //   * bytes[8]      = 6     (error-code variant disc —
+    //                            connection-refused at index 6)
+    //   * bytes[9..40]  = pad   (variant payload align = 8; the
+    //                            arm has no payload, and the buffer
+    //                            is @memset(0)-initialised before
+    //                            the lowering)
+    const testing = std.testing;
+    const val = try httpP3BuildClientSendErrIv(testing.allocator, .connection_refused);
+    defer val.deinit(testing.allocator);
+    const bytes = try httpP3LowerAsyncPayload(testing.allocator, .client_send_err, val);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqual(@as(usize, 40), bytes.len);
+    try testing.expectEqual(@as(u8, 1), bytes[0]); // err disc
+    for (bytes[1..8]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(@as(u8, 6), bytes[8]); // connection-refused
+    for (bytes[9..40]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "wasi:http@0.3 #589: P3 client.send err-arm uses 0.3 error-code variant discriminants" {
+    // The 0.3 `error-code` is a 39-case variant (not the flat 0.2
+    // enum) with payloads on certain arms — declared in
+    // `http_p3_error_code_cases`. The discriminant numbering must
+    // match the WIT-declaration order so a guest decoding the bytes
+    // via wit-bindgen observes the correct arm.
+    //
+    // Spot-check both ends of the table plus a payload-bearing arm to
+    // pin the ordering. The lowered envelope is always 40 bytes (the
+    // 0.3 variant envelope; a flat 0.2 enum would be 4 bytes), which
+    // is also asserted as a guard against a regression to the wrong
+    // type — the size check by itself is the strongest signal that
+    // we're using the variant lowering and not an enum lowering.
+    const testing = std.testing;
+
+    const cases = [_]struct { code: HttpErrorCode, disc: u8 }{
+        .{ .code = .DNS_timeout, .disc = 0 },
+        .{ .code = .DNS_error, .disc = 1 }, // payload-bearing
+        .{ .code = .connection_refused, .disc = 6 },
+        .{ .code = .TLS_alert_received, .disc = 14 }, // payload-bearing
+        .{ .code = .HTTP_request_denied, .disc = 15 },
+        .{ .code = .HTTP_response_body_size, .disc = 28 }, // payload-bearing
+        .{ .code = .internal_error, .disc = 38 }, // payload-bearing, last arm
+    };
+
+    for (cases) |c| {
+        const val = try httpP3BuildClientSendErrIv(testing.allocator, c.code);
+        defer val.deinit(testing.allocator);
+        const bytes = try httpP3LowerAsyncPayload(testing.allocator, .client_send_err, val);
+        defer testing.allocator.free(bytes);
+
+        // Envelope size is 40 bytes; if we mistakenly treated
+        // error-code as the 0.2 flat enum (4-byte sizeof), the
+        // buffer would shrink to 8 bytes here.
+        try testing.expectEqual(@as(usize, 40), bytes.len);
+        try testing.expectEqual(@as(u8, 1), bytes[0]); // err disc
+        try testing.expectEqual(c.disc, bytes[8]);
+        // The enum value and the WIT discriminant must agree —
+        // protects against a future reorder of `HttpErrorCode`
+        // away from the 0.3 WIT order.
+        try testing.expectEqual(@as(u32, c.disc), @intFromEnum(c.code));
+    }
+}
+
+test "wasi:http@0.3 #589: P3 client.send drains deferred outcome and lowers ok-arm bytes (loopback)" {
+    // End-to-end round-trip exercise:
+    //   * spawn a loopback HTTP/1.1 server,
+    //   * call `client.send` against it,
+    //   * observe a `.pending` future minted by `spawnHttpFetchPendingP3`,
+    //   * drive `drainPendingHttpFetchesP3` until the worker publishes,
+    //   * assert the lowered payload bytes are the canonical-ABI
+    //     `Ok(response)` envelope referencing the host's response
+    //     resource slot, and the response stream holds the served
+    //     body bytes.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var server = TestHttpServer.serveLoopback(testing.allocator, "hello-589") catch
+        return error.SkipZigTest;
+
+    try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const new_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+        .{ .handle = trailers_h },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var new_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestNewP3(&adapter, &ci, &new_args, &new_results, testing.allocator);
+    defer new_results[0].deinit(testing.allocator);
+    const req_handle = new_results[0].tuple_val[0].handle;
+    const r = adapter.lookupHttpRequestP3(req_handle).?;
+    r.scheme_disc = 0; // http
+    r.authority = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{d}", .{server.port});
+
+    const send_args = [_]InterfaceValue{.{ .handle = req_handle }};
+    var send_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
+    defer send_results[0].deinit(testing.allocator);
+
+    try testing.expect(send_results[0] == .handle);
+    const fh = send_results[0].handle;
+    const fut0 = ci.futures.getPtr(fh).?;
+    try testing.expect(fut0.state == .pending);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_http_fetches_p3.items.len);
+
+    p3DrainPendingHttpP3UntilSettled(&adapter, &ci, fh, 10_000);
+    server.thread.join();
+
+    const fut = ci.futures.getPtr(fh).?;
+    try testing.expect(fut.state == .ready);
+    const decoded = decodeP3ClientSendBytes(fut.payload.?);
+    try testing.expect(decoded.is_ok);
+    // Worker drained — entry consumed.
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches_p3.items.len);
+
+    // The decoded payload is the host's response resource slot — the
+    // body stream should hold the served bytes.
+    const resp = adapter.lookupHttpResponseP3(decoded.payload).?;
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    const body_stream = ci.streams.getPtr(resp.body_stream_handle.?).?;
+    try testing.expectEqualStrings("hello-589", body_stream.buffer.items);
 }
 
 test "wasi:http@0.3 #521: client.send proceeds past the TLS gate for https" {
@@ -31647,15 +32458,21 @@ test "wasi:http@0.3 #521: client.send proceeds past the TLS gate for https" {
     try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
     defer send_results[0].deinit(testing.allocator);
 
-    try testing.expect(send_results[0] == .result_val);
-    try testing.expect(!send_results[0].result_val.is_ok);
-    const code = send_results[0].result_val.payload.?.variant_val.discriminant;
+    // Post-#589: `client.send` returns a `.handle` future; drain it
+    // until the worker thread publishes the connect-refused outcome.
+    try testing.expect(send_results[0] == .handle);
+    const fh = send_results[0].handle;
+    p3DrainPendingHttpP3UntilSettled(&adapter, &ci, fh, 10_000);
+    const fut = ci.futures.getPtr(fh).?;
+    try testing.expect(fut.state == .ready);
+    const decoded = decodeP3ClientSendBytes(fut.payload.?);
+    try testing.expect(!decoded.is_ok);
     // The scheme gate is gone — `HTTP_protocol_error` must not be the
     // outcome of a well-formed `https://` request.
-    try testing.expect(code != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
+    try testing.expect(decoded.payload != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
     // Port 1 has no listener; TCP connect refuses before TLS runs,
     // which the #583 A3 mapping surfaces as `connection_refused`.
-    try testing.expectEqual(@as(u32, @intFromEnum(HttpErrorCode.connection_refused)), code);
+    try testing.expectEqual(@as(u32, @intFromEnum(HttpErrorCode.connection_refused)), decoded.payload);
 }
 
 test "wasi:http #583 A3: mapHttpFetchError classifies connection-refused" {
@@ -31840,11 +32657,18 @@ test "wasi:http@0.3 #583 A3: connect-refused end-to-end (P3 client.send, http)" 
     try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
     defer send_results[0].deinit(testing.allocator);
 
-    try testing.expect(send_results[0] == .result_val);
-    try testing.expect(!send_results[0].result_val.is_ok);
+    // Post-#589: deferred-completion future; drain until the worker
+    // thread publishes the connect-refused outcome.
+    try testing.expect(send_results[0] == .handle);
+    const fh = send_results[0].handle;
+    p3DrainPendingHttpP3UntilSettled(&adapter, &ci, fh, 10_000);
+    const fut = ci.futures.getPtr(fh).?;
+    try testing.expect(fut.state == .ready);
+    const decoded = decodeP3ClientSendBytes(fut.payload.?);
+    try testing.expect(!decoded.is_ok);
     try testing.expectEqual(
         @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
-        send_results[0].result_val.payload.?.variant_val.discriminant,
+        decoded.payload,
     );
 }
 
@@ -31888,9 +32712,16 @@ test "wasi:http@0.3 #521: opt-in real HTTPS client.send against example.com" {
     try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
     defer send_results[0].deinit(testing.allocator);
 
-    try testing.expect(send_results[0] == .result_val);
-    try testing.expect(send_results[0].result_val.is_ok);
-    const resp_h = send_results[0].result_val.payload.?.handle;
+    // Post-#589: deferred-completion future; drain until the worker
+    // publishes the response.
+    try testing.expect(send_results[0] == .handle);
+    const fh = send_results[0].handle;
+    p3DrainPendingHttpP3UntilSettled(&adapter, &ci, fh, 60_000);
+    const fut = ci.futures.getPtr(fh).?;
+    try testing.expect(fut.state == .ready);
+    const decoded = decodeP3ClientSendBytes(fut.payload.?);
+    try testing.expect(decoded.is_ok);
+    const resp_h = decoded.payload;
     const resp = adapter.lookupHttpResponseP3(resp_h).?;
     try testing.expect(resp.status >= 200 and resp.status < 400);
 }
@@ -31988,11 +32819,18 @@ test "wasi:http@0.3 (#538): handler.handle host-import forwards to client.send" 
     try WasiCliAdapter.httpHandlerHandleP3(&adapter, &ci, &handle_args, &handle_results, testing.allocator);
     defer handle_results[0].deinit(testing.allocator);
 
-    try testing.expect(handle_results[0] == .result_val);
-    try testing.expect(!handle_results[0].result_val.is_ok);
+    // Post-#589: `handler.handle` forwards to `client.send` and so
+    // returns a `.handle` future too. Empty allow-list resolves
+    // synchronously to `.ready` with the err-arm bytes installed.
+    try testing.expect(handle_results[0] == .handle);
+    const fh = handle_results[0].handle;
+    const fut = ci.futures.getPtr(fh).?;
+    try testing.expect(fut.state == .ready);
+    const decoded = decodeP3ClientSendBytes(fut.payload.?);
+    try testing.expect(!decoded.is_ok);
     try testing.expectEqual(
         @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
-        handle_results[0].result_val.payload.?.variant_val.discriminant,
+        decoded.payload,
     );
 }
 
