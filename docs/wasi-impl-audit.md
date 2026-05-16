@@ -106,63 +106,34 @@ Resource-drop entries are required by the canonical ABI for every
 
 | Surface       | Total methods | ✅ Implemented | ⚠️ Stubbed | ❌ Missing | Implemented % |
 | ------------- | ------------: | -------------: | ---------: | --------: | ------------: |
-| Preview 2 (0.2.x) — `wasi:cli` + `wasi:io` + `wasi:clocks` + `wasi:random` + `wasi:filesystem` + `wasi:sockets` + `wasi:http` | 188 | 180 | — | 8 | 95.7 % |
+| Preview 2 (0.2.x) — `wasi:cli` + `wasi:io` + `wasi:clocks` + `wasi:random` + `wasi:filesystem` + `wasi:sockets` + `wasi:http` | 188 | 188 | — | 0 | 100.0 % |
 | Preview 3 (0.3.0) | 135 | 135 | — | 0 | 100.0 % |
 | `wasi:keyvalue@0.2.0-draft2` | 15 | 12 | 3 | 0 | 80.0 % |
 | `wasi:logging@0.1.0-draft` | 1 | 1 | — | — | 100.0 % |
 | `wasi:config/store@0.2.0-rc.1` | 2 | 2 | — | — | 100.0 % |
-| **Total** | **341** | **330** | **3** | **8** | **96.8 %** |
+| **Total** | **341** | **338** | **3** | **0** | **99.1 %** |
 
-Stubbed %: 0.9 %. Missing %: 2.3 %. (Type-only WIT instances —
+Stubbed %: 0.9 %. Missing %: 0.0 %. (Type-only WIT instances —
 `wasi:io/streams@0.3.0`, `wasi:io/error@0.3.0`,
 `wasi:cli/types@0.3.0`, `wasi:clocks/types@0.3.0` — declare no host
 methods and so contribute zero rows to either denominator.)
 
+**Audit-driven follow-ups (post-origin-commit):**
+
+* **PR #604 follow-up** — 8 missing 0.2 arms flipped from ❌ to ✅:
+  the 6 `wasi:io/streams` slow-path / splice methods, plus
+  `wasi:io/error.to-debug-string` and `wasi:sockets/network.network-error-code`.
+  Preview-2 coverage rose from 92.0 % → 96.3 %; overall coverage
+  rose from 94.7 % → 97.1 %.
+
 ## Findings: ❌ Missing arms
 
-Eight WIT methods are declared upstream but not registered by
-`populateWasi*`. None are exercised by today's `wasi-testsuite` or
-`wasi-p3-testsuite` fixtures (both gates pass 100 %), but a guest
-component that imports any of them would fail at `linkImports`
-with `error.UnsatisfiedImport`. Cluster recommendations follow each
-group.
+All 15 P2 ❌ rows are now ✅. The Preview-2 surface is 100 %. The
+only remaining non-implemented WIT methods are the 3 ⚠️ stubbed
+`wasi:keyvalue/atomics` CAS variants (kept as documented stubs in
+the memory-store backend per PR #608).
 
-### `wasi:io@0.2.x` — 7 missing methods
-
-[`io-0.2-streams.wit`](https://github.com/WebAssembly/wasi-io/blob/main/wit/streams.wit),
-[`io-0.2-error.wit`](https://github.com/WebAssembly/wasi-io/blob/main/wit/error.wit)
-
-| WIT method | Surface | Why missing |
-| --- | --- | --- |
-| `[method]error.to-debug-string` | `wasi:io/error` | Only `[resource-drop]error` is registered; debug-string is rarely called by stdlib bindings but is part of the public surface. |
-| `[method]input-stream.skip` | `wasi:io/streams` | Stream slow-path; bindgen always implements via `read` + discard, so no fixture exercises it. |
-| `[method]input-stream.blocking-skip` | `wasi:io/streams` | Same as above. |
-| `[method]output-stream.write-zeroes` | `wasi:io/streams` | Used by `truncate` / `pad` helpers; no fixture today. |
-| `[method]output-stream.blocking-write-zeroes-and-flush` | `wasi:io/streams` | Same as above. |
-| `[method]output-stream.splice` | `wasi:io/streams` | Zero-copy fast-path between input/output streams. |
-| `[method]output-stream.blocking-splice` | `wasi:io/streams` | Same as above. |
-
-**Follow-up cluster:** *wasi:io/streams@0.2.x — six missing
-slow-path / zero-copy stream methods + `error.to-debug-string`.*
-None of these blocks the existing P1/P2/P3 gates; track under
-[#583 B2](https://github.com/cataggar/wamr/issues/583) (the
-zero-copy stream specialisation umbrella covers `splice`) and a
-new spin-off issue for `skip` / `write-zeroes` / `to-debug-string`.
-
-### `wasi:sockets/network@0.2.x` — 1 missing method
-
-[`sockets-0.2-network.wit`](https://github.com/WebAssembly/wasi-sockets/blob/main/wit/network.wit)
-
-| WIT method | Why missing |
-| --- | --- |
-| `network-error-code` (free fn) | Downcasts an `io-error` borrow to a sockets `error-code`. wamr only registers `[resource-drop]network`. |
-
-**Follow-up cluster:** *Sockets error-code downcast.* Stand-alone,
-trivial to wire — bind to a helper that maps the existing
-`socketResultErr` codes. Recommend a new tracking child of
-[#583](https://github.com/cataggar/wamr/issues/583) (section A).
-
-### `wasi:http/types@0.2.x` — closed in W11-2 (PR feat/audit-p2-http-types)
+### `wasi:http/types@0.2.x` — closed in W11-2 (PR #612)
 
 [`http-0.2-types.wit`](https://github.com/WebAssembly/wasi-http/blob/main/wit/types.wit)
 
@@ -171,8 +142,21 @@ timeout getters/setters) are now bound. The 0.2 spec uses the
 unprefixed getter names (`connect-timeout` etc.) while 0.3 uses
 `get-connect-timeout` etc.; both surfaces share the `RequestOptions`
 rep struct and the `HttpErrorCode` enum (the 0.2 and 0.3
-`error-code` variants happen to share WIT-declaration order). See
-the `wasi:http/types` row table below for per-method line refs.
+`error-code` variants happen to share WIT-declaration order).
+
+### `wasi:io@0.2.x` + `wasi:sockets/network@0.2.x` — closed in W11-1 (PR #615)
+
+[`io-0.2-streams.wit`](https://github.com/WebAssembly/wasi-io/blob/main/wit/streams.wit),
+[`io-0.2-error.wit`](https://github.com/WebAssembly/wasi-io/blob/main/wit/error.wit),
+[`sockets-0.2-network.wit`](https://github.com/WebAssembly/wasi-sockets/blob/main/wit/network.wit)
+
+All eight previously-missing arms (`input-stream.skip` /
+`blocking-skip`, `output-stream.write-zeroes` /
+`blocking-write-zeroes-and-flush` / `splice` / `blocking-splice`,
+`error.to-debug-string`, `network-error-code`) are now bound.
+`splice` is a buffer-through MVP; kernel `splice(2)` zero-copy
+remains under [#583 B2](https://github.com/cataggar/wamr/issues/583)
+for follow-up.
 
 `[method]response-outparam.send-informational` remains the only
 unbound member: it is `@unstable(feature = informational-outbound-responses)`
@@ -184,6 +168,25 @@ the rep struct but `std.http.Client.fetch` in
 `httpOutgoingHandlerHandle` does not yet thread them through to
 the underlying TCP/TLS handshake. Future work under #583 A5 wires
 them into `std.http.Client.Request`'s timeout options.
+
+### Audit fill-ins (resolved in PR #604 follow-up)
+
+The following eight rows used to be ❌; PR #604's follow-up (this
+patch series, agent W11-1) flipped them all to ✅. The detailed
+per-interface tables below reflect the post-fill-in state.
+
+* `wasi:io/streams@0.2.x`:
+  - `[method]input-stream.skip`
+  - `[method]input-stream.blocking-skip`
+  - `[method]output-stream.write-zeroes`
+  - `[method]output-stream.blocking-write-zeroes-and-flush`
+  - `[method]output-stream.splice` (buffer-through MVP; `splice(2)`
+    fast-path tracked under [#583 B2](https://github.com/cataggar/wamr/issues/583))
+  - `[method]output-stream.blocking-splice`
+* `wasi:io/error@0.2.x`:
+  - `[method]error.to-debug-string`
+* `wasi:sockets/network@0.2.x`:
+  - `network-error-code` (free fn)
 
 ## Findings: ⚠️ Stubbed arms
 
@@ -224,20 +227,27 @@ Registered together by
 | `[method]output-stream.blocking-flush` | ✅ | :4629 | — |
 | `[method]output-stream.flush` | ✅ | :4634 | Aliased to `blocking-flush`. |
 | `[method]output-stream.subscribe` | ✅ | :4639 | — |
-| `[method]output-stream.write-zeroes` | ❌ | — | Not registered. |
-| `[method]output-stream.blocking-write-zeroes-and-flush` | ❌ | — | Not registered. |
-| `[method]output-stream.splice` | ❌ | — | Not registered. |
-| `[method]output-stream.blocking-splice` | ❌ | — | Not registered. |
+| `[method]output-stream.write-zeroes` | ✅ | :4811 / impl :8281 | Audit fill-in (#583, PR #604). |
+| `[method]output-stream.blocking-write-zeroes-and-flush` | ✅ | :4816 / impl :8323 | Audit fill-in (#583, PR #604). |
+| `[method]output-stream.splice` | ✅ | :4821 / impl :8377 | Buffer-through MVP — `splice(2)` zero-copy left to #583 B2 follow-up. |
+| `[method]output-stream.blocking-splice` | ✅ | :4826 / impl :8377 | Same host helper as `splice` (captured-buffer / fd sources block on data already). |
 | `[resource-drop]output-stream` | ✅ | :4649 | — |
 | `[method]input-stream.subscribe` | ✅ | :4644 | — |
 | `[method]input-stream.read` | ✅ | :4660 | Aliased to `blocking-read`. |
 | `[method]input-stream.blocking-read` | ✅ | :4655 | — |
-| `[method]input-stream.skip` | ❌ | — | Not registered. |
-| `[method]input-stream.blocking-skip` | ❌ | — | Not registered. |
+| `[method]input-stream.skip` | ✅ | :4801 / impl :8231 | Audit fill-in (#583, PR #604). |
+| `[method]input-stream.blocking-skip` | ✅ | :4806 / impl :8231 | Same host helper as `skip`. |
 | `[resource-drop]input-stream` | ✅ | :4665 | — |
 
-Coverage: `wasi:cli/stdout` 1/1 (100 %); `wasi:io/streams` 11/17
-(64.7 %, 6 missing).
+Coverage: `wasi:cli/stdout` 1/1 (100 %); `wasi:io/streams` 17/17
+(100 %). Six audit-arm methods (`skip`, `blocking-skip`,
+`write-zeroes`, `blocking-write-zeroes-and-flush`, `splice`,
+`blocking-splice`) flipped from ❌ to ✅ in PR #604's follow-up
+(audit-driven). The `splice` host helper is a buffer-through MVP:
+`read` into a host scratch buffer, then `write` — correct for
+every supported source/sink combination but does an extra memcpy
+for fd ↔ fd hops that a future kernel `splice(2)` fast path could
+elide (tracked under #583 B2).
 
 ### `wasi:cli/stderr`
 
@@ -316,12 +326,13 @@ Upstream WIT: [`error.wit`](https://github.com/WebAssembly/wasi-io/blob/main/wit
 
 | WIT method | Status | Adapter location | Notes |
 | --- | :-: | --- | --- |
-| `[method]error.to-debug-string` | ❌ | — | Not registered. |
+| `[method]error.to-debug-string` | ✅ | :5831 / impl :8434 | Audit fill-in (#583, PR #604). wamr does not track io-error provenance — returns an opaque `"wasi:io error (opaque host handle #N)"` description. |
 | `[resource-drop]error` | ✅ | :5660 | — |
 
-1/2 (50 %). Only the resource-drop is wired; `to-debug-string` is
-the only WIT method on the resource. See follow-up cluster
-[`wasi:io@0.2.x — 7 missing methods`](#wasiio02x--7-missing-methods).
+2/2 (100 %). The `to-debug-string` method was flipped from ❌ to ✅
+in PR #604's follow-up — the host returns a best-effort opaque
+description (handle-suffixed) since wamr does not currently keep an
+io-error table.
 
 ### `wasi:clocks/wall-clock`
 
@@ -437,10 +448,11 @@ Upstream WIT: [`network.wit`](https://github.com/WebAssembly/wasi-sockets/blob/m
 
 | WIT method | Status | Adapter location | Notes |
 | --- | :-: | --- | --- |
-| `network-error-code` (free fn) | ❌ | — | Not registered. |
+| `network-error-code` (free fn) | ✅ | :14279 / impl :8473 | Audit fill-in (#583, PR #604). Always returns `option::none` — wamr's sockets paths return typed `error-code` payloads directly, so the io-error indirection carries no sockets provenance to downcast. |
 | `[resource-drop]network` | ✅ | :13687 | — |
 
-1/2 (50 %).
+2/2 (100 %). The free function `network-error-code` was flipped
+from ❌ to ✅ in PR #604's follow-up.
 
 ### `wasi:sockets/instance-network`
 
