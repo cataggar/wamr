@@ -694,6 +694,30 @@ pub fn build(b: *std.Build) void {
         simd_bench_step.dependOn(&run_simd_bench.step);
     }
 
+    // ── WASI stream zero-copy microbench (#583 B2) ──────────────────────
+    // Drives the executor's `stream.read` rendezvous against a synthetic
+    // host_driver to compare scratch-buffer vs zero-copy specialisation
+    // wall-clock + allocation cost. See
+    // `tests/benchmarks/wasi-streams/microbench.zig`.
+    const wasi_streams_bench_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmarks/wasi-streams/microbench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    wasi_streams_bench_module.addImport("wamr", lib_module);
+    const wasi_streams_bench_exe = b.addExecutable(.{
+        .name = "wasi-streams-bench",
+        .root_module = wasi_streams_bench_module,
+    });
+    b.installArtifact(wasi_streams_bench_exe);
+    const wasi_streams_bench_step = b.step(
+        "wasi-streams-bench",
+        "Run the wasi:streams zero-copy microbench (#583 B2)",
+    );
+    const run_wasi_streams_bench = b.addRunArtifact(wasi_streams_bench_exe);
+    if (b.args) |args| run_wasi_streams_bench.addArgs(args);
+    wasi_streams_bench_step.dependOn(&run_wasi_streams_bench.step);
+
     const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, component-loader, interp, aot, diff, canon, wasi)");
     inline for (.{
         .{ .name = "loader", .file = "loader.zig", .needs_aot = false },

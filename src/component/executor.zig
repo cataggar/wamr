@@ -1606,7 +1606,78 @@ fn dispatchAsyncCanon(
             // by the driver itself — production drivers do a single
             // non-blocking syscall per invocation and return `would_block`
             // on the second pass.
+            //
+            // #583 B2 — when the driver exposes `on_read_into`, we
+            // borrow a slice of guest linmem and let the driver write
+            // bytes directly into it. This skips the
+            // `stream.buffer.appendSlice` allocation + the second
+            // `@memcpy` into guest linmem that the legacy `on_read`
+            // path incurs. `comp_inst.writableGuestBytes` validates
+            // `guest_ptr + max_bytes ≤ memory.size` synchronously
+            // before the host call, and the executor never yields to
+            // a `memory.grow` between that check and the driver
+            // return — the slice stays valid for the call duration.
+            //
+            // Three preconditions for the zero-copy fast path; failing
+            // any one falls back to the legacy `on_read` path below:
+            //   * `elem_size`-aligned `guest_ptr` (the spec's
+            //     "alignment permits" gate);
+            //   * `max_count * elem_size` doesn't overflow `u32`;
+            //   * the resulting byte range is fully inside guest
+            //     `memory.size` (the "length permits" gate).
             if (s.buffer.items.len == 0 and !s.write_closed) {
+                if (s.host_driver) |drv| zero_copy: {
+                    const cb = drv.on_read_into orelse break :zero_copy;
+                    if (elem_size > 1 and (guest_ptr % elem_size) != 0) break :zero_copy;
+                    const max_bytes_u64: u64 = @as(u64, max_count) * @as(u64, elem_size);
+                    if (max_bytes_u64 > std.math.maxInt(u32)) break :zero_copy;
+                    const max_bytes: u32 = @intCast(max_bytes_u64);
+                    const dst_slice = comp_inst.writableGuestBytes(guest_ptr, max_bytes) orelse
+                        break :zero_copy;
+                    var iters: u8 = 0;
+                    var total_bytes: u32 = 0;
+                    while (iters < 32 and total_bytes < max_bytes) : (iters += 1) {
+                        const r = cb(drv.context, dst_slice[total_bytes..max_bytes]);
+                        switch (r.action) {
+                            .progressed => {
+                                if (r.bytes_written == 0) break;
+                                std.debug.assert(r.bytes_written <= max_bytes - total_bytes);
+                                total_bytes += r.bytes_written;
+                            },
+                            .would_block => break,
+                            .eof, .err => {
+                                s.write_closed = true;
+                                break;
+                            },
+                        }
+                    }
+                    if (total_bytes > 0) {
+                        const got_count = total_bytes / elem_size;
+                        // A sub-element trailing fragment (rare for
+                        // `stream<u8>` where `elem_size == 1`) can't
+                        // be delivered on this op without crossing
+                        // an element boundary in the guest's dst;
+                        // stash it in the FIFO so the next read picks
+                        // it up. The bytes are already in guest
+                        // linmem so we copy them out — alternatively
+                        // we could leak the partial element, but the
+                        // FIFO stash keeps semantics identical to the
+                        // legacy on_read path.
+                        const tail = total_bytes - got_count * elem_size;
+                        if (tail != 0) {
+                            const tail_off = got_count * elem_size;
+                            s.buffer.appendSlice(comp_inst.allocator, dst_slice[tail_off..total_bytes]) catch
+                                return error.OutOfMemory;
+                        }
+                        env.pushI32(@bitCast(async_canon.packStatus(.completed, got_count))) catch
+                            return error.StackOverflow;
+                        return;
+                    }
+                    // Driver returned `would_block` or `eof` with no
+                    // bytes; fall through. If `eof` flipped
+                    // `write_closed`, the post-drain branch surfaces
+                    // `dropped(0)`. If `would_block`, we'll park.
+                }
                 if (s.host_driver) |drv| {
                     if (drv.on_read) |cb| {
                         var driver_iters: u8 = 0;
@@ -4438,6 +4509,250 @@ test "stream.drop-writable while buffer drained: subsequent read returns DROPPED
     );
     const status: u32 = @bitCast(try env.popI32());
     try testing.expectEqual(async_canon.packStatus(.dropped, 0), status);
+}
+
+// ── #583 B2: zero-copy `on_read_into` host_driver specialisation ────────
+
+fn newStreamU8Inst(testing_allocator: std.mem.Allocator) !*instance_mod.ComponentInstance {
+    const StreamTypeFixture = struct {
+        var types_array = [_]ctypes.TypeDef{.{ .val = .u8 }};
+        var comp: ctypes.Component = .{
+            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+            .components = &.{},       .instances = &.{},      .aliases = &.{},
+            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .exports = &.{},
+        };
+    };
+    StreamTypeFixture.comp.types = &StreamTypeFixture.types_array;
+    const inst = try instance_mod.instantiate(&StreamTypeFixture.comp, testing_allocator);
+    try inst.enableTestMem(testing_allocator, 4096);
+    return inst;
+}
+
+/// Synthetic driver state shared by the zero-copy tests below: a fixed
+/// payload that the driver writes / appends and a per-invocation
+/// counter so the tests can assert which callback was invoked.
+const ZeroCopyTestDriver = struct {
+    payload: []const u8,
+    on_read_into_calls: u32 = 0,
+    on_read_calls: u32 = 0,
+
+    fn intoCb(
+        opaque_ctx: ?*anyopaque,
+        dst: []u8,
+    ) async_mod.HostStreamReadInto {
+        const self: *ZeroCopyTestDriver = @ptrCast(@alignCast(opaque_ctx.?));
+        self.on_read_into_calls += 1;
+        const n = @min(self.payload.len, dst.len);
+        if (n == 0) return .{ .action = .would_block };
+        @memcpy(dst[0..n], self.payload[0..n]);
+        return .{ .action = .progressed, .bytes_written = @intCast(n) };
+    }
+
+    fn fallbackCb(
+        opaque_ctx: ?*anyopaque,
+        stream: *async_mod.AsyncStream,
+        allocator: std.mem.Allocator,
+    ) async_mod.HostStreamAction {
+        const self: *ZeroCopyTestDriver = @ptrCast(@alignCast(opaque_ctx.?));
+        self.on_read_calls += 1;
+        stream.buffer.appendSlice(allocator, self.payload) catch return .err;
+        return .progressed;
+    }
+};
+
+test "stream.read zero-copy: aligned dst → driver writes into guest linmem with no scratch alloc (#583 B2)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU8Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Install zero-copy driver (both callbacks set so the test can
+    // assert which one fired). `payload` is the byte sequence the
+    // driver will deposit into the guest dst slice.
+    var driver_state = ZeroCopyTestDriver{ .payload = "hello-zc" };
+    {
+        const s = inst.streams.getPtr(handle).?;
+        s.host_driver = .{
+            .context = &driver_state,
+            .on_read = &ZeroCopyTestDriver.fallbackCb,
+            .on_read_into = &ZeroCopyTestDriver.intoCb,
+        };
+    }
+
+    // u8 stream: any guest_ptr is naturally elem-aligned. Read 8 bytes
+    // into dst at offset 16.
+    const dst_ptr: u32 = 16;
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 8)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.completed, 8), status);
+
+    // Zero-copy callback fired exactly once; legacy `on_read` never
+    // ran (no scratch FIFO allocation either way).
+    try testing.expectEqual(@as(u32, 1), driver_state.on_read_into_calls);
+    try testing.expectEqual(@as(u32, 0), driver_state.on_read_calls);
+    try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(handle).?.buffer.items.len);
+    try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(handle).?.buffer.capacity);
+
+    // Output bytes correct.
+    const written = inst.writableGuestBytes(dst_ptr, 8).?;
+    try testing.expectEqualStrings("hello-zc", written);
+}
+
+test "stream.read zero-copy: misaligned dst on stream<u32> falls back to scratch `on_read` (#583 B2)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    // u32 stream → elem_size = 4 / required alignment = 4.
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Driver state — eight bytes of payload that lower as two u32s.
+    var driver_state = ZeroCopyTestDriver{ .payload = "\x11\x11\x11\x11\x22\x22\x22\x22" };
+    {
+        const s = inst.streams.getPtr(handle).?;
+        s.host_driver = .{
+            .context = &driver_state,
+            .on_read = &ZeroCopyTestDriver.fallbackCb,
+            .on_read_into = &ZeroCopyTestDriver.intoCb,
+        };
+    }
+
+    // `guest_ptr = 1` is 1-byte misaligned for a 4-byte element type;
+    // the executor must reject the zero-copy fast path and use the
+    // legacy `on_read` (scratch FIFO) callback instead.
+    const dst_ptr: u32 = 1;
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 2)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.completed, 2), status);
+
+    // The fallback path fired (not the zero-copy intoCb).
+    try testing.expectEqual(@as(u32, 0), driver_state.on_read_into_calls);
+    try testing.expectEqual(@as(u32, 1), driver_state.on_read_calls);
+
+    // Output bytes still correct — fallback memcpys two u32s into the
+    // misaligned guest dst. (The legacy path uses byte memcpy so
+    // unaligned destinations work; the issue here is downstream
+    // guest load semantics, which is the guest's problem.)
+    const written = inst.writableGuestBytes(dst_ptr, 8).?;
+    try testing.expectEqualSlices(u8, "\x11\x11\x11\x11\x22\x22\x22\x22", written);
+}
+
+test "stream.read zero-copy: dst extending past memory.size falls back (no UAF of guest linmem) (#583 B2)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    // u8 stream — alignment isn't the gating factor here; we want to
+    // stress the bounds check on `writableGuestBytes(guest_ptr, len)`.
+    // `newStreamU8Inst` allocates a 4 KiB test_mem.
+    const inst = try newStreamU8Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    var driver_state = ZeroCopyTestDriver{ .payload = "ok" };
+    {
+        const s = inst.streams.getPtr(handle).?;
+        s.host_driver = .{
+            .context = &driver_state,
+            .on_read = &ZeroCopyTestDriver.fallbackCb,
+            .on_read_into = &ZeroCopyTestDriver.intoCb,
+        };
+    }
+
+    // `dst_ptr = 4090` + `max_count = 64` overshoots the 4096-byte
+    // test_mem. The would-be borrowed slice straddles the synthetic
+    // memory.size — the spec safety check (the "cross-page write
+    // because guest memory could grow mid-call" rule) forces the
+    // executor onto the scratch-FIFO path, where the legacy
+    // `on_read` callback can still service the request.
+    const dst_ptr: u32 = 4090;
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 64)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    // `on_read` payload is "ok" (2 bytes), which fits inside the 6
+    // bytes remaining at `dst_ptr = 4090..4096`. The executor's FIFO
+    // drain memcpys those 2 bytes there and reports completed(2).
+    try testing.expectEqual(async_canon.packStatus(.completed, 2), status);
+
+    try testing.expectEqual(@as(u32, 0), driver_state.on_read_into_calls);
+    try testing.expectEqual(@as(u32, 1), driver_state.on_read_calls);
+
+    const written = inst.writableGuestBytes(dst_ptr, 2).?;
+    try testing.expectEqualStrings("ok", written);
 }
 
 // ── #550: waitable.join + waitable-set.{wait,poll} event delivery ─────────
