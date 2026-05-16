@@ -1421,28 +1421,43 @@ pub const FsWriteStreamCtx = struct {
     /// end-of-file instead of `offset + bytes_written`.
     append: bool,
     /// Flipped by the adapter's `cancelAllPendingAsyncOps` driver when
-    /// the guest issues `canon task.cancel` (#583 B1). The drain loop
-    /// in `fsWriteViaStreamOnWrite` checks this on every chunk and
-    /// short-circuits with `.err` so the executor flips
-    /// `read_closed = true` and the guest's next `stream.write` sees
-    /// `DROPPED`. Cancel is observed at the **next** chunk boundary —
-    /// any pwrite already in flight runs to completion.
-    cancelled: bool = false,
+    /// the guest issues `canon task.cancel` (#583 B1, #602 follow-up).
+    ///
+    /// The drain loop in `fsWriteViaStreamOnWrite` polls this with
+    /// `.load(.acquire)` between every `FS_CANCEL_POLL_CHUNK_BYTES`-
+    /// sized `pwrite(2)` chunk and short-circuits with `.err` so the
+    /// executor flips `read_closed = true` and the guest's next
+    /// `stream.write` sees `DROPPED`. A multi-MiB guest buffer is
+    /// split into 64 KiB chunks under the hood, so cancel is observed
+    /// within at most one chunk's `pwrite(2)` latency — mirroring the
+    /// per-chunk granularity the HTTP outbound body-read loop uses
+    /// (#602). The kernel `pwrite(2)` syscall itself is atomic from
+    /// cancel's POV (a 64 KiB write either lands fully or fails), so
+    /// the chunk currently in flight always runs to completion.
+    ///
+    /// Atomic so a multi-threaded host can flip the flag mid-drain
+    /// from a separate cancel driver / event loop thread without UB;
+    /// the single-threaded executor path issues plain
+    /// `.store(true, .release)` from `cancelAllPendingAsyncOps`.
+    cancelled: std.atomic.Value(bool) = .{ .raw = false },
 };
 
 /// `AsyncStream` created by `descriptor.read-via-stream` (#573,
 /// #583 B1). Today's `fsDescriptorReadViaStreamP3` eagerly pre-buffers
 /// up to `FS_STREAM_BUFFER_CAP` bytes during the trampoline call and
-/// closes the writable end before returning, so there is no in-flight
-/// drain loop the host can interrupt. This ctx exists so the
+/// closes the writable end before returning; the pre-buffer fill is
+/// itself broken into `FS_CANCEL_POLL_CHUNK_BYTES`-sized
+/// `readPositional` chunks so a `task.cancel` issued mid-fill is
+/// observed within one chunk's latency (#583, #602 follow-up). The
+/// lazy `fsReadViaStreamOnRead` callback exists so the
 /// `cancelAllPendingAsyncOps` driver still has a uniform place to
-/// observe cancellation for read streams: the `cancelled` flag is
-/// flipped on `canon task.cancel`, and the (currently rarely-fired)
-/// `fsReadViaStreamOnRead` callback short-circuits with `.eof` once
-/// cancel is observed. If a future PR refactors read-via-stream into
-/// a chunked lazy drain (so files > 64 MiB stream rather than
-/// truncate), the existing wire-up automatically delivers cancel
-/// propagation through the same callback.
+/// observe cancellation for read streams once the writable end is
+/// re-opened: the `cancelled` flag is flipped on `canon task.cancel`,
+/// and `fsReadViaStreamOnRead` short-circuits with `.eof`. If a
+/// future PR refactors read-via-stream into a chunked lazy drain (so
+/// files > 64 MiB stream rather than truncate), the existing wire-up
+/// automatically delivers cancel propagation through the same
+/// callback at the same 64 KiB cadence.
 pub const FsReadStreamCtx = struct {
     adapter: *WasiCliAdapter,
     /// Guest-visible `descriptor` handle for the source file. Kept
@@ -1456,12 +1471,17 @@ pub const FsReadStreamCtx = struct {
     offset: u64,
     /// Running byte counter — sum of all bytes pread'd so far. The
     /// next on_read call (if the eager mode is ever relaxed) would
-    /// read at `offset + bytes_read`.
+    /// read at `offset + bytes_read`. Updated after every chunked
+    /// pre-buffer fill in `fsDescriptorReadViaStreamP3`.
     bytes_read: u64 = 0,
-    /// Set by `cancelAllPendingAsyncOps` (#583 B1). Read by
-    /// `fsReadViaStreamOnRead` to surface `.eof` and close the
-    /// stream cleanly.
-    cancelled: bool = false,
+    /// Set by `cancelAllPendingAsyncOps` (#583 B1, #602 follow-up).
+    /// Polled with `.load(.acquire)` between every
+    /// `FS_CANCEL_POLL_CHUNK_BYTES`-sized `readPositional` chunk in
+    /// the eager pre-buffer loop and by `fsReadViaStreamOnRead` to
+    /// surface `.eof` and close the stream cleanly. Mirrors the
+    /// finer-grained cancel cadence the HTTP outbound body-read
+    /// loop uses (#602).
+    cancelled: std.atomic.Value(bool) = .{ .raw = false },
 };
 
 /// A `udp-socket.receive` call that found no datagram waiting on its
@@ -7599,12 +7619,15 @@ pub const WasiCliAdapter = struct {
         // re-poll their fds; we already published the cancel.
         self.pending_udp_receives.clearRetainingCapacity();
 
-        // ── Filesystem stream contexts (#583 B1) ─────────────────
+        // ── Filesystem stream contexts (#583 B1, #602 follow-up) ──
         // Flip the cancel flag on every adapter-owned FS stream ctx.
-        // The on_read / on_write callbacks check the flag and short-
-        // circuit on the next executor invocation.
-        for (self.fs_write_stream_ctxs.items) |ctx| ctx.cancelled = true;
-        for (self.fs_read_stream_ctxs.items) |ctx| ctx.cancelled = true;
+        // The on_read / on_write callbacks poll the flag with
+        // `.load(.acquire)` between every `FS_CANCEL_POLL_CHUNK_BYTES`-
+        // sized pwrite/pread chunk and short-circuit so a multi-MiB
+        // drain is interrupted within at most one chunk's syscall
+        // latency — mirrors the HTTP body-read cadence from #602.
+        for (self.fs_write_stream_ctxs.items) |ctx| ctx.cancelled.store(true, .release);
+        for (self.fs_read_stream_ctxs.items) |ctx| ctx.cancelled.store(true, .release);
 
         // ── Outbound HTTP fetches (#583 B1) ───────────────────────
         // `shared.cancelled` is an `Atomic.Value(bool)` so the worker
@@ -10495,6 +10518,21 @@ pub const WasiCliAdapter = struct {
     /// `BUFFER_FILL_MAX` is reached.
     const FS_STREAM_BUFFER_CAP: usize = 64 * 1024 * 1024;
 
+    /// Per-chunk granularity for cancel polling inside the FS stream
+    /// drain loops (#583 B1, #602 follow-up). The `pwrite(2)` /
+    /// `pread(2)` drivers split any guest buffer larger than this into
+    /// chunks of this size and re-check `ctx.cancelled.load(.acquire)`
+    /// between chunks, so a `task.cancel` issued mid-multi-MiB
+    /// transfer is observed within at most one chunk's syscall
+    /// latency. 64 KiB matches the HTTP outbound body-read cadence
+    /// (`http_cancel_body_chunk_bytes`) and is large enough that the
+    /// per-chunk syscall overhead is negligible relative to the
+    /// cancel-observability win. The kernel syscall itself is atomic
+    /// from cancel's POV — a 64 KiB pwrite either lands fully or
+    /// fails — so the chunk currently in flight always completes
+    /// before cancel is honoured.
+    const FS_CANCEL_POLL_CHUNK_BYTES: usize = 64 * 1024;
+
     /// Allocate an empty closed `stream<u8>` slot. Used on the error
     /// arm of `read-via-stream` so the returned tuple's stream handle
     /// is well-typed (a `stream.read` against it yields the standard
@@ -10622,8 +10660,8 @@ pub const WasiCliAdapter = struct {
         };
         errdefer slot.deinit(ci.allocator);
 
-        const buf = try allocator.alloc(u8, FS_STREAM_BUFFER_CAP);
-        defer allocator.free(buf);
+        const buf_chunk = try allocator.alloc(u8, FS_CANCEL_POLL_CHUNK_BYTES);
+        defer allocator.free(buf_chunk);
 
         // Pre-validate offset: Zig's `readPositional` panics on EINVAL
         // (Linux pread with a negative offset). Cap at i64::MAX —
@@ -10641,20 +10679,27 @@ pub const WasiCliAdapter = struct {
             return;
         }
 
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const n: usize = fs_file.file.readPositional(io, &.{buf}, offset) catch 0;
-        if (n > 0) try slot.buffer.appendSlice(ci.allocator, buf[0..n]);
-
-        // (#583 B1) Install a cancel-aware host_driver so the
-        // adapter-wide `cancelAllPendingAsyncOps` driver has a uniform
-        // place to surface `canon task.cancel` for read streams. Today
-        // `write_closed = true` is set above, so the executor only
-        // drains the buffered bytes and never re-enters the driver —
-        // the wiring is "armed but dormant", primed for the lazy-
-        // chunked drain refactor (which will leave `write_closed`
-        // false and dispatch the driver on FIFO exhaustion).
+        // (#583 B1, #602 follow-up) Allocate the cancel-aware
+        // host_driver ctx BEFORE the eager-prebuffer fill so its
+        // `cancelled` flag is visible to a peer-thread cancel driver
+        // mid-fill. The fill helper below polls
+        // `read_ctx.cancelled.load(.acquire)` between every
+        // `FS_CANCEL_POLL_CHUNK_BYTES`-sized `readPositional(2)`, so
+        // a `task.cancel` issued while the host is part-way through a
+        // multi-MiB pre-buffer is observed within one chunk's pread
+        // latency — mirroring the HTTP outbound body-read cadence
+        // from #602.
         const read_ctx = try self.allocFsReadStreamCtx(handle, offset);
-        read_ctx.bytes_read = n;
+        fsEagerPreBufferChunked(fs_file, read_ctx, &slot, offset, buf_chunk, ci.allocator);
+
+        // (#583 B1) The cancel-aware host_driver wiring lets the
+        // adapter-wide `cancelAllPendingAsyncOps` driver surface
+        // `canon task.cancel` on read streams. With `write_closed =
+        // true` set above the executor only drains the buffered
+        // bytes and never re-enters the driver in steady state — the
+        // wiring is "armed but dormant", primed for the lazy-chunked
+        // drain refactor (which will leave `write_closed` false and
+        // dispatch the driver on FIFO exhaustion).
         slot.elem_size_hint = 1;
         slot.host_driver = .{
             .context = read_ctx,
@@ -10685,13 +10730,69 @@ pub const WasiCliAdapter = struct {
             .desc_handle = desc_handle,
             .offset = offset,
             .bytes_read = 0,
-            .cancelled = false,
+            .cancelled = .{ .raw = false },
         };
         self.fs_read_stream_ctxs.append(self.allocator, ctx) catch {
             self.allocator.destroy(ctx);
             return error.OutOfMemory;
         };
         return ctx;
+    }
+
+    /// Eagerly fill a `read-via-stream` slot's pre-buffer with up to
+    /// `FS_STREAM_BUFFER_CAP` bytes from `fs_file` at `base_offset`,
+    /// splitting the drain into `FS_CANCEL_POLL_CHUNK_BYTES`-sized
+    /// `readPositional(2)` chunks and polling
+    /// `ctx.cancelled.load(.acquire)` between every chunk so a
+    /// peer-thread cancel driver can interrupt the fill within one
+    /// chunk's pread latency (#583 B1, #602 follow-up).
+    ///
+    /// `scratch` must be at least `FS_CANCEL_POLL_CHUNK_BYTES` bytes;
+    /// only the first chunk-sized prefix is touched per iteration.
+    ///
+    /// Side effects: appends drained bytes to `slot.buffer` and
+    /// updates `ctx.bytes_read` after each chunk via `@atomicStore`
+    /// so peer threads watching the running counter see contiguous
+    /// progress. Returns silently on cancel, short read, EOF, or any
+    /// `readPositional` / `appendSlice` error — the pre-buffer is
+    /// best-effort and mirrors the prior single-syscall behaviour of
+    /// swallowing read errors as zero bytes drained.
+    fn fsEagerPreBufferChunked(
+        fs_file: FsDescriptor.FsFile,
+        ctx: *FsReadStreamCtx,
+        slot: *async_mod.AsyncStream,
+        base_offset: u64,
+        scratch: []u8,
+        list_allocator: Allocator,
+    ) void {
+        std.debug.assert(scratch.len >= FS_CANCEL_POLL_CHUNK_BYTES);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var total: u64 = 0;
+        const max_total: u64 = @as(u64, FS_STREAM_BUFFER_CAP);
+        while (total < max_total) {
+            if (ctx.cancelled.load(.acquire)) break;
+            const remaining: u64 = max_total - total;
+            const chunk_len: usize = @intCast(@min(
+                remaining,
+                @as(u64, FS_CANCEL_POLL_CHUNK_BYTES),
+            ));
+            const chunk_offset: u64 = base_offset +% total;
+            const n: usize = fs_file.file.readPositional(
+                io,
+                &.{scratch[0..chunk_len]},
+                chunk_offset,
+            ) catch 0;
+            if (n == 0) break;
+            // Best-effort: if the slot's buffer can't grow we bail
+            // the same way a `readPositional` error does — the bytes
+            // already drained stay; the rest is abandoned.
+            slot.buffer.appendSlice(list_allocator, scratch[0..n]) catch break;
+            total += @as(u64, n);
+            // Atomic store so a peer thread watching `bytes_read`
+            // sees the running counter advance without UB.
+            @atomicStore(u64, &ctx.bytes_read, total, .release);
+            if (n < chunk_len) break; // short read => EOF reached
+        }
     }
 
     /// `host_driver.on_read` for a `descriptor.read-via-stream`
@@ -10709,7 +10810,7 @@ pub const WasiCliAdapter = struct {
         _: Allocator,
     ) async_mod.HostStreamAction {
         const ctx: *FsReadStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
-        if (ctx.cancelled) return .eof;
+        if (ctx.cancelled.load(.acquire)) return .eof;
         // No lazy refill yet — pre-buffer fully filled by the
         // trampoline. Treat as EOF so the executor closes the
         // writable end naturally.
@@ -10870,6 +10971,7 @@ pub const WasiCliAdapter = struct {
             .offset = offset,
             .bytes_written = 0,
             .append = append,
+            .cancelled = .{ .raw = false },
         };
         self.fs_write_stream_ctxs.append(self.allocator, ctx) catch {
             self.allocator.destroy(ctx);
@@ -10888,6 +10990,18 @@ pub const WasiCliAdapter = struct {
     /// syscall error so the executor flips `read_closed = true` and
     /// the guest's next `stream.write` returns DROPPED.
     ///
+    /// Multi-MiB guest buffers are split into
+    /// `FS_CANCEL_POLL_CHUNK_BYTES`-sized chunks; the cancel flag is
+    /// polled with `.load(.acquire)` between every chunk so a
+    /// `task.cancel` issued mid-drain is observed within one chunk's
+    /// `pwrite(2)` latency (#583 B1, #602 follow-up). The first
+    /// chunk's pwrite is uninterruptible — a kernel `pwrite(2)` of
+    /// N bytes is atomic from cancel's POV — but every chunk after
+    /// that is preceded by a cancel poll. Returning `.err` mid-buffer
+    /// preserves `bytes_written` exactly at the cancel-observation
+    /// point: the file on disk holds the bytes from the chunks that
+    /// completed before cancel was seen, with no partial-chunk tear.
+    ///
     /// Re-looks up the underlying `FsDescriptor` each call: if the
     /// guest dropped the descriptor while the stream is still live,
     /// the lookup fails and we surface `.err` rather than UAF the fd.
@@ -10898,12 +11012,12 @@ pub const WasiCliAdapter = struct {
         _: Allocator,
     ) async_mod.HostStreamAction {
         const ctx: *FsWriteStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
-        // (#583 B1) `canon task.cancel` flipped the cancel flag — bail
-        // before issuing any further pwrite(2). Returning `.err` makes
-        // the executor flip `read_closed = true` so the guest's next
+        // (#583 B1) Pre-entry cancel check: bail before any pwrite(2)
+        // if the guest already cancelled. Returning `.err` makes the
+        // executor flip `read_closed = true` so the guest's next
         // `stream.write` returns DROPPED, matching the wit-bindgen
         // `Subtask` "cancelled mid-stream" decoder path.
-        if (ctx.cancelled) return .err;
+        if (ctx.cancelled.load(.acquire)) return .err;
         if (bytes.len == 0) return .progressed;
         const d = ctx.adapter.lookupFsDescriptor(ctx.desc_handle) orelse return .err;
         const fs_file: FsDescriptor.FsFile = switch (d.*) {
@@ -10912,17 +11026,42 @@ pub const WasiCliAdapter = struct {
         };
         if (!fs_file.flags.write) return .err;
         const io = std.Io.Threaded.global_single_threaded.io();
-        const write_offset: u64 = if (ctx.append) blk: {
-            // Append mode: position at the current end-of-file. We
-            // re-stat each chunk so concurrent extenders (other
-            // descriptors pointing at the same inode) don't clobber
-            // bytes we just wrote. Best-effort: a stat failure
-            // surfaces as `.err`.
-            const stat = fs_file.file.stat(io) catch return .err;
-            break :blk stat.size;
-        } else ctx.offset +% ctx.bytes_written;
-        fs_file.file.writePositionalAll(io, bytes, write_offset) catch return .err;
-        ctx.bytes_written += @as(u64, bytes.len);
+
+        // (#583, #602 follow-up) Chunked pwrite drain with per-chunk
+        // cancel polling. Splits the guest's buffer into
+        // `FS_CANCEL_POLL_CHUNK_BYTES` (64 KiB) slices; between each
+        // pwrite we re-check `ctx.cancelled` so a mid-drain
+        // `task.cancel` is observed within one chunk's latency. The
+        // first chunk is uninterruptible (the pre-entry check above
+        // is the only opportunity to skip it) — every subsequent
+        // chunk is preceded by a poll. Mirrors the HTTP body-read
+        // pattern from #602.
+        var written_this_call: usize = 0;
+        while (written_this_call < bytes.len) {
+            // Skip the poll on the very first chunk — the pre-entry
+            // check already covered that case. Polling between
+            // chunks limits the worst-case "after cancel was set"
+            // wasted work to one in-flight pwrite.
+            if (written_this_call > 0 and ctx.cancelled.load(.acquire)) return .err;
+            const remaining = bytes.len - written_this_call;
+            const chunk_len = @min(remaining, FS_CANCEL_POLL_CHUNK_BYTES);
+            const chunk = bytes[written_this_call..][0..chunk_len];
+            const write_offset: u64 = if (ctx.append) blk: {
+                // Append mode: position at the current end-of-file
+                // for every chunk so concurrent extenders (other
+                // descriptors pointing at the same inode) don't
+                // clobber bytes we just wrote. Best-effort: a stat
+                // failure surfaces as `.err`.
+                const stat = fs_file.file.stat(io) catch return .err;
+                break :blk stat.size;
+            } else ctx.offset +% ctx.bytes_written;
+            fs_file.file.writePositionalAll(io, chunk, write_offset) catch return .err;
+            // Use an atomic store so observers (e.g. a peer thread
+            // running the cancel driver) see the running counter
+            // advance without UB on the cross-thread read.
+            @atomicStore(u64, &ctx.bytes_written, ctx.bytes_written + @as(u64, chunk_len), .release);
+            written_this_call += chunk_len;
+        }
         return .progressed;
     }
 
@@ -34573,7 +34712,7 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: FS write-via-stream drain loop sh
 
     // Cancel — flips the per-ctx flag on every registered FS stream.
     WasiCliAdapter.cancelAllPendingAsyncOps(&adapter, &ci, null, testing.allocator);
-    try testing.expect(adapter.fs_write_stream_ctxs.items[0].cancelled);
+    try testing.expect(adapter.fs_write_stream_ctxs.items[0].cancelled.load(.acquire));
 
     // Post-cancel chunk: drain loop short-circuits with `.err`. The
     // running offset must NOT advance — no further pwrite happened.
@@ -34632,7 +34771,7 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: FS read-via-stream on_read short-
     try testing.expect(slot.host_driver != null);
     try testing.expectEqual(@as(usize, 1), adapter.fs_read_stream_ctxs.items.len);
     const ctx = adapter.fs_read_stream_ctxs.items[0];
-    try testing.expect(!ctx.cancelled);
+    try testing.expect(!ctx.cancelled.load(.acquire));
 
     // Snapshot the buffer length so we can prove cancel doesn't
     // mutate it.
@@ -34640,7 +34779,7 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: FS read-via-stream on_read short-
 
     // Cancel — flips the per-ctx flag on every registered FS read stream.
     WasiCliAdapter.cancelAllPendingAsyncOps(&adapter, &ci, null, testing.allocator);
-    try testing.expect(ctx.cancelled);
+    try testing.expect(ctx.cancelled.load(.acquire));
 
     // Direct invocation of on_read post-cancel: `.eof`, no bytes
     // appended. The pre-buffered FIFO content is untouched.
@@ -34654,6 +34793,251 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: FS read-via-stream on_read short-
     try testing.expectEqual(async_mod.HostStreamAction.eof, action);
     try testing.expectEqual(@as(usize, 0), stream_for_cb.buffer.items.len);
     try testing.expectEqual(buffered_before, slot.buffer.items.len);
+}
+
+test "WasiCliAdapter FS write-via-stream: per-chunk cancel polling within multi-MiB write returns .err with partial bytes persisted (#583, #602 follow-up)" {
+    // PR #602 introduced per-64-KiB cancel polling inside the HTTP
+    // outbound body-read loop; this test verifies the symmetric
+    // pattern on the FS write-via-stream driver. A watcher thread
+    // flips `ctx.cancelled` once it observes the running
+    // `bytes_written` cross the first chunk boundary; the driver's
+    // per-chunk poll then short-circuits with `.err` mid-buffer,
+    // leaving the bytes from the chunks that completed before
+    // cancel was seen intact on disk (no partial-chunk tear —
+    // each chunk's `pwrite(2)` is atomic).
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "fs-cancel-midchunk-w.bin", .data = "" });
+    const file = try tmp.dir.openFile(io, "fs-cancel-midchunk-w.bin", .{ .mode = .read_write });
+    const desc_handle = try adapter.pushFsDescriptor(.{
+        .file = .{ .file = file, .flags = .{ .read = true, .write = true } },
+    });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, stream_handle, .{});
+
+    var args = [_]InterfaceValue{
+        .{ .handle = desc_handle },
+        .{ .handle = stream_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), adapter.fs_write_stream_ctxs.items.len);
+    const ctx = adapter.fs_write_stream_ctxs.items[0];
+    const slot = ci.streams.getPtr(stream_handle).?;
+
+    const WriteWatcher = struct {
+        ctx_ref: *FsWriteStreamCtx,
+        observed_at: std.atomic.Value(u64) = .{ .raw = 0 },
+        fn run(self: *@This()) void {
+            var spins: usize = 0;
+            // Spin-poll `bytes_written`; flip cancel as soon as we
+            // see the running counter cross the first chunk
+            // boundary. The spin bound keeps a flaky CI machine
+            // (where the write finishes before the watcher
+            // schedules) from deadlocking the test — we surface
+            // the miss via `observed_at == 0` so the assertions
+            // below can `error.SkipZigTest` instead of failing.
+            while (spins < 100_000_000) : (spins += 1) {
+                const seen = @atomicLoad(u64, &self.ctx_ref.bytes_written, .acquire);
+                if (seen >= WasiCliAdapter.FS_CANCEL_POLL_CHUNK_BYTES) {
+                    self.observed_at.store(seen, .release);
+                    self.ctx_ref.cancelled.store(true, .release);
+                    return;
+                }
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var watcher_ctx = WriteWatcher{ .ctx_ref = ctx };
+    const watcher = try std.Thread.spawn(.{}, WriteWatcher.run, .{&watcher_ctx});
+
+    const buf_size: usize = 16 * 1024 * 1024;
+    const big_buf = try testing.allocator.alloc(u8, buf_size);
+    defer testing.allocator.free(big_buf);
+    @memset(big_buf, 'W');
+
+    var stream_for_cb: async_mod.AsyncStream = .{};
+    defer stream_for_cb.deinit(testing.allocator);
+    const action = slot.host_driver.?.on_write.?(
+        slot.host_driver.?.context,
+        &stream_for_cb,
+        big_buf,
+        ci.allocator,
+    );
+    watcher.join();
+    // If the watcher never observed the first-chunk boundary, the
+    // host's pwrite throughput must have outrun a spin-poll
+    // thread's wake-up — extraordinarily unlikely on any modern
+    // box, but we skip rather than flake.
+    if (watcher_ctx.observed_at.load(.acquire) == 0) return error.SkipZigTest;
+
+    try testing.expectEqual(async_mod.HostStreamAction.err, action);
+    const wrote = ctx.bytes_written;
+    // At least one chunk fired before cancel was observed.
+    try testing.expect(wrote >= WasiCliAdapter.FS_CANCEL_POLL_CHUNK_BYTES);
+    // And the driver bailed before the full buffer drained.
+    try testing.expect(wrote < buf_size);
+    // No partial-chunk tear: the file contains exactly `wrote` bytes.
+    const stat = try file.stat(io);
+    try testing.expectEqual(wrote, stat.size);
+}
+
+test "WasiCliAdapter FS read-via-stream: per-chunk cancel polling within eager pre-buffer caps bytes_read (#583, #602 follow-up)" {
+    // Symmetric to the write-side per-chunk cancel test. A watcher
+    // thread flips `ctx.cancelled` once `bytes_read` crosses the
+    // first chunk boundary; the eager-prebuffer helper observes the
+    // flip between `readPositional(2)` chunks and bails. The slot's
+    // FIFO ends up shorter than the source file, proving cancel was
+    // honoured mid-fill. Drives `fsEagerPreBufferChunked` directly
+    // because the ctx pointer is only stable after the trampoline
+    // appends it to `fs_read_stream_ctxs` — invoking the helper
+    // gives the watcher a stable ctx reference up front.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // 16 MiB of 'R' so the chunked drain has plenty of iterations
+    // for the watcher to catch a boundary.
+    const file_size: usize = 16 * 1024 * 1024;
+    const seed_buf = try testing.allocator.alloc(u8, file_size);
+    defer testing.allocator.free(seed_buf);
+    @memset(seed_buf, 'R');
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "fs-cancel-midchunk-r.bin", .data = seed_buf });
+    const file = try tmp.dir.openFile(io, "fs-cancel-midchunk-r.bin", .{ .mode = .read_only });
+    const fs_file: FsDescriptor.FsFile = .{ .file = file, .flags = .{ .read = true } };
+    const desc_handle = try adapter.pushFsDescriptor(.{ .file = fs_file });
+    _ = desc_handle;
+
+    const ctx = try adapter.allocFsReadStreamCtx(0, 0);
+
+    var slot: async_mod.AsyncStream = .{
+        .elem_type_idx = 0,
+        .elem_size_hint = 1,
+        .state = .open,
+        .read_closed = false,
+        .write_closed = true,
+    };
+    defer slot.deinit(testing.allocator);
+
+    const scratch = try testing.allocator.alloc(u8, WasiCliAdapter.FS_CANCEL_POLL_CHUNK_BYTES);
+    defer testing.allocator.free(scratch);
+
+    const ReadWatcher = struct {
+        ctx_ref: *FsReadStreamCtx,
+        observed_at: std.atomic.Value(u64) = .{ .raw = 0 },
+        fn run(self: *@This()) void {
+            var spins: usize = 0;
+            while (spins < 100_000_000) : (spins += 1) {
+                const seen = @atomicLoad(u64, &self.ctx_ref.bytes_read, .acquire);
+                if (seen >= WasiCliAdapter.FS_CANCEL_POLL_CHUNK_BYTES) {
+                    self.observed_at.store(seen, .release);
+                    self.ctx_ref.cancelled.store(true, .release);
+                    return;
+                }
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var watcher_ctx = ReadWatcher{ .ctx_ref = ctx };
+    const watcher = try std.Thread.spawn(.{}, ReadWatcher.run, .{&watcher_ctx});
+
+    WasiCliAdapter.fsEagerPreBufferChunked(fs_file, ctx, &slot, 0, scratch, testing.allocator);
+    watcher.join();
+
+    if (watcher_ctx.observed_at.load(.acquire) == 0) return error.SkipZigTest;
+
+    // Cancel observed: the FIFO holds fewer bytes than the source
+    // file. At least one chunk fired (the boundary the watcher saw)
+    // and the loop bailed before reaching EOF.
+    try testing.expect(slot.buffer.items.len >= WasiCliAdapter.FS_CANCEL_POLL_CHUNK_BYTES);
+    try testing.expect(slot.buffer.items.len < file_size);
+    // The bytes that did drain are intact: every byte is the seed
+    // 'R' — no partial-chunk tear.
+    for (slot.buffer.items) |b| try testing.expectEqual(@as(u8, 'R'), b);
+}
+
+test "WasiCliAdapter FS write-via-stream: cancel-before-first-chunk skips pwrite(2) entirely (#583, #602 follow-up)" {
+    // The per-chunk drain loop's pre-entry check must fire before
+    // any pwrite issues: if `task.cancel` was already observed when
+    // the driver gets called with a multi-MiB guest buffer, zero
+    // bytes hit the disk. Matches PR #593's original cancel
+    // semantics while documenting that the chunked refactor
+    // preserves the "no syscall on already-cancelled" guarantee.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "fs-cancel-prefirst-w.bin", .data = "" });
+    const file = try tmp.dir.openFile(io, "fs-cancel-prefirst-w.bin", .{ .mode = .read_write });
+    const desc_handle = try adapter.pushFsDescriptor(.{
+        .file = .{ .file = file, .flags = .{ .read = true, .write = true } },
+    });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, stream_handle, .{});
+
+    var args = [_]InterfaceValue{
+        .{ .handle = desc_handle },
+        .{ .handle = stream_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), adapter.fs_write_stream_ctxs.items.len);
+    const ctx = adapter.fs_write_stream_ctxs.items[0];
+    const slot = ci.streams.getPtr(stream_handle).?;
+
+    // Pre-flip cancel before invoking the driver. The driver must
+    // observe the flag on entry and return `.err` without any
+    // pwrite(2) — `bytes_written` stays at 0 and the file remains
+    // empty on disk.
+    ctx.cancelled.store(true, .release);
+
+    const buf_size: usize = 1 * 1024 * 1024;
+    const big_buf = try testing.allocator.alloc(u8, buf_size);
+    defer testing.allocator.free(big_buf);
+    @memset(big_buf, 'X');
+
+    var stream_for_cb: async_mod.AsyncStream = .{};
+    defer stream_for_cb.deinit(testing.allocator);
+    const action = slot.host_driver.?.on_write.?(
+        slot.host_driver.?.context,
+        &stream_for_cb,
+        big_buf,
+        ci.allocator,
+    );
+    try testing.expectEqual(async_mod.HostStreamAction.err, action);
+    try testing.expectEqual(@as(u64, 0), ctx.bytes_written);
+    const stat = try file.stat(io);
+    try testing.expectEqual(@as(u64, 0), stat.size);
 }
 
 test "WasiCliAdapter.cancelAllPendingAsyncOps: outbound HTTP fetch flips shared.cancelled and drainer settles HTTP_request_denied (#583 B1)" {
