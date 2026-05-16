@@ -43,7 +43,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:random`      | ✅ | ✅ | OS CSPRNG (`std.crypto.random`) + insecure variants + 128-bit seed. |
 | `wasi:sockets`     | ✅ | ✅ | TCP + UDP + DNS; allow-list gated; SO_REUSEADDR; Windows + POSIX parity. |
 | `wasi:keyvalue`    | — | — | Not implemented (#583 B4). |
-| `wasi:logging`     | — | — | Not implemented (#583 B5). |
+| `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
 | `wasi:config`      | — | — | Not implemented (#583 B6). |
 | `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
 | `wasi:threads`     | — | — | Not implemented (#583 B3). |
@@ -87,6 +87,7 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:http/types`                  | 56 | `wasi-p2-testsuite` (`zig-http`) | Fields + outgoing/incoming request/response + bodies + futures. |
 | `wasi:http/outgoing-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real `std.http.Client.fetch` for `http://` + `https://`. |
 | `wasi:http/incoming-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real TCP-listener-backed dispatch (#580). |
+| `wasi:logging/logging@0.1.0-draft` |  1 | unit tests | Host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`. No structured-logging backends yet (#583 B5). |
 
 ### WASI Preview 3 (0.3.0)
 
@@ -174,6 +175,7 @@ either added a new interface family or closed a tracker issue.
 | `wasi:sockets` Windows `bindAndGetsockname` parity              | [#587](https://github.com/cataggar/wamr/pull/587) | #583 A6 |
 | Sockets allow-list consultation at kernel-I/O                   | [#588](https://github.com/cataggar/wamr/pull/588) | #583 A1 |
 | Outbound HTTP client async state machine                        | [#590](https://github.com/cataggar/wamr/pull/590) | #583 A2 |
+| `wasi:logging@0.1.x` host adapter                               | this PR | #583 B5 |
 
 ## Known limitations
 
@@ -209,8 +211,11 @@ in that tracker.
   upstream WIT still draft. ([#583 B3](https://github.com/cataggar/wamr/issues/583))
 * **`wasi:keyvalue@0.2.x`** — not implemented; a `memory`-backed default
   impl would let the keyvalue testsuite run. ([#583 B4](https://github.com/cataggar/wamr/issues/583))
-* **`wasi:logging@0.1.x`** — not implemented; trivial wire onto `std.log` /
-  `stderr`. ([#583 B5](https://github.com/cataggar/wamr/issues/583))
+* **`wasi:logging@0.1.x`** — host adapter shipped. Routes guest
+  `log(level, context, message)` calls to host stderr + Zig's
+  `std.log.scoped(.wasi_guest)`. Level filter: `--log-level=<name>` CLI
+  flag or `WAMR_LOG_LEVEL` env var. No structured-logging backend
+  integration yet — future work.
 * **`wasi:config@0.2.x`** — not implemented; would read from env / CLI /
   config-store file. ([#583 B6](https://github.com/cataggar/wamr/issues/583))
 * **`wasi:blobstore`, `wasi:cli/run-with-server`** — pending upstream WIT
@@ -289,7 +294,8 @@ additions (one PR per interface, gated behind the existing
 
 * **`wasi:threads@0.3.x`** — [#583 B3](https://github.com/cataggar/wamr/issues/583).
 * **`wasi:keyvalue@0.2.x`** — [#583 B4](https://github.com/cataggar/wamr/issues/583).
-* **`wasi:logging@0.1.x`** — [#583 B5](https://github.com/cataggar/wamr/issues/583).
+* ~~**`wasi:logging@0.1.x`**~~ — host adapter shipped (#583 B5); see the
+  Preview-2 detail table for the registered methods.
 * **`wasi:config@0.2.x`** — [#583 B6](https://github.com/cataggar/wamr/issues/583).
 * **`wasi:blobstore`, `wasi:cli/run-with-server`** — [#583 B7](https://github.com/cataggar/wamr/issues/583).
 
