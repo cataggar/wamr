@@ -337,6 +337,22 @@ pub const HostStreamAction = enum {
     err,
 };
 
+/// Result returned by a zero-copy `on_read_into` driver callback.
+/// Distinct from the buffer-appending `on_read` shape because the
+/// driver no longer hands the executor an *implicit* byte count via
+/// `stream.buffer.items.len`; instead it states explicitly how many
+/// bytes it wrote into the guest-supplied destination.
+///
+/// Invariants:
+///   * `bytes_written` MUST be ≤ the `dst.len` passed to the callback.
+///   * On `.would_block` / `.eof` / `.err`, `bytes_written` MUST be 0.
+///   * On `.progressed` with `bytes_written == 0`, the executor treats
+///     it as a defensive `.would_block` (no spinning).
+pub const HostStreamReadInto = struct {
+    action: HostStreamAction,
+    bytes_written: u32 = 0,
+};
+
 /// Optional host-driven I/O attached to an `AsyncStream`. When set, the
 /// executor's `stream.read` / `stream.write` paths invoke the driver
 /// before parking / buffering so a long-lived host source / sink (a
@@ -350,6 +366,22 @@ pub const HostStreamAction = enum {
 /// The executor holds the canonical FIFO in `AsyncStream.buffer` — the
 /// driver appends to / drains from it directly via the `*AsyncStream`
 /// pointer the executor passes in.
+///
+/// ## Zero-copy (#583 B2)
+///
+/// Drivers that can read straight into a caller-supplied byte slice may
+/// additionally set `on_read_into`. When the executor's `stream.read`
+/// arm sees a sufficiently-aligned guest destination and a positive
+/// `max_count`, it borrows a slice of guest linmem (via
+/// `comp_inst.writableGuestBytes`, which validates `ptr + len ≤
+/// memory.size`) and passes that slice to the driver — skipping the
+/// `stream.buffer` scratch allocation and the second `@memcpy` from
+/// the FIFO into guest linmem. The slice is only valid for the
+/// synchronous duration of the call; the driver must not retain it.
+///
+/// `on_write` already operates on a borrowed slice from
+/// `comp_inst.readGuestBytes`, so the write path is implicitly
+/// zero-copy already; no symmetric `on_write_from` is required.
 pub const HostStreamDriver = struct {
     /// Opaque context (typically `*WasiCliAdapter` plus a per-socket
     /// fd captured inline). Passed back to each callback verbatim.
@@ -362,6 +394,27 @@ pub const HostStreamDriver = struct {
         stream: *AsyncStream,
         allocator: std.mem.Allocator,
     ) HostStreamAction = null,
+    /// Zero-copy variant of `on_read` (#583 B2). When set, the executor
+    /// invokes this in preference to `on_read` and passes a borrowed
+    /// slice into guest linmem. The driver writes bytes directly into
+    /// `dst[0..]` — no scratch FIFO allocation, no second memcpy.
+    ///
+    /// `dst.len` is bounded by the guest's `max_count * elem_size` and
+    /// has already been validated against `memory.size`. Drivers
+    /// should issue a single non-blocking syscall per invocation and
+    /// return `.would_block` when no data is available — the executor
+    /// will park the read.
+    ///
+    /// Falling back: when `on_read_into` is set but the guest's
+    /// destination is not addressable as a contiguous slice (e.g. the
+    /// computed length overflows or extends past `memory.size`), the
+    /// executor falls back to `on_read` if also set, otherwise parks
+    /// the read — the driver does not see the zero-copy call in that
+    /// case.
+    on_read_into: ?*const fn (
+        ctx: ?*anyopaque,
+        dst: []u8,
+    ) HostStreamReadInto = null,
     /// Called by `stream.write` when there's no parked reader and a
     /// guest write has arrived. The driver should attempt to consume
     /// the bytes (push them onto a host fd, etc.). On `would_block`

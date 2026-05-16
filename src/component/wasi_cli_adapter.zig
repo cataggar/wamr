@@ -14397,6 +14397,11 @@ pub const WasiCliAdapter = struct {
     /// bytes to the FIFO. Returns `.progressed` on byte append, `.eof`
     /// when the peer closed the fd, `.would_block` when no data is
     /// available yet.
+    ///
+    /// Retained as a fallback for the zero-copy `on_read_into` variant
+    /// below: the executor reaches this path when the guest destination
+    /// can't be addressed as a contiguous slice (`u32` overflow on
+    /// `max_count * elem_size`, out-of-bounds `(ptr, len)`).
     fn tcpReceiveStreamOnRead(
         opaque_ctx: ?*anyopaque,
         stream: *async_mod.AsyncStream,
@@ -14411,6 +14416,32 @@ pub const WasiCliAdapter = struct {
         if (n == 0) return .eof;
         stream.buffer.appendSlice(allocator, buf[0..n]) catch return .err;
         return .progressed;
+    }
+
+    /// Zero-copy `host_driver.on_read_into` for a TCP-receive
+    /// `stream<u8>` slot (#583 B2). Reads directly into the
+    /// guest-supplied destination — no intermediate stack/heap
+    /// scratch buffer. The executor has already validated that
+    /// `dst` is a borrowed slice into guest linmem with
+    /// `dst.len <= memory.size - guest_ptr`.
+    ///
+    /// Caps the per-call read at `min(dst.len, 64 KiB)` to mirror the
+    /// production `tcpReceiveStreamOnRead` ceiling — keeps a single
+    /// non-blocking syscall bounded so the executor stays responsive.
+    fn tcpReceiveStreamOnReadInto(
+        opaque_ctx: ?*anyopaque,
+        dst: []u8,
+    ) async_mod.HostStreamReadInto {
+        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (dst.len == 0) return .{ .action = .would_block };
+        if (!fdPollReady(ctx.fd, pollInEvents())) return .{ .action = .would_block };
+        const cap = @min(dst.len, 64 * 1024);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var iovecs = [_][]u8{dst[0..cap]};
+        const n = io.vtable.netRead(io.userdata, ctx.fd, &iovecs) catch
+            return .{ .action = .err };
+        if (n == 0) return .{ .action = .eof };
+        return .{ .action = .progressed, .bytes_written = @intCast(n) };
     }
 
     /// `host_driver.on_write` for a TCP-send `stream<u8>` slot. Pushes
@@ -14925,6 +14956,13 @@ pub const WasiCliAdapter = struct {
         // does a non-blocking netRead per invocation so the executor's
         // `stream.read` rendezvous can keep draining as long as bytes
         // are arriving on the fd (no per-call host-fn dispatch needed).
+        //
+        // Both callbacks are installed: the executor prefers
+        // `on_read_into` (zero-copy, #583 B2) for the common case
+        // where the guest's destination is addressable as a borrowed
+        // linmem slice; `on_read` remains a fallback when the
+        // requested length overflows `u32` or extends past
+        // `memory.size`.
         const driver_ctx = try self.allocSocketsP3StreamCtx(stream.socket.handle, s.family);
         const stream_h = ci.allocAsyncHandle();
         try ci.streams.put(ci.allocator, stream_h, .{
@@ -14933,6 +14971,7 @@ pub const WasiCliAdapter = struct {
             .host_driver = .{
                 .context = driver_ctx,
                 .on_read = &tcpReceiveStreamOnRead,
+                .on_read_into = &tcpReceiveStreamOnReadInto,
             },
         });
         // Pre-buffer anything already pending on the fd at call time so
