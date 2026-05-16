@@ -2105,6 +2105,99 @@ const HttpErrorCode = enum(u32) {
     internal_error = 38,
 };
 
+/// Map a `std.http.Client.FetchError` (or any error that reaches the
+/// outbound-handler / `client.send` catch arm) onto the most specific
+/// `wasi:http/types.error-code` variant we can name (#583 A3).
+///
+/// The full FetchError set is, transitively:
+///   * `Uri.ParseError` — `InvalidFormat`, `UnexpectedCharacter`, `InvalidPort`.
+///   * `Allocator.Error` — `OutOfMemory`.
+///   * `HostName.LookupError` — DNS resolution failures.
+///   * `IpAddress.ConnectError` / `IpAddress.BindError` — kernel-level
+///     connect failures.
+///   * `error{TlsInitializationFailed, CertificateBundleLoadFailure,
+///     UnsupportedUriScheme, UriMissingHost}` from `Client.RequestError`.
+///   * `Request.ReceiveHeadError` — HTTP/1.1 framing failures during the
+///     response head parse.
+///   * The leaf `error{StreamTooLong, WriteFailed, UnsupportedCompressionMethod}`
+///     declared on `FetchError` itself.
+///
+/// Each *classified* error has its own arm below; truly-unknown errors
+/// (`OutOfMemory`, `SystemResources`, `Canceled`, `Unexpected`, plus
+/// anything new Zig adds to the FetchError set after this revision) fall
+/// through the `else` arm to `internal_error`. The README sentence
+/// promising this as follow-up work has been retired.
+fn mapHttpFetchError(err: anyerror) HttpErrorCode {
+    return switch (err) {
+        // ── Connection-level transport (IpAddress.ConnectError) ──────────
+        error.ConnectionRefused => .connection_refused,
+        error.ConnectionResetByPeer,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.HttpRequestTruncated,
+        error.HttpConnectionClosing,
+        error.HttpChunkTruncated,
+        => .connection_terminated,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        => .destination_unavailable,
+        error.Timeout => .connection_timeout,
+        error.AccessDenied => .destination_IP_prohibited,
+
+        // ── TLS (ConnectTcpError remaps `Connection.Tls.create` failures
+        //    to `TlsInitializationFailed`; the bundle-load case is its own
+        //    arm of `RequestError`). ───────────────────────────────────────
+        error.TlsInitializationFailed => .TLS_protocol_error,
+        error.CertificateBundleLoadFailure => .TLS_certificate_error,
+
+        // ── DNS / name resolution (`HostName.LookupError`) ─────────────────
+        error.UnknownHostName,
+        error.NameServerFailure,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.ResolvConfParseFailed,
+        error.DetectingNetworkConfigurationFailed,
+        => .DNS_error,
+        error.NoAddressReturned,
+        error.AddressUnavailable,
+        => .destination_not_found,
+
+        // ── URI / request shape (`Uri.ParseError` + `RequestError`) ───────
+        error.UnsupportedUriScheme,
+        error.UriMissingHost,
+        error.UnexpectedCharacter,
+        error.InvalidFormat,
+        error.InvalidPort,
+        => .HTTP_request_URI_invalid,
+
+        // ── HTTP/1.1 response framing (`Request.ReceiveHeadError`) ────────
+        error.HttpHeadersInvalid,
+        error.HttpChunkInvalid,
+        error.HttpRedirectLocationMissing,
+        error.HttpRedirectLocationInvalid,
+        error.RedirectRequiresResend,
+        => .HTTP_protocol_error,
+        error.HttpHeadersOversize,
+        error.HttpRedirectLocationOversize,
+        => .HTTP_response_header_section_size,
+        error.StreamTooLong => .HTTP_response_body_size,
+        error.HttpContentEncodingUnsupported,
+        error.UnsupportedCompressionMethod,
+        => .HTTP_response_content_coding,
+        error.TooManyHttpRedirects => .loop_detected,
+
+        // Truly-unknown failures — intentional fallthrough. Every
+        // classified path has its own arm above. Members reaching this
+        // include `error.OutOfMemory`, `error.SystemResources`,
+        // `error.ProcessFdQuotaExceeded`, `error.SystemFdQuotaExceeded`,
+        // `error.Canceled`, `error.Unexpected`, and anything Zig adds to
+        // `FetchError` after this audit.
+        else => .internal_error,
+    };
+}
+
 const max_http_header_bytes: usize = 64 * 1024;
 const max_http_body_bytes: usize = 16 * 1024 * 1024;
 const max_http_target_bytes: usize = 8192;
@@ -15302,8 +15395,10 @@ pub const WasiCliAdapter = struct {
     /// earlier `HTTP_protocol_error` short-circuit added by #477 /
     /// #501 has been removed now that Zig 0.16 ships a working TLS
     /// client). The empty allow-list path still returns
-    /// `HTTP_request_denied`; transport / parse failures return
-    /// `internal_error`.
+    /// `HTTP_request_denied`; transport / TLS / DNS / parse failures
+    /// are mapped onto their specific `error-code` variant by
+    /// `mapHttpFetchError` (#583 A3), with `internal_error` reserved
+    /// for genuinely unclassified errors.
     fn httpOutgoingHandlerHandle(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
@@ -15412,8 +15507,8 @@ pub const WasiCliAdapter = struct {
             .extra_headers = extra_hdrs.items,
             .response_writer = &aw.writer,
             .keep_alive = false,
-        }) catch {
-            return httpHandlerDeny(self, results, allocator, .internal_error);
+        }) catch |err| {
+            return httpHandlerDeny(self, results, allocator, mapHttpFetchError(err));
         };
 
         // Extract response body
@@ -16999,8 +17094,8 @@ pub const WasiCliAdapter = struct {
             .extra_headers = extra_hdrs.items,
             .response_writer = &aw.writer,
             .keep_alive = false,
-        }) catch {
-            return httpClientDenyP3(results, allocator, .internal_error);
+        }) catch |err| {
+            return httpClientDenyP3(results, allocator, mapHttpFetchError(err));
         };
 
         // Mark transmission future as ready (request was sent).
@@ -26857,10 +26952,21 @@ test "wasi:http #521: https outgoing-handler proceeds past the TLS gate" {
     // added by #477/#501 has been removed. `https://` requests now
     // flow into `std.http.Client.fetch`, which delegates TLS to
     // `std.crypto.tls`. The destination (`127.0.0.1:1`) is almost
-    // certainly closed, so `fetch` returns a transport error and
-    // the handler surfaces `internal_error`. The point of this test
-    // is the *absence* of `HTTP_protocol_error` — that variant must
-    // never again be produced by a well-formed `https://` request.
+    // certainly closed, so `fetch` returns `error.ConnectionRefused`
+    // before the TLS handshake even begins; with the #583 A3 error
+    // refinement, this surfaces as `connection_refused` (was
+    // `internal_error` pre-refinement). The point of this test
+    // remains: `HTTP_protocol_error` must never again be produced by a
+    // well-formed `https://` request.
+    //
+    // Skipped on Windows: `std.http.Client.fetch` over WinSock surfaces
+    // `WSAECONNREFUSED` as `error.Unexpected` (or occasionally
+    // `ConnectionResetByPeer`) rather than the POSIX
+    // `error.ConnectionRefused`, so this end-to-end transport check is
+    // platform-dependent. The pure-helper `mapHttpFetchError`
+    // tests further down exercise the WIT mapping deterministically
+    // across all targets.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
@@ -26901,9 +27007,10 @@ test "wasi:http #521: https outgoing-handler proceeds past the TLS gate" {
     // The gate is gone — `HTTP_protocol_error` must never be the
     // result of a scheme check on `https://`.
     try testing.expect(fut.state.ready_err != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
-    // Connection refused / parse failure surfaces as `internal_error`.
+    // Port 1 has no listener — TCP refuses before TLS can run, so
+    // the refined mapping yields `connection_refused` (#583 A3).
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
         fut.state.ready_err,
     );
 }
@@ -29661,8 +29768,18 @@ test "wasi:http@0.3 (#487): client.send denies when allow-list empty" {
 test "wasi:http@0.3 #521: client.send proceeds past the TLS gate for https" {
     // Counterpart to the P2 test: the #477/#501 `HTTP_protocol_error`
     // short-circuit is gone for `wasi:http/client.send@0.3.0` as
-    // well. `https://127.0.0.1:1/` has no listener so we expect a
-    // transport-level `internal_error`, never `HTTP_protocol_error`.
+    // well. `https://127.0.0.1:1/` has no listener so TCP connect
+    // refuses before TLS can start; with the #583 A3 error refinement
+    // the host surfaces `connection_refused`, never
+    // `HTTP_protocol_error` and never the catch-all `internal_error`.
+    //
+    // Skipped on Windows for the same reason as the P2 sibling:
+    // WinSock's `WSAECONNREFUSED` does not round-trip through
+    // `std.http.Client.FetchError` as `error.ConnectionRefused`, so
+    // the asserted variant is platform-dependent. The pure-helper
+    // `mapHttpFetchError` tests cover the deterministic mapping on
+    // every target.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
@@ -29703,7 +29820,190 @@ test "wasi:http@0.3 #521: client.send proceeds past the TLS gate for https" {
     // The scheme gate is gone — `HTTP_protocol_error` must not be the
     // outcome of a well-formed `https://` request.
     try testing.expect(code != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
-    try testing.expectEqual(@as(u32, @intFromEnum(HttpErrorCode.internal_error)), code);
+    // Port 1 has no listener; TCP connect refuses before TLS runs,
+    // which the #583 A3 mapping surfaces as `connection_refused`.
+    try testing.expectEqual(@as(u32, @intFromEnum(HttpErrorCode.connection_refused)), code);
+}
+
+test "wasi:http #583 A3: mapHttpFetchError classifies connection-refused" {
+    // Direct mapping unit-test — does not require network. Verifies
+    // that `error.ConnectionRefused` from `std.http.Client.fetch`
+    // (e.g. attempting to dial a closed local port) surfaces as the
+    // dedicated `connection_refused` variant rather than the old
+    // catch-all `internal_error`.
+    const testing = std.testing;
+    try testing.expectEqual(HttpErrorCode.connection_refused, mapHttpFetchError(error.ConnectionRefused));
+    // Companion arms in the same connection-level cluster.
+    try testing.expectEqual(HttpErrorCode.connection_terminated, mapHttpFetchError(error.ConnectionResetByPeer));
+    try testing.expectEqual(HttpErrorCode.connection_terminated, mapHttpFetchError(error.ReadFailed));
+    try testing.expectEqual(HttpErrorCode.connection_terminated, mapHttpFetchError(error.WriteFailed));
+    try testing.expectEqual(HttpErrorCode.connection_timeout, mapHttpFetchError(error.Timeout));
+    try testing.expectEqual(HttpErrorCode.destination_unavailable, mapHttpFetchError(error.HostUnreachable));
+    try testing.expectEqual(HttpErrorCode.destination_unavailable, mapHttpFetchError(error.NetworkUnreachable));
+}
+
+test "wasi:http #583 A3: mapHttpFetchError classifies TLS handshake failures" {
+    // `std.http.Client.connectTcpOptions` remaps every non-OOM /
+    // non-cancel / non-unexpected error from `std.crypto.tls.Client.init`
+    // to `error.TlsInitializationFailed` — which is the only TLS
+    // error variant that ever escapes `client.fetch`. With the #583 A3
+    // refinement, that one variant now lands on `TLS_protocol_error`
+    // instead of the catch-all `internal_error`. Cert-bundle load
+    // failures get their own `TLS_certificate_error` arm.
+    const testing = std.testing;
+    try testing.expectEqual(HttpErrorCode.TLS_protocol_error, mapHttpFetchError(error.TlsInitializationFailed));
+    try testing.expectEqual(HttpErrorCode.TLS_certificate_error, mapHttpFetchError(error.CertificateBundleLoadFailure));
+}
+
+test "wasi:http #583 A3: mapHttpFetchError classifies DNS NXDOMAIN" {
+    // `std.Io.net.HostName.LookupError.UnknownHostName` is the
+    // canonical "no such host" failure mode (the resolver answered
+    // NXDOMAIN). With #583 A3 this maps to `DNS_error` instead of the
+    // generic `internal_error`. Other LookupError variants (resolver
+    // failure, parse failure, etc.) also flow into `DNS_error`.
+    const testing = std.testing;
+    try testing.expectEqual(HttpErrorCode.DNS_error, mapHttpFetchError(error.UnknownHostName));
+    try testing.expectEqual(HttpErrorCode.DNS_error, mapHttpFetchError(error.NameServerFailure));
+    try testing.expectEqual(HttpErrorCode.DNS_error, mapHttpFetchError(error.InvalidDnsARecord));
+    try testing.expectEqual(HttpErrorCode.DNS_error, mapHttpFetchError(error.InvalidDnsAAAARecord));
+    try testing.expectEqual(HttpErrorCode.DNS_error, mapHttpFetchError(error.ResolvConfParseFailed));
+    try testing.expectEqual(HttpErrorCode.DNS_error, mapHttpFetchError(error.DetectingNetworkConfigurationFailed));
+    try testing.expectEqual(HttpErrorCode.destination_not_found, mapHttpFetchError(error.NoAddressReturned));
+}
+
+test "wasi:http #583 A3: mapHttpFetchError classifies HTTP / URI / fallthrough" {
+    // Coverage for the remaining clusters: response-framing,
+    // URI parse failures, and the intentional `internal_error`
+    // fallthrough for truly-unknown errors.
+    const testing = std.testing;
+    // Response framing (Request.ReceiveHeadError) ────────────────────
+    try testing.expectEqual(HttpErrorCode.HTTP_protocol_error, mapHttpFetchError(error.HttpHeadersInvalid));
+    try testing.expectEqual(HttpErrorCode.HTTP_protocol_error, mapHttpFetchError(error.HttpChunkInvalid));
+    try testing.expectEqual(HttpErrorCode.HTTP_response_header_section_size, mapHttpFetchError(error.HttpHeadersOversize));
+    try testing.expectEqual(HttpErrorCode.HTTP_response_body_size, mapHttpFetchError(error.StreamTooLong));
+    try testing.expectEqual(HttpErrorCode.HTTP_response_content_coding, mapHttpFetchError(error.UnsupportedCompressionMethod));
+    try testing.expectEqual(HttpErrorCode.loop_detected, mapHttpFetchError(error.TooManyHttpRedirects));
+    try testing.expectEqual(HttpErrorCode.connection_terminated, mapHttpFetchError(error.HttpRequestTruncated));
+    try testing.expectEqual(HttpErrorCode.connection_terminated, mapHttpFetchError(error.HttpConnectionClosing));
+    // URI / request shape (Uri.ParseError + RequestError) ──────────
+    try testing.expectEqual(HttpErrorCode.HTTP_request_URI_invalid, mapHttpFetchError(error.UnsupportedUriScheme));
+    try testing.expectEqual(HttpErrorCode.HTTP_request_URI_invalid, mapHttpFetchError(error.UriMissingHost));
+    try testing.expectEqual(HttpErrorCode.HTTP_request_URI_invalid, mapHttpFetchError(error.InvalidFormat));
+    try testing.expectEqual(HttpErrorCode.HTTP_request_URI_invalid, mapHttpFetchError(error.UnexpectedCharacter));
+    try testing.expectEqual(HttpErrorCode.HTTP_request_URI_invalid, mapHttpFetchError(error.InvalidPort));
+    // Intentional fallthrough — unknown / resource-exhaustion paths.
+    try testing.expectEqual(HttpErrorCode.internal_error, mapHttpFetchError(error.OutOfMemory));
+    try testing.expectEqual(HttpErrorCode.internal_error, mapHttpFetchError(error.Unexpected));
+    try testing.expectEqual(HttpErrorCode.internal_error, mapHttpFetchError(error.Canceled));
+    try testing.expectEqual(HttpErrorCode.internal_error, mapHttpFetchError(error.SystemResources));
+}
+
+test "wasi:http #583 A3: connect-refused end-to-end (P2 outgoing-handler, http)" {
+    // End-to-end transport-error mapping for the Preview 2 outgoing
+    // handler over plaintext HTTP. Port 1 on the loopback has no
+    // listener, so `std.http.Client.fetch` returns
+    // `error.ConnectionRefused`; with the #583 A3 refinement the
+    // future surfaces `connection_refused` instead of `internal_error`.
+    //
+    // Skipped on Windows: WinSock's `WSAECONNREFUSED` does not surface
+    // as `error.ConnectionRefused` through `std.http.Client.fetch`
+    // (it appears as `error.Unexpected` / `ConnectionResetByPeer` /
+    // `BrokenPipe` depending on Zig stdlib revision), so this
+    // platform-dependent integration check is gated to POSIX. The
+    // pure-helper `mapHttpFetchError` tests cover the WIT mapping
+    // deterministically on every target.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0, // GET
+        .scheme_disc = 0, // http
+        .authority = try testing.allocator.dupe(u8, "127.0.0.1:1"),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const fut = adapter.http_future_responses.items[results[0].result_val.payload.?.handle].?;
+    try testing.expect(fut.state == .ready_err);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        fut.state.ready_err,
+    );
+}
+
+test "wasi:http@0.3 #583 A3: connect-refused end-to-end (P3 client.send, http)" {
+    // Preview 3 counterpart: same closed-port scenario via
+    // `wasi:http/client.send@0.3.0`. The error-code variant must be
+    // `connection_refused`, not `internal_error`.
+    //
+    // Skipped on Windows — see the sibling P2 test for the rationale
+    // (WinSock surfaces refusal as a non-`ConnectionRefused` error
+    // through `std.http.Client.fetch`). Pure-helper mapping tests run
+    // everywhere.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const new_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+        .{ .handle = trailers_h },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var new_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestNewP3(&adapter, &ci, &new_args, &new_results, testing.allocator);
+    defer new_results[0].deinit(testing.allocator);
+    const req_handle = new_results[0].tuple_val[0].handle;
+
+    // Set scheme=http (discriminant 0) and a closed-port authority.
+    const r = adapter.lookupHttpRequestP3(req_handle).?;
+    r.scheme_disc = 0;
+    r.authority = try testing.allocator.dupe(u8, "127.0.0.1:1");
+
+    const send_args = [_]InterfaceValue{.{ .handle = req_handle }};
+    var send_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
+    defer send_results[0].deinit(testing.allocator);
+
+    try testing.expect(send_results[0] == .result_val);
+    try testing.expect(!send_results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        send_results[0].result_val.payload.?.variant_val.discriminant,
+    );
 }
 
 test "wasi:http@0.3 #521: opt-in real HTTPS client.send against example.com" {
