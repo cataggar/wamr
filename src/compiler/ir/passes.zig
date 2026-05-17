@@ -5442,6 +5442,61 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
 
 // ── SSA Promotion (mem2reg) ─────────────────────────────────────────────
 
+/// Replace every instruction in blocks unreachable from the entry block
+/// with a single `.@"unreachable"` op. Owned operand slices on dropped
+/// instructions are freed.
+///
+/// Why this exists: several passes (notably `promoteLocalsToSSA`) walk
+/// only the dom tree reachable from block 0. Unreachable blocks are
+/// skipped, leaving their original `local_set`/`local_get` ops in place
+/// — but those reference vregs whose defining `local_get` *in a
+/// reachable block* will be neutralised by the SSA rename pass. The
+/// dangling operand reference surfaces at AArch64 codegen as
+/// `error.UnboundVReg` (issue #620).
+///
+/// Wiping unreachable blocks to `.@"unreachable"` is semantics-preserving:
+/// no execution path from entry reaches them, so their original body is
+/// dead code. Block ids are preserved so later passes that index by id
+/// stay valid.
+pub fn scrubUnreachableBlocks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    const nblocks = func.blocks.items.len;
+    if (nblocks <= 1) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    var changed = false;
+    for (func.blocks.items, 0..) |*block, idx| {
+        const bid: ir.BlockId = @intCast(idx);
+        if (bid == 0) continue; // entry is always reachable
+        if (dom.post_num[bid] != null) continue;
+
+        // Already scrubbed.
+        if (block.instructions.items.len == 1 and
+            block.instructions.items[0].op == .@"unreachable")
+        {
+            continue;
+        }
+
+        // Free operand slices on instructions we are about to drop.
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .phi => |edges| block.allocator.free(edges),
+                .parallel_copy => |pairs| block.allocator.free(pairs),
+                .call => |cl| if (cl.args.len > 0) block.allocator.free(cl.args),
+                .call_indirect => |ci| if (ci.args.len > 0) block.allocator.free(ci.args),
+                .call_ref => |cr| if (cr.args.len > 0) block.allocator.free(cr.args),
+                .ret_multi => |vregs| if (vregs.len > 0) block.allocator.free(vregs),
+                else => {},
+            }
+        }
+        block.instructions.clearRetainingCapacity();
+        try block.instructions.append(block.allocator, .{ .op = .{ .@"unreachable" = {} } });
+        changed = true;
+    }
+    return changed;
+}
+
 /// Promote wasm locals from explicit `local_set`/`local_get` ops to SSA
 /// VRegs with phi nodes at CFG join points.
 ///
@@ -5461,6 +5516,16 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
 pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
     if (func.local_count == 0) return false;
+
+    // Unreachable blocks (no path from entry) have their instructions
+    // wiped to a single `.@"unreachable"` before the SSA rename walk so
+    // they cannot retain stale references to vregs whose defining
+    // `local_get` will be neutralised in reachable blocks. Without this
+    // scrub, the DFS rename walk visits only dom-tree blocks, leaving
+    // unreachable blocks with operand vregs (`local_set idx, val=vN`)
+    // whose `val` has lost its definition — surfacing at AArch64 codegen
+    // as `error.UnboundVReg` (see issue #620).
+    _ = try scrubUnreachableBlocks(func, allocator);
 
     // Strip dead code after the first terminator in each block.
     for (func.blocks.items) |*block| {
@@ -6436,6 +6501,18 @@ pub fn runPassesWithOptions(
                     }
                 }
                 if (!any_changed) break;
+            }
+
+            // Final cleanup: drop the body of any block that is
+            // unreachable from entry, replacing it with a single
+            // `.@"unreachable"` op. Late passes (inliner on outer
+            // iter > 0, foldConstantBranches, threadChained...) can
+            // strand blocks whose original `local_set`/`local_get`
+            // ops were never neutralised by `promoteLocalsToSSA`'s
+            // dom-tree DFS — feeding `error.UnboundVReg` at codegen
+            // (issue #620).
+            if (try scrubUnreachableBlocks(func, allocator)) {
+                total_changes += 1;
             }
         }
     }
@@ -11939,6 +12016,109 @@ test "replaceInInst rewrites call_ref.func_ref" {
     const cr = func.getBlock(b0).instructions.items[0].op.call_ref;
     try std.testing.expectEqual(v_new, cr.func_ref);
     try std.testing.expectEqual(v_new, cr.args[0]);
+}
+
+test "scrubUnreachableBlocks: wipes block with no path from entry" {
+    // Regression for #620. Unreachable blocks can retain `local_set`
+    // operands that reference vregs whose defining `local_get` is
+    // neutralised by `promoteLocalsToSSA`'s dom-tree-restricted DFS,
+    // because the DFS never visits unreachable blocks. The scrub
+    // replaces such blocks with a single `.@"unreachable"` op so no
+    // dangling vreg refs survive into codegen.
+    //
+    //   block 0 (entry): ret
+    //   block 1 (unreachable, never branched to): local_set 0, vX; br 0
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    try func.getBlock(b0).append(.{ .op = .{ .ret = null } });
+
+    const v_x = func.newVReg(); // never defined
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_x } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b0 } });
+
+    const changed = try scrubUnreachableBlocks(&func, allocator);
+    try std.testing.expect(changed);
+
+    // b0 unchanged.
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b0).instructions.items.len);
+    try std.testing.expect(func.getBlock(b0).instructions.items[0].op == .ret);
+
+    // b1 is now a single `.@"unreachable"` op.
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b1).instructions.items.len);
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op == .@"unreachable");
+
+    // Idempotent: a second call observes nothing to change.
+    const changed2 = try scrubUnreachableBlocks(&func, allocator);
+    try std.testing.expect(!changed2);
+}
+
+test "scrubUnreachableBlocks: frees owned operand slices on dropped insts" {
+    // Drop a block containing `call_indirect`, `call_ref`, `call`,
+    // `ret_multi`, `phi`, `parallel_copy` — each owns a heap slice
+    // that `BasicBlock.deinit` would otherwise free. The scrub must
+    // also free those slices when it clears the block.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .ret = null } });
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+
+    const ci_args = try allocator.alloc(ir.VReg, 2);
+    ci_args[0] = v0;
+    ci_args[1] = v1;
+    try func.getBlock(b1).append(.{
+        .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = v0, .args = ci_args } },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+    const cr_args = try allocator.alloc(ir.VReg, 1);
+    cr_args[0] = v1;
+    try func.getBlock(b1).append(.{
+        .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = v0, .args = cr_args } },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+    const cl_args = try allocator.alloc(ir.VReg, 1);
+    cl_args[0] = v0;
+    try func.getBlock(b1).append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = cl_args } },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+    const rm_vals = try allocator.alloc(ir.VReg, 2);
+    rm_vals[0] = v0;
+    rm_vals[1] = v1;
+    try func.getBlock(b1).append(.{ .op = .{ .ret_multi = rm_vals } });
+    const phi_edges = try allocator.alloc(ir.Inst.PhiEdge, 1);
+    phi_edges[0] = .{ .block = b0, .val = v0 };
+    try func.getBlock(b1).append(.{
+        .op = .{ .phi = phi_edges },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+    const pc_pairs = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    pc_pairs[0] = .{ .dst = func.newVReg(), .src = v0, .ty = .i32 };
+    try func.getBlock(b1).append(.{ .op = .{ .parallel_copy = pc_pairs } });
+
+    const changed = try scrubUnreachableBlocks(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b1).instructions.items.len);
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op == .@"unreachable");
+    // `func.deinit()` at scope exit would catch any leaked slices via the
+    // testing allocator's leak detector.
 }
 
 test "promoteLocalsToSSA: simple countdown loop" {

@@ -7981,7 +7981,7 @@ pub fn compileModuleWithOptions(
     var global_call_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
     defer global_call_patches.deinit(allocator);
 
-    for (ir_module.functions.items) |func| {
+    for (ir_module.functions.items, 0..) |func, func_idx| {
         const func_base: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_base);
 
@@ -7998,7 +7998,15 @@ pub fn compileModuleWithOptions(
             .options = options,
             .allocator = allocator,
         };
-        const func_code = try compileFunctionImpl(&func, ctx, allocator);
+        const func_code = compileFunctionImpl(&func, ctx, allocator) catch |err| {
+            std.debug.print("Error compiling function {d} ({d} blocks, {d} vregs): {}\n", .{
+                func_idx,
+                func.blocks.items.len,
+                func.next_vreg,
+                err,
+            });
+            return err;
+        };
         defer allocator.free(func_code);
 
         // Globalize patch offsets to module code coordinates.
