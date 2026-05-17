@@ -862,6 +862,187 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
     return false;
 }
 
+/// Relax `B.cond` patches whose target is outside the AArch64 imm19
+/// reach (±1 MiB) by rewriting each one in place to a 2-instruction
+/// sequence using the much wider imm26 (±128 MiB) range:
+///
+///   B.!cond +8         ; conditional skip over the next instruction
+///   B target           ; long-range unconditional branch
+///
+/// Each rewrite inserts 4 bytes into `code.bytes` at `patch_offset + 4`
+/// and shifts every downstream `block_offsets` entry, `BranchPatch`,
+/// and `CallPatch` whose stored offset crosses the insertion point.
+/// The original `BranchPatch` is repointed at the inserted unconditional
+/// `B` (kind becomes `.b_uncond`) so the normal patch-resolution loop
+/// resolves the long-range half.
+///
+/// Iterates because relaxing one branch shifts code that other
+/// in-range conditional branches span — a few sweeps may surface new
+/// out-of-range candidates. Caps at `max_iter` defensive sweeps;
+/// returns `error.BranchOutOfRange` if the count is exceeded (in
+/// practice 1-2 iterations suffice even for multi-MiB functions).
+/// Issue #621.
+fn relaxOutOfRangeConditionalBranches(
+    code: *emit.CodeBuffer,
+    block_offsets: []usize,
+    patches: *std.ArrayListUnmanaged(BranchPatch),
+    call_patches: ?*std.ArrayListUnmanaged(CallPatch),
+    allocator: std.mem.Allocator,
+) !void {
+    const max_iter: u32 = 16;
+    const min_word: i64 = -(@as(i64, 1) << 18);
+    const max_word: i64 = @as(i64, 1) << 18;
+
+    // Scratch lists reused across iterations to avoid per-iter alloc churn.
+    var oor: std.ArrayListUnmanaged(usize) = .empty;
+    defer oor.deinit(allocator);
+    var ins_points: std.ArrayListUnmanaged(usize) = .empty;
+    defer ins_points.deinit(allocator);
+
+    var iter: u32 = 0;
+    while (iter < max_iter) : (iter += 1) {
+        // 1. Collect every out-of-range b_cond patch.
+        oor.clearRetainingCapacity();
+        for (patches.items, 0..) |p, i| {
+            if (p.kind != .b_cond) continue;
+            const target_off: i64 = @intCast(block_offsets[p.target_block]);
+            const patch_off: i64 = @intCast(p.patch_offset);
+            const word_off = @divTrunc(target_off - patch_off, 4);
+            if (word_off >= min_word and word_off < max_word) continue;
+            try oor.append(allocator, i);
+        }
+        if (oor.items.len == 0) return;
+
+        // 2. Sort OOR indices by patch_offset ascending so we can rebuild
+        //    `code.bytes` and compute cumulative shifts via prefix counts.
+        const SortCtx = struct {
+            patches_slice: []const BranchPatch,
+            pub fn lessThan(self: @This(), a: usize, b: usize) bool {
+                return self.patches_slice[a].patch_offset < self.patches_slice[b].patch_offset;
+            }
+        };
+        std.mem.sort(
+            usize,
+            oor.items,
+            SortCtx{ .patches_slice = patches.items },
+            SortCtx.lessThan,
+        );
+
+        // 3. Snapshot the original patch_offsets of the OOR set into a
+        //    sorted insertion-point array for O(log K) shift queries.
+        ins_points.clearRetainingCapacity();
+        try ins_points.ensureTotalCapacity(allocator, oor.items.len);
+        for (oor.items) |idx| {
+            ins_points.appendAssumeCapacity(patches.items[idx].patch_offset);
+        }
+
+        // 4. Rewrite every OOR B.cond word in place (flip its condition
+        //    bit and retarget to `+2 words` = +8 bytes). We do this
+        //    against the OLD buffer; the inserted B will be written
+        //    into the NEW buffer in step 5.
+        const old_data = code.bytes.items;
+        for (oor.items) |idx| {
+            const orig_offset = patches.items[idx].patch_offset;
+            const old_word = std.mem.readInt(u32, old_data[orig_offset..][0..4], .little);
+            const new_cond: u32 = (old_word & 0xF) ^ 1;
+            const new_bcond_word: u32 = 0x54000000 | (@as(u32, 2) << 5) | new_cond;
+            std.mem.writeInt(u32, old_data[orig_offset..][0..4], new_bcond_word, .little);
+        }
+
+        // 5. Build a fresh code buffer with a 4-byte unconditional-B slot
+        //    inserted after each OOR B.cond. Single-pass O(N) rebuild
+        //    avoids the O(K * N) memmove cost of repeated insertSlice.
+        const old_len = old_data.len;
+        const new_len = old_len + oor.items.len * 4;
+        var new_buf = try code.allocator.alloc(u8, new_len);
+        errdefer code.allocator.free(new_buf);
+
+        var src_pos: usize = 0;
+        var dst_pos: usize = 0;
+        for (oor.items) |idx| {
+            const orig_offset = patches.items[idx].patch_offset;
+            const copy_until = orig_offset + 4;
+            const chunk = copy_until - src_pos;
+            @memcpy(new_buf[dst_pos..][0..chunk], old_data[src_pos..][0..chunk]);
+            src_pos += chunk;
+            dst_pos += chunk;
+            // Placeholder unconditional `B 0` — its imm26 is patched by
+            // the resolution loop below.
+            std.mem.writeInt(u32, new_buf[dst_pos..][0..4], 0x14000000, .little);
+            dst_pos += 4;
+        }
+        @memcpy(new_buf[dst_pos..], old_data[src_pos..]);
+
+        // Swap buffers.
+        code.bytes.deinit(code.allocator);
+        code.bytes = .{ .items = new_buf[0..new_len], .capacity = new_len };
+
+        // 6. Apply cumulative shifts. For byte position X, the shift is
+        //    4 * (number of OOR insertion points strictly less than X).
+        for (block_offsets) |*bo| {
+            const shift = lowerBound(ins_points.items, bo.*);
+            bo.* += shift * 4;
+        }
+        for (patches.items, 0..) |*p, i| {
+            // Skip the OOR patches themselves — handled in step 7.
+            if (isOorIndex(oor.items, i)) continue;
+            const shift = lowerBound(ins_points.items, p.patch_offset);
+            p.patch_offset += shift * 4;
+        }
+        if (call_patches) |cp| {
+            for (cp.items) |*p| {
+                const shift = lowerBound(ins_points.items, p.patch_offset);
+                p.patch_offset += shift * 4;
+            }
+        }
+
+        // 7. Repoint each OOR patch at the inserted unconditional B. The
+        //    j-th OOR patch (zero-based by sorted order) has j prior
+        //    insertions before it, so its new B sits at:
+        //      original_offset + 4   + (j + 1) * 4 - 4
+        //    = original_offset + (j + 1) * 4
+        //    The `+ (j + 1) * 4 - 4` extra term accounts for being
+        //    after this patch's own insertion. Simplified:
+        for (oor.items, 0..) |idx, j| {
+            patches.items[idx].patch_offset = ins_points.items[j] + (j + 1) * 4;
+            patches.items[idx].kind = .b_uncond;
+        }
+    }
+    return error.BranchOutOfRange;
+}
+
+/// Number of `sorted` entries strictly less than `target`.
+fn lowerBound(sorted: []const usize, target: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = sorted.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (sorted[mid] < target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/// O(log K) membership check in a sorted-ascending index list. Used only
+/// when K (out-of-range count) is small; for larger K the indices are
+/// effectively a dense subset of `patches.items` and a flag-array would
+/// win — but the OOR set is bounded by the number of long-range
+/// conditional branches in a single function, which stays manageable
+/// even on the issue #621 repro (~16k total patches).
+fn isOorIndex(sorted: []const usize, target: usize) bool {
+    var lo: usize = 0;
+    var hi: usize = sorted.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (sorted[mid] == target) return true;
+        if (sorted[mid] < target) lo = mid + 1 else hi = mid;
+    }
+    return false;
+}
+
 pub fn compileFunctionImpl(
     func: *const ir.IrFunction,
     ctx: FuncCompileCtx,
@@ -1617,6 +1798,23 @@ pub fn compileFunctionImpl(
             code.bytes.items.len,
         );
     }
+
+    // Relax conditional branches whose imm19 reach (±1 MiB) is exceeded
+    // by the function's code size. Each out-of-range `B.cond target` is
+    // rewritten in place to a 2-instruction sequence:
+    //   B.!cond +8       ; skip the next inst when the original cond is false
+    //   B target         ; long-range unconditional branch (±128 MiB)
+    // Inserts 4 bytes per relaxed branch, shifting downstream
+    // `block_offsets`, `patches`, and `call_patches` accordingly, then
+    // re-runs the scan because each insertion can push other in-range
+    // branches out of range. Issue #621.
+    try relaxOutOfRangeConditionalBranches(
+        &code,
+        block_offsets,
+        &patches,
+        ctx.call_patches,
+        allocator,
+    );
 
     // Resolve branch patches.
     for (patches.items) |p| {
@@ -14130,4 +14328,103 @@ test "remat (#542): iconst with mixed imm12 + out-of-imm12 uses composes with #5
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
     try std.testing.expect(code.len > 0);
+}
+
+test "relaxOutOfRangeConditionalBranches: rewrites out-of-range B.cond to B.!cond+8 / B" {
+    // Regression for #621. Construct a synthetic code buffer with a
+    // single B.cond at offset 0 whose target block sits 2 MiB away —
+    // well beyond the imm19 ±1 MiB reach. The relaxer should:
+    //   1. Insert 4 bytes after the B.cond, growing the buffer by 4.
+    //   2. Rewrite the original word to `B.!cond +2 words` (skip the
+    //      inserted instruction when the original condition is false).
+    //   3. Emit a placeholder `B 0` (0x14000000) at the inserted slot.
+    //   4. Convert the patch entry to `.b_uncond` pointing at the
+    //      inserted slot.
+    //   5. Shift downstream block_offsets and call_patches by +4.
+    const allocator = std.testing.allocator;
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    // B.EQ placeholder (cond bits = 0x0). imm19 = 0 will be patched by
+    // the resolution loop after relaxation; we only test the relaxer here.
+    try code.bytes.appendSlice(allocator, &[_]u8{ 0, 0, 0, 0 }); // B.EQ 0
+    std.mem.writeInt(u32, code.bytes.items[0..4], 0x54000000, .little);
+
+    // Pad with NOPs out to 2 MiB so block 1 lands at offset 2 MiB.
+    const target_off: usize = 2 * 1024 * 1024;
+    try code.bytes.resize(allocator, target_off);
+    @memset(code.bytes.items[4..target_off], 0);
+
+    var block_offsets = [_]usize{ 0, target_off };
+    var patches: std.ArrayListUnmanaged(BranchPatch) = .empty;
+    defer patches.deinit(allocator);
+    try patches.append(allocator, .{ .patch_offset = 0, .target_block = 1, .kind = .b_cond });
+
+    var call_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
+    defer call_patches.deinit(allocator);
+    try call_patches.append(allocator, .{ .patch_offset = target_off, .target_func_idx = 0 });
+
+    try relaxOutOfRangeConditionalBranches(
+        &code,
+        &block_offsets,
+        &patches,
+        &call_patches,
+        allocator,
+    );
+
+    // Buffer grew by 4 bytes.
+    try std.testing.expectEqual(target_off + 4, code.bytes.items.len);
+
+    // Word at offset 0: B.!EQ (= B.NE, cond = 0x1) with imm19 = 2.
+    const w0 = std.mem.readInt(u32, code.bytes.items[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0x54000000 | (2 << 5) | 0x1), w0);
+
+    // Word at offset 4: placeholder unconditional B (imm26 patched later).
+    const w1 = std.mem.readInt(u32, code.bytes.items[4..8], .little);
+    try std.testing.expectEqual(@as(u32, 0x14000000), w1);
+
+    // Patch entry now points at the inserted B and is unconditional.
+    try std.testing.expectEqual(@as(usize, 4), patches.items[0].patch_offset);
+    try std.testing.expect(patches.items[0].kind == .b_uncond);
+
+    // Downstream block_offsets shifted by +4.
+    try std.testing.expectEqual(@as(usize, 0), block_offsets[0]);
+    try std.testing.expectEqual(target_off + 4, block_offsets[1]);
+
+    // Downstream call_patches shifted by +4.
+    try std.testing.expectEqual(target_off + 4, call_patches.items[0].patch_offset);
+}
+
+test "relaxOutOfRangeConditionalBranches: in-range branches are not touched" {
+    const allocator = std.testing.allocator;
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    try code.bytes.appendSlice(allocator, &[_]u8{ 0, 0, 0, 0 });
+    std.mem.writeInt(u32, code.bytes.items[0..4], 0x54000000, .little);
+
+    // Target only 256 bytes away — well within imm19 reach.
+    const target_off: usize = 256;
+    try code.bytes.resize(allocator, target_off);
+    @memset(code.bytes.items[4..target_off], 0);
+
+    var block_offsets = [_]usize{ 0, target_off };
+    var patches: std.ArrayListUnmanaged(BranchPatch) = .empty;
+    defer patches.deinit(allocator);
+    try patches.append(allocator, .{ .patch_offset = 0, .target_block = 1, .kind = .b_cond });
+
+    try relaxOutOfRangeConditionalBranches(
+        &code,
+        &block_offsets,
+        &patches,
+        null,
+        allocator,
+    );
+
+    try std.testing.expectEqual(target_off, code.bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), patches.items[0].patch_offset);
+    try std.testing.expect(patches.items[0].kind == .b_cond);
+    try std.testing.expectEqual(target_off, block_offsets[1]);
 }
