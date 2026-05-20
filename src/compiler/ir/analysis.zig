@@ -1139,6 +1139,37 @@ pub fn buildPredecessors(
     return result;
 }
 
+/// Recompute each block's on-block `predecessors` field from the
+/// canonical pred set derived from terminators.
+///
+/// Most analysis passes use `buildPredecessors` (which returns a fresh
+/// map) and never touch `BasicBlock.predecessors`. The on-block field is
+/// only consumed by the IR pretty-printer and the IR verifier
+/// (check 6, `MissingPredecessor` / `StalePredecessor`). Passes that
+/// mutate the CFG without rebuilding the on-block field will trip the
+/// verifier; call this helper after such a pass to restore the
+/// invariant.
+///
+/// Deduplicates within each pred list, matching `buildPredecessors`'
+/// semantics for `br_table` targets that list the same block twice.
+pub fn refreshBlockPredecessors(
+    func: *ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !void {
+    var preds = try buildPredecessors(func, allocator);
+    defer {
+        var it = preds.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        preds.deinit();
+    }
+
+    for (func.blocks.items, 0..) |*block, idx| {
+        block.predecessors.clearRetainingCapacity();
+        const list = preds.get(@intCast(idx)) orelse continue;
+        try block.predecessors.appendSlice(block.allocator, list);
+    }
+}
+
 /// Compute the dominator tree for `func` rooted at block 0.
 pub fn computeDominators(
     func: *const ir.IrFunction,
