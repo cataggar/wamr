@@ -25,15 +25,25 @@
 //! instruction, not a block parameter — and is therefore omitted. It will be
 //! re-introduced if/when block-params land.
 //!
-//! Paranoid-mode checks (issue #624 stretch invariant 7, implemented in #628):
+//! Paranoid-mode checks (issue #624 stretch invariants 7, 8, 9, 10):
 //!
-//!   7. **Operand-type sanity.** Each VReg operand's recorded width matches
-//!      the producing instruction's result width. Catches an i32 producer
-//!      feeding an `add` whose other operand is i64, a v128 fed into a
-//!      scalar load `base`, an `f_neg` reading the result of an integer
-//!      op, etc. Only runs when `verify_mode == .paranoid` because it
-//!      walks every operand a second time and is intended for fuzz /
-//!      debug bring-up rather than steady-state CI.
+//!   7. **Operand-type sanity** (#628). Each VReg operand's recorded width
+//!      matches the producing instruction's result width.
+//!   8. **Loop-info consistency** (#629). The natural-loop forest is well
+//!      formed: every header dominates every member block, and every latch
+//!      is a member dominated by the header.
+//!   9. **Dominator-tree structure** (#629). Entry has `idom == null`,
+//!      reachable blocks have a post-order number, and dominance is
+//!      reflexive. (A true freshness check vs a cross-pass cache is gated
+//!      on a future pass-pipeline cache landing — see TODO in
+//!      `checkDomTreeStructure`.)
+//!  10. **Live-range monotonicity** (#629). For the default sequential
+//!      block order, every `LiveRange` has `start <= end`.
+//!
+//! Paranoid checks re-derive analyses (dom, loops, liveness) for every
+//! invocation, so they're intentionally opt-in: even safety builds default
+//! to `after_each_pass` and only `wamrc --verify-ir=paranoid` (or a fuzz
+//! lane) flips them on.
 //!
 //! Wiring: `passes.runPassesWithOptions` calls `verifyFunction` after every
 //! pass invocation when `opts.verify_mode != .off`, and annotates the failure
@@ -77,6 +87,17 @@ pub const VerifyError = error{
     /// A VReg operand's recorded type does not match the type the
     /// consuming instruction expects for that role (check 7, paranoid).
     OperandTypeMismatch,
+    /// A loop header does not dominate a block listed in its body, or a
+    /// latch is not contained / not dominated (check 8, paranoid).
+    LoopInvariantBroken,
+    /// The dominator tree fails a structural soundness invariant —
+    /// entry has a non-null idom, a reachable block lacks a post-order
+    /// number, or reflexivity fails (check 9, paranoid).
+    DomTreeInconsistent,
+    /// A live range has `end < start`, indicating the underlying live-
+    /// range numbering disagrees with the program's def-before-use
+    /// structure (check 10, paranoid).
+    LiveRangeInverted,
 } || std.mem.Allocator.Error;
 
 /// Information about the most-recent verifier failure. Populated as a
@@ -546,6 +567,9 @@ pub fn verifyFunction(
     try checkSsaDominance(func, func_index, allocator);
     if (mode == .paranoid) {
         try checkOperandWidths(func, func_index, allocator);
+        try checkDomTreeStructure(func, func_index, allocator);
+        try checkLoopInfo(func, func_index, allocator);
+        try checkLiveRangeMonotonicity(func, func_index, allocator);
     }
 }
 
@@ -1265,6 +1289,202 @@ fn checkOneInst(ctx: OperandCheckCtx, inst: ir.Inst) VerifyError!void {
     }
 }
 
+// ── Check 8: loop-info consistency (paranoid only, #629) ────────────────
+
+fn checkLoopInfo(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+) VerifyError!void {
+    var dom = analysis.computeDominators(func, allocator) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer dom.deinit();
+
+    var forest = analysis.computeLoops(func, &dom, allocator) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer forest.deinit();
+
+    try verifyLoopForest(func_index, &dom, &forest);
+}
+
+/// Validate a loop forest against a dominator tree. Split out so tests
+/// can pass hand-rolled forests with deliberately broken invariants.
+fn verifyLoopForest(
+    func_index: u32,
+    dom: *const analysis.DomTree,
+    forest: *const analysis.LoopForest,
+) VerifyError!void {
+    for (forest.loops) |loop| {
+        for (loop.blocks) |b| {
+            if (!dom.dominates(loop.header, b)) {
+                const written = std.fmt.bufPrint(
+                    &detail_buf,
+                    "loop header #{d} does not dominate body block #{d}",
+                    .{ loop.header, b },
+                ) catch &detail_buf;
+                last_failure = .{
+                    .kind = error.LoopInvariantBroken,
+                    .func_index = func_index,
+                    .block = b,
+                    .detail = written,
+                };
+                return error.LoopInvariantBroken;
+            }
+        }
+        for (loop.latches) |latch| {
+            if (!loop.containsBlock(latch)) {
+                const written = std.fmt.bufPrint(
+                    &detail_buf,
+                    "loop header #{d}: latch #{d} not in loop.blocks",
+                    .{ loop.header, latch },
+                ) catch &detail_buf;
+                last_failure = .{
+                    .kind = error.LoopInvariantBroken,
+                    .func_index = func_index,
+                    .block = latch,
+                    .detail = written,
+                };
+                return error.LoopInvariantBroken;
+            }
+            if (!dom.dominates(loop.header, latch)) {
+                const written = std.fmt.bufPrint(
+                    &detail_buf,
+                    "loop header #{d} does not dominate latch #{d}",
+                    .{ loop.header, latch },
+                ) catch &detail_buf;
+                last_failure = .{
+                    .kind = error.LoopInvariantBroken,
+                    .func_index = func_index,
+                    .block = latch,
+                    .detail = written,
+                };
+                return error.LoopInvariantBroken;
+            }
+        }
+    }
+}
+
+// ── Check 9: dominator-tree structural soundness (paranoid only, #629) ──
+
+fn checkDomTreeStructure(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+) VerifyError!void {
+    var dom = analysis.computeDominators(func, allocator) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer dom.deinit();
+    try verifyDomTreeStructure(func, func_index, &dom);
+
+    // TODO: once any pass caches a `DomTree` on `IrFunction` across the
+    // pipeline, also diff that cached tree against the freshly computed
+    // one and emit `error.DomTreeInconsistent` with detail
+    // "stale dominator cache" on mismatch.
+}
+
+fn verifyDomTreeStructure(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    dom: *const analysis.DomTree,
+) VerifyError!void {
+    // Entry block's idom convention: `computeDominators` sets `idom[0] = 0`
+    // (entry dominates itself); a `null` here means an empty / unreachable
+    // entry. Anything else is structurally invalid.
+    if (func.blocks.items.len > 0) {
+        const e0 = dom.idom[0];
+        if (e0 != null and e0.? != 0) {
+            const written = std.fmt.bufPrint(
+                &detail_buf,
+                "entry idom must be self or null, got #{d}",
+                .{e0.?},
+            ) catch &detail_buf;
+            last_failure = .{
+                .kind = error.DomTreeInconsistent,
+                .func_index = func_index,
+                .block = 0,
+                .detail = written,
+            };
+            return error.DomTreeInconsistent;
+        }
+    }
+
+    for (0..func.blocks.items.len) |i| {
+        const b: ir.BlockId = @intCast(i);
+        const reachable = dom.idom[i] != null;
+        if (reachable) {
+            // Reachable blocks must have a post-order number and dominate
+            // themselves (reflexivity is encoded in `DomTree.dominates`).
+            if (dom.post_num[i] == null) {
+                const written = std.fmt.bufPrint(
+                    &detail_buf,
+                    "reachable block #{d} has no post-order number",
+                    .{b},
+                ) catch &detail_buf;
+                last_failure = .{
+                    .kind = error.DomTreeInconsistent,
+                    .func_index = func_index,
+                    .block = b,
+                    .detail = written,
+                };
+                return error.DomTreeInconsistent;
+            }
+            if (!dom.dominates(b, b)) {
+                const written = std.fmt.bufPrint(
+                    &detail_buf,
+                    "block #{d} does not dominate itself (reflexivity failed)",
+                    .{b},
+                ) catch &detail_buf;
+                last_failure = .{
+                    .kind = error.DomTreeInconsistent,
+                    .func_index = func_index,
+                    .block = b,
+                    .detail = written,
+                };
+                return error.DomTreeInconsistent;
+            }
+        }
+    }
+}
+
+// ── Check 10: live-range monotonicity (paranoid only, #629) ─────────────
+
+fn checkLiveRangeMonotonicity(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+) VerifyError!void {
+    const ranges = analysis.computeLiveRangesWithOrder(func, null, allocator) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer allocator.free(ranges);
+    try verifyLiveRangeMonotonicity(func_index, ranges);
+}
+
+fn verifyLiveRangeMonotonicity(
+    func_index: u32,
+    ranges: []const analysis.LiveRange,
+) VerifyError!void {
+    for (ranges) |r| {
+        if (r.end < r.start) {
+            const written = std.fmt.bufPrint(
+                &detail_buf,
+                "vreg %{d}: live range end={d} precedes start={d}",
+                .{ r.vreg, r.end, r.start },
+            ) catch &detail_buf;
+            last_failure = .{
+                .kind = error.LiveRangeInverted,
+                .func_index = func_index,
+                .vreg = r.vreg,
+                .detail = written,
+            };
+            return error.LiveRangeInverted;
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1556,4 +1776,110 @@ test "verifier(paranoid): parallel_copy per-pair type checked" {
     try func.getBlock(b).append(.{ .op = .{ .ret = null } });
     try testing.expectError(error.OperandTypeMismatch, verifyFunction(&func, 0, .paranoid, a));
     try testing.expectEqual(@as(?ir.VReg, v_src), last_failure.vreg);
+}
+
+// ── Check 8 / 9 / 10 tests (paranoid, #629) ─────────────────────────────
+
+test "verifier(paranoid): simple loop passes loop-info check" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+    // b0 -> b1 (header); b1 -> b1 (latch, self-loop); b1 -> b2 -> ret
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .dest = cond, .type = .i32, .op = .{ .iconst_32 = 0 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b1).addPredecessor(b0);
+    try func.getBlock(b1).addPredecessor(b1);
+    try func.getBlock(b2).addPredecessor(b1);
+    try verifyFunction(&func, 0, .paranoid, a);
+}
+
+test "verifier(paranoid): verifyLoopForest rejects header not dominating body" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+    // Trivial straight-line: b0 -> b1 ret. Header #1 does NOT dominate b0.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b1).addPredecessor(b0);
+
+    var dom = try analysis.computeDominators(&func, a);
+    defer dom.deinit();
+
+    // Hand-rolled bad forest: claim there's a loop with header=b1 and
+    // body={b0, b1}. b1 does not dominate b0 → check 8 must reject.
+    const bad_blocks = try a.alloc(ir.BlockId, 2);
+    defer a.free(bad_blocks);
+    bad_blocks[0] = 0;
+    bad_blocks[1] = 1;
+    const bad_latches = try a.alloc(ir.BlockId, 0);
+    defer a.free(bad_latches);
+    const loops = [_]analysis.Loop{.{ .header = 1, .latches = bad_latches, .blocks = bad_blocks }};
+    var hl = std.AutoHashMap(ir.BlockId, u32).init(a);
+    defer hl.deinit();
+    try hl.put(1, 0);
+    const forest = analysis.LoopForest{
+        .loops = @constCast(loops[0..]),
+        .header_loop = hl,
+        .allocator = a,
+    };
+    try testing.expectError(error.LoopInvariantBroken, verifyLoopForest(0, &dom, &forest));
+}
+
+test "verifier(paranoid): linear CFG passes dom-tree structure check" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b1).addPredecessor(b0);
+    try verifyFunction(&func, 0, .paranoid, a);
+}
+
+test "verifier(paranoid): verifyDomTreeStructure rejects non-null idom on entry" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b1).addPredecessor(b0);
+    var dom = try analysis.computeDominators(&func, a);
+    defer dom.deinit();
+    // Tamper: entry's idom must be self or null; force it to point at b1.
+    dom.idom[0] = 1;
+    try testing.expectError(error.DomTreeInconsistent, verifyDomTreeStructure(&func, 0, &dom));
+}
+
+test "verifier(paranoid): well-typed live ranges pass monotonicity" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try func.getBlock(b).append(.{ .dest = v0, .type = .i32, .op = .{ .iconst_32 = 1 } });
+    try func.getBlock(b).append(.{ .dest = v1, .type = .i32, .op = .{ .iconst_32 = 2 } });
+    try func.getBlock(b).append(.{ .dest = v2, .type = .i32, .op = .{ .add = .{ .lhs = v0, .rhs = v1 } } });
+    try func.getBlock(b).append(.{ .op = .{ .ret = v2 } });
+    try verifyFunction(&func, 0, .paranoid, a);
+}
+
+test "verifier(paranoid): verifyLiveRangeMonotonicity rejects inverted range" {
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 7, .start = 10, .end = 3, .type = .i32 },
+    };
+    try testing.expectError(error.LiveRangeInverted, verifyLiveRangeMonotonicity(0, ranges[0..]));
+    try testing.expectEqual(@as(?ir.VReg, 7), last_failure.vreg);
 }
