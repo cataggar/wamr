@@ -5233,6 +5233,10 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
     defer allocator.free(eligible);
     for (module.functions.items, 0..) |*f, i| eligible[i] = isInlinable(f, inline_small_max_insts, inline_small_max_blocks);
 
+    var caller_changed = try allocator.alloc(bool, module.functions.items.len);
+    defer allocator.free(caller_changed);
+    @memset(caller_changed, false);
+
     var inlined_count: u32 = 0;
     for (module.functions.items, 0..) |*caller, caller_idx| {
         // Only scan blocks that existed at the start of this pass. Newly
@@ -5435,8 +5439,20 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
             // can no longer free its args slice; release it here.
             if (call_args.len > 0) caller.allocator.free(call_args);
 
+            caller_changed[caller_idx] = true;
             inlined_count += 1;
         }
+    }
+
+    // The inliner mutates the CFG (new `br` terminators on caller blocks,
+    // cloned callee terminators referencing shifted block ids, post-call
+    // IR moved into `b_after_id` whose successors now have `b_after_id`
+    // as a predecessor instead of `b`) without updating the on-block
+    // `BasicBlock.predecessors` field. Refresh it for every caller we
+    // touched so the IR verifier (check 6, `MissingPredecessor` /
+    // `StalePredecessor`) sees a consistent view. See issue #630.
+    for (module.functions.items, 0..) |*f, i| {
+        if (caller_changed[i]) try analysis.refreshBlockPredecessors(f, allocator);
     }
     return inlined_count;
 }
