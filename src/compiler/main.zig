@@ -630,8 +630,8 @@ const compile_usage =
     \\                                 after every pass that mutated the
     \\                                 function. Modes:
     \\                                   after-each-pass (default with --verify-ir)
-    \\                                   paranoid        (reserved; same as
-    \\                                                    after-each-pass today)
+    \\                                   paranoid        (adds operand-width
+    \\                                                    sanity check, #628)
     \\                                 Default: on for safety builds, off
     \\                                 for release builds.
     \\  --no-verify-ir                Disable the IR verifier (overrides
