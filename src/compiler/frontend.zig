@@ -469,7 +469,21 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 if (vreg_stack.items.len > frame.stack_depth) {
                     vreg_stack.items.len = frame.stack_depth;
                 }
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
+                // Only emit the fall-through `br frame.end_block` when
+                // current_block doesn't already end with a terminator.
+                // Inside dead code (after `br`/`return`/`unreachable`), the
+                // block was already closed by that terminator; emitting a
+                // second `br` here produces a block with two terminators,
+                // which trips the IR verifier (issue #631
+                // `MultipleTerminators`) and confuses the inliner.
+                const cur_insts = ir_func.getBlock(current_block).instructions.items;
+                const already_terminated = cur_insts.len != 0 and switch (cur_insts[cur_insts.len - 1].op) {
+                    .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => true,
+                    else => false,
+                };
+                if (!already_terminated) {
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
+                }
                 current_block = frame.end_block;
                 // Re-push the N results as fresh vregs loaded from the
                 // result_locals, preserving stack order (results[0] deepest).
