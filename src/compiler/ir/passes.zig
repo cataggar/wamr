@@ -5253,6 +5253,11 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
                 var i: usize = 0;
                 while (i < block.instructions.items.len) : (i += 1) {
                     const inst = block.instructions.items[i];
+                    // Stop scanning at the block's terminator. Anything past
+                    // it is dead code — splitting at a call there would
+                    // leave the original terminator stranded as a non-final
+                    // terminator (issue #631 MultipleTerminators).
+                    if (verifier.isTerminator(inst.op)) break;
                     const call = switch (inst.op) {
                         .call => |c| c,
                         else => continue,
@@ -5381,6 +5386,15 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
                                 caller.allocator,
                                 .{ .op = .{ .br = b_after_id } },
                             );
+                            // Drop any unreachable code that followed the `ret`
+                            // in the callee block. Leaving it would produce a
+                            // clone with multiple terminators (or a clone whose
+                            // *last* instruction is a non-terminator, which
+                            // hides the true successor edge from
+                            // `forEachSuccessor` and surfaces later as
+                            // `MissingPredecessor` once `promoteLocalsToSSA`
+                            // strips the trailing junk). See issue #631.
+                            break;
                         },
                         else => {
                             var cloned = citem;
@@ -5403,7 +5417,19 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
                             } else {
                                 shiftBlockIdsInInst(&cloned, clone_offset);
                             }
+                            const is_terminator = switch (cloned.op) {
+                                .br, .br_if, .br_table, .ret_multi, .@"unreachable" => true,
+                                else => false,
+                            };
                             try caller.blocks.items[clone_id].instructions.append(caller.allocator, cloned);
+                            if (is_terminator) {
+                                // Same reasoning as the `.ret` arm above: drop
+                                // any callee instructions that followed a
+                                // terminator so the clone has exactly one
+                                // terminator and it is the block's last
+                                // instruction. See issue #631.
+                                break;
+                            }
                         },
                     }
                 }
@@ -5936,6 +5962,17 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
             });
         }
     }
+
+    // The dead-code-after-terminator strip above changed the LAST
+    // instruction of any block that had post-terminator junk (e.g.
+    // `br loop_header; <orphan ops>` left by an earlier pass or by the
+    // frontend before its own dead-code guard). `forEachSuccessor` only
+    // looks at the last instruction, so trimming flips the successor
+    // set — recorded `BasicBlock.predecessors` of the previously-implied
+    // successor become stale, and the actual terminator's targets gain
+    // a missing predecessor entry. Rebuild the on-block lists now so
+    // the IR verifier's check 6 sees a consistent view. See issue #632.
+    try analysis.refreshBlockPredecessors(func, allocator);
 
     return changed;
 }
