@@ -24,6 +24,17 @@ const ExecEnv = wamr.exec_env.ExecEnv;
 
 const aot_harness = @import("aot_harness.zig");
 const aot_runtime = wamr.aot_runtime;
+const ir_verifier = wamr.ir_verifier;
+
+/// Triage mode (issue #627): when true, every AOT compile in this suite runs
+/// with `verify_ir = true`, and any `error.CompileFailed` is printed as a
+/// `triage:` line tagged with the running test name. Set via build option
+/// `-Dverify-ir-triage`; falls back to `false` when this file is built as a
+/// standalone `zig test` (no `build_options` module present).
+const triage_mode: bool = blk: {
+    const opt = @import("differential_options");
+    break :blk opt.verify_ir_triage;
+};
 
 /// Runtime-arch gate for the AOT half of these tests. We deliberately keep
 /// this narrower than `aot_harness.can_exec_aot` (which also lists aarch64):
@@ -56,7 +67,15 @@ fn runInterpI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8
 /// `aot_harness.Harness`. Kept as a thin wrapper so `expectDiffI32` reads
 /// symmetrically against `runInterpI32`.
 fn runAotI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !i32 {
-    const h = try aot_harness.Harness.init(allocator, wasm);
+    const h = if (comptime triage_mode)
+        aot_harness.Harness.initWithOptions(allocator, wasm, null, .{ .verify_ir = true }) catch |err| {
+            if (err == error.CompileFailed) {
+                std.debug.print("triage: export='{s}' — {f}\n", .{ name, ir_verifier.last_failure });
+            }
+            return err;
+        }
+    else
+        try aot_harness.Harness.init(allocator, wasm);
     defer h.deinit();
 
     const func_idx = h.findFuncExport(name) orelse return error.FunctionNotFound;
