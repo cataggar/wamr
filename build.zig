@@ -111,6 +111,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "network_tests", network_tests);
 
     const skip_coldstart = b.option(bool, "skip-coldstart", "Skip cold-start budget tests (issue #395)") orelse false;
+    const verify_ir_triage = b.option(bool, "verify-ir-triage", "Run differential tests with the IR verifier enabled and print per-test verifier failures (issue #627)") orelse false;
 
     const config_module = options.createModule();
 
@@ -504,6 +505,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     differential_test_module.addImport("wamr", lib_module);
+    const differential_options = b.addOptions();
+    differential_options.addOption(bool, "verify_ir_triage", verify_ir_triage);
+    differential_test_module.addImport("differential_options", differential_options.createModule());
     const differential_tests = b.addTest(.{
         .root_module = differential_test_module,
     });
