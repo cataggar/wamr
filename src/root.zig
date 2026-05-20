@@ -84,6 +84,9 @@ pub const aarch64_peephole = @import("compiler/codegen/aarch64/peephole.zig");
 /// AOT compiler optimization passes.
 pub const passes = @import("compiler/ir/passes.zig");
 
+/// IR invariant checker run between passes (#624).
+pub const ir_verifier = @import("compiler/ir/verifier.zig");
+
 // Testing
 /// Spec test runner infrastructure.
 pub const spec_runner = @import("tests/spec_runner.zig");

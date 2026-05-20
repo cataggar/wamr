@@ -244,6 +244,11 @@ pub const Harness = struct {
         /// after wiring imports. The spec runner and the differential
         /// tests need this. Fuzz targets should pass `false`.
         invoke_start: bool = true,
+        /// Run the IR verifier (#624) between optimisation passes. Off
+        /// by default so the differential-test corpus (which exercises
+        /// pre-existing IR shapes the verifier has not yet been
+        /// audited against) keeps working. Fuzz targets opt in.
+        verify_ir: bool = false,
     };
 
     /// Compile `wasm_bytes` through the full AOT pipeline and instantiate it.
@@ -298,7 +303,7 @@ pub const Harness = struct {
             return error.CompileFailed;
         };
 
-        const aot_bin = compileToAot(allocator, arena, &wasm_module, registry) catch |err| {
+        const aot_bin = compileToAot(allocator, arena, &wasm_module, registry, options.verify_ir) catch |err| {
             std.debug.print("aot_harness: compile failed: {}\n", .{err});
             return error.CompileFailed;
         };
@@ -1002,16 +1007,26 @@ fn compileToAot(
     arena: *std.heap.ArenaAllocator,
     module: *const types.WasmModule,
     registry: ?*const ImportRegistry,
+    verify_ir: bool,
 ) ![]u8 {
     const a = arena.allocator();
 
     var ir_module = try frontend.lowerModule(module, a);
     defer ir_module.deinit();
 
-    _ = try passes.runPasses(&ir_module, passes.defaultPassesForTarget(switch (builtin.cpu.arch) {
-        .aarch64 => .aarch64,
-        else => .x86_64,
-    }), a);
+    // Opt-in IR verifier (#624). Fuzz / differential harness callers can
+    // toggle this via `InitOptions.verify_ir`; default `false` to avoid
+    // regressing pre-existing differential tests whose IR shapes have not
+    // yet been audited against the invariants.
+    _ = try passes.runPassesWithOptions(
+        &ir_module,
+        passes.defaultPassesForTarget(switch (builtin.cpu.arch) {
+            .aarch64 => .aarch64,
+            else => .x86_64,
+        }),
+        a,
+        .{ .verify_mode = if (verify_ir) .after_each_pass else .off },
+    );
 
     const code: []const u8, const offsets: []const u32 = switch (builtin.cpu.arch) {
         .aarch64 => blk: {
