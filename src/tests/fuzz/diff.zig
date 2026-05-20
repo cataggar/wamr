@@ -66,7 +66,7 @@ fn runOnce(allocator: std.mem.Allocator, io: std.Io, crashes_dir: []const u8, by
 
     // Full AOT compile + instantiate, but do NOT invoke start. Native AOT
     // invocation below is limited to the statically safe subset selected above.
-    const h = aot_harness.Harness.initWithOptions(allocator, bytes, null, .{ .invoke_start = false }) catch return;
+    const h = aot_harness.Harness.initWithOptions(allocator, bytes, null, .{ .invoke_start = false, .verify_ir = true }) catch return;
     defer h.deinit();
 
     for (targets[0..target_count]) |target| {

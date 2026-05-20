@@ -51,6 +51,6 @@ fn runOnce(allocator: std.mem.Allocator, bytes: []const u8) !void {
     // arbitrary wasm bytecode can SEGV on OOB memory/table access, and
     // the runtime does not sandbox those faults. Compile + instantiate
     // only.
-    const h = aot_harness.Harness.initWithOptions(allocator, bytes, null, .{ .invoke_start = false }) catch return;
+    const h = aot_harness.Harness.initWithOptions(allocator, bytes, null, .{ .invoke_start = false, .verify_ir = true }) catch return;
     defer h.deinit();
 }

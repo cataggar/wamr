@@ -9,6 +9,7 @@ const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
 const alias_class = @import("alias_class.zig");
 const deadStoreElimination = @import("dead_store_elimination.zig").deadStoreElimination;
+const verifier = @import("verifier.zig");
 
 const LoadKey = alias_class.LoadKey;
 
@@ -2534,6 +2535,10 @@ pub const RunOptions = struct {
     /// `lowerPhisToLocals` (first outer iteration) and once-per-function
     /// after every successful round of `inlineSmallFunctions`.
     dump_hook: ?DumpHook = null,
+    /// Run the IR verifier between passes (#624). Off by default so
+    /// release builds pay nothing. Callers in debug / fuzz contexts
+    /// should set this to `.after_each_pass`.
+    verify_mode: verifier.VerifyMode = .off,
 };
 
 const PassNameEntry = struct { fn_ptr: PassFn, name: []const u8 };
@@ -6392,6 +6397,24 @@ pub fn runPassesWithOptions(
 ) !u32 {
     var total_changes: u32 = 0;
 
+    // Local helper: run the verifier and stamp the pass name on the
+    // surfaced failure record. A no-op when `verify_mode == .off`.
+    const Verify = struct {
+        fn check(
+            mode: verifier.VerifyMode,
+            pass_label: []const u8,
+            func: *const ir.IrFunction,
+            func_idx: u32,
+            alloc: std.mem.Allocator,
+        ) verifier.VerifyError!void {
+            if (mode == .off) return;
+            verifier.verifyFunction(func, func_idx, mode, alloc) catch |e| {
+                verifier.last_failure.pass_name = pass_label;
+                return e;
+            };
+        }
+    };
+
     // Outer loop: alternate between module-level inlining and per-function
     // fixpoint passes. The first per-function round constant-folds
     // arguments at call sites (e.g. via `forwardLocalGet` + `constantFold`),
@@ -6415,6 +6438,12 @@ pub fn runPassesWithOptions(
             if (iter_inlined == 0) break;
             inlined_count += iter_inlined;
             total_changes += 1;
+
+            if (opts.verify_mode != .off) {
+                for (module.functions.items, 0..) |*f, fi| {
+                    try Verify.check(opts.verify_mode, "inlineSmallFunctions", f, @intCast(fi), allocator);
+                }
+            }
 
             if (opts.dump_hook) |hook| {
                 for (module.functions.items, 0..) |*f, fi| {
@@ -6450,6 +6479,7 @@ pub fn runPassesWithOptions(
             if (outer_iter == 0) {
                 if (try promoteLocalsToSSA(func, allocator)) {
                     total_changes += 1;
+                    try Verify.check(opts.verify_mode, "promoteLocalsToSSA", func, func_idx, allocator);
                     if (opts.dump_hook) |hook| {
                         try hook.callback(hook.ctx, .{
                             .pass_name = "promoteLocalsToSSA",
@@ -6462,6 +6492,7 @@ pub fn runPassesWithOptions(
                     }
                     if (try lowerPhisToLocals(func, allocator)) {
                         total_changes += 1;
+                        try Verify.check(opts.verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
                         if (opts.dump_hook) |hook| {
                             try hook.callback(hook.ctx, .{
                                 .pass_name = "lowerPhisToLocals",
@@ -6489,6 +6520,9 @@ pub fn runPassesWithOptions(
                         any_changed = true;
                         total_changes += 1;
                     }
+                    if (changed) {
+                        try Verify.check(opts.verify_mode, passName(pass), func, func_idx, allocator);
+                    }
                     if (opts.dump_hook) |hook| {
                         try hook.callback(hook.ctx, .{
                             .pass_name = passName(pass),
@@ -6513,6 +6547,7 @@ pub fn runPassesWithOptions(
             // (issue #620).
             if (try scrubUnreachableBlocks(func, allocator)) {
                 total_changes += 1;
+                try Verify.check(opts.verify_mode, "scrubUnreachableBlocks", func, func_idx, allocator);
             }
         }
     }

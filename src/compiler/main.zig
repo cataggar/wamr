@@ -80,6 +80,13 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     var dump_func_globs: std.ArrayList([]const u8) = .empty;
     var dump_out_dir: ?[]const u8 = null;
 
+    // Default to `.after_each_pass` in safe builds (Debug / ReleaseSafe)
+    // and `.off` in release builds, matching the cost-vs-diagnostic
+    // tradeoff documented in #624. The user can override with
+    // `--verify-ir[=…]` or `--no-verify-ir`.
+    var verify_mode: wamr.ir_verifier.VerifyMode =
+        if (std.debug.runtime_safety) .after_each_pass else .off;
+
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const a = sub_args[i];
@@ -118,6 +125,14 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             try dump_func_globs.append(dump_alloc, a["--dump-ir-functions=".len..]);
         } else if (std.mem.startsWith(u8, a, "--dump-ir-out=")) {
             dump_out_dir = a["--dump-ir-out=".len..];
+        } else if (std.mem.eql(u8, a, "--verify-ir")) {
+            verify_mode = .after_each_pass;
+        } else if (std.mem.eql(u8, a, "--verify-ir=after-each-pass")) {
+            verify_mode = .after_each_pass;
+        } else if (std.mem.eql(u8, a, "--verify-ir=paranoid")) {
+            verify_mode = .paranoid;
+        } else if (std.mem.eql(u8, a, "--no-verify-ir")) {
+            verify_mode = .off;
         } else if (a.len > 0 and a[0] == '-') {
             std.debug.print("error: unknown option '{s}' — try `wamrc compile help`\n", .{a});
             std.process.exit(1);
@@ -240,14 +255,41 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
 
     // 4. Optimize IR (unless -O0)
     if (optimize) {
-        const run_opts: passes.RunOptions = if (dumper.pass_names.len == 0) .{} else .{
-            .dump_hook = .{ .ctx = @ptrCast(&dumper), .callback = Dumper.callback },
+        const run_opts: passes.RunOptions = .{
+            .dump_hook = if (dumper.pass_names.len == 0) null else .{
+                .ctx = @ptrCast(&dumper),
+                .callback = Dumper.callback,
+            },
+            .verify_mode = verify_mode,
         };
         const opt_changes = passes.runPassesWithOptions(&ir_module, passes.defaultPassesForTarget(target_arch), allocator, run_opts) catch |err| {
+            // If the IR verifier tripped, surface its diagnostic before
+            // the generic "Error optimizing IR" line so the user sees the
+            // pass name + block/inst/vreg coordinates.
+            switch (err) {
+                error.UnboundVRegUse,
+                error.VRegDefinedTwice,
+                error.MissingTerminator,
+                error.MultipleTerminators,
+                error.DanglingBlockRef,
+                error.StalePredecessor,
+                error.MissingPredecessor,
+                => {
+                    const f = wamr.ir_verifier.last_failure;
+                    var buf: [256]u8 = undefined;
+                    var w = std.Io.Writer.fixed(&buf);
+                    f.format(&w) catch {};
+                    std.debug.print("{s}\n", .{w.buffered()});
+                },
+                else => {},
+            }
             std.debug.print("Error optimizing IR: {}\n", .{err});
             std.process.exit(1);
         };
         std.debug.print("Optimization: {d} passes made changes\n", .{opt_changes});
+        if (verify_mode != .off) {
+            std.debug.print("IR verifier: enabled ({s})\n", .{@tagName(verify_mode)});
+        }
     }
 
     // #540: Route phi-resolution through register MOV instead of frame
@@ -584,6 +626,16 @@ const compile_usage =
     \\                                 stdout, one snapshot per pass per
     \\                                 function preceded by a header
     \\                                 comment.
+    \\  --verify-ir[=<mode>]          Run the IR invariant checker (#624)
+    \\                                 after every pass that mutated the
+    \\                                 function. Modes:
+    \\                                   after-each-pass (default with --verify-ir)
+    \\                                   paranoid        (reserved; same as
+    \\                                                    after-each-pass today)
+    \\                                 Default: on for safety builds, off
+    \\                                 for release builds.
+    \\  --no-verify-ir                Disable the IR verifier (overrides
+    \\                                 the safety-build default).
     \\
 ;
 
