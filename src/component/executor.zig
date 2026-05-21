@@ -19,6 +19,8 @@ const HostTrapInfo = @import("../runtime/common/exec_env.zig").HostTrapInfo;
 const interp = @import("../runtime/interpreter/interp.zig");
 const indexspace = @import("indexspace.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
+const core_backend = @import("core_backend.zig");
+const debugAotEnabled = core_backend.debugAotEnabled;
 const Allocator = std.mem.Allocator;
 
 const ComponentInstance = instance_mod.ComponentInstance;
@@ -259,7 +261,13 @@ pub fn callComponentFuncByLocal(
     // backend is AOT-only. (#625 phase 3.)
     if (core_entry.module_inst == null) {
         if (core_entry.aot_inst) |ai| {
-            return callComponentFuncByLocalAot(
+            if (debugAotEnabled()) {
+                std.debug.print(
+                    "[aot-debug] callComponentFuncByLocal -> AOT core_inst_idx={d} core_func_idx={d} func_type_idx={d}\n",
+                    .{ exported.core_instance_idx, exported.core_func_idx, exported.func_type_idx },
+                );
+            }
+            const r = callComponentFuncByLocalAot(
                 owner_inst,
                 ai,
                 exported,
@@ -267,6 +275,14 @@ pub fn callComponentFuncByLocal(
                 out_results,
                 allocator,
             );
+            if (debugAotEnabled()) {
+                if (r) |_| {
+                    std.debug.print("[aot-debug] callComponentFuncByLocal AOT result: ok\n", .{});
+                } else |err| {
+                    std.debug.print("[aot-debug] callComponentFuncByLocal AOT result: {s}\n", .{@errorName(err)});
+                }
+            }
+            return r;
         }
         return error.CoreInstanceNotAvailable;
     }

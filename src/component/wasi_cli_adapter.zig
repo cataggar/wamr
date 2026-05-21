@@ -42,6 +42,8 @@ const ctypes = @import("types.zig");
 const abi = @import("canonical_abi.zig");
 const async_mod = @import("async.zig");
 const async_canon = @import("async_canon.zig");
+const core_backend = @import("core_backend.zig");
+const debugAotEnabled = core_backend.debugAotEnabled;
 
 // ── Local TypeDef table for hand-lowered list<compound> shapes (#402) ───────
 //
@@ -23126,7 +23128,6 @@ const ctypes_root = @import("types.zig");
 const component_loader = @import("loader.zig");
 const executor_root = @import("executor.zig");
 const abi_root = @import("canonical_abi.zig");
-const core_backend = @import("core_backend.zig");
 
 pub const RunComponentError = error{
     LoadFailed,
@@ -23907,12 +23908,15 @@ pub fn runLoadedComponent(
             .result_val => |rv| rv.is_ok,
             else => true,
         } };
-    } else |_| {
+    } else |err| {
         // `wasi:cli/exit.{exit, exit-with-code}` traps after stashing
         // a code on the adapter; translate that into a normal outcome
         // that carries the numeric exit code so the CLI can mirror it
         // into the host process exit code (see issue #436).
         if (adapter.exit_code) |code| return .{ .is_ok = code == 0, .exit_code = code };
+        if (debugAotEnabled()) {
+            std.debug.print("[aot-debug] runComponent_2 trap from callComponentFunc(\"run\"): {s}\n", .{@errorName(err)});
+        }
         return error.Trap;
     }
 }

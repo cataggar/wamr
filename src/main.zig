@@ -38,6 +38,13 @@ pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
+    // Process-global AOT debug toggle. See `core_backend.setDebugAotEnabled`
+    // for what it controls and #644 for context.
+    if (init.environ_map.get("WAMR_AOT_DEBUG")) |v| {
+        const on = !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
+        wamr.component_core_backend.setDebugAotEnabled(on);
+    }
+
     if (args.len < 2) {
         std.debug.print("error: missing subcommand — try `wamr help`\n", .{});
         return 2;

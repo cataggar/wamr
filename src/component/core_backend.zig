@@ -127,6 +127,22 @@ pub const PrecompiledCore = struct {
     cwasm_bytes: []const u8,
 };
 
+/// Process-global toggle for AOT debug diagnostics. Off by default;
+/// `main.zig` sets it during startup when the `WAMR_AOT_DEBUG` env var
+/// is set to a non-empty / non-`0` / non-`false` value. Read via
+/// `debugAotEnabled` from any code path that wants to surface AOT
+/// instantiation / call / trap details that would otherwise be
+/// swallowed by the `error.Trap` envelope (see #644).
+var aot_debug_enabled: bool = false;
+
+pub fn setDebugAotEnabled(on: bool) void {
+    aot_debug_enabled = on;
+}
+
+pub fn debugAotEnabled() bool {
+    return aot_debug_enabled;
+}
+
 /// Caller-supplied instantiation options. Today only `precompiled_cores`
 /// is wired; the struct exists so future opts (verbose load logging,
 /// custom AOT host imports, …) can be added without breaking the API.
