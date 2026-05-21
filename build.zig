@@ -545,6 +545,19 @@ pub fn build(b: *std.Build) void {
     const run_component_precompile_tests = b.addRunArtifact(component_precompile_tests);
     test_step.dependOn(&run_component_precompile_tests.step);
 
+    // Phase 3: canon.lift dispatches onto AOT cores (#625).
+    const component_aot_canonlift_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/component_aot_canonlift_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    component_aot_canonlift_module.addImport("wamr", lib_module);
+    const component_aot_canonlift_tests = b.addTest(.{
+        .root_module = component_aot_canonlift_module,
+    });
+    const run_component_aot_canonlift_tests = b.addRunArtifact(component_aot_canonlift_tests);
+    test_step.dependOn(&run_component_aot_canonlift_tests.step);
+
     // Cold-start budget tests (issue #395). In-process timing companion
     // to the subprocess harness in #394. Compile a 36-byte noop wasm
     // through the just-built `wamrc` to produce a `.cwasm` fixture, then

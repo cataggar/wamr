@@ -18,6 +18,7 @@ const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const HostTrapInfo = @import("../runtime/common/exec_env.zig").HostTrapInfo;
 const interp = @import("../runtime/interpreter/interp.zig");
 const indexspace = @import("indexspace.zig");
+const aot_runtime = @import("../runtime/aot/runtime.zig");
 const Allocator = std.mem.Allocator;
 
 const ComponentInstance = instance_mod.ComponentInstance;
@@ -75,6 +76,12 @@ pub const ExecutionError = error{
     PostReturnFailed,
     LiftError,
     LowerError,
+    /// AOT-backed core hit a canon-ABI shape this PR doesn't yet
+    /// support — only scalar primitive params and a single scalar
+    /// result land on the fast path; compound types, memory-spilled
+    /// params, and post-return on AOT cores are deferred to a
+    /// follow-up (see issue #625 phase 3 notes).
+    AotPathUnsupported,
 };
 
 // ── Lift options parsed from CanonOpt array ─────────────────────────────────
@@ -240,7 +247,30 @@ pub fn callComponentFuncByLocal(
     if (exported.core_instance_idx >= owner_inst.core_instances.len)
         return error.CoreInstanceNotAvailable;
     const core_entry = owner_inst.core_instances[exported.core_instance_idx];
-    const module_inst = core_entry.module_inst orelse return error.CoreInstanceNotAvailable;
+
+    // AOT fast path: when the core is AOT-backed and the canon-ABI
+    // shape is scalar-only, dispatch through `aot_runtime.callFuncScalar`
+    // directly. This is the phase-3 minimum: it proves the end-to-end
+    // canon.lift → AOT path works for primitive-typed exports
+    // (componentize-js's TCGC `compile()` ABI is mostly i32/string,
+    // and string is not yet on this path). More complex shapes —
+    // compound types, memory-spilled params, post-return — fall
+    // through to the interpreter path, which then traps if the
+    // backend is AOT-only. (#625 phase 3.)
+    if (core_entry.module_inst == null) {
+        if (core_entry.aot_inst) |ai| {
+            return callComponentFuncByLocalAot(
+                owner_inst,
+                ai,
+                exported,
+                args,
+                out_results,
+                allocator,
+            );
+        }
+        return error.CoreInstanceNotAvailable;
+    }
+    const module_inst = core_entry.module_inst.?;
 
     // Parse canonical options
     const lift_opts = LiftOptions.fromOpts(exported.opts);
@@ -369,6 +399,133 @@ pub fn callComponentFuncByLocal(
         }
         interp.executeFunction(env, pr_idx) catch {};
     }
+}
+
+/// AOT-backed canon.lift dispatch. Scalar-primitive-only fast path for
+/// `callComponentFuncByLocal` (issue #625 phase 3 minimum). Lowers
+/// `args` into a packed `[]Value` and dispatches via
+/// `aot_runtime.callFuncScalar`. Returns `error.AotPathUnsupported`
+/// for any shape outside the supported subset:
+///   * params and result must each be a primitive scalar (`bool`,
+///     `s8/u8/s16/u16/s32/u32/char/s64/u64/f32/f64`),
+///   * no memory-spilled params (covered automatically — primitives
+///     flatten 1:1),
+///   * at most one result (matches `MAX_FLAT_RESULTS`),
+///   * no `post_return` (AOT doesn't go through `ExecEnv` so the
+///     interp re-push trick from the standard path doesn't apply yet).
+///
+/// Compound types, strings, lists, resources, futures/streams, and
+/// post-return are deferred to a follow-up — the canon-ABI lower/lift
+/// helpers in this file are tightly coupled to `ExecEnv`'s stack
+/// machine, so a clean refactor that lets both backends share them
+/// belongs in its own PR.
+fn callComponentFuncByLocalAot(
+    owner_inst: *const ComponentInstance,
+    ai: *aot_runtime.AotInstance,
+    exported: ComponentInstance.ExportedFunc.Local,
+    args: []const InterfaceValue,
+    out_results: []InterfaceValue,
+    allocator: Allocator,
+) ExecutionError!void {
+    const lift_opts = LiftOptions.fromOpts(exported.opts);
+    if (lift_opts.is_async) return error.AotPathUnsupported;
+    if (lift_opts.post_return_idx != null) return error.AotPathUnsupported;
+
+    const registry = TypeRegistry.init(owner_inst.component);
+
+    const func_type = blk: {
+        const td = registry.get(exported.func_type_idx) orelse return error.InvalidFuncType;
+        switch (td) {
+            .func => |ft| break :blk ft,
+            else => return error.InvalidFuncType,
+        }
+    };
+
+    const param_types = getParamValTypes(func_type, allocator) catch return error.OutOfMemory;
+    defer allocator.free(param_types);
+    const result_types = getResultValTypes(func_type, allocator) catch return error.OutOfMemory;
+    defer allocator.free(result_types);
+
+    if (result_types.len > MAX_FLAT_RESULTS) return error.AotPathUnsupported;
+
+    // Lower each arg into a single core Value. We only accept shapes
+    // that flatten to one slot; everything else routes to the
+    // compound-types follow-up.
+    var arg_buf: [16]core_types.Value = undefined;
+    if (args.len > arg_buf.len) return error.AotPathUnsupported;
+    var core_param_types: [16]core_types.ValType = undefined;
+    var core_result_types: [1]core_types.ValType = undefined;
+
+    for (args, param_types, 0..) |val, pt, i| {
+        const cv = lowerScalarArg(val, pt) catch return error.AotPathUnsupported;
+        arg_buf[i] = cv.value;
+        core_param_types[i] = cv.ty;
+    }
+
+    if (result_types.len == 1) {
+        core_result_types[0] = scalarValType(result_types[0]) catch return error.AotPathUnsupported;
+    }
+
+    var results_buf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
+    const results = aot_runtime.callFuncScalar(
+        ai,
+        exported.core_func_idx,
+        core_param_types[0..args.len],
+        core_result_types[0..result_types.len],
+        arg_buf[0..args.len],
+        &results_buf,
+    ) catch return error.TrapInCoreFunction;
+
+    if (result_types.len == 1) {
+        out_results[0] = liftScalarResult(results[0], result_types[0]) catch
+            return error.AotPathUnsupported;
+    }
+}
+
+const LoweredScalar = struct { ty: core_types.ValType, value: core_types.Value };
+
+fn lowerScalarArg(val: InterfaceValue, t: ctypes.ValType) !LoweredScalar {
+    return switch (t) {
+        .bool => .{ .ty = .i32, .value = .{ .i32 = if (val.bool) 1 else 0 } },
+        .s8 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, val.s8) } },
+        .u8 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, @intCast(val.u8)) } },
+        .s16 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, val.s16) } },
+        .u16 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, @intCast(val.u16)) } },
+        .s32 => .{ .ty = .i32, .value = .{ .i32 = val.s32 } },
+        .u32, .char => .{ .ty = .i32, .value = .{ .i32 = @bitCast(val.u32) } },
+        .s64 => .{ .ty = .i64, .value = .{ .i64 = val.s64 } },
+        .u64 => .{ .ty = .i64, .value = .{ .i64 = @bitCast(val.u64) } },
+        .f32 => .{ .ty = .f32, .value = .{ .f32 = @bitCast(val.f32) } },
+        .f64 => .{ .ty = .f64, .value = .{ .f64 = @bitCast(val.f64) } },
+        else => error.AotPathUnsupported,
+    };
+}
+
+fn scalarValType(t: ctypes.ValType) !core_types.ValType {
+    return switch (t) {
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char => .i32,
+        .s64, .u64 => .i64,
+        .f32 => .f32,
+        .f64 => .f64,
+        else => error.AotPathUnsupported,
+    };
+}
+
+fn liftScalarResult(r: aot_runtime.ScalarResult, t: ctypes.ValType) !InterfaceValue {
+    return switch (t) {
+        .bool => .{ .bool = (r.i32 != 0) },
+        .s8 => .{ .s8 = @truncate(r.i32) },
+        .u8 => .{ .u8 = @truncate(@as(u32, @bitCast(r.i32))) },
+        .s16 => .{ .s16 = @truncate(r.i32) },
+        .u16 => .{ .u16 = @truncate(@as(u32, @bitCast(r.i32))) },
+        .s32 => .{ .s32 = r.i32 },
+        .u32, .char => .{ .u32 = @bitCast(r.i32) },
+        .s64 => .{ .s64 = r.i64 },
+        .u64 => .{ .u64 = @bitCast(r.i64) },
+        .f32 => .{ .f32 = @bitCast(r.f32) },
+        .f64 => .{ .f64 = @bitCast(r.f64) },
+        else => error.AotPathUnsupported,
+    };
 }
 
 /// Async-lifted variant of `callComponentFuncByLocal`. Lifts args and
