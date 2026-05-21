@@ -462,14 +462,17 @@ fn callComponentFuncByLocalAot(
     const result_types = getResultValTypes(func_type, allocator) catch return error.OutOfMemory;
     defer allocator.free(result_types);
 
-    if (result_types.len > MAX_FLAT_RESULTS) return error.AotPathUnsupported;
+    const flat_param_count = countFlatTypes(registry, param_types);
+    const flat_result_count = countFlatTypes(registry, result_types);
 
-    // Lower each arg into a single core Value. We only accept shapes
-    // that flatten to one slot; everything else routes to the
-    // compound-types follow-up.
-    var arg_buf: [16]core_types.Value = undefined;
-    if (args.len > arg_buf.len) return error.AotPathUnsupported;
-    var core_param_types: [16]core_types.ValType = undefined;
+    // Phase B.1 still requires params to flatten into ≤ MAX_FLAT_PARAMS
+    // single-slot scalars. Memory-spilled params and >1-slot compound
+    // params are deferred to phase B.2.
+    if (flat_param_count > MAX_FLAT_PARAMS) return error.AotPathUnsupported;
+    if (args.len > 16) return error.AotPathUnsupported;
+
+    var arg_buf: [17]core_types.Value = undefined; // +1 slot for retptr
+    var core_param_types: [17]core_types.ValType = undefined;
     var core_result_types: [1]core_types.ValType = undefined;
 
     for (args, param_types, 0..) |val, pt, i| {
@@ -478,6 +481,70 @@ fn callComponentFuncByLocalAot(
         core_param_types[i] = cv.ty;
     }
 
+    // Spilled-result path (#650 phase B.1): when the lifted result
+    // flattens to >MAX_FLAT_RESULTS, the canon ABI emits the core
+    // function as `(...params, retptr) -> ()` and the lifted tuple
+    // lives at retptr in linear memory. Allocate retptr via realloc,
+    // call the core, then read back via `loadInterfaceValue` (which
+    // is already memory-only / backend-agnostic).
+    if (flat_result_count > MAX_FLAT_RESULTS) {
+        if (ai.memories.len == 0) return error.AotPathUnsupported;
+        const mem: []u8 = ai.memories[0].data;
+        const realloc_idx = lift_opts.realloc_idx orelse return error.AotPathUnsupported;
+
+        const ret_size = computeTupleSize(registry, result_types);
+        const ret_align = computeTupleAlign(registry, result_types);
+
+        const realloc_args = [_]core_types.Value{
+            .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = @intCast(ret_align) }, .{ .i32 = @intCast(ret_size) },
+        };
+        const realloc_param_types = [_]core_types.ValType{ .i32, .i32, .i32, .i32 };
+        const realloc_result_types = [_]core_types.ValType{.i32};
+        var realloc_results_buf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
+        const realloc_results = aot_runtime.callFuncScalar(
+            ai,
+            realloc_idx,
+            &realloc_param_types,
+            &realloc_result_types,
+            &realloc_args,
+            &realloc_results_buf,
+        ) catch return error.TrapInCoreFunction;
+        const retptr: u32 = @bitCast(realloc_results[0].i32);
+
+        // Append retptr as the last core arg.
+        arg_buf[args.len] = .{ .i32 = @bitCast(retptr) };
+        core_param_types[args.len] = .i32;
+
+        var results_buf: [1]aot_runtime.ScalarResult = undefined;
+        _ = aot_runtime.callFuncScalar(
+            ai,
+            exported.core_func_idx,
+            core_param_types[0 .. args.len + 1],
+            &.{},
+            arg_buf[0 .. args.len + 1],
+            &results_buf,
+        ) catch return error.TrapInCoreFunction;
+
+        // Memory may have been resized during the core call (mem.grow);
+        // re-acquire the slice from the AOT instance.
+        const mem_after: []u8 = ai.memories[0].data;
+        _ = mem;
+
+        var offset: u32 = retptr;
+        for (result_types, 0..) |rt, i| {
+            const al = typeAlign(registry, rt);
+            offset = abi.alignUp(offset, al);
+            out_results[i] = loadInterfaceValue(mem_after, offset, rt, registry, allocator) catch
+                return error.LiftError;
+            offset += typeSize(registry, rt);
+        }
+        return;
+    }
+
+    // Flat-result path (≤ MAX_FLAT_RESULTS=1). Multiple interface
+    // results are not supported here yet (the canon ABI caps results
+    // anyway since v1).
+    if (result_types.len > 1) return error.AotPathUnsupported;
     if (result_types.len == 1) {
         core_result_types[0] = scalarValType(result_types[0], registry) catch return error.AotPathUnsupported;
     }

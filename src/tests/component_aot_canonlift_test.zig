@@ -276,3 +276,117 @@ test "#650 phase A: AOT lifts result<(),()> via scalar fast path" {
         try std.testing.expect(rv.payload == null);
     }
 }
+
+// #650 phase B.1 — retptr-based compound returns on AOT.
+//
+// Core wasm exports two functions:
+//   * `realloc(orig, sz, align, new_sz)` — fixed-bump allocator
+//      that always returns 16, so the lifted return tuple lands
+//      at offset 16 in linear memory.
+//   * `wp(retptr)` — writes 0x000000AA at retptr+0 and 0x000000BB
+//      at retptr+4, returns no flat results.
+//
+// canon.lift retypes `wp` as `func() -> tuple<u32, u32>`. The lifted
+// type flattens to 2 i32 slots, exceeding `MAX_FLAT_RESULTS=1`, so
+// canon ABI emits the core function as `(retptr) -> ()` and the
+// AOT path must (a) call realloc to obtain retptr, (b) push retptr
+// as the trailing i32 arg, and (c) read both u32 fields back from
+// linear memory via `loadInterfaceValue`.
+//
+// Pre-phase-B.1 this lift hit `error.AotPathUnsupported` on
+// `result_types.len > MAX_FLAT_RESULTS` (which conflated interface
+// arity with flat slot count anyway).
+const retptr_core_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    // type section: 2 types
+    0x01, 0x0d, 0x02,
+    0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, // realloc: (i32,i32,i32,i32) -> i32
+    0x60, 0x01, 0x7f, 0x00, // wp: (i32) -> ()
+    // func section: 2 funcs
+    0x03, 0x03, 0x02, 0x00, 0x01,
+    // memory section: 1 page
+    0x05, 0x03, 0x01, 0x00, 0x01,
+    // export section: memory, realloc, wp (payload=9+10+5+count(1)=25)
+    0x07, 0x19, 0x03,
+    0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    0x07, 'r', 'e', 'a', 'l', 'l', 'o', 'c', 0x00, 0x00,
+    0x02, 'w', 'p', 0x00, 0x01,
+    // code section: 2 funcs (payload=25 = count(1) + body0(5) + body1(19))
+    0x0a, 0x19, 0x02,
+    0x04, 0x00, 0x41, 0x10, 0x0b, // realloc: i32.const 16; end
+    // wp body (size=18): 00 20 00 41 AA 01 36 02 00 20 00 41 BB 01 36 02 04 0b
+    0x12,
+    0x00,
+    0x20, 0x00, 0x41, 0xaa, 0x01, 0x36, 0x02, 0x00,
+    0x20, 0x00, 0x41, 0xbb, 0x01, 0x36, 0x02, 0x04,
+    0x0b,
+};
+
+test "#650 phase B.1: AOT lifts tuple<u32,u32> via retptr" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &retptr_core_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &retptr_core_wasm }};
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+
+    // type 0: tuple<u32, u32>; type 1: () -> tuple<u32, u32> (referencing type 0).
+    const tuple_fields = [_]ctypes.ValType{ .u32, .u32 };
+    const types = [_]ctypes.TypeDef{
+        .{ .tuple = .{ .fields = &tuple_fields } },
+        .{ .func = .{
+            .params = &.{},
+            .results = .{ .unnamed = .{ .tuple = 0 } },
+        } },
+    };
+    // Canon-lift `wp` (core_func_idx=1) with realloc bound to core_func_idx=0.
+    const lift_opts = [_]ctypes.CanonOpt{
+        .{ .realloc = 0 },
+    };
+    const canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 1, .type_idx = 1, .opts = &lift_opts } },
+    };
+    const exports = [_]ctypes.ExportDecl{
+        .{ .name = "wp", .desc = .{ .func = 1 }, .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports,
+    };
+
+    const pcs = [_]instance.PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = cwasm_bytes },
+    };
+    const inst = try instance.instantiateWithOptions(&component, allocator, .{
+        .precompiled_cores = &pcs,
+    });
+    defer inst.deinit();
+
+    try std.testing.expect(inst.core_instances[0].aot_inst != null);
+
+    const ef = inst.getExport("wp") orelse return error.TestFailed;
+    const local = switch (ef) {
+        .local => |l| l,
+        else => return error.TestFailed,
+    };
+    var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
+    try executor.callComponentFuncByLocal(inst, local, &.{}, &results, allocator);
+    defer results[0].deinit(allocator);
+
+    const tup = results[0].tuple_val;
+    try std.testing.expectEqual(@as(usize, 2), tup.len);
+    try std.testing.expectEqual(@as(u32, 0xAA), tup[0].u32);
+    try std.testing.expectEqual(@as(u32, 0xBB), tup[1].u32);
+}
