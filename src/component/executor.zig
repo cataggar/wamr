@@ -473,13 +473,13 @@ fn callComponentFuncByLocalAot(
     var core_result_types: [1]core_types.ValType = undefined;
 
     for (args, param_types, 0..) |val, pt, i| {
-        const cv = lowerScalarArg(val, pt) catch return error.AotPathUnsupported;
+        const cv = lowerScalarArg(val, pt, registry) catch return error.AotPathUnsupported;
         arg_buf[i] = cv.value;
         core_param_types[i] = cv.ty;
     }
 
     if (result_types.len == 1) {
-        core_result_types[0] = scalarValType(result_types[0]) catch return error.AotPathUnsupported;
+        core_result_types[0] = scalarValType(result_types[0], registry) catch return error.AotPathUnsupported;
     }
 
     var results_buf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
@@ -493,14 +493,21 @@ fn callComponentFuncByLocalAot(
     ) catch return error.TrapInCoreFunction;
 
     if (result_types.len == 1) {
-        out_results[0] = liftScalarResult(results[0], result_types[0]) catch
+        out_results[0] = liftScalarResult(results[0], result_types[0], registry) catch
             return error.AotPathUnsupported;
     }
 }
 
 const LoweredScalar = struct { ty: core_types.ValType, value: core_types.Value };
 
-fn lowerScalarArg(val: InterfaceValue, t: ctypes.ValType) !LoweredScalar {
+/// Lower an interface value to a single core value slot. Handles
+/// primitives directly; for compound types, only those that flatten
+/// to exactly 1 i32 slot are accepted (today: `enum`,
+/// `result<(),()>`, and `variant` whose every arm is empty). Anything
+/// else (multi-slot results, list/string, payload-bearing variants,
+/// records/tuples) routes through `error.AotPathUnsupported` — that's
+/// the #650 phase B work.
+fn lowerScalarArg(val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !LoweredScalar {
     return switch (t) {
         .bool => .{ .ty = .i32, .value = .{ .i32 = if (val.bool) 1 else 0 } },
         .s8 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, val.s8) } },
@@ -513,21 +520,36 @@ fn lowerScalarArg(val: InterfaceValue, t: ctypes.ValType) !LoweredScalar {
         .u64 => .{ .ty = .i64, .value = .{ .i64 = @bitCast(val.u64) } },
         .f32 => .{ .ty = .f32, .value = .{ .f32 = @bitCast(val.f32) } },
         .f64 => .{ .ty = .f64, .value = .{ .f64 = @bitCast(val.f64) } },
+        .enum_ => .{ .ty = .i32, .value = .{ .i32 = @bitCast(val.enum_val) } },
+        .result, .variant => blk: {
+            if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
+            const disc: u32 = switch (val) {
+                .result_val => |r| if (r.is_ok) 0 else 1,
+                .variant_val => |v| v.discriminant,
+                else => return error.AotPathUnsupported,
+            };
+            break :blk .{ .ty = .i32, .value = .{ .i32 = @bitCast(disc) } };
+        },
         else => error.AotPathUnsupported,
     };
 }
 
-fn scalarValType(t: ctypes.ValType) !core_types.ValType {
+fn scalarValType(t: ctypes.ValType, registry: TypeRegistry) !core_types.ValType {
     return switch (t) {
         .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char => .i32,
         .s64, .u64 => .i64,
         .f32 => .f32,
         .f64 => .f64,
+        .enum_ => .i32,
+        .result, .variant => blk: {
+            if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
+            break :blk .i32;
+        },
         else => error.AotPathUnsupported,
     };
 }
 
-fn liftScalarResult(r: aot_runtime.ScalarResult, t: ctypes.ValType) !InterfaceValue {
+fn liftScalarResult(r: aot_runtime.ScalarResult, t: ctypes.ValType, registry: TypeRegistry) !InterfaceValue {
     return switch (t) {
         .bool => .{ .bool = (r.i32 != 0) },
         .s8 => .{ .s8 = @truncate(r.i32) },
@@ -540,6 +562,19 @@ fn liftScalarResult(r: aot_runtime.ScalarResult, t: ctypes.ValType) !InterfaceVa
         .u64 => .{ .u64 = @bitCast(r.i64) },
         .f32 => .{ .f32 = @bitCast(r.f32) },
         .f64 => .{ .f64 = @bitCast(r.f64) },
+        .enum_ => .{ .enum_val = @bitCast(r.i32) },
+        .result => blk: {
+            if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
+            const disc: u32 = @bitCast(r.i32);
+            // Canon ABI: 0 = ok, 1 = err. Both arms empty in this fast
+            // path so payload is null on either side.
+            break :blk .{ .result_val = .{ .is_ok = disc == 0, .payload = null } };
+        },
+        .variant => blk: {
+            if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
+            const disc: u32 = @bitCast(r.i32);
+            break :blk .{ .variant_val = .{ .discriminant = disc, .payload = null } };
+        },
         else => error.AotPathUnsupported,
     };
 }
