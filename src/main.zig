@@ -95,6 +95,13 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // rewrites synchronously after every mutation. Null ⇒ in-memory
     // only (default, behaviour-compatible with PR #601).
     var keyvalue_store_path: ?[]const u8 = null;
+    // `--precompiled-dir=<path>` (#642): explicit path to a
+    // `wamrc compile-component` output bundle (manifest.json + per-core
+    // .cwasm artifacts). When unset, `runRun` probes for a sibling
+    // `<input>.cwasm.d/manifest.json` next to the component file and
+    // uses it on a best-effort basis (mismatch → warning + interpreter
+    // fallback). When set, the bundle is mandatory: any error is fatal.
+    var precompiled_dir: ?[]const u8 = null;
     var listen_address: ?std.Io.net.IpAddress = null;
     // `--tls-cert=<path>` + `--tls-key=<path>` (or the combined
     // `--tls-pem=<path>`) (#583 follow-up to #595): when both cert
@@ -292,6 +299,31 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     return 2;
                 }
                 keyvalue_store_path = spec;
+            } else if (std.mem.eql(u8, arg, "--precompiled-dir") or std.mem.startsWith(u8, arg, "--precompiled-dir=")) {
+                // `--precompiled-dir <path>` (#642): explicit path to a
+                // `wamrc compile-component` output directory containing
+                // `manifest.json` + `module<N>.cwasm`. Cores in the bundle
+                // are loaded as AOT; cores missing from the manifest fall
+                // back to the interpreter. A mismatched / stale manifest
+                // is a hard error (vs. the silent fallback used by the
+                // sibling auto-detect path below).
+                if (precompiled_dir != null) {
+                    std.debug.print("error: --precompiled-dir specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--precompiled-dir")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --precompiled-dir requires a path to a wamrc compile-component output dir\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--precompiled-dir=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --precompiled-dir path is empty\n", .{});
+                    return 2;
+                }
+                precompiled_dir = spec;
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
@@ -399,6 +431,58 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 std.debug.print("Error: --config-store '{s}': {}\n", .{ config_store_path orelse "", err });
                 return 2;
             };
+            // #642: resolve the AOT precompiled-cores bundle.
+            //
+            //  * `--precompiled-dir <path>` (explicit, mandatory): any
+            //    error opening / validating the manifest is fatal so the
+            //    user knows the AOT path isn't being taken.
+            //  * sibling `<input>.cwasm.d/manifest.json` (auto-detect,
+            //    best-effort): mismatch / stale / missing → one
+            //    `warning: ...` line on stderr and we fall through to
+            //    the interpreter path (matches wasmtime's behaviour).
+            //
+            // The `LoadedManifest`'s lifetime must outlive
+            // `runComponent` / `runHttpComponent` because the mmapped
+            // `.cwasm` buffers it owns are borrowed by the
+            // `PrecompiledCore` slice handed to the instance loader.
+            var loaded_manifest: ?wamr.component_aot.LoadedManifest = null;
+            defer if (loaded_manifest) |*lm| lm.deinit();
+
+            if (precompiled_dir) |dir| {
+                loaded_manifest = wamr.component_aot.loadManifest(allocator, dir, wasm_data) catch |err| {
+                    std.debug.print("Error: --precompiled-dir '{s}': {s}\n", .{ dir, loadManifestErrorMessage(err) });
+                    return 2;
+                };
+                const n = loaded_manifest.?.precompiledCores().len;
+                std.debug.print("wamr: loaded AOT bundle from {s} ({d} core{s} precompiled)\n", .{ dir, n, if (n == 1) @as([]const u8, "") else "s" });
+            } else {
+                // Auto-probe `<input>.cwasm.d/manifest.json`. Don't
+                // fail the run if the bundle is absent / stale — just
+                // tell the user we're skipping it.
+                const sibling = std.fmt.allocPrint(allocator, "{s}.cwasm.d", .{path}) catch return 1;
+                defer allocator.free(sibling);
+                const probe = std.fs.path.join(allocator, &.{ sibling, "manifest.json" }) catch return 1;
+                defer allocator.free(probe);
+                const io_probe = init.io;
+                const cwd_probe = std.Io.Dir.cwd();
+                const exists = blk: {
+                    var f = cwd_probe.openFile(io_probe, probe, .{}) catch break :blk false;
+                    f.close(io_probe);
+                    break :blk true;
+                };
+                if (exists) {
+                    if (wamr.component_aot.loadManifest(allocator, sibling, wasm_data)) |lm| {
+                        loaded_manifest = lm;
+                        const n = lm.precompiledCores().len;
+                        std.debug.print("wamr: loaded AOT bundle from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
+                    } else |err| {
+                        std.debug.print("warning: ignoring AOT bundle at {s}: {s}\n", .{ sibling, loadManifestErrorMessage(err) });
+                    }
+                }
+            }
+            const precompiled_cores: []const wamr.component_core_backend.PrecompiledCore =
+                if (loaded_manifest) |lm| lm.precompiledCores() else &.{};
+
             if (listen_address) |addr| {
                 // Load + parse the TLS cert + key at startup, so a
                 // missing file / malformed PEM surfaces before `bind`
@@ -418,9 +502,9 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     };
                 }
                 defer if (tls_config) |*c| c.deinit();
-                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level, if (tls_config) |*c| c else null);
+                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level, if (tls_config) |*c| c else null, precompiled_cores);
             }
-            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path, precompiled_cores);
         }
     }
 
@@ -572,6 +656,7 @@ fn runComponent(
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
     config_store: []const wamr.wasi_cli_adapter.ConfigEntry,
     keyvalue_store_path: ?[]const u8,
+    precompiled_cores: []const wamr.component_core_backend.PrecompiledCore,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     // Wire the adapter's stdio directly to the host process's
@@ -671,7 +756,7 @@ fn runComponent(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const outcome = adapter_mod.runComponentBytes(data, arena_alloc, &adapter) catch |err| {
+    const outcome = adapter_mod.runComponentBytes(data, arena_alloc, &adapter, precompiled_cores) catch |err| {
         switch (err) {
             error.NoRunExport => std.debug.print(
                 "Error: component does not expose a top-level `run` export. " ++
@@ -716,6 +801,7 @@ fn runHttpComponent(
     listen_address: std.Io.net.IpAddress,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
     tls_config: ?*const wamr.wasi_cli_adapter.HttpsTlsConfig,
+    precompiled_cores: []const wamr.component_core_backend.PrecompiledCore,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
@@ -740,7 +826,7 @@ fn runHttpComponent(
         .listen_address = listen_address,
         .announce_listening = listen_address.getPort() == 0,
         .tls_config = tls_config,
-    }) catch |err| {
+    }, precompiled_cores) catch |err| {
         switch (err) {
             error.NoIncomingHandlerExport => std.debug.print(
                 "Error: component does not export `wasi:http/incoming-handler.handle`.\n",
@@ -1049,6 +1135,19 @@ fn writeStdout(io: std.Io, text: []const u8) void {
 /// Map an `HttpsTlsConfig.LoadError` to a short, user-facing
 /// diagnostic string. Used by `runRun` to surface cert / key load
 /// failures before bind in a uniform format.
+fn loadManifestErrorMessage(err: wamr.component_aot.LoadError) []const u8 {
+    return switch (err) {
+        error.ManifestNotFound => "manifest.json not found in the directory",
+        error.ManifestParseFailed => "manifest.json could not be parsed",
+        error.ManifestVersionMismatch => "manifest format version not understood by this build",
+        error.ManifestBuildIdMismatch => "manifest was produced by a different wamr build (recompile with `wamrc compile-component`)",
+        error.ManifestComponentMismatch => "manifest's component hash does not match this component (stale bundle — recompile with `wamrc compile-component`)",
+        error.CwasmReadFailed => "could not read a .cwasm artifact referenced from the manifest",
+        error.CwasmHashMismatch => "a .cwasm artifact's contents differ from the manifest's recorded hash (tampered or partial write)",
+        error.OutOfMemory => "out of memory while loading the manifest",
+    };
+}
+
 fn tlsLoadErrorMessage(err: wamr.wasi_cli_adapter.HttpsTlsConfig.LoadError) []const u8 {
     return switch (err) {
         error.TlsCertFileNotFound => "certificate file not found",
@@ -1130,6 +1229,18 @@ const run_usage =
     \\                           file containing both certificate chain
     \\                           and private key. Mutually exclusive with
     \\                           --tls-cert / --tls-key.
+    \\  --precompiled-dir PATH   For components: load AOT-compiled cores from
+    \\                           a `wamrc compile-component` output directory
+    \\                           (containing manifest.json + module<N>.cwasm).
+    \\                           Cores in the bundle execute via the AOT
+    \\                           runtime; cores missing from the manifest
+    \\                           fall back to the interpreter. A mismatched
+    \\                           manifest is a hard error. When this flag
+    \\                           is omitted, `wamr run` auto-detects a
+    \\                           sibling `<input>.cwasm.d/manifest.json`
+    \\                           and uses it on a best-effort basis
+    \\                           (mismatch -> warning + interpreter
+    \\                           fallback).
     \\
 ;
 
