@@ -115,16 +115,19 @@ test "#625 phase 3: AOT path rejects unsupported shapes cleanly" {
         .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
     };
 
-    // Declare the lift as taking a `string` param (which flattens to
-    // 2 i32 slots + needs memory) so the scalar fast path bails with
-    // AotPathUnsupported rather than producing wrong results.
-    const params = [_]ctypes.NamedValType{.{ .name = "s", .type = .string }};
+    // Declare the lift as taking a `tuple<u32,u32>` param (compound,
+    // 2 flat slots). Phase B.2 handles string/list/multi-slot
+    // primitives, but compound aggregate params (records / tuples /
+    // payload-bearing variants) still bail with AotPathUnsupported.
+    const tuple_fields = [_]ctypes.ValType{ .u32, .u32 };
+    const params = [_]ctypes.NamedValType{.{ .name = "p", .type = .{ .tuple = 0 } }};
     const types = [_]ctypes.TypeDef{
+        .{ .tuple = .{ .fields = &tuple_fields } },
         .{ .func = .{ .params = &params, .results = .{ .unnamed = .s32 } } },
     };
     const lift_opts = [_]ctypes.CanonOpt{};
     const canons = [_]ctypes.Canon{
-        .{ .lift = .{ .core_func_idx = 0, .type_idx = 0, .opts = &lift_opts } },
+        .{ .lift = .{ .core_func_idx = 0, .type_idx = 1, .opts = &lift_opts } },
     };
     const exports = [_]ctypes.ExportDecl{
         .{ .name = "go", .desc = .{ .func = 0 }, .sort_idx = .{ .sort = .func, .idx = 0 } },
@@ -156,7 +159,8 @@ test "#625 phase 3: AOT path rejects unsupported shapes cleanly" {
         else => return error.TestFailed,
     };
 
-    const args = [_]abi.InterfaceValue{.{ .string = .{ .ptr = 0, .len = 0 } }};
+    const tup_field = [_]abi.InterfaceValue{ .{ .u32 = 0 }, .{ .u32 = 0 } };
+    const args = [_]abi.InterfaceValue{.{ .tuple_val = &tup_field }};
     var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
     try std.testing.expectError(
         error.AotPathUnsupported,
@@ -389,4 +393,84 @@ test "#650 phase B.1: AOT lifts tuple<u32,u32> via retptr" {
     try std.testing.expectEqual(@as(usize, 2), tup.len);
     try std.testing.expectEqual(@as(u32, 0xAA), tup[0].u32);
     try std.testing.expectEqual(@as(u32, 0xBB), tup[1].u32);
+}
+
+// #650 phase B.2 — multi-slot flat params on AOT.
+//
+// Core wasm exports `(func "len" (param i32 i32) (result i32))` that
+// returns its second i32 arg (i.e. the string length). canon.lift
+// retypes it as `func(s: string) -> u32`. The string param flattens
+// to 2 i32 slots, exceeding what the pre-B.2 single-slot lowerScalarArg
+// could emit. Phase B.2's `lowerFlatRecur` writes both slots into the
+// AOT arg buffer.
+const string_param_core_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    // type: (i32 i32) -> i32
+    0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+    // funcs: 1 func type 0
+    0x03, 0x02, 0x01, 0x00,
+    // memory: 1 page
+    0x05, 0x03, 0x01, 0x00, 0x01,
+    // exports: memory, len  (count=3 -> wait 2; payload: 9 + 6 = 15 + 1)
+    0x07, 0x10, 0x02,
+    0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    0x03, 'l', 'e', 'n', 0x00, 0x00,
+    // code: 1 func, body = locals(1 byte) + local.get 1 + end (4 bytes)
+    0x0a, 0x06, 0x01,
+    0x04, 0x00, 0x20, 0x01, 0x0b,
+};
+
+test "#650 phase B.2: AOT lowers string param (multi-slot flat)" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &string_param_core_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &string_param_core_wasm }};
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+
+    const params = [_]ctypes.NamedValType{.{ .name = "s", .type = .string }};
+    const types = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .u32 } } },
+    };
+    const lift_opts = [_]ctypes.CanonOpt{};
+    const canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 0, .type_idx = 0, .opts = &lift_opts } },
+    };
+    const exports = [_]ctypes.ExportDecl{
+        .{ .name = "len", .desc = .{ .func = 0 }, .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports,
+    };
+
+    const pcs = [_]instance.PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = cwasm_bytes },
+    };
+    const inst = try instance.instantiateWithOptions(&component, allocator, .{
+        .precompiled_cores = &pcs,
+    });
+    defer inst.deinit();
+
+    const ef = inst.getExport("len") orelse return error.TestFailed;
+    const local = switch (ef) {
+        .local => |l| l,
+        else => return error.TestFailed,
+    };
+    const args = [_]abi.InterfaceValue{.{ .string = .{ .ptr = 0x100, .len = 42 } }};
+    var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
+    try executor.callComponentFuncByLocal(inst, local, &args, &results, allocator);
+    try std.testing.expectEqual(@as(u32, 42), results[0].u32);
 }
