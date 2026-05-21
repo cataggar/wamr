@@ -23126,6 +23126,7 @@ const ctypes_root = @import("types.zig");
 const component_loader = @import("loader.zig");
 const executor_root = @import("executor.zig");
 const abi_root = @import("canonical_abi.zig");
+const core_backend = @import("core_backend.zig");
 
 pub const RunComponentError = error{
     LoadFailed,
@@ -23862,12 +23863,21 @@ pub fn populateWasiProviders(
 
 /// Run an already-loaded component. See `runComponentBytes` for the
 /// byte-level entry point and the policy notes that apply equally here.
+///
+/// `precompiled_cores` opts individual embedded core modules into the
+/// AOT runtime (#625 / #642). Empty slice (the default) keeps every
+/// core on the interpreter — byte-identical to the pre-#642 behaviour.
 pub fn runLoadedComponent(
     component: *const ctypes_root.Component,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
+    precompiled_cores: []const core_backend.PrecompiledCore,
 ) RunComponentError!RunOutcome {
-    const inst = instance_mod.instantiate(component, allocator) catch return error.InstantiateFailed;
+    const inst = instance_mod.instantiateWithOptions(
+        component,
+        allocator,
+        .{ .precompiled_cores = precompiled_cores },
+    ) catch return error.InstantiateFailed;
     defer inst.deinit();
 
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
@@ -23927,6 +23937,7 @@ pub fn runComponentBytes(
     data: []const u8,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
+    precompiled_cores: []const core_backend.PrecompiledCore,
 ) RunComponentError!RunOutcome {
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
@@ -23939,9 +23950,9 @@ pub fn runComponentBytes(
     // `populateWasiProviders`; the missing piece was teaching the CLI to
     // call the right export. (#520)
     if (hasWasiCliRunP3Export(component_storage)) {
-        return runLoadedComponentP3(component_storage, allocator, adapter);
+        return runLoadedComponentP3(component_storage, allocator, adapter, precompiled_cores);
     }
-    return runLoadedComponent(component_storage, allocator, adapter);
+    return runLoadedComponent(component_storage, allocator, adapter, precompiled_cores);
 }
 
 /// Return true iff the top-level component exports a `wasi:cli/run@0.3.x`
@@ -24004,8 +24015,13 @@ pub fn runLoadedComponentP3(
     component: *const ctypes_root.Component,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
+    precompiled_cores: []const core_backend.PrecompiledCore,
 ) RunComponentError!RunOutcome {
-    const inst = instance_mod.instantiate(component, allocator) catch return error.InstantiateFailed;
+    const inst = instance_mod.instantiateWithOptions(
+        component,
+        allocator,
+        .{ .precompiled_cores = precompiled_cores },
+    ) catch return error.InstantiateFailed;
     defer inst.deinit();
 
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
@@ -24072,11 +24088,12 @@ pub fn runComponentBytesP3(
     data: []const u8,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
+    precompiled_cores: []const core_backend.PrecompiledCore,
 ) RunComponentError!RunOutcome {
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
-    return runLoadedComponentP3(component_storage, allocator, adapter);
+    return runLoadedComponentP3(component_storage, allocator, adapter, precompiled_cores);
 }
 
 pub const ServeHttpOptions = struct {
@@ -24319,11 +24336,12 @@ pub fn serveHttpComponentBytes(
     allocator: Allocator,
     adapter: *WasiCliAdapter,
     options: ServeHttpOptions,
+    precompiled_cores: []const core_backend.PrecompiledCore,
 ) anyerror!void {
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
-    return serveLoadedHttpComponent(component_storage, allocator, adapter, options);
+    return serveLoadedHttpComponent(component_storage, allocator, adapter, options, precompiled_cores);
 }
 
 pub fn serveLoadedHttpComponent(
@@ -24331,8 +24349,13 @@ pub fn serveLoadedHttpComponent(
     allocator: Allocator,
     adapter: *WasiCliAdapter,
     options: ServeHttpOptions,
+    precompiled_cores: []const core_backend.PrecompiledCore,
 ) anyerror!void {
-    const inst = instance_mod.instantiate(component, allocator) catch return error.InstantiateFailed;
+    const inst = instance_mod.instantiateWithOptions(
+        component,
+        allocator,
+        .{ .precompiled_cores = precompiled_cores },
+    ) catch return error.InstantiateFailed;
     defer inst.deinit();
 
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
@@ -25051,7 +25074,7 @@ test "runLoadedComponent: matches versioned WASI import names" {
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
 
-    const outcome = try runLoadedComponent(&component, testing.allocator, &adapter);
+    const outcome = try runLoadedComponent(&component, testing.allocator, &adapter, &.{});
     try testing.expect(outcome.is_ok);
     try testing.expectEqualStrings("hello, world!\n", adapter.getStdoutBytes());
 }
@@ -25339,7 +25362,7 @@ test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
     defer adapter.deinit();
     adapter.setStdinBytes("hello\n");
 
-    const outcome = runComponentBytes(data, arena_alloc, &adapter) catch |err| {
+    const outcome = runComponentBytes(data, arena_alloc, &adapter, &.{}) catch |err| {
         std.debug.print("stdio-echo run failed: {s}\n", .{@errorName(err)});
         std.debug.print("stdout so far: {s}\n", .{adapter.getStdoutBytes()});
         std.debug.print("stderr so far: {s}\n", .{adapter.getStderrBytes()});
@@ -25394,7 +25417,7 @@ test "stdio-echo: live host stdio via pipe-redirected fds (#474)" {
         );
         defer adapter.deinit();
 
-        const outcome = runComponentBytes(data, arena_alloc, &adapter) catch |err| {
+        const outcome = runComponentBytes(data, arena_alloc, &adapter, &.{}) catch |err| {
             _ = linux.close(stdout_fds[1]);
             std.debug.print("stdio-echo (live) run failed: {s}\n", .{@errorName(err)});
             return err;
