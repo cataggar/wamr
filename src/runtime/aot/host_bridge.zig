@@ -8,6 +8,11 @@
 const std = @import("std");
 const VmCtx = @import("runtime.zig").VmCtx;
 const wasi_core = @import("../../wasi/wasi_core.zig");
+const host_trampolines = @import("host_trampolines.zig");
+
+pub const TrampolinePool = host_trampolines.TrampolinePool;
+
+var g_trampoline_pool: ?*TrampolinePool = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -131,6 +136,15 @@ pub fn isSpectestModule(module_name: []const u8) bool {
     return std.mem.eql(u8, module_name, "spectest");
 }
 
+pub fn setTrampolinePool(pool: ?*TrampolinePool) void {
+    g_trampoline_pool = pool;
+    host_trampolines.setActivePool(pool);
+}
+
+pub fn getTrampolinePool() ?*TrampolinePool {
+    return g_trampoline_pool;
+}
+
 /// Resolve a `spectest.*` function name to a no-op AOT adapter. Returns null
 /// for names outside the spec's standard surface (print/print_i32/... etc).
 pub fn resolveAotSpectestFunction(name: []const u8) ?*const anyopaque {
@@ -154,8 +168,8 @@ pub fn resolveAotSpectestFunction(name: []const u8) ?*const anyopaque {
 
 test "resolveAotHostFunction: all known functions resolve" {
     const names = [_][]const u8{
-        "fd_write",      "fd_seek",           "fd_close",
-        "fd_fdstat_get", "fd_prestat_get",    "fd_prestat_dir_name",
+        "fd_write",       "fd_seek",           "fd_close",
+        "fd_fdstat_get",  "fd_prestat_get",    "fd_prestat_dir_name",
         "clock_time_get", "environ_sizes_get", "environ_get",
         "args_sizes_get", "args_get",          "proc_exit",
     };
@@ -213,6 +227,19 @@ test "aotClockTimeGet: returns time" {
     try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, result);
     const nanos = std.mem.readInt(u64, mem[0..8], .little);
     try std.testing.expect(nanos > 0);
+}
+
+test "trampoline pool getter/setter roundtrip" {
+    var pool: TrampolinePool = undefined;
+
+    setTrampolinePool(&pool);
+    try std.testing.expectEqual(&pool, getTrampolinePool().?);
+    setTrampolinePool(null);
+    try std.testing.expect(getTrampolinePool() == null);
+}
+
+test {
+    _ = @import("../../tests/aot_host_trampolines_test.zig");
 }
 
 test "aotEnvironSizesGet: writes zeroes" {
