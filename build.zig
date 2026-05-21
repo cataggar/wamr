@@ -514,6 +514,22 @@ pub fn build(b: *std.Build) void {
     const run_differential_tests = b.addRunArtifact(differential_tests);
     test_step.dependOn(&run_differential_tests.step);
 
+    // #625 phase 1: AOT-backed component-core smoke test. Lives in its
+    // own test step for the same reason `differential.zig` does:
+    // `aot_harness.zig` cannot be pulled into the `wamr` lib module
+    // (it's already owned by the test runners that route through it).
+    const component_aot_smoke_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/component_aot_smoke_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    component_aot_smoke_module.addImport("wamr", lib_module);
+    const component_aot_smoke_tests = b.addTest(.{
+        .root_module = component_aot_smoke_module,
+    });
+    const run_component_aot_smoke_tests = b.addRunArtifact(component_aot_smoke_tests);
+    test_step.dependOn(&run_component_aot_smoke_tests.step);
+
     // Cold-start budget tests (issue #395). In-process timing companion
     // to the subprocess harness in #394. Compile a 36-byte noop wasm
     // through the just-built `wamrc` to produce a `.cwasm` fixture, then

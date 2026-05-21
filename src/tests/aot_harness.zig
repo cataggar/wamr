@@ -1002,6 +1002,22 @@ fn patchImportedFuncrefElems(
     }
 }
 
+/// Compile a raw wasm-1.0 binary to AOT cwasm bytes using the same
+/// pipeline `Harness.init` uses (frontend → IR passes → arch codegen →
+/// emit_aot). Returns a freshly-allocated cwasm buffer owned by the
+/// caller — free with `allocator.free`.
+///
+/// Exposed for tests that want to drive the AOT path without standing
+/// up a full `Harness` (e.g. the component AOT smoke test, #625).
+pub fn compileWasmToAot(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const owned_wasm = try a.dupe(u8, wasm_bytes);
+    const wasm_module = try loader_mod.load(owned_wasm, a);
+    return compileToAot(allocator, &arena, &wasm_module, null, false);
+}
+
 fn compileToAot(
     allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
