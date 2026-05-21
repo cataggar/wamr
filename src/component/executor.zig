@@ -465,20 +465,64 @@ fn callComponentFuncByLocalAot(
     const flat_param_count = countFlatTypes(registry, param_types);
     const flat_result_count = countFlatTypes(registry, result_types);
 
-    // Phase B.1 still requires params to flatten into ≤ MAX_FLAT_PARAMS
-    // single-slot scalars. Memory-spilled params and >1-slot compound
-    // params are deferred to phase B.2.
-    if (flat_param_count > MAX_FLAT_PARAMS) return error.AotPathUnsupported;
-    if (args.len > 16) return error.AotPathUnsupported;
+    // #650 phase B.2: support up to MAX_FLAT_PARAMS=16 flat slots
+    // emitted from compound/multi-slot params (string/list/s64/u64/f64
+    // = 2 slots each; 1-slot compounds via lowerScalarArg). When total
+    // flat-param slots exceed MAX_FLAT_PARAMS, the canon ABI spec says
+    // spill all params to a tuple in linear memory and pass a single
+    // i32 retptr — symmetric to the spilled-results path below.
+    if (args.len != param_types.len) return error.AotPathUnsupported;
 
-    var arg_buf: [17]core_types.Value = undefined; // +1 slot for retptr
-    var core_param_types: [17]core_types.ValType = undefined;
+    // +1 slot reserved for trailing retptr in the spilled-result path.
+    const SLOT_CAP: usize = MAX_FLAT_PARAMS + 1;
+    var arg_buf: [SLOT_CAP]core_types.Value = undefined;
+    var core_param_types: [SLOT_CAP]core_types.ValType = undefined;
     var core_result_types: [1]core_types.ValType = undefined;
 
-    for (args, param_types, 0..) |val, pt, i| {
-        const cv = lowerScalarArg(val, pt, registry) catch return error.AotPathUnsupported;
-        arg_buf[i] = cv.value;
-        core_param_types[i] = cv.ty;
+    var core_arg_count: usize = 0;
+    if (flat_param_count > MAX_FLAT_PARAMS) {
+        // Memory-spill: realloc a param tuple, store every arg, pass ptr.
+        if (ai.memories.len == 0) return error.AotPathUnsupported;
+        const mem_pre: []u8 = ai.memories[0].data;
+        _ = mem_pre;
+        const realloc_idx = lift_opts.realloc_idx orelse return error.AotPathUnsupported;
+
+        const tuple_size = computeTupleSize(registry, param_types);
+        const tuple_align = computeTupleAlign(registry, param_types);
+        const realloc_args = [_]core_types.Value{
+            .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = @intCast(tuple_align) }, .{ .i32 = @intCast(tuple_size) },
+        };
+        const rpt = [_]core_types.ValType{ .i32, .i32, .i32, .i32 };
+        const rrt = [_]core_types.ValType{.i32};
+        var rbuf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
+        const rres = aot_runtime.callFuncScalar(
+            ai, realloc_idx, &rpt, &rrt, &realloc_args, &rbuf,
+        ) catch return error.TrapInCoreFunction;
+        const params_ptr: u32 = @bitCast(rres[0].i32);
+
+        // Re-acquire memory after realloc (mem.grow may relocate).
+        const mem: []u8 = ai.memories[0].data;
+        var off: u32 = params_ptr;
+        for (args, param_types) |val, pt| {
+            const al = typeAlign(registry, pt);
+            off = abi.alignUp(off, al);
+            storeInterfaceValue(mem, off, val, pt, registry);
+            off += typeSize(registry, pt);
+        }
+        arg_buf[0] = .{ .i32 = @bitCast(params_ptr) };
+        core_param_types[0] = .i32;
+        core_arg_count = 1;
+    } else {
+        // Flat path: emit one or more core slots per interface arg.
+        for (args, param_types) |val, pt| {
+            const slots_left = SLOT_CAP - core_arg_count;
+            const written = lowerFlatRecur(
+                val, pt, registry,
+                arg_buf[core_arg_count..][0..slots_left],
+                core_param_types[core_arg_count..][0..slots_left],
+            ) catch return error.AotPathUnsupported;
+            core_arg_count += written;
+        }
     }
 
     // Spilled-result path (#650 phase B.1): when the lifted result
@@ -512,16 +556,18 @@ fn callComponentFuncByLocalAot(
         const retptr: u32 = @bitCast(realloc_results[0].i32);
 
         // Append retptr as the last core arg.
-        arg_buf[args.len] = .{ .i32 = @bitCast(retptr) };
-        core_param_types[args.len] = .i32;
+        if (core_arg_count >= SLOT_CAP) return error.AotPathUnsupported;
+        arg_buf[core_arg_count] = .{ .i32 = @bitCast(retptr) };
+        core_param_types[core_arg_count] = .i32;
+        const total_args = core_arg_count + 1;
 
         var results_buf: [1]aot_runtime.ScalarResult = undefined;
         _ = aot_runtime.callFuncScalar(
             ai,
             exported.core_func_idx,
-            core_param_types[0 .. args.len + 1],
+            core_param_types[0..total_args],
             &.{},
-            arg_buf[0 .. args.len + 1],
+            arg_buf[0..total_args],
             &results_buf,
         ) catch return error.TrapInCoreFunction;
 
@@ -553,9 +599,9 @@ fn callComponentFuncByLocalAot(
     const results = aot_runtime.callFuncScalar(
         ai,
         exported.core_func_idx,
-        core_param_types[0..args.len],
+        core_param_types[0..core_arg_count],
         core_result_types[0..result_types.len],
-        arg_buf[0..args.len],
+        arg_buf[0..core_arg_count],
         &results_buf,
     ) catch return error.TrapInCoreFunction;
 
@@ -566,6 +612,69 @@ fn callComponentFuncByLocalAot(
 }
 
 const LoweredScalar = struct { ty: core_types.ValType, value: core_types.Value };
+
+/// Lower an interface value into one or more flat core slots, writing
+/// to `out_vals` and `out_types` (must have length ≥ flatten-count of
+/// `t`). Returns the number of slots written. Used by the AOT path to
+/// emit canon-ABI flat-param slots without an `ExecEnv`.
+///
+/// Handles primitives — including multi-slot ones (s64/u64=2 i64-or-
+/// i32-pair, f64=2 slots, string=2 i32, list=2 i32) — plus the 1-slot
+/// compound shapes the scalar fast path already accepts (`enum`,
+/// `result<(),()>`-style empty-payload variants/results). Anything
+/// requiring per-slot variant-arm zero-fills with mixed-type joins is
+/// deferred (returns `error.AotPathUnsupported`).
+fn lowerFlatRecur(
+    val: InterfaceValue,
+    t: ctypes.ValType,
+    registry: TypeRegistry,
+    out_vals: []core_types.Value,
+    out_types: []core_types.ValType,
+) !usize {
+    switch (t) {
+        .s64 => {
+            if (out_vals.len < 1) return error.AotPathUnsupported;
+            out_vals[0] = .{ .i64 = val.s64 };
+            out_types[0] = .i64;
+            return 1;
+        },
+        .u64 => {
+            if (out_vals.len < 1) return error.AotPathUnsupported;
+            out_vals[0] = .{ .i64 = @bitCast(val.u64) };
+            out_types[0] = .i64;
+            return 1;
+        },
+        .f64 => {
+            if (out_vals.len < 1) return error.AotPathUnsupported;
+            out_vals[0] = .{ .f64 = @bitCast(val.f64) };
+            out_types[0] = .f64;
+            return 1;
+        },
+        .string => {
+            if (out_vals.len < 2) return error.AotPathUnsupported;
+            out_vals[0] = .{ .i32 = @bitCast(val.string.ptr) };
+            out_vals[1] = .{ .i32 = @bitCast(val.string.len) };
+            out_types[0] = .i32;
+            out_types[1] = .i32;
+            return 2;
+        },
+        .list => {
+            if (out_vals.len < 2) return error.AotPathUnsupported;
+            out_vals[0] = .{ .i32 = @bitCast(val.list.ptr) };
+            out_vals[1] = .{ .i32 = @bitCast(val.list.len) };
+            out_types[0] = .i32;
+            out_types[1] = .i32;
+            return 2;
+        },
+        else => {
+            if (out_vals.len < 1) return error.AotPathUnsupported;
+            const cv = try lowerScalarArg(val, t, registry);
+            out_vals[0] = cv.value;
+            out_types[0] = cv.ty;
+            return 1;
+        },
+    }
+}
 
 /// Lower an interface value to a single core value slot. Handles
 /// primitives directly; for compound types, only those that flatten
