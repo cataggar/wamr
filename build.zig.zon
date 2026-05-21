@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wabt = .{
-            .url = "https://github.com/cataggar/wabt/archive/refs/tags/v3.0.0-dev.4.tar.gz",
-            .hash = "wabt-0.1.0-eK3F5oiaHQBElcjAXV1-6H7fgZUUvXP5_pDh-JqMUnRt",
+            .url = "https://github.com/cataggar/wabt/archive/refs/tags/v3.0.0-dev.8.tar.gz",
+            .hash = "wabt-0.1.0-eK3F5oN1JACVtQs3sEBPf4M5Syo78zb3SfjQ8XwfyGvV",
         },
     },
     .paths = .{
