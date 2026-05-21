@@ -81,5 +81,11 @@ test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
 
     host_trampolines.setActivePool(null);
     pool.deinit(allocator);
-    try std.testing.expect(!(try linuxMappingContainsAddress(allocator, base_addr)));
+    // The post-munmap "is the address still mapped?" check only works on
+    // Linux because it parses /proc/self/maps. On non-Linux we trust that
+    // pool.deinit calls munmap and skip the assertion (the deinit itself
+    // would crash if mmap state were corrupt).
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(!(try linuxMappingContainsAddress(allocator, base_addr)));
+    }
 }
