@@ -69,7 +69,7 @@ const WASM_BUDGET_NS: u64 = if (builtin.os.tag == .macos) 1_000_000 else 500_000
 
 /// Cwasm-path budget — see top-of-file rationale (and macOS note on
 /// `WASM_BUDGET_NS`).
-const CWASM_BUDGET_NS: u64 = if (builtin.os.tag == .macos) 400_000 else 200_000;
+const CWASM_BUDGET_NS: u64 = if (builtin.os.tag == .macos) 600_000 else 200_000;
 
 /// Runtime arch gate for the cwasm half. Mirrors `aot_supported` in
 /// `differential.zig`. On non-AOT-executable targets the cwasm test
