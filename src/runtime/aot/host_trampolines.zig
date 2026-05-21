@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const core_types = @import("../common/types.zig");
 
 const page_size = std.heap.page_size_min;
 
@@ -13,9 +14,37 @@ pub const MAX_SLOTS: u32 = 256;
 
 const StubFn = *const fn () callconv(.c) void;
 
+pub const LoweredSig = struct {
+    param_types: []const core_types.ValType,
+    result_types: []const core_types.ValType,
+    has_retptr: bool = false,
+};
+
+pub const DispatchResult = extern struct {
+    status: u32,
+    value: u64,
+};
+
+extern fn wamrAotDispatchComponentTrampoline(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) DispatchResult;
+
 pub const Slot = struct {
     component_inst: *anyopaque,
     canon_lower_idx: u32,
+    ctx: ?*anyopaque = null,
+    lowered_sig: LoweredSig = .{
+        .param_types = &.{},
+        .result_types = &.{},
+        .has_retptr = false,
+    },
 };
 
 var g_active_pool: ?*TrampolinePool = null;
@@ -25,20 +54,14 @@ pub fn setActivePool(pool: ?*TrampolinePool) void {
 }
 
 pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) callconv(.c) u64 {
-    _ = a0;
-    _ = a1;
-    _ = a2;
-    _ = a3;
-    _ = a4;
-    _ = a5;
-
     const pool = g_active_pool orelse return 0;
     if (slot >= pool.next_slot) return 0;
 
     const entry = pool.slots[slot];
-    _ = entry.component_inst;
-    _ = entry.canon_lower_idx;
-    return 0;
+    const ctx = entry.ctx orelse return 0;
+    const dispatched = wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5);
+    if (dispatched.status != 0) return 0;
+    return dispatched.value;
 }
 
 pub const TrampolinePool = struct {
@@ -67,6 +90,23 @@ pub const TrampolinePool = struct {
             .memory = memory,
             .slots = slots,
         };
+    }
+
+    pub fn allocSlotWithCtx(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
+        const slot = self.next_slot;
+        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+
+        self.slots[slot] = .{
+            .component_inst = ctx,
+            .canon_lower_idx = 0,
+            .ctx = ctx,
+            .lowered_sig = lowered_sig,
+        };
+        self.next_slot += 1;
+        writeStub(self.stubBytes(slot));
+        g_active_pool = self;
+
+        return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
     }
 
     pub fn allocSlot(self: *TrampolinePool, component_inst: *anyopaque, canon_lower_idx: u32) !StubFn {
