@@ -143,38 +143,58 @@ pub fn compileCoreWasm(
     wasm_bytes: []const u8,
     opts: PrecompileOptions,
 ) PrecompileError![]u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Lifetime split mirrors `src/compiler/main.zig` (`wamrc compile`)
+    // to bound peak memory on large modules (issue #640). The parsed
+    // module lives in a transient `module_arena`; IR + passes +
+    // codegen go on the outer GPA so per-function intermediates are
+    // freed back as each pass completes; emit-side field tables live
+    // in a short-lived `emit_arena`. Lumping everything on one arena
+    // (the previous implementation) retained tens of GB on a
+    // 12 610-function core.
+    var module_arena = std.heap.ArenaAllocator.init(allocator);
+    defer module_arena.deinit();
+    const ma = module_arena.allocator();
 
-    const owned_wasm = a.dupe(u8, wasm_bytes) catch return error.OutOfMemory;
-    const module = core_loader.load(owned_wasm, a) catch return error.CoreCompileFailed;
+    // Don't dupe `wasm_bytes`: `core_loader.load` only borrows from
+    // the slice (returned `module` fields are slices into it), and
+    // the caller's bytes outlive this call.
+    const module = core_loader.load(wasm_bytes, ma) catch return error.CoreCompileFailed;
 
-    var ir_module = frontend.lowerModule(&module, a) catch return error.CoreCompileFailed;
+    var ir_module = frontend.lowerModule(&module, allocator) catch return error.CoreCompileFailed;
     defer ir_module.deinit();
 
     _ = passes.runPassesWithOptions(
         &ir_module,
         passes.defaultPassesForTarget(opts.target_arch),
-        a,
+        allocator,
         .{ .verify_mode = .off },
     ) catch return error.CoreCompileFailed;
 
-    const code: []const u8, const offsets: []const u32 = switch (opts.target_arch) {
+    const code: []u8, const offsets: []u32 = switch (opts.target_arch) {
         .aarch64 => blk: {
-            const r = aarch64_compile.compileModule(&ir_module, a) catch return error.CoreCompileFailed;
+            const r = aarch64_compile.compileModule(&ir_module, allocator) catch return error.CoreCompileFailed;
             break :blk .{ r.code, r.offsets };
         },
         .x86_64 => blk: {
-            const r = x86_64_compile.compileModule(&ir_module, a) catch return error.CoreCompileFailed;
+            const r = x86_64_compile.compileModule(&ir_module, allocator) catch return error.CoreCompileFailed;
             break :blk .{ r.code, r.offsets };
         },
     };
+    defer allocator.free(code);
+    defer allocator.free(offsets);
+
+    // Short-lived arena for the emit-side field tables. `emit_aot.emit`
+    // copies what it needs into its caller-owned output buffer, so
+    // everything in here (and in `module_arena`) is safe to drop on
+    // return.
+    var emit_arena = std.heap.ArenaAllocator.init(allocator);
+    defer emit_arena.deinit();
+    const ea = emit_arena.allocator();
 
     var exports: std.ArrayList(emit_aot.ExportEntry) = .empty;
     for (module.exports) |exp| {
         if (exp.kind == .tag) continue;
-        exports.append(a, .{
+        exports.append(ea, .{
             .name = exp.name,
             .kind = @enumFromInt(@intFromEnum(exp.kind)),
             .index = exp.index,
@@ -184,7 +204,7 @@ pub fn compileCoreWasm(
     var imports: std.ArrayList(emit_aot.ImportEntry) = .empty;
     for (module.imports) |imp| {
         if (imp.kind == .function) {
-            imports.append(a, .{
+            imports.append(ea, .{
                 .module_name = imp.module_name,
                 .field_name = imp.field_name,
                 .kind = .function,
@@ -195,7 +215,7 @@ pub fn compileCoreWasm(
 
     var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
     for (module.memories) |mem| {
-        mem_entries.append(a, .{
+        mem_entries.append(ea, .{
             .min_pages = @intCast(mem.limits.min),
             .max_pages = if (mem.limits.max) |m| @as(?u32, @intCast(m)) else null,
         }) catch return error.OutOfMemory;
@@ -208,7 +228,7 @@ pub fn compileCoreWasm(
             .i32_const => |v| @bitCast(v),
             else => continue,
         };
-        data_segs.append(a, .{
+        data_segs.append(ea, .{
             .memory_idx = seg.memory_idx,
             .offset = offset,
             .data = seg.data,
@@ -218,19 +238,19 @@ pub fn compileCoreWasm(
     var func_type_entries: std.ArrayList(emit_aot.FuncTypeEntry) = .empty;
     for (module.types) |ft| {
         if (ft.kind != .func) {
-            func_type_entries.append(a, .{ .params = &.{}, .results = &.{} }) catch return error.OutOfMemory;
+            func_type_entries.append(ea, .{ .params = &.{}, .results = &.{} }) catch return error.OutOfMemory;
             continue;
         }
-        const params_bytes = a.alloc(u8, ft.params.len) catch return error.OutOfMemory;
+        const params_bytes = ea.alloc(u8, ft.params.len) catch return error.OutOfMemory;
         for (ft.params, 0..) |p, j| params_bytes[j] = @intFromEnum(p);
-        const results_bytes = a.alloc(u8, ft.results.len) catch return error.OutOfMemory;
+        const results_bytes = ea.alloc(u8, ft.results.len) catch return error.OutOfMemory;
         for (ft.results, 0..) |r, j| results_bytes[j] = @intFromEnum(r);
-        func_type_entries.append(a, .{ .params = params_bytes, .results = results_bytes }) catch return error.OutOfMemory;
+        func_type_entries.append(ea, .{ .params = params_bytes, .results = results_bytes }) catch return error.OutOfMemory;
     }
 
     var local_func_tidx_list: std.ArrayList(u32) = .empty;
     for (module.functions) |f| {
-        local_func_tidx_list.append(a, f.type_idx) catch return error.OutOfMemory;
+        local_func_tidx_list.append(ea, f.type_idx) catch return error.OutOfMemory;
     }
 
     var arch_name = std.mem.zeroes([16]u8);
@@ -302,10 +322,25 @@ pub fn precompileComponent(
     out_dir: []const u8,
     opts: PrecompileOptions,
 ) PrecompileError!PrecompileResult {
-    var load_arena = std.heap.ArenaAllocator.init(allocator);
-    defer load_arena.deinit();
-    const component = component_loader.load(component_bytes, load_arena.allocator()) catch
-        return error.InvalidComponent;
+    // Snapshot per-core byte slices off the parsed component, then
+    // drop `load_arena` before the compile loop so the parsed
+    // component (large for componentize-js workloads) isn't live in
+    // memory while each core is being AOT-compiled. The `core_mod.data`
+    // slices borrow from `component_bytes` (owned by the caller), so
+    // they remain valid after `load_arena.deinit()`.
+    var core_data_list: std.ArrayList([]const u8) = .empty;
+    defer core_data_list.deinit(allocator);
+    {
+        var load_arena = std.heap.ArenaAllocator.init(allocator);
+        defer load_arena.deinit();
+        const component = component_loader.load(component_bytes, load_arena.allocator()) catch
+            return error.InvalidComponent;
+        core_data_list.ensureTotalCapacity(allocator, component.core_modules.len) catch
+            return error.OutOfMemory;
+        for (component.core_modules) |core_mod| {
+            core_data_list.appendAssumeCapacity(core_mod.data);
+        }
+    }
 
     // Result-owned arena holds all strings the caller might read off
     // the returned Manifest (paths, hex hashes, build id).
@@ -322,10 +357,10 @@ pub fn precompileComponent(
     defer dir.close(io);
 
     var entries: std.ArrayList(ManifestModuleEntry) = .empty;
-    entries.ensureTotalCapacity(ra, component.core_modules.len) catch return error.OutOfMemory;
+    entries.ensureTotalCapacity(ra, core_data_list.items.len) catch return error.OutOfMemory;
 
-    for (component.core_modules, 0..) |core_mod, idx| {
-        const cwasm = compileCoreWasm(allocator, core_mod.data, opts) catch |err| {
+    for (core_data_list.items, 0..) |core_data, idx| {
+        const cwasm = compileCoreWasm(allocator, core_data, opts) catch |err| {
             std.log.err("precompileComponent: core {d} compile failed: {s}", .{ idx, @errorName(err) });
             return err;
         };
