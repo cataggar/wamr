@@ -19,6 +19,7 @@ const HostTrapInfo = @import("../runtime/common/exec_env.zig").HostTrapInfo;
 const interp = @import("../runtime/interpreter/interp.zig");
 const indexspace = @import("indexspace.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
+const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const core_backend = @import("core_backend.zig");
 const debugAotEnabled = core_backend.debugAotEnabled;
 const Allocator = std.mem.Allocator;
@@ -5888,6 +5889,10 @@ pub const ComponentTrampolineCtx = struct {
     param_types: []const ctypes.ValType,
     /// Component-level result types, same rationale.
     result_types: []const ctypes.ValType,
+    /// Optional component-level dispatch target used by the AOT host-import
+    /// trampoline pool, which has no ExecEnv and therefore calls straight into
+    /// `callComponentFuncByLocal` instead of the host-func path.
+    lift_target: ?ComponentInstance.ExportedFunc.Local = null,
     lower_opts: LowerOptions,
 
     /// Per-trampoline extension to the component's type indexspace, used
@@ -6185,6 +6190,166 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
             };
         }
     }
+}
+
+pub export fn wamrAotDispatchComponentTrampoline(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    const ctx: *const ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
+    const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, .{ a0, a1, a2, a3, a4, a5 }) catch |err| {
+        if (debugAotEnabled()) {
+            std.debug.print(
+                "[aot-dispatch] canon.lower trampoline failed: {s}\n",
+                .{@errorName(err)},
+            );
+        }
+        return .{ .status = 1, .value = 0 };
+    };
+    return .{ .status = 0, .value = result };
+}
+
+fn dispatchAotComponentTrampoline(
+    ctx: *const ComponentTrampolineCtx,
+    lowered_sig: host_trampolines.LoweredSig,
+    regs: [6]u64,
+) !u64 {
+    if (ctx.lower_opts.is_async or ctx.is_async_func) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len + @intFromBool(lowered_sig.has_retptr) > regs.len)
+        return error.UnsupportedSignature;
+    if (lowered_sig.has_retptr and lowered_sig.result_types.len != 0)
+        return error.UnsupportedSignature;
+
+    const allocator = ctx.comp_inst.allocator;
+    const registry = if (ctx.extended_types.len > 0)
+        TypeRegistry.fromExtended(ctx.comp_inst.component, ctx.extended_types, ctx.extended_indexspace)
+    else
+        TypeRegistry.init(ctx.comp_inst.component);
+
+    if (countFlatTypes(registry, ctx.param_types) > MAX_FLAT_PARAMS) return error.UnsupportedSignature;
+
+    var args_stack_buf: [8]InterfaceValue = undefined;
+    const args_heap: ?[]InterfaceValue = if (ctx.param_types.len <= args_stack_buf.len)
+        null
+    else
+        try allocator.alloc(InterfaceValue, ctx.param_types.len);
+    defer if (args_heap) |h| allocator.free(h);
+    const args: []InterfaceValue = args_heap orelse args_stack_buf[0..ctx.param_types.len];
+
+    var reg_index: usize = 0;
+    for (ctx.param_types, 0..) |pt, i| {
+        args[i] = try liftAotDispatcherArg(pt, lowered_sig.param_types, &reg_index, &regs, registry, allocator);
+    }
+
+    var result_dest_ptr: u32 = 0;
+    if (lowered_sig.has_retptr) {
+        if (reg_index >= regs.len) return error.UnsupportedSignature;
+        result_dest_ptr = @truncate(regs[reg_index]);
+        reg_index += 1;
+    }
+    if (reg_index != lowered_sig.param_types.len + @intFromBool(lowered_sig.has_retptr))
+        return error.UnsupportedSignature;
+
+    var results_stack_buf: [4]InterfaceValue = undefined;
+    const results_heap: ?[]InterfaceValue = if (ctx.result_types.len <= results_stack_buf.len)
+        null
+    else
+        try allocator.alloc(InterfaceValue, ctx.result_types.len);
+    const results: []InterfaceValue = results_heap orelse results_stack_buf[0..ctx.result_types.len];
+    defer {
+        for (results) |r| r.deinit(allocator);
+        if (results_heap) |h| allocator.free(h);
+    }
+
+    if (ctx.lift_target) |target| {
+        try callComponentFuncByLocal(ctx.comp_inst, target, args, results, allocator);
+    } else {
+        const call = ctx.host_func.call orelse return error.HostFuncNotBound;
+        try call(ctx.host_func.context, ctx.comp_inst, args, results, allocator);
+    }
+
+    if (lowered_sig.has_retptr) {
+        const mem_idx = ctx.lower_opts.memory_idx orelse return error.MemoryNotAvailable;
+        const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.MemoryNotAvailable;
+        var offset: u32 = result_dest_ptr;
+        for (results, ctx.result_types) |r, t| {
+            const al = typeAlign(registry, t);
+            offset = abi.alignUp(offset, al);
+            storeInterfaceValue(mem.data, offset, r, t, registry);
+            offset += typeSize(registry, t);
+        }
+        return 0;
+    }
+
+    if (ctx.result_types.len == 0) {
+        if (lowered_sig.result_types.len != 0) return error.UnsupportedSignature;
+        return 0;
+    }
+    if (ctx.result_types.len != 1 or lowered_sig.result_types.len != 1)
+        return error.UnsupportedSignature;
+    return lowerAotDispatcherResult(results[0], ctx.result_types[0], lowered_sig.result_types[0], registry);
+}
+
+fn liftAotDispatcherArg(
+    t: ctypes.ValType,
+    lowered_param_types: []const core_types.ValType,
+    reg_index: *usize,
+    regs: *const [6]u64,
+    registry: TypeRegistry,
+    allocator: Allocator,
+) !InterfaceValue {
+    switch (t) {
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char, .own, .borrow, .future, .stream, .error_context, .enum_ => {
+            if (reg_index.* >= lowered_param_types.len or lowered_param_types[reg_index.*] != .i32)
+                return error.UnsupportedSignature;
+            const slots = [_]u32{@truncate(regs[reg_index.*])};
+            reg_index.* += 1;
+            return abi.liftFlatReg(slots[0..], t, registry, allocator);
+        },
+        .s64, .u64 => {
+            if (reg_index.* >= lowered_param_types.len or lowered_param_types[reg_index.*] != .i64)
+                return error.UnsupportedSignature;
+            const raw = regs[reg_index.*];
+            const slots = [_]u32{ @truncate(raw), @truncate(raw >> 32) };
+            reg_index.* += 1;
+            return abi.liftFlatReg(slots[0..], t, registry, allocator);
+        },
+        .string, .list => {
+            if (reg_index.* + 1 >= lowered_param_types.len or
+                lowered_param_types[reg_index.*] != .i32 or
+                lowered_param_types[reg_index.* + 1] != .i32)
+                return error.UnsupportedSignature;
+            const slots = [_]u32{
+                @truncate(regs[reg_index.*]),
+                @truncate(regs[reg_index.* + 1]),
+            };
+            reg_index.* += 2;
+            return abi.liftFlatReg(slots[0..], t, registry, allocator);
+        },
+        else => return error.UnsupportedSignature,
+    }
+}
+
+fn lowerAotDispatcherResult(
+    val: InterfaceValue,
+    t: ctypes.ValType,
+    lowered_ty: core_types.ValType,
+    registry: TypeRegistry,
+) !u64 {
+    if (lowered_ty == .f32 or lowered_ty == .f64) return error.UnsupportedSignature;
+    const lowered = try lowerScalarArg(val, t, registry);
+    if (lowered.ty != lowered_ty) return error.UnsupportedSignature;
+    return switch (lowered.ty) {
+        .i32 => @as(u64, @intCast(@as(u32, @bitCast(lowered.value.i32)))),
+        .i64 => @as(u64, @bitCast(lowered.value.i64)),
+        else => error.UnsupportedSignature,
+    };
 }
 
 /// Async-lower (`canon.lower (async)`) status-word encoding (#551). Given

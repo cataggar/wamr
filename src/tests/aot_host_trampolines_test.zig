@@ -1,6 +1,32 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
+const executor = @import("../component/executor.zig");
+const instance = @import("../component/instance.zig");
+const ctypes = @import("../component/types.zig");
+const core_types = @import("../runtime/common/types.zig");
+
+const memory_core_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d,
+    0x01, 0x00, 0x00, 0x00,
+    0x05, 0x03, 0x01, 0x00,
+    0x01,
+};
+const empty_core_inst_args = [_]ctypes.CoreInstantiateArg{};
+const memory_core_modules = [_]ctypes.CoreModule{.{ .data = &memory_core_wasm }};
+const memory_core_insts = [_]ctypes.CoreInstanceExpr{.{ .instantiate = .{ .module_idx = 0, .args = &empty_core_inst_args } }};
+const memory_component = ctypes.Component{
+    .core_modules = &memory_core_modules,
+    .core_instances = &memory_core_insts,
+    .core_types = &.{},
+    .components = &.{},
+    .instances = &.{},
+    .aliases = &.{},
+    .types = &.{},
+    .canons = &.{},
+    .imports = &.{},
+    .exports = &.{},
+};
 
 fn linuxMappingContainsAddress(allocator: std.mem.Allocator, addr: usize) !bool {
     if (builtin.os.tag != .linux) return true;
@@ -29,6 +55,15 @@ fn linuxMappingContainsAddress(allocator: std.mem.Allocator, addr: usize) !bool 
     }
 
     return false;
+}
+
+fn instantiateMemoryComponent() !*instance.ComponentInstance {
+    return instance.instantiate(&memory_component, std.testing.allocator);
+}
+
+fn expectStoredPtrLen(mem: []const u8, offset: u32, expected_ptr: u32, expected_len: u32) !void {
+    try std.testing.expectEqual(expected_ptr, std.mem.readInt(u32, mem[offset..][0..4], .little));
+    try std.testing.expectEqual(expected_len, std.mem.readInt(u32, mem[offset + 4 ..][0..4], .little));
 }
 
 test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
@@ -81,11 +116,211 @@ test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
 
     host_trampolines.setActivePool(null);
     pool.deinit(allocator);
-    // The post-munmap "is the address still mapped?" check only works on
-    // Linux because it parses /proc/self/maps. On non-Linux we trust that
-    // pool.deinit calls munmap and skip the assertion (the deinit itself
-    // would crash if mmap state were corrupt).
     if (builtin.os.tag == .linux) {
         try std.testing.expect(!(try linuxMappingContainsAddress(allocator, base_addr)));
     }
+}
+
+test "#648 phase 3: genericDispatcher handles (i32) -> ()" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const Host = struct {
+        const State = struct { called: bool = false, arg: i32 = 0 };
+
+        fn drop(ctx: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            try std.testing.expectEqual(@as(usize, 1), args.len);
+            try std.testing.expectEqual(@as(usize, 0), results.len);
+            state.called = true;
+            state.arg = args[0].s32;
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    var state = Host.State{};
+    const param_types = [_]ctypes.ValType{.s32};
+    const result_types = [_]ctypes.ValType{};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .context = @ptrCast(&state), .call = &Host.drop },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const lowered_params = [_]core_types.ValType{.i32};
+    const lowered_results = [_]core_types.ValType{};
+    _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 41, 0, 0, 0, 0, 0));
+    try std.testing.expect(state.called);
+    try std.testing.expectEqual(@as(i32, 41), state.arg);
+}
+
+test "#648 phase 3: genericDispatcher handles () -> i32" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const Host = struct {
+        fn get(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            try std.testing.expectEqual(@as(usize, 0), args.len);
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            results[0] = .{ .s32 = 77 };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{};
+    const result_types = [_]ctypes.ValType{.s32};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .call = &Host.get },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const lowered_params = [_]core_types.ValType{};
+    const lowered_results = [_]core_types.ValType{.i32};
+    _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    try std.testing.expectEqual(@as(u64, 77), host_trampolines.genericDispatcher(0, 0, 0, 0, 0, 0, 0));
+}
+
+test "#648 phase 3: genericDispatcher handles (i32) -> i32" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const Host = struct {
+        fn subscribe(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            try std.testing.expectEqual(@as(i32, 12), args[0].s32);
+            results[0] = .{ .s32 = args[0].s32 + 5 };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{.s32};
+    const result_types = [_]ctypes.ValType{.s32};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .call = &Host.subscribe },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const lowered_params = [_]core_types.ValType{.i32};
+    const lowered_results = [_]core_types.ValType{.i32};
+    _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    try std.testing.expectEqual(@as(u64, 17), host_trampolines.genericDispatcher(0, 12, 0, 0, 0, 0, 0));
+}
+
+test "#648 phase 3: genericDispatcher handles (i32 i32) -> () retptr" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const Host = struct {
+        fn checkWrite(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            try std.testing.expectEqual(@as(i32, 9), args[0].s32);
+            results[0] = .{ .string = .{ .ptr = 0x55, .len = 7 } };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{.s32};
+    const result_types = [_]ctypes.ValType{.string};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .call = &Host.checkWrite },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{ .memory_idx = 0 },
+    };
+    const lowered_params = [_]core_types.ValType{.i32};
+    _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
+
+    const retptr: u32 = 24;
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 9, retptr, 0, 0, 0, 0));
+    const mem = inst.resolveTopLevelMemory(0).?.data;
+    try expectStoredPtrLen(mem, retptr, 0x55, 7);
+}
+
+test "#648 phase 3: genericDispatcher handles (i32 i32 i32 i32) -> ()" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const Host = struct {
+        fn write(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            try std.testing.expectEqual(@as(i32, 3), args[0].s32);
+            try std.testing.expectEqual(@as(u32, 0x40), args[1].list.ptr);
+            try std.testing.expectEqual(@as(u32, 5), args[1].list.len);
+            results[0] = .{ .string = .{ .ptr = 0x80, .len = 5 } };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{ .s32, .{ .list = 0 } };
+    const result_types = [_]ctypes.ValType{.string};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .call = &Host.write },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{ .memory_idx = 0 },
+    };
+    const lowered_params = [_]core_types.ValType{ .i32, .i32, .i32 };
+    _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
+
+    const retptr: u32 = 40;
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 3, 0x40, 5, retptr, 0, 0));
+    const mem = inst.resolveTopLevelMemory(0).?.data;
+    try expectStoredPtrLen(mem, retptr, 0x80, 5);
+}
+
+test "#648 phase 3: genericDispatcher handles (i32 i64 i32) -> ()" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const Host = struct {
+        fn blockingRead(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            try std.testing.expectEqual(@as(i32, 4), args[0].s32);
+            try std.testing.expectEqual(@as(u64, 0x1_0000_0002), args[1].u64);
+            results[0] = .{ .string = .{ .ptr = 0x90, .len = 2 } };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{ .s32, .u64 };
+    const result_types = [_]ctypes.ValType{.string};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .call = &Host.blockingRead },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{ .memory_idx = 0 },
+    };
+    const lowered_params = [_]core_types.ValType{ .i32, .i64 };
+    _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
+
+    const retptr: u32 = 56;
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 4, 0x1_0000_0002, retptr, 0, 0, 0));
+    const mem = inst.resolveTopLevelMemory(0).?.data;
+    try expectStoredPtrLen(mem, retptr, 0x90, 2);
 }
