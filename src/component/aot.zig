@@ -61,6 +61,19 @@ pub const LoadError = error{
     OutOfMemory,
 };
 
+/// Convention for the default precompiled-bundle directory next to a
+/// component file: strip a trailing `.wasm` (if present) and append
+/// `.cwasm.d`. Used both by `wamrc compile-component` (default `-o`)
+/// and by `wamr run`'s auto-detect probe — they must stay in sync
+/// (issue #645). Caller owns the returned slice.
+pub fn defaultPrecompiledDirFor(allocator: std.mem.Allocator, in_path: []const u8) ![]u8 {
+    const stem = if (std.mem.endsWith(u8, in_path, ".wasm"))
+        in_path[0 .. in_path.len - ".wasm".len]
+    else
+        in_path;
+    return std.mem.concat(allocator, u8, &.{ stem, ".cwasm.d" });
+}
+
 /// Manifest schema version. Bump when the on-disk layout or
 /// serialization changes in a way that older loaders cannot read.
 pub const manifest_format_version: u32 = 1;
@@ -513,4 +526,22 @@ test "isComponent: core module vs component" {
     try std.testing.expectEqual(true, try isComponent(&comp));
     try std.testing.expectError(error.InvalidMagic, isComponent(&bad));
     try std.testing.expectError(error.InvalidMagic, isComponent(&.{}));
+}
+
+test "defaultPrecompiledDirFor: strips .wasm and appends .cwasm.d (#645)" {
+    const alloc = std.testing.allocator;
+
+    const a = try defaultPrecompiledDirFor(alloc, "/tmp/stdio-echo.wasm");
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("/tmp/stdio-echo.cwasm.d", a);
+
+    // No .wasm suffix → append directly (preserves the prior fallback).
+    const b = try defaultPrecompiledDirFor(alloc, "/tmp/stdio-echo");
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("/tmp/stdio-echo.cwasm.d", b);
+
+    // .wasm appears mid-path but not as suffix → don't strip.
+    const c = try defaultPrecompiledDirFor(alloc, "/tmp/a.wasm.bak");
+    defer alloc.free(c);
+    try std.testing.expectEqualStrings("/tmp/a.wasm.bak.cwasm.d", c);
 }
