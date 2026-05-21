@@ -459,7 +459,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 // Auto-probe `<input>.cwasm.d/manifest.json`. Don't
                 // fail the run if the bundle is absent / stale — just
                 // tell the user we're skipping it.
-                const sibling = std.fmt.allocPrint(allocator, "{s}.cwasm.d", .{path}) catch return 1;
+                const sibling = wamr.component_aot.defaultPrecompiledDirFor(allocator, path) catch return 1;
                 defer allocator.free(sibling);
                 const probe = std.fs.path.join(allocator, &.{ sibling, "manifest.json" }) catch return 1;
                 defer allocator.free(probe);

@@ -620,11 +620,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         std.process.exit(1);
     };
     const out_dir = output_dir orelse blk: {
-        const stem = if (std.mem.endsWith(u8, in_path, ".wasm"))
-            in_path[0 .. in_path.len - ".wasm".len]
-        else
-            in_path;
-        break :blk try std.mem.concat(allocator, u8, &.{ stem, ".cwasm.d" });
+        break :blk try wamr.component_aot.defaultPrecompiledDirFor(allocator, in_path);
     };
 
     const io = init.io;
