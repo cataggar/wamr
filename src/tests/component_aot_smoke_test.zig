@@ -1,0 +1,109 @@
+//! #625 phase 1 — AOT-backed core instance smoke test.
+//!
+//! Drives the new `instantiateWithOptions` API end-to-end against a
+//! tiny core module precompiled in-process via `aot_harness`. Lives in
+//! its own test step because `aot_harness.zig` is owned by the
+//! test-runner module — importing it from inside `wamr` would trigger
+//! Zig 0.16's "file exists in modules X and Y" error (cf. the
+//! `differential.zig` comment in `build.zig`).
+
+const std = @import("std");
+const wamr = @import("wamr");
+const aot_harness = @import("aot_harness.zig");
+
+const instance = wamr.component_instance;
+const ctypes = wamr.component_types;
+const core_types = wamr.types;
+const aot_runtime_mod = wamr.aot_runtime;
+
+test "#625 phase 1: instantiateWithOptions loads + runs an AOT core" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    // Minimal core module exporting one `i32 -> i32` function and a memory.
+    //   (module
+    //     (memory (export "memory") 1)
+    //     (func (export "add42") (param i32) (result i32)
+    //       local.get 0 i32.const 42 i32.add)
+    //   )
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: (i32) -> i32
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        // function section: 1 fn, type 0
+        0x03, 0x02, 0x01, 0x00,
+        // memory section: 1 memory, min=1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // export section: "memory" (mem 0), "add42" (func 0)
+        0x07, 0x12, 0x02,
+        0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+        0x05, 'a', 'd', 'd', '4', '2', 0x00, 0x00,
+        // code section: local.get 0; i32.const 42; i32.add; end
+        0x0a, 0x09, 0x01, 0x07, 0x00,
+        0x20, 0x00,
+        0x41, 0x2a,
+        0x6a,
+        0x0b,
+    };
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &core_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+
+    const pcs = [_]instance.PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = cwasm_bytes },
+    };
+    const inst = try instance.instantiateWithOptions(&component, allocator, .{
+        .precompiled_cores = &pcs,
+    });
+    defer inst.deinit();
+
+    // The AOT backend should be populated, the interp one should not.
+    try std.testing.expectEqual(@as(usize, 1), inst.core_instances.len);
+    try std.testing.expect(inst.core_instances[0].module_inst == null);
+    const ai = inst.core_instances[0].aot_inst orelse return error.TestFailed;
+
+    // Backend-agnostic memory lookup must surface the AOT memory.
+    const mem = inst.firstBackendMemory() orelse return error.TestFailed;
+    try std.testing.expect(mem.data.len >= core_types.MemoryInstance.page_size);
+
+    // The exported function should be discoverable through the backend
+    // adapter — same call shape as a future canon-ABI dispatch would use.
+    const be = inst.core_instances[0].backend() orelse return error.TestFailed;
+    const fn_idx = be.findExportFunc("add42") orelse return error.TestFailed;
+
+    // And we can drive it through the AOT runtime directly. This proves
+    // the loaded artifact is actually executable end-to-end on this
+    // host; the canon-ABI dispatch that ties this into
+    // `callComponentFuncByLocal` lands in #625 phase 3.
+    const param_types = [_]core_types.ValType{.i32};
+    const result_types = [_]core_types.ValType{.i32};
+    const args = [_]core_types.Value{.{ .i32 = 100 }};
+    var results_buf: [1]aot_runtime_mod.ScalarResult = .{.{ .i32 = 0 }};
+    const results = try aot_runtime_mod.callFuncScalar(
+        ai,
+        fn_idx,
+        &param_types,
+        &result_types,
+        &args,
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(i32, 142), results[0].i32);
+}

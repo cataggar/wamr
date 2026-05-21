@@ -15,10 +15,11 @@ const ir = wamr.ir;
 
 const TargetArch = passes.TargetArch;
 
-const Subcommand = enum { compile, version, help };
+const Subcommand = enum { compile, compile_component, version, help };
 
 fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "compile")) return .compile;
+    if (std.mem.eql(u8, s, "compile-component")) return .compile_component;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
@@ -42,6 +43,7 @@ pub fn main(init: std.process.Init) !void {
         .version => try runVersion(init.io, args[2..]),
         .help => runHelp(init.io, args[2..]),
         .compile => try runCompile(init, allocator, args[2..]),
+        .compile_component => try runCompileComponent(init, allocator, args[2..]),
     }
 }
 
@@ -570,15 +572,102 @@ fn writeStdout(io: std.Io, text: []const u8) void {
     stdout_file.writeStreamingAll(io, text) catch {};
 }
 
+fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 1 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, compile_component_usage);
+        return;
+    }
+    var input_path: ?[]const u8 = null;
+    var output_dir: ?[]const u8 = null;
+    var target_arch: TargetArch = switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const a = sub_args[i];
+        if (std.mem.eql(u8, a, "-o")) {
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: -o requires an argument\n", .{});
+                std.process.exit(1);
+            }
+            output_dir = sub_args[i];
+        } else if (std.mem.startsWith(u8, a, "--target=")) {
+            const v = a["--target=".len..];
+            if (std.mem.eql(u8, v, "x86_64") or std.mem.eql(u8, v, "x86-64")) {
+                target_arch = .x86_64;
+            } else if (std.mem.eql(u8, v, "aarch64")) {
+                target_arch = .aarch64;
+            } else {
+                std.debug.print("error: unknown target '{s}'\n", .{v});
+                std.process.exit(1);
+            }
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            std.debug.print("error: unknown option '{s}'\n", .{a});
+            std.process.exit(1);
+        } else if (input_path == null) {
+            input_path = a;
+        } else {
+            std.debug.print("error: unexpected argument '{s}'\n", .{a});
+            std.process.exit(1);
+        }
+    }
+
+    const in_path = input_path orelse {
+        std.debug.print("error: missing input component path\n", .{});
+        std.process.exit(1);
+    };
+    const out_dir = output_dir orelse blk: {
+        const stem = if (std.mem.endsWith(u8, in_path, ".wasm"))
+            in_path[0 .. in_path.len - ".wasm".len]
+        else
+            in_path;
+        break :blk try std.mem.concat(allocator, u8, &.{ stem, ".cwasm.d" });
+    };
+
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    const component_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+        wamr.utils.read_file.dieReadFileError(in_path, err);
+    };
+    defer allocator.free(component_data);
+
+    std.debug.print("Loaded component {s} ({d} bytes)\n", .{ in_path, component_data.len });
+
+    const is_comp = wamr.component_aot.isComponent(component_data) catch {
+        std.debug.print("error: input is not a valid wasm module or component\n", .{});
+        std.process.exit(1);
+    };
+    if (!is_comp) {
+        std.debug.print("error: input is a core wasm module, not a component — use `wamrc compile`\n", .{});
+        std.process.exit(1);
+    }
+
+    var result = wamr.component_aot.precompileComponent(allocator, component_data, out_dir, .{
+        .target_arch = target_arch,
+    }) catch |err| {
+        std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer result.deinit();
+
+    std.debug.print("Wrote {d} core module(s) + manifest.json to {s}\n", .{
+        result.manifest.modules.len, out_dir,
+    });
+}
+
 const top_usage =
     \\wamrc - WebAssembly AOT Compiler
     \\
     \\Usage: wamrc <subcommand> [args...]
     \\
     \\Subcommands:
-    \\  compile   Compile a .wasm module to a .cwasm AOT binary
-    \\  version   Print version and exit
-    \\  help      Print this help
+    \\  compile             Compile a .wasm module to a .cwasm AOT binary
+    \\  compile-component   Precompile every embedded core of a component
+    \\  version             Print version and exit
+    \\  help                Print this help
     \\
     \\Run `wamrc <subcommand> help` to show help for a specific subcommand.
     \\
@@ -636,6 +725,21 @@ const compile_usage =
     \\                                 for release builds.
     \\  --no-verify-ir                Disable the IR verifier (overrides
     \\                                 the safety-build default).
+    \\
+;
+
+const compile_component_usage =
+    \\Usage: wamrc compile-component [options] <component.wasm> [-o <out_dir>]
+    \\
+    \\Precompile every embedded core module of a component into a directory
+    \\containing one `module<N>.cwasm` per core plus a `manifest.json`
+    \\(versioned, with build-id and component-hash, rejected on mismatch).
+    \\If `-o` is omitted, the directory is derived from the input path with
+    \\suffix `.cwasm.d`.
+    \\
+    \\Options:
+    \\  -o <dir>                      Output directory (default: <input>.cwasm.d)
+    \\  --target=<x86_64|aarch64>     Target architecture (default: host)
     \\
 ;
 

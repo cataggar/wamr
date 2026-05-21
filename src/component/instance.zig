@@ -9,6 +9,13 @@ const core_types = @import("../runtime/common/types.zig");
 const executor_mod = @import("executor.zig");
 const indexspace = @import("indexspace.zig");
 const async_mod = @import("async.zig");
+const core_backend = @import("core_backend.zig");
+const aot_loader = @import("../runtime/aot/loader.zig");
+const aot_runtime = @import("../runtime/aot/runtime.zig");
+
+pub const Options = core_backend.Options;
+pub const PrecompiledCore = core_backend.PrecompiledCore;
+pub const CoreInstanceBackend = core_backend.CoreInstanceBackend;
 
 // ── Resource Table ──────────────────────────────────────────────────────────
 
@@ -245,6 +252,12 @@ pub const ComponentInstance = struct {
     pending_core_starts: std.ArrayListUnmanaged(*core_types.ModuleInstance) = .empty,
     /// Whether the start function has been executed.
     started: bool = false,
+    /// Caller-supplied instantiation options (e.g. precompiled-core
+    /// artifacts). Captured at instantiate-time and consulted by the
+    /// section-aware loop when it reaches each `.instantiate` expr
+    /// (#625). Default `.{}` matches the pre-#625 behaviour: every
+    /// core is loaded via `runtime/interpreter/loader.zig`.
+    options: Options = .{},
     /// Allocator for instance lifetime.
     allocator: std.mem.Allocator,
     /// Child component instances created when the parent component
@@ -402,11 +415,32 @@ pub const ComponentInstance = struct {
 
     pub const CoreInstanceEntry = struct {
         module_inst: ?*core_types.ModuleInstance = null,
+        /// AOT-backed runnable form of this core instance. Mutually
+        /// exclusive with `module_inst` — set only when `instantiate`
+        /// found a `PrecompiledCore` artifact for this slot's
+        /// `module_idx` in `Options.precompiled_cores` (#625).
+        ///
+        /// Phase 1: AOT instances are loaded + own memory/tables/
+        /// globals (visible to cross-instance import wiring via the
+        /// shared `MemoryInstance`/`TableInstance`/`GlobalInstance`
+        /// types), but the canon-ABI lift call path still requires
+        /// `module_inst`; lift against an AOT-only core errors out
+        /// until phase 3 wires `aot_runtime.callFunc` into
+        /// `executor.callComponentFuncByLocal`.
+        aot_inst: ?*aot_runtime.AotInstance = null,
         /// When this entry corresponds to a `CoreInstanceExpr.exports` (an
         /// inline instance bundling named core items rather than an actual
         /// core-module instantiation), the named items live here. `module_inst`
         /// is null in that case.
         inline_exports: []const ctypes.CoreInlineExport = &.{},
+
+        /// Phase-1 helper: return whichever backend is populated. Null
+        /// for inline-exports-only entries.
+        pub fn backend(self: CoreInstanceEntry) ?CoreInstanceBackend {
+            if (self.module_inst) |mi| return .{ .interp = mi };
+            if (self.aot_inst) |ai| return .{ .aot = ai };
+            return null;
+        }
     };
 
     /// An exported component function. Two flavours:
@@ -470,6 +504,25 @@ pub const ComponentInstance = struct {
     pub fn firstModuleInst(self: *const ComponentInstance) ?*core_types.ModuleInstance {
         for (self.core_instances) |entry| {
             if (entry.module_inst) |mi| return mi;
+        }
+        return null;
+    }
+
+    /// Backend-agnostic variant of `firstModuleInst` for callers that
+    /// only need a `*MemoryInstance` and don't care whether the core
+    /// runs on the interpreter or the AOT runtime. Searches each
+    /// `core_instances[]` entry in order and returns memory index 0 on
+    /// the first backend that exposes one (#625).
+    ///
+    /// Phase 1: callers that genuinely need a `*ModuleInstance` (e.g.
+    /// to drive interp-only execution paths) keep using
+    /// `firstModuleInst`; only the read-only memory probe paths
+    /// (`readGuestBytes`, `componentTrampoline` memory lookup) should
+    /// migrate to this helper.
+    pub fn firstBackendMemory(self: *const ComponentInstance) ?*core_types.MemoryInstance {
+        for (self.core_instances) |entry| {
+            const be = entry.backend() orelse continue;
+            if (be.memory(0)) |m| return m;
         }
         return null;
     }
@@ -1265,6 +1318,7 @@ pub const ComponentInstance = struct {
             const inst_mod = @import("../runtime/interpreter/instance.zig");
             for (self.core_instances) |entry| {
                 if (entry.module_inst) |mi| inst_mod.destroy(mi);
+                if (entry.aot_inst) |ai| aot_runtime.destroy(ai);
             }
             self.allocator.free(self.core_instances);
         }
@@ -1331,6 +1385,21 @@ pub fn instantiate(
     component: *const ctypes.Component,
     allocator: std.mem.Allocator,
 ) InstantiationError!*ComponentInstance {
+    return instantiateWithOptions(component, allocator, .{});
+}
+
+/// `instantiate` variant that accepts caller-supplied options (#625).
+///
+/// Today's only option is `precompiled_cores` — a slice of
+/// `(module_idx, cwasm_bytes)` pairs that opt individual embedded
+/// core modules into the AOT runtime. Cores not covered by the slice
+/// continue to load through `runtime/interpreter/loader.zig`. Bytes
+/// are borrowed and must outlive the returned `ComponentInstance`.
+pub fn instantiateWithOptions(
+    component: *const ctypes.Component,
+    allocator: std.mem.Allocator,
+    options: Options,
+) InstantiationError!*ComponentInstance {
     const inst = allocator.create(ComponentInstance) catch return error.OutOfMemory;
 
     inst.* = .{
@@ -1340,6 +1409,7 @@ pub fn instantiate(
         .resource_tables = .empty,
         .exported_funcs = .{},
         .imports = .{},
+        .options = options,
         .allocator = allocator,
     };
     // From here on, `inst.deinit()` is the single owner of partial-init
@@ -1365,6 +1435,43 @@ pub fn instantiate(
                 .instantiate => |ie| {
                     if (ie.module_idx >= component.core_modules.len) continue;
                     const core_mod = component.core_modules[ie.module_idx];
+
+                    // #625: AOT fast-path. If the caller supplied a
+                    // precompiled artifact for this `module_idx`, load
+                    // it via `runtime/aot/loader.zig` and instantiate
+                    // it via `runtime/aot/runtime.zig`. Phase 1 only
+                    // wires up the load — cross-instance memory/table/
+                    // global sharing is structurally compatible (the
+                    // shared `runtime/common` types), but the canon-ABI
+                    // lift call path still requires `module_inst` and
+                    // errors out against an AOT-only export until
+                    // phase 3.
+                    if (inst.options.findPrecompiled(ie.module_idx)) |cwasm_bytes| {
+                        const mod_alloc = inst.module_arena.allocator();
+                        const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch continue;
+                        aot_module_ptr.* = aot_loader.load(cwasm_bytes, mod_alloc) catch |err| {
+                            std.log.warn("aot core load failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                            continue;
+                        };
+                        const aot_inst_ptr = aot_runtime.instantiate(aot_module_ptr, inst.allocator) catch |err| {
+                            std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                            continue;
+                        };
+                        aot_runtime.mapCodeExecutable(aot_inst_ptr) catch |err| {
+                            std.log.warn("aot core code-map failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                            aot_runtime.destroy(aot_inst_ptr);
+                            continue;
+                        };
+                        cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
+                        // Phase 1: AOT cores skip cross-instance import
+                        // wiring / canon-lower trampoline plumbing
+                        // (handled by the interp path below for interp
+                        // cores). The big-core workload that motivates
+                        // #625 has its imports satisfied by the AOT
+                        // host bridge / WASI; richer wiring lands in
+                        // phase 3.
+                        continue;
+                    }
 
                     const mod_alloc = inst.module_arena.allocator();
                     const loaded = loader.load(core_mod.data, mod_alloc) catch continue;
@@ -4172,3 +4279,12 @@ test "instantiate: dropping component frees shared canon-builtin ctx exactly onc
     inst.deinit();
 }
 
+
+// ─── #625 phase 1: AOT-backed core instance load smoke test ────────────────
+// (See `src/tests/component_aot_smoke_test.zig`. The test lives in its
+// own module/test step rather than here because `aot_harness.zig` is
+// owned by the test-runner module and Zig 0.16 rejects a file existing
+// in two modules; importing it from `instance.zig` would pull
+// `aot_harness.zig` into the `wamr` lib module and break the
+// `differential.zig` and `run_spec_tests.zig` test runners that also
+// import it.)
