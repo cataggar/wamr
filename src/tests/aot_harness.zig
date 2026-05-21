@@ -1078,12 +1078,27 @@ fn compileToAot(
         // Skip tag imports — AOT does not support exception handling, and
         // emit_aot.ExternalKind has no .tag variant.
         if (imp.kind == .tag) continue;
-        try import_entries.append(a, .{
-            .module_name = imp.module_name,
-            .field_name = imp.field_name,
-            .kind = @enumFromInt(@intFromEnum(imp.kind)),
-            .func_type_idx = imp.func_type_idx orelse 0,
-        });
+        switch (imp.kind) {
+            .function => try import_entries.append(a, .{
+                .module_name = imp.module_name,
+                .field_name = imp.field_name,
+                .kind = .function,
+                .func_type_idx = imp.func_type_idx orelse 0,
+            }),
+            .table => {
+                const table_type = imp.table_type orelse continue;
+                try import_entries.append(a, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .table,
+                    .table_elem_type = table_type.elem_type,
+                    .table_min = @intCast(table_type.limits.min),
+                    .table_max = if (table_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
+                });
+            },
+            .memory, .global => {},
+            .tag => unreachable,
+        }
     }
 
     var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;

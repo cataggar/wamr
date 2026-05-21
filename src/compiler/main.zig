@@ -387,13 +387,25 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     var import_entries: std.ArrayList(emit_aot.ImportEntry) = .empty;
     defer import_entries.deinit(allocator);
     for (module.imports) |imp| {
-        if (imp.kind == .function) {
-            try import_entries.append(allocator, .{
+        switch (imp.kind) {
+            .function => try import_entries.append(allocator, .{
                 .module_name = imp.module_name,
                 .field_name = imp.field_name,
                 .kind = .function,
                 .func_type_idx = imp.func_type_idx orelse 0,
-            });
+            }),
+            .table => {
+                const table_type = imp.table_type orelse continue;
+                try import_entries.append(allocator, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .table,
+                    .table_elem_type = table_type.elem_type,
+                    .table_min = @intCast(table_type.limits.min),
+                    .table_max = if (table_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
+                });
+            },
+            .memory, .global, .tag => {},
         }
     }
 

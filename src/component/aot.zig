@@ -216,13 +216,28 @@ pub fn compileCoreWasm(
 
     var imports: std.ArrayList(emit_aot.ImportEntry) = .empty;
     for (module.imports) |imp| {
-        if (imp.kind == .function) {
-            imports.append(ea, .{
+        switch (imp.kind) {
+            .function => imports.append(ea, .{
                 .module_name = imp.module_name,
                 .field_name = imp.field_name,
                 .kind = .function,
                 .func_type_idx = imp.func_type_idx orelse 0,
-            }) catch return error.OutOfMemory;
+            }) catch return error.OutOfMemory,
+            .table => {
+                const table_type = imp.table_type orelse continue;
+                imports.append(ea, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .table,
+                    .table_elem_type = table_type.elem_type,
+                    .table_min = @intCast(table_type.limits.min),
+                    .table_max = if (table_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
+                }) catch return error.OutOfMemory;
+            },
+            // TODO #649 phase 1.5: emit imported memory/global descriptors once
+            // the loader/runtime can retain and wire them through instantiation.
+            .memory, .global => {},
+            .tag => {},
         }
     }
 

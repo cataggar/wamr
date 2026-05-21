@@ -59,7 +59,16 @@ pub const AotImportDesc = struct {
     module_name: []const u8,
     field_name: []const u8,
     kind: types.ExternalKind,
-    func_type_idx: u32,
+    /// Only meaningful for `.function` imports.
+    func_type_idx: u32 = 0,
+};
+
+pub const ImportedTableDesc = struct {
+    module_name: []const u8,
+    name: []const u8,
+    elem_type: types.ValType,
+    min: u32,
+    max: ?u32,
 };
 
 /// A global initial value parsed from the AOT globals section.
@@ -103,6 +112,7 @@ pub const AotModule = struct {
     exports: []const types.ExportDesc = &.{},
     import_function_count: u32 = 0,
     imports: []const AotImportDesc = &.{},
+    imported_tables: []const ImportedTableDesc = &.{},
     memories: []const types.MemoryType = &.{},
     tables: []const types.TableType = &.{},
     data_segments: []const AotDataSegment = &.{},
@@ -116,6 +126,10 @@ pub const AotModule = struct {
             if (exp.kind == kind and std.mem.eql(u8, exp.name, name)) return exp;
         }
         return null;
+    }
+
+    pub fn importedTables(self: *const AotModule) []const ImportedTableDesc {
+        return self.imported_tables;
     }
 };
 
@@ -267,6 +281,9 @@ pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     }
     if (module.exports.len > 0) {
         allocator.free(module.exports);
+    }
+    if (module.imported_tables.len > 0) {
+        allocator.free(module.imported_tables);
     }
     if (module.memories.len > 0) {
         allocator.free(module.memories);
@@ -447,6 +464,9 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
     }
 
     var func_count: u32 = 0;
+    var table_descs: std.ArrayList(ImportedTableDesc) = .empty;
+    errdefer table_descs.deinit(allocator);
+
     for (0..count) |i| {
         const mod_name_len = try reader.readU32Le();
         const mod_name_bytes = try reader.readBytes(mod_name_len);
@@ -459,10 +479,32 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
         @memcpy(field_name, field_name_bytes);
 
         const kind_raw = try reader.readByte();
-        const func_type_idx = try reader.readU32Le();
         const kind: types.ExternalKind = @enumFromInt(kind_raw);
+        var func_type_idx: u32 = 0;
 
-        if (kind == .function) func_count += 1;
+        switch (kind) {
+            .function => {
+                func_type_idx = try reader.readU32Le();
+                func_count += 1;
+            },
+            .table => {
+                const elem_type: types.ValType = @enumFromInt(try reader.readByte());
+                const min = try reader.readU32Le();
+                const has_max = try reader.readByte();
+                const max: ?u32 = if (has_max != 0) try reader.readU32Le() else null;
+                table_descs.append(allocator, .{
+                    .module_name = mod_name,
+                    .name = field_name,
+                    .elem_type = elem_type,
+                    .min = min,
+                    .max = max,
+                }) catch return error.OutOfMemory;
+            },
+            .memory, .global, .tag => {
+                // TODO #649 phase 1.5: preserve imported memory/global payloads.
+                _ = try reader.readU32Le();
+            },
+        }
 
         import_descs[i] = .{
             .module_name = mod_name,
@@ -475,6 +517,7 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
 
     module.imports = import_descs;
     module.import_function_count = func_count;
+    module.imported_tables = table_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 fn parseMemorySection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
