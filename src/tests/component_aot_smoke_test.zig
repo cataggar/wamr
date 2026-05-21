@@ -14,7 +14,49 @@ const aot_harness = @import("aot_harness.zig");
 const instance = wamr.component_instance;
 const ctypes = wamr.component_types;
 const core_types = wamr.types;
+const aot_loader_mod = wamr.aot_loader;
 const aot_runtime_mod = wamr.aot_runtime;
+
+test "#649 phase 1: AOT loader retains imported table descriptors" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // import section: (import "env" "tbl" (table 8 8 funcref))
+        0x02, 0x0e,
+        0x01, 0x03, 'e',  'n',  'v',  0x03, 't',  'b',
+        'l',  0x01, 0x70, 0x01, 0x08, 0x08,
+        // function section: 1 local function of type 0
+        0x03, 0x02,
+        0x01, 0x00,
+        // export section: export local func 0 as "run"
+        0x07, 0x07, 0x01, 0x03, 'r',  'u',
+        'n',  0x00, 0x00,
+        // code section: empty body
+        0x0a, 0x04, 0x01, 0x02, 0x00,
+        0x0b,
+    };
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &core_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    const module = try aot_loader_mod.load(cwasm_bytes, allocator);
+    defer aot_loader_mod.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), module.imports.len);
+    try std.testing.expectEqual(core_types.ExternalKind.table, module.imports[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), module.import_function_count);
+    try std.testing.expectEqual(@as(usize, 1), module.importedTables().len);
+    const table = module.importedTables()[0];
+    try std.testing.expect(std.mem.eql(u8, table.module_name, "env"));
+    try std.testing.expect(std.mem.eql(u8, table.name, "tbl"));
+    try std.testing.expectEqual(core_types.ValType.funcref, table.elem_type);
+    try std.testing.expectEqual(@as(u32, 8), table.min);
+    try std.testing.expectEqual(@as(?u32, 8), table.max);
+}
 
 test "#625 phase 1: instantiateWithOptions loads + runs an AOT core" {
     if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
@@ -32,17 +74,15 @@ test "#625 phase 1: instantiateWithOptions loads + runs an AOT core" {
         // function section: 1 fn, type 0
         0x03, 0x02, 0x01, 0x00,
         // memory section: 1 memory, min=1
-        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x05, 0x03, 0x01, 0x00,
+        0x01,
         // export section: "memory" (mem 0), "add42" (func 0)
-        0x07, 0x12, 0x02,
-        0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
-        0x05, 'a', 'd', 'd', '4', '2', 0x00, 0x00,
+        0x07, 0x12, 0x02, 0x06, 'm',  'e',  'm',
+        'o',  'r',  'y',  0x02, 0x00, 0x05, 'a',  'd',
+        'd',  '4',  '2',  0x00, 0x00,
         // code section: local.get 0; i32.const 42; i32.add; end
-        0x0a, 0x09, 0x01, 0x07, 0x00,
-        0x20, 0x00,
-        0x41, 0x2a,
-        0x6a,
-        0x0b,
+        0x0a, 0x09, 0x01,
+        0x07, 0x00, 0x20, 0x00, 0x41, 0x2a, 0x6a, 0x0b,
     };
 
     const allocator = std.testing.allocator;

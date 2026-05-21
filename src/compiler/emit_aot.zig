@@ -8,6 +8,7 @@
 //!   [sections...] each: [4 bytes type] [4 bytes size] [payload]
 
 const std = @import("std");
+const types = @import("../runtime/common/types.zig");
 
 /// AOT binary magic number ("\0aot" little-endian).
 pub const aot_magic: u32 = 0x746f6100;
@@ -48,7 +49,10 @@ pub const ImportEntry = struct {
     module_name: []const u8,
     field_name: []const u8,
     kind: ExternalKind,
-    func_type_idx: u32,
+    func_type_idx: u32 = 0,
+    table_elem_type: types.ValType = .funcref,
+    table_min: u32 = 0,
+    table_max: ?u32 = null,
 };
 
 pub const MemoryEntry = struct {
@@ -172,7 +176,9 @@ pub fn emit(
         }
     }
 
-    // Section 8: imports (module_name, field_name, kind, func_type_idx per entry)
+    // Section 8: imports.
+    //   function: module_name, field_name, kind, func_type_idx
+    //   table   : module_name, field_name, kind, elem_type, min, has_max, max?
     if (imports) |import_list| {
         if (import_list.len > 0) {
             var tmp: std.ArrayList(u8) = .empty;
@@ -184,7 +190,20 @@ pub fn emit(
                 try appendU32Le(&tmp, allocator, @intCast(imp.field_name.len));
                 try tmp.appendSlice(allocator, imp.field_name);
                 try tmp.append(allocator, @intFromEnum(imp.kind));
-                try appendU32Le(&tmp, allocator, imp.func_type_idx);
+                switch (imp.kind) {
+                    .function => try appendU32Le(&tmp, allocator, imp.func_type_idx),
+                    .table => {
+                        try tmp.append(allocator, @intFromEnum(imp.table_elem_type));
+                        try appendU32Le(&tmp, allocator, imp.table_min);
+                        if (imp.table_max) |max| {
+                            try tmp.append(allocator, 1);
+                            try appendU32Le(&tmp, allocator, max);
+                        } else {
+                            try tmp.append(allocator, 0);
+                        }
+                    },
+                    else => return error.UnsupportedImportKind,
+                }
             }
             try emitSection(allocator, &buf, 8, tmp.items);
         }
@@ -423,6 +442,7 @@ test "emit: import section round-trip" {
 
     const import_entries = [_]ImportEntry{
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
+        .{ .module_name = "env", .field_name = "tbl", .kind = .table, .table_elem_type = .funcref, .table_min = 8, .table_max = 8 },
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
     };
     const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null, null, null);
@@ -432,10 +452,17 @@ test "emit: import section round-trip" {
     defer aot_loader.unload(&module, allocator);
 
     try std.testing.expectEqual(@as(u32, 2), module.import_function_count);
-    try std.testing.expectEqual(@as(usize, 2), module.imports.len);
+    try std.testing.expectEqual(@as(usize, 3), module.imports.len);
     try std.testing.expect(std.mem.eql(u8, module.imports[0].module_name, "wasi_snapshot_preview1"));
     try std.testing.expect(std.mem.eql(u8, module.imports[0].field_name, "fd_write"));
-    try std.testing.expect(std.mem.eql(u8, module.imports[1].field_name, "clock_time_get"));
+    try std.testing.expectEqual(types.ExternalKind.table, module.imports[1].kind);
+    try std.testing.expect(std.mem.eql(u8, module.imports[2].field_name, "clock_time_get"));
+    try std.testing.expectEqual(@as(usize, 1), module.imported_tables.len);
+    try std.testing.expect(std.mem.eql(u8, module.imported_tables[0].module_name, "env"));
+    try std.testing.expect(std.mem.eql(u8, module.imported_tables[0].name, "tbl"));
+    try std.testing.expectEqual(types.ValType.funcref, module.imported_tables[0].elem_type);
+    try std.testing.expectEqual(@as(u32, 8), module.imported_tables[0].min);
+    try std.testing.expectEqual(@as(?u32, 8), module.imported_tables[0].max);
 }
 
 test "emit: memory section round-trip" {
@@ -485,7 +512,6 @@ test "emit: v128 global init payload round-trip" {
 test "emit: type section and function type indices round-trip" {
     const allocator = std.testing.allocator;
     const aot_loader = @import("../runtime/aot/loader.zig");
-    const types = @import("../runtime/common/types.zig");
 
     // Two func types:
     //   type 0: () -> ()

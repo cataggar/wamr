@@ -2007,6 +2007,8 @@ fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allo
 }
 
 fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.TableInstance {
+    // TODO #649 phase 2: prepend borrowed imported table slots from
+    // `module.importedTables()` before allocating local tables.
     if (module.tables.len == 0) return &.{};
 
     const tables = allocator.alloc(*types.TableInstance, module.tables.len) catch return error.OutOfMemory;
