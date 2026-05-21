@@ -13,6 +13,8 @@ const core_backend = @import("core_backend.zig");
 const aot_loader = @import("../runtime/aot/loader.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
 
+const aot_host_bridge = @import("../runtime/aot/host_bridge.zig");
+
 pub const Options = core_backend.Options;
 pub const PrecompiledCore = core_backend.PrecompiledCore;
 pub const CoreInstanceBackend = core_backend.CoreInstanceBackend;
@@ -1427,6 +1429,45 @@ pub fn instantiateWithOptions(
         for (cis) |*entry| entry.* = .{};
         inst.core_instances = cis;
 
+        // #644: AOT path can't yet wire cross-instance imports
+        // (functions/memory/tables) between cores running on
+        // different backends. If even ONE core in this component
+        // would have to fall back to the interpreter, fall back
+        // ALL of them — otherwise an interp core that imports
+        // from an AOT sibling (or vice-versa) will silently see
+        // a null host_functions slot and trap on first call. The
+        // common case in P2 wit-bindgen output is exactly this:
+        // the rust main core needs interp (canon.lower imports)
+        // but the tiny shim core has no imports and looks AOT-
+        // safe in isolation.
+        const force_all_interp = blk: {
+            for (component.core_instances) |expr2| {
+                const ie = switch (expr2) {
+                    .instantiate => |x| x,
+                    else => continue,
+                };
+                if (ie.module_idx >= component.core_modules.len) continue;
+                const cwasm_bytes = inst.options.findPrecompiled(ie.module_idx) orelse continue;
+                const mod_alloc = inst.module_arena.allocator();
+                const probe_mod = mod_alloc.create(aot_loader.AotModule) catch break :blk true;
+                probe_mod.* = aot_loader.load(cwasm_bytes, mod_alloc) catch break :blk true;
+                if (firstUnsupportedAotImport(probe_mod)) |bad| {
+                    if (core_backend.debugAotEnabled()) {
+                        std.debug.print(
+                            "[aot-debug] core_module={d} has unresolvable import '{s}.{s}' (kind={s}); forcing ALL cores to interpreter to avoid cross-backend wiring gaps\n",
+                            .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
+                        );
+                    }
+                    std.log.warn(
+                        "aot core {d} has import '{s}.{s}' ({s}) that AOT cannot resolve yet; forcing entire component to interpreter",
+                        .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
+                    );
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+
         for (component.core_instances, 0..) |expr, ci_idx| {
             switch (expr) {
                 .exports => |inline_exports| {
@@ -1436,41 +1477,63 @@ pub fn instantiateWithOptions(
                     if (ie.module_idx >= component.core_modules.len) continue;
                     const core_mod = component.core_modules[ie.module_idx];
 
-                    // #625: AOT fast-path. If the caller supplied a
-                    // precompiled artifact for this `module_idx`, load
-                    // it via `runtime/aot/loader.zig` and instantiate
-                    // it via `runtime/aot/runtime.zig`. Phase 1 only
-                    // wires up the load — cross-instance memory/table/
-                    // global sharing is structurally compatible (the
-                    // shared `runtime/common` types), but the canon-ABI
-                    // lift call path still requires `module_inst` and
-                    // errors out against an AOT-only export until
-                    // phase 3.
-                    if (inst.options.findPrecompiled(ie.module_idx)) |cwasm_bytes| {
+                    // #644: AOT fast-path — only viable when every
+                    // import this core declares can be satisfied by
+                    // the AOT runtime (WASI/spectest names in
+                    // host_bridge, no canon.lower trampolines, no
+                    // cross-instance funcs/memory/tables/globals).
+                    // Anything else — and in particular wit-bindgen-
+                    // emitted P2 cores whose imports are component-
+                    // level WIT interface names like
+                    // `wasi:io/streams@0.2.0` resolved by the
+                    // component's canon.lower defs — has no AOT-side
+                    // wiring, so the very first call into the import
+                    // jumps through a null host_functions slot and
+                    // segfaults. Probe feasibility before committing
+                    // to AOT; on any unsupported import, log a
+                    // warning + fall through to the interp path that
+                    // already knows how to wire these.
+                    if (!force_all_interp) blk_aot_try: {
+                        const cwasm_bytes = inst.options.findPrecompiled(ie.module_idx) orelse break :blk_aot_try;
+                        aot_blk: {
                         const mod_alloc = inst.module_arena.allocator();
-                        const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch continue;
+                        const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch break :aot_blk;
                         aot_module_ptr.* = aot_loader.load(cwasm_bytes, mod_alloc) catch |err| {
                             std.log.warn("aot core load failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
-                            continue;
+                            break :aot_blk;
                         };
+                        if (firstUnsupportedAotImport(aot_module_ptr)) |bad| {
+                            if (core_backend.debugAotEnabled()) {
+                                std.debug.print(
+                                    "[aot-debug] skipping AOT for core_module={d}: unresolvable import '{s}.{s}' (kind={s}); falling back to interpreter\n",
+                                    .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
+                                );
+                            }
+                            std.log.warn(
+                                "aot core {d} has import '{s}.{s}' ({s}) that AOT cannot resolve yet; running on interpreter",
+                                .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
+                            );
+                            break :aot_blk;
+                        }
                         const aot_inst_ptr = aot_runtime.instantiate(aot_module_ptr, inst.allocator) catch |err| {
                             std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
-                            continue;
+                            break :aot_blk;
                         };
                         aot_runtime.mapCodeExecutable(aot_inst_ptr) catch |err| {
                             std.log.warn("aot core code-map failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                             aot_runtime.destroy(aot_inst_ptr);
-                            continue;
+                            break :aot_blk;
                         };
                         cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
                         // Phase 1: AOT cores skip cross-instance import
                         // wiring / canon-lower trampoline plumbing
                         // (handled by the interp path below for interp
-                        // cores). The big-core workload that motivates
-                        // #625 has its imports satisfied by the AOT
-                        // host bridge / WASI; richer wiring lands in
-                        // phase 3.
+                        // cores). Feasibility check above guarantees we
+                        // only commit to AOT for cores that don't need
+                        // any of that. Richer wiring lands in a
+                        // follow-up.
                         continue;
+                        }
                     }
 
                     const mod_alloc = inst.module_arena.allocator();
@@ -2333,6 +2396,38 @@ fn isWasiCliRunName(name: []const u8) bool {
     if (!std.mem.startsWith(u8, name, prefix)) return false;
     const rest = name[prefix.len..];
     return rest.len == 0 or rest[0] == '@';
+}
+
+/// Probe whether every import declared by an AOT-loaded core module
+/// has a wire-up the AOT runtime can satisfy. Today the AOT host
+/// bridge only knows the preview1 `wasi`/`wasi_snapshot_preview1`/
+/// `wasi_unstable` modules and `spectest`; everything else — and in
+/// particular wit-bindgen-emitted P2 cores whose function imports
+/// resolve via component-level `canon.lower` defs under interface
+/// names like `wasi:io/streams@0.2.0`, plus any cross-instance
+/// memory / table / global imports — has no AOT-side wiring and
+/// would fault on first use. Returns the first unsupported import,
+/// or null when the core is safe to commit to the AOT backend
+/// (#644). A null `imports` slice (no imports at all) is always
+/// supported.
+fn firstUnsupportedAotImport(module: *const aot_loader.AotModule) ?aot_loader.AotImportDesc {
+    for (module.imports) |imp| {
+        switch (imp.kind) {
+            .function => {
+                if (aot_host_bridge.isWasiModule(imp.module_name)) continue;
+                if (aot_host_bridge.isSpectestModule(imp.module_name)) continue;
+                return imp;
+            },
+            // memory / table / global / tag imports always require
+            // cross-instance wiring that the AOT runtime cannot
+            // synthesize today (memory_base / tables_info_ptr in
+            // `VmCtx` are populated from the AotInstance's own
+            // allocations, not from a borrowed *MemoryInstance /
+            // *TableInstance shared with a sibling core).
+            else => return imp,
+        }
+    }
+    return null;
 }
 
 // ── Index-space helpers ─────────────────────────────────────────────────────
