@@ -878,6 +878,10 @@ pub const AotInstance = struct {
     module: *const aot_loader.AotModule,
     memories: []*types.MemoryInstance,
     tables: []*types.TableInstance,
+    /// True when the matching `tables[i]` entry was allocated by this
+    /// instance and should be released on destroy. Borrowed imported-table
+    /// overrides leave this false so the exporting sibling retains ownership.
+    tables_owned: []bool = &.{},
     globals: []*types.GlobalInstance,
     /// Byte offset for each wasm-flat global in `VmCtx.globals_ptr`.
     global_offsets: []u32 = &.{},
@@ -955,6 +959,19 @@ pub const RuntimeError = error{
 
 /// Instantiate an AOT module, producing a runnable AotInstance.
 pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError!*AotInstance {
+    return instantiateWithOverrides(module, allocator, &.{});
+}
+
+/// Instantiate an AOT module, optionally borrowing `TableInstance`s for each
+/// imported-table slot. `imported_table_overrides[i]` maps to
+/// `module.importedTables()[i]`; null leaves that slot locally allocated.
+pub fn instantiateWithOverrides(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+    imported_table_overrides: []const ?*types.TableInstance,
+) RuntimeError!*AotInstance {
+    std.debug.assert(imported_table_overrides.len == 0 or imported_table_overrides.len == module.importedTables().len);
+
     var inst = allocator.create(AotInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(inst);
 
@@ -962,6 +979,7 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
         .module = module,
         .memories = &.{},
         .tables = &.{},
+        .tables_owned = &.{},
         .globals = &.{},
         .allocator = allocator,
         .module_ref = module,
@@ -993,8 +1011,10 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
         @memcpy(mem.data[seg.offset..][0..seg.data.len], seg.data);
     }
 
-    inst.tables = try allocateTables(module, allocator);
-    errdefer freeTables(inst.tables, allocator);
+    const table_alloc = try allocateTables(module, allocator, imported_table_overrides);
+    inst.tables = table_alloc.tables;
+    inst.tables_owned = table_alloc.owned;
+    errdefer freeTables(inst.tables, inst.tables_owned, allocator);
 
     // If no tables but we have element segments, create a default table
     if (inst.tables.len == 0 and module.elem_segments.len > 0) {
@@ -1005,16 +1025,26 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
             if (end > max_size) max_size = end;
         }
         if (max_size > 0) {
-            const tables = allocator.alloc(*types.TableInstance, 1) catch return error.OutOfMemory;
-            const elements = allocator.alloc(types.TableElement, max_size) catch return error.OutOfMemory;
-            for (elements) |*e| e.* = types.TableElement.nullForType(.funcref);
-            const tbl = allocator.create(types.TableInstance) catch return error.OutOfMemory;
-            tbl.* = .{
-                .table_type = .{ .elem_type = .funcref, .limits = .{ .min = max_size, .max = max_size } },
-                .elements = elements,
+            const fallback = blk: {
+                const tables = allocator.alloc(*types.TableInstance, 1) catch return error.OutOfMemory;
+                errdefer allocator.free(tables);
+                const owned = allocator.alloc(bool, 1) catch return error.OutOfMemory;
+                errdefer allocator.free(owned);
+                const elements = allocator.alloc(types.TableElement, max_size) catch return error.OutOfMemory;
+                errdefer allocator.free(elements);
+                for (elements) |*e| e.* = types.TableElement.nullForType(.funcref);
+                const tbl = allocator.create(types.TableInstance) catch return error.OutOfMemory;
+                errdefer allocator.destroy(tbl);
+                tbl.* = .{
+                    .table_type = .{ .elem_type = .funcref, .limits = .{ .min = max_size, .max = max_size } },
+                    .elements = elements,
+                };
+                tables[0] = tbl;
+                owned[0] = true;
+                break :blk TablesAllocation{ .tables = tables, .owned = owned };
             };
-            tables[0] = tbl;
-            inst.tables = tables;
+            inst.tables = fallback.tables;
+            inst.tables_owned = fallback.owned;
         }
     }
 
@@ -1091,7 +1121,7 @@ pub fn destroy(inst: *AotInstance) void {
         platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
     }
     freeMemories(inst.memories, allocator);
-    freeTables(inst.tables, allocator);
+    freeTables(inst.tables, inst.tables_owned, allocator);
     freeGlobals(inst.globals, allocator);
     if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
     if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
@@ -2006,19 +2036,49 @@ fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allo
     return memories;
 }
 
-fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.TableInstance {
-    // TODO #649 phase 2: prepend borrowed imported table slots from
-    // `module.importedTables()` before allocating local tables.
-    if (module.tables.len == 0) return &.{};
+const TablesAllocation = struct {
+    tables: []*types.TableInstance,
+    owned: []bool,
+};
 
-    const tables = allocator.alloc(*types.TableInstance, module.tables.len) catch return error.OutOfMemory;
+fn allocateTables(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+    imported_table_overrides: []const ?*types.TableInstance,
+) RuntimeError!TablesAllocation {
+    const imported = module.importedTables();
+    const total_count = imported.len + module.tables.len;
+    if (total_count == 0) return .{ .tables = &.{}, .owned = &.{} };
+
+    const tables = allocator.alloc(*types.TableInstance, total_count) catch return error.OutOfMemory;
+    errdefer allocator.free(tables);
+    const owned = allocator.alloc(bool, total_count) catch return error.OutOfMemory;
+    errdefer allocator.free(owned);
+    @memset(owned, false);
+
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| tables[i].release(allocator);
-        allocator.free(tables);
+        for (0..initialized) |i| {
+            if (owned[i]) tables[i].release(allocator);
+        }
     }
 
-    for (module.tables, 0..) |table_type, i| {
+    for (imported, 0..) |desc, i| {
+        if (i < imported_table_overrides.len) {
+            if (imported_table_overrides[i]) |override| {
+                tables[i] = override;
+                initialized += 1;
+                continue;
+            }
+        }
+
+        const table_type = types.TableType{
+            .elem_type = desc.elem_type,
+            .limits = .{
+                .min = desc.min,
+                .max = if (desc.max) |max| @as(u64, max) else null,
+            },
+        };
         const elements = allocator.alloc(types.TableElement, table_type.limits.min) catch return error.TableAllocationFailed;
         for (elements) |*e| e.* = types.TableElement.nullForType(table_type.elem_type);
         const tbl = allocator.create(types.TableInstance) catch {
@@ -2027,10 +2087,25 @@ fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Alloca
         };
         tbl.* = .{ .table_type = table_type, .elements = elements };
         tables[i] = tbl;
+        owned[i] = true;
         initialized += 1;
     }
 
-    return tables;
+    for (module.tables, 0..) |table_type, local_i| {
+        const i = imported.len + local_i;
+        const elements = allocator.alloc(types.TableElement, table_type.limits.min) catch return error.TableAllocationFailed;
+        for (elements) |*e| e.* = types.TableElement.nullForType(table_type.elem_type);
+        const tbl = allocator.create(types.TableInstance) catch {
+            allocator.free(elements);
+            return error.TableAllocationFailed;
+        };
+        tbl.* = .{ .table_type = table_type, .elements = elements };
+        tables[i] = tbl;
+        owned[i] = true;
+        initialized += 1;
+    }
+
+    return .{ .tables = tables, .owned = owned };
 }
 
 const GlobalLayout = struct {
@@ -2122,9 +2197,13 @@ fn freeMemories(memories: []*types.MemoryInstance, allocator: std.mem.Allocator)
     if (memories.len > 0) allocator.free(memories);
 }
 
-fn freeTables(tables: []*types.TableInstance, allocator: std.mem.Allocator) void {
-    for (tables) |t| t.release(allocator);
+fn freeTables(tables: []*types.TableInstance, owned: []bool, allocator: std.mem.Allocator) void {
+    std.debug.assert(owned.len == 0 or owned.len == tables.len);
+    for (tables, 0..) |t, i| {
+        if (owned.len == 0 or owned[i]) t.release(allocator);
+    }
     if (tables.len > 0) allocator.free(tables);
+    if (owned.len > 0) allocator.free(owned);
 }
 
 fn freeGlobals(globals: []*types.GlobalInstance, allocator: std.mem.Allocator) void {

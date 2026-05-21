@@ -821,8 +821,7 @@ pub const ComponentInstance = struct {
         for (self.trampoline_ctxs.items) |ctx| {
             if (resolveComponentFuncToHostFunc(self, self.component, ctx.component_func_idx)) |hf| {
                 ctx.host_func = hf;
-            } else {
-            }
+            } else {}
         }
     }
 
@@ -1496,43 +1495,55 @@ pub fn instantiateWithOptions(
                     if (!force_all_interp) blk_aot_try: {
                         const cwasm_bytes = inst.options.findPrecompiled(ie.module_idx) orelse break :blk_aot_try;
                         aot_blk: {
-                        const mod_alloc = inst.module_arena.allocator();
-                        const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch break :aot_blk;
-                        aot_module_ptr.* = aot_loader.load(cwasm_bytes, mod_alloc) catch |err| {
-                            std.log.warn("aot core load failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
-                            break :aot_blk;
-                        };
-                        if (firstUnsupportedAotImport(aot_module_ptr)) |bad| {
-                            if (core_backend.debugAotEnabled()) {
-                                std.debug.print(
-                                    "[aot-debug] skipping AOT for core_module={d}: unresolvable import '{s}.{s}' (kind={s}); falling back to interpreter\n",
+                            const mod_alloc = inst.module_arena.allocator();
+                            const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch break :aot_blk;
+                            aot_module_ptr.* = aot_loader.load(cwasm_bytes, mod_alloc) catch |err| {
+                                std.log.warn("aot core load failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                                break :aot_blk;
+                            };
+                            if (firstUnsupportedAotImport(aot_module_ptr)) |bad| {
+                                if (core_backend.debugAotEnabled()) {
+                                    std.debug.print(
+                                        "[aot-debug] skipping AOT for core_module={d}: unresolvable import '{s}.{s}' (kind={s}); falling back to interpreter\n",
+                                        .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
+                                    );
+                                }
+                                std.log.warn(
+                                    "aot core {d} has import '{s}.{s}' ({s}) that AOT cannot resolve yet; running on interpreter",
                                     .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
                                 );
+                                break :aot_blk;
                             }
-                            std.log.warn(
-                                "aot core {d} has import '{s}.{s}' ({s}) that AOT cannot resolve yet; running on interpreter",
-                                .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
-                            );
-                            break :aot_blk;
-                        }
-                        const aot_inst_ptr = aot_runtime.instantiate(aot_module_ptr, inst.allocator) catch |err| {
-                            std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
-                            break :aot_blk;
-                        };
-                        aot_runtime.mapCodeExecutable(aot_inst_ptr) catch |err| {
-                            std.log.warn("aot core code-map failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
-                            aot_runtime.destroy(aot_inst_ptr);
-                            break :aot_blk;
-                        };
-                        cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
-                        // Phase 1: AOT cores skip cross-instance import
-                        // wiring / canon-lower trampoline plumbing
-                        // (handled by the interp path below for interp
-                        // cores). Feasibility check above guarantees we
-                        // only commit to AOT for cores that don't need
-                        // any of that. Richer wiring lands in a
-                        // follow-up.
-                        continue;
+                            const imported_table_overrides_opt = resolveAotImportedTableOverrides(
+                                allocator,
+                                inst,
+                                component,
+                                cis,
+                                ci_idx,
+                                ie.args,
+                                aot_module_ptr,
+                            ) catch break :aot_blk;
+                            const imported_table_overrides = imported_table_overrides_opt orelse break :aot_blk;
+                            defer if (imported_table_overrides.len > 0) allocator.free(imported_table_overrides);
+
+                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides) catch |err| {
+                                std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                                break :aot_blk;
+                            };
+                            aot_runtime.mapCodeExecutable(aot_inst_ptr) catch |err| {
+                                std.log.warn("aot core code-map failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                                aot_runtime.destroy(aot_inst_ptr);
+                                break :aot_blk;
+                            };
+                            cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
+                            // Phase 1: AOT cores skip cross-instance import
+                            // wiring / canon-lower trampoline plumbing
+                            // (handled by the interp path below for interp
+                            // cores). Feasibility check above guarantees we
+                            // only commit to AOT for cores that don't need
+                            // any of that. Richer wiring lands in a
+                            // follow-up.
+                            continue;
                         }
                     }
 
@@ -1908,22 +1919,12 @@ pub fn instantiateWithOptions(
                                 if (source_inst_idx == std.math.maxInt(u32)) continue;
                                 if (source_inst_idx >= ci_idx) continue;
                                 const source_entry = cis[source_inst_idx];
-                                if (source_entry.module_inst) |src_mi| {
-                                    const exp = src_mi.module.findExport(imp.field_name, .table) orelse continue;
-                                    if (exp.index >= src_mi.tables.len) continue;
-                                    tbls_buf[imp_tbl_idx] = src_mi.tables[exp.index];
-                                    if (first_cross_src == null) first_cross_src = src_mi;
-                                    has_imports_resolved = true;
-                                    continue;
+                                const t_ptr = resolveCoreInstanceTableExport(inst, component, source_entry, imp.field_name) orelse continue;
+                                tbls_buf[imp_tbl_idx] = t_ptr;
+                                if (first_cross_src == null) {
+                                    if (source_entry.module_inst) |src_mi| first_cross_src = src_mi;
                                 }
-                                for (source_entry.inline_exports) |mem| {
-                                    if (!std.mem.eql(u8, mem.name, imp.field_name)) continue;
-                                    if (mem.sort_idx.sort != .table) break;
-                                    const t_ptr = resolveCoreTableToMI(inst, component, mem.sort_idx.idx) orelse break;
-                                    tbls_buf[imp_tbl_idx] = t_ptr;
-                                    has_imports_resolved = true;
-                                    break;
-                                }
+                                has_imports_resolved = true;
                             },
                             .global => {
                                 defer imp_glob_idx += 1;
@@ -2019,7 +2020,9 @@ pub fn instantiateWithOptions(
                     }
                     {
                         var nset: u32 = 0;
-                        for (entries) |e| if (e != null) { nset += 1; };
+                        for (entries) |e| if (e != null) {
+                            nset += 1;
+                        };
                     }
                     if (imps_buf.len > 0) allocator.free(imps_buf);
                     if (is_cross.len > 0) allocator.free(is_cross);
@@ -2495,6 +2498,30 @@ fn resolveCoreMemoryToMI(
     return src_mi.memories[exp.index];
 }
 
+fn resolveCoreInstanceTableExport(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    entry: ComponentInstance.CoreInstanceEntry,
+    export_name: []const u8,
+) ?*core_types.TableInstance {
+    if (entry.module_inst) |src_mi| {
+        const exp = src_mi.module.findExport(export_name, .table) orelse return null;
+        if (exp.index >= src_mi.tables.len) return null;
+        return src_mi.tables[exp.index];
+    }
+    if (entry.aot_inst) |src_ai| {
+        const exp = src_ai.module.findExport(export_name, .table) orelse return null;
+        if (exp.index >= src_ai.tables.len) return null;
+        return src_ai.tables[exp.index];
+    }
+    for (entry.inline_exports) |mem| {
+        if (!std.mem.eql(u8, mem.name, export_name)) continue;
+        if (mem.sort_idx.sort != .table) break;
+        return resolveCoreTableToMI(inst, component, mem.sort_idx.idx);
+    }
+    return null;
+}
+
 fn resolveCoreTableToMI(
     inst: *const ComponentInstance,
     component: *const ctypes.Component,
@@ -2503,10 +2530,37 @@ fn resolveCoreTableToMI(
     const ref = indexspace.resolveCoreTable(component, core_tbl_idx) orelse return null;
     const ie = component.aliases[ref.aliased].instance_export;
     if (ie.instance_idx >= inst.core_instances.len) return null;
-    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
-    const exp = src_mi.module.findExport(ie.name, .table) orelse return null;
-    if (exp.index >= src_mi.tables.len) return null;
-    return src_mi.tables[exp.index];
+    return resolveCoreInstanceTableExport(inst, component, inst.core_instances[ie.instance_idx], ie.name);
+}
+
+fn resolveAotImportedTableOverrides(
+    allocator: std.mem.Allocator,
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    cis: []const ComponentInstance.CoreInstanceEntry,
+    ci_idx: usize,
+    args: []const ctypes.CoreInstantiateArg,
+    module: *const aot_loader.AotModule,
+) error{OutOfMemory}!?[]?*core_types.TableInstance {
+    const imported_tables = module.importedTables();
+    if (imported_tables.len == 0) return &.{};
+
+    const overrides = try allocator.alloc(?*core_types.TableInstance, imported_tables.len);
+    errdefer allocator.free(overrides);
+
+    for (imported_tables, 0..) |imp_tbl, i| {
+        const source_inst_idx: u32 = arg_blk: {
+            for (args) |arg| {
+                if (std.mem.eql(u8, arg.name, imp_tbl.module_name)) break :arg_blk arg.instance_idx;
+            }
+            break :arg_blk std.math.maxInt(u32);
+        };
+        if (source_inst_idx == std.math.maxInt(u32)) return null;
+        if (source_inst_idx >= ci_idx) return null;
+        overrides[i] = resolveCoreInstanceTableExport(inst, component, cis[source_inst_idx], imp_tbl.name) orelse return null;
+    }
+
+    return overrides;
 }
 
 fn resolveCoreGlobalToMI(
@@ -3240,10 +3294,16 @@ test "linkImports: missing runtime import returns MissingImport" {
         .{ .name = "my-func", .desc = .{ .func = 0 } },
     };
     const component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &imports,      .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
     };
 
     const inst = try instantiate(&component, allocator);
@@ -3262,10 +3322,16 @@ test "linkImports: kind mismatch returns ImportKindMismatch" {
         .{ .name = "wasi:io/streams", .desc = .{ .instance = 0 } },
     };
     const component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &imports,      .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
     };
 
     const inst = try instantiate(&component, allocator);
@@ -3284,10 +3350,16 @@ test "linkImports: host_instance binding satisfies instance import" {
         .{ .name = "wasi:io/streams", .desc = .{ .instance = 0 } },
     };
     const component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &imports,      .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
     };
 
     const inst = try instantiate(&component, allocator);
@@ -3313,10 +3385,16 @@ test "linkImports: type import needs no binding" {
         .{ .name = "T", .desc = .{ .type = .sub_resource } },
     };
     const component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &imports,      .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
     };
 
     const inst = try instantiate(&component, allocator);
@@ -3331,10 +3409,16 @@ test "ComponentInstance: resource tables are lazy and keyed by typeidx" {
     const allocator = std.testing.allocator;
 
     const component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
 
     const inst = try instantiate(&component, allocator);
@@ -3365,23 +3449,19 @@ test "instantiate: canon.lower wires host func into core import (2A.2b)" {
     const core_wasm = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         // type section
-        0x01, 0x0b, 0x02,
-        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
-        0x60, 0x00, 0x01, 0x7f,
+        0x01, 0x0b, 0x02, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f, 0x60, 0x00, 0x01, 0x7f,
         // import section: host.sub (func type 0)
         0x02, 0x0c, 0x01,
-        0x04, 'h', 'o', 's', 't',
-        0x03, 's', 'u', 'b',
-        0x00, 0x00,
+        0x04, 'h',  'o',  's',  't',  0x03, 's',  'u',
+        'b',  0x00, 0x00,
         // function section: 1 local fn, type 1
         0x03, 0x02, 0x01, 0x01,
         // export section: "run" -> func 1
-        0x07, 0x07, 0x01,
-        0x03, 'r', 'u', 'n',
-        0x00, 0x01,
+        0x07,
+        0x07, 0x01, 0x03, 'r',  'u',  'n',  0x00, 0x01,
         // code section
-        0x0a, 0x0a, 0x01,
-        0x08, 0x00,
+        0x0a, 0x0a, 0x01, 0x08, 0x00,
         0x41, 0x07, // i32.const 7
         0x41, 0x02, // i32.const 2
         0x10, 0x00, // call 0 (imported sub)
@@ -3483,25 +3563,20 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
     const core_wasm = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         // type section (1 type)
-        0x01, 0x07, 0x01,
-        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f,
         // import section (1 import)
-        0x02, 0x0c, 0x01,
-        0x04, 'h', 'o', 's', 't',
-        0x03, 's', 'u', 'b',
-        0x00, 0x00,
+        0x02, 0x0c, 0x01, 0x04, 'h',  'o',  's',
+        't',  0x03, 's',  'u',  'b',  0x00, 0x00,
         // function section (1 local fn)
-        0x03, 0x02, 0x01, 0x00,
+        0x03,
+        0x02, 0x01, 0x00,
         // export section: "run" -> func 1
-        0x07, 0x07, 0x01,
-        0x03, 'r', 'u', 'n',
-        0x00, 0x01,
+        0x07, 0x07, 0x01, 0x03, 'r',
+        'u',  'n',  0x00, 0x01,
         // code section (1 body, 8 bytes)
-        0x0a, 0x0a, 0x01,
-        0x08, 0x00,
-        0x20, 0x00, 0x20, 0x01,
-        0x10, 0x00,
-        0x0b,
+        0x0a, 0x0a, 0x01, 0x08,
+        0x00, 0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x0b,
     };
 
     const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
@@ -3790,11 +3865,14 @@ test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)
         // type section: () -> ()
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
         // function section: 1 fn of type 0
-        0x03, 0x02, 0x01, 0x00,
+        0x03, 0x02,
+        0x01, 0x00,
         // export section: "run" -> func 0
-        0x07, 0x07, 0x01, 0x03, 'r', 'u', 'n', 0x00, 0x00,
+        0x07, 0x07, 0x01, 0x03, 'r',  'u',
+        'n',  0x00, 0x00,
         // code section: empty body
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x0a, 0x04, 0x01, 0x02, 0x00,
+        0x0b,
     };
 
     const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
@@ -4027,11 +4105,14 @@ test "instantiate: aliased instance export of sub-component publishes 'run' (#35
         // type section: () -> ()
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
         // function section: 1 fn of type 0
-        0x03, 0x02, 0x01, 0x00,
+        0x03, 0x02,
+        0x01, 0x00,
         // export section: "run" -> func 0
-        0x07, 0x07, 0x01, 0x03, 'r', 'u', 'n', 0x00, 0x00,
+        0x07, 0x07, 0x01, 0x03, 'r',  'u',
+        'n',  0x00, 0x00,
         // code section: empty body
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x0a, 0x04, 0x01, 0x02, 0x00,
+        0x0b,
     };
 
     const sub_core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
@@ -4241,11 +4322,16 @@ const ctx_share_core_wasm_533 = [_]u8{
     // import section (id=2, body=22): 3 imports.
     0x02, 0x16, 0x03,
     // host.f0 : func (type 0)
-    0x01, 'x', 0x02, 'f', '0', 0x00, 0x00,
+    0x01,
+    'x',  0x02, 'f',  '0',
+    0x00, 0x00,
     // host.f1 : func (type 0)
-    0x01, 'x', 0x02, 'f', '1', 0x00, 0x00,
+    0x01, 'x',
+    0x02, 'f',  '1',  0x00,
+    0x00,
     // host.f2 : func (type 1)
-    0x01, 'x', 0x02, 'f', '2', 0x00, 0x01,
+    0x01, 'x',  0x02,
+    'f',  '2',  0x00, 0x01,
 };
 
 // Shared fixture builder for the #533 tests. Returns a Component descriptor
@@ -4373,7 +4459,6 @@ test "instantiate: dropping component frees shared canon-builtin ctx exactly onc
     // safety check here.
     inst.deinit();
 }
-
 
 // ─── #625 phase 1: AOT-backed core instance load smoke test ────────────────
 // (See `src/tests/component_aot_smoke_test.zig`. The test lives in its
