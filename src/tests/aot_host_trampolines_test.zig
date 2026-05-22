@@ -121,6 +121,75 @@ test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
     }
 }
 
+test "#648 phase 2: trampoline slots execute through genericDispatcher" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    switch (builtin.cpu.arch) {
+        .x86_64, .aarch64 => {},
+        else => return error.SkipZigTest,
+    }
+
+    const Host = struct {
+        const State = struct {
+            base: u64,
+            called: bool = false,
+        };
+
+        fn sum(ctx: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            try std.testing.expectEqual(@as(usize, 6), args.len);
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+
+            var total = state.base;
+            for (args, 1..) |arg, expected| {
+                try std.testing.expectEqual(@as(u64, expected), arg.u64);
+                total += arg.u64;
+            }
+
+            state.called = true;
+            results[0] = .{ .u64 = total };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{ .u64, .u64, .u64, .u64, .u64, .u64 };
+    const result_types = [_]ctypes.ValType{.u64};
+    const lowered_params = [_]core_types.ValType{ .i64, .i64, .i64, .i64, .i64, .i64 };
+    const lowered_results = [_]core_types.ValType{.i64};
+
+    var state0 = Host.State{ .base = 10 };
+    var ctx0 = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .context = @ptrCast(&state0), .call = &Host.sum },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const stub0 = try pool.allocSlotWithCtx(@ptrCast(&ctx0), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    var state1 = Host.State{ .base = 20 };
+    var ctx1 = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .context = @ptrCast(&state1), .call = &Host.sum },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const stub1 = try pool.allocSlotWithCtx(@ptrCast(&ctx1), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    const TrampolineFn = *const fn (u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+    const tramp0: TrampolineFn = @ptrCast(stub0);
+    const tramp1: TrampolineFn = @ptrCast(stub1);
+
+    try std.testing.expectEqual(@as(u64, 31), tramp0(1, 2, 3, 4, 5, 6));
+    try std.testing.expectEqual(@as(u64, 41), tramp1(1, 2, 3, 4, 5, 6));
+    try std.testing.expect(state0.called);
+    try std.testing.expect(state1.called);
+}
+
 test "#648 phase 3: genericDispatcher handles (i32) -> ()" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
