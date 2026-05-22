@@ -67,7 +67,7 @@ fn expectStoredPtrLen(mem: []const u8, offset: u32, expected_ptr: u32, expected_
 }
 
 test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     var pool = try host_trampolines.TrampolinePool.init(allocator);
@@ -122,7 +122,7 @@ test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
 }
 
 test "#648 phase 2: trampoline slots execute through genericDispatcher" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
     switch (builtin.cpu.arch) {
         .x86_64, .aarch64 => {},
         else => return error.SkipZigTest,
@@ -191,7 +191,7 @@ test "#648 phase 2: trampoline slots execute through genericDispatcher" {
 }
 
 test "#648 phase 3: genericDispatcher handles (i32) -> ()" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
 
     const Host = struct {
         const State = struct { called: bool = false, arg: i32 = 0 };
@@ -230,7 +230,7 @@ test "#648 phase 3: genericDispatcher handles (i32) -> ()" {
 }
 
 test "#648 phase 3: genericDispatcher handles () -> i32" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
 
     const Host = struct {
         fn get(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
@@ -262,7 +262,7 @@ test "#648 phase 3: genericDispatcher handles () -> i32" {
 }
 
 test "#648 phase 3: genericDispatcher handles (i32) -> i32" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
 
     const Host = struct {
         fn subscribe(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
@@ -293,7 +293,7 @@ test "#648 phase 3: genericDispatcher handles (i32) -> i32" {
 }
 
 test "#648 phase 3: genericDispatcher handles (i32 i32) -> () retptr" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
 
     const Host = struct {
         fn checkWrite(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
@@ -326,7 +326,7 @@ test "#648 phase 3: genericDispatcher handles (i32 i32) -> () retptr" {
 }
 
 test "#648 phase 3: genericDispatcher handles (i32 i32 i32 i32) -> ()" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
 
     const Host = struct {
         fn write(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
@@ -361,7 +361,7 @@ test "#648 phase 3: genericDispatcher handles (i32 i32 i32 i32) -> ()" {
 }
 
 test "#648 phase 3: genericDispatcher handles (i32 i64 i32) -> ()" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
 
     const Host = struct {
         fn blockingRead(_: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {

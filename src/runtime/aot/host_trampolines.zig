@@ -82,6 +82,9 @@ pub const TrampolinePool = struct {
             .x86_64, .aarch64 => {},
             else => return error.UnsupportedPlatform,
         }
+        // macOS aarch64 forbids RWX mmap without MAP_JIT + pthread_jit_write_protect_np;
+        // not worth wiring up for stdio-echo's needs. AOT layer falls back to interp.
+        if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return error.UnsupportedPlatform;
 
         const slots = try allocator.alloc(Slot, MAX_SLOTS);
         errdefer allocator.free(slots);
