@@ -58,6 +58,88 @@ test "#649 phase 1: AOT loader retains imported table descriptors" {
     try std.testing.expectEqual(@as(?u32, 8), table.max);
 }
 
+test "#649 phase 2: instantiateWithOverrides shares imported tables across AOT cores" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const exporter_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        // function section: 1 local function of type 0
+        0x03,
+        0x02, 0x01, 0x00,
+        // table section: (table (export "tbl") 1 1 funcref)
+        0x04, 0x05, 0x01, 0x70, 0x01,
+        0x01, 0x01,
+        // export section: export table 0 as "tbl"
+        0x07, 0x07, 0x01, 0x03, 't',  'b',
+        'l',  0x01, 0x00,
+        // elem section: active elem writing func 0 at slot 0
+        0x09, 0x07, 0x01, 0x00, 0x41,
+        0x00, 0x0b, 0x01, 0x00,
+        // code section: i32.const 7; end
+        0x0a, 0x06, 0x01, 0x04,
+        0x00, 0x41, 0x07, 0x0b,
+    };
+    const importer_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        // import section: (import "env" "tbl" (table 1 1 funcref))
+        0x02,
+        0x0e, 0x01, 0x03, 'e',  'n',  'v',  0x03, 't',
+        'b',  'l',  0x01, 0x70, 0x01, 0x01, 0x01,
+        // function section: 1 local function of type 0
+        0x03,
+        0x02, 0x01, 0x00,
+        // export section: export local func 0 as "invoke"
+        0x07, 0x0a, 0x01, 0x06, 'i',
+        'n',  'v',  'o',  'k',  'e',  0x00, 0x00,
+        // code section: i32.const 0; call_indirect (type 0) table 0; end
+        0x0a,
+        0x09, 0x01, 0x07, 0x00, 0x41, 0x00, 0x11, 0x00,
+        0x00, 0x0b,
+    };
+
+    const allocator = std.testing.allocator;
+    const exporter_cwasm = try aot_harness.compileWasmToAot(allocator, &exporter_wasm);
+    defer allocator.free(exporter_cwasm);
+    const importer_cwasm = try aot_harness.compileWasmToAot(allocator, &importer_wasm);
+    defer allocator.free(importer_cwasm);
+
+    var exporter_module = try aot_loader_mod.load(exporter_cwasm, allocator);
+    defer aot_loader_mod.unload(&exporter_module, allocator);
+    var importer_module = try aot_loader_mod.load(importer_cwasm, allocator);
+    defer aot_loader_mod.unload(&importer_module, allocator);
+
+    const exporter_inst = try aot_runtime_mod.instantiate(&exporter_module, allocator);
+    defer aot_runtime_mod.destroy(exporter_inst);
+    try aot_runtime_mod.mapCodeExecutable(exporter_inst);
+
+    const overrides = [_]?*core_types.TableInstance{exporter_inst.tables[0]};
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &overrides);
+    defer aot_runtime_mod.destroy(importer_inst);
+    try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
+    try std.testing.expect(!importer_inst.tables_owned[0]);
+    try aot_runtime_mod.mapCodeExecutable(importer_inst);
+
+    const fn_idx = aot_runtime_mod.findExportFunc(importer_inst, "invoke") orelse return error.TestFailed;
+    const no_params = [_]core_types.ValType{};
+    const result_types = [_]core_types.ValType{.i32};
+    const no_args = [_]core_types.Value{};
+    var results_buf: [1]aot_runtime_mod.ScalarResult = .{.{ .i32 = 0 }};
+    const results = try aot_runtime_mod.callFuncScalar(
+        importer_inst,
+        fn_idx,
+        &no_params,
+        &result_types,
+        &no_args,
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(i32, 7), results[0].i32);
+}
+
 test "#625 phase 1: instantiateWithOptions loads + runs an AOT core" {
     if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
 
