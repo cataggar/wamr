@@ -1464,7 +1464,7 @@ pub fn instantiateWithOptions(
                     else => continue,
                 };
                 if (ie.module_idx >= component.core_modules.len) continue;
-                const cwasm_bytes = inst.options.findPrecompiled(ie.module_idx) orelse continue;
+                const cwasm_bytes = inst.options.findPrecompiled(component.core_modules[ie.module_idx].data, ie.module_idx) orelse continue;
                 const mod_alloc = inst.module_arena.allocator();
                 const probe_mod = mod_alloc.create(aot_loader.AotModule) catch break :blk true;
                 probe_mod.* = aot_loader.load(cwasm_bytes, mod_alloc) catch break :blk true;
@@ -1497,7 +1497,7 @@ pub fn instantiateWithOptions(
                     else => continue,
                 };
                 if (ie.module_idx >= component.core_modules.len) continue;
-                const cwasm_bytes = inst.options.findPrecompiled(ie.module_idx) orelse {
+                const cwasm_bytes = inst.options.findPrecompiled(component.core_modules[ie.module_idx].data, ie.module_idx) orelse {
                     std.log.warn(
                         "[aot reject] core module {d} has no precompiled artifact; `wamr` is AOT-only (#644)",
                         .{ie.module_idx},
@@ -1549,7 +1549,7 @@ pub fn instantiateWithOptions(
                     // warning + fall through to the interp path that
                     // already knows how to wire these.
                     if (!force_all_interp) blk_aot_try: {
-                        const cwasm_bytes = inst.options.findPrecompiled(ie.module_idx) orelse break :blk_aot_try;
+                        const cwasm_bytes = inst.options.findPrecompiled(core_mod.data, ie.module_idx) orelse break :blk_aot_try;
                         aot_blk: {
                             const mod_alloc = inst.module_arena.allocator();
                             const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch break :aot_blk;
@@ -2204,7 +2204,17 @@ pub fn instantiateWithOptions(
                         // path keeps handling them.
                         continue;
                     }
-                    subs[i] = instantiate(subcomp, allocator) catch
+                    // Propagate the parent's instantiation options
+                    // (precompiled_cores, aot_only) into the sub-
+                    // component so composed components produced by
+                    // `wabt component compose -d` — whose actual cores
+                    // live inside nested sub-components — pick up the
+                    // precompiled artifacts that `wamr run` emits for
+                    // them. `PrecompiledCore.component` scopes each
+                    // entry to a specific (sub-)component pointer so
+                    // sibling sub-components don't collide on shared
+                    // local `module_idx` values. (#662 phase D)
+                    subs[i] = instantiateWithOptions(subcomp, allocator, inst.options) catch
                         return error.SubComponentInstantiateFailed;
                 },
             }

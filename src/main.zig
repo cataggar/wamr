@@ -518,7 +518,41 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                         std.debug.print("Error: failed to parse component for auto-precompile: {s}\n", .{@errorName(err)});
                         return 1;
                     };
-                    const ncore = parsed.core_modules.len;
+                    // Recursively collect every core module from the
+                    // top level *and* every nested sub-component. The
+                    // top level of a `wabt component compose -d`
+                    // composed component has zero cores of its own —
+                    // the actual command + adder cores live inside
+                    // its two nested sub-components (#662 phase D).
+                    // Each entry pairs the core's raw module bytes
+                    // (a stable cross-parse identity) with its
+                    // *local* `module_idx` within the component that
+                    // contains it; `Options.findPrecompiled` matches
+                    // on the bytes-slice so sub-component
+                    // instantiations don't collide on shared local
+                    // indices.
+                    const CoreRef = struct {
+                        data: []const u8,
+                        local_idx: u32,
+                    };
+                    var all_cores: std.ArrayListUnmanaged(CoreRef) = .empty;
+                    defer all_cores.deinit(load_arena.allocator());
+                    const Walker = struct {
+                        fn walk(
+                            comp: *const wamr.component_types.Component,
+                            list: *std.ArrayListUnmanaged(CoreRef),
+                            arena: std.mem.Allocator,
+                        ) !void {
+                            for (comp.core_modules, 0..) |cm, mi| {
+                                try list.append(arena, .{ .data = cm.data, .local_idx = @intCast(mi) });
+                            }
+                            for (comp.components) |child| {
+                                try walk(child, list, arena);
+                            }
+                        }
+                    };
+                    Walker.walk(&parsed, &all_cores, load_arena.allocator()) catch return 1;
+                    const ncore = all_cores.items.len;
                     if (ncore == 0) {
                         std.debug.print("Error: component contains no core modules\n", .{});
                         return 1;
@@ -528,8 +562,8 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                         .{ ncore, if (ncore == 1) @as([]const u8, "") else "s" },
                     );
                     auto_cores.ensureTotalCapacity(allocator, ncore) catch return 1;
-                    for (parsed.core_modules, 0..) |cm, idx| {
-                        const cwasm = wamr.component_aot.compileCoreWasm(allocator, cm.data, .{}) catch |err| {
+                    for (all_cores.items, 0..) |ref, idx| {
+                        const cwasm = wamr.component_aot.compileCoreWasm(allocator, ref.data, .{}) catch |err| {
                             std.debug.print(
                                 "Error: auto-precompile failed for core module {d}: {s} (issue #644)\n",
                                 .{ idx, @errorName(err) },
@@ -537,8 +571,9 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                             return 1;
                         };
                         auto_cores.appendAssumeCapacity(.{
-                            .module_idx = @intCast(idx),
+                            .module_idx = ref.local_idx,
                             .cwasm_bytes = cwasm,
+                            .core_wasm = ref.data,
                         });
                     }
                 }

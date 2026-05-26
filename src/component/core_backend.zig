@@ -125,6 +125,22 @@ pub const CoreInstanceBackend = union(enum) {
 pub const PrecompiledCore = struct {
     module_idx: u32,
     cwasm_bytes: []const u8,
+    /// Optional raw-bytes identity of the core module that produced
+    /// this cwasm. Both `wamr.component_loader.load` invocations
+    /// against the same `wasm_data` buffer produce identical slices
+    /// for `core_modules[i].data`, so slice (ptr+len) equality is a
+    /// stable cross-parse key. When set, `findPrecompiled` matches
+    /// by `core_wasm`; when null, it falls back to matching by
+    /// `module_idx` against the *root* component (legacy on-disk
+    /// manifests + test fixtures that only have top-level cores).
+    ///
+    /// `wamr run`'s auto-precompile walks composed-component trees
+    /// (`wabt component compose -d` output) and stamps `core_wasm`
+    /// on every emitted entry so cores nested inside sub-components
+    /// can be found during recursive `instantiateWithOptions` of
+    /// those sub-components without their inner local `module_idx`
+    /// colliding with the root's. (#662 phase D)
+    core_wasm: ?[]const u8 = null,
 };
 
 /// Process-global toggle for AOT debug diagnostics. Off by default;
@@ -159,10 +175,24 @@ pub const Options = struct {
     /// fall back to interp" behaviour. See issue #644.
     aot_only: bool = false,
 
-    /// Find a precompiled artifact for a given core-module index.
-    pub fn findPrecompiled(self: Options, module_idx: u32) ?[]const u8 {
+    /// Find a precompiled artifact for a given core-module slot.
+    /// `core_wasm` is the raw module bytes from
+    /// `component.core_modules[module_idx].data`. Entries with
+    /// `core_wasm` set are matched by slice identity (stable across
+    /// re-parses of the same input); entries without (legacy
+    /// callers) are matched by `module_idx` alone.
+    pub fn findPrecompiled(
+        self: Options,
+        core_wasm: []const u8,
+        module_idx: u32,
+    ) ?[]const u8 {
         for (self.precompiled_cores) |pc| {
-            if (pc.module_idx == module_idx) return pc.cwasm_bytes;
+            if (pc.core_wasm) |cw| {
+                if (cw.ptr == core_wasm.ptr and cw.len == core_wasm.len)
+                    return pc.cwasm_bytes;
+            } else {
+                if (pc.module_idx == module_idx) return pc.cwasm_bytes;
+            }
         }
         return null;
     }
@@ -176,11 +206,35 @@ test "Options.findPrecompiled hits + misses" {
         .{ .module_idx = 2, .cwasm_bytes = &bytes_b },
     };
     const opts = Options{ .precompiled_cores = &pcs };
-    try std.testing.expectEqualSlices(u8, &bytes_a, opts.findPrecompiled(0).?);
-    try std.testing.expectEqualSlices(u8, &bytes_b, opts.findPrecompiled(2).?);
-    try std.testing.expectEqual(@as(?[]const u8, null), opts.findPrecompiled(1));
-    try std.testing.expectEqual(@as(?[]const u8, null), opts.findPrecompiled(99));
+    // Legacy entries (no `core_wasm`) match by `module_idx`; the
+    // `core_wasm` arg is ignored for those.
+    const dummy: []const u8 = &.{};
+    try std.testing.expectEqualSlices(u8, &bytes_a, opts.findPrecompiled(dummy, 0).?);
+    try std.testing.expectEqualSlices(u8, &bytes_b, opts.findPrecompiled(dummy, 2).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.findPrecompiled(dummy, 1));
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.findPrecompiled(dummy, 99));
 
     const empty_opts = Options{};
-    try std.testing.expectEqual(@as(?[]const u8, null), empty_opts.findPrecompiled(0));
+    try std.testing.expectEqual(@as(?[]const u8, null), empty_opts.findPrecompiled(dummy, 0));
+}
+
+test "Options.findPrecompiled scoped by core_wasm slice identity" {
+    // Two modules with the *same* local `module_idx = 0` (composed
+    // component case: each sub-component has its own indexing).
+    // Distinguished by `core_wasm` slice identity.
+    const mod_x_src = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const mod_y_src = [_]u8{ 0xCA, 0xFE, 0xBA, 0xBE };
+    const cwasm_x = [_]u8{ 1, 1, 1 };
+    const cwasm_y = [_]u8{ 2, 2, 2 };
+    const pcs = [_]PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = &cwasm_x, .core_wasm = &mod_x_src },
+        .{ .module_idx = 0, .cwasm_bytes = &cwasm_y, .core_wasm = &mod_y_src },
+    };
+    const opts = Options{ .precompiled_cores = &pcs };
+    try std.testing.expectEqualSlices(u8, &cwasm_x, opts.findPrecompiled(&mod_x_src, 0).?);
+    try std.testing.expectEqualSlices(u8, &cwasm_y, opts.findPrecompiled(&mod_y_src, 0).?);
+    // A third slice that matches neither (different ptr) returns null
+    // even though `module_idx` matches both entries.
+    const mod_z_src = [_]u8{ 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.findPrecompiled(&mod_z_src, 0));
 }
