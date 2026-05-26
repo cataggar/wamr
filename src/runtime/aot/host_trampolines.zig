@@ -117,15 +117,23 @@ pub const TrampolinePool = struct {
     slots: []Slot,
     next_slot: u32 = 0,
 
-    pub fn init(allocator: std.mem.Allocator) !TrampolinePool {
-        if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
-        switch (builtin.cpu.arch) {
-            .x86_64, .aarch64 => {},
-            else => return error.UnsupportedPlatform,
-        }
+    // Whether RWX trampoline pages are supported on the build target.
+    // Gated at comptime so the `std.posix.mmap` call below is not analysed
+    // on Windows / unsupported arches — that previously forced an explicit
+    // `linkLibC` on every binary reachable from `TrampolinePool.init`
+    // (broke `wamr.exe` Windows build under #662 Phase C, where the lazy
+    // pool ctor became reachable from the CLI).
+    const supports_pool: bool = blk: {
+        if (builtin.os.tag == .windows) break :blk false;
+        if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) break :blk false;
         // macOS aarch64 forbids RWX mmap without MAP_JIT + pthread_jit_write_protect_np;
         // not worth wiring up for stdio-echo's needs. AOT layer falls back to interp.
-        if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return error.UnsupportedPlatform;
+        if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) break :blk false;
+        break :blk true;
+    };
+
+    pub fn init(allocator: std.mem.Allocator) !TrampolinePool {
+        if (comptime !supports_pool) return error.UnsupportedPlatform;
 
         const slots = try allocator.alloc(Slot, MAX_SLOTS);
         errdefer allocator.free(slots);
@@ -227,6 +235,11 @@ pub const TrampolinePool = struct {
     }
 
     pub fn deinit(self: *TrampolinePool, allocator: std.mem.Allocator) void {
+        if (comptime !supports_pool) {
+            allocator.free(self.slots);
+            self.* = undefined;
+            return;
+        }
         if (g_active_pool == self) g_active_pool = null;
         std.posix.munmap(self.memory);
         allocator.free(self.slots);
