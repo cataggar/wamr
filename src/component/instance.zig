@@ -1365,6 +1365,14 @@ pub const InstantiationError = error{
     /// `linkImports` was called against an instance that already
     /// failed a previous link. Callers should `deinit` instead.
     LinkAlreadyPoisoned,
+    /// `Options.aot_only` was set, but at least one core has an
+    /// import or instantiation step the AOT runtime cannot satisfy
+    /// today. The matching `[aot reject] ...` log line names the
+    /// failing core + import. Surfaced by `wamr run` as a clear
+    /// "AOT cannot run this component" error. Library callers
+    /// that don't set `aot_only` keep the silent interp fallback.
+    /// See issue #644.
+    AotImportUnresolvable,
 };
 
 /// Instantiate a parsed component, producing a runnable ComponentInstance.
@@ -1439,7 +1447,17 @@ pub fn instantiateWithOptions(
         // the rust main core needs interp (canon.lower imports)
         // but the tiny shim core has no imports and looks AOT-
         // safe in isolation.
+        //
+        // When `options.aot_only` is set (the `wamr run` CLI
+        // mode), the silent fallback is OFF: any AOT-unresolvable
+        // core surfaces as `error.AotImportUnresolvable` so the
+        // caller can produce a clear "AOT cannot run this
+        // component" error instead of running on the interpreter.
+        // Library callers (tests, embedders) leave `aot_only` at
+        // its default (`false`) and keep today's behaviour.
+        const aot_only = inst.options.aot_only;
         const force_all_interp = blk: {
+            if (aot_only) break :blk false;
             for (component.core_instances) |expr2| {
                 const ie = switch (expr2) {
                     .instantiate => |x| x,
@@ -1466,6 +1484,44 @@ pub fn instantiateWithOptions(
             }
             break :blk false;
         };
+
+        // When `aot_only` is set, pre-flight every core's AOT-
+        // feasibility BEFORE attempting any partial instantiation.
+        // This way the typed error fires before we mutate
+        // `inst.core_instances` and before any side effects on
+        // the host side (preopens, etc.).
+        if (aot_only) {
+            for (component.core_instances) |expr2| {
+                const ie = switch (expr2) {
+                    .instantiate => |x| x,
+                    else => continue,
+                };
+                if (ie.module_idx >= component.core_modules.len) continue;
+                const cwasm_bytes = inst.options.findPrecompiled(ie.module_idx) orelse {
+                    std.log.warn(
+                        "[aot reject] core module {d} has no precompiled artifact; `wamr` is AOT-only (#644)",
+                        .{ie.module_idx},
+                    );
+                    return error.AotImportUnresolvable;
+                };
+                const mod_alloc = inst.module_arena.allocator();
+                const probe_mod = mod_alloc.create(aot_loader.AotModule) catch return error.OutOfMemory;
+                probe_mod.* = aot_loader.load(cwasm_bytes, mod_alloc) catch |err| {
+                    std.log.warn(
+                        "[aot reject] core module {d} failed AOT load: {s}",
+                        .{ ie.module_idx, @errorName(err) },
+                    );
+                    return error.AotImportUnresolvable;
+                };
+                if (firstUnsupportedAotImport(probe_mod)) |bad| {
+                    std.log.warn(
+                        "[aot reject] core module {d} import '{s}.{s}' ({s}) cannot be resolved by AOT yet (#644)",
+                        .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
+                    );
+                    return error.AotImportUnresolvable;
+                }
+            }
+        }
 
         for (component.core_instances, 0..) |expr, ci_idx| {
             switch (expr) {
@@ -1499,6 +1555,7 @@ pub fn instantiateWithOptions(
                             const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch break :aot_blk;
                             aot_module_ptr.* = aot_loader.load(cwasm_bytes, mod_alloc) catch |err| {
                                 std.log.warn("aot core load failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                                if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             };
                             if (firstUnsupportedAotImport(aot_module_ptr)) |bad| {
@@ -1512,6 +1569,7 @@ pub fn instantiateWithOptions(
                                     "aot core {d} has import '{s}.{s}' ({s}) that AOT cannot resolve yet; running on interpreter",
                                     .{ ie.module_idx, bad.module_name, bad.field_name, @tagName(bad.kind) },
                                 );
+                                if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             }
                             const imported_table_overrides_opt = resolveAotImportedTableOverrides(
@@ -1522,8 +1580,20 @@ pub fn instantiateWithOptions(
                                 ci_idx,
                                 ie.args,
                                 aot_module_ptr,
-                            ) catch break :aot_blk;
-                            const imported_table_overrides = imported_table_overrides_opt orelse break :aot_blk;
+                            ) catch {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: imported table override resolution failed", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
+                            const imported_table_overrides = imported_table_overrides_opt orelse {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: cross-instance table wiring not yet supported on AOT (#660)", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
                             defer if (imported_table_overrides.len > 0) allocator.free(imported_table_overrides);
 
                             const imported_memory_overrides_opt = resolveAotImportedMemoryOverrides(
@@ -1534,8 +1604,20 @@ pub fn instantiateWithOptions(
                                 ci_idx,
                                 ie.args,
                                 aot_module_ptr,
-                            ) catch break :aot_blk;
-                            const imported_memory_overrides = imported_memory_overrides_opt orelse break :aot_blk;
+                            ) catch {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: imported memory override resolution failed", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
+                            const imported_memory_overrides = imported_memory_overrides_opt orelse {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: cross-instance memory wiring not yet supported on AOT (#660)", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
                             defer if (imported_memory_overrides.len > 0) allocator.free(imported_memory_overrides);
 
                             const imported_global_overrides_opt = resolveAotImportedGlobalOverrides(
@@ -1546,17 +1628,31 @@ pub fn instantiateWithOptions(
                                 ci_idx,
                                 ie.args,
                                 aot_module_ptr,
-                            ) catch break :aot_blk;
-                            const imported_global_overrides = imported_global_overrides_opt orelse break :aot_blk;
+                            ) catch {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: imported global override resolution failed", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
+                            const imported_global_overrides = imported_global_overrides_opt orelse {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: cross-instance global wiring not yet supported on AOT (#660)", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
                             defer if (imported_global_overrides.len > 0) allocator.free(imported_global_overrides);
 
                             const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides) catch |err| {
                                 std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                                if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             };
                             aot_runtime.mapCodeExecutable(aot_inst_ptr) catch |err| {
                                 std.log.warn("aot core code-map failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                                 aot_runtime.destroy(aot_inst_ptr);
+                                if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             };
                             cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };

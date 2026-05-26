@@ -23132,6 +23132,14 @@ const abi_root = @import("canonical_abi.zig");
 pub const RunComponentError = error{
     LoadFailed,
     InstantiateFailed,
+    /// `Options.aot_only` was set on the component instantiation, but
+    /// at least one core has an import / wiring requirement the AOT
+    /// runtime cannot satisfy yet. The `[aot reject] ...` log lines
+    /// above this error name the failing core + import. Distinct from
+    /// `InstantiateFailed` so the CLI surfaces a clean "AOT cannot
+    /// run this component" message and exits nonzero — no silent
+    /// interp fallback in `wamr run`. See issue #644.
+    AotImportUnresolvable,
     LinkFailed,
     /// A deferred core-module `(start ...)` directive trapped while
     /// `linkImports` was draining the pending starts — typically a
@@ -23865,20 +23873,26 @@ pub fn populateWasiProviders(
 /// Run an already-loaded component. See `runComponentBytes` for the
 /// byte-level entry point and the policy notes that apply equally here.
 ///
-/// `precompiled_cores` opts individual embedded core modules into the
-/// AOT runtime (#625 / #642). Empty slice (the default) keeps every
+/// `opts.precompiled_cores` opts individual embedded core modules into
+/// the AOT runtime (#625 / #642). Empty slice (the default) keeps every
 /// core on the interpreter — byte-identical to the pre-#642 behaviour.
+/// `opts.aot_only = true` (set by `wamr run`) turns the legacy silent
+/// interp fallback into a typed `error.AotImportUnresolvable` instead
+/// (see issue #644).
 pub fn runLoadedComponent(
     component: *const ctypes_root.Component,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
-    precompiled_cores: []const core_backend.PrecompiledCore,
+    opts: core_backend.Options,
 ) RunComponentError!RunOutcome {
     const inst = instance_mod.instantiateWithOptions(
         component,
         allocator,
-        .{ .precompiled_cores = precompiled_cores },
-    ) catch return error.InstantiateFailed;
+        opts,
+    ) catch |err| switch (err) {
+        error.AotImportUnresolvable => return error.AotImportUnresolvable,
+        else => return error.InstantiateFailed,
+    };
     defer inst.deinit();
 
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
@@ -23941,7 +23955,7 @@ pub fn runComponentBytes(
     data: []const u8,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
-    precompiled_cores: []const core_backend.PrecompiledCore,
+    opts: core_backend.Options,
 ) RunComponentError!RunOutcome {
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
@@ -23954,9 +23968,9 @@ pub fn runComponentBytes(
     // `populateWasiProviders`; the missing piece was teaching the CLI to
     // call the right export. (#520)
     if (hasWasiCliRunP3Export(component_storage)) {
-        return runLoadedComponentP3(component_storage, allocator, adapter, precompiled_cores);
+        return runLoadedComponentP3(component_storage, allocator, adapter, opts);
     }
-    return runLoadedComponent(component_storage, allocator, adapter, precompiled_cores);
+    return runLoadedComponent(component_storage, allocator, adapter, opts);
 }
 
 /// Return true iff the top-level component exports a `wasi:cli/run@0.3.x`
@@ -24019,13 +24033,16 @@ pub fn runLoadedComponentP3(
     component: *const ctypes_root.Component,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
-    precompiled_cores: []const core_backend.PrecompiledCore,
+    opts: core_backend.Options,
 ) RunComponentError!RunOutcome {
     const inst = instance_mod.instantiateWithOptions(
         component,
         allocator,
-        .{ .precompiled_cores = precompiled_cores },
-    ) catch return error.InstantiateFailed;
+        opts,
+    ) catch |err| switch (err) {
+        error.AotImportUnresolvable => return error.AotImportUnresolvable,
+        else => return error.InstantiateFailed,
+    };
     defer inst.deinit();
 
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
@@ -24092,12 +24109,12 @@ pub fn runComponentBytesP3(
     data: []const u8,
     allocator: Allocator,
     adapter: *WasiCliAdapter,
-    precompiled_cores: []const core_backend.PrecompiledCore,
+    opts: core_backend.Options,
 ) RunComponentError!RunOutcome {
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
-    return runLoadedComponentP3(component_storage, allocator, adapter, precompiled_cores);
+    return runLoadedComponentP3(component_storage, allocator, adapter, opts);
 }
 
 pub const ServeHttpOptions = struct {
@@ -24340,12 +24357,12 @@ pub fn serveHttpComponentBytes(
     allocator: Allocator,
     adapter: *WasiCliAdapter,
     options: ServeHttpOptions,
-    precompiled_cores: []const core_backend.PrecompiledCore,
+    opts: core_backend.Options,
 ) anyerror!void {
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
-    return serveLoadedHttpComponent(component_storage, allocator, adapter, options, precompiled_cores);
+    return serveLoadedHttpComponent(component_storage, allocator, adapter, options, opts);
 }
 
 pub fn serveLoadedHttpComponent(
@@ -24353,13 +24370,16 @@ pub fn serveLoadedHttpComponent(
     allocator: Allocator,
     adapter: *WasiCliAdapter,
     options: ServeHttpOptions,
-    precompiled_cores: []const core_backend.PrecompiledCore,
+    opts: core_backend.Options,
 ) anyerror!void {
     const inst = instance_mod.instantiateWithOptions(
         component,
         allocator,
-        .{ .precompiled_cores = precompiled_cores },
-    ) catch return error.InstantiateFailed;
+        opts,
+    ) catch |err| switch (err) {
+        error.AotImportUnresolvable => return error.AotImportUnresolvable,
+        else => return error.InstantiateFailed,
+    };
     defer inst.deinit();
 
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
@@ -25078,7 +25098,7 @@ test "runLoadedComponent: matches versioned WASI import names" {
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
 
-    const outcome = try runLoadedComponent(&component, testing.allocator, &adapter, &.{});
+    const outcome = try runLoadedComponent(&component, testing.allocator, &adapter, .{});
     try testing.expect(outcome.is_ok);
     try testing.expectEqualStrings("hello, world!\n", adapter.getStdoutBytes());
 }
@@ -25366,7 +25386,7 @@ test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
     defer adapter.deinit();
     adapter.setStdinBytes("hello\n");
 
-    const outcome = runComponentBytes(data, arena_alloc, &adapter, &.{}) catch |err| {
+    const outcome = runComponentBytes(data, arena_alloc, &adapter, .{}) catch |err| {
         std.debug.print("stdio-echo run failed: {s}\n", .{@errorName(err)});
         std.debug.print("stdout so far: {s}\n", .{adapter.getStdoutBytes()});
         std.debug.print("stderr so far: {s}\n", .{adapter.getStderrBytes()});
@@ -25421,7 +25441,7 @@ test "stdio-echo: live host stdio via pipe-redirected fds (#474)" {
         );
         defer adapter.deinit();
 
-        const outcome = runComponentBytes(data, arena_alloc, &adapter, &.{}) catch |err| {
+        const outcome = runComponentBytes(data, arena_alloc, &adapter, .{}) catch |err| {
             _ = linux.close(stdout_fds[1]);
             std.debug.print("stdio-echo (live) run failed: {s}\n", .{@errorName(err)});
             return err;

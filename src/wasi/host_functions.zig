@@ -1071,7 +1071,7 @@ pub fn wasiSockSend(env_opaque: *anyopaque) types.HostFnError!void {
 
 /// Layout for `args_get` / `environ_get`: write `argv_ptrs` (one i32 pointer
 /// per entry) and the concatenated NUL-terminated strings to `argv_buf`.
-fn writeStringTable(mem: []u8, entries: []const []const u8, argv_ptrs: u32, argv_buf: u32) i32 {
+pub fn writeStringTable(mem: []u8, entries: []const []const u8, argv_ptrs: u32, argv_buf: u32) i32 {
     var buf_offset: u32 = 0;
     for (entries, 0..) |entry, i| {
         const ptr_slot = argv_ptrs + @as(u32, @intCast(i)) * 4;
@@ -1136,7 +1136,7 @@ fn stdioFiletype(host_fd: i32) wasi.Filetype {
     return .unknown;
 }
 
-fn ctxFdFdstatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
+pub fn ctxFdFdstatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     var entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
@@ -1179,7 +1179,7 @@ const stdio_in_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else s
 const stdio_out_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDOUT_FILENO;
 const stdio_err_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDERR_FILENO;
 
-fn ctxFdPrestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
+pub fn ctxFdPrestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const name = ctx.preopenName(u_fd) orelse return wasi_core.WASI_EBADF;
@@ -1191,7 +1191,7 @@ fn ctxFdPrestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxFdPrestatDirNameCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, path_ptr: u32, path_len: u32) i32 {
+pub fn ctxFdPrestatDirNameCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, path_ptr: u32, path_len: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const name = ctx.preopenName(u_fd) orelse return wasi_core.WASI_EBADF;
@@ -1201,13 +1201,13 @@ fn ctxFdPrestatDirNameCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, path_ptr: u32
     return wasi_core.WASI_ESUCCESS;
 }
 
-const FdIoOp = enum { read, write };
+pub const FdIoOp = enum { read, write };
 
 /// Linear-memory-driven fd_read/fd_write: parse the iov array, dispatch to
 /// posix syscalls on host_fd (regular files) or std.Io stream helpers
 /// (stdio). Updates `pos` for regular files and writes the byte count to
 /// `nresult_ptr`.
-fn ctxFdIoCore(
+pub fn ctxFdIoCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1333,7 +1333,7 @@ fn errnoToI32(e: anyerror) i32 {
     };
 }
 
-fn ctxFdSeekCore(
+pub fn ctxFdSeekCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1409,7 +1409,7 @@ fn pIoLookup(
     return .{ .ok = entry_ptr };
 }
 
-fn ctxFdPreadCore(
+pub fn ctxFdPreadCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1452,7 +1452,7 @@ fn ctxFdPreadCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxFdPwriteCore(
+pub fn ctxFdPwriteCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1505,7 +1505,7 @@ fn ctxFdPwriteCore(
 /// NUL). Truncates on overflow, matching the wasi-libc expectation that
 /// `bufused == buf_len` signals "more entries may exist; retry with the
 /// last complete entry's `d_next` cookie".
-fn ctxFdReaddirCore(
+pub fn ctxFdReaddirCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1626,7 +1626,7 @@ fn pathEscapesSandbox(path: []const u8) bool {
 /// `create_tmp_dir`) pass rights_base=0 expecting full access. fdflags
 /// (APPEND/DSYNC/NONBLOCK/RSYNC/SYNC) are cached on the FdEntry; we
 /// don't currently propagate them into host fcntl flags.
-fn ctxPathOpenCore(
+pub fn ctxPathOpenCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     dirfd: i32,
@@ -1874,7 +1874,7 @@ fn mapStdIoErr(err: anyerror) i32 {
     };
 }
 
-fn ctxPathFilestatGetCore(
+pub fn ctxPathFilestatGetCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1895,7 +1895,7 @@ fn ctxPathFilestatGetCore(
     return writeFilestat(mem, buf_ptr, stat, filetype);
 }
 
-fn ctxPathFilestatSetTimesCore(
+pub fn ctxPathFilestatSetTimesCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1936,7 +1936,7 @@ fn ctxPathFilestatSetTimesCore(
     return mapLinuxErrno(rc);
 }
 
-fn ctxPathCreateDirectoryCore(
+pub fn ctxPathCreateDirectoryCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1952,7 +1952,7 @@ fn ctxPathCreateDirectoryCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxPathRemoveDirectoryCore(
+pub fn ctxPathRemoveDirectoryCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1968,7 +1968,7 @@ fn ctxPathRemoveDirectoryCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxPathUnlinkFileCore(
+pub fn ctxPathUnlinkFileCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -1984,7 +1984,7 @@ fn ctxPathUnlinkFileCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxPathLinkCore(
+pub fn ctxPathLinkCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     old_fd: i32,
@@ -2019,7 +2019,7 @@ fn ctxPathLinkCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxPathRenameCore(
+pub fn ctxPathRenameCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     old_fd: i32,
@@ -2046,7 +2046,7 @@ fn ctxPathRenameCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxPathSymlinkCore(
+pub fn ctxPathSymlinkCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     old_path_ptr: u32,
@@ -2075,7 +2075,7 @@ fn ctxPathSymlinkCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxPathReadlinkCore(
+pub fn ctxPathReadlinkCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -2139,7 +2139,7 @@ fn filetypeFromIoKind(kind: std.Io.File.Kind) wasi.Filetype {
     };
 }
 
-fn ctxFdFilestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
+pub fn ctxFdFilestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
@@ -2177,7 +2177,7 @@ fn writeFilestatSynthesised(mem: []u8, buf_ptr: u32, filetype: wasi.Filetype) i3
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxFdFilestatSetSizeCore(ctx: *wasi.WasiCtx, fd: i32, size: i64) i32 {
+pub fn ctxFdFilestatSetSizeCore(ctx: *wasi.WasiCtx, fd: i32, size: i64) i32 {
     if (size < 0) return wasi_core.WASI_EINVAL;
     if (fd < 0) return wasi_core.WASI_EBADF;
 
@@ -2194,7 +2194,7 @@ fn ctxFdFilestatSetSizeCore(ctx: *wasi.WasiCtx, fd: i32, size: i64) i32 {
     return mapLinuxErrno(rc);
 }
 
-fn ctxFdFilestatSetTimesCore(ctx: *wasi.WasiCtx, fd: i32, atim: u64, mtim: u64, fst_flags: u16) i32 {
+pub fn ctxFdFilestatSetTimesCore(ctx: *wasi.WasiCtx, fd: i32, atim: u64, mtim: u64, fst_flags: u16) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const exclusive = wasi.FSTFLAGS_ATIM | wasi.FSTFLAGS_ATIM_NOW;
     if ((fst_flags & exclusive) == exclusive) return wasi_core.WASI_EINVAL;
@@ -2223,7 +2223,7 @@ fn nsToFutimens(ns: u64, flags: u16, set_bit: u16, now_bit: u16) std.os.linux.ti
     return .{ .sec = sec, .nsec = nsec };
 }
 
-fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
+pub fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     if ((fdflags & ~wasi.FDFLAGS_ALL) != 0) return wasi_core.WASI_EINVAL;
 
@@ -2258,7 +2258,7 @@ fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxFdFdstatSetRightsCore(ctx: *wasi.WasiCtx, fd: i32, base: u64, inheriting: u64) i32 {
+pub fn ctxFdFdstatSetRightsCore(ctx: *wasi.WasiCtx, fd: i32, base: u64, inheriting: u64) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
@@ -2273,7 +2273,7 @@ fn ctxFdFdstatSetRightsCore(ctx: *wasi.WasiCtx, fd: i32, base: u64, inheriting: 
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxFdAdviseCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64, advice: u8) i32 {
+pub fn ctxFdAdviseCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64, advice: u8) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     if (offset < 0 or len < 0) return wasi_core.WASI_EINVAL;
     if (advice > @intFromEnum(wasi.Advice.noreuse)) return wasi_core.WASI_EINVAL;
@@ -2298,7 +2298,7 @@ fn ctxFdAdviseCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64, advice: u
     return mapLinuxErrno(rc);
 }
 
-fn ctxFdAllocateCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64) i32 {
+pub fn ctxFdAllocateCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     if (offset < 0 or len < 0) return wasi_core.WASI_EINVAL;
 
@@ -2332,9 +2332,9 @@ fn ctxFdAllocateCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64) i32 {
     return mapLinuxErrno(rc);
 }
 
-const SyncMode = enum { data, full };
+pub const SyncMode = enum { data, full };
 
-fn ctxFdSyncCore(ctx: *wasi.WasiCtx, fd: i32, mode: SyncMode) i32 {
+pub fn ctxFdSyncCore(ctx: *wasi.WasiCtx, fd: i32, mode: SyncMode) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
@@ -2373,7 +2373,7 @@ fn ctxFdSyncCore(ctx: *wasi.WasiCtx, fd: i32, mode: SyncMode) i32 {
 /// rejected in the `to` slot because overwriting stdio with another
 /// resource is more invasive than the test exercises and risks
 /// interfering with the host runtime's own stdio.
-fn ctxFdRenumberCore(ctx: *wasi.WasiCtx, from: i32, to: i32) i32 {
+pub fn ctxFdRenumberCore(ctx: *wasi.WasiCtx, from: i32, to: i32) i32 {
     if (from < 0 or to < 0) return wasi_core.WASI_EBADF;
     const u_from: u32 = @intCast(from);
     const u_to: u32 = @intCast(to);
@@ -2406,7 +2406,7 @@ fn ctxFdRenumberCore(ctx: *wasi.WasiCtx, from: i32, to: i32) i32 {
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn ctxFdTellCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, offset_ptr: u32) i32 {
+pub fn ctxFdTellCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, offset_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
@@ -2570,7 +2570,7 @@ const PendingFd = struct {
     pollfd_index: ?usize,
 };
 
-fn ctxPollOneoffCore(
+pub fn ctxPollOneoffCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     in_ptr: i32,
@@ -2880,7 +2880,7 @@ fn ctxPollOneoffCore(
 /// are negative-path (bad fd, non-socket fd) so this implementation is
 /// classification-heavy; the real `shutdown(2)` call only fires for the
 /// `entry.kind == .socket` path with a valid `host_fd`.
-fn ctxSockShutdownCore(ctx: *wasi.WasiCtx, fd: i32, sdflags: i32) i32 {
+pub fn ctxSockShutdownCore(ctx: *wasi.WasiCtx, fd: i32, sdflags: i32) i32 {
     if (comptime builtin.os.tag == .windows) return wasi_core.WASI_ENOSYS;
 
     if (sdflags < 0) return wasi_core.WASI_EINVAL;
@@ -2986,7 +2986,7 @@ fn readRecvIovecs(
 /// on failure. `fdflags` may carry `FDFLAGS_NONBLOCK` — any other bit is
 /// rejected with `EINVAL`. The accepted fd is installed as a `.socket`
 /// `FdEntry` with `SOCKET_BASE_RIGHTS`.
-fn ctxSockAcceptCore(
+pub fn ctxSockAcceptCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -3047,7 +3047,7 @@ fn ctxSockAcceptCore(
 /// bitset onto `MSG_*`, and runs `recvmsg(2)`. Writes the byte count to
 /// `ro_datalen_ptr` and a (currently always 0) roflags bitset to
 /// `ro_flags_ptr`.
-fn ctxSockRecvCore(
+pub fn ctxSockRecvCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,
@@ -3115,7 +3115,7 @@ fn ctxSockRecvCore(
 /// 0). Builds an `iovec_const` array from guest memory (capped at
 /// `SOCK_IOV_MAX`) and runs `sendmsg(2)` with `MSG_NOSIGNAL` so a
 /// terminated peer surfaces as `EPIPE` instead of `SIGPIPE` on the host.
-fn ctxSockSendCore(
+pub fn ctxSockSendCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     fd: i32,

@@ -124,7 +124,6 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     var tls_cert_path: ?[]const u8 = null;
     var tls_key_path: ?[]const u8 = null;
     var tls_pem_path: ?[]const u8 = null;
-    var stack_size: u32 = 64 * 1024;
     // `--log-level=<name>` (#583 B5). Sets the host-side
     // `wasi:logging/logging.log` severity filter. The CLI flag wins
     // over the `WAMR_LOG_LEVEL` env var, which is consulted at the
@@ -139,10 +138,11 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         const arg = run_args[i];
         if (!past_options and arg.len > 0 and arg[0] == '-') {
             if (std.mem.startsWith(u8, arg, "--stack-size=")) {
-                stack_size = std.fmt.parseInt(u32, arg["--stack-size=".len..], 10) catch {
-                    std.debug.print("error: invalid --stack-size value\n", .{});
-                    return 2;
-                };
+                // #644: the interpreter stack-size knob is now a no-op
+                // since the CLI is AOT-only. Accept the flag silently
+                // so existing invocations keep working; warn once on
+                // stderr so out-of-tree callers can adapt.
+                std.debug.print("warning: --stack-size is ignored under the AOT-only CLI (issue #644)\n", .{});
             } else if (std.mem.eql(u8, arg, "--listen") or std.mem.startsWith(u8, arg, "--listen=")) {
                 if (listen_address != null) {
                     std.debug.print("error: --listen specified more than once; only one listening socket preopen is supported\n", .{});
@@ -438,22 +438,41 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 std.debug.print("Error: --config-store '{s}': {}\n", .{ config_store_path orelse "", err });
                 return 2;
             };
-            // #642: resolve the AOT precompiled-cores bundle.
+            // #642 / #644: resolve the AOT precompiled-cores bundle. The
+            // `wamr` CLI is AOT-only — every component core must be
+            // available as a precompiled `.cwasm`, or instantiation
+            // fails hard with `error.AotImportUnresolvable` (the
+            // interp fallback is disabled at the CLI surface; library
+            // callers still get the legacy silent demotion by leaving
+            // `Options.aot_only` unset).
             //
-            //  * `--precompiled-dir <path>` (explicit, mandatory): any
-            //    error opening / validating the manifest is fatal so the
-            //    user knows the AOT path isn't being taken.
-            //  * sibling `<input>.cwasm.d/manifest.json` (auto-detect,
-            //    best-effort): mismatch / stale / missing → one
+            //  * `--precompiled-dir <path>` (explicit): any error
+            //    opening / validating the manifest is fatal so the user
+            //    knows the AOT path isn't being taken.
+            //  * sibling `<input>.cwasm.d/manifest.json` (auto-detect):
+            //    used when present and valid; mismatch / stale → one
             //    `warning: ...` line on stderr and we fall through to
-            //    the interpreter path (matches wasmtime's behaviour).
+            //    the in-memory auto-precompile path below.
+            //  * neither found → AOT-compile each core to memory on
+            //    the fly. Single-run cost; users who care about
+            //    cold-start should `wamrc compile-component` once and
+            //    pass `--precompiled-dir` or use a sibling
+            //    `<input>.cwasm.d`.
             //
             // The `LoadedManifest`'s lifetime must outlive
             // `runComponent` / `runHttpComponent` because the mmapped
             // `.cwasm` buffers it owns are borrowed by the
             // `PrecompiledCore` slice handed to the instance loader.
+            // The in-memory auto-precompile path owns its `.cwasm`
+            // slices on `allocator`; the defer below frees them.
             var loaded_manifest: ?wamr.component_aot.LoadedManifest = null;
             defer if (loaded_manifest) |*lm| lm.deinit();
+
+            var auto_cores: std.ArrayListUnmanaged(wamr.component_core_backend.PrecompiledCore) = .empty;
+            defer {
+                for (auto_cores.items) |pc| allocator.free(pc.cwasm_bytes);
+                auto_cores.deinit(allocator);
+            }
 
             if (precompiled_dir) |dir| {
                 loaded_manifest = wamr.component_aot.loadManifest(allocator, dir, wasm_data) catch |err| {
@@ -464,8 +483,9 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 std.debug.print("wamr: loaded AOT bundle from {s} ({d} core{s} precompiled)\n", .{ dir, n, if (n == 1) @as([]const u8, "") else "s" });
             } else {
                 // Auto-probe `<input>.cwasm.d/manifest.json`. Don't
-                // fail the run if the bundle is absent / stale — just
-                // tell the user we're skipping it.
+                // fail the run if the bundle is absent / stale — fall
+                // through to the in-memory auto-precompile path
+                // below.
                 const sibling = wamr.component_aot.defaultPrecompiledDirFor(allocator, path) catch return 1;
                 defer allocator.free(sibling);
                 const probe = std.fs.path.join(allocator, &.{ sibling, "manifest.json" }) catch return 1;
@@ -486,9 +506,59 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                         std.debug.print("warning: ignoring AOT bundle at {s}: {s}\n", .{ sibling, loadManifestErrorMessage(err) });
                     }
                 }
+
+                // #644: no on-disk bundle → AOT-compile every core to
+                // memory now. The cwasm slices live on `allocator`
+                // (freed by the outer defer) so they outlive both the
+                // parser arena and the `runComponent` call.
+                if (loaded_manifest == null) {
+                    var load_arena = std.heap.ArenaAllocator.init(allocator);
+                    defer load_arena.deinit();
+                    const parsed = wamr.component_loader.load(wasm_data, load_arena.allocator()) catch |err| {
+                        std.debug.print("Error: failed to parse component for auto-precompile: {s}\n", .{@errorName(err)});
+                        return 1;
+                    };
+                    const ncore = parsed.core_modules.len;
+                    if (ncore == 0) {
+                        std.debug.print("Error: component contains no core modules\n", .{});
+                        return 1;
+                    }
+                    std.debug.print(
+                        "wamr: auto-precompiling {d} core{s} in memory (no on-disk bundle; pass --precompiled-dir or run `wamrc compile-component` to persist)\n",
+                        .{ ncore, if (ncore == 1) @as([]const u8, "") else "s" },
+                    );
+                    auto_cores.ensureTotalCapacity(allocator, ncore) catch return 1;
+                    for (parsed.core_modules, 0..) |cm, idx| {
+                        const cwasm = wamr.component_aot.compileCoreWasm(allocator, cm.data, .{}) catch |err| {
+                            std.debug.print(
+                                "Error: auto-precompile failed for core module {d}: {s} (issue #644)\n",
+                                .{ idx, @errorName(err) },
+                            );
+                            return 1;
+                        };
+                        auto_cores.appendAssumeCapacity(.{
+                            .module_idx = @intCast(idx),
+                            .cwasm_bytes = cwasm,
+                        });
+                    }
+                }
             }
             const precompiled_cores: []const wamr.component_core_backend.PrecompiledCore =
-                if (loaded_manifest) |lm| lm.precompiledCores() else &.{};
+                if (loaded_manifest) |lm| lm.precompiledCores() else auto_cores.items;
+
+            // #644: AOT-only policy. `wamr run` requires a precompiled
+            // bundle for every component — there is no interp fallback
+            // at the CLI surface. With auto-precompile above this
+            // should only fire when the component had no core modules
+            // (an empty / malformed input that survived parsing).
+            if (precompiled_cores.len == 0) {
+                std.debug.print(
+                    "Error: component has no AOT-compiled cores and `wamr run` is AOT-only.\n" ++
+                        "  See issue #644.\n",
+                    .{},
+                );
+                return 2;
+            }
 
             if (listen_address) |addr| {
                 // Load + parse the TLS cert + key at startup, so a
@@ -515,11 +585,146 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         }
     }
 
-    // Wasm module (core). `--listen` registers a TCP listening socket as a
-    // socket preopen (kind = .socket, fd ≥ 3) for the guest's WASI preview1
-    // sock_accept. The component-model branch above already handled --listen
-    // for HTTP servers.
-    return runWasm(wasm_data, stack_size, path, &wasm_args, env_flags.items, map_dirs.items, listen_address, allocator, io);
+    // Plain core wasm. The `wamr` CLI is AOT-only as of #644 — there
+    // is no interp fallback at the CLI surface. Auto-compile the
+    // module in-process to AOT and run it through the AOT runtime
+    // with WASI preview1 wired up via `src/runtime/aot/host_bridge.zig`.
+    if (comptime !aot_supported) {
+        std.debug.print(
+            "Error: AOT execution is not supported on this architecture, and `wamr run` is AOT-only.\n" ++
+                "  See issue #644.\n",
+            .{},
+        );
+        return 1;
+    }
+    if (listen_address != null) {
+        std.debug.print("Error: --listen is not supported for plain core wasm modules (use a component)\n", .{});
+        return 2;
+    }
+    return runCoreAot(
+        init.io,
+        allocator,
+        wasm_data,
+        wasm_args.items,
+        env_flags.items,
+        init.environ_map,
+        map_dirs.items,
+    );
+}
+
+/// Compile a plain core-wasm module to AOT in-process and execute it
+/// with WASI preview1 host functions resolved via the AOT host
+/// bridge (`src/runtime/aot/host_bridge.zig`). This is the only
+/// supported path for `\0asm` (core) inputs after #644 — the legacy
+/// interpreter `runWasm` was removed. The interpreter remains
+/// available as a library for tests / embedders.
+fn runCoreAot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    wasm_data: []const u8,
+    wasm_args: []const []const u8,
+    env_flags: []const []const u8,
+    environ_map: *const std.process.Environ.Map,
+    map_dirs: []const MapDir,
+) u8 {
+    const aot_loader = wamr.aot_loader;
+    const aot_runtime = wamr.aot_runtime;
+
+    // 1. Build the WasiCtx (args, env, preopens). Same lifetime model
+    // as runComponent: borrows strings from caller-owned slices.
+    var ctx = wamr.WasiCtx.init(allocator, io) catch |err| {
+        std.debug.print("Error: failed to init WASI ctx: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer ctx.deinit();
+
+    // argv[0] is the wasm filename (matches the interpreter precedent).
+    // We can't pass `path` here because the caller-side variable lives
+    // higher up; pick "wasm" as a stable placeholder (wasi-libc only
+    // uses argv[0] for `program_invocation_name`, not for routing).
+    var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch return 1;
+    defer allocator.free(argv_buf);
+    argv_buf[0] = "wasm";
+    for (wasm_args, 0..) |a, i| argv_buf[1 + i] = a;
+    ctx.setArgs(argv_buf);
+
+    var env_buf: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer env_buf.deinit(allocator);
+    if (env_flags.len > 0) {
+        env_buf.ensureTotalCapacity(allocator, env_flags.len) catch return 1;
+        for (env_flags) |kv| env_buf.appendAssumeCapacity(kv);
+    } else {
+        var it = environ_map.array_hash_map.iterator();
+        while (it.next()) |kv| {
+            // wasi-libc expects "NAME=value" strings.
+            const joined = std.fmt.allocPrint(allocator, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* }) catch return 1;
+            env_buf.append(allocator, joined) catch {
+                allocator.free(joined);
+                return 1;
+            };
+        }
+    }
+    defer if (env_flags.len == 0) {
+        // Only free strings we allocated ourselves above.
+        for (env_buf.items) |s| allocator.free(s);
+    };
+    ctx.setEnv(env_buf.items);
+
+    for (map_dirs) |md| {
+        _ = ctx.openMappedDir(md.host_path, md.guest_name) catch |err| {
+            std.debug.print("Error: --map-dir '{s}::{s}': {s}\n", .{ md.host_path, md.guest_name, @errorName(err) });
+            return 1;
+        };
+    }
+
+    // 2. AOT-compile the core wasm in-process. `compileCoreWasm` mirrors
+    // `wamrc compile` exactly so the same artifact would be produced.
+    const cwasm = wamr.component_aot.compileCoreWasm(allocator, wasm_data, .{}) catch |err| {
+        std.debug.print("Error: failed to AOT-compile core wasm: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer allocator.free(cwasm);
+
+    const aot_module = aot_loader.load(cwasm, allocator) catch |err| {
+        std.debug.print("Error: failed to load freshly compiled AOT module: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer aot_loader.unload(&aot_module, allocator);
+
+    const inst = aot_runtime.instantiate(&aot_module, allocator) catch |err| {
+        std.debug.print("Error: failed to instantiate AOT module: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer aot_runtime.destroy(inst);
+
+    aot_runtime.mapCodeExecutable(inst) catch |err| {
+        std.debug.print("Error: failed to map AOT code as executable: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    // 3. Wire the WasiCtx so the AOT WASI adapters in
+    // `runtime/aot/host_bridge.zig` can resolve it via `vmctx.wasi_ctx`.
+    inst.wasi_ctx = @intFromPtr(ctx);
+
+    const func_idx = aot_runtime.findExportFunc(inst, "_start") orelse
+        aot_runtime.findExportFunc(inst, "main") orelse {
+        std.debug.print("Error: no _start or main export\n", .{});
+        return 1;
+    };
+
+    // `_start` / `main` take no params and return no values for the
+    // wasi-libc CRT shape; route through `callFuncScalar` with empty
+    // slices. Any guest call to `proc_exit` short-circuits via
+    // `std.process.exit` inside the host bridge.
+    var results_buf: [0]wamr.aot_runtime.ScalarResult = .{};
+    _ = aot_runtime.callFuncScalar(inst, func_idx, &.{}, &.{}, &.{}, &results_buf) catch |err| {
+        std.debug.print("Error: AOT execution failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    // If the guest never called proc_exit, exit_code is null → success.
+    if (ctx.exit_code) |code| return @intCast(code & 0xFF);
+    return 0;
 }
 
 fn parseMapDir(spec: []const u8) !MapDir {
@@ -763,7 +968,10 @@ fn runComponent(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const outcome = adapter_mod.runComponentBytes(data, arena_alloc, &adapter, precompiled_cores) catch |err| {
+    const outcome = adapter_mod.runComponentBytes(data, arena_alloc, &adapter, .{
+        .precompiled_cores = precompiled_cores,
+        .aot_only = true,
+    }) catch |err| {
         switch (err) {
             error.NoRunExport => std.debug.print(
                 "Error: component does not expose a top-level `run` export. " ++
@@ -776,7 +984,15 @@ fn runComponent(
                 .{},
             ),
             error.LoadFailed => std.debug.print("Error: failed to load component\n", .{}),
-            error.InstantiateFailed => std.debug.print("Error: failed to instantiate component\n", .{}),
+            error.AotImportUnresolvable => std.debug.print(
+                "Error: AOT cannot run this component yet. The `wamr` CLI is AOT-only (see [aot reject] log line(s) above for the failing import). " ++
+                    "Use the library API directly to run on the interpreter (issue #644).\n",
+                .{},
+            ),
+            error.InstantiateFailed => std.debug.print(
+                "Error: failed to instantiate component (the `wamr` CLI runs all components through the AOT runtime; see issue #644)\n",
+                .{},
+            ),
             error.StartTrapped => std.debug.print(
                 "Error: component trapped during initialization (a core (start ...) directive — typically `_initialize` — failed; see [component init trap] line above for details)\n",
                 .{},
@@ -833,7 +1049,10 @@ fn runHttpComponent(
         .listen_address = listen_address,
         .announce_listening = listen_address.getPort() == 0,
         .tls_config = tls_config,
-    }, precompiled_cores) catch |err| {
+    }, .{
+        .precompiled_cores = precompiled_cores,
+        .aot_only = true,
+    }) catch |err| {
         switch (err) {
             error.NoIncomingHandlerExport => std.debug.print(
                 "Error: component does not export `wasi:http/incoming-handler.handle`.\n",
@@ -854,6 +1073,11 @@ fn runHttpComponent(
             ),
             error.AcceptFailed => std.debug.print("Error: failed to accept HTTP connection\n", .{}),
             error.LoadFailed => std.debug.print("Error: failed to load component\n", .{}),
+            error.AotImportUnresolvable => std.debug.print(
+                "Error: AOT cannot run this component yet. The `wamr` CLI is AOT-only (see [aot reject] log line(s) above for the failing import). " ++
+                    "Use the library API directly to run on the interpreter (issue #644).\n",
+                .{},
+            ),
             error.InstantiateFailed => std.debug.print("Error: failed to instantiate component\n", .{}),
             else => std.debug.print("Error: HTTP server failed: {}\n", .{err}),
         }
@@ -918,221 +1142,6 @@ fn runAotReal(data: []const u8, allocator: std.mem.Allocator) u8 {
     return 0;
 }
 
-fn runWasm(
-    wasm_data: []const u8,
-    stack_size: u32,
-    wasm_path: []const u8,
-    wasm_args: *std.ArrayListUnmanaged([]const u8),
-    env_flags: []const []const u8,
-    map_dirs: []const MapDir,
-    listen_address: ?std.Io.net.IpAddress,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-) u8 {
-    var runtime = wamr.wamr.Runtime.init(allocator);
-    defer runtime.deinit();
-
-    var module = runtime.loadModule(wasm_data) catch |err| {
-        std.debug.print("Error: failed to load module: {}\n", .{err});
-        return 1;
-    };
-    defer module.deinit();
-
-    var instance = module.instantiate() catch |err| {
-        std.debug.print("Error: failed to instantiate: {}\n", .{err});
-        return 1;
-    };
-    defer instance.deinit();
-
-    const start_func = module.findExport("_start", .function) orelse
-        module.findExport("main", .function) orelse {
-        std.debug.print("Error: no _start or main function exported\n", .{});
-        return 1;
-    };
-
-    const func_type = module.inner.getFuncType(start_func.index);
-    const param_count = if (func_type) |ft| ft.params.len else 0;
-
-    var env = wamr.exec_env.ExecEnv.create(instance.inner, stack_size, allocator) catch |err| {
-        std.debug.print("Error: failed to create execution environment: {}\n", .{err});
-        return 1;
-    };
-    defer env.destroy();
-
-    // Build argv for WASI: [wasm_path, wasm_args...]
-    var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv_list.deinit(allocator);
-    argv_list.append(allocator, wasm_path) catch return 1;
-    for (wasm_args.items) |a| argv_list.append(allocator, a) catch return 1;
-
-    var ctx = wamr.WasiCtx.init(allocator, io) catch |err| {
-        std.debug.print("Error: failed to create WASI context: {}\n", .{err});
-        return 1;
-    };
-    defer ctx.deinit();
-
-    ctx.setArgs(argv_list.items);
-    ctx.setEnv(env_flags);
-
-    for (map_dirs) |md| {
-        _ = ctx.openMappedDir(md.host_path, md.guest_name) catch |err| {
-            std.debug.print("Error: cannot pre-open '{s}' as '{s}': {}\n", .{ md.host_path, md.guest_name, err });
-            return 1;
-        };
-    }
-
-    if (listen_address) |addr| {
-        const listen_fd = openListenSocket(addr) catch |err| {
-            switch (err) {
-                error.AddressInUse => std.debug.print(
-                    "Error: --listen address already in use (another process is bound to this port)\n",
-                    .{},
-                ),
-                else => std.debug.print("Error: --listen bind failed: {}\n", .{err}),
-            }
-            return 1;
-        };
-        if (addr.getPort() == 0) {
-            // Ephemeral-port bind requested. Read back the kernel-resolved
-            // address and print it so test drivers can scrape the line.
-            if (resolvedBoundAddress(listen_fd)) |bound| {
-                var buf: [128]u8 = undefined;
-                const line = std.fmt.bufPrint(&buf, "Listening on {f}\n", .{bound}) catch buf[0..0];
-                writeStdout(io, line);
-            } else |_| {}
-        }
-        _ = ctx.addPreopenSocket(listen_fd) catch |err| {
-            std.debug.print("Error: cannot register --listen socket preopen: {}\n", .{err});
-            return 1;
-        };
-    }
-
-    env.wasi_ctx = @ptrCast(ctx);
-
-    if (param_count >= 2) {
-        env.pushI32(@intCast(wasm_args.items.len + 1)) catch {};
-        env.pushI32(0) catch {};
-    }
-
-    wamr.interp.executeFunction(env, start_func.index) catch |err| {
-        if (ctx.exit_code) |code| return @intCast(code);
-        std.debug.print("Error: execution trapped: {}\n", .{err});
-        return 1;
-    };
-
-    if (ctx.exit_code) |code| return @intCast(code);
-    return 0;
-}
-
-/// Bind a TCP socket to `addr` and put it in the listen state. Used by the
-/// core wasm `--listen=` flow to register the listener as a socket
-/// preopen (fd ≥ 3) for the guest's WASI preview1 sock_accept. Backlog
-/// matches `SOMAXCONN` on modern Linux (128 is the historical floor).
-///
-/// Implemented with raw `std.os.linux` syscalls because the cross-platform
-/// `std.posix.{socket,bind,listen,close}` wrappers were removed in Zig 0.16.0.
-/// `--listen` is therefore Linux-only on the core-wasm path; the CLI
-/// front-end rejects it elsewhere.
-/// Errors that can come back from `openListenSocket`. Explicitly
-/// declared (rather than `!`) so the caller's `catch |err| switch (err)`
-/// at line 503 sees the same set on every target — on non-Linux the
-/// comptime gate causes inference to narrow to just
-/// `{UnsupportedPlatform}`, and the macOS / Windows builds fail to
-/// type-check the `error.AddressInUse` arm.
-const OpenListenSocketError = error{
-    UnsupportedPlatform,
-    SocketFailed,
-    BindFailed,
-    AddressInUse,
-    ListenFailed,
-};
-
-fn openListenSocket(addr: std.Io.net.IpAddress) OpenListenSocketError!std.posix.fd_t {
-    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    const linux = std.os.linux;
-
-    const family: u32 = switch (addr) {
-        .ip4 => linux.AF.INET,
-        .ip6 => linux.AF.INET6,
-    };
-    const sock_type: u32 = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
-    const sock_rc = linux.socket(family, sock_type, linux.IPPROTO.TCP);
-    if (linux.errno(sock_rc) != .SUCCESS) return error.SocketFailed;
-    const fd: std.posix.fd_t = @intCast(@as(isize, @bitCast(sock_rc)));
-    errdefer _ = linux.close(fd);
-
-    // No SO_REUSEADDR / SO_REUSEPORT: exclusive bind so a second wamr
-    // started on the same port fails fast with `EADDRINUSE`. The kernel
-    // holds the port in TIME_WAIT for a few seconds after a clean
-    // shutdown; that's the intended trade-off (mirrors the component
-    // HTTP listener in `serveLoadedHttpComponent`).
-
-    switch (addr) {
-        .ip4 => |v4| {
-            const sa = linux.sockaddr.in{
-                .port = std.mem.nativeToBig(u16, v4.port),
-                .addr = @bitCast(v4.bytes),
-            };
-            const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
-            switch (linux.errno(b)) {
-                .SUCCESS => {},
-                .ADDRINUSE => return error.AddressInUse,
-                else => return error.BindFailed,
-            }
-        },
-        .ip6 => |v6| {
-            const sa = linux.sockaddr.in6{
-                .port = std.mem.nativeToBig(u16, v6.port),
-                .flowinfo = v6.flow,
-                .addr = v6.bytes,
-                .scope_id = v6.interface.index,
-            };
-            const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
-            switch (linux.errno(b)) {
-                .SUCCESS => {},
-                .ADDRINUSE => return error.AddressInUse,
-                else => return error.BindFailed,
-            }
-        },
-    }
-
-    const lr = linux.listen(fd, 128);
-    if (linux.errno(lr) != .SUCCESS) return error.ListenFailed;
-    return fd;
-}
-
-/// Read back the kernel-resolved local address of a bound listening socket
-/// via `getsockname(2)`. Used to surface the ephemeral port assigned when
-/// the caller requested `:0`.
-fn resolvedBoundAddress(fd: std.posix.fd_t) !std.Io.net.IpAddress {
-    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    const linux = std.os.linux;
-
-    var storage: linux.sockaddr.storage = undefined;
-    var len: linux.socklen_t = @sizeOf(linux.sockaddr.storage);
-    const rc = linux.getsockname(fd, @ptrCast(&storage), &len);
-    if (linux.errno(rc) != .SUCCESS) return error.GetSockNameFailed;
-
-    return switch (storage.family) {
-        linux.AF.INET => blk: {
-            const sa: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
-            break :blk .{ .ip4 = .{
-                .port = std.mem.bigToNative(u16, sa.port),
-                .bytes = @bitCast(sa.addr),
-            } };
-        },
-        linux.AF.INET6 => blk: {
-            const sa: *const linux.sockaddr.in6 = @ptrCast(@alignCast(&storage));
-            break :blk .{ .ip6 = .{
-                .port = std.mem.bigToNative(u16, sa.port),
-                .flow = sa.flowinfo,
-                .bytes = sa.addr,
-                .interface = .{ .index = sa.scope_id },
-            } };
-        },
-        else => error.UnsupportedAddressFamily,
-    };
-}
 
 fn writeStdout(io: std.Io, text: []const u8) void {
     var stdout_file = std.Io.File.stdout();
@@ -1186,13 +1195,19 @@ const top_usage =
 const run_usage =
     \\Usage: wamr run [options] <file.wasm|file.cwasm> [args...]
     \\
+    \\The `wamr` CLI is AOT-only (issue #644):
+    \\  * `.cwasm`/`.aot` core modules (magic `\0aot`) run via the AOT
+    \\    runtime directly.
+    \\  * Component-model `.wasm` files run via AOT cores loaded from a
+    \\    `wamrc compile-component` bundle (see --precompiled-dir below).
+    \\    Components without a bundle fail with a clear error.
+    \\  * Plain core wasm modules are not supported — pre-compile to
+    \\    `.cwasm`/`.aot` first.
+    \\
     \\Options:
-    \\  --stack-size=<bytes>     Stack size for the interpreter (default: 65536)
+    \\  --stack-size=<bytes>     (ignored; kept for backward compat)
     \\  --heap-size=<bytes>      Reserved (currently ignored)
     \\  --listen[=<ip:port>]     For components: serve WASI HTTP on the address.
-    \\                           For core wasm: bind a TCP listening socket and
-    \\                           expose it to the guest as the next preopen fd
-    \\                           (≥ 3) for `sock_accept` (single use only).
     \\                           Port 0 (and bare `--listen`, which means
     \\                           127.0.0.1:0) requests a kernel-assigned
     \\                           ephemeral port; the resolved address is
@@ -1239,15 +1254,10 @@ const run_usage =
     \\  --precompiled-dir PATH   For components: load AOT-compiled cores from
     \\                           a `wamrc compile-component` output directory
     \\                           (containing manifest.json + module<N>.cwasm).
-    \\                           Cores in the bundle execute via the AOT
-    \\                           runtime; cores missing from the manifest
-    \\                           fall back to the interpreter. A mismatched
-    \\                           manifest is a hard error. When this flag
-    \\                           is omitted, `wamr run` auto-detects a
-    \\                           sibling `<input>.cwasm.d/manifest.json`
-    \\                           and uses it on a best-effort basis
-    \\                           (mismatch -> warning + interpreter
-    \\                           fallback).
+    \\                           When omitted, `wamr run` auto-detects a
+    \\                           sibling `<input>.cwasm.d/manifest.json`. The
+    \\                           bundle is mandatory: components without one
+    \\                           fail with a clear error (issue #644).
     \\
 ;
 
