@@ -245,7 +245,18 @@ def main() -> int:
     ensure_coremark_src(repo)
     coremark_src = repo / "tests/benchmarks/coremark/coremark"
 
-    with tempfile.TemporaryDirectory(prefix="bench-coremark-", dir="/work" if Path("/work").is_dir() else None) as tmp:
+    # Prefer the runner's own scratch dir (writable, already on the NVMe mount
+    # under self-hosted runners). Fall back to /work only if writable — the
+    # azure-nvme convention places /work on local disk but the runner user
+    # may not own its root. Otherwise let tempfile pick the system default.
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    if runner_temp and os.access(runner_temp, os.W_OK):
+        tmp_root: str | None = runner_temp
+    elif os.access("/work", os.W_OK):
+        tmp_root = "/work"
+    else:
+        tmp_root = None
+    with tempfile.TemporaryDirectory(prefix="bench-coremark-", dir=tmp_root) as tmp:
         root = Path(tmp)
         try:
             wt_b = make_worktree(repo, args.baseline, root)
