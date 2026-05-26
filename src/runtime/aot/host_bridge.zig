@@ -24,6 +24,20 @@ pub const TrampolinePool = host_trampolines.TrampolinePool;
 
 var g_trampoline_pool: ?*TrampolinePool = null;
 
+/// When true, every AOT WASI adapter prints a one-line trace on entry.
+/// Set from `main.zig` via the `--trace-aot-wasi` CLI flag *before* the
+/// instance is run. Module-level so adapters can read it cheaply without
+/// threading a config struct through every call site.
+pub var trace_enabled: bool = false;
+
+inline fn traceAdapter(comptime name: []const u8, vmctx: *VmCtx, args: anytype) void {
+    if (!trace_enabled) return;
+    std.debug.print(
+        "[aot-wasi] {s} vmctx=0x{x} mem_base=0x{x} mem_size=0x{x} wasi_ctx=0x{x} args={any}\n",
+        .{ name, @intFromPtr(vmctx), vmctx.memory_base, vmctx.memory_size, vmctx.wasi_ctx, args },
+    );
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /// Reconstruct a mutable memory slice from the VmCtx fields.
@@ -50,6 +64,7 @@ inline fn u8FromI32(v: i32) u8 {
 // ── AOT adapters ──────────────────────────────────────────────────────
 
 pub fn aotFdWrite(vmctx: *VmCtx, fd: i32, iovs_ptr: i32, iovs_len: i32, nwritten_ptr: i32) callconv(.c) i32 {
+    traceAdapter("fd_write", vmctx, .{ fd, iovs_ptr, iovs_len, nwritten_ptr });
     const mem = getMemoryFromCtx(vmctx) orelse return wasi_core.WASI_EINVAL;
     if (getCtx(vmctx)) |ctx| {
         return host_functions.ctxFdIoCore(ctx, mem, fd, @bitCast(iovs_ptr), @bitCast(iovs_len), @bitCast(nwritten_ptr), .write);
@@ -82,6 +97,7 @@ pub fn aotFdReaddir(vmctx: *VmCtx, fd: i32, buf_ptr: i32, buf_len: i32, cookie: 
 }
 
 pub fn aotFdSeek(vmctx: *VmCtx, fd: i32, offset: i64, whence: i32, newoffset_ptr: i32) callconv(.c) i32 {
+    traceAdapter("fd_seek", vmctx, .{ fd, offset, whence, newoffset_ptr });
     if (getCtx(vmctx)) |ctx| {
         const mem = getMemoryFromCtx(vmctx) orelse return wasi_core.WASI_EINVAL;
         return host_functions.ctxFdSeekCore(ctx, mem, fd, offset, u8FromI32(whence), @bitCast(newoffset_ptr));
@@ -90,6 +106,7 @@ pub fn aotFdSeek(vmctx: *VmCtx, fd: i32, offset: i64, whence: i32, newoffset_ptr
 }
 
 pub fn aotFdClose(vmctx: *VmCtx, fd: i32) callconv(.c) i32 {
+    traceAdapter("fd_close", vmctx, .{fd});
     if (getCtx(vmctx)) |ctx| {
         if (fd < 0) return @intCast(@intFromEnum(wasi.Errno.badf));
         return @intCast(@intFromEnum(ctx.fd_close(@intCast(fd))));
@@ -369,11 +386,13 @@ pub fn aotClockTimeGet(vmctx: *VmCtx, clock_id: i32, _: i64, time_ptr: i32) call
 }
 
 pub fn aotClockResGet(vmctx: *VmCtx, clock_id: i32, resolution_ptr: i32) callconv(.c) i32 {
+    traceAdapter("clock_res_get", vmctx, .{ clock_id, resolution_ptr });
     const mem = getMemoryFromCtx(vmctx) orelse return wasi_core.WASI_EINVAL;
     return wasi_core.clockResGetCore(mem, clock_id, @bitCast(resolution_ptr));
 }
 
 pub fn aotEnvironSizesGet(vmctx: *VmCtx, count_ptr: i32, buf_size_ptr: i32) callconv(.c) i32 {
+    traceAdapter("environ_sizes_get", vmctx, .{ count_ptr, buf_size_ptr });
     const mem = getMemoryFromCtx(vmctx) orelse return wasi_core.WASI_EINVAL;
     if (getCtx(vmctx)) |ctx| {
         const sizes = ctx.environ_sizes_get();
@@ -388,6 +407,7 @@ pub fn aotEnvironSizesGet(vmctx: *VmCtx, count_ptr: i32, buf_size_ptr: i32) call
 }
 
 pub fn aotEnvironGet(vmctx: *VmCtx, environ_ptrs: i32, environ_buf: i32) callconv(.c) i32 {
+    traceAdapter("environ_get", vmctx, .{ environ_ptrs, environ_buf });
     if (getCtx(vmctx)) |ctx| {
         const mem = getMemoryFromCtx(vmctx) orelse return wasi_core.WASI_EINVAL;
         return host_functions.writeStringTable(mem, ctx.env_vars, @bitCast(environ_ptrs), @bitCast(environ_buf));
@@ -432,7 +452,7 @@ pub fn aotRandomGet(vmctx: *VmCtx, buf_ptr: i32, buf_len: i32) callconv(.c) i32 
 }
 
 pub fn aotSchedYield(vmctx: *VmCtx) callconv(.c) i32 {
-    _ = vmctx;
+    traceAdapter("sched_yield", vmctx, .{});
     return wasi_core.schedYieldCore();
 }
 
@@ -442,6 +462,7 @@ pub fn aotProcRaise(vmctx: *VmCtx, sig: i32) callconv(.c) i32 {
 }
 
 pub fn aotProcExit(vmctx: *VmCtx, code: i32) callconv(.c) void {
+    traceAdapter("proc_exit", vmctx, .{code});
     if (getCtx(vmctx)) |ctx| {
         ctx.exit_code = @bitCast(code);
     }

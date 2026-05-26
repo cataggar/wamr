@@ -414,9 +414,14 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     const code_off_s: isize = @as(isize, @bitCast(ret_addr)) - @as(isize, @bitCast(g_code_base));
     const code_off: usize = if (code_off_s >= 0) @intCast(code_off_s) else 0;
     var func_idx: isize = -1;
+    var func_start: usize = 0;
     for (g_func_offsets, 0..) |off, idx| {
-        if (off <= code_off) func_idx = @intCast(idx) else break;
+        if (off <= code_off) {
+            func_idx = @intCast(idx);
+            func_start = off;
+        } else break;
     }
+    const rel_off: usize = if (code_off >= func_start) code_off - func_start else 0;
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) {
         // Caller has armed trap-as-error; unwind instead of exiting.
         trapLongjmp();
@@ -424,8 +429,8 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     // Flush any buffered stdout from the guest before we tear down the
     // process so user-visible output isn't lost. Best-effort.
     std.debug.print(
-        "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}], mem_size=0x{x})\n",
-        .{ code_off, func_idx, vmctx.memory_size },
+        "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}]+0x{x}, mem_size=0x{x})\n",
+        .{ code_off, func_idx, rel_off, vmctx.memory_size },
     );
     std.process.exit(2);
 }
@@ -1521,12 +1526,16 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
+    // Populate diagnostic globals on every platform — `aotTrapOOB`
+    // uses `g_code_base` / `g_func_offsets` to map the trap PC back
+    // to a wasm function index. The Windows-only block below adds
+    // the VEH path on top (which also needs g_mem_*).
+    if (inst.code_base) |cb| {
+        g_code_base = @intFromPtr(cb);
+        g_code_size = inst.code_size;
+        g_func_offsets = inst.module.func_offsets;
+    }
     if (comptime windows_trap_supported) {
-        if (inst.code_base) |cb| {
-            g_code_base = @intFromPtr(cb);
-            g_code_size = inst.code_size;
-            g_func_offsets = inst.module.func_offsets;
-        }
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
         if (!g_veh_installed) {
@@ -1864,12 +1873,12 @@ pub fn callFuncScalar(
         raw[args.len] = @intFromPtr(&hrp_buf);
     }
 
+    if (inst.code_base) |cb| {
+        g_code_base = @intFromPtr(cb);
+        g_code_size = inst.code_size;
+        g_func_offsets = inst.module.func_offsets;
+    }
     if (comptime windows_trap_supported) {
-        if (inst.code_base) |cb| {
-            g_code_base = @intFromPtr(cb);
-            g_code_size = inst.code_size;
-            g_func_offsets = inst.module.func_offsets;
-        }
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
         if (!g_veh_installed) {
