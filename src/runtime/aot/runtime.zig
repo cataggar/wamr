@@ -992,7 +992,7 @@ pub const RuntimeError = error{
 
 /// Instantiate an AOT module, producing a runnable AotInstance.
 pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError!*AotInstance {
-    return instantiateWithOverrides(module, allocator, &.{}, &.{}, &.{});
+    return instantiateWithOverrides(module, allocator, &.{}, &.{}, &.{}, &.{});
 }
 
 /// Instantiate an AOT module, optionally borrowing `TableInstance`s,
@@ -1001,16 +1001,24 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
 /// `imported_memory_overrides[i]` to `module.importedMemories()[i]`,
 /// `imported_global_overrides[i]` to `module.importedGlobals()[i]`;
 /// null leaves that slot locally allocated (with a zero-valued default).
+///
+/// `imported_function_overrides[i]` maps to the *i-th function import*
+/// in `module.imports` declaration order. A non-null entry replaces the
+/// host-bridge / spectest resolution (used by #662 Phase C to wire
+/// cross-instance core-to-core fn imports + trap-on-call stubs through
+/// `host_trampolines`).
 pub fn instantiateWithOverrides(
     module: *const aot_loader.AotModule,
     allocator: std.mem.Allocator,
     imported_table_overrides: []const ?*types.TableInstance,
     imported_memory_overrides: []const ?*types.MemoryInstance,
     imported_global_overrides: []const ?*types.GlobalInstance,
+    imported_function_overrides: []const ?*const anyopaque,
 ) RuntimeError!*AotInstance {
     std.debug.assert(imported_table_overrides.len == 0 or imported_table_overrides.len == module.importedTables().len);
     std.debug.assert(imported_memory_overrides.len == 0 or imported_memory_overrides.len == module.importedMemories().len);
     std.debug.assert(imported_global_overrides.len == 0 or imported_global_overrides.len == module.importedGlobals().len);
+    std.debug.assert(imported_function_overrides.len == 0 or imported_function_overrides.len == module.import_function_count);
 
     var inst = allocator.create(AotInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(inst);
@@ -1106,7 +1114,7 @@ pub fn instantiateWithOverrides(
     errdefer if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
 
     // Resolve AOT host functions for imports
-    inst.host_functions = try resolveHostFunctions(module, allocator);
+    inst.host_functions = try resolveHostFunctionsWithOverrides(module, allocator, imported_function_overrides);
 
     // Intern each declared module type into the process-global registry and
     // build a module-local sig_table (type_idx → canonical u32 sig_id). Only
@@ -2001,7 +2009,15 @@ fn resolveHostFunctions(
     module: *const aot_loader.AotModule,
     allocator: std.mem.Allocator,
 ) RuntimeError![]const ?*const anyopaque {
-    return resolveHostFunctionsImpl(module, allocator, null);
+    return resolveHostFunctionsImpl(module, allocator, null, &.{});
+}
+
+fn resolveHostFunctionsWithOverrides(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+    overrides: []const ?*const anyopaque,
+) RuntimeError![]const ?*const anyopaque {
+    return resolveHostFunctionsImpl(module, allocator, null, overrides);
 }
 
 /// Resolve host functions with optional custom HostImports (comptime-typed).
@@ -2010,13 +2026,14 @@ pub fn resolveHostFunctionsWithHosts(
     allocator: std.mem.Allocator,
     comptime HostImportsT: ?type,
 ) RuntimeError![]const ?*const anyopaque {
-    return resolveHostFunctionsImpl(module, allocator, HostImportsT);
+    return resolveHostFunctionsImpl(module, allocator, HostImportsT, &.{});
 }
 
 fn resolveHostFunctionsImpl(
     module: *const aot_loader.AotModule,
     allocator: std.mem.Allocator,
     comptime HostImportsT: ?type,
+    overrides: []const ?*const anyopaque,
 ) RuntimeError![]const ?*const anyopaque {
     if (module.import_function_count == 0) return &.{};
 
@@ -2028,10 +2045,17 @@ fn resolveHostFunctionsImpl(
     for (module.imports) |imp| {
         if (imp.kind == .function) {
             if (func_idx < module.import_function_count) {
+                // Layer 0: caller-supplied per-import override (#662 Phase C
+                // cross-instance fn imports + trap-on-call stubs).
+                if (func_idx < overrides.len) {
+                    if (overrides[func_idx]) |entry| host_fns[func_idx] = entry;
+                }
                 // Layer 1: custom HostImports (comptime-resolved)
-                if (HostImportsT) |HI| {
-                    if (HI.resolve(imp.module_name, imp.field_name)) |entry| {
-                        host_fns[func_idx] = entry.aot_fn;
+                if (host_fns[func_idx] == null) {
+                    if (HostImportsT) |HI| {
+                        if (HI.resolve(imp.module_name, imp.field_name)) |entry| {
+                            host_fns[func_idx] = entry.aot_fn;
+                        }
                     }
                 }
                 // Layer 2: WASI / spectest (only if not already resolved)

@@ -12,6 +12,7 @@ const async_mod = @import("async.zig");
 const core_backend = @import("core_backend.zig");
 const aot_loader = @import("../runtime/aot/loader.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
+const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 
 const aot_host_bridge = @import("../runtime/aot/host_bridge.zig");
 
@@ -247,6 +248,23 @@ pub const ComponentInstance = struct {
     /// in `canon_builtin_ctxs`; that list remains the sole owner and is
     /// what `deinit` walks to free the contexts exactly once. (#533)
     canon_builtin_ctx_by_canon_idx: std.AutoHashMapUnmanaged(u32, *executor_mod.CanonBuiltinTrampolineCtx) = .empty,
+    /// Per-(component-instance) host-trampoline pool. Lazily created the
+    /// first time an AOT core needs a cross-instance fn-import thunk or a
+    /// trap-on-call stub (#662 Phase C). Slots own the executable shim
+    /// memory; the `cross_instance_thunk_ctxs` ArrayList owns the per-slot
+    /// `CrossInstanceThunkCtx` payloads they reference.
+    aot_trampoline_pool: ?*host_trampolines.TrampolinePool = null,
+    /// Per-(component-instance) ownership of cross-instance thunk
+    /// contexts (`*executor_mod.CrossInstanceThunkCtx`). Each entry is
+    /// referenced as the `ctx` of an `aot_trampoline_pool` slot installed
+    /// in a sibling AOT instance's `host_functions[]` table; freed
+    /// together on `deinit` (#662 Phase C).
+    cross_instance_thunk_ctxs: std.ArrayListUnmanaged(*executor_mod.CrossInstanceThunkCtx) = .empty,
+    /// Per-(component-instance) ownership of trap-stub label C strings
+    /// (`*const [*:0]const u8` payloads). Each entry is referenced from a
+    /// `aot_trampoline_pool` trap slot's `ctx` so a debug-mode log line
+    /// can name the un-bridged import (#662 follow-up).
+    trap_stub_labels: std.ArrayListUnmanaged([*:0]const u8) = .empty,
     /// Pending core-module start functions whose execution was deferred
     /// during `instantiate` so canon-lower trampoline `host_funcs` can be
     /// bound by `linkImports` first. Drained by `linkImports` in core-instance
@@ -1314,6 +1332,27 @@ pub const ComponentInstance = struct {
         }
         self.canon_builtin_ctxs.deinit(self.allocator);
         self.canon_builtin_ctx_by_canon_idx.deinit(self.allocator);
+        for (self.cross_instance_thunk_ctxs.items) |ctx| {
+            self.allocator.free(ctx.param_types);
+            self.allocator.free(ctx.result_types);
+            self.allocator.free(ctx.label);
+            self.allocator.destroy(ctx);
+        }
+        self.cross_instance_thunk_ctxs.deinit(self.allocator);
+        for (self.trap_stub_labels.items) |label_ptr| {
+            // Each label was allocated as a null-terminated `[]u8` via
+            // `allocator.alloc(u8, n)`; recover the slice (including the
+            // trailing nul) and free it.
+            const label_z: [*:0]const u8 = label_ptr;
+            const len = std.mem.len(label_z);
+            const slice = label_z[0 .. len + 1];
+            self.allocator.free(slice);
+        }
+        self.trap_stub_labels.deinit(self.allocator);
+        if (self.aot_trampoline_pool) |pool| {
+            pool.deinit(self.allocator);
+            self.allocator.destroy(pool);
+        }
         self.pending_core_starts.deinit(self.allocator);
         if (self.core_instances.len > 0) {
             const inst_mod = @import("../runtime/interpreter/instance.zig");
@@ -1644,7 +1683,23 @@ pub fn instantiateWithOptions(
                             };
                             defer if (imported_global_overrides.len > 0) allocator.free(imported_global_overrides);
 
-                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides) catch |err| {
+                            const imported_function_overrides = resolveAotImportedFunctionOverrides(
+                                allocator,
+                                inst,
+                                component,
+                                cis,
+                                ci_idx,
+                                ie.args,
+                                ie.module_idx,
+                                aot_module_ptr,
+                            ) catch |err| {
+                                std.log.warn("[aot reject] core module {d}: imported function override resolution failed: {s}", .{ ie.module_idx, @errorName(err) });
+                                if (aot_only) return error.AotImportUnresolvable;
+                                break :aot_blk;
+                            };
+                            defer if (imported_function_overrides.len > 0) allocator.free(imported_function_overrides);
+
+                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides, imported_function_overrides) catch |err| {
                                 std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                                 if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
@@ -2533,24 +2588,26 @@ fn isWasiCliRunName(name: []const u8) bool {
 
 /// Probe whether every import declared by an AOT-loaded core module
 /// has a wire-up the AOT runtime can satisfy. Today the AOT host
-/// bridge only knows the preview1 `wasi`/`wasi_snapshot_preview1`/
-/// `wasi_unstable` modules and `spectest`; everything else — and in
-/// particular wit-bindgen-emitted P2 cores whose function imports
-/// resolve via component-level `canon.lower` defs under interface
-/// names like `wasi:io/streams@0.2.0`, plus any cross-instance
-/// memory / table / global imports — has no AOT-side wiring and
-/// would fault on first use. Returns the first unsupported import,
-/// or null when the core is safe to commit to the AOT backend
-/// (#644). A null `imports` slice (no imports at all) is always
-/// supported.
+/// bridge knows preview1 `wasi`/`wasi_snapshot_preview1`/
+/// `wasi_unstable` and `spectest` directly; any other function import
+/// is satisfied by `resolveAotImportedFunctionOverrides` which
+/// installs either a cross-instance core-to-core thunk (when the
+/// import resolves to a sibling core's exported func) or a trap-on-
+/// call stub (#662 Phase C). Mutable globals and tag imports remain
+/// out of scope — those still surface here as unsupported (#660).
+/// Returns the first unsupported import, or null when the core is
+/// safe to commit to the AOT backend (#644). A null `imports` slice
+/// (no imports at all) is always supported.
 fn firstUnsupportedAotImport(module: *const aot_loader.AotModule) ?aot_loader.AotImportDesc {
     for (module.imports) |imp| {
         switch (imp.kind) {
-            .function => {
-                if (aot_host_bridge.isWasiModule(imp.module_name)) continue;
-                if (aot_host_bridge.isSpectestModule(imp.module_name)) continue;
-                return imp;
-            },
+            // Function imports route through `resolveAotImportedFunctionOverrides`
+            // at instantiation time. WASI / spectest land in the host bridge;
+            // everything else gets a cross-instance thunk or a trap-on-call
+            // stub. Instantiation always succeeds; calls into unbridged
+            // imports surface as a clean trap rather than a null-slot
+            // segfault (#662 Phase C).
+            .function => continue,
             // Tables and memories support cross-instance borrowing via
             // `instantiateWithOverrides`'s `imported_table_overrides` /
             // `imported_memory_overrides` slices. The caller's
@@ -2641,10 +2698,7 @@ fn resolveCoreMemoryToMI(
     const ref = indexspace.resolveCoreMemory(component, core_mem_idx) orelse return null;
     const ie = component.aliases[ref.aliased].instance_export;
     if (ie.instance_idx >= inst.core_instances.len) return null;
-    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
-    const exp = src_mi.module.findExport(ie.name, .memory) orelse return null;
-    if (exp.index >= src_mi.memories.len) return null;
-    return src_mi.memories[exp.index];
+    return resolveCoreInstanceMemoryExport(inst, component, inst.core_instances[ie.instance_idx], ie.name);
 }
 
 fn resolveCoreInstanceTableExport(
@@ -2820,6 +2874,226 @@ fn resolveAotImportedGlobalOverrides(
     return overrides;
 }
 
+/// Lazily allocate the component-instance trampoline pool used to hand
+/// AOT cores executable thunks for non-WASI fn imports (#662 Phase C).
+fn ensureAotTrampolinePool(inst: *ComponentInstance) !*host_trampolines.TrampolinePool {
+    if (inst.aot_trampoline_pool) |pool| return pool;
+    const pool = try inst.allocator.create(host_trampolines.TrampolinePool);
+    errdefer inst.allocator.destroy(pool);
+    pool.* = try host_trampolines.TrampolinePool.init(inst.allocator);
+    inst.aot_trampoline_pool = pool;
+    return pool;
+}
+
+/// Build the `imported_function_overrides[]` slice for an AOT core's
+/// `instantiateWithOverrides` call. WASI / spectest imports are left as
+/// null (the AOT runtime fills them from `host_bridge` at resolve time).
+/// Every other function import either resolves to a sibling core's
+/// exported func (→ cross-instance thunk via the trampoline pool) or is
+/// left wired as a trap-on-call stub so instantiation succeeds but a
+/// later call surfaces a clean trap rather than a segfault through a
+/// null host slot. (#662 Phase C).
+fn resolveAotImportedFunctionOverrides(
+    allocator: std.mem.Allocator,
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    cis: []const ComponentInstance.CoreInstanceEntry,
+    ci_idx: usize,
+    args: []const ctypes.CoreInstantiateArg,
+    module_idx: u32,
+    module: *const aot_loader.AotModule,
+) ![]const ?*const anyopaque {
+    if (module.import_function_count == 0) return &.{};
+
+    const overrides = try allocator.alloc(?*const anyopaque, module.import_function_count);
+    errdefer allocator.free(overrides);
+    @memset(overrides, null);
+
+    var func_idx: u32 = 0;
+    for (module.imports) |imp| {
+        if (imp.kind != .function) continue;
+        defer func_idx += 1;
+
+        // WASI / spectest stay null so the runtime can pick them up from
+        // `host_bridge` (matches the existing behaviour pre-#662).
+        if (aot_host_bridge.isWasiModule(imp.module_name)) continue;
+        if (aot_host_bridge.isSpectestModule(imp.module_name)) continue;
+
+        // Look up the `with` arg that names this import's wasm module.
+        const source_inst_idx: u32 = arg_blk: {
+            for (args) |arg| {
+                if (std.mem.eql(u8, arg.name, imp.module_name)) break :arg_blk arg.instance_idx;
+            }
+            break :arg_blk std.math.maxInt(u32);
+        };
+
+        var thunk: ?*const anyopaque = null;
+        if (source_inst_idx != std.math.maxInt(u32) and source_inst_idx < ci_idx) {
+            thunk = installCrossInstanceThunk(allocator, inst, component, cis[source_inst_idx], imp, module) catch |err| blk: {
+                std.log.warn(
+                    "[aot reject] core module {d}: cross-instance thunk for '{s}.{s}' failed ({s}); installing trap-on-call stub",
+                    .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                );
+                break :blk null;
+            };
+        }
+
+        if (thunk == null) {
+            // No sibling-core wiring available — install a trap-on-call
+            // stub so instantiation succeeds. Any actual call surfaces a
+            // clean trap via `wamrAotDispatchTrapStub`.
+            thunk = installTrapStub(allocator, inst, imp, module_idx) catch |err| blk: {
+                std.log.warn(
+                    "[aot reject] core module {d}: failed to install trap stub for '{s}.{s}': {s}",
+                    .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                );
+                break :blk null;
+            };
+        }
+
+        overrides[func_idx] = thunk;
+    }
+
+    return overrides;
+}
+
+/// Resolve a `(core_instance_entry, export_name)` reference to a
+/// concrete `(target_ai, target_func_idx)` pair for the cross-instance
+/// thunk. Walks through inline-exports + alias chains the same way
+/// `resolveCoreInstanceMemoryExport` does for memories.
+fn resolveCoreInstanceFuncToAi(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    entry: ComponentInstance.CoreInstanceEntry,
+    export_name: []const u8,
+) ?struct { ai: *aot_runtime.AotInstance, func_idx: u32 } {
+    if (entry.aot_inst) |src_ai| {
+        const exp = src_ai.module.findExport(export_name, .function) orelse return null;
+        return .{ .ai = src_ai, .func_idx = exp.index };
+    }
+    if (entry.module_inst != null) return null; // sibling on interp backend
+    for (entry.inline_exports) |mem| {
+        if (!std.mem.eql(u8, mem.name, export_name)) continue;
+        if (mem.sort_idx.sort != .func) break;
+        // Resolve through aliases to find the underlying aot_inst.
+        const cf = indexspace.resolveCoreFunc(component, mem.sort_idx.idx) orelse return null;
+        switch (cf) {
+            .aliased => |alias_idx| {
+                if (alias_idx >= component.aliases.len) return null;
+                const al = component.aliases[alias_idx];
+                const ie_al = switch (al) {
+                    .instance_export => |x| x,
+                    else => return null,
+                };
+                if (ie_al.instance_idx >= inst.core_instances.len) return null;
+                return resolveCoreInstanceFuncToAi(inst, component, inst.core_instances[ie_al.instance_idx], ie_al.name);
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn installCrossInstanceThunk(
+    allocator: std.mem.Allocator,
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    source_entry: ComponentInstance.CoreInstanceEntry,
+    imp: aot_loader.AotImportDesc,
+    module: *const aot_loader.AotModule,
+) !*const anyopaque {
+    // Only support sibling AOT cores today. Sibling interp cores fall
+    // through to a trap stub (calling across backends without a richer
+    // bridge would produce the same null-slot segfault we are trying to
+    // avoid).
+    const resolved = resolveCoreInstanceFuncToAi(inst, component, source_entry, imp.field_name) orelse return error.UnsupportedCrossInstanceSource;
+    const target_ai = resolved.ai;
+    const target_func_idx = resolved.func_idx;
+
+    if (imp.func_type_idx >= module.func_types.len) return error.InvalidFuncType;
+    const ft = module.func_types[imp.func_type_idx];
+
+    // Only register-fit signatures land in this fast path. Anything else
+    // returns an error → the caller installs a trap stub instead.
+    if (ft.params.len > 5) return error.SignatureTooWide;
+    if (ft.results.len > 1) return error.MultipleResultsUnsupported;
+    for (ft.params) |p| switch (p) {
+        .i32, .i64, .f32, .f64 => {},
+        else => return error.UnsupportedParamType,
+    };
+    for (ft.results) |r| switch (r) {
+        .i32, .i64, .f32, .f64 => {},
+        else => return error.UnsupportedResultType,
+    };
+
+    const param_types = try allocator.alloc(core_types.ValType, ft.params.len);
+    errdefer allocator.free(param_types);
+    for (ft.params, 0..) |p, i| param_types[i] = p;
+    const result_types = try allocator.alloc(core_types.ValType, ft.results.len);
+    errdefer allocator.free(result_types);
+    for (ft.results, 0..) |r, i| result_types[i] = r;
+
+    const label = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ imp.module_name, imp.field_name });
+    errdefer allocator.free(label);
+
+    const ctx = try allocator.create(executor_mod.CrossInstanceThunkCtx);
+    errdefer allocator.destroy(ctx);
+    ctx.* = .{
+        .target_ai = target_ai,
+        .target_func_idx = target_func_idx,
+        .param_types = param_types,
+        .result_types = result_types,
+        .label = label,
+    };
+    try inst.cross_instance_thunk_ctxs.append(allocator, ctx);
+    errdefer _ = inst.cross_instance_thunk_ctxs.pop();
+
+    const pool = try ensureAotTrampolinePool(inst);
+    const stub = try pool.allocCrossInstanceSlot(@ptrCast(ctx), .{
+        .param_types = param_types,
+        .result_types = result_types,
+        .has_retptr = false,
+    });
+    return @ptrCast(stub);
+}
+
+fn installTrapStub(
+    allocator: std.mem.Allocator,
+    inst: *ComponentInstance,
+    imp: aot_loader.AotImportDesc,
+    module_idx: u32,
+) !*const anyopaque {
+    // Allocate a null-terminated label so the dispatcher can `printf` it
+    // under WAMR_AOT_DEBUG without copying.
+    const len = imp.module_name.len + 1 + imp.field_name.len;
+    const buf = try allocator.alloc(u8, len + 1);
+    errdefer allocator.free(buf);
+    @memcpy(buf[0..imp.module_name.len], imp.module_name);
+    buf[imp.module_name.len] = '.';
+    @memcpy(buf[imp.module_name.len + 1 ..][0..imp.field_name.len], imp.field_name);
+    buf[len] = 0;
+
+    const label_z: [*:0]const u8 = @ptrCast(buf.ptr);
+    try inst.trap_stub_labels.append(allocator, label_z);
+    errdefer _ = inst.trap_stub_labels.pop();
+
+    if (core_backend.debugAotEnabled()) {
+        std.debug.print(
+            "[aot-bridge] core module {d}: installing trap-on-call stub for un-bridged import '{s}.{s}' (#662 follow-up)\n",
+            .{ module_idx, imp.module_name, imp.field_name },
+        );
+    }
+
+    const pool = try ensureAotTrampolinePool(inst);
+    // The trap dispatcher reads `ctx_opaque` as a `*const [*:0]const u8`
+    // when debug logging is enabled, so we hand it a pointer to the
+    // owned label entry in the ArrayList (stable because the list never
+    // shrinks before `deinit`).
+    const slot_ptr = &inst.trap_stub_labels.items[inst.trap_stub_labels.items.len - 1];
+    const stub = try pool.allocTrapSlot(@ptrCast(slot_ptr));
+    return @ptrCast(stub);
+}
+
 fn resolveCoreGlobalToMI(
     inst: *const ComponentInstance,
     component: *const ctypes.Component,
@@ -2828,10 +3102,7 @@ fn resolveCoreGlobalToMI(
     const ref = indexspace.resolveCoreGlobal(component, core_glob_idx) orelse return null;
     const ie = component.aliases[ref.aliased].instance_export;
     if (ie.instance_idx >= inst.core_instances.len) return null;
-    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
-    const exp = src_mi.module.findExport(ie.name, .global) orelse return null;
-    if (exp.index >= src_mi.globals.len) return null;
-    return src_mi.globals[exp.index];
+    return resolveCoreInstanceGlobalExport(inst, component, inst.core_instances[ie.instance_idx], ie.name);
 }
 
 /// Walk `component.type_indexspace[idx]` (loader-populated) to find the

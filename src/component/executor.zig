@@ -6223,6 +6223,133 @@ pub export fn wamrAotDispatchComponentTrampoline(
     return .{ .status = 0, .value = result };
 }
 
+/// Per-import context for the cross-instance core-to-core thunk (#662).
+/// Owned by `ComponentInstance.cross_instance_thunk_ctxs`; the trampoline
+/// pool slot stores `*CrossInstanceThunkCtx` as its `ctx`.
+pub const CrossInstanceThunkCtx = struct {
+    /// Sibling AOT instance whose `func_idx` we will re-issue the call into.
+    target_ai: *aot_runtime.AotInstance,
+    /// Index into the sibling's function-index space.
+    target_func_idx: u32,
+    /// Cached param-type slice (core ValTypes) for `callFuncScalar`. Slices
+    /// are owned by the component-instance arena.
+    param_types: []const core_types.ValType,
+    result_types: []const core_types.ValType,
+    /// Human-readable label used in trap-shaped error messages.
+    label: []const u8,
+};
+
+/// Cross-instance core-to-core dispatcher (#662). The trampoline pool stub
+/// shifts caller regs right by one to inject `slot` as the first C-ABI arg,
+/// so when the AOT codegen calls a host import as
+/// `host_fn(vmctx, arg0, arg1, …)`, the dispatcher receives
+/// `(slot, a0=vmctx, a1=arg0, a2=arg1, …, a5=arg4)`. We ignore `a0`
+/// (importer's vmctx — the sibling AotInstance builds its own vmctx
+/// internally in `callFuncScalar`) and use `a1..a5` as lowered wasm args.
+/// Calls outside the trampoline pool's 5-arg-in-regs envelope return a
+/// failing status; richer signatures land in a follow-up.
+pub export fn wamrAotDispatchCrossInstance(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    _ = a0; // importer's vmctx; the sibling AotInstance builds its own.
+    const ctx: *const CrossInstanceThunkCtx = @ptrCast(@alignCast(ctx_opaque));
+    const result = dispatchAotCrossInstance(ctx, lowered_sig.*, .{ a1, a2, a3, a4, a5, 0 }) catch |err| {
+        if (debugAotEnabled()) {
+            std.debug.print(
+                "[aot-dispatch] cross-instance thunk '{s}' failed: {s}\n",
+                .{ ctx.label, @errorName(err) },
+            );
+        }
+        return .{ .status = 1, .value = 0 };
+    };
+    return .{ .status = 0, .value = result };
+}
+
+fn dispatchAotCrossInstance(
+    ctx: *const CrossInstanceThunkCtx,
+    lowered_sig: host_trampolines.LoweredSig,
+    arg_regs: [6]u64,
+) !u64 {
+    // We support up to 5 args in registers (a1..a5 in the dispatcher's
+    // frame, since a0 is the importer's vmctx). Spilled-arg / spilled-result
+    // shapes route through the lift trampoline pathway, not this one.
+    if (lowered_sig.has_retptr) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len > 5) return error.UnsupportedSignature;
+    if (lowered_sig.result_types.len > 1) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len != ctx.param_types.len) return error.UnsupportedSignature;
+    if (lowered_sig.result_types.len != ctx.result_types.len) return error.UnsupportedSignature;
+    for (lowered_sig.param_types, ctx.param_types) |a, b| if (a != b) return error.UnsupportedSignature;
+    for (lowered_sig.result_types, ctx.result_types) |a, b| if (a != b) return error.UnsupportedSignature;
+
+    var args_buf: [5]core_types.Value = undefined;
+    for (ctx.param_types, 0..) |pt, i| {
+        args_buf[i] = switch (pt) {
+            .i32 => .{ .i32 = @bitCast(@as(u32, @truncate(arg_regs[i]))) },
+            .i64 => .{ .i64 = @bitCast(arg_regs[i]) },
+            .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(arg_regs[i]))) },
+            .f64 => .{ .f64 = @bitCast(arg_regs[i]) },
+            else => return error.UnsupportedSignature,
+        };
+    }
+
+    var results_buf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
+    const results = aot_runtime.callFuncScalar(
+        ctx.target_ai,
+        ctx.target_func_idx,
+        ctx.param_types,
+        ctx.result_types,
+        args_buf[0..ctx.param_types.len],
+        &results_buf,
+    ) catch return error.TrapInCoreFunction;
+
+    if (ctx.result_types.len == 0) return 0;
+    return switch (ctx.result_types[0]) {
+        .i32 => @as(u64, @intCast(@as(u32, @bitCast(results[0].i32)))),
+        .i64 => @bitCast(results[0].i64),
+        .f32 => @as(u64, @intCast(@as(u32, @bitCast(results[0].f32)))),
+        .f64 => @bitCast(results[0].f64),
+        else => error.UnsupportedSignature,
+    };
+}
+
+/// Trap-on-call stub dispatcher (#662 follow-up). The trampoline pool
+/// installs this dispatcher for non-WASI fn imports the AOT bridge has
+/// no wiring for yet (canon.lower / canon-builtin). Instantiation
+/// succeeds, but any actual call returns a failing `DispatchResult` so
+/// the AOT codegen's host-call site sees a clean trap rather than a
+/// segfault through a null host slot.
+pub export fn wamrAotDispatchTrapStub(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    _ = lowered_sig;
+    _ = a0;
+    _ = a1;
+    _ = a2;
+    _ = a3;
+    _ = a4;
+    _ = a5;
+    if (debugAotEnabled()) {
+        const label_ptr: *const [*:0]const u8 = @ptrCast(@alignCast(ctx_opaque));
+        std.debug.print("[aot-dispatch] trap-stub fired for unbridged import '{s}' (#662 follow-up)\n", .{label_ptr.*});
+    }
+    return .{ .status = 1, .value = 0 };
+}
+
+
 fn dispatchAotComponentTrampoline(
     ctx: *const ComponentTrampolineCtx,
     lowered_sig: host_trampolines.LoweredSig,
