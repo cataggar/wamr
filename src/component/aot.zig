@@ -38,6 +38,7 @@ const x86_64_compile = @import("../compiler/codegen/x86_64/compile.zig");
 const aarch64_compile = @import("../compiler/codegen/aarch64/compile.zig");
 const emit_aot = @import("../compiler/emit_aot.zig");
 const core_types = @import("../runtime/common/types.zig");
+const interp_instance = @import("../runtime/interpreter/instance.zig");
 const instance_mod = @import("instance.zig");
 const config = @import("../config.zig");
 
@@ -299,6 +300,70 @@ pub fn compileCoreWasm(
         local_func_tidx_list.append(ea, f.type_idx) catch return error.OutOfMemory;
     }
 
+    // Build global entries in wasm-flat order (imported globals first,
+    // then local globals). `evalInitExpr` is shared with the on-disk
+    // wamrc path so the resulting `.cwasm` is byte-identical for this
+    // section. `tmp_globals` is the running prefix `evalInitExpr` uses
+    // to resolve `global.get` in a `global` init expression.
+    var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
+    var tmp_globals: std.ArrayList(*core_types.GlobalInstance) = .empty;
+    defer {
+        for (tmp_globals.items) |g| allocator.destroy(g);
+        tmp_globals.deinit(allocator);
+    }
+    for (module.imports) |imp| {
+        if (imp.kind != .global) continue;
+        const gt = imp.global_type orelse continue;
+        const val = defaultZeroValue(gt.val_type);
+        const gi = allocator.create(core_types.GlobalInstance) catch return error.OutOfMemory;
+        gi.* = .{ .global_type = gt, .value = val };
+        tmp_globals.append(allocator, gi) catch return error.OutOfMemory;
+        global_entries.append(ea, .{
+            .val_type = @intFromEnum(gt.val_type),
+            .mutability = if (gt.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
+            .init_i64 = valueToI64(val),
+            .init_v128 = valueToV128(val),
+        }) catch return error.OutOfMemory;
+    }
+    for (module.globals) |g| {
+        const val = interp_instance.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
+        const gi = allocator.create(core_types.GlobalInstance) catch return error.OutOfMemory;
+        gi.* = .{ .global_type = g.global_type, .value = val };
+        tmp_globals.append(allocator, gi) catch return error.OutOfMemory;
+        global_entries.append(ea, .{
+            .val_type = @intFromEnum(g.global_type.val_type),
+            .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
+            .init_i64 = valueToI64(val),
+            .init_v128 = valueToV128(val),
+        }) catch return error.OutOfMemory;
+    }
+
+    // Build element segment entries. Declarative segments contribute
+    // nothing at runtime; passive segments emit with offset = 0 and
+    // `is_passive = true` (only usable via `table.init`). Funcidx
+    // null sentinels are encoded as `0xFFFFFFFF`, matching the loader.
+    var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
+    for (module.elements) |seg| {
+        if (seg.is_declarative) continue;
+        const offset: u32 = if (seg.is_passive) 0 else blk: {
+            const off = seg.offset orelse continue;
+            break :blk switch (off) {
+                .i32_const => |v| @as(u32, @bitCast(v)),
+                else => continue,
+            };
+        };
+        const indices = ea.alloc(u32, seg.func_indices.len) catch return error.OutOfMemory;
+        for (seg.func_indices, 0..) |fi, j| {
+            indices[j] = fi orelse 0xFFFFFFFF;
+        }
+        elem_entries.append(ea, .{
+            .table_idx = seg.table_idx,
+            .offset = offset,
+            .func_indices = indices,
+            .is_passive = seg.is_passive,
+        }) catch return error.OutOfMemory;
+    }
+
     var arch_name = std.mem.zeroes([16]u8);
     switch (opts.target_arch) {
         .x86_64 => @memcpy(arch_name[0..6], "x86-64"),
@@ -314,20 +379,62 @@ pub fn compileCoreWasm(
         if (data_segs.items.len > 0) data_segs.items else null,
         if (imports.items.len > 0) imports.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
-        // Globals + elems are not yet populated by this helper. The
-        // motivating workload (componentize-js cores) initialises its
-        // own globals through data segments + start code, and the
-        // existing AOT loader tolerates empty global/elem sections
-        // (it allocates from `module.memories.len`/`module.globals.len`
-        // = 0 just fine, then runs `start` which re-derives state).
-        // Wired in fully when phase 3 lights up canon-lift onto AOT
-        // exports for components that exercise top-level globals.
-        null,
-        null,
+        // Plain wasm32-wasip1 modules (AssemblyScript / Rust / clang
+        // wasi-libc) carry a mutable `i32` shadow stack pointer global
+        // that every function prologue reads/writes; failing to emit it
+        // leaves SP=0 at startup and AS aborts inside its runtime with
+        // `abort:  in (1:1)`. Componentize-js cores tolerate empty
+        // globals/elems because canon-lift wraps them; standalone cores
+        // do not. See `phase-b-diagnosis.md` (#662 Phase B).
+        if (global_entries.items.len > 0) global_entries.items else null,
+        if (elem_entries.items.len > 0) elem_entries.items else null,
         module.start_function,
         if (func_type_entries.items.len > 0) func_type_entries.items else null,
         if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
     ) catch return error.CoreCompileFailed;
+}
+
+// ── Global / element entry builders ─────────────────────────────────────
+//
+// Mirrors `src/compiler/main.zig`'s `runCompile` so the in-process AOT
+// compile produces the same `.cwasm` layout the on-disk path does. The
+// helpers here are deliberately self-contained (no cross-imports of
+// file-private functions in `compiler/main.zig`) to keep this fix
+// surgical; the duplication can be deduplicated in a follow-up by
+// hoisting them into `emit_aot.zig` or a new shared file.
+
+fn defaultZeroValue(vt: core_types.ValType) core_types.Value {
+    return switch (vt) {
+        .i32 => .{ .i32 = 0 },
+        .i64 => .{ .i64 = 0 },
+        .f32 => .{ .f32 = 0 },
+        .f64 => .{ .f64 = 0 },
+        .v128 => .{ .v128 = 0 },
+        .funcref => .{ .funcref = null },
+        .externref => .{ .externref = null },
+        .nonfuncref => .{ .nonfuncref = null },
+        .nonexternref => .{ .nonexternref = null },
+        else => .{ .i64 = 0 },
+    };
+}
+
+fn valueToI64(v: core_types.Value) i64 {
+    return switch (v) {
+        .i32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .i64 => |x| x,
+        .f32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .f64 => |x| @as(i64, @bitCast(x)),
+        .funcref, .nonfuncref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
+        .externref, .nonexternref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
+        else => 0,
+    };
+}
+
+fn valueToV128(v: core_types.Value) u128 {
+    return switch (v) {
+        .v128 => |x| x,
+        else => 0,
+    };
 }
 
 /// Hex-encode a sha256 digest into a fresh allocator-owned string.
