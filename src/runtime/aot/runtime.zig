@@ -375,6 +375,17 @@ pub const VmCtx = extern struct {
     /// exceeds `memory_size`. Handles overlapping regions (memmove
     /// semantics).
     mem_copy_fn: usize = 0,
+    /// Opaque pointer to the `WasiCtx` driving the WASI host imports
+    /// for this AOT instance (issue #644 + Approach A). `0` means no
+    /// WASI context was attached — AOT WASI adapters in
+    /// `src/runtime/aot/host_bridge.zig` then fall back to the
+    /// stateless `wasi_core.zig` defaults (zero-args, stdout-only)
+    /// instead of the full filesystem / preopen / fd-table surface.
+    /// Set during `wamr run <core.wasm>` after `instantiate` so the
+    /// AOT path matches the interpreter's WASI semantics. Must be the
+    /// **last** field in this extern struct so AOT codegen offsets
+    /// remain stable for older fields.
+    wasi_ctx: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -943,6 +954,14 @@ pub const AotInstance = struct {
     /// Sorted-by-ptr map from resolved native funcptr → sig_id. Populated in
     /// `mapCodeExecutable` once `funcptrs` hold real addresses.
     ptr_to_sig: []PtrSigEntry = &.{},
+    /// Opaque `*WasiCtx` cast to usize. Set by the CLI (see `wamr run`)
+    /// before invoking exports so AOT WASI adapters in
+    /// `src/runtime/aot/host_bridge.zig` can recover the per-process
+    /// args / env / preopens / fd-table state. `0` means "no WASI ctx";
+    /// the adapters then fall back to the stateless `wasi_core.zig`
+    /// defaults (zero-args, stdout-only). Propagated into the on-stack
+    /// `VmCtx` built in `callFuncScalar` / `callFunc`.
+    wasi_ctx: usize = 0,
 };
 
 pub const TableInfo = extern struct {
@@ -1489,6 +1508,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
         vmctx.ptr_to_sig_ptr = @intFromPtr(inst.ptr_to_sig.ptr);
         vmctx.ptr_to_sig_len = @intCast(inst.ptr_to_sig.len);
     }
+    vmctx.wasi_ctx = inst.wasi_ctx;
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -1821,6 +1841,7 @@ pub fn callFuncScalar(
         vmctx.ptr_to_sig_ptr = @intFromPtr(inst.ptr_to_sig.ptr);
         vmctx.ptr_to_sig_len = @intCast(inst.ptr_to_sig.len);
     }
+    vmctx.wasi_ctx = inst.wasi_ctx;
 
     // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
