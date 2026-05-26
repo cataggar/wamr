@@ -175,7 +175,7 @@ jobs:
         run: rustup target add wasm32-wasip1
 
       - name: Build and run component-examples (wamr golden)
-        run: zig build install component-examples component-examples-run
+        run: zig build install component-examples component-examples-run -Daot-broken-components=false
 
   wasi-p2-testsuite:
     name: Build & Test (wasi-p2-testsuite)
@@ -207,7 +207,7 @@ jobs:
         run: rustup target add wasm32-wasip1
 
       - name: Run WASI Preview 2 conformance gate
-        run: zig build wasi-p2-testsuite
+        run: zig build wasi-p2-testsuite -Daot-broken-components=false
 
   wasi-p3-testsuite:
     name: Build & Test (wasi-p3-testsuite)
