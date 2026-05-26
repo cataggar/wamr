@@ -510,6 +510,12 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     if (vmctx.instance_ptr == 0) return -1;
     const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
     if (inst.memories.len == 0) return -1;
+    // Refuse to grow a borrowed (imported) memory: reallocating the host
+    // buffer here would rebase memory.data.ptr, but the exporting sibling's
+    // `vmctx.memory_base` was captured at its own instantiate-time and would
+    // become a dangling pointer. Cross-instance grow propagation needs a
+    // vmctx-list on `MemoryInstance` — tracked separately.
+    if (inst.memories_owned.len > 0 and !inst.memories_owned[0]) return -1;
     const mem = inst.memories[0];
     const old_pages: u32 = mem.current_pages;
     if (delta_pages < 0) return -1;
@@ -877,6 +883,10 @@ const can_execute_native = native_arch != .unsupported;
 pub const AotInstance = struct {
     module: *const aot_loader.AotModule,
     memories: []*types.MemoryInstance,
+    /// True when the matching `memories[i]` entry was allocated by this
+    /// instance and should be released on destroy. Borrowed imported-memory
+    /// overrides leave this false so the exporting sibling retains ownership.
+    memories_owned: []bool = &.{},
     tables: []*types.TableInstance,
     /// True when the matching `tables[i]` entry was allocated by this
     /// instance and should be released on destroy. Borrowed imported-table
@@ -959,18 +969,22 @@ pub const RuntimeError = error{
 
 /// Instantiate an AOT module, producing a runnable AotInstance.
 pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError!*AotInstance {
-    return instantiateWithOverrides(module, allocator, &.{});
+    return instantiateWithOverrides(module, allocator, &.{}, &.{});
 }
 
-/// Instantiate an AOT module, optionally borrowing `TableInstance`s for each
-/// imported-table slot. `imported_table_overrides[i]` maps to
-/// `module.importedTables()[i]`; null leaves that slot locally allocated.
+/// Instantiate an AOT module, optionally borrowing `TableInstance`s and
+/// `MemoryInstance`s for each imported-table / imported-memory slot.
+/// `imported_table_overrides[i]` maps to `module.importedTables()[i]`,
+/// `imported_memory_overrides[i]` to `module.importedMemories()[i]`;
+/// null leaves that slot locally allocated.
 pub fn instantiateWithOverrides(
     module: *const aot_loader.AotModule,
     allocator: std.mem.Allocator,
     imported_table_overrides: []const ?*types.TableInstance,
+    imported_memory_overrides: []const ?*types.MemoryInstance,
 ) RuntimeError!*AotInstance {
     std.debug.assert(imported_table_overrides.len == 0 or imported_table_overrides.len == module.importedTables().len);
+    std.debug.assert(imported_memory_overrides.len == 0 or imported_memory_overrides.len == module.importedMemories().len);
 
     var inst = allocator.create(AotInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(inst);
@@ -978,6 +992,7 @@ pub fn instantiateWithOverrides(
     inst.* = .{
         .module = module,
         .memories = &.{},
+        .memories_owned = &.{},
         .tables = &.{},
         .tables_owned = &.{},
         .globals = &.{},
@@ -999,12 +1014,18 @@ pub fn instantiateWithOverrides(
     }
     errdefer if (inst.elem_segments_dropped.len > 0) allocator.free(inst.elem_segments_dropped);
 
-    inst.memories = try allocateMemories(module, allocator);
-    errdefer freeMemories(inst.memories, allocator);
+    const mem_alloc = try allocateMemories(module, allocator, imported_memory_overrides);
+    inst.memories = mem_alloc.memories;
+    inst.memories_owned = mem_alloc.owned;
+    errdefer freeMemories(inst.memories, inst.memories_owned, allocator);
 
-    // Apply data segments to linear memory
+    // Apply data segments to locally-allocated linear memory only.
+    // Writing into a *borrowed* memory would scribble the exporter's bytes
+    // during the importer's instantiation, since both VmCtx's see the same
+    // backing buffer.
     for (module.data_segments) |seg| {
         if (seg.memory_idx >= inst.memories.len) continue;
+        if (seg.memory_idx < inst.memories_owned.len and !inst.memories_owned[seg.memory_idx]) continue;
         const mem = inst.memories[seg.memory_idx];
         const end = @as(usize, seg.offset) + seg.data.len;
         if (end > mem.data.len) continue;
@@ -1120,7 +1141,7 @@ pub fn destroy(inst: *AotInstance) void {
     if (inst.code_base) |base| {
         platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
     }
-    freeMemories(inst.memories, allocator);
+    freeMemories(inst.memories, inst.memories_owned, allocator);
     freeTables(inst.tables, inst.tables_owned, allocator);
     freeGlobals(inst.globals, allocator);
     if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
@@ -2000,40 +2021,89 @@ fn resolveHostFunctionsImpl(
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
 
-fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.MemoryInstance {
-    if (module.memories.len == 0) return &.{};
+const MemoriesAllocation = struct {
+    memories: []*types.MemoryInstance,
+    owned: []bool,
+};
 
-    const memories = allocator.alloc(*types.MemoryInstance, module.memories.len) catch return error.OutOfMemory;
+/// Allocate the memory slots for an instance. Imported memory slots are
+/// kept at the **front** of `memories` (so `memories[0]` still aliases the
+/// active linear memory the way `VmCtx.memory_base` wiring expects).
+/// Slots with a non-null entry in `imported_memory_overrides` are borrowed
+/// from the exporting sibling; everything else (and unoverriden imports)
+/// is locally allocated.
+fn allocateMemories(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+    imported_memory_overrides: []const ?*types.MemoryInstance,
+) RuntimeError!MemoriesAllocation {
+    const imported = module.importedMemories();
+    const total_count = imported.len + module.memories.len;
+    if (total_count == 0) return .{ .memories = &.{}, .owned = &.{} };
+
+    const memories = allocator.alloc(*types.MemoryInstance, total_count) catch return error.OutOfMemory;
+    errdefer allocator.free(memories);
+    const owned = allocator.alloc(bool, total_count) catch return error.OutOfMemory;
+    errdefer allocator.free(owned);
+    @memset(owned, false);
+
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| memories[i].release(allocator);
-        allocator.free(memories);
+        for (0..initialized) |i| {
+            if (owned[i]) memories[i].release(allocator);
+        }
     }
 
-    for (module.memories, 0..) |mem_type, i| {
-        const initial_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
-        const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
-        // Pre-allocate for memory.grow: use max_pages but cap at a reasonable default
-        const alloc_pages = @min(max_pages, @max(initial_pages, 256));
-        const size = @as(usize, alloc_pages) * types.MemoryInstance.page_size;
-
-        const data = allocator.alloc(u8, size) catch return error.OutOfMemory;
-        @memset(data, 0);
-        const mem = allocator.create(types.MemoryInstance) catch {
-            allocator.free(data);
-            return error.OutOfMemory;
+    for (imported, 0..) |desc, i| {
+        if (i < imported_memory_overrides.len) {
+            if (imported_memory_overrides[i]) |override| {
+                memories[i] = override;
+                initialized += 1;
+                continue;
+            }
+        }
+        const mem_type = types.MemoryType{
+            .limits = .{
+                .min = desc.min,
+                .max = if (desc.max) |max| @as(u64, max) else null,
+            },
+            .is_memory64 = desc.is64,
         };
-        mem.* = .{
-            .memory_type = mem_type,
-            .data = data,
-            .current_pages = initial_pages,
-            .max_pages = max_pages,
-        };
-        memories[i] = mem;
+        memories[i] = try allocateOneMemory(mem_type, allocator);
+        owned[i] = true;
         initialized += 1;
     }
 
-    return memories;
+    for (module.memories, 0..) |mem_type, local_i| {
+        const i = imported.len + local_i;
+        memories[i] = try allocateOneMemory(mem_type, allocator);
+        owned[i] = true;
+        initialized += 1;
+    }
+
+    return .{ .memories = memories, .owned = owned };
+}
+
+fn allocateOneMemory(mem_type: types.MemoryType, allocator: std.mem.Allocator) RuntimeError!*types.MemoryInstance {
+    const initial_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
+    const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
+    // Pre-allocate for memory.grow: use max_pages but cap at a reasonable default
+    const alloc_pages = @min(max_pages, @max(initial_pages, 256));
+    const size = @as(usize, alloc_pages) * types.MemoryInstance.page_size;
+
+    const data = allocator.alloc(u8, size) catch return error.OutOfMemory;
+    @memset(data, 0);
+    const mem = allocator.create(types.MemoryInstance) catch {
+        allocator.free(data);
+        return error.OutOfMemory;
+    };
+    mem.* = .{
+        .memory_type = mem_type,
+        .data = data,
+        .current_pages = initial_pages,
+        .max_pages = max_pages,
+    };
+    return mem;
 }
 
 const TablesAllocation = struct {
@@ -2192,9 +2262,13 @@ fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
     return globals;
 }
 
-fn freeMemories(memories: []*types.MemoryInstance, allocator: std.mem.Allocator) void {
-    for (memories) |m| m.release(allocator);
+fn freeMemories(memories: []*types.MemoryInstance, owned: []bool, allocator: std.mem.Allocator) void {
+    std.debug.assert(owned.len == 0 or owned.len == memories.len);
+    for (memories, 0..) |m, i| {
+        if (owned.len == 0 or owned[i]) m.release(allocator);
+    }
     if (memories.len > 0) allocator.free(memories);
+    if (owned.len > 0) allocator.free(owned);
 }
 
 fn freeTables(tables: []*types.TableInstance, owned: []bool, allocator: std.mem.Allocator) void {

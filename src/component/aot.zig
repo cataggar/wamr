@@ -234,9 +234,20 @@ pub fn compileCoreWasm(
                     .table_max = if (table_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
                 }) catch return error.OutOfMemory;
             },
-            // TODO #649 phase 1.5: emit imported memory/global descriptors once
+            .memory => {
+                const memory_type = imp.memory_type orelse continue;
+                imports.append(ea, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .memory,
+                    .memory_min = @intCast(memory_type.limits.min),
+                    .memory_max = if (memory_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
+                    .memory_is64 = memory_type.is_memory64,
+                }) catch return error.OutOfMemory;
+            },
+            // TODO #649 phase 4: emit imported global descriptors once
             // the loader/runtime can retain and wire them through instantiation.
-            .memory, .global => {},
+            .global => {},
             .tag => {},
         }
     }

@@ -1096,24 +1096,30 @@ fn compileToAot(
                     .table_max = if (table_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
                 });
             },
-            .memory, .global => {},
+            .memory => {
+                const memory_type = imp.memory_type orelse continue;
+                try import_entries.append(a, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .memory,
+                    .memory_min = @intCast(memory_type.limits.min),
+                    .memory_max = if (memory_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
+                    .memory_is64 = memory_type.is_memory64,
+                });
+            },
+            .global => {},
             .tag => unreachable,
         }
     }
 
     var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
-    // Imported memories first so `memory_idx` (combined import+local
-    // indexing per interpreter loader) continues to reference the right
-    // slot. `initWithRegistry` swaps the importer's fresh allocations
-    // for the exporter's shared `*MemoryInstance` post-instantiate.
-    for (module.imports) |imp| {
-        if (imp.kind != .memory) continue;
-        const mt = imp.memory_type orelse continue;
-        try mem_entries.append(a, .{
-            .min_pages = @intCast(mt.limits.min),
-            .max_pages = if (mt.limits.max) |m| @as(?u32, @intCast(m)) else null,
-        });
-    }
+    // Local memories only. Imported memories are now retained in the AOT
+    // format as `ImportedMemoryDesc` entries (read back via
+    // `module.importedMemories()`) and allocated/borrowed at instantiate
+    // time by `aot_runtime.allocateMemories`. Pre-#649-phase-3 we faked
+    // imports as local memories so `initWithRegistry` could rewrite them
+    // post-instantiate; the new path is shape-compatible because the
+    // runtime keeps imported slots at the front of `inst.memories`.
     for (module.memories) |mem| {
         try mem_entries.append(a, .{
             .min_pages = @intCast(mem.limits.min),

@@ -117,7 +117,7 @@ test "#649 phase 2: instantiateWithOverrides shares imported tables across AOT c
     try aot_runtime_mod.mapCodeExecutable(exporter_inst);
 
     const overrides = [_]?*core_types.TableInstance{exporter_inst.tables[0]};
-    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &overrides);
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &overrides, &.{});
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
     try std.testing.expect(!importer_inst.tables_owned[0]);
@@ -228,4 +228,134 @@ test "#625 phase 1: instantiateWithOptions loads + runs an AOT core" {
     );
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqual(@as(i32, 142), results[0].i32);
+}
+
+test "#649 phase 3: AOT loader retains imported memory descriptors" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    // (module
+    //   (import "env" "mem" (memory 2 7))
+    //   (func (export "noop"))
+    // )
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // import section: "env" "mem" memory min=2 max=7
+        0x02, 0x0d,
+        0x01, 0x03, 'e',  'n',  'v',  0x03, 'm',  'e',
+        'm',  0x02, 0x01, 0x02, 0x07,
+        // function section: 1 fn type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "noop" func 0
+        0x07, 0x08, 0x01, 0x04, 'n',  'o',  'o',  'p',
+        0x00, 0x00,
+        // code section: empty body
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &core_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    const module = try aot_loader_mod.load(cwasm_bytes, allocator);
+    defer aot_loader_mod.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), module.imports.len);
+    try std.testing.expectEqual(core_types.ExternalKind.memory, module.imports[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), module.import_function_count);
+    try std.testing.expectEqual(@as(usize, 1), module.importedMemories().len);
+    const mem = module.importedMemories()[0];
+    try std.testing.expect(std.mem.eql(u8, mem.module_name, "env"));
+    try std.testing.expect(std.mem.eql(u8, mem.name, "mem"));
+    try std.testing.expectEqual(@as(u32, 2), mem.min);
+    try std.testing.expectEqual(@as(?u32, 7), mem.max);
+    try std.testing.expectEqual(false, mem.is64);
+}
+
+test "#649 phase 3: instantiateWithOverrides shares imported memory across AOT cores" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    // exporter:
+    //   (module
+    //     (memory (export "mem") 1)
+    //     (data (i32.const 0) "\55\44\33\22")
+    //   )
+    const exporter_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // memory section: 1 memory min=1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // export section: "mem" mem 0
+        0x07, 0x07, 0x01, 0x03, 'm',  'e',  'm',  0x02,
+        0x00,
+        // data section: 1 active segment, memory 0, offset 0, 4 bytes
+        0x0b, 0x0a,
+        0x01, 0x00, 0x41, 0x00, 0x0b, 0x04, 0x55, 0x44,
+        0x33, 0x22,
+    };
+
+    // importer:
+    //   (module
+    //     (import "env" "mem" (memory 1))
+    //     (func (export "read") (result i32) i32.const 0 i32.load)
+    //   )
+    const importer_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        // import section: "env" "mem" memory min=1
+        0x02, 0x0c,
+        0x01, 0x03, 'e',  'n',  'v',  0x03, 'm',  'e',
+        'm',  0x02, 0x00, 0x01,
+        // function section: 1 fn type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "read" func 0
+        0x07, 0x08, 0x01, 0x04, 'r',  'e',  'a',  'd',
+        0x00, 0x00,
+        // code section: locals=0; i32.const 0; i32.load align=2 offset=0; end
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x00, 0x28,
+        0x02, 0x00, 0x0b,
+    };
+
+    const allocator = std.testing.allocator;
+    const exporter_cwasm = try aot_harness.compileWasmToAot(allocator, &exporter_wasm);
+    defer allocator.free(exporter_cwasm);
+    const importer_cwasm = try aot_harness.compileWasmToAot(allocator, &importer_wasm);
+    defer allocator.free(importer_cwasm);
+
+    var exporter_module = try aot_loader_mod.load(exporter_cwasm, allocator);
+    defer aot_loader_mod.unload(&exporter_module, allocator);
+    var importer_module = try aot_loader_mod.load(importer_cwasm, allocator);
+    defer aot_loader_mod.unload(&importer_module, allocator);
+
+    const exporter_inst = try aot_runtime_mod.instantiate(&exporter_module, allocator);
+    defer aot_runtime_mod.destroy(exporter_inst);
+
+    // Sentinel from the exporter's data segment must be live in its memory.
+    try std.testing.expectEqual(@as(u8, 0x55), exporter_inst.memories[0].data[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), exporter_inst.memories[0].data[3]);
+
+    const overrides = [_]?*core_types.MemoryInstance{exporter_inst.memories[0]};
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &overrides);
+    defer aot_runtime_mod.destroy(importer_inst);
+    try std.testing.expectEqual(exporter_inst.memories[0], importer_inst.memories[0]);
+    try std.testing.expect(!importer_inst.memories_owned[0]);
+    try aot_runtime_mod.mapCodeExecutable(importer_inst);
+
+    const fn_idx = aot_runtime_mod.findExportFunc(importer_inst, "read") orelse return error.TestFailed;
+    const no_params = [_]core_types.ValType{};
+    const result_types = [_]core_types.ValType{.i32};
+    const no_args = [_]core_types.Value{};
+    var results_buf: [1]aot_runtime_mod.ScalarResult = .{.{ .i32 = 0 }};
+    const results = try aot_runtime_mod.callFuncScalar(
+        importer_inst,
+        fn_idx,
+        &no_params,
+        &result_types,
+        &no_args,
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    // little-endian {0x55, 0x44, 0x33, 0x22} = 0x22334455
+    try std.testing.expectEqual(@as(i32, 0x22334455), results[0].i32);
 }
