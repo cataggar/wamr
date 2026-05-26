@@ -245,9 +245,16 @@ pub fn compileCoreWasm(
                     .memory_is64 = memory_type.is_memory64,
                 }) catch return error.OutOfMemory;
             },
-            // TODO #649 phase 4: emit imported global descriptors once
-            // the loader/runtime can retain and wire them through instantiation.
-            .global => {},
+            .global => {
+                const global_type = imp.global_type orelse continue;
+                imports.append(ea, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .global,
+                    .global_val_type = global_type.val_type,
+                    .global_mutable = global_type.mutability == .mutable,
+                }) catch return error.OutOfMemory;
+            },
             .tag => {},
         }
     }

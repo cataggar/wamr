@@ -56,6 +56,8 @@ pub const ImportEntry = struct {
     memory_min: u32 = 0,
     memory_max: ?u32 = null,
     memory_is64: bool = false,
+    global_val_type: types.ValType = .i32,
+    global_mutable: bool = false,
 };
 
 pub const MemoryEntry = struct {
@@ -215,7 +217,10 @@ pub fn emit(
                         }
                         try tmp.append(allocator, if (imp.memory_is64) 1 else 0);
                     },
-                    else => return error.UnsupportedImportKind,
+                    .global => {
+                        try tmp.append(allocator, @intFromEnum(imp.global_val_type));
+                        try tmp.append(allocator, if (imp.global_mutable) 1 else 0);
+                    },
                 }
             }
             try emitSection(allocator, &buf, 8, tmp.items);

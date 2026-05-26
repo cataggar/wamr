@@ -893,6 +893,10 @@ pub const AotInstance = struct {
     /// overrides leave this false so the exporting sibling retains ownership.
     tables_owned: []bool = &.{},
     globals: []*types.GlobalInstance,
+    /// True when the matching `globals[i]` entry was allocated by this
+    /// instance and should be released on destroy. Borrowed imported-global
+    /// overrides leave this false so the exporting sibling retains ownership.
+    globals_owned: []bool = &.{},
     /// Byte offset for each wasm-flat global in `VmCtx.globals_ptr`.
     global_offsets: []u32 = &.{},
     /// Total byte size of the globals storage described by `global_offsets`.
@@ -969,22 +973,25 @@ pub const RuntimeError = error{
 
 /// Instantiate an AOT module, producing a runnable AotInstance.
 pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError!*AotInstance {
-    return instantiateWithOverrides(module, allocator, &.{}, &.{});
+    return instantiateWithOverrides(module, allocator, &.{}, &.{}, &.{});
 }
 
-/// Instantiate an AOT module, optionally borrowing `TableInstance`s and
-/// `MemoryInstance`s for each imported-table / imported-memory slot.
+/// Instantiate an AOT module, optionally borrowing `TableInstance`s,
+/// `MemoryInstance`s, and `GlobalInstance`s for each imported slot.
 /// `imported_table_overrides[i]` maps to `module.importedTables()[i]`,
-/// `imported_memory_overrides[i]` to `module.importedMemories()[i]`;
-/// null leaves that slot locally allocated.
+/// `imported_memory_overrides[i]` to `module.importedMemories()[i]`,
+/// `imported_global_overrides[i]` to `module.importedGlobals()[i]`;
+/// null leaves that slot locally allocated (with a zero-valued default).
 pub fn instantiateWithOverrides(
     module: *const aot_loader.AotModule,
     allocator: std.mem.Allocator,
     imported_table_overrides: []const ?*types.TableInstance,
     imported_memory_overrides: []const ?*types.MemoryInstance,
+    imported_global_overrides: []const ?*types.GlobalInstance,
 ) RuntimeError!*AotInstance {
     std.debug.assert(imported_table_overrides.len == 0 or imported_table_overrides.len == module.importedTables().len);
     std.debug.assert(imported_memory_overrides.len == 0 or imported_memory_overrides.len == module.importedMemories().len);
+    std.debug.assert(imported_global_overrides.len == 0 or imported_global_overrides.len == module.importedGlobals().len);
 
     var inst = allocator.create(AotInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(inst);
@@ -996,6 +1003,7 @@ pub fn instantiateWithOverrides(
         .tables = &.{},
         .tables_owned = &.{},
         .globals = &.{},
+        .globals_owned = &.{},
         .allocator = allocator,
         .module_ref = module,
     };
@@ -1069,9 +1077,11 @@ pub fn instantiateWithOverrides(
         }
     }
 
-    inst.globals = try allocateGlobals(module, allocator);
-    errdefer freeGlobals(inst.globals, allocator);
-    const global_layout = try computeGlobalLayout(module.global_inits, allocator);
+    const global_alloc = try allocateGlobals(module, imported_global_overrides, allocator);
+    inst.globals = global_alloc.globals;
+    inst.globals_owned = global_alloc.owned;
+    errdefer freeGlobals(inst.globals, inst.globals_owned, allocator);
+    const global_layout = try computeGlobalLayout(module.importedGlobals(), module.global_inits, allocator);
     inst.global_offsets = global_layout.offsets;
     inst.global_storage_size = global_layout.size;
     errdefer if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
@@ -1143,7 +1153,7 @@ pub fn destroy(inst: *AotInstance) void {
     }
     freeMemories(inst.memories, inst.memories_owned, allocator);
     freeTables(inst.tables, inst.tables_owned, allocator);
-    freeGlobals(inst.globals, allocator);
+    freeGlobals(inst.globals, inst.globals_owned, allocator);
     if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
     if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
     // inst.func_table aliases tables[0].native_backing (freed by TableInstance.release).
@@ -2202,34 +2212,98 @@ fn globalSlotSize(vt: types.ValType) u32 {
     };
 }
 
-fn computeGlobalLayout(inits: []const aot_loader.AotGlobalInit, allocator: std.mem.Allocator) RuntimeError!GlobalLayout {
-    if (inits.len == 0) return .{ .offsets = &.{}, .size = 0 };
+fn computeGlobalLayout(
+    imports: []const aot_loader.ImportedGlobalDesc,
+    inits: []const aot_loader.AotGlobalInit,
+    allocator: std.mem.Allocator,
+) RuntimeError!GlobalLayout {
+    const total = imports.len + inits.len;
+    if (total == 0) return .{ .offsets = &.{}, .size = 0 };
 
-    const offsets = allocator.alloc(u32, inits.len) catch return error.OutOfMemory;
+    const offsets = allocator.alloc(u32, total) catch return error.OutOfMemory;
     errdefer allocator.free(offsets);
 
     var next: u32 = 0;
+    // Imported globals come first in the wasm-flat global index space, so
+    // their slab offsets must match what the codegen baked into
+    // `global.get`/`global.set` instructions (frontend.zig also lays them
+    // out imports-first when computing `ir_module.global_offsets`).
+    for (imports, 0..) |g, i| {
+        next = alignForwardU32(next, globalSlotAlignment(g.val_type));
+        offsets[i] = next;
+        next += globalSlotSize(g.val_type);
+    }
     for (inits, 0..) |ginit, i| {
         const vt: types.ValType = @enumFromInt(ginit.val_type);
         next = alignForwardU32(next, globalSlotAlignment(vt));
-        offsets[i] = next;
+        offsets[imports.len + i] = next;
         next += globalSlotSize(vt);
     }
 
     return .{ .offsets = offsets, .size = next };
 }
 
-fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.GlobalInstance {
-    if (module.global_inits.len == 0) return &.{};
+/// Allocate the wasm-flat `[]*GlobalInstance` slice for an AOT instance.
+///
+/// Imported globals come first (matching codegen's wasm-flat indexing
+/// established in `frontend.zig`); for each imported slot we either
+/// borrow the override's `GlobalInstance` (retained) or, when no override
+/// is provided, allocate a fresh zero-valued local stand-in. Locally
+/// defined globals follow, materialised from `module.global_inits`.
+///
+/// The returned `GlobalsAllocation.owned[i]` is true exactly when this
+/// instance allocated `globals[i]` itself (and therefore must release it
+/// in `destroy`). Borrowed import slots leave `owned[i] = false` so the
+/// exporting sibling retains lifetime ownership.
+const GlobalsAllocation = struct {
+    globals: []*types.GlobalInstance,
+    owned: []bool,
+};
 
-    const globals = allocator.alloc(*types.GlobalInstance, module.global_inits.len) catch return error.OutOfMemory;
+fn allocateGlobals(
+    module: *const aot_loader.AotModule,
+    imported_global_overrides: []const ?*types.GlobalInstance,
+    allocator: std.mem.Allocator,
+) RuntimeError!GlobalsAllocation {
+    const imports = module.importedGlobals();
+    const total = imports.len + module.global_inits.len;
+    if (total == 0) return .{ .globals = &.{}, .owned = &.{} };
+
+    const globals = allocator.alloc(*types.GlobalInstance, total) catch return error.OutOfMemory;
+    errdefer allocator.free(globals);
+    const owned = allocator.alloc(bool, total) catch return error.OutOfMemory;
+    errdefer allocator.free(owned);
+
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| allocator.destroy(globals[i]);
-        allocator.free(globals);
+        for (0..initialized) |i| if (owned[i]) globals[i].release(allocator);
+    }
+
+    for (imports, 0..) |imp, i| {
+        if (imported_global_overrides.len > i and imported_global_overrides[i] != null) {
+            const shared = imported_global_overrides[i].?;
+            shared.retain();
+            globals[i] = shared;
+            owned[i] = false;
+        } else {
+            const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
+            g.* = .{
+                .global_type = .{
+                    .val_type = imp.val_type,
+                    .mutability = if (imp.mutable) .mutable else .immutable,
+                },
+                .value = defaultGlobalZero(imp.val_type),
+                .owned = true,
+                .ref_count = 1,
+            };
+            globals[i] = g;
+            owned[i] = true;
+        }
+        initialized += 1;
     }
 
     for (module.global_inits, 0..) |ginit, i| {
+        const slot = imports.len + i;
         const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
         const vt: types.ValType = @enumFromInt(ginit.val_type);
         // Tag the stored Value per the declared val_type so later
@@ -2255,11 +2329,27 @@ fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
             },
             .value = val,
         };
-        globals[i] = g;
+        globals[slot] = g;
+        owned[slot] = true;
         initialized += 1;
     }
 
-    return globals;
+    return .{ .globals = globals, .owned = owned };
+}
+
+fn defaultGlobalZero(vt: types.ValType) types.Value {
+    return switch (vt) {
+        .i32 => .{ .i32 = 0 },
+        .i64 => .{ .i64 = 0 },
+        .f32 => .{ .f32 = 0 },
+        .f64 => .{ .f64 = 0 },
+        .v128 => .{ .v128 = 0 },
+        .funcref => .{ .funcref = null },
+        .nonfuncref => .{ .nonfuncref = null },
+        .externref => .{ .externref = null },
+        .nonexternref => .{ .nonexternref = null },
+        else => .{ .i64 = 0 },
+    };
 }
 
 fn freeMemories(memories: []*types.MemoryInstance, owned: []bool, allocator: std.mem.Allocator) void {
@@ -2280,9 +2370,24 @@ fn freeTables(tables: []*types.TableInstance, owned: []bool, allocator: std.mem.
     if (owned.len > 0) allocator.free(owned);
 }
 
-fn freeGlobals(globals: []*types.GlobalInstance, allocator: std.mem.Allocator) void {
-    for (globals) |g| allocator.destroy(g);
+fn freeGlobals(globals: []*types.GlobalInstance, owned: []bool, allocator: std.mem.Allocator) void {
+    std.debug.assert(owned.len == 0 or owned.len == globals.len);
+    for (globals, 0..) |g, i| {
+        if (owned.len == 0) {
+            // Legacy callers pass owned=&.{} when all entries were
+            // unconditionally allocated by this instance (pre-#649-phase-4
+            // shape) — match the previous direct-destroy behaviour.
+            allocator.destroy(g);
+        } else {
+            // New-path: owned slots match the slab we created with
+            // ref_count=1; borrowed slots were retain()'d in allocateGlobals
+            // so they also need a matching release here.
+            _ = i;
+            g.release(allocator);
+        }
+    }
     if (globals.len > 0) allocator.free(globals);
+    if (owned.len > 0) allocator.free(owned);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
