@@ -65,11 +65,8 @@
         "unlink_file_trailing_slashes": "AOT codegen / runtime traps on production wasm32-wasip1 binaries (#662)"
     },
     "WASI Assemblyscript  tests [wasm32-wasip1]": {
-        "random_get-zero-length": "AssemblyScript runtime aborts at startup under AOT \u2014 likely codegen miscompilation of runtime init (#662)",
-        "args_get-multiple-arguments": "AssemblyScript runtime aborts at startup under AOT \u2014 likely codegen miscompilation of runtime init (#662)",
-        "fd_write-to-invalid-fd": "AssemblyScript runtime aborts at startup under AOT \u2014 likely codegen miscompilation of runtime init (#662)",
-        "fd_write-to-stdout": "AssemblyScript runtime aborts at startup under AOT \u2014 likely codegen miscompilation of runtime init (#662)",
-        "environ_sizes_get-no-variables": "AssemblyScript runtime aborts at startup under AOT \u2014 likely codegen miscompilation of runtime init (#662)",
-        "environ_get-multiple-variables": "AssemblyScript runtime aborts at startup under AOT \u2014 likely codegen miscompilation of runtime init (#662)"
+        "environ_sizes_get-no-variables": "wamr CLI inherits host environment when no `--env` flags are passed; the wasi-testsuite harness expects an empty environ for this case. Tracked separately from #662 Phase B \u2014 Phase B fixed the AOT startup abort that previously masked this.",
+        "args_get-multiple-arguments": "AOT hangs after Phase B fix: guest loops indefinitely past _start (#662, separate issue)",
+        "environ_get-multiple-variables": "AOT hangs after Phase B fix: guest loops indefinitely past _start (#662, separate issue)"
     }
 }
