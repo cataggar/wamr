@@ -53,6 +53,11 @@ pub const ImportEntry = struct {
     table_elem_type: types.ValType = .funcref,
     table_min: u32 = 0,
     table_max: ?u32 = null,
+    memory_min: u32 = 0,
+    memory_max: ?u32 = null,
+    memory_is64: bool = false,
+    global_val_type: types.ValType = .i32,
+    global_mutable: bool = false,
 };
 
 pub const MemoryEntry = struct {
@@ -202,7 +207,20 @@ pub fn emit(
                             try tmp.append(allocator, 0);
                         }
                     },
-                    else => return error.UnsupportedImportKind,
+                    .memory => {
+                        try appendU32Le(&tmp, allocator, imp.memory_min);
+                        if (imp.memory_max) |max| {
+                            try tmp.append(allocator, 1);
+                            try appendU32Le(&tmp, allocator, max);
+                        } else {
+                            try tmp.append(allocator, 0);
+                        }
+                        try tmp.append(allocator, if (imp.memory_is64) 1 else 0);
+                    },
+                    .global => {
+                        try tmp.append(allocator, @intFromEnum(imp.global_val_type));
+                        try tmp.append(allocator, if (imp.global_mutable) 1 else 0);
+                    },
                 }
             }
             try emitSection(allocator, &buf, 8, tmp.items);

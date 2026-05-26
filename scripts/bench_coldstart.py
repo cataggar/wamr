@@ -652,7 +652,17 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-    tmp_root = Path("/work") if Path("/work").is_dir() else None
+    # Prefer the runner's own scratch dir (writable, already on the NVMe mount
+    # under self-hosted runners). Fall back to /work only if writable — the
+    # azure-nvme convention places /work on local disk but the runner user
+    # may not own its root. Otherwise let tempfile pick the system default.
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    if runner_temp and os.access(runner_temp, os.W_OK):
+        tmp_root: str | None = runner_temp
+    elif os.access("/work", os.W_OK):
+        tmp_root = "/work"
+    else:
+        tmp_root = None
     with tempfile.TemporaryDirectory(prefix="bench-coldstart-", dir=tmp_root) as tmp:
         root = Path(tmp)
         try:

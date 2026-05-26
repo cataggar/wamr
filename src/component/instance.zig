@@ -1526,7 +1526,31 @@ pub fn instantiateWithOptions(
                             const imported_table_overrides = imported_table_overrides_opt orelse break :aot_blk;
                             defer if (imported_table_overrides.len > 0) allocator.free(imported_table_overrides);
 
-                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides) catch |err| {
+                            const imported_memory_overrides_opt = resolveAotImportedMemoryOverrides(
+                                allocator,
+                                inst,
+                                component,
+                                cis,
+                                ci_idx,
+                                ie.args,
+                                aot_module_ptr,
+                            ) catch break :aot_blk;
+                            const imported_memory_overrides = imported_memory_overrides_opt orelse break :aot_blk;
+                            defer if (imported_memory_overrides.len > 0) allocator.free(imported_memory_overrides);
+
+                            const imported_global_overrides_opt = resolveAotImportedGlobalOverrides(
+                                allocator,
+                                inst,
+                                component,
+                                cis,
+                                ci_idx,
+                                ie.args,
+                                aot_module_ptr,
+                            ) catch break :aot_blk;
+                            const imported_global_overrides = imported_global_overrides_opt orelse break :aot_blk;
+                            defer if (imported_global_overrides.len > 0) allocator.free(imported_global_overrides);
+
+                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides) catch |err| {
                                 std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                                 break :aot_blk;
                             };
@@ -2421,13 +2445,32 @@ fn firstUnsupportedAotImport(module: *const aot_loader.AotModule) ?aot_loader.Ao
                 if (aot_host_bridge.isSpectestModule(imp.module_name)) continue;
                 return imp;
             },
-            // memory / table / global / tag imports always require
-            // cross-instance wiring that the AOT runtime cannot
-            // synthesize today (memory_base / tables_info_ptr in
-            // `VmCtx` are populated from the AotInstance's own
-            // allocations, not from a borrowed *MemoryInstance /
-            // *TableInstance shared with a sibling core).
-            else => return imp,
+            // Tables and memories support cross-instance borrowing via
+            // `instantiateWithOverrides`'s `imported_table_overrides` /
+            // `imported_memory_overrides` slices. The caller's
+            // `resolveAotImported{Table,Memory}Overrides` will surface a
+            // null and fall back to interp if a `with` arg can't be
+            // satisfied, so we don't need to re-check feasibility here.
+            .table, .memory => continue,
+            // Immutable global imports flow through
+            // `imported_global_overrides`: the runtime borrows the
+            // exporter's `GlobalInstance` and bakes its value into the
+            // per-call globals slab. Mutable globals would need cross-core
+            // write-back, which requires either a per-global indirection
+            // in codegen or a slab-rebuild on each access; both are out of
+            // scope for this PR, so they still fall back to interp.
+            .global => {
+                for (module.importedGlobals()) |g| {
+                    if (!std.mem.eql(u8, g.module_name, imp.module_name)) continue;
+                    if (!std.mem.eql(u8, g.name, imp.field_name)) continue;
+                    if (g.mutable) return imp;
+                    break;
+                }
+                continue;
+            },
+            // Tag imports still require cross-instance wiring that the
+            // AOT runtime cannot synthesize today.
+            .tag => return imp,
         }
     }
     return null;
@@ -2558,6 +2601,114 @@ fn resolveAotImportedTableOverrides(
         if (source_inst_idx == std.math.maxInt(u32)) return null;
         if (source_inst_idx >= ci_idx) return null;
         overrides[i] = resolveCoreInstanceTableExport(inst, component, cis[source_inst_idx], imp_tbl.name) orelse return null;
+    }
+
+    return overrides;
+}
+
+fn resolveCoreInstanceMemoryExport(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    entry: ComponentInstance.CoreInstanceEntry,
+    export_name: []const u8,
+) ?*core_types.MemoryInstance {
+    if (entry.module_inst) |src_mi| {
+        const exp = src_mi.module.findExport(export_name, .memory) orelse return null;
+        if (exp.index >= src_mi.memories.len) return null;
+        return src_mi.memories[exp.index];
+    }
+    if (entry.aot_inst) |src_ai| {
+        const exp = src_ai.module.findExport(export_name, .memory) orelse return null;
+        if (exp.index >= src_ai.memories.len) return null;
+        return src_ai.memories[exp.index];
+    }
+    for (entry.inline_exports) |mem| {
+        if (!std.mem.eql(u8, mem.name, export_name)) continue;
+        if (mem.sort_idx.sort != .memory) break;
+        return resolveCoreMemoryToMI(inst, component, mem.sort_idx.idx);
+    }
+    return null;
+}
+
+fn resolveAotImportedMemoryOverrides(
+    allocator: std.mem.Allocator,
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    cis: []const ComponentInstance.CoreInstanceEntry,
+    ci_idx: usize,
+    args: []const ctypes.CoreInstantiateArg,
+    module: *const aot_loader.AotModule,
+) error{OutOfMemory}!?[]?*core_types.MemoryInstance {
+    const imported_memories = module.importedMemories();
+    if (imported_memories.len == 0) return &.{};
+
+    const overrides = try allocator.alloc(?*core_types.MemoryInstance, imported_memories.len);
+    errdefer allocator.free(overrides);
+
+    for (imported_memories, 0..) |imp_mem, i| {
+        const source_inst_idx: u32 = arg_blk: {
+            for (args) |arg| {
+                if (std.mem.eql(u8, arg.name, imp_mem.module_name)) break :arg_blk arg.instance_idx;
+            }
+            break :arg_blk std.math.maxInt(u32);
+        };
+        if (source_inst_idx == std.math.maxInt(u32)) return null;
+        if (source_inst_idx >= ci_idx) return null;
+        overrides[i] = resolveCoreInstanceMemoryExport(inst, component, cis[source_inst_idx], imp_mem.name) orelse return null;
+    }
+
+    return overrides;
+}
+
+fn resolveCoreInstanceGlobalExport(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    entry: ComponentInstance.CoreInstanceEntry,
+    export_name: []const u8,
+) ?*core_types.GlobalInstance {
+    if (entry.module_inst) |src_mi| {
+        const exp = src_mi.module.findExport(export_name, .global) orelse return null;
+        if (exp.index >= src_mi.globals.len) return null;
+        return src_mi.globals[exp.index];
+    }
+    if (entry.aot_inst) |src_ai| {
+        const exp = src_ai.module.findExport(export_name, .global) orelse return null;
+        if (exp.index >= src_ai.globals.len) return null;
+        return src_ai.globals[exp.index];
+    }
+    for (entry.inline_exports) |g| {
+        if (!std.mem.eql(u8, g.name, export_name)) continue;
+        if (g.sort_idx.sort != .global) break;
+        return resolveCoreGlobalToMI(inst, component, g.sort_idx.idx);
+    }
+    return null;
+}
+
+fn resolveAotImportedGlobalOverrides(
+    allocator: std.mem.Allocator,
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    cis: []const ComponentInstance.CoreInstanceEntry,
+    ci_idx: usize,
+    args: []const ctypes.CoreInstantiateArg,
+    module: *const aot_loader.AotModule,
+) error{OutOfMemory}!?[]?*core_types.GlobalInstance {
+    const imported_globals = module.importedGlobals();
+    if (imported_globals.len == 0) return &.{};
+
+    const overrides = try allocator.alloc(?*core_types.GlobalInstance, imported_globals.len);
+    errdefer allocator.free(overrides);
+
+    for (imported_globals, 0..) |imp_global, i| {
+        const source_inst_idx: u32 = arg_blk: {
+            for (args) |arg| {
+                if (std.mem.eql(u8, arg.name, imp_global.module_name)) break :arg_blk arg.instance_idx;
+            }
+            break :arg_blk std.math.maxInt(u32);
+        };
+        if (source_inst_idx == std.math.maxInt(u32)) return null;
+        if (source_inst_idx >= ci_idx) return null;
+        overrides[i] = resolveCoreInstanceGlobalExport(inst, component, cis[source_inst_idx], imp_global.name) orelse return null;
     }
 
     return overrides;

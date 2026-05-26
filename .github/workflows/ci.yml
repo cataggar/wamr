@@ -5,6 +5,7 @@ on:
     branches: [zig, main]
   pull_request:
     branches: [zig, main]
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -14,14 +15,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: [self-hosted, Linux, X64]
             name: linux-x64
             shell: bash
-          - os: ubuntu-22.04-arm
+          - os: [self-hosted, Linux, ARM64]
             name: linux-arm64
-            shell: bash
-          - os: macos-14
-            name: macos-arm64
             shell: bash
           - os: windows-latest
             name: windows-x64
@@ -51,10 +49,6 @@ jobs:
       - name: Build (ReleaseSafe)
         continue-on-error: true
         run: zig build -Doptimize=ReleaseSafe
-
-      - name: Build (wasm32-wasi cross-compile)
-        continue-on-error: true
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=wasm32-wasi -Dstrip=true
 
       - name: Spec tests (JSON)
         if: runner.os != 'Windows'

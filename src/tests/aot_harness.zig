@@ -1096,24 +1096,39 @@ fn compileToAot(
                     .table_max = if (table_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
                 });
             },
-            .memory, .global => {},
+            .memory => {
+                const memory_type = imp.memory_type orelse continue;
+                try import_entries.append(a, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .memory,
+                    .memory_min = @intCast(memory_type.limits.min),
+                    .memory_max = if (memory_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
+                    .memory_is64 = memory_type.is_memory64,
+                });
+            },
+            .global => {
+                const gt = imp.global_type orelse continue;
+                try import_entries.append(a, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .global,
+                    .global_val_type = gt.val_type,
+                    .global_mutable = gt.mutability == .mutable,
+                });
+            },
             .tag => unreachable,
         }
     }
 
     var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
-    // Imported memories first so `memory_idx` (combined import+local
-    // indexing per interpreter loader) continues to reference the right
-    // slot. `initWithRegistry` swaps the importer's fresh allocations
-    // for the exporter's shared `*MemoryInstance` post-instantiate.
-    for (module.imports) |imp| {
-        if (imp.kind != .memory) continue;
-        const mt = imp.memory_type orelse continue;
-        try mem_entries.append(a, .{
-            .min_pages = @intCast(mt.limits.min),
-            .max_pages = if (mt.limits.max) |m| @as(?u32, @intCast(m)) else null,
-        });
-    }
+    // Local memories only. Imported memories are now retained in the AOT
+    // format as `ImportedMemoryDesc` entries (read back via
+    // `module.importedMemories()`) and allocated/borrowed at instantiate
+    // time by `aot_runtime.allocateMemories`. Pre-#649-phase-3 we faked
+    // imports as local memories so `initWithRegistry` could rewrite them
+    // post-instantiate; the new path is shape-compatible because the
+    // runtime keeps imported slots at the front of `inst.memories`.
     for (module.memories) |mem| {
         try mem_entries.append(a, .{
             .min_pages = @intCast(mem.limits.min),
@@ -1121,18 +1136,16 @@ fn compileToAot(
         });
     }
 
-    // Build the global entries with wasm-flat indexing: imported globals
-    // come first (at wasm indices [0, import_global_count)), then locals.
-    // This matches what the x86_64 codegen expects: `global.get N` emits
-    // a load at offset N*8 from the globals base, where N is the raw
-    // wasm index (imports + locals).
-    //
-    // For imports we resolve values from the spectest module (the spec
-    // suite's canonical host module). Unknown imports fall back to 0.
-    //
-    // For locals we run `evalInitExpr` against all preceding globals so
-    // that `global.get` / arithmetic bytecode inits produce correct
-    // values (e.g. global.wast's $z1..$z6 depend on imported globals).
+    // Build the global entries with wasm-flat indexing. Imported globals
+    // are now emitted via `import_entries` (the #649-phase-4 path) so the
+    // runtime owns their slots at `inst.globals[0..import_count]`. Only
+    // locally-defined globals go into `global_entries`. We still maintain
+    // `tmp_globals` covering imports + locals so `evalInitExpr` for local
+    // inits and elem-segment offset evaluation observe the correct
+    // wasm-flat indexing. Imported globals' values are patched into
+    // `inst.globals[k].value` after instantiation via `patchGlobals`, and
+    // the per-call `writeGlobalsToStorage` then snapshots them into the
+    // codegen-addressable slab.
     var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
 
     // Temporary GlobalInstance list to feed evalInitExpr.
@@ -1142,7 +1155,11 @@ fn compileToAot(
         tmp_globals.deinit(a);
     }
 
-    // Imports first (only globals; other kinds are skipped).
+    // Imports first (only globals; other kinds are skipped). Values are
+    // used only to seed `tmp_globals` so local-global init exprs can
+    // resolve `global.get`; the runtime will create fresh zero-valued
+    // GlobalInstance slots for these imports, and `patchGlobals` rewrites
+    // them post-instantiate with the registry / spectest value.
     for (module.imports) |imp| {
         if (imp.kind != .global) continue;
         const gt = imp.global_type orelse continue;
@@ -1160,12 +1177,6 @@ fn compileToAot(
         const g = try a.create(types.GlobalInstance);
         g.* = .{ .global_type = gt, .value = val };
         try tmp_globals.append(a, g);
-        try global_entries.append(a, .{
-            .val_type = @intFromEnum(gt.val_type),
-            .mutability = if (gt.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
-            .init_i64 = valueToI64(val),
-            .init_v128 = valueToV128(val),
-        });
     }
 
     // Locals: evaluate init expressions against the preceding globals.
