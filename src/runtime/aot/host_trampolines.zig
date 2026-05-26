@@ -43,6 +43,42 @@ extern fn wamrAotDispatchComponentTrampoline(
     a5: u64,
 ) callconv(.c) DispatchResult;
 
+/// Cross-instance core-to-core fn-import dispatcher (#662). Implemented in
+/// `src/component/executor.zig`. The first slot (`a0`) is the importer's
+/// vmctx, which the dispatcher ignores; `a1..a5` are the lowered wasm args
+/// per the AOT codegen calling convention.
+extern fn wamrAotDispatchCrossInstance(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) DispatchResult;
+
+/// Trap-on-call stub for non-WASI function imports that have no AOT-side
+/// wiring yet (e.g. adapter-core canon.lower imports left over after #662
+/// Phase C). Returns a failing `DispatchResult` so the caller traps with
+/// a clean status rather than jumping through a null host slot.
+extern fn wamrAotDispatchTrapStub(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) DispatchResult;
+
+pub const DispatchKind = enum(u8) {
+    canon_lower,
+    cross_instance,
+    trap_stub,
+};
+
 pub const Slot = struct {
     component_inst: *anyopaque,
     canon_lower_idx: u32,
@@ -52,6 +88,7 @@ pub const Slot = struct {
         .result_types = &.{},
         .has_retptr = false,
     },
+    dispatch_kind: DispatchKind = .canon_lower,
 };
 
 var g_active_pool: ?*TrampolinePool = null;
@@ -66,7 +103,11 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
 
     const entry = pool.slots[slot];
     const ctx = entry.ctx orelse return 0;
-    const dispatched = wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5);
+    const dispatched = switch (entry.dispatch_kind) {
+        .canon_lower => wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5),
+        .cross_instance => wamrAotDispatchCrossInstance(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5),
+        .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5),
+    };
     if (dispatched.status != 0) return 0;
     return dispatched.value;
 }
@@ -131,6 +172,51 @@ pub const TrampolinePool = struct {
         self.slots[slot] = .{
             .component_inst = component_inst,
             .canon_lower_idx = canon_lower_idx,
+        };
+        self.next_slot += 1;
+        writeStub(self.stubBytes(slot), slot);
+        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        g_active_pool = self;
+
+        return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
+    }
+
+    /// Allocate a slot for a cross-instance core-to-core fn-import thunk
+    /// (#662). The stub forwards the importer's vmctx + lowered wasm args
+    /// to `wamrAotDispatchCrossInstance`, which re-issues the call into
+    /// the sibling AotInstance via `aot_runtime.callFuncScalar`.
+    pub fn allocCrossInstanceSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
+        const slot = self.next_slot;
+        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+
+        self.slots[slot] = .{
+            .component_inst = ctx,
+            .canon_lower_idx = 0,
+            .ctx = ctx,
+            .lowered_sig = lowered_sig,
+            .dispatch_kind = .cross_instance,
+        };
+        self.next_slot += 1;
+        writeStub(self.stubBytes(slot), slot);
+        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        g_active_pool = self;
+
+        return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
+    }
+
+    /// Allocate a slot for a "trap on call" stub. The instantiation flow
+    /// installs these for non-WASI fn imports that have no AOT-side wiring
+    /// (canon.lower / canon-builtin) yet — instantiation succeeds, but any
+    /// actual call traps with a clean status (#662 follow-up).
+    pub fn allocTrapSlot(self: *TrampolinePool, ctx: *anyopaque) !StubFn {
+        const slot = self.next_slot;
+        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+
+        self.slots[slot] = .{
+            .component_inst = ctx,
+            .canon_lower_idx = 0,
+            .ctx = ctx,
+            .dispatch_kind = .trap_stub,
         };
         self.next_slot += 1;
         writeStub(self.stubBytes(slot), slot);

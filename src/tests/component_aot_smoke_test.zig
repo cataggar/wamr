@@ -117,7 +117,7 @@ test "#649 phase 2: instantiateWithOverrides shares imported tables across AOT c
     try aot_runtime_mod.mapCodeExecutable(exporter_inst);
 
     const overrides = [_]?*core_types.TableInstance{exporter_inst.tables[0]};
-    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &overrides, &.{}, &.{});
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &overrides, &.{}, &.{}, &.{});
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
     try std.testing.expect(!importer_inst.tables_owned[0]);
@@ -336,7 +336,7 @@ test "#649 phase 3: instantiateWithOverrides shares imported memory across AOT c
     try std.testing.expectEqual(@as(u8, 0x22), exporter_inst.memories[0].data[3]);
 
     const overrides = [_]?*core_types.MemoryInstance{exporter_inst.memories[0]};
-    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &overrides, &.{});
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &overrides, &.{}, &.{});
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.memories[0], importer_inst.memories[0]);
     try std.testing.expect(!importer_inst.memories_owned[0]);
@@ -458,7 +458,7 @@ test "#649 phase 4: instantiateWithOverrides shares imported globals across AOT 
     try std.testing.expectEqual(@as(i32, 0x55), exporter_inst.globals[0].value.i32);
 
     const overrides = [_]?*core_types.GlobalInstance{exporter_inst.globals[0]};
-    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &.{}, &overrides);
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &.{}, &overrides, &.{});
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.globals[0], importer_inst.globals[0]);
     try std.testing.expect(!importer_inst.globals_owned[0]);
@@ -584,6 +584,7 @@ test "#649 phase 5: cross-AOT shared memory + table + global in one importer" {
         &table_overrides,
         &memory_overrides,
         &global_overrides,
+        &.{},
     );
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
