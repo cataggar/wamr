@@ -21,9 +21,6 @@ jobs:
           - os: [self-hosted, Linux, ARM64]
             name: linux-arm64
             shell: bash
-          - os: macos-14
-            name: macos-arm64
-            shell: bash
           - os: windows-latest
             name: windows-x64
             shell: pwsh
