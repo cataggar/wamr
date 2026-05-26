@@ -586,17 +586,145 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     }
 
     // Plain core wasm. The `wamr` CLI is AOT-only as of #644 — there
-    // is no interp fallback at the CLI surface. Core modules must be
-    // pre-compiled to a `.cwasm`/`.aot` file (via `wamrc`) and run as
-    // an AOT module. The `runAot` branch above handles those.
-    std.debug.print(
-        "Error: plain core wasm modules are not supported by `wamr run`.\n" ++
-            "  The CLI runs every wasm computation through the AOT pipeline.\n" ++
-            "  For core modules, pre-compile to `.cwasm`/`.aot` with `wamrc`\n" ++
-            "  and run that artifact instead. See issue #644.\n",
-        .{},
+    // is no interp fallback at the CLI surface. Auto-compile the
+    // module in-process to AOT and run it through the AOT runtime
+    // with WASI preview1 wired up via `src/runtime/aot/host_bridge.zig`.
+    if (comptime !aot_supported) {
+        std.debug.print(
+            "Error: AOT execution is not supported on this architecture, and `wamr run` is AOT-only.\n" ++
+                "  See issue #644.\n",
+            .{},
+        );
+        return 1;
+    }
+    if (listen_address != null) {
+        std.debug.print("Error: --listen is not supported for plain core wasm modules (use a component)\n", .{});
+        return 2;
+    }
+    return runCoreAot(
+        init.io,
+        allocator,
+        wasm_data,
+        wasm_args.items,
+        env_flags.items,
+        init.environ_map,
+        map_dirs.items,
     );
-    return 2;
+}
+
+/// Compile a plain core-wasm module to AOT in-process and execute it
+/// with WASI preview1 host functions resolved via the AOT host
+/// bridge (`src/runtime/aot/host_bridge.zig`). This is the only
+/// supported path for `\0asm` (core) inputs after #644 — the legacy
+/// interpreter `runWasm` was removed. The interpreter remains
+/// available as a library for tests / embedders.
+fn runCoreAot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    wasm_data: []const u8,
+    wasm_args: []const []const u8,
+    env_flags: []const []const u8,
+    environ_map: *const std.process.Environ.Map,
+    map_dirs: []const MapDir,
+) u8 {
+    const aot_loader = wamr.aot_loader;
+    const aot_runtime = wamr.aot_runtime;
+
+    // 1. Build the WasiCtx (args, env, preopens). Same lifetime model
+    // as runComponent: borrows strings from caller-owned slices.
+    var ctx = wamr.WasiCtx.init(allocator, io) catch |err| {
+        std.debug.print("Error: failed to init WASI ctx: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer ctx.deinit();
+
+    // argv[0] is the wasm filename (matches the interpreter precedent).
+    // We can't pass `path` here because the caller-side variable lives
+    // higher up; pick "wasm" as a stable placeholder (wasi-libc only
+    // uses argv[0] for `program_invocation_name`, not for routing).
+    var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch return 1;
+    defer allocator.free(argv_buf);
+    argv_buf[0] = "wasm";
+    for (wasm_args, 0..) |a, i| argv_buf[1 + i] = a;
+    ctx.setArgs(argv_buf);
+
+    var env_buf: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer env_buf.deinit(allocator);
+    if (env_flags.len > 0) {
+        env_buf.ensureTotalCapacity(allocator, env_flags.len) catch return 1;
+        for (env_flags) |kv| env_buf.appendAssumeCapacity(kv);
+    } else {
+        var it = environ_map.array_hash_map.iterator();
+        while (it.next()) |kv| {
+            // wasi-libc expects "NAME=value" strings.
+            const joined = std.fmt.allocPrint(allocator, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* }) catch return 1;
+            env_buf.append(allocator, joined) catch {
+                allocator.free(joined);
+                return 1;
+            };
+        }
+    }
+    defer if (env_flags.len == 0) {
+        // Only free strings we allocated ourselves above.
+        for (env_buf.items) |s| allocator.free(s);
+    };
+    ctx.setEnv(env_buf.items);
+
+    for (map_dirs) |md| {
+        _ = ctx.openMappedDir(md.host_path, md.guest_name) catch |err| {
+            std.debug.print("Error: --map-dir '{s}::{s}': {s}\n", .{ md.host_path, md.guest_name, @errorName(err) });
+            return 1;
+        };
+    }
+
+    // 2. AOT-compile the core wasm in-process. `compileCoreWasm` mirrors
+    // `wamrc compile` exactly so the same artifact would be produced.
+    const cwasm = wamr.component_aot.compileCoreWasm(allocator, wasm_data, .{}) catch |err| {
+        std.debug.print("Error: failed to AOT-compile core wasm: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer allocator.free(cwasm);
+
+    const aot_module = aot_loader.load(cwasm, allocator) catch |err| {
+        std.debug.print("Error: failed to load freshly compiled AOT module: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer aot_loader.unload(&aot_module, allocator);
+
+    const inst = aot_runtime.instantiate(&aot_module, allocator) catch |err| {
+        std.debug.print("Error: failed to instantiate AOT module: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer aot_runtime.destroy(inst);
+
+    aot_runtime.mapCodeExecutable(inst) catch |err| {
+        std.debug.print("Error: failed to map AOT code as executable: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    // 3. Wire the WasiCtx so the AOT WASI adapters in
+    // `runtime/aot/host_bridge.zig` can resolve it via `vmctx.wasi_ctx`.
+    inst.wasi_ctx = @intFromPtr(ctx);
+
+    const func_idx = aot_runtime.findExportFunc(inst, "_start") orelse
+        aot_runtime.findExportFunc(inst, "main") orelse {
+        std.debug.print("Error: no _start or main export\n", .{});
+        return 1;
+    };
+
+    // `_start` / `main` take no params and return no values for the
+    // wasi-libc CRT shape; route through `callFuncScalar` with empty
+    // slices. Any guest call to `proc_exit` short-circuits via
+    // `std.process.exit` inside the host bridge.
+    var results_buf: [0]wamr.aot_runtime.ScalarResult = .{};
+    _ = aot_runtime.callFuncScalar(inst, func_idx, &.{}, &.{}, &.{}, &results_buf) catch |err| {
+        std.debug.print("Error: AOT execution failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    // If the guest never called proc_exit, exit_code is null → success.
+    if (ctx.exit_code) |code| return @intCast(code & 0xFF);
+    return 0;
 }
 
 fn parseMapDir(spec: []const u8) !MapDir {
