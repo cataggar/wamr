@@ -331,6 +331,8 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     return 2;
                 }
                 precompiled_dir = spec;
+            } else if (std.mem.eql(u8, arg, "--trace-aot-wasi")) {
+                wamr.aot_host_bridge.trace_enabled = true;
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
