@@ -2470,7 +2470,7 @@ fn firstUnsupportedAotImport(module: *const aot_loader.AotModule) ?aot_loader.Ao
             },
             // Tag imports still require cross-instance wiring that the
             // AOT runtime cannot synthesize today.
-            else => return imp,
+            .tag => return imp,
         }
     }
     return null;
