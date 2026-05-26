@@ -358,7 +358,10 @@ def collect_summaries(
         wasm = paths["wasm"]
         wamr_cwasm = paths["wamr_cwasm"]
 
-        # wamr-target: cwasm + wasm
+        # wamr-target: cwasm only. As of #644 `wamr run` is AOT-only —
+        # it rejects plain core-wasm modules — so the "wasm" variant
+        # only makes sense for engines that still ship a JIT/interp
+        # path (wasmtime JIT below).
         out.append(
             time_engine_module(
                 f"{target_wamr} run {wamr_cwasm.name}",
@@ -366,18 +369,12 @@ def collect_summaries(
                 samples, warmup, ENGINE_TARGET, module_name, "cwasm",
             )
         )
-        out.append(
-            time_engine_module(
-                f"{target_wamr} run {wasm.name}",
-                [str(target_wamr), "run", str(wasm)],
-                samples, warmup, ENGINE_TARGET, module_name, "wasm",
-            )
-        )
 
-        # wamr-baseline: cwasm + wasm. The baseline build's wamr binary
-        # is paired with the *baseline* wamrc when AOT-compiling, since
-        # cwasm format is engine-version specific. Compile a dedicated
-        # baseline cwasm next to the baseline wamr.
+        # wamr-baseline: cwasm only (same reason as above). The
+        # baseline build's wamr binary is paired with the *baseline*
+        # wamrc when AOT-compiling, since cwasm format is engine-
+        # version specific. Compile a dedicated baseline cwasm next to
+        # the baseline wamr.
         baseline_cwasm = baseline_wamr.parent.parent / "_coldstart" / f"{module_name}.cwasm"
         baseline_cwasm.parent.mkdir(parents=True, exist_ok=True)
         baseline_wamrc = baseline_wamr.parent / "wamrc"
@@ -395,13 +392,6 @@ def collect_summaries(
                 f"{baseline_wamr} run {baseline_cwasm.name}",
                 [str(baseline_wamr), "run", str(baseline_cwasm)],
                 samples, warmup, ENGINE_BASELINE, module_name, "cwasm",
-            )
-        )
-        out.append(
-            time_engine_module(
-                f"{baseline_wamr} run {wasm.name}",
-                [str(baseline_wamr), "run", str(wasm)],
-                samples, warmup, ENGINE_BASELINE, module_name, "wasm",
             )
         )
 
