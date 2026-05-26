@@ -143,11 +143,21 @@ pub fn debugAotEnabled() bool {
     return aot_debug_enabled;
 }
 
-/// Caller-supplied instantiation options. Today only `precompiled_cores`
-/// is wired; the struct exists so future opts (verbose load logging,
-/// custom AOT host imports, …) can be added without breaking the API.
+/// Caller-supplied instantiation options.
 pub const Options = struct {
     precompiled_cores: []const PrecompiledCore = &.{},
+
+    /// When true, the instantiation refuses to silently fall back to
+    /// the interpreter on AOT-unresolvable imports / cross-instance
+    /// wiring gaps. Instead the failing core surfaces a typed
+    /// `error.AotImportUnresolvable` (instance.zig) and the
+    /// component-level "force every core to interp on any single
+    /// gap" policy is skipped.
+    ///
+    /// The `wamr run` CLI sets this; library callers (tests,
+    /// embedders) leave it `false` to keep the legacy "best effort,
+    /// fall back to interp" behaviour. See issue #644.
+    aot_only: bool = false,
 
     /// Find a precompiled artifact for a given core-module index.
     pub fn findPrecompiled(self: Options, module_idx: u32) ?[]const u8 {

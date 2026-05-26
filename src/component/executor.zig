@@ -85,6 +85,14 @@ pub const ExecutionError = error{
     /// params, and post-return on AOT cores are deferred to a
     /// follow-up (see issue #625 phase 3 notes).
     AotPathUnsupported,
+    /// `Options.aot_only` was set on this instantiation but at least
+    /// one core has an import (or instantiation step) the AOT runtime
+    /// cannot satisfy yet. The matching log line carries the import
+    /// `module.field` and kind. Surfaced to `wamr run`'s CLI exit
+    /// path as a clear error; library callers (tests, embedders)
+    /// that don't set `aot_only` keep the silent interp fallback.
+    /// See issue #644.
+    AotImportUnresolvable,
 };
 
 // ── Lift options parsed from CanonOpt array ─────────────────────────────────
