@@ -21,12 +21,16 @@ const indexspace = @import("indexspace.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const core_backend = @import("core_backend.zig");
+const call_frame_mod = @import("call_frame.zig");
 const debugAotEnabled = core_backend.debugAotEnabled;
 const Allocator = std.mem.Allocator;
 
 const ComponentInstance = instance_mod.ComponentInstance;
 const InterfaceValue = abi.InterfaceValue;
 const TypeRegistry = abi.TypeRegistry;
+pub const CallFrame = call_frame_mod.CallFrame;
+pub const InterpFrame = call_frame_mod.InterpFrame;
+pub const AotFrame = call_frame_mod.AotFrame;
 
 pub const MAX_FLAT_PARAMS: u32 = 16;
 pub const MAX_FLAT_RESULTS: u32 = 1;
@@ -132,25 +136,21 @@ pub const LiftOptions = struct {
 
 /// Call the core module's realloc function: (old_ptr, old_size, align, new_size) -> ptr.
 pub fn callRealloc(
-    env: *ExecEnv,
+    frame: *CallFrame,
     realloc_idx: u32,
     old_ptr: u32,
     old_size: u32,
     align_val: u32,
     new_size: u32,
 ) ExecutionError!u32 {
-    // Push the 4 i32 arguments
-    env.pushI32(@bitCast(old_ptr)) catch return error.StackOverflow;
-    env.pushI32(@bitCast(old_size)) catch return error.StackOverflow;
-    env.pushI32(@bitCast(align_val)) catch return error.StackOverflow;
-    env.pushI32(@bitCast(new_size)) catch return error.StackOverflow;
-
-    // Call the realloc function
-    interp.executeFunction(env, realloc_idx) catch return error.ReallocFailed;
-
-    // Pop the i32 result
-    const result = env.popI32() catch return error.StackUnderflow;
-    return @bitCast(result);
+    return frame.realloc(realloc_idx, old_ptr, old_size, align_val, new_size) catch |err| switch (err) {
+        error.StackOverflow => error.StackOverflow,
+        error.StackUnderflow => error.StackUnderflow,
+        error.ReallocFailed => error.ReallocFailed,
+        error.OutOfMemory => error.OutOfMemory,
+        error.AotPathUnsupported => error.AotPathUnsupported,
+        else => error.ReallocFailed,
+    };
 }
 
 // ── Core function calling ───────────────────────────────────────────────────
@@ -326,9 +326,12 @@ pub fn callComponentFuncByLocal(
     const env = ExecEnv.create(module_inst, 4096, allocator) catch return error.OutOfMemory;
     defer env.destroy();
 
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
     // Get memory if needed
     const memory: ?[]u8 = if (lift_opts.memory_idx) |mem_idx|
-        if (module_inst.getMemory(mem_idx)) |mem| mem.data else null
+        frame.memory(mem_idx)
     else
         null;
 
@@ -336,7 +339,7 @@ pub fn callComponentFuncByLocal(
     if (flat_param_count <= MAX_FLAT_PARAMS) {
         // Flatten each arg and push as core values
         for (args, param_types) |arg, pt| {
-            pushInterfaceValue(env, arg, pt, registry) catch return error.LowerError;
+            pushInterfaceValue(&frame, arg, pt, registry) catch return error.LowerError;
         }
     } else {
         // Spill to memory: allocate space via realloc, store tuple, push ptr
@@ -344,7 +347,7 @@ pub fn callComponentFuncByLocal(
         const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
-        const ptr = try callRealloc(env, realloc_idx, 0, 0, tuple_align, tuple_size);
+        const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
 
         // Store each arg at its offset in the tuple
         var offset: u32 = 0;
@@ -392,7 +395,7 @@ pub fn callComponentFuncByLocal(
     } else if (flat_result_count <= MAX_FLAT_RESULTS) {
         // Results are on the stack as flat values
         for (result_types, 0..) |rt, i| {
-            out_results[i] = popInterfaceValue(env, rt, registry, allocator) catch return error.LiftError;
+            out_results[i] = popInterfaceValue(&frame, rt, registry, allocator) catch return error.LiftError;
         }
     } else {
         // Results were stored in memory; core returned a pointer
@@ -415,7 +418,7 @@ pub fn callComponentFuncByLocal(
         // For spilled results: re-push the result pointer as i32.
         if (flat_result_count <= MAX_FLAT_RESULTS) {
             for (out_results[0..result_types.len], result_types) |r, rt| {
-                pushInterfaceValue(env, r, rt, registry) catch {};
+                pushInterfaceValue(&frame, r, rt, registry) catch {};
             }
         } else {
             // Spilled results: post_return receives the result pointer.
@@ -808,22 +811,25 @@ pub fn callComponentFuncByLocalAsyncLifted(
     const env = ExecEnv.create(module_inst, 4096, allocator) catch return error.OutOfMemory;
     defer env.destroy();
 
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
     const memory: ?[]u8 = if (lift_opts.memory_idx) |mem_idx|
-        if (module_inst.getMemory(mem_idx)) |mem| mem.data else null
+        frame.memory(mem_idx)
     else
         null;
 
     // Lower args — same logic as the sync path.
     if (flat_param_count <= MAX_FLAT_PARAMS) {
         for (args, param_types) |arg, pt| {
-            pushInterfaceValue(env, arg, pt, registry) catch return error.LowerError;
+            pushInterfaceValue(&frame, arg, pt, registry) catch return error.LowerError;
         }
     } else {
         const mem = memory orelse return error.MemoryNotAvailable;
         const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
-        const ptr = try callRealloc(env, realloc_idx, 0, 0, tuple_align, tuple_size);
+        const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
 
         var offset: u32 = 0;
         for (args, param_types) |arg, pt| {
@@ -948,28 +954,28 @@ fn typeSize(registry: TypeRegistry, t: ctypes.ValType) u32 {
 
 // ── Helper: push/pop interface values as core stack values ──────────────────
 
-fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !void {
+fn pushInterfaceValue(frame: *CallFrame, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !void {
     switch (t) {
-        .bool => try env.pushI32(if (val.bool) 1 else 0),
-        .s8 => try env.pushI32(@as(i32, val.s8)),
-        .u8 => try env.pushI32(@as(i32, @intCast(val.u8))),
-        .s16 => try env.pushI32(@as(i32, val.s16)),
-        .u16 => try env.pushI32(@as(i32, @intCast(val.u16))),
-        .s32 => try env.pushI32(val.s32),
-        .u32, .char => try env.pushI32(@bitCast(val.u32)),
-        .s64 => try env.pushI64(val.s64),
-        .u64 => try env.pushI64(@bitCast(val.u64)),
-        .f32 => try env.push(.{ .f32 = @bitCast(val.f32) }),
-        .f64 => try env.push(.{ .f64 = @bitCast(val.f64) }),
-        .own, .borrow => try env.pushI32(@bitCast(encodeResourceWire(val.handle))),
-        .future, .stream, .error_context => try env.pushI32(@bitCast(val.handle)),
+        .bool => try frame.pushSlot(.{ .i32 = if (val.bool) 1 else 0 }),
+        .s8 => try frame.pushSlot(.{ .i32 = @as(i32, val.s8) }),
+        .u8 => try frame.pushSlot(.{ .i32 = @as(i32, @intCast(val.u8)) }),
+        .s16 => try frame.pushSlot(.{ .i32 = @as(i32, val.s16) }),
+        .u16 => try frame.pushSlot(.{ .i32 = @as(i32, @intCast(val.u16)) }),
+        .s32 => try frame.pushSlot(.{ .i32 = val.s32 }),
+        .u32, .char => try frame.pushSlot(.{ .i32 = @bitCast(val.u32) }),
+        .s64 => try frame.pushSlot(.{ .i64 = val.s64 }),
+        .u64 => try frame.pushSlot(.{ .i64 = @bitCast(val.u64) }),
+        .f32 => try frame.pushSlot(.{ .f32 = @bitCast(val.f32) }),
+        .f64 => try frame.pushSlot(.{ .f64 = @bitCast(val.f64) }),
+        .own, .borrow => try frame.pushSlot(.{ .i32 = @bitCast(encodeResourceWire(val.handle)) }),
+        .future, .stream, .error_context => try frame.pushSlot(.{ .i32 = @bitCast(val.handle) }),
         .string => {
-            try env.pushI32(@bitCast(val.string.ptr));
-            try env.pushI32(@bitCast(val.string.len));
+            try frame.pushSlot(.{ .i32 = @bitCast(val.string.ptr) });
+            try frame.pushSlot(.{ .i32 = @bitCast(val.string.len) });
         },
         .list => {
-            try env.pushI32(@bitCast(val.list.ptr));
-            try env.pushI32(@bitCast(val.list.len));
+            try frame.pushSlot(.{ .i32 = @bitCast(val.list.ptr) });
+            try frame.pushSlot(.{ .i32 = @bitCast(val.list.len) });
         },
         // result<T, E>: flat repr is `[i32 disc] ++ join(flatten(T), flatten(E))`,
         // where the per-slot join takes the wider of the two arms (treated as
@@ -985,18 +991,18 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
             };
             const total_payload_slots = abi.flattenCount(registry, t) - 1;
             const disc: i32 = if (val.result_val.is_ok) 0 else 1;
-            try env.pushI32(disc);
+            try frame.pushSlot(.{ .i32 = disc });
 
             const arm_type: ?ctypes.ValType = if (val.result_val.is_ok) r.ok else r.err;
             var pushed: u32 = 0;
             if (arm_type) |at| {
                 if (val.result_val.payload) |p| {
-                    try pushInterfaceValue(env, p.*, at, registry);
+                    try pushInterfaceValue(frame, p.*, at, registry);
                     pushed = abi.flattenCount(registry, at);
                 }
             }
             while (pushed < total_payload_slots) : (pushed += 1) {
-                try env.pushI32(0);
+                try frame.pushSlot(.{ .i32 = 0 });
             }
         },
         // Compound types — lower into a scratch buffer via
@@ -1014,7 +1020,7 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
             // join behaviour: shorter arms zero-fill the remaining
             // slots so the join's flat width is constant).
             for (written..total_slots) |k| slot_buf[k] = 0;
-            for (slot_buf[0..total_slots]) |s| try env.pushI32(@bitCast(s));
+            try frame.pushSlotsU32(slot_buf[0..total_slots]);
         },
         // Resolve `.type_idx` through the registry and re-dispatch on
         // the reified ValType. The registry may have been extended with
@@ -1036,7 +1042,7 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
                 .resource => .{ .own = idx },
                 else => return error.CompoundNeedsRegistry,
             };
-            try pushInterfaceValue(env, val, reified, registry);
+            try pushInterfaceValue(frame, val, reified, registry);
         },
     }
 }
@@ -1250,19 +1256,19 @@ fn resolveArmType(t: ctypes.ValType, registry: TypeRegistry) ctypes.ValType {
     return resolved;
 }
 
-fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
+fn popInterfaceValue(frame: *CallFrame, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
     return switch (t) {
-        .bool => .{ .bool = (try env.popI32()) != 0 },
-        .s8 => .{ .s8 = @truncate(try env.popI32()) },
-        .u8 => .{ .u8 = @truncate(@as(u32, @bitCast(try env.popI32()))) },
-        .s16 => .{ .s16 = @truncate(try env.popI32()) },
-        .u16 => .{ .u16 = @truncate(@as(u32, @bitCast(try env.popI32()))) },
-        .s32 => .{ .s32 = try env.popI32() },
-        .u32, .char => .{ .u32 = @bitCast(try env.popI32()) },
-        .s64 => .{ .s64 = try env.popI64() },
-        .u64 => .{ .u64 = @bitCast(try env.popI64()) },
+        .bool => .{ .bool = (try frame.popSlot(.i32)).i32 != 0 },
+        .s8 => .{ .s8 = @truncate((try frame.popSlot(.i32)).i32) },
+        .u8 => .{ .u8 = @truncate(@as(u32, @bitCast((try frame.popSlot(.i32)).i32))) },
+        .s16 => .{ .s16 = @truncate((try frame.popSlot(.i32)).i32) },
+        .u16 => .{ .u16 = @truncate(@as(u32, @bitCast((try frame.popSlot(.i32)).i32))) },
+        .s32 => .{ .s32 = (try frame.popSlot(.i32)).i32 },
+        .u32, .char => .{ .u32 = @bitCast((try frame.popSlot(.i32)).i32) },
+        .s64 => .{ .s64 = (try frame.popSlot(.i64)).i64 },
+        .u64 => .{ .u64 = @bitCast((try frame.popSlot(.i64)).i64) },
         .f32 => blk: {
-            const v = try env.pop();
+            const v = try frame.popSlot(.f32);
             break :blk .{ .f32 = switch (v) {
                 .f32 => |f| @bitCast(f),
                 .i32 => |i| @bitCast(i),
@@ -1270,22 +1276,22 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             } };
         },
         .f64 => blk: {
-            const v = try env.pop();
+            const v = try frame.popSlot(.f64);
             break :blk .{ .f64 = switch (v) {
                 .f64 => |f| @bitCast(f),
                 .i64 => |i| @bitCast(i),
                 else => 0,
             } };
         },
-        .own, .borrow => .{ .handle = decodeResourceWire(@bitCast(try env.popI32())) },
-        .future, .stream, .error_context => .{ .handle = @bitCast(try env.popI32()) },
+        .own, .borrow => .{ .handle = decodeResourceWire(@bitCast((try frame.popSlot(.i32)).i32)) },
+        .future, .stream, .error_context => .{ .handle = @bitCast((try frame.popSlot(.i32)).i32) },
         .string => .{ .string = .{
-            .len = @bitCast(try env.popI32()),
-            .ptr = @bitCast(try env.popI32()),
+            .len = @bitCast((try frame.popSlot(.i32)).i32),
+            .ptr = @bitCast((try frame.popSlot(.i32)).i32),
         } },
         .list => .{ .list = .{
-            .len = @bitCast(try env.popI32()),
-            .ptr = @bitCast(try env.popI32()),
+            .len = @bitCast((try frame.popSlot(.i32)).i32),
+            .ptr = @bitCast((try frame.popSlot(.i32)).i32),
         } },
         // `result<T, E>`: pop all payload slots into a scratch buffer
         // (we don't know the active arm's typing until we've popped the
@@ -1306,14 +1312,12 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             const total_payload_slots = abi.flattenCount(registry, t) - 1;
             var slot_buf: [16]u32 = undefined;
             if (total_payload_slots > slot_buf.len) return error.CompoundNeedsRegistry;
-            // Pop in stack order: top of stack is the last-pushed slot,
-            // so it lands in slot_buf[total-1] first.
-            var i: u32 = total_payload_slots;
-            while (i > 0) {
-                i -= 1;
-                slot_buf[i] = @bitCast(try env.popI32());
-            }
-            const disc = try env.popI32();
+            // Pop payload slots in canonical forward order (CallFrame
+            // hides the interp's LIFO stack reversal — `popSlotsU32`
+            // writes back-to-front for the interp backend, and reads
+            // straight from the AOT results buffer for AOT).
+            try frame.popSlotsU32(slot_buf[0..total_payload_slots]);
+            const disc = (try frame.popSlot(.i32)).i32;
             const is_ok = disc == 0;
             const arm_type: ?ctypes.ValType = if (is_ok) rt.ok else rt.err;
             var payload: ?*InterfaceValue = null;
@@ -1354,12 +1358,8 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             const total_payload_slots = abi.flattenCount(registry, t) - 1;
             var slot_buf: [16]u32 = undefined;
             if (total_payload_slots > slot_buf.len) return error.CompoundNeedsRegistry;
-            var i: u32 = total_payload_slots;
-            while (i > 0) {
-                i -= 1;
-                slot_buf[i] = @bitCast(try env.popI32());
-            }
-            const disc = try env.popI32();
+            try frame.popSlotsU32(slot_buf[0..total_payload_slots]);
+            const disc = (try frame.popSlot(.i32)).i32;
             const is_some = disc != 0;
             var payload: ?*InterfaceValue = null;
             if (is_some) {
@@ -1389,7 +1389,7 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
         .record, .variant, .tuple, .flags, .enum_ => |idx| blk: {
             _ = idx;
             const total_slots = abi.flattenCount(registry, t);
-            break :blk try popFlatCompound(env, t, total_slots, registry, allocator);
+            break :blk try popFlatCompound(frame, t, total_slots, registry, allocator);
         },
         // Mirror `pushInterfaceValue`: resolve `.type_idx` and re-pop on
         // the reified ValType.
@@ -1408,7 +1408,7 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
                 .resource => .{ .own = idx },
                 else => return error.CompoundNeedsRegistry,
             };
-            break :blk try popInterfaceValue(env, reified, registry, allocator);
+            break :blk try popInterfaceValue(frame, reified, registry, allocator);
         },
     };
 }
@@ -1426,7 +1426,7 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
 /// which case the `loadInterfaceValue` (memory-spill) path is used
 /// instead. (#520 wave 2)
 fn popFlatCompound(
-    env: *ExecEnv,
+    frame: *CallFrame,
     t: ctypes.ValType,
     total_slots: u32,
     registry: TypeRegistry,
@@ -1434,11 +1434,7 @@ fn popFlatCompound(
 ) !InterfaceValue {
     var slot_buf: [32]u32 = undefined;
     if (total_slots > slot_buf.len) return error.CompoundNeedsRegistry;
-    var i: u32 = total_slots;
-    while (i > 0) {
-        i -= 1;
-        slot_buf[i] = @bitCast(try env.popI32());
-    }
+    try frame.popSlotsU32(slot_buf[0..total_slots]);
     const lifted = try liftFlatReg(slot_buf[0..total_slots], t, registry, allocator);
     return lifted.val;
 }
@@ -5978,6 +5974,9 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     else
         TypeRegistry.init(ctx.comp_inst.component);
 
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
     const flat_params = countFlatTypes(registry, ctx.param_types);
     const flat_results = countFlatTypes(registry, ctx.result_types);
 
@@ -6056,7 +6055,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         var i: usize = ctx.param_types.len;
         while (i > 0) {
             i -= 1;
-            args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch |err|
+            args[i] = popInterfaceValue(&frame, ctx.param_types[i], registry, allocator) catch |err|
                 return trampolineTrap(env, ctx, err, .lift_args);
         }
     }
@@ -6193,7 +6192,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         }
     } else {
         for (results, ctx.result_types) |r, t| {
-            pushInterfaceValue(env, r, t, registry) catch |err| {
+            pushInterfaceValue(&frame, r, t, registry) catch |err| {
                 return trampolineTrap(env, ctx, err, .lower_results);
             };
         }
@@ -7366,15 +7365,18 @@ test "pushInterfaceValue/popInterfaceValue: result<_, primitive> roundtrip (#155
     const env = try ExecEnv.create(core_inst, 64, testing.allocator);
     defer env.destroy();
 
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
     // Push ok arm: should produce [i32 0, i32 0] (zero-filled payload slot).
-    try pushInterfaceValue(env, .{ .result_val = .{ .is_ok = true, .payload = null } }, t, registry);
-    const lifted_ok = try popInterfaceValue(env, t, registry, testing.allocator);
+    try pushInterfaceValue(&frame, .{ .result_val = .{ .is_ok = true, .payload = null } }, t, registry);
+    const lifted_ok = try popInterfaceValue(&frame, t, registry, testing.allocator);
     try testing.expect(lifted_ok.result_val.is_ok);
 
     // Push err arm with payload u32=0xCAFEu: produces [i32 1, i32 0xCAFE].
     const err_payload: InterfaceValue = .{ .u32 = 0xCAFE };
     try pushInterfaceValue(
-        env,
+        &frame,
         .{ .result_val = .{ .is_ok = false, .payload = &err_payload } },
         t,
         registry,
@@ -7433,7 +7435,10 @@ test "popInterfaceValue: lift variant<record<u16, tuple<u8x4>>> from flat stack 
     try env.pushI32(0);
     try env.pushI32(1);
 
-    const lifted = try popInterfaceValue(env, t, registry, testing.allocator);
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
+    const lifted = try popInterfaceValue(&frame, t, registry, testing.allocator);
     defer lifted.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 0), lifted.variant_val.discriminant);
     const rec = lifted.variant_val.payload.?;
