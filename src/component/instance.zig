@@ -678,7 +678,9 @@ pub const ComponentInstance = struct {
         }
         const env = self.realloc_env orelse return null;
         const a: u32 = if (align_ == 0) 1 else align_;
-        return executor.callRealloc(env, realloc_local, 0, 0, a, size) catch null;
+        var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
+        defer frame.deinit();
+        return executor.callRealloc(&frame, realloc_local, 0, 0, a, size) catch null;
     }
 
     /// Return a writable slice into the canonical guest memory (or the

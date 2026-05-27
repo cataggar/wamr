@@ -21,12 +21,16 @@ const indexspace = @import("indexspace.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const core_backend = @import("core_backend.zig");
+const call_frame_mod = @import("call_frame.zig");
 const debugAotEnabled = core_backend.debugAotEnabled;
 const Allocator = std.mem.Allocator;
 
 const ComponentInstance = instance_mod.ComponentInstance;
 const InterfaceValue = abi.InterfaceValue;
 const TypeRegistry = abi.TypeRegistry;
+pub const CallFrame = call_frame_mod.CallFrame;
+pub const InterpFrame = call_frame_mod.InterpFrame;
+pub const AotFrame = call_frame_mod.AotFrame;
 
 pub const MAX_FLAT_PARAMS: u32 = 16;
 pub const MAX_FLAT_RESULTS: u32 = 1;
@@ -132,25 +136,20 @@ pub const LiftOptions = struct {
 
 /// Call the core module's realloc function: (old_ptr, old_size, align, new_size) -> ptr.
 pub fn callRealloc(
-    env: *ExecEnv,
+    frame: *CallFrame,
     realloc_idx: u32,
     old_ptr: u32,
     old_size: u32,
     align_val: u32,
     new_size: u32,
 ) ExecutionError!u32 {
-    // Push the 4 i32 arguments
-    env.pushI32(@bitCast(old_ptr)) catch return error.StackOverflow;
-    env.pushI32(@bitCast(old_size)) catch return error.StackOverflow;
-    env.pushI32(@bitCast(align_val)) catch return error.StackOverflow;
-    env.pushI32(@bitCast(new_size)) catch return error.StackOverflow;
-
-    // Call the realloc function
-    interp.executeFunction(env, realloc_idx) catch return error.ReallocFailed;
-
-    // Pop the i32 result
-    const result = env.popI32() catch return error.StackUnderflow;
-    return @bitCast(result);
+    return frame.realloc(realloc_idx, old_ptr, old_size, align_val, new_size) catch |err| switch (err) {
+        error.StackOverflow => error.StackOverflow,
+        error.StackUnderflow => error.StackUnderflow,
+        error.ReallocFailed => error.ReallocFailed,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ReallocFailed,
+    };
 }
 
 // ── Core function calling ───────────────────────────────────────────────────
@@ -254,21 +253,21 @@ pub fn callComponentFuncByLocal(
     out_results: []InterfaceValue,
     allocator: Allocator,
 ) ExecutionError!void {
-    // Get the core module instance
     if (exported.core_instance_idx >= owner_inst.core_instances.len)
         return error.CoreInstanceNotAvailable;
     const core_entry = owner_inst.core_instances[exported.core_instance_idx];
 
-    // AOT fast path: when the core is AOT-backed and the canon-ABI
-    // shape is scalar-only, dispatch through `aot_runtime.callFuncScalar`
-    // directly. This is the phase-3 minimum: it proves the end-to-end
-    // canon.lift → AOT path works for primitive-typed exports
-    // (componentize-js's TCGC `compile()` ABI is mostly i32/string,
-    // and string is not yet on this path). More complex shapes —
-    // compound types, memory-spilled params, post-return — fall
-    // through to the interpreter path, which then traps if the
-    // backend is AOT-only. (#625 phase 3.)
-    if (core_entry.module_inst == null) {
+    // Build a backend-agnostic CallFrame: InterpFrame for the interp
+    // core, AotFrame for the AOT core. Both backends are driven through
+    // the same canon-lift body below (issue #650). The handful of
+    // ABI divergences (spilled-result mode, trap diagnostics) are
+    // factored as `switch (frame.*)` predicates rather than separate
+    // call sites.
+    var frame: CallFrame = blk: {
+        if (core_entry.module_inst) |mi| {
+            const e = ExecEnv.create(mi, 4096, allocator) catch return error.OutOfMemory;
+            break :blk .{ .interp = InterpFrame.init(e) };
+        }
         if (core_entry.aot_inst) |ai| {
             if (debugAotEnabled()) {
                 std.debug.print(
@@ -276,26 +275,18 @@ pub fn callComponentFuncByLocal(
                     .{ exported.core_instance_idx, exported.core_func_idx, exported.func_type_idx },
                 );
             }
-            const r = callComponentFuncByLocalAot(
-                owner_inst,
-                ai,
-                exported,
-                args,
-                out_results,
-                allocator,
-            );
-            if (debugAotEnabled()) {
-                if (r) |_| {
-                    std.debug.print("[aot-debug] callComponentFuncByLocal AOT result: ok\n", .{});
-                } else |err| {
-                    std.debug.print("[aot-debug] callComponentFuncByLocal AOT result: {s}\n", .{@errorName(err)});
-                }
-            }
-            return r;
+            break :blk .{ .aot = AotFrame.init(ai, allocator) };
         }
         return error.CoreInstanceNotAvailable;
+    };
+    defer {
+        switch (frame) {
+            .interp => |f| f.env.destroy(),
+            .aot => {},
+        }
+        frame.deinit();
     }
-    const module_inst = core_entry.module_inst.?;
+    const is_aot = switch (frame) { .aot => true, .interp => false };
 
     // Parse canonical options
     const lift_opts = LiftOptions.fromOpts(exported.opts);
@@ -322,29 +313,29 @@ pub fn callComponentFuncByLocal(
     const flat_param_count = countFlatTypes(registry, param_types);
     const flat_result_count = countFlatTypes(registry, result_types);
 
-    // 3. Create an ExecEnv for the core call
-    const env = ExecEnv.create(module_inst, 4096, allocator) catch return error.OutOfMemory;
-    defer env.destroy();
-
-    // Get memory if needed
-    const memory: ?[]u8 = if (lift_opts.memory_idx) |mem_idx|
-        if (module_inst.getMemory(mem_idx)) |mem| mem.data else null
-    else
-        null;
+    // Get memory (default to memory 0 when no explicit memory_idx is
+    // bound in lift opts — matches canon ABI's default-memory rule and
+    // the prior AOT/interp behaviour). Re-fetch around any realloc /
+    // executeCore call since `memory.grow` may relocate the backing
+    // slice.
+    const default_mem_idx: u32 = lift_opts.memory_idx orelse 0;
+    var memory: ?[]u8 = frame.memory(default_mem_idx);
 
     // 4. Lower args onto the core stack
     if (flat_param_count <= MAX_FLAT_PARAMS) {
         // Flatten each arg and push as core values
         for (args, param_types) |arg, pt| {
-            pushInterfaceValue(env, arg, pt, registry) catch return error.LowerError;
+            pushInterfaceValue(&frame, arg, pt, registry) catch return error.LowerError;
         }
     } else {
         // Spill to memory: allocate space via realloc, store tuple, push ptr
-        const mem = memory orelse return error.MemoryNotAvailable;
         const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
-        const ptr = try callRealloc(env, realloc_idx, 0, 0, tuple_align, tuple_size);
+        const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
+        // Re-fetch memory: realloc may have grown it (relocating the slice).
+        memory = frame.memory(default_mem_idx);
+        const mem = memory orelse return error.MemoryNotAvailable;
 
         // Store each arg at its offset in the tuple
         var offset: u32 = 0;
@@ -355,32 +346,70 @@ pub fn callComponentFuncByLocal(
             offset += typeSize(registry, pt);
         }
 
-        env.pushI32(@bitCast(ptr)) catch return error.StackOverflow;
+        frame.pushSlot(.{ .i32 = @bitCast(ptr) }) catch return error.StackOverflow;
     }
 
-    // 5. Call the core function
-    interp.executeFunction(env, exported.core_func_idx) catch {
-        if (env.host_trap) |ht| {
-            // Suppress the diagnostic when this trap is actually a
-            // `wasi:cli/exit.{exit, exit-with-code}` unwind — that's
-            // normal control flow (the host code is already stashed on
-            // `WasiCliAdapter.exit_code`), not a real error (issue
-            // #436 / #448).
-            const is_wasi_exit = std.mem.eql(u8, ht.err_name, "WasiExit");
-            if (!is_wasi_exit) {
-                std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
-                if (ht.component_func_idx != std.math.maxInt(u32))
-                    std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
-                if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+    // 4b. Spilled-result mode on AOT: caller-allocates retptr and
+    // passes it as the trailing core arg. The core function returns
+    // void in this mode. (Canon ABI v1 spec; matches the convention
+    // wit-bindgen emits on AOT-compiled guests.)
+    //
+    // The interp path uses callee-allocates: the core returns the
+    // retptr it allocated itself, popped after executeCore below.
+    var aot_retptr: ?u32 = null;
+    if (is_aot and flat_result_count > MAX_FLAT_RESULTS and result_types.len > 0) {
+        const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
+        const ret_size = computeTupleSize(registry, result_types);
+        const ret_align = computeTupleAlign(registry, result_types);
+        const rp = try callRealloc(&frame, realloc_idx, 0, 0, ret_align, ret_size);
+        // Re-fetch memory after realloc.
+        memory = frame.memory(default_mem_idx);
+        frame.pushSlot(.{ .i32 = @bitCast(rp) }) catch return error.StackOverflow;
+        aot_retptr = rp;
+    }
+
+    // 5. Compute core result types for executeCore. Advisory for
+    // interp (signature comes from the module); load-bearing for AOT
+    // since callFuncScalar needs an accurate signature. Only compute
+    // it for AOT — for interp we pass an empty slice and let
+    // `executeFunction` read the core sig from the module.
+    var core_rt_buf: [1]core_types.ValType = undefined;
+    const core_result_types: []const core_types.ValType = if (!is_aot)
+        &.{}
+    else if (flat_result_count > MAX_FLAT_RESULTS or result_types.len == 0)
+        &.{}
+    else blk: {
+        core_rt_buf[0] = coreFlatSlotType(result_types[0], registry) catch
+            return error.AotPathUnsupported;
+        break :blk core_rt_buf[0..1];
+    };
+
+    // 5b. Call the core function
+    frame.executeCore(exported.core_func_idx, &.{}, core_result_types) catch {
+        switch (frame) {
+            .interp => |f| if (f.env.host_trap) |ht| {
+                // Suppress the diagnostic when this trap is actually a
+                // `wasi:cli/exit.{exit, exit-with-code}` unwind — that's
+                // normal control flow (the host code is already stashed on
+                // `WasiCliAdapter.exit_code`), not a real error (issue
+                // #436 / #448).
+                const is_wasi_exit = std.mem.eql(u8, ht.err_name, "WasiExit");
+                if (!is_wasi_exit) {
+                    std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
+                    if (ht.component_func_idx != std.math.maxInt(u32))
+                        std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
+                    if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+                        std.debug.print(
+                            " import='{s}.{s}'",
+                            .{ ht.import_module_name, ht.import_field_name },
+                        );
                     std.debug.print(
-                        " import='{s}.{s}'",
-                        .{ ht.import_module_name, ht.import_field_name },
+                        " stage={s} error={s}\n",
+                        .{ @tagName(ht.stage), ht.err_name },
                     );
-                std.debug.print(
-                    " stage={s} error={s}\n",
-                    .{ @tagName(ht.stage), ht.err_name },
-                );
-            }
+                }
+            },
+            .aot => {},
         }
         return error.TrapInCoreFunction;
     };
@@ -392,11 +421,21 @@ pub fn callComponentFuncByLocal(
     } else if (flat_result_count <= MAX_FLAT_RESULTS) {
         // Results are on the stack as flat values
         for (result_types, 0..) |rt, i| {
-            out_results[i] = popInterfaceValue(env, rt, registry, allocator) catch return error.LiftError;
+            out_results[i] = popInterfaceValue(&frame, rt, registry, allocator) catch return error.LiftError;
         }
     } else {
-        // Results were stored in memory; core returned a pointer
-        result_ptr_for_post_return = @bitCast(env.popI32() catch return error.StackUnderflow);
+        // Spilled-result path — read tuple from linear memory.
+        // Backend split: AOT pre-allocated the retptr (caller-
+        // allocates); interp expects the callee to return it.
+        if (aot_retptr) |rp| {
+            result_ptr_for_post_return = rp;
+        } else {
+            const popped = frame.popSlot(.i32) catch return error.StackUnderflow;
+            result_ptr_for_post_return = @bitCast(popped.i32);
+        }
+        // Re-fetch memory after executeCore — the core function may
+        // have grown linear memory, invalidating the captured slice.
+        memory = frame.memory(default_mem_idx);
         const mem = memory orelse return error.MemoryNotAvailable;
 
         var offset: u32 = result_ptr_for_post_return;
@@ -415,354 +454,47 @@ pub fn callComponentFuncByLocal(
         // For spilled results: re-push the result pointer as i32.
         if (flat_result_count <= MAX_FLAT_RESULTS) {
             for (out_results[0..result_types.len], result_types) |r, rt| {
-                pushInterfaceValue(env, r, rt, registry) catch {};
+                pushInterfaceValue(&frame, r, rt, registry) catch {};
             }
         } else {
             // Spilled results: post_return receives the result pointer.
-            // We've already read the ptr above; push it back for post_return.
-            env.pushI32(@bitCast(result_ptr_for_post_return)) catch {};
+            frame.pushSlot(.{ .i32 = @bitCast(result_ptr_for_post_return) }) catch {};
         }
-        interp.executeFunction(env, pr_idx) catch {};
+        frame.executeCore(pr_idx, &.{}, &.{}) catch {};
     }
 }
 
-/// AOT-backed canon.lift dispatch. Scalar-primitive-only fast path for
-/// `callComponentFuncByLocal` (issue #625 phase 3 minimum). Lowers
-/// `args` into a packed `[]Value` and dispatches via
-/// `aot_runtime.callFuncScalar`. Returns `error.AotPathUnsupported`
-/// for any shape outside the supported subset:
-///   * params and result must each be a primitive scalar (`bool`,
-///     `s8/u8/s16/u16/s32/u32/char/s64/u64/f32/f64`),
-///   * no memory-spilled params (covered automatically — primitives
-///     flatten 1:1),
-///   * at most one result (matches `MAX_FLAT_RESULTS`),
-///   * no `post_return` (AOT doesn't go through `ExecEnv` so the
-///     interp re-push trick from the standard path doesn't apply yet).
-///
-/// Compound types, strings, lists, resources, futures/streams, and
-/// post-return are deferred to a follow-up — the canon-ABI lower/lift
-/// helpers in this file are tightly coupled to `ExecEnv`'s stack
-/// machine, so a clean refactor that lets both backends share them
-/// belongs in its own PR.
-fn callComponentFuncByLocalAot(
-    owner_inst: *const ComponentInstance,
-    ai: *aot_runtime.AotInstance,
-    exported: ComponentInstance.ExportedFunc.Local,
-    args: []const InterfaceValue,
-    out_results: []InterfaceValue,
-    allocator: Allocator,
-) ExecutionError!void {
-    const lift_opts = LiftOptions.fromOpts(exported.opts);
-    if (lift_opts.is_async) return error.AotPathUnsupported;
-    if (lift_opts.post_return_idx != null) return error.AotPathUnsupported;
-
-    const registry = TypeRegistry.init(owner_inst.component);
-
-    const func_type = blk: {
-        const td = registry.get(exported.func_type_idx) orelse return error.InvalidFuncType;
-        switch (td) {
-            .func => |ft| break :blk ft,
-            else => return error.InvalidFuncType,
-        }
-    };
-
-    const param_types = getParamValTypes(func_type, allocator) catch return error.OutOfMemory;
-    defer allocator.free(param_types);
-    const result_types = getResultValTypes(func_type, allocator) catch return error.OutOfMemory;
-    defer allocator.free(result_types);
-
-    const flat_param_count = countFlatTypes(registry, param_types);
-    const flat_result_count = countFlatTypes(registry, result_types);
-
-    // #650 phase B.2: support up to MAX_FLAT_PARAMS=16 flat slots
-    // emitted from compound/multi-slot params (string/list/s64/u64/f64
-    // = 2 slots each; 1-slot compounds via lowerScalarArg). When total
-    // flat-param slots exceed MAX_FLAT_PARAMS, the canon ABI spec says
-    // spill all params to a tuple in linear memory and pass a single
-    // i32 retptr — symmetric to the spilled-results path below.
-    if (args.len != param_types.len) return error.AotPathUnsupported;
-
-    // +1 slot reserved for trailing retptr in the spilled-result path.
-    const SLOT_CAP: usize = MAX_FLAT_PARAMS + 1;
-    var arg_buf: [SLOT_CAP]core_types.Value = undefined;
-    var core_param_types: [SLOT_CAP]core_types.ValType = undefined;
-    var core_result_types: [1]core_types.ValType = undefined;
-
-    var core_arg_count: usize = 0;
-    if (flat_param_count > MAX_FLAT_PARAMS) {
-        // Memory-spill: realloc a param tuple, store every arg, pass ptr.
-        if (ai.memories.len == 0) return error.AotPathUnsupported;
-        const mem_pre: []u8 = ai.memories[0].data;
-        _ = mem_pre;
-        const realloc_idx = lift_opts.realloc_idx orelse return error.AotPathUnsupported;
-
-        const tuple_size = computeTupleSize(registry, param_types);
-        const tuple_align = computeTupleAlign(registry, param_types);
-        const realloc_args = [_]core_types.Value{
-            .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = @intCast(tuple_align) }, .{ .i32 = @intCast(tuple_size) },
-        };
-        const rpt = [_]core_types.ValType{ .i32, .i32, .i32, .i32 };
-        const rrt = [_]core_types.ValType{.i32};
-        var rbuf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
-        const rres = aot_runtime.callFuncScalar(
-            ai, realloc_idx, &rpt, &rrt, &realloc_args, &rbuf,
-        ) catch return error.TrapInCoreFunction;
-        const params_ptr: u32 = @bitCast(rres[0].i32);
-
-        // Re-acquire memory after realloc (mem.grow may relocate).
-        const mem: []u8 = ai.memories[0].data;
-        var off: u32 = params_ptr;
-        for (args, param_types) |val, pt| {
-            const al = typeAlign(registry, pt);
-            off = abi.alignUp(off, al);
-            storeInterfaceValue(mem, off, val, pt, registry);
-            off += typeSize(registry, pt);
-        }
-        arg_buf[0] = .{ .i32 = @bitCast(params_ptr) };
-        core_param_types[0] = .i32;
-        core_arg_count = 1;
-    } else {
-        // Flat path: emit one or more core slots per interface arg.
-        for (args, param_types) |val, pt| {
-            const slots_left = SLOT_CAP - core_arg_count;
-            const written = lowerFlatRecur(
-                val, pt, registry,
-                arg_buf[core_arg_count..][0..slots_left],
-                core_param_types[core_arg_count..][0..slots_left],
-            ) catch return error.AotPathUnsupported;
-            core_arg_count += written;
-        }
-    }
-
-    // Spilled-result path (#650 phase B.1): when the lifted result
-    // flattens to >MAX_FLAT_RESULTS, the canon ABI emits the core
-    // function as `(...params, retptr) -> ()` and the lifted tuple
-    // lives at retptr in linear memory. Allocate retptr via realloc,
-    // call the core, then read back via `loadInterfaceValue` (which
-    // is already memory-only / backend-agnostic).
-    if (flat_result_count > MAX_FLAT_RESULTS) {
-        if (ai.memories.len == 0) return error.AotPathUnsupported;
-        const mem: []u8 = ai.memories[0].data;
-        const realloc_idx = lift_opts.realloc_idx orelse return error.AotPathUnsupported;
-
-        const ret_size = computeTupleSize(registry, result_types);
-        const ret_align = computeTupleAlign(registry, result_types);
-
-        const realloc_args = [_]core_types.Value{
-            .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = @intCast(ret_align) }, .{ .i32 = @intCast(ret_size) },
-        };
-        const realloc_param_types = [_]core_types.ValType{ .i32, .i32, .i32, .i32 };
-        const realloc_result_types = [_]core_types.ValType{.i32};
-        var realloc_results_buf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
-        const realloc_results = aot_runtime.callFuncScalar(
-            ai,
-            realloc_idx,
-            &realloc_param_types,
-            &realloc_result_types,
-            &realloc_args,
-            &realloc_results_buf,
-        ) catch return error.TrapInCoreFunction;
-        const retptr: u32 = @bitCast(realloc_results[0].i32);
-
-        // Append retptr as the last core arg.
-        if (core_arg_count >= SLOT_CAP) return error.AotPathUnsupported;
-        arg_buf[core_arg_count] = .{ .i32 = @bitCast(retptr) };
-        core_param_types[core_arg_count] = .i32;
-        const total_args = core_arg_count + 1;
-
-        var results_buf: [1]aot_runtime.ScalarResult = undefined;
-        _ = aot_runtime.callFuncScalar(
-            ai,
-            exported.core_func_idx,
-            core_param_types[0..total_args],
-            &.{},
-            arg_buf[0..total_args],
-            &results_buf,
-        ) catch return error.TrapInCoreFunction;
-
-        // Memory may have been resized during the core call (mem.grow);
-        // re-acquire the slice from the AOT instance.
-        const mem_after: []u8 = ai.memories[0].data;
-        _ = mem;
-
-        var offset: u32 = retptr;
-        for (result_types, 0..) |rt, i| {
-            const al = typeAlign(registry, rt);
-            offset = abi.alignUp(offset, al);
-            out_results[i] = loadInterfaceValue(mem_after, offset, rt, registry, allocator) catch
-                return error.LiftError;
-            offset += typeSize(registry, rt);
-        }
-        return;
-    }
-
-    // Flat-result path (≤ MAX_FLAT_RESULTS=1). Multiple interface
-    // results are not supported here yet (the canon ABI caps results
-    // anyway since v1).
-    if (result_types.len > 1) return error.AotPathUnsupported;
-    if (result_types.len == 1) {
-        core_result_types[0] = scalarValType(result_types[0], registry) catch return error.AotPathUnsupported;
-    }
-
-    var results_buf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
-    const results = aot_runtime.callFuncScalar(
-        ai,
-        exported.core_func_idx,
-        core_param_types[0..core_arg_count],
-        core_result_types[0..result_types.len],
-        arg_buf[0..core_arg_count],
-        &results_buf,
-    ) catch return error.TrapInCoreFunction;
-
-    if (result_types.len == 1) {
-        out_results[0] = liftScalarResult(results[0], result_types[0], registry) catch
-            return error.AotPathUnsupported;
-    }
-}
-
-const LoweredScalar = struct { ty: core_types.ValType, value: core_types.Value };
-
-/// Lower an interface value into one or more flat core slots, writing
-/// to `out_vals` and `out_types` (must have length ≥ flatten-count of
-/// `t`). Returns the number of slots written. Used by the AOT path to
-/// emit canon-ABI flat-param slots without an `ExecEnv`.
-///
-/// Handles primitives — including multi-slot ones (s64/u64=2 i64-or-
-/// i32-pair, f64=2 slots, string=2 i32, list=2 i32) — plus the 1-slot
-/// compound shapes the scalar fast path already accepts (`enum`,
-/// `result<(),()>`-style empty-payload variants/results). Anything
-/// requiring per-slot variant-arm zero-fills with mixed-type joins is
-/// deferred (returns `error.AotPathUnsupported`).
-fn lowerFlatRecur(
-    val: InterfaceValue,
-    t: ctypes.ValType,
-    registry: TypeRegistry,
-    out_vals: []core_types.Value,
-    out_types: []core_types.ValType,
-) !usize {
-    switch (t) {
-        .s64 => {
-            if (out_vals.len < 1) return error.AotPathUnsupported;
-            out_vals[0] = .{ .i64 = val.s64 };
-            out_types[0] = .i64;
-            return 1;
-        },
-        .u64 => {
-            if (out_vals.len < 1) return error.AotPathUnsupported;
-            out_vals[0] = .{ .i64 = @bitCast(val.u64) };
-            out_types[0] = .i64;
-            return 1;
-        },
-        .f64 => {
-            if (out_vals.len < 1) return error.AotPathUnsupported;
-            out_vals[0] = .{ .f64 = @bitCast(val.f64) };
-            out_types[0] = .f64;
-            return 1;
-        },
-        .string => {
-            if (out_vals.len < 2) return error.AotPathUnsupported;
-            out_vals[0] = .{ .i32 = @bitCast(val.string.ptr) };
-            out_vals[1] = .{ .i32 = @bitCast(val.string.len) };
-            out_types[0] = .i32;
-            out_types[1] = .i32;
-            return 2;
-        },
-        .list => {
-            if (out_vals.len < 2) return error.AotPathUnsupported;
-            out_vals[0] = .{ .i32 = @bitCast(val.list.ptr) };
-            out_vals[1] = .{ .i32 = @bitCast(val.list.len) };
-            out_types[0] = .i32;
-            out_types[1] = .i32;
-            return 2;
-        },
-        else => {
-            if (out_vals.len < 1) return error.AotPathUnsupported;
-            const cv = try lowerScalarArg(val, t, registry);
-            out_vals[0] = cv.value;
-            out_types[0] = cv.ty;
-            return 1;
-        },
-    }
-}
-
-/// Lower an interface value to a single core value slot. Handles
-/// primitives directly; for compound types, only those that flatten
-/// to exactly 1 i32 slot are accepted (today: `enum`,
-/// `result<(),()>`, and `variant` whose every arm is empty). Anything
-/// else (multi-slot results, list/string, payload-bearing variants,
-/// records/tuples) routes through `error.AotPathUnsupported` — that's
-/// the #650 phase B work.
-fn lowerScalarArg(val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !LoweredScalar {
-    return switch (t) {
-        .bool => .{ .ty = .i32, .value = .{ .i32 = if (val.bool) 1 else 0 } },
-        .s8 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, val.s8) } },
-        .u8 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, @intCast(val.u8)) } },
-        .s16 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, val.s16) } },
-        .u16 => .{ .ty = .i32, .value = .{ .i32 = @as(i32, @intCast(val.u16)) } },
-        .s32 => .{ .ty = .i32, .value = .{ .i32 = val.s32 } },
-        .u32, .char => .{ .ty = .i32, .value = .{ .i32 = @bitCast(val.u32) } },
-        .s64 => .{ .ty = .i64, .value = .{ .i64 = val.s64 } },
-        .u64 => .{ .ty = .i64, .value = .{ .i64 = @bitCast(val.u64) } },
-        .f32 => .{ .ty = .f32, .value = .{ .f32 = @bitCast(val.f32) } },
-        .f64 => .{ .ty = .f64, .value = .{ .f64 = @bitCast(val.f64) } },
-        .enum_ => .{ .ty = .i32, .value = .{ .i32 = @bitCast(val.enum_val) } },
-        .result, .variant => blk: {
-            if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
-            const disc: u32 = switch (val) {
-                .result_val => |r| if (r.is_ok) 0 else 1,
-                .variant_val => |v| v.discriminant,
-                else => return error.AotPathUnsupported,
-            };
-            break :blk .{ .ty = .i32, .value = .{ .i32 = @bitCast(disc) } };
-        },
-        else => error.AotPathUnsupported,
-    };
-}
-
-fn scalarValType(t: ctypes.ValType, registry: TypeRegistry) !core_types.ValType {
+/// Map a single-flat-slot interface result type to its core wasm
+/// value type. Only valid when the interface type flattens to exactly
+/// one core slot (i.e. `flat_result_count <= MAX_FLAT_RESULTS=1`).
+/// Multi-slot results spill to memory and the core function returns
+/// void instead — see the `aot_retptr` / `flat_result_count >
+/// MAX_FLAT_RESULTS` branch in `callComponentFuncByLocal`.
+fn coreFlatSlotType(t: ctypes.ValType, registry: TypeRegistry) !core_types.ValType {
     return switch (t) {
         .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char => .i32,
         .s64, .u64 => .i64,
         .f32 => .f32,
         .f64 => .f64,
         .enum_ => .i32,
-        .result, .variant => blk: {
+        .own, .borrow, .future, .stream, .error_context => .i32,
+        .result, .variant, .option, .flags => blk: {
             if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
             break :blk .i32;
+        },
+        .type_idx => |idx| blk: {
+            const td = registry.get(idx) orelse return error.AotPathUnsupported;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |inner| inner,
+                .resource => .{ .own = idx },
+                else => return error.AotPathUnsupported,
+            };
+            break :blk try coreFlatSlotType(reified, registry);
         },
         else => error.AotPathUnsupported,
     };
 }
 
-fn liftScalarResult(r: aot_runtime.ScalarResult, t: ctypes.ValType, registry: TypeRegistry) !InterfaceValue {
-    return switch (t) {
-        .bool => .{ .bool = (r.i32 != 0) },
-        .s8 => .{ .s8 = @truncate(r.i32) },
-        .u8 => .{ .u8 = @truncate(@as(u32, @bitCast(r.i32))) },
-        .s16 => .{ .s16 = @truncate(r.i32) },
-        .u16 => .{ .u16 = @truncate(@as(u32, @bitCast(r.i32))) },
-        .s32 => .{ .s32 = r.i32 },
-        .u32, .char => .{ .u32 = @bitCast(r.i32) },
-        .s64 => .{ .s64 = r.i64 },
-        .u64 => .{ .u64 = @bitCast(r.i64) },
-        .f32 => .{ .f32 = @bitCast(r.f32) },
-        .f64 => .{ .f64 = @bitCast(r.f64) },
-        .enum_ => .{ .enum_val = @bitCast(r.i32) },
-        .result => blk: {
-            if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
-            const disc: u32 = @bitCast(r.i32);
-            // Canon ABI: 0 = ok, 1 = err. Both arms empty in this fast
-            // path so payload is null on either side.
-            break :blk .{ .result_val = .{ .is_ok = disc == 0, .payload = null } };
-        },
-        .variant => blk: {
-            if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
-            const disc: u32 = @bitCast(r.i32);
-            break :blk .{ .variant_val = .{ .discriminant = disc, .payload = null } };
-        },
-        else => error.AotPathUnsupported,
-    };
-}
 
 /// Async-lifted variant of `callComponentFuncByLocal`. Lifts args and
 /// drives the core wasm body the same way, but the callee delivers its
@@ -808,22 +540,25 @@ pub fn callComponentFuncByLocalAsyncLifted(
     const env = ExecEnv.create(module_inst, 4096, allocator) catch return error.OutOfMemory;
     defer env.destroy();
 
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
     const memory: ?[]u8 = if (lift_opts.memory_idx) |mem_idx|
-        if (module_inst.getMemory(mem_idx)) |mem| mem.data else null
+        frame.memory(mem_idx)
     else
         null;
 
     // Lower args — same logic as the sync path.
     if (flat_param_count <= MAX_FLAT_PARAMS) {
         for (args, param_types) |arg, pt| {
-            pushInterfaceValue(env, arg, pt, registry) catch return error.LowerError;
+            pushInterfaceValue(&frame, arg, pt, registry) catch return error.LowerError;
         }
     } else {
         const mem = memory orelse return error.MemoryNotAvailable;
         const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
-        const ptr = try callRealloc(env, realloc_idx, 0, 0, tuple_align, tuple_size);
+        const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
 
         var offset: u32 = 0;
         for (args, param_types) |arg, pt| {
@@ -948,28 +683,28 @@ fn typeSize(registry: TypeRegistry, t: ctypes.ValType) u32 {
 
 // ── Helper: push/pop interface values as core stack values ──────────────────
 
-fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !void {
+fn pushInterfaceValue(frame: *CallFrame, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !void {
     switch (t) {
-        .bool => try env.pushI32(if (val.bool) 1 else 0),
-        .s8 => try env.pushI32(@as(i32, val.s8)),
-        .u8 => try env.pushI32(@as(i32, @intCast(val.u8))),
-        .s16 => try env.pushI32(@as(i32, val.s16)),
-        .u16 => try env.pushI32(@as(i32, @intCast(val.u16))),
-        .s32 => try env.pushI32(val.s32),
-        .u32, .char => try env.pushI32(@bitCast(val.u32)),
-        .s64 => try env.pushI64(val.s64),
-        .u64 => try env.pushI64(@bitCast(val.u64)),
-        .f32 => try env.push(.{ .f32 = @bitCast(val.f32) }),
-        .f64 => try env.push(.{ .f64 = @bitCast(val.f64) }),
-        .own, .borrow => try env.pushI32(@bitCast(encodeResourceWire(val.handle))),
-        .future, .stream, .error_context => try env.pushI32(@bitCast(val.handle)),
+        .bool => try frame.pushSlot(.{ .i32 = if (val.bool) 1 else 0 }),
+        .s8 => try frame.pushSlot(.{ .i32 = @as(i32, val.s8) }),
+        .u8 => try frame.pushSlot(.{ .i32 = @as(i32, @intCast(val.u8)) }),
+        .s16 => try frame.pushSlot(.{ .i32 = @as(i32, val.s16) }),
+        .u16 => try frame.pushSlot(.{ .i32 = @as(i32, @intCast(val.u16)) }),
+        .s32 => try frame.pushSlot(.{ .i32 = val.s32 }),
+        .u32, .char => try frame.pushSlot(.{ .i32 = @bitCast(val.u32) }),
+        .s64 => try frame.pushSlot(.{ .i64 = val.s64 }),
+        .u64 => try frame.pushSlot(.{ .i64 = @bitCast(val.u64) }),
+        .f32 => try frame.pushSlot(.{ .f32 = @bitCast(val.f32) }),
+        .f64 => try frame.pushSlot(.{ .f64 = @bitCast(val.f64) }),
+        .own, .borrow => try frame.pushSlot(.{ .i32 = @bitCast(encodeResourceWire(val.handle)) }),
+        .future, .stream, .error_context => try frame.pushSlot(.{ .i32 = @bitCast(val.handle) }),
         .string => {
-            try env.pushI32(@bitCast(val.string.ptr));
-            try env.pushI32(@bitCast(val.string.len));
+            try frame.pushSlot(.{ .i32 = @bitCast(val.string.ptr) });
+            try frame.pushSlot(.{ .i32 = @bitCast(val.string.len) });
         },
         .list => {
-            try env.pushI32(@bitCast(val.list.ptr));
-            try env.pushI32(@bitCast(val.list.len));
+            try frame.pushSlot(.{ .i32 = @bitCast(val.list.ptr) });
+            try frame.pushSlot(.{ .i32 = @bitCast(val.list.len) });
         },
         // result<T, E>: flat repr is `[i32 disc] ++ join(flatten(T), flatten(E))`,
         // where the per-slot join takes the wider of the two arms (treated as
@@ -985,18 +720,18 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
             };
             const total_payload_slots = abi.flattenCount(registry, t) - 1;
             const disc: i32 = if (val.result_val.is_ok) 0 else 1;
-            try env.pushI32(disc);
+            try frame.pushSlot(.{ .i32 = disc });
 
             const arm_type: ?ctypes.ValType = if (val.result_val.is_ok) r.ok else r.err;
             var pushed: u32 = 0;
             if (arm_type) |at| {
                 if (val.result_val.payload) |p| {
-                    try pushInterfaceValue(env, p.*, at, registry);
+                    try pushInterfaceValue(frame, p.*, at, registry);
                     pushed = abi.flattenCount(registry, at);
                 }
             }
             while (pushed < total_payload_slots) : (pushed += 1) {
-                try env.pushI32(0);
+                try frame.pushSlot(.{ .i32 = 0 });
             }
         },
         // Compound types — lower into a scratch buffer via
@@ -1014,7 +749,7 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
             // join behaviour: shorter arms zero-fill the remaining
             // slots so the join's flat width is constant).
             for (written..total_slots) |k| slot_buf[k] = 0;
-            for (slot_buf[0..total_slots]) |s| try env.pushI32(@bitCast(s));
+            try frame.pushSlotsU32(slot_buf[0..total_slots]);
         },
         // Resolve `.type_idx` through the registry and re-dispatch on
         // the reified ValType. The registry may have been extended with
@@ -1036,7 +771,7 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
                 .resource => .{ .own = idx },
                 else => return error.CompoundNeedsRegistry,
             };
-            try pushInterfaceValue(env, val, reified, registry);
+            try pushInterfaceValue(frame, val, reified, registry);
         },
     }
 }
@@ -1250,19 +985,19 @@ fn resolveArmType(t: ctypes.ValType, registry: TypeRegistry) ctypes.ValType {
     return resolved;
 }
 
-fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
+fn popInterfaceValue(frame: *CallFrame, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
     return switch (t) {
-        .bool => .{ .bool = (try env.popI32()) != 0 },
-        .s8 => .{ .s8 = @truncate(try env.popI32()) },
-        .u8 => .{ .u8 = @truncate(@as(u32, @bitCast(try env.popI32()))) },
-        .s16 => .{ .s16 = @truncate(try env.popI32()) },
-        .u16 => .{ .u16 = @truncate(@as(u32, @bitCast(try env.popI32()))) },
-        .s32 => .{ .s32 = try env.popI32() },
-        .u32, .char => .{ .u32 = @bitCast(try env.popI32()) },
-        .s64 => .{ .s64 = try env.popI64() },
-        .u64 => .{ .u64 = @bitCast(try env.popI64()) },
+        .bool => .{ .bool = (try frame.popSlot(.i32)).i32 != 0 },
+        .s8 => .{ .s8 = @truncate((try frame.popSlot(.i32)).i32) },
+        .u8 => .{ .u8 = @truncate(@as(u32, @bitCast((try frame.popSlot(.i32)).i32))) },
+        .s16 => .{ .s16 = @truncate((try frame.popSlot(.i32)).i32) },
+        .u16 => .{ .u16 = @truncate(@as(u32, @bitCast((try frame.popSlot(.i32)).i32))) },
+        .s32 => .{ .s32 = (try frame.popSlot(.i32)).i32 },
+        .u32, .char => .{ .u32 = @bitCast((try frame.popSlot(.i32)).i32) },
+        .s64 => .{ .s64 = (try frame.popSlot(.i64)).i64 },
+        .u64 => .{ .u64 = @bitCast((try frame.popSlot(.i64)).i64) },
         .f32 => blk: {
-            const v = try env.pop();
+            const v = try frame.popSlot(.f32);
             break :blk .{ .f32 = switch (v) {
                 .f32 => |f| @bitCast(f),
                 .i32 => |i| @bitCast(i),
@@ -1270,22 +1005,22 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             } };
         },
         .f64 => blk: {
-            const v = try env.pop();
+            const v = try frame.popSlot(.f64);
             break :blk .{ .f64 = switch (v) {
                 .f64 => |f| @bitCast(f),
                 .i64 => |i| @bitCast(i),
                 else => 0,
             } };
         },
-        .own, .borrow => .{ .handle = decodeResourceWire(@bitCast(try env.popI32())) },
-        .future, .stream, .error_context => .{ .handle = @bitCast(try env.popI32()) },
+        .own, .borrow => .{ .handle = decodeResourceWire(@bitCast((try frame.popSlot(.i32)).i32)) },
+        .future, .stream, .error_context => .{ .handle = @bitCast((try frame.popSlot(.i32)).i32) },
         .string => .{ .string = .{
-            .len = @bitCast(try env.popI32()),
-            .ptr = @bitCast(try env.popI32()),
+            .len = @bitCast((try frame.popSlot(.i32)).i32),
+            .ptr = @bitCast((try frame.popSlot(.i32)).i32),
         } },
         .list => .{ .list = .{
-            .len = @bitCast(try env.popI32()),
-            .ptr = @bitCast(try env.popI32()),
+            .len = @bitCast((try frame.popSlot(.i32)).i32),
+            .ptr = @bitCast((try frame.popSlot(.i32)).i32),
         } },
         // `result<T, E>`: pop all payload slots into a scratch buffer
         // (we don't know the active arm's typing until we've popped the
@@ -1306,14 +1041,12 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             const total_payload_slots = abi.flattenCount(registry, t) - 1;
             var slot_buf: [16]u32 = undefined;
             if (total_payload_slots > slot_buf.len) return error.CompoundNeedsRegistry;
-            // Pop in stack order: top of stack is the last-pushed slot,
-            // so it lands in slot_buf[total-1] first.
-            var i: u32 = total_payload_slots;
-            while (i > 0) {
-                i -= 1;
-                slot_buf[i] = @bitCast(try env.popI32());
-            }
-            const disc = try env.popI32();
+            // Pop payload slots in canonical forward order (CallFrame
+            // hides the interp's LIFO stack reversal — `popSlotsU32`
+            // writes back-to-front for the interp backend, and reads
+            // straight from the AOT results buffer for AOT).
+            try frame.popSlotsU32(slot_buf[0..total_payload_slots]);
+            const disc = (try frame.popSlot(.i32)).i32;
             const is_ok = disc == 0;
             const arm_type: ?ctypes.ValType = if (is_ok) rt.ok else rt.err;
             var payload: ?*InterfaceValue = null;
@@ -1354,12 +1087,8 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             const total_payload_slots = abi.flattenCount(registry, t) - 1;
             var slot_buf: [16]u32 = undefined;
             if (total_payload_slots > slot_buf.len) return error.CompoundNeedsRegistry;
-            var i: u32 = total_payload_slots;
-            while (i > 0) {
-                i -= 1;
-                slot_buf[i] = @bitCast(try env.popI32());
-            }
-            const disc = try env.popI32();
+            try frame.popSlotsU32(slot_buf[0..total_payload_slots]);
+            const disc = (try frame.popSlot(.i32)).i32;
             const is_some = disc != 0;
             var payload: ?*InterfaceValue = null;
             if (is_some) {
@@ -1389,7 +1118,7 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
         .record, .variant, .tuple, .flags, .enum_ => |idx| blk: {
             _ = idx;
             const total_slots = abi.flattenCount(registry, t);
-            break :blk try popFlatCompound(env, t, total_slots, registry, allocator);
+            break :blk try popFlatCompound(frame, t, total_slots, registry, allocator);
         },
         // Mirror `pushInterfaceValue`: resolve `.type_idx` and re-pop on
         // the reified ValType.
@@ -1408,7 +1137,7 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
                 .resource => .{ .own = idx },
                 else => return error.CompoundNeedsRegistry,
             };
-            break :blk try popInterfaceValue(env, reified, registry, allocator);
+            break :blk try popInterfaceValue(frame, reified, registry, allocator);
         },
     };
 }
@@ -1426,7 +1155,7 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
 /// which case the `loadInterfaceValue` (memory-spill) path is used
 /// instead. (#520 wave 2)
 fn popFlatCompound(
-    env: *ExecEnv,
+    frame: *CallFrame,
     t: ctypes.ValType,
     total_slots: u32,
     registry: TypeRegistry,
@@ -1434,11 +1163,7 @@ fn popFlatCompound(
 ) !InterfaceValue {
     var slot_buf: [32]u32 = undefined;
     if (total_slots > slot_buf.len) return error.CompoundNeedsRegistry;
-    var i: u32 = total_slots;
-    while (i > 0) {
-        i -= 1;
-        slot_buf[i] = @bitCast(try env.popI32());
-    }
+    try frame.popSlotsU32(slot_buf[0..total_slots]);
     const lifted = try liftFlatReg(slot_buf[0..total_slots], t, registry, allocator);
     return lifted.val;
 }
@@ -5978,6 +5703,9 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     else
         TypeRegistry.init(ctx.comp_inst.component);
 
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
     const flat_params = countFlatTypes(registry, ctx.param_types);
     const flat_results = countFlatTypes(registry, ctx.result_types);
 
@@ -6056,7 +5784,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         var i: usize = ctx.param_types.len;
         while (i > 0) {
             i -= 1;
-            args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch |err|
+            args[i] = popInterfaceValue(&frame, ctx.param_types[i], registry, allocator) catch |err|
                 return trampolineTrap(env, ctx, err, .lift_args);
         }
     }
@@ -6193,7 +5921,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         }
     } else {
         for (results, ctx.result_types) |r, t| {
-            pushInterfaceValue(env, r, t, registry) catch |err| {
+            pushInterfaceValue(&frame, r, t, registry) catch |err| {
                 return trampolineTrap(env, ctx, err, .lower_results);
             };
         }
@@ -6478,11 +6206,26 @@ fn lowerAotDispatcherResult(
     registry: TypeRegistry,
 ) !u64 {
     if (lowered_ty == .f32 or lowered_ty == .f64) return error.UnsupportedSignature;
-    const lowered = try lowerScalarArg(val, t, registry);
-    if (lowered.ty != lowered_ty) return error.UnsupportedSignature;
-    return switch (lowered.ty) {
-        .i32 => @as(u64, @intCast(@as(u32, @bitCast(lowered.value.i32)))),
-        .i64 => @as(u64, @bitCast(lowered.value.i64)),
+    // Single-flat-slot interface results only — multi-slot shapes
+    // (string/list/multi-slot compounds) spill via the retptr path.
+    const lifted_core = coreFlatSlotType(t, registry) catch return error.UnsupportedSignature;
+    if (lifted_core != lowered_ty) return error.UnsupportedSignature;
+    return switch (t) {
+        .bool => @as(u64, @intCast(@as(u32, if (val.bool) 1 else 0))),
+        .s8 => @as(u64, @intCast(@as(u32, @bitCast(@as(i32, val.s8))))),
+        .u8 => @as(u64, val.u8),
+        .s16 => @as(u64, @intCast(@as(u32, @bitCast(@as(i32, val.s16))))),
+        .u16 => @as(u64, val.u16),
+        .s32 => @as(u64, @intCast(@as(u32, @bitCast(val.s32)))),
+        .u32, .char => @as(u64, val.u32),
+        .s64 => @as(u64, @bitCast(val.s64)),
+        .u64 => val.u64,
+        .enum_ => @as(u64, val.enum_val),
+        .own, .borrow => @as(u64, encodeResourceWire(val.handle)),
+        .future, .stream, .error_context => @as(u64, val.handle),
+        .result => @as(u64, if (val.result_val.is_ok) 0 else 1),
+        .variant => @as(u64, val.variant_val.discriminant),
+        .option => @as(u64, if (val.option_val.is_some) 1 else 0),
         else => error.UnsupportedSignature,
     };
 }
@@ -7366,15 +7109,18 @@ test "pushInterfaceValue/popInterfaceValue: result<_, primitive> roundtrip (#155
     const env = try ExecEnv.create(core_inst, 64, testing.allocator);
     defer env.destroy();
 
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
     // Push ok arm: should produce [i32 0, i32 0] (zero-filled payload slot).
-    try pushInterfaceValue(env, .{ .result_val = .{ .is_ok = true, .payload = null } }, t, registry);
-    const lifted_ok = try popInterfaceValue(env, t, registry, testing.allocator);
+    try pushInterfaceValue(&frame, .{ .result_val = .{ .is_ok = true, .payload = null } }, t, registry);
+    const lifted_ok = try popInterfaceValue(&frame, t, registry, testing.allocator);
     try testing.expect(lifted_ok.result_val.is_ok);
 
     // Push err arm with payload u32=0xCAFEu: produces [i32 1, i32 0xCAFE].
     const err_payload: InterfaceValue = .{ .u32 = 0xCAFE };
     try pushInterfaceValue(
-        env,
+        &frame,
         .{ .result_val = .{ .is_ok = false, .payload = &err_payload } },
         t,
         registry,
@@ -7433,7 +7179,10 @@ test "popInterfaceValue: lift variant<record<u16, tuple<u8x4>>> from flat stack 
     try env.pushI32(0);
     try env.pushI32(1);
 
-    const lifted = try popInterfaceValue(env, t, registry, testing.allocator);
+    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
+    defer frame.deinit();
+
+    const lifted = try popInterfaceValue(&frame, t, registry, testing.allocator);
     defer lifted.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 0), lifted.variant_val.discriminant);
     const rec = lifted.variant_val.payload.?;
