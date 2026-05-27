@@ -478,15 +478,33 @@ fn coreFlatSlotType(t: ctypes.ValType, registry: TypeRegistry) !core_types.ValTy
         .f64 => .f64,
         .enum_ => .i32,
         .own, .borrow, .future, .stream, .error_context => .i32,
-        .result, .variant, .option, .flags => blk: {
+        .result, .variant, .option, .flags, .tuple, .record => blk: {
             if (abi.flattenCount(registry, t) != 1) return error.AotPathUnsupported;
             break :blk .i32;
         },
         .type_idx => |idx| blk: {
             const td = registry.get(idx) orelse return error.AotPathUnsupported;
+            // Forward aggregate TypeDefs to the matching inline ValType so
+            // the recursion lands in the inline arm above (which enforces
+            // the `flattenCount == 1 → .i32` guard) or the direct `.enum_`
+            // arm. The `u32` payload of each ValType aggregate variant is
+            // itself a typeidx, and `flattenCount` collapses `type_idx`
+            // indirection identically to the inline form (see
+            // `canonical_abi.flattenCount` / `flattenCountDef`). So this
+            // is a pure reify-table extension — no semantic change.
+            // Without it, `wasi:cli/run.run`'s `result<unit,unit>`
+            // declared as a stand-alone TypeDef traps every AOT-backed
+            // export with `AotPathUnsupported` (issue #683).
             const reified: ctypes.ValType = switch (td) {
                 .val => |inner| inner,
                 .resource => .{ .own = idx },
+                .result => .{ .result = idx },
+                .variant => .{ .variant = idx },
+                .option => .{ .option = idx },
+                .flags => .{ .flags = idx },
+                .enum_ => .{ .enum_ = idx },
+                .tuple => .{ .tuple = idx },
+                .record => .{ .record = idx },
                 else => return error.AotPathUnsupported,
             };
             break :blk try coreFlatSlotType(reified, registry);
@@ -2996,6 +3014,35 @@ test "dispatchCanonBuiltin: waitable.join late-arrival on a cancelled subtask ca
     try testing.expectEqual(@as(usize, 1), ws.items.items.len);
     try testing.expect(ws.items.items[0].ready);
     try testing.expectEqual(STATUS_STARTED_CANCELLED, ws.items.items[0].code);
+}
+
+test "coreFlatSlotType: TypeDef indirection to single-slot result reifies to .i32 (#683)" {
+    // type 0: result<unit, unit> — discriminant only, flattens to 1 slot.
+    const result_unit = ctypes.TypeDef{ .result = .{ .ok = null, .err = null } };
+    const reg = TypeRegistry.fromTypes(&.{result_unit});
+    const slot = try coreFlatSlotType(.{ .type_idx = 0 }, reg);
+    try std.testing.expectEqual(core_types.ValType.i32, slot);
+}
+
+test "coreFlatSlotType: TypeDef indirection to multi-slot variant traps AotPathUnsupported (#683)" {
+    // type 0: variant { a, b(s64) } — 1 disc + 1 payload = 2 slots.
+    const variant_two_slot = ctypes.TypeDef{ .variant = .{ .cases = &.{
+        .{ .name = "a", .type = null },
+        .{ .name = "b", .type = .s64 },
+    } } };
+    const reg = TypeRegistry.fromTypes(&.{variant_two_slot});
+    const got = coreFlatSlotType(.{ .type_idx = 0 }, reg);
+    try std.testing.expectError(error.AotPathUnsupported, got);
+}
+
+test "coreFlatSlotType: TypeDef indirection to single-field record reifies to .i32 (#683)" {
+    // type 0: record { x: u32 } — flattens to 1 slot.
+    const record_one_slot = ctypes.TypeDef{ .record = .{ .fields = &.{
+        .{ .name = "x", .type = .u32 },
+    } } };
+    const reg = TypeRegistry.fromTypes(&.{record_one_slot});
+    const slot = try coreFlatSlotType(.{ .type_idx = 0 }, reg);
+    try std.testing.expectEqual(core_types.ValType.i32, slot);
 }
 
 test "countFlatTypes: primitives" {
