@@ -550,6 +550,22 @@ pub fn build(b: *std.Build) void {
     const run_component_precompile_tests = b.addRunArtifact(component_precompile_tests);
     test_step.dependOn(&run_component_precompile_tests.step);
 
+    // #676: wamrc compile-component must recurse into nested
+    // sub-components (the dominant shape of `wabt component
+    // compose -d` / `wasm-tools compose` output). Companion to the
+    // single-core round-trip above.
+    const component_precompile_nested_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/component_precompile_nested_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    component_precompile_nested_module.addImport("wamr", lib_module);
+    const component_precompile_nested_tests = b.addTest(.{
+        .root_module = component_precompile_nested_module,
+    });
+    const run_component_precompile_nested_tests = b.addRunArtifact(component_precompile_nested_tests);
+    test_step.dependOn(&run_component_precompile_nested_tests.step);
+
     // Phase 3: canon.lift dispatches onto AOT cores (#625).
     const component_aot_canonlift_module = b.createModule(.{
         .root_source_file = b.path("src/tests/component_aot_canonlift_test.zig"),

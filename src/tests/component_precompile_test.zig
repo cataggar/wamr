@@ -13,7 +13,6 @@ const wamr = @import("wamr");
 const aot_harness = @import("aot_harness.zig");
 
 const instance = wamr.component_instance;
-const ctypes = wamr.component_types;
 const core_types = wamr.types;
 const aot_runtime_mod = wamr.aot_runtime;
 const component_aot = wamr.component_aot;
@@ -100,31 +99,19 @@ test "#625 phase 2: precompile + loadManifest + instantiate round-trip" {
     const pcs = loaded.precompiledCores();
     try std.testing.expectEqual(@as(usize, 1), pcs.len);
     try std.testing.expectEqual(@as(u32, 0), pcs[0].module_idx);
+    // v2 manifests stamp `core_wasm` for slice-identity matching
+    // across the runtime's separate parse of `component_bytes`.
+    try std.testing.expect(pcs[0].core_wasm != null);
 
-    // Hand the loaded artifacts to instantiateWithOptions. The
-    // component path should pick the AOT branch and skip the
-    // interpreter loader for this core.
-    //
-    // We build a Component literal here rather than parsing
-    // `component_bytes` again, because the test owns the component
-    // shape and there's no reason to round-trip through the loader
-    // (which is already exercised by the unit tests in loader.zig).
-    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
-    const core_insts = [_]ctypes.CoreInstanceExpr{
-        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
-    };
-    const component = ctypes.Component{
-        .core_modules = &core_modules,
-        .core_instances = &core_insts,
-        .core_types = &.{},
-        .components = &.{},
-        .instances = &.{},
-        .aliases = &.{},
-        .types = &.{},
-        .canons = &.{},
-        .imports = &.{},
-        .exports = &.{},
-    };
+    // Parse `component_bytes` (rather than building a `Component`
+    // literal here) so the `core_modules[i].data` slices the
+    // runtime sees come from the same backing buffer the loader's
+    // re-parse saw — matching slice identities are what
+    // `findPrecompiled` uses to resolve a `PrecompiledCore`
+    // produced from disk. (#676)
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+    const component = try wamr.component_loader.load(component_bytes, parse_arena.allocator());
 
     const inst = try instance.instantiateWithOptions(&component, allocator, .{
         .precompiled_cores = pcs,

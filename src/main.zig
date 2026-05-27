@@ -1195,6 +1195,8 @@ fn loadManifestErrorMessage(err: wamr.component_aot.LoadError) []const u8 {
         error.ManifestVersionMismatch => "manifest format version not understood by this build",
         error.ManifestBuildIdMismatch => "manifest was produced by a different wamr build (recompile with `wamrc compile-component`)",
         error.ManifestComponentMismatch => "manifest's component hash does not match this component (stale bundle — recompile with `wamrc compile-component`)",
+        error.ManifestCoreMismatch => "manifest references a core module that does not appear in this component (stale bundle — recompile with `wamrc compile-component`)",
+        error.ComponentParseFailed => "manifest is valid but the component bytes failed to re-parse for nested-core resolution",
         error.CwasmReadFailed => "could not read a .cwasm artifact referenced from the manifest",
         error.CwasmHashMismatch => "a .cwasm artifact's contents differ from the manifest's recorded hash (tampered or partial write)",
         error.OutOfMemory => "out of memory while loading the manifest",
