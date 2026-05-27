@@ -1688,18 +1688,39 @@ pub fn writeGlobalsToStorage(inst: *const AotInstance, storage: []u8) void {
 }
 
 pub fn readGlobalsFromStorage(inst: *AotInstance, storage: []const u8) void {
+    const imported_count = inst.module.importedGlobals().len;
     for (inst.globals, 0..) |g, i| {
-        const off = globalOffsetAt(inst, i) orelse continue;
-        g.value = switch (g.value) {
-            .v128 => if (off + 16 <= storage.len)
-                .{ .v128 = std.mem.readInt(u128, storage[off..][0..16], .little) }
-            else
-                g.value,
-            else => if (off + 8 <= storage.len)
-                globalValueFromI64(inst, g.value, std.mem.readInt(i64, storage[off..][0..8], .little))
-            else
-                g.value,
-        };
+        if (i < imported_count and i < inst.globals_owned.len and !inst.globals_owned[i]) continue;
+        readGlobalSlotFromStorage(inst, g, i, storage);
+    }
+    flushImportedGlobalsToStorage(inst, storage);
+}
+
+fn readGlobalSlotFromStorage(inst: *const AotInstance, g: *types.GlobalInstance, i: usize, storage: []const u8) void {
+    const off = globalOffsetAt(inst, i) orelse return;
+    g.value = switch (g.value) {
+        .v128 => if (off + 16 <= storage.len)
+            .{ .v128 = std.mem.readInt(u128, storage[off..][0..16], .little) }
+        else
+            g.value,
+        else => if (off + 8 <= storage.len)
+            globalValueFromI64(inst, g.value, std.mem.readInt(i64, storage[off..][0..8], .little))
+        else
+            g.value,
+    };
+}
+
+pub fn flushImportedGlobalsToStorage(inst: *AotInstance, storage: []const u8) void {
+    const imported = inst.module.importedGlobals();
+    for (imported, 0..) |desc, i| {
+        if (!desc.mutable) continue;
+        if (i >= inst.globals.len) continue;
+        // Imported globals are per-call snapshots in AOT code. Mutable borrowed
+        // imports must be written back on call exit so sibling importers see the
+        // canonical GlobalInstance update. Concurrent host re-entry is
+        // last-writer-wins at the call boundary (#660); true interleaving would
+        // require per-access indirection instead of the slab fast path.
+        readGlobalSlotFromStorage(inst, inst.globals[i], i, storage);
     }
 }
 
@@ -2346,6 +2367,8 @@ fn allocateGlobals(
         if (imported_global_overrides.len > i and imported_global_overrides[i] != null) {
             const shared = imported_global_overrides[i].?;
             shared.retain();
+            // Exact exporter GlobalInstance; call-exit flush updates the
+            // canonical value observed by sibling importers (#660).
             globals[i] = shared;
             owned[i] = false;
         } else {

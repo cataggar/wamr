@@ -1711,13 +1711,9 @@ pub fn instantiateWithOptions(
                                 break :aot_blk;
                             };
                             cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
-                            // Phase 1: AOT cores skip cross-instance import
-                            // wiring / canon-lower trampoline plumbing
-                            // (handled by the interp path below for interp
-                            // cores). Feasibility check above guarantees we
-                            // only commit to AOT for cores that don't need
-                            // any of that. Richer wiring lands in a
-                            // follow-up.
+                            // AOT cross-instance overrides were resolved
+                            // above before instantiation; unresolved imports
+                            // either fall back to interp or use a trap stub.
                             continue;
                         }
                     }
@@ -2593,8 +2589,11 @@ fn isWasiCliRunName(name: []const u8) bool {
 /// is satisfied by `resolveAotImportedFunctionOverrides` which
 /// installs either a cross-instance core-to-core thunk (when the
 /// import resolves to a sibling core's exported func) or a trap-on-
-/// call stub (#662 Phase C). Mutable globals and tag imports remain
-/// out of scope — those still surface here as unsupported (#660).
+/// call stub (#662 Phase C). Mutable globals borrow the exporter's
+/// retained `GlobalInstance` and AOT call exit now writes mutable
+/// imported slab slots back to that canonical value (#660 item 2).
+/// Tag imports remain out of scope and still surface here as
+/// unsupported.
 /// Returns the first unsupported import, or null when the core is
 /// safe to commit to the AOT backend (#644). A null `imports` slice
 /// (no imports at all) is always supported.
@@ -2615,22 +2614,12 @@ fn firstUnsupportedAotImport(module: *const aot_loader.AotModule) ?aot_loader.Ao
             // null and fall back to interp if a `with` arg can't be
             // satisfied, so we don't need to re-check feasibility here.
             .table, .memory => continue,
-            // Immutable global imports flow through
-            // `imported_global_overrides`: the runtime borrows the
-            // exporter's `GlobalInstance` and bakes its value into the
-            // per-call globals slab. Mutable globals would need cross-core
-            // write-back, which requires either a per-global indirection
-            // in codegen or a slab-rebuild on each access; both are out of
-            // scope for this PR, so they still fall back to interp.
-            .global => {
-                for (module.importedGlobals()) |g| {
-                    if (!std.mem.eql(u8, g.module_name, imp.module_name)) continue;
-                    if (!std.mem.eql(u8, g.name, imp.field_name)) continue;
-                    if (g.mutable) return imp;
-                    break;
-                }
-                continue;
-            },
+            // Global imports flow through `imported_global_overrides`: the
+            // runtime borrows the exporter's retained `GlobalInstance` and
+            // seeds each AOT call's globals slab from it. Mutable imports are
+            // accepted because call exit flushes the slab slot back to that
+            // canonical value (#660 item 2).
+            .global => continue,
             // Tag imports still require cross-instance wiring that the
             // AOT runtime cannot synthesize today.
             .tag => return imp,

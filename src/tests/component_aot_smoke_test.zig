@@ -140,6 +140,107 @@ test "#649 phase 2: instantiateWithOverrides shares imported tables across AOT c
     try std.testing.expectEqual(@as(i32, 7), results[0].i32);
 }
 
+test "#660 item 2: AOT mutable imported global writes back across component cores" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const exporter_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> i32, () -> ()
+        0x01, 0x08, 0x02, 0x60, 0x00, 0x01, 0x7f, 0x60, 0x00, 0x00,
+        // function section: readG type 0, write_one type 1
+        0x03, 0x03, 0x02, 0x00, 0x01,
+        // global section: (global (mut i32) (i32.const 0))
+        0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b,
+        // export section: global "g", funcs "readG" and "write_one"
+        0x07, 0x19, 0x03,
+        0x01, 'g', 0x03, 0x00,
+        0x05, 'r', 'e', 'a', 'd', 'G', 0x00, 0x00,
+        0x09, 'w', 'r', 'i', 't', 'e', '_', 'o', 'n', 'e', 0x00, 0x01,
+        // code section: readG => global.get 0; write_one => global.set 0 to 1
+        0x0a, 0x0d, 0x02,
+        0x04, 0x00, 0x23, 0x00, 0x0b,
+        0x06, 0x00, 0x41, 0x01, 0x24, 0x00, 0x0b,
+    };
+    const importer_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> (), () -> i32
+        0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x01, 0x7f,
+        // import section: (import "a" "g" (global (mut i32)))
+        0x02, 0x08, 0x01, 0x01, 'a', 0x01, 'g', 0x03, 0x7f, 0x01,
+        // function section: write42 type 0, readG type 1
+        0x03, 0x03, 0x02, 0x00, 0x01,
+        // export section: funcs "write42" and "readG"
+        0x07, 0x13, 0x02,
+        0x07, 'w', 'r', 'i', 't', 'e', '4', '2', 0x00, 0x00,
+        0x05, 'r', 'e', 'a', 'd', 'G', 0x00, 0x01,
+        // code section: write42 => global.set 0 to 42; readG => global.get 0
+        0x0a, 0x0d, 0x02,
+        0x06, 0x00, 0x41, 0x2a, 0x24, 0x00, 0x0b,
+        0x04, 0x00, 0x23, 0x00, 0x0b,
+    };
+
+    const allocator = std.testing.allocator;
+    const exporter_cwasm = try aot_harness.compileWasmToAot(allocator, &exporter_wasm);
+    defer allocator.free(exporter_cwasm);
+    const importer_cwasm = try aot_harness.compileWasmToAot(allocator, &importer_wasm);
+    defer allocator.free(importer_cwasm);
+
+    const core_modules = [_]ctypes.CoreModule{
+        .{ .data = &exporter_wasm },
+        .{ .data = &importer_wasm },
+    };
+    const importer_args = [_]ctypes.CoreInstantiateArg{.{ .name = "a", .instance_idx = 0 }};
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+        .{ .instantiate = .{ .module_idx = 1, .args = &importer_args } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const pcs = [_]instance.PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = exporter_cwasm },
+        .{ .module_idx = 1, .cwasm_bytes = importer_cwasm },
+    };
+    const inst = try instance.instantiateWithOptions(&component, allocator, .{
+        .precompiled_cores = &pcs,
+        .aot_only = true,
+    });
+    defer inst.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), inst.core_instances.len);
+    const exporter_ai = inst.core_instances[0].aot_inst orelse return error.TestFailed;
+    const importer_ai = inst.core_instances[1].aot_inst orelse return error.TestFailed;
+    try std.testing.expectEqual(exporter_ai.globals[0], importer_ai.globals[0]);
+    try std.testing.expect(!importer_ai.globals_owned[0]);
+
+    const a_read = aot_runtime_mod.findExportFunc(exporter_ai, "readG") orelse return error.TestFailed;
+    const a_write_one = aot_runtime_mod.findExportFunc(exporter_ai, "write_one") orelse return error.TestFailed;
+    const b_write42 = aot_runtime_mod.findExportFunc(importer_ai, "write42") orelse return error.TestFailed;
+    const b_read = aot_runtime_mod.findExportFunc(importer_ai, "readG") orelse return error.TestFailed;
+    const no_params = [_]core_types.ValType{};
+    const no_results = [_]core_types.ValType{};
+    const i32_results = [_]core_types.ValType{.i32};
+    const no_args = [_]core_types.Value{};
+    var results_buf: [1]aot_runtime_mod.ScalarResult = .{.{ .i32 = 0 }};
+
+    _ = try aot_runtime_mod.callFuncScalar(importer_ai, b_write42, &no_params, &no_results, &no_args, &results_buf);
+    const a_after_b_write = try aot_runtime_mod.callFuncScalar(exporter_ai, a_read, &no_params, &i32_results, &no_args, &results_buf);
+    try std.testing.expectEqual(@as(i32, 42), a_after_b_write[0].i32);
+
+    _ = try aot_runtime_mod.callFuncScalar(exporter_ai, a_write_one, &no_params, &no_results, &no_args, &results_buf);
+    const b_after_a_write = try aot_runtime_mod.callFuncScalar(importer_ai, b_read, &no_params, &i32_results, &no_args, &results_buf);
+    try std.testing.expectEqual(@as(i32, 1), b_after_a_write[0].i32);
+}
+
 test "#625 phase 1: instantiateWithOptions loads + runs an AOT core" {
     if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
 
