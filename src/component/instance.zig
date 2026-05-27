@@ -3726,12 +3726,21 @@ fn resolveLiftedCoreFunc(
             const ie = a.instance_export;
             if (ie.instance_idx >= inst.core_instances.len) return null;
             const target = inst.core_instances[ie.instance_idx];
-            const mi = target.module_inst orelse return null;
-            const local = mi.getExportFunc(ie.name) orelse return null;
-            return .{
-                .core_instance_idx = ie.instance_idx,
-                .local_func_idx = local,
-            };
+            if (target.module_inst) |mi| {
+                const local = mi.getExportFunc(ie.name) orelse return null;
+                return .{
+                    .core_instance_idx = ie.instance_idx,
+                    .local_func_idx = local,
+                };
+            }
+            if (target.aot_inst) |ai| {
+                const exp = ai.module.findExport(ie.name, .function) orelse return null;
+                return .{
+                    .core_instance_idx = ie.instance_idx,
+                    .local_func_idx = exp.index,
+                };
+            }
+            return null;
         },
     }
 }
