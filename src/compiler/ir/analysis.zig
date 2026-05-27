@@ -468,6 +468,12 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .parallel_copy => |pairs| {
             for (pairs) |p| live.put(p.src, {}) catch {};
         },
+
+        // #672 EH ops. `throw`'s args are the live uses; `throw_ref`'s
+        // exnref is a single live use. `try_table_*` carry no vregs.
+        .try_table_begin, .try_table_end => {},
+        .throw => |th| for (th.args) |a| live.put(a, {}) catch {},
+        .throw_ref => |v| live.put(v, {}) catch {},
     }
 }
 
@@ -1034,6 +1040,11 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .parallel_copy => |pairs| {
             for (pairs) |p| last_use.put(p.src, pos) catch {};
         },
+
+        // #672 EH ops.
+        .try_table_begin, .try_table_end => {},
+        .throw => |th| for (th.args) |a| last_use.put(a, pos) catch {},
+        .throw_ref => |v| last_use.put(v, pos) catch {},
     }
 }
 

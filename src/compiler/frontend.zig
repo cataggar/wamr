@@ -93,6 +93,32 @@ fn globalValTypeByIdx(wasm_module: *const types.WasmModule, idx: u32) ?types.Val
     return wasm_module.globals[local_idx].global_type.val_type;
 }
 
+/// Resolve the param arity (and a borrowed type-index pointer) of a tag at
+/// global tag index `tag_idx`. Tags are indexed: imported tags come first,
+/// followed by `tag_types[]`. Each tag references a `func_type` whose
+/// `params` slice gives the throw-payload signature. Returns null if the
+/// index or any referenced type is out of range. #672.
+fn tagParamArity(wm: *const types.WasmModule, tag_idx: u32) ?u32 {
+    if (tag_idx < wm.import_tag_count) {
+        var i: u32 = 0;
+        for (wm.imports) |imp| {
+            if (imp.kind != .tag) continue;
+            if (i == tag_idx) {
+                const type_idx = imp.tag_type_idx orelse return null;
+                if (type_idx >= wm.types.len) return null;
+                return @intCast(wm.types[type_idx].params.len);
+            }
+            i += 1;
+        }
+        return null;
+    }
+    const local = tag_idx - wm.import_tag_count;
+    if (local >= wm.tag_types.len) return null;
+    const type_idx = wm.tag_types[local];
+    if (type_idx >= wm.types.len) return null;
+    return @intCast(wm.types[type_idx].params.len);
+}
+
 fn globalSlotAlignment(ty: ir.IrType) u32 {
     return switch (ty) {
         .v128 => 16,
@@ -255,7 +281,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
     // ── Control flow block stack ──────────────────────────────────────
     const BlockFrame = struct {
-        kind: enum { block, loop, @"if" },
+        kind: enum { block, loop, @"if", try_table },
         /// Block to jump to on `br` (end_block for block/if, header for loop).
         target_block: ir.BlockId,
         /// Continuation block after this construct ends.
@@ -410,6 +436,34 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     });
                     continue;
                 },
+                // #672 EH: skip immediates and push a dummy try_table frame
+                // so a matching `end` doesn't underflow the block stack.
+                .try_table => {
+                    _ = readBlockType(code, &ip, module_sigs);
+                    const clause_count = readU32(code, &ip);
+                    var ci: u32 = 0;
+                    while (ci < clause_count) : (ci += 1) {
+                        const ck = readU32(code, &ip);
+                        if (ck == 0 or ck == 1) _ = readU32(code, &ip);
+                        _ = readU32(code, &ip);
+                    }
+                    try block_stack.append(allocator, .{
+                        .kind = .try_table,
+                        .target_block = 0,
+                        .end_block = 0,
+                        .else_block = null,
+                        .stack_depth = vreg_stack.items.len,
+                        .param_types = NO_TYPES,
+                        .result_types = NO_TYPES,
+                        .param_locals = &[_]u32{},
+                        .result_locals = &[_]u32{},
+                    });
+                    continue;
+                },
+                .throw, .throw_ref => {
+                    skipOperands(code, &ip, op);
+                    continue;
+                },
                 else => {
                     // Skip operands for dead instructions
                     skipOperands(code, &ip, op);
@@ -478,10 +532,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 // `MultipleTerminators`) and confuses the inliner.
                 const cur_insts = ir_func.getBlock(current_block).instructions.items;
                 const already_terminated = cur_insts.len != 0 and switch (cur_insts[cur_insts.len - 1].op) {
-                    .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => true,
+                    .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable", .throw, .throw_ref => true,
                     else => false,
                 };
                 if (!already_terminated) {
+                    // #672 EH: a try_table body that falls through must
+                    // emit `try_table_end` to bracket the begin op before
+                    // the implicit fall-through `br`.
+                    if (frame.kind == .try_table) {
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .try_table_end = {} } });
+                    }
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
                 }
                 current_block = frame.end_block;
@@ -589,6 +649,111 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .param_locals = param_locals,
                     .result_locals = result_locals,
                 });
+            },
+            // #672 EH: `try_table` opens a region that catches matching
+            // exceptions and transfers to per-clause handlers. Commit 2
+            // emits the new IR op + records the clause table; the handler
+            // BlockIds resolve to the target frames' `target_block` (i.e.
+            // the block that label_idx names — same scope as `br`). Real
+            // CFG plumbing of the unwind path is wired in commit 3/4.
+            .try_table => {
+                const bt = readBlockType(code, &ip, module_sigs);
+                const n_params: usize = bt.params.len;
+                const clause_count = readU32(code, &ip);
+                const RawClause = struct { kind: u8, tag_idx: ?u32, label_idx: u32 };
+                const raw_clauses = try frame_alloc.alloc(RawClause, clause_count);
+                var ci: u32 = 0;
+                while (ci < clause_count) : (ci += 1) {
+                    const ck_raw = readU32(code, &ip);
+                    const ck: u8 = @intCast(ck_raw & 0xFF);
+                    var tag_idx: ?u32 = null;
+                    if (ck == 0 or ck == 1) tag_idx = readU32(code, &ip);
+                    const label_idx = readU32(code, &ip);
+                    raw_clauses[ci] = .{ .kind = ck, .tag_idx = tag_idx, .label_idx = label_idx };
+                }
+                const end_block = try ir_func.newBlock();
+                const param_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.params);
+                const result_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.results);
+                // Pop body params (top-last), store to param_locals.
+                if (n_params > 0 and vreg_stack.items.len >= n_params) {
+                    var i: usize = n_params;
+                    while (i > 0) {
+                        i -= 1;
+                        const v = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = param_locals[i], .val = v } } });
+                    }
+                }
+                const pre_depth = vreg_stack.items.len;
+                // Re-push params as fresh vregs inside the try body.
+                var pi: usize = 0;
+                while (pi < n_params) : (pi += 1) {
+                    const dest = ir_func.newVReg();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = param_locals[pi] }, .dest = dest, .type = bt.params[pi] });
+                    try vreg_stack.append(allocator, dest);
+                }
+                try block_stack.append(allocator, .{
+                    .kind = .try_table,
+                    .target_block = end_block,
+                    .end_block = end_block,
+                    .else_block = null,
+                    .stack_depth = pre_depth,
+                    .param_types = bt.params,
+                    .result_types = bt.results,
+                    .param_locals = param_locals,
+                    .result_locals = result_locals,
+                });
+                // Resolve each clause's label_idx against the current
+                // block_stack (which now includes the try_table frame at
+                // top — label 0 names the try_table itself). The handler
+                // BlockId is the target the labelled construct uses for
+                // `br` (same lookup as `br`). For loop labels this is the
+                // header (re-enters the loop); for block/if/try_table
+                // labels this is the end_block.
+                const clauses = try ir_func.allocator.alloc(ir.Inst.CatchClause, clause_count);
+                ci = 0;
+                while (ci < clause_count) : (ci += 1) {
+                    const rc = raw_clauses[ci];
+                    var handler: ir.BlockId = end_block;
+                    if (rc.label_idx < block_stack.items.len) {
+                        const target_frame = block_stack.items[block_stack.items.len - 1 - rc.label_idx];
+                        handler = target_frame.target_block;
+                    }
+                    clauses[ci] = .{
+                        .kind = rc.kind,
+                        .tag_idx = rc.tag_idx,
+                        .handler = handler,
+                    };
+                }
+                try ir_func.getBlock(current_block).append(.{
+                    .op = .{ .try_table_begin = .{
+                        .result_arity = @intCast(bt.results.len),
+                        .clauses = clauses,
+                    } },
+                });
+            },
+            // #672 EH: throw — pop tag's params, emit terminator. Real
+            // unwind dispatch lands in commit 3+.
+            .throw => {
+                const tag_idx = readU32(code, &ip);
+                const arity = tagParamArity(wasm_module, tag_idx) orelse 0;
+                const args = try ir_func.allocator.alloc(ir.VReg, arity);
+                var ai: u32 = arity;
+                while (ai > 0) {
+                    ai -= 1;
+                    args[ai] = safePop(&vreg_stack);
+                }
+                try ir_func.getBlock(current_block).append(.{
+                    .op = .{ .throw = .{ .tag_idx = tag_idx, .args = args } },
+                });
+                dead_code = true;
+            },
+            // #672 EH: throw_ref — pop exnref, emit terminator.
+            .throw_ref => {
+                const exnref = safePop(&vreg_stack);
+                try ir_func.getBlock(current_block).append(.{
+                    .op = .{ .throw_ref = exnref },
+                });
+                dead_code = true;
             },
             .@"if" => {
                 const bt = readBlockType(code, &ip, module_sigs);
@@ -3634,6 +3799,35 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
         .br_on_null, .br_on_non_null => _ = readU32(code, ip), // label depth
         .call_ref, .return_call_ref => _ = readU32(code, ip), // typeidx
         // ref_as_non_null has no operands
+        // #672 EH: try_table has blocktype + clause list; throw has a
+        // single u32 tag idx; throw_ref has no immediates.
+        .try_table => {
+            // Block type: signed-LEB128 byte (or multi-byte ref-htype) —
+            // mirrors the parsing in `readBlockType`. Simple skip suffices
+            // here because we never re-read these bytes.
+            if (ip.* < code.len) {
+                const b0 = code[ip.*];
+                if (b0 == 0x63 or b0 == 0x64) {
+                    ip.* += 1;
+                    while (ip.* < code.len) {
+                        const hb = code[ip.*];
+                        ip.* += 1;
+                        if ((hb & 0x80) == 0) break;
+                    }
+                } else {
+                    _ = leb128.readSignedLossy(i64, code, ip);
+                }
+            }
+            const clause_count = readU32(code, ip);
+            var ci: u32 = 0;
+            while (ci < clause_count) : (ci += 1) {
+                const ck = readU32(code, ip);
+                if (ck == 0 or ck == 1) _ = readU32(code, ip);
+                _ = readU32(code, ip);
+            }
+        },
+        .throw => _ = readU32(code, ip),
+        .throw_ref => {},
         // No operands
         else => {},
     }
@@ -7437,4 +7631,146 @@ test "lower: dead code after br is skipped" {
     } else |_| {
         // Error is also acceptable — we just shouldn't crash
     }
+}
+
+// ── #672 EH: try_table / throw / throw_ref lowering tests ──────────────
+
+test "lower throw: emits throw IR op as terminator" {
+    const allocator = std.testing.allocator;
+
+    // Tag type: takes one i32, no results.
+    const tag_ft = types.FuncType{ .params = &[_]types.ValType{.i32}, .results = &.{} };
+    const func_ft = types.FuncType{ .params = &.{}, .results = &.{} };
+
+    // Function body: i32.const 7; throw 0; end
+    const code = [_]u8{
+        0x41, 0x07, // i32.const 7
+        0x08, 0x00, // throw tag 0
+        0x0B, // end
+    };
+    const func = types.WasmFunction{
+        .type_idx = 1,
+        .func_type = func_ft,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    var wm = types.WasmModule{};
+    wm.types = &[_]types.FuncType{ tag_ft, func_ft };
+    wm.functions = &[_]types.WasmFunction{func};
+    wm.tag_types = &[_]u32{0}; // local tag 0 uses type 0
+
+    var ir_module = try lowerModule(&wm, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    // Find the throw instruction.
+    var saw_throw = false;
+    for (ir_func.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            if (std.meta.activeTag(inst.op) == .throw) {
+                try std.testing.expectEqual(@as(u32, 0), inst.op.throw.tag_idx);
+                try std.testing.expectEqual(@as(usize, 1), inst.op.throw.args.len);
+                saw_throw = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_throw);
+}
+
+test "lower throw_ref: emits throw_ref IR op as terminator" {
+    const allocator = std.testing.allocator;
+
+    // (func (param exnref) throw_ref) — exnref is lowered to a single
+    // 64-bit slot in the frontend, but for this shape test we just
+    // need an i32 local to feed the throw_ref.
+    const func_ft = types.FuncType{ .params = &[_]types.ValType{.i32}, .results = &.{} };
+
+    // Body: local.get 0; throw_ref; end
+    const code = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x0A, // throw_ref
+        0x0B, // end
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_ft,
+        .local_count = 1,
+        .locals = &.{},
+        .code = &code,
+    };
+    var wm = types.WasmModule{};
+    wm.types = &[_]types.FuncType{func_ft};
+    wm.functions = &[_]types.WasmFunction{func};
+
+    var ir_module = try lowerModule(&wm, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    var saw_throw_ref = false;
+    for (ir_func.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            if (std.meta.activeTag(inst.op) == .throw_ref) {
+                saw_throw_ref = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_throw_ref);
+}
+
+test "lower try_table: emits begin/end and records clauses" {
+    const allocator = std.testing.allocator;
+
+    const tag_ft = types.FuncType{ .params = &[_]types.ValType{.i32}, .results = &.{} };
+    const func_ft = types.FuncType{ .params = &.{}, .results = &.{} };
+
+    // try_table (catch 0 0) nop end end
+    //   0x1F = try_table
+    //   0x40 = block type void
+    //   0x01 = one clause
+    //     kind=0 (catch tag), tag_idx=0, label_idx=0
+    //   0x01 = nop
+    //   0x0B = end (try_table body)
+    //   0x0B = end (function)
+    const code = [_]u8{
+        0x1F, 0x40, 0x01, 0x00, 0x00, 0x00,
+        0x01,
+        0x0B,
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 1,
+        .func_type = func_ft,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    var wm = types.WasmModule{};
+    wm.types = &[_]types.FuncType{ tag_ft, func_ft };
+    wm.functions = &[_]types.WasmFunction{func};
+    wm.tag_types = &[_]u32{0};
+
+    var ir_module = try lowerModule(&wm, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    var saw_begin = false;
+    var saw_end = false;
+    for (ir_func.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            switch (inst.op) {
+                .try_table_begin => |tb| {
+                    try std.testing.expectEqual(@as(u32, 0), tb.result_arity);
+                    try std.testing.expectEqual(@as(usize, 1), tb.clauses.len);
+                    try std.testing.expectEqual(@as(u8, 0), tb.clauses[0].kind);
+                    try std.testing.expectEqual(@as(?u32, 0), tb.clauses[0].tag_idx);
+                    saw_begin = true;
+                },
+                .try_table_end => saw_end = true,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_begin);
+    try std.testing.expect(saw_end);
 }

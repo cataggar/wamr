@@ -256,7 +256,15 @@ pub fn compileCoreWasm(
                     .global_mutable = global_type.mutability == .mutable,
                 }) catch return error.OutOfMemory;
             },
-            .tag => {},
+            .tag => {
+                const type_idx = imp.tag_type_idx orelse continue;
+                imports.append(ea, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .tag,
+                    .tag_type_idx = type_idx,
+                }) catch return error.OutOfMemory;
+            },
         }
     }
 
@@ -298,6 +306,14 @@ pub fn compileCoreWasm(
     var local_func_tidx_list: std.ArrayList(u32) = .empty;
     for (module.functions) |f| {
         local_func_tidx_list.append(ea, f.type_idx) catch return error.OutOfMemory;
+    }
+
+    // Locally-declared tags (#672). `module.tag_types` is parallel to the
+    // wasm tag section: each entry is a function-type index describing the
+    // exception parameters.
+    var tag_entries: std.ArrayList(emit_aot.TagEntry) = .empty;
+    for (module.tag_types) |type_idx| {
+        tag_entries.append(ea, .{ .type_idx = type_idx }) catch return error.OutOfMemory;
     }
 
     // Build global entries in wasm-flat order (imported globals first,
@@ -391,6 +407,7 @@ pub fn compileCoreWasm(
         module.start_function,
         if (func_type_entries.items.len > 0) func_type_entries.items else null,
         if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
+        if (tag_entries.items.len > 0) tag_entries.items else null,
     ) catch return error.CoreCompileFailed;
 }
 

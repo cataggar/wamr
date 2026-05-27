@@ -539,6 +539,15 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .phi => {},
         // Parallel-copy operands handled separately (unbounded slice).
         .parallel_copy => {},
+
+        // #672 EH ops. `throw.args` is unbounded (depends on tag arity),
+        // so we handle it the same way as `phi` / `parallel_copy` — the
+        // unbounded handling falls to callers that walk the slice
+        // explicitly. `throw_ref` has a single exnref use which fits
+        // the bounded list.
+        .try_table_begin, .try_table_end => {},
+        .throw => {},
+        .throw_ref => |v| list.append(v),
     }
     return list;
 }
@@ -1015,6 +1024,17 @@ pub fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             for (@constCast(pairs)) |*p| {
                 if (p.src == old) p.src = new;
             }
+        },
+
+        // #672 EH ops.
+        .try_table_begin, .try_table_end => {},
+        .throw => |*th| {
+            for (@constCast(th.args)) |*a| {
+                if (a.* == old) a.* = new;
+            }
+        },
+        .throw_ref => |*v| {
+            if (v.* == old) v.* = new;
         },
     }
 }
@@ -5073,6 +5093,15 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
                 p.src += offset;
                 p.dst += offset;
             }
+        },
+
+        // #672 EH ops.
+        .try_table_begin, .try_table_end => {},
+        .throw => |*th| {
+            for (@constCast(th.args)) |*a| a.* += offset;
+        },
+        .throw_ref => |*v| {
+            v.* += offset;
         },
     }
 }

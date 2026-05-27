@@ -1701,7 +1701,29 @@ pub fn instantiateWithOptions(
                             };
                             defer if (imported_function_overrides.len > 0) allocator.free(imported_function_overrides);
 
-                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides, imported_function_overrides) catch |err| {
+                            const imported_tag_overrides_opt = resolveAotImportedTagOverrides(
+                                allocator,
+                                cis,
+                                ci_idx,
+                                ie.args,
+                                aot_module_ptr,
+                            ) catch {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: imported tag override resolution failed", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
+                            const imported_tag_overrides = imported_tag_overrides_opt orelse {
+                                if (aot_only) {
+                                    std.log.warn("[aot reject] core module {d}: cross-instance tag wiring failed (#670)", .{ie.module_idx});
+                                    return error.AotImportUnresolvable;
+                                }
+                                break :aot_blk;
+                            };
+                            defer if (imported_tag_overrides.len > 0) allocator.free(imported_tag_overrides);
+
+                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides, imported_function_overrides, imported_tag_overrides) catch |err| {
                                 std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                                 if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
@@ -2622,9 +2644,11 @@ fn firstUnsupportedAotImport(module: *const aot_loader.AotModule) ?aot_loader.Ao
             // accepted because call exit flushes the slab slot back to that
             // canonical value (#660 item 2).
             .global => continue,
-            // Tag imports still require cross-instance wiring that the
-            // AOT runtime cannot synthesize today.
-            .tag => return imp,
+            // Tag imports are wired the same way as globals/tables/memories:
+            // a sibling core's exported `TagInstance` is passed in via
+            // `imported_tag_overrides` so AOT cores can `throw` and `catch`
+            // a shared tag identity. Closes #670.
+            .tag => continue,
         }
     }
     return null;
@@ -2860,6 +2884,62 @@ fn resolveAotImportedGlobalOverrides(
         if (source_inst_idx == std.math.maxInt(u32)) return null;
         if (source_inst_idx >= ci_idx) return null;
         overrides[i] = resolveCoreInstanceGlobalExport(inst, component, cis[source_inst_idx], imp_global.name) orelse return null;
+    }
+
+    return overrides;
+}
+
+/// #672 commit 5: resolve a sibling core instance's exported tag by name.
+/// Both interp module-instances and AOT instances expose tags through
+/// `module.findExport(name, .tag)` indexed into a `tags: []*TagInstance`
+/// slot, so the lookup shape mirrors `resolveCoreInstanceGlobalExport`.
+fn resolveCoreInstanceTagExport(
+    entry: ComponentInstance.CoreInstanceEntry,
+    export_name: []const u8,
+) ?*core_types.TagInstance {
+    if (entry.module_inst) |src_mi| {
+        const exp = src_mi.module.findExport(export_name, .tag) orelse return null;
+        if (exp.index >= src_mi.tags.len) return null;
+        return src_mi.tags[exp.index];
+    }
+    if (entry.aot_inst) |src_ai| {
+        const exp = src_ai.module.findExport(export_name, .tag) orelse return null;
+        if (exp.index >= src_ai.tags.len) return null;
+        return src_ai.tags[exp.index];
+    }
+    // Inline-export bundles don't expose tag instances today (no fixture
+    // exercises that path); fall through as unresolved so the caller can
+    // either reject AOT or surface a clear error.
+    return null;
+}
+
+/// #672 commit 5: build the `imported_tag_overrides[]` slice for an AOT
+/// core's `instantiateWithOverrides` call. Each entry borrows a sibling
+/// instance's exported `TagInstance` so throw / catch see the same
+/// identity across cores in the same component (closes #670).
+fn resolveAotImportedTagOverrides(
+    allocator: std.mem.Allocator,
+    cis: []const ComponentInstance.CoreInstanceEntry,
+    ci_idx: usize,
+    args: []const ctypes.CoreInstantiateArg,
+    module: *const aot_loader.AotModule,
+) error{OutOfMemory}!?[]?*core_types.TagInstance {
+    const imported_tags = module.importedTags();
+    if (imported_tags.len == 0) return &.{};
+
+    const overrides = try allocator.alloc(?*core_types.TagInstance, imported_tags.len);
+    errdefer allocator.free(overrides);
+
+    for (imported_tags, 0..) |imp_tag, i| {
+        const source_inst_idx: u32 = arg_blk: {
+            for (args) |arg| {
+                if (std.mem.eql(u8, arg.name, imp_tag.module_name)) break :arg_blk arg.instance_idx;
+            }
+            break :arg_blk std.math.maxInt(u32);
+        };
+        if (source_inst_idx == std.math.maxInt(u32)) return null;
+        if (source_inst_idx >= ci_idx) return null;
+        overrides[i] = resolveCoreInstanceTagExport(cis[source_inst_idx], imp_tag.name) orelse return null;
     }
 
     return overrides;

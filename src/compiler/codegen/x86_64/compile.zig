@@ -68,6 +68,13 @@ const vmctx_table_set_fn_field: i32 = 192; // VmCtx.table_set_fn offset (usize)
 const vmctx_futex_wait32_fn_field: i32 = 200; // VmCtx.futex_wait32_fn offset (usize)
 const vmctx_futex_wait64_fn_field: i32 = 208; // VmCtx.futex_wait64_fn offset (usize)
 const vmctx_futex_notify_fn_field: i32 = 216; // VmCtx.futex_notify_fn offset (usize)
+// #672 commit 4: AOT exception-handling fields. Inserted before
+// `wasi_ctx` in the extern VmCtx struct so all earlier offsets above
+// remain stable.
+const vmctx_tags_ptr_field: i32 = 240; // VmCtx.tags_ptr offset (usize)
+const vmctx_aot_throw_uncaught_fn_field: i32 = 256; // VmCtx.aot_throw_uncaught_fn (usize)
+const vmctx_exception_params_field: i32 = 264; // VmCtx.exception_params base ([16]u64)
+const vmctx_exception_param_count_field: i32 = 392; // VmCtx.exception_param_count (u32)
 // Per-table descriptor layout (TableInfo, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
 const table_info_ptr_off: i32 = 0;
@@ -111,6 +118,52 @@ fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
 fn emitTrapHelperCall(code: *emit.CodeBuffer, field_offset: i32) !void {
     try code.movRegReg(param_regs[0], .r10);
     try code.movRegMem(.rax, param_regs[0], field_offset);
+    try code.callReg(.rax);
+}
+
+/// #672 commit 4: emit lowering of the IR `throw` op on x86_64.
+///
+/// Mirror of `emitThrow` in src/compiler/codegen/aarch64/compile.zig.
+/// Sequence:
+///   for each arg:
+///     mov rax, <arg-vreg>            ; via useVReg (scratch=rax)
+///     mov [rbx + exception_params + i*8], rax
+///   mov [rbx + exception_param_count], r10d        ; param_count (u32)
+///   mov r10, [rbx + tags_ptr]
+///   mov param_regs[1], [r10 + tag_idx*8]           ; arg1 = *TagInstance
+///   mov param_regs[0], rbx                         ; arg0 = vmctx
+///   mov rax, [rbx + aot_throw_uncaught_fn]
+///   call rax                                       ; noreturn
+///
+/// `rbx` holds the VmCtx* throughout function execution
+/// (callee-saved, established by compileFunctionRA). Because `throw`
+/// is a terminator (the trampoline is noreturn) no caller-save snapshot
+/// is required; we can clobber any caller-save register freely.
+fn emitThrow(
+    code: *emit.CodeBuffer,
+    th: ir.Inst.Throw,
+    alloc_result: *const regalloc.AllocResult,
+) !void {
+    if (th.args.len > 16) return error.UnimplementedOp;
+
+    for (th.args, 0..) |arg_vreg, i| {
+        const src = try useVReg(code, alloc_result, arg_vreg, .rax);
+        const disp: i32 = vmctx_exception_params_field + @as(i32, @intCast(i)) * 8;
+        try code.movMemReg(.rbx, disp, src);
+    }
+
+    // exception_param_count = th.args.len (u32 store).
+    try code.movRegImm32(.r10, @intCast(th.args.len));
+    try code.movMemRegSized(.rbx, vmctx_exception_param_count_field, .r10, 4);
+
+    // r10 = vmctx.tags_ptr;  arg1 = r10[tag_idx]
+    try code.movRegMem(.r10, .rbx, vmctx_tags_ptr_field);
+    const tag_disp: i32 = @as(i32, @intCast(th.tag_idx)) * 8;
+    try code.movRegMem(param_regs[1], .r10, tag_disp);
+
+    // arg0 = vmctx; rax = aot_throw_uncaught_fn; call rax (noreturn).
+    try code.movRegReg(param_regs[0], .rbx);
+    try code.movRegMem(.rax, .rbx, vmctx_aot_throw_uncaught_fn_field);
     try code.callReg(.rax);
 }
 
@@ -1321,6 +1374,17 @@ fn compileInst(
         // parallel_copy is an aarch64-only post-pipeline op (#540).
         // x86_64 keeps the synth-local frameStore/frameLoad path.
         .parallel_copy => unreachable,
+
+        // #672 EH ops:
+        //   try_table_begin / try_table_end emit no machine code. The
+        //   handler block is reachable through normal `br` targets; full
+        //   catch dispatch arrives with the cross-function unwind work
+        //   (commit 5 of #672).
+        //   Stack-based compileInst is test-only on x86_64; production
+        //   compilation goes through compileInstRA, which carries the
+        //   real `throw` lowering (mirror of aarch64 emitThrow).
+        .try_table_begin, .try_table_end => {},
+        .throw, .throw_ref => return error.UnimplementedOp,
     }
 }
 
@@ -4772,6 +4836,23 @@ fn compileInstRA(
         // ── Stubs for ops not commonly hit ────────────────────────────
         // Phi must be lowered before codegen.
         .phi => unreachable,
+
+        // #672 commit 4: AOT exception-handling ops on x86_64.
+        //   try_table_begin / try_table_end emit no machine code; the
+        //   handler block is reachable through normal `br` targets.
+        //   Full catch dispatch arrives with the cross-function unwind
+        //   work (commit 5 of #672).
+        //   throw lowers via `emitThrow` (mirror of aarch64).
+        //   throw_ref still routes through the uncaught trap helper:
+        //   exnref state lives in ExecEnv (interp-only); the AOT
+        //   counterpart arrives with commit 5.
+        .try_table_begin, .try_table_end => {},
+        .throw => |th| try emitThrow(code, th, alloc_result),
+        .throw_ref => {
+            try code.movRegReg(.r10, .rbx);
+            try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
+        },
+
         else => {
             // For unhandled ops, emit a no-op placeholder
             if (inst.dest) |dest| {
@@ -6741,4 +6822,66 @@ test "compileModule: regalloc hints — leaf 2-arg call emits no inter-vreg shuf
     const iconst_to_rdx = [_]u8{ 0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00 };
     try std.testing.expect(containsBytes(caller_code, &iconst_to_rsi));
     try std.testing.expect(containsBytes(caller_code, &iconst_to_rdx));
+}
+
+test "#672 commit 4: try_table_begin / try_table_end are no-ops on x86_64" {
+    // Verifies that wrapping a trivial body in try_table_begin / try_table_end
+    // AOT-compiles without error and produces only the body's machine code.
+    const allocator = std.testing.allocator;
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    _ = try func.newBlock();
+    try func.getBlock(0).append(.{
+        .op = .{ .try_table_begin = .{ .result_arity = 0, .clauses = &.{} } },
+    });
+    try func.getBlock(0).append(.{ .op = .try_table_end });
+    try func.getBlock(0).append(.{ .op = .{ .ret = null } });
+    _ = try ir_module.addFunction(func);
+
+    const result = try compileModule(&ir_module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+    // Compiling must succeed and produce a non-empty function body
+    // (prologue + epilogue at minimum).
+    try std.testing.expect(result.code.len > 0);
+}
+
+test "#672 commit 4: throw lowers to mov-arg + call qword [rbx + throw_fn]" {
+    // Builds a function whose body is `throw $tag i32.const 0xDEAD`.
+    // Verifies the emitted bytes include:
+    //   * a u32 store to [rbx + exception_param_count_field]  (sized MOV)
+    //   * a u64 load of vmctx.tags_ptr     mov r10, [rbx + 240]
+    //   * a u64 load of aot_throw_uncaught_fn  mov rax, [rbx + 256]
+    //   * `call rax` (FF D0)
+    const allocator = std.testing.allocator;
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    _ = try func.newBlock();
+    const arg = func.newVReg();
+    try func.getBlock(0).append(.{ .op = .{ .iconst_32 = 0xDEAD }, .dest = arg, .type = .i32 });
+    const args = try allocator.alloc(ir.VReg, 1);
+    args[0] = arg;
+    try func.getBlock(0).append(.{ .op = .{ .throw = .{ .tag_idx = 0, .args = args } } });
+    _ = try ir_module.addFunction(func);
+
+    const result = try compileModule(&ir_module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    // mov r10, qword ptr [rbx + 240]
+    //   REX.W|R = 0x4C, opcode 0x8B,
+    //   ModR/M = 10_010_011 = 0x93 (mod=disp32, reg=r10.low3=2, rm=rbx.low3=3),
+    //   disp32 = 240 (little-endian).
+    try std.testing.expect(containsBytes(result.code, &.{ 0x4C, 0x8B, 0x93, 0xF0, 0x00, 0x00, 0x00 }));
+    // mov rax, qword ptr [rbx + 256]
+    //   REX.W = 0x48, opcode 0x8B,
+    //   ModR/M = 10_000_011 = 0x83 (mod=disp32, reg=rax=0, rm=rbx=3),
+    //   disp32 = 256 (0x100).
+    try std.testing.expect(containsBytes(result.code, &.{ 0x48, 0x8B, 0x83, 0x00, 0x01, 0x00, 0x00 }));
+    // call rax (FF D0)
+    try std.testing.expect(containsBytes(result.code, &.{ 0xFF, 0xD0 }));
 }

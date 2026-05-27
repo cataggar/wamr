@@ -409,6 +409,30 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         }
     }
 
+    // Locally-declared tags (#672). Mirrors `module.tag_types` 1:1.
+    var tag_entries: std.ArrayList(emit_aot.TagEntry) = .empty;
+    defer tag_entries.deinit(allocator);
+    for (module.tag_types) |type_idx| {
+        try tag_entries.append(allocator, .{ .type_idx = type_idx });
+    }
+
+    // Surface tag imports too. The outer `for (module.imports)` loop above
+    // intentionally still drops `.memory` / `.global` because the standalone
+    // `wamrc` path doesn't carry imported memory/global descriptors; tags
+    // are different because the component-mode path (`src/component/aot.zig`)
+    // and this path both need the loader to reconstruct `imported_tags` for
+    // cross-instance wiring.
+    for (module.imports) |imp| {
+        if (imp.kind != .tag) continue;
+        const type_idx = imp.tag_type_idx orelse continue;
+        try import_entries.append(allocator, .{
+            .module_name = imp.module_name,
+            .field_name = imp.field_name,
+            .kind = .tag,
+            .tag_type_idx = type_idx,
+        });
+    }
+
     // Build memory entries from the parsed wasm module
     var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
     defer mem_entries.deinit(allocator);
@@ -528,6 +552,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         module.start_function,
         if (func_type_entries.items.len > 0) func_type_entries.items else null,
         if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
+        if (tag_entries.items.len > 0) tag_entries.items else null,
     );
     defer allocator.free(aot_binary);
 

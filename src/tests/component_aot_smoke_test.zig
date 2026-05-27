@@ -117,7 +117,7 @@ test "#649 phase 2: instantiateWithOverrides shares imported tables across AOT c
     try aot_runtime_mod.mapCodeExecutable(exporter_inst);
 
     const overrides = [_]?*core_types.TableInstance{exporter_inst.tables[0]};
-    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &overrides, &.{}, &.{}, &.{});
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &overrides, &.{}, &.{}, &.{}, &.{});
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
     try std.testing.expect(!importer_inst.tables_owned[0]);
@@ -437,7 +437,7 @@ test "#649 phase 3: instantiateWithOverrides shares imported memory across AOT c
     try std.testing.expectEqual(@as(u8, 0x22), exporter_inst.memories[0].data[3]);
 
     const overrides = [_]?*core_types.MemoryInstance{exporter_inst.memories[0]};
-    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &overrides, &.{}, &.{});
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &overrides, &.{}, &.{}, &.{});
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.memories[0], importer_inst.memories[0]);
     try std.testing.expect(!importer_inst.memories_owned[0]);
@@ -559,7 +559,7 @@ test "#649 phase 4: instantiateWithOverrides shares imported globals across AOT 
     try std.testing.expectEqual(@as(i32, 0x55), exporter_inst.globals[0].value.i32);
 
     const overrides = [_]?*core_types.GlobalInstance{exporter_inst.globals[0]};
-    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &.{}, &overrides, &.{});
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(&importer_module, allocator, &.{}, &.{}, &overrides, &.{}, &.{});
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.globals[0], importer_inst.globals[0]);
     try std.testing.expect(!importer_inst.globals_owned[0]);
@@ -686,6 +686,7 @@ test "#649 phase 5: cross-AOT shared memory + table + global in one importer" {
         &memory_overrides,
         &global_overrides,
         &.{},
+        &.{},
     );
     defer aot_runtime_mod.destroy(importer_inst);
     try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
@@ -712,4 +713,72 @@ test "#649 phase 5: cross-AOT shared memory + table + global in one importer" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     // mem[0]=7 + global=3 + tbl[0]()=100 = 110
     try std.testing.expectEqual(@as(i32, 110), results[0].i32);
+}
+
+test "#670 / #672 commit 5: instantiateWithOverrides shares imported tags across AOT cores" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    // exporter:
+    //   (module
+    //     (type (func (param i32)))
+    //     (tag (export "t") (type 0))
+    //   )
+    const exporter_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: (i32) -> ()
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,
+        // tag section (id=13): 1 entry, attribute=0x00, type_idx=0
+        0x0d, 0x03, 0x01, 0x00, 0x00,
+        // export section: "t" tag 0
+        0x07, 0x05, 0x01, 0x01, 't',  0x04, 0x00,
+    };
+
+    // importer:
+    //   (module
+    //     (type (func (param i32)))
+    //     (import "env" "t" (tag (type 0)))
+    //   )
+    const importer_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: (i32) -> ()
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,
+        // import section: "env" "t" tag attribute=0 type_idx=0
+        0x02, 0x0a,
+        0x01, 0x03, 'e',  'n',  'v',  0x01, 't',  0x04,
+        0x00, 0x00,
+    };
+
+    const allocator = std.testing.allocator;
+    const exporter_cwasm = try aot_harness.compileWasmToAot(allocator, &exporter_wasm);
+    defer allocator.free(exporter_cwasm);
+    const importer_cwasm = try aot_harness.compileWasmToAot(allocator, &importer_wasm);
+    defer allocator.free(importer_cwasm);
+
+    var exporter_module = try aot_loader_mod.load(exporter_cwasm, allocator);
+    defer aot_loader_mod.unload(&exporter_module, allocator);
+    var importer_module = try aot_loader_mod.load(importer_cwasm, allocator);
+    defer aot_loader_mod.unload(&importer_module, allocator);
+
+    const exporter_inst = try aot_runtime_mod.instantiate(&exporter_module, allocator);
+    defer aot_runtime_mod.destroy(exporter_inst);
+
+    try std.testing.expectEqual(@as(usize, 1), exporter_inst.tags.len);
+
+    const overrides = [_]?*core_types.TagInstance{exporter_inst.tags[0]};
+    const importer_inst = try aot_runtime_mod.instantiateWithOverrides(
+        &importer_module,
+        allocator,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &overrides,
+    );
+    defer aot_runtime_mod.destroy(importer_inst);
+
+    // Cross-instance tag identity: importer.tags[0] must equal exporter's
+    // tag pointer (same allocation, not a copy) and must NOT be owned.
+    try std.testing.expectEqual(@as(usize, 1), importer_inst.tags.len);
+    try std.testing.expectEqual(exporter_inst.tags[0], importer_inst.tags[0]);
+    try std.testing.expect(!importer_inst.tags_owned[0]);
 }

@@ -3068,6 +3068,20 @@ fn compileInst(
         // Phi must be lowered before codegen.
         .phi => unreachable,
         .parallel_copy => |pairs| try emitParallelCopy(code, pairs, reg_map, fctx.allocator),
+        // #672 EH ops — commit 3:
+        //   * try_table_begin / try_table_end: no-op. In-function catch
+        //     dispatch is deferred to a later commit; for now the catch
+        //     handler block is reached via normal br targets only (any
+        //     `throw` inside the region escapes as an uncaught trap).
+        //   * throw: spill payload into vmctx, call `aot_throw_uncaught`
+        //     trampoline (noreturn).
+        //   * throw_ref: route through the unreachable trap helper. The
+        //     exnref state lives in ExecEnv (interp-only); cross-arch
+        //     AOT exnref support arrives with cross-function unwind in
+        //     commit 5.
+        .try_table_begin, .try_table_end => {},
+        .throw => |th| try emitThrow(code, th, reg_map),
+        .throw_ref => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
@@ -6548,6 +6562,11 @@ const vmctx_elem_drop_fn_slot: u12 = 19; // byte 152, scale 8
 const vmctx_futex_wait32_fn_slot: u12 = 25; // byte 200, scale 8
 const vmctx_futex_wait64_fn_slot: u12 = 26; // byte 208, scale 8
 const vmctx_futex_notify_fn_slot: u12 = 27; // byte 216, scale 8
+// #672 EH slots — added in commit 3.
+const vmctx_tags_ptr_slot: u12 = 30; // byte 240, scale 8
+const vmctx_aot_throw_uncaught_fn_slot: u12 = 32; // byte 256, scale 8
+const vmctx_exception_params_byte_off: u32 = 264; // [16]u64 buffer base
+const vmctx_exception_param_count_slot_w: u12 = 98; // byte 392 (u32), scale 4
 
 // Per-table descriptor layout (`TableInfo`, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
@@ -7519,6 +7538,51 @@ fn patchBCondHere(code: *emit.CodeBuffer, patch_off: usize) void {
 fn emitTrapHelperCall(code: *emit.CodeBuffer, slot: u12) !void {
     try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, slot);
+    try code.blr(RegMap.tmp0);
+    try code.brk(0);
+}
+
+/// Lower IR `throw`. Terminator semantics let us clobber every caller-save
+/// register: the helper is noreturn (it longjmps via `trapLongjmp` when
+/// trap-as-error is armed, otherwise `std.process.exit(2)`).
+///
+/// Sequence (commit 3 of #672, leaf-function-only first cut):
+///   * Spill each operand into `vmctx.exception_params[i]`.
+///   * Write `param_count` into `vmctx.exception_param_count`.
+///   * Load `*TagInstance` from `vmctx.tags_ptr[tag_idx]` into x1.
+///   * mov x0, vmctx; ldr xtmp, [vmctx + aot_throw_uncaught_fn]; blr xtmp; brk 0.
+///
+/// Limitations: tag_idx must fit in the 12-bit unsigned scaled-by-8
+/// LDR immediate range (`tag_idx < 512`). Higher indices return
+/// `error.UnimplementedOp` for now; lifting this requires the indexed
+/// addressing path that `emitGlobalGet` already uses for large globals
+/// and is filed for the cross-function unwind commit (#672 commit 5).
+fn emitThrow(
+    code: *emit.CodeBuffer,
+    th: ir.Inst.Throw,
+    reg_map: *RegMap,
+) !void {
+    if (th.args.len > 16) return error.UnimplementedOp;
+    if (th.tag_idx >= 512) return error.UnimplementedOp;
+
+    // exception_params[i] = arg[i]. Single scratch (tmp0) reused across iterations.
+    for (th.args, 0..) |arg_vreg, i| {
+        const src = try useInto(code, reg_map, arg_vreg, RegMap.tmp0);
+        const slot: u12 = @intCast(vmctx_exception_params_byte_off / 8 + i);
+        try code.strImm(src, .x19, slot);
+    }
+
+    // exception_param_count = th.args.len (u32, scale-4 slot).
+    try code.movImm64(RegMap.tmp0, @as(u64, th.args.len));
+    try code.strImm32(RegMap.tmp0, .x19, vmctx_exception_param_count_slot_w);
+
+    // x1 = vmctx.tags_ptr[tag_idx].
+    try code.ldrImm(RegMap.tmp0, .x19, vmctx_tags_ptr_slot);
+    try code.ldrImm(.x1, RegMap.tmp0, @intCast(th.tag_idx));
+
+    // mov x0, vmctx; ldr tmp0, [vmctx + aot_throw_uncaught_fn]; blr tmp0; brk 0.
+    try code.movRegReg(.x0, .x19);
+    try code.ldrImm(RegMap.tmp0, .x19, vmctx_aot_throw_uncaught_fn_slot);
     try code.blr(RegMap.tmp0);
     try code.brk(0);
 }
@@ -14427,4 +14491,63 @@ test "relaxOutOfRangeConditionalBranches: in-range branches are not touched" {
     try std.testing.expectEqual(@as(usize, 0), patches.items[0].patch_offset);
     try std.testing.expect(patches.items[0].kind == .b_cond);
     try std.testing.expectEqual(target_off, block_offsets[1]);
+}
+
+// ── #672 commit 3: aarch64 EH codegen ────────────────────────────────
+
+test "#672 commit 3: throw lowers to STR / LDR / BLR + BRK" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0xDEAD }, .dest = v0, .type = .i32 });
+
+    const args = try allocator.alloc(ir.VReg, 1);
+    args[0] = v0;
+    try block.append(.{ .op = .{ .throw = .{ .tag_idx = 3, .args = args } } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+
+    // The throw sequence ends with `brk #0` (0xD4200000). Scan for it.
+    var found_brk = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if (w == 0xD4200000) {
+            found_brk = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_brk);
+}
+
+test "#672 commit 3: try_table_begin / try_table_end are no-ops" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+
+    // Wrap a trivial body in try_table_begin / try_table_end.
+    const clauses = try allocator.alloc(ir.Inst.CatchClause, 0);
+    try block.append(.{ .op = .{ .try_table_begin = .{
+        .result_arity = 0,
+        .clauses = clauses,
+    } } });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .try_table_end = {} } });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
 }

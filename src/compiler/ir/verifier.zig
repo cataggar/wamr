@@ -493,6 +493,11 @@ pub fn forEachOperand(
         .parallel_copy => |pairs| {
             for (pairs) |p| cb(ctx, p.src);
         },
+
+        // #672 EH ops.
+        .try_table_begin, .try_table_end => {},
+        .throw => |th| for (th.args) |a| cb(ctx, a),
+        .throw_ref => |v| cb(ctx, v),
     }
 }
 
@@ -505,6 +510,8 @@ pub fn isTerminator(op: ir.Inst.Op) bool {
         .ret,
         .ret_multi,
         .@"unreachable",
+        .throw,
+        .throw_ref,
         => true,
         .call => |c| c.tail,
         .call_indirect => |c| c.tail,
@@ -1286,6 +1293,15 @@ fn checkOneInst(ctx: OperandCheckCtx, inst: ir.Inst) VerifyError!void {
 
         // Parallel copy: each pair carries its own width.
         .parallel_copy => |pairs| for (pairs) |p| try ctx.expect(p.src, p.ty, "src"),
+
+        // #672 EH ops: try_table_begin / try_table_end carry no vreg
+        // operands. `throw`'s args are popped at lowering time; their
+        // widths are derived from the tag's func_type so we don't try
+        // to re-typecheck them here in commit 2. `throw_ref` carries a
+        // single exnref which we model as i32 for now (no dedicated
+        // exnref width yet).
+        .try_table_begin, .try_table_end, .throw => {},
+        .throw_ref => |v| try ctx.expect(v, .i32, "exnref"),
     }
 }
 

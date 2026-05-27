@@ -29,6 +29,7 @@ pub const AotSectionType = enum(u32) {
     elem = 11,
     start = 12,
     type = 13,
+    tag = 14,
     _,
 };
 
@@ -86,6 +87,15 @@ pub const ImportedGlobalDesc = struct {
     mutable: bool,
 };
 
+/// A tag (exception handling) import. `type_idx` references the function-type
+/// describing the exception parameters (tag attribute is always `0x00` for
+/// the MVP).
+pub const ImportedTagDesc = struct {
+    module_name: []const u8,
+    name: []const u8,
+    type_idx: u32,
+};
+
 /// A global initial value parsed from the AOT globals section.
 pub const AotGlobalInit = struct {
     val_type: u8,
@@ -130,6 +140,12 @@ pub const AotModule = struct {
     imported_tables: []const ImportedTableDesc = &.{},
     imported_memories: []const ImportedMemoryDesc = &.{},
     imported_globals: []const ImportedGlobalDesc = &.{},
+    imported_tags: []const ImportedTagDesc = &.{},
+    /// Type indices for locally-declared tags (parallel to the wasm tag
+    /// section). Each entry references `func_types[i]` describing the
+    /// exception parameters. Matches the interpreter's
+    /// `WasmModule.tag_types`.
+    tag_types: []const u32 = &.{},
     memories: []const types.MemoryType = &.{},
     tables: []const types.TableType = &.{},
     data_segments: []const AotDataSegment = &.{},
@@ -155,6 +171,10 @@ pub const AotModule = struct {
 
     pub fn importedGlobals(self: *const AotModule) []const ImportedGlobalDesc {
         return self.imported_globals;
+    }
+
+    pub fn importedTags(self: *const AotModule) []const ImportedTagDesc {
+        return self.imported_tags;
     }
 };
 
@@ -271,6 +291,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .type => {
                 try parseTypeSection(&reader, section_size, &module, allocator);
             },
+            .tag => {
+                try parseTagSection(&reader, section_size, &module, allocator);
+            },
             else => {
                 // Skip unknown/unhandled sections
                 reader.pos += section_size;
@@ -315,6 +338,12 @@ pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     }
     if (module.imported_globals.len > 0) {
         allocator.free(module.imported_globals);
+    }
+    if (module.imported_tags.len > 0) {
+        allocator.free(module.imported_tags);
+    }
+    if (module.tag_types.len > 0) {
+        allocator.free(module.tag_types);
     }
     if (module.memories.len > 0) {
         allocator.free(module.memories);
@@ -421,6 +450,25 @@ fn parseTypeSection(reader: *BinaryReader, section_size: u32, module: *AotModule
     module.func_types = entries;
 }
 
+/// Parse the AOT tag section (#672): a u32 count followed by `count` u32
+/// type indices, one per locally-declared tag. Matches the on-wire shape of
+/// the wasm tag section after the per-tag attribute byte (always 0x00 in
+/// MVP exception handling) is dropped during emit.
+fn parseTagSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+    const needed = @as(usize, count) * 4;
+    if (reader.remaining() < needed) return error.UnexpectedEnd;
+
+    const tag_types = allocator.alloc(u32, count) catch return error.OutOfMemory;
+    errdefer allocator.free(tag_types);
+    for (0..count) |i| {
+        tag_types[i] = try reader.readU32Le();
+    }
+    module.tag_types = tag_types;
+}
+
 fn parseExportSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
     if (section_size < 4) return error.InvalidSection;
     const count = try reader.readU32Le();
@@ -501,6 +549,8 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
     errdefer memory_descs.deinit(allocator);
     var global_descs: std.ArrayList(ImportedGlobalDesc) = .empty;
     errdefer global_descs.deinit(allocator);
+    var tag_descs: std.ArrayList(ImportedTagDesc) = .empty;
+    errdefer tag_descs.deinit(allocator);
 
     for (0..count) |i| {
         const mod_name_len = try reader.readU32Le();
@@ -559,9 +609,15 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
                 }) catch return error.OutOfMemory;
             },
             .tag => {
-                // TODO #649: preserve imported tag payloads (exception handling
-                // is not yet supported in AOT).
-                _ = try reader.readU32Le();
+                // #672 commit 1: surface tag imports through to instantiation.
+                // Wire format is a single u32 type-idx (matches the legacy
+                // discard at the same offset).
+                const type_idx = try reader.readU32Le();
+                tag_descs.append(allocator, .{
+                    .module_name = mod_name,
+                    .name = field_name,
+                    .type_idx = type_idx,
+                }) catch return error.OutOfMemory;
             },
         }
 
@@ -579,6 +635,7 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
     module.imported_tables = table_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
     module.imported_memories = memory_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
     module.imported_globals = global_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    module.imported_tags = tag_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 fn parseMemorySection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {

@@ -375,6 +375,33 @@ pub const VmCtx = extern struct {
     /// exceeds `memory_size`. Handles overlapping regions (memmove
     /// semantics).
     mem_copy_fn: usize = 0,
+    /// Pointer to `[]*TagInstance` for this instance — `inst.tags.ptr`.
+    /// AOT codegen for `throw` indexes this to resolve `tag_idx` →
+    /// `*TagInstance` at runtime. Length matches `tags_count`.
+    /// Issue #672.
+    tags_ptr: usize = 0,
+    /// Number of entries in `tags_ptr`.
+    tags_count: u32 = 0,
+    /// Padding to keep the following 8-byte field aligned.
+    _pad_tags: u32 = 0,
+    /// `fn (*VmCtx, *TagInstance) noreturn` — invoked by AOT-compiled
+    /// `throw` when no in-function catch handler claims the exception.
+    /// Reads `exception_params` / `exception_param_count`, records the
+    /// pending exception, and longjmps via `trapLongjmp` (Windows) or
+    /// exits the process (other platforms) — mirroring `trap_unreachable_fn`.
+    /// Issue #672.
+    aot_throw_uncaught_fn: usize = 0,
+    /// Scratch buffer where AOT-compiled `throw` writes the wasm operand
+    /// stack values that constitute the exception payload, one per slot.
+    /// 16 slots = max exception arity supported by the leaf-function
+    /// path. Read by `aotThrowUncaught` to relay them to the embedder.
+    /// Per-thread isolation is the embedder's responsibility (one VmCtx
+    /// per call-frame chain).
+    exception_params: [16]u64 = [_]u64{0} ** 16,
+    /// Valid-prefix length of `exception_params` for the most recent throw.
+    exception_param_count: u32 = 0,
+    /// Padding so `wasi_ctx` stays 8-byte aligned.
+    _pad_exc: u32 = 0,
     /// Opaque pointer to the `WasiCtx` driving the WASI host imports
     /// for this AOT instance (issue #644 + Approach A). `0` means no
     /// WASI context was attached — AOT WASI adapters in
@@ -465,6 +492,23 @@ pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
     std.debug.print("wasm trap: invalid conversion to integer\n", .{});
+    std.process.exit(2);
+}
+
+/// Host helper invoked from AOT-compiled `throw` when control flow
+/// cannot find a matching catch handler inside the current function
+/// (the only case lowered by commit 3 of #672). Reads the payload
+/// AOT codegen stored in `vmctx.exception_params` (count =
+/// `vmctx.exception_param_count`) and surfaces an uncaught-exception
+/// trap. Cross-function unwind + in-function catch dispatch are
+/// scheduled for later commits in PR #674; once they land, this helper
+/// becomes the leaf fallback only.
+pub fn aotThrowUncaught(vmctx: *VmCtx, tag_inst: *types.TagInstance) callconv(.c) noreturn {
+    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    std.debug.print(
+        "wasm trap: uncaught exception (tag=0x{x}, payload_words={d})\n",
+        .{ @intFromPtr(tag_inst), vmctx.exception_param_count },
+    );
     std.process.exit(2);
 }
 
@@ -918,6 +962,13 @@ pub const AotInstance = struct {
     /// instance. Borrowed imported-global overrides leave this false, but are
     /// still retain()'d on borrow and release()'d on destroy.
     globals_owned: []bool = &.{},
+    /// Tag instances (#672). `tags[0..import_tag_count]` are imported (and may
+    /// be borrowed from a sibling instance via `imported_tag_overrides`);
+    /// `tags[import_tag_count..]` are locally declared and own-allocated
+    /// from `module.tag_types`. `tags_owned[i]` distinguishes the two for
+    /// cleanup purposes (borrowed entries are NOT freed on destroy).
+    tags: []*types.TagInstance = &.{},
+    tags_owned: []bool = &.{},
     /// Byte offset for each wasm-flat global in `VmCtx.globals_ptr`.
     global_offsets: []u32 = &.{},
     /// Total byte size of the globals storage described by `global_offsets`.
@@ -1004,14 +1055,15 @@ pub const RuntimeError = error{
 
 /// Instantiate an AOT module, producing a runnable AotInstance.
 pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError!*AotInstance {
-    return instantiateWithOverrides(module, allocator, &.{}, &.{}, &.{}, &.{});
+    return instantiateWithOverrides(module, allocator, &.{}, &.{}, &.{}, &.{}, &.{});
 }
 
 /// Instantiate an AOT module, optionally borrowing `TableInstance`s,
-/// `MemoryInstance`s, and `GlobalInstance`s for each imported slot.
-/// `imported_table_overrides[i]` maps to `module.importedTables()[i]`,
+/// `MemoryInstance`s, `GlobalInstance`s, and `TagInstance`s for each imported
+/// slot. `imported_table_overrides[i]` maps to `module.importedTables()[i]`,
 /// `imported_memory_overrides[i]` to `module.importedMemories()[i]`,
-/// `imported_global_overrides[i]` to `module.importedGlobals()[i]`;
+/// `imported_global_overrides[i]` to `module.importedGlobals()[i]`,
+/// `imported_tag_overrides[i]` to `module.importedTags()[i]`;
 /// null leaves that slot locally allocated (with a zero-valued default).
 ///
 /// `imported_function_overrides[i]` maps to the *i-th function import*
@@ -1026,11 +1078,13 @@ pub fn instantiateWithOverrides(
     imported_memory_overrides: []const ?*types.MemoryInstance,
     imported_global_overrides: []const ?*types.GlobalInstance,
     imported_function_overrides: []const ?*const anyopaque,
+    imported_tag_overrides: []const ?*types.TagInstance,
 ) RuntimeError!*AotInstance {
     std.debug.assert(imported_table_overrides.len == 0 or imported_table_overrides.len == module.importedTables().len);
     std.debug.assert(imported_memory_overrides.len == 0 or imported_memory_overrides.len == module.importedMemories().len);
     std.debug.assert(imported_global_overrides.len == 0 or imported_global_overrides.len == module.importedGlobals().len);
     std.debug.assert(imported_function_overrides.len == 0 or imported_function_overrides.len == module.import_function_count);
+    std.debug.assert(imported_tag_overrides.len == 0 or imported_tag_overrides.len == module.importedTags().len);
 
     var inst = allocator.create(AotInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(inst);
@@ -1043,6 +1097,8 @@ pub fn instantiateWithOverrides(
         .tables_owned = &.{},
         .globals = &.{},
         .globals_owned = &.{},
+        .tags = &.{},
+        .tags_owned = &.{},
         .allocator = allocator,
         .module_ref = module,
     };
@@ -1125,6 +1181,16 @@ pub fn instantiateWithOverrides(
     inst.global_storage_size = global_layout.size;
     errdefer if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
 
+    // #672 commit 1: allocate tag instances. Imported entries borrow when
+    // an override is supplied (cross-instance tag identity, future #670);
+    // otherwise we synthesize a fresh local instance derived from the
+    // declared param arity so the instance is self-consistent even when
+    // no exporter has been wired yet.
+    const tag_alloc = try allocateTags(module, imported_tag_overrides, allocator);
+    inst.tags = tag_alloc.tags;
+    inst.tags_owned = tag_alloc.owned;
+    errdefer freeTags(inst.tags, inst.tags_owned, allocator);
+
     // Resolve AOT host functions for imports
     inst.host_functions = try resolveHostFunctionsWithOverrides(module, allocator, imported_function_overrides);
 
@@ -1197,6 +1263,7 @@ pub fn destroy(inst: *AotInstance) void {
     freeMemories(inst.memories, inst.memories_owned, allocator);
     freeTables(inst.tables, inst.tables_owned, allocator);
     freeGlobals(inst.globals, inst.globals_owned, allocator);
+    freeTags(inst.tags, inst.tags_owned, allocator);
     if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
     if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
     // inst.func_table aliases tables[0].native_backing (freed by TableInstance.release).
@@ -1254,6 +1321,14 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
     vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
     vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
     vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
+    vmctx.aot_throw_uncaught_fn = @intFromPtr(&aotThrowUncaught);
+    if (inst.tags.len > 0) {
+        vmctx.tags_ptr = @intFromPtr(inst.tags.ptr);
+        vmctx.tags_count = @intCast(inst.tags.len);
+    } else {
+        vmctx.tags_ptr = 0;
+        vmctx.tags_count = 0;
+    }
     vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
     vmctx.tables_info_ptr = if (inst.tables_info.len > 0) @intFromPtr(inst.tables_info.ptr) else 0;
     vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
@@ -2474,6 +2549,85 @@ fn freeGlobals(globals: []*types.GlobalInstance, owned: []bool, allocator: std.m
     if (owned.len > 0) allocator.free(owned);
 }
 
+// ─── Tags (#672) ────────────────────────────────────────────────────────────
+
+const TagsAllocation = struct {
+    tags: []*types.TagInstance,
+    owned: []bool,
+};
+
+/// Allocate (or borrow) `TagInstance`s for every imported + declared tag.
+/// `imported_tag_overrides[i]` (if non-null) borrows a sibling instance's
+/// tag for `module.importedTags()[i]`; otherwise a fresh `TagInstance` is
+/// synthesized so the slot is well-formed even with no exporter wired.
+/// Local (declared) tag arity is read from `module.func_types[type_idx]`.
+fn allocateTags(
+    module: *const aot_loader.AotModule,
+    imported_tag_overrides: []const ?*types.TagInstance,
+    allocator: std.mem.Allocator,
+) RuntimeError!TagsAllocation {
+    const import_tags = module.importedTags();
+    const total = import_tags.len + module.tag_types.len;
+    if (total == 0) return .{ .tags = &.{}, .owned = &.{} };
+
+    const tags = allocator.alloc(*types.TagInstance, total) catch return error.OutOfMemory;
+    errdefer allocator.free(tags);
+    const owned = allocator.alloc(bool, total) catch return error.OutOfMemory;
+    errdefer allocator.free(owned);
+
+    // Synthesize a placeholder for failure paths so freeTags can iterate
+    // before any real allocation has happened.
+    var created: usize = 0;
+    errdefer for (tags[0..created], owned[0..created]) |t, o| {
+        if (o) allocator.destroy(t);
+    };
+
+    for (import_tags, 0..) |imp_desc, i| {
+        if (i < imported_tag_overrides.len) {
+            if (imported_tag_overrides[i]) |borrowed| {
+                tags[i] = borrowed;
+                owned[i] = false;
+                created += 1;
+                continue;
+            }
+        }
+        // No override → synthesize a local placeholder with the declared
+        // import's arity. Cross-instance identity is resolved later
+        // (commit 6, closes #670).
+        const arity = arityForTypeIdx(module, imp_desc.type_idx);
+        const t = allocator.create(types.TagInstance) catch return error.OutOfMemory;
+        t.* = .{ .param_arity = arity };
+        tags[i] = t;
+        owned[i] = true;
+        created += 1;
+    }
+
+    for (module.tag_types, 0..) |type_idx, j| {
+        const slot = import_tags.len + j;
+        const t = allocator.create(types.TagInstance) catch return error.OutOfMemory;
+        t.* = .{ .param_arity = arityForTypeIdx(module, type_idx) };
+        tags[slot] = t;
+        owned[slot] = true;
+        created += 1;
+    }
+
+    return .{ .tags = tags, .owned = owned };
+}
+
+fn arityForTypeIdx(module: *const aot_loader.AotModule, type_idx: u32) u32 {
+    if (type_idx >= module.func_types.len) return 0;
+    return @intCast(module.func_types[type_idx].params.len);
+}
+
+fn freeTags(tags: []*types.TagInstance, owned: []bool, allocator: std.mem.Allocator) void {
+    std.debug.assert(owned.len == 0 or owned.len == tags.len);
+    for (tags, 0..) |t, i| {
+        if (owned.len == 0 or owned[i]) allocator.destroy(t);
+    }
+    if (tags.len > 0) allocator.free(tags);
+    if (owned.len > 0) allocator.free(owned);
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 test "instantiate: empty module" {
@@ -2524,6 +2678,71 @@ test "findExportFunc: returns null for missing export" {
     try std.testing.expectEqual(@as(?u32, null), findExportFunc(inst, "nonexistent"));
 }
 
+test "#672: instantiate allocates TagInstance for declared tags" {
+    // A module declaring two tags with different param-arity should
+    // surface `inst.tags` parallel to `module.tag_types`, with each
+    // entry's `param_arity` taken from `module.func_types[type_idx]`.
+    const params0 = [_]types.ValType{ .i32, .i32 };
+    const params1 = [_]types.ValType{.i64};
+    const ftypes = [_]aot_loader.AotFuncType{
+        .{ .params = &params0, .results = &.{} },
+        .{ .params = &params1, .results = &.{} },
+    };
+    const tags = [_]u32{ 0, 1 };
+    const module = aot_loader.AotModule{
+        .func_types = &ftypes,
+        .tag_types = &tags,
+    };
+
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    try std.testing.expectEqual(@as(usize, 2), inst.tags.len);
+    try std.testing.expectEqual(@as(usize, 2), inst.tags_owned.len);
+    try std.testing.expect(inst.tags_owned[0]);
+    try std.testing.expect(inst.tags_owned[1]);
+    try std.testing.expectEqual(@as(u32, 2), inst.tags[0].param_arity);
+    try std.testing.expectEqual(@as(u32, 1), inst.tags[1].param_arity);
+}
+
+test "#672: instantiate borrows imported tag overrides" {
+    // An imported tag whose `imported_tag_overrides[i]` is non-null
+    // should borrow that `*TagInstance` rather than synthesizing a fresh
+    // one; the borrowed entry must NOT be freed on destroy.
+    const params = [_]types.ValType{.i32};
+    const ftypes = [_]aot_loader.AotFuncType{
+        .{ .params = &params, .results = &.{} },
+    };
+    const imported = [_]aot_loader.ImportedTagDesc{
+        .{ .module_name = "env", .name = "exn", .type_idx = 0 },
+    };
+    const module = aot_loader.AotModule{
+        .func_types = &ftypes,
+        .imported_tags = &imported,
+    };
+
+    // Stand-in exporter tag — allocated by the test, not by the runtime.
+    const exporter_tag = try std.testing.allocator.create(types.TagInstance);
+    defer std.testing.allocator.destroy(exporter_tag);
+    exporter_tag.* = .{ .param_arity = 1 };
+
+    const overrides = [_]?*types.TagInstance{exporter_tag};
+    const inst = try instantiateWithOverrides(
+        &module,
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &overrides,
+    );
+    defer destroy(inst);
+
+    try std.testing.expectEqual(@as(usize, 1), inst.tags.len);
+    try std.testing.expectEqual(exporter_tag, inst.tags[0]);
+    try std.testing.expect(!inst.tags_owned[0]);
+}
+
 test "findExportFunc: finds exported function" {
     const exports = [_]types.ExportDesc{
         .{ .name = "memory", .kind = .memory, .index = 0 },
@@ -2571,7 +2790,7 @@ test "memory.grow propagates to cross-instance AOT memory subscribers" {
     };
     const importer_module = aot_loader.AotModule{ .imported_memories = &imported_mems };
     const memory_overrides = [_]?*types.MemoryInstance{exporter.memories[0]};
-    const importer = try instantiateWithOverrides(&importer_module, std.testing.allocator, &.{}, &memory_overrides, &.{}, &.{});
+    const importer = try instantiateWithOverrides(&importer_module, std.testing.allocator, &.{}, &memory_overrides, &.{}, &.{}, &.{});
     defer destroy(importer);
 
     try std.testing.expectEqual(exporter.memories[0], importer.memories[0]);
@@ -2634,7 +2853,7 @@ test "#660 item 4: borrowed memory overrides are retained until importer destroy
     try std.testing.expectEqual(@as(u8, 0xa5), exporter_inst.memories[0].data[7]);
 
     const overrides = [_]?*types.MemoryInstance{exporter_inst.memories[0]};
-    const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &.{}, &overrides, &.{}, &.{});
+    const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &.{}, &overrides, &.{}, &.{}, &.{});
     try std.testing.expectEqual(exporter_inst.memories[0], importer_inst.memories[0]);
     try std.testing.expect(!importer_inst.memories_owned[0]);
     try std.testing.expectEqual(@as(u32, 2), exporter_inst.memories[0].ref_count);
@@ -2666,7 +2885,7 @@ test "#660 item 4: borrowed table overrides are retained until importer destroy"
     try std.testing.expectEqual(@as(u32, 1), exporter_inst.tables[0].ref_count);
 
     const overrides = [_]?*types.TableInstance{exporter_inst.tables[0]};
-    const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &overrides, &.{}, &.{}, &.{});
+    const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &overrides, &.{}, &.{}, &.{}, &.{});
     try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
     try std.testing.expect(!importer_inst.tables_owned[0]);
     try std.testing.expectEqual(@as(u32, 2), exporter_inst.tables[0].ref_count);
@@ -2737,6 +2956,11 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 216), @offsetOf(VmCtx, "futex_notify_fn"));
     try std.testing.expectEqual(@as(usize, 224), @offsetOf(VmCtx, "mem_fill_fn"));
     try std.testing.expectEqual(@as(usize, 232), @offsetOf(VmCtx, "mem_copy_fn"));
+    try std.testing.expectEqual(@as(usize, 240), @offsetOf(VmCtx, "tags_ptr"));
+    try std.testing.expectEqual(@as(usize, 248), @offsetOf(VmCtx, "tags_count"));
+    try std.testing.expectEqual(@as(usize, 256), @offsetOf(VmCtx, "aot_throw_uncaught_fn"));
+    try std.testing.expectEqual(@as(usize, 264), @offsetOf(VmCtx, "exception_params"));
+    try std.testing.expectEqual(@as(usize, 392), @offsetOf(VmCtx, "exception_param_count"));
 }
 
 test "getFuncAddr: import indices return null" {
