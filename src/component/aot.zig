@@ -57,6 +57,14 @@ pub const LoadError = error{
     ManifestVersionMismatch,
     ManifestBuildIdMismatch,
     ManifestComponentMismatch,
+    /// v2 manifest references a `core_sha256` that no core in the
+    /// supplied component bytes matches (or vice versa) — the
+    /// manifest was produced from a different component shape than
+    /// the one being loaded.
+    ManifestCoreMismatch,
+    /// v2 loader couldn't re-parse `expected_component_bytes` to
+    /// walk its nested-component tree.
+    ComponentParseFailed,
     CwasmReadFailed,
     CwasmHashMismatch,
     OutOfMemory,
@@ -77,17 +85,38 @@ pub fn defaultPrecompiledDirFor(allocator: std.mem.Allocator, in_path: []const u
 
 /// Manifest schema version. Bump when the on-disk layout or
 /// serialization changes in a way that older loaders cannot read.
-pub const manifest_format_version: u32 = 1;
+///
+/// History:
+///   * v1 — single top-level loop, one `ManifestModuleEntry` per
+///     `component.core_modules[idx]`. No `core_sha256`; matching at
+///     load time was `module_idx`-only against the root component.
+///   * v2 — recursive walker; one entry per *leaf* core anywhere in
+///     the nested-component tree. `core_sha256` is the primary key.
+///     Required for `wabt component compose -d` /
+///     `wasm-tools compose` output whose cores live inside
+///     sub-components. (#676)
+pub const manifest_format_version: u32 = 2;
 
 /// Per-core entry in the manifest.
 pub const ManifestModuleEntry = struct {
-    /// Index into `component.core_modules` this artifact precompiles.
+    /// Leaf-local core-module index — i.e. the position within the
+    /// `core_modules` slice of the (sub-)component that *directly*
+    /// contains this core. Used by the v1 fallback loader (which
+    /// matches against the root component); v2 manifests carry it
+    /// for debugging only and match by `core_sha256` instead.
     idx: u32,
     /// Relative path under the manifest's directory (e.g. `module3.cwasm`).
     path: []const u8,
     /// Hex sha256 of the `.cwasm` bytes, used to detect tampering
     /// or partial writes on load.
     sha256: []const u8,
+    /// Hex sha256 of the **raw core-module bytes** (`core_mod.data`)
+    /// that produced this cwasm. Primary key for cross-parse
+    /// identity in v2 manifests — `loadManifest` recomputes this
+    /// per visited core in the live component tree and matches
+    /// against this field. Null/empty on v1-shaped JSON read from
+    /// disk (back-compat for fixtures persisted before #676).
+    core_sha256: ?[]const u8 = null,
 };
 
 /// Top-level manifest. Serialized to / parsed from `manifest.json`.
@@ -498,18 +527,44 @@ pub fn precompileComponent(
     // memory while each core is being AOT-compiled. The `core_mod.data`
     // slices borrow from `component_bytes` (owned by the caller), so
     // they remain valid after `load_arena.deinit()`.
-    var core_data_list: std.ArrayList([]const u8) = .empty;
+    //
+    // Recurses into `component.components` so cores inside nested
+    // sub-components (the dominant shape of `wabt component compose -d`
+    // / `wasm-tools compose` output) are precompiled too — without
+    // this the manifest is always empty for composed components and
+    // `--precompiled-dir` falls back to in-memory AOT on every cold
+    // start. (#676)
+    const CoreRef = struct {
+        data: []const u8,
+        /// Position within the `core_modules[]` of the (sub-)component
+        /// that directly contains this core. Persisted as
+        /// `ManifestModuleEntry.idx` for human debugging and for the
+        /// v1-fallback loader path.
+        local_idx: u32,
+    };
+    var core_data_list: std.ArrayList(CoreRef) = .empty;
     defer core_data_list.deinit(allocator);
     {
         var load_arena = std.heap.ArenaAllocator.init(allocator);
         defer load_arena.deinit();
         const component = component_loader.load(component_bytes, load_arena.allocator()) catch
             return error.InvalidComponent;
-        core_data_list.ensureTotalCapacity(allocator, component.core_modules.len) catch
-            return error.OutOfMemory;
-        for (component.core_modules) |core_mod| {
-            core_data_list.appendAssumeCapacity(core_mod.data);
-        }
+        const Walker = struct {
+            fn walk(
+                comp: *const ctypes.Component,
+                list: *std.ArrayList(CoreRef),
+                alloc: std.mem.Allocator,
+            ) PrecompileError!void {
+                for (comp.core_modules, 0..) |cm, mi| {
+                    list.append(alloc, .{ .data = cm.data, .local_idx = @intCast(mi) }) catch
+                        return error.OutOfMemory;
+                }
+                for (comp.components) |child| {
+                    try walk(child, list, alloc);
+                }
+            }
+        };
+        try Walker.walk(&component, &core_data_list, allocator);
     }
 
     // Result-owned arena holds all strings the caller might read off
@@ -529,8 +584,8 @@ pub fn precompileComponent(
     var entries: std.ArrayList(ManifestModuleEntry) = .empty;
     entries.ensureTotalCapacity(ra, core_data_list.items.len) catch return error.OutOfMemory;
 
-    for (core_data_list.items, 0..) |core_data, idx| {
-        const cwasm = compileCoreWasm(allocator, core_data, opts) catch |err| {
+    for (core_data_list.items, 0..) |core_ref, idx| {
+        const cwasm = compileCoreWasm(allocator, core_ref.data, opts) catch |err| {
             std.log.err("precompileComponent: core {d} compile failed: {s}", .{ idx, @errorName(err) });
             return err;
         };
@@ -544,10 +599,12 @@ pub fn precompileComponent(
         };
 
         const hex = hexSha256(ra, cwasm) catch return error.OutOfMemory;
+        const core_hex = hexSha256(ra, core_ref.data) catch return error.OutOfMemory;
         entries.append(ra, .{
-            .idx = @intCast(idx),
+            .idx = core_ref.local_idx,
             .path = rel_path,
             .sha256 = hex,
+            .core_sha256 = core_hex,
         }) catch return error.OutOfMemory;
     }
 
@@ -607,7 +664,12 @@ pub fn loadManifest(
         .{ .ignore_unknown_fields = true },
     ) catch return error.ManifestParseFailed;
 
-    if (parsed.version != manifest_format_version) return error.ManifestVersionMismatch;
+    // v1 was top-level-only and matched by root `module_idx`; v2
+    // (#676) recurses into nested sub-components and matches by raw
+    // core-bytes sha256. Both still rejected when `wamr_build_id`
+    // doesn't match — AOT codegen isn't stable across versions.
+    if (parsed.version != 1 and parsed.version != manifest_format_version)
+        return error.ManifestVersionMismatch;
     if (!std.mem.eql(u8, parsed.wamr_build_id, config.version)) return error.ManifestBuildIdMismatch;
 
     // Verify the manifest was produced from the component the caller
@@ -647,8 +709,80 @@ pub fn loadManifest(
     }
 
     const pcs = allocator.alloc(core_backend.PrecompiledCore, parsed.modules.len) catch return error.OutOfMemory;
-    for (parsed.modules, 0..) |mod, i| {
-        pcs[i] = .{ .module_idx = mod.idx, .cwasm_bytes = cwasm_buffers[i] };
+    errdefer allocator.free(pcs);
+
+    // v2 (or any manifest entry carrying `core_sha256`) lets us
+    // recurse into nested sub-components and match each on-disk
+    // entry to the live core_modules[i].data slice by raw-bytes
+    // sha256. The runtime's `findPrecompiled` then matches by
+    // slice identity, sidestepping module_idx collisions across
+    // sibling sub-components. (#676)
+    const any_core_sha = blk: {
+        for (parsed.modules) |mod| if (mod.core_sha256 != null) break :blk true;
+        break :blk false;
+    };
+
+    if (any_core_sha) {
+        // Re-parse the component into a scratch arena to walk its
+        // nested-component tree. `core_mod.data` slices reference
+        // `expected_component_bytes` (owned by the caller) so they
+        // remain valid after `scratch.deinit()`; only the parse
+        // bookkeeping lives in the arena.
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const live = component_loader.load(expected_component_bytes, scratch.allocator()) catch
+            return error.ComponentParseFailed;
+
+        const Visit = struct { data: []const u8, local_idx: u32, hex: [64]u8 };
+        var visits: std.ArrayList(Visit) = .empty;
+        defer visits.deinit(scratch.allocator());
+
+        const Walker = struct {
+            fn walk(
+                comp: *const ctypes.Component,
+                list: *std.ArrayList(Visit),
+                alloc: std.mem.Allocator,
+            ) error{OutOfMemory}!void {
+                for (comp.core_modules, 0..) |cm, mi| {
+                    var d: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(cm.data, &d, .{});
+                    var h: [64]u8 = undefined;
+                    const hc = "0123456789abcdef";
+                    for (d, 0..) |b, j| {
+                        h[j * 2] = hc[b >> 4];
+                        h[j * 2 + 1] = hc[b & 0x0f];
+                    }
+                    try list.append(alloc, .{ .data = cm.data, .local_idx = @intCast(mi), .hex = h });
+                }
+                for (comp.components) |child| try walk(child, list, alloc);
+            }
+        };
+        Walker.walk(&live, &visits, scratch.allocator()) catch return error.OutOfMemory;
+
+        // For every manifest entry, locate the matching live core by
+        // core_sha256 and stamp a `PrecompiledCore` with slice
+        // identity (`core_wasm = core_mod.data`).
+        for (parsed.modules, 0..) |mod, i| {
+            const want = mod.core_sha256 orelse return error.ManifestCoreMismatch;
+            const match = blk: {
+                for (visits.items) |v| {
+                    if (std.mem.eql(u8, &v.hex, want)) break :blk v;
+                }
+                break :blk null;
+            };
+            const v = match orelse return error.ManifestCoreMismatch;
+            pcs[i] = .{
+                .module_idx = v.local_idx,
+                .cwasm_bytes = cwasm_buffers[i],
+                .core_wasm = v.data,
+            };
+        }
+    } else {
+        // v1 fallback: legacy on-disk shape with top-level-only
+        // cores keyed by root-local `module_idx`.
+        for (parsed.modules, 0..) |mod, i| {
+            pcs[i] = .{ .module_idx = mod.idx, .cwasm_bytes = cwasm_buffers[i] };
+        }
     }
 
     return .{
