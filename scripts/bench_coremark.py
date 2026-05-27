@@ -29,15 +29,17 @@ from pathlib import Path
 ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
 
 # Signature of the known x86_64 native AOT-run flake from issue #406:
-# `wamr run` traps with `out of bounds memory access (..., local_func[-1], ...)`
-# at a native PC that isn't inside any local function. The trap is
-# non-deterministic on shared GitHub-hosted x86_64 runners — it has been
-# observed firing on baseline `main` (run 3/3 after two clean runs of the
-# same binary), proving it's not introduced by any single change. Retry
-# this exact failure mode up to `_TRAP_RETRY_MAX` times before treating
-# it as a real regression.
+# `wamr run` traps with `out of bounds memory access (..., local_func[N]+0x0, ...)`
+# at the very first byte of a local function (or with a synthetic `[-1]`
+# function index). The trap is non-deterministic on shared GitHub-hosted
+# x86_64 runners — it has been observed firing on baseline `main` after a
+# clean run of the same binary, proving it's not introduced by any single
+# change. Real coremark regressions would trap deeper inside a function
+# (non-zero offset), so a `+0x0` offset is the discriminator. Retry this
+# failure mode up to `_TRAP_RETRY_MAX` times before treating it as a real
+# regression.
 _TRAP_FLAKE_PATTERN = re.compile(
-    r"wasm trap: out of bounds memory access.*local_func\[-1\]",
+    r"wasm trap: out of bounds memory access.*local_func\[-?\d+\]\+0x0",
     re.IGNORECASE,
 )
 _TRAP_RETRY_MAX = 3
