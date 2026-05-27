@@ -1322,8 +1322,14 @@ fn compileInst(
         // x86_64 keeps the synth-local frameStore/frameLoad path.
         .parallel_copy => unreachable,
 
-        // #672 EH ops — placeholder. Real lowering lands in commit 4.
-        .try_table_begin, .try_table_end, .throw, .throw_ref => return error.UnimplementedOp,
+        // #672 EH ops — commit 3:
+        //   try_table_begin / try_table_end are scaffolding-only no-ops
+        //   so wasm using `try_table` (without taking the throw path on
+        //   x86_64) AOT-compiles. throw / throw_ref are intentionally
+        //   left as UnimplementedOp until the x86_64 counterpart of
+        //   commit 3 lands as commit 4 of #672.
+        .try_table_begin, .try_table_end => {},
+        .throw, .throw_ref => return error.UnimplementedOp,
     }
 }
 

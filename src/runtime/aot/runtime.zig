@@ -375,6 +375,33 @@ pub const VmCtx = extern struct {
     /// exceeds `memory_size`. Handles overlapping regions (memmove
     /// semantics).
     mem_copy_fn: usize = 0,
+    /// Pointer to `[]*TagInstance` for this instance — `inst.tags.ptr`.
+    /// AOT codegen for `throw` indexes this to resolve `tag_idx` →
+    /// `*TagInstance` at runtime. Length matches `tags_count`.
+    /// Issue #672.
+    tags_ptr: usize = 0,
+    /// Number of entries in `tags_ptr`.
+    tags_count: u32 = 0,
+    /// Padding to keep the following 8-byte field aligned.
+    _pad_tags: u32 = 0,
+    /// `fn (*VmCtx, *TagInstance) noreturn` — invoked by AOT-compiled
+    /// `throw` when no in-function catch handler claims the exception.
+    /// Reads `exception_params` / `exception_param_count`, records the
+    /// pending exception, and longjmps via `trapLongjmp` (Windows) or
+    /// exits the process (other platforms) — mirroring `trap_unreachable_fn`.
+    /// Issue #672.
+    aot_throw_uncaught_fn: usize = 0,
+    /// Scratch buffer where AOT-compiled `throw` writes the wasm operand
+    /// stack values that constitute the exception payload, one per slot.
+    /// 16 slots = max exception arity supported by the leaf-function
+    /// path. Read by `aotThrowUncaught` to relay them to the embedder.
+    /// Per-thread isolation is the embedder's responsibility (one VmCtx
+    /// per call-frame chain).
+    exception_params: [16]u64 = [_]u64{0} ** 16,
+    /// Valid-prefix length of `exception_params` for the most recent throw.
+    exception_param_count: u32 = 0,
+    /// Padding so `wasi_ctx` stays 8-byte aligned.
+    _pad_exc: u32 = 0,
     /// Opaque pointer to the `WasiCtx` driving the WASI host imports
     /// for this AOT instance (issue #644 + Approach A). `0` means no
     /// WASI context was attached — AOT WASI adapters in
@@ -465,6 +492,23 @@ pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
     std.debug.print("wasm trap: invalid conversion to integer\n", .{});
+    std.process.exit(2);
+}
+
+/// Host helper invoked from AOT-compiled `throw` when control flow
+/// cannot find a matching catch handler inside the current function
+/// (the only case lowered by commit 3 of #672). Reads the payload
+/// AOT codegen stored in `vmctx.exception_params` (count =
+/// `vmctx.exception_param_count`) and surfaces an uncaught-exception
+/// trap. Cross-function unwind + in-function catch dispatch are
+/// scheduled for later commits in PR #674; once they land, this helper
+/// becomes the leaf fallback only.
+pub fn aotThrowUncaught(vmctx: *VmCtx, tag_inst: *types.TagInstance) callconv(.c) noreturn {
+    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    std.debug.print(
+        "wasm trap: uncaught exception (tag=0x{x}, payload_words={d})\n",
+        .{ @intFromPtr(tag_inst), vmctx.exception_param_count },
+    );
     std.process.exit(2);
 }
 
@@ -1277,6 +1321,14 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
     vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
     vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
     vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
+    vmctx.aot_throw_uncaught_fn = @intFromPtr(&aotThrowUncaught);
+    if (inst.tags.len > 0) {
+        vmctx.tags_ptr = @intFromPtr(inst.tags.ptr);
+        vmctx.tags_count = @intCast(inst.tags.len);
+    } else {
+        vmctx.tags_ptr = 0;
+        vmctx.tags_count = 0;
+    }
     vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
     vmctx.tables_info_ptr = if (inst.tables_info.len > 0) @intFromPtr(inst.tables_info.ptr) else 0;
     vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
@@ -2904,6 +2956,11 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 216), @offsetOf(VmCtx, "futex_notify_fn"));
     try std.testing.expectEqual(@as(usize, 224), @offsetOf(VmCtx, "mem_fill_fn"));
     try std.testing.expectEqual(@as(usize, 232), @offsetOf(VmCtx, "mem_copy_fn"));
+    try std.testing.expectEqual(@as(usize, 240), @offsetOf(VmCtx, "tags_ptr"));
+    try std.testing.expectEqual(@as(usize, 248), @offsetOf(VmCtx, "tags_count"));
+    try std.testing.expectEqual(@as(usize, 256), @offsetOf(VmCtx, "aot_throw_uncaught_fn"));
+    try std.testing.expectEqual(@as(usize, 264), @offsetOf(VmCtx, "exception_params"));
+    try std.testing.expectEqual(@as(usize, 392), @offsetOf(VmCtx, "exception_param_count"));
 }
 
 test "getFuncAddr: import indices return null" {
