@@ -526,12 +526,6 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     if (vmctx.instance_ptr == 0) return -1;
     const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
     if (inst.memories.len == 0) return -1;
-    // Refuse to grow a borrowed (imported) memory: reallocating the host
-    // buffer here would rebase memory.data.ptr, but the exporting sibling's
-    // `vmctx.memory_base` was captured at its own instantiate-time and would
-    // become a dangling pointer. Cross-instance grow propagation needs a
-    // vmctx-list on `MemoryInstance` — tracked separately.
-    if (inst.memories_owned.len > 0 and !inst.memories_owned[0]) return -1;
     const mem = inst.memories[0];
     const old_pages: u32 = mem.current_pages;
     if (delta_pages < 0) return -1;
@@ -541,16 +535,27 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     if (new_pages_u64 > cap) return -1;
     const new_pages: u32 = @intCast(new_pages_u64);
     const new_size: usize = @as(usize, new_pages) * types.MemoryInstance.page_size;
+    const old_data_ptr = mem.data.ptr;
     if (new_size > mem.data.len) {
         const new_data = inst.allocator.realloc(mem.data, new_size) catch return -1;
         @memset(new_data[mem.data.len..], 0);
         mem.data = new_data;
     }
     mem.current_pages = new_pages;
-    vmctx.memory_base = @intFromPtr(mem.data.ptr);
-    vmctx.memory_size = @as(usize, new_pages) * types.MemoryInstance.page_size;
-    vmctx.memory_pages = new_pages;
+    refreshVmCtxMemory(vmctx, mem);
+
+    if (mem.data.ptr != old_data_ptr or new_pages != old_pages) {
+        for (mem.vmctx_subscribers.items) |subscriber_opaque| {
+            const subscriber: *VmCtx = @ptrCast(@alignCast(subscriber_opaque));
+            if (subscriber == vmctx) continue;
+            refreshVmCtxMemory(subscriber, mem);
+        }
+    }
+
     if (comptime windows_trap_supported) {
+        // g_mem_* mirrors the currently executing vmctx for the Windows VEH
+        // diagnostics path; subscriber vmctxs may be inactive or on another
+        // thread, so only the active grow caller updates these globals.
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
     }
@@ -918,6 +923,8 @@ pub const AotInstance = struct {
     /// Total byte size of the globals storage described by `global_offsets`.
     global_storage_size: u32 = 0,
     allocator: std.mem.Allocator,
+    /// Stable vmctx storage used by AOT calls and MemoryInstance subscriber lists.
+    vmctx: VmCtx = .{},
     /// Base address of the mapped executable code (null if not yet mapped).
     code_base: ?[*]const u8 = null,
     /// Size of the mapped executable region (for cleanup).
@@ -1173,6 +1180,9 @@ pub fn instantiateWithOverrides(
         inst.func_sig_ids = fsi;
     }
 
+    refreshVmCtxForInstance(inst, null);
+    subscribeVmCtxToMemories(inst) catch return error.OutOfMemory;
+
     return inst;
 }
 
@@ -1183,6 +1193,7 @@ pub fn destroy(inst: *AotInstance) void {
     if (inst.code_base) |base| {
         platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
     }
+    unsubscribeVmCtxFromMemories(inst);
     freeMemories(inst.memories, inst.memories_owned, allocator);
     freeTables(inst.tables, inst.tables_owned, allocator);
     freeGlobals(inst.globals, inst.globals_owned, allocator);
@@ -1197,6 +1208,89 @@ pub fn destroy(inst: *AotInstance) void {
     if (inst.tables_info.len > 0) allocator.free(inst.tables_info);
     if (inst.extra_tables_storage.len > 0) allocator.free(inst.extra_tables_storage);
     allocator.destroy(inst);
+}
+
+fn refreshVmCtxMemory(vmctx: *VmCtx, mem: *types.MemoryInstance) void {
+    vmctx.memory_base = @intFromPtr(mem.data.ptr);
+    vmctx.memory_size = @as(usize, mem.current_pages) * types.MemoryInstance.page_size;
+    vmctx.memory_max_size = mem.data.len;
+    vmctx.memory_pages = mem.current_pages;
+}
+
+fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
+    const vmctx = &inst.vmctx;
+    if (inst.memories.len > 0) {
+        refreshVmCtxMemory(vmctx, inst.memories[0]);
+    } else {
+        vmctx.memory_base = 0;
+        vmctx.memory_size = 0;
+        vmctx.memory_max_size = 0;
+        vmctx.memory_pages = 0;
+    }
+
+    vmctx.globals_ptr = if (globals_buf) |buf| @intFromPtr(buf.ptr) else 0;
+    vmctx.globals_count = @intCast(inst.globals.len);
+    if (inst.host_functions.len > 0) {
+        vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
+        vmctx.host_functions_count = @intCast(inst.host_functions.len);
+    } else {
+        vmctx.host_functions_ptr = 0;
+        vmctx.host_functions_count = 0;
+    }
+    if (inst.func_table.len > 0) {
+        vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
+        vmctx.func_table_len = @intCast(inst.func_table.len);
+    } else {
+        vmctx.func_table_ptr = 0;
+        vmctx.func_table_len = 0;
+    }
+    vmctx.funcptrs_ptr = if (inst.funcptrs.len > 0) @intFromPtr(inst.funcptrs.ptr) else 0;
+    vmctx.instance_ptr = @intFromPtr(inst);
+    vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
+    vmctx.mem_fill_fn = @intFromPtr(&memFillHelper);
+    vmctx.mem_copy_fn = @intFromPtr(&memCopyHelper);
+    vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
+    vmctx.trap_unreachable_fn = @intFromPtr(&aotTrapUnreachable);
+    vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
+    vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
+    vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
+    vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
+    vmctx.tables_info_ptr = if (inst.tables_info.len > 0) @intFromPtr(inst.tables_info.ptr) else 0;
+    vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
+    vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
+    vmctx.table_set_fn = @intFromPtr(&tableSetHelper);
+    vmctx.futex_wait32_fn = @intFromPtr(&aotAtomicWait32);
+    vmctx.futex_wait64_fn = @intFromPtr(&aotAtomicWait64);
+    vmctx.futex_notify_fn = @intFromPtr(&aotAtomicNotify);
+    vmctx.sig_table_ptr = if (inst.sig_table.len > 0) @intFromPtr(inst.sig_table.ptr) else 0;
+    vmctx.func_sig_ids_ptr = if (inst.func_sig_ids.len > 0) @intFromPtr(inst.func_sig_ids.ptr) else 0;
+    if (inst.ptr_to_sig.len > 0) {
+        vmctx.ptr_to_sig_ptr = @intFromPtr(inst.ptr_to_sig.ptr);
+        vmctx.ptr_to_sig_len = @intCast(inst.ptr_to_sig.len);
+    } else {
+        vmctx.ptr_to_sig_ptr = 0;
+        vmctx.ptr_to_sig_len = 0;
+    }
+    vmctx.wasi_ctx = inst.wasi_ctx;
+}
+
+fn subscribeVmCtxToMemories(inst: *AotInstance) !void {
+    // Subscribe owned and borrowed slots: if an importer grows a borrowed
+    // memory, the exporter's active vmctx must be refreshed too.
+    const vmctx_opaque: *anyopaque = @ptrCast(&inst.vmctx);
+    var subscribed: usize = 0;
+    errdefer {
+        for (inst.memories[0..subscribed]) |mem| mem.unsubscribeVmCtx(vmctx_opaque);
+    }
+    for (inst.memories) |mem| {
+        try mem.subscribeVmCtx(vmctx_opaque, inst.allocator);
+        subscribed += 1;
+    }
+}
+
+fn unsubscribeVmCtxFromMemories(inst: *AotInstance) void {
+    const vmctx_opaque: *anyopaque = @ptrCast(&inst.vmctx);
+    for (inst.memories) |mem| mem.unsubscribeVmCtx(vmctx_opaque);
 }
 
 /// Look up an exported function by name, returning its function index.
@@ -1473,55 +1567,12 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     const globals_buf = std.mem.sliceAsBytes(globals_words);
     writeGlobalsToStorage(inst, globals_buf);
 
-    // Build VMContext for the compiled function
-    var vmctx = VmCtx{};
-    if (inst.memories.len > 0) {
-        vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
-        vmctx.memory_size = @as(usize, inst.memories[0].current_pages) * types.MemoryInstance.page_size;
-        vmctx.memory_max_size = inst.memories[0].data.len;
-        vmctx.memory_pages = inst.memories[0].current_pages;
-    }
     // Always provide a valid globals pointer — compiled code may access globals
     // even if none are explicitly initialized (they default to zero).
-    vmctx.globals_ptr = @intFromPtr(globals_buf.ptr);
-    vmctx.globals_count = @intCast(inst.globals.len);
-    if (inst.host_functions.len > 0) {
-        vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
-        vmctx.host_functions_count = @intCast(inst.host_functions.len);
-    }
-    if (inst.func_table.len > 0) {
-        vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
-        vmctx.func_table_len = @intCast(inst.func_table.len);
-    }
-    if (inst.funcptrs.len > 0) {
-        vmctx.funcptrs_ptr = @intFromPtr(inst.funcptrs.ptr);
-    }
-    vmctx.instance_ptr = @intFromPtr(inst);
-    vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
-    vmctx.mem_fill_fn = @intFromPtr(&memFillHelper);
-    vmctx.mem_copy_fn = @intFromPtr(&memCopyHelper);
-    vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
-    vmctx.trap_unreachable_fn = @intFromPtr(&aotTrapUnreachable);
-    vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
-    vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
-    vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
-    vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
-    if (inst.tables_info.len > 0) {
-        vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
-    }
-    vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
-    vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
-    vmctx.table_set_fn = @intFromPtr(&tableSetHelper);
-    vmctx.futex_wait32_fn = @intFromPtr(&aotAtomicWait32);
-    vmctx.futex_wait64_fn = @intFromPtr(&aotAtomicWait64);
-    vmctx.futex_notify_fn = @intFromPtr(&aotAtomicNotify);
-    if (inst.sig_table.len > 0) vmctx.sig_table_ptr = @intFromPtr(inst.sig_table.ptr);
-    if (inst.func_sig_ids.len > 0) vmctx.func_sig_ids_ptr = @intFromPtr(inst.func_sig_ids.ptr);
-    if (inst.ptr_to_sig.len > 0) {
-        vmctx.ptr_to_sig_ptr = @intFromPtr(inst.ptr_to_sig.ptr);
-        vmctx.ptr_to_sig_len = @intCast(inst.ptr_to_sig.len);
-    }
-    vmctx.wasi_ctx = inst.wasi_ctx;
+    const previous_globals_ptr = inst.vmctx.globals_ptr;
+    refreshVmCtxForInstance(inst, globals_buf);
+    const vmctx = &inst.vmctx;
+    defer inst.vmctx.globals_ptr = previous_globals_ptr;
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -1543,7 +1594,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
             g_veh_installed = true;
         }
     }
-    const result = func_ptr(&vmctx);
+    const result = func_ptr(vmctx);
 
     // Sync globals back from flat storage to GlobalInstance objects.
     readGlobalsFromStorage(inst, globals_buf);
@@ -1813,52 +1864,10 @@ pub fn callFuncScalar(
     const globals_buf = std.mem.sliceAsBytes(globals_words);
     writeGlobalsToStorage(inst, globals_buf);
 
-    var vmctx = VmCtx{};
-    if (inst.memories.len > 0) {
-        vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
-        vmctx.memory_size = @as(usize, inst.memories[0].current_pages) * types.MemoryInstance.page_size;
-        vmctx.memory_max_size = inst.memories[0].data.len;
-        vmctx.memory_pages = inst.memories[0].current_pages;
-    }
-    vmctx.globals_ptr = @intFromPtr(globals_buf.ptr);
-    vmctx.globals_count = @intCast(inst.globals.len);
-    if (inst.host_functions.len > 0) {
-        vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
-        vmctx.host_functions_count = @intCast(inst.host_functions.len);
-    }
-    if (inst.func_table.len > 0) {
-        vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
-        vmctx.func_table_len = @intCast(inst.func_table.len);
-    }
-    if (inst.funcptrs.len > 0) {
-        vmctx.funcptrs_ptr = @intFromPtr(inst.funcptrs.ptr);
-    }
-    vmctx.instance_ptr = @intFromPtr(inst);
-    vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
-    vmctx.mem_fill_fn = @intFromPtr(&memFillHelper);
-    vmctx.mem_copy_fn = @intFromPtr(&memCopyHelper);
-    vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
-    vmctx.trap_unreachable_fn = @intFromPtr(&aotTrapUnreachable);
-    vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
-    vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
-    vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
-    vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
-    if (inst.tables_info.len > 0) {
-        vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
-    }
-    vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
-    vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
-    vmctx.table_set_fn = @intFromPtr(&tableSetHelper);
-    vmctx.futex_wait32_fn = @intFromPtr(&aotAtomicWait32);
-    vmctx.futex_wait64_fn = @intFromPtr(&aotAtomicWait64);
-    vmctx.futex_notify_fn = @intFromPtr(&aotAtomicNotify);
-    if (inst.sig_table.len > 0) vmctx.sig_table_ptr = @intFromPtr(inst.sig_table.ptr);
-    if (inst.func_sig_ids.len > 0) vmctx.func_sig_ids_ptr = @intFromPtr(inst.func_sig_ids.ptr);
-    if (inst.ptr_to_sig.len > 0) {
-        vmctx.ptr_to_sig_ptr = @intFromPtr(inst.ptr_to_sig.ptr);
-        vmctx.ptr_to_sig_len = @intCast(inst.ptr_to_sig.len);
-    }
-    vmctx.wasi_ctx = inst.wasi_ctx;
+    const previous_globals_ptr = inst.vmctx.globals_ptr;
+    refreshVmCtxForInstance(inst, globals_buf);
+    const vmctx = &inst.vmctx;
+    defer inst.vmctx.globals_ptr = previous_globals_ptr;
 
     // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
@@ -1927,55 +1936,55 @@ pub fn callFuncScalar(
     const raw_result: u64 = switch (effective_args) {
         0 => blk: {
             const f: CallFn0 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx);
+            break :blk f(vmctx);
         },
         1 => blk: {
             const f: CallFn1 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0]);
+            break :blk f(vmctx, raw[0]);
         },
         2 => blk: {
             const f: CallFn2 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1]);
+            break :blk f(vmctx, raw[0], raw[1]);
         },
         3 => blk: {
             const f: CallFn3 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2]);
         },
         4 => blk: {
             const f: CallFn4 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3]);
         },
         5 => blk: {
             const f: CallFn5 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4]);
         },
         6 => blk: {
             const f: CallFn6 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
         },
         7 => blk: {
             const f: CallFn7 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
         },
         8 => blk: {
             const f: CallFn8 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
         },
         9 => blk: {
             const f: CallFn9 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8]);
         },
         10 => blk: {
             const f: CallFn10 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9]);
         },
         11 => blk: {
             const f: CallFn11 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10]);
         },
         12 => blk: {
             const f: CallFn12 = @ptrCast(@alignCast(addr));
-            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]);
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]);
         },
         else => unreachable,
     };
@@ -2526,6 +2535,43 @@ test "instantiate: module with memory" {
     try std.testing.expectEqual(@as(u32, 1), inst.memories[0].current_pages);
     // Pre-allocated to max_pages (4) for memory.grow support
     try std.testing.expectEqual(@as(usize, 4 * 65536), inst.memories[0].data.len);
+}
+
+test "memory.grow propagates to cross-instance AOT memory subscribers" {
+    const mem_types = [_]types.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 4 } },
+    };
+    const exporter_module = aot_loader.AotModule{ .memories = &mem_types };
+    const exporter = try instantiate(&exporter_module, std.testing.allocator);
+    defer destroy(exporter);
+
+    const imported_mems = [_]aot_loader.ImportedMemoryDesc{
+        .{ .module_name = "exporter", .name = "memory", .min = 1, .max = 4 },
+    };
+    const importer_module = aot_loader.AotModule{ .imported_memories = &imported_mems };
+    const memory_overrides = [_]?*types.MemoryInstance{exporter.memories[0]};
+    const importer = try instantiateWithOverrides(&importer_module, std.testing.allocator, &.{}, &memory_overrides, &.{}, &.{});
+    defer destroy(importer);
+
+    try std.testing.expectEqual(exporter.memories[0], importer.memories[0]);
+    try std.testing.expectEqual(@as(usize, 2), exporter.memories[0].vmctx_subscribers.items.len);
+
+    try std.testing.expectEqual(@as(i32, 1), memGrowHelper(&exporter.vmctx, 1));
+    try std.testing.expectEqual(@as(u32, 2), exporter.vmctx.memory_pages);
+    try std.testing.expectEqual(@as(u32, 2), importer.vmctx.memory_pages);
+    try std.testing.expectEqual(@as(usize, 2 * types.MemoryInstance.page_size), importer.vmctx.memory_size);
+
+    const grown_offset = types.MemoryInstance.page_size;
+    const importer_mem: [*]u8 = @ptrFromInt(importer.vmctx.memory_base);
+    try std.testing.expectEqual(@as(u8, 0), importer_mem[grown_offset]);
+    importer_mem[grown_offset] = 0x5A;
+
+    const exporter_mem: [*]u8 = @ptrFromInt(exporter.vmctx.memory_base);
+    try std.testing.expectEqual(@as(u8, 0x5A), exporter_mem[grown_offset]);
+
+    try std.testing.expectEqual(@as(i32, 2), memGrowHelper(&importer.vmctx, 1));
+    try std.testing.expectEqual(@as(u32, 3), exporter.vmctx.memory_pages);
+    try std.testing.expectEqual(@as(u32, 3), importer.vmctx.memory_pages);
 }
 
 test "instantiate: module with table" {
