@@ -32,12 +32,14 @@
 //!                            operand stack; aot: passes arg buffer to
 //!                            `aot_runtime.callFuncScalar`).
 //!
-//! `AotFrame` is structurally complete in this commit but most ops
-//! return `error.AotPathUnsupported`: the AOT path still routes
-//! through the parallel `callComponentFuncByLocalAot` helper. The
-//! AOT side is fully wired up in the follow-up commit; this commit
-//! introduces the abstraction and migrates the interp path onto it,
-//! without behaviour change.
+//! `AotFrame` and `InterpFrame` ops are fully implemented; the
+//! parallel AOT helpers (`callComponentFuncByLocalAot`,
+//! `lowerFlatRecur`, `lowerScalarArg`, `liftScalarResult`) were
+//! deleted once `callComponentFuncByLocal` started using this
+//! abstraction. Every canon-ABI shape that the interp path
+//! supports — record/tuple/variant/option/result/flags/list/string
+//! and multi-slot scalars — is supported on the AOT path through
+//! the same `pushInterfaceValue` / `popInterfaceValue` walks.
 
 const std = @import("std");
 const core_types = @import("../runtime/common/types.zig");
@@ -53,7 +55,6 @@ pub const FrameError = error{
     ReallocFailed,
     TrapInCoreFunction,
     OutOfMemory,
-    AotPathUnsupported,
 };
 
 /// Interp-backed frame. Threads the existing `ExecEnv` operand stack
@@ -136,11 +137,12 @@ pub const InterpFrame = struct {
     }
 };
 
-/// AOT-backed frame. Structurally present so callers can build a
-/// `CallFrame` for either backend; the bodies are stubs in this commit
-/// (returning `error.AotPathUnsupported`) and get filled in when the
-/// AOT path is ported off the parallel `callComponentFuncByLocalAot`
-/// helper in the follow-up commit.
+/// AOT-backed frame. Buffers args lowered via `pushSlot` /
+/// `pushSlotsU32`, then drives `aot_runtime.callFuncScalar` on
+/// `executeCore`. Result slots from the core function are surfaced
+/// in canonical forward order via `popSlot` (cursor-advance into
+/// `results`), matching the abstraction the interp side gets from
+/// the operand stack.
 pub const AotFrame = struct {
     ai: *aot_runtime.AotInstance,
     /// Args buffered by `pushSlot` / `pushSlotsU32`, consumed by the

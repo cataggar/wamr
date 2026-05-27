@@ -148,7 +148,6 @@ pub fn callRealloc(
         error.StackUnderflow => error.StackUnderflow,
         error.ReallocFailed => error.ReallocFailed,
         error.OutOfMemory => error.OutOfMemory,
-        error.AotPathUnsupported => error.AotPathUnsupported,
         else => error.ReallocFailed,
     };
 }
