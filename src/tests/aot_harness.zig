@@ -1275,6 +1275,12 @@ fn compileToAot(
     const tidxs = try a.alloc(u32, module.functions.len);
     for (module.functions, 0..) |f, i| tidxs[i] = f.type_idx;
 
+    // Locally-declared tags (#672) — mirrors `module.tag_types` 1:1.
+    var tag_entries: std.ArrayList(emit_aot.TagEntry) = .empty;
+    for (module.tag_types) |type_idx| {
+        try tag_entries.append(a, .{ .type_idx = type_idx });
+    }
+
     return try emit_aot.emit(
         allocator,
         code,
@@ -1289,6 +1295,7 @@ fn compileToAot(
         module.start_function,
         if (ft_entries.items.len > 0) ft_entries.items else null,
         if (tidxs.len > 0) tidxs else null,
+        if (tag_entries.items.len > 0) tag_entries.items else null,
     );
 }
 

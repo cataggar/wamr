@@ -1701,7 +1701,7 @@ pub fn instantiateWithOptions(
                             };
                             defer if (imported_function_overrides.len > 0) allocator.free(imported_function_overrides);
 
-                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides, imported_function_overrides) catch |err| {
+                            const aot_inst_ptr = aot_runtime.instantiateWithOverrides(aot_module_ptr, inst.allocator, imported_table_overrides, imported_memory_overrides, imported_global_overrides, imported_function_overrides, &.{}) catch |err| {
                                 std.log.warn("aot core instantiate failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                                 if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;

@@ -22,6 +22,7 @@ pub const ExternalKind = enum(u8) {
     table = 0x01,
     memory = 0x02,
     global = 0x03,
+    tag = 0x04,
 };
 
 pub const AotEmitOptions = struct {
@@ -58,6 +59,10 @@ pub const ImportEntry = struct {
     memory_is64: bool = false,
     global_val_type: types.ValType = .i32,
     global_mutable: bool = false,
+    /// Function-type index describing the tag's parameter signature
+    /// (when `kind == .tag`). Matches the wasm tag-import payload after
+    /// dropping the always-zero attribute byte.
+    tag_type_idx: u32 = 0,
 };
 
 pub const MemoryEntry = struct {
@@ -89,6 +94,13 @@ pub const FuncTypeEntry = struct {
     results: []const u8,
 };
 
+/// Locally-declared tag (exception handling) entry. `type_idx` references
+/// the function-type describing the exception parameters; the tag attribute
+/// byte (always 0x00 in the MVP) is dropped on-wire.
+pub const TagEntry = struct {
+    type_idx: u32,
+};
+
 /// Emit an AOT binary to an owned byte buffer.
 pub fn emit(
     allocator: std.mem.Allocator,
@@ -104,6 +116,7 @@ pub fn emit(
     start_function: ?u32,
     func_types: ?[]const FuncTypeEntry,
     local_func_type_indices: ?[]const u32,
+    tags: ?[]const TagEntry,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -221,6 +234,12 @@ pub fn emit(
                         try tmp.append(allocator, @intFromEnum(imp.global_val_type));
                         try tmp.append(allocator, if (imp.global_mutable) 1 else 0);
                     },
+                    .tag => {
+                        // Wire shape: just the type-idx u32. The MVP-EH
+                        // attribute byte (always 0x00) is omitted to match
+                        // `loader.zig:parseImportSection`'s reader.
+                        try appendU32Le(&tmp, allocator, imp.tag_type_idx);
+                    },
                 }
             }
             try emitSection(allocator, &buf, 8, tmp.items);
@@ -293,6 +312,19 @@ pub fn emit(
         try emitSection(allocator, &buf, 12, tmp.items);
     }
 
+    // Section 14: locally-declared tags (#672). Each entry is a u32 type-idx.
+    if (tags) |tag_list| {
+        if (tag_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(tag_list.len));
+            for (tag_list) |t| {
+                try appendU32Le(&tmp, allocator, t.type_idx);
+            }
+            try emitSection(allocator, &buf, 14, tmp.items);
+        }
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -328,7 +360,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
 
 test "emit: minimal (no functions, no exports) has correct magic and version" {
     const allocator = std.testing.allocator;
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // At least header (8) + target_info section (8+40) + text section (8+0) + func section (8+4) + export section (8+4)
@@ -343,7 +375,7 @@ test "emit: one function offset produces valid function section" {
     const allocator = std.testing.allocator;
     const code = [_]u8{ 0xCC, 0xC3 }; // int3; ret
     const offsets = [_]u32{0};
-    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null, null, null, null);
+    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 3 (function)
@@ -374,7 +406,7 @@ test "emit: export section encodes name, kind, and index" {
         .kind = .function,
         .index = 7,
     }};
-    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 4 (export)
@@ -421,7 +453,7 @@ test "roundtrip: emit then load with AOT loader" {
     const data = try emit(allocator, &code, &offsets, &exports, .{
         .arch = arch_name,
         .e_machine = 0x3E,
-    }, null, null, null, null, null, null, null, null);
+    }, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Parse back with the AOT loader
@@ -463,7 +495,7 @@ test "emit: import section round-trip" {
         .{ .module_name = "env", .field_name = "tbl", .kind = .table, .table_elem_type = .funcref, .table_min = 8, .table_max = 8 },
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -491,7 +523,7 @@ test "emit: memory section round-trip" {
         .{ .min_pages = 2, .max_pages = null },
         .{ .min_pages = 1, .max_pages = 256 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -513,7 +545,7 @@ test "emit: v128 global init payload round-trip" {
         .{ .val_type = 0x7F, .mutability = 0, .init_i64 = 0x1234 },
         .{ .val_type = 0x7B, .mutability = 1, .init_v128 = init_bits },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, &globals, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, &globals, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -560,6 +592,7 @@ test "emit: type section and function type indices round-trip" {
         null,
         &ft_entries,
         &tidxs,
+        null,
     );
     defer allocator.free(data);
 
@@ -580,4 +613,52 @@ test "emit: type section and function type indices round-trip" {
     try std.testing.expectEqual(@as(u32, 1), module.local_func_type_indices[0]);
     try std.testing.expectEqual(@as(u32, 0), module.local_func_type_indices[1]);
     try std.testing.expectEqual(@as(u32, 1), module.local_func_type_indices[2]);
+}
+
+test "#672: tag imports and declared tags round-trip" {
+    const allocator = std.testing.allocator;
+    const aot_loader = @import("../runtime/aot/loader.zig");
+
+    // Import a tag from "env" referring to func_type 0 (one i32 param),
+    // and declare two local tags referring to func_types 0 and 1.
+    const import_entries = [_]ImportEntry{
+        .{ .module_name = "env", .field_name = "exn", .kind = .tag, .tag_type_idx = 0 },
+    };
+    const tag_entries = [_]TagEntry{
+        .{ .type_idx = 0 },
+        .{ .type_idx = 1 },
+    };
+
+    const data = try emit(
+        allocator,
+        &.{},
+        &.{},
+        &.{},
+        .{},
+        null,
+        &import_entries,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &tag_entries,
+    );
+    defer allocator.free(data);
+
+    const module = try aot_loader.load(data, allocator);
+    defer aot_loader.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), module.imports.len);
+    try std.testing.expectEqual(types.ExternalKind.tag, module.imports[0].kind);
+
+    try std.testing.expectEqual(@as(usize, 1), module.imported_tags.len);
+    try std.testing.expect(std.mem.eql(u8, module.imported_tags[0].module_name, "env"));
+    try std.testing.expect(std.mem.eql(u8, module.imported_tags[0].name, "exn"));
+    try std.testing.expectEqual(@as(u32, 0), module.imported_tags[0].type_idx);
+
+    try std.testing.expectEqual(@as(usize, 2), module.tag_types.len);
+    try std.testing.expectEqual(@as(u32, 0), module.tag_types[0]);
+    try std.testing.expectEqual(@as(u32, 1), module.tag_types[1]);
 }
