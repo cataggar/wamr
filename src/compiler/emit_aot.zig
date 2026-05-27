@@ -70,6 +70,12 @@ pub const MemoryEntry = struct {
     max_pages: ?u32,
 };
 
+pub const TableEntry = struct {
+    elem_type: types.ValType,
+    min: u32,
+    max: ?u32,
+};
+
 pub const GlobalEntry = struct {
     val_type: u8,
     mutability: u8,
@@ -117,6 +123,7 @@ pub fn emit(
     func_types: ?[]const FuncTypeEntry,
     local_func_type_indices: ?[]const u32,
     tags: ?[]const TagEntry,
+    tables: ?[]const TableEntry,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -325,6 +332,31 @@ pub fn emit(
         }
     }
 
+    // Section 15: locally-defined tables (#681). Wire format mirrors the
+    // imported-table tail in section 8:
+    //   elem_type (u8), min (u32 LE), has_max (u8), max (u32 LE if has_max).
+    // Richer TableType fields (`elem_tidx`, `init_expr`, `is_table64`) are
+    // intentionally not round-tripped — imported tables don't carry them
+    // either, and the AOT runtime ignores them when allocating tables.
+    if (tables) |tbl_list| {
+        if (tbl_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(tbl_list.len));
+            for (tbl_list) |t| {
+                try tmp.append(allocator, @intFromEnum(t.elem_type));
+                try appendU32Le(&tmp, allocator, t.min);
+                if (t.max) |max| {
+                    try tmp.append(allocator, 1);
+                    try appendU32Le(&tmp, allocator, max);
+                } else {
+                    try tmp.append(allocator, 0);
+                }
+            }
+            try emitSection(allocator, &buf, 15, tmp.items);
+        }
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -360,7 +392,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
 
 test "emit: minimal (no functions, no exports) has correct magic and version" {
     const allocator = std.testing.allocator;
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // At least header (8) + target_info section (8+40) + text section (8+0) + func section (8+4) + export section (8+4)
@@ -375,7 +407,7 @@ test "emit: one function offset produces valid function section" {
     const allocator = std.testing.allocator;
     const code = [_]u8{ 0xCC, 0xC3 }; // int3; ret
     const offsets = [_]u32{0};
-    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null, null, null, null, null);
+    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 3 (function)
@@ -406,7 +438,7 @@ test "emit: export section encodes name, kind, and index" {
         .kind = .function,
         .index = 7,
     }};
-    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 4 (export)
@@ -453,7 +485,7 @@ test "roundtrip: emit then load with AOT loader" {
     const data = try emit(allocator, &code, &offsets, &exports, .{
         .arch = arch_name,
         .e_machine = 0x3E,
-    }, null, null, null, null, null, null, null, null, null);
+    }, null, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Parse back with the AOT loader
@@ -495,7 +527,7 @@ test "emit: import section round-trip" {
         .{ .module_name = "env", .field_name = "tbl", .kind = .table, .table_elem_type = .funcref, .table_min = 8, .table_max = 8 },
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -523,7 +555,7 @@ test "emit: memory section round-trip" {
         .{ .min_pages = 2, .max_pages = null },
         .{ .min_pages = 1, .max_pages = 256 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -536,6 +568,29 @@ test "emit: memory section round-trip" {
     try std.testing.expectEqual(@as(u64, 256), module.memories[1].limits.max.?);
 }
 
+test "emit: locally-defined table section round-trip (#681)" {
+    const allocator = std.testing.allocator;
+    const aot_loader = @import("../runtime/aot/loader.zig");
+
+    const tbl_entries = [_]TableEntry{
+        .{ .elem_type = .funcref, .min = 1, .max = null },
+        .{ .elem_type = .funcref, .min = 2, .max = 10 },
+    };
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null, null, null, null, null, &tbl_entries);
+    defer allocator.free(data);
+
+    const module = try aot_loader.load(data, allocator);
+    defer aot_loader.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), module.tables.len);
+    try std.testing.expectEqual(types.ValType.funcref, module.tables[0].elem_type);
+    try std.testing.expectEqual(@as(u64, 1), module.tables[0].limits.min);
+    try std.testing.expect(module.tables[0].limits.max == null);
+    try std.testing.expectEqual(types.ValType.funcref, module.tables[1].elem_type);
+    try std.testing.expectEqual(@as(u64, 2), module.tables[1].limits.min);
+    try std.testing.expectEqual(@as(u64, 10), module.tables[1].limits.max.?);
+}
+
 test "emit: v128 global init payload round-trip" {
     const allocator = std.testing.allocator;
     const aot_loader = @import("../runtime/aot/loader.zig");
@@ -545,7 +600,7 @@ test "emit: v128 global init payload round-trip" {
         .{ .val_type = 0x7F, .mutability = 0, .init_i64 = 0x1234 },
         .{ .val_type = 0x7B, .mutability = 1, .init_v128 = init_bits },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, &globals, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, &globals, null, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -592,6 +647,7 @@ test "emit: type section and function type indices round-trip" {
         null,
         &ft_entries,
         &tidxs,
+        null,
         null,
     );
     defer allocator.free(data);
@@ -644,6 +700,7 @@ test "#672: tag imports and declared tags round-trip" {
         null,
         null,
         &tag_entries,
+        null,
     );
     defer allocator.free(data);
 

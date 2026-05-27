@@ -30,6 +30,7 @@ pub const AotSectionType = enum(u32) {
     start = 12,
     type = 13,
     tag = 14,
+    table = 15,
     _,
 };
 
@@ -293,6 +294,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             },
             .tag => {
                 try parseTagSection(&reader, section_size, &module, allocator);
+            },
+            .table => {
+                try parseTableSection(&reader, section_size, &module, allocator);
             },
             else => {
                 // Skip unknown/unhandled sections
@@ -636,6 +640,28 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
     module.imported_memories = memory_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
     module.imported_globals = global_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
     module.imported_tags = tag_descs.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+fn parseTableSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const tbl_types = allocator.alloc(types.TableType, count) catch return error.OutOfMemory;
+    errdefer allocator.free(tbl_types);
+
+    for (0..count) |i| {
+        const elem_type: types.ValType = @enumFromInt(try reader.readByte());
+        const min = try reader.readU32Le();
+        const has_max = try reader.readByte();
+        const max: ?u64 = if (has_max != 0) @as(u64, try reader.readU32Le()) else null;
+        tbl_types[i] = .{
+            .elem_type = elem_type,
+            .limits = .{ .min = min, .max = max },
+        };
+    }
+
+    module.tables = tbl_types;
 }
 
 fn parseMemorySection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {

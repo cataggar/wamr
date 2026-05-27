@@ -443,6 +443,20 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         });
     }
 
+    // Locally-defined tables (#681). Imported tables already round-trip
+    // through `import_entries`; without this section the loader can't
+    // recover `module.tables`, leaving exported local tables
+    // (e.g. wit-component's `(table $imports)`) unallocated at runtime.
+    var table_entries: std.ArrayList(emit_aot.TableEntry) = .empty;
+    defer table_entries.deinit(allocator);
+    for (module.tables) |t| {
+        try table_entries.append(allocator, .{
+            .elem_type = t.elem_type,
+            .min = @intCast(t.limits.min),
+            .max = if (t.limits.max) |m| @as(?u32, @intCast(m)) else null,
+        });
+    }
+
     // Build global entries in wasm-flat order (imported globals first, then
     // local globals) so codegen offsets match runtime storage.
     var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
@@ -553,6 +567,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         if (func_type_entries.items.len > 0) func_type_entries.items else null,
         if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
         if (tag_entries.items.len > 0) tag_entries.items else null,
+        if (table_entries.items.len > 0) table_entries.items else null,
     );
     defer allocator.free(aot_binary);
 

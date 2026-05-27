@@ -305,6 +305,20 @@ pub fn compileCoreWasm(
         }) catch return error.OutOfMemory;
     }
 
+    // Locally-defined tables (#681). Imported tables already round-trip
+    // via `import_entries`; local tables need section 15 so the loader
+    // populates `module.tables` and `allocateTables` creates the matching
+    // `TableInstance`s. wit-component cores rely on this for
+    // `(table $imports)`.
+    var table_entries: std.ArrayList(emit_aot.TableEntry) = .empty;
+    for (module.tables) |t| {
+        table_entries.append(ea, .{
+            .elem_type = t.elem_type,
+            .min = @intCast(t.limits.min),
+            .max = if (t.limits.max) |m| @as(?u32, @intCast(m)) else null,
+        }) catch return error.OutOfMemory;
+    }
+
     var data_segs: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     for (module.data_segments) |seg| {
         if (seg.is_passive) continue;
@@ -437,6 +451,7 @@ pub fn compileCoreWasm(
         if (func_type_entries.items.len > 0) func_type_entries.items else null,
         if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
         if (tag_entries.items.len > 0) tag_entries.items else null,
+        if (table_entries.items.len > 0) table_entries.items else null,
     ) catch return error.CoreCompileFailed;
 }
 
