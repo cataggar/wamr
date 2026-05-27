@@ -502,6 +502,9 @@ pub const MemoryInstance = struct {
     current_pages: u32,
     max_pages: u32,
     ref_count: u32 = 1,
+    /// AOT vmctx mirrors that currently reference this memory. Stored as
+    /// opaque pointers to avoid a common/types.zig -> aot/runtime.zig cycle.
+    vmctx_subscribers: std.ArrayListUnmanaged(*anyopaque) = .empty,
     /// Waiter queue for memory.atomic.wait/notify (shared memory only).
     /// Heap-allocated and shared across threads via ref counting.
     waiter_queue: ?*WaiterQueue = null,
@@ -530,10 +533,27 @@ pub const MemoryInstance = struct {
         self.ref_count += 1;
     }
 
+    pub fn subscribeVmCtx(self: *MemoryInstance, vmctx: *anyopaque, allocator: std.mem.Allocator) !void {
+        for (self.vmctx_subscribers.items) |subscriber| {
+            if (subscriber == vmctx) return;
+        }
+        try self.vmctx_subscribers.append(allocator, vmctx);
+    }
+
+    pub fn unsubscribeVmCtx(self: *MemoryInstance, vmctx: *anyopaque) void {
+        for (self.vmctx_subscribers.items, 0..) |subscriber, i| {
+            if (subscriber == vmctx) {
+                _ = self.vmctx_subscribers.swapRemove(i);
+                return;
+            }
+        }
+    }
+
     pub fn release(self: *MemoryInstance, allocator: std.mem.Allocator) void {
         self.ref_count -= 1;
         if (self.ref_count == 0) {
             if (self.waiter_queue) |wq| wq.deinit(allocator);
+            self.vmctx_subscribers.deinit(allocator);
             if (self.data.len > 0) allocator.free(self.data);
             allocator.destroy(self);
         }
