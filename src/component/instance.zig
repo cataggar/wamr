@@ -3060,13 +3060,51 @@ fn resolveAotImportedFunctionOverrides(
 
         var thunk: ?*const anyopaque = null;
         if (source_inst_idx != std.math.maxInt(u32) and source_inst_idx < ci_idx) {
-            thunk = installCrossInstanceThunk(allocator, inst, component, cis[source_inst_idx], imp, module) catch |err| blk: {
-                std.log.warn(
-                    "[aot reject] core module {d}: cross-instance thunk for '{s}.{s}' failed ({s}); installing trap-on-call stub",
-                    .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
-                );
-                break :blk null;
-            };
+            const src_entry = cis[source_inst_idx];
+
+            // Wit-component adapter pattern: the sibling is an inline-
+            // exports synthetic core instance whose `imp.field_name`
+            // member is a `canon.lower` contributor bridging a parent
+            // WASIp2 import. Build a ComponentTrampolineCtx and route
+            // through the canon-lower dispatcher rather than the
+            // sibling-AOT cross-instance path (which only handles
+            // alias-of-AOT-export sources).
+            if (resolveInlineExportCanonRef(component, src_entry, imp.field_name)) |canon_ref| {
+                switch (canon_ref) {
+                    .lowered => |cl_idx| {
+                        thunk = installCanonLowerBackedCrossInstanceThunk(
+                            allocator,
+                            inst,
+                            component,
+                            cl_idx,
+                            imp,
+                            module,
+                        ) catch |err| blk: {
+                            std.log.warn(
+                                "[aot reject] core module {d}: canon-lower thunk for '{s}.{s}' failed ({s}); falling back to cross-instance / trap-stub",
+                                .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                            );
+                            break :blk null;
+                        };
+                    },
+                    // Resource-drop / new / rep and other canon-builtin
+                    // contributors still fall through to the trap stub.
+                    // Bridging them requires a separate canon-builtin
+                    // dispatch kind in the trampoline pool; tracked as a
+                    // follow-up to #687.
+                    else => {},
+                }
+            }
+
+            if (thunk == null) {
+                thunk = installCrossInstanceThunk(allocator, inst, component, src_entry, imp, module) catch |err| blk: {
+                    std.log.warn(
+                        "[aot reject] core module {d}: cross-instance thunk for '{s}.{s}' failed ({s}); installing trap-on-call stub",
+                        .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                    );
+                    break :blk null;
+                };
+            }
         }
 
         if (thunk == null) {
@@ -3183,6 +3221,170 @@ fn installCrossInstanceThunk(
     const stub = try pool.allocCrossInstanceSlot(@ptrCast(ctx), .{
         .param_types = param_types,
         .result_types = result_types,
+        .has_retptr = false,
+    });
+    return @ptrCast(stub);
+}
+
+/// Walk a sibling core instance's `inline_exports` and, if `export_name`
+/// names a member backed directly by a canon contributor (rather than an
+/// alias of a sibling-instance export), return that canon-func reference.
+/// Returns `null` for non-canon backings (the caller should fall back to
+/// the alias-walking path in `resolveCoreInstanceFuncToAi`).
+///
+/// wit-component adapter outputs use this pattern: the synthetic
+/// `(core instance (exports ...))` instance the adapter produces names
+/// each parent-component WASIp2 import via a `canon.lower` contributor.
+fn resolveInlineExportCanonRef(
+    component: *const ctypes.Component,
+    entry: ComponentInstance.CoreInstanceEntry,
+    export_name: []const u8,
+) ?indexspace.CoreFuncRef {
+    if (entry.module_inst != null) return null;
+    if (entry.aot_inst != null) return null;
+    for (entry.inline_exports) |mem| {
+        if (!std.mem.eql(u8, mem.name, export_name)) continue;
+        if (mem.sort_idx.sort != .func) return null;
+        return indexspace.resolveCoreFunc(component, mem.sort_idx.idx);
+    }
+    return null;
+}
+
+/// Build a `ComponentTrampolineCtx` for a `canon.lower` decl, mirroring the
+/// interp path's ctx-population at the bottom of `instantiateWithOptions`'s
+/// inline-exports walk. The resulting ctx has `host_func = .{}` (empty);
+/// `linkImports` rebinds it later by walking `inst.trampoline_ctxs`.
+///
+/// The ctx is registered on `inst.trampoline_ctxs` (which owns destruction)
+/// before returning. On error, the partially-built ctx is fully cleaned up.
+fn buildLoweredComponentTrampolineCtx(
+    allocator: std.mem.Allocator,
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    canon_lower_idx: u32,
+) !*executor_mod.ComponentTrampolineCtx {
+    if (canon_lower_idx >= component.canons.len) return error.UnsupportedCrossInstanceSource;
+    const lower = switch (component.canons[canon_lower_idx]) {
+        .lower => |l| l,
+        else => return error.UnsupportedCrossInstanceSource,
+    };
+
+    const ctx_ptr = try allocator.create(executor_mod.ComponentTrampolineCtx);
+    errdefer allocator.destroy(ctx_ptr);
+
+    const rft_opt: ?ResolvedFuncType = resolveCompFuncType(component, lower.func_idx) orelse blk: {
+        if (lower.func_idx >= component.types.len) break :blk null;
+        break :blk switch (component.types[lower.func_idx]) {
+            .func => |f| ResolvedFuncType{ .ft = f },
+            else => null,
+        };
+    };
+    const rft = rft_opt orelse return error.UnsupportedCrossInstanceSource;
+
+    const ext_base: u32 = if (component.type_indexspace.len > 0)
+        @intCast(component.type_indexspace.len)
+    else
+        @intCast(component.types.len);
+
+    const ext: InstanceTypeExtension = if (rft.decls) |decls|
+        try buildInstanceTypeExtension(allocator, decls, ext_base, component)
+    else
+        InstanceTypeExtension.empty();
+    // Once `ctx_ptr.*` is initialized with `extended_types/indexspace`,
+    // the ComponentTrampolineCtx.deinit path owns those slices; before
+    // that, the local errdefer below frees them.
+    var ext_owned_by_ctx = false;
+    errdefer if (!ext_owned_by_ctx) ext.deinit(allocator, true);
+
+    const ft = rft.ft;
+    const params = try allocator.alloc(ctypes.ValType, ft.params.len);
+    errdefer allocator.free(params);
+    for (ft.params, 0..) |p, i| {
+        params[i] = if (rft.decls != null) rewriteValTypeAbsolute(ext_base, p.type) else p.type;
+    }
+    const results = switch (ft.results) {
+        .none => try allocator.alloc(ctypes.ValType, 0),
+        .unnamed => |t| blk: {
+            const r = try allocator.alloc(ctypes.ValType, 1);
+            r[0] = if (rft.decls != null) rewriteValTypeAbsolute(ext_base, t) else t;
+            break :blk r;
+        },
+        .named => |named| blk: {
+            const r = try allocator.alloc(ctypes.ValType, named.len);
+            for (named, 0..) |n, i| {
+                r[i] = if (rft.decls != null) rewriteValTypeAbsolute(ext_base, n.type) else n.type;
+            }
+            break :blk r;
+        },
+    };
+    errdefer allocator.free(results);
+
+    ctx_ptr.* = .{
+        .comp_inst = inst,
+        .host_func = .{},
+        .component_func_idx = lower.func_idx,
+        .param_types = params,
+        .result_types = results,
+        .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
+        .extended_types = ext.extension_types,
+        .extended_indexspace = ext.extension_indexspace,
+        .is_async_func = ft.is_async,
+    };
+    ext_owned_by_ctx = true;
+
+    try inst.trampoline_ctxs.append(allocator, ctx_ptr);
+    return ctx_ptr;
+}
+
+/// Install a cross-instance thunk for an AOT core module's import whose
+/// sibling source is a `canon.lower` contributor (the wit-component
+/// adapter pattern). Builds a `ComponentTrampolineCtx` keyed off the
+/// canon-lower's component-func index and allocates a pool slot that
+/// dispatches via `wamrAotDispatchComponentTrampoline` →
+/// `dispatchAotComponentTrampoline`. The dispatcher invokes the bound
+/// `HostFunc` directly, so the standard WASIp2 host implementations work
+/// without any further bridge.
+///
+/// The `HostFunc` is left empty here; `linkImports` later walks
+/// `inst.trampoline_ctxs` and binds via `resolveComponentFuncToHostFunc`.
+fn installCanonLowerBackedCrossInstanceThunk(
+    allocator: std.mem.Allocator,
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    canon_lower_idx: u32,
+    imp: aot_loader.AotImportDesc,
+    module: *const aot_loader.AotModule,
+) !*const anyopaque {
+    const ctx_ptr = try buildLoweredComponentTrampolineCtx(allocator, inst, component, canon_lower_idx);
+    // Once registered on inst.trampoline_ctxs, ownership is the
+    // ComponentInstance's; pop on subsequent failure to avoid leaking
+    // a published-but-unused entry.
+    errdefer _ = inst.trampoline_ctxs.pop();
+
+    // Attempt to bind the HostFunc eagerly so calls that fire before
+    // `linkImports` (e.g. AOT start-section that calls back through
+    // a canon.lower import) still dispatch correctly. linkImports's
+    // later sweep is idempotent.
+    if (resolveComponentFuncToHostFunc(inst, component, ctx_ptr.component_func_idx)) |hf| {
+        ctx_ptr.host_func = hf;
+    }
+
+    // Lowered (core-level) signature for the trampoline pool slot. We
+    // take the AOT importer's view of the import's signature — that's
+    // what the AOT codegen's call site emits, and it must match what
+    // `dispatchAotComponentTrampoline` lifts off the register file.
+    if (imp.func_type_idx >= module.func_types.len) return error.InvalidFuncType;
+    const ft = module.func_types[imp.func_type_idx];
+    const arena = inst.module_arena.allocator();
+    const lowered_params = try arena.alloc(core_types.ValType, ft.params.len);
+    for (ft.params, 0..) |p, i| lowered_params[i] = p;
+    const lowered_results = try arena.alloc(core_types.ValType, ft.results.len);
+    for (ft.results, 0..) |r, i| lowered_results[i] = r;
+
+    const pool = try ensureAotTrampolinePool(inst);
+    const stub = try pool.allocCanonLowerAotSlot(@ptrCast(ctx_ptr), .{
+        .param_types = lowered_params,
+        .result_types = lowered_results,
         .has_retptr = false,
     });
     return @ptrCast(stub);

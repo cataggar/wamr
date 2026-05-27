@@ -660,3 +660,155 @@ test "#650 commit 2: AOT lifts func(list<u8>) -> string (acceptance)" {
     try std.testing.expectEqual(@as(u32, 0x100), results[0].string.ptr);
     try std.testing.expectEqual(@as(u32, 5), results[0].string.len);
 }
+
+// ── #687: canon-lower-backed cross-instance bridging ─────────────────────
+
+/// AOT module that imports `env.increment: (i32) -> i32` and exports
+/// `go: (i32) -> i32` which simply forwards to the import. Used by the
+/// #687 fixture to exercise the canon-lower-backed cross-instance thunk.
+const aot_forwarder_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    // type section: 1 type, (i32)->i32
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    // import section: "env"."increment" (func type 0)
+    0x02, 0x11, 0x01,
+    0x03, 'e', 'n', 'v',
+    0x09, 'i', 'n', 'c', 'r', 'e', 'm', 'e', 'n', 't',
+    0x00, 0x00,
+    // function section: 1 func of type 0
+    0x03, 0x02, 0x01, 0x00,
+    // memory section: 1 memory min 1
+    0x05, 0x03, 0x01, 0x00, 0x01,
+    // export section: "memory" (mem 0) + "go" (func 1)
+    0x07, 0x0f, 0x02,
+    0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    0x02, 'g', 'o', 0x00, 0x01,
+    // code section: 1 func body — local.get 0; call 0; end (6 body bytes)
+    0x0a, 0x08, 0x01,
+    0x06,
+    0x00,
+    0x20, 0x00,
+    0x10, 0x00,
+    0x0b,
+};
+
+const Incr687Ctx = struct {
+    observed: i32 = 0,
+    return_value: i32 = 0,
+
+    fn call(
+        ctx: ?*anyopaque,
+        _: *instance.ComponentInstance,
+        args: []const abi.InterfaceValue,
+        results: []abi.InterfaceValue,
+        _: std.mem.Allocator,
+    ) anyerror!void {
+        const self: *Incr687Ctx = @ptrCast(@alignCast(ctx.?));
+        self.observed = args[0].s32;
+        self.return_value = args[0].s32 + 1;
+        results[0] = .{ .s32 = self.return_value };
+    }
+};
+
+test "#687: AOT core imports a canon-lower-bridged sibling export" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &aot_forwarder_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    // Component shape:
+    //   import "incr": (i32)->i32   = comp-func 0
+    //   core_inst 0 = (exports "increment" -> core-func 0 (the lower))
+    //   core_inst 1 = (instantiate $aot (with "env" $core_inst_0))
+    //   alias core-func ("go" of core_inst 1)            = core-func 1
+    //   canons[0] = lower(comp-func 0)                    -> core-func 0
+    //   canons[1] = lift(core-func 1, type 0)             = comp-func 1
+    //   export "go" = sort_idx{ .func, 1 }
+    //
+    // Without #687, the AOT import "env.increment" cannot be resolved
+    // (its sibling source is a canon.lower, not an alias-of-AOT-export),
+    // so the core call traps. With the fix, the import is bridged
+    // through `dispatchAotComponentTrampoline` to the bound HostFunc.
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &aot_forwarder_wasm }};
+
+    const inst0_exports = [_]ctypes.CoreInlineExport{
+        .{ .name = "increment", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const inst1_args = [_]ctypes.CoreInstantiateArg{
+        .{ .name = "env", .instance_idx = 0 },
+    };
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .exports = &inst0_exports },
+        .{ .instantiate = .{ .module_idx = 0, .args = &inst1_args } },
+    };
+
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{ .sort = .{ .core = .func }, .instance_idx = 1, .name = "go" } },
+    };
+
+    const params = [_]ctypes.NamedValType{.{ .name = "x", .type = .s32 }};
+    const types = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .s32 } } },
+    };
+
+    const empty_opts = [_]ctypes.CanonOpt{};
+    const canons = [_]ctypes.Canon{
+        .{ .lower = .{ .func_idx = 0, .opts = &empty_opts } },
+        .{ .lift = .{ .core_func_idx = 1, .type_idx = 0, .opts = &empty_opts } },
+    };
+
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "incr", .desc = .{ .func = 0 } },
+    };
+    const exports = [_]ctypes.ExportDecl{
+        .{ .name = "go", .desc = .{ .func = 0 }, .sort_idx = .{ .sort = .func, .idx = 1 } },
+    };
+
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases,
+        .types = &types,
+        .canons = &canons,
+        .imports = &imports,
+        .exports = &exports,
+    };
+
+    const pcs = [_]instance.PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = cwasm_bytes },
+    };
+    const inst = try instance.instantiateWithOptions(&component, allocator, .{
+        .precompiled_cores = &pcs,
+    });
+    defer inst.deinit();
+
+    try std.testing.expect(inst.core_instances[1].aot_inst != null);
+
+    // Bind the parent "incr" import to a host function that increments
+    // its argument. linkImports walks `inst.trampoline_ctxs` and rebinds
+    // the canon-lower ctx that #687 registered there.
+    var host_ctx = Incr687Ctx{};
+    var providers: std.StringHashMapUnmanaged(instance.ImportBinding) = .{};
+    defer providers.deinit(allocator);
+    try providers.put(allocator, "incr", .{
+        .host_func = .{ .context = &host_ctx, .call = Incr687Ctx.call },
+    });
+    try inst.linkImports(providers);
+
+    const ef = inst.getExport("go") orelse return error.TestFailed;
+    const local = switch (ef) {
+        .local => |l| l,
+        else => return error.TestFailed,
+    };
+
+    const args = [_]abi.InterfaceValue{.{ .s32 = 41 }};
+    var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
+    try executor.callComponentFuncByLocal(inst, local, &args, &results, allocator);
+    try std.testing.expectEqual(@as(i32, 41), host_ctx.observed);
+    try std.testing.expectEqual(@as(i32, 42), results[0].s32);
+}

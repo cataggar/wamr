@@ -5998,6 +5998,38 @@ pub export fn wamrAotDispatchComponentTrampoline(
     return .{ .status = 0, .value = result };
 }
 
+/// AOT-codegen-flavoured canon.lower dispatcher (#687). The trampoline pool
+/// stub shifts caller regs right by one to inject `slot` as the first
+/// C-ABI arg, so when the AOT codegen calls a host import as
+/// `host_fn(vmctx, arg0, arg1, …)`, this dispatcher receives
+/// `(slot, a0=vmctx, a1=arg0, a2=arg1, …, a5=arg4)`. We discard `a0`
+/// (importer's vmctx) and re-issue `dispatchAotComponentTrampoline` over
+/// `a1..a5`, matching the lowered wasm-arg shape the host trampoline
+/// already expects.
+pub export fn wamrAotDispatchComponentTrampolineAot(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    _ = a0;
+    const ctx: *const ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
+    const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, .{ a1, a2, a3, a4, a5, 0 }) catch |err| {
+        if (debugAotEnabled()) {
+            std.debug.print(
+                "[aot-dispatch] canon.lower(aot) trampoline failed: {s}\n",
+                .{@errorName(err)},
+            );
+        }
+        return .{ .status = 1, .value = 0 };
+    };
+    return .{ .status = 0, .value = result };
+}
+
 /// Per-import context for the cross-instance core-to-core thunk (#662).
 /// Owned by `ComponentInstance.cross_instance_thunk_ctxs`; the trampoline
 /// pool slot stores `*CrossInstanceThunkCtx` as its `ctx`.

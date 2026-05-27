@@ -43,6 +43,22 @@ extern fn wamrAotDispatchComponentTrampoline(
     a5: u64,
 ) callconv(.c) DispatchResult;
 
+/// AOT-codegen-flavoured wrapper around `wamrAotDispatchComponentTrampoline`
+/// for canon.lower imports of an AOT core module. AOT-emitted host-import
+/// call sites pass the importer's vmctx as the first arg, so `a0` here is
+/// vmctx (which the host trampoline ignores) and `a1..a5` are the lowered
+/// wasm args. (#687.)
+extern fn wamrAotDispatchComponentTrampolineAot(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) callconv(.c) DispatchResult;
+
 /// Cross-instance core-to-core fn-import dispatcher (#662). Implemented in
 /// `src/component/executor.zig`. The first slot (`a0`) is the importer's
 /// vmctx, which the dispatcher ignores; `a1..a5` are the lowered wasm args
@@ -75,6 +91,7 @@ extern fn wamrAotDispatchTrapStub(
 
 pub const DispatchKind = enum(u8) {
     canon_lower,
+    canon_lower_aot,
     cross_instance,
     trap_stub,
 };
@@ -105,6 +122,7 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
     const ctx = entry.ctx orelse return 0;
     const dispatched = switch (entry.dispatch_kind) {
         .canon_lower => wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5),
+        .canon_lower_aot => wamrAotDispatchComponentTrampolineAot(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5),
         .cross_instance => wamrAotDispatchCrossInstance(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5),
         .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5),
     };
@@ -180,6 +198,30 @@ pub const TrampolinePool = struct {
         self.slots[slot] = .{
             .component_inst = component_inst,
             .canon_lower_idx = canon_lower_idx,
+        };
+        self.next_slot += 1;
+        writeStub(self.stubBytes(slot), slot);
+        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        g_active_pool = self;
+
+        return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
+    }
+
+    /// Allocate a slot for a canon-lower-backed cross-instance thunk where
+    /// the *importer* is an AOT-compiled core module. Same shape as
+    /// `allocSlotWithCtx` but routes through `wamrAotDispatchComponentTrampolineAot`
+    /// so the dispatcher skips the AOT codegen's leading vmctx argument
+    /// before treating the remaining registers as lowered wasm args. (#687.)
+    pub fn allocCanonLowerAotSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
+        const slot = self.next_slot;
+        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+
+        self.slots[slot] = .{
+            .component_inst = ctx,
+            .canon_lower_idx = 0,
+            .ctx = ctx,
+            .lowered_sig = lowered_sig,
+            .dispatch_kind = .canon_lower_aot,
         };
         self.next_slot += 1;
         writeStub(self.stubBytes(slot), slot);
