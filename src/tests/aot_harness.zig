@@ -1057,10 +1057,6 @@ fn compileToAot(
 
     var exports: std.ArrayList(emit_aot.ExportEntry) = .empty;
     for (module.exports) |exp| {
-        // emit_aot.ExternalKind lacks .tag (0x04); exception handling is not
-        // supported in AOT. Drop tag exports rather than panicking on the enum
-        // conversion below.
-        if (exp.kind == .tag) continue;
         try exports.append(a, .{
             .name = exp.name,
             .kind = @enumFromInt(@intFromEnum(exp.kind)),
@@ -1075,9 +1071,6 @@ fn compileToAot(
     // two spectest imports; skipping imports turns that into out-of-range.
     var import_entries: std.ArrayList(emit_aot.ImportEntry) = .empty;
     for (module.imports) |imp| {
-        // Skip tag imports — AOT does not support exception handling, and
-        // emit_aot.ExternalKind has no .tag variant.
-        if (imp.kind == .tag) continue;
         switch (imp.kind) {
             .function => try import_entries.append(a, .{
                 .module_name = imp.module_name,
@@ -1117,7 +1110,17 @@ fn compileToAot(
                     .global_mutable = gt.mutability == .mutable,
                 });
             },
-            .tag => unreachable,
+            .tag => {
+                // #672 commit 5: surface tag imports so the AOT loader can
+                // reconstruct `imported_tags` for cross-instance wiring (#670).
+                const type_idx = imp.tag_type_idx orelse continue;
+                try import_entries.append(a, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .tag,
+                    .tag_type_idx = type_idx,
+                });
+            },
         }
     }
 
