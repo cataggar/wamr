@@ -1139,6 +1139,20 @@ fn compileToAot(
         });
     }
 
+    // Locally-defined tables (#681) — imported tables round-trip via
+    // `import_entries`/`ImportedTableDesc`, while local tables need the
+    // dedicated section 15 added by #681. Without this, `module.tables`
+    // is empty on the loader side and `findExport(name, .table)` against
+    // a local table resolves to an unallocated `tables[i]` slot.
+    var table_entries: std.ArrayList(emit_aot.TableEntry) = .empty;
+    for (module.tables) |t| {
+        try table_entries.append(a, .{
+            .elem_type = t.elem_type,
+            .min = @intCast(t.limits.min),
+            .max = if (t.limits.max) |m| @as(?u32, @intCast(m)) else null,
+        });
+    }
+
     // Build the global entries with wasm-flat indexing. Imported globals
     // are now emitted via `import_entries` (the #649-phase-4 path) so the
     // runtime owns their slots at `inst.globals[0..import_count]`. Only
@@ -1299,6 +1313,7 @@ fn compileToAot(
         if (ft_entries.items.len > 0) ft_entries.items else null,
         if (tidxs.len > 0) tidxs else null,
         if (tag_entries.items.len > 0) tag_entries.items else null,
+        if (table_entries.items.len > 0) table_entries.items else null,
     );
 }
 
