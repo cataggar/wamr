@@ -374,6 +374,21 @@ fn formatPayload(op: ir.Inst.Op, w: *std.Io.Writer) Error!void {
         .f64x2_extract_lane,
         .f64x2_replace_lane,
         => try formatGenericSimdPayload(op, w),
+
+        // #672 EH ops.
+        .try_table_begin => |tb| {
+            try w.print(" results={d} clauses={d}", .{ tb.result_arity, tb.clauses.len });
+        },
+        .try_table_end => {},
+        .throw => |th| {
+            try w.print(" tag={d} args=[", .{th.tag_idx});
+            for (th.args, 0..) |a, i| {
+                if (i != 0) try w.print(",", .{});
+                try w.print("v{d}", .{a});
+            }
+            try w.print("]", .{});
+        },
+        .throw_ref => |v| try w.print(" v{d}", .{v}),
     }
 }
 

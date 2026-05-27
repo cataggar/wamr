@@ -3068,6 +3068,8 @@ fn compileInst(
         // Phi must be lowered before codegen.
         .phi => unreachable,
         .parallel_copy => |pairs| try emitParallelCopy(code, pairs, reg_map, fctx.allocator),
+        // #672 EH ops — placeholder. Real lowering lands in commit 3.
+        .try_table_begin, .try_table_end, .throw, .throw_ref => return error.UnimplementedOp,
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands

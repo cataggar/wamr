@@ -306,6 +306,75 @@ pub const Inst = struct {
         // Owned: the backing slice is freed by `BasicBlock.deinit` and
         // tracked alongside `phi` in `owned_phi_edges` / similar.
         parallel_copy: []const ParallelCopy,
+
+        // ── Exception handling (#672) ──────────────────────────────────
+        // Modern Wasm 3.0 EH only: try_table / throw / throw_ref.
+        // Legacy try/catch/rethrow/delegate/catch_all are NOT modelled.
+
+        /// Open a try region (matches the Wasm `try_table` opcode). The
+        /// op is emitted at the start of the try body and carries the
+        /// list of catch clauses with the IR `BlockId` of each handler.
+        ///
+        /// Codegen attaches an unwind table entry [try_start_pc,
+        /// try_end_pc, clauses_ptr] for the function; throws inside the
+        /// region consult this table to dispatch.
+        ///
+        /// Commit 2 only: lowering decodes try_table into this op +
+        /// normal block scaffolding; codegen still errors out.
+        try_table_begin: TryTableBegin,
+
+        /// Close the matching try region. Emitted at the `end` opcode
+        /// terminating a try_table body. Pairs 1:1 with `try_table_begin`
+        /// in well-formed wasm; codegen uses both to derive the
+        /// try_start_pc / try_end_pc range stored in the unwind table.
+        try_table_end: void,
+
+        /// Throw an exception (Wasm `throw` opcode). Terminator.
+        /// `tag_idx` indexes the *resolved* tag instance in the module's
+        /// tag space (imports first, then declared). `args` are popped
+        /// from the wasm operand stack at lowering time (count =
+        /// tag's func_type.params.len).
+        ///
+        /// At runtime, control transfers either to a matching catch in
+        /// an enclosing try region of the *same* function (commits 3-4)
+        /// or, when commit 5 lands, an enclosing frame's try region.
+        ///
+        /// Owned: `args` is freed by `BasicBlock.deinit`.
+        throw: Throw,
+
+        /// Rethrow a caught exnref (Wasm `throw_ref` opcode). Terminator.
+        /// `exnref` carries the exnref pushed by an earlier catch_ref /
+        /// catch_all_ref clause.
+        throw_ref: VReg,
+    };
+
+    /// One arm of a `try_table` instruction. `kind` maps directly to the
+    /// 4 wasm catch-clause discriminants:
+    ///   0 = catch tag        — handler receives the tag's params
+    ///   1 = catch_ref tag    — handler receives params + an exnref
+    ///   2 = catch_all        — handler receives no params
+    ///   3 = catch_all_ref    — handler receives a single exnref
+    pub const CatchClause = struct {
+        kind: u8,
+        tag_idx: ?u32 = null,
+        handler: BlockId,
+    };
+
+    pub const TryTableBegin = struct {
+        /// Number of results the try body yields on normal exit. Carried
+        /// through so codegen can size the spill area for the handler
+        /// resolution stub matching commit 5's cross-frame unwind.
+        result_arity: u32,
+        /// Owned slice freed by `BasicBlock.deinit` via
+        /// `owned_catch_clauses`.
+        clauses: []const CatchClause,
+    };
+
+    pub const Throw = struct {
+        tag_idx: u32,
+        /// Owned slice freed by `BasicBlock.deinit` via
+        /// `owned_throw_args`.
+        args: []const VReg,
     };
 
     pub const BinOp = struct {
@@ -896,6 +965,9 @@ pub const BasicBlock = struct {
                 .call_indirect => |ci| if (ci.args.len > 0) self.allocator.free(ci.args),
                 .call_ref => |cr| if (cr.args.len > 0) self.allocator.free(cr.args),
                 .ret_multi => |vregs| if (vregs.len > 0) self.allocator.free(vregs),
+                // #672 EH ops own their immediate slices.
+                .try_table_begin => |tt| if (tt.clauses.len > 0) self.allocator.free(tt.clauses),
+                .throw => |th| if (th.args.len > 0) self.allocator.free(th.args),
                 else => {},
             }
         }

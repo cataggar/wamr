@@ -1321,6 +1321,9 @@ fn compileInst(
         // parallel_copy is an aarch64-only post-pipeline op (#540).
         // x86_64 keeps the synth-local frameStore/frameLoad path.
         .parallel_copy => unreachable,
+
+        // #672 EH ops — placeholder. Real lowering lands in commit 4.
+        .try_table_begin, .try_table_end, .throw, .throw_ref => return error.UnimplementedOp,
     }
 }
 
