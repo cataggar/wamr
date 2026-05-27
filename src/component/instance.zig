@@ -3355,11 +3355,24 @@ fn installCanonLowerBackedCrossInstanceThunk(
     imp: aot_loader.AotImportDesc,
     module: *const aot_loader.AotModule,
 ) !*const anyopaque {
+    // Probe the pool first so failures on platforms that don't support
+    // RWX trampoline pages (Windows, macOS aarch64, non-x86_64/aarch64
+    // arches) bail before we allocate or publish the ctx — the caller
+    // installs a trap stub instead. Doing this up front also keeps the
+    // failure-cleanup path trivially correct.
+    const pool = try ensureAotTrampolinePool(inst);
+
     const ctx_ptr = try buildLoweredComponentTrampolineCtx(allocator, inst, component, canon_lower_idx);
-    // Once registered on inst.trampoline_ctxs, ownership is the
-    // ComponentInstance's; pop on subsequent failure to avoid leaking
-    // a published-but-unused entry.
-    errdefer _ = inst.trampoline_ctxs.pop();
+    // `buildLoweredComponentTrampolineCtx` publishes `ctx_ptr` on
+    // `inst.trampoline_ctxs` as its final step, so a failure below has
+    // to pop the entry AND release the ctx's owned memory (param/result
+    // type slices + extension storage). `ComponentInstance.deinit` is
+    // the only other place that does this teardown.
+    errdefer {
+        _ = inst.trampoline_ctxs.pop();
+        ctx_ptr.deinit(allocator);
+        allocator.destroy(ctx_ptr);
+    }
 
     // Attempt to bind the HostFunc eagerly so calls that fire before
     // `linkImports` (e.g. AOT start-section that calls back through
@@ -3381,7 +3394,6 @@ fn installCanonLowerBackedCrossInstanceThunk(
     const lowered_results = try arena.alloc(core_types.ValType, ft.results.len);
     for (ft.results, 0..) |r, i| lowered_results[i] = r;
 
-    const pool = try ensureAotTrampolinePool(inst);
     const stub = try pool.allocCanonLowerAotSlot(@ptrCast(ctx_ptr), .{
         .param_types = lowered_params,
         .result_types = lowered_results,
