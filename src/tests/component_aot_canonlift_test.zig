@@ -13,6 +13,7 @@
 //! `module_inst orelse` guard refused AOT-only cores.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const wamr = @import("wamr");
 const aot_harness = @import("aot_harness.zig");
 
@@ -712,6 +713,13 @@ const Incr687Ctx = struct {
 
 test "#687: AOT core imports a canon-lower-bridged sibling export" {
     if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+    // Cross-instance AOT bridging needs `TrampolinePool` (RWX page
+    // allocator). Skip on platforms where the pool ctor is comptime-
+    // disabled (`runtime/aot/host_trampolines.zig:144-151`): Windows
+    // and macOS aarch64. On those targets the runtime falls back to
+    // the trap-on-call stub, which the fixture intentionally exercises.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &aot_forwarder_wasm);
