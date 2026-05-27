@@ -149,15 +149,15 @@ pub const AotFrame = struct {
     arg_types: std.ArrayList(core_types.ValType),
     /// Results from the most recent `executeCore`, consumed by
     /// `popSlot` / `popSlotsU32`.
-    results: []core_types.Value = &.{},
+    results: []aot_runtime.ScalarResult = &.{},
     result_cursor: usize = 0,
     allocator: Allocator,
 
     pub fn init(ai: *aot_runtime.AotInstance, allocator: Allocator) AotFrame {
         return .{
             .ai = ai,
-            .args = std.ArrayList(core_types.Value){},
-            .arg_types = std.ArrayList(core_types.ValType){},
+            .args = .empty,
+            .arg_types = .empty,
             .allocator = allocator,
         };
     }
@@ -174,15 +174,43 @@ pub const AotFrame = struct {
     }
 
     pub fn popSlot(self: *AotFrame, t: core_types.ValType) FrameError!core_types.Value {
-        _ = self;
-        _ = t;
-        return error.AotPathUnsupported;
+        if (self.result_cursor == 0) return error.StackUnderflow;
+        self.result_cursor -= 1;
+        const sr = self.results[self.result_cursor];
+        return switch (t) {
+            .i32 => switch (sr) {
+                .i32 => |x| .{ .i32 = x },
+                .i64 => |x| .{ .i32 = @truncate(x) },
+                .funcref => |fr| .{ .i32 = @bitCast(@as(u32, @truncate(fr orelse 0))) },
+                .externref => |er| .{ .i32 = @bitCast(@as(u32, @truncate(er orelse 0))) },
+                else => return error.StackUnderflow,
+            },
+            .i64 => switch (sr) {
+                .i64 => |x| .{ .i64 = x },
+                .i32 => |x| .{ .i64 = @as(i64, x) },
+                else => return error.StackUnderflow,
+            },
+            .f32 => switch (sr) {
+                .f32 => |x| .{ .f32 = @bitCast(x) },
+                .i32 => |x| .{ .f32 = @bitCast(x) },
+                else => return error.StackUnderflow,
+            },
+            .f64 => switch (sr) {
+                .f64 => |x| .{ .f64 = @bitCast(x) },
+                .i64 => |x| .{ .f64 = @bitCast(x) },
+                else => return error.StackUnderflow,
+            },
+            else => return error.StackUnderflow,
+        };
     }
 
     pub fn popSlotsU32(self: *AotFrame, out: []u32) FrameError!void {
-        _ = self;
-        _ = out;
-        return error.AotPathUnsupported;
+        var i = out.len;
+        while (i > 0) {
+            i -= 1;
+            const v = try self.popSlot(.i32);
+            out[i] = @bitCast(v.i32);
+        }
     }
 
     pub fn pushSlotsU32(self: *AotFrame, in: []const u32) FrameError!void {
@@ -202,13 +230,27 @@ pub const AotFrame = struct {
         alignment: u32,
         new_size: u32,
     ) FrameError!u32 {
-        _ = self;
-        _ = realloc_idx;
-        _ = old_ptr;
-        _ = old_size;
-        _ = alignment;
-        _ = new_size;
-        return error.AotPathUnsupported;
+        const args = [_]core_types.Value{
+            .{ .i32 = @bitCast(old_ptr) },
+            .{ .i32 = @bitCast(old_size) },
+            .{ .i32 = @bitCast(alignment) },
+            .{ .i32 = @bitCast(new_size) },
+        };
+        const param_types = [_]core_types.ValType{ .i32, .i32, .i32, .i32 };
+        const result_types = [_]core_types.ValType{.i32};
+        var rbuf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
+        const rres = aot_runtime.callFuncScalar(
+            self.ai,
+            realloc_idx,
+            &param_types,
+            &result_types,
+            &args,
+            &rbuf,
+        ) catch return error.ReallocFailed;
+        return switch (rres[0]) {
+            .i32 => |x| @bitCast(x),
+            else => error.ReallocFailed,
+        };
     }
 
     pub fn executeCore(
@@ -217,11 +259,44 @@ pub const AotFrame = struct {
         param_types: []const core_types.ValType,
         result_types: []const core_types.ValType,
     ) FrameError!void {
-        _ = self;
-        _ = func_idx;
+        // Free the previous result buffer (if any) before running the
+        // next core call; popSlot consumed up to result_cursor but the
+        // backing slice itself is owned by the frame.
+        if (self.results.len > 0) {
+            self.allocator.free(self.results);
+            self.results = &.{};
+            self.result_cursor = 0;
+        }
+        // `arg_types` is the canonical list of types we recorded as args
+        // were pushed via `pushSlot`. The advisory `param_types` from
+        // the caller is ignored — the active source of truth is what
+        // the canon-ABI lowering actually emitted.
         _ = param_types;
-        _ = result_types;
-        return error.AotPathUnsupported;
+
+        const results_out = self.allocator.alloc(aot_runtime.ScalarResult, result_types.len) catch
+            return error.OutOfMemory;
+        errdefer self.allocator.free(results_out);
+
+        const got = aot_runtime.callFuncScalar(
+            self.ai,
+            func_idx,
+            self.arg_types.items,
+            result_types,
+            self.args.items,
+            results_out,
+        ) catch return error.TrapInCoreFunction;
+
+        // Reset args for the next call (e.g. a subsequent post_return).
+        self.args.clearRetainingCapacity();
+        self.arg_types.clearRetainingCapacity();
+
+        // Convert the (slice-into-out) view into an owned slice of the
+        // same allocator. `aot_runtime.callFuncScalar` returns a slice
+        // pointing into `results_out`; we keep the whole `results_out`
+        // buffer to back popSlot.
+        std.debug.assert(got.ptr == results_out.ptr);
+        self.results = results_out;
+        self.result_cursor = got.len;
     }
 };
 

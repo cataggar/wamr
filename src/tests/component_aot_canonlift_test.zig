@@ -115,17 +115,24 @@ test "#625 phase 3: AOT path rejects unsupported shapes cleanly" {
         .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
     };
 
-    // Declare the lift as taking a `tuple<u32,u32>` param (compound,
-    // 2 flat slots). Phase B.2 handles string/list/multi-slot
-    // primitives, but compound aggregate params (records / tuples /
-    // payload-bearing variants) still bail with AotPathUnsupported.
-    const tuple_fields = [_]ctypes.ValType{ .u32, .u32 };
+    // After commit 2 (CallFrame refactor) compound aggregate params are
+    // handled by the unified canon-ABI walk, so the previous
+    // `tuple<u32,u32>` rejection no longer applies. The remaining
+    // guard-rail is the canon-ABI requirement that spilling params to
+    // memory (>MAX_FLAT_PARAMS) needs a `realloc` binding. Declare a
+    // wide param tuple (17 u32 fields → 17 flat slots > MAX_FLAT_PARAMS)
+    // with NO realloc in lift_opts; the AOT path must surface
+    // `error.ReallocNotAvailable`.
+    const tuple_fields = [_]ctypes.ValType{
+        .u32, .u32, .u32, .u32, .u32, .u32, .u32, .u32, .u32,
+        .u32, .u32, .u32, .u32, .u32, .u32, .u32, .u32,
+    };
     const params = [_]ctypes.NamedValType{.{ .name = "p", .type = .{ .tuple = 0 } }};
     const types = [_]ctypes.TypeDef{
         .{ .tuple = .{ .fields = &tuple_fields } },
         .{ .func = .{ .params = &params, .results = .{ .unnamed = .s32 } } },
     };
-    const lift_opts = [_]ctypes.CanonOpt{};
+    const lift_opts = [_]ctypes.CanonOpt{}; // no realloc → spill must fail
     const canons = [_]ctypes.Canon{
         .{ .lift = .{ .core_func_idx = 0, .type_idx = 1, .opts = &lift_opts } },
     };
@@ -159,11 +166,12 @@ test "#625 phase 3: AOT path rejects unsupported shapes cleanly" {
         else => return error.TestFailed,
     };
 
-    const tup_field = [_]abi.InterfaceValue{ .{ .u32 = 0 }, .{ .u32 = 0 } };
+    var tup_field: [17]abi.InterfaceValue = undefined;
+    for (&tup_field) |*v| v.* = .{ .u32 = 0 };
     const args = [_]abi.InterfaceValue{.{ .tuple_val = &tup_field }};
     var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
     try std.testing.expectError(
-        error.AotPathUnsupported,
+        error.ReallocNotAvailable,
         executor.callComponentFuncByLocal(inst, local, &args, &results, allocator),
     );
 }
@@ -473,4 +481,182 @@ test "#650 phase B.2: AOT lowers string param (multi-slot flat)" {
     var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
     try executor.callComponentFuncByLocal(inst, local, &args, &results, allocator);
     try std.testing.expectEqual(@as(u32, 42), results[0].u32);
+}
+
+// #650 commit 2 — tuple<u32,u32> as PARAM (multi-slot compound param)
+// on AOT via the unified CallFrame path. Phase B.1 only tested tuple
+// as a RESULT (retptr-based). Phase B.2 tested string-as-param (2 i32
+// slots) but not a true compound. With the CallFrame refactor the
+// AOT path delegates to the same `pushInterfaceValue` /
+// `abi.lowerFlatReg` walk that interp uses, so compound aggregate
+// params work for free.
+//
+// Reuses `string_param_core_wasm` (`(i32 i32) -> i32` returning
+// `local.get 1`). canon.lift retypes it as
+// `func(p: tuple<u32, u32>) -> u32`; the tuple flattens to 2 i32
+// slots in order, the function returns the second element, which we
+// assert is the tuple's second u32 field.
+test "#650 commit 2: AOT lowers tuple<u32,u32> as multi-slot compound param" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &string_param_core_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &string_param_core_wasm }};
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+
+    // type 0: tuple<u32,u32>; type 1: (p: tuple<u32,u32>) -> u32
+    const tuple_fields = [_]ctypes.ValType{ .u32, .u32 };
+    const params = [_]ctypes.NamedValType{.{ .name = "p", .type = .{ .tuple = 0 } }};
+    const types = [_]ctypes.TypeDef{
+        .{ .tuple = .{ .fields = &tuple_fields } },
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .u32 } } },
+    };
+    const lift_opts = [_]ctypes.CanonOpt{};
+    const canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 0, .type_idx = 1, .opts = &lift_opts } },
+    };
+    const exports = [_]ctypes.ExportDecl{
+        .{ .name = "go", .desc = .{ .func = 0 }, .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports,
+    };
+
+    const pcs = [_]instance.PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = cwasm_bytes },
+    };
+    const inst = try instance.instantiateWithOptions(&component, allocator, .{
+        .precompiled_cores = &pcs,
+    });
+    defer inst.deinit();
+
+    const ef = inst.getExport("go") orelse return error.TestFailed;
+    const local = switch (ef) {
+        .local => |l| l,
+        else => return error.TestFailed,
+    };
+
+    const tup_field = [_]abi.InterfaceValue{ .{ .u32 = 100 }, .{ .u32 = 200 } };
+    const args = [_]abi.InterfaceValue{.{ .tuple_val = &tup_field }};
+    var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
+    try executor.callComponentFuncByLocal(inst, local, &args, &results, allocator);
+    // core returns local.get 1 (the second flat slot of the tuple).
+    try std.testing.expectEqual(@as(u32, 200), results[0].u32);
+}
+
+// #650 commit 2 — headline acceptance: `func(list<u8>) -> string`.
+//
+// Two-stage lowering on the AOT path:
+//   1. list<u8> flattens to 2 i32 slots (ptr, len) — fits flat, no spill.
+//   2. string flattens to 2 i32 slots — > MAX_FLAT_RESULTS=1 → spilled.
+//      AOT uses caller-allocates: host calls `realloc(0,0,4,8)` to
+//      reserve 8 bytes for the (str_ptr, str_len) tuple, then passes
+//      retptr as the trailing core arg. Core returns void.
+//
+// Core wasm:
+//   func[0] realloc:  (i32 i32 i32 i32) -> i32           ;; returns 16
+//   func[1] cast:     (list_ptr list_len retptr) -> ()   ;; stores list_ptr/len at retptr+{0,4}
+const list_to_string_core_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    // type section: 2 types
+    0x01, 0x0f, 0x02,
+    0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, // realloc: (i32,i32,i32,i32) -> i32 (8 bytes)
+    0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00, // cast: (i32,i32,i32) -> () (6 bytes)
+    // func section: 2 funcs (types 0 and 1)
+    0x03, 0x03, 0x02, 0x00, 0x01,
+    // memory section: 1 page
+    0x05, 0x03, 0x01, 0x00, 0x01,
+    // export section: memory, realloc, cast
+    // payload = 9 ("memory") + 10 ("realloc") + 7 ("cast") + 1(count) = 27
+    0x07, 0x1b, 0x03,
+    0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    0x07, 'r', 'e', 'a', 'l', 'l', 'o', 'c', 0x00, 0x00,
+    0x04, 'c', 'a', 's', 't', 0x00, 0x01,
+    // code section: 2 funcs
+    // body0 (realloc): 0x00 0x41 0x10 0x0b = 4 bytes (preceded by size 0x04)
+    // body1 (cast): locals(0) + 2× (local.get x; local.get y; i32.store memarg) + end
+    //   = 0x00 + (0x20 0x02 0x20 0x00 0x36 0x02 0x00) + (0x20 0x02 0x20 0x01 0x36 0x02 0x04) + 0x0b
+    //   = 1 + 7 + 7 + 1 = 16 bytes (preceded by size 0x10)
+    // section payload = count(1) + len-prefix(1)+body0(4) + len-prefix(1)+body1(16) = 23
+    0x0a, 0x17, 0x02,
+    0x04, 0x00, 0x41, 0x10, 0x0b,
+    0x10, 0x00,
+    0x20, 0x02, 0x20, 0x00, 0x36, 0x02, 0x00,
+    0x20, 0x02, 0x20, 0x01, 0x36, 0x02, 0x04,
+    0x0b,
+};
+
+test "#650 commit 2: AOT lifts func(list<u8>) -> string (acceptance)" {
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &list_to_string_core_wasm);
+    defer allocator.free(cwasm_bytes);
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &list_to_string_core_wasm }};
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+
+    // type 0: list<u8>; type 1: func(b: list<u8>) -> string
+    const params = [_]ctypes.NamedValType{.{ .name = "b", .type = .{ .list = 0 } }};
+    const types = [_]ctypes.TypeDef{
+        .{ .list = .{ .element = .u8 } },
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .string } } },
+    };
+    // canon.lift cast (core_func 1) with realloc bound to core_func 0.
+    const lift_opts = [_]ctypes.CanonOpt{
+        .{ .realloc = 0 },
+    };
+    const canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 1, .type_idx = 1, .opts = &lift_opts } },
+    };
+    const exports = [_]ctypes.ExportDecl{
+        .{ .name = "cast", .desc = .{ .func = 0 }, .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports,
+    };
+
+    const pcs = [_]instance.PrecompiledCore{
+        .{ .module_idx = 0, .cwasm_bytes = cwasm_bytes },
+    };
+    const inst = try instance.instantiateWithOptions(&component, allocator, .{
+        .precompiled_cores = &pcs,
+    });
+    defer inst.deinit();
+
+    const ef = inst.getExport("cast") orelse return error.TestFailed;
+    const local = switch (ef) {
+        .local => |l| l,
+        else => return error.TestFailed,
+    };
+    const args = [_]abi.InterfaceValue{.{ .list = .{ .ptr = 0x100, .len = 5 } }};
+    var results: [1]abi.InterfaceValue = .{.{ .s32 = 0 }};
+    try executor.callComponentFuncByLocal(inst, local, &args, &results, allocator);
+    defer results[0].deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 0x100), results[0].string.ptr);
+    try std.testing.expectEqual(@as(u32, 5), results[0].string.len);
 }
