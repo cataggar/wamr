@@ -1620,6 +1620,7 @@ pub fn instantiateWithOptions(
                                 cis,
                                 ci_idx,
                                 ie.args,
+                                ie.module_idx,
                                 aot_module_ptr,
                             ) catch {
                                 if (aot_only) {
@@ -1630,7 +1631,7 @@ pub fn instantiateWithOptions(
                             };
                             const imported_table_overrides = imported_table_overrides_opt orelse {
                                 if (aot_only) {
-                                    std.log.warn("[aot reject] core module {d}: cross-instance table wiring not yet supported on AOT (#660)", .{ie.module_idx});
+                                    std.log.warn("[aot reject] core module {d}: cross-instance table wiring unresolved (see preceding [aot reject] line)", .{ie.module_idx});
                                     return error.AotImportUnresolvable;
                                 }
                                 break :aot_blk;
@@ -1644,6 +1645,7 @@ pub fn instantiateWithOptions(
                                 cis,
                                 ci_idx,
                                 ie.args,
+                                ie.module_idx,
                                 aot_module_ptr,
                             ) catch {
                                 if (aot_only) {
@@ -1654,7 +1656,7 @@ pub fn instantiateWithOptions(
                             };
                             const imported_memory_overrides = imported_memory_overrides_opt orelse {
                                 if (aot_only) {
-                                    std.log.warn("[aot reject] core module {d}: cross-instance memory wiring not yet supported on AOT (#660)", .{ie.module_idx});
+                                    std.log.warn("[aot reject] core module {d}: cross-instance memory wiring unresolved (see preceding [aot reject] line)", .{ie.module_idx});
                                     return error.AotImportUnresolvable;
                                 }
                                 break :aot_blk;
@@ -1668,6 +1670,7 @@ pub fn instantiateWithOptions(
                                 cis,
                                 ci_idx,
                                 ie.args,
+                                ie.module_idx,
                                 aot_module_ptr,
                             ) catch {
                                 if (aot_only) {
@@ -1678,7 +1681,7 @@ pub fn instantiateWithOptions(
                             };
                             const imported_global_overrides = imported_global_overrides_opt orelse {
                                 if (aot_only) {
-                                    std.log.warn("[aot reject] core module {d}: cross-instance global wiring not yet supported on AOT (#660)", .{ie.module_idx});
+                                    std.log.warn("[aot reject] core module {d}: cross-instance global wiring unresolved (see preceding [aot reject] line)", .{ie.module_idx});
                                     return error.AotImportUnresolvable;
                                 }
                                 break :aot_blk;
@@ -2758,6 +2761,7 @@ fn resolveAotImportedTableOverrides(
     cis: []const ComponentInstance.CoreInstanceEntry,
     ci_idx: usize,
     args: []const ctypes.CoreInstantiateArg,
+    module_idx: u32,
     module: *const aot_loader.AotModule,
 ) error{OutOfMemory}!?[]?*core_types.TableInstance {
     const imported_tables = module.importedTables();
@@ -2773,9 +2777,27 @@ fn resolveAotImportedTableOverrides(
             }
             break :arg_blk std.math.maxInt(u32);
         };
-        if (source_inst_idx == std.math.maxInt(u32)) return null;
-        if (source_inst_idx >= ci_idx) return null;
-        overrides[i] = resolveCoreInstanceTableExport(inst, component, cis[source_inst_idx], imp_tbl.name) orelse return null;
+        if (source_inst_idx == std.math.maxInt(u32)) {
+            std.log.warn(
+                "[aot reject] core module {d}: imported table '{s}.{s}' — instantiate arg '{s}' not provided to core_instance ci_idx={d}",
+                .{ module_idx, imp_tbl.module_name, imp_tbl.name, imp_tbl.module_name, ci_idx },
+            );
+            return null;
+        }
+        if (source_inst_idx >= ci_idx) {
+            std.log.warn(
+                "[aot reject] core module {d}: imported table '{s}.{s}' — source core_instance idx={d} is a forward reference (ci_idx={d})",
+                .{ module_idx, imp_tbl.module_name, imp_tbl.name, source_inst_idx, ci_idx },
+            );
+            return null;
+        }
+        overrides[i] = resolveCoreInstanceTableExport(inst, component, cis[source_inst_idx], imp_tbl.name) orelse {
+            std.log.warn(
+                "[aot reject] core module {d}: imported table '{s}.{s}' — source core_instance idx={d} does not export a table named '{s}'",
+                .{ module_idx, imp_tbl.module_name, imp_tbl.name, source_inst_idx, imp_tbl.name },
+            );
+            return null;
+        };
     }
 
     return overrides;
@@ -2812,6 +2834,7 @@ fn resolveAotImportedMemoryOverrides(
     cis: []const ComponentInstance.CoreInstanceEntry,
     ci_idx: usize,
     args: []const ctypes.CoreInstantiateArg,
+    module_idx: u32,
     module: *const aot_loader.AotModule,
 ) error{OutOfMemory}!?[]?*core_types.MemoryInstance {
     const imported_memories = module.importedMemories();
@@ -2827,9 +2850,27 @@ fn resolveAotImportedMemoryOverrides(
             }
             break :arg_blk std.math.maxInt(u32);
         };
-        if (source_inst_idx == std.math.maxInt(u32)) return null;
-        if (source_inst_idx >= ci_idx) return null;
-        overrides[i] = resolveCoreInstanceMemoryExport(inst, component, cis[source_inst_idx], imp_mem.name) orelse return null;
+        if (source_inst_idx == std.math.maxInt(u32)) {
+            std.log.warn(
+                "[aot reject] core module {d}: imported memory '{s}.{s}' — instantiate arg '{s}' not provided to core_instance ci_idx={d}",
+                .{ module_idx, imp_mem.module_name, imp_mem.name, imp_mem.module_name, ci_idx },
+            );
+            return null;
+        }
+        if (source_inst_idx >= ci_idx) {
+            std.log.warn(
+                "[aot reject] core module {d}: imported memory '{s}.{s}' — source core_instance idx={d} is a forward reference (ci_idx={d})",
+                .{ module_idx, imp_mem.module_name, imp_mem.name, source_inst_idx, ci_idx },
+            );
+            return null;
+        }
+        overrides[i] = resolveCoreInstanceMemoryExport(inst, component, cis[source_inst_idx], imp_mem.name) orelse {
+            std.log.warn(
+                "[aot reject] core module {d}: imported memory '{s}.{s}' — source core_instance idx={d} does not export a memory named '{s}'",
+                .{ module_idx, imp_mem.module_name, imp_mem.name, source_inst_idx, imp_mem.name },
+            );
+            return null;
+        };
     }
 
     return overrides;
@@ -2866,6 +2907,7 @@ fn resolveAotImportedGlobalOverrides(
     cis: []const ComponentInstance.CoreInstanceEntry,
     ci_idx: usize,
     args: []const ctypes.CoreInstantiateArg,
+    module_idx: u32,
     module: *const aot_loader.AotModule,
 ) error{OutOfMemory}!?[]?*core_types.GlobalInstance {
     const imported_globals = module.importedGlobals();
@@ -2881,9 +2923,27 @@ fn resolveAotImportedGlobalOverrides(
             }
             break :arg_blk std.math.maxInt(u32);
         };
-        if (source_inst_idx == std.math.maxInt(u32)) return null;
-        if (source_inst_idx >= ci_idx) return null;
-        overrides[i] = resolveCoreInstanceGlobalExport(inst, component, cis[source_inst_idx], imp_global.name) orelse return null;
+        if (source_inst_idx == std.math.maxInt(u32)) {
+            std.log.warn(
+                "[aot reject] core module {d}: imported global '{s}.{s}' — instantiate arg '{s}' not provided to core_instance ci_idx={d}",
+                .{ module_idx, imp_global.module_name, imp_global.name, imp_global.module_name, ci_idx },
+            );
+            return null;
+        }
+        if (source_inst_idx >= ci_idx) {
+            std.log.warn(
+                "[aot reject] core module {d}: imported global '{s}.{s}' — source core_instance idx={d} is a forward reference (ci_idx={d})",
+                .{ module_idx, imp_global.module_name, imp_global.name, source_inst_idx, ci_idx },
+            );
+            return null;
+        }
+        overrides[i] = resolveCoreInstanceGlobalExport(inst, component, cis[source_inst_idx], imp_global.name) orelse {
+            std.log.warn(
+                "[aot reject] core module {d}: imported global '{s}.{s}' — source core_instance idx={d} does not export a global named '{s}'",
+                .{ module_idx, imp_global.module_name, imp_global.name, source_inst_idx, imp_global.name },
+            );
+            return null;
+        };
     }
 
     return overrides;
