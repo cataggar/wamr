@@ -905,18 +905,18 @@ pub const AotInstance = struct {
     module: *const aot_loader.AotModule,
     memories: []*types.MemoryInstance,
     /// True when the matching `memories[i]` entry was allocated by this
-    /// instance and should be released on destroy. Borrowed imported-memory
-    /// overrides leave this false so the exporting sibling retains ownership.
+    /// instance. Borrowed imported-memory overrides leave this false, but are
+    /// still retain()'d on borrow and release()'d on destroy.
     memories_owned: []bool = &.{},
     tables: []*types.TableInstance,
     /// True when the matching `tables[i]` entry was allocated by this
-    /// instance and should be released on destroy. Borrowed imported-table
-    /// overrides leave this false so the exporting sibling retains ownership.
+    /// instance. Borrowed imported-table overrides leave this false, but are
+    /// still retain()'d on borrow and release()'d on destroy.
     tables_owned: []bool = &.{},
     globals: []*types.GlobalInstance,
     /// True when the matching `globals[i]` entry was allocated by this
-    /// instance and should be released on destroy. Borrowed imported-global
-    /// overrides leave this false so the exporting sibling retains ownership.
+    /// instance. Borrowed imported-global overrides leave this false, but are
+    /// still retain()'d on borrow and release()'d on destroy.
     globals_owned: []bool = &.{},
     /// Byte offset for each wasm-flat global in `VmCtx.globals_ptr`.
     global_offsets: []u32 = &.{},
@@ -2124,8 +2124,8 @@ const MemoriesAllocation = struct {
 /// kept at the **front** of `memories` (so `memories[0]` still aliases the
 /// active linear memory the way `VmCtx.memory_base` wiring expects).
 /// Slots with a non-null entry in `imported_memory_overrides` are borrowed
-/// from the exporting sibling; everything else (and unoverriden imports)
-/// is locally allocated.
+/// from the exporting sibling (retain()'d until destroy); everything else
+/// (and unoverriden imports) is locally allocated.
 fn allocateMemories(
     module: *const aot_loader.AotModule,
     allocator: std.mem.Allocator,
@@ -2143,14 +2143,13 @@ fn allocateMemories(
 
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| {
-            if (owned[i]) memories[i].release(allocator);
-        }
+        for (0..initialized) |i| memories[i].release(allocator);
     }
 
     for (imported, 0..) |desc, i| {
         if (i < imported_memory_overrides.len) {
             if (imported_memory_overrides[i]) |override| {
+                @constCast(override).retain();
                 memories[i] = override;
                 initialized += 1;
                 continue;
@@ -2222,14 +2221,13 @@ fn allocateTables(
 
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| {
-            if (owned[i]) tables[i].release(allocator);
-        }
+        for (0..initialized) |i| tables[i].release(allocator);
     }
 
     for (imported, 0..) |desc, i| {
         if (i < imported_table_overrides.len) {
             if (imported_table_overrides[i]) |override| {
+                @constCast(override).retain();
                 tables[i] = override;
                 initialized += 1;
                 continue;
@@ -2440,8 +2438,8 @@ fn defaultGlobalZero(vt: types.ValType) types.Value {
 
 fn freeMemories(memories: []*types.MemoryInstance, owned: []bool, allocator: std.mem.Allocator) void {
     std.debug.assert(owned.len == 0 or owned.len == memories.len);
-    for (memories, 0..) |m, i| {
-        if (owned.len == 0 or owned[i]) m.release(allocator);
+    for (memories) |m| {
+        m.release(allocator);
     }
     if (memories.len > 0) allocator.free(memories);
     if (owned.len > 0) allocator.free(owned);
@@ -2449,8 +2447,8 @@ fn freeMemories(memories: []*types.MemoryInstance, owned: []bool, allocator: std
 
 fn freeTables(tables: []*types.TableInstance, owned: []bool, allocator: std.mem.Allocator) void {
     std.debug.assert(owned.len == 0 or owned.len == tables.len);
-    for (tables, 0..) |t, i| {
-        if (owned.len == 0 or owned[i]) t.release(allocator);
+    for (tables) |t| {
+        t.release(allocator);
     }
     if (tables.len > 0) allocator.free(tables);
     if (owned.len > 0) allocator.free(owned);
@@ -2611,6 +2609,71 @@ test "instantiate: module with table" {
     for (inst.tables[0].elements) |elem| {
         try std.testing.expect(elem.isNull());
     }
+}
+
+test "#660 item 4: borrowed memory overrides are retained until importer destroy" {
+    const mem_types = [_]types.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 4 } },
+    };
+    const data = [_]u8{0xa5};
+    const data_segments = [_]aot_loader.AotDataSegment{
+        .{ .memory_idx = 0, .offset = 7, .data = &data },
+    };
+    const exporter_module = aot_loader.AotModule{
+        .memories = &mem_types,
+        .data_segments = &data_segments,
+    };
+    const imported = [_]aot_loader.ImportedMemoryDesc{
+        .{ .module_name = "env", .name = "mem", .min = 1, .max = 4 },
+    };
+    const importer_module = aot_loader.AotModule{ .imported_memories = &imported };
+
+    const exporter_inst = try instantiate(&exporter_module, std.testing.allocator);
+    defer destroy(exporter_inst);
+    try std.testing.expectEqual(@as(u32, 1), exporter_inst.memories[0].ref_count);
+    try std.testing.expectEqual(@as(u8, 0xa5), exporter_inst.memories[0].data[7]);
+
+    const overrides = [_]?*types.MemoryInstance{exporter_inst.memories[0]};
+    const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &.{}, &overrides, &.{}, &.{});
+    try std.testing.expectEqual(exporter_inst.memories[0], importer_inst.memories[0]);
+    try std.testing.expect(!importer_inst.memories_owned[0]);
+    try std.testing.expectEqual(@as(u32, 2), exporter_inst.memories[0].ref_count);
+
+    destroy(importer_inst);
+    try std.testing.expectEqual(@as(u32, 1), exporter_inst.memories[0].ref_count);
+
+    const vmctx = VmCtx{
+        .memory_base = @intFromPtr(exporter_inst.memories[0].data.ptr),
+        .memory_size = @as(usize, exporter_inst.memories[0].current_pages) * types.MemoryInstance.page_size,
+    };
+    const memory: [*]u8 = @ptrFromInt(vmctx.memory_base);
+    try std.testing.expectEqual(@as(u8, 0xa5), memory[7]);
+}
+
+test "#660 item 4: borrowed table overrides are retained until importer destroy" {
+    const tbl_types = [_]types.TableType{
+        .{ .elem_type = .funcref, .limits = .{ .min = 2, .max = 2 } },
+    };
+    const exporter_module = aot_loader.AotModule{ .tables = &tbl_types };
+    const imported = [_]aot_loader.ImportedTableDesc{
+        .{ .module_name = "env", .name = "tbl", .elem_type = .funcref, .min = 2, .max = 2 },
+    };
+    const importer_module = aot_loader.AotModule{ .imported_tables = &imported };
+
+    const exporter_inst = try instantiate(&exporter_module, std.testing.allocator);
+    defer destroy(exporter_inst);
+    exporter_inst.tables[0].elements[1] = .{ .value = .{ .funcref = 42 } };
+    try std.testing.expectEqual(@as(u32, 1), exporter_inst.tables[0].ref_count);
+
+    const overrides = [_]?*types.TableInstance{exporter_inst.tables[0]};
+    const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &overrides, &.{}, &.{}, &.{});
+    try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
+    try std.testing.expect(!importer_inst.tables_owned[0]);
+    try std.testing.expectEqual(@as(u32, 2), exporter_inst.tables[0].ref_count);
+
+    destroy(importer_inst);
+    try std.testing.expectEqual(@as(u32, 1), exporter_inst.tables[0].ref_count);
+    try std.testing.expectEqual(@as(?u32, 42), exporter_inst.tables[0].elements[1].value.funcref);
 }
 
 test "getFuncAddr: returns null without text section" {
