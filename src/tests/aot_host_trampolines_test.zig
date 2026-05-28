@@ -112,7 +112,7 @@ test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
     try std.testing.expectEqual(@as(u32, 4), pool.next_slot);
     try std.testing.expectEqual(@as(u32, 22), pool.slots[1].canon_lower_idx);
     try std.testing.expectEqual(@intFromPtr(&fake_component_2), @intFromPtr(pool.slots[2].component_inst));
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(3, 1, 2, 3, 4, 5, 6));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(3, 1, 2, 3, 4, 5, 6, 7, 8, 9));
 
     host_trampolines.setActivePool(null);
     pool.deinit(allocator);
@@ -224,7 +224,7 @@ test "#648 phase 3: genericDispatcher handles (i32) -> ()" {
     const lowered_results = [_]core_types.ValType{};
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
 
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 41, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 41, 0, 0, 0, 0, 0, 0, 0, 0));
     try std.testing.expect(state.called);
     try std.testing.expectEqual(@as(i32, 41), state.arg);
 }
@@ -258,7 +258,7 @@ test "#648 phase 3: genericDispatcher handles () -> i32" {
     const lowered_results = [_]core_types.ValType{.i32};
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
 
-    try std.testing.expectEqual(@as(u64, 77), host_trampolines.genericDispatcher(0, 0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 77), host_trampolines.genericDispatcher(0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 }
 
 test "#648 phase 3: genericDispatcher handles (i32) -> i32" {
@@ -289,7 +289,7 @@ test "#648 phase 3: genericDispatcher handles (i32) -> i32" {
     const lowered_results = [_]core_types.ValType{.i32};
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
 
-    try std.testing.expectEqual(@as(u64, 17), host_trampolines.genericDispatcher(0, 12, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 17), host_trampolines.genericDispatcher(0, 12, 0, 0, 0, 0, 0, 0, 0, 0));
 }
 
 test "#648 phase 3: genericDispatcher handles (i32 i32) -> () retptr" {
@@ -320,7 +320,7 @@ test "#648 phase 3: genericDispatcher handles (i32 i32) -> () retptr" {
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
 
     const retptr: u32 = 24;
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 9, retptr, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 9, retptr, 0, 0, 0, 0, 0, 0, 0));
     const mem = inst.resolveTopLevelMemory(0).?.data;
     try expectStoredPtrLen(mem, retptr, 0x55, 7);
 }
@@ -355,7 +355,7 @@ test "#648 phase 3: genericDispatcher handles (i32 i32 i32 i32) -> ()" {
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
 
     const retptr: u32 = 40;
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 3, 0x40, 5, retptr, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 3, 0x40, 5, retptr, 0, 0, 0, 0, 0));
     const mem = inst.resolveTopLevelMemory(0).?.data;
     try expectStoredPtrLen(mem, retptr, 0x80, 5);
 }
@@ -389,7 +389,123 @@ test "#648 phase 3: genericDispatcher handles (i32 i64 i32) -> ()" {
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
 
     const retptr: u32 = 56;
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 4, 0x1_0000_0002, retptr, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 4, 0x1_0000_0002, retptr, 0, 0, 0, 0, 0, 0));
     const mem = inst.resolveTopLevelMemory(0).?.data;
     try expectStoredPtrLen(mem, retptr, 0x90, 2);
+}
+
+test "#689: trampoline stub forwards 7 i32 args (widest WASIp2 method shape)" {
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
+    switch (builtin.cpu.arch) {
+        .x86_64, .aarch64 => {},
+        else => return error.SkipZigTest,
+    }
+
+    // 7 i32 wasm params is what wasi:filesystem/types.[method]descriptor.link-at
+    // lowers to: enough to push caller_a6 onto the dispatcher's stack frame on
+    // x86_64 SysV (only 6 reg args). On AArch64 all 7 fit in x0..x6 but the
+    // injected slot pushes x6 -> x7, exercising the widened shift sequence.
+    const Host = struct {
+        const State = struct { received: [7]i32 = [_]i32{0} ** 7, called: bool = false };
+
+        fn capture(ctx: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            try std.testing.expectEqual(@as(usize, 7), args.len);
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            var sum: i32 = 0;
+            for (args, 0..) |a, i| {
+                state.received[i] = a.s32;
+                sum +%= a.s32;
+            }
+            state.called = true;
+            results[0] = .{ .s32 = sum };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{ .s32, .s32, .s32, .s32, .s32, .s32, .s32 };
+    const result_types = [_]ctypes.ValType{.s32};
+    const lowered_params = [_]core_types.ValType{ .i32, .i32, .i32, .i32, .i32, .i32, .i32 };
+    const lowered_results = [_]core_types.ValType{.i32};
+
+    var state = Host.State{};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .context = @ptrCast(&state), .call = &Host.capture },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const stub = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    const TrampolineFn = *const fn (u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+    const tramp: TrampolineFn = @ptrCast(stub);
+
+    const result = tramp(101, 202, 303, 404, 505, 606, 707);
+
+    try std.testing.expect(state.called);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 101, 202, 303, 404, 505, 606, 707 }, &state.received);
+    // 101+202+303+404+505+606+707 = 2828
+    try std.testing.expectEqual(@as(u64, 2828), result);
+}
+
+test "#689: trampoline stub forwards 8 i32 args (cap)" {
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
+    switch (builtin.cpu.arch) {
+        .x86_64, .aarch64 => {},
+        else => return error.SkipZigTest,
+    }
+
+    // 8 i32 wasm params is the new cap installed by #689 — exercises both
+    // stack-arg slots on x86_64 (caller a6, a7) and the stack-spill arg on
+    // AArch64 (caller a7 lands at [sp+8] after the stub's push).
+    const Host = struct {
+        const State = struct { received: [8]i32 = [_]i32{0} ** 8, called: bool = false };
+
+        fn capture(ctx: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            try std.testing.expectEqual(@as(usize, 8), args.len);
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            var sum: i32 = 0;
+            for (args, 0..) |a, i| {
+                state.received[i] = a.s32;
+                sum +%= a.s32;
+            }
+            state.called = true;
+            results[0] = .{ .s32 = sum };
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    const param_types = [_]ctypes.ValType{ .s32, .s32, .s32, .s32, .s32, .s32, .s32, .s32 };
+    const result_types = [_]ctypes.ValType{.s32};
+    const lowered_params = [_]core_types.ValType{ .i32, .i32, .i32, .i32, .i32, .i32, .i32, .i32 };
+    const lowered_results = [_]core_types.ValType{.i32};
+
+    var state = Host.State{};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .context = @ptrCast(&state), .call = &Host.capture },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const stub = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    const TrampolineFn = *const fn (u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+    const tramp: TrampolineFn = @ptrCast(stub);
+
+    const result = tramp(1, 2, 4, 8, 16, 32, 64, 128);
+
+    try std.testing.expect(state.called);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 4, 8, 16, 32, 64, 128 }, &state.received);
+    try std.testing.expectEqual(@as(u64, 255), result);
 }

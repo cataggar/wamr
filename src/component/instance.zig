@@ -3183,8 +3183,12 @@ fn installCrossInstanceThunk(
     const ft = module.func_types[imp.func_type_idx];
 
     // Only register-fit signatures land in this fast path. Anything else
-    // returns an error → the caller installs a trap stub instead.
-    if (ft.params.len > 5) return error.SignatureTooWide;
+    // returns an error → the caller installs a trap stub instead. The cap
+    // of 8 covers every WASIp2 method emitted by the public adapters
+    // (`link-at` = 7 wasm params is the widest seen in real binaries);
+    // widened from 5 in #689 so the WASIp1→WASIp2 adapter's filesystem
+    // methods stop trap-stubbing.
+    if (ft.params.len > 8) return error.SignatureTooWide;
     if (ft.results.len > 1) return error.MultipleResultsUnsupported;
     for (ft.params) |p| switch (p) {
         .i32, .i64, .f32, .f64 => {},
