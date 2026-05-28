@@ -544,6 +544,22 @@ pub fn build(b: *std.Build) void {
     const run_differential_tests = b.addRunArtifact(differential_tests);
     test_step.dependOn(&run_differential_tests.step);
 
+    // #694: regression test for active elem segments referencing
+    // funcidx ≥ 256 (was capped by a fixed 256-entry buffer in
+    // `mapCodeExecutable`, silently dropping both the native pointer
+    // and the sig_id update for any high-funcidx slot).
+    const aot_high_funcidx_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/aot_high_funcidx_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    aot_high_funcidx_module.addImport("wamr", lib_module);
+    const aot_high_funcidx_tests = b.addTest(.{
+        .root_module = aot_high_funcidx_module,
+    });
+    const run_aot_high_funcidx_tests = b.addRunArtifact(aot_high_funcidx_tests);
+    test_step.dependOn(&run_aot_high_funcidx_tests.step);
+
     // #625 phase 1: AOT-backed component-core smoke test. Lives in its
     // own test step for the same reason `differential.zig` does:
     // `aot_harness.zig` cannot be pulled into the `wamr` lib module

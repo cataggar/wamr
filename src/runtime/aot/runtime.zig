@@ -1567,10 +1567,22 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     // Build function pointer table for call_indirect
     const import_count = module.import_function_count;
 
-    // Build module func idx → native address mapping (temporary)
+    // Build module func idx → native address mapping (temporary).
+    //
+    // #694: must be sized to `total_funcs`, NOT a fixed 256-entry stack
+    // buffer. With a fixed cap, any module whose import_count +
+    // func_count exceeds the cap silently dropped both the funcptr
+    // and the type_backing update for high-funcidx active elem
+    // segments, causing call_indirect through those slots to fail the
+    // sig-id type check and trap on `unreachable`.
     const total_funcs = import_count + module.func_count;
-    var func_addrs: [256]usize = std.mem.zeroes([256]usize);
-    const n_addrs = @min(total_funcs, func_addrs.len);
+    const func_addrs: []usize = if (total_funcs > 0)
+        inst.allocator.alloc(usize, total_funcs) catch return error.OutOfMemory
+    else
+        &.{};
+    defer if (func_addrs.len > 0) inst.allocator.free(func_addrs);
+    @memset(func_addrs, 0);
+    const n_addrs = func_addrs.len;
     // Import functions → host function pointers
     for (0..@min(import_count, @min(inst.host_functions.len, n_addrs))) |i| {
         func_addrs[i] = if (inst.host_functions[i]) |ptr| @intFromPtr(ptr) else 0;
