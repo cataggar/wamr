@@ -10,6 +10,13 @@ break the runner.
 The wamr CLI uses a Wasmtime-shaped subcommand layout
 (`wamr run <file.wasm>`, `wamr version`), so the adapter inserts `run` /
 `version` after the binary path.
+
+Since #680, the `wamr` runtime is AOT-only and no longer embeds the
+compiler. This adapter therefore pre-compiles every `.wasm` fixture with
+`wamrc compile -o <sibling>.cwasm` (cached by mtime) and then hands the
+resulting `.cwasm` to `wamr run`. Set `WAMRC` to point at the freshly-built
+`wamrc` binary; the adapter falls back to a `wamrc` sibling of `WAMR` and
+then to `PATH`.
 """
 
 import os
@@ -22,6 +29,26 @@ from typing import Dict, List, Tuple
 
 
 WAMR = shlex.split(os.getenv("WAMR", "wamr"))
+
+
+def _resolve_wamrc() -> List[str]:
+    """Locate the `wamrc` binary. Preference order: $WAMRC, sibling of
+    $WAMR, then `wamrc` on $PATH. Mirrors `findWamrBinary` in
+    `src/compiler/main.zig` (just in reverse — there wamrc finds wamr).
+    """
+    env = os.getenv("WAMRC")
+    if env:
+        return shlex.split(env)
+    if WAMR:
+        sibling = Path(WAMR[0]).resolve().with_name(
+            "wamrc.exe" if os.name == "nt" else "wamrc"
+        )
+        if sibling.exists():
+            return [str(sibling)]
+    return ["wamrc"]
+
+
+WAMRC = _resolve_wamrc()
 
 
 def get_name() -> str:
@@ -80,6 +107,64 @@ def _isolate_preopens(dirs: List[Tuple[Path, str]]) -> List[Tuple[Path, str]]:
     return isolated
 
 
+def _is_component(path: Path) -> bool:
+    """Read the 8-byte wasm prefix and distinguish a component from a
+    core module. Both start with `\\0asm`; core's version word is
+    `0x0000_0001`, component's is `0x0001_000d`.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return False
+    if len(head) < 8 or head[:4] != b"\x00asm":
+        return False
+    return head[4:8] == b"\x0d\x00\x01\x00"
+
+
+def _precompile(test_path: str) -> str:
+    """Compile `<test_path>` to a sibling AOT artifact, skipping
+    recompile if the artifact exists and is newer than the source.
+    Returns the path `wamr run` should be invoked with — the sibling
+    `.cwasm` for core wasm, or the source `.wasm` itself for a
+    component (since `wamr run` auto-probes the sibling
+    `<stem>.cwasm.json` manifest). Inputs that don't end in `.wasm`
+    pass through unchanged.
+
+    Passes `--no-verify-ir` to match the verifier setting the
+    in-process compiler used pre-#680 (`compileCoreWasm` defaults to
+    `.verify_mode = .off`). Verifier failures on production wasm
+    binaries are tracked separately (#662) and already gated through
+    `tests/wasi-testsuite-skip.json`; running the verifier here
+    surfaces those same bugs as adapter failures and breaks suites
+    that previously hit the silent codegen path.
+    """
+    p = Path(test_path)
+    if p.suffix != ".wasm":
+        return test_path
+    if _is_component(p):
+        manifest = p.with_suffix(".cwasm.json")
+        if not manifest.exists() or manifest.stat().st_mtime < p.stat().st_mtime:
+            # `wamrc compile-component` already disables the IR
+            # verifier internally (compileCoreWasm hard-codes
+            # verify_mode=.off), so no extra flag is needed here.
+            subprocess.run(
+                WAMRC + ["compile-component", "-o", str(manifest), str(p)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+        return test_path
+    cwasm = p.with_suffix(".cwasm")
+    if cwasm.exists() and cwasm.stat().st_mtime >= p.stat().st_mtime:
+        return str(cwasm)
+    subprocess.run(
+        WAMRC + ["compile", "--no-verify-ir", "-o", str(cwasm), str(p)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    return str(cwasm)
+
+
 def compute_argv(
     test_path: str,
     args_env_dirs: Tuple[List[str], Dict[str, str], List[Tuple[Path, str]]],
@@ -117,6 +202,10 @@ def compute_argv(
     if wasi_world == "wasi:http/service":
         argv += ["--listen"]
 
-    argv += [test_path]
+    # Pre-compile the wasm fixture to its sibling AOT artifact: for
+    # core wasm we get a `.cwasm`; for components we write a
+    # `<stem>.cwasm.json` manifest + per-core `.cwasm` files that
+    # `wamr run` auto-discovers via sibling probing. (#680)
+    argv += [_precompile(test_path)]
     argv += args
     return argv

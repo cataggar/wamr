@@ -247,6 +247,7 @@ pub fn build(b: *std.Build) void {
     // Point the adapter at the freshly-installed wamr binary so we don't pick
     // up a stale system iwasm.
     wasi_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    wasi_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
     wasi_runner.step.dependOn(b.getInstallStep());
     const wasi_testsuite_step = b.step(
         "wasi-testsuite",
@@ -276,6 +277,7 @@ pub fn build(b: *std.Build) void {
         "tests/wasi-p3-testsuite-skip.json",
     });
     wasi_p3_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    wasi_p3_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
     wasi_p3_runner.step.dependOn(b.getInstallStep());
     const wasi_p3_testsuite_step = b.step(
         "wasi-p3-testsuite",
