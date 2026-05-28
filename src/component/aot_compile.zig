@@ -23,6 +23,7 @@ const passes = @import("../compiler/ir/passes.zig");
 const x86_64_compile = @import("../compiler/codegen/x86_64/compile.zig");
 const aarch64_compile = @import("../compiler/codegen/aarch64/compile.zig");
 const emit_aot = @import("../compiler/emit_aot.zig");
+const name_section_mod = @import("../runtime/common/name_section.zig");
 const core_types = @import("../runtime/common/types.zig");
 const interp_instance = @import("../runtime/interpreter/instance.zig");
 const config = @import("../config.zig");
@@ -306,6 +307,22 @@ pub fn compileCoreWasm(
         .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
     }
 
+    // Parse the wasm `name` custom section directly from the source
+    // bytes for trap-decode diagnostics (#694). The interpreter loader
+    // skips custom sections, so this is a separate pass over the same
+    // buffer. A malformed or absent name section is non-fatal:
+    // fall back to no names and let the trap helpers print
+    // `local_func[N]` without a symbol.
+    const fn_name_entries: ?[]emit_aot.FunctionNameEntry = blk: {
+        const parsed = name_section_mod.parseFunctionNames(wasm_bytes, ea) catch break :blk null;
+        if (parsed.len == 0) break :blk null;
+        const entries = ea.alloc(emit_aot.FunctionNameEntry, parsed.len) catch break :blk null;
+        for (parsed, 0..) |p, idx| {
+            entries[idx] = .{ .index = p.index, .name = p.name };
+        }
+        break :blk entries;
+    };
+
     return emit_aot.emit(
         allocator,
         code,
@@ -329,6 +346,7 @@ pub fn compileCoreWasm(
         if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
         if (tag_entries.items.len > 0) tag_entries.items else null,
         if (table_entries.items.len > 0) table_entries.items else null,
+        fn_name_entries,
     ) catch return error.CoreCompileFailed;
 }
 

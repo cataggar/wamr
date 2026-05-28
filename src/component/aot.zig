@@ -31,6 +31,7 @@ const std = @import("std");
 const ctypes = @import("types.zig");
 const component_loader = @import("loader.zig");
 const core_backend = @import("core_backend.zig");
+const name_section_mod = @import("../runtime/common/name_section.zig");
 const core_types = @import("../runtime/common/types.zig");
 const config = @import("../config.zig");
 

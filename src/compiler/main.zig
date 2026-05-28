@@ -554,6 +554,24 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         try local_func_tidx_list.append(allocator, f.type_idx);
     }
 
+    // Parse the wasm `name` custom section directly from the source
+    // bytes. The interpreter loader skips custom sections, so this is
+    // a separate pass over the same buffer. A malformed name section is
+    // non-fatal (diagnostic-only): fall back to no names and let the
+    // trap helpers print `local_func[N]` without a symbol. Allocates
+    // into the same arena as the other emit-side scratch buffers.
+    const fn_name_entries: ?[]emit_aot.FunctionNameEntry = blk: {
+        const parsed = wamr.name_section.parseFunctionNames(wasm_data, allocator) catch break :blk null;
+        defer allocator.free(parsed);
+        if (parsed.len == 0) break :blk null;
+        const entries = allocator.alloc(emit_aot.FunctionNameEntry, parsed.len) catch break :blk null;
+        for (parsed, 0..) |p, idx| {
+            entries[idx] = .{ .index = p.index, .name = p.name };
+        }
+        break :blk entries;
+    };
+    defer if (fn_name_entries) |e| allocator.free(e);
+
     const aot_binary = try emit_aot.emit(
         allocator,
         compiled.code,
@@ -570,6 +588,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
         if (tag_entries.items.len > 0) tag_entries.items else null,
         if (table_entries.items.len > 0) table_entries.items else null,
+        fn_name_entries,
     );
     defer allocator.free(aot_binary);
 

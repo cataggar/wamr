@@ -1314,6 +1314,7 @@ fn compileToAot(
         if (tidxs.len > 0) tidxs else null,
         if (tag_entries.items.len > 0) tag_entries.items else null,
         if (table_entries.items.len > 0) table_entries.items else null,
+        null,
     );
 }
 

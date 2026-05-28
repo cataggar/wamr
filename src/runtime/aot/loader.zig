@@ -153,6 +153,12 @@ pub const AotModule = struct {
     global_inits: []const AotGlobalInit = &.{},
     elem_segments: []const AotElemSegment = &.{},
     start_function: ?u32 = null,
+    /// Round-tripped wasm function-name custom section (subsection 1).
+    /// Optional, purely diagnostic — empty when the source wasm had no
+    /// names. The AOT trap helpers use this to render `local_func[N]`
+    /// with the wasm-side symbol. Indices follow the wasm convention
+    /// (imports first, then locals). Owned by the loader allocator.
+    function_names: []const types.NameSection.FunctionName = &.{},
 
     /// Find an export by name and kind.
     pub fn findExport(self: *const AotModule, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
@@ -298,6 +304,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .table => {
                 try parseTableSection(&reader, section_size, &module, allocator);
             },
+            .name => {
+                try parseNameSection(&reader, section_size, &module, allocator);
+            },
             else => {
                 // Skip unknown/unhandled sections
                 reader.pos += section_size;
@@ -378,6 +387,12 @@ pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     }
     if (module.elem_segments.len > 0) {
         allocator.free(module.elem_segments);
+    }
+    for (module.function_names) |fn_name| {
+        if (fn_name.name.len > 0) allocator.free(fn_name.name);
+    }
+    if (module.function_names.len > 0) {
+        allocator.free(module.function_names);
     }
 }
 
@@ -471,6 +486,40 @@ fn parseTagSection(reader: *BinaryReader, section_size: u32, module: *AotModule,
         tag_types[i] = try reader.readU32Le();
     }
     module.tag_types = tag_types;
+}
+
+/// Parse the AOT function-names section (#694). Wire format mirrors the
+/// emitter in `compiler/emit_aot.zig`:
+///   count: u32 LE
+///   for each: index: u32 LE, name_len: u32 LE, name bytes
+/// Indices are in the wasm function index space (imports first, then
+/// locals). Each name is allocator-duped so it outlives the source AOT
+/// buffer. Purely diagnostic — used by the AOT trap helpers to render
+/// `local_func[N]` symbolically.
+fn parseNameSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const entries = allocator.alloc(types.NameSection.FunctionName, count) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |i| {
+            if (entries[i].name.len > 0) allocator.free(entries[i].name);
+        }
+        allocator.free(entries);
+    }
+    for (0..count) |i| {
+        const idx = try reader.readU32Le();
+        const name_len = try reader.readU32Le();
+        if (reader.remaining() < name_len) return error.UnexpectedEnd;
+        const name_bytes = try reader.readBytes(name_len);
+        const owned = allocator.alloc(u8, name_len) catch return error.OutOfMemory;
+        @memcpy(owned, name_bytes);
+        entries[i] = .{ .index = idx, .name = owned };
+        initialized = i + 1;
+    }
+    module.function_names = entries;
 }
 
 fn parseExportSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
