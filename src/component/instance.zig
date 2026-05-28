@@ -3045,18 +3045,31 @@ fn resolveAotImportedFunctionOverrides(
         if (imp.kind != .function) continue;
         defer func_idx += 1;
 
-        // WASI / spectest stay null so the runtime can pick them up from
-        // `host_bridge` (matches the existing behaviour pre-#662).
-        if (aot_host_bridge.isWasiModule(imp.module_name)) continue;
-        if (aot_host_bridge.isSpectestModule(imp.module_name)) continue;
-
-        // Look up the `with` arg that names this import's wasm module.
+        // Look up the `with` arg that names this import's wasm module
+        // FIRST — before any WASI / spectest short-circuit. For
+        // component-embedded WASIp1 cores, `wasm-tools component new
+        // --adapt …` rewrites the WASIp1 imports to point at a sibling
+        // **adapter** core, but keeps `imp.module_name ==
+        // "wasi_snapshot_preview1"`. If we let the WASI guard fire
+        // first, the adapter wiring is discarded and the runtime falls
+        // back to `host_bridge.aot*` with no `WasiCtx` on the inner
+        // core's vmctx — guest sees empty argv/env (#698).
         const source_inst_idx: u32 = arg_blk: {
             for (args) |arg| {
                 if (std.mem.eql(u8, arg.name, imp.module_name)) break :arg_blk arg.instance_idx;
             }
             break :arg_blk std.math.maxInt(u32);
         };
+
+        // No `with` arg → standalone-style WASIp1 / spectest import.
+        // Leave the override `null` so the AOT runtime fills it from
+        // `host_bridge` at resolve time (matches pre-#662 behaviour;
+        // `aot_inst.wasi_ctx` gets wired by `main.runRun` for the
+        // standalone `wamr run hello.wasm` path).
+        if (source_inst_idx == std.math.maxInt(u32)) {
+            if (aot_host_bridge.isWasiModule(imp.module_name)) continue;
+            if (aot_host_bridge.isSpectestModule(imp.module_name)) continue;
+        }
 
         var thunk: ?*const anyopaque = null;
         if (source_inst_idx != std.math.maxInt(u32) and source_inst_idx < ci_idx) {
