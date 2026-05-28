@@ -247,6 +247,7 @@ pub fn build(b: *std.Build) void {
     // Point the adapter at the freshly-installed wamr binary so we don't pick
     // up a stale system iwasm.
     wasi_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    wasi_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
     wasi_runner.step.dependOn(b.getInstallStep());
     const wasi_testsuite_step = b.step(
         "wasi-testsuite",
@@ -276,6 +277,7 @@ pub fn build(b: *std.Build) void {
         "tests/wasi-p3-testsuite-skip.json",
     });
     wasi_p3_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    wasi_p3_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
     wasi_p3_runner.step.dependOn(b.getInstallStep());
     const wasi_p3_testsuite_step = b.step(
         "wasi-p3-testsuite",
@@ -412,6 +414,29 @@ pub fn build(b: *std.Build) void {
         wamrc_help_compile.addArgs(&.{ "help", "compile" });
         wamrc_help_compile.expectExitCode(0);
         test_step.dependOn(&wamrc_help_compile.step);
+
+        const wamrc_help_run = b.addRunArtifact(wamrc);
+        wamrc_help_run.addArgs(&.{ "help", "run" });
+        wamrc_help_run.expectExitCode(0);
+        test_step.dependOn(&wamrc_help_run.step);
+    }
+
+    // `wamrc run` smoke (#665): compile + spawn the just-built `wamr`
+    // against the 36-byte noop core wasm. Exercises the full subprocess
+    // pipeline (sibling-output → freshness sidecar → wamr discovery via
+    // `WAMR_BIN` → exit-code propagation). Output goes to a build-cache
+    // file via `-o` so the source tree stays clean.
+    if (aot_executable_target) {
+        const wamrc_run_smoke = b.addRunArtifact(wamrc);
+        wamrc_run_smoke.addArg("run");
+        wamrc_run_smoke.addArg("-o");
+        const smoke_out = wamrc_run_smoke.addOutputFileArg("noop.cwasm");
+        _ = smoke_out;
+        wamrc_run_smoke.addFileArg(b.path("tests/coldstart/noop.wasm"));
+        wamrc_run_smoke.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+        wamrc_run_smoke.step.dependOn(b.getInstallStep());
+        wamrc_run_smoke.expectExitCode(0);
+        test_step.dependOn(&wamrc_run_smoke.step);
     }
 
     // Compiler IR passes tests (separate module to avoid root/wamr conflict)
@@ -1150,12 +1175,14 @@ const ComponentRunSteps = struct {
     wasmtime: *std.Build.Step,
 };
 
-/// Register one component fixture against both run parents. Wires
-/// up the wamr arm via `b.addRunArtifact(wamr_exe)` and the wasmtime
-/// arm via `b.addSystemCommand({"wasmtime", "run", "-S",
-/// "cli-exit-with-code"})`. Both arms assert the same expected
-/// stdout + exit code, so byte-equivalent output across runtimes is
-/// the parity invariant the CI cross-validation job enforces
+/// Register one component fixture against both run parents. The wamr
+/// arm spawns the freshly-built `wamrc run` (which compiles the
+/// component into sibling `<stem>.cwasm.json` + `<stem>.<N>.cwasm`
+/// files if missing or stale and then spawns `wamr run` itself with
+/// stdio inherited). The wasmtime arm uses `wasmtime run -S
+/// cli-exit-with-code`. Both arms assert the same expected stdout
+/// + exit code, so byte-equivalent output across runtimes is the
+/// parity invariant the CI cross-validation job enforces
 /// (cataggar/wamr#457).
 fn wireComponentRun(
     b: *std.Build,
@@ -1166,10 +1193,14 @@ fn wireComponentRun(
     expected_exit: u8,
     opts: WireRunOptions,
 ) void {
+    _ = wamr_exe;
     if (!opts.skip_wamr) {
-        const run = b.addRunArtifact(wamr_exe);
-        run.addArg("run");
+        const wamrc_path = b.getInstallPath(.bin, "wamrc");
+        const wamr_path = b.getInstallPath(.bin, "wamr");
+        const run = b.addSystemCommand(&.{ wamrc_path, "run" });
         run.addFileArg(component);
+        run.setEnvironmentVariable("WAMR_BIN", wamr_path);
+        run.step.dependOn(b.getInstallStep());
         run.expectExitCode(expected_exit);
         run.expectStdOutEqual(expected_stdout);
         runs.wamr.dependOn(&run.step);

@@ -16,6 +16,7 @@ const instance = wamr.component_instance;
 const core_types = wamr.types;
 const aot_runtime_mod = wamr.aot_runtime;
 const component_aot = wamr.component_aot;
+const component_aot_compile = wamr.component_aot_compile;
 
 /// Same i32->i32 +42 module used by the phase-1 smoke test.
 const core_wasm = [_]u8{
@@ -81,19 +82,21 @@ test "#625 phase 2: precompile + loadManifest + instantiate round-trip" {
     defer allocator.free(component_bytes);
 
     // tmp dir that we own + clean up. Path is `.zig-cache/tmp/<sub_path>`
-    // per `std.testing.tmpDir`'s implementation.
+    // per `std.testing.tmpDir`'s implementation. The manifest sidecar
+    // lives at `<tmp>/component.cwasm.json` with cores at
+    // `<tmp>/component.<N>.cwasm`.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer allocator.free(tmp_path);
+    const manifest_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/component.cwasm.json", .{tmp.sub_path});
+    defer allocator.free(manifest_path);
 
     // Precompile + write manifest.
-    var precomp = try component_aot.precompileComponent(allocator, component_bytes, tmp_path, .{});
+    var precomp = try component_aot_compile.precompileComponent(allocator, component_bytes, manifest_path, .{});
     defer precomp.deinit();
     try std.testing.expectEqual(@as(usize, 1), precomp.manifest.modules.len);
 
     // Load manifest from disk, verifying hashes + build id.
-    var loaded = try component_aot.loadManifest(allocator, tmp_path, component_bytes);
+    var loaded = try component_aot.loadManifest(allocator, manifest_path, component_bytes);
     defer loaded.deinit();
 
     const pcs = loaded.precompiledCores();
@@ -150,13 +153,13 @@ test "#625 phase 2: loadManifest rejects mismatched component bytes" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer allocator.free(tmp_path);
+    const manifest_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/component.cwasm.json", .{tmp.sub_path});
+    defer allocator.free(manifest_path);
 
-    var precomp = try component_aot.precompileComponent(allocator, component_bytes, tmp_path, .{});
+    var precomp = try component_aot_compile.precompileComponent(allocator, component_bytes, manifest_path, .{});
     defer precomp.deinit();
 
     // Hash should reject any other bytes.
     const other_bytes = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
-    try std.testing.expectError(error.ManifestComponentMismatch, component_aot.loadManifest(allocator, tmp_path, &other_bytes));
+    try std.testing.expectError(error.ManifestComponentMismatch, component_aot.loadManifest(allocator, manifest_path, &other_bytes));
 }

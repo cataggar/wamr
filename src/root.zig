@@ -129,6 +129,7 @@ pub const component_indexspace = @import("component/indexspace.zig");
 pub const component_instance = @import("component/instance.zig");
 pub const component_core_backend = @import("component/core_backend.zig");
 pub const component_aot = @import("component/aot.zig");
+pub const component_aot_compile = @import("component/aot_compile.zig");
 
 /// Component Model async ABI (tasks, futures, streams).
 pub const component_async = @import("component/async.zig");

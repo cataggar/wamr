@@ -10,7 +10,7 @@
 //! instance section instantiates the sub-component.
 //!
 //! Validates that `precompileComponent` recurses into the
-//! sub-component (writing one `module<N>.cwasm` per leaf core) and
+//! sub-component (writing one `<stem>.<N>.cwasm` per leaf core) and
 //! that `loadManifest` resolves each entry to the live
 //! `core_modules[i].data` slice by `core_sha256`, stamping
 //! `core_wasm` so `Options.findPrecompiled` matches by slice
@@ -25,6 +25,7 @@ const instance = wamr.component_instance;
 const core_types = wamr.types;
 const aot_runtime_mod = wamr.aot_runtime;
 const component_aot = wamr.component_aot;
+const component_aot_compile = wamr.component_aot_compile;
 
 /// Same i32->i32 +42 module used by the phase-1 smoke test.
 const core_wasm = [_]u8{
@@ -119,16 +120,16 @@ test "#676: precompile recurses into nested sub-components" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer allocator.free(tmp_path);
+    const manifest_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested.cwasm.json", .{tmp.sub_path});
+    defer allocator.free(manifest_path);
 
-    var precomp = try component_aot.precompileComponent(allocator, component_bytes, tmp_path, .{});
+    var precomp = try component_aot_compile.precompileComponent(allocator, component_bytes, manifest_path, .{});
     defer precomp.deinit();
     try std.testing.expectEqual(@as(usize, 1), precomp.manifest.modules.len);
     try std.testing.expect(precomp.manifest.modules[0].core_sha256 != null);
     try std.testing.expectEqual(@as(u32, 0), precomp.manifest.modules[0].idx);
 
-    var loaded = try component_aot.loadManifest(allocator, tmp_path, component_bytes);
+    var loaded = try component_aot.loadManifest(allocator, manifest_path, component_bytes);
     defer loaded.deinit();
 
     const pcs = loaded.precompiledCores();

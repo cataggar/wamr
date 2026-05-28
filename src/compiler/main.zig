@@ -15,11 +15,12 @@ const ir = wamr.ir;
 
 const TargetArch = passes.TargetArch;
 
-const Subcommand = enum { compile, compile_component, version, help };
+const Subcommand = enum { compile, compile_component, run, version, help };
 
 fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "compile")) return .compile;
     if (std.mem.eql(u8, s, "compile-component")) return .compile_component;
+    if (std.mem.eql(u8, s, "run")) return .run;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
@@ -44,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
         .help => runHelp(init.io, args[2..]),
         .compile => try runCompile(init, allocator, args[2..]),
         .compile_component => try runCompileComponent(init, allocator, args[2..]),
+        .run => try runRun(init, allocator, args[2..]),
     }
 }
 
@@ -630,7 +632,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         return;
     }
     var input_path: ?[]const u8 = null;
-    var output_dir: ?[]const u8 = null;
+    var output_manifest: ?[]const u8 = null;
     var target_arch: TargetArch = switch (builtin.cpu.arch) {
         .aarch64 => .aarch64,
         else => .x86_64,
@@ -645,7 +647,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
                 std.debug.print("error: -o requires an argument\n", .{});
                 std.process.exit(1);
             }
-            output_dir = sub_args[i];
+            output_manifest = sub_args[i];
         } else if (std.mem.startsWith(u8, a, "--target=")) {
             const v = a["--target=".len..];
             if (std.mem.eql(u8, v, "x86_64") or std.mem.eql(u8, v, "x86-64")) {
@@ -671,8 +673,8 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         std.debug.print("error: missing input component path\n", .{});
         std.process.exit(1);
     };
-    const out_dir = output_dir orelse blk: {
-        break :blk try wamr.component_aot.defaultPrecompiledDirFor(allocator, in_path);
+    const manifest_path: []const u8 = if (output_manifest) |o| o else blk: {
+        break :blk try wamr.component_aot.defaultManifestPathFor(allocator, in_path);
     };
 
     const io = init.io;
@@ -693,7 +695,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         std.process.exit(1);
     }
 
-    var result = wamr.component_aot.precompileComponent(allocator, component_data, out_dir, .{
+    var result = wamr.component_aot_compile.precompileComponent(allocator, component_data, manifest_path, .{
         .target_arch = target_arch,
     }) catch |err| {
         std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
@@ -701,10 +703,393 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
     };
     defer result.deinit();
 
-    std.debug.print("Wrote {d} core module(s) + manifest.json to {s}\n", .{
-        result.manifest.modules.len, out_dir,
+    std.debug.print("Wrote {d} core module(s) + {s}\n", .{
+        result.manifest.modules.len, manifest_path,
     });
 }
+
+/// `wamrc run` — compile (if needed) and then execute via the `wamr`
+/// runtime as a subprocess. Default output lives next to the input:
+/// `foo.wasm` → `foo.cwasm` (core) or `foo.cwasm.json` + `foo.<N>.cwasm`
+/// (component). The existing artifact is reused when a "target format"
+/// check passes (see `coreArtifactFresh` / component manifest
+/// verification); otherwise it is recompiled in place.
+fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 1 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, run_usage);
+        return;
+    }
+
+    var input_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var force = false;
+    var target_arch: TargetArch = switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+
+    // After we encounter `--` or the first non-option positional, every
+    // remaining token is forwarded verbatim to `wamr run`. We split the
+    // input on `--` so users can disambiguate `wamrc run -O0 foo.wasm`
+    // (still our flag) from `wamrc run foo.wasm -- --listen ...`
+    // (`--listen` belongs to `wamr`).
+    var forward_args: std.ArrayList([]const u8) = .empty;
+    defer forward_args.deinit(allocator);
+
+    var i: usize = 0;
+    var saw_dashdash = false;
+    while (i < sub_args.len) : (i += 1) {
+        const a = sub_args[i];
+        if (saw_dashdash) {
+            try forward_args.append(allocator, a);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--")) {
+            saw_dashdash = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-o") and i + 1 < sub_args.len) {
+            i += 1;
+            output_path = sub_args[i];
+        } else if (std.mem.eql(u8, a, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, a, "--target") and i + 1 < sub_args.len) {
+            i += 1;
+            target_arch = parseTargetArchOrDie(sub_args[i]);
+        } else if (std.mem.startsWith(u8, a, "--target=")) {
+            target_arch = parseTargetArchOrDie(a["--target=".len..]);
+        } else if (a.len > 0 and a[0] == '-' and input_path == null) {
+            std.debug.print("error: unknown option '{s}' — try `wamrc run help`\n", .{a});
+            std.process.exit(1);
+        } else if (input_path == null) {
+            input_path = a;
+        } else {
+            // Implicit forward: positionals after the input wasm go to
+            // `wamr run` without requiring `--`.
+            try forward_args.append(allocator, a);
+        }
+    }
+
+    const in_path = input_path orelse {
+        std.debug.print("error: missing input wasm file — usage: wamrc run <input.wasm> [-- args...]\n", .{});
+        std.process.exit(1);
+    };
+
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+        wamr.utils.read_file.dieReadFileError(in_path, err);
+    };
+    defer allocator.free(wasm_data);
+
+    const is_comp = wamr.component_aot.isComponent(wasm_data) catch {
+        std.debug.print("error: '{s}' is not a valid wasm module or component\n", .{in_path});
+        std.process.exit(1);
+    };
+
+    // Resolve the artifact path. For components this is a manifest
+    // sidecar (`<stem>.cwasm.json`); for core wasm it's the `.cwasm`
+    // itself. Default lives next to the input.
+    var derived_output: ?[]u8 = null;
+    defer if (derived_output) |d| allocator.free(d);
+
+    const artifact_path: []const u8 = if (is_comp) blk: {
+        if (output_path) |p| break :blk p;
+        const d = try wamr.component_aot.defaultManifestPathFor(allocator, in_path);
+        derived_output = d;
+        break :blk d;
+    } else blk: {
+        if (output_path) |p| break :blk p;
+        const d = try deriveOutputPath(allocator, in_path);
+        derived_output = d;
+        break :blk d;
+    };
+
+    // Freshness check. On a hit we skip compilation entirely; on a miss
+    // (or `--force`) we (re)compile in place.
+    var did_compile = false;
+    if (is_comp) {
+        const fresh = !force and componentArtifactFresh(allocator, artifact_path, wasm_data);
+        if (!fresh) {
+            std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
+            var result = wamr.component_aot_compile.precompileComponent(allocator, wasm_data, artifact_path, .{
+                .target_arch = target_arch,
+            }) catch |err| {
+                std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            result.deinit();
+            did_compile = true;
+        }
+    } else {
+        const fresh = !force and coreArtifactFresh(allocator, artifact_path, wasm_data, target_arch, in_path);
+        if (!fresh) {
+            std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
+            const cwasm = wamr.component_aot_compile.compileCoreWasm(allocator, wasm_data, .{
+                .target_arch = target_arch,
+            }) catch |err| {
+                std.debug.print("error: compile failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer allocator.free(cwasm);
+            writeFileAtomic(io, artifact_path, cwasm) catch |err| {
+                std.debug.print("error: failed to write '{s}': {s}\n", .{ artifact_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            writeCoreSidecar(allocator, io, artifact_path, wasm_data, target_arch) catch |err| {
+                std.debug.print("warning: failed to write fingerprint sidecar for '{s}': {s}\n", .{ artifact_path, @errorName(err) });
+            };
+            did_compile = true;
+        }
+    }
+    if (!did_compile) {
+        std.debug.print("wamrc: reusing {s} (up to date)\n", .{artifact_path});
+    }
+
+    // Build the argv for `wamr run`. Layout:
+    //   wamr run <artifact> [forwarded args...]
+    const wamr_bin = findWamrBinary(allocator, io, init.environ_map) catch |err| {
+        std.debug.print("error: could not locate `wamr` binary: {s}\n" ++
+            "  Set WAMR_BIN, install `wamr` on PATH, or place it next to wamrc.\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer allocator.free(wamr_bin);
+
+    var child_argv: std.ArrayList([]const u8) = .empty;
+    defer child_argv.deinit(allocator);
+    try child_argv.append(allocator, wamr_bin);
+    try child_argv.append(allocator, "run");
+    // For components, `wamr run` takes the source `.wasm` and
+    // auto-discovers the sibling `<stem>.cwasm.json` (or honours
+    // `--precompiled-manifest` if the user picked a non-default
+    // location). For core wasm we hand it the freshly-written
+    // `.cwasm` directly.
+    if (is_comp) {
+        if (output_path != null) {
+            try child_argv.append(allocator, "--precompiled-manifest");
+            try child_argv.append(allocator, artifact_path);
+        }
+        try child_argv.append(allocator, in_path);
+    } else {
+        try child_argv.append(allocator, artifact_path);
+    }
+    for (forward_args.items) |fa| try child_argv.append(allocator, fa);
+
+    var child = std.process.spawn(io, .{
+        .argv = child_argv.items,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        std.debug.print("error: failed to spawn '{s}': {s}\n", .{ wamr_bin, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    const term = child.wait(io) catch |err| {
+        std.debug.print("error: failed waiting for `wamr` subprocess: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    switch (term) {
+        .exited => |code| std.process.exit(code),
+        .signal => |sig| {
+            std.debug.print("error: `wamr` was killed by signal {d}\n", .{@intFromEnum(sig)});
+            std.process.exit(1);
+        },
+        .stopped => |sig| {
+            std.debug.print("error: `wamr` was stopped by signal {d}\n", .{@intFromEnum(sig)});
+            std.process.exit(1);
+        },
+        .unknown => |code| {
+            std.debug.print("error: `wamr` terminated with unknown status {d}\n", .{code});
+            std.process.exit(1);
+        },
+    }
+}
+
+fn parseTargetArchOrDie(s: []const u8) TargetArch {
+    if (std.mem.eql(u8, s, "aarch64")) return .aarch64;
+    if (std.mem.eql(u8, s, "x86_64") or std.mem.eql(u8, s, "x86-64")) return .x86_64;
+    std.debug.print("error: unknown target '{s}' (supported: x86_64, aarch64)\n", .{s});
+    std.process.exit(1);
+}
+
+fn targetArchName(arch: TargetArch) []const u8 {
+    return switch (arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+    };
+}
+
+/// Fingerprint persisted next to a `<input>.cwasm` so `wamrc run` can
+/// decide whether to reuse the artifact. The cwasm header alone only
+/// stores `aot_magic + aot_version`; the sidecar adds the bits we
+/// otherwise can't recover (target arch, wamr build id, source hash).
+const CoreSidecar = struct {
+    aot_version: u32,
+    wamr_build_id: []const u8,
+    target_arch: []const u8,
+    wasm_sha256: []const u8,
+};
+
+fn coreSidecarPathAlloc(allocator: std.mem.Allocator, artifact_path: []const u8) ![]u8 {
+    return std.mem.concat(allocator, u8, &.{ artifact_path, ".id" });
+}
+
+fn writeCoreSidecar(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    artifact_path: []const u8,
+    wasm_data: []const u8,
+    target_arch: TargetArch,
+) !void {
+    var hex_hash: [64]u8 = undefined;
+    hexSha256Into(wasm_data, &hex_hash);
+
+    const sidecar: CoreSidecar = .{
+        .aot_version = emit_aot.aot_version,
+        .wamr_build_id = wamr.version.string,
+        .target_arch = targetArchName(target_arch),
+        .wasm_sha256 = &hex_hash,
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var sw: std.json.Stringify = .{ .writer = &aw.writer };
+    try sw.write(sidecar);
+
+    const sidecar_path = try coreSidecarPathAlloc(allocator, artifact_path);
+    defer allocator.free(sidecar_path);
+    try writeFileAtomic(io, sidecar_path, aw.written());
+}
+
+fn hexSha256Into(data: []const u8, out: *[64]u8) void {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |b, j| {
+        out[j * 2] = hex[b >> 4];
+        out[j * 2 + 1] = hex[b & 0x0f];
+    }
+}
+
+fn writeFileAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    // Write to `<path>.tmp` then rename for crash safety. Falls back
+    // to a plain overwrite if the rename fails (e.g. cross-device).
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.Io.Dir.cwd();
+    if (path.len + 4 > tmp_buf.len) {
+        // Path too long for the buffer — just overwrite directly.
+        try cwd.writeFile(io, .{ .sub_path = path, .data = bytes });
+        return;
+    }
+    @memcpy(tmp_buf[0..path.len], path);
+    @memcpy(tmp_buf[path.len..][0..4], ".tmp");
+    const tmp_path = tmp_buf[0 .. path.len + 4];
+    try cwd.writeFile(io, .{ .sub_path = tmp_path, .data = bytes });
+    cwd.rename(tmp_path, cwd, path, io) catch {
+        // Best-effort: overwrite directly, then clean up the tmp.
+        try cwd.writeFile(io, .{ .sub_path = path, .data = bytes });
+        cwd.deleteFile(io, tmp_path) catch {};
+    };
+}
+
+/// True iff `artifact_path` is a `.cwasm` whose magic + version match
+/// the current `emit_aot.aot_version` AND whose sidecar matches the
+/// current wamr build id, target arch, and source wasm hash.
+fn coreArtifactFresh(
+    allocator: std.mem.Allocator,
+    artifact_path: []const u8,
+    wasm_data: []const u8,
+    target_arch: TargetArch,
+    in_path: []const u8,
+) bool {
+    _ = in_path;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    // 1. Read enough of the cwasm to validate the header.
+    var header: [8]u8 = undefined;
+    const got = cwd.readFile(io, artifact_path, &header) catch return false;
+    if (got.len < 8) return false;
+    const magic = std.mem.readInt(u32, header[0..4], .little);
+    const version = std.mem.readInt(u32, header[4..8], .little);
+    if (magic != emit_aot.aot_magic) return false;
+    if (version != emit_aot.aot_version) return false;
+
+    // 2. Read + parse the sidecar.
+    const sidecar_path = coreSidecarPathAlloc(allocator, artifact_path) catch return false;
+    defer allocator.free(sidecar_path);
+    const json_bytes = cwd.readFileAlloc(io, sidecar_path, allocator, @enumFromInt(64 * 1024)) catch return false;
+    defer allocator.free(json_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(
+        CoreSidecar,
+        arena.allocator(),
+        json_bytes,
+        .{ .ignore_unknown_fields = true },
+    ) catch return false;
+
+    if (parsed.aot_version != emit_aot.aot_version) return false;
+    if (!std.mem.eql(u8, parsed.wamr_build_id, wamr.version.string)) return false;
+    if (!std.mem.eql(u8, parsed.target_arch, targetArchName(target_arch))) return false;
+
+    var hex_hash: [64]u8 = undefined;
+    hexSha256Into(wasm_data, &hex_hash);
+    if (!std.mem.eql(u8, parsed.wasm_sha256, &hex_hash)) return false;
+
+    return true;
+}
+
+/// True iff `manifest_path` holds a manifest that loads cleanly
+/// against the supplied component bytes. `loadManifest` already
+/// validates `wamr_build_id`, `component_sha256`, and every per-core
+/// `sha256`, so a successful load *is* the freshness signal.
+fn componentArtifactFresh(
+    allocator: std.mem.Allocator,
+    manifest_path: []const u8,
+    wasm_data: []const u8,
+) bool {
+    var loaded = wamr.component_aot.loadManifest(allocator, manifest_path, wasm_data) catch return false;
+    loaded.deinit();
+    return true;
+}
+
+/// Resolve a path to a sibling `wamr` binary. Resolution order:
+///   1. `WAMR_BIN` environment variable (caller's responsibility to
+///      point at a real file).
+///   2. `<dir-of-wamrc>/wamr` — covers `zig build` (both binaries land
+///      in `zig-out/bin/`) and most install layouts.
+///   3. PATH lookup of `wamr` (we let `process.spawn` do this implicitly
+///      by returning the bare name `"wamr"`).
+fn findWamrBinary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+) ![]u8 {
+    if (environ_map.get("WAMR_BIN")) |env_path| {
+        if (env_path.len > 0) return allocator.dupe(u8, env_path);
+    }
+
+    // Locate sibling next to wamrc.
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.process.executablePath(io, &exe_buf)) |n| {
+        const exe_path = exe_buf[0..n];
+        const dir = std.fs.path.dirname(exe_path) orelse "";
+        if (dir.len > 0) {
+            const candidate = try std.fs.path.join(allocator, &.{ dir, "wamr" });
+            // Don't access() here — let spawn surface a clearer error
+            // (e.g. "FileNotFound") with the candidate path baked in.
+            return candidate;
+        }
+    } else |_| {}
+
+    // Final fallback: let the OS look up "wamr" on PATH.
+    return allocator.dupe(u8, "wamr");
+}
+
 
 const top_usage =
     \\wamrc - WebAssembly AOT Compiler
@@ -714,6 +1099,7 @@ const top_usage =
     \\Subcommands:
     \\  compile             Compile a .wasm module to a .cwasm AOT binary
     \\  compile-component   Precompile every embedded core of a component
+    \\  run                 Compile (if needed) and execute via the wamr runtime
     \\  version             Print version and exit
     \\  help                Print this help
     \\
@@ -777,19 +1163,54 @@ const compile_usage =
 ;
 
 const compile_component_usage =
-    \\Usage: wamrc compile-component [options] <component.wasm> [-o <out_dir>]
+    \\Usage: wamrc compile-component [options] <component.wasm> [-o <manifest.json>]
     \\
-    \\Precompile every embedded core module of a component into a directory
-    \\containing one `module<N>.cwasm` per core plus a `manifest.json`
-    \\(versioned, with build-id and component-hash, rejected on mismatch).
-    \\If `-o` is omitted, the directory is derived from the input path with
-    \\suffix `.cwasm.d`.
+    \\Precompile every embedded core module of a component, writing each
+    \\as `<stem>.<N>.cwasm` next to the source `.wasm` and a versioned
+    \\`<stem>.cwasm.json` manifest sidecar (with build-id and component
+    \\sha256; rejected on mismatch). If `-o` is omitted, the manifest
+    \\path is derived from the input by stripping `.wasm` and appending
+    \\`.cwasm.json`; per-core artifacts land in the manifest's directory.
     \\
     \\Options:
-    \\  -o <dir>                      Output directory (default: <input>.cwasm.d)
+    \\  -o <manifest.json>            Manifest path (default: <input>.cwasm.json)
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
     \\
 ;
+
+const run_usage =
+    \\Usage: wamrc run [options] <input.wasm> [-- <wamr args...>]
+    \\
+    \\Compile <input.wasm> if the existing artifact is missing or stale,
+    \\then spawn `wamr run <artifact>` with stdin/stdout/stderr inherited
+    \\and propagate its exit code. By default the artifact is written
+    \\next to the source:
+    \\
+    \\  core wasm  : foo.wasm  ->  foo.cwasm          (+ foo.cwasm.id sidecar)
+    \\  component  : foo.wasm  ->  foo.cwasm.json     (+ foo.<N>.cwasm per core)
+    \\
+    \\The artifact is reused only when the target-format check passes:
+    \\
+    \\  * core     : cwasm magic + aot_version match, plus the sidecar
+    \\               records the current wamr build id, target arch, and
+    \\               the source's sha256.
+    \\  * component: `loadManifest` accepts the manifest sidecar (it
+    \\               already checks wamr_build_id, the component sha256,
+    \\               and every per-core sha256).
+    \\
+    \\Anything after `--` (or any positional after the input) is forwarded
+    \\verbatim to `wamr run`. The `wamr` binary is located via
+    \\$WAMR_BIN, then a sibling of wamrc, then PATH.
+    \\
+    \\Options:
+    \\  -o <file>                     Override the artifact path (a `.cwasm`
+    \\                                 for core wasm, a `.cwasm.json` manifest
+    \\                                 for components)
+    \\  --force                       Recompile even if the artifact is fresh
+    \\  --target=<x86_64|aarch64>     Target architecture (default: host)
+    \\
+;
+
 
 const version_usage =
     \\Usage: wamrc version
