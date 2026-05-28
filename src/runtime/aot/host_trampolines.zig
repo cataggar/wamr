@@ -9,13 +9,15 @@ const platform = @import("../../platform/platform.zig");
 const core_types = @import("../common/types.zig");
 
 const page_size = std.heap.page_size_min;
-// Stubs forward up to 9 lowered C-ABI args (a0..a8) into `genericDispatcher`,
-// so the dispatcher kinds can carry up to 8 wasm-level params (after dropping
-// the importer's vmctx for the AOT-codegen variants). See #689 — the older
-// 6-arg shape couldn't lower WASIp2 filesystem methods like `link-at` (7
-// wasm params) and silently fell back to a trap stub.
-const x86_64_stub_bytes: usize = 61;
-const aarch64_stub_bytes: usize = 76;
+// Stubs forward up to 10 lowered C-ABI args (a0..a9) into `genericDispatcher`,
+// so the dispatcher kinds can carry up to 9 wasm-level params (after dropping
+// the importer's vmctx for the AOT-codegen variants). See #700 — widened from
+// 9 (a0..a8) so `wasi_snapshot_preview1.path_open` (9 wasm params) stops
+// trap-stubbing on the WASIp1→WASIp2 adapter path. Previously widened from
+// 6 → 9 in #689 to lower WASIp2 filesystem methods like `link-at` (7 wasm
+// params).
+const x86_64_stub_bytes: usize = 63;
+const aarch64_stub_bytes: usize = 84;
 
 pub const STUB_BYTES: usize = switch (builtin.cpu.arch) {
     .x86_64 => x86_64_stub_bytes,
@@ -49,6 +51,7 @@ extern fn wamrAotDispatchComponentTrampoline(
     a6: u64,
     a7: u64,
     a8: u64,
+    a9: u64,
 ) callconv(.c) DispatchResult;
 
 /// AOT-codegen-flavoured wrapper around `wamrAotDispatchComponentTrampoline`
@@ -68,6 +71,7 @@ extern fn wamrAotDispatchComponentTrampolineAot(
     a6: u64,
     a7: u64,
     a8: u64,
+    a9: u64,
 ) callconv(.c) DispatchResult;
 
 /// Cross-instance core-to-core fn-import dispatcher (#662). Implemented in
@@ -86,6 +90,7 @@ extern fn wamrAotDispatchCrossInstance(
     a6: u64,
     a7: u64,
     a8: u64,
+    a9: u64,
 ) callconv(.c) DispatchResult;
 
 /// Trap-on-call stub for non-WASI function imports that have no AOT-side
@@ -104,6 +109,7 @@ extern fn wamrAotDispatchTrapStub(
     a6: u64,
     a7: u64,
     a8: u64,
+    a9: u64,
 ) callconv(.c) DispatchResult;
 
 pub const DispatchKind = enum(u8) {
@@ -131,17 +137,17 @@ pub fn setActivePool(pool: ?*TrampolinePool) void {
     g_active_pool = pool;
 }
 
-pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64) callconv(.c) u64 {
+pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) callconv(.c) u64 {
     const pool = g_active_pool orelse return 0;
     if (slot >= pool.next_slot) return 0;
 
     const entry = pool.slots[slot];
     const ctx = entry.ctx orelse return 0;
     const dispatched = switch (entry.dispatch_kind) {
-        .canon_lower => wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8),
-        .canon_lower_aot => wamrAotDispatchComponentTrampolineAot(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8),
-        .cross_instance => wamrAotDispatchCrossInstance(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8),
-        .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8),
+        .canon_lower => wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+        .canon_lower_aot => wamrAotDispatchComponentTrampolineAot(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+        .cross_instance => wamrAotDispatchCrossInstance(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+        .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
     };
     if (dispatched.status != 0) return 0;
     return dispatched.value;
@@ -331,34 +337,31 @@ fn dispatcherAddr() usize {
 fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     std.debug.assert(bytes.len >= STUB_BYTES);
 
-    // Caller passes up to 9 args (a0..a8): a0..a5 in regs (rdi, rsi, rdx,
-    // rcx, r8, r9), a6/a7/a8 on stack at [rsp+8/+16/+24]. We inject `slot`
-    // as the new first arg and forward a0..a8, so the dispatcher receives
-    // 10 args (slot + a0..a8): rdi=slot, rsi/rdx/rcx/r8/r9=a0..a4, and
-    // a5..a8 on stack at [rsp+8..+32] after `call rax` pushes the return
-    // address. We pre-push caller_a8/_a7/_a6 (read out of the caller's
+    // Caller passes up to 10 args (a0..a9): a0..a5 in regs (rdi, rsi, rdx,
+    // rcx, r8, r9), a6/a7/a8/a9 on stack at [rsp+8/+16/+24/+32]. We inject
+    // `slot` as the new first arg and forward a0..a9, so the dispatcher
+    // receives 11 args (slot + a0..a9): rdi=slot, rsi/rdx/rcx/r8/r9=a0..a4,
+    // and a5..a9 on stack at [rsp+8..+40] after `call rax` pushes the return
+    // address. We pre-push caller_a9/_a8/_a7/_a6 (read out of the caller's
     // outgoing stack-arg region) and r9 (caller_a5) to land them at the
     // right offsets.
     //
-    // SysV alignment (#691): at stub entry rsp%16==8 (caller's pre-call
-    // rsp was 16-aligned, `call` pushed 8). The 4 pushes below shift rsp
-    // by -32 (no net change mod 16), and `call rax` shifts by another -8
-    // → dispatcher would enter with rsp%16==0, violating SysV's
-    // `(rsp+8)%16==0` invariant. The first 16-aligned op in the
-    // dispatcher (e.g. SmpAllocator.alloc via vtable) then faults with
-    // a hardware #GP. Fix: `sub rsp, 8` before the 4 reads/pushes, then
-    // `add rsp, 40` in the epilogue. Read displacements also shift +8
-    // (0x18 → 0x20) because the caller_a6/a7/a8 stack-arg region now
-    // sits 8 bytes higher relative to the adjusted rsp.
+    // SysV alignment (#691, #700): at stub entry rsp%16==8 (caller's pre-call
+    // rsp was 16-aligned, `call` pushed 8). The 5 pushes below shift rsp
+    // by -40 → rsp%16==0 before `call rax`, which pushes another 8 → the
+    // dispatcher enters with rsp%16==8, satisfying SysV's
+    // `(rsp+8)%16==0` invariant. No extra align pad needed — the previous
+    // 4-push (a6..a8) layout in #689 did need a `sub rsp, 8` pad; widening
+    // to 5 pushes (a6..a9) in #700 naturally re-aligns.
     //
-    // Prologue-align (4 bytes): pad rsp for SysV.
-    const prologue_align = [_]u8{
-        0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
-    };
-    // Prologue (20 bytes): read caller stack args into our frame, then
-    // push r9.
+    // Prologue (26 bytes): read caller stack args into our frame, then
+    // push r9. Reads always come from [rsp+0x20] because each push shifts
+    // the remaining caller args up by 8 (caller_a9 was at [rsp+32]; after
+    // pushing it, caller_a8 is at [rsp+32]; and so on).
     const prologue_stack = [_]u8{
-        0x48, 0x8B, 0x44, 0x24, 0x20, // mov rax, [rsp+32]  (caller_a8)
+        0x48, 0x8B, 0x44, 0x24, 0x20, // mov rax, [rsp+32]  (caller_a9)
+        0x50, // push rax
+        0x48, 0x8B, 0x44, 0x24, 0x20, // mov rax, [rsp+32]  (caller_a8, shifted)
         0x50, // push rax
         0x48, 0x8B, 0x44, 0x24, 0x20, // mov rax, [rsp+32]  (caller_a7, shifted)
         0x50, // push rax
@@ -377,8 +380,7 @@ fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
         0xBF, // mov edi, imm32 (slot)
     };
     const movabs = [_]u8{ 0x48, 0xB8 };
-    // Epilogue (7 bytes): call dispatcher, drop our 32-byte spill + 8-byte
-    // alignment pad, return.
+    // Epilogue (7 bytes): call dispatcher, drop our 40-byte spill, return.
     const epilogue = [_]u8{
         0xFF, 0xD0, // call rax
         0x48, 0x83, 0xC4, 0x28, // add rsp, 40
@@ -386,8 +388,6 @@ fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     };
 
     var cursor: usize = 0;
-    @memcpy(bytes[cursor .. cursor + prologue_align.len], &prologue_align);
-    cursor += prologue_align.len;
     @memcpy(bytes[cursor .. cursor + prologue_stack.len], &prologue_stack);
     cursor += prologue_stack.len;
     @memcpy(bytes[cursor .. cursor + shift.len], &shift);
@@ -407,9 +407,10 @@ fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
 fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     std.debug.assert(bytes.len >= STUB_BYTES);
 
-    // AAPCS64: a0..a7 in x0..x7, a8 on stack at [sp+0]. We inject `slot`
-    // as x0 and forward a0..a8 to the dispatcher, so dispatcher sees
-    // (slot, a0..a8) = 10 args: x0=slot, x1..x7=a0..a6, [sp+0]=a7, [sp+8]=a8.
+    // AAPCS64: a0..a7 in x0..x7, a8 on stack at [sp+0], a9 at [sp+8]. We
+    // inject `slot` as x0 and forward a0..a9 to the dispatcher, so
+    // dispatcher sees (slot, a0..a9) = 11 args: x0=slot, x1..x7=a0..a6,
+    // [sp+0]=a7, [sp+8]=a8, [sp+16]=a9.
     //
     // Unlike the 6-arg version we can no longer tail-call: we own a stack
     // frame for the dispatcher's stack args + a saved LR. So we use
@@ -418,10 +419,16 @@ fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
 
     // str x30, [sp, #-16]!  -- save LR, sp -= 16. Keeps sp 16-byte aligned.
     emitAarch64(bytes, &cursor, 0xF81F0FFE);
-    // ldr x9, [sp, #16]     -- x9 = caller_a8 (was at [sp+0] pre-push).
+    // ldr x9,  [sp, #16]    -- x9  = caller_a8 (was at [sp+0] pre-push).
     emitAarch64(bytes, &cursor, 0xF9400BE9);
-    // stp x7, x9, [sp, #-16]!  -- push caller_a7 + caller_a8.
-    // After this: [sp+0]=a7, [sp+8]=a8 (dispatcher's stack args).
+    // ldr x10, [sp, #24]    -- x10 = caller_a9 (was at [sp+8] pre-push).
+    emitAarch64(bytes, &cursor, 0xF9400FEA);
+    // str x10, [sp, #-16]!  -- push caller_a9; sp -= 16, [sp+0]=a9.
+    // (The upper 8 bytes are padding; the dispatcher won't read them.)
+    emitAarch64(bytes, &cursor, 0xF81F0FEA);
+    // stp x7, x9, [sp, #-16]!  -- push caller_a7 + caller_a8; sp -= 16.
+    // After this: [sp+0]=a7, [sp+8]=a8, [sp+16]=a9 (the dispatcher's stack
+    // args).
     emitAarch64(bytes, &cursor, 0xA9BF27E7);
 
     // Shift x0..x7 right by one register (x7=x6, x6=x5, ..., x1=x0).
@@ -449,8 +456,8 @@ fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
 
     // blr x16                 -- call dispatcher.
     emitAarch64(bytes, &cursor, 0xD63F0200);
-    // add sp, sp, #16         -- pop the two pushed stack args.
-    emitAarch64(bytes, &cursor, 0x910043FF);
+    // add sp, sp, #32         -- pop the two 16-byte pushes (a7+a8 + a9+pad).
+    emitAarch64(bytes, &cursor, 0x910083FF);
     // ldr x30, [sp], #16      -- restore LR with post-increment.
     emitAarch64(bytes, &cursor, 0xF84107FE);
     // ret                     -- branch to LR.
@@ -486,12 +493,12 @@ test "#648 phase 2: x86_64 trampoline encoder emits slot and dispatcher immediat
 
     encodeX8664Stub(&bytes, 0x11223344, 0x1122334455667788);
 
-    // Stub layout (#691): sub rsp, 8 (SysV align pad); pre-spill
-    // caller_a8/_a7/_a6 from [rsp+32], then push r9 (caller_a5); shift
-    // rdi..r9; mov edi, slot; movabs rax, dispatcher; call rax;
-    // add rsp, 40; ret.
+    // Stub layout (#700): pre-spill caller_a9/_a8/_a7/_a6 from [rsp+32],
+    // then push r9 (caller_a5); shift rdi..r9; mov edi, slot;
+    // movabs rax, dispatcher; call rax; add rsp, 40; ret. The 5 pushes
+    // self-align SysV (8 - 40 ≡ 0 mod 16) so no `sub rsp, 8` pad is needed.
     const expected = [_]u8{
-        0x48, 0x83, 0xEC, 0x08,
+        0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
         0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
         0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
         0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
@@ -522,12 +529,15 @@ test "#648 phase 2: aarch64 trampoline encoder emits slot and dispatcher immedia
 
     encodeAarch64Stub(&bytes, 0x1234, 0x1122334455667788);
 
-    // Stub layout (#689): save LR, read caller_a8, push x7+caller_a8;
-    // shift x0..x7; movz x0,slot; movz/movk x16,dispatcher; blr x16; pop
-    // pushed args; restore LR; ret.
+    // Stub layout (#700): save LR, read caller_a8/a9 into x9/x10, push
+    // caller_a9 (with pad), push x7+caller_a8; shift x0..x7;
+    // movz x0,slot; movz/movk x16,dispatcher; blr x16; pop the two 16-byte
+    // pushes (add sp, sp, #32); restore LR; ret.
     const expected = [_]u32{
         0xF81F0FFE, // str x30, [sp, #-16]!
-        0xF9400BE9, // ldr x9, [sp, #16]
+        0xF9400BE9, // ldr x9,  [sp, #16]
+        0xF9400FEA, // ldr x10, [sp, #24]
+        0xF81F0FEA, // str x10, [sp, #-16]!
         0xA9BF27E7, // stp x7, x9, [sp, #-16]!
         0xAA0603E7, // mov x7, x6
         0xAA0503E6, // mov x6, x5
@@ -542,7 +552,7 @@ test "#648 phase 2: aarch64 trampoline encoder emits slot and dispatcher immedia
         0xF2C66890, // movk x16, #0x3344, lsl 32
         0xF2E22450, // movk x16, #0x1122, lsl 48
         0xD63F0200, // blr x16
-        0x910043FF, // add sp, sp, #16
+        0x910083FF, // add sp, sp, #32
         0xF84107FE, // ldr x30, [sp], #16
         0xD65F03C0, // ret
     };

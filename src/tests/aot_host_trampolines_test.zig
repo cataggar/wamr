@@ -112,7 +112,7 @@ test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
     try std.testing.expectEqual(@as(u32, 4), pool.next_slot);
     try std.testing.expectEqual(@as(u32, 22), pool.slots[1].canon_lower_idx);
     try std.testing.expectEqual(@intFromPtr(&fake_component_2), @intFromPtr(pool.slots[2].component_inst));
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(3, 1, 2, 3, 4, 5, 6, 7, 8, 9));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
 
     host_trampolines.setActivePool(null);
     pool.deinit(allocator);
@@ -224,7 +224,7 @@ test "#648 phase 3: genericDispatcher handles (i32) -> ()" {
     const lowered_results = [_]core_types.ValType{};
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
 
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 41, 0, 0, 0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 41, 0, 0, 0, 0, 0, 0, 0, 0, 0));
     try std.testing.expect(state.called);
     try std.testing.expectEqual(@as(i32, 41), state.arg);
 }
@@ -258,7 +258,7 @@ test "#648 phase 3: genericDispatcher handles () -> i32" {
     const lowered_results = [_]core_types.ValType{.i32};
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
 
-    try std.testing.expectEqual(@as(u64, 77), host_trampolines.genericDispatcher(0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 77), host_trampolines.genericDispatcher(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 }
 
 test "#648 phase 3: genericDispatcher handles (i32) -> i32" {
@@ -289,7 +289,7 @@ test "#648 phase 3: genericDispatcher handles (i32) -> i32" {
     const lowered_results = [_]core_types.ValType{.i32};
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
 
-    try std.testing.expectEqual(@as(u64, 17), host_trampolines.genericDispatcher(0, 12, 0, 0, 0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 17), host_trampolines.genericDispatcher(0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 }
 
 test "#648 phase 3: genericDispatcher handles (i32 i32) -> () retptr" {
@@ -320,7 +320,7 @@ test "#648 phase 3: genericDispatcher handles (i32 i32) -> () retptr" {
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
 
     const retptr: u32 = 24;
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 9, retptr, 0, 0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 9, retptr, 0, 0, 0, 0, 0, 0, 0, 0));
     const mem = inst.resolveTopLevelMemory(0).?.data;
     try expectStoredPtrLen(mem, retptr, 0x55, 7);
 }
@@ -355,7 +355,7 @@ test "#648 phase 3: genericDispatcher handles (i32 i32 i32 i32) -> ()" {
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
 
     const retptr: u32 = 40;
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 3, 0x40, 5, retptr, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 3, 0x40, 5, retptr, 0, 0, 0, 0, 0, 0));
     const mem = inst.resolveTopLevelMemory(0).?.data;
     try expectStoredPtrLen(mem, retptr, 0x80, 5);
 }
@@ -389,7 +389,7 @@ test "#648 phase 3: genericDispatcher handles (i32 i64 i32) -> ()" {
     _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &.{}, .has_retptr = true });
 
     const retptr: u32 = 56;
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 4, 0x1_0000_0002, retptr, 0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(0, 4, 0x1_0000_0002, retptr, 0, 0, 0, 0, 0, 0, 0));
     const mem = inst.resolveTopLevelMemory(0).?.data;
     try expectStoredPtrLen(mem, retptr, 0x90, 2);
 }

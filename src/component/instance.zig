@@ -3197,11 +3197,12 @@ fn installCrossInstanceThunk(
 
     // Only register-fit signatures land in this fast path. Anything else
     // returns an error → the caller installs a trap stub instead. The cap
-    // of 8 covers every WASIp2 method emitted by the public adapters
-    // (`link-at` = 7 wasm params is the widest seen in real binaries);
-    // widened from 5 in #689 so the WASIp1→WASIp2 adapter's filesystem
-    // methods stop trap-stubbing.
-    if (ft.params.len > 8) return error.SignatureTooWide;
+    // of 9 covers `wasi_snapshot_preview1.path_open` (9 wasm params, the
+    // widest WASIp1 sig); widened from 8 in #700 — pre-fix #689 had
+    // widened from 5 to 8 to fit WASIp2 filesystem methods like `link-at`
+    // (7 wasm params), but `path_open` only started routing through this
+    // path with #699's WASI-guard reorder.
+    if (ft.params.len > 9) return error.SignatureTooWide;
     if (ft.results.len > 1) return error.MultipleResultsUnsupported;
     for (ft.params) |p| switch (p) {
         .i32, .i64, .f32, .f64 => {},
