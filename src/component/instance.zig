@@ -270,6 +270,18 @@ pub const ComponentInstance = struct {
     /// bound by `linkImports` first. Drained by `linkImports` in core-instance
     /// order; see `runDeferredCoreStarts` (issue #308).
     pending_core_starts: std.ArrayListUnmanaged(*core_types.ModuleInstance) = .empty,
+    /// Pending AOT-instantiated core-module start functions whose execution
+    /// was deferred during `instantiate` so cross-instance imports (resolved
+    /// against sibling cores) are wired before the start runs. Drained by
+    /// `linkImports` after `pending_core_starts`. Mirrors #308 for the AOT
+    /// path. Without this, AOT modules with start sections — e.g. the
+    /// wasi-libc adapter's `path_unlink_file` (`State::new` cabi_realloc) —
+    /// never initialize `__stack_pointer` / `allocation_state`, and any
+    /// subsequent guest call into the adapter traps on State magic mismatch.
+    pending_aot_starts: std.ArrayListUnmanaged(struct {
+        inst: *aot_runtime.AotInstance,
+        start_idx: u32,
+    }) = .empty,
     /// Whether the start function has been executed.
     started: bool = false,
     /// Caller-supplied instantiation options (e.g. precompiled-core
@@ -1228,6 +1240,7 @@ pub const ComponentInstance = struct {
         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
         const interp = @import("../runtime/interpreter/interp.zig");
         defer self.pending_core_starts.clearRetainingCapacity();
+        defer self.pending_aot_starts.clearRetainingCapacity();
 
         for (self.pending_core_starts.items) |mi| {
             const start_idx = mi.module.start_function orelse continue;
@@ -1240,6 +1253,16 @@ pub const ComponentInstance = struct {
                         .{ ht.core_func_idx, ht.import_module_name, ht.import_field_name, @tagName(ht.stage), ht.err_name },
                     );
                 }
+                return inst_mod.InstantiationError.StartFunctionFailed;
+            };
+        }
+
+        for (self.pending_aot_starts.items) |entry| {
+            aot_runtime.callFunc(entry.inst, entry.start_idx, void) catch |err| {
+                std.debug.print(
+                    "[component init trap] aot start_func={d} error={s}\n",
+                    .{ entry.start_idx, @errorName(err) },
+                );
                 return inst_mod.InstantiationError.StartFunctionFailed;
             };
         }
@@ -1356,6 +1379,7 @@ pub const ComponentInstance = struct {
             self.allocator.destroy(pool);
         }
         self.pending_core_starts.deinit(self.allocator);
+        self.pending_aot_starts.deinit(self.allocator);
         if (self.core_instances.len > 0) {
             const inst_mod = @import("../runtime/interpreter/instance.zig");
             for (self.core_instances) |entry| {
@@ -1738,6 +1762,19 @@ pub fn instantiateWithOptions(
                                 break :aot_blk;
                             };
                             cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
+                            // Defer the AOT core module's `(start ...)` until
+                            // `runDeferredCoreStarts`, after all sibling cores
+                            // are wired and trampolines are bound (#308 AOT
+                            // analogue).
+                            if (aot_module_ptr.start_function) |start_idx| {
+                                inst.pending_aot_starts.append(allocator, .{
+                                    .inst = aot_inst_ptr,
+                                    .start_idx = start_idx,
+                                }) catch {
+                                    if (aot_only) return error.AotImportUnresolvable;
+                                    break :aot_blk;
+                                };
+                            }
                             // AOT cross-instance overrides were resolved
                             // above before instantiation; unresolved imports
                             // either fall back to interp or use a trap stub.
