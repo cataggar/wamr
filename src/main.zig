@@ -102,13 +102,12 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // rewrites synchronously after every mutation. Null ⇒ in-memory
     // only (default, behaviour-compatible with PR #601).
     var keyvalue_store_path: ?[]const u8 = null;
-    // `--precompiled-dir=<path>` (#642): explicit path to a
-    // `wamrc compile-component` output bundle (manifest.json + per-core
-    // .cwasm artifacts). When unset, `runRun` probes for a sibling
-    // `<input>.cwasm.d/manifest.json` next to the component file and
-    // uses it on a best-effort basis (mismatch → warning + interpreter
-    // fallback). When set, the bundle is mandatory: any error is fatal.
-    var precompiled_dir: ?[]const u8 = null;
+    // `--precompiled-manifest=<path>` (#642, #680): explicit path to a
+    // `wamrc compile-component` manifest sidecar (`<stem>.cwasm.json`).
+    // When unset, `runRun` probes for a sibling `<input>.cwasm.json`
+    // next to the component file. Missing/stale bundle is fatal — the
+    // `wamr` CLI no longer embeds the AOT compiler.
+    var precompiled_manifest: ?[]const u8 = null;
     var listen_address: ?std.Io.net.IpAddress = null;
     // `--tls-cert=<path>` + `--tls-key=<path>` (or the combined
     // `--tls-pem=<path>`) (#583 follow-up to #595): when both cert
@@ -306,31 +305,29 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     return 2;
                 }
                 keyvalue_store_path = spec;
-            } else if (std.mem.eql(u8, arg, "--precompiled-dir") or std.mem.startsWith(u8, arg, "--precompiled-dir=")) {
-                // `--precompiled-dir <path>` (#642): explicit path to a
-                // `wamrc compile-component` output directory containing
-                // `manifest.json` + `module<N>.cwasm`. Cores in the bundle
-                // are loaded as AOT; cores missing from the manifest fall
-                // back to the interpreter. A mismatched / stale manifest
-                // is a hard error (vs. the silent fallback used by the
-                // sibling auto-detect path below).
-                if (precompiled_dir != null) {
-                    std.debug.print("error: --precompiled-dir specified more than once\n", .{});
+            } else if (std.mem.eql(u8, arg, "--precompiled-manifest") or std.mem.startsWith(u8, arg, "--precompiled-manifest=")) {
+                // `--precompiled-manifest <path>` (#642, #680): explicit
+                // path to a `wamrc compile-component` manifest sidecar
+                // (`<stem>.cwasm.json`). Per-core `.cwasm` files
+                // resolve relative to the manifest's directory. A
+                // mismatched / stale manifest is a hard error.
+                if (precompiled_manifest != null) {
+                    std.debug.print("error: --precompiled-manifest specified more than once\n", .{});
                     return 2;
                 }
-                const spec = if (std.mem.eql(u8, arg, "--precompiled-dir")) blk: {
+                const spec = if (std.mem.eql(u8, arg, "--precompiled-manifest")) blk: {
                     i += 1;
                     if (i >= run_args.len) {
-                        std.debug.print("error: --precompiled-dir requires a path to a wamrc compile-component output dir\n", .{});
+                        std.debug.print("error: --precompiled-manifest requires a path to a wamrc compile-component manifest\n", .{});
                         return 2;
                     }
                     break :blk run_args[i];
-                } else arg["--precompiled-dir=".len..];
+                } else arg["--precompiled-manifest=".len..];
                 if (spec.len == 0) {
-                    std.debug.print("error: --precompiled-dir path is empty\n", .{});
+                    std.debug.print("error: --precompiled-manifest path is empty\n", .{});
                     return 2;
                 }
-                precompiled_dir = spec;
+                precompiled_manifest = spec;
             } else if (std.mem.eql(u8, arg, "--trace-aot-wasi")) {
                 wamr.aot_host_bridge.trace_enabled = true;
             } else if (std.mem.eql(u8, arg, "--")) {
@@ -440,154 +437,80 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 std.debug.print("Error: --config-store '{s}': {}\n", .{ config_store_path orelse "", err });
                 return 2;
             };
-            // #642 / #644: resolve the AOT precompiled-cores bundle. The
-            // `wamr` CLI is AOT-only — every component core must be
+            // #644 / #680: resolve the AOT precompiled-cores manifest.
+            // The `wamr` CLI is AOT-only and the runtime no longer
+            // embeds the compiler — every component core must be
             // available as a precompiled `.cwasm`, or instantiation
-            // fails hard with `error.AotImportUnresolvable` (the
-            // interp fallback is disabled at the CLI surface; library
-            // callers still get the legacy silent demotion by leaving
+            // fails hard with `error.AotImportUnresolvable` (the interp
+            // fallback is disabled at the CLI surface; library callers
+            // still get the legacy silent demotion by leaving
             // `Options.aot_only` unset).
             //
-            //  * `--precompiled-dir <path>` (explicit): any error
+            //  * `--precompiled-manifest <path>` (explicit): any error
             //    opening / validating the manifest is fatal so the user
             //    knows the AOT path isn't being taken.
-            //  * sibling `<input>.cwasm.d/manifest.json` (auto-detect):
-            //    used when present and valid; mismatch / stale → one
-            //    `warning: ...` line on stderr and we fall through to
-            //    the in-memory auto-precompile path below.
-            //  * neither found → AOT-compile each core to memory on
-            //    the fly. Single-run cost; users who care about
-            //    cold-start should `wamrc compile-component` once and
-            //    pass `--precompiled-dir` or use a sibling
-            //    `<input>.cwasm.d`.
+            //  * sibling `<input>.cwasm.json` (auto-detect):
+            //    used when present and valid.
+            //  * neither found → hard error. The `wamr` binary no
+            //    longer embeds the AOT compiler (issue #680); users
+            //    must run `wamrc compile-component <component.wasm>`
+            //    or `wamrc run <component.wasm>` first.
             //
             // The `LoadedManifest`'s lifetime must outlive
             // `runComponent` / `runHttpComponent` because the mmapped
             // `.cwasm` buffers it owns are borrowed by the
             // `PrecompiledCore` slice handed to the instance loader.
-            // The in-memory auto-precompile path owns its `.cwasm`
-            // slices on `allocator`; the defer below frees them.
             var loaded_manifest: ?wamr.component_aot.LoadedManifest = null;
             defer if (loaded_manifest) |*lm| lm.deinit();
 
-            var auto_cores: std.ArrayListUnmanaged(wamr.component_core_backend.PrecompiledCore) = .empty;
-            defer {
-                for (auto_cores.items) |pc| allocator.free(pc.cwasm_bytes);
-                auto_cores.deinit(allocator);
-            }
-
-            if (precompiled_dir) |dir| {
-                loaded_manifest = wamr.component_aot.loadManifest(allocator, dir, wasm_data) catch |err| {
-                    std.debug.print("Error: --precompiled-dir '{s}': {s}\n", .{ dir, loadManifestErrorMessage(err) });
+            if (precompiled_manifest) |mp| {
+                loaded_manifest = wamr.component_aot.loadManifest(allocator, mp, wasm_data) catch |err| {
+                    std.debug.print("Error: --precompiled-manifest '{s}': {s}\n", .{ mp, loadManifestErrorMessage(err) });
                     return 2;
                 };
                 const n = loaded_manifest.?.precompiledCores().len;
-                std.debug.print("wamr: loaded AOT bundle from {s} ({d} core{s} precompiled)\n", .{ dir, n, if (n == 1) @as([]const u8, "") else "s" });
+                std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ mp, n, if (n == 1) @as([]const u8, "") else "s" });
             } else {
-                // Auto-probe `<input>.cwasm.d/manifest.json`. Don't
-                // fail the run if the bundle is absent / stale — fall
-                // through to the in-memory auto-precompile path
-                // below.
-                const sibling = wamr.component_aot.defaultPrecompiledDirFor(allocator, path) catch return 1;
+                // Auto-probe `<input>.cwasm.json`. Without an embedded
+                // compiler the absence of a sibling manifest is fatal —
+                // direct the user at `wamrc`.
+                const sibling = wamr.component_aot.defaultManifestPathFor(allocator, path) catch return 1;
                 defer allocator.free(sibling);
-                const probe = std.fs.path.join(allocator, &.{ sibling, "manifest.json" }) catch return 1;
-                defer allocator.free(probe);
                 const io_probe = init.io;
                 const cwd_probe = std.Io.Dir.cwd();
                 const exists = blk: {
-                    var f = cwd_probe.openFile(io_probe, probe, .{}) catch break :blk false;
+                    var f = cwd_probe.openFile(io_probe, sibling, .{}) catch break :blk false;
                     f.close(io_probe);
                     break :blk true;
                 };
-                if (exists) {
-                    if (wamr.component_aot.loadManifest(allocator, sibling, wasm_data)) |lm| {
-                        loaded_manifest = lm;
-                        const n = lm.precompiledCores().len;
-                        std.debug.print("wamr: loaded AOT bundle from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
-                    } else |err| {
-                        std.debug.print("warning: ignoring AOT bundle at {s}: {s}\n", .{ sibling, loadManifestErrorMessage(err) });
-                    }
-                }
-
-                // #644: no on-disk bundle → AOT-compile every core to
-                // memory now. The cwasm slices live on `allocator`
-                // (freed by the outer defer) so they outlive both the
-                // parser arena and the `runComponent` call.
-                if (loaded_manifest == null) {
-                    var load_arena = std.heap.ArenaAllocator.init(allocator);
-                    defer load_arena.deinit();
-                    const parsed = wamr.component_loader.load(wasm_data, load_arena.allocator()) catch |err| {
-                        std.debug.print("Error: failed to parse component for auto-precompile: {s}\n", .{@errorName(err)});
-                        return 1;
-                    };
-                    // Recursively collect every core module from the
-                    // top level *and* every nested sub-component. The
-                    // top level of a `wabt component compose -d`
-                    // composed component has zero cores of its own —
-                    // the actual command + adder cores live inside
-                    // its two nested sub-components (#662 phase D).
-                    // Each entry pairs the core's raw module bytes
-                    // (a stable cross-parse identity) with its
-                    // *local* `module_idx` within the component that
-                    // contains it; `Options.findPrecompiled` matches
-                    // on the bytes-slice so sub-component
-                    // instantiations don't collide on shared local
-                    // indices.
-                    const CoreRef = struct {
-                        data: []const u8,
-                        local_idx: u32,
-                    };
-                    var all_cores: std.ArrayListUnmanaged(CoreRef) = .empty;
-                    defer all_cores.deinit(load_arena.allocator());
-                    const Walker = struct {
-                        fn walk(
-                            comp: *const wamr.component_types.Component,
-                            list: *std.ArrayListUnmanaged(CoreRef),
-                            arena: std.mem.Allocator,
-                        ) !void {
-                            for (comp.core_modules, 0..) |cm, mi| {
-                                try list.append(arena, .{ .data = cm.data, .local_idx = @intCast(mi) });
-                            }
-                            for (comp.components) |child| {
-                                try walk(child, list, arena);
-                            }
-                        }
-                    };
-                    Walker.walk(&parsed, &all_cores, load_arena.allocator()) catch return 1;
-                    const ncore = all_cores.items.len;
-                    if (ncore == 0) {
-                        std.debug.print("Error: component contains no core modules\n", .{});
-                        return 1;
-                    }
+                if (!exists) {
                     std.debug.print(
-                        "wamr: auto-precompiling {d} core{s} in memory (no on-disk bundle; pass --precompiled-dir or run `wamrc compile-component` to persist)\n",
-                        .{ ncore, if (ncore == 1) @as([]const u8, "") else "s" },
+                        "Error: no AOT manifest found for '{s}'. The `wamr` runtime no longer embeds the compiler (#680).\n" ++
+                            "  Run `wamrc compile-component {s}` to produce '{s}', or\n" ++
+                            "  run `wamrc run {s} [-- args...]` to compile and execute in one step.\n",
+                        .{ path, path, sibling, path },
                     );
-                    auto_cores.ensureTotalCapacity(allocator, ncore) catch return 1;
-                    for (all_cores.items, 0..) |ref, idx| {
-                        const cwasm = wamr.component_aot.compileCoreWasm(allocator, ref.data, .{}) catch |err| {
-                            std.debug.print(
-                                "Error: auto-precompile failed for core module {d}: {s} (issue #644)\n",
-                                .{ idx, @errorName(err) },
-                            );
-                            return 1;
-                        };
-                        auto_cores.appendAssumeCapacity(.{
-                            .module_idx = ref.local_idx,
-                            .cwasm_bytes = cwasm,
-                            .core_wasm = ref.data,
-                        });
-                    }
+                    return 2;
                 }
+                loaded_manifest = wamr.component_aot.loadManifest(allocator, sibling, wasm_data) catch |err| {
+                    std.debug.print(
+                        "Error: AOT manifest at '{s}' is stale or invalid: {s}.\n" ++
+                            "  Rebuild it with `wamrc compile-component {s}` or run `wamrc run {s}`.\n",
+                        .{ sibling, loadManifestErrorMessage(err), path, path },
+                    );
+                    return 2;
+                };
+                const n = loaded_manifest.?.precompiledCores().len;
+                std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
             }
             const precompiled_cores: []const wamr.component_core_backend.PrecompiledCore =
-                if (loaded_manifest) |lm| lm.precompiledCores() else auto_cores.items;
+                loaded_manifest.?.precompiledCores();
 
             // #644: AOT-only policy. `wamr run` requires a precompiled
             // bundle for every component — there is no interp fallback
-            // at the CLI surface. With auto-precompile above this
-            // should only fire when the component had no core modules
-            // (an empty / malformed input that survived parsing).
+            // at the CLI surface and no in-process compiler. An empty
+            // bundle means the component had no core modules (an
+            // empty / malformed input that survived parsing).
             if (precompiled_cores.len == 0) {
                 std.debug.print(
                     "Error: component has no AOT-compiled cores and `wamr run` is AOT-only.\n" ++
@@ -622,146 +545,22 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         }
     }
 
-    // Plain core wasm. The `wamr` CLI is AOT-only as of #644 — there
-    // is no interp fallback at the CLI surface. Auto-compile the
-    // module in-process to AOT and run it through the AOT runtime
-    // with WASI preview1 wired up via `src/runtime/aot/host_bridge.zig`.
-    if (comptime !aot_supported) {
-        std.debug.print(
-            "Error: AOT execution is not supported on this architecture, and `wamr run` is AOT-only.\n" ++
-                "  See issue #644.\n",
-            .{},
-        );
-        return 1;
-    }
+    // Plain core wasm. The `wamr` runtime no longer embeds the AOT
+    // compiler (#680) — users must precompile with `wamrc compile`
+    // (or use `wamrc run` for one-shot test execution).
+    _ = aot_supported;
     if (listen_address != null) {
         std.debug.print("Error: --listen is not supported for plain core wasm modules (use a component)\n", .{});
         return 2;
     }
-    return runCoreAot(
-        init.io,
-        allocator,
-        wasm_data,
-        wasm_args.items,
-        env_flags.items,
-        init.environ_map,
-        map_dirs.items,
+    std.debug.print(
+        "Error: '{s}' is a plain core wasm module and the `wamr` runtime is AOT-only (#644)\n" ++
+            "       without an embedded compiler (#680).\n" ++
+            "  Run `wamrc compile {s}` to produce a `.cwasm`, then `wamr run <output>.cwasm`, or\n" ++
+            "  run `wamrc run {s} [-- args...]` to compile and execute in one step.\n",
+        .{ path, path, path },
     );
-}
-
-/// Compile a plain core-wasm module to AOT in-process and execute it
-/// with WASI preview1 host functions resolved via the AOT host
-/// bridge (`src/runtime/aot/host_bridge.zig`). This is the only
-/// supported path for `\0asm` (core) inputs after #644 — the legacy
-/// interpreter `runWasm` was removed. The interpreter remains
-/// available as a library for tests / embedders.
-fn runCoreAot(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    wasm_data: []const u8,
-    wasm_args: []const []const u8,
-    env_flags: []const []const u8,
-    environ_map: *const std.process.Environ.Map,
-    map_dirs: []const MapDir,
-) u8 {
-    const aot_loader = wamr.aot_loader;
-    const aot_runtime = wamr.aot_runtime;
-
-    // 1. Build the WasiCtx (args, env, preopens). Same lifetime model
-    // as runComponent: borrows strings from caller-owned slices.
-    var ctx = wamr.WasiCtx.init(allocator, io) catch |err| {
-        std.debug.print("Error: failed to init WASI ctx: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    defer ctx.deinit();
-
-    // argv[0] is the wasm filename (matches the interpreter precedent).
-    // We can't pass `path` here because the caller-side variable lives
-    // higher up; pick "wasm" as a stable placeholder (wasi-libc only
-    // uses argv[0] for `program_invocation_name`, not for routing).
-    var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch return 1;
-    defer allocator.free(argv_buf);
-    argv_buf[0] = "wasm";
-    for (wasm_args, 0..) |a, i| argv_buf[1 + i] = a;
-    ctx.setArgs(argv_buf);
-
-    var env_buf: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer env_buf.deinit(allocator);
-    if (env_flags.len > 0) {
-        env_buf.ensureTotalCapacity(allocator, env_flags.len) catch return 1;
-        for (env_flags) |kv| env_buf.appendAssumeCapacity(kv);
-    } else {
-        var it = environ_map.array_hash_map.iterator();
-        while (it.next()) |kv| {
-            // wasi-libc expects "NAME=value" strings.
-            const joined = std.fmt.allocPrint(allocator, "{s}={s}", .{ kv.key_ptr.*, kv.value_ptr.* }) catch return 1;
-            env_buf.append(allocator, joined) catch {
-                allocator.free(joined);
-                return 1;
-            };
-        }
-    }
-    defer if (env_flags.len == 0) {
-        // Only free strings we allocated ourselves above.
-        for (env_buf.items) |s| allocator.free(s);
-    };
-    ctx.setEnv(env_buf.items);
-
-    for (map_dirs) |md| {
-        _ = ctx.openMappedDir(md.host_path, md.guest_name) catch |err| {
-            std.debug.print("Error: --map-dir '{s}::{s}': {s}\n", .{ md.host_path, md.guest_name, @errorName(err) });
-            return 1;
-        };
-    }
-
-    // 2. AOT-compile the core wasm in-process. `compileCoreWasm` mirrors
-    // `wamrc compile` exactly so the same artifact would be produced.
-    const cwasm = wamr.component_aot.compileCoreWasm(allocator, wasm_data, .{}) catch |err| {
-        std.debug.print("Error: failed to AOT-compile core wasm: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    defer allocator.free(cwasm);
-
-    const aot_module = aot_loader.load(cwasm, allocator) catch |err| {
-        std.debug.print("Error: failed to load freshly compiled AOT module: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    defer aot_loader.unload(&aot_module, allocator);
-
-    const inst = aot_runtime.instantiate(&aot_module, allocator) catch |err| {
-        std.debug.print("Error: failed to instantiate AOT module: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    defer aot_runtime.destroy(inst);
-
-    aot_runtime.mapCodeExecutable(inst) catch |err| {
-        std.debug.print("Error: failed to map AOT code as executable: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-
-    // 3. Wire the WasiCtx so the AOT WASI adapters in
-    // `runtime/aot/host_bridge.zig` can resolve it via `vmctx.wasi_ctx`.
-    inst.wasi_ctx = @intFromPtr(ctx);
-
-    const func_idx = aot_runtime.findExportFunc(inst, "_start") orelse
-        aot_runtime.findExportFunc(inst, "main") orelse {
-        std.debug.print("Error: no _start or main export\n", .{});
-        return 1;
-    };
-
-    // `_start` / `main` take no params and return no values for the
-    // wasi-libc CRT shape; route through `callFuncScalar` with empty
-    // slices. Any guest call to `proc_exit` short-circuits via
-    // `std.process.exit` inside the host bridge.
-    var results_buf: [0]wamr.aot_runtime.ScalarResult = .{};
-    _ = aot_runtime.callFuncScalar(inst, func_idx, &.{}, &.{}, &.{}, &results_buf) catch |err| {
-        std.debug.print("Error: AOT execution failed: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-
-    // If the guest never called proc_exit, exit_code is null → success.
-    if (ctx.exit_code) |code| return @intCast(code & 0xFF);
-    return 0;
+    return 2;
 }
 
 fn parseMapDir(spec: []const u8) !MapDir {
@@ -1185,17 +984,17 @@ fn writeStdout(io: std.Io, text: []const u8) void {
     stdout_file.writeStreamingAll(io, text) catch {};
 }
 
-/// Map an `HttpsTlsConfig.LoadError` to a short, user-facing
-/// diagnostic string. Used by `runRun` to surface cert / key load
-/// failures before bind in a uniform format.
+/// Map a `component_aot.LoadError` to a short, user-facing
+/// diagnostic string. Used by `runRun` to surface manifest load
+/// failures in a uniform format.
 fn loadManifestErrorMessage(err: wamr.component_aot.LoadError) []const u8 {
     return switch (err) {
-        error.ManifestNotFound => "manifest.json not found in the directory",
-        error.ManifestParseFailed => "manifest.json could not be parsed",
+        error.ManifestNotFound => "manifest sidecar not found at the given path",
+        error.ManifestParseFailed => "manifest sidecar could not be parsed",
         error.ManifestVersionMismatch => "manifest format version not understood by this build",
         error.ManifestBuildIdMismatch => "manifest was produced by a different wamr build (recompile with `wamrc compile-component`)",
-        error.ManifestComponentMismatch => "manifest's component hash does not match this component (stale bundle — recompile with `wamrc compile-component`)",
-        error.ManifestCoreMismatch => "manifest references a core module that does not appear in this component (stale bundle — recompile with `wamrc compile-component`)",
+        error.ManifestComponentMismatch => "manifest's component hash does not match this component (stale — recompile with `wamrc compile-component`)",
+        error.ManifestCoreMismatch => "manifest references a core module that does not appear in this component (stale — recompile with `wamrc compile-component`)",
         error.ComponentParseFailed => "manifest is valid but the component bytes failed to re-parse for nested-core resolution",
         error.CwasmReadFailed => "could not read a .cwasm artifact referenced from the manifest",
         error.CwasmHashMismatch => "a .cwasm artifact's contents differ from the manifest's recorded hash (tampered or partial write)",
@@ -1238,8 +1037,8 @@ const run_usage =
     \\  * `.cwasm`/`.aot` core modules (magic `\0aot`) run via the AOT
     \\    runtime directly.
     \\  * Component-model `.wasm` files run via AOT cores loaded from a
-    \\    `wamrc compile-component` bundle (see --precompiled-dir below).
-    \\    Components without a bundle fail with a clear error.
+    \\    `wamrc compile-component` manifest (see --precompiled-manifest below).
+    \\    Components without a manifest fail with a clear error.
     \\  * Plain core wasm modules are not supported — pre-compile to
     \\    `.cwasm`/`.aot` first.
     \\
@@ -1290,13 +1089,16 @@ const run_usage =
     \\                           file containing both certificate chain
     \\                           and private key. Mutually exclusive with
     \\                           --tls-cert / --tls-key.
-    \\  --precompiled-dir PATH   For components: load AOT-compiled cores from
-    \\                           a `wamrc compile-component` output directory
-    \\                           (containing manifest.json + module<N>.cwasm).
-    \\                           When omitted, `wamr run` auto-detects a
-    \\                           sibling `<input>.cwasm.d/manifest.json`. The
-    \\                           bundle is mandatory: components without one
-    \\                           fail with a clear error (issue #644).
+    \\  --precompiled-manifest PATH
+    \\                           For components: load AOT-compiled cores by
+    \\                           reading a `wamrc compile-component` manifest
+    \\                           sidecar (`<stem>.cwasm.json`). Per-core
+    \\                           `.cwasm` files resolve relative to the
+    \\                           manifest's directory. When omitted, `wamr
+    \\                           run` auto-detects a sibling
+    \\                           `<input>.cwasm.json`. The manifest is
+    \\                           mandatory: components without one fail
+    \\                           with a clear error (issues #644, #680).
     \\
 ;
 
