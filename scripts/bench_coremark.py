@@ -31,15 +31,17 @@ ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
 # Signature of the known x86_64 native AOT-run flake from issue #406:
 # `wamr run` traps with `out of bounds memory access (..., local_func[N]+0x0, ...)`
 # at the very first byte of a local function (or with a synthetic `[-1]`
-# function index). The trap is non-deterministic on shared GitHub-hosted
-# x86_64 runners — it has been observed firing on baseline `main` after a
-# clean run of the same binary, proving it's not introduced by any single
-# change. Real coremark regressions would trap deeper inside a function
-# (non-zero offset), so a `+0x0` offset is the discriminator. Retry this
-# failure mode up to `_TRAP_RETRY_MAX` times before treating it as a real
-# regression.
+# function index). PR #696 added an optional `"<name>"` annotation between
+# the bracketed funcidx and the offset (e.g. `local_func[0] "__wasm_call_ctors"+0x0`),
+# so the pattern accepts an optional quoted name. The trap is non-deterministic
+# on shared GitHub-hosted x86_64 runners — it has been observed firing on
+# baseline `main` after a clean run of the same binary, proving it's not
+# introduced by any single change. Real coremark regressions would trap
+# deeper inside a function (non-zero offset), so a `+0x0` offset is the
+# discriminator. Retry this failure mode up to `_TRAP_RETRY_MAX` times
+# before treating it as a real regression.
 _TRAP_FLAKE_PATTERN = re.compile(
-    r"wasm trap: out of bounds memory access.*local_func\[-?\d+\]\+0x0",
+    r'wasm trap: out of bounds memory access.*local_func\[-?\d+\](?:\s+"[^"]*")?\+0x0',
     re.IGNORECASE,
 )
 _TRAP_RETRY_MAX = 3
