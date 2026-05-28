@@ -19,6 +19,16 @@ var g_code_base: usize = 0;
 var g_code_size: usize = 0;
 var g_mem_base: usize = 0;
 var g_mem_size: usize = 0;
+/// Wasm `name` custom-section entries for the AOT core whose code is
+/// currently mapped through `g_code_base`. Used by `aotTrapUnreachable`
+/// / `aotTrapOOB` / `aotTrap*` to render `local_func[N]` symbolically
+/// when a guest traps. Set alongside `g_func_offsets` and cleared on
+/// `callFunc` / `callFuncScalar` exit (see `pushTrapDecodeFrame`).
+var g_func_names: []const types.NameSection.FunctionName = &.{};
+/// Number of imported functions in the currently-active core. Needed
+/// to convert a local-func index back to the wasm function index space
+/// (imports first, then locals) for `g_func_names` lookup.
+var g_imported_function_count: u32 = 0;
 
 // ── Trap-as-error plumbing (Windows x86_64 only) ─────────────────────
 //
@@ -436,6 +446,71 @@ pub const PtrSigEntry = extern struct {
 var g_func_offsets: []const u32 = &.{};
 var g_veh_installed: bool = false;
 
+/// Snapshot of the per-`callFunc`/`callFuncScalar` trap-decode globals so
+/// that nested cross-instance calls (#694) can restore the caller's
+/// view after they return. Without this, the inner call's overwrite of
+/// `g_code_base` / `g_func_offsets` / `g_func_names` /
+/// `g_imported_function_count` / `g_mem_base` / `g_mem_size` leaks past
+/// the return and mis-decodes any later trap in the outer AOT body.
+const TrapDecodeFrame = struct {
+    code_base: usize,
+    code_size: usize,
+    func_offsets: []const u32,
+    func_names: []const types.NameSection.FunctionName,
+    imported_function_count: u32,
+    mem_base: usize,
+    mem_size: usize,
+};
+
+fn captureTrapDecodeFrame() TrapDecodeFrame {
+    return .{
+        .code_base = g_code_base,
+        .code_size = g_code_size,
+        .func_offsets = g_func_offsets,
+        .func_names = g_func_names,
+        .imported_function_count = g_imported_function_count,
+        .mem_base = g_mem_base,
+        .mem_size = g_mem_size,
+    };
+}
+
+fn restoreTrapDecodeFrame(frame: TrapDecodeFrame) void {
+    g_code_base = frame.code_base;
+    g_code_size = frame.code_size;
+    g_func_offsets = frame.func_offsets;
+    g_func_names = frame.func_names;
+    g_imported_function_count = frame.imported_function_count;
+    g_mem_base = frame.mem_base;
+    g_mem_size = frame.mem_size;
+}
+
+/// Install the calling AOT instance's diagnostic identity. Caller is
+/// expected to pair this with a `defer restoreTrapDecodeFrame(...)`.
+fn installTrapDecodeFrameFor(inst: *const AotInstance) void {
+    if (inst.code_base) |cb| {
+        g_code_base = @intFromPtr(cb);
+        g_code_size = inst.code_size;
+        g_func_offsets = inst.module.func_offsets;
+    }
+    g_func_names = inst.module.function_names;
+    g_imported_function_count = inst.module.import_function_count;
+}
+
+/// Resolve `local_func[N]` back to the wasm-side symbol when the AOT
+/// artifact preserves a `name` custom section. `local_idx` is the
+/// `func_offsets` index reported by the trap helper's PC decode; the
+/// wasm function index space prefixes imports, so we shift by
+/// `g_imported_function_count` before looking up.
+fn lookupLocalFuncName(local_idx: isize) ?[]const u8 {
+    if (local_idx < 0) return null;
+    if (g_func_names.len == 0) return null;
+    const wasm_idx: u32 = @intCast(@as(usize, @intCast(local_idx)) + g_imported_function_count);
+    for (g_func_names) |entry| {
+        if (entry.index == wasm_idx) return entry.name;
+    }
+    return null;
+}
+
 pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     const ret_addr: usize = @returnAddress();
     const code_off_s: isize = @as(isize, @bitCast(ret_addr)) - @as(isize, @bitCast(g_code_base));
@@ -455,11 +530,63 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     }
     // Flush any buffered stdout from the guest before we tear down the
     // process so user-visible output isn't lost. Best-effort.
-    std.debug.print(
-        "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}]+0x{x}, mem_size=0x{x})\n",
-        .{ code_off, func_idx, rel_off, vmctx.memory_size },
-    );
+    if (lookupLocalFuncName(func_idx)) |name| {
+        std.debug.print(
+            "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}] \"{s}\"+0x{x}, mem_size=0x{x})\n",
+            .{ code_off, func_idx, name, rel_off, vmctx.memory_size },
+        );
+    } else {
+        std.debug.print(
+            "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}]+0x{x}, mem_size=0x{x})\n",
+            .{ code_off, func_idx, rel_off, vmctx.memory_size },
+        );
+    }
     std.process.exit(2);
+}
+
+/// Resolve the trapping wasm function from `@returnAddress()` for the
+/// non-OOB trap helpers (`aotTrapUnreachable`, `aotTrapInt*`,
+/// `aotTrapInvalidConversion`). Returns `(local_idx, rel_off, name_opt)`
+/// where `local_idx == -1` when no `func_offsets` entry contains the PC.
+const TrapPcLocation = struct {
+    code_off: usize,
+    func_idx: isize,
+    rel_off: usize,
+    name: ?[]const u8,
+};
+
+fn decodeTrapReturnAddress(ret_addr: usize) TrapPcLocation {
+    const code_off_s: isize = @as(isize, @bitCast(ret_addr)) - @as(isize, @bitCast(g_code_base));
+    const code_off: usize = if (code_off_s >= 0) @intCast(code_off_s) else 0;
+    var func_idx: isize = -1;
+    var func_start: usize = 0;
+    for (g_func_offsets, 0..) |off, idx| {
+        if (off <= code_off) {
+            func_idx = @intCast(idx);
+            func_start = off;
+        } else break;
+    }
+    const rel_off: usize = if (code_off >= func_start) code_off - func_start else 0;
+    return .{
+        .code_off = code_off,
+        .func_idx = func_idx,
+        .rel_off = rel_off,
+        .name = lookupLocalFuncName(func_idx),
+    };
+}
+
+fn printTrapWithPc(kind: []const u8, loc: TrapPcLocation) void {
+    if (loc.name) |name| {
+        std.debug.print(
+            "wasm trap: {s} (code+0x{x}, local_func[{d}] \"{s}\"+0x{x})\n",
+            .{ kind, loc.code_off, loc.func_idx, name, loc.rel_off },
+        );
+    } else {
+        std.debug.print(
+            "wasm trap: {s} (code+0x{x}, local_func[{d}]+0x{x})\n",
+            .{ kind, loc.code_off, loc.func_idx, loc.rel_off },
+        );
+    }
 }
 
 /// Host helper invoked from AOT-compiled code for `unreachable`,
@@ -469,29 +596,33 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
 /// returns `error.WasmTrap`. Otherwise prints a diagnostic and exits.
 pub fn aotTrapUnreachable(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
+    const loc = decodeTrapReturnAddress(@returnAddress());
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
-    std.debug.print("wasm trap: unreachable\n", .{});
+    printTrapWithPc("unreachable", loc);
     std.process.exit(2);
 }
 
 pub fn aotTrapIntDivZero(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
+    const loc = decodeTrapReturnAddress(@returnAddress());
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
-    std.debug.print("wasm trap: integer divide by zero\n", .{});
+    printTrapWithPc("integer divide by zero", loc);
     std.process.exit(2);
 }
 
 pub fn aotTrapIntOverflow(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
+    const loc = decodeTrapReturnAddress(@returnAddress());
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
-    std.debug.print("wasm trap: integer overflow\n", .{});
+    printTrapWithPc("integer overflow", loc);
     std.process.exit(2);
 }
 
 pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
+    const loc = decodeTrapReturnAddress(@returnAddress());
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
-    std.debug.print("wasm trap: invalid conversion to integer\n", .{});
+    printTrapWithPc("invalid conversion to integer", loc);
     std.process.exit(2);
 }
 
@@ -1656,11 +1787,14 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     // uses `g_code_base` / `g_func_offsets` to map the trap PC back
     // to a wasm function index. The Windows-only block below adds
     // the VEH path on top (which also needs g_mem_*).
-    if (inst.code_base) |cb| {
-        g_code_base = @intFromPtr(cb);
-        g_code_size = inst.code_size;
-        g_func_offsets = inst.module.func_offsets;
-    }
+    //
+    // Snapshot the previous decode frame so a nested cross-instance
+    // call (#694) can restore it on return; without this, a trap that
+    // fires in the outer body after the inner returns mis-decodes the
+    // PC against the *callee's* func_offsets table.
+    const previous_trap_frame = captureTrapDecodeFrame();
+    defer restoreTrapDecodeFrame(previous_trap_frame);
+    installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
@@ -1978,11 +2112,13 @@ pub fn callFuncScalar(
         raw[args.len] = @intFromPtr(&hrp_buf);
     }
 
-    if (inst.code_base) |cb| {
-        g_code_base = @intFromPtr(cb);
-        g_code_size = inst.code_size;
-        g_func_offsets = inst.module.func_offsets;
-    }
+    // Snapshot the previous decode frame so a nested cross-instance
+    // call (#694) can restore it on return; without this, a trap that
+    // fires in the outer body after the inner returns mis-decodes the
+    // PC against the *callee's* func_offsets table.
+    const previous_trap_frame = captureTrapDecodeFrame();
+    defer restoreTrapDecodeFrame(previous_trap_frame);
+    installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
