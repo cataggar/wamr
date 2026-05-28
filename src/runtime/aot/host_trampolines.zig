@@ -401,10 +401,10 @@ fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     // str x30, [sp, #-16]!  -- save LR, sp -= 16. Keeps sp 16-byte aligned.
     emitAarch64(bytes, &cursor, 0xF81F0FFE);
     // ldr x9, [sp, #16]     -- x9 = caller_a8 (was at [sp+0] pre-push).
-    emitAarch64(bytes, &cursor, 0xF94007E9);
+    emitAarch64(bytes, &cursor, 0xF9400BE9);
     // stp x7, x9, [sp, #-16]!  -- push caller_a7 + caller_a8.
     // After this: [sp+0]=a7, [sp+8]=a8 (dispatcher's stack args).
-    emitAarch64(bytes, &cursor, 0xA9BF93E7);
+    emitAarch64(bytes, &cursor, 0xA9BF27E7);
 
     // Shift x0..x7 right by one register (x7=x6, x6=x5, ..., x1=x0).
     inline for ([_]struct { dst: u5, src: u5 }{
@@ -434,7 +434,7 @@ fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     // add sp, sp, #16         -- pop the two pushed stack args.
     emitAarch64(bytes, &cursor, 0x910043FF);
     // ldr x30, [sp], #16      -- restore LR with post-increment.
-    emitAarch64(bytes, &cursor, 0xF84047FE);
+    emitAarch64(bytes, &cursor, 0xF84107FE);
     // ret                     -- branch to LR.
     emitAarch64(bytes, &cursor, 0xD65F03C0);
 
@@ -507,8 +507,8 @@ test "#648 phase 2: aarch64 trampoline encoder emits slot and dispatcher immedia
     // pushed args; restore LR; ret.
     const expected = [_]u32{
         0xF81F0FFE, // str x30, [sp, #-16]!
-        0xF94007E9, // ldr x9, [sp, #16]
-        0xA9BF93E7, // stp x7, x9, [sp, #-16]!
+        0xF9400BE9, // ldr x9, [sp, #16]
+        0xA9BF27E7, // stp x7, x9, [sp, #-16]!
         0xAA0603E7, // mov x7, x6
         0xAA0503E6, // mov x6, x5
         0xAA0403E5, // mov x5, x4
@@ -523,7 +523,7 @@ test "#648 phase 2: aarch64 trampoline encoder emits slot and dispatcher immedia
         0xF2E22450, // movk x16, #0x1122, lsl 48
         0xD63F0200, // blr x16
         0x910043FF, // add sp, sp, #16
-        0xF84047FE, // ldr x30, [sp], #16
+        0xF84107FE, // ldr x30, [sp], #16
         0xD65F03C0, // ret
     };
 
