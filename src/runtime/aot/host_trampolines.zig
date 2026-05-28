@@ -14,7 +14,7 @@ const page_size = std.heap.page_size_min;
 // the importer's vmctx for the AOT-codegen variants). See #689 — the older
 // 6-arg shape couldn't lower WASIp2 filesystem methods like `link-at` (7
 // wasm params) and silently fell back to a trap stub.
-const x86_64_stub_bytes: usize = 57;
+const x86_64_stub_bytes: usize = 61;
 const aarch64_stub_bytes: usize = 76;
 
 pub const STUB_BYTES: usize = switch (builtin.cpu.arch) {
@@ -340,14 +340,29 @@ fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     // outgoing stack-arg region) and r9 (caller_a5) to land them at the
     // right offsets.
     //
+    // SysV alignment (#691): at stub entry rsp%16==8 (caller's pre-call
+    // rsp was 16-aligned, `call` pushed 8). The 4 pushes below shift rsp
+    // by -32 (no net change mod 16), and `call rax` shifts by another -8
+    // → dispatcher would enter with rsp%16==0, violating SysV's
+    // `(rsp+8)%16==0` invariant. The first 16-aligned op in the
+    // dispatcher (e.g. SmpAllocator.alloc via vtable) then faults with
+    // a hardware #GP. Fix: `sub rsp, 8` before the 4 reads/pushes, then
+    // `add rsp, 40` in the epilogue. Read displacements also shift +8
+    // (0x18 → 0x20) because the caller_a6/a7/a8 stack-arg region now
+    // sits 8 bytes higher relative to the adjusted rsp.
+    //
+    // Prologue-align (4 bytes): pad rsp for SysV.
+    const prologue_align = [_]u8{
+        0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+    };
     // Prologue (20 bytes): read caller stack args into our frame, then
     // push r9.
     const prologue_stack = [_]u8{
-        0x48, 0x8B, 0x44, 0x24, 0x18, // mov rax, [rsp+24]  (caller_a8)
+        0x48, 0x8B, 0x44, 0x24, 0x20, // mov rax, [rsp+32]  (caller_a8)
         0x50, // push rax
-        0x48, 0x8B, 0x44, 0x24, 0x18, // mov rax, [rsp+24]  (caller_a7, shifted)
+        0x48, 0x8B, 0x44, 0x24, 0x20, // mov rax, [rsp+32]  (caller_a7, shifted)
         0x50, // push rax
-        0x48, 0x8B, 0x44, 0x24, 0x18, // mov rax, [rsp+24]  (caller_a6, shifted)
+        0x48, 0x8B, 0x44, 0x24, 0x20, // mov rax, [rsp+32]  (caller_a6, shifted)
         0x50, // push rax
         0x41, 0x51, // push r9             (caller_a5)
     };
@@ -362,14 +377,17 @@ fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
         0xBF, // mov edi, imm32 (slot)
     };
     const movabs = [_]u8{ 0x48, 0xB8 };
-    // Epilogue (7 bytes): call dispatcher, drop our 32-byte spill, return.
+    // Epilogue (7 bytes): call dispatcher, drop our 32-byte spill + 8-byte
+    // alignment pad, return.
     const epilogue = [_]u8{
         0xFF, 0xD0, // call rax
-        0x48, 0x83, 0xC4, 0x20, // add rsp, 32
+        0x48, 0x83, 0xC4, 0x28, // add rsp, 40
         0xC3, // ret
     };
 
     var cursor: usize = 0;
+    @memcpy(bytes[cursor .. cursor + prologue_align.len], &prologue_align);
+    cursor += prologue_align.len;
     @memcpy(bytes[cursor .. cursor + prologue_stack.len], &prologue_stack);
     cursor += prologue_stack.len;
     @memcpy(bytes[cursor .. cursor + shift.len], &shift);
@@ -468,13 +486,15 @@ test "#648 phase 2: x86_64 trampoline encoder emits slot and dispatcher immediat
 
     encodeX8664Stub(&bytes, 0x11223344, 0x1122334455667788);
 
-    // Stub layout (#689): pre-spill caller_a8/_a7/_a6 from [rsp+24], then
-    // push r9 (caller_a5); shift rdi..r9; mov edi, slot; movabs rax,
-    // dispatcher; call rax; add rsp, 32; ret.
+    // Stub layout (#691): sub rsp, 8 (SysV align pad); pre-spill
+    // caller_a8/_a7/_a6 from [rsp+32], then push r9 (caller_a5); shift
+    // rdi..r9; mov edi, slot; movabs rax, dispatcher; call rax;
+    // add rsp, 40; ret.
     const expected = [_]u8{
-        0x48, 0x8B, 0x44, 0x24, 0x18, 0x50,
-        0x48, 0x8B, 0x44, 0x24, 0x18, 0x50,
-        0x48, 0x8B, 0x44, 0x24, 0x18, 0x50,
+        0x48, 0x83, 0xEC, 0x08,
+        0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
+        0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
+        0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
         0x41, 0x51,
         0x4D, 0x89, 0xC1,
         0x49, 0x89, 0xC8,
@@ -485,7 +505,7 @@ test "#648 phase 2: x86_64 trampoline encoder emits slot and dispatcher immediat
         0x48, 0xB8,
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
         0xFF, 0xD0,
-        0x48, 0x83, 0xC4, 0x20,
+        0x48, 0x83, 0xC4, 0x28,
         0xC3,
     };
 
@@ -532,4 +552,53 @@ test "#648 phase 2: aarch64 trampoline encoder emits slot and dispatcher immedia
         const start = idx * @sizeOf(u32);
         try std.testing.expectEqual(word, std.mem.readInt(u32, bytes[start..][0..4], .little));
     }
+}
+
+// Test scaffolding for the #691 SysV alignment regression test (below). A
+// naked recorder lets us capture rsp at dispatcher entry with zero prologue,
+// so the assertion checks the actual call-site alignment rather than
+// whatever offset Zig's prologue might introduce.
+var alignment_captured_rsp: usize = 0;
+
+fn alignmentRecorder() callconv(.naked) void {
+    asm volatile (
+        \\ movq %%rsp, %[dst]
+        \\ xorl %%eax, %%eax
+        \\ retq
+        : [dst] "=m" (alignment_captured_rsp),
+    );
+}
+
+test "#691: x86_64 stub keeps SysV 16-byte stack alignment at dispatcher entry" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;
+
+    // Allocate one RWX page for a hand-written stub that targets
+    // `alignmentRecorder` (instead of `genericDispatcher`). The recorder
+    // captures rsp at entry and returns; we then assert SysV's
+    // `(rsp+8) % 16 == 0` invariant — equivalent to `rsp % 16 == 8` —
+    // holds at dispatcher entry. Before #691 the four-push prologue
+    // introduced by #690 left rsp at 0 mod 16 at the dispatcher, which
+    // faulted the first 16-aligned op inside `callFuncScalar` (e.g.
+    // `SmpAllocator.alloc` via vtable) on cross-instance calls.
+    const memory = try std.posix.mmap(
+        null,
+        page_size,
+        .{ .READ = true, .WRITE = true, .EXEC = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(memory);
+    @memset(memory, 0);
+
+    encodeX8664Stub(memory[0..STUB_BYTES], 0, @intFromPtr(&alignmentRecorder));
+
+    alignment_captured_rsp = 0;
+    const Stub = *const fn (u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+    const stub: Stub = @ptrCast(memory.ptr);
+    _ = stub(1, 2, 3, 4, 5, 6, 7, 8, 9);
+
+    try std.testing.expect(alignment_captured_rsp != 0);
+    try std.testing.expectEqual(@as(usize, 8), alignment_captured_rsp & 0xF);
 }
