@@ -6142,6 +6142,101 @@ fn dispatchAotCrossInstance(
     };
 }
 
+/// Canon-builtin dispatcher for AOT-compiled core modules (#701, follow-up
+/// to #687). Mirrors `wamrAotDispatchCrossInstance`'s vmctx-as-first-arg
+/// convention: `a0` is the importer's vmctx (ignored — canon-builtins
+/// operate on the component instance carried in the ctx), and `a1` is the
+/// wasm-level handle / rep value. Today this handles the three
+/// `resource.{drop,new,rep}` kinds that #701 explicitly targets; other
+/// canon-builtin kinds (`context.*`, `task.*`, async ABI) trap-stub
+/// pending a follow-up.
+pub export fn wamrAotDispatchCanonBuiltin(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    _ = a0; // importer's vmctx; canon-builtins resolve state via ctx.comp_inst.
+    _ = a2;
+    _ = a3;
+    _ = a4;
+    _ = a5;
+    _ = a6;
+    _ = a7;
+    _ = a8;
+    _ = a9;
+    const ctx: *const CanonBuiltinTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
+    const result = dispatchAotCanonBuiltin(ctx, lowered_sig.*, @as(u32, @truncate(a1))) catch |err| {
+        if (debugAotEnabled()) {
+            std.debug.print(
+                "[aot-dispatch] canon-builtin '{s}' failed: {s}\n",
+                .{ @tagName(ctx.canon), @errorName(err) },
+            );
+        }
+        return .{ .status = 1, .value = 0 };
+    };
+    return .{ .status = 0, .value = result };
+}
+
+fn dispatchAotCanonBuiltin(
+    ctx: *const CanonBuiltinTrampolineCtx,
+    lowered_sig: host_trampolines.LoweredSig,
+    arg0: u32,
+) !u64 {
+    // All in-scope canon-builtins ({resource}.drop/new/rep) lower to a single
+    // i32 input and 0 or 1 i32 outputs. Any other shape is a wiring bug.
+    if (lowered_sig.has_retptr) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len != 1) return error.UnsupportedSignature;
+    if (lowered_sig.param_types[0] != .i32) return error.UnsupportedSignature;
+    if (lowered_sig.result_types.len > 1) return error.UnsupportedSignature;
+    if (lowered_sig.result_types.len == 1 and lowered_sig.result_types[0] != .i32)
+        return error.UnsupportedSignature;
+
+    const comp_inst = ctx.comp_inst;
+    const allocator = comp_inst.allocator;
+
+    switch (ctx.canon) {
+        .resource_new => |resource_idx| {
+            if (lowered_sig.result_types.len != 1) return error.UnsupportedSignature;
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
+                return error.OutOfMemory;
+            const handle = try canonResourceNew(rt, arg0, allocator);
+            return @as(u64, @intCast(handle));
+        },
+        .resource_drop => |resource_idx| {
+            if (lowered_sig.result_types.len != 0) return error.UnsupportedSignature;
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
+                return error.OutOfMemory;
+            _ = canonResourceDrop(rt, arg0, allocator);
+            // Mirror the interp arm in `dispatchCanonBuiltinWithCtx`: notify
+            // the host adapter so it can release kernel-side state attached
+            // to the dropped handle. WAMR's host fns return reps as wire
+            // handles directly (no automatic `canon resource.new` wrap), so
+            // the per-type table is typically empty here. (#575)
+            if (comp_inst.on_resource_drop) |hook| {
+                hook(comp_inst.on_resource_drop_ctx, comp_inst, resource_idx, arg0);
+            }
+            return 0;
+        },
+        .resource_rep => |resource_idx| {
+            if (lowered_sig.result_types.len != 1) return error.UnsupportedSignature;
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
+                return error.OutOfMemory;
+            const rep_val = canonResourceRep(rt, arg0) orelse 0;
+            return @as(u64, @intCast(rep_val));
+        },
+        else => return error.UnsupportedSignature,
+    }
+}
+
 /// Trap-on-call stub dispatcher (#662 follow-up). The trampoline pool
 /// installs this dispatcher for non-WASI fn imports the AOT bridge has
 /// no wiring for yet (canon.lower / canon-builtin). Instantiation
@@ -7312,4 +7407,166 @@ test "encode/decodeResourceWire round-trip (#520 wave 2)" {
         const slot: u32 = @intCast(i);
         try testing.expectEqual(slot, decodeResourceWire(encodeResourceWire(slot)));
     }
+}
+
+// ── #701: AOT canon-builtin dispatcher ──────────────────────────────────────
+
+test "wamrAotDispatchCanonBuiltin: resource.new/rep/drop round-trip + on_resource_drop hook (#701)" {
+    // End-to-end test of the AOT-side canon-builtin dispatcher added in
+    // #701. Drives a `*ComponentInstance` through `wamrAotDispatchCanonBuiltin`
+    // for each of the three in-scope canon kinds and verifies the resource
+    // table mutates correctly + the `on_resource_drop` hook fires.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, allocator);
+    defer inst.deinit();
+
+    // Wire a drop-hook so we can assert it fires with the right
+    // (resource_idx, handle) pair when `.resource_drop` dispatches.
+    const HookState = struct {
+        var fires: u32 = 0;
+        var last_resource_idx: u32 = 0xFFFF_FFFF;
+        var last_handle: u32 = 0xFFFF_FFFF;
+        fn reset() void {
+            fires = 0;
+            last_resource_idx = 0xFFFF_FFFF;
+            last_handle = 0xFFFF_FFFF;
+        }
+        fn cb(_: ?*anyopaque, _: *ComponentInstance, ridx: u32, h: u32) void {
+            fires += 1;
+            last_resource_idx = ridx;
+            last_handle = h;
+        }
+    };
+    HookState.reset();
+    inst.on_resource_drop = &HookState.cb;
+    inst.on_resource_drop_ctx = null;
+
+    const resource_idx: u32 = 7;
+    const new_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .resource_new = resource_idx },
+    };
+    const drop_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .resource_drop = resource_idx },
+    };
+    const rep_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .resource_rep = resource_idx },
+    };
+
+    const i32_one = [_]core_types.ValType{.i32};
+    const sig_one_to_one = host_trampolines.LoweredSig{
+        .param_types = &i32_one,
+        .result_types = &i32_one,
+    };
+    const sig_one_to_void = host_trampolines.LoweredSig{
+        .param_types = &i32_one,
+        .result_types = &.{},
+    };
+
+    // resource.new(rep=123) → handle.  Convention: a0 is importer's
+    // vmctx (ignored), a1 is the wasm arg.
+    const new_res = wamrAotDispatchCanonBuiltin(
+        @ptrCast(@constCast(&new_ctx)),
+        &sig_one_to_one,
+        0xDEAD, 123, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    try testing.expectEqual(@as(u32, 0), new_res.status);
+    const handle: u32 = @intCast(new_res.value);
+    // ResourceTable.new returns the slot index, starting at 0 for a fresh
+    // table — don't assume handle != 0; round-trip via rep / drop instead.
+
+    // resource.rep(handle) → 123. Resource table is keyed by the
+    // canon's `resource_idx` immediate, so use the same idx as new.
+    const rep_res = wamrAotDispatchCanonBuiltin(
+        @ptrCast(@constCast(&rep_ctx)),
+        &sig_one_to_one,
+        0, handle, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    try testing.expectEqual(@as(u32, 0), rep_res.status);
+    try testing.expectEqual(@as(u64, 123), rep_res.value);
+
+    // resource.drop(handle). Status=0, value=0 (drop returns no
+    // i32 result on the wasm side). Hook must fire exactly once
+    // with (resource_idx, handle).
+    const drop_res = wamrAotDispatchCanonBuiltin(
+        @ptrCast(@constCast(&drop_ctx)),
+        &sig_one_to_void,
+        0, handle, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    try testing.expectEqual(@as(u32, 0), drop_res.status);
+    try testing.expectEqual(@as(u64, 0), drop_res.value);
+    try testing.expectEqual(@as(u32, 1), HookState.fires);
+    try testing.expectEqual(resource_idx, HookState.last_resource_idx);
+    try testing.expectEqual(handle, HookState.last_handle);
+
+    // After drop, resource.rep on the freed handle returns 0 (canonResourceRep
+    // returns null → dispatcher coerces to 0).
+    const rep_after = wamrAotDispatchCanonBuiltin(
+        @ptrCast(@constCast(&rep_ctx)),
+        &sig_one_to_one,
+        0, handle, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    try testing.expectEqual(@as(u32, 0), rep_after.status);
+    try testing.expectEqual(@as(u64, 0), rep_after.value);
+}
+
+test "wamrAotDispatchCanonBuiltin: rejects malformed lowered_sig (#701)" {
+    // Any sig that isn't `(i32) → ()` (drop) or `(i32) → i32`
+    // (new/rep) must return a failing DispatchResult so the wiring
+    // bug surfaces as a clean trap instead of a misread arg.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, allocator);
+    defer inst.deinit();
+
+    const drop_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .resource_drop = 0 },
+    };
+
+    // Wrong shape: drop with a result; reject.
+    const i32_one = [_]core_types.ValType{.i32};
+    const bad_sig = host_trampolines.LoweredSig{
+        .param_types = &i32_one,
+        .result_types = &i32_one,
+    };
+    const res = wamrAotDispatchCanonBuiltin(
+        @ptrCast(@constCast(&drop_ctx)),
+        &bad_sig,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    try testing.expectEqual(@as(u32, 1), res.status);
+
+    // Unsupported canon kind (e.g. context.get) → reject.
+    const ctx_get = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .context_get = .{ .val_type = .i32, .slot = 0 } },
+    };
+    const ok_sig = host_trampolines.LoweredSig{
+        .param_types = &i32_one,
+        .result_types = &i32_one,
+    };
+    const res2 = wamrAotDispatchCanonBuiltin(
+        @ptrCast(@constCast(&ctx_get)),
+        &ok_sig,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    try testing.expectEqual(@as(u32, 1), res2.status);
 }

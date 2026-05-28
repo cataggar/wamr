@@ -3137,11 +3137,33 @@ fn resolveAotImportedFunctionOverrides(
                             break :blk null;
                         };
                     },
-                    // Resource-drop / new / rep and other canon-builtin
-                    // contributors still fall through to the trap stub.
-                    // Bridging them requires a separate canon-builtin
-                    // dispatch kind in the trampoline pool; tracked as a
-                    // follow-up to #687.
+                    // Canon-builtin contributors: `resource.{drop,new,rep}`
+                    // are bridged through `CanonBuiltinTrampolineCtx` +
+                    // `wamrAotDispatchCanonBuiltin`. Other canon-builtin
+                    // kinds (`context.*`, `task.*`, async ABI) still fall
+                    // through to the trap stub pending follow-up to #701.
+                    .resource_drop, .resource_new, .resource_rep => {
+                        const canon_idx_b: u32 = switch (canon_ref) {
+                            .resource_drop => |i| i,
+                            .resource_new => |i| i,
+                            .resource_rep => |i| i,
+                            else => unreachable,
+                        };
+                        thunk = installCanonBuiltinBackedCrossInstanceThunk(
+                            allocator,
+                            inst,
+                            component,
+                            canon_idx_b,
+                            imp,
+                            module,
+                        ) catch |err| blk: {
+                            std.log.warn(
+                                "[aot reject] core module {d}: canon-builtin thunk for '{s}.{s}' failed ({s}); falling back to cross-instance / trap-stub",
+                                .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                            );
+                            break :blk null;
+                        };
+                    },
                     else => {},
                 }
             }
@@ -3450,6 +3472,85 @@ fn installCanonLowerBackedCrossInstanceThunk(
     for (ft.results, 0..) |r, i| lowered_results[i] = r;
 
     const stub = try pool.allocCanonLowerAotSlot(@ptrCast(ctx_ptr), .{
+        .param_types = lowered_params,
+        .result_types = lowered_results,
+        .has_retptr = false,
+    });
+    return @ptrCast(stub);
+}
+
+/// Bridge an AOT core module's import that resolves through a sibling
+/// inline-export to a canon-builtin (`resource.{drop,new,rep}`) contributor.
+/// Mirrors `installCanonLowerBackedCrossInstanceThunk` but uses the
+/// existing `CanonBuiltinTrampolineCtx` (shared with the interp wiring at
+/// `linkImports`) and the canon-builtin trampoline-pool slot. Other
+/// canon-builtin kinds (`context.*`, `task.*`, async ABI) return
+/// `error.UnsupportedCanonKind` so the caller falls through to the trap
+/// stub; bridging them is a follow-up to #701.
+fn installCanonBuiltinBackedCrossInstanceThunk(
+    allocator: std.mem.Allocator,
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    canon_idx: u32,
+    imp: aot_loader.AotImportDesc,
+    module: *const aot_loader.AotModule,
+) !*const anyopaque {
+    if (canon_idx >= component.canons.len) return error.InvalidCanonIdx;
+    const canon = component.canons[canon_idx];
+    switch (canon) {
+        .resource_drop, .resource_new, .resource_rep => {},
+        else => return error.UnsupportedCanonKind,
+    }
+
+    // Defensive shape check: every in-scope canon-builtin is `(i32) → ()`
+    // (drop) or `(i32) → i32` (new/rep). Reject anything else early so
+    // the trampoline-pool slot can rely on the lowered-sig invariants.
+    if (imp.func_type_idx >= module.func_types.len) return error.InvalidFuncType;
+    const ft = module.func_types[imp.func_type_idx];
+    if (ft.params.len != 1 or ft.params[0] != .i32) return error.UnsupportedSignature;
+    switch (canon) {
+        .resource_drop => if (ft.results.len != 0) return error.UnsupportedSignature,
+        .resource_new, .resource_rep => {
+            if (ft.results.len != 1 or ft.results[0] != .i32) return error.UnsupportedSignature;
+        },
+        else => unreachable,
+    }
+
+    // Probe the pool first so failures on platforms without RWX trampoline
+    // pages bail before we publish a new ctx — the caller installs a trap
+    // stub instead.
+    const pool = try ensureAotTrampolinePool(inst);
+
+    // Reuse / build the per-canon-def-id ctx. Same memoisation map the
+    // interp `linkImports` sweep at instance.zig:1939 uses, so a single
+    // canon-def shared by interp and AOT imports points at one ctx.
+    const ctx_ptr = ctx_blk: {
+        if (inst.canon_builtin_ctx_by_canon_idx.get(canon_idx)) |existing| {
+            break :ctx_blk existing;
+        }
+        const new_ctx = try allocator.create(executor_mod.CanonBuiltinTrampolineCtx);
+        errdefer allocator.destroy(new_ctx);
+        new_ctx.* = .{
+            .comp_inst = inst,
+            .canon = canon,
+        };
+        try inst.canon_builtin_ctxs.append(allocator, new_ctx);
+        errdefer _ = inst.canon_builtin_ctxs.pop();
+        // Failing to record the memoisation entry is non-fatal — the
+        // canon_builtin_ctxs list still owns the allocation, so it gets
+        // freed on `deinit`. Subsequent duplicate slots will allocate
+        // their own ctx (graceful degradation under OOM).
+        inst.canon_builtin_ctx_by_canon_idx.put(allocator, canon_idx, new_ctx) catch {};
+        break :ctx_blk new_ctx;
+    };
+
+    const arena = inst.module_arena.allocator();
+    const lowered_params = try arena.alloc(core_types.ValType, ft.params.len);
+    for (ft.params, 0..) |p, i| lowered_params[i] = p;
+    const lowered_results = try arena.alloc(core_types.ValType, ft.results.len);
+    for (ft.results, 0..) |r, i| lowered_results[i] = r;
+
+    const stub = try pool.allocCanonBuiltinAotSlot(@ptrCast(ctx_ptr), .{
         .param_types = lowered_params,
         .result_types = lowered_results,
         .has_retptr = false,
