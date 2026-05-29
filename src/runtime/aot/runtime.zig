@@ -1507,6 +1507,17 @@ pub fn findExportFunc(inst: *const AotInstance, name: []const u8) ?u32 {
     return null;
 }
 
+/// Look up an exported memory by name, returning the underlying
+/// `*MemoryInstance` from the AOT instance's `memories` array.
+/// Used by `ComponentInstance.resolveTopLevelMemory` to follow an
+/// `alias core export "name"` decl through an AOT sibling core
+/// instance for canon-lower(aot) retptr stores. Issue #707.
+pub fn findExportMemory(inst: *const AotInstance, name: []const u8) ?*types.MemoryInstance {
+    const exp = inst.module.findExport(name, .memory) orelse return null;
+    if (exp.index >= inst.memories.len) return null;
+    return inst.memories[exp.index];
+}
+
 /// Get the native code pointer for a function by module-level index.
 /// Import functions (func_idx < import_function_count) have no native code
 /// and return null.  Local functions are looked up in func_offsets after
