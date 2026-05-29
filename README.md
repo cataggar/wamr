@@ -35,6 +35,8 @@ For release builds:
 $ zig build -Doptimize=ReleaseSafe
 ```
 
+`ReleaseSafe` is the primary source-build recommendation. The 2026-05-29 optimize-mode comparison shows cold-start `noop.cwasm` at ×0.54 Safe/Fast and SIMD interpreter rows at ×0.99 median on the project VM, while also showing `ReleaseSafe` catching a CoreMark AOT compiler invariant before timing; see [`docs/bench/optimize-mode-comparison-2026-05-29.md`](docs/bench/optimize-mode-comparison-2026-05-29.md).
+
 Cross-compilation works out of the box:
 
 ```console

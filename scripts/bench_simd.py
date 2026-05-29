@@ -10,6 +10,7 @@ Usage
 -----
     scripts/bench_simd.py --baseline origin/main --target HEAD --runs 3
     scripts/bench_simd.py --baseline origin/main --target HEAD --emit github
+    scripts/bench_simd.py --optimize both
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
 
 HARNESS_OVERLAY = (
     "build.zig",
@@ -156,12 +159,13 @@ def build_and_run(
     wasmtime: bool,
     wasmtime_path: str,
     wasmtime_iterations: int | None,
+    optimize: str,
 ) -> list[Measurement]:
     env = worktree_env(wt)
     overlay_harness(source_repo, wt)
 
-    print(f"[harness] building {wt.name} (ReleaseFast)", file=sys.stderr)
-    run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=wt, env=env)
+    print(f"[harness] building {wt.name} ({optimize})", file=sys.stderr)
+    run(["zig", "build", f"-Doptimize={optimize}"], cwd=wt, env=env)
 
     runner = wt / "zig-out/bin/simd-bench-runner"
     if not runner.exists():
@@ -227,13 +231,14 @@ def render_table(
     baseline_rows: list[Measurement],
     target_ref: str,
     target_rows: list[Measurement],
+    optimize: str = "ReleaseFast",
 ) -> str:
     baseline = summarize(baseline_rows)
     target = summarize(target_rows)
     keys = sorted(set(baseline) | set(target))
 
     lines = [
-        "### SIMD AOT benchmark comparison",
+        "### SIMD AOT benchmark comparison" if optimize == "ReleaseFast" else f"### SIMD AOT benchmark comparison ({optimize})",
         "",
         "| Case | Engine | Ref | Status | Result | Median run | Median compile | Code size | Iterations |",
         "|---|---|---|---|---:|---:|---:|---:|---:|",
@@ -267,6 +272,51 @@ def render_table(
             "",
             "AOT rows with `unsupported` are expected for refs or SIMD opcode families without native v128 lowering.",
             "CoreMark is scalar, so this harness is the SIMD-specific signal for issue #220.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+
+
+def render_optimize_table(
+    target_ref: str,
+    results: dict[str, list[Measurement]],
+) -> str:
+    summaries = {optimize: summarize(rows) for optimize, rows in results.items()}
+    keys = sorted(set(summaries["ReleaseFast"]) | set(summaries["ReleaseSafe"]))
+    lines = [
+        "### SIMD AOT optimize-mode comparison",
+        "",
+        "| Case | Engine | Ref | Fast status | Safe status | Fast median run | Safe median run | Safe/Fast run | Fast median compile | Safe median compile | Safe/Fast compile |",
+        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for case, engine in keys:
+        fast = summaries["ReleaseFast"].get((case, engine))
+        safe = summaries["ReleaseSafe"].get((case, engine))
+        fast_run = fast["run_ns"] if fast is not None else None
+        safe_run = safe["run_ns"] if safe is not None else None
+        fast_compile = fast["compile_ns"] if fast is not None else None
+        safe_compile = safe["compile_ns"] if safe is not None else None
+        lines.append(
+            "| `{case}` | `{engine}` | `{ref}` (target) | {fast_status} | {safe_status} | {fast_run} | {safe_run} | {run_ratio} | {fast_compile} | {safe_compile} | {compile_ratio} |".format(
+                case=case,
+                engine=engine,
+                ref=target_ref,
+                fast_status=fast["status"] if fast is not None else "missing",
+                safe_status=safe["status"] if safe is not None else "missing",
+                fast_run=fmt_ns(fast_run),
+                safe_run=fmt_ns(safe_run),
+                run_ratio=fmt_ratio(safe_run, fast_run),
+                fast_compile=fmt_ns(fast_compile),
+                safe_compile=fmt_ns(safe_compile),
+                compile_ratio=fmt_ratio(safe_compile, fast_compile),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "Safe/Fast ratios compare ReleaseSafe timing divided by ReleaseFast timing for the same target/case/engine.",
         ]
     )
     return "\n".join(lines)
@@ -317,6 +367,12 @@ def main() -> int:
         default="markdown",
         help="`github` also appends to $GITHUB_STEP_SUMMARY when present",
     )
+    p.add_argument(
+        "--optimize",
+        choices=OPTIMIZE_CHOICES,
+        default="ReleaseFast",
+        help="Zig optimize mode for wamr builds (default: ReleaseFast); `both` compares ReleaseFast vs ReleaseSafe for --target only",
+    )
     args = p.parse_args()
 
     if args.runs <= 0:
@@ -333,31 +389,53 @@ def main() -> int:
     ) as tmp:
         root = Path(tmp)
         try:
-            wt_b = make_worktree(repo, args.baseline, root, "baseline")
-            wt_t = make_worktree(repo, args.target, root, "target")
-
-            baseline_rows = build_and_run(
-                wt_b,
-                repo,
-                args.runs,
-                args.iterations,
-                args.wasmtime,
-                args.wasmtime_path,
-                args.wasmtime_iterations,
-            )
-            target_rows = build_and_run(
-                wt_t,
-                repo,
-                args.runs,
-                args.iterations,
-                args.wasmtime,
-                args.wasmtime_path,
-                args.wasmtime_iterations,
-            )
+            optimize_modes = parse_optimize_modes(args.optimize)
+            if args.optimize == "both":
+                optimize_results: dict[str, list[Measurement]] = {}
+                for optimize in optimize_modes:
+                    wt_t = make_worktree(repo, args.target, root, f"target-{optimize_slug(optimize)}")
+                    optimize_results[optimize] = build_and_run(
+                        wt_t,
+                        repo,
+                        args.runs,
+                        args.iterations,
+                        args.wasmtime,
+                        args.wasmtime_path,
+                        args.wasmtime_iterations,
+                        optimize,
+                    )
+            else:
+                only = optimize_modes[0]
+                wt_b = make_worktree(repo, args.baseline, root, "baseline")
+                wt_t = make_worktree(repo, args.target, root, "target")
+                baseline_rows = build_and_run(
+                    wt_b,
+                    repo,
+                    args.runs,
+                    args.iterations,
+                    args.wasmtime,
+                    args.wasmtime_path,
+                    args.wasmtime_iterations,
+                    only,
+                )
+                target_rows = build_and_run(
+                    wt_t,
+                    repo,
+                    args.runs,
+                    args.iterations,
+                    args.wasmtime,
+                    args.wasmtime_path,
+                    args.wasmtime_iterations,
+                    only,
+                )
         finally:
             run(["git", "worktree", "prune"], cwd=repo)
 
-    table = render_table(args.baseline, baseline_rows, args.target, target_rows)
+    if args.optimize == "both":
+        table = render_optimize_table(args.target, optimize_results)
+    else:
+        only = parse_optimize_modes(args.optimize)[0]
+        table = render_table(args.baseline, baseline_rows, args.target, target_rows, only)
     print(table)
 
     if args.out:

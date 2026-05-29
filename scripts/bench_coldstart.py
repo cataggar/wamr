@@ -23,6 +23,7 @@ Usage
         --samples 50 --warmup 5 --regression-ratio 1.5 \\
         --out coldstart-table.md --json coldstart.json --emit github
     scripts/bench_coldstart.py --target HEAD --wasmtime --include-jit
+    scripts/bench_coldstart.py --optimize both
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
 
 
 # Modules in the order they should appear in tables / JSON output.
@@ -124,11 +127,11 @@ def worktree_env(wt: Path) -> dict:
     return env
 
 
-def build_worktree(wt: Path) -> dict:
-    """``zig build -Doptimize=ReleaseFast`` and return the env to reuse."""
+def build_worktree(wt: Path, optimize: str) -> dict:
+    """Build wamr/wamrc and return the env to reuse."""
     env = worktree_env(wt)
-    print(f"[harness] building {wt.name} (ReleaseFast)", file=sys.stderr)
-    run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=wt, env=env)
+    print(f"[harness] building {wt.name} ({optimize})", file=sys.stderr)
+    run(["zig", "build", f"-Doptimize={optimize}"], cwd=wt, env=env)
     wamr = wt / "zig-out/bin/wamr"
     wamrc = wt / "zig-out/bin/wamrc"
     if not wamr.exists():
@@ -352,6 +355,7 @@ def collect_summaries(
     modules: dict[str, dict[str, Path]],
     samples: int,
     warmup: int,
+    baseline_env: dict | None = None,
 ) -> list[Summary]:
     out: list[Summary] = []
     for module_name, paths in modules.items():
@@ -386,6 +390,7 @@ def collect_summaries(
             run(
                 [str(baseline_wamrc), "compile", str(wasm), "-o", str(baseline_cwasm)],
                 cwd=baseline_wamr.parent,
+                env=baseline_env,
             )
         out.append(
             time_engine_module(
@@ -420,6 +425,44 @@ def collect_summaries(
     return out
 
 
+def collect_target_summaries(
+    *,
+    target_wamr: Path,
+    wasmtime_path: str | None,
+    modules: dict[str, dict[str, Path]],
+    samples: int,
+    warmup: int,
+) -> list[Summary]:
+    out: list[Summary] = []
+    for module_name, paths in modules.items():
+        wasm = paths["wasm"]
+        wamr_cwasm = paths["wamr_cwasm"]
+        out.append(
+            time_engine_module(
+                f"{target_wamr} run {wamr_cwasm.name}",
+                [str(target_wamr), "run", str(wamr_cwasm)],
+                samples, warmup, ENGINE_TARGET, module_name, "cwasm",
+            )
+        )
+        if wasmtime_path is not None and "wasmtime_cwasm" in paths:
+            wt_cwasm = paths["wasmtime_cwasm"]
+            out.append(
+                time_engine_module(
+                    f"{wasmtime_path} {wt_cwasm.name}",
+                    [wasmtime_path, "run", "--allow-precompiled", str(wt_cwasm)],
+                    samples, warmup, ENGINE_WASMTIME_AOT, module_name, "cwasm",
+                )
+            )
+            out.append(
+                time_engine_module(
+                    f"{wasmtime_path} {wasm.name}",
+                    [wasmtime_path, "run", str(wasm)],
+                    samples, warmup, ENGINE_WASMTIME_JIT, module_name, "wasm",
+                )
+            )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Rendering + regression detection.
 # ---------------------------------------------------------------------------
@@ -448,6 +491,7 @@ def render_table(
     target_ref: str,
     summaries: list[Summary],
     wasmtime_path: str | None,
+    optimize: str = "ReleaseFast",
 ) -> str:
     """Markdown table grouped by (module, variant)."""
     modules_seen: list[str] = []
@@ -463,7 +507,10 @@ def render_table(
         engines.append((ENGINE_WASMTIME_AOT, "wasmtime (precompiled)"))
         engines.append((ENGINE_WASMTIME_JIT, "wasmtime (JIT)"))
 
-    lines: list[str] = ["### Cold-start CLI comparison (median ms)", ""]
+    title = "### Cold-start CLI comparison (median ms)"
+    if optimize != "ReleaseFast":
+        title += f" ({optimize})"
+    lines: list[str] = [title, ""]
     lines.append(
         "| Module | Variant | Engine | Median | Min | Max | p95 | σ | Δ vs baseline |"
     )
@@ -489,6 +536,48 @@ def render_table(
                     f"{fmt_ms(s.max_ns)} | {fmt_ms(s.p95_ns)} | "
                     f"{fmt_ms(s.stdev_ns)} | {delta} |"
                 )
+    return "\n".join(lines)
+
+
+def render_optimize_table(
+    target_ref: str,
+    results: dict[str, list[Summary]],
+    wasmtime_path: str | None,
+) -> str:
+    modules_seen: list[str] = []
+    for summaries in results.values():
+        for s in summaries:
+            if s.module not in modules_seen:
+                modules_seen.append(s.module)
+
+    engines: list[tuple[str, str]] = [(ENGINE_TARGET, f"target (`{target_ref}`)")]
+    if wasmtime_path is not None:
+        engines.append((ENGINE_WASMTIME_AOT, "wasmtime (precompiled)"))
+        engines.append((ENGINE_WASMTIME_JIT, "wasmtime (JIT)"))
+
+    lines: list[str] = [
+        "### Cold-start CLI optimize-mode comparison (median ms)",
+        "",
+        "| Module | Variant | Engine | ReleaseFast median | ReleaseSafe median | Safe/Fast | ReleaseFast p95 | ReleaseSafe p95 |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for module in modules_seen:
+        for variant in ("cwasm", "wasm"):
+            for engine_id, engine_label in engines:
+                fast = lookup(results["ReleaseFast"], engine_id, module, variant)
+                safe = lookup(results["ReleaseSafe"], engine_id, module, variant)
+                if fast is None and safe is None:
+                    continue
+                lines.append(
+                    f"| `{module}` | `{variant}` | {engine_label} | "
+                    f"{fmt_ms(fast.median_ns if fast else None)} | "
+                    f"{fmt_ms(safe.median_ns if safe else None)} | "
+                    f"{fmt_ratio(safe.median_ns if safe else None, fast.median_ns if fast else None)} | "
+                    f"{fmt_ms(fast.p95_ns if fast else None)} | "
+                    f"{fmt_ms(safe.p95_ns if safe else None)} |"
+                )
+    lines.append("")
+    lines.append("Safe/Fast ratios compare ReleaseSafe median divided by ReleaseFast median for the same target/module/engine.")
     return "\n".join(lines)
 
 
@@ -619,6 +708,12 @@ def main() -> int:
     p.add_argument("--out", type=Path, default=None, help="if given, write the markdown table here as well")
     p.add_argument("--emit", choices=["markdown", "github"], default="markdown", help="`github` also appends to $GITHUB_STEP_SUMMARY when present")
     p.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1], help="path to wamr repo (default: parent of scripts/)")
+    p.add_argument(
+        "--optimize",
+        choices=OPTIMIZE_CHOICES,
+        default="ReleaseFast",
+        help="Zig optimize mode for wamr builds (default: ReleaseFast); `both` compares ReleaseFast vs ReleaseSafe for --target only",
+    )
     args = p.parse_args()
 
     if args.samples <= 0:
@@ -653,44 +748,69 @@ def main() -> int:
         tmp_root = "/work"
     else:
         tmp_root = None
+    optimize_modes = parse_optimize_modes(args.optimize)
+    summaries_by_optimize: dict[str, list[Summary]] = {}
     with tempfile.TemporaryDirectory(prefix="bench-coldstart-", dir=tmp_root) as tmp:
         root = Path(tmp)
         try:
-            wt_t = make_worktree(repo, args.target, root, "target")
-            wt_b = make_worktree(repo, args.baseline, root, "baseline")
-
-            target_env = build_worktree(wt_t)
-            build_worktree(wt_b)
-
-            modules = prepare_modules(
-                repo,
-                wt_t,
-                target_env,
-                root / "modules",
-                include_jit=args.include_jit,
-                use_wasmtime=args.wasmtime,
-                wasmtime_path=wasmtime_path,
-            )
-
-            summaries = collect_summaries(
-                target_wamr=wt_t / "zig-out/bin/wamr",
-                baseline_wamr=wt_b / "zig-out/bin/wamr",
-                wasmtime_path=wasmtime_path,
-                modules=modules,
-                samples=args.samples,
-                warmup=args.warmup,
-            )
+            if args.optimize == "both":
+                for optimize in optimize_modes:
+                    slug = optimize_slug(optimize)
+                    wt_t = make_worktree(repo, args.target, root, f"target-{slug}")
+                    target_env = build_worktree(wt_t, optimize)
+                    modules = prepare_modules(
+                        repo,
+                        wt_t,
+                        target_env,
+                        root / "modules" / slug,
+                        include_jit=args.include_jit,
+                        use_wasmtime=args.wasmtime,
+                        wasmtime_path=wasmtime_path,
+                    )
+                    summaries_by_optimize[optimize] = collect_target_summaries(
+                        target_wamr=wt_t / "zig-out/bin/wamr",
+                        wasmtime_path=wasmtime_path,
+                        modules=modules,
+                        samples=args.samples,
+                        warmup=args.warmup,
+                    )
+                summaries = summaries_by_optimize["ReleaseFast"]
+                table = render_optimize_table(args.target, summaries_by_optimize, wasmtime_path)
+                regressions: list[Regression] = []
+            else:
+                only = optimize_modes[0]
+                wt_t = make_worktree(repo, args.target, root, "target")
+                wt_b = make_worktree(repo, args.baseline, root, "baseline")
+                target_env = build_worktree(wt_t, only)
+                baseline_env = build_worktree(wt_b, only)
+                modules = prepare_modules(
+                    repo,
+                    wt_t,
+                    target_env,
+                    root / "modules" / optimize_slug(only),
+                    include_jit=args.include_jit,
+                    use_wasmtime=args.wasmtime,
+                    wasmtime_path=wasmtime_path,
+                )
+                summaries = collect_summaries(
+                    target_wamr=wt_t / "zig-out/bin/wamr",
+                    baseline_wamr=wt_b / "zig-out/bin/wamr",
+                    wasmtime_path=wasmtime_path,
+                    modules=modules,
+                    samples=args.samples,
+                    warmup=args.warmup,
+                    baseline_env=baseline_env,
+                )
+                table = render_table(args.baseline, args.target, summaries, wasmtime_path, only)
+                regressions = find_regressions(
+                    summaries,
+                    regression_ratio=args.regression_ratio,
+                    budget_ms=args.budget_ms,
+                )
         finally:
             run(["git", "worktree", "prune"], cwd=repo, check=False)
 
-    table = render_table(args.baseline, args.target, summaries, wasmtime_path)
     print(table)
-
-    regressions = find_regressions(
-        summaries,
-        regression_ratio=args.regression_ratio,
-        budget_ms=args.budget_ms,
-    )
 
     if regressions:
         print("", file=sys.stderr)
