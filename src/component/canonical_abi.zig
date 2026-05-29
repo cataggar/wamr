@@ -5,6 +5,7 @@
 //! See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md
 
 const std = @import("std");
+const config = @import("../config.zig");
 const ctypes = @import("types.zig");
 const Allocator = std.mem.Allocator;
 
@@ -568,13 +569,14 @@ pub const LoadError = error{
     InvalidTypeIndex,
     InvalidDiscriminant,
     OutOfMemory,
-};
+} || CanonPtrLenError;
 
 /// Load any value from linear memory, resolving compound types via registry.
 pub fn loadValReg(memory: []const u8, ptr: u32, t: ctypes.ValType, reg: TypeRegistry, alloc: Allocator) LoadError!InterfaceValue {
     return switch (t) {
         // Primitives delegate to existing path
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .future, .stream, .error_context, .string, .list => loadVal(memory, ptr, t),
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .future, .stream, .error_context, .string => loadVal(memory, ptr, t),
+        .list => loadVal(memory, ptr, t),
         .enum_ => |idx| blk: {
             const td = reg.get(idx) orelse break :blk error.InvalidTypeIndex;
             const disc_sz = discriminantSize(td.enum_.names.len);
@@ -839,12 +841,13 @@ pub fn storeVal(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValue) 
 pub const StoreError = error{
     CompoundNeedsRegistry,
     InvalidTypeIndex,
-};
+} || CanonPtrLenError;
 
 /// Store any value to linear memory, resolving compound types via registry.
 pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValue, reg: TypeRegistry) StoreError!void {
     switch (t) {
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .future, .stream, .error_context, .string, .list => try storeVal(memory, ptr, t, val),
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .future, .stream, .error_context, .string => try storeVal(memory, ptr, t, val),
+        .list => try storeVal(memory, ptr, t, val),
         .enum_ => {
             const idx = t.enum_;
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
@@ -1425,6 +1428,124 @@ pub const AbiError = error{
     BufferTooSmall,
     OutOfMemory,
 };
+
+pub const strict_canon_max_ptr_len_bytes: usize = 256 * 1024 * 1024;
+
+pub const CanonPtrLenError = error{
+    CanonStringLengthExceedsMemory,
+    CanonStringRangePastEnd,
+    CanonStringImplausibleLength,
+    CanonListLengthExceedsMemory,
+    CanonListRangePastEnd,
+    CanonListImplausibleLength,
+    CanonListMisaligned,
+};
+
+pub fn validatePtrLen(memory_len: usize, pl: InterfaceValue.PtrLen, kind: enum { string, list }, elem_align: u32, elem_size: u32, context: []const u8) CanonPtrLenError!void {
+    if (comptime !config.wamr_strict_canon) return;
+    const label = @tagName(kind);
+    if (kind == .list and elem_align > 1 and pl.ptr % elem_align != 0) {
+        std.log.warn("[{s}] {s} ptr {d} is not aligned to {d}", .{ context, label, pl.ptr, elem_align });
+        return error.CanonListMisaligned;
+    }
+    if (pl.len > strict_canon_max_ptr_len_bytes) {
+        std.log.warn("[{s}] {s} length {d} implausibly large — likely garbage register slot", .{ context, label, pl.len });
+        return if (kind == .string) error.CanonStringImplausibleLength else error.CanonListImplausibleLength;
+    }
+    if (pl.len > memory_len) {
+        std.log.warn("[{s}] {s} length {d} exceeds memory size {d} (likely wrong memory_idx for canon-lower)", .{ context, label, pl.len, memory_len });
+        return if (kind == .string) error.CanonStringLengthExceedsMemory else error.CanonListLengthExceedsMemory;
+    }
+    const bytes_per_elem = @max(@as(u32, 1), elem_size);
+    const byte_len = std.math.mul(usize, @intCast(pl.len), @intCast(bytes_per_elem)) catch {
+        std.log.warn("[{s}] {s} length {d} implausibly large — likely garbage register slot", .{ context, label, pl.len });
+        return if (kind == .string) error.CanonStringImplausibleLength else error.CanonListImplausibleLength;
+    };
+    if (byte_len > strict_canon_max_ptr_len_bytes) {
+        std.log.warn("[{s}] {s} length {d} implausibly large — likely garbage register slot", .{ context, label, pl.len });
+        return if (kind == .string) error.CanonStringImplausibleLength else error.CanonListImplausibleLength;
+    }
+    const end = std.math.add(usize, @intCast(pl.ptr), byte_len) catch {
+        std.log.warn("[{s}] {s} [{d}, {d}) past end of memory size {d}", .{ context, label, pl.ptr, std.math.maxInt(usize), memory_len });
+        return if (kind == .string) error.CanonStringRangePastEnd else error.CanonListRangePastEnd;
+    };
+    if (end > memory_len) {
+        std.log.warn("[{s}] {s} [{d}, {d}) past end of memory size {d}", .{ context, label, pl.ptr, end, memory_len });
+        return if (kind == .string) error.CanonStringRangePastEnd else error.CanonListRangePastEnd;
+    }
+}
+
+fn listLayout(reg: TypeRegistry, element: ctypes.ValType) struct { alignment: u32, size: u32 } {
+    return .{
+        .alignment = @max(@as(u32, 1), alignOfType(reg, element)),
+        .size = @max(@as(u32, 1), sizeOfType(reg, element)),
+    };
+}
+
+pub fn validatePtrLenValue(memory_len: usize, val: InterfaceValue, t: ctypes.ValType, reg: TypeRegistry, context: []const u8) (CanonPtrLenError || error{InvalidTypeIndex})!void {
+    if (comptime !config.wamr_strict_canon) return;
+    switch (t) {
+        .string => try validatePtrLen(memory_len, val.string, .string, 1, 1, context),
+        .list => |idx| {
+            if (reg.get(idx)) |td| {
+                const list = switch (td) {
+                    .list => |l| l,
+                    else => return error.InvalidTypeIndex,
+                };
+                const layout = listLayout(reg, list.element);
+                try validatePtrLen(memory_len, val.list, .list, layout.alignment, layout.size, context);
+            } else {
+                try validatePtrLen(memory_len, val.list, .list, 1, 1, context);
+            }
+        },
+        .record => |idx| {
+            const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            for (td.record.fields, val.record_val) |field, field_val| try validatePtrLenValue(memory_len, field_val, field.type, reg, context);
+        },
+        .tuple => |idx| {
+            const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            for (td.tuple.fields, val.tuple_val) |field_t, field_val| try validatePtrLenValue(memory_len, field_val, field_t, reg, context);
+        },
+        .variant => |idx| {
+            const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            if (val.variant_val.payload) |payload| if (td.variant.cases[val.variant_val.discriminant].type) |payload_t| try validatePtrLenValue(memory_len, payload.*, payload_t, reg, context);
+        },
+        .option => |idx| {
+            const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            if (val.option_val.payload) |payload| try validatePtrLenValue(memory_len, payload.*, td.option.inner, reg, context);
+        },
+        .result => |idx| {
+            const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            const payload_t = if (val.result_val.is_ok) td.result.ok else td.result.err;
+            if (payload_t) |pt| if (val.result_val.payload) |payload| try validatePtrLenValue(memory_len, payload.*, pt, reg, context);
+        },
+        .type_idx => |idx| {
+            const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            try validatePtrLenValueFromDef(memory_len, val, td, reg, context);
+        },
+        else => {},
+    }
+}
+
+fn validatePtrLenValueFromDef(memory_len: usize, val: InterfaceValue, td: ctypes.TypeDef, reg: TypeRegistry, context: []const u8) (CanonPtrLenError || error{InvalidTypeIndex})!void {
+    if (comptime !config.wamr_strict_canon) return;
+    switch (td) {
+        .val => |inner| try validatePtrLenValue(memory_len, val, inner, reg, context),
+        .list => |list| {
+            const layout = listLayout(reg, list.element);
+            try validatePtrLen(memory_len, val.list, .list, layout.alignment, layout.size, context);
+        },
+        .record => |record| for (record.fields, val.record_val) |field, field_val| try validatePtrLenValue(memory_len, field_val, field.type, reg, context),
+        .tuple => |tuple| for (tuple.fields, val.tuple_val) |field_t, field_val| try validatePtrLenValue(memory_len, field_val, field_t, reg, context),
+        .variant => |variant| if (val.variant_val.payload) |payload| if (variant.cases[val.variant_val.discriminant].type) |payload_t| try validatePtrLenValue(memory_len, payload.*, payload_t, reg, context),
+        .option => |option| if (val.option_val.payload) |payload| try validatePtrLenValue(memory_len, payload.*, option.inner, reg, context),
+        .result => |result| {
+            const payload_t = if (val.result_val.is_ok) result.ok else result.err;
+            if (payload_t) |pt| if (val.result_val.payload) |payload| try validatePtrLenValue(memory_len, payload.*, pt, reg, context);
+        },
+        else => {},
+    }
+}
 
 // ── Memory helpers ──────────────────────────────────────────────────────────
 

@@ -3449,6 +3449,7 @@ fn buildLoweredComponentTrampolineCtx(
         .comp_inst = inst,
         .host_func = .{},
         .component_func_idx = lower.func_idx,
+        .canon_lower_idx = canon_lower_idx,
         .param_types = params,
         .result_types = results,
         .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),

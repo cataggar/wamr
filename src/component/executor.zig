@@ -10,6 +10,7 @@
 //! See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md
 
 const std = @import("std");
+const config = @import("../config.zig");
 const ctypes = @import("types.zig");
 const abi = @import("canonical_abi.zig");
 const instance_mod = @import("instance.zig");
@@ -28,6 +29,7 @@ const Allocator = std.mem.Allocator;
 const ComponentInstance = instance_mod.ComponentInstance;
 const InterfaceValue = abi.InterfaceValue;
 const TypeRegistry = abi.TypeRegistry;
+const lifted_result_invariant_violated: [:0]const u8 = "lifted-result-invariant-violated";
 pub const CallFrame = call_frame_mod.CallFrame;
 pub const InterpFrame = call_frame_mod.InterpFrame;
 pub const AotFrame = call_frame_mod.AotFrame;
@@ -286,7 +288,10 @@ pub fn callComponentFuncByLocal(
         }
         frame.deinit();
     }
-    const is_aot = switch (frame) { .aot => true, .interp => false };
+    const is_aot = switch (frame) {
+        .aot => true,
+        .interp => false,
+    };
 
     // Parse canonical options
     const lift_opts = LiftOptions.fromOpts(exported.opts);
@@ -513,7 +518,6 @@ fn coreFlatSlotType(t: ctypes.ValType, registry: TypeRegistry) !core_types.ValTy
     };
 }
 
-
 /// Async-lifted variant of `callComponentFuncByLocal`. Lifts args and
 /// drives the core wasm body the same way, but the callee delivers its
 /// results via `canon task.return` (#478 sub-PR 2). On return from the
@@ -697,6 +701,63 @@ fn typeSize(registry: TypeRegistry, t: ctypes.ValType) u32 {
     const s = abi.elemSize(t);
     if (s > 0) return s;
     return abi.sizeOfType(registry, t);
+}
+
+fn strictCanonMemory(ctx: *const ComponentTrampolineCtx) ![]const u8 {
+    const mem_idx = ctx.lower_opts.memory_idx orelse 0;
+    const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.MemoryNotAvailable;
+    return mem.data;
+}
+
+fn validateCanonPtrLenValue(mem: []const u8, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry, context: []const u8) !void {
+    if (comptime !config.wamr_strict_canon) return;
+    try abi.validatePtrLenValue(mem.len, val, t, registry, context);
+}
+
+fn typeContainsPtrLen(t: ctypes.ValType, registry: TypeRegistry) bool {
+    if (comptime !config.wamr_strict_canon) return false;
+    return switch (t) {
+        .string, .list => true,
+        .record => |idx| if (registry.get(idx)) |td| blk: {
+            for (td.record.fields) |field| if (typeContainsPtrLen(field.type, registry)) break :blk true;
+            break :blk false;
+        } else false,
+        .tuple => |idx| if (registry.get(idx)) |td| blk: {
+            for (td.tuple.fields) |field_t| if (typeContainsPtrLen(field_t, registry)) break :blk true;
+            break :blk false;
+        } else false,
+        .variant => |idx| if (registry.get(idx)) |td| blk: {
+            for (td.variant.cases) |case| if (case.type) |payload_t| if (typeContainsPtrLen(payload_t, registry)) break :blk true;
+            break :blk false;
+        } else false,
+        .option => |idx| if (registry.get(idx)) |td| typeContainsPtrLen(td.option.inner, registry) else false,
+        .result => |idx| if (registry.get(idx)) |td| ((td.result.ok != null and typeContainsPtrLen(td.result.ok.?, registry)) or (td.result.err != null and typeContainsPtrLen(td.result.err.?, registry))) else false,
+        .type_idx => |idx| if (registry.get(idx)) |td| typeDefContainsPtrLen(td, registry) else false,
+        else => false,
+    };
+}
+
+fn typeDefContainsPtrLen(td: ctypes.TypeDef, registry: TypeRegistry) bool {
+    if (comptime !config.wamr_strict_canon) return false;
+    return switch (td) {
+        .val => |inner| typeContainsPtrLen(inner, registry),
+        .list => true,
+        .record => |record| blk: {
+            for (record.fields) |field| if (typeContainsPtrLen(field.type, registry)) break :blk true;
+            break :blk false;
+        },
+        .tuple => |tuple| blk: {
+            for (tuple.fields) |field_t| if (typeContainsPtrLen(field_t, registry)) break :blk true;
+            break :blk false;
+        },
+        .variant => |variant| blk: {
+            for (variant.cases) |case| if (case.type) |payload_t| if (typeContainsPtrLen(payload_t, registry)) break :blk true;
+            break :blk false;
+        },
+        .option => |option| typeContainsPtrLen(option.inner, registry),
+        .result => |result| (result.ok != null and typeContainsPtrLen(result.ok.?, registry)) or (result.err != null and typeContainsPtrLen(result.err.?, registry)),
+        else => false,
+    };
 }
 
 // ── Helper: push/pop interface values as core stack values ──────────────────
@@ -1395,11 +1456,11 @@ fn storeInterfaceValue(
     t: ctypes.ValType,
     registry: TypeRegistry,
 ) abi.StoreError!void {
-    abi.storeVal(mem, ptr, t, val) catch {
-        // Only error storeVal can return is CompoundNeedsRegistry —
-        // re-attempt via the registry-aware path so the error
-        // propagates instead of silently writing nothing. Issue #707.
-        try abi.storeValReg(mem, ptr, t, val, registry);
+    abi.storeVal(mem, ptr, t, val) catch |err| switch (err) {
+        error.CompoundNeedsRegistry => {
+            try abi.storeValReg(mem, ptr, t, val, registry);
+        },
+        inline else => |e| return e,
     };
 }
 
@@ -2776,13 +2837,13 @@ test "LowerOptions: async opt flips is_async (#551 canon-lower-of-async-func)" {
     const lo_async = LowerOptions.fromOpts(&opts_async);
     try std.testing.expectEqual(true, lo_async.is_async);
 
-    const opts_sync = [_]ctypes.CanonOpt{ .{ .memory = 0 } };
+    const opts_sync = [_]ctypes.CanonOpt{.{ .memory = 0 }};
     const lo_sync = LowerOptions.fromOpts(&opts_sync);
     try std.testing.expectEqual(false, lo_sync.is_async);
 
     // `callback` opt on the lower side is accepted as a no-op (Binary.md
     // canon opt vec is shared with canon.lift); it must NOT flip is_async.
-    const opts_cb = [_]ctypes.CanonOpt{ .{ .callback = 3 } };
+    const opts_cb = [_]ctypes.CanonOpt{.{ .callback = 3 }};
     const lo_cb = LowerOptions.fromOpts(&opts_cb);
     try std.testing.expectEqual(false, lo_cb.is_async);
 }
@@ -2790,9 +2851,15 @@ test "LowerOptions: async opt flips is_async (#551 canon-lower-of-async-func)" {
 test "packAsyncLowerStatus: pending future → (handle << 4) | STATUS_STARTED (#551)" {
     const testing = std.testing;
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -2837,9 +2904,15 @@ test "dispatchCanonBuiltin: waitable.join wires a subtask_managed future as .sub
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -2889,9 +2962,15 @@ test "dispatchCanonBuiltin: waitable.join on a non-subtask future keeps the futu
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -2938,9 +3017,15 @@ test "dispatchCanonBuiltin: waitable.join late-arrival on an already-fired subta
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -2984,9 +3069,15 @@ test "dispatchCanonBuiltin: waitable.join late-arrival on a cancelled subtask ca
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3285,9 +3376,15 @@ test "dispatchCanonBuiltin: task.yield pushes resumed=0 with no task manager" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3315,9 +3412,15 @@ test "dispatchCanonBuiltin: task.yield observes cancellation via TaskManager" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3368,9 +3471,15 @@ test "dispatchCanonBuiltin: task.cancel without task manager traps with Function
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3400,9 +3509,15 @@ test "dispatchCanonBuiltin: task.cancel without current_task traps with Function
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3435,9 +3550,15 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3473,9 +3594,15 @@ test "dispatchCanonBuiltin: task.cancel is idempotent" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3526,9 +3653,15 @@ test "dispatchCanonBuiltin: task.cancel + cancellable task.yield observes cancel
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3583,9 +3716,15 @@ test "dispatchCanonBuiltin: context set+get round-trip on implicit task" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3625,9 +3764,15 @@ test "dispatchCanonBuiltin: context set+yield+get round-trip on async task" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3687,9 +3832,15 @@ test "dispatchCanonBuiltin: context.get out-of-range slot traps" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3718,9 +3869,15 @@ test "dispatchCanonBuiltin: task.return delivers results to the current task (#4
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3767,9 +3924,15 @@ test "dispatchCanonBuiltin: task.return without a task manager is malformed" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3799,9 +3962,15 @@ test "dispatchCanonBuiltin: waitable-set.new allocates a fresh handle; drop free
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3842,9 +4011,15 @@ test "dispatchCanonBuiltin: future.new + drop both ends round-trip" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -3902,9 +4077,15 @@ fn newFutureU32Inst(testing_allocator: std.mem.Allocator) !*instance_mod.Compone
     const FutureTypeFixture = struct {
         var types_array = [_]ctypes.TypeDef{.{ .val = .u32 }};
         var comp: ctypes.Component = .{
-            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-            .components = &.{},       .instances = &.{},      .aliases = &.{},
-            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .core_modules = &.{},
+            .core_instances = &.{},
+            .core_types = &.{},
+            .components = &.{},
+            .instances = &.{},
+            .aliases = &.{},
+            .types = &.{},
+            .canons = &.{},
+            .imports = &.{},
             .exports = &.{},
         };
     };
@@ -4290,9 +4471,15 @@ fn newStreamU32Inst(testing_allocator: std.mem.Allocator) !*instance_mod.Compone
     const StreamTypeFixture = struct {
         var types_array = [_]ctypes.TypeDef{.{ .val = .u32 }};
         var comp: ctypes.Component = .{
-            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-            .components = &.{},       .instances = &.{},      .aliases = &.{},
-            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .core_modules = &.{},
+            .core_instances = &.{},
+            .core_types = &.{},
+            .components = &.{},
+            .instances = &.{},
+            .aliases = &.{},
+            .types = &.{},
+            .canons = &.{},
+            .imports = &.{},
             .exports = &.{},
         };
     };
@@ -4715,9 +4902,15 @@ fn newStreamU8Inst(testing_allocator: std.mem.Allocator) !*instance_mod.Componen
     const StreamTypeFixture = struct {
         var types_array = [_]ctypes.TypeDef{.{ .val = .u8 }};
         var comp: ctypes.Component = .{
-            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-            .components = &.{},       .instances = &.{},      .aliases = &.{},
-            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .core_modules = &.{},
+            .core_instances = &.{},
+            .core_types = &.{},
+            .components = &.{},
+            .instances = &.{},
+            .aliases = &.{},
+            .types = &.{},
+            .canons = &.{},
+            .imports = &.{},
             .exports = &.{},
         };
     };
@@ -5425,9 +5618,15 @@ test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -5474,9 +5673,15 @@ test "dispatchCanonBuiltin: error_context.new captures debug-message bytes (#480
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -5515,9 +5720,15 @@ test "dispatchCanonBuiltin: error_context.debug_message returns stored bytes via
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -5560,9 +5771,15 @@ test "dispatchCanonBuiltin: error_context.new + drop + new produces distinct han
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -5666,6 +5883,7 @@ pub const ComponentTrampolineCtx = struct {
     /// `ComponentInstance.linkImports` can re-bind the host_func after the
     /// caller supplies providers.
     component_func_idx: u32 = 0,
+    canon_lower_idx: u32 = 0,
     /// Component-level parameter types, cached so `trampoline` doesn't have
     /// to re-walk the FuncType on every call.
     param_types: []const ctypes.ValType,
@@ -5837,6 +6055,13 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
                 return trampolineTrap(env, ctx, err, .lift_args);
         }
     }
+    var strict_mem: ?[]const u8 = null;
+    for (args, ctx.param_types) |arg, pt| {
+        if (typeContainsPtrLen(pt, registry)) {
+            if (strict_mem == null) strict_mem = strictCanonMemory(ctx) catch |err| return trampolineTrap(env, ctx, err, .memory_resolve);
+            validateCanonPtrLenValue(strict_mem.?, arg, pt, registry, "canon-lift") catch |err| return trampolineTrap(env, ctx, err, .lift_args);
+        }
+    }
 
     // Invoke host. Host owns allocation of any compound result values via
     // `allocator`; we deinit each result after lowering so payloads
@@ -5963,6 +6188,9 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
             return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
+            if (typeContainsPtrLen(t, registry)) {
+                validateCanonPtrLenValue(mem.data, r, t, registry, "canon-lift") catch |err| return trampolineTrap(env, ctx, err, .lower_results);
+            }
             const al = typeAlign(registry, t);
             offset = abi.alignUp(offset, al);
             storeInterfaceValue(mem.data, offset, r, t, registry) catch |err|
@@ -5971,6 +6199,10 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         }
     } else {
         for (results, ctx.result_types) |r, t| {
+            if (typeContainsPtrLen(t, registry)) {
+                if (strict_mem == null) strict_mem = strictCanonMemory(ctx) catch |err| return trampolineTrap(env, ctx, err, .memory_resolve);
+                validateCanonPtrLenValue(strict_mem.?, r, t, registry, "canon-lift") catch |err| return trampolineTrap(env, ctx, err, .lower_results);
+            }
             pushInterfaceValue(&frame, r, t, registry) catch |err| {
                 return trampolineTrap(env, ctx, err, .lower_results);
             };
@@ -6000,7 +6232,8 @@ pub export fn wamrAotDispatchComponentTrampoline(
                 .{@errorName(err)},
             );
         }
-        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
+        const err_name = if (err == error.LiftedResultInvariantViolated) lifted_result_invariant_violated.ptr else @errorName(err).ptr;
+        return .{ .status = 1, .value = 0, .err_name = err_name };
     };
     return .{ .status = 0, .value = result };
 }
@@ -6037,7 +6270,8 @@ pub export fn wamrAotDispatchComponentTrampolineAot(
                 .{@errorName(err)},
             );
         }
-        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
+        const err_name = if (err == error.LiftedResultInvariantViolated) lifted_result_invariant_violated.ptr else @errorName(err).ptr;
+        return .{ .status = 1, .value = 0, .err_name = err_name };
     };
     return .{ .status = 0, .value = result };
 }
@@ -6278,6 +6512,59 @@ pub export fn wamrAotDispatchTrapStub(
     return .{ .status = 1, .value = 0 };
 }
 
+fn traceCanonValue(mem: ?[]const u8, val: InterfaceValue) void {
+    switch (val) {
+        .string => |pl| {
+            std.debug.print("string(ptr=0x{x},len={d},hex=", .{ pl.ptr, pl.len });
+            if (mem) |m| {
+                const n: usize = @min(@as(usize, @intCast(pl.len)), @as(usize, 64));
+                const start: usize = @intCast(pl.ptr);
+                if (start <= m.len and n <= m.len - start) {
+                    for (m[start .. start + n]) |b| std.debug.print("{x:0>2}", .{b});
+                    if (pl.len > 64) std.debug.print("…", .{});
+                } else std.debug.print("<oob>", .{});
+            } else std.debug.print("<no-mem>", .{});
+            std.debug.print(")", .{});
+        },
+        .list => |pl| std.debug.print("list(ptr=0x{x},len={d})", .{ pl.ptr, pl.len }),
+        .bool => |v| std.debug.print("{any}", .{v}),
+        .s8 => |v| std.debug.print("{d}", .{v}),
+        .u8 => |v| std.debug.print("{d}", .{v}),
+        .s16 => |v| std.debug.print("{d}", .{v}),
+        .u16 => |v| std.debug.print("{d}", .{v}),
+        .s32 => |v| std.debug.print("{d}", .{v}),
+        .u32 => |v| std.debug.print("{d}", .{v}),
+        .s64 => |v| std.debug.print("{d}", .{v}),
+        .u64 => |v| std.debug.print("{d}", .{v}),
+        .f32 => |v| std.debug.print("f32bits=0x{x}", .{v}),
+        .f64 => |v| std.debug.print("f64bits=0x{x}", .{v}),
+        .char => |v| std.debug.print("char=0x{x}", .{v}),
+        .handle => |v| std.debug.print("handle={d}", .{v}),
+        else => std.debug.print("…", .{}),
+    }
+}
+
+fn traceCanonSlice(mem: ?[]const u8, vals: []const InterfaceValue) void {
+    std.debug.print("[", .{});
+    for (vals, 0..) |v, i| {
+        if (i != 0) std.debug.print(",", .{});
+        if (i >= 8) {
+            std.debug.print("…", .{});
+            break;
+        }
+        traceCanonValue(mem, v);
+    }
+    std.debug.print("]", .{});
+}
+
+fn traceCanonLowerCall(ctx: *const ComponentTrampolineCtx, lowered_sig: host_trampolines.LoweredSig, mem: ?[]const u8, mem_idx: u32, args: []const InterfaceValue, results: []const InterfaceValue, result_dest_ptr: u32) void {
+    if (!debugAotEnabled()) return;
+    std.debug.print("[canon-lower] slot={d} cfi={d} mem_idx={d} mem_size={d} params=", .{ lowered_sig.slot, ctx.canon_lower_idx, mem_idx, if (mem) |m| m.len else 0 });
+    traceCanonSlice(mem, args);
+    std.debug.print(" result_ptr=0x{x} result=", .{result_dest_ptr});
+    traceCanonSlice(mem, results);
+    std.debug.print("\n", .{});
+}
 
 fn dispatchAotComponentTrampoline(
     ctx: *const ComponentTrampolineCtx,
@@ -6306,9 +6593,14 @@ fn dispatchAotComponentTrampoline(
     defer if (args_heap) |h| allocator.free(h);
     const args: []InterfaceValue = args_heap orelse args_stack_buf[0..ctx.param_types.len];
 
+    var strict_mem: ?[]const u8 = null;
     var reg_index: usize = 0;
     for (ctx.param_types, 0..) |pt, i| {
         args[i] = try liftAotDispatcherArg(pt, lowered_sig.param_types, &reg_index, &regs, registry, allocator);
+        if (typeContainsPtrLen(pt, registry)) {
+            if (strict_mem == null) strict_mem = try strictCanonMemory(ctx);
+            try validateCanonPtrLenValue(strict_mem.?, args[i], pt, registry, "canon-lift");
+        }
     }
 
     var result_dest_ptr: u32 = 0;
@@ -6347,6 +6639,11 @@ fn dispatchAotComponentTrampoline(
         try call(ctx.host_func.context, ctx.comp_inst, args, results, allocator);
     }
     results_filled = results.len;
+    if (debugAotEnabled()) {
+        const mem_idx = ctx.lower_opts.memory_idx orelse 0;
+        const trace_mem = if (ctx.comp_inst.resolveTopLevelMemory(mem_idx)) |mem| mem.data else null;
+        traceCanonLowerCall(ctx, lowered_sig, trace_mem, mem_idx, args, results, result_dest_ptr);
+    }
 
     if (lowered_sig.has_retptr) {
         // Default to memory 0 when canon-lower has no explicit `.memory` opt,
@@ -6356,6 +6653,9 @@ fn dispatchAotComponentTrampoline(
         const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.MemoryNotAvailable;
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
+            if (typeContainsPtrLen(t, registry)) {
+                validateCanonPtrLenValue(mem.data, r, t, registry, "canon-lift") catch return error.LiftedResultInvariantViolated;
+            }
             const al = typeAlign(registry, t);
             offset = abi.alignUp(offset, al);
             try storeInterfaceValue(mem.data, offset, r, t, registry);
@@ -6370,6 +6670,10 @@ fn dispatchAotComponentTrampoline(
     }
     if (ctx.result_types.len != 1 or lowered_sig.result_types.len != 1)
         return error.UnsupportedSignature;
+    if (typeContainsPtrLen(ctx.result_types[0], registry)) {
+        const mem = strict_mem orelse try strictCanonMemory(ctx);
+        validateCanonPtrLenValue(mem, results[0], ctx.result_types[0], registry, "canon-lift") catch return error.LiftedResultInvariantViolated;
+    }
     return lowerAotDispatcherResult(results[0], ctx.result_types[0], lowered_sig.result_types[0], registry);
 }
 
@@ -6630,10 +6934,16 @@ test "componentTrampoline: async-lower no-result (clocks-style) packs (handle <<
     const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
 
     var component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
     defer comp_inst.deinit();
@@ -6723,10 +7033,16 @@ test "componentTrampoline: async-lower with-result spilled-params writes payload
     const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
 
     var component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
     defer comp_inst.deinit();
@@ -6844,10 +7160,16 @@ test "componentTrampoline: async-lower resource handle arg uses encodeResourceWi
     const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
 
     var component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
     defer comp_inst.deinit();
@@ -6928,10 +7250,16 @@ test "componentTrampoline: async-lower routing fires for FuncType.is_async even 
     const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
 
     var component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
     defer comp_inst.deinit();
@@ -6994,9 +7322,15 @@ test "canonBuiltinTrampoline: context.{set,get} round-trip through implicit fall
     defer env.destroy();
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
@@ -7197,10 +7531,16 @@ test "componentTrampoline: param spill loads tuple from memory" {
     // below; comp_inst.deinit will destroy it.
 
     var component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
     defer comp_inst.deinit();
@@ -7289,10 +7629,16 @@ test "componentTrampoline: result spill stores tuple into memory" {
     // ownership transferred to comp_inst.core_instances[0] below.
 
     var component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
     defer comp_inst.deinit();
@@ -7352,10 +7698,16 @@ test "pushInterfaceValue/popInterfaceValue: result<_, primitive> roundtrip (#155
         .{ .result = .{ .ok = null, .err = .u32 } },
     };
     var component = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &type_defs,      .canons = &.{},
-        .imports = &.{},          .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const registry = TypeRegistry.init(&component);
     const t: ctypes.ValType = .{ .result = 0 };
@@ -7414,10 +7766,16 @@ test "popInterfaceValue: lift variant<record<u16, tuple<u8x4>>> from flat stack 
         .{ .variant = .{ .cases = &cases } }, // 2
     };
     var component = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},   .instances = &.{},      .aliases = &.{},
-        .types = &type_defs,  .canons = &.{},
-        .imports = &.{},      .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const registry = TypeRegistry.init(&component);
     const t: ctypes.ValType = .{ .variant = 2 };
@@ -7479,9 +7837,15 @@ test "wamrAotDispatchCanonBuiltin: resource.new/rep/drop round-trip + on_resourc
     const allocator = testing.allocator;
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, allocator);
@@ -7537,7 +7901,16 @@ test "wamrAotDispatchCanonBuiltin: resource.new/rep/drop round-trip + on_resourc
     const new_res = wamrAotDispatchCanonBuiltin(
         @ptrCast(@constCast(&new_ctx)),
         &sig_one_to_one,
-        0xDEAD, 123, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xDEAD,
+        123,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     try testing.expectEqual(@as(u32, 0), new_res.status);
     const handle: u32 = @intCast(new_res.value);
@@ -7549,7 +7922,16 @@ test "wamrAotDispatchCanonBuiltin: resource.new/rep/drop round-trip + on_resourc
     const rep_res = wamrAotDispatchCanonBuiltin(
         @ptrCast(@constCast(&rep_ctx)),
         &sig_one_to_one,
-        0, handle, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
+        handle,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     try testing.expectEqual(@as(u32, 0), rep_res.status);
     try testing.expectEqual(@as(u64, 123), rep_res.value);
@@ -7560,7 +7942,16 @@ test "wamrAotDispatchCanonBuiltin: resource.new/rep/drop round-trip + on_resourc
     const drop_res = wamrAotDispatchCanonBuiltin(
         @ptrCast(@constCast(&drop_ctx)),
         &sig_one_to_void,
-        0, handle, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
+        handle,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     try testing.expectEqual(@as(u32, 0), drop_res.status);
     try testing.expectEqual(@as(u64, 0), drop_res.value);
@@ -7573,7 +7964,16 @@ test "wamrAotDispatchCanonBuiltin: resource.new/rep/drop round-trip + on_resourc
     const rep_after = wamrAotDispatchCanonBuiltin(
         @ptrCast(@constCast(&rep_ctx)),
         &sig_one_to_one,
-        0, handle, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
+        handle,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     try testing.expectEqual(@as(u32, 0), rep_after.status);
     try testing.expectEqual(@as(u64, 0), rep_after.value);
@@ -7587,9 +7987,15 @@ test "wamrAotDispatchCanonBuiltin: rejects malformed lowered_sig (#701)" {
     const allocator = testing.allocator;
 
     var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
         .exports = &.{},
     };
     const inst = try instance_mod.instantiate(&comp, allocator);
@@ -7609,7 +8015,16 @@ test "wamrAotDispatchCanonBuiltin: rejects malformed lowered_sig (#701)" {
     const res = wamrAotDispatchCanonBuiltin(
         @ptrCast(@constCast(&drop_ctx)),
         &bad_sig,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     try testing.expectEqual(@as(u32, 1), res.status);
 
@@ -7625,7 +8040,16 @@ test "wamrAotDispatchCanonBuiltin: rejects malformed lowered_sig (#701)" {
     const res2 = wamrAotDispatchCanonBuiltin(
         @ptrCast(@constCast(&ctx_get)),
         &ok_sig,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     try testing.expectEqual(@as(u32, 1), res2.status);
 }
