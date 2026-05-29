@@ -112,7 +112,14 @@ test "#648 phase 1: trampoline pool allocates mmap-backed stub slots" {
     try std.testing.expectEqual(@as(u32, 4), pool.next_slot);
     try std.testing.expectEqual(@as(u32, 22), pool.slots[1].canon_lower_idx);
     try std.testing.expectEqual(@intFromPtr(&fake_component_2), @intFromPtr(pool.slots[2].component_inst));
-    try std.testing.expectEqual(@as(u64, 0), host_trampolines.genericDispatcher(3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+    // Slot 3 was allocated via `allocSlot` (no ctx), so genericDispatcher
+    // hits the `entry.ctx orelse` arm and returns DISPATCH_FAILURE_SENTINEL
+    // (#708). Pre-708 this returned 0, which looked like a legitimate empty
+    // handle / zero-length value to the guest.
+    try std.testing.expectEqual(
+        host_trampolines.DISPATCH_FAILURE_SENTINEL,
+        host_trampolines.genericDispatcher(3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+    );
 
     host_trampolines.setActivePool(null);
     pool.deinit(allocator);
@@ -508,4 +515,73 @@ test "#689: trampoline stub forwards 8 i32 args (cap)" {
     try std.testing.expect(state.called);
     try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 4, 8, 16, 32, 64, 128 }, &state.received);
     try std.testing.expectEqual(@as(u64, 255), result);
+}
+
+// --- #708: non-zero sentinel + loud state-machine warns ---
+
+test "#708: genericDispatcher returns sentinel on host-fn error" {
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
+
+    const Host = struct {
+        fn failing(_: ?*anyopaque, _: *instance.ComponentInstance, _: []const instance.InterfaceValue, _: []instance.InterfaceValue, _: std.mem.Allocator) !void {
+            return error.OutOfMemory;
+        }
+    };
+
+    const inst = try instantiateMemoryComponent();
+    defer inst.deinit();
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    host_trampolines.setActivePool(&pool);
+    defer host_trampolines.setActivePool(null);
+
+    const param_types = [_]ctypes.ValType{.s32};
+    const result_types = [_]ctypes.ValType{};
+    var ctx = executor.ComponentTrampolineCtx{
+        .comp_inst = inst,
+        .host_func = .{ .call = &Host.failing },
+        .param_types = &param_types,
+        .result_types = &result_types,
+        .lower_opts = .{},
+    };
+    const lowered_params = [_]core_types.ValType{.i32};
+    const lowered_results = [_]core_types.ValType{};
+    _ = try pool.allocSlotWithCtx(@ptrCast(&ctx), .{ .param_types = &lowered_params, .result_types = &lowered_results });
+
+    // Pre-708 this collapsed to 0; the guest saw a legitimate-looking zero
+    // handle / length / discriminant and threaded the failure several more
+    // ops before crashing somewhere unrelated. Sentinel makes the first
+    // downstream use trip a wit-bindgen `unreachable` with a stack
+    // pointing at this import.
+    try std.testing.expectEqual(
+        host_trampolines.DISPATCH_FAILURE_SENTINEL,
+        host_trampolines.genericDispatcher(0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    );
+}
+
+test "#708: genericDispatcher returns sentinel when called with no active pool" {
+    // Belt-and-braces — `setActivePool(null)` simulates the AOT trampoline
+    // firing after instance teardown.
+    host_trampolines.setActivePool(null);
+    try std.testing.expectEqual(
+        host_trampolines.DISPATCH_FAILURE_SENTINEL,
+        host_trampolines.genericDispatcher(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    );
+}
+
+test "#708: genericDispatcher returns sentinel for out-of-range slot index" {
+    if (builtin.os.tag == .windows or (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.SkipZigTest;
+
+    var pool = try host_trampolines.TrampolinePool.init(std.testing.allocator);
+    defer pool.deinit(std.testing.allocator);
+
+    host_trampolines.setActivePool(&pool);
+    defer host_trampolines.setActivePool(null);
+
+    // next_slot is 0 — any slot index is OOR.
+    try std.testing.expectEqual(
+        host_trampolines.DISPATCH_FAILURE_SENTINEL,
+        host_trampolines.genericDispatcher(7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    );
 }
