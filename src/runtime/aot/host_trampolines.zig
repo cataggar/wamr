@@ -93,6 +93,27 @@ extern fn wamrAotDispatchCrossInstance(
     a9: u64,
 ) callconv(.c) DispatchResult;
 
+/// Canon-builtin dispatcher for AOT-compiled core modules whose imports
+/// resolve through a sibling inline-export to a `canon.resource.{drop,new,rep}`
+/// (or other canon-builtin) contributor. Same vmctx-as-first-arg convention
+/// as the other `*Aot` dispatchers — `a0` is the importer's vmctx (ignored),
+/// `a1` is the wasm-level handle / rep. Implemented in
+/// `src/component/executor.zig`. (#701, follow-up to #687.)
+extern fn wamrAotDispatchCanonBuiltin(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) callconv(.c) DispatchResult;
+
 /// Trap-on-call stub for non-WASI function imports that have no AOT-side
 /// wiring yet (e.g. adapter-core canon.lower imports left over after #662
 /// Phase C). Returns a failing `DispatchResult` so the caller traps with
@@ -116,6 +137,7 @@ pub const DispatchKind = enum(u8) {
     canon_lower,
     canon_lower_aot,
     cross_instance,
+    canon_builtin_aot,
     trap_stub,
 };
 
@@ -147,6 +169,7 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
         .canon_lower => wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .canon_lower_aot => wamrAotDispatchComponentTrampolineAot(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .cross_instance => wamrAotDispatchCrossInstance(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+        .canon_builtin_aot => wamrAotDispatchCanonBuiltin(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
     };
     if (dispatched.status != 0) return 0;
@@ -268,6 +291,30 @@ pub const TrampolinePool = struct {
             .ctx = ctx,
             .lowered_sig = lowered_sig,
             .dispatch_kind = .cross_instance,
+        };
+        self.next_slot += 1;
+        writeStub(self.stubBytes(slot), slot);
+        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        g_active_pool = self;
+
+        return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
+    }
+
+    /// Allocate a slot for a canon-builtin (`resource.{drop,new,rep}`, etc.)
+    /// imported by an AOT-compiled core module. Routes through
+    /// `wamrAotDispatchCanonBuiltin`, which switches on the `CanonBuiltinTrampolineCtx`
+    /// to invoke the right pure helper against the component's resource
+    /// table. (#701, follow-up to #687.)
+    pub fn allocCanonBuiltinAotSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
+        const slot = self.next_slot;
+        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+
+        self.slots[slot] = .{
+            .component_inst = ctx,
+            .canon_lower_idx = 0,
+            .ctx = ctx,
+            .lowered_sig = lowered_sig,
+            .dispatch_kind = .canon_builtin_aot,
         };
         self.next_slot += 1;
         writeStub(self.stubBytes(slot), slot);
