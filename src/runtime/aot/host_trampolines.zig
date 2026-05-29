@@ -46,6 +46,21 @@ pub const DispatchResult = extern struct {
     err_name: ?[*:0]const u8 = null,
 };
 
+/// Sentinel u64 returned to the guest by `genericDispatcher` when a
+/// dispatcher arm reports `status != 0` (or when the slot-lookup
+/// state machine has hit an invariant violation). Chosen to be
+/// non-zero, non-aligned, and outside every plausible canon-ABI
+/// "small integer" range (handles, lengths, discriminants) so that
+/// the *first* downstream use in guest code trips a wit-bindgen
+/// `unreachable`, producing a stack trace pointing at the failing
+/// import. Returning `0` instead — which we did until #708 — looks
+/// like a legitimate empty handle / zero-length buffer / first
+/// discriminant arm, so the guest happily threads the failure
+/// through several more operations before crashing somewhere
+/// unrelated. Pair-with the per-slot warn-once line emitted by
+/// `genericDispatcher` for the operator-side context.
+pub const DISPATCH_FAILURE_SENTINEL: u64 = 0xDEAD_DEAD_DEAD_DEAD;
+
 extern fn wamrAotDispatchComponentTrampoline(
     ctx_opaque: *anyopaque,
     lowered_sig: *const LoweredSig,
@@ -178,11 +193,29 @@ pub fn setActivePool(pool: ?*TrampolinePool) void {
 var g_dispatch_warn_once: std.bit_set.IntegerBitSet(MAX_SLOTS) = .initEmpty();
 
 pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) callconv(.c) u64 {
-    const pool = g_active_pool orelse return 0;
-    if (slot >= pool.next_slot) return 0;
+    const pool = g_active_pool orelse {
+        std.log.warn(
+            "[aot dispatch] called with no active TrampolinePool (slot={d}); returning sentinel 0x{x:0>16}",
+            .{ slot, DISPATCH_FAILURE_SENTINEL },
+        );
+        return DISPATCH_FAILURE_SENTINEL;
+    };
+    if (slot >= pool.next_slot) {
+        std.log.warn(
+            "[aot dispatch] slot={d} out of range (next_slot={d}); returning sentinel 0x{x:0>16}",
+            .{ slot, pool.next_slot, DISPATCH_FAILURE_SENTINEL },
+        );
+        return DISPATCH_FAILURE_SENTINEL;
+    }
 
     const entry = pool.slots[slot];
-    const ctx = entry.ctx orelse return 0;
+    const ctx = entry.ctx orelse {
+        std.log.warn(
+            "[aot dispatch] slot={d} has null ctx (kind={s}); returning sentinel 0x{x:0>16}",
+            .{ slot, @tagName(entry.dispatch_kind), DISPATCH_FAILURE_SENTINEL },
+        );
+        return DISPATCH_FAILURE_SENTINEL;
+    };
     const dispatched = switch (entry.dispatch_kind) {
         .canon_lower => wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .canon_lower_aot => wamrAotDispatchComponentTrampolineAot(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
@@ -191,10 +224,10 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
         .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
     };
     if (dispatched.status != 0) {
-        // Surface the silent-zero collapse once per slot. The `trap_stub`
-        // kind is an explicit, expected trap path — it has already
-        // printed its own diagnostic and the slot pre-emptively means
-        // "this import is known-unbound", so no extra warning helps.
+        // Surface the failure once per slot. The `trap_stub` kind is an
+        // explicit, expected trap path — it has already printed its own
+        // diagnostic and the slot pre-emptively means "this import is
+        // known-unbound", so no extra warning helps.
         if (entry.dispatch_kind != .trap_stub and slot < MAX_SLOTS and !g_dispatch_warn_once.isSet(slot)) {
             g_dispatch_warn_once.set(slot);
             const err_str: []const u8 = if (dispatched.err_name) |p|
@@ -202,11 +235,11 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
             else
                 "(unknown — wrapper did not populate err_name)";
             std.log.warn(
-                "[aot dispatch] slot={d} kind={s} status={d} err={s}: returning 0 to guest (likely UnsupportedSignature in canon-lower/aot lift/lower path); set WAMR_AOT_DEBUG=1 for the underlying error.",
-                .{ slot, @tagName(entry.dispatch_kind), dispatched.status, err_str },
+                "[aot dispatch] slot={d} kind={s} status={d} err={s}: returning sentinel 0x{x:0>16} to guest (likely UnsupportedSignature in canon-lower/aot lift/lower path); set WAMR_AOT_DEBUG=1 for the underlying error.",
+                .{ slot, @tagName(entry.dispatch_kind), dispatched.status, err_str, DISPATCH_FAILURE_SENTINEL },
             );
         }
-        return 0;
+        return DISPATCH_FAILURE_SENTINEL;
     }
     return dispatched.value;
 }
