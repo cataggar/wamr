@@ -342,7 +342,7 @@ pub fn callComponentFuncByLocal(
         for (args, param_types) |arg, pt| {
             const al = typeAlign(registry, pt);
             offset = abi.alignUp(offset, al);
-            storeInterfaceValue(mem, offset, arg, pt, registry);
+            storeInterfaceValue(mem, offset, arg, pt, registry) catch return error.LowerError;
             offset += typeSize(registry, pt);
         }
 
@@ -582,7 +582,7 @@ pub fn callComponentFuncByLocalAsyncLifted(
         for (args, param_types) |arg, pt| {
             const al = typeAlign(registry, pt);
             offset = abi.alignUp(offset, al);
-            storeInterfaceValue(mem, offset, arg, pt, registry);
+            storeInterfaceValue(mem, offset, arg, pt, registry) catch return error.LowerError;
             offset += typeSize(registry, pt);
         }
         env.pushI32(@bitCast(ptr)) catch return error.StackOverflow;
@@ -1394,10 +1394,12 @@ fn storeInterfaceValue(
     val: InterfaceValue,
     t: ctypes.ValType,
     registry: TypeRegistry,
-) void {
+) abi.StoreError!void {
     abi.storeVal(mem, ptr, t, val) catch {
-        // Compound type — use registry-aware store
-        abi.storeValReg(mem, ptr, t, val, registry) catch {};
+        // Only error storeVal can return is CompoundNeedsRegistry —
+        // re-attempt via the registry-aware path so the error
+        // propagates instead of silently writing nothing. Issue #707.
+        try abi.storeValReg(mem, ptr, t, val, registry);
     };
 }
 
@@ -5963,7 +5965,8 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         for (results, ctx.result_types) |r, t| {
             const al = typeAlign(registry, t);
             offset = abi.alignUp(offset, al);
-            storeInterfaceValue(mem.data, offset, r, t, registry);
+            storeInterfaceValue(mem.data, offset, r, t, registry) catch |err|
+                return trampolineTrap(env, ctx, err, .lower_results);
             offset += typeSize(registry, t);
         }
     } else {
@@ -5997,7 +6000,7 @@ pub export fn wamrAotDispatchComponentTrampoline(
                 .{@errorName(err)},
             );
         }
-        return .{ .status = 1, .value = 0 };
+        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
     };
     return .{ .status = 0, .value = result };
 }
@@ -6034,7 +6037,7 @@ pub export fn wamrAotDispatchComponentTrampolineAot(
                 .{@errorName(err)},
             );
         }
-        return .{ .status = 1, .value = 0 };
+        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
     };
     return .{ .status = 0, .value = result };
 }
@@ -6181,7 +6184,7 @@ pub export fn wamrAotDispatchCanonBuiltin(
                 .{ @tagName(ctx.canon), @errorName(err) },
             );
         }
-        return .{ .status = 1, .value = 0 };
+        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
     };
     return .{ .status = 0, .value = result };
 }
@@ -6323,8 +6326,17 @@ fn dispatchAotComponentTrampoline(
     else
         try allocator.alloc(InterfaceValue, ctx.result_types.len);
     const results: []InterfaceValue = results_heap orelse results_stack_buf[0..ctx.result_types.len];
+    // `host_func.call` only initialises the prefix of `results` it
+    // successfully fills before returning an error; the remainder is
+    // backed by `undefined` stack/heap memory. We track how many
+    // entries are valid and only `deinit` that prefix. Without this
+    // a failing host (e.g. `getEnvironment` -> `error.IoError` when
+    // `cabi_realloc` is unavailable) used to dereference an
+    // `undefined` tag in `InterfaceValue.deinit`'s switch and panic
+    // with "switch on corrupt value".
+    var results_filled: usize = 0;
     defer {
-        for (results) |r| r.deinit(allocator);
+        for (results[0..results_filled]) |r| r.deinit(allocator);
         if (results_heap) |h| allocator.free(h);
     }
 
@@ -6334,15 +6346,19 @@ fn dispatchAotComponentTrampoline(
         const call = ctx.host_func.call orelse return error.HostFuncNotBound;
         try call(ctx.host_func.context, ctx.comp_inst, args, results, allocator);
     }
+    results_filled = results.len;
 
     if (lowered_sig.has_retptr) {
-        const mem_idx = ctx.lower_opts.memory_idx orelse return error.MemoryNotAvailable;
+        // Default to memory 0 when canon-lower has no explicit `.memory` opt,
+        // mirroring the canon-lift path (see line ~321). The component's
+        // single core memory is what the AOT caller's retptr points into.
+        const mem_idx = ctx.lower_opts.memory_idx orelse 0;
         const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.MemoryNotAvailable;
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
             const al = typeAlign(registry, t);
             offset = abi.alignUp(offset, al);
-            storeInterfaceValue(mem.data, offset, r, t, registry);
+            try storeInterfaceValue(mem.data, offset, r, t, registry);
             offset += typeSize(registry, t);
         }
         return 0;
@@ -6365,36 +6381,54 @@ fn liftAotDispatcherArg(
     registry: TypeRegistry,
     allocator: Allocator,
 ) !InterfaceValue {
-    switch (t) {
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char, .own, .borrow, .future, .stream, .error_context, .enum_ => {
-            if (reg_index.* >= lowered_param_types.len or lowered_param_types[reg_index.*] != .i32)
-                return error.UnsupportedSignature;
-            const slots = [_]u32{@truncate(regs[reg_index.*])};
-            reg_index.* += 1;
-            return abi.liftFlatReg(slots[0..], t, registry, allocator);
-        },
-        .s64, .u64 => {
-            if (reg_index.* >= lowered_param_types.len or lowered_param_types[reg_index.*] != .i64)
-                return error.UnsupportedSignature;
-            const raw = regs[reg_index.*];
-            const slots = [_]u32{ @truncate(raw), @truncate(raw >> 32) };
-            reg_index.* += 1;
-            return abi.liftFlatReg(slots[0..], t, registry, allocator);
-        },
-        .string, .list => {
-            if (reg_index.* + 1 >= lowered_param_types.len or
-                lowered_param_types[reg_index.*] != .i32 or
-                lowered_param_types[reg_index.* + 1] != .i32)
-                return error.UnsupportedSignature;
-            const slots = [_]u32{
-                @truncate(regs[reg_index.*]),
-                @truncate(regs[reg_index.* + 1]),
-            };
-            reg_index.* += 2;
-            return abi.liftFlatReg(slots[0..], t, registry, allocator);
-        },
-        else => return error.UnsupportedSignature,
+    // Generic slot-driven lift: derive the wasm flat-slot count from the
+    // canonical ABI's `flattenCount`, then walk that many lowered core
+    // slots converting each into the u32-cell encoding expected by
+    // `abi.liftFlatReg` (i32/f32 -> 1 cell; i64/f64 -> 2 cells lo|hi).
+    // This covers every primitive the narrow per-type switch used to
+    // enumerate (bool/sN/uN/char/own/borrow/future/stream/error_context/
+    // enum_/s64/u64/string/list) plus the compound shapes the canonical
+    // ABI flattens into multiple slots (type_idx, record, tuple, variant,
+    // option, result, flags). Without the compound coverage every
+    // canon.lower import carrying a compound param lands in the old
+    // `else` arm and rejects with `UnsupportedSignature` — silently
+    // collapsed to `return 0` by `genericDispatcher`
+    // (`host_trampolines.zig:175`). Issue #707.
+    const slot_count = abi.flattenCount(registry, t);
+    if (slot_count == 0) return error.UnsupportedSignature;
+    if (reg_index.* + slot_count > lowered_param_types.len) return error.UnsupportedSignature;
+
+    var cell_buf: [MAX_FLAT_PARAMS * 2]u32 = undefined;
+    var cells_used: usize = 0;
+    var k: usize = 0;
+    while (k < slot_count) : (k += 1) {
+        const lpt = lowered_param_types[reg_index.* + k];
+        const raw = regs[reg_index.* + k];
+        switch (lpt) {
+            .i32, .f32 => {
+                if (cells_used >= cell_buf.len) return error.UnsupportedSignature;
+                cell_buf[cells_used] = @truncate(raw);
+                cells_used += 1;
+            },
+            .i64, .f64 => {
+                if (cells_used + 2 > cell_buf.len) return error.UnsupportedSignature;
+                cell_buf[cells_used] = @truncate(raw);
+                cell_buf[cells_used + 1] = @truncate(raw >> 32);
+                cells_used += 2;
+            },
+            else => return error.UnsupportedSignature,
+        }
     }
+    reg_index.* += slot_count;
+    // Use the local `liftFlatReg` (above in this file) rather than
+    // `abi.liftFlatReg`: the local copy has full compound coverage —
+    // `.record`, `.tuple`, `.flags`, plus all `.type_idx` reifications
+    // (including `.list`). The `canonical_abi.liftFlatReg` copy falls
+    // back to `liftFlat` for `.record/.tuple/.flags` and returns
+    // `CompoundNeedsRegistry` — which would silently zero-return to
+    // the guest through `genericDispatcher`. Issue #707.
+    const r = liftFlatReg(cell_buf[0..cells_used], t, registry, allocator) catch return error.UnsupportedSignature;
+    return r.val;
 }
 
 fn lowerAotDispatcherResult(
@@ -6402,7 +6436,7 @@ fn lowerAotDispatcherResult(
     t: ctypes.ValType,
     lowered_ty: core_types.ValType,
     registry: TypeRegistry,
-) !u64 {
+) error{UnsupportedSignature}!u64 {
     if (lowered_ty == .f32 or lowered_ty == .f64) return error.UnsupportedSignature;
     // Single-flat-slot interface results only — multi-slot shapes
     // (string/list/multi-slot compounds) spill via the retptr path.
@@ -6424,6 +6458,31 @@ fn lowerAotDispatcherResult(
         .result => @as(u64, if (val.result_val.is_ok) 0 else 1),
         .variant => @as(u64, val.variant_val.discriminant),
         .option => @as(u64, if (val.option_val.is_some) 1 else 0),
+        // Resolve a typedef-encoded result through the registry and recurse.
+        // The shape is unwrapped exactly as `coreFlatSlotType` does for
+        // `.type_idx`, so it lands on one of the inline arms above (which
+        // are already guarded by the `flattenCount == 1` check inside
+        // `coreFlatSlotType`). Without this arm any canon.lower import
+        // returning a typedef-bound compound (e.g. an exported
+        // `result<unit, error-code>` alias) rejects with
+        // `UnsupportedSignature` and silently zero-returns to the guest
+        // via `genericDispatcher` (`host_trampolines.zig:175`). Issue #707.
+        .type_idx => |idx| blk: {
+            const td = registry.get(idx) orelse return error.UnsupportedSignature;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |inner| inner,
+                .resource => .{ .own = idx },
+                .result => .{ .result = idx },
+                .variant => .{ .variant = idx },
+                .option => .{ .option = idx },
+                .flags => .{ .flags = idx },
+                .enum_ => .{ .enum_ = idx },
+                .tuple => .{ .tuple = idx },
+                .record => .{ .record = idx },
+                else => return error.UnsupportedSignature,
+            };
+            break :blk try lowerAotDispatcherResult(val, reified, lowered_ty, registry);
+        },
         else => error.UnsupportedSignature,
     };
 }

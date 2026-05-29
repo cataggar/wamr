@@ -574,15 +574,31 @@ pub const ComponentInstance = struct {
     ///      core module (where the local memory idx matches N).
     pub fn resolveTopLevelMemory(self: *const ComponentInstance, idx: u32) ?*core_types.MemoryInstance {
         const ref = indexspace.resolveCoreMemory(self.component, idx) orelse {
-            const mi = self.firstModuleInst() orelse return null;
-            return mi.getMemory(idx);
+            if (self.firstModuleInst()) |mi| return mi.getMemory(idx);
+            // All-AOT components have no interp `module_inst` on any core
+            // instance; fall through to the backend-agnostic probe so
+            // canon-lower(aot) retptr stores and `canonicalMemory()`
+            // succeed against the AOT core's memory. Issue #707.
+            return self.firstBackendMemory();
         };
         const ie = self.component.aliases[ref.aliased].instance_export;
         if (ie.instance_idx >= self.core_instances.len) return null;
-        const src_mi = self.core_instances[ie.instance_idx].module_inst orelse return null;
-        const exp = src_mi.module.findExport(ie.name, .memory) orelse return null;
-        if (exp.index >= src_mi.memories.len) return null;
-        return src_mi.memories[exp.index];
+        const src_entry = self.core_instances[ie.instance_idx];
+        if (src_entry.module_inst) |src_mi| {
+            const exp = src_mi.module.findExport(ie.name, .memory) orelse return null;
+            if (exp.index >= src_mi.memories.len) return null;
+            return src_mi.memories[exp.index];
+        }
+        // AOT source — go via backend-agnostic memory probe. The AOT
+        // runtime synthesises a single canonical memory; we look up
+        // by name through `findExportMemory`, falling back to memory
+        // 0 when the AOT export table doesn't carry memory entries
+        // by name. Issue #707.
+        if (src_entry.aot_inst) |ai| {
+            if (aot_runtime.findExportMemory(ai, ie.name)) |mi| return mi;
+            if (src_entry.backend()) |be| return be.memory(0);
+        }
+        return null;
     }
 
     /// Resolve a top-level core func indexspace index to a callable
@@ -665,6 +681,23 @@ pub const ComponentInstance = struct {
         return null;
     }
 
+    /// AOT analogue of `reallocOwner`. Walks `core_instances` looking
+    /// for an `aot_inst` that exports `cabi_realloc`. Required because
+    /// fully-precompiled components have no interp `module_inst` on any
+    /// `core_instances` entry, and `hostAllocGuest`'s interp fallback
+    /// otherwise returns null — surfacing as `error.IoError` from
+    /// `getEnvironment` / `read-via-stream` / any other adapter that
+    /// must materialise a host-built `list` / `string` into guest
+    /// memory before lowering. Pairs with the canon-lower-aot
+    /// dispatcher widening in this PR (issue #707).
+    fn reallocOwnerAot(self: *const ComponentInstance) ?*aot_runtime.AotInstance {
+        for (self.core_instances) |entry| {
+            const ai = entry.aot_inst orelse continue;
+            if (aot_runtime.findExportFunc(ai, "cabi_realloc") != null) return ai;
+        }
+        return null;
+    }
+
     /// Allocate `size` bytes inside the canonical guest linear memory
     /// (or the test_mem shim, if installed) aligned to `align_`. Returns
     /// the guest-side pointer, or null on failure.
@@ -674,6 +707,23 @@ pub const ComponentInstance = struct {
     /// canonical ABI sees a `(ptr, len)` PtrLen.
     pub fn hostAllocGuest(self: *ComponentInstance, size: u32, align_: u32) ?u32 {
         if (self.test_mem) |tm| return tm.alloc(size, align_);
+        const a: u32 = if (align_ == 0) 1 else align_;
+        // Prefer the AOT path when a precompiled core owns `cabi_realloc`:
+        // it dispatches straight into native code via `aot_runtime.callFuncScalar`,
+        // matching the dispatch path the rest of the all-AOT component
+        // already uses. The interp path below only runs when no AOT
+        // core exports `cabi_realloc`. (#707 surfaced this — every
+        // canon-lower import returning a `list`/`string`/multi-slot
+        // compound goes through `hostAllocGuest`, and all-AOT
+        // components previously failed here with `error.IoError`.)
+        if (self.reallocOwnerAot()) |ai| {
+            const realloc_idx = aot_runtime.findExportFunc(ai, "cabi_realloc") orelse return null;
+            const executor = @import("executor.zig");
+            const aot_call_frame = @import("call_frame.zig");
+            var frame: executor.CallFrame = .{ .aot = aot_call_frame.AotFrame.init(ai, self.allocator) };
+            defer frame.deinit();
+            return executor.callRealloc(&frame, realloc_idx, 0, 0, a, size) catch null;
+        }
         const realloc_owner = self.reallocOwner() orelse return null;
         const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
@@ -689,7 +739,6 @@ pub const ComponentInstance = struct {
             self.realloc_env_owner = if (self.realloc_env != null) realloc_owner else null;
         }
         const env = self.realloc_env orelse return null;
-        const a: u32 = if (align_ == 0) 1 else align_;
         var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
         defer frame.deinit();
         return executor.callRealloc(&frame, realloc_local, 0, 0, a, size) catch null;
@@ -3463,19 +3512,54 @@ fn installCanonLowerBackedCrossInstanceThunk(
     // take the AOT importer's view of the import's signature — that's
     // what the AOT codegen's call site emits, and it must match what
     // `dispatchAotComponentTrampoline` lifts off the register file.
+    //
+    // `has_retptr` must be derived from the component-level result
+    // flatten count, not hardcoded: per the canonical ABI, results
+    // whose joined flatten count exceeds `MAX_FLAT_RESULTS` (1 for
+    // canon.lower) are returned via a caller-allocated buffer whose
+    // pointer is appended as the last i32 param of the wasm core
+    // signature. The AOT codegen emits exactly that shape, so the
+    // last `ft.params` slot is the retptr — `lowered_params` must
+    // omit it and `has_retptr` must be `true`. Without this fix every
+    // canon.lower import returning a compound (`result<…>`, `list<…>`,
+    // `option<…>`, multi-field record/tuple) lands in
+    // `dispatchAotComponentTrampoline`'s
+    // `reg_index != lp.len + has_retptr` check and rejects with
+    // `UnsupportedSignature` — silently degraded by `genericDispatcher`
+    // (`host_trampolines.zig:175`) to a `return 0`. Issue #707.
     if (imp.func_type_idx >= module.func_types.len) return error.InvalidFuncType;
     const ft = module.func_types[imp.func_type_idx];
+
+    const canonical_abi = @import("canonical_abi.zig");
+    const registry = if (ctx_ptr.extended_types.len > 0)
+        canonical_abi.TypeRegistry.fromExtended(ctx_ptr.comp_inst.component, ctx_ptr.extended_types, ctx_ptr.extended_indexspace)
+    else
+        canonical_abi.TypeRegistry.init(ctx_ptr.comp_inst.component);
+    var flat_result_count: u32 = 0;
+    for (ctx_ptr.result_types) |rt| flat_result_count += canonical_abi.flattenCount(registry, rt);
+    const has_retptr = ctx_ptr.result_types.len > 0 and flat_result_count > canonical_abi.MAX_FLAT_RESULTS;
+
     const arena = inst.module_arena.allocator();
-    const lowered_params = try arena.alloc(core_types.ValType, ft.params.len);
-    for (ft.params, 0..) |p, i| lowered_params[i] = p;
+    const lowered_param_len: usize = if (has_retptr) blk: {
+        if (ft.params.len == 0) return error.InvalidFuncType;
+        break :blk ft.params.len - 1;
+    } else ft.params.len;
+    const lowered_params = try arena.alloc(core_types.ValType, lowered_param_len);
+    for (ft.params[0..lowered_param_len], 0..) |p, i| lowered_params[i] = p;
     const lowered_results = try arena.alloc(core_types.ValType, ft.results.len);
     for (ft.results, 0..) |r, i| lowered_results[i] = r;
 
     const stub = try pool.allocCanonLowerAotSlot(@ptrCast(ctx_ptr), .{
         .param_types = lowered_params,
         .result_types = lowered_results,
-        .has_retptr = false,
+        .has_retptr = has_retptr,
     });
+    if (core_backend.debugAotEnabled()) {
+        std.debug.print(
+            "[install canon-lower(aot)] slot={d} module='{s}' field='{s}' cfi={d} flat_results={d} has_retptr={} mem_opt={?} realloc_opt={?}\n",
+            .{ pool.next_slot - 1, imp.module_name, imp.field_name, ctx_ptr.component_func_idx, flat_result_count, has_retptr, ctx_ptr.lower_opts.memory_idx, ctx_ptr.lower_opts.realloc_idx },
+        );
+    }
     return @ptrCast(stub);
 }
 

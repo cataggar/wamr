@@ -37,6 +37,12 @@ pub const LoweredSig = struct {
 pub const DispatchResult = extern struct {
     status: u32,
     value: u64,
+    /// On `status != 0`, optional pointer to a `@errorName()` C string set
+    /// by the wrapper before returning. `genericDispatcher` surfaces it in
+    /// the one-shot per-slot warning so the underlying lift/lower failure
+    /// is visible in release builds without needing `WAMR_AOT_DEBUG=1`.
+    /// Issue #707.
+    err_name: ?[*:0]const u8 = null,
 };
 
 extern fn wamrAotDispatchComponentTrampoline(
@@ -159,6 +165,17 @@ pub fn setActivePool(pool: ?*TrampolinePool) void {
     g_active_pool = pool;
 }
 
+// One-shot per-slot "silent zero" warning. The trampoline pool collapses
+// any non-zero dispatcher status into `return 0` to the guest so we don't
+// corrupt the caller's wasm return-slot stack (we have no way to raise a
+// trap from this calling convention). That mask is what historically hid
+// every `UnsupportedSignature` regression — see issues #687, #689, #691,
+// #707 — because the guest sees the dispatch as a successful zero-return
+// rather than a trap. To surface the failure without spamming stderr on
+// hot paths, warn at most once per `(slot)` site via a 256-bit set
+// (one bit per `MAX_SLOTS` entry). Released-build visible.
+var g_dispatch_warn_once: std.bit_set.IntegerBitSet(MAX_SLOTS) = .initEmpty();
+
 pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) callconv(.c) u64 {
     const pool = g_active_pool orelse return 0;
     if (slot >= pool.next_slot) return 0;
@@ -172,7 +189,24 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
         .canon_builtin_aot => wamrAotDispatchCanonBuiltin(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
     };
-    if (dispatched.status != 0) return 0;
+    if (dispatched.status != 0) {
+        // Surface the silent-zero collapse once per slot. The `trap_stub`
+        // kind is an explicit, expected trap path — it has already
+        // printed its own diagnostic and the slot pre-emptively means
+        // "this import is known-unbound", so no extra warning helps.
+        if (entry.dispatch_kind != .trap_stub and slot < MAX_SLOTS and !g_dispatch_warn_once.isSet(slot)) {
+            g_dispatch_warn_once.set(slot);
+            const err_str: []const u8 = if (dispatched.err_name) |p|
+                std.mem.span(p)
+            else
+                "(unknown — wrapper did not populate err_name)";
+            std.log.warn(
+                "[aot dispatch] slot={d} kind={s} status={d} err={s}: returning 0 to guest (likely UnsupportedSignature in canon-lower/aot lift/lower path); set WAMR_AOT_DEBUG=1 for the underlying error.",
+                .{ slot, @tagName(entry.dispatch_kind), dispatched.status, err_str },
+            );
+        }
+        return 0;
+    }
     return dispatched.value;
 }
 
