@@ -181,6 +181,7 @@ pub const version = .{
     .minor = 1,
     .patch = 0,
     .string = config.version,
+    .mode = @import("builtin").mode,
 };
 
 test {

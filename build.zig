@@ -395,14 +395,21 @@ pub fn build(b: *std.Build) void {
 
     // CLI smoke assertions: subcommand layout, exit codes, version stdout.
     {
-        const wamr_version_line = b.fmt("wamr {s}\n", .{version_string});
-        const wamrc_version_line = b.fmt("wamrc {s}\n", .{version_string});
+        const optimize_name = @tagName(optimize);
+        const wamr_version_line = b.fmt("wamr {s}\noptimize {s}\n", .{ version_string, optimize_name });
+        const wamrc_version_line = b.fmt("wamrc {s}\noptimize {s}\n", .{ version_string, optimize_name });
 
         const wamr_version_run = b.addRunArtifact(exe);
         wamr_version_run.addArg("version");
         wamr_version_run.expectExitCode(0);
         wamr_version_run.expectStdOutEqual(wamr_version_line);
         test_step.dependOn(&wamr_version_run.step);
+
+        const wamr_long_version_run = b.addRunArtifact(exe);
+        wamr_long_version_run.addArg("--version");
+        wamr_long_version_run.expectExitCode(0);
+        wamr_long_version_run.expectStdOutEqual(wamr_version_line);
+        test_step.dependOn(&wamr_long_version_run.step);
 
         const wamrc_version_run = b.addRunArtifact(wamrc);
         wamrc_version_run.addArg("version");

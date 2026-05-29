@@ -13,6 +13,7 @@ Usage
 -----
     scripts/bench_coremark.py --baseline origin/main --target HEAD --runs 3
     scripts/bench_coremark.py --baseline origin/main --target HEAD --emit github
+    scripts/bench_coremark.py --optimize both
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
 
 ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
 
@@ -101,10 +104,10 @@ def ensure_coremark_src(repo: Path) -> None:
     )
 
 
-def make_worktree(repo: Path, ref: str, root: Path) -> Path:
+def make_worktree(repo: Path, ref: str, root: Path, label: str) -> Path:
     """Create a fresh worktree at `ref` under `root` so concurrent builds don't fight."""
     sha = run(["git", "rev-parse", ref], cwd=repo).strip()
-    wt = root / f"wt-{sha[:12]}"
+    wt = root / f"{label}-{sha[:12]}"
     if wt.exists():
         run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo)
     run(["git", "worktree", "add", "--detach", str(wt), sha], cwd=repo)
@@ -125,12 +128,12 @@ def worktree_env(wt: Path) -> dict:
     return env
 
 
-def build_and_run(wt: Path, runs: int, coremark_src: Path) -> list[float]:
+def build_and_run(wt: Path, runs: int, coremark_src: Path, optimize: str) -> list[float]:
     """Build wamr + AOT-compile + run CoreMark `runs` times, return iter/s list."""
     env = worktree_env(wt)
     # Each worktree owns its own .zig-cache (already on /work for our runner).
-    print(f"[harness] building {wt.name} (ReleaseFast)", file=sys.stderr)
-    run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=wt, env=env)
+    print(f"[harness] building {wt.name} ({optimize})", file=sys.stderr)
+    run(["zig", "build", f"-Doptimize={optimize}"], cwd=wt, env=env)
 
     cm = wt / "tests/benchmarks/coremark"
     # Symlink CoreMark sources from the canonical location to avoid re-cloning
@@ -197,13 +200,14 @@ def render_table(
     baseline_vals: list[float],
     target_ref: str,
     target_vals: list[float],
+    optimize: str = "ReleaseFast",
 ) -> str:
     bm, bmin, bmax = fmt_stats(baseline_vals)
     tm, tmin, tmax = fmt_stats(target_vals)
     delta_pct = compute_delta_pct(baseline_vals, target_vals)
     sign = "+" if delta_pct >= 0 else ""
     lines = [
-        "### CoreMark AOT comparison",
+        "### CoreMark AOT comparison" if optimize == "ReleaseFast" else f"### CoreMark AOT comparison ({optimize})",
         "",
         f"| Ref | Mean iter/s | Min | Max | Runs |",
         f"|---|---:|---:|---:|---:|",
@@ -211,6 +215,38 @@ def render_table(
         f"| `{target_ref}` (target) | {tm:.1f} | {tmin:.1f} | {tmax:.1f} | {len(target_vals)} |",
         f"| **Δ** | **{sign}{delta_pct:.2f}%** | | | |",
     ]
+    return "\n".join(lines)
+
+
+def fmt_iter_stats(values: list[float] | None) -> tuple[str, str, str]:
+    if values is None:
+        return "failed", "failed", "0"
+    mean, min_val, max_val = fmt_stats(values)
+    return f"{mean:.1f}", f"{min_val:.1f}..{max_val:.1f}", str(len(values))
+
+
+def render_optimize_table(
+    target_ref: str,
+    results: dict[str, list[float] | None],
+) -> str:
+    fast_vals = results["ReleaseFast"]
+    safe_vals = results["ReleaseSafe"]
+    fast_mean, fast_range, fast_runs = fmt_iter_stats(fast_vals)
+    safe_mean, safe_range, safe_runs = fmt_iter_stats(safe_vals)
+    ratio = "—"
+    if fast_vals is not None and safe_vals is not None:
+        ratio = fmt_ratio(statistics.fmean(safe_vals), statistics.fmean(fast_vals))
+    lines = [
+        "### CoreMark AOT optimize-mode comparison",
+        "",
+        "| Ref | ReleaseFast mean iter/s | ReleaseSafe mean iter/s | Safe/Fast iter/s | ReleaseFast min..max | ReleaseSafe min..max | Runs |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+        f"| `{target_ref}` (target) | {fast_mean} | {safe_mean} | {ratio} | "
+        f"{fast_range} | {safe_range} | {fast_runs}/{safe_runs} |",
+    ]
+    if fast_vals is None or safe_vals is None:
+        lines.append("")
+        lines.append("At least one optimize mode failed before producing a CoreMark timing; see raw harness output above.")
     return "\n".join(lines)
 
 
@@ -238,6 +274,12 @@ def main() -> int:
         help="`github` also appends to $GITHUB_STEP_SUMMARY when present",
     )
     p.add_argument(
+        "--optimize",
+        choices=OPTIMIZE_CHOICES,
+        default="ReleaseFast",
+        help="Zig optimize mode for wamr builds (default: ReleaseFast); `both` compares ReleaseFast vs ReleaseSafe for --target only",
+    )
+    p.add_argument(
         "--min-delta-pct",
         type=float,
         default=None,
@@ -260,19 +302,32 @@ def main() -> int:
         tmp_root = "/work"
     else:
         tmp_root = None
+    optimize_modes = parse_optimize_modes(args.optimize)
     with tempfile.TemporaryDirectory(prefix="bench-coremark-", dir=tmp_root) as tmp:
         root = Path(tmp)
         try:
-            wt_b = make_worktree(repo, args.baseline, root)
-            wt_t = make_worktree(repo, args.target, root)
-
-            baseline_vals = build_and_run(wt_b, args.runs, coremark_src)
-            target_vals = build_and_run(wt_t, args.runs, coremark_src)
+            if args.optimize == "both":
+                results: dict[str, list[float] | None] = {}
+                for optimize in optimize_modes:
+                    wt_t = make_worktree(repo, args.target, root, f"target-{optimize_slug(optimize)}")
+                    try:
+                        results[optimize] = build_and_run(wt_t, args.runs, coremark_src, optimize)
+                    except Exception as exc:
+                        print(f"[harness] {optimize} failed before producing complete CoreMark timings: {exc}", file=sys.stderr)
+                        results[optimize] = None
+                table = render_optimize_table(args.target, results)
+                baseline_vals: list[float] | None = None
+                target_vals = results["ReleaseFast"] or []
+            else:
+                only = optimize_modes[0]
+                wt_b = make_worktree(repo, args.baseline, root, "wt")
+                wt_t = make_worktree(repo, args.target, root, "wt-target")
+                baseline_vals = build_and_run(wt_b, args.runs, coremark_src, only)
+                target_vals = build_and_run(wt_t, args.runs, coremark_src, only)
+                table = render_table(args.baseline, baseline_vals, args.target, target_vals, only)
         finally:
             # Clean up worktrees so the parent repo isn't left with stale refs.
             run(["git", "worktree", "prune"], cwd=repo)
-
-    table = render_table(args.baseline, baseline_vals, args.target, target_vals)
     print(table)
 
     if args.out:
@@ -284,7 +339,7 @@ def main() -> int:
             with open(summary, "a") as fh:
                 fh.write(table + "\n")
 
-    if args.min_delta_pct is not None:
+    if args.min_delta_pct is not None and baseline_vals is not None:
         delta_pct = compute_delta_pct(baseline_vals, target_vals)
         if delta_pct < args.min_delta_pct:
             print(

@@ -50,6 +50,10 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
 
+    if (std.mem.eql(u8, args[1], "--version")) {
+        return try runVersion(init.io, args[2..]);
+    }
+
     const subcmd = parseSubcommand(args[1]) orelse {
         std.debug.print("error: unknown subcommand '{s}' — try `wamr help`\n", .{args[1]});
         return 2;
@@ -68,6 +72,7 @@ fn runVersion(io: std.Io, args: []const []const u8) !u8 {
         return 0;
     }
     writeStdout(io, "wamr " ++ wamr.version.string ++ "\n");
+    writeStdout(io, "optimize " ++ @tagName(wamr.version.mode) ++ "\n");
     return 0;
 }
 
@@ -1055,7 +1060,6 @@ fn runAotReal(
     if (ctx.exit_code) |code| return @intCast(code & 0xFF);
     return 0;
 }
-
 
 fn writeStdout(io: std.Io, text: []const u8) void {
     var stdout_file = std.Io.File.stdout();

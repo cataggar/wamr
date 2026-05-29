@@ -55,6 +55,7 @@ fn runVersion(io: std.Io, args: []const []const u8) !void {
         return;
     }
     writeStdout(io, "wamrc " ++ wamr.version.string ++ "\n");
+    writeStdout(io, "optimize " ++ @tagName(wamr.version.mode) ++ "\n");
 }
 
 fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -1109,7 +1110,6 @@ fn findWamrBinary(
     return allocator.dupe(u8, "wamr");
 }
 
-
 const top_usage =
     \\wamrc - WebAssembly AOT Compiler
     \\
@@ -1229,7 +1229,6 @@ const run_usage =
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
     \\
 ;
-
 
 const version_usage =
     \\Usage: wamrc version
