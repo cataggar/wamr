@@ -32,6 +32,7 @@ pub const LoweredSig = struct {
     param_types: []const core_types.ValType,
     result_types: []const core_types.ValType,
     has_retptr: bool = false,
+    slot: u32 = 0,
 };
 
 pub const DispatchResult = extern struct {
@@ -263,6 +264,7 @@ pub const TrampolinePool = struct {
             .ctx = ctx,
             .lowered_sig = lowered_sig,
         };
+        self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
         writeStub(self.stubBytes(slot), slot);
         platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
@@ -303,6 +305,7 @@ pub const TrampolinePool = struct {
             .lowered_sig = lowered_sig,
             .dispatch_kind = .canon_lower_aot,
         };
+        self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
         writeStub(self.stubBytes(slot), slot);
         platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
@@ -326,6 +329,7 @@ pub const TrampolinePool = struct {
             .lowered_sig = lowered_sig,
             .dispatch_kind = .cross_instance,
         };
+        self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
         writeStub(self.stubBytes(slot), slot);
         platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
@@ -350,6 +354,7 @@ pub const TrampolinePool = struct {
             .lowered_sig = lowered_sig,
             .dispatch_kind = .canon_builtin_aot,
         };
+        self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
         writeStub(self.stubBytes(slot), slot);
         platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
@@ -583,18 +588,13 @@ test "#648 phase 2: x86_64 trampoline encoder emits slot and dispatcher immediat
         0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
         0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
         0x48, 0x8B, 0x44, 0x24, 0x20, 0x50,
-        0x41, 0x51,
-        0x4D, 0x89, 0xC1,
-        0x49, 0x89, 0xC8,
-        0x48, 0x89, 0xD1,
-        0x48, 0x89, 0xF2,
-        0x48, 0x89, 0xFE,
-        0xBF, 0x44, 0x33, 0x22, 0x11,
-        0x48, 0xB8,
-        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
-        0xFF, 0xD0,
-        0x48, 0x83, 0xC4, 0x28,
-        0xC3,
+        0x41, 0x51, 0x4D, 0x89, 0xC1, 0x49,
+        0x89, 0xC8, 0x48, 0x89, 0xD1, 0x48,
+        0x89, 0xF2, 0x48, 0x89, 0xFE, 0xBF,
+        0x44, 0x33, 0x22, 0x11, 0x48, 0xB8,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33,
+        0x22, 0x11, 0xFF, 0xD0, 0x48, 0x83,
+        0xC4, 0x28, 0xC3,
     };
 
     try std.testing.expectEqual(@as(usize, x86_64_stub_bytes), expected.len);
