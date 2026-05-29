@@ -112,6 +112,11 @@ pub fn build(b: *std.Build) void {
 
     const skip_coldstart = b.option(bool, "skip-coldstart", "Skip cold-start budget tests (issue #395)") orelse false;
     const verify_ir_triage = b.option(bool, "verify-ir-triage", "Run differential tests with the IR verifier enabled and print per-test verifier failures (issue #627)") orelse false;
+    const wamr_strict_canon = b.option(bool, "wamr-strict-canon", "Enable strict canonical ABI ptr/len diagnostics") orelse switch (optimize) {
+        .ReleaseFast => false,
+        else => true,
+    };
+    options.addOption(bool, "wamr_strict_canon", wamr_strict_canon);
     const aot_broken_components = b.option(
         bool,
         "aot-broken-components",
