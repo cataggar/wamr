@@ -277,6 +277,9 @@ pub const tags = opt("tags", false);
 /// Enable the Component Model (WASIp3).
 pub const component_model = opt("component_model", false);
 
+/// Enable strict canonical ABI ptr/len diagnostics.
+pub const wamr_strict_canon = opt("wamr_strict_canon", builtin.mode != .ReleaseFast);
+
 /// Pass user data pointer to the memory allocator.
 pub const mem_alloc_with_user_data = opt("mem_alloc_with_user_data", false);
 

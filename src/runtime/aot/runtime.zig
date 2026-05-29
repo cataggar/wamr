@@ -1790,15 +1790,24 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
             return error.FunctionNotFound;
     };
 
-    // Build flat globals storage for AOT access.
-    const globals_words = inst.allocator.alloc(u128, globalStorageWordCount(inst)) catch return error.OutOfMemory;
-    defer inst.allocator.free(globals_words);
-    const globals_buf = std.mem.sliceAsBytes(globals_words);
-    writeGlobalsToStorage(inst, globals_buf);
+    const previous_globals_ptr = inst.vmctx.globals_ptr;
+    // Host imports may re-enter the same AOT instance (notably cabi_realloc).
+    // Reuse the active globals slab so mutable globals are not forked.
+    const reuse_globals = previous_globals_ptr != 0;
+    const globals_word_count = globalStorageWordCount(inst);
+    var globals_words: []u128 = &.{};
+    if (!reuse_globals) {
+        globals_words = inst.allocator.alloc(u128, globals_word_count) catch return error.OutOfMemory;
+    }
+    defer if (!reuse_globals) inst.allocator.free(globals_words);
+    const globals_buf: []u8 = if (reuse_globals)
+        @as([*]u8, @ptrFromInt(previous_globals_ptr))[0 .. globals_word_count * @sizeOf(u128)]
+    else
+        std.mem.sliceAsBytes(globals_words);
+    if (!reuse_globals) writeGlobalsToStorage(inst, globals_buf);
 
     // Always provide a valid globals pointer — compiled code may access globals
     // even if none are explicitly initialized (they default to zero).
-    const previous_globals_ptr = inst.vmctx.globals_ptr;
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx = &inst.vmctx;
     defer inst.vmctx.globals_ptr = previous_globals_ptr;
@@ -2111,13 +2120,22 @@ pub fn callFuncScalar(
             return error.FunctionNotFound;
     };
 
-    // Build flat globals storage for AOT access (mirrors callFunc).
-    const globals_words = inst.allocator.alloc(u128, globalStorageWordCount(inst)) catch return error.OutOfMemory;
-    defer inst.allocator.free(globals_words);
-    const globals_buf = std.mem.sliceAsBytes(globals_words);
-    writeGlobalsToStorage(inst, globals_buf);
-
     const previous_globals_ptr = inst.vmctx.globals_ptr;
+    // Host imports may re-enter the same AOT instance (notably cabi_realloc).
+    // Reuse the active globals slab so mutable globals are not forked.
+    const reuse_globals = previous_globals_ptr != 0;
+    const globals_word_count = globalStorageWordCount(inst);
+    var globals_words: []u128 = &.{};
+    if (!reuse_globals) {
+        globals_words = inst.allocator.alloc(u128, globals_word_count) catch return error.OutOfMemory;
+    }
+    defer if (!reuse_globals) inst.allocator.free(globals_words);
+    const globals_buf: []u8 = if (reuse_globals)
+        @as([*]u8, @ptrFromInt(previous_globals_ptr))[0 .. globals_word_count * @sizeOf(u128)]
+    else
+        std.mem.sliceAsBytes(globals_words);
+    if (!reuse_globals) writeGlobalsToStorage(inst, globals_buf);
+
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx = &inst.vmctx;
     defer inst.vmctx.globals_ptr = previous_globals_ptr;
