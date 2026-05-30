@@ -433,6 +433,48 @@ pub const ComponentInstance = struct {
     realloc_env: ?*@import("../runtime/common/exec_env.zig").ExecEnv = null,
     realloc_env_owner: ?*core_types.ModuleInstance = null,
 
+    /// Canon-lower opts of the in-flight host import call, set by
+    /// `componentTrampoline` / `dispatchAotComponentTrampoline` before
+    /// dispatching into the host method and cleared after. Lets
+    /// `hostAllocAndWrite` honor the lowerer's chosen `(realloc $f)` +
+    /// `(memory $m)` instead of falling back to the canonical
+    /// `cabi_realloc` search.
+    ///
+    /// Critical for wit-component's `wasi_snapshot_preview1` adapter:
+    /// the adapter imports WASIp2 via `canon.lower (realloc
+    /// $cabi_import_realloc)`, where `cabi_import_realloc` routes
+    /// through a per-call `import_alloc` cell that pins string
+    /// allocations to the adapter's own `temporary_data` buffer.
+    /// `fd_readdir` (in the adapter) asserts the returned `name` ptr
+    /// equals `temporary_data` — calling the main module's
+    /// `cabi_realloc` instead returns a ptr in the wrong memory and
+    /// trips that assertion. (#715.)
+    current_lower_call_ctx: ?CanonLowerCallCtx = null,
+
+    /// Resolved canon-lower opts for an in-flight host import call.
+    /// `memory` and `realloc` are pre-resolved from the canon-lower
+    /// opts' top-level indices so `hostAllocAndWrite` does not redo
+    /// the indexspace lookups per byte. Either field may be null when
+    /// the canon-lower decl omitted the corresponding opt.
+    pub const CanonLowerCallCtx = struct {
+        memory: ?*core_types.MemoryInstance = null,
+        realloc: ?ReallocTarget = null,
+    };
+
+    /// A directly-callable realloc, resolved from a top-level core-func
+    /// index in canon-lower opts. Backend-tagged because realloc can
+    /// live on either a fully-AOT-precompiled core or an interp core.
+    pub const ReallocTarget = union(enum) {
+        interp: struct {
+            mi: *core_types.ModuleInstance,
+            local_idx: u32,
+        },
+        aot: struct {
+            ai: *aot_runtime.AotInstance,
+            local_idx: u32,
+        },
+    };
+
     /// Allocate a fresh async-handle (#478 sub-PR 3). Used by every
     /// `.new`-flavoured canon-builtin to mint a unique key into the
     /// per-instance future / stream / error-context / waitable-set
@@ -632,6 +674,44 @@ pub const ComponentInstance = struct {
         }
     }
 
+    /// AOT-aware sibling of `resolveTopLevelCoreFunc`. Returns either an
+    /// AOT or interp `ReallocTarget` for the named export of the
+    /// aliased core instance. Used by the canon-lower trampoline to
+    /// pre-resolve `(realloc $f)` before stashing the call ctx on
+    /// `current_lower_call_ctx`. (#715.)
+    pub fn resolveTopLevelCoreFuncAny(
+        self: *const ComponentInstance,
+        idx: u32,
+    ) ?ReallocTarget {
+        const ref = indexspace.resolveCoreFunc(self.component, idx) orelse return null;
+        switch (ref) {
+            .lowered,
+            .resource_drop,
+            .resource_new,
+            .resource_rep,
+            .task_yield,
+            .context_get,
+            .context_set,
+            .task_return,
+            .async_canon,
+            => return null,
+            .aliased => |alias_idx| {
+                const ie = self.component.aliases[alias_idx].instance_export;
+                if (ie.instance_idx >= self.core_instances.len) return null;
+                const entry = self.core_instances[ie.instance_idx];
+                if (entry.module_inst) |mi| {
+                    const local = mi.getExportFunc(ie.name) orelse return null;
+                    return .{ .interp = .{ .mi = mi, .local_idx = local } };
+                }
+                if (entry.aot_inst) |ai| {
+                    const local = aot_runtime.findExportFunc(ai, ie.name) orelse return null;
+                    return .{ .aot = .{ .ai = ai, .local_idx = local } };
+                }
+                return null;
+            },
+        }
+    }
+
     /// Read `len` bytes starting at guest linear-memory offset `ptr` from the
     /// canonical memory of this component. Used by host adapter callbacks
     /// invoked from `componentTrampoline` to materialize `list<u8>` /
@@ -647,6 +727,19 @@ pub const ComponentInstance = struct {
             const end = @as(usize, ptr) + @as(usize, len);
             if (end > tm.buffer.len) return null;
             return tm.buffer[ptr..end];
+        }
+        // Mirror `writableGuestBytes`: when the in-flight canon-lower
+        // pinned a specific `(memory $m)`, read from THAT memory so
+        // string/list args lifted from the lowerer (e.g. the
+        // wit-component preview1 adapter's per-page memory) resolve
+        // correctly. Falls back to the canonical memory otherwise.
+        // (#715.)
+        if (self.current_lower_call_ctx) |cctx| {
+            if (cctx.memory) |mem| {
+                const end = @as(usize, ptr) + @as(usize, len);
+                if (end > mem.data.len) return null;
+                return mem.data[ptr..end];
+            }
         }
         const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);
@@ -708,6 +801,42 @@ pub const ComponentInstance = struct {
     pub fn hostAllocGuest(self: *ComponentInstance, size: u32, align_: u32) ?u32 {
         if (self.test_mem) |tm| return tm.alloc(size, align_);
         const a: u32 = if (align_ == 0) 1 else align_;
+        // Honor the in-flight canon-lower's `(realloc $f)` when set.
+        // This is required for wit-component's preview1 adapter, which
+        // imports WASIp2 via `canon.lower (realloc $cabi_import_realloc)`;
+        // `cabi_import_realloc` routes through a per-call `import_alloc`
+        // cell that pins return-string allocations to the adapter's
+        // internal `temporary_data` buffer. Falling back to the main
+        // module's `cabi_realloc` here returns a ptr in the wrong
+        // memory and trips an assertion inside the adapter's
+        // `fd_readdir` handler. (#715.)
+        if (self.current_lower_call_ctx) |cctx| {
+            if (cctx.realloc) |target| {
+                const executor = @import("executor.zig");
+                const call_frame_mod = @import("call_frame.zig");
+                switch (target) {
+                    .aot => |t| {
+                        var frame: executor.CallFrame = .{
+                            .aot = call_frame_mod.AotFrame.init(t.ai, self.allocator),
+                        };
+                        defer frame.deinit();
+                        return executor.callRealloc(&frame, t.local_idx, 0, 0, a, size) catch null;
+                    },
+                    .interp => |t| {
+                        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+                        if (self.realloc_env_owner != t.mi) {
+                            if (self.realloc_env) |old| old.destroy();
+                            self.realloc_env = ExecEnv.create(t.mi, 1024, self.allocator) catch null;
+                            self.realloc_env_owner = if (self.realloc_env != null) t.mi else null;
+                        }
+                        const env = self.realloc_env orelse return null;
+                        var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
+                        defer frame.deinit();
+                        return executor.callRealloc(&frame, t.local_idx, 0, 0, a, size) catch null;
+                    },
+                }
+            }
+        }
         // Prefer the AOT path when a precompiled core owns `cabi_realloc`:
         // it dispatches straight into native code via `aot_runtime.callFuncScalar`,
         // matching the dispatch path the rest of the all-AOT component
@@ -752,6 +881,18 @@ pub const ComponentInstance = struct {
             const end = @as(usize, ptr) + @as(usize, len);
             if (end > tm.buffer.len) return null;
             return tm.buffer[ptr..end];
+        }
+        // When the in-flight canon-lower pinned a specific `(memory $m)`,
+        // write into THAT memory — the `hostAllocGuest` ptr above came
+        // from the lowerer's realloc, which allocates inside the same
+        // memory. Mismatching here would write into the wrong module's
+        // memory and silently corrupt unrelated guest state. (#715.)
+        if (self.current_lower_call_ctx) |cctx| {
+            if (cctx.memory) |mem| {
+                const end = @as(usize, ptr) + @as(usize, len);
+                if (end > mem.data.len) return null;
+                return mem.data[ptr..end];
+            }
         }
         const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);

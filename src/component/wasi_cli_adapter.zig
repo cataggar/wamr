@@ -3895,6 +3895,119 @@ pub const ConfigEntry = struct {
     value: []const u8,
 };
 
+/// One-shot trace helpers used by `WasiCliAdapter.tracedAdapterCall`.
+/// File-scoped because they don't touch adapter state — the wrapper
+/// only forwards what `args` / `results` / the error happen to be.
+/// All lines go through `std.log.warn` so they survive in release
+/// builds without needing `WAMR_AOT_DEBUG=1`. (#715)
+fn logAdapterEntry(
+    comptime iface_short: []const u8,
+    comptime member: []const u8,
+    args: []const InterfaceValue,
+) void {
+    if (args.len == 0) {
+        std.debug.print("[adapter→] {s}/{s} args=()\n", .{ iface_short, member });
+    } else {
+        std.debug.print("[adapter→] {s}/{s} args.len={d} arg0={s}\n", .{
+            iface_short,
+            member,
+            args.len,
+            describeInterfaceValue(args[0]),
+        });
+    }
+}
+
+fn logAdapterExitOk(
+    comptime iface_short: []const u8,
+    comptime member: []const u8,
+    results: []const InterfaceValue,
+) void {
+    if (results.len == 0) {
+        std.debug.print("[adapter←] {s}/{s} ok results=()\n", .{ iface_short, member });
+    } else {
+        std.debug.print("[adapter←] {s}/{s} ok result0={s}\n", .{
+            iface_short,
+            member,
+            describeInterfaceValue(results[0]),
+        });
+    }
+}
+
+fn logAdapterExitErr(
+    comptime iface_short: []const u8,
+    comptime member: []const u8,
+    err: anyerror,
+) void {
+    std.debug.print("[adapter←] {s}/{s} err={s}\n", .{
+        iface_short,
+        member,
+        @errorName(err),
+    });
+}
+
+/// Render a short, log-line-safe summary of an `InterfaceValue`:
+/// primitive tag + scalar value when applicable; for `result_val`
+/// includes is_ok and the inner variant discriminant if any (this is
+/// the shape that matters for #715 — `result<descriptor-type,
+/// error-code>` ok-arm discriminant tells us whether the adapter
+/// thinks the descriptor is a directory).
+///
+/// Returns a static or short-lived buffer slice via a fixed-size
+/// thread-local — fine for log lines, not safe to retain.
+fn describeInterfaceValue(v: InterfaceValue) []const u8 {
+    const S = struct {
+        threadlocal var buf: [128]u8 = undefined;
+    };
+    return std.fmt.bufPrint(&S.buf, "{f}", .{InterfaceValueBrief{ .v = v }}) catch
+        @tagName(v);
+}
+
+const InterfaceValueBrief = struct {
+    v: InterfaceValue,
+
+    pub fn format(self: InterfaceValueBrief, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.v) {
+            .bool => |b| try writer.print("bool({})", .{b}),
+            .u8 => |x| try writer.print("u8({d})", .{x}),
+            .s8 => |x| try writer.print("s8({d})", .{x}),
+            .u16 => |x| try writer.print("u16({d})", .{x}),
+            .s16 => |x| try writer.print("s16({d})", .{x}),
+            .u32 => |x| try writer.print("u32({d})", .{x}),
+            .s32 => |x| try writer.print("s32({d})", .{x}),
+            .u64 => |x| try writer.print("u64({d})", .{x}),
+            .s64 => |x| try writer.print("s64({d})", .{x}),
+            .f32 => |x| try writer.print("f32(0x{x:0>8})", .{x}),
+            .f64 => |x| try writer.print("f64(0x{x:0>16})", .{x}),
+            .char => |x| try writer.print("char(U+{x})", .{x}),
+            .handle => |h| try writer.print("handle({d})", .{h}),
+            .string => |sl| try writer.print("string(ptr=0x{x},len={d})", .{ sl.ptr, sl.len }),
+            .list => |sl| try writer.print("list(ptr=0x{x},len={d})", .{ sl.ptr, sl.len }),
+            .enum_val => |d| try writer.print("enum({d})", .{d}),
+            .variant_val => |vv| try writer.print("variant(disc={d})", .{vv.discriminant}),
+            .option_val => |ov| try writer.print("option({s})", .{if (ov.is_some) "some" else "none"}),
+            .result_val => |rv| {
+                if (rv.payload) |p| {
+                    switch (p.*) {
+                        .variant_val => |vv| try writer.print(
+                            "result({s},disc={d})",
+                            .{ if (rv.is_ok) "ok" else "err", vv.discriminant },
+                        ),
+                        else => try writer.print(
+                            "result({s},payload={s})",
+                            .{ if (rv.is_ok) "ok" else "err", @tagName(p.*) },
+                        ),
+                    }
+                } else {
+                    try writer.print("result({s},no-payload)", .{if (rv.is_ok) "ok" else "err"});
+                }
+            },
+            .record_val => |fields| try writer.print("record(len={d})", .{fields.len}),
+            .tuple_val => |fields| try writer.print("tuple(len={d})", .{fields.len}),
+            .flags_val => |words| try writer.print("flags(words={d})", .{words.len}),
+        }
+    }
+};
+
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
@@ -4280,6 +4393,24 @@ pub const WasiCliAdapter = struct {
     /// the pair on first call and cache it for the lifetime of the
     /// adapter. (#520)
     insecure_seed_cache: ?[2]u64 = null,
+
+    /// When true, every host-import callback registered through
+    /// `populateWasiFilesystem*` emits one `std.log.warn` line on entry
+    /// and one on exit (with the interface + member name, a short
+    /// summary of `args[0]`, and the success/error outcome). Off by
+    /// default; flipped on by `WAMR_TRACE_CLI_ADAPTER=1` (wired in
+    /// `main.zig`). The thunks compiled around each member are
+    /// zero-cost when this is false (one load + branch per call).
+    ///
+    /// This sub-layer trace complements the `[aot dispatch]` warn-once
+    /// machinery added in #714 — the dispatch layer surfaces failures
+    /// in the canon-lower / cross-instance / canon-builtin paths,
+    /// while this surfaces *which* adapter member the guest is
+    /// actually calling. #715 is the motivating bug: AOT
+    /// `fd_readdir` panics with `ENOTDIR` after `descriptor.get-type`
+    /// returns `directory` cleanly, and the dispatch layer is silent,
+    /// so the divergence has to be in the adapter sub-layer.
+    trace_calls: bool = false,
 
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
     /// after the component runs to inspect captured output. This is the
@@ -4745,6 +4876,68 @@ pub const WasiCliAdapter = struct {
     /// and `warning` aliases).
     pub fn setLogLevel(self: *WasiCliAdapter, level: WasiLogLevel) void {
         self.log_level = level;
+    }
+
+    /// Toggle the per-member adapter-call trace described on
+    /// `trace_calls`. Intended to be flipped on once at process
+    /// startup from the `WAMR_TRACE_CLI_ADAPTER` env var (see
+    /// `main.zig`); tests can set it directly. (#715)
+    pub fn setTraceCalls(self: *WasiCliAdapter, on: bool) void {
+        self.trace_calls = on;
+    }
+
+    /// Function-pointer shape every adapter member callback shares
+    /// (matches the inline type used by the existing `M` structs in
+    /// each `populate*` function). Hoisting it as a named alias keeps
+    /// `tracedAdapterCall` readable. (#715)
+    pub const AdapterCallFn = *const fn (
+        ?*anyopaque,
+        *ComponentInstance,
+        []const InterfaceValue,
+        []InterfaceValue,
+        Allocator,
+    ) anyerror!void;
+
+    /// Wrap an adapter callback in a comptime-generated trace thunk
+    /// (#715). The returned function pointer has the same signature as
+    /// `impl` and:
+    ///   * when `self.trace_calls == false` (the default), does one
+    ///     extra load + branch per call before tail-calling `impl`;
+    ///   * when `self.trace_calls == true`, also emits one
+    ///     `std.log.warn` line on entry and one on exit, carrying
+    ///     `iface_short`, `member`, a short `args[0]` summary, and
+    ///     the success/error outcome.
+    ///
+    /// `iface_short` is a stable shorthand (e.g. `"filesystem/types"`)
+    /// — keep it short, it's repeated on every line.
+    pub fn tracedAdapterCall(
+        comptime iface_short: []const u8,
+        comptime member: []const u8,
+        comptime impl: AdapterCallFn,
+    ) AdapterCallFn {
+        const Thunk = struct {
+            fn wrapped(
+                ctx_opaque: ?*anyopaque,
+                ci: *ComponentInstance,
+                args: []const InterfaceValue,
+                results: []InterfaceValue,
+                allocator: Allocator,
+            ) anyerror!void {
+                const self_opt: ?*WasiCliAdapter = if (ctx_opaque) |c|
+                    @ptrCast(@alignCast(c))
+                else
+                    null;
+                const tracing = if (self_opt) |s| s.trace_calls else false;
+                if (tracing) logAdapterEntry(iface_short, member, args);
+                if (impl(ctx_opaque, ci, args, results, allocator)) |_| {
+                    if (tracing) logAdapterExitOk(iface_short, member, results);
+                } else |err| {
+                    if (tracing) logAdapterExitErr(iface_short, member, err);
+                    return err;
+                }
+            }
+        };
+        return Thunk.wrapped;
     }
 
     /// Captured stdout bytes (valid for buffer-backed sinks).
@@ -8601,7 +8794,10 @@ pub const WasiCliAdapter = struct {
         interface_name: []const u8,
     ) !void {
         try self.fs_preopens_iface.members.put(self.allocator, "get-directories", .{
-            .func = .{ .context = self, .call = &fsGetDirectories },
+            .func = .{
+                .context = self,
+                .call = tracedAdapterCall("filesystem/preopens", "get-directories", &fsGetDirectories),
+            },
         });
         try providers.put(self.allocator, interface_name, .{
             .host_instance = &self.fs_preopens_iface,
@@ -8650,9 +8846,12 @@ pub const WasiCliAdapter = struct {
             .{ .name = "filesystem-error-code", .call = &fsFilesystemErrorCode },
             .{ .name = "[resource-drop]descriptor", .call = &fsDescriptorDrop },
         };
-        for (members) |m| {
+        inline for (members) |m| {
             try self.fs_types_iface.members.put(self.allocator, m.name, .{
-                .func = .{ .context = self, .call = m.call },
+                .func = .{
+                    .context = self,
+                    .call = tracedAdapterCall("filesystem/types", m.name, m.call),
+                },
             });
         }
         try providers.put(self.allocator, interface_name, .{
@@ -8671,7 +8870,10 @@ pub const WasiCliAdapter = struct {
         interface_name: []const u8,
     ) !void {
         try self.fs_preopens_p3_iface.members.put(self.allocator, "get-directories", .{
-            .func = .{ .context = self, .call = &fsGetDirectories },
+            .func = .{
+                .context = self,
+                .call = tracedAdapterCall("filesystem/preopens@p3", "get-directories", &fsGetDirectories),
+            },
         });
         try providers.put(self.allocator, interface_name, .{
             .host_instance = &self.fs_preopens_p3_iface,
@@ -8729,9 +8931,12 @@ pub const WasiCliAdapter = struct {
             // Tier D: verbatim carry-over.
             .{ .name = "[resource-drop]descriptor", .call = &fsDescriptorDrop },
         };
-        for (members) |m| {
+        inline for (members) |m| {
             try self.fs_types_p3_iface.members.put(self.allocator, m.name, .{
-                .func = .{ .context = self, .call = m.call },
+                .func = .{
+                    .context = self,
+                    .call = tracedAdapterCall("filesystem/types@p3", m.name, m.call),
+                },
             });
         }
         try providers.put(self.allocator, interface_name, .{
@@ -9606,7 +9811,15 @@ pub const WasiCliAdapter = struct {
             return;
         };
 
-        const guest_ptr: u32 = if (n == 0) 0 else (ci.hostAllocAndWrite(buf[0..n]) orelse return error.IoError);
+        // Always invoke `cabi_realloc` (via `hostAllocAndWrite`), even for
+        // a zero-length read. The wit-component preview1 adapter's
+        // `fd_read`/`fd_pread` pin a `OneAlloc(BumpAlloc::new(ptr, len))`
+        // for the duration of the call and then assert
+        // `data.as_ptr() == ptr` on the lifted list. If we short-circuit
+        // and return `{ptr: 0, len: 0}`, the assertion fires and the
+        // guest panics. `BumpAlloc::alloc(0)` returns the pinned ptr,
+        // which is exactly what the adapter's lift expects. (#715.)
+        const guest_ptr: u32 = ci.hostAllocAndWrite(buf[0..n]) orelse return error.IoError;
 
         const eof = (cap == 0) or (n < cap);
         const tuple_fields = try allocator.alloc(InterfaceValue, 2);
@@ -27119,6 +27332,61 @@ test "filesystem #475: read without read flag returns access" {
     );
 }
 
+// #715: positional `descriptor.read` past EOF must still invoke
+// `cabi_realloc` (via `hostAllocAndWrite`) so the wit-component
+// preview1 adapter's `OneAlloc(BumpAlloc::new(ptr, len))` returns
+// the pinned ptr to the list lift. If we short-circuit `n == 0` →
+// `guest_ptr = 0`, the adapter trips `assert_eq!(data.as_ptr(),
+// ptr)` inside `fd_read`/`fd_pread` and the guest panics with
+// `NOTDIR` (mistranslated, but the assertion path is the cause).
+test "#715: positional read past EOF returns non-zero allocated guest ptr" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "abc" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_only });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    // Pre-advance the bump so a subsequent 0-byte alloc returns a
+    // distinct, post-priming offset only if it actually went through
+    // `hostAllocAndWrite` → `cabi_realloc`. (First allocation always
+    // returns offset 0 in `TestGuestMem`, hence the prime.)
+    _ = ci.hostAllocAndWrite("priming-bytes") orelse return error.TestOom;
+    const bump_after_prime = ci.test_mem.?.bump;
+    try testing.expect(bump_after_prime > 0);
+
+    // Offset past end of file → reads zero bytes, eof=true.
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .u64 = 64 },
+        .{ .u64 = 100 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorRead(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    const tup = results[0].result_val.payload.?.*.tuple_val;
+    const list_pl = tup[0].list;
+    try testing.expectEqual(@as(u32, 0), list_pl.len);
+    try testing.expect(tup[1].bool); // eof
+    // The fix: even with len=0, the list ptr must come from
+    // `cabi_realloc`. The pre-fix code returned 0; the fix returns
+    // the current bump offset (≥ `bump_after_prime`).
+    try testing.expectEqual(bump_after_prime, list_pl.ptr);
+}
+
 test "filesystem #475: positional write extends file" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -42022,4 +42290,137 @@ test "wasi:sockets/network.network-error-code: returns option::none for opaque i
 
     try testing.expect(results[0] == .option_val);
     try testing.expect(!results[0].option_val.is_some);
+}
+
+// =========================================================================
+// #715: WAMR_TRACE_CLI_ADAPTER trace-thunk smoke tests.
+//
+// These verify the comptime wrapper installed around every fs adapter
+// member by `populateWasiFilesystem*`:
+//   * defaults to off and forwards transparently,
+//   * propagates the underlying impl's return value (ok or error),
+//   * does not crash when flipped on (we cannot assert on `std.log.warn`
+//     output in the default test runner, but exercising the on-path
+//     gives the comptime-formatter helpers any-actual-call coverage).
+// =========================================================================
+
+test "#715: trace_calls defaults off; setTraceCalls flips it" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try testing.expect(!adapter.trace_calls);
+    adapter.setTraceCalls(true);
+    try testing.expect(adapter.trace_calls);
+    adapter.setTraceCalls(false);
+    try testing.expect(!adapter.trace_calls);
+}
+
+test "#715: traced fs/preopens get-directories forwards ok with trace off" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try adapter.populateWasiFilesystemPreopens(&providers, "wasi:filesystem/preopens");
+
+    const binding = providers.get("wasi:filesystem/preopens").?;
+    const member = binding.host_instance.members.get("get-directories").?;
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try member.func.call.?(member.func.context, &ci, &.{}, &results, testing.allocator);
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, 0), results[0].list.len);
+}
+
+test "#715: traced fs/preopens get-directories forwards ok with trace on" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setTraceCalls(true);
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try adapter.populateWasiFilesystemPreopens(&providers, "wasi:filesystem/preopens");
+
+    const binding = providers.get("wasi:filesystem/preopens").?;
+    const member = binding.host_instance.members.get("get-directories").?;
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try member.func.call.?(member.func.context, &ci, &.{}, &results, testing.allocator);
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, 0), results[0].list.len);
+}
+
+test "#715: traced fs/types descriptor.get-type propagates impl errors with trace on" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setTraceCalls(true);
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try adapter.populateWasiFilesystemTypes(&providers, "wasi:filesystem/types");
+
+    const binding = providers.get("wasi:filesystem/types").?;
+    const member = binding.host_instance.members.get("[method]descriptor.get-type").?;
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    // empty args → underlying fsDescriptorGetType returns error.InvalidArgs.
+    // The thunk must surface the error unchanged.
+    try testing.expectError(
+        error.InvalidArgs,
+        member.func.call.?(member.func.context, &ci, &.{}, &results, testing.allocator),
+    );
+}
+
+test "#715: traced fs/types descriptor.get-type ok-path returns directory for preopen" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setTraceCalls(true);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const handle = try adapter.addPreopen("/data", tmp.dir);
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try adapter.populateWasiFilesystemTypes(&providers, "wasi:filesystem/types");
+
+    const binding = providers.get("wasi:filesystem/types").?;
+    const member = binding.host_instance.members.get("[method]descriptor.get-type").?;
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{.{ .handle = handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try member.func.call.?(member.func.context, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const payload = results[0].result_val.payload.?;
+    try testing.expect(payload.* == .variant_val);
+    // 3 = `DescType.directory` in WIT order.
+    try testing.expectEqual(@as(u32, 3), payload.*.variant_val.discriminant);
+}
+
+test "#715: describeInterfaceValue formats common shapes" {
+    const testing = std.testing;
+    // result(ok, variant(disc=3)) — exactly the shape get-type returns for
+    // a preopen. This is the shape #715 turns on.
+    const ok_inner: InterfaceValue = .{ .variant_val = .{ .discriminant = 3, .payload = null } };
+    const ok_res: InterfaceValue = .{ .result_val = .{ .is_ok = true, .payload = &ok_inner } };
+    const s = describeInterfaceValue(ok_res);
+    try testing.expect(std.mem.indexOf(u8, s, "result(ok") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "disc=3") != null);
+
+    // handle(7)
+    const h: InterfaceValue = .{ .handle = 7 };
+    const s2 = describeInterfaceValue(h);
+    try testing.expect(std.mem.indexOf(u8, s2, "handle(7)") != null);
 }

@@ -129,6 +129,31 @@ pub fn decodeResourceWireAbi(wire: u32) u32 {
     return wire -% 1;
 }
 
+/// Read the discriminant from an interface value that represents an
+/// enum/payload-less variant. Host adapters and codegen both build
+/// such values, and they conventionally use either of two equivalent
+/// tags interchangeably:
+///
+///   * `.enum_val = N`                         (the canonical enum form)
+///   * `.variant_val = .{ .discriminant = N, .payload = null }`
+///     (the variant form, used when the constructor doesn't know
+///     whether the registered WIT type is `enum` or a payload-less
+///     `variant`).
+///
+/// Zig's `union(enum)` has no guaranteed in-memory layout, so the two
+/// fields do **not** alias — reading `val.enum_val` when the active
+/// tag is `.variant_val` returns garbage (0 in practice for our
+/// `InterfaceValue` layout). Every `.enum_` store/load branch must
+/// therefore go through this helper instead of `val.enum_val`. (#715)
+fn enumDiscriminantOf(val: InterfaceValue) StoreError!u32 {
+    return switch (val) {
+        .enum_val => |e| e,
+        .variant_val => |v| v.discriminant,
+        else => error.InvalidDiscriminant,
+    };
+}
+
+
 /// Runtime representation of a component interface value.
 /// Primitives are stored inline; compound types use allocator-owned slices.
 pub const InterfaceValue = union(enum) {
@@ -841,6 +866,7 @@ pub fn storeVal(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValue) 
 pub const StoreError = error{
     CompoundNeedsRegistry,
     InvalidTypeIndex,
+    InvalidDiscriminant,
 } || CanonPtrLenError;
 
 /// Store any value to linear memory, resolving compound types via registry.
@@ -852,10 +878,11 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
             const idx = t.enum_;
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
             const disc_sz = discriminantSize(td.enum_.names.len);
+            const disc = try enumDiscriminantOf(val);
             switch (disc_sz) {
-                1 => storeU8(memory, ptr, @intCast(val.enum_val)),
-                2 => storeU16(memory, ptr, @intCast(val.enum_val)),
-                else => storeU32(memory, ptr, val.enum_val),
+                1 => storeU8(memory, ptr, @intCast(disc)),
+                2 => storeU16(memory, ptr, @intCast(disc)),
+                else => storeU32(memory, ptr, disc),
             }
         },
         .flags => {
@@ -1037,10 +1064,11 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
         },
         .enum_ => |en| {
             const disc_sz = discriminantSize(en.names.len);
+            const disc = try enumDiscriminantOf(val);
             switch (disc_sz) {
-                1 => storeU8(memory, ptr, @intCast(val.enum_val)),
-                2 => storeU16(memory, ptr, @intCast(val.enum_val)),
-                else => storeU32(memory, ptr, val.enum_val),
+                1 => storeU8(memory, ptr, @intCast(disc)),
+                2 => storeU16(memory, ptr, @intCast(disc)),
+                else => storeU32(memory, ptr, disc),
             }
         },
         .option => |opt| {

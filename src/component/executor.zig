@@ -941,7 +941,11 @@ fn lowerFlatReg(
         .enum_ => |idx| {
             const td = registry.get(idx) orelse return error.InvalidTypeIndex;
             if (td != .enum_) return error.InvalidTypeIndex;
-            out[0] = val.enum_val;
+            out[0] = switch (val) {
+                .enum_val => |e| e,
+                .variant_val => |v| v.discriminant,
+                else => return error.InvalidValue,
+            };
             return 1;
         },
         .flags => |idx| {
@@ -5873,6 +5877,27 @@ pub const LowerOptions = struct {
     }
 };
 
+/// Resolve a canon-lower's `(memory $m)` / `(realloc $f)` opts into a
+/// directly-usable `CanonLowerCallCtx`. Called by the trampoline once
+/// per host import dispatch and stashed on `comp_inst` so
+/// `hostAllocAndWrite` honors the lowerer's pinned memory + realloc
+/// (e.g. wit-component preview1 adapter's `cabi_import_realloc`
+/// routing to per-call `temporary_data`). (#715.)
+fn resolveLowerCallCtx(
+    comp_inst: *ComponentInstance,
+    lower_opts: LowerOptions,
+) ?ComponentInstance.CanonLowerCallCtx {
+    if (lower_opts.memory_idx == null and lower_opts.realloc_idx == null) return null;
+    var cctx: ComponentInstance.CanonLowerCallCtx = .{};
+    if (lower_opts.memory_idx) |midx| {
+        cctx.memory = comp_inst.resolveTopLevelMemory(midx);
+    }
+    if (lower_opts.realloc_idx) |ridx| {
+        cctx.realloc = comp_inst.resolveTopLevelCoreFuncAny(ridx);
+    }
+    return cctx;
+}
+
 /// Per-import-slot context for the canon-lower trampoline. Owned by the
 /// `ComponentInstance` that installs the trampoline onto a core
 /// ModuleInstance's `host_func_entries`.
@@ -6112,6 +6137,9 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     const call = ctx.host_func.call orelse {
         return trampolineTrap(env, ctx, error.HostFuncNotBound, .host_call);
     };
+    const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
+    ctx.comp_inst.current_lower_call_ctx = resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts);
+    defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
     call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch |err| {
         return trampolineTrap(env, ctx, err, .host_call);
     };
@@ -6636,6 +6664,9 @@ fn dispatchAotComponentTrampoline(
         try callComponentFuncByLocal(ctx.comp_inst, target, args, results, allocator);
     } else {
         const call = ctx.host_func.call orelse return error.HostFuncNotBound;
+        const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
+        ctx.comp_inst.current_lower_call_ctx = resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts);
+        defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
         try call(ctx.host_func.context, ctx.comp_inst, args, results, allocator);
     }
     results_filled = results.len;
@@ -6756,11 +6787,19 @@ fn lowerAotDispatcherResult(
         .u32, .char => @as(u64, val.u32),
         .s64 => @as(u64, @bitCast(val.s64)),
         .u64 => val.u64,
-        .enum_ => @as(u64, val.enum_val),
+        .enum_ => @as(u64, switch (val) {
+            .enum_val => |e| e,
+            .variant_val => |v| v.discriminant,
+            else => return error.UnsupportedSignature,
+        }),
         .own, .borrow => @as(u64, encodeResourceWire(val.handle)),
         .future, .stream, .error_context => @as(u64, val.handle),
         .result => @as(u64, if (val.result_val.is_ok) 0 else 1),
-        .variant => @as(u64, val.variant_val.discriminant),
+        .variant => @as(u64, switch (val) {
+            .variant_val => |v| v.discriminant,
+            .enum_val => |e| e,
+            else => return error.UnsupportedSignature,
+        }),
         .option => @as(u64, if (val.option_val.is_some) 1 else 0),
         // Resolve a typedef-encoded result through the registry and recurse.
         // The shape is unwrapped exactly as `coreFlatSlotType` does for
