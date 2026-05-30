@@ -10904,10 +10904,17 @@ pub const WasiCliAdapter = struct {
                 else => .unknown,
             };
 
-            const name_ptr: u32 = if (entry.name.len == 0) 0 else (ci.hostAllocAndWrite(entry.name) orelse {
+            // Always go through `hostAllocAndWrite`, even when the entry
+            // name is empty, so the returned string ptr matches the
+            // `TwoAllocs` pin the wit-component preview1 adapter installs
+            // around `read-directory-entry` (it asserts
+            // `name.as_ptr() == temporary_data`). `std.fs.Dir.Iterator`
+            // never yields a zero-length name today, but mirror the #715
+            // `fd_read` fix here for symmetry/defence in depth.
+            const name_ptr: u32 = ci.hostAllocAndWrite(entry.name) orelse {
                 results[0] = try fsResultErr(allocator, .insufficient_memory);
                 return;
-            });
+            };
 
             const fields = try allocator.alloc(InterfaceValue, 2);
             fields[0] = .{ .variant_val = .{
