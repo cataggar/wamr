@@ -470,7 +470,7 @@ fn lowerByteListList(ci: *ComponentInstance, lists: []const []const u8) !Interfa
         const inner_ptr: u32 = if (bytes.len == 0)
             (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
         else
-            (ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory);
+            (ci.hostAllocAndWrite(bytes, 1) orelse return error.OutOfMemory);
         std.mem.writeInt(u32, dst[off..][0..4], inner_ptr, .little);
         std.mem.writeInt(u32, dst[off + 4 ..][0..4], @intCast(bytes.len), .little);
         off += 8;
@@ -493,11 +493,11 @@ fn lowerFieldEntriesList(ci: *ComponentInstance, entries: []const HttpFieldEntry
         const name_ptr: u32 = if (e.name.len == 0)
             (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
         else
-            (ci.hostAllocAndWrite(e.name) orelse return error.OutOfMemory);
+            (ci.hostAllocAndWrite(e.name, 1) orelse return error.OutOfMemory);
         const value_ptr: u32 = if (e.value.len == 0)
             (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
         else
-            (ci.hostAllocAndWrite(e.value) orelse return error.OutOfMemory);
+            (ci.hostAllocAndWrite(e.value, 1) orelse return error.OutOfMemory);
         std.mem.writeInt(u32, dst[off..][0..4], name_ptr, .little);
         std.mem.writeInt(u32, dst[off + 4 ..][0..4], @intCast(e.name.len), .little);
         std.mem.writeInt(u32, dst[off + 8 ..][0..4], value_ptr, .little);
@@ -5965,7 +5965,7 @@ pub const WasiCliAdapter = struct {
         for (ready, 0..) |idx, i| {
             std.mem.writeInt(u32, bytes[i * 4 ..][0..4], idx, .little);
         }
-        const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+        const ptr = ci.hostAllocAndWrite(bytes, 1) orelse return error.OutOfMemory;
         return .{ .list = .{ .ptr = ptr, .len = @intCast(ready.len) } };
     }
 
@@ -6393,7 +6393,7 @@ pub const WasiCliAdapter = struct {
         const buf = try allocator.alloc(u8, capped);
         defer allocator.free(buf);
         wasi_p2_core.Random.getRandomBytes(buf);
-        const guest_ptr = ci.hostAllocAndWrite(buf) orelse return error.IoError;
+        const guest_ptr = ci.hostAllocAndWrite(buf, 1) orelse return error.IoError;
         results[0] = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(capped) } };
     }
 
@@ -6428,7 +6428,7 @@ pub const WasiCliAdapter = struct {
         const buf = try allocator.alloc(u8, capped);
         defer allocator.free(buf);
         self.ensureInsecurePrng().bytes(buf);
-        const guest_ptr = ci.hostAllocAndWrite(buf) orelse return error.IoError;
+        const guest_ptr = ci.hostAllocAndWrite(buf, 1) orelse return error.IoError;
         results[0] = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(capped) } };
     }
 
@@ -8115,8 +8115,8 @@ pub const WasiCliAdapter = struct {
         defer allocator.free(scratch);
 
         for (self.env, 0..) |e, i| {
-            const name_ptr = ci.hostAllocAndWrite(e.name) orelse return error.IoError;
-            const value_ptr = ci.hostAllocAndWrite(e.value) orelse return error.IoError;
+            const name_ptr = ci.hostAllocAndWrite(e.name, 1) orelse return error.IoError;
+            const value_ptr = ci.hostAllocAndWrite(e.value, 1) orelse return error.IoError;
             const off = i * stride;
             std.mem.writeInt(u32, scratch[off..][0..4], name_ptr, .little);
             std.mem.writeInt(u32, scratch[off + 4 ..][0..4], @intCast(e.name.len), .little);
@@ -8124,7 +8124,7 @@ pub const WasiCliAdapter = struct {
             std.mem.writeInt(u32, scratch[off + 12 ..][0..4], @intCast(e.value.len), .little);
         }
 
-        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.IoError;
+        const list_ptr = ci.hostAllocAndWrite(scratch, 4) orelse return error.IoError;
         results[0] = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
     }
 
@@ -8152,13 +8152,13 @@ pub const WasiCliAdapter = struct {
         defer allocator.free(scratch);
 
         for (self.argv, 0..) |s, i| {
-            const s_ptr = ci.hostAllocAndWrite(s) orelse return error.IoError;
+            const s_ptr = ci.hostAllocAndWrite(s, 1) orelse return error.IoError;
             const off = i * stride;
             std.mem.writeInt(u32, scratch[off..][0..4], s_ptr, .little);
             std.mem.writeInt(u32, scratch[off + 4 ..][0..4], @intCast(s.len), .little);
         }
 
-        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.IoError;
+        const list_ptr = ci.hostAllocAndWrite(scratch, 4) orelse return error.IoError;
         results[0] = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
     }
 
@@ -8447,7 +8447,7 @@ pub const WasiCliAdapter = struct {
 
         switch (stream.read(buf)) {
             .ok => |n| {
-                const guest_ptr = ci.hostAllocAndWrite(buf[0..n]) orelse return error.IoError;
+                const guest_ptr = ci.hostAllocAndWrite(buf[0..n], 1) orelse return error.IoError;
                 const list_val = try allocator.create(InterfaceValue);
                 list_val.* = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(n) } };
                 results[0] = .{ .result_val = .{ .is_ok = true, .payload = list_val } };
@@ -8722,7 +8722,7 @@ pub const WasiCliAdapter = struct {
             .{handle},
         );
         defer allocator.free(msg);
-        const guest_ptr = ci.hostAllocAndWrite(msg) orelse return error.IoError;
+        const guest_ptr = ci.hostAllocAndWrite(msg, 1) orelse return error.IoError;
         results[0] = .{ .string = .{ .ptr = guest_ptr, .len = @intCast(msg.len) } };
     }
 
@@ -9099,7 +9099,7 @@ pub const WasiCliAdapter = struct {
         defer allocator.free(scratch);
 
         for (self.fs_preopens.items, 0..) |p, i| {
-            const name_ptr = ci.hostAllocAndWrite(p.name) orelse return error.IoError;
+            const name_ptr = ci.hostAllocAndWrite(p.name, 1) orelse return error.IoError;
             const off = i * stride;
             // `dir_handle` is the host-side 0-based slot index; the
             // canon-ABI wire handle is `slot + 1` per the resource
@@ -9111,7 +9111,7 @@ pub const WasiCliAdapter = struct {
             std.mem.writeInt(u32, scratch[off + 8 ..][0..4], @intCast(p.name.len), .little);
         }
 
-        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.IoError;
+        const list_ptr = ci.hostAllocAndWrite(scratch, 4) orelse return error.IoError;
         results[0] = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
     }
 
@@ -9819,7 +9819,7 @@ pub const WasiCliAdapter = struct {
         // and return `{ptr: 0, len: 0}`, the assertion fires and the
         // guest panics. `BumpAlloc::alloc(0)` returns the pinned ptr,
         // which is exactly what the adapter's lift expects. (#715.)
-        const guest_ptr: u32 = ci.hostAllocAndWrite(buf[0..n]) orelse return error.IoError;
+        const guest_ptr: u32 = ci.hostAllocAndWrite(buf[0..n], 1) orelse return error.IoError;
 
         const eof = (cap == 0) or (n < cap);
         const tuple_fields = try allocator.alloc(InterfaceValue, 2);
@@ -10773,7 +10773,7 @@ pub const WasiCliAdapter = struct {
             return;
         }
 
-        const guest_ptr = ci.hostAllocAndWrite(buf[0..n]) orelse {
+        const guest_ptr = ci.hostAllocAndWrite(buf[0..n], 1) orelse {
             results[0] = try fsResultErr(allocator, .insufficient_memory);
             return;
         };
@@ -10911,7 +10911,7 @@ pub const WasiCliAdapter = struct {
             // `name.as_ptr() == temporary_data`). `std.fs.Dir.Iterator`
             // never yields a zero-length name today, but mirror the #715
             // `fd_read` fix here for symmetry/defence in depth.
-            const name_ptr: u32 = ci.hostAllocAndWrite(entry.name) orelse {
+            const name_ptr: u32 = ci.hostAllocAndWrite(entry.name, 1) orelse {
                 results[0] = try fsResultErr(allocator, .insufficient_memory);
                 return;
             };
@@ -11805,7 +11805,7 @@ pub const WasiCliAdapter = struct {
             const name_ptr: u32 = if (entry.name.len == 0)
                 0
             else
-                (ci.hostAllocAndWrite(entry.name) orelse {
+                (ci.hostAllocAndWrite(entry.name, 1) orelse {
                     enum_err = .insufficient_memory;
                     break;
                 });
@@ -11987,7 +11987,7 @@ pub const WasiCliAdapter = struct {
         if (disc == SOCKETS_P3_ERROR_OTHER_DISC) {
             if (diag) |msg| {
                 if (msg.len != 0) {
-                    if (ci.hostAllocAndWrite(msg)) |ptr| {
+                    if (ci.hostAllocAndWrite(msg, 1)) |ptr| {
                         const str_iv = try allocator.create(InterfaceValue);
                         str_iv.* = .{ .string = .{ .ptr = ptr, .len = @intCast(msg.len) } };
                         const opt_iv = try allocator.create(InterfaceValue);
@@ -13957,7 +13957,7 @@ pub const WasiCliAdapter = struct {
             // Lower the data slice into guest memory directly so the
             // record value already carries the canonical `.list = PtrLen`
             // shape (issue #402).
-            const data_ptr: u32 = if (msg.data.len == 0) 0 else (ci.hostAllocAndWrite(msg.data) orelse return error.OutOfMemory);
+            const data_ptr: u32 = if (msg.data.len == 0) 0 else (ci.hostAllocAndWrite(msg.data, 1) orelse return error.OutOfMemory);
             const remote_iv = try lowerIpSocketAddress(allocator, msg.from);
             const rec = try allocator.alloc(InterfaceValue, 2);
             rec[0] = .{ .list = .{ .ptr = data_ptr, .len = @intCast(msg.data.len) } };
@@ -15335,7 +15335,7 @@ pub const WasiCliAdapter = struct {
         const data_ptr: u32 = if (bytes.len == 0)
             0
         else
-            (ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory);
+            (ci.hostAllocAndWrite(bytes, 1) orelse return error.OutOfMemory);
         const data_iv = InterfaceValue{ .list = .{ .ptr = data_ptr, .len = @intCast(bytes.len) } };
         const remote_iv = try lowerIpSocketAddress(ci.allocator, remote);
         const fields = try ci.allocator.alloc(InterfaceValue, 2);
@@ -16499,7 +16499,7 @@ pub const WasiCliAdapter = struct {
         const ptr = if (bytes.len == 0)
             (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
         else
-            (ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory);
+            (ci.hostAllocAndWrite(bytes, 1) orelse return error.OutOfMemory);
         return .{ .string = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
     }
 
@@ -21790,7 +21790,7 @@ pub const WasiCliAdapter = struct {
         allocator: Allocator,
         message: []const u8,
     ) !InterfaceValue {
-        const ptr = ci.hostAllocAndWrite(message) orelse return error.OutOfMemory;
+        const ptr = ci.hostAllocAndWrite(message, 1) orelse return error.OutOfMemory;
         const string_val = try allocator.create(InterfaceValue);
         string_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(message.len) } };
         const err_payload = try allocator.create(InterfaceValue);
@@ -21921,7 +21921,7 @@ pub const WasiCliAdapter = struct {
             const guest_ptr: u32 = if (val.len == 0)
                 (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
             else
-                (ci.hostAllocAndWrite(val) orelse return error.OutOfMemory);
+                (ci.hostAllocAndWrite(val, 1) orelse return error.OutOfMemory);
             const list_val = try allocator.create(InterfaceValue);
             list_val.* = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(val.len) } };
             results[0] = try keyvalueResultOk(allocator, .{ .option_val = .{
@@ -22172,7 +22172,7 @@ pub const WasiCliAdapter = struct {
                 const key_ptr: u32 = if (k.len == 0)
                     (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
                 else
-                    (ci.hostAllocAndWrite(k) orelse return error.OutOfMemory);
+                    (ci.hostAllocAndWrite(k, 1) orelse return error.OutOfMemory);
                 std.mem.writeInt(u32, dst[off..][0..4], key_ptr, .little);
                 std.mem.writeInt(u32, dst[off + 4 ..][0..4], @intCast(k.len), .little);
                 off += stride;
@@ -22183,7 +22183,7 @@ pub const WasiCliAdapter = struct {
             // Lift the next-page cursor as a decimal-ASCII string.
             var buf: [32]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, "{d}", .{end_index}) catch unreachable;
-            const ptr = ci.hostAllocAndWrite(s) orelse return error.OutOfMemory;
+            const ptr = ci.hostAllocAndWrite(s, 1) orelse return error.OutOfMemory;
             const some_val = try allocator.create(InterfaceValue);
             some_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(s.len) } };
             break :blk .{ .option_val = .{ .is_some = true, .payload = some_val } };
@@ -22293,7 +22293,7 @@ pub const WasiCliAdapter = struct {
         allocator: Allocator,
         message: []const u8,
     ) !InterfaceValue {
-        const ptr = ci.hostAllocAndWrite(message) orelse return error.OutOfMemory;
+        const ptr = ci.hostAllocAndWrite(message, 1) orelse return error.OutOfMemory;
         const string_val = try allocator.create(InterfaceValue);
         string_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(message.len) } };
         const inner_err = try allocator.create(InterfaceValue);
@@ -22523,7 +22523,7 @@ pub const WasiCliAdapter = struct {
         const guest_ptr: u32 = if (observed.len == 0)
             (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
         else
-            (ci.hostAllocAndWrite(observed) orelse return error.OutOfMemory);
+            (ci.hostAllocAndWrite(observed, 1) orelse return error.OutOfMemory);
         const list_val = try allocator.create(InterfaceValue);
         list_val.* = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(observed.len) } };
         results[0] = try keyvalueResultOk(allocator, .{ .option_val = .{
@@ -22627,11 +22627,11 @@ pub const WasiCliAdapter = struct {
                     const k_out_ptr: u32 = if (k_bytes.len == 0)
                         (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
                     else
-                        (ci.hostAllocAndWrite(k_bytes) orelse return error.OutOfMemory);
+                        (ci.hostAllocAndWrite(k_bytes, 1) orelse return error.OutOfMemory);
                     const v_out_ptr: u32 = if (stored_value.len == 0)
                         (ci.hostAllocGuest(1, 1) orelse return error.OutOfMemory)
                     else
-                        (ci.hostAllocAndWrite(stored_value) orelse return error.OutOfMemory);
+                        (ci.hostAllocAndWrite(stored_value, 1) orelse return error.OutOfMemory);
                     dst[out_off] = 1; // option::some discriminant.
                     std.mem.writeInt(u32, dst[out_off + 4 ..][0..4], k_out_ptr, .little);
                     std.mem.writeInt(u32, dst[out_off + 8 ..][0..4], @intCast(k_bytes.len), .little);
@@ -23051,7 +23051,7 @@ pub const WasiCliAdapter = struct {
             return error.OutOfBoundsMemory;
 
         if (self.lookupConfig(key_bytes)) |value| {
-            const value_ptr = ci.hostAllocAndWrite(value) orelse
+            const value_ptr = ci.hostAllocAndWrite(value, 1) orelse
                 return error.OutOfMemory;
             const str_iv = try allocator.create(InterfaceValue);
             errdefer allocator.destroy(str_iv);
@@ -23101,8 +23101,8 @@ pub const WasiCliAdapter = struct {
         defer allocator.free(scratch);
 
         for (self.config_store, 0..) |e, i| {
-            const name_ptr = ci.hostAllocAndWrite(e.name) orelse return error.OutOfMemory;
-            const value_ptr = ci.hostAllocAndWrite(e.value) orelse return error.OutOfMemory;
+            const name_ptr = ci.hostAllocAndWrite(e.name, 1) orelse return error.OutOfMemory;
+            const value_ptr = ci.hostAllocAndWrite(e.value, 1) orelse return error.OutOfMemory;
             const off = i * stride;
             std.mem.writeInt(u32, scratch[off..][0..4], name_ptr, .little);
             std.mem.writeInt(u32, scratch[off + 4 ..][0..4], @intCast(e.name.len), .little);
@@ -23110,7 +23110,7 @@ pub const WasiCliAdapter = struct {
             std.mem.writeInt(u32, scratch[off + 12 ..][0..4], @intCast(e.value.len), .little);
         }
 
-        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.OutOfMemory;
+        const list_ptr = ci.hostAllocAndWrite(scratch, 4) orelse return error.OutOfMemory;
         list_iv.* = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = list_iv } };
     }
@@ -25591,6 +25591,56 @@ test "populateWasiProviders: binds full cli surface (#153)" {
     try testing.expect(adapter.io_streams_iface.members.contains("[method]input-stream.subscribe"));
 }
 
+test "wasi:cli/environment.get-environment returns a 4-aligned list backing (#719)" {
+    // Regression for the alignment bug that surfaced through #714's
+    // dispatch-sentinel: `hostAllocAndWrite` used to hardcode align=1,
+    // so the `list<tuple<string,string>>` ptr came back unaligned and
+    // canon-lift rejected it with `error.CanonListMisaligned`. In the
+    // wild that cascaded into a guest OOB inside Zig stdlib's
+    // `process.Environ.Map.putPosixBlock`.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const env_entries = [_]EnvVar{
+        .{ .name = "PATH", .value = "/usr/bin:/bin" },
+        .{ .name = "HOME", .value = "/home/user" },
+        .{ .name = "X", .value = "" },
+    };
+    adapter.setEnvironment(&env_entries);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.getEnvironment(&adapter, &ci, &.{}, &results, testing.allocator);
+
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, env_entries.len), results[0].list.len);
+    try testing.expectEqual(@as(u32, 0), results[0].list.ptr % 4);
+}
+
+test "wasi:cli/environment.get-arguments returns a 4-aligned list backing (#719)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const argv = [_][]const u8{ "prog", "--flag", "value" };
+    adapter.setArguments(&argv);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.getArguments(&adapter, &ci, &.{}, &results, testing.allocator);
+
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, argv.len), results[0].list.len);
+    try testing.expectEqual(@as(u32, 0), results[0].list.ptr % 4);
+}
+
 test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
     const testing = std.testing;
     const data = @embedFile("fixtures/stdio-echo.wasm");
@@ -25818,7 +25868,7 @@ test "wasi:io/poll.poll returns ready indices and drops pollables (#199)" {
     var arg_bytes: [8]u8 = undefined;
     std.mem.writeInt(u32, arg_bytes[0..4], pending_handle, .little);
     std.mem.writeInt(u32, arg_bytes[4..8], ready_handle, .little);
-    const arg_ptr = ci.hostAllocAndWrite(&arg_bytes) orelse return error.OutOfMemory;
+    const arg_ptr = ci.hostAllocAndWrite(&arg_bytes, 1) orelse return error.OutOfMemory;
     const args: [1]InterfaceValue = .{.{ .list = .{ .ptr = arg_ptr, .len = 2 } }};
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.pollPoll(&adapter, &ci, &args, &results, testing.allocator);
@@ -25848,7 +25898,7 @@ test "wasi:io/poll.poll advances deterministic clock for timers (#199)" {
 
     var arg_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, arg_bytes[0..4], timer_handle, .little);
-    const arg_ptr = ci.hostAllocAndWrite(&arg_bytes) orelse return error.OutOfMemory;
+    const arg_ptr = ci.hostAllocAndWrite(&arg_bytes, 1) orelse return error.OutOfMemory;
     const args: [1]InterfaceValue = .{.{ .list = .{ .ptr = arg_ptr, .len = 1 } }};
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.pollPoll(&adapter, &ci, &args, &results, testing.allocator);
@@ -26591,7 +26641,7 @@ test "wasi:filesystem@0.3.0 open-at: future payload decodes to result<descriptor
     defer p3TestDeinitAsyncTables(&ci, testing.allocator);
 
     // open-at args: (borrow<descriptor>, path-flags, path, open-flags, descriptor-flags)
-    const path_ptr = ci.hostAllocAndWrite("openat.txt").?;
+    const path_ptr = ci.hostAllocAndWrite("openat.txt", 1).?;
     const path_flags = try testing.allocator.alloc(u32, 1);
     defer testing.allocator.free(path_flags);
     path_flags[0] = 1; // symlink-follow
@@ -26650,7 +26700,7 @@ test "wasi:filesystem@0.3.0 open-at: missing path → future payload encodes err
     p3TestInitAsyncTables(&ci);
     defer p3TestDeinitAsyncTables(&ci, testing.allocator);
 
-    const path_ptr = ci.hostAllocAndWrite("does-not-exist").?;
+    const path_ptr = ci.hostAllocAndWrite("does-not-exist", 1).?;
     const empty_flags = try testing.allocator.alloc(u32, 1);
     defer testing.allocator.free(empty_flags);
     empty_flags[0] = 0;
@@ -26794,7 +26844,7 @@ test "wasi:filesystem@0.3.0 stat-at: future payload decodes to result<descriptor
     p3TestInitAsyncTables(&ci);
     defer p3TestDeinitAsyncTables(&ci, testing.allocator);
 
-    const path_ptr = ci.hostAllocAndWrite("statme.txt").?;
+    const path_ptr = ci.hostAllocAndWrite("statme.txt", 1).?;
     const empty_flags = try testing.allocator.alloc(u32, 1);
     defer testing.allocator.free(empty_flags);
     empty_flags[0] = 0;
@@ -26855,8 +26905,8 @@ test "wasi:filesystem@0.3.0 link-at: future payload encodes result<_, error-code
     p3TestInitAsyncTables(&ci);
     defer p3TestDeinitAsyncTables(&ci, testing.allocator);
 
-    const old_path_ptr = ci.hostAllocAndWrite("src.txt").?;
-    const new_path_ptr = ci.hostAllocAndWrite("dst.txt").?;
+    const old_path_ptr = ci.hostAllocAndWrite("src.txt", 1).?;
+    const new_path_ptr = ci.hostAllocAndWrite("dst.txt", 1).?;
     const flags = try testing.allocator.alloc(u32, 1);
     defer testing.allocator.free(flags);
     flags[0] = 0;
@@ -27222,7 +27272,7 @@ test "filesystem #571: set-times-at on missing path returns no-entry" {
     var ci: ComponentInstance = undefined;
     try ci.enableTestMem(testing.allocator, 64);
     defer ci.disableTestMem();
-    const path_ptr = ci.hostAllocAndWrite("z.txt") orelse return error.OutOfMemory;
+    const path_ptr = ci.hostAllocAndWrite("z.txt", 1) orelse return error.OutOfMemory;
 
     var empty_flags = [_]u32{0};
     var args = [_]InterfaceValue{
@@ -27369,7 +27419,7 @@ test "#715: positional read past EOF returns non-zero allocated guest ptr" {
     // distinct, post-priming offset only if it actually went through
     // `hostAllocAndWrite` → `cabi_realloc`. (First allocation always
     // returns offset 0 in `TestGuestMem`, hence the prime.)
-    _ = ci.hostAllocAndWrite("priming-bytes") orelse return error.TestOom;
+    _ = ci.hostAllocAndWrite("priming-bytes", 1) orelse return error.TestOom;
     const bump_after_prime = ci.test_mem.?.bump;
     try testing.expect(bump_after_prime > 0);
 
@@ -31992,7 +32042,7 @@ test "wasi:config/store.get: file-only store returns Some(value) for known key, 
     defer ci.disableTestMem();
 
     // get("foo") -> Ok(Some("bar"))
-    const foo_key_ptr = ci.hostAllocAndWrite("foo") orelse return error.OutOfMemory;
+    const foo_key_ptr = ci.hostAllocAndWrite("foo", 1) orelse return error.OutOfMemory;
     const get_args_foo = [_]InterfaceValue{
         .{ .string = .{ .ptr = foo_key_ptr, .len = 3 } },
     };
@@ -32008,7 +32058,7 @@ test "wasi:config/store.get: file-only store returns Some(value) for known key, 
     try expectInterfaceBytes(&ci, ok_payload.option_val.payload.?.*, "bar");
 
     // get("missing") -> Ok(None)
-    const miss_key_ptr = ci.hostAllocAndWrite("missing") orelse return error.OutOfMemory;
+    const miss_key_ptr = ci.hostAllocAndWrite("missing", 1) orelse return error.OutOfMemory;
     const get_args_miss = [_]InterfaceValue{
         .{ .string = .{ .ptr = miss_key_ptr, .len = 7 } },
     };
@@ -32680,7 +32730,7 @@ test "filesystem #571: open-at defaults to READ when no R/W requested" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("x.txt").?;
+    const path_ptr = ci.hostAllocAndWrite("x.txt", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .u32 = 0 }, // path-flags
@@ -32719,7 +32769,7 @@ test "filesystem #571: open-at(CREATE) implies WRITE and defaults READ" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("new.cleanup").?;
+    const path_ptr = ci.hostAllocAndWrite("new.cleanup", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .u32 = 0 }, // path-flags
@@ -32758,7 +32808,7 @@ test "filesystem #571: open-at(CREATE, WRITE) keeps WRITE without adding READ" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("write-only.cleanup").?;
+    const path_ptr = ci.hostAllocAndWrite("write-only.cleanup", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .u32 = 0 },
@@ -32806,7 +32856,7 @@ test "filesystem #571: open-at(TRUNCATE, WRITE) truncates existing file to 0 byt
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("trunc.cleanup").?;
+    const path_ptr = ci.hostAllocAndWrite("trunc.cleanup", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .u32 = 0 },
@@ -32843,7 +32893,7 @@ test "filesystem #571: open-at on a directory without DIRECTORY flag returns dir
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("sub").?;
+    const path_ptr = ci.hostAllocAndWrite("sub", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .u32 = 0 },
@@ -32882,7 +32932,7 @@ test "filesystem #571: open-at(WRITE) on directory returns is-directory error" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("sub2").?;
+    const path_ptr = ci.hostAllocAndWrite("sub2", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .u32 = 0 },
@@ -32922,7 +32972,7 @@ test "filesystem #571: open-at rejects symlink-follow that escapes sandbox" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("parent").?;
+    const path_ptr = ci.hostAllocAndWrite("parent", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .u32 = 0b1 }, // path-flags = SYMLINK_FOLLOW
@@ -32961,7 +33011,7 @@ test "filesystem #571: intermediate symlink rejected by create-directory-at" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const path_ptr = ci.hostAllocAndWrite("parent/q.cleanup").?;
+    const path_ptr = ci.hostAllocAndWrite("parent/q.cleanup", 1).?;
     var args = [_]InterfaceValue{
         .{ .handle = preopen_handle },
         .{ .string = .{ .ptr = path_ptr, .len = @intCast("parent/q.cleanup".len) } },
@@ -33406,7 +33456,7 @@ test "sockets #178: tcp resource-drop after listen frees server" {
 /// `ci.enableTestMem(...)` first; the bytes live for the lifetime
 /// of `test_mem`.
 fn testMakeListVal(ci: *ComponentInstance, _: Allocator, bytes: []const u8) !InterfaceValue {
-    const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+    const ptr = ci.hostAllocAndWrite(bytes, 1) orelse return error.OutOfMemory;
     return .{ .list = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
 }
 
@@ -34999,7 +35049,7 @@ test "sockets #178 UDP: loopback send + receive round-trip" {
             defer a.destroy(remote_opt_payload);
 
             const hello = "hello";
-            const data_ptr = ci.hostAllocAndWrite(hello).?;
+            const data_ptr = ci.hostAllocAndWrite(hello, 1).?;
             const dg_fields = try a.alloc(InterfaceValue, 2);
             defer a.free(dg_fields);
             dg_fields[0] = .{ .list = .{ .ptr = data_ptr, .len = @intCast(hello.len) } };
@@ -35085,7 +35135,7 @@ test "sockets #178 UDP: send unconnected + per-datagram none is invalid_argument
             }
             // Build datagram with remote = none and lower into guest mem (#402).
             const data_byte = [_]u8{42};
-            const data_ptr = ci.hostAllocAndWrite(&data_byte).?;
+            const data_ptr = ci.hostAllocAndWrite(&data_byte, 1).?;
             const dg_fields = try a.alloc(InterfaceValue, 2);
             defer a.free(dg_fields);
             dg_fields[0] = .{ .list = .{ .ptr = data_ptr, .len = 1 } };
@@ -39018,7 +39068,7 @@ test "wasi:http@0.3 (#552): scheme byte-validation accepts http/https, rejects b
     // Helper: call set-scheme with Some(Other(name)) and report ok/err.
     const Caller = struct {
         fn callSet(a: *WasiCliAdapter, c: *ComponentInstance, rh: u32, name: []const u8) !bool {
-            const arg_ptr = c.hostAllocAndWrite(name) orelse return error.OutOfMemory;
+            const arg_ptr = c.hostAllocAndWrite(name, 1) orelse return error.OutOfMemory;
             var payload_str: InterfaceValue = .{ .string = .{ .ptr = arg_ptr, .len = @intCast(name.len) } };
             var variant_inner: InterfaceValue = .{ .variant_val = .{ .discriminant = 2, .payload = &payload_str } };
             const args = [_]InterfaceValue{
@@ -39078,7 +39128,7 @@ test "wasi:http@0.3 (#552): method byte-validation enforces RFC 7230 tchar" {
     const Caller = struct {
         fn callOther(a: *WasiCliAdapter, c: *ComponentInstance, rh: u32, name: []const u8) !bool {
             const arg_ptr = if (name.len > 0)
-                (c.hostAllocAndWrite(name) orelse return error.OutOfMemory)
+                (c.hostAllocAndWrite(name, 1) orelse return error.OutOfMemory)
             else
                 @as(u32, 0);
             var payload_str: InterfaceValue = .{ .string = .{ .ptr = arg_ptr, .len = @intCast(name.len) } };
@@ -39149,7 +39199,7 @@ test "wasi:http@0.3 (#552): path-with-query byte-validation rejects control byte
     const Caller = struct {
         fn callSetSome(a: *WasiCliAdapter, c: *ComponentInstance, rh: u32, path: []const u8) !bool {
             const arg_ptr = if (path.len > 0)
-                (c.hostAllocAndWrite(path) orelse return error.OutOfMemory)
+                (c.hostAllocAndWrite(path, 1) orelse return error.OutOfMemory)
             else
                 @as(u32, 0);
             var payload_str: InterfaceValue = .{ .string = .{ .ptr = arg_ptr, .len = @intCast(path.len) } };
@@ -39212,7 +39262,7 @@ test "wasi:http@0.3 (#552): authority byte-validation: host[:port], rejects bad 
     const Caller = struct {
         fn callSetSome(a: *WasiCliAdapter, c: *ComponentInstance, rh: u32, auth: []const u8) !bool {
             const arg_ptr = if (auth.len > 0)
-                (c.hostAllocAndWrite(auth) orelse return error.OutOfMemory)
+                (c.hostAllocAndWrite(auth, 1) orelse return error.OutOfMemory)
             else
                 @as(u32, 0);
             var payload_str: InterfaceValue = .{ .string = .{ .ptr = arg_ptr, .len = @intCast(auth.len) } };
@@ -40460,8 +40510,8 @@ test "wasi:logging (#583 B5): wasiLog reads guest-memory strings via ComponentIn
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const ctx_ptr = ci.hostAllocAndWrite("svc:web").?;
-    const msg_ptr = ci.hostAllocAndWrite("served 200 in 4ms").?;
+    const ctx_ptr = ci.hostAllocAndWrite("svc:web", 1).?;
+    const msg_ptr = ci.hostAllocAndWrite("served 200 in 4ms", 1).?;
 
     var args = [_]InterfaceValue{
         .{ .enum_val = @intFromEnum(WasiLogLevel.info) },
@@ -40486,8 +40536,8 @@ test "wasi:logging (#583 B5): out-of-range enum discriminant is silently dropped
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    const ctx_ptr = ci.hostAllocAndWrite("x").?;
-    const msg_ptr = ci.hostAllocAndWrite("y").?;
+    const ctx_ptr = ci.hostAllocAndWrite("x", 1).?;
+    const msg_ptr = ci.hostAllocAndWrite("y", 1).?;
     // Discriminant 6 is past `critical` (the WIT enum has 6 variants
     // numbered 0..=5). Real loggers drop and carry on; trapping the
     // component over a malformed log line would be hostile.
@@ -40584,14 +40634,14 @@ test "populateWasiProviders: wasi:logging 0.1 and 0.2 route to distinct HostInst
 /// value; caller writes it into an args slot. Allocator-free — the
 /// guest-side bytes outlive the test through `TestGuestMem.deinit`.
 fn testKeyvalueStringArg(ci: *ComponentInstance, bytes: []const u8) !InterfaceValue {
-    const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+    const ptr = ci.hostAllocAndWrite(bytes, 1) orelse return error.OutOfMemory;
     return .{ .string = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
 }
 
 /// Lift a host `[]const u8` into a guest `list<u8>`-shaped
 /// `InterfaceValue` via the test guest memory.
 fn testKeyvalueListArg(ci: *ComponentInstance, bytes: []const u8) !InterfaceValue {
-    const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+    const ptr = ci.hostAllocAndWrite(bytes, 1) orelse return error.OutOfMemory;
     return .{ .list = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
 }
 
@@ -41030,12 +41080,12 @@ test "wasi:keyvalue/batch: get-many + set-many + delete-many round-trip (#583 B4
     const tup_ptr = ci.hostAllocGuest(tuples * stride, 4) orelse return error.OutOfMemory;
     {
         const dst = ci.writableGuestBytes(tup_ptr, tuples * stride) orelse return error.OutOfMemory;
-        const k1_ptr = ci.hostAllocAndWrite("a") orelse return error.OutOfMemory;
-        const v1_ptr = ci.hostAllocAndWrite("apple") orelse return error.OutOfMemory;
-        const k2_ptr = ci.hostAllocAndWrite("b") orelse return error.OutOfMemory;
-        const v2_ptr = ci.hostAllocAndWrite("banana") orelse return error.OutOfMemory;
-        const k3_ptr = ci.hostAllocAndWrite("c") orelse return error.OutOfMemory;
-        const v3_ptr = ci.hostAllocAndWrite("cherry") orelse return error.OutOfMemory;
+        const k1_ptr = ci.hostAllocAndWrite("a", 1) orelse return error.OutOfMemory;
+        const v1_ptr = ci.hostAllocAndWrite("apple", 1) orelse return error.OutOfMemory;
+        const k2_ptr = ci.hostAllocAndWrite("b", 1) orelse return error.OutOfMemory;
+        const v2_ptr = ci.hostAllocAndWrite("banana", 1) orelse return error.OutOfMemory;
+        const k3_ptr = ci.hostAllocAndWrite("c", 1) orelse return error.OutOfMemory;
+        const v3_ptr = ci.hostAllocAndWrite("cherry", 1) orelse return error.OutOfMemory;
         const entries = [_]struct { kp: u32, kl: u32, vp: u32, vl: u32 }{
             .{ .kp = k1_ptr, .kl = 1, .vp = v1_ptr, .vl = 5 },
             .{ .kp = k2_ptr, .kl = 1, .vp = v2_ptr, .vl = 6 },
@@ -41066,9 +41116,9 @@ test "wasi:keyvalue/batch: get-many + set-many + delete-many round-trip (#583 B4
         const keys_len: u32 = 3;
         get_keys_ptr = ci.hostAllocGuest(keys_len * list_stride, 4) orelse return error.OutOfMemory;
         const dst = ci.writableGuestBytes(get_keys_ptr, keys_len * list_stride) orelse return error.OutOfMemory;
-        const kb_ptr = ci.hostAllocAndWrite("b") orelse return error.OutOfMemory;
-        const km_ptr = ci.hostAllocAndWrite("missing") orelse return error.OutOfMemory;
-        const ka_ptr = ci.hostAllocAndWrite("a") orelse return error.OutOfMemory;
+        const kb_ptr = ci.hostAllocAndWrite("b", 1) orelse return error.OutOfMemory;
+        const km_ptr = ci.hostAllocAndWrite("missing", 1) orelse return error.OutOfMemory;
+        const ka_ptr = ci.hostAllocAndWrite("a", 1) orelse return error.OutOfMemory;
         std.mem.writeInt(u32, dst[0..4], kb_ptr, .little);
         std.mem.writeInt(u32, dst[4..8], 1, .little);
         std.mem.writeInt(u32, dst[8..12], km_ptr, .little);
@@ -41107,8 +41157,8 @@ test "wasi:keyvalue/batch: get-many + set-many + delete-many round-trip (#583 B4
         const list_stride: u32 = 8;
         const dk_ptr = ci.hostAllocGuest(2 * list_stride, 4) orelse return error.OutOfMemory;
         const dst = ci.writableGuestBytes(dk_ptr, 2 * list_stride) orelse return error.OutOfMemory;
-        const ka_ptr = ci.hostAllocAndWrite("a") orelse return error.OutOfMemory;
-        const kc_ptr = ci.hostAllocAndWrite("c") orelse return error.OutOfMemory;
+        const ka_ptr = ci.hostAllocAndWrite("a", 1) orelse return error.OutOfMemory;
+        const kc_ptr = ci.hostAllocAndWrite("c", 1) orelse return error.OutOfMemory;
         std.mem.writeInt(u32, dst[0..4], ka_ptr, .little);
         std.mem.writeInt(u32, dst[4..8], 1, .little);
         std.mem.writeInt(u32, dst[8..12], kc_ptr, .little);

@@ -2449,7 +2449,7 @@ fn dispatchAsyncCanon(
                 return;
             }
 
-            const guest_ptr = comp_inst.hostAllocAndWrite(stored) orelse
+            const guest_ptr = comp_inst.hostAllocAndWrite(stored, 1) orelse
                 return error.OutOfMemory;
             env.pushI32(@bitCast(guest_ptr)) catch return error.StackOverflow;
             env.pushI32(@bitCast(@as(u32, @intCast(stored.len)))) catch
@@ -5694,7 +5694,7 @@ test "dispatchCanonBuiltin: error_context.new captures debug-message bytes (#480
     defer inst.disableTestMem();
 
     const msg = "hello error";
-    const ptr = inst.hostAllocAndWrite(msg).?;
+    const ptr = inst.hostAllocAndWrite(msg, 1).?;
 
     try env.pushI32(@bitCast(ptr));
     try env.pushI32(@intCast(msg.len));
@@ -5792,7 +5792,7 @@ test "dispatchCanonBuiltin: error_context.new + drop + new produces distinct han
     defer inst.disableTestMem();
 
     const msg1 = "first failure";
-    const ptr1 = inst.hostAllocAndWrite(msg1).?;
+    const ptr1 = inst.hostAllocAndWrite(msg1, 1).?;
     try env.pushI32(@bitCast(ptr1));
     try env.pushI32(@intCast(msg1.len));
     try dispatchCanonBuiltin(
@@ -5815,7 +5815,7 @@ test "dispatchCanonBuiltin: error_context.new + drop + new produces distinct han
     try testing.expectEqual(@as(u32, 0), inst.error_contexts.count());
 
     const msg2 = "second failure";
-    const ptr2 = inst.hostAllocAndWrite(msg2).?;
+    const ptr2 = inst.hostAllocAndWrite(msg2, 1).?;
     try env.pushI32(@bitCast(ptr2));
     try env.pushI32(@intCast(msg2.len));
     try dispatchCanonBuiltin(

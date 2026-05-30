@@ -900,20 +900,27 @@ pub const ComponentInstance = struct {
         return mem.data[ptr..end];
     }
 
-    /// Allocate `bytes.len` bytes in guest memory and copy `bytes` into
-    /// them. Returns the guest-side pointer or null on failure (no
-    /// `cabi_realloc` export, OOM, or invocation error).
+    /// Allocate `bytes.len` bytes in guest memory at `alignment` byte
+    /// alignment and copy `bytes` into them. Returns the guest-side
+    /// pointer or null on failure (no `cabi_realloc` export, OOM, or
+    /// invocation error).
     ///
     /// Used by host-side callbacks (e.g. `wasi:io/streams.[method]
-    /// input-stream.blocking-read`) that must materialize a `list<u8>`
+    /// input-stream.blocking-read`) that must materialize a `list<T>`
     /// or `string` value into guest memory before the canonical ABI
     /// stores its `(ptr, len)` representation in a spilled result tuple.
     ///
+    /// `alignment` MUST match the canonical-ABI alignment of the list's
+    /// element type. Strings and `list<u8>` use `1`; lists of records
+    /// containing `u32`/pointer fields (e.g. `list<tuple<string,
+    /// string>>` from `get-environment`) require `4`. Passing the wrong
+    /// alignment leaves the returned ptr unaligned and the guest's
+    /// canon-lift rejects it (#719).
+    ///
     /// Convention: wit-bindgen emits a single `cabi_realloc` export on
-    /// the main core module; we call it with `(0, 0, align=1, len)` to
-    /// allocate fresh space.
-    pub fn hostAllocAndWrite(self: *ComponentInstance, bytes: []const u8) ?u32 {
-        const ptr = self.hostAllocGuest(@intCast(bytes.len), 1) orelse return null;
+    /// the main core module; we call it with `(0, 0, alignment, len)`.
+    pub fn hostAllocAndWrite(self: *ComponentInstance, bytes: []const u8, alignment: u32) ?u32 {
+        const ptr = self.hostAllocGuest(@intCast(bytes.len), alignment) orelse return null;
         const dst = self.writableGuestBytes(ptr, @intCast(bytes.len)) orelse return null;
         @memcpy(dst, bytes);
         return ptr;
