@@ -17,6 +17,12 @@ pub const MapDir = struct {
 
 const Subcommand = enum { run, version, help };
 
+/// Set by `WAMR_TRACE_CLI_ADAPTER=1` at startup (#715). Each
+/// `WasiCliAdapter` constructed during `runRun` / `runComponent`
+/// receives this flag via `setTraceCalls`. Process-global mirrors
+/// the `WAMR_AOT_DEBUG` toggle next door.
+var wasi_cli_adapter_trace_enabled: bool = false;
+
 fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "run")) return .run;
     if (std.mem.eql(u8, s, "version")) return .version;
@@ -44,7 +50,15 @@ pub fn main(init: std.process.Init) !u8 {
         const on = !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
         wamr.component_core_backend.setDebugAotEnabled(on);
     }
-
+    // Per-member adapter-call trace (#715). When `WAMR_TRACE_CLI_ADAPTER`
+    // is set to a non-empty / non-`0` / non-`false` value, every call
+    // into a `WasiCliAdapter` filesystem host import emits an
+    // `[adapter→]`/`[adapter←]` warn line. The adapter constructed in
+    // `runRun` (or `runComponent`) reads this flag through `setTraceCalls`.
+    if (init.environ_map.get("WAMR_TRACE_CLI_ADAPTER")) |v| {
+        const on = !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
+        wasi_cli_adapter_trace_enabled = on;
+    }
     if (args.len < 2) {
         std.debug.print("error: missing subcommand — try `wamr help`\n", .{});
         return 2;
@@ -731,6 +745,7 @@ fn runComponent(
     // inspect captured stdout, use `WasiCliAdapter.init` instead.
     var adapter = adapter_mod.WasiCliAdapter.initWithHostStdio(allocator);
     defer adapter.deinit();
+    adapter.setTraceCalls(wasi_cli_adapter_trace_enabled);
 
     // argv[0] = basename of the wasm path, rest = user args. Matches
     // the wasmtime convention (and wasi-testsuite fixtures' assumption,
@@ -882,6 +897,7 @@ fn runHttpComponent(
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
     defer adapter.deinit();
+    adapter.setTraceCalls(wasi_cli_adapter_trace_enabled);
 
     var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch
         return 1;
