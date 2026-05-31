@@ -191,13 +191,80 @@ pub const ForwardingHostFnCtx = struct {
 /// lift uses the owner's type registry and core instances.
 pub fn forwardingHostFnCall(
     ctx_opaque: ?*anyopaque,
-    _: *ComponentInstance,
+    ci: *ComponentInstance,
     args: []const InterfaceValue,
     out_results: []InterfaceValue,
     allocator: Allocator,
 ) anyerror!void {
     const ctx: *const ForwardingHostFnCtx = @ptrCast(@alignCast(ctx_opaque orelse return error.FunctionNotFound));
-    return callComponentFuncByLocal(ctx.owner, ctx.local, args, out_results, allocator);
+    // Cross-component forwarding (issue #719): string/list args lifted
+    // from the CALLER's guest memory carry (ptr, len) tuples whose
+    // `ptr` is only valid in the caller's address space. The callee's
+    // `canon lift` pushes those slots straight onto its own stack, so
+    // without an explicit copy step the callee would dereference a
+    // caller-memory pointer that is out of bounds (or worse: points
+    // at unrelated data) inside its own linear memory and trap.
+    //
+    // Materialise top-level `string` / `list<u8>` args into the
+    // callee's guest memory before forwarding: read source bytes
+    // through `ci.readGuestBytes`, allocate destination bytes via
+    // `ctx.owner.hostAllocGuest` (which routes through the callee's
+    // `cabi_realloc`), copy, and rewrite the PtrLen.
+    var rewritten: ?[]InterfaceValue = null;
+    defer if (rewritten) |slc| allocator.free(slc);
+    var needs_rewrite = false;
+    for (args) |a| switch (a) {
+        .string, .list => {
+            needs_rewrite = true;
+            break;
+        },
+        else => {},
+    };
+    if (needs_rewrite and ctx.owner != ci) {
+        const buf = try allocator.alloc(InterfaceValue, args.len);
+        rewritten = buf;
+        @memcpy(buf, args);
+        for (buf, args) |*dst, src| switch (src) {
+            .string => |pl| {
+                if (pl.len == 0) {
+                    dst.* = .{ .string = .{ .ptr = 0, .len = 0 } };
+                } else {
+                    const bytes = ci.readGuestBytes(pl.ptr, pl.len) orelse
+                        return error.MemoryNotAvailable;
+                    const owner_mut: *ComponentInstance = @constCast(ctx.owner);
+                    const new_ptr = owner_mut.hostAllocGuest(pl.len, 1) orelse
+                        return error.ReallocFailed;
+                    const dest = owner_mut.writableGuestBytes(new_ptr, pl.len) orelse
+                        return error.MemoryNotAvailable;
+                    @memcpy(dest, bytes);
+                    dst.* = .{ .string = .{ .ptr = new_ptr, .len = pl.len } };
+                }
+            },
+            .list => |pl| {
+                if (pl.len == 0) {
+                    dst.* = .{ .list = .{ .ptr = 0, .len = 0 } };
+                } else {
+                    // Conservatively copy as raw bytes (`list<u8>`).
+                    // Lists of larger element types reaching this
+                    // forwarding path would need element-size-aware
+                    // alignment, but none of the current cross-
+                    // component fixtures exercise that shape.
+                    const bytes = ci.readGuestBytes(pl.ptr, pl.len) orelse
+                        return error.MemoryNotAvailable;
+                    const owner_mut: *ComponentInstance = @constCast(ctx.owner);
+                    const new_ptr = owner_mut.hostAllocGuest(pl.len, 1) orelse
+                        return error.ReallocFailed;
+                    const dest = owner_mut.writableGuestBytes(new_ptr, pl.len) orelse
+                        return error.MemoryNotAvailable;
+                    @memcpy(dest, bytes);
+                    dst.* = .{ .list = .{ .ptr = new_ptr, .len = pl.len } };
+                }
+            },
+            else => {},
+        };
+    }
+    const effective_args: []const InterfaceValue = if (rewritten) |slc| slc else args;
+    return callComponentFuncByLocal(ctx.owner, ctx.local, effective_args, out_results, allocator);
 }
 
 pub fn callComponentFunc(
@@ -296,6 +363,45 @@ pub fn callComponentFuncByLocal(
     // Parse canonical options
     const lift_opts = LiftOptions.fromOpts(exported.opts);
 
+    // Translate the component-level `realloc` core-funcidx (as carried
+    // in `canon lift` opts) into a function index local to the lifted
+    // core function's own AOT module / interp module instance. Without
+    // this translation, `AotFrame.realloc` / `InterpFrame.realloc`
+    // would dispatch against the WRONG wasm function — sometimes
+    // landing inside an unrelated once-init guard whose body starts
+    // with `unreachable` (#719: tcgc.compile trapping at
+    // `local_func[26]+0x23f` because component-level realloc_idx 81
+    // was passed straight through as a module-local funcidx).
+    //
+    // Per Canon ABI v1, `(realloc $f)` must live on the same core
+    // module as the lift's memory; we treat a cross-instance resolve
+    // as a malformed component. Hand-authored test fixtures that do
+    // not register an `aliases[]` entry for their realloc export
+    // fall back to interpreting `realloc_idx` as module-local (the
+    // pre-#719 behaviour) — real wit-component output always carries
+    // a corresponding alias and hits the translation path.
+    const resolved_realloc_idx: ?u32 = blk: {
+        const ridx = lift_opts.realloc_idx orelse break :blk null;
+        const target = owner_inst.resolveTopLevelCoreFuncAny(ridx) orelse
+            break :blk ridx;
+        switch (target) {
+            .aot => |t| {
+                if (core_entry.aot_inst) |ai| {
+                    if (ai != t.ai) return error.ReallocNotAvailable;
+                    break :blk t.local_idx;
+                }
+                return error.ReallocNotAvailable;
+            },
+            .interp => |t| {
+                if (core_entry.module_inst) |mi| {
+                    if (mi != t.mi) return error.ReallocNotAvailable;
+                    break :blk t.local_idx;
+                }
+                return error.ReallocNotAvailable;
+            },
+        }
+    };
+
     // Get the type registry — must come from the owner so component-
     // level type indices resolve in the owner's type-indexspace.
     const registry = TypeRegistry.init(owner_inst.component);
@@ -334,7 +440,7 @@ pub fn callComponentFuncByLocal(
         }
     } else {
         // Spill to memory: allocate space via realloc, store tuple, push ptr
-        const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
+        const realloc_idx = resolved_realloc_idx orelse return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
         const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
@@ -363,7 +469,7 @@ pub fn callComponentFuncByLocal(
     // retptr it allocated itself, popped after executeCore below.
     var aot_retptr: ?u32 = null;
     if (is_aot and flat_result_count > MAX_FLAT_RESULTS and result_types.len > 0) {
-        const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
+        const realloc_idx = resolved_realloc_idx orelse return error.ReallocNotAvailable;
         const ret_size = computeTupleSize(registry, result_types);
         const ret_align = computeTupleAlign(registry, result_types);
         const rp = try callRealloc(&frame, realloc_idx, 0, 0, ret_align, ret_size);
@@ -577,7 +683,22 @@ pub fn callComponentFuncByLocalAsyncLifted(
         }
     } else {
         const mem = memory orelse return error.MemoryNotAvailable;
-        const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
+        // Translate component-level realloc core-funcidx → module-local
+        // (mirrors the sync-lift fix in `callComponentFuncByLocal`; #719).
+        // Falls back to `ridx_comp` when no alias entry resolves, matching
+        // the pre-#719 hand-authored fixture convention.
+        const ridx_comp = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
+        const realloc_idx = blk2: {
+            const target = owner_inst.resolveTopLevelCoreFuncAny(ridx_comp) orelse
+                break :blk2 ridx_comp;
+            switch (target) {
+                .interp => |t| {
+                    if (t.mi != module_inst) return error.ReallocNotAvailable;
+                    break :blk2 t.local_idx;
+                },
+                .aot => return error.ReallocNotAvailable,
+            }
+        };
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
         const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
