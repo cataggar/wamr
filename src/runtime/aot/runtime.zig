@@ -512,33 +512,22 @@ fn lookupLocalFuncName(local_idx: isize) ?[]const u8 {
 }
 
 pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
-    const ret_addr: usize = @returnAddress();
-    const code_off_s: isize = @as(isize, @bitCast(ret_addr)) - @as(isize, @bitCast(g_code_base));
-    const code_off: usize = if (code_off_s >= 0) @intCast(code_off_s) else 0;
-    var func_idx: isize = -1;
-    var func_start: usize = 0;
-    for (g_func_offsets, 0..) |off, idx| {
-        if (off <= code_off) {
-            func_idx = @intCast(idx);
-            func_start = off;
-        } else break;
-    }
-    const rel_off: usize = if (code_off >= func_start) code_off - func_start else 0;
+    const loc = decodeTrapReturnAddress(@returnAddress());
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) {
         // Caller has armed trap-as-error; unwind instead of exiting.
         trapLongjmp();
     }
     // Flush any buffered stdout from the guest before we tear down the
     // process so user-visible output isn't lost. Best-effort.
-    if (lookupLocalFuncName(func_idx)) |name| {
+    if (loc.name) |name| {
         std.debug.print(
             "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}] \"{s}\"+0x{x}, mem_size=0x{x})\n",
-            .{ code_off, func_idx, name, rel_off, vmctx.memory_size },
+            .{ loc.code_off, loc.func_idx, name, loc.rel_off, vmctx.memory_size },
         );
     } else {
         std.debug.print(
             "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}]+0x{x}, mem_size=0x{x})\n",
-            .{ code_off, func_idx, rel_off, vmctx.memory_size },
+            .{ loc.code_off, loc.func_idx, loc.rel_off, vmctx.memory_size },
         );
     }
     std.process.exit(2);
@@ -558,6 +547,13 @@ const TrapPcLocation = struct {
 fn decodeTrapReturnAddress(ret_addr: usize) TrapPcLocation {
     const code_off_s: isize = @as(isize, @bitCast(ret_addr)) - @as(isize, @bitCast(g_code_base));
     const code_off: usize = if (code_off_s >= 0) @intCast(code_off_s) else 0;
+    // PC falls outside the currently-installed code region (e.g. a trap
+    // raised from a different AOT instance whose decode frame was just
+    // restored, or a PC corruption). Refuse to scan g_func_offsets so we
+    // don't report a stale last-index match.
+    if (g_code_size == 0 or code_off >= g_code_size) {
+        return .{ .code_off = code_off, .func_idx = -1, .rel_off = 0, .name = null };
+    }
     var func_idx: isize = -1;
     var func_start: usize = 0;
     for (g_func_offsets, 0..) |off, idx| {

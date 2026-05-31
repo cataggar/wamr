@@ -37,6 +37,34 @@ pub const AotFrame = call_frame_mod.AotFrame;
 pub const MAX_FLAT_PARAMS: u32 = 16;
 pub const MAX_FLAT_RESULTS: u32 = 1;
 
+// ── Core function index newtypes ────────────────────────────────────────────
+
+/// A core-funcidx that lives in the **component**'s function index space
+/// (as carried in `canon lift` / `canon lower` opts). Must be translated
+/// through `ComponentInstance.resolveTopLevelCoreFuncAny` before it can
+/// be invoked on a `CallFrame`. Distinct from `CoreFuncIdxLocal` so the
+/// compiler rejects the (#719) bug class where a component-level idx
+/// was passed straight through to a frame call. Zero runtime cost.
+pub const CoreFuncIdxComponent = enum(u32) {
+    _,
+    pub inline fn from(raw: u32) CoreFuncIdxComponent {
+        return @enumFromInt(raw);
+    }
+    pub inline fn value(self: CoreFuncIdxComponent) u32 {
+        return @intFromEnum(self);
+    }
+};
+
+/// A core-funcidx in the **owning module instance**'s local function
+/// index space — directly callable via `CallFrame.realloc` /
+/// `CallFrame.executeCore`. Produced by translating a
+/// `CoreFuncIdxComponent` through `resolveTopLevelCoreFuncAny`, or
+/// minted by lookups like `aot_runtime.findExportFunc` /
+/// `ModuleInstance.getExportFunc`. Re-exported from `call_frame.zig`
+/// where the frame methods consume it.
+pub const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
+
+
 /// Component-model `MAX_FLAT_PARAMS_ASYNC` per the spec's
 /// canonical-ABI rules for `canon.lower (async)`: when a lifted async
 /// func has more than 4 flat-params, the caller spills the entire
@@ -106,8 +134,12 @@ pub const ExecutionError = error{
 /// Parsed canonical options for a lifted function.
 pub const LiftOptions = struct {
     memory_idx: ?u32 = null,
-    realloc_idx: ?u32 = null,
-    post_return_idx: ?u32 = null,
+    /// Component-level core-funcidx. Translate via
+    /// `ComponentInstance.resolveTopLevelCoreFuncAny` before calling.
+    realloc_idx: ?CoreFuncIdxComponent = null,
+    /// Component-level core-funcidx. Translate via
+    /// `ComponentInstance.resolveTopLevelCoreFuncAny` before calling.
+    post_return_idx: ?CoreFuncIdxComponent = null,
     string_encoding: ctypes.StringEncoding = .utf8,
     /// Whether this lift uses the async ABI (Binary.md `canonopt 0x06`).
     /// Async lifts return a packed status immediately; results are
@@ -116,18 +148,18 @@ pub const LiftOptions = struct {
     /// Optional resumption callback core funcidx (Binary.md `canonopt 0x07`).
     /// Only meaningful when `is_async`; the single-threaded poll-cycle
     /// dispatcher invokes it once after each yield. (#478 sub-PR 2.)
-    callback_idx: ?u32 = null,
+    callback_idx: ?CoreFuncIdxComponent = null,
 
     pub fn fromOpts(opts: []const ctypes.CanonOpt) LiftOptions {
         var lo = LiftOptions{};
         for (opts) |opt| {
             switch (opt) {
                 .memory => |idx| lo.memory_idx = idx,
-                .realloc => |idx| lo.realloc_idx = idx,
-                .post_return => |idx| lo.post_return_idx = idx,
+                .realloc => |idx| lo.realloc_idx = CoreFuncIdxComponent.from(idx),
+                .post_return => |idx| lo.post_return_idx = CoreFuncIdxComponent.from(idx),
                 .string_encoding => |enc| lo.string_encoding = enc,
                 .async_lift => lo.is_async = true,
-                .callback => |idx| lo.callback_idx = idx,
+                .callback => |idx| lo.callback_idx = CoreFuncIdxComponent.from(idx),
             }
         }
         return lo;
@@ -139,7 +171,7 @@ pub const LiftOptions = struct {
 /// Call the core module's realloc function: (old_ptr, old_size, align, new_size) -> ptr.
 pub fn callRealloc(
     frame: *CallFrame,
-    realloc_idx: u32,
+    realloc_idx: CoreFuncIdxLocal,
     old_ptr: u32,
     old_size: u32,
     align_val: u32,
@@ -308,6 +340,45 @@ pub fn flattenForwardedChain(
     }
 }
 
+// ── Component → module-local funcidx translation ────────────────────────────
+
+/// Translate a component-level core-funcidx into a `CoreFuncIdxLocal`
+/// inside `core_entry`'s owning module instance. Returns `null` when
+/// `comp_idx` is `null`. The fallback is the pre-#719 behaviour for
+/// hand-authored test fixtures that do not register an `aliases[]`
+/// entry — we interpret the component-level index as module-local.
+/// Real wit-component output always carries the alias and hits the
+/// translation path. Returns `error.ReallocNotAvailable` when the
+/// alias resolves to a *different* core instance than the one
+/// currently executing the lift, which Canon ABI v1 forbids
+/// (`(realloc $f)` must live on the same core module as the lift's
+/// memory).
+fn translateComponentFuncIdx(
+    owner_inst: *const ComponentInstance,
+    core_entry: ComponentInstance.CoreInstanceEntry,
+    comp_idx: ?CoreFuncIdxComponent,
+) ExecutionError!?CoreFuncIdxLocal {
+    const cidx = comp_idx orelse return null;
+    const target = owner_inst.resolveTopLevelCoreFuncAny(cidx.value()) orelse
+        return CoreFuncIdxLocal.from(cidx.value());
+    switch (target) {
+        .aot => |t| {
+            if (core_entry.aot_inst) |ai| {
+                if (ai != t.ai) return error.ReallocNotAvailable;
+                return t.local_idx;
+            }
+            return error.ReallocNotAvailable;
+        },
+        .interp => |t| {
+            if (core_entry.module_inst) |mi| {
+                if (mi != t.mi) return error.ReallocNotAvailable;
+                return t.local_idx;
+            }
+            return error.ReallocNotAvailable;
+        },
+    }
+}
+
 /// Invoke a component-level lifted export, given the owning instance and
 /// its already-resolved owner-relative indices. This is the common path
 /// shared between name-keyed dispatch (`callComponentFunc`) and the
@@ -363,44 +434,31 @@ pub fn callComponentFuncByLocal(
     // Parse canonical options
     const lift_opts = LiftOptions.fromOpts(exported.opts);
 
-    // Translate the component-level `realloc` core-funcidx (as carried
-    // in `canon lift` opts) into a function index local to the lifted
-    // core function's own AOT module / interp module instance. Without
-    // this translation, `AotFrame.realloc` / `InterpFrame.realloc`
-    // would dispatch against the WRONG wasm function — sometimes
-    // landing inside an unrelated once-init guard whose body starts
-    // with `unreachable` (#719: tcgc.compile trapping at
+    // Translate the component-level `realloc` and `post_return`
+    // core-funcidx (as carried in `canon lift` opts) into function
+    // indices local to the lifted core function's own AOT module /
+    // interp module instance. Without this translation,
+    // `AotFrame.realloc` / `InterpFrame.realloc` (or `executeCore` for
+    // post_return) would dispatch against the WRONG wasm function —
+    // sometimes landing inside an unrelated once-init guard whose body
+    // starts with `unreachable` (#719: tcgc.compile trapping at
     // `local_func[26]+0x23f` because component-level realloc_idx 81
-    // was passed straight through as a module-local funcidx).
+    // was passed straight through as a module-local funcidx). The
+    // `CoreFuncIdxComponent` / `CoreFuncIdxLocal` newtype enums make
+    // this conversion explicit and compiler-enforced.
     //
-    // Per Canon ABI v1, `(realloc $f)` must live on the same core
-    // module as the lift's memory; we treat a cross-instance resolve
-    // as a malformed component. Hand-authored test fixtures that do
-    // not register an `aliases[]` entry for their realloc export
-    // fall back to interpreting `realloc_idx` as module-local (the
-    // pre-#719 behaviour) — real wit-component output always carries
-    // a corresponding alias and hits the translation path.
-    const resolved_realloc_idx: ?u32 = blk: {
-        const ridx = lift_opts.realloc_idx orelse break :blk null;
-        const target = owner_inst.resolveTopLevelCoreFuncAny(ridx) orelse
-            break :blk ridx;
-        switch (target) {
-            .aot => |t| {
-                if (core_entry.aot_inst) |ai| {
-                    if (ai != t.ai) return error.ReallocNotAvailable;
-                    break :blk t.local_idx;
-                }
-                return error.ReallocNotAvailable;
-            },
-            .interp => |t| {
-                if (core_entry.module_inst) |mi| {
-                    if (mi != t.mi) return error.ReallocNotAvailable;
-                    break :blk t.local_idx;
-                }
-                return error.ReallocNotAvailable;
-            },
-        }
-    };
+    // Per Canon ABI v1, `(realloc $f)` and `(post-return $f)` must
+    // live on the same core module as the lift's memory; we treat a
+    // cross-instance resolve as a malformed component. Hand-authored
+    // test fixtures that do not register an `aliases[]` entry for
+    // their realloc/post_return export fall back to interpreting the
+    // index as module-local (the pre-#719 behaviour) — real
+    // wit-component output always carries a corresponding alias and
+    // hits the translation path.
+    const resolved_realloc_idx: ?CoreFuncIdxLocal =
+        try translateComponentFuncIdx(owner_inst, core_entry, lift_opts.realloc_idx);
+    const resolved_post_return_idx: ?CoreFuncIdxLocal =
+        try translateComponentFuncIdx(owner_inst, core_entry, lift_opts.post_return_idx);
 
     // Get the type registry — must come from the owner so component-
     // level type indices resolve in the owner's type-indexspace.
@@ -496,7 +554,7 @@ pub fn callComponentFuncByLocal(
     };
 
     // 5b. Call the core function
-    frame.executeCore(exported.core_func_idx, &.{}, core_result_types) catch {
+    frame.executeCore(CoreFuncIdxLocal.from(exported.core_func_idx), &.{}, core_result_types) catch {
         switch (frame) {
             .interp => |f| if (f.env.host_trap) |ht| {
                 // Suppress the diagnostic when this trap is actually a
@@ -559,7 +617,7 @@ pub fn callComponentFuncByLocal(
     }
 
     // 7. Post-return callback
-    if (lift_opts.post_return_idx) |pr_idx| {
+    if (resolved_post_return_idx) |pr_idx| {
         // Per spec: post_return receives the flat result value(s).
         // For inline results (≤ MAX_FLAT_RESULTS): re-push the flat values.
         // For spilled results: re-push the result pointer as i32.
@@ -688,9 +746,9 @@ pub fn callComponentFuncByLocalAsyncLifted(
         // Falls back to `ridx_comp` when no alias entry resolves, matching
         // the pre-#719 hand-authored fixture convention.
         const ridx_comp = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
-        const realloc_idx = blk2: {
-            const target = owner_inst.resolveTopLevelCoreFuncAny(ridx_comp) orelse
-                break :blk2 ridx_comp;
+        const realloc_idx: CoreFuncIdxLocal = blk2: {
+            const target = owner_inst.resolveTopLevelCoreFuncAny(ridx_comp.value()) orelse
+                break :blk2 CoreFuncIdxLocal.from(ridx_comp.value());
             switch (target) {
                 .interp => |t| {
                     if (t.mi != module_inst) return error.ReallocNotAvailable;
@@ -2930,19 +2988,19 @@ test "LiftOptions: parse from CanonOpt array" {
     };
     const lo = LiftOptions.fromOpts(&opts);
     try std.testing.expectEqual(@as(?u32, 0), lo.memory_idx);
-    try std.testing.expectEqual(@as(?u32, 1), lo.realloc_idx);
-    try std.testing.expectEqual(@as(?u32, 2), lo.post_return_idx);
+    try std.testing.expectEqual(@as(?CoreFuncIdxComponent, CoreFuncIdxComponent.from(1)), lo.realloc_idx);
+    try std.testing.expectEqual(@as(?CoreFuncIdxComponent, CoreFuncIdxComponent.from(2)), lo.post_return_idx);
     try std.testing.expectEqual(ctypes.StringEncoding.utf16, lo.string_encoding);
 }
 
 test "LiftOptions: defaults" {
     const lo = LiftOptions.fromOpts(&.{});
     try std.testing.expectEqual(@as(?u32, null), lo.memory_idx);
-    try std.testing.expectEqual(@as(?u32, null), lo.realloc_idx);
-    try std.testing.expectEqual(@as(?u32, null), lo.post_return_idx);
+    try std.testing.expectEqual(@as(?CoreFuncIdxComponent, null), lo.realloc_idx);
+    try std.testing.expectEqual(@as(?CoreFuncIdxComponent, null), lo.post_return_idx);
     try std.testing.expectEqual(ctypes.StringEncoding.utf8, lo.string_encoding);
     try std.testing.expectEqual(false, lo.is_async);
-    try std.testing.expectEqual(@as(?u32, null), lo.callback_idx);
+    try std.testing.expectEqual(@as(?CoreFuncIdxComponent, null), lo.callback_idx);
 }
 
 test "LiftOptions: async + callback (#478 sub-PR 2)" {
@@ -2954,7 +3012,7 @@ test "LiftOptions: async + callback (#478 sub-PR 2)" {
     const lo = LiftOptions.fromOpts(&opts);
     try std.testing.expectEqual(@as(?u32, 0), lo.memory_idx);
     try std.testing.expectEqual(true, lo.is_async);
-    try std.testing.expectEqual(@as(?u32, 7), lo.callback_idx);
+    try std.testing.expectEqual(@as(?CoreFuncIdxComponent, CoreFuncIdxComponent.from(7)), lo.callback_idx);
 }
 
 test "LowerOptions: async opt flips is_async (#551 canon-lower-of-async-func)" {
@@ -5965,7 +6023,9 @@ const HostFunc = instance_mod.HostFunc;
 /// resolve once at instantiation time instead of on every call.
 pub const LowerOptions = struct {
     memory_idx: ?u32 = null,
-    realloc_idx: ?u32 = null,
+    /// Component-level core-funcidx. Translate via
+    /// `ComponentInstance.resolveTopLevelCoreFuncAny` before calling.
+    realloc_idx: ?CoreFuncIdxComponent = null,
     string_encoding: ctypes.StringEncoding = .utf8,
     /// `canon.lower (async) (func)` — Binary.md `canonopt 0x06` shared with
     /// the lift side. When set, the canon-lower trampoline returns a packed
@@ -5982,7 +6042,7 @@ pub const LowerOptions = struct {
         for (opts) |opt| {
             switch (opt) {
                 .memory => |idx| lo.memory_idx = idx,
-                .realloc => |idx| lo.realloc_idx = idx,
+                .realloc => |idx| lo.realloc_idx = CoreFuncIdxComponent.from(idx),
                 .post_return => {},
                 .string_encoding => |enc| lo.string_encoding = enc,
                 // `async` flips into the async-lower path (#551). The
@@ -6014,7 +6074,7 @@ fn resolveLowerCallCtx(
         cctx.memory = comp_inst.resolveTopLevelMemory(midx);
     }
     if (lower_opts.realloc_idx) |ridx| {
-        cctx.realloc = comp_inst.resolveTopLevelCoreFuncAny(ridx);
+        cctx.realloc = comp_inst.resolveTopLevelCoreFuncAny(ridx.value());
     }
     return cctx;
 }

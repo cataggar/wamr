@@ -13,6 +13,8 @@ const core_backend = @import("core_backend.zig");
 const aot_loader = @import("../runtime/aot/loader.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
+const call_frame_mod = @import("call_frame.zig");
+const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
 
 const aot_host_bridge = @import("../runtime/aot/host_bridge.zig");
 
@@ -467,11 +469,11 @@ pub const ComponentInstance = struct {
     pub const ReallocTarget = union(enum) {
         interp: struct {
             mi: *core_types.ModuleInstance,
-            local_idx: u32,
+            local_idx: CoreFuncIdxLocal,
         },
         aot: struct {
             ai: *aot_runtime.AotInstance,
-            local_idx: u32,
+            local_idx: CoreFuncIdxLocal,
         },
     };
 
@@ -701,11 +703,11 @@ pub const ComponentInstance = struct {
                 const entry = self.core_instances[ie.instance_idx];
                 if (entry.module_inst) |mi| {
                     const local = mi.getExportFunc(ie.name) orelse return null;
-                    return .{ .interp = .{ .mi = mi, .local_idx = local } };
+                    return .{ .interp = .{ .mi = mi, .local_idx = CoreFuncIdxLocal.from(local) } };
                 }
                 if (entry.aot_inst) |ai| {
                     const local = aot_runtime.findExportFunc(ai, ie.name) orelse return null;
-                    return .{ .aot = .{ .ai = ai, .local_idx = local } };
+                    return .{ .aot = .{ .ai = ai, .local_idx = CoreFuncIdxLocal.from(local) } };
                 }
                 return null;
             },
@@ -813,7 +815,6 @@ pub const ComponentInstance = struct {
         if (self.current_lower_call_ctx) |cctx| {
             if (cctx.realloc) |target| {
                 const executor = @import("executor.zig");
-                const call_frame_mod = @import("call_frame.zig");
                 switch (target) {
                     .aot => |t| {
                         var frame: executor.CallFrame = .{
@@ -851,7 +852,7 @@ pub const ComponentInstance = struct {
             const aot_call_frame = @import("call_frame.zig");
             var frame: executor.CallFrame = .{ .aot = aot_call_frame.AotFrame.init(ai, self.allocator) };
             defer frame.deinit();
-            return executor.callRealloc(&frame, realloc_idx, 0, 0, a, size) catch null;
+            return executor.callRealloc(&frame, CoreFuncIdxLocal.from(realloc_idx), 0, 0, a, size) catch null;
         }
         const realloc_owner = self.reallocOwner() orelse return null;
         const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
@@ -870,7 +871,7 @@ pub const ComponentInstance = struct {
         const env = self.realloc_env orelse return null;
         var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
         defer frame.deinit();
-        return executor.callRealloc(&frame, realloc_local, 0, 0, a, size) catch null;
+        return executor.callRealloc(&frame, CoreFuncIdxLocal.from(realloc_local), 0, 0, a, size) catch null;
     }
 
     /// Return a writable slice into the canonical guest memory (or the
@@ -3704,9 +3705,10 @@ fn installCanonLowerBackedCrossInstanceThunk(
         .has_retptr = has_retptr,
     });
     if (core_backend.debugAotEnabled()) {
+        const realloc_dbg: ?u32 = if (ctx_ptr.lower_opts.realloc_idx) |r| r.value() else null;
         std.debug.print(
             "[install canon-lower(aot)] slot={d} module='{s}' field='{s}' cfi={d} flat_results={d} has_retptr={} mem_opt={?} realloc_opt={?}\n",
-            .{ pool.next_slot - 1, imp.module_name, imp.field_name, ctx_ptr.component_func_idx, flat_result_count, has_retptr, ctx_ptr.lower_opts.memory_idx, ctx_ptr.lower_opts.realloc_idx },
+            .{ pool.next_slot - 1, imp.module_name, imp.field_name, ctx_ptr.component_func_idx, flat_result_count, has_retptr, ctx_ptr.lower_opts.memory_idx, realloc_dbg },
         );
     }
     return @ptrCast(stub);
