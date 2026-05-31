@@ -48,6 +48,22 @@ const interp = @import("../runtime/interpreter/interp.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
 const Allocator = std.mem.Allocator;
 
+/// A core-funcidx in the owning module instance's local function index
+/// space — directly callable via `CallFrame.realloc` /
+/// `CallFrame.executeCore`. Distinct from `executor.CoreFuncIdxComponent`
+/// so the compiler rejects passing a component-level idx straight
+/// through to a frame call (the #719 bug class). Zero runtime cost.
+pub const CoreFuncIdxLocal = enum(u32) {
+    _,
+    pub inline fn from(raw: u32) CoreFuncIdxLocal {
+        return @enumFromInt(raw);
+    }
+    pub inline fn value(self: CoreFuncIdxLocal) u32 {
+        return @intFromEnum(self);
+    }
+};
+
+
 pub const FrameError = error{
     StackOverflow,
     StackUnderflow,
@@ -104,7 +120,7 @@ pub const InterpFrame = struct {
 
     pub fn realloc(
         self: *InterpFrame,
-        realloc_idx: u32,
+        realloc_idx: CoreFuncIdxLocal,
         old_ptr: u32,
         old_size: u32,
         alignment: u32,
@@ -114,7 +130,7 @@ pub const InterpFrame = struct {
         self.env.pushI32(@bitCast(old_size)) catch return error.StackOverflow;
         self.env.pushI32(@bitCast(alignment)) catch return error.StackOverflow;
         self.env.pushI32(@bitCast(new_size)) catch return error.StackOverflow;
-        interp.executeFunction(self.env, realloc_idx) catch return error.ReallocFailed;
+        interp.executeFunction(self.env, realloc_idx.value()) catch return error.ReallocFailed;
         const result = self.env.popI32() catch return error.StackUnderflow;
         return @bitCast(result);
     }
@@ -127,13 +143,13 @@ pub const InterpFrame = struct {
     /// they are kept in the API to keep the two impls symmetric.
     pub fn executeCore(
         self: *InterpFrame,
-        func_idx: u32,
+        func_idx: CoreFuncIdxLocal,
         param_types: []const core_types.ValType,
         result_types: []const core_types.ValType,
     ) FrameError!void {
         _ = param_types;
         _ = result_types;
-        interp.executeFunction(self.env, func_idx) catch return error.TrapInCoreFunction;
+        interp.executeFunction(self.env, func_idx.value()) catch return error.TrapInCoreFunction;
     }
 };
 
@@ -226,7 +242,7 @@ pub const AotFrame = struct {
 
     pub fn realloc(
         self: *AotFrame,
-        realloc_idx: u32,
+        realloc_idx: CoreFuncIdxLocal,
         old_ptr: u32,
         old_size: u32,
         alignment: u32,
@@ -243,7 +259,7 @@ pub const AotFrame = struct {
         var rbuf: [1]aot_runtime.ScalarResult = .{.{ .i32 = 0 }};
         const rres = aot_runtime.callFuncScalar(
             self.ai,
-            realloc_idx,
+            realloc_idx.value(),
             &param_types,
             &result_types,
             &args,
@@ -257,7 +273,7 @@ pub const AotFrame = struct {
 
     pub fn executeCore(
         self: *AotFrame,
-        func_idx: u32,
+        func_idx: CoreFuncIdxLocal,
         param_types: []const core_types.ValType,
         result_types: []const core_types.ValType,
     ) FrameError!void {
@@ -281,7 +297,7 @@ pub const AotFrame = struct {
 
         const got = aot_runtime.callFuncScalar(
             self.ai,
-            func_idx,
+            func_idx.value(),
             self.arg_types.items,
             result_types,
             self.args.items,
@@ -352,7 +368,7 @@ pub const CallFrame = union(enum) {
 
     pub fn realloc(
         self: *CallFrame,
-        realloc_idx: u32,
+        realloc_idx: CoreFuncIdxLocal,
         old_ptr: u32,
         old_size: u32,
         alignment: u32,
@@ -366,7 +382,7 @@ pub const CallFrame = union(enum) {
 
     pub fn executeCore(
         self: *CallFrame,
-        func_idx: u32,
+        func_idx: CoreFuncIdxLocal,
         param_types: []const core_types.ValType,
         result_types: []const core_types.ValType,
     ) FrameError!void {
