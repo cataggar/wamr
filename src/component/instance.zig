@@ -1281,7 +1281,22 @@ pub const ComponentInstance = struct {
                             }
                             const flat = resolved orelse continue;
 
-                            const member_func_td = resolveTypeDef(child.component, member_func_type) orelse
+                            // `member_func_type` is the type index inside the
+                            // instance body's local type space — NOT the
+                            // child component's outer type indexspace.
+                            // The previous code called
+                            // `resolveTypeDef(child.component, …)`, which
+                            // only worked when the local index happened to
+                            // alias an outer func type. Components emitted
+                            // by jco — including the keyvault repro's
+                            // `azure:codegen/tcgc` instance import — declare
+                            // their func types inline inside the instance
+                            // body, and surfaced as `error.SubComponentLinkFailed`
+                            // because the outer-space lookup returned a
+                            // non-func TypeDef (in this case the next
+                            // outer-space instance type at the same index).
+                            // (#719 cross-component composition path.)
+                            const member_func_td = resolveInstanceTypeLocal(decls, member_func_type) orelse
                                 return error.SubComponentLinkFailed;
                             const member_ft = switch (member_func_td) {
                                 .func => |f| f,
