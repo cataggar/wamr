@@ -11,11 +11,12 @@ const alias_class = @import("alias_class.zig");
 const deadStoreElimination = @import("dead_store_elimination.zig").deadStoreElimination;
 const verifier = @import("verifier.zig");
 
-const LoadKey = alias_class.LoadKey;
+pub const LoadKey = alias_class.LoadKey;
 
 /// Stack of per-dominator-level load value tables, shared by
-/// `commonSubexprElimination` and `globalValueNumbering` when handling
-/// `load` / `local_get` / `local_set` (issue #541).
+/// `commonSubexprElimination`, `globalValueNumbering`, and
+/// `forwardRedundantLoadsDominator` when handling `load` / `local_get` /
+/// `local_set` (issue #541).
 ///
 /// Each frame maps a `LoadKey` to the VReg that holds its current
 /// value at this point on the dominator path. Lookup walks top→bottom
@@ -32,17 +33,17 @@ const LoadKey = alias_class.LoadKey;
 ///     since a merge block dominated by the branch head IS reachable
 ///     via the barrier-containing branch on some execution path
 ///     (issue #719). To make `clearAll` see the right frames at the
-///     right time, callers reorder dom-tree children via
-///     `sortDomChildrenBarrierLast` so barrier subtrees are visited
+///     right time, callers walk dom-tree children through
+///     `BarrierOrderedDomChildren` so barrier subtrees are visited
 ///     before their non-barrier siblings.
-const LoadFrameStack = struct {
+pub const LoadFrameStack = struct {
     frames: std.ArrayList(std.AutoHashMap(LoadKey, ir.VReg)),
     alloc: std.mem.Allocator,
     /// Scratch buffer for `invalidateMem` to avoid allocating one map's
     /// worth of keys per store.
     scratch: std.ArrayList(LoadKey),
 
-    fn init(alloc: std.mem.Allocator) LoadFrameStack {
+    pub fn init(alloc: std.mem.Allocator) LoadFrameStack {
         return .{
             .frames = .empty,
             .alloc = alloc,
@@ -50,23 +51,23 @@ const LoadFrameStack = struct {
         };
     }
 
-    fn deinit(self: *LoadFrameStack) void {
+    pub fn deinit(self: *LoadFrameStack) void {
         for (self.frames.items) |*f| f.deinit();
         self.frames.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
     }
 
-    fn push(self: *LoadFrameStack) !void {
+    pub fn push(self: *LoadFrameStack) !void {
         try self.frames.append(self.alloc, std.AutoHashMap(LoadKey, ir.VReg).init(self.alloc));
     }
 
-    fn pop(self: *LoadFrameStack) void {
+    pub fn pop(self: *LoadFrameStack) void {
         var f = self.frames.pop().?;
         f.deinit();
     }
 
     /// Search top→bottom for a current binding of `key`.
-    fn lookup(self: *LoadFrameStack, key: LoadKey) ?ir.VReg {
+    pub fn lookup(self: *LoadFrameStack, key: LoadKey) ?ir.VReg {
         var i = self.frames.items.len;
         while (i > 0) {
             i -= 1;
@@ -76,13 +77,13 @@ const LoadFrameStack = struct {
     }
 
     /// Add `(key -> vreg)` to the current (top) frame.
-    fn record(self: *LoadFrameStack, key: LoadKey, vreg: ir.VReg) !void {
+    pub fn record(self: *LoadFrameStack, key: LoadKey, vreg: ir.VReg) !void {
         try self.frames.items[self.frames.items.len - 1].put(key, vreg);
     }
 
     /// Drop entries in every active frame whose `.mem` keys overlap the
     /// store. `.local` entries are never affected.
-    fn invalidateMem(self: *LoadFrameStack, st: anytype) !void {
+    pub fn invalidateMem(self: *LoadFrameStack, st: anytype) !void {
         for (self.frames.items) |*frame| {
             self.scratch.clearRetainingCapacity();
             var it = frame.iterator();
@@ -96,14 +97,14 @@ const LoadFrameStack = struct {
     }
 
     /// Drop `.local = idx` from every active frame.
-    fn invalidateLocal(self: *LoadFrameStack, idx: u32) void {
+    pub fn invalidateLocal(self: *LoadFrameStack, idx: u32) void {
         for (self.frames.items) |*frame| {
             _ = frame.remove(.{ .local = idx });
         }
     }
 
     /// Coarse barrier (call, atomic, bulk-memory): clear all frames.
-    fn clearAll(self: *LoadFrameStack) void {
+    pub fn clearAll(self: *LoadFrameStack) void {
         for (self.frames.items) |*frame| frame.clearRetainingCapacity();
     }
 };
@@ -129,6 +130,157 @@ pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
         .memory_grow,
         => true,
         else => false,
+    };
+}
+
+/// Owns a dominator-tree child adjacency whose ordering preserves the
+/// `LoadFrameStack` barrier-soundness invariant. Building the adjacency and
+/// applying the barrier-aware sort are deliberately coupled so new dom-DFS
+/// load-forwarding passes cannot accidentally walk an unsorted child list.
+pub const BarrierOrderedDomChildren = struct {
+    children: []std.ArrayList(ir.BlockId),
+    allocator: std.mem.Allocator,
+
+    pub fn build(
+        func: *const ir.IrFunction,
+        dom: anytype,
+        allocator: std.mem.Allocator,
+    ) !BarrierOrderedDomChildren {
+        const nblocks = func.blocks.items.len;
+        const children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+        for (children) |*list| list.* = .empty;
+
+        var ordered: BarrierOrderedDomChildren = .{
+            .children = children,
+            .allocator = allocator,
+        };
+        errdefer ordered.deinit();
+
+        for (0..nblocks) |i| {
+            const bid: ir.BlockId = @intCast(i);
+            const idom = dom.idom[bid] orelse continue;
+            if (idom == bid) continue;
+            try ordered.children[idom].append(allocator, bid);
+        }
+        try sortDomChildrenBarrierLast(func, dom, ordered.children, allocator);
+        return ordered;
+    }
+
+    pub fn deinit(self: *BarrierOrderedDomChildren) void {
+        for (self.children) |*list| list.deinit(self.allocator);
+        self.allocator.free(self.children);
+        self.* = undefined;
+    }
+
+    pub fn forBlock(self: BarrierOrderedDomChildren, bid: ir.BlockId) []const ir.BlockId {
+        return self.children[bid].items;
+    }
+};
+
+pub const LoadForwardingDomWalkInstructionResult = enum {
+    unchanged,
+    changed,
+    removed,
+};
+
+/// Generic driver for load-forwarding dominator DFS passes.
+/// The driver owns dominator computation, `BarrierOrderedDomChildren`, the
+/// DFS stack, `LoadFrameStack` push/pop, load/store/barrier dispatch, and the
+/// optional visitor snapshot/restore protocol. The visitor owns any pass-local
+/// tables plus `onInstruction`, returning whether it changed or removed the
+/// current instruction. Set `pub const forward_destless_loads = true` only for
+/// visitors that intentionally remove redundant dest-less loads.
+pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
+    return struct {
+        const Frame = struct {
+            bid: ir.BlockId,
+            phase: u1,
+            snap_len: usize,
+        };
+
+        pub fn run(
+            visitor: *Visitor,
+            func: *ir.IrFunction,
+            allocator: std.mem.Allocator,
+        ) !bool {
+            if (func.blocks.items.len == 0) return false;
+
+            var dom = try analysis.computeDominators(func, allocator);
+            defer dom.deinit();
+
+            var dom_children = try BarrierOrderedDomChildren.build(func, &dom, allocator);
+            defer dom_children.deinit();
+
+            if (dom.idom[0] == null) return false;
+
+            var load_frames = LoadFrameStack.init(allocator);
+            defer load_frames.deinit();
+
+            var stack: std.ArrayList(Frame) = .empty;
+            defer stack.deinit(allocator);
+            try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0 });
+
+            const forward_destless_loads = comptime if (@hasDecl(Visitor, "forward_destless_loads"))
+                Visitor.forward_destless_loads
+            else
+                false;
+
+            var changed = false;
+            while (stack.items.len > 0) {
+                const top = &stack.items[stack.items.len - 1];
+                if (top.phase == 1) {
+                    if (@hasDecl(Visitor, "restore")) visitor.restore(top.snap_len);
+                    load_frames.pop();
+                    _ = stack.pop();
+                    continue;
+                }
+
+                const bid = top.bid;
+                top.phase = 1;
+                top.snap_len = if (@hasDecl(Visitor, "snapshot")) visitor.snapshot() else 0;
+                try load_frames.push();
+
+                const block = &func.blocks.items[bid];
+                var i: usize = 0;
+                while (i < block.instructions.items.len) {
+                    const inst = &block.instructions.items[i];
+                    switch (inst.op) {
+                        .load => |ld| {
+                            if (inst.dest != null or forward_destless_loads) {
+                                const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(ld) };
+                                if (load_frames.lookup(key)) |held| {
+                                    if (inst.dest) |dest| replaceVReg(func, dest, held);
+                                    _ = block.instructions.orderedRemove(i);
+                                    changed = true;
+                                    continue;
+                                }
+                                if (inst.dest) |dest| try load_frames.record(key, dest);
+                            }
+                        },
+                        .store => |st| try load_frames.invalidateMem(st),
+                        else => {
+                            if (opIsLoadBarrier(inst.op)) load_frames.clearAll();
+                        },
+                    }
+
+                    switch (try visitor.onInstruction(func, bid, i, &block.instructions.items[i], &load_frames)) {
+                        .unchanged => {},
+                        .changed => changed = true,
+                        .removed => {
+                            changed = true;
+                            continue;
+                        },
+                    }
+                    i += 1;
+                }
+
+                for (dom_children.forBlock(bid)) |child| {
+                    try stack.append(allocator, .{ .bid = child, .phase = 0, .snap_len = 0 });
+                }
+            }
+
+            return changed;
+        }
     };
 }
 
@@ -173,7 +325,7 @@ pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
 /// Cost: one O(N + E) post-order pass plus a small sort per
 /// node. Insertion sort keeps the order deterministic and is fine
 /// because individual blocks have very few dom-tree children.
-pub fn sortDomChildrenBarrierLast(
+fn sortDomChildrenBarrierLast(
     func: *const ir.IrFunction,
     dom: anytype, // analysis.Dominators
     children: []std.ArrayList(ir.BlockId),
@@ -2075,135 +2227,53 @@ fn hasSideEffect(inst: ir.Inst) bool {
 /// iterated blocks in raw id order, not RPO. PR #195 fixed block
 /// ordering and emission order, making this safe again.
 pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    if (func.blocks.items.len == 0) return false;
-
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
-
-    const nblocks = func.blocks.items.len;
-
-    // Build dom-tree children lists.
-    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
-    defer {
-        for (children) |*list| list.deinit(allocator);
-        allocator.free(children);
-    }
-    for (children) |*list| list.* = .empty;
-    for (0..nblocks) |i| {
-        const bid: ir.BlockId = @intCast(i);
-        const idom = dom.idom[bid] orelse continue;
-        if (idom == bid) continue; // entry block
-        try children[idom].append(allocator, bid);
-    }
-    try sortDomChildrenBarrierLast(func, &dom, children, allocator);
-
     // Expression table: flat append-only list with snapshot/restore.
     const ExprEntry = struct { inst: ir.Inst, dest: ir.VReg };
-    var table: std.ArrayList(ExprEntry) = .empty;
-    defer table.deinit(allocator);
 
-    const Frame = struct {
-        bid: ir.BlockId,
-        phase: u1,
-        snap_len: usize,
-    };
-    var stack: std.ArrayList(Frame) = .empty;
-    defer stack.deinit(allocator);
+    const Visitor = struct {
+        table: std.ArrayList(ExprEntry),
+        allocator: std.mem.Allocator,
 
-    if (dom.idom[0] == null) return false;
-    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0 });
-
-    // Parallel stack of per-dominator-level load tables. Handles `load`,
-    // `local_get`, and their invalidation by stores/`local_set`/barriers.
-    // See `LoadFrameStack` doc. Distinct from the pure-expr `table`
-    // above because per-instruction alias invalidation cannot be
-    // expressed via the snapshot/restore append-only protocol used for
-    // strictly pure ops.
-    var load_frames = LoadFrameStack.init(allocator);
-    defer load_frames.deinit();
-
-    var changed = false;
-    while (stack.items.len > 0) {
-        const top = &stack.items[stack.items.len - 1];
-        if (top.phase == 1) {
-            // Backtrack: restore expression table.
-            table.shrinkRetainingCapacity(top.snap_len);
-            load_frames.pop();
-            _ = stack.pop();
-            continue;
+        pub fn snapshot(self: *@This()) usize {
+            return self.table.items.len;
         }
-        const bid = top.bid;
-        top.phase = 1;
-        top.snap_len = table.items.len;
-        try load_frames.push();
 
-        const block = &func.blocks.items[bid];
-        var i: usize = 0;
-        while (i < block.instructions.items.len) {
-            const inst = &block.instructions.items[i];
-            switch (inst.op) {
-                .load => |ld| {
-                    if (inst.dest) |dest| {
-                        const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(ld) };
-                        if (load_frames.lookup(key)) |held| {
-                            replaceVReg(func, dest, held);
-                            _ = block.instructions.orderedRemove(i);
-                            changed = true;
-                            continue;
-                        }
-                        try load_frames.record(key, dest);
-                    }
-                    i += 1;
-                    continue;
-                },
-                .store => |st| {
-                    try load_frames.invalidateMem(st);
-                    i += 1;
-                    continue;
-                },
-                else => {
-                    if (opIsLoadBarrier(inst.op)) {
-                        load_frames.clearAll();
-                        i += 1;
-                        continue;
-                    }
-                },
-            }
+        pub fn restore(self: *@This(), snap_len: usize) void {
+            self.table.shrinkRetainingCapacity(snap_len);
+        }
 
-            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) {
-                i += 1;
-                continue;
-            }
+        pub fn onInstruction(
+            self: *@This(),
+            ir_func: *ir.IrFunction,
+            _: ir.BlockId,
+            _: usize,
+            inst: *ir.Inst,
+            _: *LoadFrameStack,
+        ) !LoadForwardingDomWalkInstructionResult {
+            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) return .unchanged;
 
             // Scan table backwards for nearest dominating match.
             // Later entries are from closer ancestors, so backwards
             // scan picks the nearest def and minimises live-range
             // inflation.
-            var found = false;
-            var k: usize = table.items.len;
+            var k: usize = self.table.items.len;
             while (k > 0) {
                 k -= 1;
-                const entry = &table.items[k];
+                const entry = &self.table.items[k];
                 if (entry.inst.type == inst.type and sameOp(entry.inst, inst.*)) {
-                    replaceVReg(func, inst.dest.?, entry.dest);
-                    changed = true;
-                    found = true;
-                    break;
+                    replaceVReg(ir_func, inst.dest.?, entry.dest);
+                    return .changed;
                 }
             }
-            if (!found) {
-                try table.append(allocator, .{ .inst = inst.*, .dest = inst.dest.? });
-            }
-            i += 1;
-        }
 
-        // Push dom-tree children for DFS traversal.
-        for (children[bid].items) |c| {
-            try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0 });
+            try self.table.append(self.allocator, .{ .inst = inst.*, .dest = inst.dest.? });
+            return .unchanged;
         }
-    }
+    };
 
-    return changed;
+    var visitor = Visitor{ .table = .empty, .allocator = allocator };
+    defer visitor.table.deinit(allocator);
+    return try LoadForwardingDomWalk(Visitor).run(&visitor, func, allocator);
 }
 
 fn isPure(inst: ir.Inst) bool {
@@ -2506,80 +2576,29 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
 ///
 /// Subsumes block-local `commonSubexprElimination`.
 pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    if (func.blocks.items.len == 0) return false;
-
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
-    if (dom.idom[0] == null) return false;
-
-    const nblocks = func.blocks.items.len;
-    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
-    defer {
-        for (children) |*list| list.deinit(allocator);
-        allocator.free(children);
-    }
-    for (children) |*list| list.* = .empty;
-    for (0..nblocks) |i| {
-        const bid: ir.BlockId = @intCast(i);
-        const idom = dom.idom[bid] orelse continue;
-        if (idom == bid) continue;
-        try children[idom].append(allocator, bid);
-    }
-    try sortDomChildrenBarrierLast(func, &dom, children, allocator);
-
     const GvnEntry = struct { inst: ir.Inst, vreg: ir.VReg };
-    var table: std.ArrayList(GvnEntry) = .empty;
-    defer table.deinit(allocator);
 
-    const Frame = struct { bid: ir.BlockId, phase: u1, snap_len: usize };
-    var stack: std.ArrayList(Frame) = .empty;
-    defer stack.deinit(allocator);
-    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0 });
+    const Visitor = struct {
+        table: std.ArrayList(GvnEntry),
+        allocator: std.mem.Allocator,
 
-    // Per-dominator-level load tables (see `LoadFrameStack`). Tracks
-    // `load` and `local_get` value numbers with proper alias
-    // invalidation on stores / `local_set` / barriers.
-    var load_frames = LoadFrameStack.init(allocator);
-    defer load_frames.deinit();
-
-    var changed = false;
-    while (stack.items.len > 0) {
-        const top = &stack.items[stack.items.len - 1];
-        if (top.phase == 1) {
-            table.shrinkRetainingCapacity(top.snap_len);
-            load_frames.pop();
-            _ = stack.pop();
-            continue;
+        pub fn snapshot(self: *@This()) usize {
+            return self.table.items.len;
         }
-        const bid = top.bid;
-        top.phase = 1;
-        top.snap_len = table.items.len;
-        try load_frames.push();
 
-        const block = &func.blocks.items[bid];
-        var i: usize = 0;
-        while (i < block.instructions.items.len) {
-            const inst = &block.instructions.items[i];
+        pub fn restore(self: *@This(), snap_len: usize) void {
+            self.table.shrinkRetainingCapacity(snap_len);
+        }
+
+        pub fn onInstruction(
+            self: *@This(),
+            ir_func: *ir.IrFunction,
+            _: ir.BlockId,
+            _: usize,
+            inst: *ir.Inst,
+            _: *LoadFrameStack,
+        ) !LoadForwardingDomWalkInstructionResult {
             switch (inst.op) {
-                .load => |ld| {
-                    if (inst.dest) |dest| {
-                        const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(ld) };
-                        if (load_frames.lookup(key)) |held| {
-                            replaceVReg(func, dest, held);
-                            _ = block.instructions.orderedRemove(i);
-                            changed = true;
-                            continue;
-                        }
-                        try load_frames.record(key, dest);
-                    }
-                    i += 1;
-                    continue;
-                },
-                .store => |st| {
-                    try load_frames.invalidateMem(st);
-                    i += 1;
-                    continue;
-                },
                 .local_get, .local_set => {
                     // Cross-block local_get / local_set value-numbering
                     // is unsound after `lowerPhisToLocals`: SSA phis are
@@ -2588,29 +2607,17 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
                     // `.local(idx)` value across a loop back-edge would
                     // erase the iteration update. Single-block local
                     // forwarding is handled by `forwardLocalGet` and
-                    // `forwardRedundantLoads`. We deliberately fall
-                    // through to the generic skip below; no .local
-                    // entries are ever recorded in `load_frames`, so
-                    // invalidation is moot.
-                    i += 1;
-                    continue;
+                    // `forwardRedundantLoads`. No .local entries are ever
+                    // recorded in `LoadFrameStack`, so invalidation is moot.
+                    return .unchanged;
                 },
-                else => {
-                    if (opIsLoadBarrier(inst.op)) {
-                        load_frames.clearAll();
-                        i += 1;
-                        continue;
-                    }
-                },
+                else => {},
             }
 
-            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) {
-                i += 1;
-                continue;
-            }
+            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) return .unchanged;
 
             var found: ?ir.VReg = null;
-            for (table.items) |entry| {
+            for (self.table.items) |entry| {
                 if (entry.inst.type == inst.type and sameOp(entry.inst, inst.*)) {
                     found = entry.vreg;
                     break;
@@ -2618,20 +2625,18 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
             }
 
             if (found) |earlier_vreg| {
-                replaceVReg(func, inst.dest.?, earlier_vreg);
-                changed = true;
-            } else {
-                try table.append(allocator, .{ .inst = inst.*, .vreg = inst.dest.? });
+                replaceVReg(ir_func, inst.dest.?, earlier_vreg);
+                return .changed;
             }
-            i += 1;
-        }
 
-        for (children[bid].items) |child| {
-            try stack.append(allocator, .{ .bid = child, .phase = 0, .snap_len = 0 });
+            try self.table.append(self.allocator, .{ .inst = inst.*, .vreg = inst.dest.? });
+            return .unchanged;
         }
-    }
+    };
 
-    return changed;
+    var visitor = Visitor{ .table = .empty, .allocator = allocator };
+    defer visitor.table.deinit(allocator);
+    return try LoadForwardingDomWalk(Visitor).run(&visitor, func, allocator);
 }
 
 // ── Pass Manager ────────────────────────────────────────────────────────────

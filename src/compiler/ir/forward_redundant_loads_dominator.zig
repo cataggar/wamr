@@ -4,7 +4,7 @@
 //! dominator-tree walk. The algorithm (per #391):
 //!
 //!   1. DFS the dominator tree from the entry block.
-//!   2. On entry to each block, push a fresh `(MemKey -> VReg)` map.
+//!   2. On entry to each block, push a fresh `(LoadKey -> VReg)` map.
 //!   3. While scanning instructions, lookups walk the stack from
 //!      innermost to outermost frame. A hit means an ancestor (or this
 //!      block) already loaded the same `(base, offset, size, sign_extend)`
@@ -14,9 +14,8 @@
 //!      dominated blocks). Calls and barriers clear every frame fully.
 //!   5. On exit from a block, pop its frame.
 //!
-//! Invalidation rules mirror `forward_redundant_loads.zig`; the key
-//! type lives in `alias_class.zig` so #467's wasm-local-slot extension
-//! can drop a new union variant in one place.
+//! Invalidation rules mirror `forward_redundant_loads.zig`; the `LoadKey`
+//! type lives in `alias_class.zig` and is managed by the shared driver.
 //!
 //! Sibling-block invariance: stores in one branch of a diamond do not
 //! propagate up into the dominator's frame (we only invalidate frames
@@ -27,159 +26,36 @@
 //! bulk-memory) on one diamond branch DOES need to wipe ancestor
 //! cached loads, because a merge block dominated by the diamond head
 //! is reachable via the barrier-containing branch on some execution
-//! path. We achieve this with `passes.sortDomChildrenBarrierLast`,
-//! which schedules barrier-containing subtrees to be DFS-visited
-//! before their non-barrier siblings — so the barrier's `clearAll`
-//! takes effect on ancestor frames before any non-barrier subtree
-//! gets a chance to forward stale loads into a downstream merge.
+//! path. We achieve this by walking children through
+//! `passes.BarrierOrderedDomChildren`, which schedules barrier-containing
+//! subtrees to be DFS-visited before their non-barrier siblings — so the
+//! barrier's `clearAll` takes effect on ancestor frames before any non-barrier
+//! subtree gets a chance to forward stale loads into a downstream merge.
 
 const std = @import("std");
 const ir = @import("ir.zig");
 const passes = @import("passes.zig");
-const analysis = @import("analysis.zig");
-const alias_class = @import("alias_class.zig");
-
-const MemKey = alias_class.MemKey;
-
 pub fn forwardRedundantLoadsDominator(
     func: *ir.IrFunction,
     allocator: std.mem.Allocator,
 ) !bool {
-    if (func.blocks.items.len == 0) return false;
+    const Visitor = struct {
+        pub const forward_destless_loads = true;
 
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
-
-    const nblocks = func.blocks.items.len;
-
-    // Build dom-tree children list.
-    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
-    defer {
-        for (children) |*list| list.deinit(allocator);
-        allocator.free(children);
-    }
-    for (children) |*list| list.* = .empty;
-    for (0..nblocks) |i| {
-        const bid: ir.BlockId = @intCast(i);
-        const idom_opt = dom.idom[bid];
-        if (idom_opt == null) continue; // unreachable
-        const idom = idom_opt.?;
-        if (idom == bid) continue; // entry's idom is itself
-        try children[idom].append(allocator, bid);
-    }
-    try passes.sortDomChildrenBarrierLast(func, &dom, children, allocator);
-
-    if (dom.idom[0] == null) return false;
-
-    var changed = false;
-
-    // Stack of per-dominator-level value tables. Lookup walks top→bottom.
-    var table_stack: std.ArrayList(std.AutoHashMap(MemKey, ir.VReg)) = .empty;
-    defer {
-        for (table_stack.items) |*t| t.deinit();
-        table_stack.deinit(allocator);
-    }
-
-    // DFS frames. Each block is visited twice: phase=0 to scan and push
-    // children, phase=1 to pop its table on the way back up.
-    const Frame = struct { bid: ir.BlockId, phase: u1 };
-    var dfs: std.ArrayList(Frame) = .empty;
-    defer dfs.deinit(allocator);
-    try dfs.append(allocator, .{ .bid = 0, .phase = 0 });
-
-    while (dfs.items.len > 0) {
-        const top = &dfs.items[dfs.items.len - 1];
-        if (top.phase == 1) {
-            var popped = table_stack.pop().?;
-            popped.deinit();
-            _ = dfs.pop();
-            continue;
+        pub fn onInstruction(
+            _: *@This(),
+            _: *ir.IrFunction,
+            _: ir.BlockId,
+            _: usize,
+            _: *ir.Inst,
+            _: anytype,
+        ) !passes.LoadForwardingDomWalkInstructionResult {
+            return .unchanged;
         }
-        top.phase = 1;
-        const bid = top.bid;
+    };
 
-        try table_stack.append(allocator, std.AutoHashMap(MemKey, ir.VReg).init(allocator));
-        var table = &table_stack.items[table_stack.items.len - 1];
-
-        const block = &func.blocks.items[bid];
-
-        var i: usize = 0;
-        var alias_buf: std.ArrayList(MemKey) = .empty;
-        defer alias_buf.deinit(allocator);
-
-        while (i < block.instructions.items.len) {
-            const inst = &block.instructions.items[i];
-            switch (inst.op) {
-                .load => |ld| {
-                    const key = alias_class.memKeyFromLoad(ld);
-
-                    var hit: ?ir.VReg = null;
-                    var t = table_stack.items.len;
-                    while (t > 0) : (t -= 1) {
-                        if (table_stack.items[t - 1].get(key)) |held| {
-                            hit = held;
-                            break;
-                        }
-                    }
-
-                    if (hit) |held_vreg| {
-                        if (inst.dest) |dest| {
-                            passes.replaceVReg(func, dest, held_vreg);
-                        }
-                        _ = block.instructions.orderedRemove(i);
-                        changed = true;
-                        continue;
-                    }
-
-                    if (inst.dest) |dest| {
-                        try table.put(key, dest);
-                    }
-                },
-                .store => |st| {
-                    // Invalidate aliasing entries across every active
-                    // frame on the current DFS path. Sibling branches
-                    // not on the path are untouched (their frames are
-                    // not present in the stack).
-                    for (table_stack.items) |*frame| {
-                        alias_buf.clearRetainingCapacity();
-                        var it = frame.iterator();
-                        while (it.next()) |entry| {
-                            if (alias_class.storeAliases(entry.key_ptr.*, st)) {
-                                try alias_buf.append(allocator, entry.key_ptr.*);
-                            }
-                        }
-                        for (alias_buf.items) |k| _ = frame.remove(k);
-                    }
-                },
-                .call,
-                .call_indirect,
-                .call_ref,
-                .atomic_load,
-                .atomic_store,
-                .atomic_rmw,
-                .atomic_cmpxchg,
-                .atomic_fence,
-                .atomic_notify,
-                .atomic_wait,
-                .memory_copy,
-                .memory_fill,
-                .memory_init,
-                .memory_grow,
-                => {
-                    for (table_stack.items) |*frame| frame.clearRetainingCapacity();
-                },
-                else => {},
-            }
-            i += 1;
-        }
-
-        // Push children so each is visited under our just-populated frame.
-        for (children[bid].items) |c| {
-            try dfs.append(allocator, .{ .bid = c, .phase = 0 });
-        }
-    }
-
-    return changed;
+    var visitor = Visitor{};
+    return try passes.LoadForwardingDomWalk(Visitor).run(&visitor, func, allocator);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
