@@ -22,6 +22,16 @@
 //! propagate up into the dominator's frame (we only invalidate frames
 //! that are on the current DFS path), so the unrelated sibling-then-
 //! merge block still observes the dominator's load.
+//!
+//! Sibling-block BARRIER soundness (#719): a barrier (call / atomic /
+//! bulk-memory) on one diamond branch DOES need to wipe ancestor
+//! cached loads, because a merge block dominated by the diamond head
+//! is reachable via the barrier-containing branch on some execution
+//! path. We achieve this with `passes.sortDomChildrenBarrierLast`,
+//! which schedules barrier-containing subtrees to be DFS-visited
+//! before their non-barrier siblings — so the barrier's `clearAll`
+//! takes effect on ancestor frames before any non-barrier subtree
+//! gets a chance to forward stale loads into a downstream merge.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -57,6 +67,7 @@ pub fn forwardRedundantLoadsDominator(
         if (idom == bid) continue; // entry's idom is itself
         try children[idom].append(allocator, bid);
     }
+    try passes.sortDomChildrenBarrierLast(func, &dom, children, allocator);
 
     if (dom.idom[0] == null) return false;
 
@@ -339,6 +350,53 @@ test "dominator FRL: call between dominator-load and dominated-load clears scope
     const changed = try forwardRedundantLoadsDominator(&func, allocator);
     try testing.expect(!changed);
     // Tail's load is preserved (still 2 insts including ret).
+    const t = &func.blocks.items[tail];
+    try testing.expectEqual(@as(usize, 2), t.instructions.items.len);
+    try testing.expect(t.instructions.items[0].op == .load);
+}
+
+test "dominator FRL: call in sibling branch invalidates merge-block forwarding (#719)" {
+    // entry:  v_dom = load p[0]; br_if cond, sib, tail
+    // sib:    call f; br tail
+    // tail:   v_tail = load p[0]; ret
+    //
+    // idom(tail) = entry. The path entry → sib → tail crosses a
+    // barrier, so the load in `tail` must NOT be forwarded from `v_dom`.
+    //
+    // Regression test mirroring the GVN-side bug (issue #719): without
+    // dom-DFS reordering, `tail` is popped before `sib` and forwards
+    // the stale ancestor value.
+    const allocator = testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const sib = try func.newBlock();
+    const tail = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_tail = func.newVReg();
+
+    {
+        const blk = &func.blocks.items[entry];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+        try terminateBrIf(blk, cond, sib, tail);
+    }
+    {
+        const blk = &func.blocks.items[sib];
+        try blk.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+        try terminateBr(blk, tail);
+    }
+    {
+        const blk = &func.blocks.items[tail];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+        try blk.append(.{ .op = .{ .ret = null }, .type = .i32 });
+    }
+
+    _ = try forwardRedundantLoadsDominator(&func, allocator);
     const t = &func.blocks.items[tail];
     try testing.expectEqual(@as(usize, 2), t.instructions.items.len);
     try testing.expect(t.instructions.items[0].op == .load);

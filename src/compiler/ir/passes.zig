@@ -21,8 +21,20 @@ const LoadKey = alias_class.LoadKey;
 /// value at this point on the dominator path. Lookup walks top→bottom
 /// (innermost scope wins). Stores, `local_set`, and barriers (calls,
 /// atomics, bulk-memory) invalidate matching entries across every
-/// active frame — sibling dominator branches are NOT on the stack so
-/// they are intrinsically protected (see #525 sibling-invariance).
+/// active frame.
+///
+/// Sibling-dominator-branch handling has two cases:
+///   * STORES on a sibling branch leave the dominator's frame alone
+///     — only frames on the current DFS path are invalidated. Sound
+///     because a sibling-branch store does not execute on the
+///     execution path through the other branch.
+///   * BARRIERS on a sibling branch must wipe ancestor frames too,
+///     since a merge block dominated by the branch head IS reachable
+///     via the barrier-containing branch on some execution path
+///     (issue #719). To make `clearAll` see the right frames at the
+///     right time, callers reorder dom-tree children via
+///     `sortDomChildrenBarrierLast` so barrier subtrees are visited
+///     before their non-barrier siblings.
 const LoadFrameStack = struct {
     frames: std.ArrayList(std.AutoHashMap(LoadKey, ir.VReg)),
     alloc: std.mem.Allocator,
@@ -99,7 +111,7 @@ const LoadFrameStack = struct {
 /// Returns true iff `op` is a coarse barrier that invalidates every
 /// load (memory + local) tracked by the dominator-scoped CSE/GVN.
 /// Mirrors the barrier set in `forward_redundant_loads.zig`.
-fn opIsLoadBarrier(op: ir.Inst.Op) bool {
+pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
     return switch (op) {
         .call,
         .call_indirect,
@@ -118,6 +130,114 @@ fn opIsLoadBarrier(op: ir.Inst.Op) bool {
         => true,
         else => false,
     };
+}
+
+/// Reorder dom-tree children lists so subtrees that contain a
+/// load barrier (`opIsLoadBarrier`) come **last** in each list
+/// — and therefore are popped **first** under the DFS stack's
+/// LIFO discipline.
+///
+/// Why this matters for `LoadFrameStack`-based passes
+/// (`commonSubexprElimination`, `globalValueNumbering`,
+/// `forwardRedundantLoadsDominator`):
+///
+///   * A barrier's `clearAll` only invalidates frames that are
+///     currently on the DFS stack at the moment the barrier
+///     executes.
+///   * If we visit a non-barrier sibling subtree BEFORE its
+///     barrier-containing sibling, the non-barrier subtree (and
+///     its dominated descendants) sees the pre-barrier ancestor
+///     cached loads — and on a control-flow path that actually
+///     goes through the barrier-containing sibling, those cached
+///     values are stale. The subtree may then unsoundly forward a
+///     load across what is, on some execution path, a barrier.
+///
+/// Concretely (issue #719): a wasm function with
+///
+///     entry:  v_dom = load p[16]
+///             br_if cond, sib, tail
+///     sib:    call f            ; barrier
+///             br tail
+///     tail:   v_tail = load p[16]
+///             ; ... use v_tail ...
+///
+/// has `idom(tail) = entry` because tail is reachable from entry
+/// without going through sib. Without this reordering, DFS visits
+/// `tail` before `sib` (tail has the higher block-id and is pushed
+/// later), forwards `v_tail` ← `v_dom`, and only later visits
+/// `sib` whose `clearAll` is now too late. After this reordering
+/// we visit `sib` first; its `clearAll` wipes entry's frame; then
+/// when `tail` is visited the cached `v_dom` is gone and `v_tail`
+/// is kept.
+///
+/// Cost: one O(N + E) post-order pass plus a small sort per
+/// node. Insertion sort keeps the order deterministic and is fine
+/// because individual blocks have very few dom-tree children.
+pub fn sortDomChildrenBarrierLast(
+    func: *const ir.IrFunction,
+    dom: anytype, // analysis.Dominators
+    children: []std.ArrayList(ir.BlockId),
+    allocator: std.mem.Allocator,
+) !void {
+    const nblocks = func.blocks.items.len;
+    if (nblocks == 0) return;
+
+    var subtree_has = try allocator.alloc(bool, nblocks);
+    defer allocator.free(subtree_has);
+    for (0..nblocks) |i| {
+        var has = false;
+        for (func.blocks.items[i].instructions.items) |inst| {
+            if (opIsLoadBarrier(inst.op)) {
+                has = true;
+                break;
+            }
+        }
+        subtree_has[i] = has;
+    }
+
+    const PostFrame = struct { bid: ir.BlockId, phase: u1 };
+    var stack: std.ArrayList(PostFrame) = .empty;
+    defer stack.deinit(allocator);
+
+    // Post-order walk every dom-tree root (entry plus any
+    // unreachable-from-entry blocks that still have `idom == self`).
+    for (0..nblocks) |i| {
+        const root: ir.BlockId = @intCast(i);
+        const idom = dom.idom[root] orelse continue;
+        if (idom != root) continue;
+        try stack.append(allocator, .{ .bid = root, .phase = 0 });
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            if (top.phase == 1) {
+                const b = top.bid;
+                for (children[b].items) |c| {
+                    if (subtree_has[c]) subtree_has[b] = true;
+                }
+                _ = stack.pop();
+                continue;
+            }
+            top.phase = 1;
+            const b = top.bid;
+            for (children[b].items) |c| {
+                try stack.append(allocator, .{ .bid = c, .phase = 0 });
+            }
+        }
+    }
+
+    // Stable insertion-sort each child list so non-barrier subtrees
+    // come first (pushed first → popped last) and barrier subtrees
+    // come last (pushed last → popped first).
+    const Ctx = struct {
+        sh: []const bool,
+        fn lt(ctx: @This(), a: ir.BlockId, b: ir.BlockId) bool {
+            const ai: u1 = if (ctx.sh[a]) 1 else 0;
+            const bi: u1 = if (ctx.sh[b]) 1 else 0;
+            return ai < bi;
+        }
+    };
+    for (children) |*list| {
+        std.sort.insertion(ir.BlockId, list.items, Ctx{ .sh = subtree_has }, Ctx.lt);
+    }
 }
 
 pub const TargetArch = enum { x86_64, aarch64 };
@@ -1975,6 +2095,7 @@ pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocat
         if (idom == bid) continue; // entry block
         try children[idom].append(allocator, bid);
     }
+    try sortDomChildrenBarrierLast(func, &dom, children, allocator);
 
     // Expression table: flat append-only list with snapshot/restore.
     const ExprEntry = struct { inst: ir.Inst, dest: ir.VReg };
@@ -2404,6 +2525,7 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
         if (idom == bid) continue;
         try children[idom].append(allocator, bid);
     }
+    try sortDomChildrenBarrierLast(func, &dom, children, allocator);
 
     const GvnEntry = struct { inst: ir.Inst, vreg: ir.VReg };
     var table: std.ArrayList(GvnEntry) = .empty;
@@ -12887,4 +13009,79 @@ test "GVN load: call between dominator-load and dominated-load invalidates (#541
 
     const changed = try globalValueNumbering(&func, allocator);
     try std.testing.expect(!changed);
+}
+
+test "GVN load: call in sibling block invalidates dominator-cached load on merge (#719)" {
+    // entry: load v_base[0] -> v_dom; br_if cond, sib, tail
+    // sib:   call f -> v_c; br tail
+    // tail:  load v_base[0] -> v_tail; ret v_tail
+    //
+    // `tail` has two predecessors: `entry` (br_if's else) and `sib` (br).
+    // idom(tail) = entry. The execution path entry → sib → tail crosses
+    // a barrier (call), so tail's load must NOT be rewritten to v_dom.
+    //
+    // Regression test for the dominator-DFS soundness bug found via
+    // #719's keyvault tcgc trap: GVN visits dominator-tree children in
+    // block-id order via a stack, so the higher-id child (`tail`) was
+    // popped and processed BEFORE its lower-id sibling (`sib`) with the
+    // barrier had a chance to call `clearAll`. Result: tail unsoundly
+    // forwarded the pre-barrier value v_dom.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const sib = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_c = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = sib, .else_block = tail } } });
+
+    try func.getBlock(sib).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_c, .type = .i32 });
+    try func.getBlock(sib).append(.{ .op = .{ .br = tail } });
+
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    _ = try globalValueNumbering(&func, allocator);
+    // tail's ret must still reference v_tail — the load must survive.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
+    // tail's first instruction must still be the load itself.
+    try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .load);
+}
+
+test "CSE load: call in sibling block invalidates dominator-cached load on merge (#719)" {
+    // Same shape as the GVN counterpart above — also covers
+    // `commonSubexprElimination` since CSE uses the same
+    // `LoadFrameStack` + dom-DFS structure.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const sib = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_c = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = sib, .else_block = tail } } });
+
+    try func.getBlock(sib).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_c, .type = .i32 });
+    try func.getBlock(sib).append(.{ .op = .{ .br = tail } });
+
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    _ = try commonSubexprElimination(&func, allocator);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
+    try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .load);
 }
