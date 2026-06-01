@@ -51,6 +51,11 @@ pub const PrecompileOptions = struct {
         .aarch64 => .aarch64,
         else => .x86_64,
     },
+    /// When false, skip IR optimization passes (mirrors `wamrc compile -O0`).
+    /// Useful for #743-style AOT-codegen bisection: if a bug disappears at
+    /// `-O0` we know it's in the optimization pipeline; if it persists the
+    /// bug is in the frontend / SSA / codegen.
+    optimize: bool = true,
 };
 
 /// AOT-compile a single core wasm module. Returns freshly-allocated
@@ -84,12 +89,14 @@ pub fn compileCoreWasm(
     var ir_module = frontend.lowerModule(&module, allocator) catch return error.CoreCompileFailed;
     defer ir_module.deinit();
 
-    _ = passes.runPassesWithOptions(
-        &ir_module,
-        passes.defaultPassesForTarget(opts.target_arch),
-        allocator,
-        .{ .verify_mode = .off },
-    ) catch return error.CoreCompileFailed;
+    if (opts.optimize) {
+        _ = passes.runPassesWithOptions(
+            &ir_module,
+            passes.defaultPassesForTarget(opts.target_arch),
+            allocator,
+            .{ .verify_mode = .off },
+        ) catch return error.CoreCompileFailed;
+    }
 
     const code: []u8, const offsets: []u32 = switch (opts.target_arch) {
         .aarch64 => blk: {

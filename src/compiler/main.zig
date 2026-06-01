@@ -653,6 +653,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
     }
     var input_path: ?[]const u8 = null;
     var output_manifest: ?[]const u8 = null;
+    var optimize: bool = true;
     var target_arch: TargetArch = switch (builtin.cpu.arch) {
         .aarch64 => .aarch64,
         else => .x86_64,
@@ -668,6 +669,8 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
                 std.process.exit(1);
             }
             output_manifest = sub_args[i];
+        } else if (std.mem.eql(u8, a, "-O0")) {
+            optimize = false;
         } else if (std.mem.startsWith(u8, a, "--target=")) {
             const v = a["--target=".len..];
             if (std.mem.eql(u8, v, "x86_64") or std.mem.eql(u8, v, "x86-64")) {
@@ -717,6 +720,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
 
     var result = wamr.component_aot_compile.precompileComponent(allocator, component_data, manifest_path, .{
         .target_arch = target_arch,
+        .optimize = optimize,
     }) catch |err| {
         std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
@@ -1194,6 +1198,7 @@ const compile_component_usage =
     \\Options:
     \\  -o <manifest.json>            Manifest path (default: <input>.cwasm.json)
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
+    \\  -O0                           Disable IR optimizations (every core)
     \\
 ;
 
