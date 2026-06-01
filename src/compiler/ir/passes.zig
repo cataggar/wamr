@@ -32,8 +32,8 @@ const LoadKey = alias_class.LoadKey;
 ///     since a merge block dominated by the branch head IS reachable
 ///     via the barrier-containing branch on some execution path
 ///     (issue #719). To make `clearAll` see the right frames at the
-///     right time, callers reorder dom-tree children via
-///     `sortDomChildrenBarrierLast` so barrier subtrees are visited
+///     right time, callers walk dom-tree children through
+///     `BarrierOrderedDomChildren` so barrier subtrees are visited
 ///     before their non-barrier siblings.
 const LoadFrameStack = struct {
     frames: std.ArrayList(std.AutoHashMap(LoadKey, ir.VReg)),
@@ -132,6 +132,50 @@ pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
     };
 }
 
+/// Owns a dominator-tree child adjacency whose ordering preserves the
+/// `LoadFrameStack` barrier-soundness invariant. Building the adjacency and
+/// applying the barrier-aware sort are deliberately coupled so new dom-DFS
+/// load-forwarding passes cannot accidentally walk an unsorted child list.
+pub const BarrierOrderedDomChildren = struct {
+    children: []std.ArrayList(ir.BlockId),
+    allocator: std.mem.Allocator,
+
+    pub fn build(
+        func: *const ir.IrFunction,
+        dom: anytype,
+        allocator: std.mem.Allocator,
+    ) !BarrierOrderedDomChildren {
+        const nblocks = func.blocks.items.len;
+        const children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+        for (children) |*list| list.* = .empty;
+
+        var ordered: BarrierOrderedDomChildren = .{
+            .children = children,
+            .allocator = allocator,
+        };
+        errdefer ordered.deinit();
+
+        for (0..nblocks) |i| {
+            const bid: ir.BlockId = @intCast(i);
+            const idom = dom.idom[bid] orelse continue;
+            if (idom == bid) continue;
+            try ordered.children[idom].append(allocator, bid);
+        }
+        try sortDomChildrenBarrierLast(func, dom, ordered.children, allocator);
+        return ordered;
+    }
+
+    pub fn deinit(self: *BarrierOrderedDomChildren) void {
+        for (self.children) |*list| list.deinit(self.allocator);
+        self.allocator.free(self.children);
+        self.* = undefined;
+    }
+
+    pub fn forBlock(self: BarrierOrderedDomChildren, bid: ir.BlockId) []const ir.BlockId {
+        return self.children[bid].items;
+    }
+};
+
 /// Reorder dom-tree children lists so subtrees that contain a
 /// load barrier (`opIsLoadBarrier`) come **last** in each list
 /// — and therefore are popped **first** under the DFS stack's
@@ -173,7 +217,7 @@ pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
 /// Cost: one O(N + E) post-order pass plus a small sort per
 /// node. Insertion sort keeps the order deterministic and is fine
 /// because individual blocks have very few dom-tree children.
-pub fn sortDomChildrenBarrierLast(
+fn sortDomChildrenBarrierLast(
     func: *const ir.IrFunction,
     dom: anytype, // analysis.Dominators
     children: []std.ArrayList(ir.BlockId),
@@ -2080,22 +2124,8 @@ pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocat
     var dom = try analysis.computeDominators(func, allocator);
     defer dom.deinit();
 
-    const nblocks = func.blocks.items.len;
-
-    // Build dom-tree children lists.
-    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
-    defer {
-        for (children) |*list| list.deinit(allocator);
-        allocator.free(children);
-    }
-    for (children) |*list| list.* = .empty;
-    for (0..nblocks) |i| {
-        const bid: ir.BlockId = @intCast(i);
-        const idom = dom.idom[bid] orelse continue;
-        if (idom == bid) continue; // entry block
-        try children[idom].append(allocator, bid);
-    }
-    try sortDomChildrenBarrierLast(func, &dom, children, allocator);
+    var dom_children = try BarrierOrderedDomChildren.build(func, &dom, allocator);
+    defer dom_children.deinit();
 
     // Expression table: flat append-only list with snapshot/restore.
     const ExprEntry = struct { inst: ir.Inst, dest: ir.VReg };
@@ -2198,7 +2228,7 @@ pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocat
         }
 
         // Push dom-tree children for DFS traversal.
-        for (children[bid].items) |c| {
+        for (dom_children.forBlock(bid)) |c| {
             try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0 });
         }
     }
@@ -2512,20 +2542,8 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
     defer dom.deinit();
     if (dom.idom[0] == null) return false;
 
-    const nblocks = func.blocks.items.len;
-    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
-    defer {
-        for (children) |*list| list.deinit(allocator);
-        allocator.free(children);
-    }
-    for (children) |*list| list.* = .empty;
-    for (0..nblocks) |i| {
-        const bid: ir.BlockId = @intCast(i);
-        const idom = dom.idom[bid] orelse continue;
-        if (idom == bid) continue;
-        try children[idom].append(allocator, bid);
-    }
-    try sortDomChildrenBarrierLast(func, &dom, children, allocator);
+    var dom_children = try BarrierOrderedDomChildren.build(func, &dom, allocator);
+    defer dom_children.deinit();
 
     const GvnEntry = struct { inst: ir.Inst, vreg: ir.VReg };
     var table: std.ArrayList(GvnEntry) = .empty;
@@ -2626,7 +2644,7 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
             i += 1;
         }
 
-        for (children[bid].items) |child| {
+        for (dom_children.forBlock(bid)) |child| {
             try stack.append(allocator, .{ .bid = child, .phase = 0, .snap_len = 0 });
         }
     }

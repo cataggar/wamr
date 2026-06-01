@@ -27,11 +27,11 @@
 //! bulk-memory) on one diamond branch DOES need to wipe ancestor
 //! cached loads, because a merge block dominated by the diamond head
 //! is reachable via the barrier-containing branch on some execution
-//! path. We achieve this with `passes.sortDomChildrenBarrierLast`,
-//! which schedules barrier-containing subtrees to be DFS-visited
-//! before their non-barrier siblings — so the barrier's `clearAll`
-//! takes effect on ancestor frames before any non-barrier subtree
-//! gets a chance to forward stale loads into a downstream merge.
+//! path. We achieve this by walking children through
+//! `passes.BarrierOrderedDomChildren`, which schedules barrier-containing
+//! subtrees to be DFS-visited before their non-barrier siblings — so the
+//! barrier's `clearAll` takes effect on ancestor frames before any non-barrier
+//! subtree gets a chance to forward stale loads into a downstream merge.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -50,24 +50,8 @@ pub fn forwardRedundantLoadsDominator(
     var dom = try analysis.computeDominators(func, allocator);
     defer dom.deinit();
 
-    const nblocks = func.blocks.items.len;
-
-    // Build dom-tree children list.
-    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
-    defer {
-        for (children) |*list| list.deinit(allocator);
-        allocator.free(children);
-    }
-    for (children) |*list| list.* = .empty;
-    for (0..nblocks) |i| {
-        const bid: ir.BlockId = @intCast(i);
-        const idom_opt = dom.idom[bid];
-        if (idom_opt == null) continue; // unreachable
-        const idom = idom_opt.?;
-        if (idom == bid) continue; // entry's idom is itself
-        try children[idom].append(allocator, bid);
-    }
-    try passes.sortDomChildrenBarrierLast(func, &dom, children, allocator);
+    var dom_children = try passes.BarrierOrderedDomChildren.build(func, &dom, allocator);
+    defer dom_children.deinit();
 
     if (dom.idom[0] == null) return false;
 
@@ -174,7 +158,7 @@ pub fn forwardRedundantLoadsDominator(
         }
 
         // Push children so each is visited under our just-populated frame.
-        for (children[bid].items) |c| {
+        for (dom_children.forBlock(bid)) |c| {
             try dfs.append(allocator, .{ .bid = c, .phase = 0 });
         }
     }
