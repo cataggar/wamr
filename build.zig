@@ -1,5 +1,18 @@
 const std = @import("std");
 
+const fuzz_seed_wasms = [_][]const u8{
+    "diamond_call_indirect_then_load.wasm",
+    "loop_backedge_barrier.wasm",
+    "loop_body_call.wasm",
+    "triangle_store.wasm",
+    "nested_ifs_mixed.wasm",
+    "indirect_vs_direct_call.wasm",
+    "atomic_barrier.wasm",
+    "bulk_memory_barrier.wasm",
+    "tail_call_barrier.wasm",
+    "multi_memory_forwarding.wasm",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -877,6 +890,15 @@ pub fn build(b: *std.Build) void {
         });
         const install_fuzz = b.addInstallArtifact(fuzz_exe, .{});
         fuzz_step.dependOn(&install_fuzz.step);
+    }
+
+    inline for (fuzz_seed_wasms) |seed_wasm| {
+        const install_seed = b.addInstallFileWithDir(
+            b.path("src/tests/fuzz/seeds/" ++ seed_wasm),
+            .{ .custom = "fuzz-seeds" },
+            seed_wasm,
+        );
+        fuzz_step.dependOn(&install_seed.step);
     }
 
     // ── OSS-Fuzz shim libraries ──────────────────────────────────────
