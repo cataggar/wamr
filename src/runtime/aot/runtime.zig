@@ -52,6 +52,196 @@ const windows_trap_supported = builtin.os.tag == .windows and builtin.cpu.arch =
 var g_saved_ctx: windows.CONTEXT align(16) = undefined;
 var g_trap_catching: bool = false;
 var g_trap_occurred: bool = false;
+/// Forensic dump targets parsed from `WAMR_TRAP_OOB_DUMP`; populated by
+/// `main.zig` at startup. See `aotTrapOobDumpMem` (#719).
+pub var g_trap_oob_dump_env: ?[]const u8 = null;
+
+// ─── #719 watch-addr SIGUSR1-driven address watcher ─────────────────────
+//
+// When the env var `WAMR_WATCH_ADDR=<hex_off>:<lo>:<hi>[:<min_mem_mb>]`
+// is set, a background thread polls `*(u32*)(host_base + wasm_off)`
+// and signals the main thread via SIGUSR1 the first time the watched
+// value enters the half-open range `[lo, hi)`. The handler decodes
+// the interrupted RIP into `local_func[N] + rel_off` so we can pin
+// down the wasm function performing the rogue write.
+//
+// Intended for chasing the deep #719 trap where `tcgc-core` dlmalloc's
+// `treebins[0]` (wasm 0x247bb8) gets overwritten with a static-data
+// pointer (< 0x800000). Inert when the env var is unset.
+const WatchAddrConfig = struct {
+    wasm_off: u32,
+    lo: u32,
+    hi: u32,
+    min_mem_bytes: usize,
+};
+var g_watch_cfg: ?WatchAddrConfig = null;
+var g_watch_host_base: std.atomic.Value(usize) = .init(0);
+var g_watch_armed: std.atomic.Value(bool) = .init(false);
+var g_watch_caught: std.atomic.Value(u32) = .init(0);
+var g_watch_main_tid: i32 = 0;
+var g_watch_pid: i32 = 0;
+var g_watch_prev_action: std.os.linux.Sigaction = undefined;
+const WATCH_MAX_CATCHES: u32 = 16;
+const linux_watch = std.os.linux;
+const watch_supported = builtin.os.tag == .linux and builtin.cpu.arch == .x86_64;
+
+const WatchUcontextX86_64 = extern struct {
+    _flags: usize,
+    _link: ?*anyopaque,
+    _stack: linux_watch.stack_t,
+    mcontext: extern struct {
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rdi: u64,
+        rsi: u64,
+        rbp: u64,
+        rbx: u64,
+        rdx: u64,
+        rax: u64,
+        rcx: u64,
+        rsp: u64,
+        rip: u64,
+    },
+};
+
+fn watchSigusr1(_: linux_watch.SIG, _: *const linux_watch.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    if (ctx == null) return;
+    if (!watch_supported) return;
+    const u: *const WatchUcontextX86_64 = @ptrCast(@alignCast(ctx.?));
+    const rip = u.mcontext.rip;
+    const cfg = g_watch_cfg orelse return;
+    const base = g_watch_host_base.load(.acquire);
+    var val: u32 = 0;
+    if (base != 0) {
+        const p: *const u32 = @ptrFromInt(base + cfg.wasm_off);
+        val = p.*;
+    }
+    const hits = g_watch_caught.load(.acquire);
+    const loc = decodeTrapReturnAddress(rip);
+    if (loc.name) |name| {
+        std.debug.print(
+            "[watch-caught #{d}] val=0x{x} rip=0x{x} code+0x{x} local_func[{d}] \"{s}\"+0x{x}\n",
+            .{ hits, val, rip, loc.code_off, loc.func_idx, name, loc.rel_off },
+        );
+    } else {
+        std.debug.print(
+            "[watch-caught #{d}] val=0x{x} rip=0x{x} code+0x{x} local_func[{d}]+0x{x}\n",
+            .{ hits, val, rip, loc.code_off, loc.func_idx, loc.rel_off },
+        );
+    }
+}
+
+fn watchSleepNs(ns: u64) void {
+    const sec: i64 = @intCast(ns / std.time.ns_per_s);
+    const nsec: i64 = @intCast(ns % std.time.ns_per_s);
+    const ts = std.posix.timespec{ .sec = sec, .nsec = nsec };
+    _ = std.posix.system.nanosleep(&ts, null);
+}
+
+fn watchPoller() void {
+    var prev: u32 = 0xFFFFFFFF;
+    var first_read = true;
+    while (g_watch_armed.load(.monotonic)) {
+        const base = g_watch_host_base.load(.acquire);
+        if (base == 0) {
+            std.Thread.yield() catch {};
+            watchSleepNs(1_000_000); // 1ms, wait for memory attach
+            continue;
+        }
+        const cfg = g_watch_cfg orelse return;
+        const p: *const u32 = @ptrFromInt(base + cfg.wasm_off);
+        const v = p.*;
+        if (first_read or v != prev) {
+            first_read = false;
+            prev = v;
+            if (v >= cfg.lo and v < cfg.hi) {
+                const cnt = g_watch_caught.fetchAdd(1, .acq_rel);
+                if (cnt < WATCH_MAX_CATCHES and watch_supported) {
+                    // Signal main thread to capture its RIP.
+                    _ = linux_watch.tgkill(g_watch_pid, g_watch_main_tid, linux_watch.SIG.USR1);
+                    // Sleep so handler runs before we keep polling.
+                    watchSleepNs(2_000_000); // 2ms
+                } else if (cnt == WATCH_MAX_CATCHES) {
+                    std.debug.print("[watch-addr] hit catch-cap; muting further signals\n", .{});
+                }
+            }
+        }
+        // tight poll — yield to let main thread run
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// Parse `WAMR_WATCH_ADDR=<hex_off>:<lo>:<hi>[:<min_mem_mb>]` and start
+/// the watcher thread. Address fields accept `0x`-prefixed hex; the
+/// optional `<min_mem_mb>` arms only for memories at least that large
+/// (decimal). Inert if the platform isn't supported.
+pub fn initWatchAddrFromEnv(env_val: []const u8) !void {
+    if (!watch_supported) {
+        std.debug.print("[watch-addr] unsupported on this platform; ignoring\n", .{});
+        return;
+    }
+    var it = std.mem.splitScalar(u8, env_val, ':');
+    const off_s = it.next() orelse return error.BadFormat;
+    const lo_s = it.next() orelse return error.BadFormat;
+    const hi_s = it.next() orelse return error.BadFormat;
+    const mb_s = it.next();
+    const off = try parseWatchU32Hex(off_s);
+    const lo = try parseWatchU32Hex(lo_s);
+    const hi = try parseWatchU32Hex(hi_s);
+    const mb: usize = if (mb_s) |s| try parseWatchUsizeDec(s) else 0;
+
+    g_watch_cfg = .{
+        .wasm_off = off,
+        .lo = lo,
+        .hi = hi,
+        .min_mem_bytes = mb * 1024 * 1024,
+    };
+    g_watch_pid = @intCast(linux_watch.getpid());
+    g_watch_main_tid = @intCast(linux_watch.gettid());
+
+    const act: linux_watch.Sigaction = .{
+        .handler = .{ .sigaction = watchSigusr1 },
+        .mask = linux_watch.sigemptyset(),
+        .flags = linux_watch.SA.SIGINFO | linux_watch.SA.RESTART,
+    };
+    std.posix.sigaction(.USR1, &act, &g_watch_prev_action);
+
+    g_watch_armed.store(true, .release);
+    _ = try std.Thread.spawn(.{}, watchPoller, .{});
+
+    std.debug.print(
+        "[watch-addr] armed wasm_off=0x{x} bad_range=[0x{x}..0x{x}) min_mem={d}MB main_tid={d}\n",
+        .{ off, lo, hi, mb, g_watch_main_tid },
+    );
+}
+
+fn parseWatchU32Hex(s: []const u8) !u32 {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    const hex = if (std.mem.startsWith(u8, trimmed, "0x") or std.mem.startsWith(u8, trimmed, "0X"))
+        trimmed[2..]
+    else
+        trimmed;
+    return std.fmt.parseInt(u32, hex, 16);
+}
+
+fn parseWatchUsizeDec(s: []const u8) !usize {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    return std.fmt.parseInt(usize, trimmed, 10);
+}
+
+/// Called from `refreshVmCtxMemory` so the watcher always reads the
+/// freshest host base, including across `memory.grow` remappings.
+fn watchAddrNoteMemory(host_base: usize, wasm_size: usize) void {
+    const cfg = g_watch_cfg orelse return;
+    if (wasm_size < cfg.min_mem_bytes) return;
+    g_watch_host_base.store(host_base, .release);
+}
 /// Exception code of the last fault vehHandler redirected to trapLongjmp.
 /// Sampled by `callFuncScalar` after trap return to decide whether to
 /// re-arm the thread's stack guard page (see `resetStackGuardPage`).
@@ -511,6 +701,24 @@ fn lookupLocalFuncName(local_idx: isize) ?[]const u8 {
     return null;
 }
 
+/// Probe entry-point intended to be called from gdb / watchpoint scripts
+/// to map an arbitrary native PC to (local_func, rel_off, name) using the
+/// currently-installed trap-decode globals. Prints one line on stderr.
+pub export fn aotProbeDecodePc(pc: usize) callconv(.c) void {
+    const loc = decodeTrapReturnAddress(pc);
+    if (loc.name) |name| {
+        std.debug.print(
+            "[probe] pc=0x{x} code+0x{x} local_func[{d}] \"{s}\"+0x{x}\n",
+            .{ pc, loc.code_off, loc.func_idx, name, loc.rel_off },
+        );
+    } else {
+        std.debug.print(
+            "[probe] pc=0x{x} code+0x{x} local_func[{d}]+0x{x}\n",
+            .{ pc, loc.code_off, loc.func_idx, loc.rel_off },
+        );
+    }
+}
+
 pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     const loc = decodeTrapReturnAddress(@returnAddress());
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) {
@@ -530,7 +738,73 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
             .{ loc.code_off, loc.func_idx, loc.rel_off, vmctx.memory_size },
         );
     }
+    aotTrapOobDumpMem(vmctx);
     std.process.exit(2);
+}
+
+/// Forensic dump for #719. Enabled by `WAMR_TRAP_OOB_DUMP=<hex>[,<hex>...]`
+/// (each value is a wasm linear-memory address). For every address we
+/// print the surrounding 64 bytes, and if the 32-bit value there looks
+/// like a valid wasm-memory pointer we follow it and print 64 bytes
+/// there too. Intentionally side-effect free if the env var is unset.
+fn aotTrapOobDumpMem(vmctx: *VmCtx) void {
+    const env = g_trap_oob_dump_env orelse return;
+    if (vmctx.memory_base == 0 or vmctx.memory_size == 0) return;
+    const mem: [*]const u8 = @ptrFromInt(vmctx.memory_base);
+
+    var it = std.mem.splitScalar(u8, env, ',');
+    while (it.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const hex = if (std.mem.startsWith(u8, trimmed, "0x") or std.mem.startsWith(u8, trimmed, "0X"))
+            trimmed[2..]
+        else
+            trimmed;
+        const addr = std.fmt.parseInt(u64, hex, 16) catch {
+            std.debug.print("[trap-dump] bad hex token: '{s}'\n", .{trimmed});
+            continue;
+        };
+        dumpAddr(mem, vmctx.memory_size, addr, 0);
+    }
+}
+
+fn dumpAddr(mem: [*]const u8, mem_size: usize, addr: u64, depth: u8) void {
+    const start: u64 = if (addr >= 32) addr - 32 else 0;
+    const end: u64 = @min(addr + 64, mem_size);
+    if (start >= end) {
+        std.debug.print("[trap-dump] addr=0x{x} OUT OF RANGE (mem_size=0x{x})\n", .{ addr, mem_size });
+        return;
+    }
+    std.debug.print("[trap-dump] addr=0x{x} window [0x{x}..0x{x}):\n", .{ addr, start, end });
+    var off: u64 = start;
+    while (off < end) : (off += 16) {
+        const row_end = @min(off + 16, end);
+        std.debug.print("  0x{x:0>8}:", .{off});
+        var i: u64 = off;
+        while (i < row_end) : (i += 1) {
+            std.debug.print(" {x:0>2}", .{mem[@intCast(i)]});
+        }
+        var pad: u64 = row_end;
+        while (pad < off + 16) : (pad += 1) std.debug.print("   ", .{});
+        std.debug.print("  |", .{});
+        i = off;
+        while (i < row_end) : (i += 1) {
+            const c = mem[@intCast(i)];
+            std.debug.print("{c}", .{if (c >= 0x20 and c < 0x7f) c else @as(u8, '.')});
+        }
+        std.debug.print("|\n", .{});
+    }
+
+    if (depth >= 2) return;
+    // Try interpreting the aligned u32 at `addr` as a wasm-memory pointer
+    // and recurse one level so we can chase treebin-slot → chunk-header.
+    if (addr + 4 <= mem_size and addr % 4 == 0) {
+        const ptr_le = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(mem + addr)), .little);
+        if (ptr_le != 0 and ptr_le < mem_size) {
+            std.debug.print("[trap-dump]   *(u32)0x{x} = 0x{x} (in-range; following)\n", .{ addr, ptr_le });
+            dumpAddr(mem, mem_size, ptr_le, depth + 1);
+        }
+    }
 }
 
 /// Resolve the trapping wasm function from `@returnAddress()` for the
@@ -1409,6 +1683,18 @@ fn refreshVmCtxMemory(vmctx: *VmCtx, mem: *types.MemoryInstance) void {
     vmctx.memory_size = @as(usize, mem.current_pages) * types.MemoryInstance.page_size;
     vmctx.memory_max_size = mem.data.len;
     vmctx.memory_pages = mem.current_pages;
+    // #719 forensic aid: when the trap-OOB dump env var is set, also log
+    // the host base addr for every memory we attach so a gdb hardware
+    // watchpoint can be placed on `mem_base + wasm_offset` cheaply.
+    if (g_trap_oob_dump_env != null) {
+        std.debug.print(
+            "[mem-base] host_base=0x{x} wasm_size=0x{x} max=0x{x}\n",
+            .{ vmctx.memory_base, vmctx.memory_size, vmctx.memory_max_size },
+        );
+    }
+    // Keep the WAMR_WATCH_ADDR poller pointed at the current mapping;
+    // memory.grow can move us via mremap so this must run every refresh.
+    watchAddrNoteMemory(vmctx.memory_base, vmctx.memory_size);
 }
 
 fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
