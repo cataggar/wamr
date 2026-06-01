@@ -1152,9 +1152,21 @@ pub const ComponentInstance = struct {
                     .func => |t| t,
                     else => unreachable,
                 };
-                const ctx = try child.allocator.create(executor_mod.ForwardingHostFnCtx);
-                errdefer child.allocator.destroy(ctx);
-                ctx.* = .{ .owner = flat.owner, .local = flat.local };
+                const child_func_td = resolveTypeDef(child.component, child_type_idx) orelse
+                    return error.SubComponentLinkFailed;
+                const child_ft = switch (child_func_td) {
+                    .func => |f| f,
+                    else => return error.SubComponentLinkFailed,
+                };
+                const reg = @import("canonical_abi.zig").TypeRegistry.init(child.component);
+                const ctx = try executor_mod.buildForwardingHostFnCtx(
+                    child.allocator,
+                    flat.owner,
+                    flat.local,
+                    child_ft,
+                    reg,
+                );
+                errdefer executor_mod.destroyForwardingHostFnCtx(ctx, child.allocator);
                 try child.forwarding_ctxs.append(child.allocator, ctx);
                 return .{ .host_func = .{
                     .context = ctx,
@@ -1269,9 +1281,21 @@ pub const ComponentInstance = struct {
                             }
                             const flat = resolved orelse continue;
 
-                            const ctx = try child.allocator.create(executor_mod.ForwardingHostFnCtx);
-                            errdefer child.allocator.destroy(ctx);
-                            ctx.* = .{ .owner = flat.owner, .local = flat.local };
+                            const member_func_td = resolveTypeDef(child.component, member_func_type) orelse
+                                return error.SubComponentLinkFailed;
+                            const member_ft = switch (member_func_td) {
+                                .func => |f| f,
+                                else => return error.SubComponentLinkFailed,
+                            };
+                            const member_reg = @import("canonical_abi.zig").TypeRegistry.init(child.component);
+                            const ctx = try executor_mod.buildForwardingHostFnCtx(
+                                child.allocator,
+                                flat.owner,
+                                flat.local,
+                                member_ft,
+                                member_reg,
+                            );
+                            errdefer executor_mod.destroyForwardingHostFnCtx(ctx, child.allocator);
                             try child.forwarding_ctxs.append(child.allocator, ctx);
                             try hi.members.put(child.allocator, exp.name, .{ .func = .{
                                 .context = ctx,
@@ -1517,7 +1541,7 @@ pub const ComponentInstance = struct {
         // Forwarding contexts / synthetic host instances are owned by
         // this instance because its `imports` map borrows them. Free
         // them before tearing down `imports` itself.
-        for (self.forwarding_ctxs.items) |ctx| self.allocator.destroy(ctx);
+        for (self.forwarding_ctxs.items) |ctx| executor_mod.destroyForwardingHostFnCtx(ctx, self.allocator);
         self.forwarding_ctxs.deinit(self.allocator);
         for (self.synthetic_host_instances.items) |hi| {
             hi.deinit(self.allocator);
