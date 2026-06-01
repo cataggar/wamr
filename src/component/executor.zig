@@ -212,10 +212,56 @@ pub fn callRealloc(
 /// owner-relative `ExportedFunc.Local` produced by
 /// `flattenForwardedChain` — or built directly from a `canon.lift`
 /// when the parent's component-func-index resolves to `.lifted`.
+///
+/// `param_types` / `result_types` snapshot the **child-side** func
+/// signature so the cross-memory marshaler can drive its per-element
+/// list walks (#726). Both slices are owned by `child.allocator`; free
+/// them via `deinit`. `registry` is a value-type view over
+/// `child.component` and outlives the ctx.
 pub const ForwardingHostFnCtx = struct {
     owner: *const ComponentInstance,
     local: ComponentInstance.ExportedFunc.Local,
+    param_types: []const ctypes.ValType = &.{},
+    result_types: []const ctypes.ValType = &.{},
+    registry: TypeRegistry = .{ .types = &.{} },
+
+    pub fn deinit(self: *ForwardingHostFnCtx, allocator: Allocator) void {
+        if (self.param_types.len > 0) allocator.free(self.param_types);
+        if (self.result_types.len > 0) allocator.free(self.result_types);
+    }
 };
+
+/// Build a `ForwardingHostFnCtx` populated with the child-side func
+/// signature so the cross-memory marshaler can drive typed walks of
+/// `list<compound>` payloads (#726). Caller owns the returned pointer
+/// and must release via `destroyForwardingHostFnCtx`.
+pub fn buildForwardingHostFnCtx(
+    allocator: Allocator,
+    owner: *const ComponentInstance,
+    local: ComponentInstance.ExportedFunc.Local,
+    ft: ctypes.FuncType,
+    registry: TypeRegistry,
+) !*ForwardingHostFnCtx {
+    const ctx = try allocator.create(ForwardingHostFnCtx);
+    errdefer allocator.destroy(ctx);
+    const params = try getParamValTypes(ft, allocator);
+    errdefer allocator.free(params);
+    const results = try getResultValTypes(ft, allocator);
+    errdefer allocator.free(results);
+    ctx.* = .{
+        .owner = owner,
+        .local = local,
+        .param_types = params,
+        .result_types = results,
+        .registry = registry,
+    };
+    return ctx;
+}
+
+pub fn destroyForwardingHostFnCtx(ctx: *ForwardingHostFnCtx, allocator: Allocator) void {
+    ctx.deinit(allocator);
+    allocator.destroy(ctx);
+}
 
 /// `HostFunc.call` adapter for forwarding contexts. Ignores the
 /// trampoline's `ci` (the child whose core call invoked the import)
@@ -250,11 +296,21 @@ pub fn forwardingHostFnCall(
     // single arena so cleanup is `arena.deinit()`. (#719 Bug B path 2.)
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    const have_types = ctx.param_types.len == args.len;
     var needs_rewrite = false;
-    for (args) |a| {
-        if (interfaceValueContainsPtrLen(a)) {
-            needs_rewrite = true;
-            break;
+    if (have_types) {
+        for (ctx.param_types) |pt| {
+            if (valTypeHasPtrLen(ctx.registry, pt)) {
+                needs_rewrite = true;
+                break;
+            }
+        }
+    } else {
+        for (args) |a| {
+            if (interfaceValueContainsPtrLen(a)) {
+                needs_rewrite = true;
+                break;
+            }
         }
     }
     var effective_args: []const InterfaceValue = args;
@@ -263,12 +319,19 @@ pub fn forwardingHostFnCall(
         const arena_alloc = arena.allocator();
         const buf = try arena_alloc.alloc(InterfaceValue, args.len);
         for (args, 0..) |a, i| {
-            buf[i] = try marshalValueAcrossMemory(ci, owner_mut, a, arena_alloc);
+            buf[i] = if (have_types)
+                try marshalValueAcrossMemoryTyped(ci, owner_mut, a, ctx.param_types[i], ctx.registry, arena_alloc)
+            else
+                try marshalValueAcrossMemory(ci, owner_mut, a, arena_alloc);
         }
         effective_args = buf;
     }
     try callComponentFuncByLocal(ctx.owner, ctx.local, effective_args, out_results, allocator);
-    try rewriteResultsBackToCaller(ci, @constCast(ctx.owner), out_results, allocator);
+    if (have_types) {
+        try rewriteResultsBackToCallerTyped(ci, @constCast(ctx.owner), out_results, ctx.result_types, ctx.registry, allocator);
+    } else {
+        try rewriteResultsBackToCaller(ci, @constCast(ctx.owner), out_results, allocator);
+    }
 }
 
 /// Mirror of the arg-side marshaling block in `forwardingHostFnCall`,
@@ -330,6 +393,36 @@ fn rewriteResultsBackToCaller(
         const translated = try rewriteValueBackToCallerOwned(caller, callee, original, allocator);
         original.deinit(allocator);
         slot.* = translated;
+    }
+}
+
+/// Typed companion to `rewriteResultsBackToCaller`. Used when
+/// `forwardingHostFnCall` has populated `ctx.result_types` so
+/// `list<compound>` results can be element-walked per #726.
+fn rewriteResultsBackToCallerTyped(
+    caller: *ComponentInstance,
+    callee: *ComponentInstance,
+    out_results: []InterfaceValue,
+    result_types: []const ctypes.ValType,
+    reg: TypeRegistry,
+    allocator: Allocator,
+) anyerror!void {
+    if (caller == callee) return;
+    var needs_rewrite = false;
+    for (result_types) |rt| {
+        if (valTypeHasPtrLen(reg, rt)) {
+            needs_rewrite = true;
+            break;
+        }
+    }
+    if (!needs_rewrite) return;
+    const n = @min(out_results.len, result_types.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const original = out_results[i];
+        const translated = try rewriteValueBackToCallerOwnedTyped(caller, callee, original, result_types[i], reg, allocator);
+        original.deinit(allocator);
+        out_results[i] = translated;
     }
 }
 
@@ -530,6 +623,421 @@ fn marshalValueAcrossMemory(
             return .{ .result_val = .{ .is_ok = r.is_ok, .payload = new_payload } };
         },
         // Pure scalars / handles / flags / enums: no nested PtrLen.
+        else => return val,
+    }
+}
+
+// ── #726: typed cross-memory marshaling for `list<compound>` ────────────────
+//
+// `marshalValueAcrossMemory` / `rewriteValueBackToCallerOwned`
+// (PR #725 / #727) walk the InterfaceValue tree alone, so `.list` is
+// byte-copied opaque. For `list<string>`, `list<record { ...: string }>`,
+// `list<list<u8>>`, `list<option<string>>`, `list<result<string, _>>`,
+// `list<variant ... with string arms>` and `list<tuple<u32, string>>`
+// the inner (ptr, len) tuples stay pointing into the source memory —
+// the same class of bug PR #725 fixed for top-level compounds.
+//
+// The typed variants below take a `(t, reg)` pair and, when `.list`
+// elements themselves contain a PtrLen, re-lift / re-lower each
+// element through `canonical_abi.loadValReg` / `storeValReg` against
+// the source/destination memories so element-internal pointers are
+// translated correctly. Pure-scalar element types still take the
+// existing opaque-bytes fast path.
+
+/// Recursive: does the canonical-ABI representation of `t` carry any
+/// `.string` / `.list` payload that needs cross-memory translation?
+/// Lookups stop at unresolved/recursive types and conservatively
+/// return false (no translation), matching the pre-#726 behaviour for
+/// untyped values.
+fn valTypeHasPtrLen(reg: TypeRegistry, t: ctypes.ValType) bool {
+    switch (t) {
+        .string, .list => return true,
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .future, .stream, .error_context => return false,
+        else => {},
+    }
+    const td = reg.resolve(t) orelse return false;
+    return switch (td) {
+        .record => |r| blk: {
+            for (r.fields) |f| if (valTypeHasPtrLen(reg, f.type)) break :blk true;
+            break :blk false;
+        },
+        .tuple => |tup| blk: {
+            for (tup.fields) |f| if (valTypeHasPtrLen(reg, f)) break :blk true;
+            break :blk false;
+        },
+        .variant => |v| blk: {
+            for (v.cases) |c| if (c.type) |ct| if (valTypeHasPtrLen(reg, ct)) break :blk true;
+            break :blk false;
+        },
+        .option => |o| valTypeHasPtrLen(reg, o.inner),
+        .result => |r| (if (r.ok) |ok| valTypeHasPtrLen(reg, ok) else false) or
+            (if (r.err) |er| valTypeHasPtrLen(reg, er) else false),
+        .list => |l| valTypeHasPtrLen(reg, l.element) or true, // .list itself is a PtrLen
+        .flags, .enum_, .resource => false,
+        .val => |v| valTypeHasPtrLen(reg, v),
+        .func, .component, .instance => false,
+    };
+}
+
+/// Per-element list stride (size rounded up to element alignment).
+fn listElementStride(reg: TypeRegistry, elem_t: ctypes.ValType) u32 {
+    const sz = abi.sizeOfType(reg, elem_t);
+    const al = abi.alignOfType(reg, elem_t);
+    return abi.alignUp(sz, al);
+}
+
+/// Typed companion to `marshalValueAcrossMemory`. Drives per-element
+/// translation for `.list` when the element type contains a PtrLen;
+/// otherwise reuses the opaque-bytes fast path.
+fn marshalValueAcrossMemoryTyped(
+    src: *ComponentInstance,
+    dst: *ComponentInstance,
+    val: InterfaceValue,
+    t: ctypes.ValType,
+    reg: TypeRegistry,
+    arena: std.mem.Allocator,
+) anyerror!InterfaceValue {
+    switch (val) {
+        .string => |pl| {
+            if (pl.len == 0) return .{ .string = .{ .ptr = 0, .len = 0 } };
+            const bytes = src.readGuestBytes(pl.ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            const new_ptr = dst.hostAllocGuest(pl.len, 1) orelse
+                return error.ReallocFailed;
+            const dest = dst.writableGuestBytes(new_ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            @memcpy(dest, bytes);
+            return .{ .string = .{ .ptr = new_ptr, .len = pl.len } };
+        },
+        .list => |pl| {
+            if (pl.len == 0) return .{ .list = .{ .ptr = 0, .len = 0 } };
+            const elem_t = blk: {
+                const td = reg.resolve(t) orelse break :blk null;
+                break :blk switch (td) {
+                    .list => |l| l.element,
+                    else => null,
+                };
+            };
+            // Without a resolvable element type we can't compute
+            // stride/load/store; fall back to the opaque byte-copy.
+            // This is also the right behaviour for primitive-element
+            // lists where the bytewise copy already does the job.
+            if (elem_t == null or !valTypeHasPtrLen(reg, elem_t.?)) {
+                // Bytewise copy with correct stride: pl.len is the
+                // element count, not the byte size. For primitive
+                // elements stride == elemSize so this also handles
+                // alignment. For untyped fallback (elem_t == null)
+                // we have no stride info, so we delegate to the
+                // untyped helper which preserves the legacy behaviour
+                // for test-only paths that don't supply a registry.
+                if (elem_t == null) {
+                    return try marshalValueAcrossMemory(src, dst, val, arena);
+                }
+                const et2 = elem_t.?;
+                const stride2 = listElementStride(reg, et2);
+                const elem_align2 = abi.alignOfType(reg, et2);
+                const total_bytes2 = std.math.mul(u32, pl.len, stride2) catch
+                    return error.MemoryNotAvailable;
+                const bytes = src.readGuestBytes(pl.ptr, total_bytes2) orelse
+                    return error.MemoryNotAvailable;
+                const new_ptr = dst.hostAllocGuest(total_bytes2, elem_align2) orelse
+                    return error.ReallocFailed;
+                const dest = dst.writableGuestBytes(new_ptr, total_bytes2) orelse
+                    return error.MemoryNotAvailable;
+                @memcpy(dest, bytes);
+                return .{ .list = .{ .ptr = new_ptr, .len = pl.len } };
+            }
+            // Slow path: per-element re-lift / re-lower.
+            const et = elem_t.?;
+            const stride = listElementStride(reg, et);
+            const elem_align = abi.alignOfType(reg, et);
+            const total_bytes = std.math.mul(u32, pl.len, stride) catch
+                return error.MemoryNotAvailable;
+            const src_bytes = src.readGuestBytes(pl.ptr, total_bytes) orelse
+                return error.MemoryNotAvailable;
+            const new_ptr = dst.hostAllocGuest(total_bytes, elem_align) orelse
+                return error.ReallocFailed;
+            // `loadValReg` reads ptrs out of src_bytes (so element
+            // PtrLens still address src memory); the translated value
+            // is then stored into dst_bytes via `storeValReg`.
+            var i: u32 = 0;
+            while (i < pl.len) : (i += 1) {
+                const off: u32 = i * stride;
+                const lifted = try abi.loadValReg(src_bytes, off, et, reg, arena);
+                const translated = try marshalValueAcrossMemoryTyped(src, dst, lifted, et, reg, arena);
+                // Re-read writable dst_bytes inside the loop in case
+                // `dst.hostAllocGuest` invalidated the previous view
+                // (memory.grow during a nested element translation).
+                const dst_bytes = dst.writableGuestBytes(new_ptr, total_bytes) orelse
+                    return error.MemoryNotAvailable;
+                try abi.storeValReg(dst_bytes, off, et, translated, reg);
+            }
+            return .{ .list = .{ .ptr = new_ptr, .len = pl.len } };
+        },
+        .record_val => |fields| {
+            const td = reg.resolve(t);
+            const field_types: ?[]const ctypes.Field = if (td) |d| switch (d) {
+                .record => |r| r.fields,
+                else => null,
+            } else null;
+            const out = try arena.alloc(InterfaceValue, fields.len);
+            for (fields, 0..) |f, i| {
+                if (field_types) |ft| if (i < ft.len) {
+                    out[i] = try marshalValueAcrossMemoryTyped(src, dst, f, ft[i].type, reg, arena);
+                    continue;
+                };
+                out[i] = try marshalValueAcrossMemory(src, dst, f, arena);
+            }
+            return .{ .record_val = out };
+        },
+        .tuple_val => |fields| {
+            const td = reg.resolve(t);
+            const field_types: ?[]const ctypes.ValType = if (td) |d| switch (d) {
+                .tuple => |tup| tup.fields,
+                else => null,
+            } else null;
+            const out = try arena.alloc(InterfaceValue, fields.len);
+            for (fields, 0..) |f, i| {
+                if (field_types) |ft| if (i < ft.len) {
+                    out[i] = try marshalValueAcrossMemoryTyped(src, dst, f, ft[i], reg, arena);
+                    continue;
+                };
+                out[i] = try marshalValueAcrossMemory(src, dst, f, arena);
+            }
+            return .{ .tuple_val = out };
+        },
+        .variant_val => |v| {
+            const td = reg.resolve(t);
+            const case_t: ?ctypes.ValType = if (td) |d| switch (d) {
+                .variant => |vt| if (v.discriminant < vt.cases.len) vt.cases[v.discriminant].type else null,
+                else => null,
+            } else null;
+            const new_payload: ?*const InterfaceValue = if (v.payload) |p| blk: {
+                const nv = try arena.create(InterfaceValue);
+                nv.* = if (case_t) |ct|
+                    try marshalValueAcrossMemoryTyped(src, dst, p.*, ct, reg, arena)
+                else
+                    try marshalValueAcrossMemory(src, dst, p.*, arena);
+                break :blk nv;
+            } else null;
+            return .{ .variant_val = .{ .discriminant = v.discriminant, .payload = new_payload } };
+        },
+        .option_val => |o| {
+            const td = reg.resolve(t);
+            const inner_t: ?ctypes.ValType = if (td) |d| switch (d) {
+                .option => |ot| ot.inner,
+                else => null,
+            } else null;
+            const new_payload: ?*const InterfaceValue = if (o.payload) |p| blk: {
+                const nv = try arena.create(InterfaceValue);
+                nv.* = if (inner_t) |it|
+                    try marshalValueAcrossMemoryTyped(src, dst, p.*, it, reg, arena)
+                else
+                    try marshalValueAcrossMemory(src, dst, p.*, arena);
+                break :blk nv;
+            } else null;
+            return .{ .option_val = .{ .is_some = o.is_some, .payload = new_payload } };
+        },
+        .result_val => |r| {
+            const td = reg.resolve(t);
+            const arm_t: ?ctypes.ValType = if (td) |d| switch (d) {
+                .result => |rt| if (r.is_ok) rt.ok else rt.err,
+                else => null,
+            } else null;
+            const new_payload: ?*const InterfaceValue = if (r.payload) |p| blk: {
+                const nv = try arena.create(InterfaceValue);
+                nv.* = if (arm_t) |at|
+                    try marshalValueAcrossMemoryTyped(src, dst, p.*, at, reg, arena)
+                else
+                    try marshalValueAcrossMemory(src, dst, p.*, arena);
+                break :blk nv;
+            } else null;
+            return .{ .result_val = .{ .is_ok = r.is_ok, .payload = new_payload } };
+        },
+        else => return val,
+    }
+}
+
+/// Typed companion to `rewriteValueBackToCallerOwned`. Mirror of
+/// `marshalValueAcrossMemoryTyped` for the result direction: deep-copy
+/// into `allocator` so the existing `InterfaceValue.deinit` ownership
+/// contract continues to hold at the call site.
+fn rewriteValueBackToCallerOwnedTyped(
+    caller: *ComponentInstance,
+    callee: *ComponentInstance,
+    val: InterfaceValue,
+    t: ctypes.ValType,
+    reg: TypeRegistry,
+    allocator: Allocator,
+) anyerror!InterfaceValue {
+    switch (val) {
+        .string => |pl| {
+            if (pl.len == 0) return .{ .string = .{ .ptr = 0, .len = 0 } };
+            const bytes = callee.readGuestBytes(pl.ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            const new_ptr = caller.hostAllocGuest(pl.len, 1) orelse
+                return error.ReallocFailed;
+            const dest = caller.writableGuestBytes(new_ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            @memcpy(dest, bytes);
+            return .{ .string = .{ .ptr = new_ptr, .len = pl.len } };
+        },
+        .list => |pl| {
+            if (pl.len == 0) return .{ .list = .{ .ptr = 0, .len = 0 } };
+            const elem_t = blk: {
+                const td = reg.resolve(t) orelse break :blk null;
+                break :blk switch (td) {
+                    .list => |l| l.element,
+                    else => null,
+                };
+            };
+            if (elem_t == null or !valTypeHasPtrLen(reg, elem_t.?)) {
+                if (elem_t == null) {
+                    return try rewriteValueBackToCallerOwned(caller, callee, val, allocator);
+                }
+                const et2 = elem_t.?;
+                const stride2 = listElementStride(reg, et2);
+                const elem_align2 = abi.alignOfType(reg, et2);
+                const total_bytes2 = std.math.mul(u32, pl.len, stride2) catch
+                    return error.MemoryNotAvailable;
+                const bytes = callee.readGuestBytes(pl.ptr, total_bytes2) orelse
+                    return error.MemoryNotAvailable;
+                const new_ptr = caller.hostAllocGuest(total_bytes2, elem_align2) orelse
+                    return error.ReallocFailed;
+                const dest = caller.writableGuestBytes(new_ptr, total_bytes2) orelse
+                    return error.MemoryNotAvailable;
+                @memcpy(dest, bytes);
+                return .{ .list = .{ .ptr = new_ptr, .len = pl.len } };
+            }
+            const et = elem_t.?;
+            const stride = listElementStride(reg, et);
+            const elem_align = abi.alignOfType(reg, et);
+            const total_bytes = std.math.mul(u32, pl.len, stride) catch
+                return error.MemoryNotAvailable;
+            const src_bytes = callee.readGuestBytes(pl.ptr, total_bytes) orelse
+                return error.MemoryNotAvailable;
+            const new_ptr = caller.hostAllocGuest(total_bytes, elem_align) orelse
+                return error.ReallocFailed;
+            var i: u32 = 0;
+            while (i < pl.len) : (i += 1) {
+                const off: u32 = i * stride;
+                // Use a transient arena for the lifted intermediate so
+                // we don't leak callee-side allocations into the
+                // caller-owned tree's allocator. The intermediate is
+                // freed by `arena.deinit` at end of element.
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const arena_alloc = arena.allocator();
+                const lifted = try abi.loadValReg(src_bytes, off, et, reg, arena_alloc);
+                // Translate into caller memory through the typed
+                // marshaler (writes new ptrs through caller.hostAllocGuest).
+                const translated = try marshalValueAcrossMemoryTyped(callee, caller, lifted, et, reg, arena_alloc);
+                const dst_bytes = caller.writableGuestBytes(new_ptr, total_bytes) orelse
+                    return error.MemoryNotAvailable;
+                try abi.storeValReg(dst_bytes, off, et, translated, reg);
+            }
+            return .{ .list = .{ .ptr = new_ptr, .len = pl.len } };
+        },
+        .record_val => |fields| {
+            const td = reg.resolve(t);
+            const field_types: ?[]const ctypes.Field = if (td) |d| switch (d) {
+                .record => |r| r.fields,
+                else => null,
+            } else null;
+            const out = try allocator.alloc(InterfaceValue, fields.len);
+            errdefer allocator.free(out);
+            var produced: usize = 0;
+            errdefer for (out[0..produced]) |o| o.deinit(allocator);
+            for (fields, 0..) |f, i| {
+                out[i] = if (field_types) |ft|
+                    (if (i < ft.len)
+                        try rewriteValueBackToCallerOwnedTyped(caller, callee, f, ft[i].type, reg, allocator)
+                    else
+                        try rewriteValueBackToCallerOwned(caller, callee, f, allocator))
+                else
+                    try rewriteValueBackToCallerOwned(caller, callee, f, allocator);
+                produced = i + 1;
+            }
+            return .{ .record_val = out };
+        },
+        .tuple_val => |fields| {
+            const td = reg.resolve(t);
+            const field_types: ?[]const ctypes.ValType = if (td) |d| switch (d) {
+                .tuple => |tup| tup.fields,
+                else => null,
+            } else null;
+            const out = try allocator.alloc(InterfaceValue, fields.len);
+            errdefer allocator.free(out);
+            var produced: usize = 0;
+            errdefer for (out[0..produced]) |o| o.deinit(allocator);
+            for (fields, 0..) |f, i| {
+                out[i] = if (field_types) |ft|
+                    (if (i < ft.len)
+                        try rewriteValueBackToCallerOwnedTyped(caller, callee, f, ft[i], reg, allocator)
+                    else
+                        try rewriteValueBackToCallerOwned(caller, callee, f, allocator))
+                else
+                    try rewriteValueBackToCallerOwned(caller, callee, f, allocator);
+                produced = i + 1;
+            }
+            return .{ .tuple_val = out };
+        },
+        .variant_val => |v| {
+            const td = reg.resolve(t);
+            const case_t: ?ctypes.ValType = if (td) |d| switch (d) {
+                .variant => |vt| if (v.discriminant < vt.cases.len) vt.cases[v.discriminant].type else null,
+                else => null,
+            } else null;
+            const new_payload: ?*const InterfaceValue = if (v.payload) |p| blk: {
+                const nv = try allocator.create(InterfaceValue);
+                errdefer allocator.destroy(nv);
+                nv.* = if (case_t) |ct|
+                    try rewriteValueBackToCallerOwnedTyped(caller, callee, p.*, ct, reg, allocator)
+                else
+                    try rewriteValueBackToCallerOwned(caller, callee, p.*, allocator);
+                break :blk nv;
+            } else null;
+            return .{ .variant_val = .{ .discriminant = v.discriminant, .payload = new_payload } };
+        },
+        .option_val => |o| {
+            const td = reg.resolve(t);
+            const inner_t: ?ctypes.ValType = if (td) |d| switch (d) {
+                .option => |ot| ot.inner,
+                else => null,
+            } else null;
+            const new_payload: ?*const InterfaceValue = if (o.payload) |p| blk: {
+                const nv = try allocator.create(InterfaceValue);
+                errdefer allocator.destroy(nv);
+                nv.* = if (inner_t) |it|
+                    try rewriteValueBackToCallerOwnedTyped(caller, callee, p.*, it, reg, allocator)
+                else
+                    try rewriteValueBackToCallerOwned(caller, callee, p.*, allocator);
+                break :blk nv;
+            } else null;
+            return .{ .option_val = .{ .is_some = o.is_some, .payload = new_payload } };
+        },
+        .result_val => |r| {
+            const td = reg.resolve(t);
+            const arm_t: ?ctypes.ValType = if (td) |d| switch (d) {
+                .result => |rt| if (r.is_ok) rt.ok else rt.err,
+                else => null,
+            } else null;
+            const new_payload: ?*const InterfaceValue = if (r.payload) |p| blk: {
+                const nv = try allocator.create(InterfaceValue);
+                errdefer allocator.destroy(nv);
+                nv.* = if (arm_t) |at|
+                    try rewriteValueBackToCallerOwnedTyped(caller, callee, p.*, at, reg, allocator)
+                else
+                    try rewriteValueBackToCallerOwned(caller, callee, p.*, allocator);
+                break :blk nv;
+            } else null;
+            return .{ .result_val = .{ .is_ok = r.is_ok, .payload = new_payload } };
+        },
+        .flags_val => |words| {
+            const copy = try allocator.alloc(u32, words.len);
+            @memcpy(copy, words);
+            return .{ .flags_val = copy };
+        },
         else => return val,
     }
 }
@@ -8780,4 +9288,235 @@ test "rewriteResultsBackToCaller: no-op when caller == callee" {
     // No rewrite, ptr unchanged.
     try testing.expectEqual(ptr, out_results[0].string.ptr);
     try testing.expectEqual(@as(u32, msg.len), out_results[0].string.len);
+}
+
+test "valTypeHasPtrLen: scalars vs strings vs lists vs nested compounds (#726)" {
+    const testing = std.testing;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{
+            // 0: list<string>
+            .{ .list = .{ .element = .string } },
+            // 1: list<u32>
+            .{ .list = .{ .element = .u32 } },
+            // 2: record { name: string, age: u32 }
+            .{ .record = .{ .fields = &.{
+                .{ .name = "name", .type = .string },
+                .{ .name = "age", .type = .u32 },
+            } } },
+            // 3: record { id: u32, name: string }
+            // 4: tuple<u32, u32>
+            .{ .tuple = .{ .fields = &.{ .u32, .u32 } } },
+        },
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const reg = abi.TypeRegistry.init(&comp);
+
+    try testing.expect(!valTypeHasPtrLen(reg, .u32));
+    try testing.expect(!valTypeHasPtrLen(reg, .u64));
+    try testing.expect(!valTypeHasPtrLen(reg, .bool));
+    try testing.expect(valTypeHasPtrLen(reg, .string));
+    try testing.expect(valTypeHasPtrLen(reg, .{ .list = 0 })); // list<string>
+    try testing.expect(valTypeHasPtrLen(reg, .{ .list = 1 })); // list<u32> — still a PtrLen itself
+    try testing.expect(valTypeHasPtrLen(reg, .{ .record = 2 })); // record has string field
+    try testing.expect(!valTypeHasPtrLen(reg, .{ .tuple = 4 })); // pure u32 tuple
+}
+
+test "marshalValueAcrossMemoryTyped: list<string> element ptrs translated to dst memory (#726)" {
+    const testing = std.testing;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{
+            // 0: list<string>
+            .{ .list = .{ .element = .string } },
+        },
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const src = try instance_mod.instantiate(&comp, testing.allocator);
+    defer src.deinit();
+    try src.enableTestMem(testing.allocator, 4096);
+    defer src.disableTestMem();
+
+    const dst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer dst.deinit();
+    try dst.enableTestMem(testing.allocator, 4096);
+    defer dst.disableTestMem();
+
+    // Skew dst's bump so dst pointers can't accidentally equal src pointers.
+    _ = dst.hostAllocGuest(128, 1).?;
+
+    // Plant the three element string payloads in src.
+    const msgs = [_][]const u8{ "alpha", "beta", "gamma-longer" };
+    var src_ptrs: [3]u32 = undefined;
+    for (msgs, 0..) |m, i| {
+        src_ptrs[i] = src.hostAllocAndWrite(m, 1).?;
+    }
+
+    // Plant the (ptr, len) array (3 elements × 8 bytes = 24 bytes) in src.
+    const list_ptr = src.hostAllocGuest(24, 4).?;
+    {
+        const list_bytes = src.writableGuestBytes(list_ptr, 24).?;
+        for (msgs, 0..) |m, i| {
+            const off = i * 8;
+            std.mem.writeInt(u32, list_bytes[off..][0..4], src_ptrs[i], .little);
+            std.mem.writeInt(u32, list_bytes[off + 4 ..][0..4], @intCast(m.len), .little);
+        }
+    }
+
+    const val: InterfaceValue = .{ .list = .{ .ptr = list_ptr, .len = @intCast(msgs.len) } };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const reg = abi.TypeRegistry.init(&comp);
+    const out = try marshalValueAcrossMemoryTyped(src, dst, val, .{ .list = 0 }, reg, arena.allocator());
+
+    // Outer list ptr must have moved into dst.
+    try testing.expect(out.list.ptr != list_ptr);
+    try testing.expectEqual(@as(u32, msgs.len), out.list.len);
+
+    // Read the translated (ptr, len) array out of dst and verify each
+    // element ptr is in dst (not in src) and payload bytes match.
+    const dst_list_bytes = dst.readGuestBytes(out.list.ptr, 24).?;
+    for (msgs, 0..) |m, i| {
+        const off = i * 8;
+        const new_elem_ptr = std.mem.readInt(u32, dst_list_bytes[off..][0..4], .little);
+        const new_elem_len = std.mem.readInt(u32, dst_list_bytes[off + 4 ..][0..4], .little);
+        try testing.expect(new_elem_ptr != src_ptrs[i]);
+        try testing.expectEqual(@as(u32, @intCast(m.len)), new_elem_len);
+        const new_bytes = dst.readGuestBytes(new_elem_ptr, new_elem_len).?;
+        try testing.expectEqualStrings(m, new_bytes);
+    }
+}
+
+test "marshalValueAcrossMemoryTyped: list<u32> uses fast bytewise copy (#726)" {
+    const testing = std.testing;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{
+            // 0: list<u32>
+            .{ .list = .{ .element = .u32 } },
+        },
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const src = try instance_mod.instantiate(&comp, testing.allocator);
+    defer src.deinit();
+    try src.enableTestMem(testing.allocator, 4096);
+    defer src.disableTestMem();
+
+    const dst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer dst.deinit();
+    try dst.enableTestMem(testing.allocator, 4096);
+    defer dst.disableTestMem();
+
+    _ = dst.hostAllocGuest(64, 1).?;
+
+    const values = [_]u32{ 0x11111111, 0x22222222, 0x33333333, 0x44444444 };
+    const total_bytes: u32 = @intCast(values.len * 4);
+    const src_ptr = src.hostAllocGuest(total_bytes, 4).?;
+    {
+        const sb = src.writableGuestBytes(src_ptr, total_bytes).?;
+        for (values, 0..) |v, i| {
+            std.mem.writeInt(u32, sb[i * 4 ..][0..4], v, .little);
+        }
+    }
+
+    const val: InterfaceValue = .{ .list = .{ .ptr = src_ptr, .len = @intCast(values.len) } };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const reg = abi.TypeRegistry.init(&comp);
+    const out = try marshalValueAcrossMemoryTyped(src, dst, val, .{ .list = 0 }, reg, arena.allocator());
+
+    try testing.expect(out.list.ptr != src_ptr);
+    try testing.expectEqual(@as(u32, values.len), out.list.len);
+    const dst_bytes = dst.readGuestBytes(out.list.ptr, total_bytes).?;
+    for (values, 0..) |v, i| {
+        const got = std.mem.readInt(u32, dst_bytes[i * 4 ..][0..4], .little);
+        try testing.expectEqual(v, got);
+    }
+}
+
+test "rewriteValueBackToCallerOwnedTyped: list<string> translated callee→caller (#726)" {
+    const testing = std.testing;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{
+            .{ .list = .{ .element = .string } },
+        },
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const caller = try instance_mod.instantiate(&comp, testing.allocator);
+    defer caller.deinit();
+    try caller.enableTestMem(testing.allocator, 4096);
+    defer caller.disableTestMem();
+
+    const callee = try instance_mod.instantiate(&comp, testing.allocator);
+    defer callee.deinit();
+    try callee.enableTestMem(testing.allocator, 4096);
+    defer callee.disableTestMem();
+
+    _ = caller.hostAllocGuest(96, 1).?;
+
+    // Plant a list<string> with two elements in callee memory.
+    const msgs = [_][]const u8{ "first-result", "second" };
+    var callee_ptrs: [2]u32 = undefined;
+    for (msgs, 0..) |m, i| {
+        callee_ptrs[i] = callee.hostAllocAndWrite(m, 1).?;
+    }
+    const list_ptr = callee.hostAllocGuest(16, 4).?;
+    {
+        const lb = callee.writableGuestBytes(list_ptr, 16).?;
+        for (msgs, 0..) |m, i| {
+            std.mem.writeInt(u32, lb[i * 8 ..][0..4], callee_ptrs[i], .little);
+            std.mem.writeInt(u32, lb[i * 8 + 4 ..][0..4], @intCast(m.len), .little);
+        }
+    }
+
+    const original: InterfaceValue = .{ .list = .{ .ptr = list_ptr, .len = @intCast(msgs.len) } };
+    const reg = abi.TypeRegistry.init(&comp);
+    const out = try rewriteValueBackToCallerOwnedTyped(caller, callee, original, .{ .list = 0 }, reg, testing.allocator);
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.list.ptr != list_ptr);
+    try testing.expectEqual(@as(u32, msgs.len), out.list.len);
+    const cb = caller.readGuestBytes(out.list.ptr, 16).?;
+    for (msgs, 0..) |m, i| {
+        const np = std.mem.readInt(u32, cb[i * 8 ..][0..4], .little);
+        const nl = std.mem.readInt(u32, cb[i * 8 + 4 ..][0..4], .little);
+        try testing.expect(np != callee_ptrs[i]);
+        try testing.expectEqual(@as(u32, @intCast(m.len)), nl);
+        try testing.expectEqualStrings(m, caller.readGuestBytes(np, nl).?);
+    }
 }
