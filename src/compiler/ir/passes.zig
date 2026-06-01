@@ -123,24 +123,7 @@ pub const LoadFrameStack = struct {
 /// G loop back-edge / dominated loop body — #734
 /// H barrier in then + store in else / merge — #734
 pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
-    return switch (op) {
-        .call,
-        .call_indirect,
-        .call_ref,
-        .atomic_load,
-        .atomic_store,
-        .atomic_rmw,
-        .atomic_cmpxchg,
-        .atomic_fence,
-        .atomic_notify,
-        .atomic_wait,
-        .memory_copy,
-        .memory_fill,
-        .memory_init,
-        .memory_grow,
-        => true,
-        else => false,
-    };
+    return alias_class.opIsLoadBarrier(op);
 }
 
 /// Owns a dominator-tree child adjacency whose ordering preserves the
@@ -13048,12 +13031,18 @@ test "GVN load: call in sibling block invalidates dominator-cached load on merge
     const entry = try func.newBlock();
     const sib = try func.newBlock();
     const tail = try func.newBlock();
+    try func.getBlock(sib).addPredecessor(entry);
+    try func.getBlock(tail).addPredecessor(entry);
+    try func.getBlock(tail).addPredecessor(sib);
+
     const v_base = func.newVReg();
     const cond = func.newVReg();
     const v_dom = func.newVReg();
     const v_c = func.newVReg();
     const v_tail = func.newVReg();
 
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond, .type = .i32 });
     try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
     try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = sib, .else_block = tail } } });
 
@@ -13064,6 +13053,7 @@ test "GVN load: call in sibling block invalidates dominator-cached load on merge
     try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
 
     _ = try globalValueNumbering(&func, allocator);
+    try verifier.verifyFunction(&func, 0, .paranoid, allocator);
     // tail's ret must still reference v_tail — the load must survive.
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
     // tail's first instruction must still be the load itself.
