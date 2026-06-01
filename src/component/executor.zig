@@ -224,10 +224,28 @@ pub const ForwardingHostFnCtx = struct {
     param_types: []const ctypes.ValType = &.{},
     result_types: []const ctypes.ValType = &.{},
     registry: TypeRegistry = .{ .types = &.{} },
+    /// Per-trampoline extended TypeRegistry slot table. Used when the
+    /// FuncType being forwarded was lifted out of an instance-type body
+    /// whose nested `.record`/`.result`/etc. references use indices
+    /// LOCAL to that body's decl space. Empty for top-level imports.
+    /// Allocated by `buildInstanceTypeExtension`; freed in `deinit`
+    /// with a deep walk of `extended_types`.
+    extended_types: []const ctypes.TypeDef = &.{},
+    extended_indexspace: []const ?u32 = &.{},
 
     pub fn deinit(self: *ForwardingHostFnCtx, allocator: Allocator) void {
         if (self.param_types.len > 0) allocator.free(self.param_types);
         if (self.result_types.len > 0) allocator.free(self.result_types);
+        if (self.extended_types.len > 0) {
+            for (self.extended_types) |td| switch (td) {
+                .record => |rec| allocator.free(rec.fields),
+                .tuple => |tup| allocator.free(tup.fields),
+                .variant => |v| allocator.free(v.cases),
+                else => {},
+            };
+            allocator.free(self.extended_types);
+        }
+        if (self.extended_indexspace.len > 0) allocator.free(self.extended_indexspace);
     }
 };
 
@@ -261,6 +279,38 @@ pub fn buildForwardingHostFnCtx(
 pub fn destroyForwardingHostFnCtx(ctx: *ForwardingHostFnCtx, allocator: Allocator) void {
     ctx.deinit(allocator);
     allocator.destroy(ctx);
+}
+
+/// Like `buildForwardingHostFnCtx`, but takes pre-rewritten ValType
+/// slices for `param_types` / `result_types` plus an instance-type
+/// extension. Used when the FuncType being forwarded was lifted from
+/// an instance-type body whose local type indexspace must be merged
+/// into the registry via `TypeRegistry.fromExtended` so canon-ABI
+/// resolution sees through `.result` / `.record` / etc. references.
+///
+/// Ownership: the ctx takes ownership of all four passed slices and
+/// frees them via `deinit`.
+pub fn buildForwardingHostFnCtxWithExtension(
+    allocator: Allocator,
+    owner: *const ComponentInstance,
+    local: ComponentInstance.ExportedFunc.Local,
+    param_types: []const ctypes.ValType,
+    result_types: []const ctypes.ValType,
+    registry: TypeRegistry,
+    extended_types: []const ctypes.TypeDef,
+    extended_indexspace: []const ?u32,
+) !*ForwardingHostFnCtx {
+    const ctx = try allocator.create(ForwardingHostFnCtx);
+    ctx.* = .{
+        .owner = owner,
+        .local = local,
+        .param_types = param_types,
+        .result_types = result_types,
+        .registry = registry,
+        .extended_types = extended_types,
+        .extended_indexspace = extended_indexspace,
+    };
+    return ctx;
 }
 
 /// `HostFunc.call` adapter for forwarding contexts. Ignores the

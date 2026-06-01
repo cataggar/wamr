@@ -1302,13 +1302,75 @@ pub const ComponentInstance = struct {
                                 .func => |f| f,
                                 else => return error.SubComponentLinkFailed,
                             };
-                            const member_reg = @import("canonical_abi.zig").TypeRegistry.init(child.component);
-                            const ctx = try executor_mod.buildForwardingHostFnCtx(
+
+                            // The FuncType lives inside the instance-type body,
+                            // so its param/result `.record`/`.result`/`.list`/etc.
+                            // type-index references are LOCAL to that body's decl
+                            // space — NOT the child's outer component
+                            // type-indexspace. If we hand `child.component`'s
+                            // registry to the forwarding ctx as-is, the cross-
+                            // memory rewriter's `valTypeHasPtrLen` walks the
+                            // outer indexspace at the local index and gets back
+                            // garbage (e.g. the keyvault repro's tcgc.compile
+                            // result type — `result<string,string>` — resolved
+                            // through the OUTER registry to an `.instance`
+                            // TypeDef and `needs_rewrite` came back `false`).
+                            // That caused the lifted string ptr — which points
+                            // into TCGC's 31 MiB memory — to never get
+                            // translated into the caller's (codegen-cli's)
+                            // 22 MiB memory; canon-lift validation then tripped
+                            // and the AOT dispatcher returned a sentinel that
+                            // the guest tried to JSON.parse as a `len`, leading
+                            // to the `unreachable` crash. (#743 / sibling of
+                            // #719 / #729 — same instance-type-local index bug.)
+                            //
+                            // Build a per-trampoline extension that materializes
+                            // the instance body's local type space at an absolute
+                            // offset, rewrite each ValType to the absolute index,
+                            // and hand the ctx a `fromExtended` registry that
+                            // can resolve both spaces.
+                            const ext_base: u32 = if (child.component.type_indexspace.len > 0)
+                                @intCast(child.component.type_indexspace.len)
+                            else
+                                @intCast(child.component.types.len);
+                            const ext = buildInstanceTypeExtension(child.allocator, decls, ext_base, child.component) catch
+                                return error.OutOfMemory;
+                            errdefer ext.deinit(child.allocator, true);
+
+                            const member_params = try child.allocator.alloc(ctypes.ValType, member_ft.params.len);
+                            errdefer child.allocator.free(member_params);
+                            for (member_ft.params, 0..) |p, i| {
+                                member_params[i] = rewriteValTypeAbsolute(ext_base, p.type);
+                            }
+                            const member_results: []ctypes.ValType = switch (member_ft.results) {
+                                .none => try child.allocator.alloc(ctypes.ValType, 0),
+                                .unnamed => |t| blk: {
+                                    const r = try child.allocator.alloc(ctypes.ValType, 1);
+                                    r[0] = rewriteValTypeAbsolute(ext_base, t);
+                                    break :blk r;
+                                },
+                                .named => |named| blk: {
+                                    const r = try child.allocator.alloc(ctypes.ValType, named.len);
+                                    for (named, 0..) |n, i| r[i] = rewriteValTypeAbsolute(ext_base, n.type);
+                                    break :blk r;
+                                },
+                            };
+                            errdefer child.allocator.free(member_results);
+
+                            const member_reg = @import("canonical_abi.zig").TypeRegistry.fromExtended(
+                                child.component,
+                                ext.extension_types,
+                                ext.extension_indexspace,
+                            );
+                            const ctx = try executor_mod.buildForwardingHostFnCtxWithExtension(
                                 child.allocator,
                                 flat.owner,
                                 flat.local,
-                                member_ft,
+                                member_params,
+                                member_results,
                                 member_reg,
+                                ext.extension_types,
+                                ext.extension_indexspace,
                             );
                             errdefer executor_mod.destroyForwardingHostFnCtx(ctx, child.allocator);
                             try child.forwarding_ctxs.append(child.allocator, ctx);
