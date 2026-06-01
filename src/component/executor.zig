@@ -518,36 +518,36 @@ pub fn callComponentFuncByLocal(
         frame.pushSlot(.{ .i32 = @bitCast(ptr) }) catch return error.StackOverflow;
     }
 
-    // 4b. Spilled-result mode on AOT: caller-allocates retptr and
-    // passes it as the trailing core arg. The core function returns
-    // void in this mode. (Canon ABI v1 spec; matches the convention
-    // wit-bindgen emits on AOT-compiled guests.)
+    // 4b. Spilled-result mode: per canon-ABI v1 spec for canon.lift,
+    // when `flat_count(results) > MAX_FLAT_RESULTS` the lifted core
+    // function uses CALLEE-allocates — it allocates the result buffer
+    // (via its own realloc) and returns the pointer as a single i32
+    // result. The caller does NOT pass a retptr. This matches what
+    // wit-bindgen / rust-wit-bindgen emit on both interp and AOT.
     //
-    // The interp path uses callee-allocates: the core returns the
-    // retptr it allocated itself, popped after executeCore below.
-    var aot_retptr: ?u32 = null;
-    if (is_aot and flat_result_count > MAX_FLAT_RESULTS and result_types.len > 0) {
-        const realloc_idx = resolved_realloc_idx orelse return error.ReallocNotAvailable;
-        const ret_size = computeTupleSize(registry, result_types);
-        const ret_align = computeTupleAlign(registry, result_types);
-        const rp = try callRealloc(&frame, realloc_idx, 0, 0, ret_align, ret_size);
-        // Re-fetch memory after realloc.
-        memory = frame.memory(default_mem_idx);
-        frame.pushSlot(.{ .i32 = @bitCast(rp) }) catch return error.StackOverflow;
-        aot_retptr = rp;
-    }
+    // Earlier this path had a backend split (AOT caller-allocates,
+    // interp callee-allocates), which broke real components: tcgc.compile
+    // is emitted as `(param i32 i32 i32 i32) (result i32)` and the
+    // AOT-pushed extra retptr arg was simply ignored, so the result
+    // pointer was never read — see #719.
 
     // 5. Compute core result types for executeCore. Advisory for
     // interp (signature comes from the module); load-bearing for AOT
     // since callFuncScalar needs an accurate signature. Only compute
     // it for AOT — for interp we pass an empty slice and let
     // `executeFunction` read the core sig from the module.
+    //
+    // Spilled-result lift returns the retptr as a single i32 (callee-
+    // allocates); other cases return the (single) flat result.
     var core_rt_buf: [1]core_types.ValType = undefined;
     const core_result_types: []const core_types.ValType = if (!is_aot)
         &.{}
-    else if (flat_result_count > MAX_FLAT_RESULTS or result_types.len == 0)
+    else if (result_types.len == 0)
         &.{}
-    else blk: {
+    else if (flat_result_count > MAX_FLAT_RESULTS) blk: {
+        core_rt_buf[0] = .i32;
+        break :blk core_rt_buf[0..1];
+    } else blk: {
         core_rt_buf[0] = coreFlatSlotType(result_types[0], registry) catch
             return error.AotPathUnsupported;
         break :blk core_rt_buf[0..1];
@@ -593,15 +593,11 @@ pub fn callComponentFuncByLocal(
             out_results[i] = popInterfaceValue(&frame, rt, registry, allocator) catch return error.LiftError;
         }
     } else {
-        // Spilled-result path — read tuple from linear memory.
-        // Backend split: AOT pre-allocated the retptr (caller-
-        // allocates); interp expects the callee to return it.
-        if (aot_retptr) |rp| {
-            result_ptr_for_post_return = rp;
-        } else {
-            const popped = frame.popSlot(.i32) catch return error.StackUnderflow;
-            result_ptr_for_post_return = @bitCast(popped.i32);
-        }
+        // Spilled-result path — callee allocated the buffer and
+        // returned its pointer as a single i32 (canon-ABI v1 lift
+        // convention). Pop it and read the tuple from linear memory.
+        const popped = frame.popSlot(.i32) catch return error.StackUnderflow;
+        result_ptr_for_post_return = @bitCast(popped.i32);
         // Re-fetch memory after executeCore — the core function may
         // have grown linear memory, invalidating the captured slice.
         memory = frame.memory(default_mem_idx);
@@ -636,9 +632,11 @@ pub fn callComponentFuncByLocal(
 /// Map a single-flat-slot interface result type to its core wasm
 /// value type. Only valid when the interface type flattens to exactly
 /// one core slot (i.e. `flat_result_count <= MAX_FLAT_RESULTS=1`).
-/// Multi-slot results spill to memory and the core function returns
-/// void instead — see the `aot_retptr` / `flat_result_count >
-/// MAX_FLAT_RESULTS` branch in `callComponentFuncByLocal`.
+/// Multi-slot results spill to memory: the lifted core function
+/// callee-allocates the buffer (via realloc) and returns its pointer
+/// as a single i32 (canon-ABI v1 spilled-result convention) — see
+/// the `flat_result_count > MAX_FLAT_RESULTS` branch in
+/// `callComponentFuncByLocal`.
 fn coreFlatSlotType(t: ctypes.ValType, registry: TypeRegistry) !core_types.ValType {
     return switch (t) {
         .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char => .i32,

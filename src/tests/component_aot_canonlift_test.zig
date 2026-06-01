@@ -296,25 +296,28 @@ test "#650 phase A: AOT lifts result<(),()> via scalar fast path" {
 //   * `realloc(orig, sz, align, new_sz)` — fixed-bump allocator
 //      that always returns 16, so the lifted return tuple lands
 //      at offset 16 in linear memory.
-//   * `wp(retptr)` — writes 0x000000AA at retptr+0 and 0x000000BB
-//      at retptr+4, returns no flat results.
+//   * `wp()` — writes 0x000000AA at offset 16 and 0x000000BB at
+//      offset 20, returns the retptr (16) as a single i32 result.
 //
 // canon.lift retypes `wp` as `func() -> tuple<u32, u32>`. The lifted
 // type flattens to 2 i32 slots, exceeding `MAX_FLAT_RESULTS=1`, so
-// canon ABI emits the core function as `(retptr) -> ()` and the
-// AOT path must (a) call realloc to obtain retptr, (b) push retptr
-// as the trailing i32 arg, and (c) read both u32 fields back from
-// linear memory via `loadInterfaceValue`.
+// canon ABI v1 spilled-result convention applies: the core function
+// is emitted as `() -> i32` (CALLEE-allocates retptr) — the callee
+// allocates the buffer via its own realloc and returns the pointer.
+// The lift trampoline pops the i32 retptr and reads both u32 fields
+// back from linear memory via `loadInterfaceValue`.
 //
 // Pre-phase-B.1 this lift hit `error.AotPathUnsupported` on
 // `result_types.len > MAX_FLAT_RESULTS` (which conflated interface
-// arity with flat slot count anyway).
+// arity with flat slot count anyway). Pre-#719 the AOT path used
+// caller-allocates (passing retptr as a trailing arg, expecting void
+// return) which mismatched what wit-bindgen actually emits.
 const retptr_core_wasm = [_]u8{
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-    // type section: 2 types
+    // type section: 2 types (size = 9 + 4 = 13)
     0x01, 0x0d, 0x02,
     0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, // realloc: (i32,i32,i32,i32) -> i32
-    0x60, 0x01, 0x7f, 0x00, // wp: (i32) -> ()
+    0x60, 0x00, 0x01, 0x7f, // wp: () -> i32
     // func section: 2 funcs
     0x03, 0x03, 0x02, 0x00, 0x01,
     // memory section: 1 page
@@ -324,14 +327,19 @@ const retptr_core_wasm = [_]u8{
     0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
     0x07, 'r', 'e', 'a', 'l', 'l', 'o', 'c', 0x00, 0x00,
     0x02, 'w', 'p', 0x00, 0x01,
-    // code section: 2 funcs (payload=25 = count(1) + body0(5) + body1(19))
-    0x0a, 0x19, 0x02,
+    // code section: 2 funcs (payload = count(1) + body0(5) + body1(21) = 27)
+    0x0a, 0x1b, 0x02,
     0x04, 0x00, 0x41, 0x10, 0x0b, // realloc: i32.const 16; end
-    // wp body (size=18): 00 20 00 41 AA 01 36 02 00 20 00 41 BB 01 36 02 04 0b
-    0x12,
+    // wp body (size=20): locals(0) +
+    //   i32.const 16; i32.const 0xAA; i32.store offset=0
+    //   i32.const 16; i32.const 0xBB; i32.store offset=4
+    //   i32.const 16          ;; return retptr
+    //   end
+    0x14,
     0x00,
-    0x20, 0x00, 0x41, 0xaa, 0x01, 0x36, 0x02, 0x00,
-    0x20, 0x00, 0x41, 0xbb, 0x01, 0x36, 0x02, 0x04,
+    0x41, 0x10, 0x41, 0xaa, 0x01, 0x36, 0x02, 0x00,
+    0x41, 0x10, 0x41, 0xbb, 0x01, 0x36, 0x02, 0x04,
+    0x41, 0x10,
     0x0b,
 };
 
@@ -563,19 +571,21 @@ test "#650 commit 2: AOT lowers tuple<u32,u32> as multi-slot compound param" {
 // Two-stage lowering on the AOT path:
 //   1. list<u8> flattens to 2 i32 slots (ptr, len) — fits flat, no spill.
 //   2. string flattens to 2 i32 slots — > MAX_FLAT_RESULTS=1 → spilled.
-//      AOT uses caller-allocates: host calls `realloc(0,0,4,8)` to
-//      reserve 8 bytes for the (str_ptr, str_len) tuple, then passes
-//      retptr as the trailing core arg. Core returns void.
+//      AOT uses callee-allocates (canon-ABI v1 lift convention,
+//      matching wit-bindgen): core is emitted as
+//      `(list_ptr, list_len) -> retptr`. Core allocates the
+//      (str_ptr, str_len) buffer via its own realloc and returns
+//      the pointer as a single i32 result.
 //
 // Core wasm:
-//   func[0] realloc:  (i32 i32 i32 i32) -> i32           ;; returns 16
-//   func[1] cast:     (list_ptr list_len retptr) -> ()   ;; stores list_ptr/len at retptr+{0,4}
+//   func[0] realloc:  (i32 i32 i32 i32) -> i32      ;; returns 16
+//   func[1] cast:     (list_ptr list_len) -> i32    ;; stores list_ptr/len at 16+{0,4}, returns 16
 const list_to_string_core_wasm = [_]u8{
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-    // type section: 2 types
+    // type section: 2 types (size = 9 + 6 = 15)
     0x01, 0x0f, 0x02,
-    0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, // realloc: (i32,i32,i32,i32) -> i32 (8 bytes)
-    0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00, // cast: (i32,i32,i32) -> () (6 bytes)
+    0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, // realloc: (i32,i32,i32,i32) -> i32 (9 bytes)
+    0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // cast: (i32,i32) -> i32 (6 bytes)
     // func section: 2 funcs (types 0 and 1)
     0x03, 0x03, 0x02, 0x00, 0x01,
     // memory section: 1 page
@@ -588,15 +598,19 @@ const list_to_string_core_wasm = [_]u8{
     0x04, 'c', 'a', 's', 't', 0x00, 0x01,
     // code section: 2 funcs
     // body0 (realloc): 0x00 0x41 0x10 0x0b = 4 bytes (preceded by size 0x04)
-    // body1 (cast): locals(0) + 2× (local.get x; local.get y; i32.store memarg) + end
-    //   = 0x00 + (0x20 0x02 0x20 0x00 0x36 0x02 0x00) + (0x20 0x02 0x20 0x01 0x36 0x02 0x04) + 0x0b
-    //   = 1 + 7 + 7 + 1 = 16 bytes (preceded by size 0x10)
-    // section payload = count(1) + len-prefix(1)+body0(4) + len-prefix(1)+body1(16) = 23
-    0x0a, 0x17, 0x02,
+    // body1 (cast, callee-allocates): locals(0) +
+    //   i32.const 16; local.get 0; i32.store offset=0
+    //   i32.const 16; local.get 1; i32.store offset=4
+    //   i32.const 16              ;; return retptr
+    //   end
+    //   = 1 + (2+2+3) + (2+2+3) + 2 + 1 = 18 bytes (preceded by size 0x12)
+    // section payload = count(1) + len-prefix(1)+body0(4) + len-prefix(1)+body1(18) = 25
+    0x0a, 0x19, 0x02,
     0x04, 0x00, 0x41, 0x10, 0x0b,
-    0x10, 0x00,
-    0x20, 0x02, 0x20, 0x00, 0x36, 0x02, 0x00,
-    0x20, 0x02, 0x20, 0x01, 0x36, 0x02, 0x04,
+    0x12, 0x00,
+    0x41, 0x10, 0x20, 0x00, 0x36, 0x02, 0x00,
+    0x41, 0x10, 0x20, 0x01, 0x36, 0x02, 0x04,
+    0x41, 0x10,
     0x0b,
 };
 
