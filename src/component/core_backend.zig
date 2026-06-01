@@ -159,6 +159,21 @@ pub fn debugAotEnabled() bool {
     return aot_debug_enabled;
 }
 
+/// Process-global toggle that converts the cross-instance AOT fast-thunk's
+/// "caller memory != target memory" warning into a typed trap. Off by
+/// default; `main.zig` sets it during startup when `WAMR_TRAP_CROSS_MEMORY_THUNK`
+/// is set to a non-empty / non-`0` / non-`false` value. See the dispatcher
+/// in `executor.dispatchAotCrossInstance` and #719 Bug B for context.
+var trap_cross_memory_enabled: bool = false;
+
+pub fn setTrapCrossMemoryEnabled(on: bool) void {
+    trap_cross_memory_enabled = on;
+}
+
+pub fn trapCrossMemoryEnabled() bool {
+    return trap_cross_memory_enabled;
+}
+
 /// Caller-supplied instantiation options.
 pub const Options = struct {
     precompiled_cores: []const PrecompiledCore = &.{},

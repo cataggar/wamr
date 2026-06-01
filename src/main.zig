@@ -50,6 +50,20 @@ pub fn main(init: std.process.Init) !u8 {
         const on = !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
         wamr.component_core_backend.setDebugAotEnabled(on);
     }
+    // Process-global toggle for the AOT cross-instance fast-thunk
+    // cross-memory guard (#719 Bug B). The thunk forwards raw core args
+    // between sibling AOT instances with no canon.lower / canon.lift
+    // marshaling; when source and target memories differ, any i32 the
+    // caller intended as a pointer silently dereferences whatever bytes
+    // live at the same numeric offset in the target's memory. By default
+    // we only `std.log.warn` (once per import) on first detection so
+    // working configurations aren't broken; when this env var is set we
+    // also trap, which converts silent corruption into a clean error
+    // with the import label.
+    if (init.environ_map.get("WAMR_TRAP_CROSS_MEMORY_THUNK")) |v| {
+        const on = !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
+        wamr.component_core_backend.setTrapCrossMemoryEnabled(on);
+    }
     // Per-member adapter-call trace (#715). When `WAMR_TRACE_CLI_ADAPTER`
     // is set to a non-empty / non-`0` / non-`false` value, every call
     // into a `WasiCliAdapter` filesystem host import emits an
