@@ -6497,15 +6497,29 @@ pub const CrossInstanceThunkCtx = struct {
     result_types: []const core_types.ValType,
     /// Human-readable label used in trap-shaped error messages.
     label: []const u8,
+    /// True once we've already complained about a caller / target memory
+    /// mismatch for this import. The fast thunk forwards raw core args
+    /// between sibling AOT instances with no canon.lower / canon.lift
+    /// marshaling, so any i32 that the caller intended as a *pointer into
+    /// its own linear memory* gets passed to the target unchanged and
+    /// silently dereferences whatever (unrelated) bytes happen to live at
+    /// the same numeric offset in the target's memory — corrupting
+    /// dlmalloc bookkeeping or worse. We can't distinguish "ptr i32" from
+    /// "scalar i32" at this layer, but if both source and target share the
+    /// same memory the forwarding is a no-op and safe, so the mismatch
+    /// itself is a strong red flag worth surfacing once per import.
+    /// (#719 Bug B follow-up.)
+    cross_memory_warned: bool = false,
 };
 
 /// Cross-instance core-to-core dispatcher (#662). The trampoline pool stub
 /// shifts caller regs right by one to inject `slot` as the first C-ABI arg,
 /// so when the AOT codegen calls a host import as
 /// `host_fn(vmctx, arg0, arg1, …)`, the dispatcher receives
-/// `(slot, a0=vmctx, a1=arg0, a2=arg1, …, a9=arg8)`. We ignore `a0`
-/// (importer's vmctx — the sibling AotInstance builds its own vmctx
-/// internally in `callFuncScalar`) and use `a1..a9` as lowered wasm args.
+/// `(slot, a0=vmctx, a1=arg0, a2=arg1, …, a9=arg8)`. `a0` is the *importer's*
+/// vmctx — the sibling AotInstance builds its own vmctx internally in
+/// `callFuncScalar`, but we peek at the importer's `memory_base` for the
+/// cross-memory guard (#719 Bug B); `a1..a9` are the lowered wasm args.
 /// Calls outside the trampoline pool's 9-arg-in-regs envelope return a
 /// failing status; richer signatures land in a follow-up. The 5 → 8 widening
 /// in #689 covered WASIp2 filesystem methods like `link-at` (7 wasm params);
@@ -6525,9 +6539,8 @@ pub export fn wamrAotDispatchCrossInstance(
     a8: u64,
     a9: u64,
 ) callconv(.c) host_trampolines.DispatchResult {
-    _ = a0; // importer's vmctx; the sibling AotInstance builds its own.
-    const ctx: *const CrossInstanceThunkCtx = @ptrCast(@alignCast(ctx_opaque));
-    const result = dispatchAotCrossInstance(ctx, lowered_sig.*, .{ a1, a2, a3, a4, a5, a6, a7, a8, a9, 0 }) catch |err| {
+    const ctx: *CrossInstanceThunkCtx = @ptrCast(@alignCast(ctx_opaque));
+    const result = dispatchAotCrossInstance(ctx, lowered_sig.*, a0, .{ a1, a2, a3, a4, a5, a6, a7, a8, a9, 0 }) catch |err| {
         if (debugAotEnabled()) {
             std.debug.print(
                 "[aot-dispatch] cross-instance thunk '{s}' failed: {s}\n",
@@ -6540,8 +6553,9 @@ pub export fn wamrAotDispatchCrossInstance(
 }
 
 fn dispatchAotCrossInstance(
-    ctx: *const CrossInstanceThunkCtx,
+    ctx: *CrossInstanceThunkCtx,
     lowered_sig: host_trampolines.LoweredSig,
+    caller_vmctx: u64,
     arg_regs: [10]u64,
 ) !u64 {
     // We support up to 9 args in registers (a1..a9 in the dispatcher's
@@ -6554,6 +6568,33 @@ fn dispatchAotCrossInstance(
     if (lowered_sig.result_types.len != ctx.result_types.len) return error.UnsupportedSignature;
     for (lowered_sig.param_types, ctx.param_types) |a, b| if (a != b) return error.UnsupportedSignature;
     for (lowered_sig.result_types, ctx.result_types) |a, b| if (a != b) return error.UnsupportedSignature;
+
+    // Cross-memory guard (#719 Bug B follow-up). The fast thunk forwards
+    // raw core args between sibling AOT instances with no canon.lower /
+    // canon.lift marshaling. If the caller's i32s denote pointers into
+    // *its own* linear memory and the target has a different memory,
+    // they dereference garbage on the target side — typically corrupting
+    // the target's dlmalloc bookkeeping with a static-data address that
+    // happens to live at the same numeric offset. We can't distinguish
+    // "ptr i32" from "scalar i32" without component-level type info, but
+    // the memory mismatch *itself* is the strong signal worth surfacing.
+    // One-shot per ctx to keep the log readable.
+    if (!ctx.cross_memory_warned and caller_vmctx != 0 and hasPotentialPtr(ctx.param_types)) {
+        const vm: *const aot_runtime.VmCtx = @ptrFromInt(@as(usize, @intCast(caller_vmctx)));
+        const caller_mb = vm.memory_base;
+        if (ctx.target_ai.memories.len > 0) {
+            const target_mb = @intFromPtr(ctx.target_ai.memories[0].data.ptr);
+            if (caller_mb != 0 and caller_mb != target_mb) {
+                ctx.cross_memory_warned = true;
+                std.log.warn(
+                    "[aot cross-instance] '{s}': caller memory_base=0x{x} != target memory_base=0x{x}; sig has {d} i32 param(s) that may be pointers. " ++
+                        "If this import takes string/list args, the call will silently corrupt the target's heap; set WAMR_TRAP_CROSS_MEMORY_THUNK=1 to convert this into a trap.",
+                    .{ ctx.label, caller_mb, target_mb, countI32Params(ctx.param_types) },
+                );
+                if (trapCrossMemoryEnabled()) return error.CrossMemoryFastThunkUnsupported;
+            }
+        }
+    }
 
     var args_buf: [9]core_types.Value = undefined;
     for (ctx.param_types, 0..) |pt, i| {
@@ -6584,6 +6625,23 @@ fn dispatchAotCrossInstance(
         .f64 => @bitCast(results[0].f64),
         else => error.UnsupportedSignature,
     };
+}
+
+fn hasPotentialPtr(types: []const core_types.ValType) bool {
+    for (types) |t| if (t == .i32) return true;
+    return false;
+}
+
+fn countI32Params(types: []const core_types.ValType) usize {
+    var n: usize = 0;
+    for (types) |t| if (t == .i32) {
+        n += 1;
+    };
+    return n;
+}
+
+fn trapCrossMemoryEnabled() bool {
+    return core_backend.trapCrossMemoryEnabled();
 }
 
 /// Canon-builtin dispatcher for AOT-compiled core modules (#701, follow-up
