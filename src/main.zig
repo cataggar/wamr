@@ -73,6 +73,11 @@ pub fn main(init: std.process.Init) !u8 {
         const on = !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
         wasi_cli_adapter_trace_enabled = on;
     }
+    if (init.environ_map.get("WAMR_TRAP_OOB_DUMP")) |v| {
+        if (v.len > 0) {
+            wamr.aot_runtime.g_trap_oob_dump_env = v;
+        }
+    }
     if (args.len < 2) {
         std.debug.print("error: missing subcommand — try `wamr help`\n", .{});
         return 2;

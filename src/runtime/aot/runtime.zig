@@ -52,6 +52,9 @@ const windows_trap_supported = builtin.os.tag == .windows and builtin.cpu.arch =
 var g_saved_ctx: windows.CONTEXT align(16) = undefined;
 var g_trap_catching: bool = false;
 var g_trap_occurred: bool = false;
+/// Forensic dump targets parsed from `WAMR_TRAP_OOB_DUMP`; populated by
+/// `main.zig` at startup. See `aotTrapOobDumpMem` (#719).
+pub var g_trap_oob_dump_env: ?[]const u8 = null;
 /// Exception code of the last fault vehHandler redirected to trapLongjmp.
 /// Sampled by `callFuncScalar` after trap return to decide whether to
 /// re-arm the thread's stack guard page (see `resetStackGuardPage`).
@@ -511,6 +514,24 @@ fn lookupLocalFuncName(local_idx: isize) ?[]const u8 {
     return null;
 }
 
+/// Probe entry-point intended to be called from gdb / watchpoint scripts
+/// to map an arbitrary native PC to (local_func, rel_off, name) using the
+/// currently-installed trap-decode globals. Prints one line on stderr.
+pub export fn aotProbeDecodePc(pc: usize) callconv(.c) void {
+    const loc = decodeTrapReturnAddress(pc);
+    if (loc.name) |name| {
+        std.debug.print(
+            "[probe] pc=0x{x} code+0x{x} local_func[{d}] \"{s}\"+0x{x}\n",
+            .{ pc, loc.code_off, loc.func_idx, name, loc.rel_off },
+        );
+    } else {
+        std.debug.print(
+            "[probe] pc=0x{x} code+0x{x} local_func[{d}]+0x{x}\n",
+            .{ pc, loc.code_off, loc.func_idx, loc.rel_off },
+        );
+    }
+}
+
 pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     const loc = decodeTrapReturnAddress(@returnAddress());
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) {
@@ -530,7 +551,73 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
             .{ loc.code_off, loc.func_idx, loc.rel_off, vmctx.memory_size },
         );
     }
+    aotTrapOobDumpMem(vmctx);
     std.process.exit(2);
+}
+
+/// Forensic dump for #719. Enabled by `WAMR_TRAP_OOB_DUMP=<hex>[,<hex>...]`
+/// (each value is a wasm linear-memory address). For every address we
+/// print the surrounding 64 bytes, and if the 32-bit value there looks
+/// like a valid wasm-memory pointer we follow it and print 64 bytes
+/// there too. Intentionally side-effect free if the env var is unset.
+fn aotTrapOobDumpMem(vmctx: *VmCtx) void {
+    const env = g_trap_oob_dump_env orelse return;
+    if (vmctx.memory_base == 0 or vmctx.memory_size == 0) return;
+    const mem: [*]const u8 = @ptrFromInt(vmctx.memory_base);
+
+    var it = std.mem.splitScalar(u8, env, ',');
+    while (it.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const hex = if (std.mem.startsWith(u8, trimmed, "0x") or std.mem.startsWith(u8, trimmed, "0X"))
+            trimmed[2..]
+        else
+            trimmed;
+        const addr = std.fmt.parseInt(u64, hex, 16) catch {
+            std.debug.print("[trap-dump] bad hex token: '{s}'\n", .{trimmed});
+            continue;
+        };
+        dumpAddr(mem, vmctx.memory_size, addr, 0);
+    }
+}
+
+fn dumpAddr(mem: [*]const u8, mem_size: usize, addr: u64, depth: u8) void {
+    const start: u64 = if (addr >= 32) addr - 32 else 0;
+    const end: u64 = @min(addr + 64, mem_size);
+    if (start >= end) {
+        std.debug.print("[trap-dump] addr=0x{x} OUT OF RANGE (mem_size=0x{x})\n", .{ addr, mem_size });
+        return;
+    }
+    std.debug.print("[trap-dump] addr=0x{x} window [0x{x}..0x{x}):\n", .{ addr, start, end });
+    var off: u64 = start;
+    while (off < end) : (off += 16) {
+        const row_end = @min(off + 16, end);
+        std.debug.print("  0x{x:0>8}:", .{off});
+        var i: u64 = off;
+        while (i < row_end) : (i += 1) {
+            std.debug.print(" {x:0>2}", .{mem[@intCast(i)]});
+        }
+        var pad: u64 = row_end;
+        while (pad < off + 16) : (pad += 1) std.debug.print("   ", .{});
+        std.debug.print("  |", .{});
+        i = off;
+        while (i < row_end) : (i += 1) {
+            const c = mem[@intCast(i)];
+            std.debug.print("{c}", .{if (c >= 0x20 and c < 0x7f) c else @as(u8, '.')});
+        }
+        std.debug.print("|\n", .{});
+    }
+
+    if (depth >= 2) return;
+    // Try interpreting the aligned u32 at `addr` as a wasm-memory pointer
+    // and recurse one level so we can chase treebin-slot → chunk-header.
+    if (addr + 4 <= mem_size and addr % 4 == 0) {
+        const ptr_le = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(mem + addr)), .little);
+        if (ptr_le != 0 and ptr_le < mem_size) {
+            std.debug.print("[trap-dump]   *(u32)0x{x} = 0x{x} (in-range; following)\n", .{ addr, ptr_le });
+            dumpAddr(mem, mem_size, ptr_le, depth + 1);
+        }
+    }
 }
 
 /// Resolve the trapping wasm function from `@returnAddress()` for the
@@ -1409,6 +1496,15 @@ fn refreshVmCtxMemory(vmctx: *VmCtx, mem: *types.MemoryInstance) void {
     vmctx.memory_size = @as(usize, mem.current_pages) * types.MemoryInstance.page_size;
     vmctx.memory_max_size = mem.data.len;
     vmctx.memory_pages = mem.current_pages;
+    // #719 forensic aid: when the trap-OOB dump env var is set, also log
+    // the host base addr for every memory we attach so a gdb hardware
+    // watchpoint can be placed on `mem_base + wasm_offset` cheaply.
+    if (g_trap_oob_dump_env != null) {
+        std.debug.print(
+            "[mem-base] host_base=0x{x} wasm_size=0x{x} max=0x{x}\n",
+            .{ vmctx.memory_base, vmctx.memory_size, vmctx.memory_max_size },
+        );
+    }
 }
 
 fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
