@@ -267,7 +267,162 @@ pub fn forwardingHostFnCall(
         }
         effective_args = buf;
     }
-    return callComponentFuncByLocal(ctx.owner, ctx.local, effective_args, out_results, allocator);
+    try callComponentFuncByLocal(ctx.owner, ctx.local, effective_args, out_results, allocator);
+    try rewriteResultsBackToCaller(ci, @constCast(ctx.owner), out_results, allocator);
+}
+
+/// Mirror of the arg-side marshaling block in `forwardingHostFnCall`,
+/// applied to the results returned by `callComponentFuncByLocal`.
+///
+/// Background (#719 Bug B, Path 3): a sibling/parent-component's lifted
+/// callee returns `out_results` whose `.string` / `.list` PtrLens point
+/// into the CALLEE's linear memory. When control returns to the child
+/// component that originally invoked the import, the caller's
+/// trampoline lowers those PtrLens back onto its own core stack (or
+/// stores them at `retptr` in its own linear memory). At that point
+/// the i32 ptr is reinterpreted at the same numeric offset inside the
+/// CALLER's memory — wrong memory, silent corruption (or a clean
+/// `LiftedResultInvariantViolated` trap when `validateCanonPtrLenValue`
+/// catches it).
+///
+/// This helper walks the returned tree and translates every nested
+/// PtrLen from callee-memory (`callee`) back into caller-memory
+/// (`caller`) via `caller.hostAllocGuest` + bytewise copy. After it
+/// runs, the caller's downstream lowering writes pointers that are
+/// valid in its own memory.
+///
+/// Bytes copied during arg-side marshaling (`marshalValueAcrossMemory`
+/// allocated into callee memory) and any extra callee-side allocations
+/// done by the lifted call body remain live in the callee — there is
+/// no general way to free them here without a per-component
+/// post-return hook. This matches the pre-existing arg-side
+/// asymmetry: cross-component byte-copies leak into the dst memory
+/// until that core instance is torn down. Out of scope for this PR;
+/// tracked separately.
+fn rewriteResultsBackToCaller(
+    caller: *ComponentInstance,
+    callee: *ComponentInstance,
+    out_results: []InterfaceValue,
+    allocator: Allocator,
+) anyerror!void {
+    if (caller == callee) return;
+    var needs_rewrite = false;
+    for (out_results) |r| {
+        if (interfaceValueContainsPtrLen(r)) {
+            needs_rewrite = true;
+            break;
+        }
+    }
+    if (!needs_rewrite) return;
+
+    // The translated tree is owned by an arena that the caller's
+    // downstream lowering does NOT free (it only reads the
+    // InterfaceValue's flat tags). We have to keep that storage alive
+    // for the duration of the caller's lowering. The simplest contract
+    // that doesn't require changing `out_results`' allocator is: free
+    // any compound payloads previously allocated against `allocator`
+    // (via `InterfaceValue.deinit`), then overwrite each slot in place
+    // with a fresh deep-copy whose compound payloads are re-allocated
+    // against `allocator`. This keeps the existing deinit-by-allocator
+    // ownership contract intact at every call site.
+    for (out_results) |*slot| {
+        const original = slot.*;
+        const translated = try rewriteValueBackToCallerOwned(caller, callee, original, allocator);
+        original.deinit(allocator);
+        slot.* = translated;
+    }
+}
+
+/// Deep-copy `val` and translate every nested `.string` / `.list`
+/// PtrLen from `callee` to `caller`. The returned tree owns its
+/// allocations via `allocator` so the caller's existing
+/// `InterfaceValue.deinit` cleanup contract continues to hold.
+fn rewriteValueBackToCallerOwned(
+    caller: *ComponentInstance,
+    callee: *ComponentInstance,
+    val: InterfaceValue,
+    allocator: Allocator,
+) anyerror!InterfaceValue {
+    switch (val) {
+        .string => |pl| {
+            if (pl.len == 0) return .{ .string = .{ .ptr = 0, .len = 0 } };
+            const bytes = callee.readGuestBytes(pl.ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            const new_ptr = caller.hostAllocGuest(pl.len, 1) orelse
+                return error.ReallocFailed;
+            const dest = caller.writableGuestBytes(new_ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            @memcpy(dest, bytes);
+            return .{ .string = .{ .ptr = new_ptr, .len = pl.len } };
+        },
+        .list => |pl| {
+            if (pl.len == 0) return .{ .list = .{ .ptr = 0, .len = 0 } };
+            const bytes = callee.readGuestBytes(pl.ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            const new_ptr = caller.hostAllocGuest(pl.len, 1) orelse
+                return error.ReallocFailed;
+            const dest = caller.writableGuestBytes(new_ptr, pl.len) orelse
+                return error.MemoryNotAvailable;
+            @memcpy(dest, bytes);
+            return .{ .list = .{ .ptr = new_ptr, .len = pl.len } };
+        },
+        .record_val => |fields| {
+            const out = try allocator.alloc(InterfaceValue, fields.len);
+            errdefer allocator.free(out);
+            var produced: usize = 0;
+            errdefer for (out[0..produced]) |o| o.deinit(allocator);
+            for (fields, 0..) |f, i| {
+                out[i] = try rewriteValueBackToCallerOwned(caller, callee, f, allocator);
+                produced = i + 1;
+            }
+            return .{ .record_val = out };
+        },
+        .tuple_val => |fields| {
+            const out = try allocator.alloc(InterfaceValue, fields.len);
+            errdefer allocator.free(out);
+            var produced: usize = 0;
+            errdefer for (out[0..produced]) |o| o.deinit(allocator);
+            for (fields, 0..) |f, i| {
+                out[i] = try rewriteValueBackToCallerOwned(caller, callee, f, allocator);
+                produced = i + 1;
+            }
+            return .{ .tuple_val = out };
+        },
+        .variant_val => |v| {
+            const new_payload: ?*const InterfaceValue = if (v.payload) |p| blk: {
+                const nv = try allocator.create(InterfaceValue);
+                errdefer allocator.destroy(nv);
+                nv.* = try rewriteValueBackToCallerOwned(caller, callee, p.*, allocator);
+                break :blk nv;
+            } else null;
+            return .{ .variant_val = .{ .discriminant = v.discriminant, .payload = new_payload } };
+        },
+        .option_val => |o| {
+            const new_payload: ?*const InterfaceValue = if (o.payload) |p| blk: {
+                const nv = try allocator.create(InterfaceValue);
+                errdefer allocator.destroy(nv);
+                nv.* = try rewriteValueBackToCallerOwned(caller, callee, p.*, allocator);
+                break :blk nv;
+            } else null;
+            return .{ .option_val = .{ .is_some = o.is_some, .payload = new_payload } };
+        },
+        .result_val => |r| {
+            const new_payload: ?*const InterfaceValue = if (r.payload) |p| blk: {
+                const nv = try allocator.create(InterfaceValue);
+                errdefer allocator.destroy(nv);
+                nv.* = try rewriteValueBackToCallerOwned(caller, callee, p.*, allocator);
+                break :blk nv;
+            } else null;
+            return .{ .result_val = .{ .is_ok = r.is_ok, .payload = new_payload } };
+        },
+        .flags_val => |words| {
+            const copy = try allocator.alloc(u32, words.len);
+            @memcpy(copy, words);
+            return .{ .flags_val = copy };
+        },
+        // Pure scalars / handles / enums: no nested PtrLen, no owned heap.
+        else => return val,
+    }
 }
 
 /// Cheap pre-flight: does `val` contain any `.string` / `.list` PtrLen,
@@ -8537,4 +8692,92 @@ test "interfaceValueContainsPtrLen: returns false for pure scalars" {
     try testing.expect(!interfaceValueContainsPtrLen(.{
         .option_val = .{ .is_some = true, .payload = &u32_payload },
     }));
+}
+
+test "rewriteResultsBackToCaller: nested string in result<string, _> translated callee→caller (#719 Path 3)" {
+    const testing = std.testing;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const caller = try instance_mod.instantiate(&comp, testing.allocator);
+    defer caller.deinit();
+    try caller.enableTestMem(testing.allocator, 4096);
+    defer caller.disableTestMem();
+
+    const callee = try instance_mod.instantiate(&comp, testing.allocator);
+    defer callee.deinit();
+    try callee.enableTestMem(testing.allocator, 4096);
+    defer callee.disableTestMem();
+
+    // Bump the caller's bump-allocator first so the freshly-translated
+    // ptr can't accidentally equal the callee ptr by sheer luck.
+    _ = caller.hostAllocGuest(64, 1).?;
+    const msg = "callee-allocated";
+    const callee_ptr = callee.hostAllocAndWrite(msg, 1).?;
+
+    // Build a result<string, _> as it would arrive from the callee.
+    const inner_str: InterfaceValue = .{ .string = .{ .ptr = callee_ptr, .len = @intCast(msg.len) } };
+    const inner_copy = try testing.allocator.create(InterfaceValue);
+    inner_copy.* = inner_str;
+    var out_results = [_]InterfaceValue{
+        .{ .result_val = .{ .is_ok = true, .payload = inner_copy } },
+    };
+    defer for (out_results) |r| r.deinit(testing.allocator);
+
+    try rewriteResultsBackToCaller(caller, callee, &out_results, testing.allocator);
+
+    try testing.expect(out_results[0].result_val.is_ok);
+    const new_pl = out_results[0].result_val.payload.?.*;
+    switch (new_pl) {
+        .string => |pl| {
+            try testing.expect(pl.ptr != callee_ptr);
+            try testing.expectEqual(@as(u32, msg.len), pl.len);
+            const caller_bytes = caller.readGuestBytes(pl.ptr, pl.len).?;
+            try testing.expectEqualStrings(msg, caller_bytes);
+        },
+        else => return error.UnexpectedTag,
+    }
+}
+
+test "rewriteResultsBackToCaller: no-op when caller == callee" {
+    const testing = std.testing;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    try inst.enableTestMem(testing.allocator, 4096);
+    defer inst.disableTestMem();
+
+    const msg = "intra-component";
+    const ptr = inst.hostAllocAndWrite(msg, 1).?;
+    var out_results = [_]InterfaceValue{
+        .{ .string = .{ .ptr = ptr, .len = @intCast(msg.len) } },
+    };
+
+    try rewriteResultsBackToCaller(inst, inst, &out_results, testing.allocator);
+
+    // No rewrite, ptr unchanged.
+    try testing.expectEqual(ptr, out_results[0].string.ptr);
+    try testing.expectEqual(@as(u32, msg.len), out_results[0].string.len);
 }
