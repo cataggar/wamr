@@ -277,3 +277,168 @@ test "dominator FRL: call in sibling branch invalidates merge-block forwarding (
     try testing.expectEqual(@as(usize, 2), t.instructions.items.len);
     try testing.expect(t.instructions.items[0].op == .load);
 }
+
+
+test "FRLDominator (cell C): call AFTER load in same block prevents later forwarding (#734)" {
+    // entry: load p[0]; call barrier; load p[0]; ret second load.
+    // FRL deletes fused loads, so both load instructions must remain.
+    const allocator = testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_first = func.newVReg();
+    const v_call = func.newVReg();
+    const v_second = func.newVReg();
+
+    const blk = &func.blocks.items[entry];
+    try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_first, .type = .i32 });
+    try blk.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_second, .type = .i32 });
+    try blk.append(.{ .op = .{ .ret = v_second }, .type = .i32 });
+
+    const changed = try forwardRedundantLoadsDominator(&func, allocator);
+    try testing.expect(!changed);
+    try testing.expectEqual(@as(usize, 4), blk.instructions.items.len);
+    try testing.expect(blk.instructions.items[0].op == .load);
+    try testing.expect(blk.instructions.items[2].op == .load);
+    try testing.expectEqual(ir.Inst.Op{ .ret = v_second }, blk.instructions.items[3].op);
+}
+
+test "FRLDominator (cell F): call in sibling SUBTREE invalidates merge forwarding (#719,#734)" {
+    // entry branches directly to tail or to a sibling subtree containing a call.
+    // The merge load is reachable through that deeper barrier subtree.
+    const allocator = testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const sib_top = try func.newBlock();
+    const sib_call = try func.newBlock();
+    const tail = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_tail = func.newVReg();
+
+    {
+        const blk = &func.blocks.items[entry];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+        try terminateBrIf(blk, cond, sib_top, tail);
+    }
+    {
+        const blk = &func.blocks.items[sib_top];
+        try terminateBr(blk, sib_call);
+    }
+    {
+        const blk = &func.blocks.items[sib_call];
+        try blk.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+        try terminateBr(blk, tail);
+    }
+    {
+        const blk = &func.blocks.items[tail];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+        try blk.append(.{ .op = .{ .ret = v_tail }, .type = .i32 });
+    }
+
+    _ = try forwardRedundantLoadsDominator(&func, allocator);
+    const t = &func.blocks.items[tail];
+    try testing.expectEqual(@as(usize, 2), t.instructions.items.len);
+    try testing.expect(t.instructions.items[0].op == .load);
+    try testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, t.instructions.items[1].op);
+}
+
+test "FRLDominator (cell G): call on loop back-edge invalidates dominated body forwarding (#734)" {
+    // entry loads, header may take a call-bearing latch back-edge, then body loads.
+    // The body load is reachable after the back-edge barrier and must survive.
+    const allocator = testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const latch = try func.newBlock();
+    const body = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_body = func.newVReg();
+
+    {
+        const blk = &func.blocks.items[entry];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+        try terminateBr(blk, header);
+    }
+    {
+        const blk = &func.blocks.items[header];
+        try terminateBrIf(blk, cond, latch, body);
+    }
+    {
+        const blk = &func.blocks.items[latch];
+        try blk.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+        try terminateBr(blk, header);
+    }
+    {
+        const blk = &func.blocks.items[body];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_body, .type = .i32 });
+        try blk.append(.{ .op = .{ .ret = v_body }, .type = .i32 });
+    }
+
+    _ = try forwardRedundantLoadsDominator(&func, allocator);
+    const b = &func.blocks.items[body];
+    try testing.expectEqual(@as(usize, 2), b.instructions.items.len);
+    try testing.expect(b.instructions.items[0].op == .load);
+    try testing.expectEqual(ir.Inst.Op{ .ret = v_body }, b.instructions.items[1].op);
+}
+
+test "FRLDominator (cell H): barrier in then-branch, store in else-branch, merge load not fused (#734)" {
+    // entry branches to a call in then or an aliasing store in else, then merges.
+    // The merge load is reachable through the barrier branch and must survive.
+    const allocator = testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const then_blk = try func.newBlock();
+    const else_blk = try func.newBlock();
+    const merge = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_store_val = func.newVReg();
+    const v_merge = func.newVReg();
+
+    {
+        const blk = &func.blocks.items[entry];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+        try terminateBrIf(blk, cond, then_blk, else_blk);
+    }
+    {
+        const blk = &func.blocks.items[then_blk];
+        try blk.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+        try terminateBr(blk, merge);
+    }
+    {
+        const blk = &func.blocks.items[else_blk];
+        try blk.append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_store_val } }, .type = .i32 });
+        try terminateBr(blk, merge);
+    }
+    {
+        const blk = &func.blocks.items[merge];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_merge, .type = .i32 });
+        try blk.append(.{ .op = .{ .ret = v_merge }, .type = .i32 });
+    }
+
+    _ = try forwardRedundantLoadsDominator(&func, allocator);
+    const m = &func.blocks.items[merge];
+    try testing.expectEqual(@as(usize, 2), m.instructions.items.len);
+    try testing.expect(m.instructions.items[0].op == .load);
+    try testing.expectEqual(ir.Inst.Op{ .ret = v_merge }, m.instructions.items[1].op);
+}

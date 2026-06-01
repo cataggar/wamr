@@ -112,6 +112,16 @@ pub const LoadFrameStack = struct {
 /// Returns true iff `op` is a coarse barrier that invalidates every
 /// load (memory + local) tracked by the dominator-scoped CSE/GVN.
 /// Mirrors the barrier set in `forward_redundant_loads.zig`.
+///
+/// Load-forwarding regression matrix (barrier position × load reachability):
+/// A none / linear chain — control tests
+/// B same block before load / direct successor — existing tests
+/// C same block after load / later same-block load — #734
+/// D dominator-path block / direct — existing tests
+/// E sibling block / common-ancestor merge — #719
+/// F sibling subtree one level deeper / common-ancestor merge — #734
+/// G loop back-edge / dominated loop body — #734
+/// H barrier in then + store in else / merge — #734
 pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
     return switch (op) {
         .call,
@@ -13089,4 +13099,249 @@ test "CSE load: call in sibling block invalidates dominator-cached load on merge
     _ = try commonSubexprElimination(&func, allocator);
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
     try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .load);
+}
+
+
+test "GVN load (cell C): call AFTER load in same block prevents fusion of later load (#734)" {
+    // entry: load p[0]; call barrier; load p[0]; ret second load.
+    // The pre-barrier load survives, and the post-barrier load is not fused.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_first = func.newVReg();
+    const v_call = func.newVReg();
+    const v_second = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_first, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_second, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .ret = v_second } });
+
+    const changed = try globalValueNumbering(&func, allocator);
+    try std.testing.expect(!changed);
+    const block = func.getBlock(entry);
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    try std.testing.expect(block.instructions.items[0].op == .load);
+    try std.testing.expect(block.instructions.items[2].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_second }, block.instructions.items[3].op);
+}
+
+test "GVN load (cell F): call in sibling SUBTREE invalidates merge forwarding (#719,#734)" {
+    // entry branches directly to tail or to a sibling subtree containing a call.
+    // The merge load is reachable through that deeper barrier subtree.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const sib_top = try func.newBlock();
+    const sib_call = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = sib_top, .else_block = tail } } });
+    try func.getBlock(sib_top).append(.{ .op = .{ .br = sib_call } });
+    try func.getBlock(sib_call).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(sib_call).append(.{ .op = .{ .br = tail } });
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    _ = try globalValueNumbering(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(tail).instructions.items.len);
+    try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
+}
+
+test "GVN load (cell G): call on loop back-edge invalidates dominated body forwarding (#734)" {
+    // entry loads, header may take a call-bearing latch back-edge, then body loads.
+    // The body load is reachable after the back-edge barrier and must survive.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const latch = try func.newBlock();
+    const body = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_body = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = latch, .else_block = body } } });
+    try func.getBlock(latch).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(latch).append(.{ .op = .{ .br = header } });
+    try func.getBlock(body).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_body, .type = .i32 });
+    try func.getBlock(body).append(.{ .op = .{ .ret = v_body } });
+
+    _ = try globalValueNumbering(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(body).instructions.items.len);
+    try std.testing.expect(func.getBlock(body).instructions.items[0].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_body }, func.getBlock(body).instructions.items[1].op);
+}
+
+test "GVN load (cell H): barrier in then and store in else leave merge load unfused (#734)" {
+    // entry branches to a call in then or an aliasing store in else, then merges.
+    // The merge load is reachable through the barrier branch and must survive.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const then_blk = try func.newBlock();
+    const else_blk = try func.newBlock();
+    const merge = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_store_val = func.newVReg();
+    const v_merge = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = then_blk, .else_block = else_blk } } });
+    try func.getBlock(then_blk).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(then_blk).append(.{ .op = .{ .br = merge } });
+    try func.getBlock(else_blk).append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_store_val } }, .type = .i32 });
+    try func.getBlock(else_blk).append(.{ .op = .{ .br = merge } });
+    try func.getBlock(merge).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_merge, .type = .i32 });
+    try func.getBlock(merge).append(.{ .op = .{ .ret = v_merge } });
+
+    _ = try globalValueNumbering(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(merge).instructions.items.len);
+    try std.testing.expect(func.getBlock(merge).instructions.items[0].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_merge }, func.getBlock(merge).instructions.items[1].op);
+}
+
+test "CSE load (cell C): call AFTER load in same block prevents fusion of later load (#734)" {
+    // entry: load p[0]; call barrier; load p[0]; ret second load.
+    // The pre-barrier load survives, and the post-barrier load is not fused.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_first = func.newVReg();
+    const v_call = func.newVReg();
+    const v_second = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_first, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_second, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .ret = v_second } });
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(!changed);
+    const block = func.getBlock(entry);
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    try std.testing.expect(block.instructions.items[0].op == .load);
+    try std.testing.expect(block.instructions.items[2].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_second }, block.instructions.items[3].op);
+}
+
+test "CSE load (cell F): call in sibling SUBTREE invalidates merge forwarding (#719,#734)" {
+    // entry branches directly to tail or to a sibling subtree containing a call.
+    // The merge load is reachable through that deeper barrier subtree.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const sib_top = try func.newBlock();
+    const sib_call = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = sib_top, .else_block = tail } } });
+    try func.getBlock(sib_top).append(.{ .op = .{ .br = sib_call } });
+    try func.getBlock(sib_call).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(sib_call).append(.{ .op = .{ .br = tail } });
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    _ = try commonSubexprElimination(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(tail).instructions.items.len);
+    try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
+}
+
+test "CSE load (cell G): call on loop back-edge invalidates dominated body forwarding (#734)" {
+    // entry loads, header may take a call-bearing latch back-edge, then body loads.
+    // The body load is reachable after the back-edge barrier and must survive.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const latch = try func.newBlock();
+    const body = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_body = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = latch, .else_block = body } } });
+    try func.getBlock(latch).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(latch).append(.{ .op = .{ .br = header } });
+    try func.getBlock(body).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_body, .type = .i32 });
+    try func.getBlock(body).append(.{ .op = .{ .ret = v_body } });
+
+    _ = try commonSubexprElimination(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(body).instructions.items.len);
+    try std.testing.expect(func.getBlock(body).instructions.items[0].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_body }, func.getBlock(body).instructions.items[1].op);
+}
+
+test "CSE load (cell H): barrier in then and store in else leave merge load unfused (#734)" {
+    // entry branches to a call in then or an aliasing store in else, then merges.
+    // The merge load is reachable through the barrier branch and must survive.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const then_blk = try func.newBlock();
+    const else_blk = try func.newBlock();
+    const merge = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_call = func.newVReg();
+    const v_store_val = func.newVReg();
+    const v_merge = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = then_blk, .else_block = else_blk } } });
+    try func.getBlock(then_blk).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+    try func.getBlock(then_blk).append(.{ .op = .{ .br = merge } });
+    try func.getBlock(else_blk).append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_store_val } }, .type = .i32 });
+    try func.getBlock(else_blk).append(.{ .op = .{ .br = merge } });
+    try func.getBlock(merge).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_merge, .type = .i32 });
+    try func.getBlock(merge).append(.{ .op = .{ .ret = v_merge } });
+
+    _ = try commonSubexprElimination(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(merge).instructions.items.len);
+    try std.testing.expect(func.getBlock(merge).instructions.items[0].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_merge }, func.getBlock(merge).instructions.items[1].op);
 }
