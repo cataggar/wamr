@@ -25,7 +25,7 @@
 //! instruction, not a block parameter — and is therefore omitted. It will be
 //! re-introduced if/when block-params land.
 //!
-//! Paranoid-mode checks (issue #624 stretch invariants 7, 8, 9, 10):
+//! Paranoid-mode checks (issue #624 stretch invariants 7, 8, 9, 10, plus #738):
 //!
 //!   7. **Operand-type sanity** (#628). Each VReg operand's recorded width
 //!      matches the producing instruction's result width.
@@ -39,6 +39,9 @@
 //!      `checkDomTreeStructure`.)
 //!  10. **Live-range monotonicity** (#629). For the default sequential
 //!      block order, every `LiveRange` has `start <= end`.
+//!  11. **Load-forwarding soundness** (#738). A load result used across a
+//!      CFG edge must be free of aliasing stores and load barriers on every
+//!      path from its definition to each cross-block use.
 //!
 //! Paranoid checks re-derive analyses (dom, loops, liveness) for every
 //! invocation, so they're intentionally opt-in: even safety builds default
@@ -52,15 +55,16 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
+const alias_class = @import("alias_class.zig");
 
 pub const VerifyMode = enum {
     /// Skip verification entirely (no-op, zero cost).
     off,
     /// Run checks 1, 2, 4, 5, 6 after every pass.
     after_each_pass,
-    /// Additionally run check 7 (operand-width sanity). Future stricter
-    /// checks (loop / dom-tree freshness, live-range monotonicity) will
-    /// also land here.
+    /// Additionally run paranoid re-derivation checks: operand widths,
+    /// loop / dom-tree consistency, live-range monotonicity, and
+    /// load-forwarding soundness.
     paranoid,
 };
 
@@ -98,6 +102,9 @@ pub const VerifyError = error{
     /// range numbering disagrees with the program's def-before-use
     /// structure (check 10, paranoid).
     LiveRangeInverted,
+    /// A load result is used across a CFG edge along a path containing an
+    /// aliasing store or load barrier (check 11, paranoid).
+    LoadForwardingUnsound,
 } || std.mem.Allocator.Error;
 
 /// Information about the most-recent verifier failure. Populated as a
@@ -577,6 +584,7 @@ pub fn verifyFunction(
         try checkDomTreeStructure(func, func_index, allocator);
         try checkLoopInfo(func, func_index, allocator);
         try checkLiveRangeMonotonicity(func, func_index, allocator);
+        try verifyLoadForwardingSoundness(func, func_index, allocator);
     }
 }
 
@@ -884,7 +892,7 @@ fn checkSsaDominance(
 /// Thread-local scratch used to format dynamic detail strings (e.g.
 /// "operand %3 has type v128, expected i32"). The single-threaded
 /// verifier guarantees no two checks share this buffer concurrently.
-threadlocal var detail_buf: [160]u8 = undefined;
+threadlocal var detail_buf: [512]u8 = undefined;
 
 /// Build a dense `[]?ir.IrType` keyed by VReg. Params (vregs
 /// `0..param_count`) get types from `func.local_types` when present;
@@ -1056,17 +1064,14 @@ fn checkOneInst(ctx: OperandCheckCtx, inst: ir.Inst) VerifyError!void {
         // operand (and result) type.
         .clz, .ctz, .popcnt, .eqz => |v| try ctx.expect(v, inst.type, "operand"),
         .extend8_s, .extend16_s, .extend32_s => |v| try ctx.expect(v, inst.type, "operand"),
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest => |v|
-            try ctx.expect(v, inst.type, "operand"),
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest => |v| try ctx.expect(v, inst.type, "operand"),
 
         // Width-changing conversions: operand width fixed per-op, dest is
         // `inst.type`.
         .wrap_i64 => |v| try ctx.expect(v, .i64, "operand"),
         .extend_i32_s, .extend_i32_u => |v| try ctx.expect(v, .i32, "operand"),
-        .trunc_f32_s, .trunc_f32_u, .trunc_sat_f32_s, .trunc_sat_f32_u => |v|
-            try ctx.expect(v, .f32, "operand"),
-        .trunc_f64_s, .trunc_f64_u, .trunc_sat_f64_s, .trunc_sat_f64_u => |v|
-            try ctx.expect(v, .f64, "operand"),
+        .trunc_f32_s, .trunc_f32_u, .trunc_sat_f32_s, .trunc_sat_f32_u => |v| try ctx.expect(v, .f32, "operand"),
+        .trunc_f64_s, .trunc_f64_u, .trunc_sat_f64_s, .trunc_sat_f64_u => |v| try ctx.expect(v, .f64, "operand"),
         .convert_i32_s, .convert_i32_u => |v| try ctx.expect(v, .i32, "operand"),
         .convert_i64_s, .convert_i64_u => |v| try ctx.expect(v, .i64, "operand"),
         .demote_f64 => |v| try ctx.expect(v, .f64, "operand"),
@@ -1501,6 +1506,336 @@ fn verifyLiveRangeMonotonicity(
     }
 }
 
+// ── Check 11: load-forwarding soundness (paranoid only, #738) ───────────
+
+/// Re-derive the post-pass load-forwarding invariant from final IR only.
+/// For each memory-load result consumed across a CFG edge, every CFG path
+/// from the load definition to that use must avoid aliasing stores and coarse
+/// load barriers before the use observes the value.
+fn verifyLoadForwardingSoundness(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+) VerifyError!void {
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            switch (inst.op) {
+                .load => |ld| {
+                    const dest = inst.dest orelse continue;
+                    const load_key = alias_class.LoadKey{ .mem = alias_class.memKeyFromLoad(ld) };
+                    try verifyLoadResultSoundness(
+                        func,
+                        func_index,
+                        allocator,
+                        dest,
+                        load_key,
+                        block.id,
+                        @intCast(ii),
+                    );
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+fn verifyLoadResultSoundness(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+    load_vreg: ir.VReg,
+    load_key: alias_class.LoadKey,
+    def_block: ir.BlockId,
+    def_inst: u32,
+) VerifyError!void {
+    for (func.blocks.items) |*use_block| {
+        for (use_block.instructions.items, 0..) |inst, ii| {
+            var found_use = false;
+            const Ctx = struct {
+                found: *bool,
+                target: ir.VReg,
+            };
+            var ctx = Ctx{ .found = &found_use, .target = load_vreg };
+            forEachOperand(inst, &ctx, struct {
+                fn cb(ptr: *Ctx, v: ir.VReg) void {
+                    if (v == ptr.target) ptr.found.* = true;
+                }
+            }.cb);
+
+            if (!found_use or use_block.id == def_block) continue;
+            try verifyLoadUseCleanPaths(
+                func,
+                func_index,
+                allocator,
+                load_vreg,
+                load_key,
+                def_block,
+                def_inst,
+                use_block.id,
+                @intCast(ii),
+            );
+        }
+    }
+}
+
+fn verifyLoadUseCleanPaths(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+    load_vreg: ir.VReg,
+    load_key: alias_class.LoadKey,
+    def_block: ir.BlockId,
+    def_inst: u32,
+    use_block: ir.BlockId,
+    use_inst: u32,
+) VerifyError!void {
+    const nblocks = func.blocks.items.len;
+    const can_reach_use = try allocator.alloc(bool, nblocks);
+    defer allocator.free(can_reach_use);
+    @memset(can_reach_use, false);
+    try markBlocksReaching(func, use_block, can_reach_use, allocator);
+
+    const visited = try allocator.alloc(bool, nblocks);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    var path: std.ArrayList(ir.BlockId) = .empty;
+    defer path.deinit(allocator);
+
+    try verifyLoadUseCleanPathsDfs(
+        func,
+        func_index,
+        allocator,
+        load_vreg,
+        load_key,
+        def_block,
+        def_inst,
+        use_block,
+        use_inst,
+        can_reach_use,
+        visited,
+        &path,
+        def_block,
+    );
+}
+
+fn markBlocksReaching(
+    func: *const ir.IrFunction,
+    target: ir.BlockId,
+    out: []bool,
+    allocator: std.mem.Allocator,
+) VerifyError!void {
+    var stack: std.ArrayList(ir.BlockId) = .empty;
+    defer stack.deinit(allocator);
+    out[target] = true;
+    try stack.append(allocator, target);
+
+    while (stack.pop()) |b| {
+        for (func.blocks.items[b].predecessors.items) |pred| {
+            if (out[pred]) continue;
+            out[pred] = true;
+            try stack.append(allocator, pred);
+        }
+    }
+}
+
+fn verifyLoadUseCleanPathsDfs(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+    load_vreg: ir.VReg,
+    load_key: alias_class.LoadKey,
+    def_block: ir.BlockId,
+    def_inst: u32,
+    use_block: ir.BlockId,
+    use_inst: u32,
+    can_reach_use: []const bool,
+    visited: []bool,
+    path: *std.ArrayList(ir.BlockId),
+    cur_block: ir.BlockId,
+) VerifyError!void {
+    if (cur_block >= func.blocks.items.len or !can_reach_use[cur_block] or visited[cur_block]) return;
+    visited[cur_block] = true;
+    defer visited[cur_block] = false;
+    try path.append(allocator, cur_block);
+    defer _ = path.pop();
+
+    const block = &func.blocks.items[cur_block];
+    var start: usize = 0;
+    var end: usize = block.instructions.items.len;
+    if (cur_block == def_block) start = @as(usize, def_inst) + 1;
+    if (cur_block == use_block) end = @min(end, @as(usize, use_inst));
+    if (start > end) start = end;
+
+    for (block.instructions.items[start..end], start..) |inst, ii| {
+        switch (inst.op) {
+            .store => |st| {
+                if (alias_class.storeAliasesLoad(load_key, st)) {
+                    return failLoadForwardingSoundness(
+                        func,
+                        func_index,
+                        load_vreg,
+                        inst.op,
+                        cur_block,
+                        @intCast(ii),
+                        path.items,
+                        use_block,
+                        can_reach_use,
+                    );
+                }
+            },
+            else => {},
+        }
+        if (alias_class.opIsLoadBarrier(inst.op)) {
+            return failLoadForwardingSoundness(
+                func,
+                func_index,
+                load_vreg,
+                inst.op,
+                cur_block,
+                @intCast(ii),
+                path.items,
+                use_block,
+                can_reach_use,
+            );
+        }
+    }
+
+    if (cur_block == use_block) return;
+    if (block.instructions.items.len == 0) return;
+
+    const last = block.instructions.items[block.instructions.items.len - 1].op;
+    switch (last) {
+        .br => |target| try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, target),
+        .br_if => |bi| {
+            try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, bi.then_block);
+            try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, bi.else_block);
+        },
+        .br_table => |bt| {
+            for (bt.targets) |target| {
+                try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, target);
+            }
+            try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, bt.default);
+        },
+        else => {},
+    }
+}
+
+fn failLoadForwardingSoundness(
+    func: *const ir.IrFunction,
+    func_index: u32,
+    load_vreg: ir.VReg,
+    offending_op: ir.Inst.Op,
+    offending_block: ir.BlockId,
+    offending_inst: u32,
+    path_prefix: []const ir.BlockId,
+    use_block: ir.BlockId,
+    can_reach_use: []const bool,
+) VerifyError {
+    var path_buf: [256]u8 = undefined;
+    const path_text = formatLoadForwardingPath(func, path_prefix, use_block, can_reach_use, &path_buf);
+    const written = std.fmt.bufPrint(
+        &detail_buf,
+        "load %{d} crosses {s} on path {s}",
+        .{ load_vreg, @tagName(std.meta.activeTag(offending_op)), path_text },
+    ) catch &detail_buf;
+    last_failure = .{
+        .kind = error.LoadForwardingUnsound,
+        .func_index = func_index,
+        .block = offending_block,
+        .inst_index = offending_inst,
+        .vreg = load_vreg,
+        .detail = written,
+    };
+    return error.LoadForwardingUnsound;
+}
+
+fn formatLoadForwardingPath(
+    func: *const ir.IrFunction,
+    path_prefix: []const ir.BlockId,
+    use_block: ir.BlockId,
+    can_reach_use: []const bool,
+    buf: []u8,
+) []const u8 {
+    var len: usize = 0;
+    appendPathBlocks(buf, &len, path_prefix);
+    if (path_prefix.len == 0) return buf[0..len];
+
+    var cur = path_prefix[path_prefix.len - 1];
+    var suffix_seen = [_]ir.BlockId{std.math.maxInt(ir.BlockId)} ** 16;
+    var suffix_seen_len: usize = 0;
+    while (cur != use_block) {
+        var next: ?ir.BlockId = null;
+        if (cur < func.blocks.items.len) {
+            const block = &func.blocks.items[cur];
+            if (block.instructions.items.len != 0) {
+                const last = block.instructions.items[block.instructions.items.len - 1].op;
+                switch (last) {
+                    .br => |target| {
+                        if (target < can_reach_use.len and can_reach_use[target]) next = target;
+                    },
+                    .br_if => |bi| {
+                        if (bi.then_block < can_reach_use.len and can_reach_use[bi.then_block]) next = bi.then_block;
+                        if (next == null and bi.else_block < can_reach_use.len and can_reach_use[bi.else_block]) next = bi.else_block;
+                    },
+                    .br_table => |bt| {
+                        for (bt.targets) |target| {
+                            if (target < can_reach_use.len and can_reach_use[target]) {
+                                next = target;
+                                break;
+                            }
+                        }
+                        if (next == null and bt.default < can_reach_use.len and can_reach_use[bt.default]) next = bt.default;
+                    },
+                    else => {},
+                }
+            }
+        }
+        const n = next orelse {
+            appendPathText(buf, &len, " -> ...");
+            break;
+        };
+        var repeats = false;
+        for (suffix_seen[0..suffix_seen_len]) |seen| {
+            if (seen == n) repeats = true;
+        }
+        if (repeats) {
+            appendPathText(buf, &len, " -> ...");
+            break;
+        }
+        if (suffix_seen_len < suffix_seen.len) {
+            suffix_seen[suffix_seen_len] = n;
+            suffix_seen_len += 1;
+        }
+        appendPathBlock(buf, &len, n);
+        cur = n;
+    }
+    return buf[0..len];
+}
+
+fn appendPathBlocks(buf: []u8, len: *usize, blocks: []const ir.BlockId) void {
+    for (blocks) |b| appendPathBlock(buf, len, b);
+}
+
+fn appendPathBlock(buf: []u8, len: *usize, block: ir.BlockId) void {
+    if (len.* == 0) {
+        appendPathText(buf, len, "#");
+    } else {
+        appendPathText(buf, len, " -> #");
+    }
+    var tmp: [32]u8 = undefined;
+    const digits = std.fmt.bufPrint(&tmp, "{d}", .{block}) catch return;
+    appendPathText(buf, len, digits);
+}
+
+fn appendPathText(buf: []u8, len: *usize, text: []const u8) void {
+    if (len.* >= buf.len) return;
+    const available = buf.len - len.*;
+    const n = @min(available, text.len);
+    @memcpy(buf[len.* .. len.* + n], text[0..n]);
+    len.* += n;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1509,6 +1844,74 @@ fn newReturnBlock(func: *ir.IrFunction, ret_v: ?ir.VReg) !ir.BlockId {
     const b = try func.newBlock();
     try func.getBlock(b).append(.{ .op = .{ .ret = ret_v } });
     return b;
+}
+
+test "verifier: load forwarding soundness permits clean cross-block reuse" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 1, 0, 1);
+    defer func.deinit();
+
+    const base = func.newVReg();
+    const entry = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(exit).addPredecessor(entry);
+
+    const loaded = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = exit } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = loaded } });
+
+    try verifyFunction(&func, 0, .paranoid, a);
+}
+
+test "verifier: load forwarding soundness rejects cross-block barrier" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 1, 0, 1);
+    defer func.deinit();
+
+    const base = func.newVReg();
+    const entry = try func.newBlock();
+    const call_block = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(call_block).addPredecessor(entry);
+    try func.getBlock(exit).addPredecessor(call_block);
+
+    const loaded = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = call_block } });
+    try func.getBlock(call_block).append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try func.getBlock(call_block).append(.{ .op = .{ .br = exit } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = loaded } });
+
+    try verifyFunction(&func, 0, .after_each_pass, a);
+    try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .paranoid, a));
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "call") != null);
+}
+
+test "verifier: load forwarding soundness catches sibling barrier regression" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 3, 0, 3);
+    defer func.deinit();
+
+    const base = func.newVReg();
+    const cond = func.newVReg();
+    const elem = func.newVReg();
+    const entry = try func.newBlock();
+    const barrier = try func.newBlock();
+    const merge = try func.newBlock();
+    try func.getBlock(barrier).addPredecessor(entry);
+    try func.getBlock(merge).addPredecessor(entry);
+    try func.getBlock(merge).addPredecessor(barrier);
+
+    const loaded = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = barrier, .else_block = merge } } });
+    try func.getBlock(barrier).append(.{ .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = elem } } });
+    try func.getBlock(barrier).append(.{ .op = .{ .br = merge } });
+    try func.getBlock(merge).append(.{ .op = .{ .ret = loaded } });
+
+    try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .paranoid, a));
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "call_indirect") != null);
 }
 
 test "verifier: empty function passes" {

@@ -63,3 +63,26 @@ pub fn storeAliasesLoad(key: LoadKey, st: anytype) bool {
         .local => false,
     };
 }
+
+/// Returns true iff `op` is a coarse barrier that invalidates every tracked
+/// load-forwarding value (memory + local).
+pub fn opIsLoadBarrier(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .call,
+        .call_indirect,
+        .call_ref,
+        .atomic_load,
+        .atomic_store,
+        .atomic_rmw,
+        .atomic_cmpxchg,
+        .atomic_fence,
+        .atomic_notify,
+        .atomic_wait,
+        .memory_copy,
+        .memory_fill,
+        .memory_init,
+        .memory_grow,
+        => true,
+        else => false,
+    };
+}
