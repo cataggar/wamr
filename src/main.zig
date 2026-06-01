@@ -78,6 +78,13 @@ pub fn main(init: std.process.Init) !u8 {
             wamr.aot_runtime.g_trap_oob_dump_env = v;
         }
     }
+    if (init.environ_map.get("WAMR_WATCH_ADDR")) |v| {
+        if (v.len > 0) {
+            wamr.aot_runtime.initWatchAddrFromEnv(v) catch |err| {
+                std.debug.print("[watch-addr] init failed: {s}\n", .{@errorName(err)});
+            };
+        }
+    }
     if (args.len < 2) {
         std.debug.print("error: missing subcommand — try `wamr help`\n", .{});
         return 2;
