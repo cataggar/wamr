@@ -1,6 +1,7 @@
 //! Core WebAssembly types used throughout the runtime.
 
 const std = @import("std");
+const platform = @import("../../platform/platform.zig");
 
 /// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
 const Mutex = struct {
@@ -508,8 +509,82 @@ pub const MemoryInstance = struct {
     /// Waiter queue for memory.atomic.wait/notify (shared memory only).
     /// Heap-allocated and shared across threads via ref counting.
     waiter_queue: ?*WaiterQueue = null,
+    /// When non-null, `data.ptr == reserved_base` and `[reserved_base,
+    /// reserved_base+reserved_size)` is a stable virtual address
+    /// reservation (POSIX mmap, Windows VirtualAlloc). `grow` extends
+    /// `data.len` in place by committing more pages — the pointer
+    /// never moves, so external aliases into this memory (e.g.
+    /// SpiderMonkey/StarlingMonkey external strings, host-held slices
+    /// taken before a `memory.grow`) remain valid. Issue #752: TCGC's
+    /// componentize-js engine reads a 1.3 MiB string as an external
+    /// string; a subsequent `Map.set` triggers `memory.grow`; under
+    /// the legacy `allocator.realloc` path that grow relocated the
+    /// buffer and silently corrupted the external string, surfacing
+    /// as TCGC's "Resolved to / which is outside package file://"
+    /// module-resolution failure.
+    reserved_base: ?[*]align(page_size_min) u8 = null,
+    /// Size of the reservation when `reserved_base != null`. Constant
+    /// for the lifetime of the memory.
+    reserved_size: usize = 0,
 
     pub const page_size: u32 = 65536;
+
+    /// Page size of the host platform — used for mmap/mprotect alignment.
+    /// Distinct from `page_size` above (the wasm linear-memory page = 64 KiB)
+    /// because Linux page-grained mprotect needs 4 KiB on x86_64 / 16 KiB on
+    /// aarch64. wasm pages are always a multiple of any reasonable host page,
+    /// so the OS calls never see sub-page slack.
+    pub const page_size_min: u29 = std.heap.page_size_min;
+
+    /// Allocate a `MemoryInstance` with **stable-address backing** when the
+    /// host supports it. The memory's `data.ptr` is pinned to a virtual
+    /// address reservation of `cap_pages * 64 KiB`, with `initial_pages`
+    /// committed up front. `grow` extends the committed window via
+    /// `mprotect`; the pointer never moves, so external aliases into the
+    /// memory survive any `memory.grow` calls. (Issue #752.)
+    ///
+    /// `cap_pages` should be `min(mem_type.limits.max orelse 65536, 65536)`.
+    /// On platforms without reservation support (Windows for now), or
+    /// when the OS reservation fails, this function returns null and the
+    /// caller is expected to fall back to the legacy
+    /// `allocator.realloc`-backed path (which may relocate `data.ptr`
+    /// on grow). The caller owns release via `MemoryInstance.release`.
+    pub fn createReserved(
+        mem_type: MemoryType,
+        initial_pages: u32,
+        cap_pages: u32,
+        allocator: std.mem.Allocator,
+    ) ?*MemoryInstance {
+        if (!platform.supports_reserved_memory) return null;
+        if (cap_pages == 0) return null;
+        const reserved_size: usize = @as(usize, cap_pages) * page_size;
+        const base = platform.reserveAddressSpace(reserved_size) orelse return null;
+        errdefer platform.releaseAddressSpace(base, reserved_size);
+
+        const initial_size: usize = @as(usize, initial_pages) * page_size;
+        if (initial_size > 0) {
+            platform.commitPages(base, initial_size) catch {
+                platform.releaseAddressSpace(base, reserved_size);
+                return null;
+            };
+            // `mmap` with `MAP_ANONYMOUS` zeroes new pages; mprotect on a
+            // freshly reserved region preserves that. No memset needed.
+        }
+
+        const mem = allocator.create(MemoryInstance) catch {
+            platform.releaseAddressSpace(base, reserved_size);
+            return null;
+        };
+        mem.* = .{
+            .memory_type = mem_type,
+            .data = base[0..initial_size],
+            .current_pages = initial_pages,
+            .max_pages = cap_pages,
+            .reserved_base = base,
+            .reserved_size = reserved_size,
+        };
+        return mem;
+    }
 
     pub fn grow(self: *MemoryInstance, delta: u32, allocator: std.mem.Allocator) !u32 {
         const old_pages = self.current_pages;
@@ -521,9 +596,21 @@ pub const MemoryInstance = struct {
         const new_size = @as(usize, new_pages) * page_size;
         const old_size = self.data.len;
         if (old_size < new_size) {
-            self.data = try allocator.realloc(self.data, new_size);
-            // Zero-initialize the new pages (wasm spec requirement)
-            @memset(self.data[old_size..new_size], 0);
+            if (self.reserved_base) |base| {
+                // Stable-address path: commit additional pages within
+                // the reservation. `data.ptr` is unchanged; we only
+                // extend `data.len`. mmap PROT_NONE pages were
+                // anonymous so they are already zero; mprotect to
+                // READ|WRITE makes them touchable. (#752)
+                if (new_size > self.reserved_size) return error.MemoryGrowFailed;
+                platform.commitPages(@alignCast(base + old_size), new_size - old_size) catch
+                    return error.MemoryGrowFailed;
+                self.data = base[0..new_size];
+            } else {
+                self.data = try allocator.realloc(self.data, new_size);
+                // Zero-initialize the new pages (wasm spec requirement)
+                @memset(self.data[old_size..new_size], 0);
+            }
         }
         self.current_pages = new_pages;
         return old_pages;
@@ -554,7 +641,11 @@ pub const MemoryInstance = struct {
         if (self.ref_count == 0) {
             if (self.waiter_queue) |wq| wq.deinit(allocator);
             self.vmctx_subscribers.deinit(allocator);
-            if (self.data.len > 0) allocator.free(self.data);
+            if (self.reserved_base) |base| {
+                platform.releaseAddressSpace(base, self.reserved_size);
+            } else if (self.data.len > 0) {
+                allocator.free(self.data);
+            }
             allocator.destroy(self);
         }
     }
@@ -965,6 +1056,58 @@ test "MemoryInstance: grow fails when exceeding max" {
     try std.testing.expectError(error.MemoryGrowFailed, result);
     // Page count should be unchanged
     try std.testing.expectEqual(@as(u32, 1), mem.current_pages);
+}
+
+// #752: stable-address backing for linear memory. A reserved-mem
+// `MemoryInstance` MUST keep `data.ptr` pinned across any number of
+// `grow` calls so external aliases (SpiderMonkey/StarlingMonkey
+// "external strings" pointing at canon-lifted bytes, host-side
+// slices captured across cross-instance marshal) remain valid.
+test "MemoryInstance: createReserved keeps data.ptr stable across grow" {
+    if (!platform.supports_reserved_memory) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mem_type: MemoryType = .{ .limits = .{ .min = 1, .max = 8 } };
+    const mem = MemoryInstance.createReserved(mem_type, 1, 8, allocator) orelse
+        return error.SkipZigTest;
+    defer mem.release(allocator);
+
+    try std.testing.expect(mem.reserved_base != null);
+    try std.testing.expectEqual(@as(usize, 8) * MemoryInstance.page_size, mem.reserved_size);
+    try std.testing.expectEqual(@as(u32, 1), mem.current_pages);
+    try std.testing.expectEqual(@as(usize, MemoryInstance.page_size), mem.data.len);
+
+    // Capture a host-side slice and a few sentinel bytes before grow.
+    const pinned_ptr = mem.data.ptr;
+    mem.data[0] = 0xAB;
+    mem.data[MemoryInstance.page_size - 1] = 0xCD;
+    const pinned_slice = mem.data[0..16];
+    pinned_slice[5] = 0x5A;
+
+    const old_pages = try mem.grow(3, allocator);
+    try std.testing.expectEqual(@as(u32, 1), old_pages);
+    try std.testing.expectEqual(@as(u32, 4), mem.current_pages);
+    try std.testing.expectEqual(@as(usize, 4) * MemoryInstance.page_size, mem.data.len);
+
+    // Pointer stability: must be the same as before grow.
+    try std.testing.expectEqual(pinned_ptr, mem.data.ptr);
+
+    // Pre-grow bytes must still be readable.
+    try std.testing.expectEqual(@as(u8, 0xAB), mem.data[0]);
+    try std.testing.expectEqual(@as(u8, 0xCD), mem.data[MemoryInstance.page_size - 1]);
+    try std.testing.expectEqual(@as(u8, 0x5A), pinned_slice[5]);
+
+    // Newly committed pages must be zero (wasm spec).
+    try std.testing.expectEqual(@as(u8, 0), mem.data[MemoryInstance.page_size]);
+    try std.testing.expectEqual(@as(u8, 0), mem.data[4 * MemoryInstance.page_size - 1]);
+
+    // Another grow → still stable.
+    _ = try mem.grow(4, allocator);
+    try std.testing.expectEqual(pinned_ptr, mem.data.ptr);
+    try std.testing.expectEqual(@as(u32, 8), mem.current_pages);
+
+    // Growing past the cap fails.
+    try std.testing.expectError(error.MemoryGrowFailed, mem.grow(1, allocator));
+    try std.testing.expectEqual(@as(u32, 8), mem.current_pages);
 }
 
 test "WasmModule: getFuncType for import and local functions" {

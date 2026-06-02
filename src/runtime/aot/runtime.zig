@@ -963,8 +963,9 @@ pub fn aotAtomicNotify(vmctx: *VmCtx, addr: u32, count: u32) callconv(.c) i32 {
 }
 
 /// Host helper invoked from AOT-compiled `memory.grow` sites.
-/// Grows `inst.memories[0]` by `delta_pages`, reallocating the host buffer
-/// if needed, updates `vmctx` mirror fields (memory_base/size/pages) so
+/// Grows `inst.memories[0]` by `delta_pages`, reallocating or
+/// committing the host buffer if needed (see `MemoryInstance.grow`),
+/// updates `vmctx` mirror fields (memory_base/size/pages) so
 /// subsequent loads/stores see the new buffer, and returns the previous
 /// page count. Returns -1 on failure (OOM or exceeds max).
 pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
@@ -972,21 +973,16 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
     if (inst.memories.len == 0) return -1;
     const mem = inst.memories[0];
-    const old_pages: u32 = mem.current_pages;
     if (delta_pages < 0) return -1;
     const delta: u32 = @intCast(delta_pages);
-    const new_pages_u64: u64 = @as(u64, old_pages) + @as(u64, delta);
-    const cap: u64 = @min(mem.max_pages, 65536);
-    if (new_pages_u64 > cap) return -1;
-    const new_pages: u32 = @intCast(new_pages_u64);
-    const new_size: usize = @as(usize, new_pages) * types.MemoryInstance.page_size;
     const old_data_ptr = mem.data.ptr;
-    if (new_size > mem.data.len) {
-        const new_data = inst.allocator.realloc(mem.data, new_size) catch return -1;
-        @memset(new_data[mem.data.len..], 0);
-        mem.data = new_data;
-    }
-    mem.current_pages = new_pages;
+    // Route through `MemoryInstance.grow` so reserved (mmap-backed)
+    // memories take the `mprotect`/commit path and legacy ones take
+    // the `allocator.realloc` path. (#752: the legacy path may move
+    // `data.ptr`; the reserved path keeps it pinned, preserving
+    // external aliases held outside the vmctx-subscriber mechanism.)
+    const old_pages = mem.grow(delta, inst.allocator) catch return -1;
+    const new_pages = mem.current_pages;
     refreshVmCtxMemory(vmctx, mem);
 
     if (mem.data.ptr != old_data_ptr or new_pages != old_pages) {
@@ -2714,10 +2710,28 @@ fn allocateMemories(
 fn allocateOneMemory(mem_type: types.MemoryType, allocator: std.mem.Allocator) RuntimeError!*types.MemoryInstance {
     const initial_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
     const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
-    // Pre-allocate for memory.grow: use max_pages but cap at a reasonable default
+
+    // Prefer stable-address backing on platforms that support it (#752).
+    // Reserving `max_pages * 64 KiB` of virtual address space up front
+    // means `memory.grow` only `mprotect`s additional pages — the
+    // `data.ptr` never moves. This keeps any external aliases into
+    // this memory valid across grows, including SpiderMonkey/
+    // StarlingMonkey "external string" char pointers that
+    // componentize-js wraps around canon-lifted strings. Falls back to
+    // the allocator-realloc path if reservation isn't supported on the
+    // host (Windows for now) or the reservation fails.
+    if (types.MemoryInstance.createReserved(mem_type, initial_pages, max_pages, allocator)) |mem| {
+        return mem;
+    }
+
+    // Fallback: legacy allocator-backed memory. Pre-size to a reasonable
+    // chunk so the first few `memory.grow` calls hit the no-op path
+    // (still copies via `allocator.realloc` once the cap is exceeded).
+    // `data.len` intentionally tracks the *allocated* capacity, not
+    // `current_pages * page_size` — `MemoryInstance.grow` keys its
+    // "do we need to realloc?" check on `data.len`.
     const alloc_pages = @min(max_pages, @max(initial_pages, 256));
     const size = @as(usize, alloc_pages) * types.MemoryInstance.page_size;
-
     const data = allocator.alloc(u8, size) catch return error.OutOfMemory;
     @memset(data, 0);
     const mem = allocator.create(types.MemoryInstance) catch {
@@ -3232,8 +3246,20 @@ test "instantiate: module with memory" {
 
     try std.testing.expectEqual(@as(usize, 1), inst.memories.len);
     try std.testing.expectEqual(@as(u32, 1), inst.memories[0].current_pages);
-    // Pre-allocated to max_pages (4) for memory.grow support
-    try std.testing.expectEqual(@as(usize, 4 * 65536), inst.memories[0].data.len);
+    try std.testing.expectEqual(@as(u32, 4), inst.memories[0].max_pages);
+    // `data.len` tracks the currently-committed window. With the
+    // stable-address (mmap-reserved) backing introduced for #752,
+    // that is `current_pages * page_size`; with the legacy
+    // allocator-realloc fallback it is the pre-allocated capacity
+    // (`alloc_pages * page_size`, ≥ `current_pages * page_size`).
+    // Either way, the slice must cover at least the logical
+    // current-pages range.
+    try std.testing.expect(
+        inst.memories[0].data.len >= @as(usize, 1) * types.MemoryInstance.page_size,
+    );
+    try std.testing.expect(
+        inst.memories[0].data.len <= @as(usize, 4) * types.MemoryInstance.page_size,
+    );
 }
 
 test "memory.grow propagates to cross-instance AOT memory subscribers" {

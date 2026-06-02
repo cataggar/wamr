@@ -220,6 +220,84 @@ fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (err != .SUCCESS) return error.MprotectFailed;
 }
 
+// ── Reserved address-space helpers (linear-memory backing) ──────────────
+//
+// `MemoryInstance` (src/runtime/common/types.zig) backs each wasm linear
+// memory with a `[]u8`. Historically `MemoryInstance.grow` used
+// `allocator.realloc`, which can **relocate** the buffer. wamr's
+// vmctx-subscriber machinery refreshes every AOT vmctx's `memory_base`
+// mirror after a grow, so generated code keeps working — but **external
+// pointers held outside the vmctx mechanism** (StarlingMonkey /
+// SpiderMonkey "external strings" referencing wasm memory; host-held
+// slices captured across a cross-instance marshal) become dangling.
+// Issue #752: TCGC's componentize-js engine reads a 1.3 MiB
+// `__spec_files` JSON string as an external string. Subsequent
+// `Map.set` inside `compileInner` triggers a `memory.grow` that
+// relocates the backing; the external string's char pointer dangles
+// and TCGC's module resolver sees partially-corrupted UTF-8 → fails to
+// find `@typespec/compiler` with the cryptic "Resolved to / which is
+// outside package file://" error.
+//
+// `reserveAddressSpace` reserves `size` bytes of virtual address space
+// (POSIX `mmap(MAP_PRIVATE|MAP_ANONYMOUS)` with `PROT_NONE`; Windows
+// `VirtualAlloc(MEM_RESERVE)`). The returned region is **not** backed
+// by physical memory and cannot be read or written until `commitPages`
+// changes the protection on a sub-range. `releaseAddressSpace`
+// releases the entire reservation.
+//
+// `commitPages(addr, size)` enables read/write on `[addr, addr+size)`.
+// On POSIX this is `mprotect(PROT_READ|PROT_WRITE)`, which on Linux
+// triggers lazy demand-paging — physical pages are only allocated as
+// the wasm guest first touches them. On Windows this is
+// `VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)` on top of the existing
+// reservation.
+//
+// Stability contract: the returned base pointer is valid for the
+// lifetime of the reservation (until `releaseAddressSpace`). The
+// caller may keep slices into the address range across any number of
+// `commitPages` calls — extending the committed range never moves
+// existing addresses.
+
+/// True on platforms where `reserveAddressSpace` + `commitPages` are
+/// supported. On unsupported platforms callers must fall back to the
+/// pre-#752 `allocator.realloc` path (which moves the buffer and is
+/// unsafe for external-string aliases).
+pub const supports_reserved_memory: bool = !is_windows;
+
+/// Reserve `size` bytes of virtual address space, no physical pages
+/// backed. Returns the base pointer or null on failure. Free with
+/// `releaseAddressSpace`.
+pub fn reserveAddressSpace(size: usize) ?[*]align(page_size) u8 {
+    if (size == 0) return null;
+    if (is_windows) {
+        // Windows: reservation needs a separate commit step — gate at
+        // call sites via `supports_reserved_memory` and fall back to
+        // the allocator path here. (Tracking a Windows-native
+        // reserve/commit implementation as a follow-up.)
+        return null;
+    }
+    const ptr = mmap(null, size, .{}, .{}) orelse return null;
+    return @alignCast(ptr);
+}
+
+/// Release a previously reserved address range. `size` must match the
+/// `reserveAddressSpace` call's `size`.
+pub fn releaseAddressSpace(addr: [*]align(page_size) u8, size: usize) void {
+    if (size == 0) return;
+    if (is_windows) unreachable;
+    munmap(addr, size);
+}
+
+/// Commit physical-page backing for `[addr, addr+size)` within a
+/// previously reserved range. On POSIX this is
+/// `mprotect(PROT_READ|PROT_WRITE)`; pages are demand-paged on first
+/// access. Returns `error.MprotectFailed` on failure.
+pub fn commitPages(addr: [*]align(page_size) u8, size: usize) !void {
+    if (size == 0) return;
+    if (is_windows) unreachable;
+    try mprotect(addr, size, .{ .read = true, .write = true });
+}
+
 // ── 2. Threading ────────────────────────────────────────────────────────
 
 pub const Thread = std.Thread;
