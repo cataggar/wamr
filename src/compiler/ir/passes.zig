@@ -2679,6 +2679,91 @@ pub const RunOptions = struct {
     /// release builds pay nothing. Callers in debug / fuzz contexts
     /// should set this to `.after_each_pass`.
     verify_mode: verifier.VerifyMode = .off,
+    /// Optional per-function pass-pipeline filter used to bisect AOT
+    /// codegen miscompiles (#743 / #761). Default `.{}` means "no
+    /// filtering" — the full pipeline runs for every function.
+    bisect: PassBisectSpec = .{},
+};
+
+/// Filter that selectively skips IR optimisation passes or caps the
+/// pipeline length for specific functions. Used by `wamrc` bisection
+/// knobs (`WAMR_AOT_SKIP_PASS` / `WAMR_AOT_PASSES_LIMIT`) to narrow a
+/// suspected codegen miscompile to a single pass + function pair
+/// without recompiling the rest of the module with a partial pipeline.
+///
+/// `pass_idx` here refers to the index into the per-function pipeline
+/// slice handed to `runPassesWithOptions` (typically the slice
+/// returned by `defaultPassesForTarget`). The infrastructure passes
+/// (`inlineSmallFunctions`, `promoteLocalsToSSA`, `lowerPhisToLocals`,
+/// `scrubUnreachableBlocks`) live outside that slice and are never
+/// affected by this filter.
+///
+/// Lifetime: `Skip.func_filter` / `Limit.func_filter` are borrowed
+/// slices. Callers (typically `aot_bisect.global`) keep them live for
+/// the process lifetime.
+pub const PassBisectSpec = struct {
+    /// Skip pass-indices in the inclusive range `[pass_idx_lo,
+    /// pass_idx_hi]` for the listed functions (or all functions when
+    /// `func_filter == null`). Multiple entries may overlap; a pass is
+    /// skipped if *any* entry matches.
+    pub const Skip = struct {
+        pass_idx_lo: u32,
+        pass_idx_hi: u32,
+        func_filter: ?[]const u32 = null,
+    };
+    /// Cap the per-function pipeline to the first `n` passes for the
+    /// listed functions (or all functions when `func_filter == null`).
+    /// Only one `Limit` is supported — the env parser overwrites on
+    /// repeat.
+    pub const Limit = struct {
+        n: u32,
+        func_filter: ?[]const u32 = null,
+    };
+
+    skip: []const Skip = &.{},
+    limit: ?Limit = null,
+
+    /// True when no filtering is configured — fast path for callers
+    /// that want to skip per-pass overhead checks.
+    pub fn isEmpty(self: PassBisectSpec) bool {
+        return self.skip.len == 0 and self.limit == null;
+    }
+
+    /// True when pass index `pass_idx` should be skipped for function
+    /// `func_idx` per any `Skip` entry.
+    pub fn shouldSkip(self: PassBisectSpec, func_idx: u32, pass_idx: u32) bool {
+        for (self.skip) |s| {
+            if (pass_idx < s.pass_idx_lo or pass_idx > s.pass_idx_hi) continue;
+            if (funcMatches(s.func_filter, func_idx)) return true;
+        }
+        return false;
+    }
+
+    /// The pipeline-length cap for `func_idx`, or `null` when no
+    /// `Limit` applies (run the full slice).
+    pub fn effectiveLimit(self: PassBisectSpec, func_idx: u32) ?u32 {
+        const lim = self.limit orelse return null;
+        if (!funcMatches(lim.func_filter, func_idx)) return null;
+        return lim.n;
+    }
+
+    /// True when this spec narrows behaviour for `func_idx` at all.
+    /// Used to decide per-function verifier suppression: partial
+    /// pipelines on a function can leave its IR in a state later
+    /// cleanups would normalise, tripping benign structural checks.
+    pub fn affectsFunction(self: PassBisectSpec, func_idx: u32) bool {
+        if (self.effectiveLimit(func_idx) != null) return true;
+        for (self.skip) |s| {
+            if (funcMatches(s.func_filter, func_idx)) return true;
+        }
+        return false;
+    }
+
+    fn funcMatches(filter: ?[]const u32, func_idx: u32) bool {
+        const list = filter orelse return true;
+        for (list) |f| if (f == func_idx) return true;
+        return false;
+    }
 };
 
 const PassNameEntry = struct { fn_ptr: PassFn, name: []const u8 };
@@ -6628,7 +6713,17 @@ pub fn runPassesWithOptions(
     // Cap the outer iterations at 2 — sufficient for the
     // constant-argument-specialisation cases that motivate this loop,
     // without exploding compile time.
-    const outer_max: u32 = 2;
+    //
+    // #761: when a per-function bisect spec is active, force a single
+    // outer iteration. The second iteration re-runs module-level
+    // `inlineSmallFunctions` on IR that the first per-function pass
+    // round has already filtered, which would leak the partial
+    // pipeline's effects into otherwise-unaffected callers/callees and
+    // defeat the per-function isolation promise. One outer round still
+    // runs full inlining first (over vanilla post-frontend IR), so
+    // unaffected functions retain the same inlining behaviour as
+    // without the bisect.
+    const outer_max: u32 = if (opts.bisect.isEmpty()) 2 else 1;
     var outer_iter: u32 = 0;
     while (outer_iter < outer_max) : (outer_iter += 1) {
         // Module-level: inline small leaf callees. Iterate to fixpoint so
@@ -6643,7 +6738,11 @@ pub fn runPassesWithOptions(
 
             if (opts.verify_mode != .off) {
                 for (module.functions.items, 0..) |*f, fi| {
-                    try Verify.check(opts.verify_mode, "inlineSmallFunctions", f, @intCast(fi), allocator);
+                    const fi32: u32 = @intCast(fi);
+                    // #761: suppress verifier on bisect-affected funcs.
+                    const vm: verifier.VerifyMode =
+                        if (opts.bisect.affectsFunction(fi32)) .off else opts.verify_mode;
+                    try Verify.check(vm, "inlineSmallFunctions", f, fi32, allocator);
                 }
             }
 
@@ -6674,6 +6773,18 @@ pub fn runPassesWithOptions(
 
         for (module.functions.items, 0..) |*func, func_idx_usize| {
             const func_idx: u32 = @intCast(func_idx_usize);
+            // #761: per-function verifier suppression — skipping a
+            // pass (or capping the pipeline) on a function can leave
+            // IR in a state that later cleanups would normalise,
+            // tripping benign structural checks. Unaffected functions
+            // still verify normally so most of the module retains
+            // soundness coverage during a bisect. Computed once
+            // per-function and reused for every Verify.check site
+            // below (promoteLocalsToSSA, lowerPhisToLocals, the per-
+            // pass fixpoint, scrubUnreachableBlocks).
+            const effective_verify_mode: verifier.VerifyMode =
+                if (opts.bisect.affectsFunction(func_idx)) .off else opts.verify_mode;
+
             // SSA promotion: only meaningful on the first outer round. On
             // later rounds the function is already past mem2reg and any new
             // local_set/get inserted by inlining is handled by
@@ -6681,7 +6792,7 @@ pub fn runPassesWithOptions(
             if (outer_iter == 0) {
                 if (try promoteLocalsToSSA(func, allocator)) {
                     total_changes += 1;
-                    try Verify.check(opts.verify_mode, "promoteLocalsToSSA", func, func_idx, allocator);
+                    try Verify.check(effective_verify_mode, "promoteLocalsToSSA", func, func_idx, allocator);
                     if (opts.dump_hook) |hook| {
                         try hook.callback(hook.ctx, .{
                             .pass_name = "promoteLocalsToSSA",
@@ -6694,7 +6805,7 @@ pub fn runPassesWithOptions(
                     }
                     if (try lowerPhisToLocals(func, allocator)) {
                         total_changes += 1;
-                        try Verify.check(opts.verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
+                        try Verify.check(effective_verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
                         if (opts.dump_hook) |hook| {
                             try hook.callback(hook.ctx, .{
                                 .pass_name = "lowerPhisToLocals",
@@ -6713,17 +6824,27 @@ pub fn runPassesWithOptions(
             // re-expose opportunities for each other (e.g. constantFold →
             // CSE → DCE → more constantFold). Cap iterations as a safety
             // net.
+            // Apply #761 bisect filter: per-function pipeline-length
+            // cap (`limit`) and per-pass skip mask. When the spec is
+            // empty `effective_passes_len == passes.len` and the
+            // shouldSkip check inside the loop short-circuits.
+            const effective_passes_len: usize = blk: {
+                const cap = opts.bisect.effectiveLimit(func_idx) orelse break :blk passes.len;
+                break :blk @min(@as(usize, cap), passes.len);
+            };
             var iter: u32 = 0;
             while (iter < 8) : (iter += 1) {
                 var any_changed = false;
-                for (passes) |pass| {
+                for (passes[0..effective_passes_len], 0..) |pass, pass_idx_usize| {
+                    const pass_idx: u32 = @intCast(pass_idx_usize);
+                    if (opts.bisect.shouldSkip(func_idx, pass_idx)) continue;
                     const changed = try pass(func, allocator);
                     if (changed) {
                         any_changed = true;
                         total_changes += 1;
                     }
                     if (changed) {
-                        try Verify.check(opts.verify_mode, passName(pass), func, func_idx, allocator);
+                        try Verify.check(effective_verify_mode, passName(pass), func, func_idx, allocator);
                     }
                     if (opts.dump_hook) |hook| {
                         try hook.callback(hook.ctx, .{
@@ -6749,7 +6870,7 @@ pub fn runPassesWithOptions(
             // (issue #620).
             if (try scrubUnreachableBlocks(func, allocator)) {
                 total_changes += 1;
-                try Verify.check(opts.verify_mode, "scrubUnreachableBlocks", func, func_idx, allocator);
+                try Verify.check(effective_verify_mode, "scrubUnreachableBlocks", func, func_idx, allocator);
             }
         }
     }
@@ -7099,6 +7220,125 @@ test "constantFold: iconst + iconst + add → iconst" {
 
     // The add should now be iconst_32(7)
     try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, block.instructions.items[2].op);
+}
+
+// ── #761 bisect-filter integration tests ────────────────────────────────────
+//
+// These exercise `runPassesWithOptions`'s consumption of the
+// `PassBisectSpec` filter. The pure-Spec unit tests live in
+// `src/compiler/aot_bisect.zig`; here we assert that the per-function
+// loop actually honours `shouldSkip` and `effectiveLimit`.
+
+fn bisectTestBuildAddModule(allocator: std.mem.Allocator) !ir.IrModule {
+    // Two functions, each just `iconst 3; iconst 4; v2 = add v0 v1; ret v2`.
+    // `constantFold` should rewrite the `add` to `iconst_32 7` when it
+    // runs; the filter test asserts whether that happened per function.
+    var module = ir.IrModule.init(allocator);
+    errdefer module.deinit();
+
+    inline for (0..2) |_| {
+        var func = ir.IrFunction.init(allocator, 0, 1, 0);
+        errdefer func.deinit();
+        const block_id = try func.newBlock();
+        var block = &func.blocks.items[block_id];
+        const v0 = func.newVReg();
+        const v1 = func.newVReg();
+        const v2 = func.newVReg();
+        try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0 });
+        try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = v1 });
+        try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+        try block.append(.{ .op = .{ .ret = v2 } });
+        _ = try module.addFunction(func);
+    }
+    return module;
+}
+
+fn bisectTestAddOpAt(module: *const ir.IrModule, func_idx: usize) ir.Inst.Op {
+    return module.functions.items[func_idx].blocks.items[0].instructions.items[2].op;
+}
+
+test "PassBisectSpec: skip filter honours per-function func_filter" {
+    const allocator = std.testing.allocator;
+    var module = try bisectTestBuildAddModule(allocator);
+    defer module.deinit();
+
+    const fn0_only = [_]u32{0};
+    const single_pass: []const PassFn = &.{&constantFold};
+    const spec: PassBisectSpec = .{
+        .skip = &.{.{ .pass_idx_lo = 0, .pass_idx_hi = 0, .func_filter = &fn0_only }},
+    };
+    _ = try runPassesWithOptions(&module, single_pass, allocator, .{ .bisect = spec });
+
+    // func[0]: constantFold was skipped — add still present.
+    switch (bisectTestAddOpAt(&module, 0)) {
+        .add => {},
+        else => |op| {
+            std.debug.print("expected .add for func[0], got {s}\n", .{@tagName(op)});
+            return error.TestUnexpectedResult;
+        },
+    }
+    // func[1]: constantFold ran — add was folded to iconst_32 7.
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, bisectTestAddOpAt(&module, 1));
+}
+
+test "PassBisectSpec: skip filter applies to all funcs when func_filter is null" {
+    const allocator = std.testing.allocator;
+    var module = try bisectTestBuildAddModule(allocator);
+    defer module.deinit();
+
+    const single_pass: []const PassFn = &.{&constantFold};
+    const spec: PassBisectSpec = .{
+        .skip = &.{.{ .pass_idx_lo = 0, .pass_idx_hi = 0, .func_filter = null }},
+    };
+    _ = try runPassesWithOptions(&module, single_pass, allocator, .{ .bisect = spec });
+
+    for (0..2) |fi| {
+        switch (bisectTestAddOpAt(&module, fi)) {
+            .add => {},
+            else => |op| {
+                std.debug.print("expected .add for func[{d}], got {s}\n", .{ fi, @tagName(op) });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "PassBisectSpec: effectiveLimit truncates pipeline per function" {
+    const allocator = std.testing.allocator;
+    var module = try bisectTestBuildAddModule(allocator);
+    defer module.deinit();
+
+    // Pipeline of [forwardLocalGet, constantFold]. With limit=1 on
+    // func[0], only forwardLocalGet runs there (no-op on this input);
+    // func[1] runs the full pipeline so the add folds to iconst.
+    const two_pass: []const PassFn = &.{ &forwardLocalGet, &constantFold };
+    const fn0_only = [_]u32{0};
+    const spec: PassBisectSpec = .{
+        .limit = .{ .n = 1, .func_filter = &fn0_only },
+    };
+    _ = try runPassesWithOptions(&module, two_pass, allocator, .{ .bisect = spec });
+
+    switch (bisectTestAddOpAt(&module, 0)) {
+        .add => {},
+        else => |op| {
+            std.debug.print("expected .add for func[0], got {s}\n", .{@tagName(op)});
+            return error.TestUnexpectedResult;
+        },
+    }
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, bisectTestAddOpAt(&module, 1));
+}
+
+test "PassBisectSpec: empty spec runs full pipeline (default no-op)" {
+    const allocator = std.testing.allocator;
+    var module = try bisectTestBuildAddModule(allocator);
+    defer module.deinit();
+
+    const single_pass: []const PassFn = &.{&constantFold};
+    _ = try runPassesWithOptions(&module, single_pass, allocator, .{});
+
+    for (0..2) |fi| {
+        try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, bisectTestAddOpAt(&module, fi));
+    }
 }
 
 test "constantFold: eqz on constant" {

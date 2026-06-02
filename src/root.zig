@@ -89,6 +89,10 @@ pub const aarch64_peephole = @import("compiler/codegen/aarch64/peephole.zig");
 /// AOT compiler optimization passes.
 pub const passes = @import("compiler/ir/passes.zig");
 
+/// AOT codegen bisection knobs — env-var parsing + process-global
+/// `PassBisectSpec` consumed by `runPassesWithOptions` (#761 / #743).
+pub const aot_bisect = @import("compiler/aot_bisect.zig");
+
 /// IR invariant checker run between passes (#624).
 pub const ir_verifier = @import("compiler/ir/verifier.zig");
 

@@ -30,6 +30,16 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
+    // #761 / #743: stamp the process-global PassBisectSpec from
+    // WAMR_AOT_SKIP_PASS{,ES} / WAMR_AOT_PASSES_LIMIT. Both
+    // compile-paths (`runCompile`, `compileCoreWasm`) thread
+    // `wamr.aot_bisect.global` into `passes.RunOptions.bisect`.
+    // Use the process arena so the spec storage (tens of bytes) is
+    // reclaimed cleanly at exit without tripping the GPA leak
+    // detector — the spec is borrowed by every `runPassesWithOptions`
+    // call for the lifetime of the wamrc invocation.
+    wamr.aot_bisect.parseFromEnv(init.environ_map, init.arena.allocator());
+
     if (args.len < 2) {
         std.debug.print("error: missing subcommand — try `wamrc help`\n", .{});
         std.process.exit(1);
@@ -266,6 +276,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
                 .callback = Dumper.callback,
             },
             .verify_mode = verify_mode,
+            .bisect = wamr.aot_bisect.global,
         };
         const opt_changes = passes.runPassesWithOptions(&ir_module, passes.defaultPassesForTarget(target_arch), allocator, run_opts) catch |err| {
             // If the IR verifier tripped, surface its diagnostic before
