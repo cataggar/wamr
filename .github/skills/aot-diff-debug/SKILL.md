@@ -154,3 +154,15 @@ Once you have a minimal reproducer (ideally <10 lines of C):
 - `src/compiler/frontend.zig` — wasm-to-IR translation
 - `src/compiler/codegen/x86_64/compile.zig:277` — `emitMemBoundsCheck` (clobbers r11)
 - `src/compiler/codegen/x86_64/compile.zig:313` — `emitMemBoundsCheckDynamic` (clobbers r11)
+
+## Companion skill
+
+If after Phase 1 you've localized the bug to a specific function
+(`local_func[N]` in a trap, or via diff narrowing) but it goes away
+with `-O0` — i.e. the bug is somewhere in the IR optimization
+pipeline rather than in codegen itself — hand off to the
+**`aot-pass-bisect`** skill. That skill applies
+`WAMR_AOT_SKIP_PASS=...:fn=<N>` + `--cache-dir` to localize the
+responsible pass in ~5 cycles of seconds-each-when-cached
+recompiles, instead of the 8-40 min per cycle a full recompile
+takes on large components.
