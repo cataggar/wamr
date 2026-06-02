@@ -69,6 +69,28 @@ pub const max_cache_file_bytes: usize = 256 * 1024 * 1024;
 pub const max_func_code_bytes: u32 = 16 * 1024 * 1024;
 pub const max_call_patches_per_func: u32 = 1 << 20;
 
+/// Per-compile-call statistics for diagnosis. Populated by
+/// `compileModuleCached` and surfaced by the CLI / tests.
+pub const CacheStats = struct {
+    reused: u32 = 0,
+    recompiled: u32 = 0,
+};
+
+/// Output of `<arch>.compileModuleCached`. Shared between backends so
+/// the CLI can dispatch without a per-arch wrapper type.
+pub const CompileResultCached = struct {
+    /// Concatenated native code for every function in the module,
+    /// inter-function PC-relative calls already resolved.
+    code: []u8,
+    /// Per-local-function byte offset into `code`.
+    offsets: []u32,
+    /// Per-function cache entries. Caller owns and must free each
+    /// entry's `code` + `call_patches` (or use the entries to build a
+    /// `Cache` and call `Cache.deinit`).
+    cache_functions: []CachedFunction,
+    stats: CacheStats,
+};
+
 /// Inter-function PC-relative call patch carried in a cached function.
 /// `patch_offset` is relative to the start of this function's code
 /// (not the module's global code blob); the reuse path re-bases by

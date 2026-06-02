@@ -29,6 +29,7 @@ const core_types = @import("../runtime/common/types.zig");
 const interp_instance = @import("../runtime/interpreter/instance.zig");
 const config = @import("../config.zig");
 const aot_bisect = @import("../compiler/aot_bisect.zig");
+const codegen_cache = @import("../compiler/codegen_cache.zig");
 
 // Re-export the on-disk JSON schema from `aot.zig` so `precompileComponent`
 // and `loadManifest` agree on layout without duplicating the schema.
@@ -79,6 +80,26 @@ pub const PrecompileOptions = struct {
     /// `-O0` we know it's in the optimization pipeline; if it persists the
     /// bug is in the frontend / SSA / codegen.
     optimize: bool = true,
+    /// #761 Phase 2: per-core codegen cache directory. When non-null,
+    /// `precompileComponent` reads `<dir>/core<N>.cache` for each core
+    /// (if present, header-compatible) to reuse cached per-function
+    /// native code, and writes the updated cache back. Has no effect
+    /// on `compileCoreWasm` itself — use `compileCoreWasmCached`
+    /// directly for in-memory cache reuse.
+    cache_dir: ?[]const u8 = null,
+};
+
+/// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
+pub const CompileCacheCtx = struct {
+    /// Optional prior cache to consult for per-function reuse.
+    /// Borrowed; not freed by the callee.
+    reuse: ?*const codegen_cache.Cache = null,
+    /// When non-null, the freshly-built cache (along with build-id /
+    /// arch / abi / module_epoch suitable for the on-disk format) is
+    /// moved here. Caller owns and must call `Cache.deinit(allocator)`.
+    /// When null, the new cache is built and discarded internally
+    /// (zero observable change from old behaviour).
+    produced: ?*?codegen_cache.Cache = null,
 };
 
 /// AOT-compile a single core wasm module. Returns freshly-allocated
@@ -91,6 +112,18 @@ pub fn compileCoreWasm(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
     opts: PrecompileOptions,
+) PrecompileError![]u8 {
+    return compileCoreWasmCached(allocator, wasm_bytes, opts, .{});
+}
+
+/// Cache-aware variant of `compileCoreWasm`. Pass a `cache_ctx` to
+/// reuse cached per-function codegen from a prior compile and/or to
+/// capture the freshly-built cache for persisting next to the cwasm.
+pub fn compileCoreWasmCached(
+    allocator: std.mem.Allocator,
+    wasm_bytes: []const u8,
+    opts: PrecompileOptions,
+    cache_ctx: CompileCacheCtx,
 ) PrecompileError![]u8 {
     // Lifetime split mirrors `src/compiler/main.zig` (`wamrc compile`)
     // to bound peak memory on large modules (issue #640). The parsed
@@ -155,18 +188,63 @@ pub fn compileCoreWasm(
         };
     }
 
-    const code: []u8, const offsets: []u32 = switch (opts.target_arch) {
-        .aarch64 => blk: {
-            const r = aarch64_compile.compileModule(&ir_module, allocator) catch return error.CoreCompileFailed;
-            break :blk .{ r.code, r.offsets };
-        },
-        .x86_64 => blk: {
-            const r = x86_64_compile.compileModule(&ir_module, allocator) catch return error.CoreCompileFailed;
-            break :blk .{ r.code, r.offsets };
-        },
+    // #761 Phase 2: drive codegen through the cache-aware path so a
+    // caller-provided `reuse` short-circuits per-function compile for
+    // matching IR hashes, and the freshly-built cache can be moved
+    // back to the caller (typically the `wamrc compile-component
+    // --cache-dir <dir>` driver, which then persists one file per
+    // core). When `cache_ctx.reuse == null` and `cache_ctx.produced
+    // == null` the behaviour is identical to the historical
+    // non-cached path — we build the cache in memory and immediately
+    // free it on return.
+    const target_abi = codegen_cache.TargetAbi.forHost(opts.target_arch);
+    const epoch_inputs: codegen_cache.ModuleEpochInputs = .{
+        .wamr_build_id = config.version,
+        .target_arch = opts.target_arch,
+        .target_abi = target_abi,
+        .import_count = ir_module.import_count,
+        .global_types = ir_module.global_types,
+        .global_offsets = ir_module.global_offsets,
+        .global_storage_size = ir_module.global_storage_size,
+        .func_types = ir_module.func_types.items,
+        .func_type_indices = ir_module.func_type_indices.items,
     };
+    const module_epoch = codegen_cache.hashModuleEpoch(epoch_inputs);
+
+    const compiled: codegen_cache.CompileResultCached = switch (opts.target_arch) {
+        .aarch64 => aarch64_compile.compileModuleCached(&ir_module, cache_ctx.reuse, allocator) catch
+            return error.CoreCompileFailed,
+        .x86_64 => x86_64_compile.compileModuleCached(&ir_module, cache_ctx.reuse, allocator) catch
+            return error.CoreCompileFailed,
+    };
+    const code = compiled.code;
+    const offsets = compiled.offsets;
     defer allocator.free(code);
     defer allocator.free(offsets);
+
+    // Decide ownership of the freshly-built per-function cache entries.
+    // If the caller wants the cache, we move it into `*produced`;
+    // otherwise we own and free it on return.
+    var release_cache_funcs = true;
+    defer if (release_cache_funcs) {
+        for (compiled.cache_functions) |*f| {
+            allocator.free(f.code);
+            allocator.free(f.call_patches);
+        }
+        allocator.free(compiled.cache_functions);
+    };
+    if (cache_ctx.produced) |dst| {
+        const build_id_dup = allocator.dupe(u8, config.version) catch return error.OutOfMemory;
+        errdefer allocator.free(build_id_dup);
+        dst.* = codegen_cache.Cache{
+            .wamr_build_id = build_id_dup,
+            .target_arch = opts.target_arch,
+            .target_abi = target_abi,
+            .module_epoch = module_epoch,
+            .functions = compiled.cache_functions,
+        };
+        release_cache_funcs = false;
+    }
 
     // Short-lived arena for the emit-side field tables. `emit_aot.emit`
     // copies what it needs into its caller-owned output buffer, so
@@ -570,7 +648,39 @@ pub fn precompileComponent(
     entries.ensureTotalCapacity(ra, core_data_list.items.len) catch return error.OutOfMemory;
 
     for (core_data_list.items, 0..) |core_ref, idx| {
-        const cwasm = compileCoreWasm(allocator, core_ref.data, opts) catch |err| {
+        // #761 Phase 2: per-core codegen cache. Build the per-core
+        // cache path once; load+validate existing cache for reuse, and
+        // capture the freshly-built cache to persist back. Header
+        // mismatches are NOT errors — they just yield a warning + a
+        // full recompile for that core, matching the single-module
+        // `wamrc compile --cache` behaviour.
+        var per_core_cache_path: ?[]u8 = null;
+        defer if (per_core_cache_path) |p| allocator.free(p);
+        var loaded_cache: ?codegen_cache.Cache = null;
+        defer if (loaded_cache) |*c| c.deinit(allocator);
+        var produced_cache: ?codegen_cache.Cache = null;
+        defer if (produced_cache) |*c| c.deinit(allocator);
+
+        const cache_ctx: CompileCacheCtx = blk: {
+            const cd = opts.cache_dir orelse break :blk .{};
+            const p = std.fmt.allocPrint(allocator, "{s}/core{d}.cache", .{ cd, idx }) catch
+                return error.OutOfMemory;
+            per_core_cache_path = p;
+            cwd.createDirPath(io, cd) catch {};
+            // Best-effort load — any error degrades to full recompile
+            // for this core, with the new cache written below.
+            const bytes_or = cwd.readFileAlloc(io, p, allocator, @enumFromInt(codegen_cache.max_cache_file_bytes));
+            if (bytes_or) |bytes| {
+                defer allocator.free(bytes);
+                if (codegen_cache.deserialize(bytes, allocator)) |c| {
+                    loaded_cache = c;
+                } else |_| {}
+            } else |_| {}
+            const reuse_ptr: ?*const codegen_cache.Cache = if (loaded_cache) |*c| c else null;
+            break :blk .{ .reuse = reuse_ptr, .produced = &produced_cache };
+        };
+
+        const cwasm = compileCoreWasmCached(allocator, core_ref.data, opts, cache_ctx) catch |err| {
             std.log.err("precompileComponent: core {d} compile failed: {s}", .{ idx, @errorName(err) });
             return err;
         };
@@ -581,6 +691,22 @@ pub fn precompileComponent(
         dir.writeFile(io, .{ .sub_path = rel_path, .data = cwasm }) catch |err| {
             std.log.err("precompileComponent: write {s}/{s} failed: {s}", .{ parent_dir_path, rel_path, @errorName(err) });
             return error.WriteFailed;
+        };
+
+        // Persist the freshly-built cache (if any) AFTER the cwasm is
+        // on disk so a partial failure can't leave a cache that
+        // outlives its artifact.
+        if (per_core_cache_path) |p| if (produced_cache) |*pc| {
+            const bytes = codegen_cache.serialize(pc, allocator) catch |err| blk: {
+                std.log.warn("precompileComponent: core {d} cache serialise failed: {s}", .{ idx, @errorName(err) });
+                break :blk null;
+            };
+            if (bytes) |b| {
+                defer allocator.free(b);
+                cwd.writeFile(io, .{ .sub_path = p, .data = b }) catch |err| {
+                    std.log.warn("precompileComponent: core {d} cache write to {s} failed: {s}", .{ idx, p, @errorName(err) });
+                };
+            }
         };
 
         const hex = hexSha256(ra, cwasm) catch return error.OutOfMemory;
