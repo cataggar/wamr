@@ -28,6 +28,7 @@ const name_section_mod = @import("../runtime/common/name_section.zig");
 const core_types = @import("../runtime/common/types.zig");
 const interp_instance = @import("../runtime/interpreter/instance.zig");
 const config = @import("../config.zig");
+const aot_bisect = @import("../compiler/aot_bisect.zig");
 
 // Re-export the on-disk JSON schema from `aot.zig` so `precompileComponent`
 // and `loadManifest` agree on layout without duplicating the schema.
@@ -140,6 +141,13 @@ pub fn compileCoreWasm(
                     .after_each_pass
                 else
                     .off,
+                // #761 / #743: thread the global bisect spec through
+                // so `WAMR_AOT_SKIP_PASS=...:fn=<idx>` narrows the
+                // partial pipeline to one suspect function. The pass
+                // loop forces verify off per-function for any function
+                // affected by the spec to keep partial-pipeline IR
+                // states from tripping benign structural checks.
+                .bisect = aot_bisect.global,
             },
         ) catch |err| {
             logVerifierFailure(err);
