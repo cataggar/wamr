@@ -78,6 +78,25 @@ pub fn main(init: std.process.Init) !u8 {
             wamr.aot_runtime.g_trap_oob_dump_env = v;
         }
     }
+    // Tune the per-`TrampolinePool` slot cap (#756). Componentize-js
+    // wasms that import lots of unsatisfied `wasi:*` interfaces can
+    // chew through hundreds of slots on instantiation; the default
+    // (`host_trampolines.DEFAULT_MAX_SLOTS`) is sized to comfortably
+    // cover the workloads we know about, but the env var lets users
+    // size the pool exactly without rebuilding. Clamped at
+    // `MAX_SLOTS_HARD` inside `TrampolinePool.init`.
+    if (init.environ_map.get("WAMR_MAX_TRAMPOLINE_SLOTS")) |v| {
+        if (v.len > 0) {
+            if (std.fmt.parseInt(u32, v, 10)) |n| {
+                wamr.host_trampolines.current_max_slots = n;
+            } else |err| {
+                std.debug.print(
+                    "warning: WAMR_MAX_TRAMPOLINE_SLOTS={s}: {s} — using default {d}\n",
+                    .{ v, @errorName(err), wamr.host_trampolines.current_max_slots },
+                );
+            }
+        }
+    }
     if (init.environ_map.get("WAMR_WATCH_ADDR")) |v| {
         if (v.len > 0) {
             wamr.aot_runtime.initWatchAddrFromEnv(v) catch |err| {

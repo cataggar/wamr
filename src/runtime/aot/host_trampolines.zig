@@ -24,7 +24,64 @@ pub const STUB_BYTES: usize = switch (builtin.cpu.arch) {
     .aarch64 => aarch64_stub_bytes,
     else => 1,
 };
-pub const MAX_SLOTS: u32 = 2048;
+/// Default per-`TrampolinePool` slot count. The pool memory cost is
+/// `cap * (@sizeOf(Slot) + STUB_BYTES) + (MAX_SLOTS_HARD / 8)` for
+/// the warn-once bit set — at the default `@sizeOf(Slot) = 64` and
+/// `STUB_BYTES = 63` (x86_64) / `84` (aarch64):
+///
+///   | cap   | x86_64 (~127 B/slot) | aarch64 (~148 B/slot) |
+///   |------:|---------------------:|----------------------:|
+///   |  256  |               ~32 KB |                ~37 KB |
+///   | 2048  |              ~254 KB |               ~296 KB |
+///   | 4096  |              ~508 KB |               ~592 KB |
+///   | 8192  |             ~1016 KB |              ~1184 KB |
+///
+/// Real-world measurements (instrumented `pool.next_slot` at the end
+/// of `instantiateWithOptions`):
+///
+///   * Standalone `componentize-js` (the #754 minimal repro,
+///     `tests/regressions/754-slice/`):              432 slots
+///   * Composed codegen-cli + TCGC (#752 motivating
+///     workload, per-instance):                    130 + 168 slots
+///
+/// `4096` gives ~9× headroom over the observed worst case at a
+/// resident cost of <600 KB on either arch. Override at runtime
+/// via `WAMR_MAX_TRAMPOLINE_SLOTS=<N>` or `wamr run
+/// --max-trampoline-slots <N>` — `MAX_SLOTS_HARD` is the comptime
+/// ceiling that prevents accidental DoS via huge tuning values.
+///
+/// History:
+///   * Pre-PR #755: `256` — exhausted by any standalone
+///     componentize-js wasm; surfaced as `OutOfTrampolineSlots`
+///     warnings buried among `SignatureTooWide` rejects, then a
+///     segfault. The #754 bisection's first hard prerequisite.
+///   * PR #755 (interim): `2048` — unblocked #754 but had only
+///     ~5× headroom over the measured worst case.
+///   * This commit (#756): `4096` runtime-tunable.
+pub const DEFAULT_MAX_SLOTS: u32 = 4096;
+
+/// Comptime hard ceiling on per-pool slot count. Used to size the
+/// `g_dispatch_warn_once` fixed-bit-set (whose width must be
+/// comptime-known) and to guard against `--max-trampoline-slots
+/// 4000000000` accidents. Increase only when a real workload needs
+/// more than 64 K imports per component instance. The bit set
+/// itself is 8 KB at this size.
+pub const MAX_SLOTS_HARD: u32 = 65536;
+
+/// Process-wide runtime cap, mutable so embedders / `wamr run`'s
+/// `WAMR_MAX_TRAMPOLINE_SLOTS` knob can adjust it before any
+/// `TrampolinePool.init()` runs. New pools created after the change
+/// pick up the new cap; existing pools keep their original size.
+/// Clamped to `MAX_SLOTS_HARD` by `TrampolinePool.init`.
+pub var current_max_slots: u32 = DEFAULT_MAX_SLOTS;
+
+/// Legacy alias. New code should use `MAX_SLOTS_HARD` (the
+/// comptime ceiling) for fixed-bit-set sizing and
+/// `TrampolinePool.cap` for per-pool bounds. Existing call sites
+/// that bounds-check against `MAX_SLOTS` keep working — they're
+/// now checking against the wider ceiling, with the tighter
+/// per-pool check happening in `allocSlot*`.
+pub const MAX_SLOTS: u32 = MAX_SLOTS_HARD;
 
 const StubFn = *const fn () callconv(.c) void;
 
@@ -190,7 +247,11 @@ pub fn setActivePool(pool: ?*TrampolinePool) void {
 // rather than a trap. To surface the failure without spamming stderr on
 // hot paths, warn at most once per `(slot)` site via a 256-bit set
 // (one bit per `MAX_SLOTS` entry). Released-build visible.
-var g_dispatch_warn_once: std.bit_set.IntegerBitSet(MAX_SLOTS) = .initEmpty();
+// `ArrayBitSet` (not `IntegerBitSet`) because `MAX_SLOTS_HARD` is
+// 65536 bits = 8 KB — too wide for the single-integer backing
+// `IntegerBitSet` uses. The bit set is reset only at process start,
+// so the 8 KB resident cost is negligible.
+var g_dispatch_warn_once: std.bit_set.ArrayBitSet(usize, MAX_SLOTS) = .initEmpty();
 
 pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) callconv(.c) u64 {
     const pool = g_active_pool orelse {
@@ -247,7 +308,29 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
 pub const TrampolinePool = struct {
     memory: []align(page_size) u8,
     slots: []Slot,
+    /// Per-pool slot cap. Snapshot of `current_max_slots` at `init`
+    /// time, clamped to `MAX_SLOTS_HARD`. Used by `allocSlot*`
+    /// instead of the legacy comptime `MAX_SLOTS` so embedders can
+    /// tune via `WAMR_MAX_TRAMPOLINE_SLOTS` without rebuilding.
+    cap: u32,
     next_slot: u32 = 0,
+    /// Set once the pool first refuses an allocation. Suppresses
+    /// duplicate `OutOfTrampolineSlots` log spam (the failure mode
+    /// pre-#756 was 30+ identical warnings followed by a
+    /// segfault) and signals to `populate*Imports` that
+    /// instantiation should fail cleanly rather than installing
+    /// trap stubs that themselves OOM the pool.
+    exhausted: bool = false,
+    /// Last import name refused after exhaustion. Borrowed from the
+    /// caller; assumed to outlive the pool. Used by the structured
+    /// error log so the user knows which import tripped the cap.
+    last_refused_module: []const u8 = "",
+    last_refused_field: []const u8 = "",
+    /// Set by `setNextImportContext` before each `allocSlot*` call
+    /// so the exhaustion error can name the import that caused it.
+    /// `""` means "unknown" (test fixtures, hand-rolled callers).
+    next_import_module: []const u8 = "",
+    next_import_field: []const u8 = "",
 
     // Whether RWX trampoline pages are supported on the build target.
     // Gated at comptime so the `std.posix.mmap` call below is not analysed
@@ -265,12 +348,20 @@ pub const TrampolinePool = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) !TrampolinePool {
+        return initWithCap(allocator, current_max_slots);
+    }
+
+    /// Explicit-cap variant for callers that want to override the
+    /// process-wide `current_max_slots` (tests, embedders sizing for
+    /// known workloads). `cap` is clamped to `[1, MAX_SLOTS_HARD]`.
+    pub fn initWithCap(allocator: std.mem.Allocator, cap_req: u32) !TrampolinePool {
         if (comptime !supports_pool) return error.UnsupportedPlatform;
 
-        const slots = try allocator.alloc(Slot, MAX_SLOTS);
+        const cap: u32 = @min(@max(cap_req, 1), MAX_SLOTS_HARD);
+        const slots = try allocator.alloc(Slot, cap);
         errdefer allocator.free(slots);
 
-        const map_len = std.mem.alignForward(usize, @as(usize, MAX_SLOTS) * STUB_BYTES, page_size);
+        const map_len = std.mem.alignForward(usize, @as(usize, cap) * STUB_BYTES, page_size);
         const memory = try std.posix.mmap(
             null,
             map_len,
@@ -284,12 +375,70 @@ pub const TrampolinePool = struct {
         return .{
             .memory = memory,
             .slots = slots,
+            .cap = cap,
         };
     }
 
-    pub fn allocSlotWithCtx(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
+    /// Common bounds check + exhaustion tracking for every
+    /// `allocSlot*` path (#756). On first refusal, snapshots the
+    /// failing import's name (from `next_import_module` /
+    /// `next_import_field`, set by the caller via
+    /// `setNextImportContext`) and emits ONE structured error log
+    /// with a `bump MAX_SLOTS or compose against a host adapter`
+    /// hint. Subsequent calls return `OutOfTrampolineSlots`
+    /// silently so the warning storm pre-#756 (~30+ identical
+    /// `[aot reject] ... installing trap-on-call stub` lines
+    /// followed by a segfault) no longer happens. Callers that
+    /// loop over imports SHOULD additionally short-circuit on
+    /// `pool.exhausted` so their own per-import diagnostics don't
+    /// fire post-exhaustion.
+    fn reserveSlot(self: *TrampolinePool) error{OutOfTrampolineSlots}!u32 {
         const slot = self.next_slot;
-        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+        if (slot < self.cap) return slot;
+        if (!self.exhausted) {
+            self.exhausted = true;
+            self.last_refused_module = self.next_import_module;
+            self.last_refused_field = self.next_import_field;
+            std.log.err(
+                "[aot trampoline-pool] exhausted at {d}/{d} slots; first refused import: '{s}.{s}'.\n" ++
+                    "  hint: set WAMR_MAX_TRAMPOLINE_SLOTS=<N> (or compile a build with a larger\n" ++
+                    "        host_trampolines.DEFAULT_MAX_SLOTS); or compose this component against\n" ++
+                    "        a host adapter so wasi:* imports route through the canon-lower-aot fast\n" ++
+                    "        path (which does not consume a trampoline slot).",
+                .{ self.cap, self.cap, self.last_refused_module, self.last_refused_field },
+            );
+        }
+        return error.OutOfTrampolineSlots;
+    }
+
+    /// Compatibility shim: `allocSlot*` paths used to call
+    /// `reserveSlotAnon()` before `setNextImportContext` existed.
+    /// Equivalent to `reserveSlot` now that the context is read off
+    /// the pool's own fields. Kept as a separate name so search
+    /// tools (and reviewers) can find the call sites.
+    fn reserveSlotAnon(self: *TrampolinePool) error{OutOfTrampolineSlots}!u32 {
+        return self.reserveSlot();
+    }
+
+    /// Record the import that the NEXT `allocSlot*` call is for, so
+    /// the exhaustion error in `reserveSlot` can name it. Callers
+    /// in `component/instance.zig`'s `populate*Imports` walk should
+    /// call this right before each `pool.allocX(...)`. Borrowed —
+    /// the caller must keep `module_name` and `field_name` alive
+    /// until the alloc returns (always trivially true: WASI import
+    /// names are static string literals or borrowed from
+    /// component-level metadata that outlives the pool).
+    pub fn setNextImportContext(
+        self: *TrampolinePool,
+        module_name: []const u8,
+        field_name: []const u8,
+    ) void {
+        self.next_import_module = module_name;
+        self.next_import_field = field_name;
+    }
+
+    pub fn allocSlotWithCtx(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
+        const slot = try self.reserveSlotAnon();
 
         self.slots[slot] = .{
             .component_inst = ctx,
@@ -307,8 +456,7 @@ pub const TrampolinePool = struct {
     }
 
     pub fn allocSlot(self: *TrampolinePool, component_inst: *anyopaque, canon_lower_idx: u32) !StubFn {
-        const slot = self.next_slot;
-        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+        const slot = try self.reserveSlotAnon();
 
         self.slots[slot] = .{
             .component_inst = component_inst,
@@ -328,8 +476,7 @@ pub const TrampolinePool = struct {
     /// so the dispatcher skips the AOT codegen's leading vmctx argument
     /// before treating the remaining registers as lowered wasm args. (#687.)
     pub fn allocCanonLowerAotSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
-        const slot = self.next_slot;
-        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+        const slot = try self.reserveSlotAnon();
 
         self.slots[slot] = .{
             .component_inst = ctx,
@@ -352,8 +499,7 @@ pub const TrampolinePool = struct {
     /// to `wamrAotDispatchCrossInstance`, which re-issues the call into
     /// the sibling AotInstance via `aot_runtime.callFuncScalar`.
     pub fn allocCrossInstanceSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
-        const slot = self.next_slot;
-        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+        const slot = try self.reserveSlotAnon();
 
         self.slots[slot] = .{
             .component_inst = ctx,
@@ -377,8 +523,7 @@ pub const TrampolinePool = struct {
     /// to invoke the right pure helper against the component's resource
     /// table. (#701, follow-up to #687.)
     pub fn allocCanonBuiltinAotSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
-        const slot = self.next_slot;
-        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+        const slot = try self.reserveSlotAnon();
 
         self.slots[slot] = .{
             .component_inst = ctx,
@@ -401,8 +546,7 @@ pub const TrampolinePool = struct {
     /// (canon.lower / canon-builtin) yet — instantiation succeeds, but any
     /// actual call traps with a clean status (#662 follow-up).
     pub fn allocTrapSlot(self: *TrampolinePool, ctx: *anyopaque) !StubFn {
-        const slot = self.next_slot;
-        if (slot >= MAX_SLOTS) return error.OutOfTrampolineSlots;
+        const slot = try self.reserveSlotAnon();
 
         self.slots[slot] = .{
             .component_inst = ctx,

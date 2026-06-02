@@ -3381,6 +3381,29 @@ fn resolveAotImportedFunctionOverrides(
         if (imp.kind != .function) continue;
         defer func_idx += 1;
 
+        // Set the trampoline-pool import context so an
+        // `OutOfTrampolineSlots` exhaustion error names the import
+        // that tripped the cap (#756). Read inside `reserveSlot`
+        // on the first refusal; ignored on the success path.
+        if (inst.aot_trampoline_pool) |pool| {
+            pool.setNextImportContext(imp.module_name, imp.field_name);
+            // Pool already exhausted by an earlier import in this
+            // walk — stop trying. The structured error already
+            // fired ONCE on first refusal; emitting one
+            // `[aot reject] ...` warning per remaining import
+            // produces 30+ lines of noise (the pre-#756 failure
+            // shape) without changing the outcome (the guest will
+            // hit a null function pointer the moment it tries to
+            // call any import). Better: let the override stay
+            // null and leave the failure mode as "pool exhausted,
+            // see error above" instead of "pool exhausted +
+            // mystery segfault".
+            if (pool.exhausted) {
+                overrides[func_idx] = null;
+                continue;
+            }
+        }
+
         // Look up the `with` arg that names this import's wasm module
         // FIRST — before any WASI / spectest short-circuit. For
         // component-embedded WASIp1 cores, `wasm-tools component new
@@ -3429,10 +3452,12 @@ fn resolveAotImportedFunctionOverrides(
                             imp,
                             module,
                         ) catch |err| blk: {
-                            std.log.warn(
-                                "[aot reject] core module {d}: canon-lower thunk for '{s}.{s}' failed ({s}); falling back to cross-instance / trap-stub",
-                                .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
-                            );
+                            if (err != error.OutOfTrampolineSlots) {
+                                std.log.warn(
+                                    "[aot reject] core module {d}: canon-lower thunk for '{s}.{s}' failed ({s}); falling back to cross-instance / trap-stub",
+                                    .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                                );
+                            }
                             break :blk null;
                         };
                     },
@@ -3456,10 +3481,12 @@ fn resolveAotImportedFunctionOverrides(
                             imp,
                             module,
                         ) catch |err| blk: {
-                            std.log.warn(
-                                "[aot reject] core module {d}: canon-builtin thunk for '{s}.{s}' failed ({s}); falling back to cross-instance / trap-stub",
-                                .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
-                            );
+                            if (err != error.OutOfTrampolineSlots) {
+                                std.log.warn(
+                                    "[aot reject] core module {d}: canon-builtin thunk for '{s}.{s}' failed ({s}); falling back to cross-instance / trap-stub",
+                                    .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                                );
+                            }
                             break :blk null;
                         };
                     },
@@ -3469,10 +3496,19 @@ fn resolveAotImportedFunctionOverrides(
 
             if (thunk == null) {
                 thunk = installCrossInstanceThunk(allocator, inst, component, src_entry, imp, module) catch |err| blk: {
-                    std.log.warn(
-                        "[aot reject] core module {d}: cross-instance thunk for '{s}.{s}' failed ({s}); installing trap-on-call stub",
-                        .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
-                    );
+                    // Suppress the per-import warning when the pool
+                    // is exhausted: the structured `[aot trampoline-
+                    // pool] exhausted ...` error already fired once
+                    // from `reserveSlot`, and the next-loop-iteration
+                    // `pool.exhausted` short-circuit kicks in
+                    // immediately so the user sees one diagnostic
+                    // instead of a 30-line warning storm (#756).
+                    if (err != error.OutOfTrampolineSlots) {
+                        std.log.warn(
+                            "[aot reject] core module {d}: cross-instance thunk for '{s}.{s}' failed ({s}); installing trap-on-call stub",
+                            .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                        );
+                    }
                     break :blk null;
                 };
             }
@@ -3483,10 +3519,12 @@ fn resolveAotImportedFunctionOverrides(
             // stub so instantiation succeeds. Any actual call surfaces a
             // clean trap via `wamrAotDispatchTrapStub`.
             thunk = installTrapStub(allocator, inst, imp, module_idx) catch |err| blk: {
-                std.log.warn(
-                    "[aot reject] core module {d}: failed to install trap stub for '{s}.{s}': {s}",
-                    .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
-                );
+                if (err != error.OutOfTrampolineSlots) {
+                    std.log.warn(
+                        "[aot reject] core module {d}: failed to install trap stub for '{s}.{s}': {s}",
+                        .{ module_idx, imp.module_name, imp.field_name, @errorName(err) },
+                    );
+                }
                 break :blk null;
             };
         }
