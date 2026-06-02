@@ -3699,6 +3699,28 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     // using .i32 makes writeDefTyped zero-extend and truncate the upper
     // 32 bits of the result. Walk the IR to propagate each select's true
     // value type from its producing instruction.
+    //
+    // #754: the previous single-pass form built `vreg_ty` from the initial
+    // (wrong `.i32`) types and then overwrote each select's `.type`
+    // without updating the map. Chained selects — where one select's
+    // result feeds another's `if_true` — therefore stayed at `.i32`
+    // because the second select looked up the first's stale entry. The
+    // motivating real-world hit was SpiderMonkey's `js::math_min`, a
+    // four-deep select chain that returned the *low 32 bits* of an f64
+    // (zero for any whole number whose mantissa fits in 52 bits), which
+    // made `Math.min(3, 11)` return 0 and in turn made
+    // `String.prototype.slice` always return `""` because its
+    // `Math.min(intStart, len)` clamp produced 0 → the `intStart >=
+    // intEnd` early-out fired.
+    //
+    // Fix: when a select's type is rewritten, immediately update the
+    // map entry for its destination so chained selects see the new
+    // type. Single-pass is sufficient because select instructions in
+    // a basic block are processed in producer-before-consumer order,
+    // and `if_true` for a chained select is always defined earlier in
+    // the same block as the consuming select. Falls back to fixpoint
+    // iteration if a select reads from an as-yet-unresolved producer
+    // (cross-block edges, etc.).
     {
         var vreg_ty = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
         defer vreg_ty.deinit();
@@ -3710,11 +3732,20 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         // Locals carry their declared wasm type via local_get/local_set,
         // but the recorded type of local_get is what we already stored.
         // That's fine: local_get writes the value with .type = <local_type>.
-        for (ir_func.blocks.items) |*blk| {
-            for (blk.instructions.items, 0..) |inst, i| {
-                if (std.meta.activeTag(inst.op) == .select) {
-                    if (vreg_ty.get(inst.op.select.if_true)) |t| {
-                        blk.instructions.items[i].type = t;
+        var changed = true;
+        var passes: u32 = 0;
+        while (changed and passes < 16) : (passes += 1) {
+            changed = false;
+            for (ir_func.blocks.items) |*blk| {
+                for (blk.instructions.items, 0..) |inst, i| {
+                    if (std.meta.activeTag(inst.op) == .select) {
+                        if (vreg_ty.get(inst.op.select.if_true)) |t| {
+                            if (blk.instructions.items[i].type != t) {
+                                blk.instructions.items[i].type = t;
+                                changed = true;
+                                if (inst.dest) |d| try vreg_ty.put(d, t);
+                            }
+                        }
                     }
                 }
             }

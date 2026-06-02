@@ -24,7 +24,7 @@ pub const STUB_BYTES: usize = switch (builtin.cpu.arch) {
     .aarch64 => aarch64_stub_bytes,
     else => 1,
 };
-pub const MAX_SLOTS: u32 = 256;
+pub const MAX_SLOTS: u32 = 2048;
 
 const StubFn = *const fn () callconv(.c) void;
 
