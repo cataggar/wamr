@@ -20,6 +20,7 @@ const aot = @import("aot.zig");
 const core_loader = @import("../runtime/interpreter/loader.zig");
 const frontend = @import("../compiler/frontend.zig");
 const passes = @import("../compiler/ir/passes.zig");
+const verifier = @import("../compiler/ir/verifier.zig");
 const x86_64_compile = @import("../compiler/codegen/x86_64/compile.zig");
 const aarch64_compile = @import("../compiler/codegen/aarch64/compile.zig");
 const emit_aot = @import("../compiler/emit_aot.zig");
@@ -42,6 +43,27 @@ pub const PrecompileError = error{
     OpenDirFailed,
     JsonSerializationFailed,
 };
+
+/// Surface the IR verifier's diagnostic detail to stderr when a
+/// per-pass verify check trips inside `precompileComponent`. The
+/// verifier's `last_failure` thread-local already carries the
+/// pass name, function/block/inst indices, vreg and a short
+/// human-readable detail string; without printing it the only
+/// thing the user sees is `error: CoreCompileFailed`, which
+/// makes catching e.g. a #754-class operand-type mismatch
+/// almost as painful as the original silent miscompile.
+fn logVerifierFailure(err: anyerror) void {
+    const f = verifier.last_failure;
+    if (f.func_index == null and f.detail.len == 0) {
+        std.log.err("aot-compile failed: {s}", .{@errorName(err)});
+        return;
+    }
+    var buf: [512]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&buf);
+    f.format(&fbs) catch {};
+    const written = fbs.buffered();
+    std.log.err("aot-compile failed: {s}", .{written});
+}
 
 /// Options controlling `precompileComponent`. Today only the target
 /// arch is exposed; future options (opt level, dump-ir hooks, …) slot
@@ -94,8 +116,35 @@ pub fn compileCoreWasm(
             &ir_module,
             passes.defaultPassesForTarget(opts.target_arch),
             allocator,
-            .{ .verify_mode = .off },
-        ) catch return error.CoreCompileFailed;
+            .{
+                // Match single-module `wamrc compile`: run the IR verifier
+                // after every pass in safe builds. Components are heavy
+                // (the StarlingMonkey-bundled wasms used by jco have
+                // ~12 k functions), but verifier-caught bugs like #754
+                // — operand-type-mismatch on `select` propagating
+                // through chained selects — are silent miscompiles
+                // that cost far more to debug at runtime than to catch
+                // here.  Release builds keep the previous off-by-default
+                // behaviour for compile-time perf.
+                //
+                // Note: `-O0` (this branch's else arm) intentionally
+                // skips the verifier because the frontend emits
+                // dead instructions after `unreachable` / unconditional
+                // `br` that `scrubUnreachableBlocks` (a runPasses-
+                // internal cleanup, not a public pass) trims before
+                // verify — without that cleanup the structural
+                // checks trip benign `MultipleTerminators` errors.
+                // Users who want belt-and-suspenders verification on
+                // an `-O0` build should drop `-O0` instead.
+                .verify_mode = if (std.debug.runtime_safety)
+                    .after_each_pass
+                else
+                    .off,
+            },
+        ) catch |err| {
+            logVerifierFailure(err);
+            return error.CoreCompileFailed;
+        };
     }
 
     const code: []u8, const offsets: []u32 = switch (opts.target_arch) {

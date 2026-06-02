@@ -16,6 +16,11 @@ const range_split = @import("../../ir/range_split.zig");
 /// adding the option if needed; for routine bench triage just edit this
 /// line and rebuild — the harness handles isolated caches per worktree.
 const range_split_debug = false;
+
+/// #754 codegen trace knob — when true, print one line per `select`
+/// emission. Off by default; see x86_64/compile.zig for the matching
+/// flag and a longer rationale.
+const trace_select: bool = false;
 const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
 const local_init = @import("../../ir/local_init.zig");
@@ -6036,6 +6041,12 @@ fn emitSelect(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
+    if (trace_select) {
+        std.debug.print(
+            "[codegen.aarch64.select] dest=v{d} type={s} if_true=v{d} if_false=v{d} cond=v{d}\n",
+            .{ dest, @tagName(inst.type), sel.if_true, sel.if_false, sel.cond },
+        );
+    }
     // Load cond first; after CMP we don't need the cond register anymore,
     // so we can reuse tmp0 for subsequent uses if desired. We keep t/f in
     // distinct scratches (tmp1/tmp2) so CSEL can read them simultaneously.
@@ -6045,6 +6056,14 @@ fn emitSelect(
     const f_r = try useInto(code, reg_map, sel.if_false, RegMap.tmp2);
     const info = try destBegin(reg_map, dest, RegMap.tmp0);
     // wasm: select picks if_true when cond != 0.
+    //
+    // #754: `inst.type` MUST reflect the actual 64-bit type when
+    // selecting f64/i64 values — `csel32` clobbers the upper 32 bits
+    // of the destination register. The frontend's untyped `select`
+    // initially records `.i32` and a fix-up pass propagates the
+    // correct type from the `if_true` producer; flip `trace_select`
+    // on a debug build if a chained-select pattern is suspected of
+    // returning only the low 32 bits.
     if (inst.type == .i32) {
         try code.csel32(info.reg, t_r, f_r, .ne);
     } else {

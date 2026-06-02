@@ -11,6 +11,25 @@ const ir = @import("../../ir/ir.zig");
 const passes = @import("../../ir/passes.zig");
 const emit = @import("emit.zig");
 
+// ── Comptime codegen-trace knobs ────────────────────────────────────────
+//
+// Flip any of these to `true` and rebuild to dump a per-instruction
+// trace of the corresponding codegen path. Always `false` in the
+// committed source so release builds stay zero-cost. The point is
+// not to be on in production but to give the next investigator a
+// one-line change to instrument a class of opcodes when a wamr-AOT
+// bug looks "type-width-shaped" (the #754 motivating bug was
+// chained `select` on f64 that wrote only the low 32 bits because
+// the IR's `inst.type` was `.i32`).
+//
+// Each trace prints to stderr via `std.debug.print` — no allocator
+// allocations, safe to use from inside the codegen hot path.
+const trace_select: bool = false;
+const trace_write_def_typed: bool = false;
+const trace_memory_copy: bool = false;
+const trace_memory_fill: bool = false;
+const trace_call_indirect: bool = false;
+
 /// Platform-specific ABI parameter registers, resolved at comptime.
 const param_regs = if (builtin.os.tag == .windows)
     [_]emit.Reg{ .rcx, .rdx, .r8, .r9 } // Win64
@@ -2581,6 +2600,12 @@ fn writeDefTyped(
     result_reg: emit.Reg,
     val_type: ir.IrType,
 ) !void {
+    if (trace_write_def_typed) {
+        std.debug.print(
+            "[codegen.writeDefTyped] dest=v{d} src={s} type={s} → {s}\n",
+            .{ dest, @tagName(result_reg), @tagName(val_type), if (val_type == .i32) "32-bit (writeDefI32)" else "64-bit (writeDef)" },
+        );
+    }
     if (val_type == .i32) {
         try writeDefI32(code, alloc_result, dest, result_reg);
     } else {
@@ -4002,6 +4027,12 @@ fn compileInstRA(
         // ── Select ────────────────────────────────────────────────────
         .select => |sel| {
             const dest = inst.dest orelse return;
+            if (trace_select) {
+                std.debug.print(
+                    "[codegen.select] dest=v{d} type={s} if_true=v{d} if_false=v{d} cond=v{d}\n",
+                    .{ dest, @tagName(inst.type), sel.if_true, sel.if_false, sel.cond },
+                );
+            }
             // Stage operands through non-allocatable scratch registers
             // (.r10, .r11) so no allocated VReg can collide with our
             // intermediate storage. The previous implementation loaded
@@ -4019,6 +4050,15 @@ fn compileInstRA(
             // upper-bit garbage doesn't affect the branch.
             try code.testRegReg32(cond_reg, cond_reg);
             try code.cmovnz(.r11, .r10); // if cond != 0, r11 = r10 (if_true)
+            // #754: `inst.type` here MUST be `.i64`/`.f64` when the
+            // selected values are 64-bit. The frontend sets it to
+            // `.i32` initially and a fix-up pass corrects it from
+            // the if_true producer's type — see frontend.zig's
+            // "Fix-up pass" near the end of `lowerFunction`. If you
+            // see a select returning the low 32 bits of an f64
+            // (e.g. zero for whole-number doubles), enable
+            // `trace_select` + `trace_write_def_typed` to confirm
+            // the type fix-up reached this instruction.
             try writeDefTyped(code, alloc_result, dest, .r11, inst.type);
         },
 
