@@ -50,6 +50,11 @@ pub const aot_runtime = @import("runtime/aot/runtime.zig");
 /// AOT ↔ WASI host function bridge.
 pub const aot_host_bridge = @import("runtime/aot/host_bridge.zig");
 
+/// AOT host-import trampoline pool (#662, #756). Exposed so `wamr
+/// run` can tune the per-pool slot cap via the
+/// `WAMR_MAX_TRAMPOLINE_SLOTS` env var.
+pub const host_trampolines = @import("runtime/aot/host_trampolines.zig");
+
 /// WASI core logic (pure functions, shared by interpreter and AOT).
 pub const wasi_core = @import("wasi/wasi_core.zig");
 
