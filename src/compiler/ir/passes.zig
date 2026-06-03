@@ -2679,9 +2679,9 @@ pub const RunOptions = struct {
     /// release builds pay nothing. Callers in debug / fuzz contexts
     /// should set this to `.after_each_pass`.
     verify_mode: verifier.VerifyMode = .off,
-    /// Optional per-function pass-pipeline filter used to bisect AOT
-    /// codegen miscompiles (#743 / #761). Default `.{}` means "no
-    /// filtering" — the full pipeline runs for every function.
+    /// Optional pass/prelude filter used to bisect AOT codegen
+    /// miscompiles (#743 / #761). Default `.{}` means "no filtering" —
+    /// the full pipeline runs for every function.
     bisect: PassBisectSpec = .{},
     /// Module index used to narrow `bisect.skip`/`bisect.limit` entries
     /// whose `mod_filter` is non-null. Defaults to 0; single-module
@@ -2691,18 +2691,18 @@ pub const RunOptions = struct {
     module_idx: u32 = 0,
 };
 
-/// Filter that selectively skips IR optimisation passes or caps the
-/// pipeline length for specific functions. Used by `wamrc` bisection
-/// knobs (`WAMR_AOT_SKIP_PASS` / `WAMR_AOT_PASSES_LIMIT`) to narrow a
-/// suspected codegen miscompile to a single pass + function pair
-/// without recompiling the rest of the module with a partial pipeline.
+/// Filter that selectively skips IR optimisation passes, caps the
+/// pipeline length for specific functions, or skips the prelude passes
+/// that run outside the per-function pass slice. Used by `wamrc`
+/// bisection knobs (`WAMR_AOT_SKIP_PASS` / `WAMR_AOT_PASSES_LIMIT` /
+/// `WAMR_AOT_SKIP_*`) to narrow a suspected codegen miscompile.
 ///
 /// `pass_idx` here refers to the index into the per-function pipeline
 /// slice handed to `runPassesWithOptions` (typically the slice
-/// returned by `defaultPassesForTarget`). The infrastructure passes
-/// (`inlineSmallFunctions`, `promoteLocalsToSSA`, `lowerPhisToLocals`,
-/// `scrubUnreachableBlocks`) live outside that slice and are never
-/// affected by this filter.
+/// returned by `defaultPassesForTarget`). The prelude skip fields below
+/// handle `inlineSmallFunctions`, `promoteLocalsToSSA`, and
+/// `lowerPhisToLocals`; `scrubUnreachableBlocks` is deliberately not
+/// filtered.
 ///
 /// Lifetime: `Skip.func_filter` / `Limit.func_filter` are borrowed
 /// slices. Callers (typically `aot_bisect.global`) keep them live for
@@ -2729,14 +2729,60 @@ pub const PassBisectSpec = struct {
         func_filter: ?[]const u32 = null,
         mod_filter: ?[]const u32 = null,
     };
+    /// Scope for function-level prelude skips. `null` filters mean "all
+    /// functions/modules"; non-null slices narrow to the listed indices.
+    pub const PreludeFilter = struct {
+        func_filter: ?[]const u32 = null,
+        mod_filter: ?[]const u32 = null,
+    };
 
     skip: []const Skip = &.{},
     limit: ?Limit = null,
+    /// Module-level prelude skip for `inlineSmallFunctions`. `&.{}`
+    /// means disabled, `null` means every module, and a non-empty slice
+    /// means only those module indices.
+    skip_inline_small: ?[]const u32 = &.{},
+    /// Function-level prelude skips. `null` means disabled; `.{}`
+    /// means every module/function; non-null fields inside the struct
+    /// narrow to the listed module/function indices.
+    skip_promote_ssa: ?PreludeFilter = null,
+    skip_phis_to_locals: ?PreludeFilter = null,
 
-    /// True when no filtering is configured — fast path for callers
-    /// that want to skip per-pass overhead checks.
+    /// True when no filtering is configured anywhere.
     pub fn isEmpty(self: PassBisectSpec) bool {
-        return self.skip.len == 0 and self.limit == null;
+        return self.skip.len == 0 and
+            self.limit == null and
+            !preludeFilterEnabled(self.skip_inline_small) and
+            self.skip_promote_ssa == null and
+            self.skip_phis_to_locals == null;
+    }
+
+    /// True when this spec may alter any function in `module_idx`.
+    /// Used for module-level scheduling decisions: a spec scoped to a
+    /// different `:mod=N` must leave this module's optimization loop
+    /// byte-for-byte equivalent to the unfiltered path.
+    pub fn affectsModule(self: PassBisectSpec, module_idx: u32) bool {
+        if (self.skipsInlineSmall(module_idx) or
+            preludeFilterMatchesModule(self.skip_promote_ssa, module_idx) or
+            preludeFilterMatchesModule(self.skip_phis_to_locals, module_idx))
+        {
+            return true;
+        }
+        return self.hasPassPipelineFilterInModule(module_idx);
+    }
+
+    /// True when the per-function pass slice is filtered in
+    /// `module_idx`. Unlike prelude skips, these filters can affect only
+    /// a subset of functions, so the outer inlining loop must be capped
+    /// to avoid propagating partial-pipeline effects into callers.
+    pub fn hasPassPipelineFilterInModule(self: PassBisectSpec, module_idx: u32) bool {
+        if (self.limit) |lim| {
+            if (modMatches(lim.mod_filter, module_idx)) return true;
+        }
+        for (self.skip) |s| {
+            if (modMatches(s.mod_filter, module_idx)) return true;
+        }
+        return false;
     }
 
     /// True when pass index `pass_idx` should be skipped for function
@@ -2762,12 +2808,32 @@ pub const PassBisectSpec = struct {
         return lim.n;
     }
 
+    pub fn skipsInlineSmall(self: PassBisectSpec, module_idx: u32) bool {
+        return preludeMatches(self.skip_inline_small, module_idx);
+    }
+
+    pub fn skipsPromoteSSA(self: PassBisectSpec, module_idx: u32, func_idx: u32) bool {
+        return preludeFilterMatchesFunction(self.skip_promote_ssa, module_idx, func_idx) or
+            preludeFilterMatchesFunction(self.skip_phis_to_locals, module_idx, func_idx);
+    }
+
+    pub fn skipsPhisToLocals(self: PassBisectSpec, module_idx: u32, func_idx: u32) bool {
+        return preludeFilterMatchesFunction(self.skip_phis_to_locals, module_idx, func_idx);
+    }
+
+    pub fn lowerPhisSkipForcesPromote(self: PassBisectSpec) bool {
+        const lower = self.skip_phis_to_locals orelse return false;
+        const promote = self.skip_promote_ssa orelse return true;
+        return !preludeFilterCovers(promote, lower);
+    }
+
     /// True when this spec narrows behaviour for `func_idx` in
     /// `module_idx` at all. Used to decide per-function verifier
     /// suppression: partial pipelines on a function can leave its IR
     /// in a state later cleanups would normalise, tripping benign
     /// structural checks.
     pub fn affectsFunction(self: PassBisectSpec, module_idx: u32, func_idx: u32) bool {
+        if (self.skipsInlineSmall(module_idx) or self.skipsPromoteSSA(module_idx, func_idx)) return true;
         if (self.effectiveLimit(module_idx, func_idx) != null) return true;
         for (self.skip) |s| {
             if (!modMatches(s.mod_filter, module_idx)) continue;
@@ -2786,6 +2852,49 @@ pub const PassBisectSpec = struct {
         const list = filter orelse return true;
         for (list) |m| if (m == module_idx) return true;
         return false;
+    }
+
+    fn preludeFilterEnabled(filter: ?[]const u32) bool {
+        const list = filter orelse return true;
+        return list.len != 0;
+    }
+
+    fn preludeMatches(filter: ?[]const u32, module_idx: u32) bool {
+        const list = filter orelse return true;
+        if (list.len == 0) return false;
+        for (list) |m| if (m == module_idx) return true;
+        return false;
+    }
+
+    fn preludeFilterMatchesModule(filter: ?PreludeFilter, module_idx: u32) bool {
+        const f = filter orelse return false;
+        return modMatches(f.mod_filter, module_idx);
+    }
+
+    fn preludeFilterMatchesFunction(filter: ?PreludeFilter, module_idx: u32, func_idx: u32) bool {
+        const f = filter orelse return false;
+        return modMatches(f.mod_filter, module_idx) and funcMatches(f.func_filter, func_idx);
+    }
+
+    fn preludeFilterCovers(cover: PreludeFilter, covered: PreludeFilter) bool {
+        return filterDimensionCovers(cover.mod_filter, covered.mod_filter) and
+            filterDimensionCovers(cover.func_filter, covered.func_filter);
+    }
+
+    fn filterDimensionCovers(cover: ?[]const u32, covered: ?[]const u32) bool {
+        if (cover == null) return true;
+        const covered_list = covered orelse return false;
+        for (covered_list) |item| {
+            var found = false;
+            for (cover.?) |cover_item| {
+                if (cover_item == item) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
     }
 };
 
@@ -6751,48 +6860,49 @@ pub fn runPassesWithOptions(
     // constant-argument-specialisation cases that motivate this loop,
     // without exploding compile time.
     //
-    // #761: when a per-function bisect spec is active, force a single
-    // outer iteration. The second iteration re-runs module-level
-    // `inlineSmallFunctions` on IR that the first per-function pass
-    // round has already filtered, which would leak the partial
-    // pipeline's effects into otherwise-unaffected callers/callees and
-    // defeat the per-function isolation promise. One outer round still
-    // runs full inlining first (over vanilla post-frontend IR), so
-    // unaffected functions retain the same inlining behaviour as
-    // without the bisect.
-    const outer_max: u32 = if (opts.bisect.isEmpty()) 2 else 1;
+    // #761: when the current module has a per-function pass-pipeline
+    // bisect filter, force a single outer iteration. The second
+    // iteration re-runs module-level `inlineSmallFunctions` on IR that
+    // the first per-function pass round has already filtered, which
+    // would leak the partial pipeline's effects into otherwise-
+    // unaffected callers/callees and defeat the per-function isolation
+    // promise. Prelude skips are module-wide, so they keep the normal
+    // two-round schedule.
+    const outer_max: u32 = if (opts.bisect.hasPassPipelineFilterInModule(opts.module_idx)) 1 else 2;
     var outer_iter: u32 = 0;
     while (outer_iter < outer_max) : (outer_iter += 1) {
         // Module-level: inline small leaf callees. Iterate to fixpoint so
         // callers of callers also benefit within a single outer round.
         var inline_iter: u32 = 0;
         var inlined_count: u32 = 0;
-        while (inline_iter < 4) : (inline_iter += 1) {
-            const iter_inlined = try inlineSmallFunctionsCount(module, allocator);
-            if (iter_inlined == 0) break;
-            inlined_count += iter_inlined;
-            total_changes += 1;
+        if (!opts.bisect.skipsInlineSmall(opts.module_idx)) {
+            while (inline_iter < 4) : (inline_iter += 1) {
+                const iter_inlined = try inlineSmallFunctionsCount(module, allocator);
+                if (iter_inlined == 0) break;
+                inlined_count += iter_inlined;
+                total_changes += 1;
 
-            if (opts.verify_mode != .off) {
-                for (module.functions.items, 0..) |*f, fi| {
-                    const fi32: u32 = @intCast(fi);
-                    // #761: suppress verifier on bisect-affected funcs.
-                    const vm: verifier.VerifyMode =
-                        if (opts.bisect.affectsFunction(opts.module_idx, fi32)) .off else opts.verify_mode;
-                    try Verify.check(vm, "inlineSmallFunctions", f, fi32, allocator);
+                if (opts.verify_mode != .off) {
+                    for (module.functions.items, 0..) |*f, fi| {
+                        const fi32: u32 = @intCast(fi);
+                        // #761: suppress verifier on bisect-affected funcs.
+                        const vm: verifier.VerifyMode =
+                            if (opts.bisect.affectsFunction(opts.module_idx, fi32)) .off else opts.verify_mode;
+                        try Verify.check(vm, "inlineSmallFunctions", f, fi32, allocator);
+                    }
                 }
-            }
 
-            if (opts.dump_hook) |hook| {
-                for (module.functions.items, 0..) |*f, fi| {
-                    try hook.callback(hook.ctx, .{
-                        .pass_name = "inlineSmallFunctions",
-                        .func = f,
-                        .func_index = @intCast(fi),
-                        .changed = true,
-                        .iter = inline_iter,
-                        .outer_iter = outer_iter,
-                    });
+                if (opts.dump_hook) |hook| {
+                    for (module.functions.items, 0..) |*f, fi| {
+                        try hook.callback(hook.ctx, .{
+                            .pass_name = "inlineSmallFunctions",
+                            .func = f,
+                            .func_index = @intCast(fi),
+                            .changed = true,
+                            .iter = inline_iter,
+                            .outer_iter = outer_iter,
+                        });
+                    }
                 }
             }
         }
@@ -6826,7 +6936,7 @@ pub fn runPassesWithOptions(
             // later rounds the function is already past mem2reg and any new
             // local_set/get inserted by inlining is handled by
             // `forwardLocalGet` + `deadLocalSetElimination`.
-            if (outer_iter == 0) {
+            if (outer_iter == 0 and !opts.bisect.skipsPromoteSSA(opts.module_idx, func_idx)) {
                 if (try promoteLocalsToSSA(func, allocator)) {
                     total_changes += 1;
                     try Verify.check(effective_verify_mode, "promoteLocalsToSSA", func, func_idx, allocator);
@@ -6840,7 +6950,7 @@ pub fn runPassesWithOptions(
                             .outer_iter = outer_iter,
                         });
                     }
-                    if (try lowerPhisToLocals(func, allocator)) {
+                    if (!opts.bisect.skipsPhisToLocals(opts.module_idx, func_idx) and try lowerPhisToLocals(func, allocator)) {
                         total_changes += 1;
                         try Verify.check(effective_verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
                         if (opts.dump_hook) |hook| {
@@ -6934,7 +7044,8 @@ pub const default_passes: []const PassFn = &.{
     &inductionVariableSimplification,
     &hoistLoopInvariantCode,
     &unrollSmallFixedLoops,
-    &@import("forward_redundant_loads.zig").forwardRedundantLoads,@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
     &deadStoreElimination,
     &deadCodeElimination,
@@ -6943,7 +7054,6 @@ pub const default_passes: []const PassFn = &.{
     &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
-
 
 /// Default optimization pipeline for x86-64.
 ///
@@ -6973,7 +7083,8 @@ const x86_64_default_passes: []const PassFn = &.{
     &foldWrapOfExtend,
     &globalValueNumbering,
     &hoistLoopInvariantCode,
-    &@import("forward_redundant_loads.zig").forwardRedundantLoads,@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
     &deadStoreElimination,
     &deadCodeElimination,
@@ -6984,56 +7095,56 @@ const x86_64_default_passes: []const PassFn = &.{
 };
 
 const default_passes_no_iv: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,      &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,   &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,        &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,   &hoistLoopInvariantCode,
+    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,    &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,         &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,    &hoistLoopInvariantCode,
     &unrollSmallFixedLoops,            &deadCodeElimination,     &deadLocalSetElimination, &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const default_passes_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,               &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,            &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,                 &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,            &inductionVariableSimplification,
-    &hoistLoopInvariantCode,           &deadCodeElimination,     &deadLocalSetElimination,         &hoistLoopBoundsChecks,
+    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,    &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,         &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,    &inductionVariableSimplification,
+    &hoistLoopInvariantCode,           &deadCodeElimination,     &deadLocalSetElimination, &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const default_passes_no_iv_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,          &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,       &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,            &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,       &hoistLoopInvariantCode,
-    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,
+    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,     &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,  &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,       &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,  &hoistLoopInvariantCode,
+    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_iv: []const PassFn = &.{
-    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
-    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &deadCodeElimination,     &deadLocalSetElimination,
-    &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const x86_64_default_passes_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
-    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &inductionVariableSimplification, &hoistLoopInvariantCode,      &deadCodeElimination,     &deadLocalSetElimination,
-    &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
     &forwardLocalGet,           &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
     &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
     &foldBranchOnEqz,           &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
     &foldSignExtendingLoad,     &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &hoistLoopInvariantCode,    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
+    &hoistLoopInvariantCode,    &unrollSmallFixedLoops,            &deadCodeElimination,     &deadLocalSetElimination,
+    &hoistLoopBoundsChecks,     &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,                 &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd,       &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
+    &foldBranchOnEqz,                 &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
+    &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
+    &inductionVariableSimplification, &hoistLoopInvariantCode,           &deadCodeElimination,     &deadLocalSetElimination,
+    &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
+    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
+    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
+    &hoistLoopInvariantCode,     &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks, &foldLoadStoreOffset,
 };
 
@@ -7510,6 +7621,87 @@ fn bisectTestBuildAddModule(allocator: std.mem.Allocator) !ir.IrModule {
     return module;
 }
 
+fn bisectTestBuildInlineModule(allocator: std.mem.Allocator) !ir.IrModule {
+    var module = ir.IrModule.init(allocator);
+    errdefer module.deinit();
+
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    {
+        const callee = &module.functions.items[0];
+        const cb = try callee.newBlock();
+        _ = callee.newVReg();
+        const v_get = callee.newVReg();
+        try callee.getBlock(cb).append(.{ .op = .{ .local_get = 0 }, .dest = v_get, .type = .i32 });
+        try callee.getBlock(cb).append(.{ .op = .{ .ret = v_get } });
+    }
+
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    const args = try allocator.alloc(ir.VReg, 1);
+    {
+        const caller = &module.functions.items[1];
+        const mb = try caller.newBlock();
+        const v_arg = caller.newVReg();
+        const v_ret = caller.newVReg();
+        try caller.getBlock(mb).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_arg, .type = .i32 });
+        args[0] = v_arg;
+        try caller.getBlock(mb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_ret, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    return module;
+}
+
+fn bisectTestBuildLoopModule(allocator: std.mem.Allocator) !ir.IrModule {
+    var module = ir.IrModule.init(allocator);
+    errdefer module.deinit();
+
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 1));
+    const func = &module.functions.items[0];
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_three = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_three });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_three } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_ctr = func.newVReg();
+    const v_eqz = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_ctr, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_ctr }, .dest = v_eqz });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_eqz, .then_block = b2, .else_block = b3 } } });
+
+    const v_one = func.newVReg();
+    const v_dec = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one });
+    try func.getBlock(b3).append(.{ .op = .{ .sub = .{ .lhs = v_ctr, .rhs = v_one } }, .dest = v_dec });
+    try func.getBlock(b3).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_dec } } });
+    try func.getBlock(b3).append(.{ .op = .{ .br = b1 } });
+
+    const v_result = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 0 }, .dest = v_result, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_result } });
+
+    return module;
+}
+
+fn bisectTestModuleHasPhi(module: *const ir.IrModule) bool {
+    for (module.functions.items) |func| {
+        for (func.blocks.items) |block| {
+            for (block.instructions.items) |inst| {
+                if (inst.op == .phi) return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn bisectTestAddOpAt(module: *const ir.IrModule, func_idx: usize) ir.Inst.Op {
     return module.functions.items[func_idx].blocks.items[0].instructions.items[2].op;
 }
@@ -7641,6 +7833,90 @@ test "PassBisectSpec: skip honours mod_filter — matching module skips" {
             },
         }
     }
+}
+
+test "PassBisectSpec: skip_inline_small gates module prelude" {
+    const allocator = std.testing.allocator;
+    const no_passes: []const PassFn = &.{};
+
+    {
+        var module = try bisectTestBuildInlineModule(allocator);
+        defer module.deinit();
+
+        const mod4 = [_]u32{4};
+        const spec: PassBisectSpec = .{ .skip_inline_small = &mod4 };
+        _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec, .module_idx = 0 });
+
+        try std.testing.expect(module.functions.items[1].blocks.items.len > 1);
+    }
+    {
+        var module = try bisectTestBuildInlineModule(allocator);
+        defer module.deinit();
+
+        const spec: PassBisectSpec = .{ .skip_inline_small = null };
+        _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec, .module_idx = 0 });
+
+        try std.testing.expectEqual(@as(usize, 1), module.functions.items[1].blocks.items.len);
+        try std.testing.expect(module.functions.items[1].blocks.items[0].instructions.items[1].op == .call);
+    }
+}
+
+test "PassBisectSpec: skip_promote_ssa gates SSA prelude" {
+    const allocator = std.testing.allocator;
+    const no_passes: []const PassFn = &.{};
+
+    {
+        var module = try bisectTestBuildLoopModule(allocator);
+        defer module.deinit();
+
+        _ = try runPassesWithOptions(&module, no_passes, allocator, .{});
+
+        try std.testing.expect(module.functions.items[0].local_count > 1);
+        try std.testing.expect(!bisectTestModuleHasPhi(&module));
+    }
+    {
+        var module = try bisectTestBuildLoopModule(allocator);
+        defer module.deinit();
+
+        const spec: PassBisectSpec = .{ .skip_promote_ssa = .{} };
+        _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec });
+
+        try std.testing.expectEqual(@as(u32, 1), module.functions.items[0].local_count);
+        try std.testing.expect(!bisectTestModuleHasPhi(&module));
+    }
+}
+
+test "PassBisectSpec: skip_promote_ssa func_filter only gates matching funcs" {
+    const allocator = std.testing.allocator;
+    const no_passes: []const PassFn = &.{};
+    var module = try bisectTestBuildLoopModule(allocator);
+    defer module.deinit();
+
+    var second = try bisectTestBuildLoopModule(allocator);
+    defer second.deinit();
+    var second_func = second.functions.pop().?;
+    errdefer second_func.deinit();
+    try module.functions.append(allocator, second_func);
+
+    const fn1 = [_]u32{1};
+    const spec: PassBisectSpec = .{ .skip_promote_ssa = .{ .func_filter = &fn1 } };
+    _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec });
+
+    try std.testing.expect(module.functions.items[0].local_count > 1);
+    try std.testing.expectEqual(@as(u32, 1), module.functions.items[1].local_count);
+}
+
+test "PassBisectSpec: skip_phis_to_locals forces promote skip in run loop" {
+    const allocator = std.testing.allocator;
+    const no_passes: []const PassFn = &.{};
+    var module = try bisectTestBuildLoopModule(allocator);
+    defer module.deinit();
+
+    const spec: PassBisectSpec = .{ .skip_phis_to_locals = .{} };
+    _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec });
+
+    try std.testing.expectEqual(@as(u32, 1), module.functions.items[0].local_count);
+    try std.testing.expect(!bisectTestModuleHasPhi(&module));
 }
 
 test "constantFold: eqz on constant" {
@@ -10754,7 +11030,7 @@ test "inlineSmallFunctions: br_table callee gets inlined with remapped targets" 
     try std.testing.expectEqual(module.functions.items[1].blocks.items[0].instructions.items[0].dest.?, bt.index);
 }
 
-test "runPasses: re-runs inlining after first per-function fixpoint" {
+test "runPasses: non-matching mod filter preserves second inlining round" {
     // Scenario: a caller invokes a small leaf callee with an argument that
     // is itself the result of a small chain (local.get → constant fold).
     // After the first per-function fixpoint round the call survives, but
@@ -10819,7 +11095,9 @@ test "runPasses: re-runs inlining after first per-function fixpoint" {
         &constantFold,
         &deadCodeElimination,
     };
-    _ = try runPasses(&module, &test_passes, allocator);
+    const mod4_only = [_]u32{4};
+    const spec: PassBisectSpec = .{ .skip_inline_small = &mod4_only };
+    _ = try runPassesWithOptions(&module, &test_passes, allocator, .{ .bisect = spec, .module_idx = 0 });
 
     // After two outer rounds, f2 must contain no `.call` instructions:
     // f0 was inlined into f1 during the first outer round, and the now
@@ -13632,7 +13910,6 @@ test "CSE load: call in sibling block invalidates dominator-cached load on merge
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
     try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .load);
 }
-
 
 test "GVN load (cell C): call AFTER load in same block prevents fusion of later load (#734)" {
     // entry: load p[0]; call barrier; load p[0]; ret second load.

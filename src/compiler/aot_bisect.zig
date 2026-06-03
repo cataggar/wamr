@@ -1,8 +1,9 @@
 //! AOT codegen bisection knobs (#761 / #743).
 //!
-//! `wamrc` exposes three env vars to let bisects narrow a suspected
-//! IR-optimisation miscompile down to a single (pass, function) pair
-//! without recompiling the rest of the module with a partial pipeline:
+//! `wamrc` exposes env vars to let bisects narrow a suspected
+//! IR-optimisation miscompile down to a single (pass, function) pair,
+//! or to one of the module/function-level prelude passes, without
+//! recompiling the rest of the module with a partial pipeline:
 //!
 //! ```
 //! WAMR_AOT_SKIP_PASS=15                      # skip pass 15 in every func
@@ -14,6 +15,10 @@
 //! WAMR_AOT_PASSES_LIMIT=30                   # cap pipeline at 30 passes
 //! WAMR_AOT_PASSES_LIMIT=30:fn=11040,11041    # cap only listed funcs
 //! WAMR_AOT_PASSES_LIMIT=30:mod=4             # cap only in module 4
+//! WAMR_AOT_SKIP_INLINE_SMALL=mod=4            # skip inlineSmallFunctions in module 4
+//! WAMR_AOT_SKIP_PROMOTE_SSA=1                 # skip promoteLocalsToSSA in every module
+//! WAMR_AOT_SKIP_PROMOTE_SSA=mod=4:fn=0-5999   # skip promote in module 4 funcs 0-5999
+//! WAMR_AOT_SKIP_PHIS_TO_LOCALS=mod=4          # skip lowerPhisToLocals in module 4
 //! ```
 //!
 //! Grammar (single env var):
@@ -21,6 +26,7 @@
 //!   skip_spec   := <pass_idx_or_range> { ':' filter }
 //!   limit_spec  := <usize>             { ':' filter }
 //!   filter      := 'fn=' <fn_list> | 'mod=' <fn_list>
+//!   prelude     := '' | '1' | 'true' | 'all' | { filter }
 //!   pass_idx_or_range := <usize> [ '-' <usize> ]
 //!   fn_list     := <fn_item> { ',' <fn_item> }
 //!   fn_item     := <usize> [ '-' <usize> ]
@@ -32,16 +38,22 @@
 //! assigned by `wamrc compile-component`; the single-module
 //! `wamrc compile` path treats every spec as module 0, so a
 //! `:mod=N` filter with `N != 0` never matches there.
+//! Prelude skip env vars use the `prelude` grammar above: set the env
+//! var to `1`, `true`, `all`, or an empty value to skip in every module;
+//! set it to `mod=...` and/or `fn=...` to narrow by module/function
+//! (the module-level inliner accepts only `mod=...`). Skipping
+//! `lowerPhisToLocals` also skips `promoteLocalsToSSA` for the same
+//! scope so the pipeline cannot leave SSA phi nodes for later codegen.
 //!
 //! Multiple `Skip` entries may be supplied via `WAMR_AOT_SKIP_PASSES`
 //! by joining specs with `;`. The single-spec form
 //! (`WAMR_AOT_SKIP_PASS`) is an alias accepting at most one spec.
 //!
 //! All parsing is pure (`parseSkipSpec` / `parseLimitSpec` /
-//! `parseFnList`) and unit-tested without env-var I/O. `parseFromEnv`
-//! is a thin wrapper that pulls the three keys and stamps the result
-//! into the process-global `global` for `runPassesWithOptions` to
-//! consult via `passes.RunOptions.bisect`.
+//! `parsePreludeFilter` / `parseFnList`) and unit-tested without
+//! env-var I/O. `parseFromEnv` is a thin wrapper that pulls the env
+//! vars and stamps the result into the process-global `global` for
+//! `runPassesWithOptions` to consult via `passes.RunOptions.bisect`.
 
 const std = @import("std");
 const passes = @import("ir/passes.zig");
@@ -49,6 +61,7 @@ const passes = @import("ir/passes.zig");
 pub const Spec = passes.PassBisectSpec;
 pub const Skip = passes.PassBisectSpec.Skip;
 pub const Limit = passes.PassBisectSpec.Limit;
+pub const PreludeFilter = passes.PassBisectSpec.PreludeFilter;
 
 pub const ParseError = error{
     EmptyInput,
@@ -68,7 +81,7 @@ pub const ParseError = error{
 /// short-lived CLI tool and these are tens of bytes.
 pub var global: Spec = .{};
 
-/// Pull the three env vars out of `env` and stamp `global` with the
+/// Pull the bisect env vars out of `env` and stamp `global` with the
 /// resulting spec. Logs `[#761 bisect] …` warnings for each active
 /// knob and `[#761 bisect] WARN: …` on parse errors (env-var typos
 /// silently degrading to "full pipeline" is the failure mode users
@@ -76,6 +89,8 @@ pub var global: Spec = .{};
 ///
 /// Allocations live in `gpa` and are never freed.
 pub fn parseFromEnv(env: *const std.process.Environ.Map, gpa: std.mem.Allocator) void {
+    global = .{};
+
     // Warn if both forms are set — we silently prefer the strictly-
     // more-expressive `_PASSES`, but a contradiction is worth
     // surfacing so users aren't confused by which spec is active.
@@ -112,6 +127,50 @@ pub fn parseFromEnv(env: *const std.process.Environ.Map, gpa: std.mem.Allocator)
             logLimit(lim);
         } else |e| {
             std.log.warn("[#761 bisect] WAMR_AOT_PASSES_LIMIT={s}: {s} — ignoring", .{ v, @errorName(e) });
+        }
+    }
+
+    parsePreludeModuleSkipFromEnv(env, "WAMR_AOT_SKIP_INLINE_SMALL", "inlineSmallFunctions", &global.skip_inline_small, gpa);
+    parsePreludeFunctionSkipFromEnv(env, "WAMR_AOT_SKIP_PROMOTE_SSA", "promoteLocalsToSSA", &global.skip_promote_ssa, gpa);
+    parsePreludeFunctionSkipFromEnv(env, "WAMR_AOT_SKIP_PHIS_TO_LOCALS", "lowerPhisToLocals", &global.skip_phis_to_locals, gpa);
+    if (global.lowerPhisSkipForcesPromote()) {
+        std.log.warn(
+            "[#761 bisect] WAMR_AOT_SKIP_PHIS_TO_LOCALS also skips promoteLocalsToSSA for matching modules to avoid leaving SSA phis in IR",
+            .{},
+        );
+    }
+}
+
+fn parsePreludeModuleSkipFromEnv(
+    env: *const std.process.Environ.Map,
+    key: []const u8,
+    pass_name: []const u8,
+    out: *?[]const u32,
+    gpa: std.mem.Allocator,
+) void {
+    if (env.get(key)) |v| {
+        if (parsePreludeModFilter(v, gpa)) |filter| {
+            out.* = filter;
+            logPreludeModuleSkip(pass_name, filter);
+        } else |e| {
+            std.log.warn("[#761 bisect] {s}={s}: {s} — ignoring", .{ key, v, @errorName(e) });
+        }
+    }
+}
+
+fn parsePreludeFunctionSkipFromEnv(
+    env: *const std.process.Environ.Map,
+    key: []const u8,
+    pass_name: []const u8,
+    out: *?PreludeFilter,
+    gpa: std.mem.Allocator,
+) void {
+    if (env.get(key)) |v| {
+        if (parsePreludeFilter(v, gpa)) |filter| {
+            out.* = filter;
+            logPreludeFunctionSkip(pass_name, filter);
+        } else |e| {
+            std.log.warn("[#761 bisect] {s}={s}: {s} — ignoring", .{ key, v, @errorName(e) });
         }
     }
 }
@@ -178,8 +237,42 @@ pub fn parseLimitSpec(text: []const u8, gpa: std.mem.Allocator) ParseError!Limit
         if (fn_filter) |f| gpa.free(f);
         if (mod_filter) |m| gpa.free(m);
     }
+
     if (rest) |r| try parseFnAndModFilters(r, gpa, &fn_filter, &mod_filter);
     return .{ .n = n, .func_filter = fn_filter, .mod_filter = mod_filter };
+}
+
+/// Parse the value of a prelude skip env var. `null` means "all
+/// modules"; a non-empty slice means "only those module indices".
+pub fn parsePreludeModFilter(text: []const u8, gpa: std.mem.Allocator) ParseError!?[]const u32 {
+    const filter = try parsePreludeFilter(text, gpa);
+    errdefer {
+        if (filter.func_filter) |f| gpa.free(f);
+        if (filter.mod_filter) |m| gpa.free(m);
+    }
+    if (filter.func_filter != null) return error.UnknownTrailing;
+    return filter.mod_filter;
+}
+
+/// Parse the value of a function-level prelude skip env var. `null`
+/// fields mean "all"; non-null slices narrow by module/function.
+pub fn parsePreludeFilter(text: []const u8, gpa: std.mem.Allocator) ParseError!PreludeFilter {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    if (trimmed.len == 0 or
+        std.ascii.eqlIgnoreCase(trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "all"))
+    {
+        return .{};
+    }
+    var fn_filter: ?[]const u32 = null;
+    var mod_filter: ?[]const u32 = null;
+    errdefer {
+        if (fn_filter) |f| gpa.free(f);
+        if (mod_filter) |m| gpa.free(m);
+    }
+    try parseFnAndModFilters(trimmed, gpa, &fn_filter, &mod_filter);
+    return .{ .func_filter = fn_filter, .mod_filter = mod_filter };
 }
 
 /// Parse the trailing `fn=...[:mod=...]` or `mod=...[:fn=...]` after
@@ -327,6 +420,38 @@ fn logLimit(lim: Limit) void {
     );
 }
 
+fn logPreludeModuleSkip(pass_name: []const u8, mod_filter: ?[]const u32) void {
+    if (mod_filter) |list| {
+        std.log.warn(
+            "[#761 bisect] SKIP {s} in {d} module(s)",
+            .{ pass_name, list.len },
+        );
+    } else {
+        std.log.warn(
+            "[#761 bisect] SKIP {s} (all modules)",
+            .{pass_name},
+        );
+    }
+}
+
+fn logPreludeFunctionSkip(pass_name: []const u8, filter: PreludeFilter) void {
+    var fn_buf: [64]u8 = undefined;
+    var mod_buf: [64]u8 = undefined;
+    const fn_part = if (filter.func_filter) |list|
+        std.fmt.bufPrint(&fn_buf, " for {d} func(s)", .{list.len}) catch ""
+    else
+        "";
+    const mod_part = if (filter.mod_filter) |list|
+        std.fmt.bufPrint(&mod_buf, " in {d} module(s)", .{list.len}) catch ""
+    else
+        "";
+    const scope_suffix = if (fn_part.len == 0 and mod_part.len == 0) " (all funcs, all modules)" else "";
+    std.log.warn(
+        "[#761 bisect] SKIP {s}{s}{s}{s}",
+        .{ pass_name, fn_part, mod_part, scope_suffix },
+    );
+}
+
 // ---------------------------------------------------------------------
 // Tests — pure, no env-var or filesystem I/O.
 // ---------------------------------------------------------------------
@@ -442,6 +567,75 @@ test "parseLimitSpec: limit + mod filter" {
     try testing.expectEqualSlices(u32, &.{4}, lim.mod_filter.?);
 }
 
+test "parsePreludeModFilter: all modules and mod filters" {
+    {
+        const filter = try parsePreludeModFilter("1", testing.allocator);
+        try testing.expectEqual(@as(?[]const u32, null), filter);
+    }
+    {
+        const filter = try parsePreludeModFilter("true", testing.allocator);
+        try testing.expectEqual(@as(?[]const u32, null), filter);
+    }
+    {
+        const filter = try parsePreludeModFilter("all", testing.allocator);
+        try testing.expectEqual(@as(?[]const u32, null), filter);
+    }
+    {
+        const filter = try parsePreludeModFilter("mod=0,4-5", testing.allocator);
+        defer testing.allocator.free(filter.?);
+        try testing.expectEqualSlices(u32, &.{ 0, 4, 5 }, filter.?);
+    }
+    try testing.expectError(error.UnknownTrailing, parsePreludeModFilter("fn=1", testing.allocator));
+}
+
+test "parsePreludeFilter: function and module filters" {
+    {
+        const filter = try parsePreludeFilter("1", testing.allocator);
+        try testing.expectEqual(@as(?[]const u32, null), filter.mod_filter);
+        try testing.expectEqual(@as(?[]const u32, null), filter.func_filter);
+    }
+    {
+        const filter = try parsePreludeFilter("mod=4:fn=0-2,9", testing.allocator);
+        defer testing.allocator.free(filter.mod_filter.?);
+        defer testing.allocator.free(filter.func_filter.?);
+        try testing.expectEqualSlices(u32, &.{4}, filter.mod_filter.?);
+        try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 9 }, filter.func_filter.?);
+    }
+    {
+        const filter = try parsePreludeFilter("fn=7:mod=2", testing.allocator);
+        defer testing.allocator.free(filter.mod_filter.?);
+        defer testing.allocator.free(filter.func_filter.?);
+        try testing.expectEqualSlices(u32, &.{2}, filter.mod_filter.?);
+        try testing.expectEqualSlices(u32, &.{7}, filter.func_filter.?);
+    }
+    try testing.expectError(error.UnknownTrailing, parsePreludeFilter("mod=1:mod=2", testing.allocator));
+}
+
+test "parseFromEnv: prelude skip env vars honour module and function filters" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("WAMR_AOT_SKIP_INLINE_SMALL", "mod=4");
+    try env.put("WAMR_AOT_SKIP_PROMOTE_SSA", "mod=4:fn=1-2");
+    try env.put("WAMR_AOT_SKIP_PHIS_TO_LOCALS", "mod=0,4:fn=9");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    defer global = .{};
+
+    parseFromEnv(&env, arena.allocator());
+
+    try testing.expect(!global.skipsInlineSmall(0));
+    try testing.expect(global.skipsInlineSmall(4));
+    try testing.expect(!global.skipsPromoteSSA(0, 1));
+    try testing.expect(global.skipsPromoteSSA(4, 1));
+    try testing.expect(global.skipsPromoteSSA(4, 2));
+    try testing.expect(!global.skipsPromoteSSA(4, 3));
+    try testing.expect(global.skipsPromoteSSA(0, 9)); // lower skip forces promote for matching funcs
+    try testing.expect(global.skipsPhisToLocals(0, 9));
+    try testing.expect(global.skipsPhisToLocals(4, 9));
+    try testing.expect(!global.skipsPhisToLocals(4, 8));
+}
+
 test "Spec.shouldSkip + effectiveLimit + affectsFunction" {
     const funcs = [_]u32{11040};
     const spec: Spec = .{
@@ -466,6 +660,8 @@ test "Spec.shouldSkip + effectiveLimit + affectsFunction" {
     try testing.expect(spec.affectsFunction(0, 11040));
     try testing.expect(spec.affectsFunction(0, 0)); // hit by pass-17 all-funcs skip
     try testing.expect(spec.affectsFunction(0, 99999)); // same
+    try testing.expect(spec.hasPassPipelineFilterInModule(0));
+    try testing.expect(spec.hasPassPipelineFilterInModule(4));
 }
 
 test "Spec.shouldSkip honours mod_filter" {
@@ -485,6 +681,10 @@ test "Spec.shouldSkip honours mod_filter" {
     // affectsFunction matches the module
     try testing.expect(spec.affectsFunction(4, 0));
     try testing.expect(!spec.affectsFunction(0, 0));
+    try testing.expect(spec.affectsModule(4));
+    try testing.expect(!spec.affectsModule(0));
+    try testing.expect(spec.hasPassPipelineFilterInModule(4));
+    try testing.expect(!spec.hasPassPipelineFilterInModule(0));
 }
 
 test "Spec.shouldSkip with both mod_filter AND func_filter" {
@@ -516,6 +716,59 @@ test "Spec.effectiveLimit honours mod_filter" {
     try testing.expectEqual(@as(?u32, 5), spec.effectiveLimit(4, 9999));
     try testing.expectEqual(@as(?u32, null), spec.effectiveLimit(0, 0));
     try testing.expectEqual(@as(?u32, null), spec.effectiveLimit(1, 0));
+    try testing.expect(spec.affectsModule(4));
+    try testing.expect(!spec.affectsModule(0));
+    try testing.expect(spec.hasPassPipelineFilterInModule(4));
+    try testing.expect(!spec.hasPassPipelineFilterInModule(0));
+}
+
+test "Spec prelude skip helpers honour module filters" {
+    const mod4 = [_]u32{4};
+    const mod0_and_4 = [_]u32{ 0, 4 };
+
+    try testing.expect(!(Spec{}).skipsInlineSmall(4));
+
+    const all_modules: Spec = .{ .skip_inline_small = null };
+    try testing.expect(all_modules.skipsInlineSmall(0));
+    try testing.expect(all_modules.skipsInlineSmall(4));
+
+    const module_4_only: Spec = .{ .skip_inline_small = &mod4 };
+    try testing.expect(!module_4_only.skipsInlineSmall(0));
+    try testing.expect(module_4_only.skipsInlineSmall(4));
+    try testing.expect(!module_4_only.affectsModule(0));
+    try testing.expect(module_4_only.affectsModule(4));
+    try testing.expect(!module_4_only.hasPassPipelineFilterInModule(4));
+
+    const module_0_and_4: Spec = .{ .skip_inline_small = &mod0_and_4 };
+    try testing.expect(module_0_and_4.skipsInlineSmall(0));
+    try testing.expect(module_0_and_4.skipsInlineSmall(4));
+    try testing.expect(!module_0_and_4.skipsInlineSmall(1));
+}
+
+test "Spec lowerPhis skip forces matching promote skip" {
+    const mod4 = [_]u32{4};
+    const lower_only: Spec = .{ .skip_phis_to_locals = .{ .mod_filter = &mod4 } };
+
+    try testing.expect(lower_only.lowerPhisSkipForcesPromote());
+    try testing.expect(!lower_only.skipsPromoteSSA(0, 0));
+    try testing.expect(lower_only.skipsPromoteSSA(4, 0));
+    try testing.expect(!lower_only.skipsPhisToLocals(0, 0));
+    try testing.expect(lower_only.skipsPhisToLocals(4, 0));
+
+    const promote_covers_lower: Spec = .{
+        .skip_promote_ssa = .{},
+        .skip_phis_to_locals = .{ .mod_filter = &mod4 },
+    };
+    try testing.expect(!promote_covers_lower.lowerPhisSkipForcesPromote());
+    try testing.expect(promote_covers_lower.skipsPromoteSSA(0, 0));
+    try testing.expect(promote_covers_lower.skipsPromoteSSA(4, 0));
+
+    const funcs = [_]u32{ 1, 2 };
+    const fn_scoped: Spec = .{ .skip_promote_ssa = .{ .mod_filter = &mod4, .func_filter = &funcs } };
+    try testing.expect(!fn_scoped.skipsPromoteSSA(4, 0));
+    try testing.expect(fn_scoped.skipsPromoteSSA(4, 1));
+    try testing.expect(fn_scoped.skipsPromoteSSA(4, 2));
+    try testing.expect(!fn_scoped.skipsPromoteSSA(0, 1));
 }
 
 test "Spec.isEmpty default" {
