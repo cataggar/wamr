@@ -674,18 +674,19 @@ fn checkTerminators(func: *const ir.IrFunction, func_index: u32) VerifyError!voi
 
 // ── Check 5: dangling block refs ────────────────────────────────────────
 
+const BlockRefCtx = struct {
+    ok: bool = true,
+    bad: ir.BlockId = 0,
+    nblocks: u32,
+};
+
 fn checkBlockRefs(func: *const ir.IrFunction, func_index: u32) VerifyError!void {
     const nblocks: u32 = @intCast(func.blocks.items.len);
     for (func.blocks.items) |block| {
         for (block.instructions.items, 0..) |inst, ii| {
-            const Ctx = struct {
-                ok: bool = true,
-                bad: ir.BlockId = 0,
-                nblocks: u32,
-            };
-            var c = Ctx{ .nblocks = nblocks };
+            var c = BlockRefCtx{ .nblocks = nblocks };
             forEachSuccessor(inst.op, &c, struct {
-                fn cb(ptr: *Ctx, target: ir.BlockId) void {
+                fn cb(ptr: *BlockRefCtx, target: ir.BlockId) void {
                     if (!ptr.ok) return;
                     if (target >= ptr.nblocks) {
                         ptr.ok = false;
@@ -1846,6 +1847,15 @@ fn newReturnBlock(func: *ir.IrFunction, ret_v: ?ir.VReg) !ir.BlockId {
     return b;
 }
 
+test "verifier: LastFailure format includes one-byte detail" {
+    const failure = LastFailure{ .kind = error.MissingTerminator, .detail = "x" };
+    var buf: [128]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&buf, "{f}", .{failure});
+
+    try testing.expectEqualStrings("IR verifier: MissingTerminator — x", rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, " — x") != null);
+}
+
 test "verifier: load forwarding soundness permits clean cross-block reuse" {
     const a = testing.allocator;
     var func = ir.IrFunction.init(a, 1, 0, 1);
@@ -1953,6 +1963,13 @@ test "verifier: detects multiple terminators" {
     try testing.expectError(error.MultipleTerminators, verifyFunction(&func, 0, .after_each_pass, a));
 }
 
+test "verifier: block-ref callback context defaults bad block to entry" {
+    const ctx = BlockRefCtx{ .nblocks = 1 };
+
+    try testing.expect(ctx.ok);
+    try testing.expectEqual(@as(ir.BlockId, 0), ctx.bad);
+}
+
 test "verifier: detects dangling block ref" {
     const a = testing.allocator;
     var func = ir.IrFunction.init(a, 0, 0, 0);
@@ -1960,6 +1977,10 @@ test "verifier: detects dangling block ref" {
     const b0 = try func.newBlock();
     try func.getBlock(b0).append(.{ .op = .{ .br = 99 } });
     try testing.expectError(error.DanglingBlockRef, verifyFunction(&func, 0, .after_each_pass, a));
+    try testing.expectEqual(error.DanglingBlockRef, last_failure.kind);
+    try testing.expectEqual(@as(?ir.BlockId, b0), last_failure.block);
+    try testing.expectEqual(@as(?u32, 0), last_failure.inst_index);
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "nonexistent block") != null);
 }
 
 test "verifier: detects stale predecessor" {
@@ -2020,6 +2041,90 @@ test "verifier: detects unbound vreg use (non-dominating def)" {
     try func.getBlock(b2).addPredecessor(b0);
     try testing.expectError(error.UnboundVRegUse, verifyFunction(&func, 0, .after_each_pass, a));
     try testing.expectEqual(@as(?ir.VReg, v), last_failure.vreg);
+}
+
+test "verifier: cross-block non-dominance reports first bad operand" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const left = try func.newBlock();
+    const right = try func.newBlock();
+    const cond = func.newVReg();
+    const v_left = func.newVReg();
+    const v_other = func.newVReg();
+    const v_out = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = cond, .type = .i32, .op = .{ .iconst_32 = 0 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = left, .else_block = right } } });
+    try func.getBlock(left).append(.{ .dest = v_left, .type = .i32, .op = .{ .iconst_32 = 1 } });
+    try func.getBlock(left).append(.{ .dest = v_other, .type = .i32, .op = .{ .iconst_32 = 2 } });
+    try func.getBlock(left).append(.{ .op = .{ .ret = v_left } });
+    try func.getBlock(right).append(.{ .dest = v_out, .type = .i32, .op = .{ .add = .{ .lhs = v_left, .rhs = v_other } } });
+    try func.getBlock(right).append(.{ .op = .{ .ret = v_out } });
+    try func.getBlock(left).addPredecessor(entry);
+    try func.getBlock(right).addPredecessor(entry);
+
+    try testing.expectError(error.UnboundVRegUse, verifyFunction(&func, 0, .after_each_pass, a));
+    try testing.expectEqual(@as(?ir.VReg, v_left), last_failure.vreg);
+    try testing.expectEqual(@as(?ir.BlockId, right), last_failure.block);
+    try testing.expectEqual(@as(?u32, 0), last_failure.inst_index);
+}
+
+test "verifier: same-block def-after-use reports first bad operand" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const v_future = func.newVReg();
+    const v_other_bad = func.newVReg();
+    const v_out = func.newVReg();
+    try func.getBlock(b0).append(.{ .dest = v_out, .type = .i32, .op = .{ .add = .{ .lhs = v_future, .rhs = v_other_bad } } });
+    try func.getBlock(b0).append(.{ .dest = v_future, .type = .i32, .op = .{ .iconst_32 = 1 } });
+    try func.getBlock(b0).append(.{ .dest = v_other_bad, .type = .i32, .op = .{ .iconst_32 = 2 } });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_out } });
+
+    try testing.expectError(error.UnboundVRegUse, verifyFunction(&func, 0, .after_each_pass, a));
+    try testing.expectEqual(@as(?ir.VReg, v_future), last_failure.vreg);
+    try testing.expectEqual(@as(?ir.BlockId, b0), last_failure.block);
+    try testing.expectEqual(@as(?u32, 0), last_failure.inst_index);
+}
+
+test "verifier: phi dominance reports first bad incoming operand" {
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const left = try func.newBlock();
+    const right = try func.newBlock();
+    const merge = try func.newBlock();
+    const cond = func.newVReg();
+    const v_left = func.newVReg();
+    const v_right = func.newVReg();
+    const v_phi = func.newVReg();
+    const edges = try a.alloc(ir.Inst.PhiEdge, 2);
+    edges[0] = .{ .block = right, .val = v_left };
+    edges[1] = .{ .block = left, .val = v_right };
+
+    try func.getBlock(entry).append(.{ .dest = cond, .type = .i32, .op = .{ .iconst_32 = 0 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = left, .else_block = right } } });
+    try func.getBlock(left).append(.{ .dest = v_left, .type = .i32, .op = .{ .iconst_32 = 1 } });
+    try func.getBlock(left).append(.{ .op = .{ .br = merge } });
+    try func.getBlock(right).append(.{ .dest = v_right, .type = .i32, .op = .{ .iconst_32 = 2 } });
+    try func.getBlock(right).append(.{ .op = .{ .br = merge } });
+    try func.getBlock(merge).append(.{ .dest = v_phi, .type = .i32, .op = .{ .phi = edges } });
+    try func.getBlock(merge).append(.{ .op = .{ .ret = v_phi } });
+    try func.getBlock(left).addPredecessor(entry);
+    try func.getBlock(right).addPredecessor(entry);
+    try func.getBlock(merge).addPredecessor(left);
+    try func.getBlock(merge).addPredecessor(right);
+
+    try testing.expectError(error.UnboundVRegUse, verifyFunction(&func, 0, .after_each_pass, a));
+    try testing.expectEqual(@as(?ir.VReg, v_left), last_failure.vreg);
+    try testing.expectEqual(@as(?ir.BlockId, merge), last_failure.block);
+    try testing.expectEqual(@as(?u32, 0), last_failure.inst_index);
 }
 
 test "verifier: dominating def across blocks passes" {
@@ -2250,6 +2355,9 @@ test "verifier(paranoid): verifyLoopForest rejects header not dominating body" {
         .allocator = a,
     };
     try testing.expectError(error.LoopInvariantBroken, verifyLoopForest(0, &dom, &forest));
+    try testing.expectEqual(error.LoopInvariantBroken, last_failure.kind);
+    try testing.expectEqual(@as(?ir.BlockId, b0), last_failure.block);
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "body block #0") != null);
 }
 
 test "verifier(paranoid): linear CFG passes dom-tree structure check" {
