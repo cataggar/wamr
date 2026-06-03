@@ -7214,6 +7214,226 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+fn appendDomWalkMarker(func: *ir.IrFunction, block_id: ir.BlockId, value: i32) !ir.VReg {
+    const dest = func.newVReg();
+    try func.getBlock(block_id).append(.{ .op = .{ .iconst_32 = value }, .dest = dest, .type = .i32 });
+    return dest;
+}
+
+fn appendDomWalkBr(func: *ir.IrFunction, from: ir.BlockId, target: ir.BlockId) !void {
+    try func.getBlock(from).append(.{ .op = .{ .br = target } });
+}
+
+fn appendDomWalkRet(func: *ir.IrFunction, block_id: ir.BlockId) !void {
+    try func.getBlock(block_id).append(.{ .op = .{ .ret = null } });
+}
+
+fn buildDomWalkLinearFixture(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    errdefer func.deinit();
+
+    const entry = try func.newBlock();
+    const child = try func.newBlock();
+    const grandchild = try func.newBlock();
+
+    _ = try appendDomWalkMarker(&func, entry, 10);
+    try appendDomWalkBr(&func, entry, child);
+    _ = try appendDomWalkMarker(&func, child, 20);
+    try appendDomWalkBr(&func, child, grandchild);
+    _ = try appendDomWalkMarker(&func, grandchild, 30);
+    try appendDomWalkRet(&func, grandchild);
+
+    return func;
+}
+
+fn buildDomWalkTwoChildFixture(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    errdefer func.deinit();
+
+    const entry = try func.newBlock();
+    const left = try func.newBlock();
+    const right = try func.newBlock();
+
+    const cond = try appendDomWalkMarker(&func, entry, 10);
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = left, .else_block = right } } });
+    _ = try appendDomWalkMarker(&func, left, 20);
+    try appendDomWalkRet(&func, left);
+    _ = try appendDomWalkMarker(&func, right, 30);
+    try appendDomWalkRet(&func, right);
+
+    return func;
+}
+
+fn buildDomWalkRemovingFixture(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    errdefer func.deinit();
+
+    const entry = try func.newBlock();
+    _ = try appendDomWalkMarker(&func, entry, 10);
+    _ = try appendDomWalkMarker(&func, entry, 20);
+    try appendDomWalkRet(&func, entry);
+
+    return func;
+}
+
+const DomWalkRecordingVisitor = struct {
+    allocator: std.mem.Allocator,
+    state: std.ArrayList(ir.BlockId) = .empty,
+    snapshots: std.ArrayList(usize) = .empty,
+    restores: std.ArrayList(usize) = .empty,
+    visit_counts: []u8,
+
+    fn init(allocator: std.mem.Allocator, block_count: usize) !@This() {
+        const visit_counts = try allocator.alloc(u8, block_count);
+        @memset(visit_counts, 0);
+        return .{ .allocator = allocator, .visit_counts = visit_counts };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.state.deinit(self.allocator);
+        self.snapshots.deinit(self.allocator);
+        self.restores.deinit(self.allocator);
+        self.allocator.free(self.visit_counts);
+    }
+
+    pub fn snapshot(self: *@This()) usize {
+        const len = self.state.items.len;
+        self.snapshots.append(self.allocator, len) catch @panic("OOM recording DomWalk snapshot");
+        return len;
+    }
+
+    pub fn restore(self: *@This(), snap_len: usize) void {
+        self.restores.append(self.allocator, snap_len) catch @panic("OOM recording DomWalk restore");
+        std.debug.assert(snap_len <= self.state.items.len);
+        self.state.shrinkRetainingCapacity(snap_len);
+    }
+
+    pub fn onInstruction(
+        self: *@This(),
+        _: *ir.IrFunction,
+        bid: ir.BlockId,
+        _: usize,
+        inst: *ir.Inst,
+        _: *LoadFrameStack,
+    ) !LoadForwardingDomWalkInstructionResult {
+        if (inst.op == .iconst_32) {
+            self.visit_counts[bid] += 1;
+            try self.state.append(self.allocator, bid);
+        }
+        return .unchanged;
+    }
+};
+
+const DomWalkRestoreOnlyVisitor = struct {
+    allocator: std.mem.Allocator,
+    restores: std.ArrayList(usize) = .empty,
+
+    fn deinit(self: *@This()) void {
+        self.restores.deinit(self.allocator);
+    }
+
+    pub fn restore(self: *@This(), snap_len: usize) void {
+        self.restores.append(self.allocator, snap_len) catch @panic("OOM recording DomWalk restore");
+        std.debug.assert(snap_len == 0);
+    }
+
+    pub fn onInstruction(
+        _: *@This(),
+        _: *ir.IrFunction,
+        _: ir.BlockId,
+        _: usize,
+        _: *ir.Inst,
+        _: *LoadFrameStack,
+    ) !LoadForwardingDomWalkInstructionResult {
+        return .unchanged;
+    }
+};
+
+const DomWalkRemovingVisitor = struct {
+    removed_count: usize = 0,
+
+    pub fn onInstruction(
+        self: *@This(),
+        func: *ir.IrFunction,
+        bid: ir.BlockId,
+        i: usize,
+        inst: *ir.Inst,
+        _: *LoadFrameStack,
+    ) !LoadForwardingDomWalkInstructionResult {
+        if (inst.op == .iconst_32) {
+            _ = func.getBlock(bid).instructions.orderedRemove(i);
+            self.removed_count += 1;
+            return .removed;
+        }
+        return .unchanged;
+    }
+};
+
+test "DomWalk restore-only visitor restores zero without snapshot" {
+    const allocator = std.testing.allocator;
+    var func = try buildDomWalkLinearFixture(allocator);
+    defer func.deinit();
+
+    var visitor = DomWalkRestoreOnlyVisitor{ .allocator = allocator };
+    defer visitor.deinit();
+
+    const changed = try LoadForwardingDomWalk(DomWalkRestoreOnlyVisitor).run(&visitor, &func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(usize, 3), visitor.restores.items.len);
+    for (visitor.restores.items) |snap_len| {
+        try std.testing.expectEqual(@as(usize, 0), snap_len);
+    }
+}
+
+test "DomWalk snapshot/restore follows dominator stack order" {
+    const allocator = std.testing.allocator;
+    var func = try buildDomWalkLinearFixture(allocator);
+    defer func.deinit();
+
+    var visitor = try DomWalkRecordingVisitor.init(allocator, func.blocks.items.len);
+    defer visitor.deinit();
+
+    const changed = try LoadForwardingDomWalk(DomWalkRecordingVisitor).run(&visitor, &func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, visitor.snapshots.items);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, visitor.restores.items);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1 }, visitor.visit_counts);
+    try std.testing.expectEqual(@as(usize, 0), visitor.state.items.len);
+}
+
+test "DomWalk phase-pop continue does not reprocess popped frames" {
+    const allocator = std.testing.allocator;
+    var func = try buildDomWalkTwoChildFixture(allocator);
+    defer func.deinit();
+
+    var visitor = try DomWalkRecordingVisitor.init(allocator, func.blocks.items.len);
+    defer visitor.deinit();
+
+    const changed = try LoadForwardingDomWalk(DomWalkRecordingVisitor).run(&visitor, &func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1 }, visitor.visit_counts);
+    try std.testing.expectEqual(@as(usize, 3), visitor.snapshots.items.len);
+    try std.testing.expectEqual(@as(usize, 3), visitor.restores.items.len);
+    try std.testing.expectEqual(@as(usize, 1), visitor.restores.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), visitor.restores.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), visitor.restores.items[2]);
+    try std.testing.expectEqual(@as(usize, 0), visitor.state.items.len);
+}
+
+test "DomWalk removed instruction rechecks shifted instruction" {
+    const allocator = std.testing.allocator;
+    var func = try buildDomWalkRemovingFixture(allocator);
+    defer func.deinit();
+
+    var visitor = DomWalkRemovingVisitor{};
+    const changed = try LoadForwardingDomWalk(DomWalkRemovingVisitor).run(&visitor, &func, allocator);
+
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 2), visitor.removed_count);
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(0).instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = null }, func.getBlock(0).instructions.items[0].op);
+}
+
 test "constantFold: iconst + iconst + add → iconst" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
