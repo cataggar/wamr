@@ -95,6 +95,7 @@ const Machine = struct {
     locals: []Value,
     globals: []Value,
     memory: []u8,
+    memory_transferred: bool = false,
     fuel: u32,
     block: ir.BlockId = 0,
     prev_block: ?ir.BlockId = null,
@@ -105,6 +106,7 @@ const Machine = struct {
         self.allocator.free(self.vreg_init);
         self.allocator.free(self.locals);
         self.allocator.free(self.globals);
+        if (!self.memory_transferred) self.allocator.free(self.memory);
     }
 
     fn stepFuel(self: *Machine) ?Outcome {
@@ -189,6 +191,39 @@ const Machine = struct {
         }
         if (dest) |d| try self.setVReg(d, .{ .ty = ty, .bits = acc });
     }
+
+    fn processPhiGroup(self: *Machine) !void {
+        const block = &self.func.blocks.items[self.block];
+        if (self.inst_index >= block.instructions.items.len) return;
+        if (block.instructions.items[self.inst_index].op != .phi) return;
+        const pred = self.prev_block orelse return error.InvalidPhi;
+
+        const start = self.inst_index;
+        var end = start;
+        while (end < block.instructions.items.len and block.instructions.items[end].op == .phi) : (end += 1) {}
+        const count = end - start;
+
+        const values = try self.allocator.alloc(Value, count);
+        defer self.allocator.free(values);
+        const dests = try self.allocator.alloc(ir.VReg, count);
+        defer self.allocator.free(dests);
+
+        for (block.instructions.items[start..end], 0..) |inst, i| {
+            dests[i] = inst.dest orelse return error.InvalidPhi;
+            const edges = inst.op.phi;
+            for (edges) |edge| {
+                if (edge.block == pred) {
+                    values[i] = .{ .ty = inst.type, .bits = (try self.getVReg(edge.val)).bits };
+                    break;
+                }
+            } else {
+                return error.InvalidPhi;
+            }
+        }
+
+        for (dests, values) |dest, value| try self.setVReg(dest, value);
+        self.inst_index = end;
+    }
 };
 
 pub fn run(allocator: std.mem.Allocator, func: *const ir.IrFunction, options: RunOptions) !Outcome {
@@ -210,7 +245,6 @@ pub fn run(allocator: std.mem.Allocator, func: *const ir.IrFunction, options: Ru
         .memory = try allocator.dupe(u8, options.memory),
         .fuel = options.fuel,
     };
-    errdefer allocator.free(machine.memory);
     defer machine.deinitScratch();
     @memset(machine.vregs, .{});
     @memset(machine.vreg_init, false);
@@ -225,6 +259,11 @@ pub fn run(allocator: std.mem.Allocator, func: *const ir.IrFunction, options: Ru
     while (true) {
         if (machine.stepFuel()) |outcome| return outcome;
         const block = &func.blocks.items[machine.block];
+        machine.processPhiGroup() catch |err| switch (err) {
+            error.UninitializedVReg => return .{ .trapped = .uninitialized_vreg },
+            error.InvalidPhi => return .{ .trapped = .invalid_phi },
+            else => return err,
+        };
         if (machine.inst_index >= block.instructions.items.len) {
             return .{ .trapped = .invalid_branch };
         }
@@ -305,24 +344,17 @@ fn execInst(machine: *Machine, inst: ir.Inst) !?Outcome {
                 out[0] = (try machine.getVReg(v)).normalized();
                 break :blk out;
             } else try machine.allocator.alloc(Value, 0);
+            machine.memory_transferred = true;
             return .{ .returned = .{ .results = results, .memory = machine.memory } };
         },
         .ret_multi => |vregs| {
             const results = try machine.allocator.alloc(Value, vregs.len);
             for (vregs, 0..) |v, i| results[i] = (try machine.getVReg(v)).normalized();
+            machine.memory_transferred = true;
             return .{ .returned = .{ .results = results, .memory = machine.memory } };
         },
         .@"unreachable" => return .{ .trapped = .unreachable_reached },
-        .phi => |edges| {
-            const pred = machine.prev_block orelse return error.InvalidPhi;
-            for (edges) |edge| {
-                if (edge.block == pred) {
-                    if (inst.dest) |d| try machine.setVReg(d, .{ .ty = inst.type, .bits = (try machine.getVReg(edge.val)).bits });
-                    return null;
-                }
-            }
-            return error.InvalidPhi;
-        },
+        .phi => return error.InvalidPhi,
         .parallel_copy => |pairs| {
             var scratch = try machine.allocator.alloc(Value, pairs.len);
             defer machine.allocator.free(scratch);
@@ -489,6 +521,48 @@ test "interp: diamond phi selects incoming predecessor" {
     var right_out = try run(a, &func, .{ .params = &.{Value.i32v(0)} });
     defer right_out.deinit(a);
     try std.testing.expectEqual(@as(u64, 22), right_out.returned.results[0].bits);
+}
+
+test "interp: phi groups read incoming values in parallel" {
+    const a = std.testing.allocator;
+    var func = ir.IrFunction.init(a, 0, 1, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(header).addPredecessor(entry);
+    try func.getBlock(header).addPredecessor(body);
+    try func.getBlock(body).addPredecessor(header);
+    try func.getBlock(exit).addPredecessor(header);
+
+    const zero = func.newVReg();
+    const bound = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = zero, .type = .i32, .op = .{ .iconst_32 = 0 } });
+    try func.getBlock(entry).append(.{ .dest = bound, .type = .i32, .op = .{ .iconst_32 = 3 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+
+    const phi_i = func.newVReg();
+    const phi_prev_i = func.newVReg();
+    const inc = func.newVReg();
+    const i_edges = try a.dupe(ir.Inst.PhiEdge, &.{ .{ .block = entry, .val = zero }, .{ .block = body, .val = inc } });
+    const prev_edges = try a.dupe(ir.Inst.PhiEdge, &.{ .{ .block = entry, .val = zero }, .{ .block = body, .val = phi_i } });
+    const cond = func.newVReg();
+    try func.getBlock(header).append(.{ .dest = phi_i, .type = .i32, .op = .{ .phi = i_edges } });
+    try func.getBlock(header).append(.{ .dest = phi_prev_i, .type = .i32, .op = .{ .phi = prev_edges } });
+    try func.getBlock(header).append(.{ .dest = cond, .type = .i32, .op = .{ .lt_u = .{ .lhs = phi_i, .rhs = bound } } });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = body, .else_block = exit } } });
+
+    const one = func.newVReg();
+    try func.getBlock(body).append(.{ .dest = one, .type = .i32, .op = .{ .iconst_32 = 1 } });
+    try func.getBlock(body).append(.{ .dest = inc, .type = .i32, .op = .{ .add = .{ .lhs = phi_i, .rhs = one } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = header } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = phi_prev_i } });
+
+    var outcome = try run(a, &func, .{ .fuel = 100 });
+    defer outcome.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), outcome.returned.results[0].bits);
 }
 
 test "interp: load and store round-trip memory" {
