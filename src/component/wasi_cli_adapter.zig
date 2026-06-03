@@ -45,6 +45,50 @@ const async_canon = @import("async_canon.zig");
 const core_backend = @import("core_backend.zig");
 const debugAotEnabled = core_backend.debugAotEnabled;
 
+// ── Pending `wasi:cli/exit` code handoff to the AOT dispatcher (#760) ───────
+//
+// `WasiCliAdapter.cliExit` / `.cliExitWithCode` raise `error.WasiExit` after
+// stashing the requested exit code on `self.exit_code`. Under the
+// interpreter that error unwinds Zig-style to `runLoadedComponent`'s catch
+// arm, which reads `adapter.exit_code` and returns a normal `RunOutcome`.
+//
+// Under the AOT host-import dispatchers
+// (`executor.wamrAotDispatchComponentTrampoline{,Aot}`) the C calling
+// convention can't propagate a Zig error back to the AOT codegen caller —
+// historically the catch arm returned `status=1` and `genericDispatcher`
+// wrote the post-#714 `0xdeaddeaddeaddead` sentinel into the guest's
+// return slot. The wit-bindgen-generated `wasi:cli/exit.exit` lift then
+// saw a value where the call was supposed to have unwound, tripping
+// `unreachable executed at adapter line 2335: host exit implementation
+// didn't exit!` in the WASIp1 → preview2 adapter and SIGSEGV'ing the host.
+//
+// Fix: `cliExit` / `cliExitWithCode` pin the code in this thread-local
+// before returning; the AOT dispatcher reads (and clears) it on
+// `error.WasiExit` and calls `std.process.exit` directly — mirroring the
+// existing `aotProcExit` precedent at
+// `src/runtime/aot/host_bridge.zig:464` for raw-WASIp1 `proc_exit`.
+//
+// Thread-local so multi-instance / multi-thread embeddings stay isolated.
+// Use `recordPendingWasiExit` / `takePendingWasiExitCode` rather than
+// touching the variable directly so a future raiser of `error.WasiExit`
+// can't forget the wiring (rubber-duck #3).
+pub threadlocal var pending_wasi_exit_code: ?u32 = null;
+
+/// Pin the exit code a `cliExit` / `cliExitWithCode` caller wants the AOT
+/// dispatcher to surface as the host process exit code. Always called
+/// *immediately* before returning `error.WasiExit`.
+pub fn recordPendingWasiExit(code: u32) void {
+    pending_wasi_exit_code = code;
+}
+
+/// Read and clear the pinned exit code. The clear is what keeps stale TLS
+/// from one test or one nested run leaking into the next.
+pub fn takePendingWasiExitCode() ?u32 {
+    const code = pending_wasi_exit_code;
+    pending_wasi_exit_code = null;
+    return code;
+}
+
 // ── Local TypeDef table for hand-lowered list<compound> shapes (#402) ───────
 //
 // `incomingDatagramReceive` and `outgoingSend` produce/consume canonical
@@ -8066,6 +8110,14 @@ pub const WasiCliAdapter = struct {
             else => 0,
         } else 0;
         self.exit_code = code;
+        // #760: pin the code in TLS so the AOT host-import dispatcher
+        // can call `std.process.exit(code)` on this `error.WasiExit`
+        // rather than writing the post-#714 sentinel into the guest's
+        // return slot (which causes the wit-bindgen WASIp1 adapter to
+        // trip its "host exit implementation didn't exit!" assertion).
+        // The interpreter path is unchanged — it keeps reading
+        // `self.exit_code` from `runLoadedComponent`'s catch arm.
+        recordPendingWasiExit(code);
         return error.WasiExit;
     }
 
@@ -8087,6 +8139,8 @@ pub const WasiCliAdapter = struct {
             else => 0,
         } else 0;
         self.exit_code = code;
+        // #760: see `cliExit` above for the TLS handoff rationale.
+        recordPendingWasiExit(code);
         return error.WasiExit;
     }
 
@@ -37759,8 +37813,79 @@ test "populateWasiCliP3: cliExitWithCode(7) routes through P3 exit iface (#482)"
     const args: [1]InterfaceValue = .{.{ .u8 = 7 }};
     var ci: ComponentInstance = undefined;
 
+    // #760: reset the TLS so an earlier test (or a stale `recordPendingWasiExit`
+    // call from a prior cliExit invocation in this thread) can't fool the
+    // assertion below into thinking the call set it.
+    _ = takePendingWasiExitCode();
+    // And again on the way out so this test doesn't leave stale state
+    // for a sibling test in the same thread (rubber-duck #3).
+    defer _ = takePendingWasiExitCode();
+
     try testing.expectError(error.WasiExit, member.func.call.?(member.func.context, &ci, &args, &.{}, testing.allocator));
     try testing.expectEqual(@as(?u32, 7), adapter.exit_code);
+    // #760: the AOT host-import dispatcher reads the requested exit code
+    // from this TLS to drive `std.process.exit`; the historical bug was
+    // that `cliExitWithCode` only set `adapter.exit_code`, leaving the
+    // dispatcher to write a sentinel into the guest's return slot.
+    try testing.expectEqual(@as(?u32, 7), pending_wasi_exit_code);
+}
+
+// #760: companion coverage for the 0.2 / non-P3 `cliExit` (result-typed
+// arg form). Asserts both result discriminants pin the matching exit
+// code into the TLS the AOT host-import dispatcher consumes.
+test "wasi:cli/exit.exit (0.2 result-typed) pins TLS for AOT dispatcher (#760)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try adapter.populateWasiCliExit(&providers, "wasi:cli/exit@0.2.0");
+
+    const member = adapter.cli_exit_iface.members.get("exit") orelse return error.MissingMember;
+    var ci: ComponentInstance = undefined;
+
+    // Drain any prior TLS pin so we can attribute observations to this test.
+    _ = takePendingWasiExitCode();
+    defer _ = takePendingWasiExitCode();
+
+    // result<_, _>.ok → exit code 0.
+    {
+        const ok_args: [1]InterfaceValue = .{.{ .result_val = .{ .is_ok = true, .payload = null } }};
+        try testing.expectError(
+            error.WasiExit,
+            member.func.call.?(member.func.context, &ci, &ok_args, &.{}, testing.allocator),
+        );
+        try testing.expectEqual(@as(?u32, 0), adapter.exit_code);
+        try testing.expectEqual(@as(?u32, 0), pending_wasi_exit_code);
+    }
+    // Drain between sub-cases — `takePendingWasiExitCode` clears, but
+    // we re-record below so the second assertion is meaningful.
+    _ = takePendingWasiExitCode();
+
+    // result<_, _>.err → exit code 1.
+    {
+        const err_args: [1]InterfaceValue = .{.{ .result_val = .{ .is_ok = false, .payload = null } }};
+        try testing.expectError(
+            error.WasiExit,
+            member.func.call.?(member.func.context, &ci, &err_args, &.{}, testing.allocator),
+        );
+        try testing.expectEqual(@as(?u32, 1), adapter.exit_code);
+        try testing.expectEqual(@as(?u32, 1), pending_wasi_exit_code);
+    }
+}
+
+// #760: `takePendingWasiExitCode` must drain the TLS so it can't leak
+// across nested runs or sibling tests in the same thread.
+test "takePendingWasiExitCode drains the pinned code (#760)" {
+    const testing = std.testing;
+    _ = takePendingWasiExitCode(); // ensure clean entry
+    recordPendingWasiExit(42);
+    try testing.expectEqual(@as(?u32, 42), pending_wasi_exit_code);
+    try testing.expectEqual(@as(?u32, 42), takePendingWasiExitCode());
+    try testing.expectEqual(@as(?u32, null), pending_wasi_exit_code);
+    try testing.expectEqual(@as(?u32, null), takePendingWasiExitCode());
 }
 
 test "populateWasiCliP3: stdinReadViaStreamP3 attaches lazy host source (#482, #537)" {

@@ -464,6 +464,35 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&wamrc_run_smoke.step);
     }
 
+    // #760 regression: AOT `wasi:cli/exit.exit` must terminate the host
+    // process with the requested discriminant rather than returning the
+    // post-#714 sentinel through the canon-lower(aot) trampoline. Two
+    // hand-rolled WAT fixtures (`tests/regressions/760-aot-cli-exit/`)
+    // import `wasi:cli/exit@0.2.0` directly (no preview1 → preview2
+    // adapter, so unrelated to the cross-instance #662 blocker that
+    // gates the `zig-exit` example) and exit with the ok / err
+    // discriminants. Before the fix both crashed the host with SIGSEGV
+    // (exit 139) after the wit-bindgen adapter's "host exit
+    // implementation didn't exit!" assertion fired on the sentinel
+    // return; after the fix the host exits 0 / 1 respectively.
+    if (aot_executable_target) {
+        const fixtures = [_]struct { name: []const u8, expected_exit: u8 }{
+            .{ .name = "exit-ok.wasm", .expected_exit = 0 },
+            .{ .name = "exit-with-code-7.wasm", .expected_exit = 1 },
+        };
+        for (fixtures) |f| {
+            const run = b.addRunArtifact(wamrc);
+            run.addArg("run");
+            run.addArg("-o");
+            _ = run.addOutputFileArg(b.fmt("760-{s}.cwasm", .{f.name}));
+            run.addFileArg(b.path(b.fmt("tests/regressions/760-aot-cli-exit/{s}", .{f.name})));
+            run.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+            run.step.dependOn(b.getInstallStep());
+            run.expectExitCode(f.expected_exit);
+            test_step.dependOn(&run.step);
+        }
+    }
+
     // Compiler IR passes tests (separate module to avoid root/wamr conflict)
     const passes_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/passes.zig"),

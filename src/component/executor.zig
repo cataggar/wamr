@@ -23,6 +23,13 @@ const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const core_backend = @import("core_backend.zig");
 const call_frame_mod = @import("call_frame.zig");
+// `wasi_cli_adapter` is imported solely for the
+// `takePendingWasiExitCode` handoff used by the AOT host-import
+// dispatchers below (#760). The two modules are otherwise mutually
+// dependent (`wasi_cli_adapter` already imports `executor`), but
+// neither side names the other at comptime, so the cyclic `@import`
+// resolves cleanly.
+const wasi_cli_adapter = @import("wasi_cli_adapter.zig");
 const debugAotEnabled = core_backend.debugAotEnabled;
 const Allocator = std.mem.Allocator;
 
@@ -7210,6 +7217,36 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     }
 }
 
+/// #760: special-case `error.WasiExit` from the AOT host-import
+/// dispatchers' catch arms.
+///
+/// `wasi:cli/exit.{exit,exit-with-code}` raises `error.WasiExit` after
+/// pinning the requested code in `wasi_cli_adapter.pending_wasi_exit_code`.
+/// On the interpreter path that error unwinds Zig-style to
+/// `runLoadedComponent`'s catch arm (`wasi_cli_adapter.zig:24145`), which
+/// reads `adapter.exit_code` and produces a normal `RunOutcome`. On the
+/// AOT path the C-ABI dispatcher used to translate that into a generic
+/// `status=1` failure — `genericDispatcher` then wrote the post-#714
+/// `0xdeaddeaddeaddead` sentinel into the guest's return slot, the
+/// wit-bindgen WASIp1 → preview2 adapter saw a value where `exit` was
+/// supposed to have unwound, and `unreachable executed at adapter line
+/// 2335: host exit implementation didn't exit!` SIGSEGV'd the host
+/// after a successful run.
+///
+/// Match `aotProcExit`'s precedent at `src/runtime/aot/host_bridge.zig:464`
+/// for raw-WASIp1 `proc_exit`: when the TLS is set, terminate the host
+/// process with the requested code directly. When it isn't set (which
+/// would mean a contract violation in some future `error.WasiExit`
+/// raiser), fall through to the existing sentinel/warn-once path so
+/// the bug surfaces rather than masquerading as a silent exit-0 —
+/// returning `true` tells the caller "we handled it" only when the
+/// process is about to be replaced anyway (i.e. never).
+fn handleWasiExitFromAotDispatch() void {
+    if (wasi_cli_adapter.takePendingWasiExitCode()) |code| {
+        std.process.exit(@intCast(code & 0xff));
+    }
+}
+
 pub export fn wamrAotDispatchComponentTrampoline(
     ctx_opaque: *anyopaque,
     lowered_sig: *const host_trampolines.LoweredSig,
@@ -7226,6 +7263,7 @@ pub export fn wamrAotDispatchComponentTrampoline(
 ) callconv(.c) host_trampolines.DispatchResult {
     const ctx: *const ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
     const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 }) catch |err| {
+        if (err == error.WasiExit) handleWasiExitFromAotDispatch();
         if (debugAotEnabled()) {
             std.debug.print(
                 "[aot-dispatch] canon.lower trampoline failed: {s}\n",
@@ -7264,6 +7302,7 @@ pub export fn wamrAotDispatchComponentTrampolineAot(
     _ = a0;
     const ctx: *const ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
     const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, .{ a1, a2, a3, a4, a5, a6, a7, a8, a9, 0 }) catch |err| {
+        if (err == error.WasiExit) handleWasiExitFromAotDispatch();
         if (debugAotEnabled()) {
             std.debug.print(
                 "[aot-dispatch] canon.lower(aot) trampoline failed: {s}\n",
