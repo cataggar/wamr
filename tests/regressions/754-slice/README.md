@@ -53,6 +53,22 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/wamr run repro.wasm   # → "FAIL slice=\"\""
 ```
 
+## One-command differential (#757)
+
+Had `wamrc verify` (issue #757) existed at the time of the original
+bisect, the single command that would have surfaced the bug — and
+saved most of the ~6 hours of probe-building — is:
+
+```sh
+./zig-out/bin/wamrc verify repro.wasm
+```
+
+That spawns both `wasmtime run repro.wasm` and `wamr run repro.wasm`
+under the hood, captures both stdouts, and prints the first-divergence
+offset with hex+ASCII context on each side. Exit 1 on divergence,
+0 on match, 2 on setup error. See `.github/skills/aot-diff-debug/SKILL.md`
+for the broader workflow.
+
 ## Bisect status (in progress)
 
 - ✅ Disproved: WASI fs, IR-opt passes, canon-lift/lower, `memory.grow`

@@ -16,12 +16,24 @@ const codegen_cache = wamr.codegen_cache;
 
 const TargetArch = passes.TargetArch;
 
-const Subcommand = enum { compile, compile_component, run, version, help };
+const verify_mod = @import("verify.zig");
+// Bring the unit tests in `verify.zig` and `verify_args.zig` into the
+// `wamrc_unit_tests` test runner's reachable set. Without this they
+// would only execute if some non-test code path imported them — which
+// is true for `verify_mod` itself, but `verify_args` is reached only
+// transitively through it, so the test discovery sweep needs an
+// explicit anchor.
+comptime {
+    _ = @import("verify_args.zig");
+}
+
+const Subcommand = enum { compile, compile_component, run, verify, version, help };
 
 fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "compile")) return .compile;
     if (std.mem.eql(u8, s, "compile-component")) return .compile_component;
     if (std.mem.eql(u8, s, "run")) return .run;
+    if (std.mem.eql(u8, s, "verify")) return .verify;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
@@ -57,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
         .compile => try runCompile(init, allocator, args[2..]),
         .compile_component => try runCompileComponent(init, allocator, args[2..]),
         .run => try runRun(init, allocator, args[2..]),
+        .verify => try runVerify(init, allocator, args[2..]),
     }
 }
 
@@ -1098,6 +1111,48 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
     }
 }
 
+fn runVerify(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 1 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, verify_usage);
+        return;
+    }
+
+    var diag: verify_mod.ParseDiagnostic = .{};
+    var parsed = verify_mod.parse(allocator, sub_args, &diag) catch |err| {
+        switch (err) {
+            error.MissingInputPath => std.debug.print(
+                "error: missing input wasm file — try `wamrc verify help`\n",
+                .{},
+            ),
+            error.DuplicateInputPath => std.debug.print(
+                "error: unexpected extra positional '{s}' (only one input wasm allowed) — try `wamrc verify help`\n",
+                .{diag.value},
+            ),
+            error.UnknownOption => std.debug.print(
+                "error: unknown option '{s}' — try `wamrc verify help`\n",
+                .{diag.option},
+            ),
+            error.MissingValue => std.debug.print(
+                "error: option '{s}' requires a value — try `wamrc verify help`\n",
+                .{diag.option},
+            ),
+            error.InvalidIntegerArgument => std.debug.print(
+                "error: option '{s}' expects an integer, got '{s}' — try `wamrc verify help`\n",
+                .{ diag.option, diag.value },
+            ),
+            error.OutOfMemory => std.debug.print("error: out of memory parsing args\n", .{}),
+        }
+        std.process.exit(2);
+    };
+    defer parsed.deinit();
+
+    const exit_code = verify_mod.run(init, allocator, parsed.options) catch |err| {
+        std.debug.print("error: verify failed: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    std.process.exit(exit_code);
+}
+
 fn parseTargetArchOrDie(s: []const u8) TargetArch {
     if (std.mem.eql(u8, s, "aarch64")) return .aarch64;
     if (std.mem.eql(u8, s, "x86_64") or std.mem.eql(u8, s, "x86-64")) return .x86_64;
@@ -1290,6 +1345,7 @@ const top_usage =
     \\  compile             Compile a .wasm module to a .cwasm AOT binary
     \\  compile-component   Precompile every embedded core of a component
     \\  run                 Compile (if needed) and execute via the wamr runtime
+    \\  verify              Differential-test wamr-AOT vs wasmtime on a wasm
     \\  version             Print version and exit
     \\  help                Print this help
     \\
@@ -1416,6 +1472,61 @@ const run_usage =
     \\                                 for components)
     \\  --force                       Recompile even if the artifact is fresh
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
+    \\
+;
+
+const verify_usage =
+    \\Usage: wamrc verify [options] <input.wasm> [-- <guest args...>]
+    \\
+    \\Differential-test wamr-AOT against wasmtime (the reference oracle)
+    \\on <input.wasm>. Compiles the wasm to AOT, runs it under both
+    \\runtimes with the same flags + guest argv, diffs stdout (by
+    \\default) / stderr / exit codes, and exits:
+    \\
+    \\  0  outputs match
+    \\  1  divergence found (first-difference offset is printed with
+    \\     hex+ASCII context on each side; see --hex-context)
+    \\  2  setup error (missing wasmtime, AOT compile failure, …)
+    \\
+    \\Why wasmtime: it's the de-facto reference implementation, already
+    \\installed on every wamr dev box, and a black-box oracle catches
+    \\the bigger bug class — things both wamr engines share (canon-lift
+    \\quirks, adapter bugs) that an interp-vs-AOT diff would miss.
+    \\
+    \\Motivating case: issue #754 took ~6 hours to bisect; the actual
+    \\fix was 13 lines. A built-in differential tester would have
+    \\shortened that to minutes. See also
+    \\`.github/skills/aot-diff-debug/SKILL.md`.
+    \\
+    \\Binary resolution:
+    \\  wasmtime: --wasmtime-bin → $WASMTIME_BIN → `wasmtime` on $PATH.
+    \\  wamr:     --wamr-bin → $WAMR_BIN → sibling-of-wamrc → `wamr` on $PATH.
+    \\
+    \\Options:
+    \\  --map-dir HOST::GUEST    Mount a host directory on both runs.
+    \\                           Translates to `--dir` for wasmtime and
+    \\                           `--map-dir` for wamr. Repeatable.
+    \\  --env KEY=VALUE          Pass an env var to both runs. Repeatable.
+    \\  --max-runtime <SEC>      Per-runtime watchdog (default 60).
+    \\                           Killed and reported as divergence if
+    \\                           exceeded. 0 disables the watchdog.
+    \\  --hex-context <N>        Bytes of hex+ASCII context shown on each
+    \\                           side of the first-diff offset (default 32).
+    \\  --stdout-only            Diff only stdout (default).
+    \\  --stderr-only            Diff only stderr.
+    \\  --diff-everything        Diff stdout AND stderr.
+    \\  --strict-exit            Require matching exit codes too. Off by
+    \\                           default — wamr's "successful run then
+    \\                           host SIGSEGV" failure class (#760) would
+    \\                           otherwise drown out codegen regressions.
+    \\  --keep-cwasm             Leave the precompiled artifacts in the
+    \\                           staging dir for post-mortem inspection.
+    \\                           Default: cleaned up on exit.
+    \\  --json                   Emit a single-line JSON report instead
+    \\                           of human-readable text. Exit-code
+    \\                           semantics are unchanged.
+    \\  --wasmtime-bin <path>    Override wasmtime resolution.
+    \\  --wamr-bin <path>        Override wamr resolution.
     \\
 ;
 
