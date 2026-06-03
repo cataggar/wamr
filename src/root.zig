@@ -93,6 +93,12 @@ pub const passes = @import("compiler/ir/passes.zig");
 /// `PassBisectSpec` consumed by `runPassesWithOptions` (#761 / #743).
 pub const aot_bisect = @import("compiler/aot_bisect.zig");
 
+/// AOT codegen cache (#761 Phase 2) — sidecar file format + canonical
+/// IR hasher + module-epoch hasher. Lets a recompile reuse cached
+/// native code for any function whose IR is unchanged from the
+/// previous build.
+pub const codegen_cache = @import("compiler/codegen_cache.zig");
+
 /// IR invariant checker run between passes (#624).
 pub const ir_verifier = @import("compiler/ir/verifier.zig");
 

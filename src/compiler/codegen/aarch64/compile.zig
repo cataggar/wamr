@@ -10,6 +10,7 @@ const emit = @import("emit.zig");
 const schedule = @import("schedule.zig");
 const coalesce_post = @import("coalesce_post.zig");
 const range_split = @import("../../ir/range_split.zig");
+const codegen_cache = @import("../../codegen_cache.zig");
 
 /// Compile-time debug flag: when true, print per-function range-split
 /// stats to stderr. Flip via `zig build -Drange-split-debug=true` after
@@ -8323,6 +8324,163 @@ pub fn compileModuleWithOptions(
     return .{
         .code = try all_code.toOwnedSlice(allocator),
         .offsets = try offsets.toOwnedSlice(allocator),
+    };
+}
+
+// ── #761 Phase 2: codegen cache integration ──────────────────────────────
+
+pub const CompileResultCached = codegen_cache.CompileResultCached;
+
+/// Same as `compileModuleWithOptions` but consults an optional `reuse`
+/// cache to skip per-function codegen for functions whose IR sha256
+/// matches the cached entry. Reused code's local-offset call patches
+/// are rebased to the new module layout; the existing BL patch
+/// resolution loop runs unchanged.
+pub fn compileModuleCached(
+    ir_module: *const ir.IrModule,
+    reuse: ?*const codegen_cache.Cache,
+    allocator: std.mem.Allocator,
+) !codegen_cache.CompileResultCached {
+    return compileModuleCachedWithOptions(ir_module, reuse, allocator, .{});
+}
+
+pub fn compileModuleCachedWithOptions(
+    ir_module: *const ir.IrModule,
+    reuse: ?*const codegen_cache.Cache,
+    allocator: std.mem.Allocator,
+    options: CompileOptions,
+) !codegen_cache.CompileResultCached {
+    var all_code: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer all_code.deinit(allocator);
+    var offsets: std.ArrayListUnmanaged(u32) = .empty;
+    errdefer offsets.deinit(allocator);
+
+    var global_call_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
+    defer global_call_patches.deinit(allocator);
+
+    const func_count: usize = ir_module.functions.items.len;
+    var cache_funcs = try allocator.alloc(codegen_cache.CachedFunction, func_count);
+    var cache_init: usize = 0;
+    errdefer {
+        for (cache_funcs[0..cache_init]) |*f| {
+            allocator.free(f.code);
+            allocator.free(f.call_patches);
+        }
+        allocator.free(cache_funcs);
+    }
+
+    var stats: codegen_cache.CacheStats = .{};
+
+    for (ir_module.functions.items, 0..) |func, fi| {
+        const func_base: u32 = @intCast(all_code.items.len);
+        try offsets.append(allocator, func_base);
+
+        const ir_sha = codegen_cache.hashFunction(&func);
+
+        var reused = false;
+        var hit_code: []const u8 = undefined;
+        var hit_patches: []const codegen_cache.FuncCallPatch = undefined;
+        if (reuse) |r| {
+            if (fi < r.functions.len and
+                std.mem.eql(u8, &r.functions[fi].ir_sha256, &ir_sha))
+            {
+                hit_code = r.functions[fi].code;
+                hit_patches = r.functions[fi].call_patches;
+                reused = true;
+            }
+        }
+
+        var cache_code_owned: []u8 = undefined;
+        var cache_patches_owned: []codegen_cache.FuncCallPatch = undefined;
+
+        if (reused) {
+            cache_code_owned = try allocator.dupe(u8, hit_code);
+            errdefer allocator.free(cache_code_owned);
+            cache_patches_owned = try allocator.dupe(codegen_cache.FuncCallPatch, hit_patches);
+            try all_code.appendSlice(allocator, hit_code);
+            for (hit_patches) |p| {
+                try global_call_patches.append(allocator, .{
+                    .patch_offset = @as(usize, func_base) + @as(usize, p.patch_offset),
+                    .target_func_idx = p.target_func_idx,
+                });
+            }
+            stats.reused += 1;
+        } else {
+            var func_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
+            defer func_patches.deinit(allocator);
+
+            const ctx: FuncCompileCtx = .{
+                .import_count = ir_module.import_count,
+                .call_patches = &func_patches,
+                .global_types = ir_module.global_types orelse &.{},
+                .global_offsets = ir_module.global_offsets orelse &.{},
+                .func_types = ir_module.func_types.items,
+                .func_type_indices = ir_module.func_type_indices.items,
+                .options = options,
+                .allocator = allocator,
+            };
+            const func_code = compileFunctionImpl(&func, ctx, allocator) catch |err| {
+                std.debug.print("Error compiling function {d} ({d} blocks, {d} vregs): {}\n", .{
+                    fi,
+                    func.blocks.items.len,
+                    func.next_vreg,
+                    err,
+                });
+                return err;
+            };
+
+            const new_patches = try allocator.alloc(codegen_cache.FuncCallPatch, func_patches.items.len);
+            errdefer allocator.free(new_patches);
+            for (func_patches.items, new_patches) |src, *dst| {
+                dst.* = .{
+                    .patch_offset = @intCast(src.patch_offset),
+                    .target_func_idx = src.target_func_idx,
+                };
+            }
+            cache_code_owned = func_code;
+            cache_patches_owned = new_patches;
+
+            for (func_patches.items) |p| {
+                try global_call_patches.append(allocator, .{
+                    .patch_offset = p.patch_offset + func_base,
+                    .target_func_idx = p.target_func_idx,
+                });
+            }
+            try all_code.appendSlice(allocator, func_code);
+            stats.recompiled += 1;
+        }
+
+        cache_funcs[fi] = .{
+            .ir_sha256 = ir_sha,
+            .code = cache_code_owned,
+            .call_patches = cache_patches_owned,
+        };
+        cache_init += 1;
+    }
+
+    // Resolve BL patches — identical logic to
+    // `compileModuleWithOptions` above.
+    for (global_call_patches.items) |p| {
+        if (p.target_func_idx >= offsets.items.len) return error.BadFuncIndex;
+        const target_off: i64 = @intCast(offsets.items[p.target_func_idx]);
+        const patch_off: i64 = @intCast(p.patch_offset);
+        const delta_bytes = target_off - patch_off;
+        if (@mod(delta_bytes, 4) != 0) return error.BranchMisaligned;
+        const word_off = @divExact(delta_bytes, 4);
+        const limit: i64 = 1 << 25;
+        if (word_off >= limit or word_off < -limit) return error.CallOutOfRange;
+        const bytes = all_code.items[p.patch_offset..][0..4];
+        const existing = std.mem.readInt(u32, bytes, .little);
+        const imm26: u26 = @bitCast(@as(i26, @intCast(word_off)));
+        const new_word: u32 = (existing & 0xFC000000) | imm26;
+        std.mem.writeInt(u32, bytes, new_word, .little);
+    }
+
+    return .{
+        .code = try all_code.toOwnedSlice(allocator),
+        .offsets = try offsets.toOwnedSlice(allocator),
+        .cache_functions = cache_funcs,
+        .stats = stats,
     };
 }
 

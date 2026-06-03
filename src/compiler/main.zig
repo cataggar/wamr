@@ -12,6 +12,7 @@ const aarch64_compile = wamr.aarch64_compile;
 const passes = wamr.passes;
 const ir_print = wamr.ir_print;
 const ir = wamr.ir;
+const codegen_cache = wamr.codegen_cache;
 
 const TargetArch = passes.TargetArch;
 
@@ -82,6 +83,11 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         .aarch64 => .aarch64,
         else => .x86_64,
     };
+    // #761 Phase 2: optional per-function codegen cache (sidecar file).
+    // When set, wamrc reads <cache_path> at start (if it exists) and
+    // reuses cached per-function code for IR hashes that still match;
+    // writes the (possibly-updated) cache back to <cache_path> at end.
+    var cache_path: ?[]const u8 = null;
 
     // --dump-ir-after / --dump-ir-functions / --dump-ir-out collection.
     // `dump_pass_names` and `dump_func_globs` are owned by the arena
@@ -148,6 +154,11 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             verify_mode = .paranoid;
         } else if (std.mem.eql(u8, a, "--no-verify-ir")) {
             verify_mode = .off;
+        } else if (std.mem.eql(u8, a, "--cache") and i + 1 < sub_args.len) {
+            i += 1;
+            cache_path = sub_args[i];
+        } else if (std.mem.startsWith(u8, a, "--cache=")) {
+            cache_path = a["--cache=".len..];
         } else if (a.len > 0 and a[0] == '-') {
             std.debug.print("error: unknown option '{s}' — try `wamrc compile help`\n", .{a});
             std.process.exit(1);
@@ -340,26 +351,73 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         }
     }
 
-    // 5. Compile IR to native code (target-dependent)
-    const CompileResult = x86_64_compile.CompileResult;
-    const compiled: CompileResult = switch (target_arch) {
-        .x86_64 => x86_64_compile.compileModule(&ir_module, allocator) catch |err| {
+    // 5. Compile IR to native code (target-dependent).
+    //
+    // #761 Phase 2: when `--cache <path>` was supplied, try to load
+    // the prior cache, validate every header field (magic / version /
+    // build id / arch / abi / module epoch / func count), and pass it
+    // to the cached codegen path. Any per-function ir_sha256 still
+    // matching the rebuilt IR reuses the cached native bytes; the
+    // rest fall back to full codegen. The new cache (always produced
+    // by compileModuleCached) is serialised + atomically written to
+    // <path> after a successful emit so the next bisect cycle can
+    // reuse it.
+    const target_abi = codegen_cache.TargetAbi.forHost(target_arch);
+    const epoch_inputs: codegen_cache.ModuleEpochInputs = .{
+        .wamr_build_id = wamr.version.string,
+        .target_arch = target_arch,
+        .target_abi = target_abi,
+        .import_count = ir_module.import_count,
+        .global_types = ir_module.global_types,
+        .global_offsets = ir_module.global_offsets,
+        .global_storage_size = ir_module.global_storage_size,
+        .func_types = ir_module.func_types.items,
+        .func_type_indices = ir_module.func_type_indices.items,
+    };
+    const module_epoch = codegen_cache.hashModuleEpoch(epoch_inputs);
+
+    var loaded_cache: ?codegen_cache.Cache = null;
+    defer if (loaded_cache) |*c| c.deinit(allocator);
+    if (cache_path) |cp| {
+        loaded_cache = loadCacheCompat(io, allocator, cp, .{
+            .wamr_build_id = wamr.version.string,
+            .target_arch = target_arch,
+            .target_abi = target_abi,
+            .module_epoch = module_epoch,
+            .func_count = @intCast(ir_module.functions.items.len),
+        });
+    }
+    const reuse_ptr: ?*const codegen_cache.Cache = if (loaded_cache) |*c| c else null;
+
+    const compiled: codegen_cache.CompileResultCached = switch (target_arch) {
+        .x86_64 => x86_64_compile.compileModuleCached(&ir_module, reuse_ptr, allocator) catch |err| {
             std.debug.print("Error compiling to x86-64: {}\n", .{err});
             std.process.exit(1);
         },
-        .aarch64 => blk: {
-            const r = aarch64_compile.compileModuleWithOptions(&ir_module, allocator, .{
-                .enable_scheduler = enable_aarch64_scheduler,
-                .enable_xreg_alloc = enable_aarch64_xreg_alloc,
-            }) catch |err| {
-                std.debug.print("Error compiling to AArch64: {}\n", .{err});
-                std.process.exit(1);
-            };
-            break :blk .{ .code = r.code, .offsets = r.offsets };
+        .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
+            .enable_scheduler = enable_aarch64_scheduler,
+            .enable_xreg_alloc = enable_aarch64_xreg_alloc,
+        }) catch |err| {
+            std.debug.print("Error compiling to AArch64: {}\n", .{err});
+            std.process.exit(1);
         },
     };
     defer allocator.free(compiled.code);
     defer allocator.free(compiled.offsets);
+    defer {
+        for (compiled.cache_functions) |*f| {
+            allocator.free(f.code);
+            allocator.free(f.call_patches);
+        }
+        allocator.free(compiled.cache_functions);
+    }
+
+    if (cache_path != null) {
+        std.debug.print(
+            "Codegen cache: {d} reused, {d} recompiled (of {d} functions)\n",
+            .{ compiled.stats.reused, compiled.stats.recompiled, ir_module.functions.items.len },
+        );
+    }
 
     std.debug.print("Generated {d} bytes of native code\n", .{compiled.code.len});
 
@@ -616,6 +674,96 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     };
 
     std.debug.print("Written {s} ({d} bytes)\n", .{ out_path, aot_binary.len });
+
+    // 8. Persist the codegen cache (Phase 2) if --cache was passed.
+    //    Write only after the cwasm itself is on disk so a partial
+    //    failure can't leave a cache pointing at an absent / older
+    //    artifact.
+    if (cache_path) |cp| {
+        const cache_to_write: codegen_cache.Cache = .{
+            .wamr_build_id = wamr.version.string,
+            .target_arch = target_arch,
+            .target_abi = target_abi,
+            .module_epoch = module_epoch,
+            .functions = compiled.cache_functions,
+        };
+        const cache_bytes = codegen_cache.serialize(&cache_to_write, allocator) catch |err| {
+            std.debug.print("warning: codegen cache: serialise failed: {} — cache not updated\n", .{err});
+            return;
+        };
+        defer allocator.free(cache_bytes);
+        writeFileAtomic(io, cp, cache_bytes) catch |err| {
+            std.debug.print("warning: codegen cache: write to {s} failed: {} — cache not updated\n", .{ cp, err });
+            return;
+        };
+        std.debug.print("Cache written {s} ({d} bytes)\n", .{ cp, cache_bytes.len });
+    }
+}
+
+/// Inputs for `loadCacheCompat`'s header-compatibility check.
+const CacheLoadCheck = struct {
+    wamr_build_id: []const u8,
+    target_arch: TargetArch,
+    target_abi: codegen_cache.TargetAbi,
+    module_epoch: [32]u8,
+    func_count: u32,
+};
+
+/// Try to read + deserialise + header-validate a codegen-cache sidecar.
+/// Returns null on any mismatch (with a one-line warning explaining
+/// which header field differed) so a fresh-but-incompatible cache
+/// degrades cleanly to "full recompile" instead of failing the build.
+fn loadCacheCompat(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expect: CacheLoadCheck,
+) ?codegen_cache.Cache {
+    const cwd = std.Io.Dir.cwd();
+    const bytes = cwd.readFileAlloc(io, path, allocator, @enumFromInt(codegen_cache.max_cache_file_bytes)) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("Codegen cache: no existing cache at {s} — full recompile\n", .{path});
+            return null;
+        },
+        else => {
+            std.debug.print("warning: codegen cache: read {s} failed: {} — full recompile\n", .{ path, err });
+            return null;
+        },
+    };
+    defer allocator.free(bytes);
+
+    var cache = codegen_cache.deserialize(bytes, allocator) catch |err| {
+        std.debug.print("warning: codegen cache: {s} unreadable ({}) — full recompile\n", .{ path, err });
+        return null;
+    };
+    errdefer cache.deinit(allocator);
+
+    if (!std.mem.eql(u8, cache.wamr_build_id, expect.wamr_build_id)) {
+        std.debug.print("Codegen cache: build-id mismatch (cached={s}, current={s}) — full recompile\n", .{ cache.wamr_build_id, expect.wamr_build_id });
+        cache.deinit(allocator);
+        return null;
+    }
+    if (cache.target_arch != expect.target_arch) {
+        std.debug.print("Codegen cache: target-arch mismatch — full recompile\n", .{});
+        cache.deinit(allocator);
+        return null;
+    }
+    if (cache.target_abi != expect.target_abi) {
+        std.debug.print("Codegen cache: target-abi mismatch — full recompile\n", .{});
+        cache.deinit(allocator);
+        return null;
+    }
+    if (!std.mem.eql(u8, &cache.module_epoch, &expect.module_epoch)) {
+        std.debug.print("Codegen cache: module-epoch mismatch (imports/globals/types changed) — full recompile\n", .{});
+        cache.deinit(allocator);
+        return null;
+    }
+    if (cache.functions.len != expect.func_count) {
+        std.debug.print("Codegen cache: func-count mismatch (cached={d}, current={d}) — full recompile\n", .{ cache.functions.len, expect.func_count });
+        cache.deinit(allocator);
+        return null;
+    }
+    return cache;
 }
 
 fn defaultZeroValue(vt: wamr.types.ValType) wamr.types.Value {
@@ -669,6 +817,8 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         .aarch64 => .aarch64,
         else => .x86_64,
     };
+    // #761 Phase 2: per-core codegen cache directory.
+    var cache_dir: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -692,6 +842,11 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
                 std.debug.print("error: unknown target '{s}'\n", .{v});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, a, "--cache-dir") and i + 1 < sub_args.len) {
+            i += 1;
+            cache_dir = sub_args[i];
+        } else if (std.mem.startsWith(u8, a, "--cache-dir=")) {
+            cache_dir = a["--cache-dir=".len..];
         } else if (std.mem.startsWith(u8, a, "-")) {
             std.debug.print("error: unknown option '{s}'\n", .{a});
             std.process.exit(1);
@@ -732,6 +887,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
     var result = wamr.component_aot_compile.precompileComponent(allocator, component_data, manifest_path, .{
         .target_arch = target_arch,
         .optimize = optimize,
+        .cache_dir = cache_dir,
     }) catch |err| {
         std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
@@ -1193,6 +1349,16 @@ const compile_usage =
     \\                                 for release builds.
     \\  --no-verify-ir                Disable the IR verifier (overrides
     \\                                 the safety-build default).
+    \\  --cache <path>                #761 Phase 2 codegen cache sidecar.
+    \\                                 Read on entry (if exists) to reuse
+    \\                                 cached native code per function
+    \\                                 whose IR hash still matches; write
+    \\                                 the (possibly-updated) cache back
+    \\                                 to <path> after a successful emit.
+    \\                                 Cache is invalidated wholesale on
+    \\                                 any header mismatch (build id,
+    \\                                 target arch+abi, module-level
+    \\                                 codegen invariants, func count).
     \\
 ;
 
@@ -1210,6 +1376,13 @@ const compile_component_usage =
     \\  -o <manifest.json>            Manifest path (default: <input>.cwasm.json)
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
     \\  -O0                           Disable IR optimizations (every core)
+    \\  --cache-dir <dir>             #761 Phase 2 codegen cache root. Per
+    \\                                 core: read/write `<dir>/core<N>.cache`
+    \\                                 to reuse cached native code for any
+    \\                                 function whose IR hash still matches.
+    \\                                 Header-incompatible caches fall back
+    \\                                 to full recompile of that core
+    \\                                 (warn-only, never errors).
     \\
 ;
 

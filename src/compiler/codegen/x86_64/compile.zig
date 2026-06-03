@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const ir = @import("../../ir/ir.zig");
 const passes = @import("../../ir/passes.zig");
 const emit = @import("emit.zig");
+const codegen_cache = @import("../../codegen_cache.zig");
 
 // ── Comptime codegen-trace knobs ────────────────────────────────────────
 //
@@ -1566,6 +1567,147 @@ const GlobalCallPatch = struct {
     patch_offset: usize,
     target_func_idx: u32,
 };
+
+// ── #761 Phase 2: codegen cache integration ──────────────────────────────
+
+/// Same as `compileModule` but consults an optional `reuse` cache to
+/// skip per-function codegen for any function whose IR sha256 matches
+/// the cached entry. The reused code's local-offset `call_patches` are
+/// rebased to the new module-level layout, and the existing inter-
+/// function patch resolution loop runs unchanged.
+///
+/// Always returns a fresh `cache_functions` slice — the caller persists
+/// it (along with module-epoch + build-id metadata) for the next
+/// recompile cycle. Ownership of `cache_functions[i].{code, call_patches}`
+/// transfers to the caller; free via `codegen_cache.Cache.deinit` or
+/// manually.
+pub fn compileModuleCached(
+    ir_module: *const ir.IrModule,
+    reuse: ?*const codegen_cache.Cache,
+    allocator: std.mem.Allocator,
+) !codegen_cache.CompileResultCached {
+    var all_code: std.ArrayList(u8) = .empty;
+    errdefer all_code.deinit(allocator);
+    var offsets: std.ArrayList(u32) = .empty;
+    errdefer offsets.deinit(allocator);
+    var global_call_patches: std.ArrayList(GlobalCallPatch) = .empty;
+    defer global_call_patches.deinit(allocator);
+
+    const func_count: usize = ir_module.functions.items.len;
+    var cache_funcs = try allocator.alloc(codegen_cache.CachedFunction, func_count);
+    var cache_init: usize = 0;
+    errdefer {
+        for (cache_funcs[0..cache_init]) |*f| {
+            allocator.free(f.code);
+            allocator.free(f.call_patches);
+        }
+        allocator.free(cache_funcs);
+    }
+
+    var stats: codegen_cache.CacheStats = .{};
+
+    for (ir_module.functions.items, 0..) |func, fi| {
+        const func_start: u32 = @intCast(all_code.items.len);
+        try offsets.append(allocator, func_start);
+
+        const ir_sha = codegen_cache.hashFunction(&func);
+
+        // Cache lookup: by function position AND ir_sha256. Position
+        // alone is unsafe because two same-shape modules could share
+        // sha256 for fn[3] but reuse against a different module's fn[3]
+        // would still be wrong. Position is fine here because the
+        // outer epoch check (in the caller) guarantees `func_count`
+        // and codegen-relevant module metadata match before any
+        // per-fn reuse is considered.
+        var reused = false;
+        var hit_code: []const u8 = undefined;
+        var hit_patches: []const codegen_cache.FuncCallPatch = undefined;
+        if (reuse) |r| {
+            if (fi < r.functions.len and
+                std.mem.eql(u8, &r.functions[fi].ir_sha256, &ir_sha))
+            {
+                hit_code = r.functions[fi].code;
+                hit_patches = r.functions[fi].call_patches;
+                reused = true;
+            }
+        }
+
+        var cache_code_owned: []u8 = undefined;
+        var cache_patches_owned: []codegen_cache.FuncCallPatch = undefined;
+
+        if (reused) {
+            // Dup so the new cache owns its own memory independent of
+            // the `reuse` lifetime.
+            cache_code_owned = try allocator.dupe(u8, hit_code);
+            errdefer allocator.free(cache_code_owned);
+            cache_patches_owned = try allocator.dupe(codegen_cache.FuncCallPatch, hit_patches);
+            try all_code.appendSlice(allocator, hit_code);
+            for (hit_patches) |p| {
+                try global_call_patches.append(allocator, .{
+                    .patch_offset = @as(usize, func_start) + @as(usize, p.patch_offset),
+                    .target_func_idx = p.target_func_idx,
+                });
+            }
+            stats.reused += 1;
+        } else {
+            const result = try compileFunctionRAWithGlobalOffsets(
+                &func,
+                ir_module.import_count,
+                ir_module.global_offsets orelse &.{},
+                allocator,
+            );
+            // `result.code` and `result.call_patches` are owned here.
+            // Convert internal CallPatch → public FuncCallPatch and
+            // hand both to the cache slot.
+            defer allocator.free(result.call_patches);
+            const new_patches = try allocator.alloc(codegen_cache.FuncCallPatch, result.call_patches.len);
+            errdefer allocator.free(new_patches);
+            for (result.call_patches, new_patches) |src, *dst| {
+                dst.* = .{
+                    .patch_offset = @intCast(src.patch_offset),
+                    .target_func_idx = src.target_func_idx,
+                };
+            }
+            cache_code_owned = result.code;
+            cache_patches_owned = new_patches;
+            try all_code.appendSlice(allocator, result.code);
+            for (result.call_patches) |patch| {
+                try global_call_patches.append(allocator, .{
+                    .patch_offset = func_start + patch.patch_offset,
+                    .target_func_idx = patch.target_func_idx,
+                });
+            }
+            stats.recompiled += 1;
+        }
+
+        cache_funcs[fi] = .{
+            .ir_sha256 = ir_sha,
+            .code = cache_code_owned,
+            .call_patches = cache_patches_owned,
+        };
+        cache_init += 1;
+    }
+
+    // Inter-function PC-relative E8 patches — identical logic to
+    // `compileModule` above so reused and fresh code share the same
+    // resolution pass.
+    for (global_call_patches.items) |patch| {
+        if (patch.target_func_idx < offsets.items.len) {
+            const target_off = offsets.items[patch.target_func_idx];
+            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
+            std.mem.writeInt(i32, all_code.items[patch.patch_offset..][0..4], rel, .little);
+        }
+    }
+
+    return .{
+        .code = try all_code.toOwnedSlice(allocator),
+        .offsets = try offsets.toOwnedSlice(allocator),
+        .cache_functions = cache_funcs,
+        .stats = stats,
+    };
+}
+
+pub const CompileResultCached = codegen_cache.CompileResultCached;
 
 // ── Register-Allocated Compilation ────────────────────────────────────
 
@@ -4983,6 +5125,132 @@ test "compileModule: two functions have correct offsets" {
     try std.testing.expectEqual(@as(usize, 2), result.offsets.len);
     try std.testing.expectEqual(@as(u32, 0), result.offsets[0]);
     try std.testing.expect(result.offsets[1] > 0);
+}
+
+// ── #761 Phase 2 cache integration tests ──────────────────────────────────
+
+fn freeCachedFuncs(allocator: std.mem.Allocator, funcs: []codegen_cache.CachedFunction) void {
+    for (funcs) |*f| {
+        allocator.free(f.code);
+        allocator.free(f.call_patches);
+    }
+    allocator.free(funcs);
+}
+
+fn buildTwoFnAddModule(allocator: std.mem.Allocator) !ir.IrModule {
+    var ir_module = ir.IrModule.init(allocator);
+    errdefer ir_module.deinit();
+    inline for ([_]i32{ 1, 2 }) |k| {
+        var f = ir.IrFunction.init(allocator, 0, 1, 0);
+        errdefer f.deinit();
+        _ = try f.newBlock();
+        const v0 = f.newVReg();
+        try f.getBlock(0).append(.{ .op = .{ .iconst_32 = k }, .dest = v0 });
+        try f.getBlock(0).append(.{ .op = .{ .ret = v0 } });
+        _ = try ir_module.addFunction(f);
+    }
+    return ir_module;
+}
+
+test "compileModuleCached: no reuse produces same bytes as compileModule" {
+    const allocator = std.testing.allocator;
+    var m_a = try buildTwoFnAddModule(allocator);
+    defer m_a.deinit();
+    var m_b = try buildTwoFnAddModule(allocator);
+    defer m_b.deinit();
+
+    const baseline = try compileModule(&m_a, allocator);
+    defer allocator.free(baseline.code);
+    defer allocator.free(baseline.offsets);
+
+    const cached = try compileModuleCached(&m_b, null, allocator);
+    defer allocator.free(cached.code);
+    defer allocator.free(cached.offsets);
+    defer freeCachedFuncs(allocator, cached.cache_functions);
+
+    try std.testing.expectEqualSlices(u8, baseline.code, cached.code);
+    try std.testing.expectEqualSlices(u32, baseline.offsets, cached.offsets);
+    try std.testing.expectEqual(@as(u32, 0), cached.stats.reused);
+    try std.testing.expectEqual(@as(u32, 2), cached.stats.recompiled);
+    try std.testing.expectEqual(@as(usize, 2), cached.cache_functions.len);
+}
+
+test "compileModuleCached: warm cache reuses every function (byte-identical)" {
+    const allocator = std.testing.allocator;
+    var m_cold = try buildTwoFnAddModule(allocator);
+    defer m_cold.deinit();
+
+    // Cold compile to populate the cache.
+    const cold = try compileModuleCached(&m_cold, null, allocator);
+    defer allocator.free(cold.code);
+    defer allocator.free(cold.offsets);
+
+    // Build a Cache stub from the cold-compile output. Note: this test
+    // only exercises the per-fn cache table — module-epoch matching is
+    // verified at the CLI layer, not inside compileModuleCached.
+    const reuse: codegen_cache.Cache = .{
+        .wamr_build_id = "x",
+        .target_arch = .x86_64,
+        .target_abi = .x86_64_sysv,
+        .module_epoch = .{0} ** 32,
+        .functions = cold.cache_functions,
+    };
+
+    // Warm compile against a freshly-built (equivalent) module.
+    var m_warm = try buildTwoFnAddModule(allocator);
+    defer m_warm.deinit();
+    const warm = try compileModuleCached(&m_warm, &reuse, allocator);
+    defer allocator.free(warm.code);
+    defer allocator.free(warm.offsets);
+    defer freeCachedFuncs(allocator, warm.cache_functions);
+    // Free `cold.cache_functions` AFTER the assertions (defer) —
+    // `reuse.functions` borrows from it.
+    defer freeCachedFuncs(allocator, cold.cache_functions);
+
+    try std.testing.expectEqualSlices(u8, cold.code, warm.code);
+    try std.testing.expectEqualSlices(u32, cold.offsets, warm.offsets);
+    try std.testing.expectEqual(@as(u32, 2), warm.stats.reused);
+    try std.testing.expectEqual(@as(u32, 0), warm.stats.recompiled);
+}
+
+test "compileModuleCached: per-function IR mismatch recompiles only that function" {
+    const allocator = std.testing.allocator;
+    var m_cold = try buildTwoFnAddModule(allocator);
+    defer m_cold.deinit();
+
+    const cold = try compileModuleCached(&m_cold, null, allocator);
+    defer allocator.free(cold.code);
+    defer allocator.free(cold.offsets);
+
+    const reuse: codegen_cache.Cache = .{
+        .wamr_build_id = "x",
+        .target_arch = .x86_64,
+        .target_abi = .x86_64_sysv,
+        .module_epoch = .{0} ** 32,
+        .functions = cold.cache_functions,
+    };
+
+    // Edit fn[1] to return a different constant — IR hash mismatch on
+    // fn[1] only, fn[0] still reuses.
+    var m_warm = try buildTwoFnAddModule(allocator);
+    defer m_warm.deinit();
+    m_warm.functions.items[1].blocks.items[0].instructions.items[0].op = .{ .iconst_32 = 99 };
+
+    const warm = try compileModuleCached(&m_warm, &reuse, allocator);
+    defer allocator.free(warm.code);
+    defer allocator.free(warm.offsets);
+    defer freeCachedFuncs(allocator, warm.cache_functions);
+    // Note: free `cold.cache_functions` AFTER the assertions below —
+    // `reuse.functions` borrows from it, so freeing earlier would
+    // leave `reuse.functions[0].ir_sha256` reading 0xAA poison.
+    defer freeCachedFuncs(allocator, cold.cache_functions);
+
+    try std.testing.expectEqual(@as(u32, 1), warm.stats.reused);
+    try std.testing.expectEqual(@as(u32, 1), warm.stats.recompiled);
+    // fn[0]'s ir_sha256 in the new cache should match the cold-compile's
+    // (we re-hash inside compileModuleCached, so two equivalent IRs
+    // produce equal hashes).
+    try std.testing.expectEqualSlices(u8, &warm.cache_functions[0].ir_sha256, &reuse.functions[0].ir_sha256);
 }
 
 test "compileFunction: empty function produces prologue and epilogue" {
