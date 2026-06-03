@@ -72,10 +72,28 @@ fn terminateBrIf(blk: *ir.BasicBlock, cond: ir.VReg, t: ir.BlockId, e: ir.BlockI
     try blk.append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = t, .else_block = e } }, .type = .i32 });
 }
 
+const FrlTestFuncMeta = struct {
+    params: u32 = 0,
+    results: u32 = 0,
+    locals: u32 = 0,
+};
+
+fn makeFrlTestFunc(allocator: std.mem.Allocator, meta: FrlTestFuncMeta) ir.IrFunction {
+    return ir.IrFunction.init(allocator, meta.params, meta.results, meta.locals);
+}
+
+fn expectFrlTestFuncMeta(func: *const ir.IrFunction, meta: FrlTestFuncMeta) !void {
+    try testing.expectEqual(meta.params, func.param_count);
+    try testing.expectEqual(meta.results, func.result_count);
+    try testing.expectEqual(meta.locals, func.local_count);
+}
+
 test "dominator FRL: forwards through linear chain (entry → mid → tail)" {
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const mid = try func.newBlock();
@@ -111,8 +129,10 @@ test "dominator FRL: forwards through linear chain (entry → mid → tail)" {
 
 test "dominator FRL: diamond merge — load forwarded from dominator" {
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const left = try func.newBlock();
@@ -156,8 +176,10 @@ test "dominator FRL: sibling-block store does NOT invalidate dominator-cached va
     //        but must NOT touch the entry frame so `right` still forwards.
     // right: load @base (should be forwarded from entry's v_dom).
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const left = try func.newBlock();
@@ -200,8 +222,10 @@ test "dominator FRL: sibling-block store does NOT invalidate dominator-cached va
 
 test "dominator FRL: call between dominator-load and dominated-load clears scope" {
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const tail = try func.newBlock();
@@ -243,8 +267,10 @@ test "dominator FRL: call in sibling branch invalidates merge-block forwarding (
     // dom-DFS reordering, `tail` is popped before `sib` and forwards
     // the stale ancestor value.
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const sib = try func.newBlock();
@@ -278,13 +304,14 @@ test "dominator FRL: call in sibling branch invalidates merge-block forwarding (
     try testing.expect(t.instructions.items[0].op == .load);
 }
 
-
 test "FRLDominator (cell C): call AFTER load in same block prevents later forwarding (#734)" {
     // entry: load p[0]; call barrier; load p[0]; ret second load.
     // FRL deletes fused loads, so both load instructions must remain.
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const v_base = func.newVReg();
@@ -310,8 +337,10 @@ test "FRLDominator (cell F): call in sibling SUBTREE invalidates merge forwardin
     // entry branches directly to tail or to a sibling subtree containing a call.
     // The merge load is reachable through that deeper barrier subtree.
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const sib_top = try func.newBlock();
@@ -355,8 +384,10 @@ test "FRLDominator (cell G): call on loop back-edge invalidates dominated body f
     // entry loads, header may take a call-bearing latch back-edge, then body loads.
     // The body load is reachable after the back-edge barrier and must survive.
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const header = try func.newBlock();
@@ -400,8 +431,10 @@ test "FRLDominator (cell H): barrier in then-branch, store in else-branch, merge
     // entry branches to a call in then or an aliasing store in else, then merges.
     // The merge load is reachable through the barrier branch and must survive.
     const allocator = testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
     defer func.deinit();
+    try expectFrlTestFuncMeta(&func, meta);
 
     const entry = try func.newBlock();
     const then_blk = try func.newBlock();
