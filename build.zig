@@ -617,6 +617,18 @@ pub fn build(b: *std.Build) void {
     const run_ir_interp_tests = b.addRunArtifact(ir_interp_tests);
     test_step.dependOn(&run_ir_interp_tests.step);
 
+    // IR deterministic generator tests (#736).
+    const ir_fuzz_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ir_fuzz_tests = b.addTest(.{
+        .root_module = ir_fuzz_test_module,
+    });
+    const run_ir_fuzz_tests = b.addRunArtifact(ir_fuzz_tests);
+    test_step.dependOn(&run_ir_fuzz_tests.step);
+
     // Dominator-aware redundant-load forwarder tests (#391).
     const dom_frl_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/forward_redundant_loads_dominator.zig"),
