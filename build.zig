@@ -26,6 +26,16 @@ pub fn build(b: *std.Build) void {
         .x86_64, .aarch64 => true,
         else => false,
     };
+    // Subset of `aot_executable_target` where the host-import trampoline
+    // pool is supported. Mirrors `supports_pool` in
+    // `src/runtime/aot/host_trampolines.zig:341`: Windows can't mmap RWX
+    // pages the same way, and macOS aarch64 needs MAP_JIT +
+    // `pthread_jit_write_protect_np` plumbing that isn't wired. The
+    // canon-lower (aot) dispatcher path — and therefore any
+    // component-importing-host-fn end-to-end test — needs this.
+    const aot_trampoline_pool_target = aot_executable_target and
+        target.result.os.tag != .windows and
+        !(target.result.os.tag == .macos and target_arch == .aarch64);
     // codegen-bench emits x86-64 machine code but does not execute it. It can
     // run on the native AOT arches with a portable timer fallback.
     const bench_target = aot_executable_target;
@@ -475,7 +485,13 @@ pub fn build(b: *std.Build) void {
     // (exit 139) after the wit-bindgen adapter's "host exit
     // implementation didn't exit!" assertion fired on the sentinel
     // return; after the fix the host exits 0 / 1 respectively.
-    if (aot_executable_target) {
+    //
+    // Gated on `aot_trampoline_pool_target` (not just
+    // `aot_executable_target`) because canon-lower for a host import
+    // requires the host-import trampoline pool, which isn't supported
+    // on Windows / macOS-aarch64 — running there fails with
+    // `[aot reject] ... UnsupportedPlatform` regardless of #760.
+    if (aot_trampoline_pool_target) {
         const fixtures = [_]struct { name: []const u8, expected_exit: u8 }{
             .{ .name = "exit-ok.wasm", .expected_exit = 0 },
             .{ .name = "exit-with-code-7.wasm", .expected_exit = 1 },
