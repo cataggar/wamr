@@ -75,6 +75,31 @@ fn emitFunctionReturn(
     }
 }
 
+/// True iff `block`'s last instruction is a terminator per the IR verifier's
+/// `isTerminator` semantics (issue #765). Mirrors
+/// `src/compiler/ir/verifier.zig`'s definition — keep the two lists in sync.
+///
+/// Includes tail variants of `call`, `call_indirect`, and `call_ref` because
+/// the verifier treats them as terminators. The frontend uses this to skip
+/// appending implicit fall-through terminators (`ret`, `br`, etc.) when the
+/// current block is already closed by an explicit terminator emitted in the
+/// body — typically `unreachable`/`return`/`return_call` followed by `end` or
+/// `else`, where the dead-code dispatcher falls through to the normal handler.
+/// Without this guard the frontend emits two terminators in the same block,
+/// which trips `MultipleTerminators` in the verifier before any cleanup pass
+/// can run.
+fn endsWithTerminator(block: *const ir.BasicBlock) bool {
+    const items = block.instructions.items;
+    if (items.len == 0) return false;
+    return switch (items[items.len - 1].op) {
+        .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable", .throw, .throw_ref => true,
+        .call => |c| c.tail,
+        .call_indirect => |c| c.tail,
+        .call_ref => |c| c.tail,
+        else => false,
+    };
+}
+
 /// Look up the wasm value type of the global at the given wasm-flat index
 /// (imports come first, then locally-defined globals). Returns null if the
 /// index is out of range.
@@ -475,17 +500,28 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         switch (op) {
             .end => {
                 if (block_stack.items.len == 0) {
-                    // Function-level end: emit ret (single or multi-value)
-                    if (result_count > 1) {
-                        var rets = try allocator.alloc(ir.VReg, result_count);
-                        var k: u32 = 0;
-                        while (k < result_count) : (k += 1) {
-                            rets[result_count - 1 - k] = safePop(&vreg_stack);
+                    // Function-level end: emit an implicit `ret` to terminate
+                    // the entry function unless the body already closed the
+                    // current block with an explicit terminator (e.g.
+                    // `unreachable; end` or `return_call $f; end`). The
+                    // dead-code dispatcher above resets `dead_code = false`
+                    // and falls through here for those cases, so without
+                    // this guard the block ends up with two terminators —
+                    // the verifier's `MultipleTerminators` check trips on
+                    // the very first pass that runs with verification on
+                    // (issue #765).
+                    if (!endsWithTerminator(ir_func.getBlock(current_block))) {
+                        if (result_count > 1) {
+                            var rets = try allocator.alloc(ir.VReg, result_count);
+                            var k: u32 = 0;
+                            while (k < result_count) : (k += 1) {
+                                rets[result_count - 1 - k] = safePop(&vreg_stack);
+                            }
+                            try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
+                        } else {
+                            const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
+                            try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
                         }
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
-                    } else {
-                        const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
                     }
                     break;
                 }
@@ -530,12 +566,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 // second `br` here produces a block with two terminators,
                 // which trips the IR verifier (issue #631
                 // `MultipleTerminators`) and confuses the inliner.
-                const cur_insts = ir_func.getBlock(current_block).instructions.items;
-                const already_terminated = cur_insts.len != 0 and switch (cur_insts[cur_insts.len - 1].op) {
-                    .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable", .throw, .throw_ref => true,
-                    else => false,
-                };
-                if (!already_terminated) {
+                // See also issue #765 — the shared helper covers tail-call
+                // terminators (`return_call*`) that this site's inline
+                // predicate previously missed.
+                if (!endsWithTerminator(ir_func.getBlock(current_block))) {
                     // #672 EH: a try_table body that falls through must
                     // emit `try_table_end` to bracket the begin op before
                     // the implicit fall-through `br`.
@@ -802,20 +836,40 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .@"else" => {
                 const frame = &block_stack.items[block_stack.items.len - 1];
                 const n_res: usize = frame.result_types.len;
-                // Store then-branch results to result_locals, trim stack,
-                // and jump to the common end_block.
-                if (n_res > 0 and vreg_stack.items.len >= frame.stack_depth + n_res) {
-                    var i: usize = n_res;
-                    while (i > 0) {
-                        i -= 1;
-                        const v = safePop(&vreg_stack);
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_locals[i], .val = v } } });
+                // When the then-branch already closed `current_block` with
+                // an explicit terminator (e.g. `if (then unreachable) else
+                // ... end`), the dead-code dispatcher above resets
+                // `dead_code = false` and falls through here. Skip both
+                // the result-local materialization and the implicit `br
+                // frame.end_block` so we don't append a second terminator
+                // to a block that's already closed (issue #765). The stack
+                // is at `frame.stack_depth` in dead-code mode, so the
+                // result-local store would have been a no-op anyway, but
+                // the unconditional `br` was the actual offender.
+                const then_terminated = endsWithTerminator(ir_func.getBlock(current_block));
+                if (!then_terminated) {
+                    // Store then-branch results to result_locals, trim stack,
+                    // and jump to the common end_block.
+                    if (n_res > 0 and vreg_stack.items.len >= frame.stack_depth + n_res) {
+                        var i: usize = n_res;
+                        while (i > 0) {
+                            i -= 1;
+                            const v = safePop(&vreg_stack);
+                            try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_locals[i], .val = v } } });
+                        }
+                    }
+                    if (vreg_stack.items.len > frame.stack_depth) {
+                        vreg_stack.items.len = frame.stack_depth;
+                    }
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
+                } else {
+                    // Body still consumed result-shaped operands on the wasm
+                    // operand stack; drop anything beyond the pre-block
+                    // depth so the else-branch starts clean.
+                    if (vreg_stack.items.len > frame.stack_depth) {
+                        vreg_stack.items.len = frame.stack_depth;
                     }
                 }
-                if (vreg_stack.items.len > frame.stack_depth) {
-                    vreg_stack.items.len = frame.stack_depth;
-                }
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
                 current_block = frame.else_block orelse {
                     std.debug.print("wamrc: else without else_block (if-frame state desync)\n", .{});
                     return error.InvalidBytecode;
@@ -1240,6 +1294,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 if (have_default and resolved_count > 0) {
                     // Shrink slice ownership to actually-resolved entries.
                     const final_targets = ir_targets[0..resolved_count];
+                    // Track the full allocation in `owned_br_table_targets`
+                    // so `IrFunction.deinit` frees it. The slice stored on
+                    // the IR op only needs the resolved prefix, but
+                    // `allocator.free` requires the base allocation —
+                    // append `ir_targets`, not `final_targets` (issue
+                    // #765 follow-up — frontend was leaking br_table
+                    // targets because every other producer of the op
+                    // (notably `inlineSmallFunctions`) registers its
+                    // allocation here, but the frontend never did).
+                    try ir_func.owned_br_table_targets.append(ir_func.allocator, ir_targets);
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .br_table = .{
                         .index = index,
                         .targets = final_targets,
@@ -7570,6 +7634,102 @@ test "lower unreachable" {
 
     // Should be unreachable op
     try std.testing.expectEqual(ir.Inst.Op{ .@"unreachable" = {} }, insts[0].op);
+}
+
+// Issue #765: the function-level `end` handler used to unconditionally
+// emit `ret`/`ret_multi`, producing two terminators when the body fell
+// into dead code via `unreachable`/`return`/`return_call` immediately
+// before the implicit function `end`. The bytecode here mirrors what
+// `wamrc compile-component` saw in stdio-echo.wasm and tripped the IR
+// verifier's `MultipleTerminators` (check 4) at the first pass that ran
+// with verification on (`inlineSmallFunctions` in ReleaseSafe builds).
+test "lower: function body ending in unreachable; end emits a single terminator" {
+    const allocator = std.testing.allocator;
+
+    // unreachable (0x00) then end (0x0B) — the canonical bytecode for
+    // a void function whose body falls off via `unreachable`.
+    const func_type = types.FuncType{ .params = &.{}, .results = &.{} };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &[_]u8{ 0x00, 0x0B },
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    const insts = ir_func.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .@"unreachable" = {} }, insts[0].op);
+}
+
+// Issue #765 (companion case): the `return` opcode also sets `dead_code`;
+// a subsequent `end` must not append a second `ret`.
+test "lower: function body ending in return; end emits a single terminator" {
+    const allocator = std.testing.allocator;
+
+    // return (0x0F) then end (0x0B) for a void function.
+    const func_type = types.FuncType{ .params = &.{}, .results = &.{} };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &[_]u8{ 0x0F, 0x0B },
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    const insts = ir_func.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    try std.testing.expect(insts[0].op == .ret);
+}
+
+// Issue #765 (companion case): a function body that ends with values on
+// the operand stack and an `unreachable` before the implicit `end` must
+// still emit only the explicit `unreachable`. The earlier regression in
+// `stdio-echo.wasm` had this exact shape (call $f then unreachable then
+// end), which lowered to call + unreachable + ret (two terminators).
+test "lower: locals + unreachable before end yields single terminator" {
+    const allocator = std.testing.allocator;
+
+    // local.get 0 (push i32), unreachable, end. Function takes one i32
+    // param, returns one i32 — the trailing `unreachable` is the body's
+    // only exit and the implicit `end` must not append a second `ret`.
+    const func_type = types.FuncType{ .params = &[_]types.ValType{.i32}, .results = &[_]types.ValType{.i32} };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 1,
+        .locals = &.{},
+        .code = &[_]u8{ 0x20, 0x00, 0x00, 0x0B }, // local.get 0; unreachable; end
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    const insts = ir_func.blocks.items[0].instructions.items;
+    // Body: local.get + unreachable. No trailing `ret`.
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .@"unreachable" = {} }, insts[1].op);
 }
 
 test "lower empty module" {
