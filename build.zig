@@ -509,6 +509,30 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // #757 `wamrc verify` smoke (no wasmtime required):
+    //   * `verify help` → exit 0 + non-empty stdout.
+    //   * `verify --wasmtime-bin=/dev/null/nope <wasm>` → spawn fails →
+    //     exit 2 (setup error). Exercises the binary-resolution +
+    //     "spawn failed = setup error" wiring without needing
+    //     wasmtime on the test runner's PATH.
+    // Reuses the 339-byte `tests/regressions/760-aot-cli-exit/exit-ok.wasm`
+    // (a valid component the AOT precompile accepts) so the smoke
+    // gets past the precompile step before the wasmtime spawn fails.
+    if (aot_trampoline_pool_target) {
+        const verify_help = b.addRunArtifact(wamrc);
+        verify_help.addArgs(&.{ "verify", "help" });
+        verify_help.expectExitCode(0);
+        test_step.dependOn(&verify_help.step);
+
+        const verify_no_wasmtime = b.addRunArtifact(wamrc);
+        verify_no_wasmtime.addArgs(&.{ "verify", "--wasmtime-bin=/dev/null/nope-wamrc-757" });
+        verify_no_wasmtime.addFileArg(b.path("tests/regressions/760-aot-cli-exit/exit-ok.wasm"));
+        verify_no_wasmtime.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+        verify_no_wasmtime.step.dependOn(b.getInstallStep());
+        verify_no_wasmtime.expectExitCode(2);
+        test_step.dependOn(&verify_no_wasmtime.step);
+    }
+
     // Compiler IR passes tests (separate module to avoid root/wamr conflict)
     const passes_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/passes.zig"),
