@@ -2758,6 +2758,14 @@ pub const PassBisectSpec = struct {
     /// byte-for-byte equivalent to the unfiltered path.
     pub fn affectsModule(self: PassBisectSpec, module_idx: u32) bool {
         if (self.skipsInlineSmall(module_idx) or self.skipsPromoteSSA(module_idx)) return true;
+        return self.hasPassPipelineFilterInModule(module_idx);
+    }
+
+    /// True when the per-function pass slice is filtered in
+    /// `module_idx`. Unlike prelude skips, these filters can affect only
+    /// a subset of functions, so the outer inlining loop must be capped
+    /// to avoid propagating partial-pipeline effects into callers.
+    pub fn hasPassPipelineFilterInModule(self: PassBisectSpec, module_idx: u32) bool {
         if (self.limit) |lim| {
             if (modMatches(lim.mod_filter, module_idx)) return true;
         }
@@ -6821,15 +6829,15 @@ pub fn runPassesWithOptions(
     // constant-argument-specialisation cases that motivate this loop,
     // without exploding compile time.
     //
-    // #761: when the current module is affected by a bisect spec, force
-    // a single outer iteration. The second iteration re-runs
-    // module-level `inlineSmallFunctions` on IR that the first
-    // per-function pass round has already filtered, which would leak
-    // the partial pipeline's effects into otherwise-unaffected
-    // callers/callees and defeat the per-function isolation promise.
-    // A spec whose `:mod=N` filter does not match this module must not
-    // shorten the normal two-round schedule.
-    const outer_max: u32 = if (opts.bisect.affectsModule(opts.module_idx)) 1 else 2;
+    // #761: when the current module has a per-function pass-pipeline
+    // bisect filter, force a single outer iteration. The second
+    // iteration re-runs module-level `inlineSmallFunctions` on IR that
+    // the first per-function pass round has already filtered, which
+    // would leak the partial pipeline's effects into otherwise-
+    // unaffected callers/callees and defeat the per-function isolation
+    // promise. Prelude skips are module-wide, so they keep the normal
+    // two-round schedule.
+    const outer_max: u32 = if (opts.bisect.hasPassPipelineFilterInModule(opts.module_idx)) 1 else 2;
     var outer_iter: u32 = 0;
     while (outer_iter < outer_max) : (outer_iter += 1) {
         // Module-level: inline small leaf callees. Iterate to fixpoint so

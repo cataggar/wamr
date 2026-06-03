@@ -579,6 +579,8 @@ test "Spec.shouldSkip + effectiveLimit + affectsFunction" {
     try testing.expect(spec.affectsFunction(0, 11040));
     try testing.expect(spec.affectsFunction(0, 0)); // hit by pass-17 all-funcs skip
     try testing.expect(spec.affectsFunction(0, 99999)); // same
+    try testing.expect(spec.hasPassPipelineFilterInModule(0));
+    try testing.expect(spec.hasPassPipelineFilterInModule(4));
 }
 
 test "Spec.shouldSkip honours mod_filter" {
@@ -600,6 +602,8 @@ test "Spec.shouldSkip honours mod_filter" {
     try testing.expect(!spec.affectsFunction(0, 0));
     try testing.expect(spec.affectsModule(4));
     try testing.expect(!spec.affectsModule(0));
+    try testing.expect(spec.hasPassPipelineFilterInModule(4));
+    try testing.expect(!spec.hasPassPipelineFilterInModule(0));
 }
 
 test "Spec.shouldSkip with both mod_filter AND func_filter" {
@@ -633,6 +637,8 @@ test "Spec.effectiveLimit honours mod_filter" {
     try testing.expectEqual(@as(?u32, null), spec.effectiveLimit(1, 0));
     try testing.expect(spec.affectsModule(4));
     try testing.expect(!spec.affectsModule(0));
+    try testing.expect(spec.hasPassPipelineFilterInModule(4));
+    try testing.expect(!spec.hasPassPipelineFilterInModule(0));
 }
 
 test "Spec prelude skip helpers honour module filters" {
@@ -650,6 +656,7 @@ test "Spec prelude skip helpers honour module filters" {
     try testing.expect(module_4_only.skipsInlineSmall(4));
     try testing.expect(!module_4_only.affectsModule(0));
     try testing.expect(module_4_only.affectsModule(4));
+    try testing.expect(!module_4_only.hasPassPipelineFilterInModule(4));
 
     const module_0_and_4: Spec = .{ .skip_inline_small = &mod0_and_4 };
     try testing.expect(module_0_and_4.skipsInlineSmall(0));
