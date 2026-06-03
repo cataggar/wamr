@@ -82,12 +82,6 @@ fn finishCase(
     inputs: []interp.Value,
     memory: []u8,
 ) !Case {
-    errdefer {
-        var f = func;
-        f.deinit();
-        allocator.free(inputs);
-        allocator.free(memory);
-    }
     try verifier.verifyFunction(&func, 0, .after_each_pass, allocator);
     return .{ .seed = seed, .shape = shape, .func = func, .inputs = inputs, .memory = memory };
 }

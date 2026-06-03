@@ -340,8 +340,9 @@ fn execInst(machine: *Machine, inst: ir.Inst) !?Outcome {
         },
         .ret => |maybe_v| {
             const results = if (maybe_v) |v| blk: {
+                const value = (try machine.getVReg(v)).normalized();
                 const out = try machine.allocator.alloc(Value, 1);
-                out[0] = (try machine.getVReg(v)).normalized();
+                out[0] = value;
                 break :blk out;
             } else try machine.allocator.alloc(Value, 0);
             machine.memory_transferred = true;
@@ -349,6 +350,7 @@ fn execInst(machine: *Machine, inst: ir.Inst) !?Outcome {
         },
         .ret_multi => |vregs| {
             const results = try machine.allocator.alloc(Value, vregs.len);
+            errdefer machine.allocator.free(results);
             for (vregs, 0..) |v, i| results[i] = (try machine.getVReg(v)).normalized();
             machine.memory_transferred = true;
             return .{ .returned = .{ .results = results, .memory = machine.memory } };
