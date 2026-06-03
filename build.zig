@@ -605,6 +605,18 @@ pub fn build(b: *std.Build) void {
     const run_verifier_tests = b.addRunArtifact(verifier_tests);
     test_step.dependOn(&run_verifier_tests.step);
 
+    // IR interpreter tests (#736).
+    const ir_interp_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/interp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ir_interp_tests = b.addTest(.{
+        .root_module = ir_interp_test_module,
+    });
+    const run_ir_interp_tests = b.addRunArtifact(ir_interp_tests);
+    test_step.dependOn(&run_ir_interp_tests.step);
+
     // Dominator-aware redundant-load forwarder tests (#391).
     const dom_frl_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/forward_redundant_loads_dominator.zig"),
