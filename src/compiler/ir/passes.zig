@@ -6686,15 +6686,29 @@ pub fn runPassesWithOptions(
 
     // Local helper: run the verifier and stamp the pass name on the
     // surfaced failure record. A no-op when `verify_mode == .off`.
+    //
+    // Refreshes `BasicBlock.predecessors` from the current CFG before
+    // each check. `BasicBlock.predecessors` is essentially a derived
+    // field — the only non-verifier/non-printer consumer is
+    // `analysis.refreshBlockPredecessors` itself. Several CFG-mutating
+    // passes (`scrubUnreachableBlocks`, `tailDuplicateSmallJoins`,
+    // `foldConstantBranches`, etc.) historically forgot to refresh and
+    // tripped the verifier's check 6. Rather than require every pass
+    // author to remember the refresh, normalise the predecessor list
+    // here so the verifier sees a consistent CFG (issue #765). The
+    // standalone `verifier.verifyFunction` is left unchanged so the
+    // direct-call tests continue to exercise check 6's recorded-vs-
+    // derived comparison.
     const Verify = struct {
         fn check(
             mode: verifier.VerifyMode,
             pass_label: []const u8,
-            func: *const ir.IrFunction,
+            func: *ir.IrFunction,
             func_idx: u32,
             alloc: std.mem.Allocator,
         ) verifier.VerifyError!void {
             if (mode == .off) return;
+            try analysis.refreshBlockPredecessors(func, alloc);
             verifier.verifyFunction(func, func_idx, mode, alloc) catch |e| {
                 verifier.last_failure.pass_name = pass_label;
                 return e;
