@@ -87,6 +87,12 @@ pub const PrecompileOptions = struct {
     /// on `compileCoreWasm` itself — use `compileCoreWasmCached`
     /// directly for in-memory cache reuse.
     cache_dir: ?[]const u8 = null,
+    /// #743 / #761: per-core module index used by `:mod=N` bisect
+    /// filters. The component driver sets this to the per-core index
+    /// before each `compileCoreWasm` call; the single-module
+    /// `wamrc compile` path leaves it at the default 0 (which still
+    /// matches `:mod=0` filters, as intended).
+    module_idx: u32 = 0,
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -181,6 +187,8 @@ pub fn compileCoreWasmCached(
                 // affected by the spec to keep partial-pipeline IR
                 // states from tripping benign structural checks.
                 .bisect = aot_bisect.global,
+                // Per-core index honoured by `:mod=N` bisect filters.
+                .module_idx = opts.module_idx,
             },
         ) catch |err| {
             logVerifierFailure(err);
@@ -680,7 +688,11 @@ pub fn precompileComponent(
             break :blk .{ .reuse = reuse_ptr, .produced = &produced_cache };
         };
 
-        const cwasm = compileCoreWasmCached(allocator, core_ref.data, opts, cache_ctx) catch |err| {
+        // Override opts.module_idx per core so `:mod=N` bisect filters resolve correctly.
+        var per_core_opts = opts;
+        per_core_opts.module_idx = @intCast(idx);
+
+        const cwasm = compileCoreWasmCached(allocator, core_ref.data, per_core_opts, cache_ctx) catch |err| {
             std.log.err("precompileComponent: core {d} compile failed: {s}", .{ idx, @errorName(err) });
             return err;
         };
