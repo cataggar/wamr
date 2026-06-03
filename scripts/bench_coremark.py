@@ -42,12 +42,18 @@ ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
 # introduced by any single change. Real coremark regressions would trap
 # deeper inside a function (non-zero offset), so a `+0x0` offset is the
 # discriminator. Retry this failure mode up to `_TRAP_RETRY_MAX` times
-# before treating it as a real regression.
+# before treating it as a real regression. Bumped from 3 → 5 because
+# CI run https://github.com/cataggar/wamr/actions/runs/26850322663 (on
+# PR #763) exhausted the 3-retry budget when the flake fired 4 times
+# in a row on a single CoreMark slot — the underlying #406 cause
+# remains unfixed, so a temporary larger retry window keeps CI green
+# without hiding a real regression (real codegen bugs trap deeper
+# inside a function and don't match `+0x0`).
 _TRAP_FLAKE_PATTERN = re.compile(
     r'wasm trap: out of bounds memory access.*local_func\[-?\d+\](?:\s+"[^"]*")?\+0x0',
     re.IGNORECASE,
 )
-_TRAP_RETRY_MAX = 3
+_TRAP_RETRY_MAX = 5
 
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> str:
