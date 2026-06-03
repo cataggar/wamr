@@ -2076,10 +2076,14 @@ fn compileFunctionRAWithGlobalOffsets(
                     },
                     .memory_fill => |mf| {
                         if (smallFixedBulkMemLen(&const_vals, mf.len) == null) {
-                            // REP STOSB clobbers rdi (index 3 in alloc_regs).
+                            // REP STOSB clobbers rdi. Keep this tied to
+                            // x86_64_alloc_regs order; a stale hard-coded
+                            // index let live vregs survive in rdi across
+                            // large memory.fill (#743).
+                            const rdi_idx = x86_64_alloc_idx(.rdi) orelse unreachable;
                             try clobber_points.append(allocator, .{
                                 .pos = pos,
-                                .regs_clobbered = @as(u64, 1) << 3,
+                                .regs_clobbered = @as(u64, 1) << @as(u6, @intCast(rdi_idx)),
                             });
                         }
                     },
