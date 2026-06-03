@@ -826,7 +826,19 @@ fn decodeTrapReturnAddress(ret_addr: usize) TrapPcLocation {
     // restored, or a PC corruption). Refuse to scan g_func_offsets so we
     // don't report a stale last-index match.
     if (g_code_size == 0 or code_off >= g_code_size) {
+        printTrapDecodeForensic(ret_addr, "ret-addr above code blob or no code installed");
         return .{ .code_off = code_off, .func_idx = -1, .rel_off = 0, .name = null };
+    }
+    if (code_off_s < 0) {
+        // #406: ret-addr below the AOT code blob is anomalous — the trap
+        // helper expects to be called from inside AOT code, so `@returnAddress()`
+        // should land between `g_code_base` and `g_code_base + g_code_size`.
+        // Falling below indicates either host-stack corruption (the return
+        // slot got overwritten before the trap helper read it) or `g_code_base`
+        // being stale. Surface the raw values so the next time this fires we
+        // have actionable data instead of the misleading degenerate decode
+        // (`local_func[0] "__wasm_call_ctors"+0x0`) below.
+        printTrapDecodeForensic(ret_addr, "ret-addr below code blob (host stack corruption?)");
     }
     var func_idx: isize = -1;
     var func_start: usize = 0;
@@ -843,6 +855,18 @@ fn decodeTrapReturnAddress(ret_addr: usize) TrapPcLocation {
         .rel_off = rel_off,
         .name = lookupLocalFuncName(func_idx),
     };
+}
+
+/// #406 forensic: when the trap-PC decoder hits a fallback path
+/// (ret_addr outside the AOT code blob), print the raw inputs so the
+/// next time a flake fires we get actionable data instead of just the
+/// misleading symbolic decode the caller is about to print. Tagged
+/// `[#406]` for grep-ability across CI logs.
+fn printTrapDecodeForensic(ret_addr: usize, why: []const u8) void {
+    std.debug.print(
+        "[#406] trap decoder fallback: {s} — raw ret=0x{x} g_code_base=0x{x} g_code_size=0x{x}\n",
+        .{ why, ret_addr, g_code_base, g_code_size },
+    );
 }
 
 fn printTrapWithPc(kind: []const u8, loc: TrapPcLocation) void {
