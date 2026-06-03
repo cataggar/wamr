@@ -2729,27 +2729,32 @@ pub const PassBisectSpec = struct {
         func_filter: ?[]const u32 = null,
         mod_filter: ?[]const u32 = null,
     };
+    /// Scope for function-level prelude skips. `null` filters mean "all
+    /// functions/modules"; non-null slices narrow to the listed indices.
+    pub const PreludeFilter = struct {
+        func_filter: ?[]const u32 = null,
+        mod_filter: ?[]const u32 = null,
+    };
 
     skip: []const Skip = &.{},
     limit: ?Limit = null,
-    /// Prelude skip module filters. `&.{}` means disabled, `null`
-    /// means every module, and a non-empty slice means only those
-    /// module indices. They intentionally do not have per-function
-    /// filters because these passes are either module-scoped
-    /// (`inlineSmallFunctions`) or must run consistently for the whole
-    /// module's local/phi form (`promoteLocalsToSSA`,
-    /// `lowerPhisToLocals`).
+    /// Module-level prelude skip for `inlineSmallFunctions`. `&.{}`
+    /// means disabled, `null` means every module, and a non-empty slice
+    /// means only those module indices.
     skip_inline_small: ?[]const u32 = &.{},
-    skip_promote_ssa: ?[]const u32 = &.{},
-    skip_phis_to_locals: ?[]const u32 = &.{},
+    /// Function-level prelude skips. `null` means disabled; `.{}`
+    /// means every module/function; non-null fields inside the struct
+    /// narrow to the listed module/function indices.
+    skip_promote_ssa: ?PreludeFilter = null,
+    skip_phis_to_locals: ?PreludeFilter = null,
 
     /// True when no filtering is configured anywhere.
     pub fn isEmpty(self: PassBisectSpec) bool {
         return self.skip.len == 0 and
             self.limit == null and
             !preludeFilterEnabled(self.skip_inline_small) and
-            !preludeFilterEnabled(self.skip_promote_ssa) and
-            !preludeFilterEnabled(self.skip_phis_to_locals);
+            self.skip_promote_ssa == null and
+            self.skip_phis_to_locals == null;
     }
 
     /// True when this spec may alter any function in `module_idx`.
@@ -2757,7 +2762,12 @@ pub const PassBisectSpec = struct {
     /// different `:mod=N` must leave this module's optimization loop
     /// byte-for-byte equivalent to the unfiltered path.
     pub fn affectsModule(self: PassBisectSpec, module_idx: u32) bool {
-        if (self.skipsInlineSmall(module_idx) or self.skipsPromoteSSA(module_idx)) return true;
+        if (self.skipsInlineSmall(module_idx) or
+            preludeFilterMatchesModule(self.skip_promote_ssa, module_idx) or
+            preludeFilterMatchesModule(self.skip_phis_to_locals, module_idx))
+        {
+            return true;
+        }
         return self.hasPassPipelineFilterInModule(module_idx);
     }
 
@@ -2802,18 +2812,19 @@ pub const PassBisectSpec = struct {
         return preludeMatches(self.skip_inline_small, module_idx);
     }
 
-    pub fn skipsPromoteSSA(self: PassBisectSpec, module_idx: u32) bool {
-        return preludeMatches(self.skip_promote_ssa, module_idx) or
-            preludeMatches(self.skip_phis_to_locals, module_idx);
+    pub fn skipsPromoteSSA(self: PassBisectSpec, module_idx: u32, func_idx: u32) bool {
+        return preludeFilterMatchesFunction(self.skip_promote_ssa, module_idx, func_idx) or
+            preludeFilterMatchesFunction(self.skip_phis_to_locals, module_idx, func_idx);
     }
 
-    pub fn skipsPhisToLocals(self: PassBisectSpec, module_idx: u32) bool {
-        return preludeMatches(self.skip_phis_to_locals, module_idx);
+    pub fn skipsPhisToLocals(self: PassBisectSpec, module_idx: u32, func_idx: u32) bool {
+        return preludeFilterMatchesFunction(self.skip_phis_to_locals, module_idx, func_idx);
     }
 
     pub fn lowerPhisSkipForcesPromote(self: PassBisectSpec) bool {
-        return preludeFilterEnabled(self.skip_phis_to_locals) and
-            !preludeFilterSubset(self.skip_phis_to_locals, self.skip_promote_ssa);
+        const lower = self.skip_phis_to_locals orelse return false;
+        const promote = self.skip_promote_ssa orelse return true;
+        return !preludeFilterCovers(promote, lower);
     }
 
     /// True when this spec narrows behaviour for `func_idx` in
@@ -2822,7 +2833,7 @@ pub const PassBisectSpec = struct {
     /// in a state later cleanups would normalise, tripping benign
     /// structural checks.
     pub fn affectsFunction(self: PassBisectSpec, module_idx: u32, func_idx: u32) bool {
-        if (self.skipsInlineSmall(module_idx) or self.skipsPromoteSSA(module_idx)) return true;
+        if (self.skipsInlineSmall(module_idx) or self.skipsPromoteSSA(module_idx, func_idx)) return true;
         if (self.effectiveLimit(module_idx, func_idx) != null) return true;
         for (self.skip) |s| {
             if (!modMatches(s.mod_filter, module_idx)) continue;
@@ -2855,13 +2866,33 @@ pub const PassBisectSpec = struct {
         return false;
     }
 
-    fn preludeFilterSubset(needle: ?[]const u32, haystack: ?[]const u32) bool {
-        if (!preludeFilterEnabled(needle)) return true;
-        if (!preludeFilterEnabled(haystack)) return false;
-        if (haystack == null) return true;
-        if (needle == null) return false;
-        for (needle.?) |m| {
-            if (!preludeMatches(haystack, m)) return false;
+    fn preludeFilterMatchesModule(filter: ?PreludeFilter, module_idx: u32) bool {
+        const f = filter orelse return false;
+        return modMatches(f.mod_filter, module_idx);
+    }
+
+    fn preludeFilterMatchesFunction(filter: ?PreludeFilter, module_idx: u32, func_idx: u32) bool {
+        const f = filter orelse return false;
+        return modMatches(f.mod_filter, module_idx) and funcMatches(f.func_filter, func_idx);
+    }
+
+    fn preludeFilterCovers(cover: PreludeFilter, covered: PreludeFilter) bool {
+        return filterDimensionCovers(cover.mod_filter, covered.mod_filter) and
+            filterDimensionCovers(cover.func_filter, covered.func_filter);
+    }
+
+    fn filterDimensionCovers(cover: ?[]const u32, covered: ?[]const u32) bool {
+        if (cover == null) return true;
+        const covered_list = covered orelse return false;
+        for (covered_list) |item| {
+            var found = false;
+            for (cover.?) |cover_item| {
+                if (cover_item == item) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
         }
         return true;
     }
@@ -6905,7 +6936,7 @@ pub fn runPassesWithOptions(
             // later rounds the function is already past mem2reg and any new
             // local_set/get inserted by inlining is handled by
             // `forwardLocalGet` + `deadLocalSetElimination`.
-            if (outer_iter == 0 and !opts.bisect.skipsPromoteSSA(opts.module_idx)) {
+            if (outer_iter == 0 and !opts.bisect.skipsPromoteSSA(opts.module_idx, func_idx)) {
                 if (try promoteLocalsToSSA(func, allocator)) {
                     total_changes += 1;
                     try Verify.check(effective_verify_mode, "promoteLocalsToSSA", func, func_idx, allocator);
@@ -6919,7 +6950,7 @@ pub fn runPassesWithOptions(
                             .outer_iter = outer_iter,
                         });
                     }
-                    if (!opts.bisect.skipsPhisToLocals(opts.module_idx) and try lowerPhisToLocals(func, allocator)) {
+                    if (!opts.bisect.skipsPhisToLocals(opts.module_idx, func_idx) and try lowerPhisToLocals(func, allocator)) {
                         total_changes += 1;
                         try Verify.check(effective_verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
                         if (opts.dump_hook) |hook| {
@@ -7847,12 +7878,32 @@ test "PassBisectSpec: skip_promote_ssa gates SSA prelude" {
         var module = try bisectTestBuildLoopModule(allocator);
         defer module.deinit();
 
-        const spec: PassBisectSpec = .{ .skip_promote_ssa = null };
+        const spec: PassBisectSpec = .{ .skip_promote_ssa = .{} };
         _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec });
 
         try std.testing.expectEqual(@as(u32, 1), module.functions.items[0].local_count);
         try std.testing.expect(!bisectTestModuleHasPhi(&module));
     }
+}
+
+test "PassBisectSpec: skip_promote_ssa func_filter only gates matching funcs" {
+    const allocator = std.testing.allocator;
+    const no_passes: []const PassFn = &.{};
+    var module = try bisectTestBuildLoopModule(allocator);
+    defer module.deinit();
+
+    var second = try bisectTestBuildLoopModule(allocator);
+    defer second.deinit();
+    var second_func = second.functions.pop().?;
+    errdefer second_func.deinit();
+    try module.functions.append(allocator, second_func);
+
+    const fn1 = [_]u32{1};
+    const spec: PassBisectSpec = .{ .skip_promote_ssa = .{ .func_filter = &fn1 } };
+    _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec });
+
+    try std.testing.expect(module.functions.items[0].local_count > 1);
+    try std.testing.expectEqual(@as(u32, 1), module.functions.items[1].local_count);
 }
 
 test "PassBisectSpec: skip_phis_to_locals forces promote skip in run loop" {
@@ -7861,7 +7912,7 @@ test "PassBisectSpec: skip_phis_to_locals forces promote skip in run loop" {
     var module = try bisectTestBuildLoopModule(allocator);
     defer module.deinit();
 
-    const spec: PassBisectSpec = .{ .skip_phis_to_locals = null };
+    const spec: PassBisectSpec = .{ .skip_phis_to_locals = .{} };
     _ = try runPassesWithOptions(&module, no_passes, allocator, .{ .bisect = spec });
 
     try std.testing.expectEqual(@as(u32, 1), module.functions.items[0].local_count);
