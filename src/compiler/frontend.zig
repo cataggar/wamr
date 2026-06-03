@@ -1294,6 +1294,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 if (have_default and resolved_count > 0) {
                     // Shrink slice ownership to actually-resolved entries.
                     const final_targets = ir_targets[0..resolved_count];
+                    // Track the full allocation in `owned_br_table_targets`
+                    // so `IrFunction.deinit` frees it. The slice stored on
+                    // the IR op only needs the resolved prefix, but
+                    // `allocator.free` requires the base allocation —
+                    // append `ir_targets`, not `final_targets` (issue
+                    // #765 follow-up — frontend was leaking br_table
+                    // targets because every other producer of the op
+                    // (notably `inlineSmallFunctions`) registers its
+                    // allocation here, but the frontend never did).
+                    try ir_func.owned_br_table_targets.append(ir_func.allocator, ir_targets);
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .br_table = .{
                         .index = index,
                         .targets = final_targets,
