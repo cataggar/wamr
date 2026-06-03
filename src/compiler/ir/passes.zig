@@ -2683,6 +2683,12 @@ pub const RunOptions = struct {
     /// codegen miscompiles (#743 / #761). Default `.{}` means "no
     /// filtering" — the full pipeline runs for every function.
     bisect: PassBisectSpec = .{},
+    /// Module index used to narrow `bisect.skip`/`bisect.limit` entries
+    /// whose `mod_filter` is non-null. Defaults to 0; single-module
+    /// callers (`wamrc compile`) can leave it at the default. The
+    /// component AOT driver (`wamrc compile-component`) passes the
+    /// per-core index so `:mod=N` filters resolve correctly.
+    module_idx: u32 = 0,
 };
 
 /// Filter that selectively skips IR optimisation passes or caps the
@@ -2704,20 +2710,24 @@ pub const RunOptions = struct {
 pub const PassBisectSpec = struct {
     /// Skip pass-indices in the inclusive range `[pass_idx_lo,
     /// pass_idx_hi]` for the listed functions (or all functions when
-    /// `func_filter == null`). Multiple entries may overlap; a pass is
-    /// skipped if *any* entry matches.
+    /// `func_filter == null`) within the listed modules (or all
+    /// modules when `mod_filter == null`). Multiple entries may
+    /// overlap; a pass is skipped if *any* entry matches.
     pub const Skip = struct {
         pass_idx_lo: u32,
         pass_idx_hi: u32,
         func_filter: ?[]const u32 = null,
+        mod_filter: ?[]const u32 = null,
     };
     /// Cap the per-function pipeline to the first `n` passes for the
-    /// listed functions (or all functions when `func_filter == null`).
-    /// Only one `Limit` is supported — the env parser overwrites on
-    /// repeat.
+    /// listed functions (or all functions when `func_filter == null`)
+    /// within the listed modules (or all modules when
+    /// `mod_filter == null`). Only one `Limit` is supported — the
+    /// env parser overwrites on repeat.
     pub const Limit = struct {
         n: u32,
         func_filter: ?[]const u32 = null,
+        mod_filter: ?[]const u32 = null,
     };
 
     skip: []const Skip = &.{},
@@ -2730,30 +2740,37 @@ pub const PassBisectSpec = struct {
     }
 
     /// True when pass index `pass_idx` should be skipped for function
-    /// `func_idx` per any `Skip` entry.
-    pub fn shouldSkip(self: PassBisectSpec, func_idx: u32, pass_idx: u32) bool {
+    /// `func_idx` in module `module_idx` per any `Skip` entry.
+    /// `module_idx` of 0 is the default for callers (single-module
+    /// `wamrc compile`) that don't track a per-core module index;
+    /// `:mod=N` filters in such a context never match unless `N == 0`.
+    pub fn shouldSkip(self: PassBisectSpec, module_idx: u32, func_idx: u32, pass_idx: u32) bool {
         for (self.skip) |s| {
             if (pass_idx < s.pass_idx_lo or pass_idx > s.pass_idx_hi) continue;
+            if (!modMatches(s.mod_filter, module_idx)) continue;
             if (funcMatches(s.func_filter, func_idx)) return true;
         }
         return false;
     }
 
-    /// The pipeline-length cap for `func_idx`, or `null` when no
-    /// `Limit` applies (run the full slice).
-    pub fn effectiveLimit(self: PassBisectSpec, func_idx: u32) ?u32 {
+    /// The pipeline-length cap for `func_idx` in module `module_idx`,
+    /// or `null` when no `Limit` applies (run the full slice).
+    pub fn effectiveLimit(self: PassBisectSpec, module_idx: u32, func_idx: u32) ?u32 {
         const lim = self.limit orelse return null;
+        if (!modMatches(lim.mod_filter, module_idx)) return null;
         if (!funcMatches(lim.func_filter, func_idx)) return null;
         return lim.n;
     }
 
-    /// True when this spec narrows behaviour for `func_idx` at all.
-    /// Used to decide per-function verifier suppression: partial
-    /// pipelines on a function can leave its IR in a state later
-    /// cleanups would normalise, tripping benign structural checks.
-    pub fn affectsFunction(self: PassBisectSpec, func_idx: u32) bool {
-        if (self.effectiveLimit(func_idx) != null) return true;
+    /// True when this spec narrows behaviour for `func_idx` in
+    /// `module_idx` at all. Used to decide per-function verifier
+    /// suppression: partial pipelines on a function can leave its IR
+    /// in a state later cleanups would normalise, tripping benign
+    /// structural checks.
+    pub fn affectsFunction(self: PassBisectSpec, module_idx: u32, func_idx: u32) bool {
+        if (self.effectiveLimit(module_idx, func_idx) != null) return true;
         for (self.skip) |s| {
+            if (!modMatches(s.mod_filter, module_idx)) continue;
             if (funcMatches(s.func_filter, func_idx)) return true;
         }
         return false;
@@ -2762,6 +2779,12 @@ pub const PassBisectSpec = struct {
     fn funcMatches(filter: ?[]const u32, func_idx: u32) bool {
         const list = filter orelse return true;
         for (list) |f| if (f == func_idx) return true;
+        return false;
+    }
+
+    fn modMatches(filter: ?[]const u32, module_idx: u32) bool {
+        const list = filter orelse return true;
+        for (list) |m| if (m == module_idx) return true;
         return false;
     }
 };
@@ -6755,7 +6778,7 @@ pub fn runPassesWithOptions(
                     const fi32: u32 = @intCast(fi);
                     // #761: suppress verifier on bisect-affected funcs.
                     const vm: verifier.VerifyMode =
-                        if (opts.bisect.affectsFunction(fi32)) .off else opts.verify_mode;
+                        if (opts.bisect.affectsFunction(opts.module_idx, fi32)) .off else opts.verify_mode;
                     try Verify.check(vm, "inlineSmallFunctions", f, fi32, allocator);
                 }
             }
@@ -6797,7 +6820,7 @@ pub fn runPassesWithOptions(
             // below (promoteLocalsToSSA, lowerPhisToLocals, the per-
             // pass fixpoint, scrubUnreachableBlocks).
             const effective_verify_mode: verifier.VerifyMode =
-                if (opts.bisect.affectsFunction(func_idx)) .off else opts.verify_mode;
+                if (opts.bisect.affectsFunction(opts.module_idx, func_idx)) .off else opts.verify_mode;
 
             // SSA promotion: only meaningful on the first outer round. On
             // later rounds the function is already past mem2reg and any new
@@ -6843,7 +6866,7 @@ pub fn runPassesWithOptions(
             // empty `effective_passes_len == passes.len` and the
             // shouldSkip check inside the loop short-circuits.
             const effective_passes_len: usize = blk: {
-                const cap = opts.bisect.effectiveLimit(func_idx) orelse break :blk passes.len;
+                const cap = opts.bisect.effectiveLimit(opts.module_idx, func_idx) orelse break :blk passes.len;
                 break :blk @min(@as(usize, cap), passes.len);
             };
             var iter: u32 = 0;
@@ -6851,7 +6874,7 @@ pub fn runPassesWithOptions(
                 var any_changed = false;
                 for (passes[0..effective_passes_len], 0..) |pass, pass_idx_usize| {
                     const pass_idx: u32 = @intCast(pass_idx_usize);
-                    if (opts.bisect.shouldSkip(func_idx, pass_idx)) continue;
+                    if (opts.bisect.shouldSkip(opts.module_idx, func_idx, pass_idx)) continue;
                     const changed = try pass(func, allocator);
                     if (changed) {
                         any_changed = true;
@@ -7572,6 +7595,51 @@ test "PassBisectSpec: empty spec runs full pipeline (default no-op)" {
 
     for (0..2) |fi| {
         try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, bisectTestAddOpAt(&module, fi));
+    }
+}
+
+test "PassBisectSpec: skip honours mod_filter — only matching module skips" {
+    const allocator = std.testing.allocator;
+    var module = try bisectTestBuildAddModule(allocator);
+    defer module.deinit();
+
+    // Skip the only pass for ALL funcs (`func_filter == null`) but only
+    // when running against module index 4. We invoke the pipeline with
+    // module_idx = 0, so the skip should NOT match and the fold should run.
+    const mod_4_only = [_]u32{4};
+    const single_pass: []const PassFn = &.{&constantFold};
+    const spec: PassBisectSpec = .{
+        .skip = &.{.{ .pass_idx_lo = 0, .pass_idx_hi = 0, .mod_filter = &mod_4_only }},
+    };
+    _ = try runPassesWithOptions(&module, single_pass, allocator, .{ .bisect = spec, .module_idx = 0 });
+
+    // module_idx = 0 ≠ 4: skip didn't match, both funcs got folded.
+    for (0..2) |fi| {
+        try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, bisectTestAddOpAt(&module, fi));
+    }
+}
+
+test "PassBisectSpec: skip honours mod_filter — matching module skips" {
+    const allocator = std.testing.allocator;
+    var module = try bisectTestBuildAddModule(allocator);
+    defer module.deinit();
+
+    // Same as above but module_idx == 4: skip matches, no fold runs.
+    const mod_4_only = [_]u32{4};
+    const single_pass: []const PassFn = &.{&constantFold};
+    const spec: PassBisectSpec = .{
+        .skip = &.{.{ .pass_idx_lo = 0, .pass_idx_hi = 0, .mod_filter = &mod_4_only }},
+    };
+    _ = try runPassesWithOptions(&module, single_pass, allocator, .{ .bisect = spec, .module_idx = 4 });
+
+    for (0..2) |fi| {
+        switch (bisectTestAddOpAt(&module, fi)) {
+            .add => {},
+            else => |op| {
+                std.debug.print("expected .add for func[{d}], got {s}\n", .{ fi, @tagName(op) });
+                return error.TestUnexpectedResult;
+            },
+        }
     }
 }
 
