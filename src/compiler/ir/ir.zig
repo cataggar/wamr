@@ -1042,7 +1042,102 @@ pub const IrFunction = struct {
     pub fn getBlock(self: *IrFunction, id: BlockId) *BasicBlock {
         return &self.blocks.items[id];
     }
+
+    /// Deep-copy this function into `allocator`.
+    ///
+    /// `IrFunction` owns several instruction payload slices with two
+    /// different lifetimes: most are block-owned and freed by
+    /// `BasicBlock.deinit`, while `br_table.targets` slices are tracked in
+    /// `owned_br_table_targets` and freed by `IrFunction.deinit`. Preserve
+    /// that split so clones can be mutated and destroyed independently.
+    pub fn clone(self: *const IrFunction, allocator: std.mem.Allocator) !IrFunction {
+        var out = IrFunction.init(allocator, self.param_count, self.result_count, self.local_count);
+        errdefer out.deinit();
+
+        out.name = self.name;
+        out.phi_synth_local_start = self.phi_synth_local_start;
+        out.phi_synth_local_end = self.phi_synth_local_end;
+        out.next_vreg = self.next_vreg;
+        if (self.local_types) |lt| {
+            out.local_types = try allocator.dupe(IrType, lt);
+        }
+
+        try out.blocks.ensureTotalCapacity(allocator, self.blocks.items.len);
+        for (self.blocks.items) |*block| {
+            var copied = BasicBlock.init(block.id, allocator);
+            errdefer copied.deinit();
+
+            try copied.predecessors.appendSlice(allocator, block.predecessors.items);
+            try copied.instructions.ensureTotalCapacity(allocator, block.instructions.items.len);
+            for (block.instructions.items) |inst| {
+                try copied.instructions.append(allocator, try cloneInst(inst, allocator, &out));
+            }
+
+            out.blocks.appendAssumeCapacity(copied);
+        }
+
+        return out;
+    }
 };
+
+fn cloneInst(inst: Inst, allocator: std.mem.Allocator, owner: *IrFunction) !Inst {
+    var out = inst;
+    out.op = try cloneOp(inst.op, allocator, owner);
+    return out;
+}
+
+fn cloneVRegSlice(allocator: std.mem.Allocator, values: []const VReg) ![]const VReg {
+    if (values.len == 0) return &.{};
+    return try allocator.dupe(VReg, values);
+}
+
+fn cloneOp(op: Inst.Op, allocator: std.mem.Allocator, owner: *IrFunction) !Inst.Op {
+    return switch (op) {
+        .br_table => |bt| blk: {
+            const targets = try allocator.dupe(BlockId, bt.targets);
+            errdefer allocator.free(targets);
+            try owner.owned_br_table_targets.append(allocator, targets);
+            break :blk .{ .br_table = .{
+                .index = bt.index,
+                .targets = targets,
+                .default = bt.default,
+            } };
+        },
+        .ret_multi => |vregs| .{ .ret_multi = try cloneVRegSlice(allocator, vregs) },
+        .call => |cl| .{ .call = .{
+            .func_idx = cl.func_idx,
+            .args = try cloneVRegSlice(allocator, cl.args),
+            .extra_results = cl.extra_results,
+            .tail = cl.tail,
+        } },
+        .call_indirect => |ci| .{ .call_indirect = .{
+            .type_idx = ci.type_idx,
+            .elem_idx = ci.elem_idx,
+            .args = try cloneVRegSlice(allocator, ci.args),
+            .extra_results = ci.extra_results,
+            .table_idx = ci.table_idx,
+            .tail = ci.tail,
+        } },
+        .call_ref => |cr| .{ .call_ref = .{
+            .type_idx = cr.type_idx,
+            .func_ref = cr.func_ref,
+            .args = try cloneVRegSlice(allocator, cr.args),
+            .extra_results = cr.extra_results,
+            .tail = cr.tail,
+        } },
+        .phi => |edges| .{ .phi = try allocator.dupe(Inst.PhiEdge, edges) },
+        .parallel_copy => |pairs| .{ .parallel_copy = try allocator.dupe(Inst.ParallelCopy, pairs) },
+        .try_table_begin => |tt| .{ .try_table_begin = .{
+            .result_arity = tt.result_arity,
+            .clauses = if (tt.clauses.len == 0) &.{} else try allocator.dupe(Inst.CatchClause, tt.clauses),
+        } },
+        .throw => |th| .{ .throw = .{
+            .tag_idx = th.tag_idx,
+            .args = try cloneVRegSlice(allocator, th.args),
+        } },
+        else => op,
+    };
+}
 
 /// Function type metadata copied from the Wasm type section. Slices are owned
 /// by the containing `IrModule`.
@@ -1149,6 +1244,101 @@ test "IrFunction: newVReg returns sequential values" {
     try std.testing.expectEqual(@as(VReg, 2), func.newVReg());
     try std.testing.expectEqual(@as(VReg, 3), func.newVReg());
     try std.testing.expectEqual(@as(VReg, 4), func.next_vreg);
+}
+
+test "IrFunction: clone deep-copies owned slices" {
+    const allocator = std.testing.allocator;
+
+    var func = IrFunction.init(allocator, 2, 1, 3);
+    defer func.deinit();
+    func.name = "clone-source";
+    func.local_types = try allocator.dupe(IrType, &.{ .i32, .i64, .i32, .i32, .i64 });
+    func.phi_synth_local_start = 3;
+    func.phi_synth_local_end = 5;
+    _ = func.newVReg();
+    _ = func.newVReg();
+    _ = func.newVReg();
+
+    const entry = try func.newBlock();
+    const join = try func.newBlock();
+    try func.getBlock(join).addPredecessor(entry);
+
+    const targets = try allocator.dupe(BlockId, &.{join});
+    try func.owned_br_table_targets.append(allocator, targets);
+    const call_args = try allocator.dupe(VReg, &.{ 0, 1 });
+    try func.getBlock(entry).append(.{
+        .op = .{ .call = .{ .func_idx = 7, .args = call_args, .extra_results = 1, .tail = true } },
+        .dest = 2,
+        .type = .i32,
+    });
+    try func.getBlock(entry).append(.{
+        .op = .{ .br_table = .{ .index = 0, .targets = targets, .default = join } },
+        .type = .void,
+    });
+
+    const phi_edges = try allocator.dupe(Inst.PhiEdge, &.{.{ .block = entry, .val = 2 }});
+    try func.getBlock(join).append(.{ .op = .{ .phi = phi_edges }, .dest = 3, .type = .i32 });
+    const copies = try allocator.dupe(Inst.ParallelCopy, &.{.{ .dst = 4, .src = 3, .ty = .i32 }});
+    try func.getBlock(join).append(.{ .op = .{ .parallel_copy = copies }, .type = .void });
+    const ret_vals = try allocator.dupe(VReg, &.{ 3, 4 });
+    try func.getBlock(join).append(.{ .op = .{ .ret_multi = ret_vals }, .type = .void });
+    const clauses = try allocator.dupe(Inst.CatchClause, &.{.{ .kind = 0, .tag_idx = 9, .handler = join }});
+    try func.getBlock(join).append(.{ .op = .{ .try_table_begin = .{ .result_arity = 0, .clauses = clauses } }, .type = .void });
+    const throw_args = try allocator.dupe(VReg, &.{3});
+    try func.getBlock(join).append(.{ .op = .{ .throw = .{ .tag_idx = 9, .args = throw_args } }, .type = .void });
+
+    var copy = try func.clone(allocator);
+    defer copy.deinit();
+
+    try std.testing.expectEqualStrings(func.name.?, copy.name.?);
+    try std.testing.expectEqual(func.param_count, copy.param_count);
+    try std.testing.expectEqual(func.result_count, copy.result_count);
+    try std.testing.expectEqual(func.local_count, copy.local_count);
+    try std.testing.expectEqual(func.next_vreg, copy.next_vreg);
+    try std.testing.expectEqual(func.phi_synth_local_start, copy.phi_synth_local_start);
+    try std.testing.expectEqual(func.phi_synth_local_end, copy.phi_synth_local_end);
+    try std.testing.expectEqualSlices(IrType, func.local_types.?, copy.local_types.?);
+    try std.testing.expect(@intFromPtr(func.local_types.?.ptr) != @intFromPtr(copy.local_types.?.ptr));
+
+    try std.testing.expectEqual(func.blocks.items.len, copy.blocks.items.len);
+    try std.testing.expectEqualSlices(BlockId, func.getBlock(join).predecessors.items, copy.getBlock(join).predecessors.items);
+
+    const src_call = func.getBlock(entry).instructions.items[0].op.call;
+    const dst_call = copy.getBlock(entry).instructions.items[0].op.call;
+    try std.testing.expectEqualSlices(VReg, src_call.args, dst_call.args);
+    try std.testing.expect(@intFromPtr(src_call.args.ptr) != @intFromPtr(dst_call.args.ptr));
+
+    const src_bt = func.getBlock(entry).instructions.items[1].op.br_table;
+    const dst_bt = copy.getBlock(entry).instructions.items[1].op.br_table;
+    try std.testing.expectEqualSlices(BlockId, src_bt.targets, dst_bt.targets);
+    try std.testing.expect(@intFromPtr(src_bt.targets.ptr) != @intFromPtr(dst_bt.targets.ptr));
+    try std.testing.expectEqual(@as(usize, 1), copy.owned_br_table_targets.items.len);
+    try std.testing.expectEqual(@intFromPtr(dst_bt.targets.ptr), @intFromPtr(copy.owned_br_table_targets.items[0].ptr));
+
+    const src_phi = func.getBlock(join).instructions.items[0].op.phi;
+    const dst_phi = copy.getBlock(join).instructions.items[0].op.phi;
+    try std.testing.expectEqualSlices(Inst.PhiEdge, src_phi, dst_phi);
+    try std.testing.expect(@intFromPtr(src_phi.ptr) != @intFromPtr(dst_phi.ptr));
+
+    const src_pc = func.getBlock(join).instructions.items[1].op.parallel_copy;
+    const dst_pc = copy.getBlock(join).instructions.items[1].op.parallel_copy;
+    try std.testing.expectEqualSlices(Inst.ParallelCopy, src_pc, dst_pc);
+    try std.testing.expect(@intFromPtr(src_pc.ptr) != @intFromPtr(dst_pc.ptr));
+
+    const src_ret = func.getBlock(join).instructions.items[2].op.ret_multi;
+    const dst_ret = copy.getBlock(join).instructions.items[2].op.ret_multi;
+    try std.testing.expectEqualSlices(VReg, src_ret, dst_ret);
+    try std.testing.expect(@intFromPtr(src_ret.ptr) != @intFromPtr(dst_ret.ptr));
+
+    const src_tt = func.getBlock(join).instructions.items[3].op.try_table_begin;
+    const dst_tt = copy.getBlock(join).instructions.items[3].op.try_table_begin;
+    try std.testing.expectEqualSlices(Inst.CatchClause, src_tt.clauses, dst_tt.clauses);
+    try std.testing.expect(@intFromPtr(src_tt.clauses.ptr) != @intFromPtr(dst_tt.clauses.ptr));
+
+    const src_throw = func.getBlock(join).instructions.items[4].op.throw;
+    const dst_throw = copy.getBlock(join).instructions.items[4].op.throw;
+    try std.testing.expectEqualSlices(VReg, src_throw.args, dst_throw.args);
+    try std.testing.expect(@intFromPtr(src_throw.args.ptr) != @intFromPtr(dst_throw.args.ptr));
 }
 
 test "IrType: v128 uses 16 bytes and two spill slots" {
