@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) void {
     const link_libc = b.option(bool, "link-libc", "Link libc") orelse
         (stack_protector or target.result.os.tag == .wasi);
     const version_string = b.option([]const u8, "version", "Version string") orelse "dev";
+    const ir_property_iterations = b.option(u32, "ir-property-iters", "IR optimizer property-test iterations per shape/pass") orelse 8;
 
     // ── Feature flags ──────────────────────────────────────────────────
     const options = b.addOptions();
@@ -628,6 +629,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_ir_fuzz_tests = b.addRunArtifact(ir_fuzz_tests);
     test_step.dependOn(&run_ir_fuzz_tests.step);
+
+    // IR optimizer property tests (#736).
+    const ir_property_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/property_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ir_property_options = b.addOptions();
+    ir_property_options.addOption(u32, "iterations", ir_property_iterations);
+    ir_property_test_module.addImport("ir_property_options", ir_property_options.createModule());
+    const ir_property_tests = b.addTest(.{
+        .root_module = ir_property_test_module,
+    });
+    const run_ir_property_tests = b.addRunArtifact(ir_property_tests);
+    test_step.dependOn(&run_ir_property_tests.step);
 
     // Dominator-aware redundant-load forwarder tests (#391).
     const dom_frl_test_module = b.createModule(.{
