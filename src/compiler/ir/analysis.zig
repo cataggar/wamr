@@ -258,6 +258,48 @@ pub fn cloneBlockIdMap(
     return result;
 }
 
+fn consumeCachedSuccessor(cached: []const ir.BlockId, index: *usize, target: ir.BlockId) bool {
+    if (index.* >= cached.len or cached[index.*] != target) return false;
+    index.* += 1;
+    return true;
+}
+
+fn cachedBlockSuccessorsMatch(block: *const ir.BasicBlock, cached: []const ir.BlockId) bool {
+    var index: usize = 0;
+    for (block.instructions.items) |inst| {
+        switch (inst.op) {
+            .br => |target| {
+                if (!consumeCachedSuccessor(cached, &index, target)) return false;
+            },
+            .br_if => |bi| {
+                if (!consumeCachedSuccessor(cached, &index, bi.then_block)) return false;
+                if (!consumeCachedSuccessor(cached, &index, bi.else_block)) return false;
+            },
+            .br_table => |bt| {
+                for (bt.targets) |target| {
+                    if (!consumeCachedSuccessor(cached, &index, target)) return false;
+                }
+                if (!consumeCachedSuccessor(cached, &index, bt.default)) return false;
+            },
+            else => {},
+        }
+    }
+    return index == cached.len;
+}
+
+fn cachedSuccessorsStillMatch(
+    func: *const ir.IrFunction,
+    successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+) bool {
+    if (@as(usize, @intCast(successors.count())) != func.blocks.items.len) return false;
+    for (0..func.blocks.items.len) |idx| {
+        const bid: ir.BlockId = @intCast(idx);
+        const cached = successors.get(bid) orelse return false;
+        if (!cachedBlockSuccessorsMatch(&func.blocks.items[idx], cached)) return false;
+    }
+    return true;
+}
+
 // ── Liveness analysis ───────────────────────────────────────────────────
 
 /// Per-block liveness sets.
@@ -1334,6 +1376,8 @@ pub fn cloneDomTree(source: *const DomTree, allocator: std.mem.Allocator) !DomTr
 
 pub const CfgAnalysisCache = struct {
     allocator: std.mem.Allocator,
+    cached_func: ?*const ir.IrFunction = null,
+    dirty: bool = false,
     successors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null,
     predecessors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null,
     dominators: ?DomTree = null,
@@ -1343,10 +1387,10 @@ pub const CfgAnalysisCache = struct {
     }
 
     pub fn deinit(self: *CfgAnalysisCache) void {
-        self.invalidate();
+        self.clear();
     }
 
-    pub fn invalidate(self: *CfgAnalysisCache) void {
+    fn clear(self: *CfgAnalysisCache) void {
         if (self.dominators) |*dom| {
             dom.deinit();
             self.dominators = null;
@@ -1359,14 +1403,45 @@ pub const CfgAnalysisCache = struct {
             freeBlockIdMap(succs, self.allocator);
             self.successors = null;
         }
+        self.cached_func = null;
+        self.dirty = false;
+    }
+
+    /// Mark cached CFG analyses as potentially stale. The next lookup compares
+    /// the cached successor lists to the current function and reuses the
+    /// analyses only when the block set and branch edges are unchanged.
+    pub fn invalidate(self: *CfgAnalysisCache) void {
+        if (self.successors != null or self.predecessors != null or self.dominators != null) {
+            self.dirty = true;
+        }
+    }
+
+    fn ensureFresh(self: *CfgAnalysisCache, func: *const ir.IrFunction) void {
+        if (self.cached_func) |cached| {
+            if (cached != func) {
+                self.clear();
+                return;
+            }
+        }
+        if (!self.dirty) return;
+        if (self.successors) |*succs| {
+            if (cachedSuccessorsStillMatch(func, succs)) {
+                self.dirty = false;
+                return;
+            }
+        }
+        self.clear();
     }
 
     pub fn getSuccessors(
         self: *CfgAnalysisCache,
         func: *const ir.IrFunction,
     ) !*const std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+        self.ensureFresh(func);
         if (self.successors == null) {
             self.successors = try buildSuccessorsFresh(func, self.allocator);
+            self.cached_func = func;
+            self.dirty = false;
         }
         return &self.successors.?;
     }
@@ -1375,6 +1450,7 @@ pub const CfgAnalysisCache = struct {
         self: *CfgAnalysisCache,
         func: *const ir.IrFunction,
     ) !*const std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+        self.ensureFresh(func);
         if (self.predecessors == null) {
             const successors = try self.getSuccessors(func);
             self.predecessors = try buildPredecessorsFromSuccessors(func, self.allocator, successors);
@@ -1386,6 +1462,7 @@ pub const CfgAnalysisCache = struct {
         self: *CfgAnalysisCache,
         func: *const ir.IrFunction,
     ) !*const DomTree {
+        self.ensureFresh(func);
         if (self.dominators == null) {
             const timing = beginTiming(.compute_dominators);
             defer timing.finish(func);
@@ -2320,6 +2397,15 @@ test "buildPredecessors: diamond" {
     try std.testing.expectEqual(@as(usize, 2), preds.get(b3).?.len);
 }
 
+fn expectDomTreeEqual(expected: *const DomTree, actual: *const DomTree) !void {
+    try std.testing.expectEqual(expected.idom.len, actual.idom.len);
+    for (expected.idom, actual.idom) |e, a| try std.testing.expectEqual(e, a);
+    try std.testing.expectEqual(expected.post_num.len, actual.post_num.len);
+    for (expected.post_num, actual.post_num) |e, a| try std.testing.expectEqual(e, a);
+    try std.testing.expectEqual(expected.post_order.len, actual.post_order.len);
+    for (expected.post_order, actual.post_order) |e, a| try std.testing.expectEqual(e, a);
+}
+
 test "CfgAnalysisCache: predecessor cache deduplicates repeated br_table targets" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 0);
@@ -2340,6 +2426,45 @@ test "CfgAnalysisCache: predecessor cache deduplicates repeated br_table targets
     const preds = try cache.getPredecessors(&func);
     try std.testing.expectEqual(@as(usize, 1), preds.get(b1).?.len);
     try std.testing.expectEqual(b0, preds.get(b1).?[0]);
+}
+
+test "CfgAnalysisCache: invalidate keeps dominators after non-CFG edit" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    var cache = CfgAnalysisCache.init(allocator);
+    defer cache.deinit();
+
+    const dom_before = try cache.getDominators(&func);
+    const idom_ptr = dom_before.idom.ptr;
+    const post_num_ptr = dom_before.post_num.ptr;
+    const post_order_ptr = dom_before.post_order.ptr;
+
+    func.getBlock(b0).instructions.items[0].op = .{ .iconst_32 = 7 };
+    cache.invalidate();
+    try std.testing.expect(cache.dirty);
+
+    const dom_after = try cache.getDominators(&func);
+    try std.testing.expect(!cache.dirty);
+    try std.testing.expect(idom_ptr == dom_after.idom.ptr);
+    try std.testing.expect(post_num_ptr == dom_after.post_num.ptr);
+    try std.testing.expect(post_order_ptr == dom_after.post_order.ptr);
+
+    var fresh = try computeDominators(&func, allocator);
+    defer fresh.deinit();
+    try expectDomTreeEqual(&fresh, dom_after);
 }
 
 test "CfgAnalysisCache: invalidate refreshes dominators after branch retarget" {
@@ -2366,9 +2491,15 @@ test "CfgAnalysisCache: invalidate refreshes dominators after branch retarget" {
 
     func.getBlock(b0).instructions.items[1].op.br_if.else_block = b1;
     cache.invalidate();
+    try std.testing.expect(cache.dirty);
 
     const dom_after = try cache.getDominators(&func);
+    try std.testing.expect(!cache.dirty);
     try std.testing.expectEqual(@as(?ir.BlockId, b1), dom_after.idom[b3]);
+
+    var fresh = try computeDominators(&func, allocator);
+    defer fresh.deinit();
+    try expectDomTreeEqual(&fresh, dom_after);
 }
 
 test "computeDominators: linear chain" {
