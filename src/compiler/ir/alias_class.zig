@@ -27,8 +27,33 @@ pub fn memKeyFromLoad(ld: anytype) MemKey {
     };
 }
 
+/// Identifies the byte range written by a linear-memory store.
+pub const StoreRange = struct {
+    base: ir.VReg,
+    offset: u32,
+    size: u8,
+};
+
+/// Build a store range for a full 128-bit SIMD store.
+pub fn storeRangeFromV128Store(st: anytype) StoreRange {
+    return .{
+        .base = st.base,
+        .offset = st.offset,
+        .size = 16,
+    };
+}
+
+/// Build a store range for a SIMD lane store.
+pub fn storeRangeFromV128StoreLane(st: anytype) StoreRange {
+    return .{
+        .base = st.base,
+        .offset = st.offset,
+        .size = st.accessSize(),
+    };
+}
+
 /// True iff a store at `(st.base, st.offset, st.size)` may overlap a load
-/// keyed at `key`. Conservative: same base register, byte ranges overlap.
+/// keyed at `key`. Precise helper for same base registers and byte ranges.
 pub fn storeAliases(key: MemKey, st: anytype) bool {
     if (key.base != st.base) return false;
     const key_end: u64 = @as(u64, key.offset) + @as(u64, key.size);
@@ -40,8 +65,11 @@ pub fn storeAliases(key: MemKey, st: anytype) bool {
 /// wasm linear-memory loads and wasm-local-slot reads in one table.
 ///
 /// `mem` and `local` are disjoint alias classes:
-///   * A linear-memory `store` invalidates only overlapping `.mem`
-///     entries — never `.local`.
+///   * A linear-memory `store` never invalidates `.local`.
+///   * For `.mem`, stores with the same base VReg use precise byte-range
+///     overlap; stores with a different base VReg invalidate conservatively
+///     because distinct guest-address VRegs can still evaluate to the same
+///     address.
 ///   * A `local_set i, v` invalidates only `.local = i` — never `.mem`,
 ///     and never `.local = j` for `j != i` (wasm locals are not aliased
 ///     across distinct indices).
@@ -57,10 +85,12 @@ pub const LoadKey = union(enum) {
 
 /// True iff a memory store may invalidate a value held under `key`.
 /// `.local` entries are never invalidated by memory stores.
+/// `.mem` entries use precise byte-range overlap for the same base VReg and
+/// conservative invalidation for different base VRegs.
 pub fn storeAliasesLoad(key: LoadKey, st: anytype) bool {
     return switch (key) {
-        .mem => |m| storeAliases(m, st),
         .local => false,
+        .mem => |m| if (m.base == st.base) storeAliases(m, st) else true,
     };
 }
 

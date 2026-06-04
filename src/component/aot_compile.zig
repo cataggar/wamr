@@ -67,9 +67,7 @@ fn logVerifierFailure(err: anyerror) void {
     std.log.err("aot-compile failed: {s}", .{written});
 }
 
-/// Options controlling `precompileComponent`. Today only the target
-/// arch is exposed; future options (opt level, dump-ir hooks, …) slot
-/// in here without breaking the API.
+/// Options controlling `precompileComponent` and per-core compilation.
 pub const PrecompileOptions = struct {
     target_arch: passes.TargetArch = switch (builtin.cpu.arch) {
         .aarch64 => .aarch64,
@@ -93,6 +91,18 @@ pub const PrecompileOptions = struct {
     /// `wamrc compile` path leaves it at the default 0 (which still
     /// matches `:mod=0` filters, as intended).
     module_idx: u32 = 0,
+    /// Optional pass-loop timing/progress diagnostics, normally parsed by
+    /// `wamrc` from `WAMR_AOT_PASS_TIMING*`.
+    pass_timing: passes.PassTimingOptions = .{},
+    /// Optional analysis recomputation diagnostics, normally parsed by
+    /// `wamrc` from `WAMR_AOT_ANALYSIS_TIMING*`.
+    analysis_timing: passes.AnalysisTimingOptions = .{},
+    /// Tail-duplication compile-time guard/cap options.
+    tail_duplication: passes.TailDuplicationOptions = .{},
+    /// IR verifier mode for optimized builds. Defaults match the historical
+    /// component path: safe builds verify after each pass; release builds do
+    /// not verify unless explicitly requested.
+    verify_mode: verifier.VerifyMode = if (std.debug.runtime_safety) .after_each_pass else .off,
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -157,15 +167,17 @@ pub fn compileCoreWasmCached(
             passes.defaultPassesForTarget(opts.target_arch),
             allocator,
             .{
-                // Match single-module `wamrc compile`: run the IR verifier
-                // after every pass in safe builds. Components are heavy
+                // The default `opts.verify_mode` matches single-module
+                // `wamrc compile`: run the IR verifier after every pass in
+                // safe builds, and keep it off in release unless requested.
+                // Components are heavy
                 // (the StarlingMonkey-bundled wasms used by jco have
                 // ~12 k functions), but verifier-caught bugs like #754
                 // — operand-type-mismatch on `select` propagating
                 // through chained selects — are silent miscompiles
                 // that cost far more to debug at runtime than to catch
-                // here.  Release builds keep the previous off-by-default
-                // behaviour for compile-time perf.
+                // here, but `wamrc compile-component --verify-ir=off` can
+                // force it off for compile-time triage.
                 //
                 // Note: `-O0` (this branch's else arm) intentionally
                 // skips the verifier because the frontend emits
@@ -176,10 +188,7 @@ pub fn compileCoreWasmCached(
                 // checks trip benign `MultipleTerminators` errors.
                 // Users who want belt-and-suspenders verification on
                 // an `-O0` build should drop `-O0` instead.
-                .verify_mode = if (std.debug.runtime_safety)
-                    .after_each_pass
-                else
-                    .off,
+                .verify_mode = opts.verify_mode,
                 // #761 / #743: thread the global bisect spec through
                 // so `WAMR_AOT_SKIP_PASS=...:fn=<idx>` narrows the
                 // partial pipeline to one suspect function. The pass
@@ -189,6 +198,9 @@ pub fn compileCoreWasmCached(
                 .bisect = aot_bisect.global,
                 // Per-core index honoured by `:mod=N` bisect filters.
                 .module_idx = opts.module_idx,
+                .pass_timing = opts.pass_timing,
+                .analysis_timing = opts.analysis_timing,
+                .tail_duplication = opts.tail_duplication,
             },
         ) catch |err| {
             logVerifierFailure(err);

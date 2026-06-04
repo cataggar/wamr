@@ -785,8 +785,15 @@ fn checkSsaDominance(
     func_index: u32,
     allocator: std.mem.Allocator,
 ) VerifyError!void {
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
+    const cfg_cache = analysis.currentCfgAnalysisCache();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (cfg_cache) |cache|
+        try cache.getDominators(func)
+    else blk: {
+        owned_dom = try analysis.computeDominators(func, allocator);
+        break :blk &owned_dom.?;
+    };
 
     const nblocks = func.blocks.items.len;
     // For each VReg, record (block, inst_index) of its definition.
@@ -832,7 +839,7 @@ fn checkSsaDominance(
             var c = Ctx{
                 .param_count = param_count,
                 .def_loc = &def_loc,
-                .dom = &dom,
+                .dom = dom,
                 .cur_block = block.id,
                 .cur_idx = @intCast(ii),
                 .cur_op = inst.op,
@@ -1318,17 +1325,26 @@ fn checkLoopInfo(
     func_index: u32,
     allocator: std.mem.Allocator,
 ) VerifyError!void {
-    var dom = analysis.computeDominators(func, allocator) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
+    const cfg_cache = analysis.currentCfgAnalysisCache();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (cfg_cache) |cache|
+        cache.getDominators(func) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+        }
+    else blk: {
+        owned_dom = analysis.computeDominators(func, allocator) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        break :blk &owned_dom.?;
     };
-    defer dom.deinit();
 
-    var forest = analysis.computeLoops(func, &dom, allocator) catch |e| switch (e) {
+    var forest = analysis.computeLoopsCached(func, dom, allocator, cfg_cache) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer forest.deinit();
 
-    try verifyLoopForest(func_index, &dom, &forest);
+    try verifyLoopForest(func_index, dom, &forest);
 }
 
 /// Validate a loop forest against a dominator tree. Split out so tests
@@ -1395,11 +1411,20 @@ fn checkDomTreeStructure(
     func_index: u32,
     allocator: std.mem.Allocator,
 ) VerifyError!void {
-    var dom = analysis.computeDominators(func, allocator) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
+    const cfg_cache = analysis.currentCfgAnalysisCache();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (cfg_cache) |cache|
+        cache.getDominators(func) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+        }
+    else blk: {
+        owned_dom = analysis.computeDominators(func, allocator) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        break :blk &owned_dom.?;
     };
-    defer dom.deinit();
-    try verifyDomTreeStructure(func, func_index, &dom);
+    try verifyDomTreeStructure(func, func_index, dom);
 
     // TODO: once any pass caches a `DomTree` on `IrFunction` across the
     // pipeline, also diff that cached tree against the freshly computed
@@ -1672,6 +1697,36 @@ fn verifyLoadUseCleanPathsDfs(
         switch (inst.op) {
             .store => |st| {
                 if (alias_class.storeAliasesLoad(load_key, st)) {
+                    return failLoadForwardingSoundness(
+                        func,
+                        func_index,
+                        load_vreg,
+                        inst.op,
+                        cur_block,
+                        @intCast(ii),
+                        path.items,
+                        use_block,
+                        can_reach_use,
+                    );
+                }
+            },
+            .v128_store => |st| {
+                if (alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128Store(st))) {
+                    return failLoadForwardingSoundness(
+                        func,
+                        func_index,
+                        load_vreg,
+                        inst.op,
+                        cur_block,
+                        @intCast(ii),
+                        path.items,
+                        use_block,
+                        can_reach_use,
+                    );
+                }
+            },
+            .v128_store_lane => |st| {
+                if (alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128StoreLane(st))) {
                     return failLoadForwardingSoundness(
                         func,
                         func_index,

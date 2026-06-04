@@ -117,9 +117,8 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     // Default to `.after_each_pass` in safe builds (Debug / ReleaseSafe)
     // and `.off` in release builds, matching the cost-vs-diagnostic
     // tradeoff documented in #624. The user can override with
-    // `--verify-ir[=…]` or `--no-verify-ir`.
-    var verify_mode: wamr.ir_verifier.VerifyMode =
-        if (std.debug.runtime_safety) .after_each_pass else .off;
+    // `WAMR_AOT_VERIFY_IR`, `--verify-ir[=…]`, or `--no-verify-ir`.
+    var verify_mode = verifyModeFromEnvOrDefault(init.environ_map);
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -161,10 +160,8 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             dump_out_dir = a["--dump-ir-out=".len..];
         } else if (std.mem.eql(u8, a, "--verify-ir")) {
             verify_mode = .after_each_pass;
-        } else if (std.mem.eql(u8, a, "--verify-ir=after-each-pass")) {
-            verify_mode = .after_each_pass;
-        } else if (std.mem.eql(u8, a, "--verify-ir=paranoid")) {
-            verify_mode = .paranoid;
+        } else if (std.mem.startsWith(u8, a, "--verify-ir=")) {
+            verify_mode = parseVerifyModeOrDie("--verify-ir", a["--verify-ir=".len..]);
         } else if (std.mem.eql(u8, a, "--no-verify-ir")) {
             verify_mode = .off;
         } else if (std.mem.eql(u8, a, "--cache") and i + 1 < sub_args.len) {
@@ -301,6 +298,9 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             },
             .verify_mode = verify_mode,
             .bisect = wamr.aot_bisect.global,
+            .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
+            .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
+            .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
         };
         const opt_changes = passes.runPassesWithOptions(&ir_module, passes.defaultPassesForTarget(target_arch), allocator, run_opts) catch |err| {
             // If the IR verifier tripped, surface its diagnostic before
@@ -832,6 +832,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
     };
     // #761 Phase 2: per-core codegen cache directory.
     var cache_dir: ?[]const u8 = null;
+    var verify_mode = verifyModeFromEnvOrDefault(init.environ_map);
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -845,6 +846,12 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
             output_manifest = sub_args[i];
         } else if (std.mem.eql(u8, a, "-O0")) {
             optimize = false;
+        } else if (std.mem.eql(u8, a, "--verify-ir")) {
+            verify_mode = .after_each_pass;
+        } else if (std.mem.startsWith(u8, a, "--verify-ir=")) {
+            verify_mode = parseVerifyModeOrDie("--verify-ir", a["--verify-ir=".len..]);
+        } else if (std.mem.eql(u8, a, "--no-verify-ir")) {
+            verify_mode = .off;
         } else if (std.mem.startsWith(u8, a, "--target=")) {
             const v = a["--target=".len..];
             if (std.mem.eql(u8, v, "x86_64") or std.mem.eql(u8, v, "x86-64")) {
@@ -901,6 +908,10 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         .target_arch = target_arch,
         .optimize = optimize,
         .cache_dir = cache_dir,
+        .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
+        .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
+        .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
+        .verify_mode = verify_mode,
     }) catch |err| {
         std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
@@ -1018,6 +1029,10 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
             std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
             var result = wamr.component_aot_compile.precompileComponent(allocator, wasm_data, artifact_path, .{
                 .target_arch = target_arch,
+                .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
+                .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
+                .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
+                .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {
                 std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -1031,6 +1046,10 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
             std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
             const cwasm = wamr.component_aot_compile.compileCoreWasm(allocator, wasm_data, .{
                 .target_arch = target_arch,
+                .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
+                .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
+                .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
+                .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {
                 std.debug.print("error: compile failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -1158,6 +1177,47 @@ fn parseTargetArchOrDie(s: []const u8) TargetArch {
     if (std.mem.eql(u8, s, "x86_64") or std.mem.eql(u8, s, "x86-64")) return .x86_64;
     std.debug.print("error: unknown target '{s}' (supported: x86_64, aarch64)\n", .{s});
     std.process.exit(1);
+}
+
+fn defaultVerifyMode() wamr.ir_verifier.VerifyMode {
+    return if (std.debug.runtime_safety) .after_each_pass else .off;
+}
+
+fn parseVerifyMode(value: []const u8) ?wamr.ir_verifier.VerifyMode {
+    if (std.ascii.eqlIgnoreCase(value, "default")) return defaultVerifyMode();
+    if (std.ascii.eqlIgnoreCase(value, "off") or
+        std.mem.eql(u8, value, "0") or
+        std.ascii.eqlIgnoreCase(value, "false") or
+        std.ascii.eqlIgnoreCase(value, "no"))
+    {
+        return .off;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "after-each-pass") or
+        std.ascii.eqlIgnoreCase(value, "after_each_pass") or
+        std.ascii.eqlIgnoreCase(value, "on") or
+        std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes"))
+    {
+        return .after_each_pass;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "paranoid")) return .paranoid;
+    return null;
+}
+
+fn parseVerifyModeOrDie(source: []const u8, value: []const u8) wamr.ir_verifier.VerifyMode {
+    return parseVerifyMode(value) orelse {
+        std.debug.print(
+            "error: invalid {s} value '{s}' (expected: off, after-each-pass, paranoid, default)\n",
+            .{ source, value },
+        );
+        std.process.exit(1);
+    };
+}
+
+fn verifyModeFromEnvOrDefault(env: *const std.process.Environ.Map) wamr.ir_verifier.VerifyMode {
+    const value = env.get("WAMR_AOT_VERIFY_IR") orelse return defaultVerifyMode();
+    return parseVerifyModeOrDie("WAMR_AOT_VERIFY_IR", value);
 }
 
 fn targetArchName(arch: TargetArch) []const u8 {
@@ -1398,11 +1458,13 @@ const compile_usage =
     \\  --verify-ir[=<mode>]          Run the IR invariant checker (#624)
     \\                                 after every pass that mutated the
     \\                                 function. Modes:
+    \\                                   off
     \\                                   after-each-pass (default with --verify-ir)
     \\                                   paranoid        (adds operand-width
     \\                                                    sanity check, #628)
     \\                                 Default: on for safety builds, off
-    \\                                 for release builds.
+    \\                                 for release builds; overridden by
+    \\                                 WAMR_AOT_VERIFY_IR when set.
     \\  --no-verify-ir                Disable the IR verifier (overrides
     \\                                 the safety-build default).
     \\  --cache <path>                #761 Phase 2 codegen cache sidecar.
@@ -1432,6 +1494,13 @@ const compile_component_usage =
     \\  -o <manifest.json>            Manifest path (default: <input>.cwasm.json)
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
     \\  -O0                           Disable IR optimizations (every core)
+    \\  --verify-ir[=<mode>]          Run the IR verifier after optimized IR
+    \\                                 passes. Modes: off, after-each-pass,
+    \\                                 paranoid, default. Default: on for
+    \\                                 safety builds, off for release builds;
+    \\                                 overridden by WAMR_AOT_VERIFY_IR when
+    \\                                 set.
+    \\  --no-verify-ir                Disable the IR verifier.
     \\  --cache-dir <dir>             #761 Phase 2 codegen cache root. Per
     \\                                 core: read/write `<dir>/core<N>.cache`
     \\                                 to reuse cached native code for any
@@ -1439,6 +1508,19 @@ const compile_component_usage =
     \\                                 Header-incompatible caches fall back
     \\                                 to full recompile of that core
     \\                                 (warn-only, never errors).
+    \\
+    \\Diagnostics env:
+    \\  WAMR_AOT_PASS_TIMING=1        Log slow pass and verifier phases
+    \\                                 (existing pass-timing diagnostics).
+    \\  WAMR_AOT_PASS_TIMING_THRESHOLD_MS=<ms>
+    \\                                 Pass/verifier threshold (default: 100).
+    \\  WAMR_AOT_ANALYSIS_TIMING=1    Log slow buildSuccessors /
+    \\                                 computeDominators calls.
+    \\  WAMR_AOT_ANALYSIS_TIMING_THRESHOLD_MS=<ms>
+    \\                                 Slow-call threshold (default: 100).
+    \\  WAMR_AOT_ANALYSIS_TIMING_MODULE=<N>
+    \\  WAMR_AOT_ANALYSIS_TIMING_FUNC=<N>
+    \\                                 Optional module/function filters.
     \\
 ;
 

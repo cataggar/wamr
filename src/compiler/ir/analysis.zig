@@ -6,6 +6,194 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 
+pub const TimingOptions = struct {
+    enabled: bool = false,
+    threshold_ns: u64 = 100 * std.time.ns_per_ms,
+    module_filter: ?u32 = null,
+    func_filter: ?u32 = null,
+
+    fn contextMatches(self: TimingOptions, ctx: TimingContext) bool {
+        if (!self.enabled) return false;
+        if (self.module_filter) |want| {
+            if (ctx.module_idx == null or ctx.module_idx.? != want) return false;
+        }
+        if (self.func_filter) |want| {
+            if (ctx.func_idx == null or ctx.func_idx.? != want) return false;
+        }
+        return true;
+    }
+};
+
+pub const TimingContext = struct {
+    module_idx: ?u32 = null,
+    func_idx: ?u32 = null,
+    phase: []const u8 = "-",
+    pass_idx: ?u32 = null,
+    pass_name: []const u8 = "-",
+};
+
+const TimingState = struct {
+    options: TimingOptions = .{},
+    context: TimingContext = .{},
+    build_successors_calls: u64 = 0,
+    compute_dominators_calls: u64 = 0,
+};
+
+threadlocal var timing_state: TimingState = .{};
+
+pub fn setTimingOptions(options: TimingOptions) TimingOptions {
+    const previous = timing_state.options;
+    timing_state.options = options;
+    if (!options.enabled) timing_state.context = .{};
+    return previous;
+}
+
+pub const TimingContextScope = struct {
+    previous: TimingContext,
+
+    pub fn deinit(self: *TimingContextScope) void {
+        timing_state.context = self.previous;
+    }
+};
+
+pub fn pushTimingContext(context: TimingContext) TimingContextScope {
+    const previous = timing_state.context;
+    timing_state.context = context;
+    return .{ .previous = previous };
+}
+
+const TimingKind = enum {
+    build_successors,
+    compute_dominators,
+
+    fn label(self: TimingKind) []const u8 {
+        return switch (self) {
+            .build_successors => "buildSuccessors",
+            .compute_dominators => "computeDominators",
+        };
+    }
+};
+
+const TimingSample = struct {
+    kind: TimingKind,
+    enabled: bool = false,
+    call_index: u64 = 0,
+    start_ns: u64 = 0,
+
+    fn finish(self: TimingSample, func: *const ir.IrFunction) void {
+        if (!self.enabled) return;
+        const elapsed_ns = elapsedTimingNsSince(self.start_ns);
+        if (elapsed_ns < timing_state.options.threshold_ns) return;
+        printAnalysisTiming(self.kind, self.call_index, func, elapsed_ns);
+    }
+};
+
+fn beginTiming(kind: TimingKind) TimingSample {
+    const options = timing_state.options;
+    if (!options.contextMatches(timing_state.context)) {
+        return .{ .kind = kind };
+    }
+    const call_index = switch (kind) {
+        .build_successors => blk: {
+            timing_state.build_successors_calls += 1;
+            break :blk timing_state.build_successors_calls;
+        },
+        .compute_dominators => blk: {
+            timing_state.compute_dominators_calls += 1;
+            break :blk timing_state.compute_dominators_calls;
+        },
+    };
+    return .{
+        .kind = kind,
+        .enabled = true,
+        .call_index = call_index,
+        .start_ns = timingNowNs(),
+    };
+}
+
+fn timingNowNs() u64 {
+    return switch (comptime @import("builtin").os.tag) {
+        .linux => blk: {
+            const linux = std.os.linux;
+            var ts: linux.timespec = undefined;
+            const rc = linux.clock_gettime(.MONOTONIC, &ts);
+            if (rc != 0) return 0;
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+        .macos, .ios, .tvos, .watchos, .visionos => blk: {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+        .windows => blk: {
+            const ntdll = std.os.windows.ntdll;
+            var counter: std.os.windows.LARGE_INTEGER = undefined;
+            var freq: std.os.windows.LARGE_INTEGER = undefined;
+            _ = ntdll.RtlQueryPerformanceCounter(&counter);
+            _ = ntdll.RtlQueryPerformanceFrequency(&freq);
+            const ticks: u128 = @intCast(counter);
+            const hz: u128 = @intCast(freq);
+            break :blk @as(u64, @truncate(ticks * std.time.ns_per_s / hz));
+        },
+        else => 0,
+    };
+}
+
+fn elapsedTimingNsSince(start_ns: u64) u64 {
+    const now_ns = timingNowNs();
+    return if (now_ns >= start_ns) now_ns - start_ns else 0;
+}
+
+fn countInstructions(func: *const ir.IrFunction) usize {
+    var total: usize = 0;
+    for (func.blocks.items) |*block| total += block.instructions.items.len;
+    return total;
+}
+
+fn printAnalysisTiming(
+    kind: TimingKind,
+    call_index: u64,
+    func: *const ir.IrFunction,
+    elapsed_ns: u64,
+) void {
+    const ctx = timing_state.context;
+    var module_buf: [16]u8 = undefined;
+    const module_text = if (ctx.module_idx) |idx|
+        std.fmt.bufPrint(&module_buf, "{d}", .{idx}) catch "?"
+    else
+        "-";
+    var func_buf: [16]u8 = undefined;
+    const func_text = if (ctx.func_idx) |idx|
+        std.fmt.bufPrint(&func_buf, "{d}", .{idx}) catch "?"
+    else
+        "-";
+    var pass_idx_buf: [16]u8 = undefined;
+    const pass_idx_text = if (ctx.pass_idx) |idx|
+        std.fmt.bufPrint(&pass_idx_buf, "{d}", .{idx}) catch "?"
+    else
+        "-";
+    const func_name = func.name orelse "-";
+    const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
+    const elapsed_ms_frac = (elapsed_ns % std.time.ns_per_ms) / std.time.ns_per_us;
+    std.debug.print(
+        "[aot-analysis-timing] analysis={s} call={d} mod={s} local_func={s} phase={s} pass={s} pass_name={s} func_name={s} elapsed_ms={d}.{d:0>3} blocks={d} insts={d}\n",
+        .{
+            kind.label(),
+            call_index,
+            module_text,
+            func_text,
+            ctx.phase,
+            pass_idx_text,
+            ctx.pass_name,
+            func_name,
+            elapsed_ms,
+            elapsed_ms_frac,
+            func.blocks.items.len,
+            countInstructions(func),
+        },
+    );
+}
+
 // ── CFG: Successor computation ──────────────────────────────────────────
 
 /// Compute successor block IDs for each block by scanning branch instructions.
@@ -13,6 +201,19 @@ pub fn buildSuccessors(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
 ) !std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+    if (currentCfgAnalysisCache()) |cache| {
+        return cloneBlockIdMap(try cache.getSuccessors(func), allocator);
+    }
+    return buildSuccessorsFresh(func, allocator);
+}
+
+fn buildSuccessorsFresh(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+    const timing = beginTiming(.build_successors);
+    defer timing.finish(func);
+
     var successors = std.AutoHashMap(ir.BlockId, []const ir.BlockId).init(allocator);
 
     for (func.blocks.items, 0..) |block, idx| {
@@ -34,6 +235,27 @@ pub fn buildSuccessors(
         try successors.put(@intCast(idx), try succs.toOwnedSlice(allocator));
     }
     return successors;
+}
+
+pub fn freeBlockIdMap(map: *std.AutoHashMap(ir.BlockId, []const ir.BlockId), allocator: std.mem.Allocator) void {
+    var it = map.iterator();
+    while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+    map.deinit();
+}
+
+pub fn cloneBlockIdMap(
+    source: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+    var result = std.AutoHashMap(ir.BlockId, []const ir.BlockId).init(allocator);
+    errdefer freeBlockIdMap(&result, allocator);
+
+    var it = @constCast(source).iterator();
+    while (it.next()) |entry| {
+        const owned = try allocator.dupe(ir.BlockId, entry.value_ptr.*);
+        try result.put(entry.key_ptr.*, owned);
+    }
+    return result;
 }
 
 // ── Liveness analysis ───────────────────────────────────────────────────
@@ -1095,6 +1317,106 @@ pub const DomTree = struct {
     }
 };
 
+pub fn cloneDomTree(source: *const DomTree, allocator: std.mem.Allocator) !DomTree {
+    const idom = try allocator.dupe(?ir.BlockId, source.idom);
+    errdefer allocator.free(idom);
+    const post_num = try allocator.dupe(?u32, source.post_num);
+    errdefer allocator.free(post_num);
+    const post_order = try allocator.dupe(ir.BlockId, source.post_order);
+    errdefer allocator.free(post_order);
+    return .{
+        .idom = idom,
+        .post_num = post_num,
+        .post_order = post_order,
+        .allocator = allocator,
+    };
+}
+
+pub const CfgAnalysisCache = struct {
+    allocator: std.mem.Allocator,
+    successors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null,
+    predecessors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null,
+    dominators: ?DomTree = null,
+
+    pub fn init(allocator: std.mem.Allocator) CfgAnalysisCache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *CfgAnalysisCache) void {
+        self.invalidate();
+    }
+
+    pub fn invalidate(self: *CfgAnalysisCache) void {
+        if (self.dominators) |*dom| {
+            dom.deinit();
+            self.dominators = null;
+        }
+        if (self.predecessors) |*preds| {
+            freeBlockIdMap(preds, self.allocator);
+            self.predecessors = null;
+        }
+        if (self.successors) |*succs| {
+            freeBlockIdMap(succs, self.allocator);
+            self.successors = null;
+        }
+    }
+
+    pub fn getSuccessors(
+        self: *CfgAnalysisCache,
+        func: *const ir.IrFunction,
+    ) !*const std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+        if (self.successors == null) {
+            self.successors = try buildSuccessorsFresh(func, self.allocator);
+        }
+        return &self.successors.?;
+    }
+
+    pub fn getPredecessors(
+        self: *CfgAnalysisCache,
+        func: *const ir.IrFunction,
+    ) !*const std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+        if (self.predecessors == null) {
+            const successors = try self.getSuccessors(func);
+            self.predecessors = try buildPredecessorsFromSuccessors(func, self.allocator, successors);
+        }
+        return &self.predecessors.?;
+    }
+
+    pub fn getDominators(
+        self: *CfgAnalysisCache,
+        func: *const ir.IrFunction,
+    ) !*const DomTree {
+        if (self.dominators == null) {
+            const timing = beginTiming(.compute_dominators);
+            defer timing.finish(func);
+            const successors = try self.getSuccessors(func);
+            const predecessors = try self.getPredecessors(func);
+            self.dominators = try computeDominatorsFromCfg(func, self.allocator, successors, predecessors);
+        }
+        return &self.dominators.?;
+    }
+};
+
+threadlocal var scoped_cfg_cache: ?*CfgAnalysisCache = null;
+
+pub const CfgAnalysisCacheScope = struct {
+    previous: ?*CfgAnalysisCache,
+
+    pub fn deinit(self: *CfgAnalysisCacheScope) void {
+        scoped_cfg_cache = self.previous;
+    }
+};
+
+pub fn pushCfgAnalysisCache(cache: *CfgAnalysisCache) CfgAnalysisCacheScope {
+    const previous = scoped_cfg_cache;
+    scoped_cfg_cache = cache;
+    return .{ .previous = previous };
+}
+
+pub fn currentCfgAnalysisCache() ?*CfgAnalysisCache {
+    return scoped_cfg_cache;
+}
+
 /// Compute predecessors for each block from `buildSuccessors`. The
 /// `BasicBlock.predecessors` field is not guaranteed to be populated by
 /// all IR producers, so passes that need predecessors should use this.
@@ -1102,13 +1424,20 @@ pub fn buildPredecessors(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
 ) !std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
-    const successors = try buildSuccessors(func, allocator);
-    defer {
-        var it = successors.iterator();
-        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
-        @constCast(&successors).deinit();
+    if (currentCfgAnalysisCache()) |cache| {
+        return cloneBlockIdMap(try cache.getPredecessors(func), allocator);
     }
+    var successors = try buildSuccessorsFresh(func, allocator);
+    defer freeBlockIdMap(&successors, allocator);
 
+    return buildPredecessorsFromSuccessors(func, allocator, &successors);
+}
+
+fn buildPredecessorsFromSuccessors(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+    successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+) !std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
     var lists = std.AutoHashMap(ir.BlockId, std.ArrayList(ir.BlockId)).init(allocator);
     defer {
         var it = lists.iterator();
@@ -1119,7 +1448,7 @@ pub fn buildPredecessors(
         try lists.put(@intCast(idx), .empty);
     }
 
-    var sit = successors.iterator();
+    var sit = @constCast(successors).iterator();
     while (sit.next()) |entry| {
         const from = entry.key_ptr.*;
         for (entry.value_ptr.*) |to| {
@@ -1167,12 +1496,10 @@ pub fn refreshBlockPredecessors(
     func: *ir.IrFunction,
     allocator: std.mem.Allocator,
 ) !void {
-    var preds = try buildPredecessors(func, allocator);
-    defer {
-        var it = preds.iterator();
-        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
-        preds.deinit();
-    }
+    var successors = try buildSuccessorsFresh(func, allocator);
+    defer freeBlockIdMap(&successors, allocator);
+    var preds = try buildPredecessorsFromSuccessors(func, allocator, &successors);
+    defer freeBlockIdMap(&preds, allocator);
 
     for (func.blocks.items, 0..) |*block, idx| {
         block.predecessors.clearRetainingCapacity();
@@ -1186,20 +1513,28 @@ pub fn computeDominators(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
 ) !DomTree {
-    const nblocks = func.blocks.items.len;
+    if (currentCfgAnalysisCache()) |cache| {
+        return cloneDomTree(try cache.getDominators(func), allocator);
+    }
 
-    const successors = try buildSuccessors(func, allocator);
-    defer {
-        var sit = successors.iterator();
-        while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
-        @constCast(&successors).deinit();
-    }
-    var predecessors = try buildPredecessors(func, allocator);
-    defer {
-        var pit = predecessors.iterator();
-        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
-        predecessors.deinit();
-    }
+    const timing = beginTiming(.compute_dominators);
+    defer timing.finish(func);
+
+    var successors = try buildSuccessorsFresh(func, allocator);
+    defer freeBlockIdMap(&successors, allocator);
+    var predecessors = try buildPredecessorsFromSuccessors(func, allocator, &successors);
+    defer freeBlockIdMap(&predecessors, allocator);
+
+    return computeDominatorsFromCfg(func, allocator, &successors, &predecessors);
+}
+
+fn computeDominatorsFromCfg(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+    successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+) !DomTree {
+    const nblocks = func.blocks.items.len;
 
     // ── Iterative DFS to produce post-order from entry (block 0) ──
     var post_order: std.ArrayList(ir.BlockId) = .empty;
@@ -1436,20 +1771,48 @@ pub fn computeLoops(
     dom: *const DomTree,
     allocator: std.mem.Allocator,
 ) !LoopForest {
-    const nblocks = func.blocks.items.len;
+    if (currentCfgAnalysisCache()) |cache| {
+        return computeLoopsCached(func, dom, allocator, cache);
+    }
 
-    const successors = try buildSuccessors(func, allocator);
-    defer {
-        var sit = successors.iterator();
-        while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
-        @constCast(&successors).deinit();
+    return computeLoopsFresh(func, dom, allocator);
+}
+
+fn computeLoopsFresh(
+    func: *const ir.IrFunction,
+    dom: *const DomTree,
+    allocator: std.mem.Allocator,
+) !LoopForest {
+    var successors = try buildSuccessorsFresh(func, allocator);
+    defer freeBlockIdMap(&successors, allocator);
+    var predecessors = try buildPredecessorsFromSuccessors(func, allocator, &successors);
+    defer freeBlockIdMap(&predecessors, allocator);
+
+    return computeLoopsFromCfg(func, dom, allocator, &successors, &predecessors);
+}
+
+pub fn computeLoopsCached(
+    func: *const ir.IrFunction,
+    dom: *const DomTree,
+    allocator: std.mem.Allocator,
+    cache: ?*CfgAnalysisCache,
+) !LoopForest {
+    if (cache) |c| {
+        const successors = try c.getSuccessors(func);
+        const predecessors = try c.getPredecessors(func);
+        return computeLoopsFromCfg(func, dom, allocator, successors, predecessors);
     }
-    var predecessors = try buildPredecessors(func, allocator);
-    defer {
-        var pit = predecessors.iterator();
-        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
-        predecessors.deinit();
-    }
+    return computeLoopsFresh(func, dom, allocator);
+}
+
+fn computeLoopsFromCfg(
+    func: *const ir.IrFunction,
+    dom: *const DomTree,
+    allocator: std.mem.Allocator,
+    successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+) !LoopForest {
+    const nblocks = func.blocks.items.len;
 
     // ── Collect back-edges per header ──
     // A back-edge is t → h where h dominates t. Both ends must be
@@ -1703,7 +2066,6 @@ pub fn computeBlockFrequencies(
     return freq;
 }
 
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "buildSuccessors: linear block" {
@@ -1956,6 +2318,57 @@ test "buildPredecessors: diamond" {
     try std.testing.expectEqual(@as(usize, 1), preds.get(b1).?.len);
     try std.testing.expectEqual(@as(usize, 1), preds.get(b2).?.len);
     try std.testing.expectEqual(@as(usize, 2), preds.get(b3).?.len);
+}
+
+test "CfgAnalysisCache: predecessor cache deduplicates repeated br_table targets" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const idx = func.newVReg();
+    const targets = try allocator.dupe(ir.BlockId, &.{ b1, b1 });
+    try func.owned_br_table_targets.append(allocator, targets);
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = idx });
+    try func.getBlock(b0).append(.{ .op = .{ .br_table = .{ .index = idx, .targets = targets, .default = b1 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+
+    var cache = CfgAnalysisCache.init(allocator);
+    defer cache.deinit();
+
+    const preds = try cache.getPredecessors(&func);
+    try std.testing.expectEqual(@as(usize, 1), preds.get(b1).?.len);
+    try std.testing.expectEqual(b0, preds.get(b1).?[0]);
+}
+
+test "CfgAnalysisCache: invalidate refreshes dominators after branch retarget" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    var cache = CfgAnalysisCache.init(allocator);
+    defer cache.deinit();
+
+    const dom_before = try cache.getDominators(&func);
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom_before.idom[b3]);
+
+    func.getBlock(b0).instructions.items[1].op.br_if.else_block = b1;
+    cache.invalidate();
+
+    const dom_after = try cache.getDominators(&func);
+    try std.testing.expectEqual(@as(?ir.BlockId, b1), dom_after.idom[b3]);
 }
 
 test "computeDominators: linear chain" {
@@ -2367,7 +2780,6 @@ test "computeLiveRanges: max_loop_depth is 0 for ranges outside any loop" {
         try std.testing.expectEqual(@as(u8, 0), r.max_loop_depth);
     }
 }
-
 
 test "computeBlockFrequencies: single block has frequency 1.0" {
     const allocator = std.testing.allocator;
