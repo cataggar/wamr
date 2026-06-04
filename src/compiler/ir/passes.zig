@@ -229,8 +229,10 @@ pub const LoadForwardingDomWalkInstructionResult = enum {
 /// DFS stack, `LoadFrameStack` push/pop, load/store/barrier dispatch, and the
 /// optional visitor snapshot/restore protocol. The visitor owns any pass-local
 /// tables plus `onInstruction`, returning whether it changed or removed the
-/// current instruction. Set `pub const forward_destless_loads = true` only for
-/// visitors that intentionally remove redundant dest-less loads.
+/// current instruction. Visitors may provide `canonicalizeVReg` and
+/// `onForwardedLoad` to batch load-forwarding rewrites themselves. Set
+/// `pub const forward_destless_loads = true` only for visitors that
+/// intentionally remove redundant dest-less loads.
 pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
     return struct {
         const Frame = struct {
@@ -246,10 +248,16 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
         ) !bool {
             if (func.blocks.items.len == 0) return false;
 
-            var dom = try analysis.computeDominators(func, allocator);
-            defer dom.deinit();
+            var owned_dom: ?analysis.DomTree = null;
+            defer if (owned_dom) |*dom| dom.deinit();
+            const dom: *const analysis.DomTree = if (analysis.currentCfgAnalysisCache()) |cache|
+                try cache.getDominators(func)
+            else blk: {
+                owned_dom = try analysis.computeDominators(func, allocator);
+                break :blk &owned_dom.?;
+            };
 
-            var dom_children = try BarrierOrderedDomChildren.build(func, &dom, allocator);
+            var dom_children = try BarrierOrderedDomChildren.build(func, dom, allocator);
             defer dom_children.deinit();
 
             if (dom.idom[0] == null) return false;
@@ -288,14 +296,30 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
                     switch (inst.op) {
                         .load => |ld| {
                             if (inst.dest != null or forward_destless_loads) {
-                                const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(ld) };
-                                if (load_frames.lookup(key)) |held| {
-                                    if (inst.dest) |dest| replaceVReg(func, dest, held);
-                                    _ = block.instructions.orderedRemove(i);
-                                    changed = true;
-                                    continue;
+                                var key_ld = ld;
+                                if (comptime @hasDecl(Visitor, "canonicalizeVReg")) {
+                                    key_ld.base = visitor.canonicalizeVReg(key_ld.base);
                                 }
-                                if (inst.dest) |dest| try load_frames.record(key, dest);
+                                const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(key_ld) };
+                                if (load_frames.lookup(key)) |held| {
+                                    if (comptime @hasDecl(Visitor, "onForwardedLoad")) {
+                                        switch (try visitor.onForwardedLoad(func, bid, i, inst, inst.dest, held, &load_frames)) {
+                                            .unchanged => {},
+                                            .changed => changed = true,
+                                            .removed => {
+                                                changed = true;
+                                                continue;
+                                            },
+                                        }
+                                    } else {
+                                        if (inst.dest) |dest| replaceVReg(func, dest, held);
+                                        _ = block.instructions.orderedRemove(i);
+                                        changed = true;
+                                        continue;
+                                    }
+                                } else if (inst.dest) |dest| {
+                                    try load_frames.record(key, dest);
+                                }
                             }
                         },
                         .store => |st| try load_frames.invalidateMem(st),
@@ -905,6 +929,104 @@ pub fn replaceVRegCount(func: *ir.IrFunction, old: ir.VReg, new: ir.VReg) u32 {
     return replacements;
 }
 
+pub const VRegAliasMap = std.AutoHashMap(ir.VReg, ir.VReg);
+
+fn canonicalVReg(aliases: *const VRegAliasMap, vreg: ir.VReg) ir.VReg {
+    var cur = vreg;
+    var remaining = aliases.count();
+    while (remaining > 0) : (remaining -= 1) {
+        const next = aliases.get(cur) orelse return cur;
+        if (next == cur) return cur;
+        cur = next;
+    }
+    return cur;
+}
+
+fn putVRegAlias(aliases: *VRegAliasMap, old: ir.VReg, new: ir.VReg) !void {
+    const replacement = canonicalVReg(aliases, new);
+    if (old == replacement) {
+        _ = aliases.remove(old);
+        return;
+    }
+    try aliases.put(old, replacement);
+}
+
+fn aliasedVReg(aliases: *const VRegAliasMap, vreg: ir.VReg) ?ir.VReg {
+    const replacement = canonicalVReg(aliases, vreg);
+    return if (replacement == vreg) null else replacement;
+}
+
+fn replaceAliasedVRegSlot(aliases: *const VRegAliasMap, slot: *ir.VReg) u32 {
+    if (aliasedVReg(aliases, slot.*)) |replacement| {
+        slot.* = replacement;
+        return 1;
+    }
+    return 0;
+}
+
+fn replaceAliasedVRegSlice(aliases: *const VRegAliasMap, vregs: []ir.VReg) u32 {
+    var replacements: u32 = 0;
+    for (vregs) |*vreg| {
+        replacements += replaceAliasedVRegSlot(aliases, vreg);
+    }
+    return replacements;
+}
+
+fn replaceAliasesInInstCount(inst: *ir.Inst, aliases: *const VRegAliasMap) u32 {
+    if (aliases.count() == 0) return 0;
+
+    var replacements: u32 = 0;
+    const used_vregs = getUsedVRegs(inst.*);
+    for (used_vregs.slice()) |used| {
+        const replacement = aliasedVReg(aliases, used) orelse continue;
+        const inst_replacements = countUsesInInst(inst.*, used);
+        if (inst_replacements == 0) continue;
+        replaceInInst(inst, used, replacement);
+        replacements += inst_replacements;
+    }
+
+    switch (inst.op) {
+        .ret_multi => |vregs| replacements += replaceAliasedVRegSlice(aliases, @constCast(vregs)),
+        .call => |cl| replacements += replaceAliasedVRegSlice(aliases, @constCast(cl.args)),
+        .call_indirect => |*ci| {
+            replacements += replaceAliasedVRegSlot(aliases, &ci.elem_idx);
+            replacements += replaceAliasedVRegSlice(aliases, @constCast(ci.args));
+        },
+        .call_ref => |*cr| {
+            replacements += replaceAliasedVRegSlot(aliases, &cr.func_ref);
+            replacements += replaceAliasedVRegSlice(aliases, @constCast(cr.args));
+        },
+        .phi => |edges| {
+            for (@constCast(edges)) |*edge| {
+                replacements += replaceAliasedVRegSlot(aliases, &edge.val);
+            }
+        },
+        .parallel_copy => |pairs| {
+            for (@constCast(pairs)) |*p| {
+                replacements += replaceAliasedVRegSlot(aliases, &p.src);
+            }
+        },
+        .throw => |*th| replacements += replaceAliasedVRegSlice(aliases, @constCast(th.args)),
+        else => {},
+    }
+
+    return replacements;
+}
+
+/// Apply all VReg aliases with a single function scan.
+/// Returns the number of operand slots that were actually rewritten.
+pub fn replaceVRegsCount(func: *ir.IrFunction, aliases: *const VRegAliasMap) u32 {
+    if (aliases.count() == 0) return 0;
+
+    var replacements: u32 = 0;
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |*inst| {
+            replacements += replaceAliasesInInstCount(inst, aliases);
+        }
+    }
+    return replacements;
+}
+
 /// Count the number of operand slots in `func` that currently reference
 /// `vreg`. Cheap O(N) scan; used by passes that need to detect whether
 /// a rewrite would actually change anything (for idempotent fixpoint
@@ -917,6 +1039,52 @@ pub fn countUsesOfVReg(func: *const ir.IrFunction, vreg: ir.VReg) u32 {
         }
     }
     return count;
+}
+
+/// Map of VReg -> number of operand slots referencing it, tallied in a single
+/// pass over `func`. Use this when a pass needs the use count of *many* VRegs:
+/// one lookup is O(1), whereas calling `countUsesOfVReg` per query rescans the
+/// whole function and makes the pass O(queries * insts) — a quadratic blowup on
+/// large functions. The tally mirrors `countUsesInInst` exactly, so
+/// `useCounts.get(v) orelse 0` equals `countUsesOfVReg(func, v)` for the
+/// function in its current (unmutated) state.
+pub const VRegUseCounts = std.AutoHashMap(ir.VReg, u32);
+
+pub fn buildVRegUseCounts(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !VRegUseCounts {
+    var counts = VRegUseCounts.init(allocator);
+    errdefer counts.deinit();
+
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            for (getUsedVRegs(inst).slice()) |u| try addVRegUse(&counts, u);
+            switch (inst.op) {
+                .ret_multi => |vregs| for (vregs) |v| try addVRegUse(&counts, v),
+                .call => |cl| for (cl.args) |a| try addVRegUse(&counts, a),
+                .call_indirect => |ci| {
+                    try addVRegUse(&counts, ci.elem_idx);
+                    for (ci.args) |a| try addVRegUse(&counts, a);
+                },
+                .call_ref => |cr| {
+                    try addVRegUse(&counts, cr.func_ref);
+                    for (cr.args) |a| try addVRegUse(&counts, a);
+                },
+                .phi => |edges| for (edges) |edge| try addVRegUse(&counts, edge.val),
+                .parallel_copy => |pairs| for (pairs) |p| try addVRegUse(&counts, p.src),
+                .throw => |th| for (th.args) |a| try addVRegUse(&counts, a),
+                else => {},
+            }
+        }
+    }
+
+    return counts;
+}
+
+fn addVRegUse(counts: *VRegUseCounts, vreg: ir.VReg) !void {
+    const gop = try counts.getOrPut(vreg);
+    gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
 }
 
 fn countVRegSliceUses(vregs: []const ir.VReg, vreg: ir.VReg) u32 {
@@ -2662,13 +2830,26 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
 
 // ── Global Value Numbering (cross-block CSE) ────────────────────────────────
 
+const GvnForwardedLoad = struct { bid: ir.BlockId, index: usize };
+
+fn removeForwardedLoads(func: *ir.IrFunction, forwarded_loads: []const GvnForwardedLoad) void {
+    var i = forwarded_loads.len;
+    while (i > 0) {
+        i -= 1;
+        const loc = forwarded_loads[i];
+        _ = func.blocks.items[loc.bid].instructions.orderedRemove(loc.index);
+    }
+}
+
 /// Dominator-scoped GVN: deduplicate identical pure, non-trapping
 /// instructions across basic blocks using the dominator tree.
 ///
 /// Walks the dom tree in DFS pre-order with a scoped expression table.
 /// When an instruction in block B matches an entry from a dominator of B,
-/// all uses of B's instruction are rewritten to the dominating def via
-/// `replaceVReg`. `deadCodeElimination` removes the now-unused original.
+/// GVN records an alias from B's result to the dominating def. All aliases are
+/// applied with one function scan at the end of the pass so huge functions do
+/// not get rescanned once per duplicate. `deadCodeElimination` removes the
+/// now-unused original.
 ///
 /// Subsumes block-local `commonSubexprElimination`.
 pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
@@ -2676,6 +2857,8 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
 
     const Visitor = struct {
         table: std.ArrayList(GvnEntry),
+        aliases: VRegAliasMap,
+        forwarded_loads: std.ArrayList(GvnForwardedLoad),
         allocator: std.mem.Allocator,
 
         pub fn snapshot(self: *@This()) usize {
@@ -2686,9 +2869,33 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
             self.table.shrinkRetainingCapacity(snap_len);
         }
 
+        pub fn canonicalizeVReg(self: *@This(), vreg: ir.VReg) ir.VReg {
+            return canonicalVReg(&self.aliases, vreg);
+        }
+
+        fn recordAlias(self: *@This(), old: ir.VReg, new: ir.VReg) !void {
+            try putVRegAlias(&self.aliases, old, new);
+        }
+
+        pub fn onForwardedLoad(
+            self: *@This(),
+            _: *ir.IrFunction,
+            bid: ir.BlockId,
+            index: usize,
+            _: *ir.Inst,
+            maybe_dest: ?ir.VReg,
+            held: ir.VReg,
+            _: *LoadFrameStack,
+        ) !LoadForwardingDomWalkInstructionResult {
+            const dest = maybe_dest orelse return .unchanged;
+            try self.recordAlias(dest, held);
+            try self.forwarded_loads.append(self.allocator, .{ .bid = bid, .index = index });
+            return .unchanged;
+        }
+
         pub fn onInstruction(
             self: *@This(),
-            ir_func: *ir.IrFunction,
+            _: *ir.IrFunction,
             _: ir.BlockId,
             _: usize,
             inst: *ir.Inst,
@@ -2712,27 +2919,43 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
 
             if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) return .unchanged;
 
+            var canonical_inst = inst.*;
+            _ = replaceAliasesInInstCount(&canonical_inst, &self.aliases);
+
             var found: ?ir.VReg = null;
             for (self.table.items) |entry| {
-                if (entry.inst.type == inst.type and sameOp(entry.inst, inst.*)) {
+                if (entry.inst.type == canonical_inst.type and sameOp(entry.inst, canonical_inst)) {
                     found = entry.vreg;
                     break;
                 }
             }
 
             if (found) |earlier_vreg| {
-                const replacements = replaceVRegCount(ir_func, inst.dest.?, earlier_vreg);
-                return if (replacements > 0) .changed else .unchanged;
+                try self.recordAlias(inst.dest.?, earlier_vreg);
+                return .unchanged;
             }
 
-            try self.table.append(self.allocator, .{ .inst = inst.*, .vreg = inst.dest.? });
+            try self.table.append(self.allocator, .{ .inst = canonical_inst, .vreg = inst.dest.? });
             return .unchanged;
         }
     };
 
-    var visitor = Visitor{ .table = .empty, .allocator = allocator };
+    var visitor = Visitor{
+        .table = .empty,
+        .aliases = VRegAliasMap.init(allocator),
+        .forwarded_loads = .empty,
+        .allocator = allocator,
+    };
     defer visitor.table.deinit(allocator);
-    return try LoadForwardingDomWalk(Visitor).run(&visitor, func, allocator);
+    defer visitor.aliases.deinit();
+    defer visitor.forwarded_loads.deinit(allocator);
+
+    _ = try LoadForwardingDomWalk(Visitor).run(&visitor, func, allocator);
+    const replacements = replaceVRegsCount(func, &visitor.aliases);
+    if (replacements > 0) {
+        removeForwardedLoads(func, visitor.forwarded_loads.items);
+    }
+    return replacements > 0;
 }
 
 // ── Pass Manager ────────────────────────────────────────────────────────────
@@ -2796,7 +3019,45 @@ pub const RunOptions = struct {
     /// pass loop. Off by default; `wamrc` populates this from
     /// `WAMR_AOT_PASS_TIMING*` environment variables.
     pass_timing: PassTimingOptions = .{},
+    /// Optional stderr timing diagnostics for expensive CFG/dominator
+    /// recomputation inside analysis helpers. Off by default; `wamrc`
+    /// populates this from `WAMR_AOT_ANALYSIS_TIMING*` environment
+    /// variables.
+    analysis_timing: AnalysisTimingOptions = .{},
+    /// Compile-time guard for `tailDuplicateSmallJoins`. Defaults keep the
+    /// pass enabled for normal functions but skip/cap pathological CFGs.
+    tail_duplication: TailDuplicationOptions = .{},
 };
+
+pub const AnalysisTimingOptions = analysis.TimingOptions;
+
+pub const default_tail_dup_max_blocks: usize = 2048;
+pub const default_tail_dup_max_instructions: usize = 32 * 1024;
+pub const default_tail_dup_max_work: usize = 8 * 1024 * 1024;
+
+pub const TailDuplicationOptions = struct {
+    skip: bool = false,
+    max_blocks: usize = default_tail_dup_max_blocks,
+    max_instructions: usize = default_tail_dup_max_instructions,
+    max_work: usize = default_tail_dup_max_work,
+    log: bool = false,
+};
+
+threadlocal var tail_duplication_options: TailDuplicationOptions = .{};
+
+const TailDuplicationOptionsScope = struct {
+    previous: TailDuplicationOptions,
+
+    fn deinit(self: *TailDuplicationOptionsScope) void {
+        tail_duplication_options = self.previous;
+    }
+};
+
+fn pushTailDuplicationOptions(options: TailDuplicationOptions) TailDuplicationOptionsScope {
+    const previous = tail_duplication_options;
+    tail_duplication_options = options;
+    return .{ .previous = previous };
+}
 
 pub const PassTimingOptions = struct {
     enabled: bool = false,
@@ -2849,6 +3110,45 @@ pub fn passTimingOptionsFromEnv(env: *const std.process.Environ.Map) PassTimingO
     return out;
 }
 
+/// Parse env-gated analysis timing diagnostics. `WAMR_AOT_ANALYSIS_TIMING=1`
+/// enables logging for slow `buildSuccessors` / `computeDominators` calls.
+/// Optional knobs:
+///
+///   - `WAMR_AOT_ANALYSIS_TIMING_THRESHOLD_MS` (default: 100)
+///   - `WAMR_AOT_ANALYSIS_TIMING_MODULE` (component core/module index)
+///   - `WAMR_AOT_ANALYSIS_TIMING_FUNC` (local IR function index)
+pub fn analysisTimingOptionsFromEnv(env: *const std.process.Environ.Map) AnalysisTimingOptions {
+    const gate = env.get("WAMR_AOT_ANALYSIS_TIMING") orelse return .{};
+    if (!envFlagEnabled(gate)) return .{};
+
+    var out = AnalysisTimingOptions{ .enabled = true };
+    if (parseEnvU64For(env, "WAMR_AOT_ANALYSIS_TIMING_THRESHOLD_MS", "aot-analysis-timing")) |ms| {
+        const max_ms = std.math.maxInt(u64) / std.time.ns_per_ms;
+        out.threshold_ns = if (ms > max_ms) std.math.maxInt(u64) else ms * std.time.ns_per_ms;
+    }
+    if (parseEnvU32For(env, "WAMR_AOT_ANALYSIS_TIMING_MODULE", "aot-analysis-timing")) |m| out.module_filter = m;
+    if (parseEnvU32For(env, "WAMR_AOT_ANALYSIS_TIMING_FUNC", "aot-analysis-timing")) |f| out.func_filter = f;
+    return out;
+}
+
+/// Parse tail-duplication compile-time guard knobs. Set any max to `0` to
+/// disable that individual cap while validating the pass on large inputs.
+///
+///   - `WAMR_AOT_SKIP_TAIL_DUP=1` disables the pass globally.
+///   - `WAMR_AOT_TAIL_DUP_MAX_BLOCKS` (default: 2048)
+///   - `WAMR_AOT_TAIL_DUP_MAX_INSTS` (default: 32768)
+///   - `WAMR_AOT_TAIL_DUP_MAX_WORK` (default: 8388608)
+///   - `WAMR_AOT_TAIL_DUP_LOG=1` logs skip/cap decisions.
+pub fn tailDuplicationOptionsFromEnv(env: *const std.process.Environ.Map) TailDuplicationOptions {
+    var out = TailDuplicationOptions{};
+    if (env.get("WAMR_AOT_SKIP_TAIL_DUP")) |v| out.skip = envFlagEnabled(v);
+    if (parseEnvUsizeFor(env, "WAMR_AOT_TAIL_DUP_MAX_BLOCKS", "aot-tail-dup")) |n| out.max_blocks = n;
+    if (parseEnvUsizeFor(env, "WAMR_AOT_TAIL_DUP_MAX_INSTS", "aot-tail-dup")) |n| out.max_instructions = n;
+    if (parseEnvUsizeFor(env, "WAMR_AOT_TAIL_DUP_MAX_WORK", "aot-tail-dup")) |n| out.max_work = n;
+    if (env.get("WAMR_AOT_TAIL_DUP_LOG")) |v| out.log = envFlagEnabled(v);
+    return out;
+}
+
 fn envFlagEnabled(value: []const u8) bool {
     return value.len != 0 and
         !std.mem.eql(u8, value, "0") and
@@ -2858,17 +3158,33 @@ fn envFlagEnabled(value: []const u8) bool {
 }
 
 fn parseEnvU64(env: *const std.process.Environ.Map, name: []const u8) ?u64 {
+    return parseEnvU64For(env, name, "aot-pass-timing");
+}
+
+fn parseEnvU64For(env: *const std.process.Environ.Map, name: []const u8, comptime label: []const u8) ?u64 {
     const value = env.get(name) orelse return null;
     return std.fmt.parseInt(u64, value, 10) catch |err| {
-        std.debug.print("[aot-pass-timing] ignoring {s}={s}: {s}\n", .{ name, value, @errorName(err) });
+        std.debug.print("[" ++ label ++ "] ignoring {s}={s}: {s}\n", .{ name, value, @errorName(err) });
         return null;
     };
 }
 
 fn parseEnvU32(env: *const std.process.Environ.Map, name: []const u8) ?u32 {
+    return parseEnvU32For(env, name, "aot-pass-timing");
+}
+
+fn parseEnvU32For(env: *const std.process.Environ.Map, name: []const u8, comptime label: []const u8) ?u32 {
     const value = env.get(name) orelse return null;
     return std.fmt.parseInt(u32, value, 10) catch |err| {
-        std.debug.print("[aot-pass-timing] ignoring {s}={s}: {s}\n", .{ name, value, @errorName(err) });
+        std.debug.print("[" ++ label ++ "] ignoring {s}={s}: {s}\n", .{ name, value, @errorName(err) });
+        return null;
+    };
+}
+
+fn parseEnvUsizeFor(env: *const std.process.Environ.Map, name: []const u8, comptime label: []const u8) ?usize {
+    const value = env.get(name) orelse return null;
+    return std.fmt.parseInt(usize, value, 10) catch |err| {
+        std.debug.print("[" ++ label ++ "] ignoring {s}={s}: {s}\n", .{ name, value, @errorName(err) });
         return null;
     };
 }
@@ -3269,6 +3585,15 @@ pub fn passName(p: PassFn) []const u8 {
     return "<unknown>";
 }
 
+fn passMutatesCfg(p: PassFn) bool {
+    return p == &foldConstantBranches or
+        p == &foldBranchOnEqz or
+        p == &threadChainedConditionalBranches or
+        p == &tailDuplicateSmallJoins or
+        p == &hoistLoopInvariantCode or
+        p == &unrollSmallFixedLoops;
+}
+
 // ── Loop-invariant bounds-check hoisting ────────────────────────────────────
 
 /// Hoist loop-invariant bounds checks to the loop preheader.
@@ -3315,19 +3640,28 @@ pub fn passName(p: PassFn) []const u8 {
 pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
+    const cfg_cache = analysis.currentCfgAnalysisCache();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (cfg_cache) |cache|
+        try cache.getDominators(func)
+    else blk: {
+        owned_dom = try analysis.computeDominators(func, allocator);
+        break :blk &owned_dom.?;
+    };
 
-    var lf = try analysis.computeLoops(func, &dom, allocator);
+    var lf = try analysis.computeLoopsCached(func, dom, allocator, cfg_cache);
     defer lf.deinit();
     if (lf.loops.len == 0) return false;
 
-    var predecessors = try analysis.buildPredecessors(func, allocator);
-    defer {
-        var pit = predecessors.iterator();
-        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
-        predecessors.deinit();
-    }
+    var owned_predecessors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null;
+    defer if (owned_predecessors) |*preds| analysis.freeBlockIdMap(preds, allocator);
+    const predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId) = if (cfg_cache) |cache|
+        try cache.getPredecessors(func)
+    else blk: {
+        owned_predecessors = try analysis.buildPredecessors(func, allocator);
+        break :blk &owned_predecessors.?;
+    };
 
     // Build def-block map: for each VReg, which block defines it?
     var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
@@ -3403,7 +3737,7 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
                 return d.dominates(a, b);
             }
         };
-        std.sort.insertion(ir.BlockId, must_exec.items, &dom, DomLess.lt);
+        std.sort.insertion(ir.BlockId, must_exec.items, dom, DomLess.lt);
 
         // ── Scan must-execute blocks for loop-invariant bases ──
         // Stop at the first fence op (call, memory_grow, etc.) in any
@@ -3554,19 +3888,25 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
 pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
+    const cfg_cache = analysis.currentCfgAnalysisCache();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (cfg_cache) |cache|
+        try cache.getDominators(func)
+    else blk: {
+        owned_dom = try analysis.computeDominators(func, allocator);
+        break :blk &owned_dom.?;
+    };
 
-    var lf = try analysis.computeLoops(func, &dom, allocator);
+    var lf = try analysis.computeLoopsCached(func, dom, allocator, cfg_cache);
     defer lf.deinit();
     if (lf.loops.len == 0) return false;
 
-    var predecessors = try analysis.buildPredecessors(func, allocator);
-    defer {
-        var pit = predecessors.iterator();
-        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
-        predecessors.deinit();
-    }
+    var predecessors = if (cfg_cache) |cache|
+        try analysis.cloneBlockIdMap(try cache.getPredecessors(func), allocator)
+    else
+        try analysis.buildPredecessors(func, allocator);
+    defer analysis.freeBlockIdMap(&predecessors, allocator);
 
     var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
     defer def_block.deinit();
@@ -3578,7 +3918,7 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
 
     var changed = false;
     for (lf.loops) |*loop| {
-        const ph = (try obtainLoopPreheader(func, loop, &predecessors, &dom, allocator)) orelse continue;
+        const ph = (try obtainLoopPreheader(func, loop, &predecessors, dom, allocator)) orelse continue;
 
         // One-shot scan of the loop body: which wasm-local / wasm-global
         // indices are written, and does the body contain any call or
@@ -4939,6 +5279,13 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
         }
     }
 
+    // Tally uses once. Rewriting a br_if to use the inner value only ever
+    // zeroes the (single-use) eqz result it replaces and is sound regardless
+    // of use count, so the precomputed tally yields the same decisions as a
+    // per-candidate `countUsesOfVReg` scan without the O(br_ifs * insts) cost.
+    var use_counts = try buildVRegUseCounts(func, allocator);
+    defer use_counts.deinit();
+
     for (func.blocks.items) |*block| {
         if (block.instructions.items.len == 0) continue;
         const term = &block.instructions.items[block.instructions.items.len - 1];
@@ -4951,7 +5298,7 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
                     .eqz => |v| v,
                     else => continue,
                 };
-                if (countUsesOfVReg(func, bi.cond) != 1) continue;
+                if ((use_counts.get(bi.cond) orelse 0) != 1) continue;
                 term.op = .{ .br_if = .{
                     .cond = inner,
                     .then_block = bi.else_block,
@@ -5212,6 +5559,14 @@ pub fn foldSignExtendingLoad(func: *ir.IrFunction, allocator: std.mem.Allocator)
     var rewrites = std.ArrayList(Rewrite).empty;
     defer rewrites.deinit(allocator);
 
+    // Tally uses once. Folding requires the load result to have exactly one
+    // use (rewriting the load to sign-extend would change the value seen by
+    // any other consumer), and candidates are collected from the unmutated
+    // function, so the precomputed tally matches a per-candidate
+    // `countUsesOfVReg` scan at far lower cost on large functions.
+    var use_counts = try buildVRegUseCounts(func, allocator);
+    defer use_counts.deinit();
+
     for (func.blocks.items, 0..) |block, bi| {
         for (block.instructions.items, 0..) |inst, ii| {
             const ext_dest = inst.dest orelse continue;
@@ -5239,7 +5594,7 @@ pub fn foldSignExtendingLoad(func: *ir.IrFunction, allocator: std.mem.Allocator)
             if (ld.size != want_size) continue;
             if (ld.sign_extend) continue;
             if (producer.type != ext_type) continue;
-            if (countUsesOfVReg(func, src) != 1) continue;
+            if ((use_counts.get(src) orelse 0) != 1) continue;
             const load_dest = producer.dest orelse continue;
             try rewrites.append(allocator, .{
                 .ext_blk = @intCast(bi),
@@ -5300,6 +5655,13 @@ pub fn foldSelectOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
         }
     }
 
+    // Tally uses once. Rewriting a select to use the inner value only zeroes
+    // the (single-use) eqz result and is sound regardless of use count, so the
+    // precomputed tally matches a per-candidate `countUsesOfVReg` scan without
+    // the O(selects * insts) blowup.
+    var use_counts = try buildVRegUseCounts(func, allocator);
+    defer use_counts.deinit();
+
     for (func.blocks.items) |*block| {
         for (block.instructions.items) |*inst| {
             const sel = switch (inst.op) {
@@ -5313,7 +5675,7 @@ pub fn foldSelectOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
                 .eqz => |v| v,
                 else => continue,
             };
-            if (countUsesOfVReg(func, sel.cond) != 1) continue;
+            if ((use_counts.get(sel.cond) orelse 0) != 1) continue;
             inst.op = .{ .select = .{
                 .cond = inner,
                 .if_true = sel.if_false,
@@ -6243,6 +6605,7 @@ pub fn scrubUnreachableBlocks(func: *ir.IrFunction, allocator: std.mem.Allocator
         try block.instructions.append(block.allocator, .{ .op = .{ .@"unreachable" = {} } });
         changed = true;
     }
+    if (analysis.currentCfgAnalysisCache()) |cache| cache.invalidate();
     return changed;
 }
 
@@ -6283,21 +6646,6 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                 .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
                     if (idx + 1 < block.instructions.items.len)
                         block.instructions.shrinkRetainingCapacity(idx + 1);
-                    break;
-                },
-                else => {},
-            }
-        }
-    }
-
-    // Strip dead code after the first terminator in each block.
-    for (func.blocks.items) |*block| {
-        for (block.instructions.items, 0..) |inst, idx| {
-            switch (inst.op) {
-                .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
-                    if (idx + 1 < block.instructions.items.len) {
-                        block.instructions.shrinkRetainingCapacity(idx + 1);
-                    }
                     break;
                 },
                 else => {},
@@ -6360,6 +6708,13 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     }
     for (has_phi) |*m| m.* = std.AutoHashMap(ir.BlockId, ir.VReg).init(allocator);
 
+    // Reverse index: phi-dest VReg -> the local it was placed for. Phi dests
+    // are freshly allocated and unique, so this lets the rename walk map a phi
+    // back to its local in O(1) instead of scanning all `nlocals` per phi
+    // (which was the dominant O(phis * locals) cost on large functions).
+    var phi_local = std.AutoHashMap(ir.VReg, usize).init(allocator);
+    defer phi_local.deinit();
+
     // Worklist for iterated DF.
     var worklist: std.ArrayList(ir.BlockId) = .empty;
     defer worklist.deinit(allocator);
@@ -6401,6 +6756,12 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                         .type = local_type,
                     });
                     try has_phi[local_idx].put(y, phi_dest);
+                    // Phi dests are freshly allocated and globally unique, so
+                    // each maps to exactly one local; assert it to catch any
+                    // VReg-uniqueness violation early.
+                    const gop = try phi_local.getOrPut(phi_dest);
+                    std.debug.assert(!gop.found_existing);
+                    gop.value_ptr.* = local_idx;
                     if (!in_worklist[y]) {
                         try worklist.append(allocator, y);
                         in_worklist[y] = true;
@@ -6581,13 +6942,8 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                 .phi => {
                     // Push phi dest onto the local's stack.
                     const dest = inst.dest orelse continue;
-                    for (0..nlocals) |local_idx| {
-                        if (has_phi[local_idx].get(bid)) |phi_vreg| {
-                            if (phi_vreg == dest) {
-                                try stacks[local_idx].append(allocator, dest);
-                                break;
-                            }
-                        }
+                    if (phi_local.get(dest)) |local_idx| {
+                        try stacks[local_idx].append(allocator, dest);
                     }
                 },
                 .local_set => |ls| {
@@ -6633,19 +6989,13 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
             for (succ_block.instructions.items) |*succ_inst| {
                 if (succ_inst.op != .phi) break; // phis are at top
                 const phi_dest = succ_inst.dest orelse continue;
-                // Find which local this phi belongs to.
-                for (0..nlocals) |local_idx| {
-                    if (has_phi[local_idx].get(succ)) |pv| {
-                        if (pv == phi_dest) {
-                            // Fill in this block's edge.
-                            for (@constCast(succ_inst.op.phi)) |*edge| {
-                                if (edge.block == bid) {
-                                    if (stacks[local_idx].items.len > 0) {
-                                        edge.val = stacks[local_idx].items[stacks[local_idx].items.len - 1];
-                                    }
-                                }
-                            }
-                            break;
+                // Find which local this phi belongs to (O(1) reverse lookup).
+                const local_idx = phi_local.get(phi_dest) orelse continue;
+                // Fill in this block's edge.
+                for (@constCast(succ_inst.op.phi)) |*edge| {
+                    if (edge.block == bid) {
+                        if (stacks[local_idx].items.len > 0) {
+                            edge.val = stacks[local_idx].items[stacks[local_idx].items.len - 1];
                         }
                     }
                 }
@@ -6944,7 +7294,29 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
 /// emits them. The outer `runPasses` fixpoint loop (cap 8) bounds how
 /// many times this pass can re-run — in practice 1-2 invocations suffice.
 pub fn tailDuplicateSmallJoins(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    return tailDuplicateSmallJoinsWithOptions(func, allocator, tail_duplication_options);
+}
+
+fn tailDuplicateSmallJoinsWithOptions(
+    func: *ir.IrFunction,
+    allocator: std.mem.Allocator,
+    options: TailDuplicationOptions,
+) !bool {
     if (func.blocks.items.len < 2) return false;
+
+    const stats = collectPassTimingStats(func);
+    if (options.skip) {
+        logTailDupSkip(func, "env-skip", options, stats, null);
+        return false;
+    }
+    if (tailDupCapExceeded(options.max_blocks, stats.blocks)) {
+        logTailDupSkip(func, "max-blocks", options, stats, null);
+        return false;
+    }
+    if (tailDupCapExceeded(options.max_instructions, stats.instructions)) {
+        logTailDupSkip(func, "max-insts", options, stats, null);
+        return false;
+    }
 
     var predecessors = try analysis.buildPredecessors(func, allocator);
     defer {
@@ -6953,25 +7325,271 @@ pub fn tailDuplicateSmallJoins(func: *ir.IrFunction, allocator: std.mem.Allocato
         predecessors.deinit();
     }
 
+    const estimate = estimateTailDuplicationWork(func, &predecessors, stats);
+    if (estimate.candidate_joins == 0) return false;
+    if (tailDupCapExceeded(options.max_work, estimate.total)) {
+        logTailDupSkip(func, "max-work", options, stats, estimate);
+        return false;
+    }
+
     var changed = false;
 
     var b_id: ir.BlockId = 1;
     while (b_id < func.blocks.items.len) : (b_id += 1) {
         if (try tryAbsorbJoin(func, b_id, &predecessors, allocator)) {
             changed = true;
+            // The CFG changed, so any cached successors/predecessors/dominators
+            // a later pass might read are now stale. Invalidate before the
+            // incremental update below so an allocation failure there cannot
+            // leave a stale cache behind.
+            if (analysis.currentCfgAnalysisCache()) |cache| cache.invalidate();
 
-            // Predecessor map is now stale (preds of B disappeared; preds
-            // of B's successors gained the duplicated copies). Rebuild
-            // before considering further joins so the next iteration sees
-            // the current CFG.
-            var it = predecessors.iterator();
-            while (it.next()) |entry| allocator.free(entry.value_ptr.*);
-            predecessors.deinit();
-            predecessors = try analysis.buildPredecessors(func, allocator);
+            // Patch the predecessor map in place rather than rebuilding the
+            // entire map (an O(blocks+edges) operation, plus a full successor
+            // rebuild) after every absorption. The per-absorption rebuild made
+            // this pass O(joins * (blocks+edges)) and the dominant AOT
+            // compile-time cost on large functions.
+            try applyTailDupToPredecessors(func, b_id, &predecessors, allocator);
         }
     }
 
     return changed;
+}
+
+/// Incrementally update `predecessors` after `tryAbsorbJoin` duplicated join
+/// `b_id` into each of its predecessors, reproducing exactly what a fresh
+/// `analysis.buildPredecessors` would yield — without the O(blocks+edges)
+/// rebuild that previously ran after every absorption.
+///
+/// Absorbing join `B` (whose predecessors all end in a plain `br B`) rewrites
+/// each predecessor's terminator into a clone of `B`'s terminator. The only
+/// predecessor-set changes are therefore:
+///   - each distinct successor of `B` gains every former predecessor of `B`,
+///     and
+///   - `B` loses all of its predecessors.
+///
+/// `B` keeps its own (unchanged) outgoing edges and stays in `func.blocks`
+/// until a later `scrubUnreachableBlocks`, so it remains a predecessor of its
+/// successors — matching a fresh rebuild. Because the IR verifier guarantees a
+/// single terminator at the end of every block, each former predecessor's only
+/// out-edge was `br B`, so appending it to a successor's list never duplicates
+/// an existing entry.
+fn applyTailDupToPredecessors(
+    func: *const ir.IrFunction,
+    b_id: ir.BlockId,
+    predecessors: *std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    allocator: std.mem.Allocator,
+) !void {
+    const b_slot = predecessors.getPtr(b_id) orelse return;
+    const cloned_preds = b_slot.*;
+    if (cloned_preds.len == 0) return;
+
+    const b = &func.blocks.items[b_id];
+    const term = b.instructions.items[b.instructions.items.len - 1];
+
+    // An absorbable join always ends in a single br / br_if / ret terminator,
+    // so it has at most two distinct successors to fix up.
+    var succ_buf: [2]ir.BlockId = undefined;
+    var succ_len: usize = 0;
+    switch (term.op) {
+        .br => |tgt| {
+            succ_buf[0] = tgt;
+            succ_len = 1;
+        },
+        .br_if => |bi| {
+            succ_buf[0] = bi.then_block;
+            succ_len = 1;
+            if (bi.else_block != bi.then_block) {
+                succ_buf[1] = bi.else_block;
+                succ_len = 2;
+            }
+        },
+        else => {}, // ret: no successors
+    }
+
+    // `B` is never its own successor (self-loop joins are rejected by
+    // `tryAbsorbJoin`), so none of these slots alias `b_slot`, and overwriting
+    // existing values never rehashes the map — `b_slot` stays valid.
+    for (succ_buf[0..succ_len]) |s_id| {
+        const slot = predecessors.getPtr(s_id) orelse continue;
+        const old = slot.*;
+        const updated = try allocator.alloc(ir.BlockId, old.len + cloned_preds.len);
+        @memcpy(updated[0..old.len], old);
+        @memcpy(updated[old.len..], cloned_preds);
+        allocator.free(old);
+        slot.* = updated;
+    }
+
+    allocator.free(cloned_preds);
+    b_slot.* = &.{};
+}
+
+const TailDupWorkEstimate = struct {
+    candidate_joins: usize = 0,
+    predecessor_edges: usize = 0,
+    external_use_scans: usize = 0,
+    cloned_instructions: usize = 0,
+    cfg_rebuild_work: usize = 0,
+    total: usize = 0,
+
+    fn addWork(self: *TailDupWorkEstimate, amount: usize) void {
+        self.total = saturatingAddUsize(self.total, amount);
+    }
+};
+
+fn tailDupCapExceeded(limit: usize, value: usize) bool {
+    return limit != 0 and value > limit;
+}
+
+fn saturatingAddUsize(a: usize, b: usize) usize {
+    const max = std.math.maxInt(usize);
+    return if (max - a < b) max else a + b;
+}
+
+fn saturatingMulUsize(a: usize, b: usize) usize {
+    if (a == 0 or b == 0) return 0;
+    const max = std.math.maxInt(usize);
+    return if (a > max / b) max else a * b;
+}
+
+fn logTailDupSkip(
+    func: *const ir.IrFunction,
+    reason: []const u8,
+    options: TailDuplicationOptions,
+    stats: PassTimingStats,
+    estimate: ?TailDupWorkEstimate,
+) void {
+    if (!options.log) return;
+    const func_name = func.name orelse "-";
+    if (estimate) |e| {
+        std.debug.print(
+            "[aot-tail-dup] skip reason={s} func_name={s} blocks={d} insts={d} max_blocks={d} max_insts={d} max_work={d} candidates={d} pred_edges={d} ext_scans={d} cloned_insts={d} rebuild_work={d} work={d}\n",
+            .{
+                reason,
+                func_name,
+                stats.blocks,
+                stats.instructions,
+                options.max_blocks,
+                options.max_instructions,
+                options.max_work,
+                e.candidate_joins,
+                e.predecessor_edges,
+                e.external_use_scans,
+                e.cloned_instructions,
+                e.cfg_rebuild_work,
+                e.total,
+            },
+        );
+    } else {
+        std.debug.print(
+            "[aot-tail-dup] skip reason={s} func_name={s} blocks={d} insts={d} max_blocks={d} max_insts={d} max_work={d}\n",
+            .{
+                reason,
+                func_name,
+                stats.blocks,
+                stats.instructions,
+                options.max_blocks,
+                options.max_instructions,
+                options.max_work,
+            },
+        );
+    }
+}
+
+fn estimateTailDuplicationWork(
+    func: *const ir.IrFunction,
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    stats: PassTimingStats,
+) TailDupWorkEstimate {
+    var out = TailDupWorkEstimate{};
+
+    var b_id: ir.BlockId = 1;
+    while (b_id < func.blocks.items.len) : (b_id += 1) {
+        const candidate = estimateTailDupCandidate(func, b_id, predecessors) orelse continue;
+        out.candidate_joins = saturatingAddUsize(out.candidate_joins, 1);
+        out.predecessor_edges = saturatingAddUsize(out.predecessor_edges, candidate.pred_count);
+        out.external_use_scans = saturatingAddUsize(out.external_use_scans, candidate.def_count);
+        const cloned = saturatingMulUsize(candidate.pred_count, candidate.inst_count);
+        out.cloned_instructions = saturatingAddUsize(out.cloned_instructions, cloned);
+        const rebuild = saturatingAddUsize(stats.blocks, stats.instructions);
+        out.cfg_rebuild_work = saturatingAddUsize(out.cfg_rebuild_work, rebuild);
+
+        out.addWork(candidate.pred_count);
+        out.addWork(saturatingMulUsize(candidate.def_count, stats.instructions));
+        out.addWork(cloned);
+        out.addWork(rebuild);
+    }
+
+    return out;
+}
+
+const TailDupCandidateEstimate = struct {
+    pred_count: usize,
+    inst_count: usize,
+    def_count: usize,
+};
+
+fn estimateTailDupCandidate(
+    func: *const ir.IrFunction,
+    b_id: ir.BlockId,
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+) ?TailDupCandidateEstimate {
+    const b = &func.blocks.items[b_id];
+    if (b.instructions.items.len == 0) return null;
+
+    const term_idx = findTerminatorIndex(b);
+    if (term_idx == b.instructions.items.len) return null;
+    if (term_idx != b.instructions.items.len - 1) return null;
+
+    const body_len = term_idx;
+    if (body_len > 4) return null;
+
+    switch (b.instructions.items[term_idx].op) {
+        .br, .br_if, .ret => {},
+        else => return null,
+    }
+
+    var def_count: usize = 0;
+    for (b.instructions.items[0..body_len]) |inst| {
+        if (inst.dest != null) def_count += 1;
+        switch (inst.op) {
+            .phi,
+            .call,
+            .call_indirect,
+            .call_ref,
+            .call_result,
+            .br,
+            .br_if,
+            .br_table,
+            .ret,
+            .ret_multi,
+            .@"unreachable",
+            => return null,
+            else => {},
+        }
+    }
+    if (b.instructions.items[term_idx].dest != null) def_count += 1;
+
+    const preds = predecessors.get(b_id) orelse return null;
+    if (preds.len < 2) return null;
+
+    for (preds) |p| {
+        if (p == b_id) return null;
+        if (p >= func.blocks.items.len) return null;
+        const pb = &func.blocks.items[p];
+        if (pb.instructions.items.len == 0) return null;
+        const pterm = pb.instructions.items[pb.instructions.items.len - 1];
+        switch (pterm.op) {
+            .br => |tgt| if (tgt != b_id) return null,
+            else => return null,
+        }
+    }
+
+    return .{
+        .pred_count = preds.len,
+        .inst_count = b.instructions.items.len,
+        .def_count = def_count,
+    };
 }
 
 /// Attempt to tail-duplicate block `b_id` into each of its predecessors.
@@ -7151,6 +7769,10 @@ pub fn runPassesWithOptions(
     opts: RunOptions,
 ) !u32 {
     var total_changes: u32 = 0;
+    const previous_analysis_timing = analysis.setTimingOptions(opts.analysis_timing);
+    defer _ = analysis.setTimingOptions(previous_analysis_timing);
+    var tail_dup_scope = pushTailDuplicationOptions(opts.tail_duplication);
+    defer tail_dup_scope.deinit();
 
     // Local helper: run the verifier and stamp the pass name on the
     // surfaced failure record. A no-op when `verify_mode == .off`.
@@ -7171,11 +7793,19 @@ pub fn runPassesWithOptions(
         fn check(
             mode: verifier.VerifyMode,
             pass_label: []const u8,
+            module_idx: u32,
             func: *ir.IrFunction,
             func_idx: u32,
             alloc: std.mem.Allocator,
         ) verifier.VerifyError!void {
             if (mode == .off) return;
+            var timing_context = analysis.pushTimingContext(.{
+                .module_idx = module_idx,
+                .func_idx = func_idx,
+                .phase = "verify",
+                .pass_name = pass_label,
+            });
+            defer timing_context.deinit();
             try analysis.refreshBlockPredecessors(func, alloc);
             verifier.verifyFunction(func, func_idx, mode, alloc) catch |e| {
                 verifier.last_failure.pass_name = pass_label;
@@ -7226,7 +7856,15 @@ pub fn runPassesWithOptions(
         var inlined_count: u32 = 0;
         if (!opts.bisect.skipsInlineSmall(opts.module_idx)) {
             while (inline_iter < 4) : (inline_iter += 1) {
-                const iter_inlined = try inlineSmallFunctionsCount(module, allocator);
+                const iter_inlined = blk: {
+                    var timing_context = analysis.pushTimingContext(.{
+                        .module_idx = opts.module_idx,
+                        .phase = "pass",
+                        .pass_name = "inlineSmallFunctions",
+                    });
+                    defer timing_context.deinit();
+                    break :blk try inlineSmallFunctionsCount(module, allocator);
+                };
                 if (iter_inlined == 0) break;
                 inlined_count += iter_inlined;
                 total_changes += 1;
@@ -7237,7 +7875,7 @@ pub fn runPassesWithOptions(
                         // #761: suppress verifier on bisect-affected funcs.
                         const vm: verifier.VerifyMode =
                             if (opts.bisect.affectsFunction(opts.module_idx, fi32)) .off else opts.verify_mode;
-                        try Verify.check(vm, "inlineSmallFunctions", f, fi32, allocator);
+                        try Verify.check(vm, "inlineSmallFunctions", opts.module_idx, f, fi32, allocator);
                     }
                 }
 
@@ -7300,6 +7938,10 @@ pub fn runPassesWithOptions(
             // pass fixpoint, scrubUnreachableBlocks).
             const effective_verify_mode: verifier.VerifyMode =
                 if (opts.bisect.affectsFunction(opts.module_idx, func_idx)) .off else opts.verify_mode;
+            var cfg_cache = analysis.CfgAnalysisCache.init(allocator);
+            defer cfg_cache.deinit();
+            var cfg_cache_scope = analysis.pushCfgAnalysisCache(&cfg_cache);
+            defer cfg_cache_scope.deinit();
 
             // SSA promotion: only meaningful on the first outer round. On
             // later rounds the function is already past mem2reg and any new
@@ -7311,7 +7953,17 @@ pub fn runPassesWithOptions(
                 if (timing_for_func) {
                     printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
                 }
-                const promote_changed = try promoteLocalsToSSA(func, allocator);
+                const promote_changed = blk: {
+                    var timing_context = analysis.pushTimingContext(.{
+                        .module_idx = opts.module_idx,
+                        .func_idx = func_idx,
+                        .phase = "pass",
+                        .pass_name = "promoteLocalsToSSA",
+                    });
+                    defer timing_context.deinit();
+                    break :blk try promoteLocalsToSSA(func, allocator);
+                };
+                cfg_cache.invalidate();
                 if (timing_for_func) {
                     maybePrintPassTiming(
                         timing,
@@ -7336,7 +7988,7 @@ pub fn runPassesWithOptions(
                     if (timing_for_func) {
                         printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
                     }
-                    try Verify.check(effective_verify_mode, "promoteLocalsToSSA", func, func_idx, allocator);
+                    try Verify.check(effective_verify_mode, "promoteLocalsToSSA", opts.module_idx, func, func_idx, allocator);
                     if (timing_for_func) {
                         maybePrintPassTiming(
                             timing,
@@ -7370,7 +8022,16 @@ pub fn runPassesWithOptions(
                         if (timing_for_func) {
                             printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
                         }
-                        const lower_changed = try lowerPhisToLocals(func, allocator);
+                        const lower_changed = blk: {
+                            var timing_context = analysis.pushTimingContext(.{
+                                .module_idx = opts.module_idx,
+                                .func_idx = func_idx,
+                                .phase = "pass",
+                                .pass_name = "lowerPhisToLocals",
+                            });
+                            defer timing_context.deinit();
+                            break :blk try lowerPhisToLocals(func, allocator);
+                        };
                         if (timing_for_func) {
                             maybePrintPassTiming(
                                 timing,
@@ -7395,7 +8056,7 @@ pub fn runPassesWithOptions(
                             if (timing_for_func) {
                                 printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
                             }
-                            try Verify.check(effective_verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
+                            try Verify.check(effective_verify_mode, "lowerPhisToLocals", opts.module_idx, func, func_idx, allocator);
                             if (timing_for_func) {
                                 maybePrintPassTiming(
                                     timing,
@@ -7452,7 +8113,18 @@ pub fn runPassesWithOptions(
                     if (timing_for_func) {
                         printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
                     }
-                    const changed = try pass(func, allocator);
+                    const changed = blk: {
+                        var timing_context = analysis.pushTimingContext(.{
+                            .module_idx = opts.module_idx,
+                            .func_idx = func_idx,
+                            .phase = "pass",
+                            .pass_idx = pass_idx,
+                            .pass_name = pass_label,
+                        });
+                        defer timing_context.deinit();
+                        break :blk try pass(func, allocator);
+                    };
+                    if (passMutatesCfg(pass)) cfg_cache.invalidate();
                     if (timing_for_func) {
                         maybePrintPassTiming(
                             timing,
@@ -7480,7 +8152,7 @@ pub fn runPassesWithOptions(
                         if (timing_for_func) {
                             printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
                         }
-                        try Verify.check(effective_verify_mode, pass_label, func, func_idx, allocator);
+                        try Verify.check(effective_verify_mode, pass_label, opts.module_idx, func, func_idx, allocator);
                         if (timing_for_func) {
                             maybePrintPassTiming(
                                 timing,
@@ -7526,7 +8198,17 @@ pub fn runPassesWithOptions(
             if (timing_for_func) {
                 printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
             }
-            const scrub_changed = try scrubUnreachableBlocks(func, allocator);
+            const scrub_changed = blk: {
+                var timing_context = analysis.pushTimingContext(.{
+                    .module_idx = opts.module_idx,
+                    .func_idx = func_idx,
+                    .phase = "pass",
+                    .pass_name = "scrubUnreachableBlocks",
+                });
+                defer timing_context.deinit();
+                break :blk try scrubUnreachableBlocks(func, allocator);
+            };
+            cfg_cache.invalidate();
             if (timing_for_func) {
                 maybePrintPassTiming(
                     timing,
@@ -7551,7 +8233,7 @@ pub fn runPassesWithOptions(
                 if (timing_for_func) {
                     printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
                 }
-                try Verify.check(effective_verify_mode, "scrubUnreachableBlocks", func, func_idx, allocator);
+                try Verify.check(effective_verify_mode, "scrubUnreachableBlocks", opts.module_idx, func, func_idx, allocator);
                 if (timing_for_func) {
                     maybePrintPassTiming(
                         timing,
@@ -9101,6 +9783,34 @@ test "replaceVRegCount: reports only actual rewritten uses" {
 
     try std.testing.expectEqual(@as(u32, 1), replaceVRegCount(&func, v0, v1));
     try std.testing.expectEqual(@as(u32, 0), replaceVRegCount(&func, v0, v1));
+}
+
+test "replaceVRegsCount: batches multiple aliases in one function scan" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v2 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v2 } }, .dest = v3 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    var aliases = VRegAliasMap.init(allocator);
+    defer aliases.deinit();
+    try putVRegAlias(&aliases, v0, v1);
+    try putVRegAlias(&aliases, v2, v1);
+
+    try std.testing.expectEqual(@as(u32, 3), replaceVRegsCount(&func, &aliases));
+    try std.testing.expectEqual(ir.Inst.Op{ .add = .{ .lhs = v1, .rhs = v1 } }, block.instructions.items[3].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v1 }, block.instructions.items[4].op);
+    try std.testing.expectEqual(@as(u32, 0), replaceVRegsCount(&func, &aliases));
 }
 
 // ── Block Reordering Tests ─────────────────────────────────────────────────
@@ -12571,6 +13281,60 @@ test "computeMagicU32: known divisors" {
     }
 }
 
+test "buildVRegUseCounts matches countUsesOfVReg across op kinds" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+
+    // getUsedVRegs path: binary op, eqz, select (cover br_if.cond too).
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = func.newVReg(), .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .eqz = v0 }, .dest = func.newVReg(), .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .select = .{ .cond = v2, .if_true = v0, .if_false = v1 } }, .dest = func.newVReg(), .type = .i32 });
+
+    // Variadic switch paths mirrored by buildVRegUseCounts/countUsesInInst.
+    const cl_args = try allocator.alloc(ir.VReg, 2);
+    cl_args[0] = v0;
+    cl_args[1] = v0;
+    try func.getBlock(b0).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = cl_args } }, .dest = func.newVReg(), .type = .i32 });
+
+    const ci_args = try allocator.alloc(ir.VReg, 1);
+    ci_args[0] = v1;
+    try func.getBlock(b0).append(.{ .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = v2, .args = ci_args } }, .dest = func.newVReg(), .type = .i32 });
+
+    const cr_args = try allocator.alloc(ir.VReg, 1);
+    cr_args[0] = v0;
+    try func.getBlock(b0).append(.{ .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = v1, .args = cr_args } }, .dest = func.newVReg(), .type = .i32 });
+
+    const phi_edges = try allocator.alloc(ir.Inst.PhiEdge, 2);
+    phi_edges[0] = .{ .block = b0, .val = v0 };
+    phi_edges[1] = .{ .block = b0, .val = v2 };
+    try func.getBlock(b0).append(.{ .op = .{ .phi = phi_edges }, .dest = func.newVReg(), .type = .i32 });
+
+    const pc_pairs = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    pc_pairs[0] = .{ .dst = func.newVReg(), .src = v1, .ty = .i32 };
+    try func.getBlock(b0).append(.{ .op = .{ .parallel_copy = pc_pairs } });
+
+    const rm_vals = try allocator.alloc(ir.VReg, 2);
+    rm_vals[0] = v0;
+    rm_vals[1] = v1;
+    try func.getBlock(b0).append(.{ .op = .{ .ret_multi = rm_vals } });
+
+    var counts = try buildVRegUseCounts(&func, allocator);
+    defer counts.deinit();
+
+    // The precomputed tally must equal a per-vreg countUsesOfVReg scan for
+    // every vreg (defs included, which should report zero uses unless used).
+    var v: ir.VReg = 0;
+    while (v < func.next_vreg) : (v += 1) {
+        try std.testing.expectEqual(countUsesOfVReg(&func, v), counts.get(v) orelse 0);
+    }
+}
+
 test "foldBranchOnEqz: swaps targets and drops eqz use" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 1, 1, 0);
@@ -13995,6 +14759,91 @@ test "tailDuplicateSmallJoins: 4-block diamond — join inlined into both arms" 
     }
 }
 
+test "tailDuplicateSmallJoins: block cap skips eligible diamond without changes" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const v_join_add = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_join_add });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_join_add } });
+
+    const changed = try tailDuplicateSmallJoinsWithOptions(&func, allocator, .{
+        .max_blocks = 3,
+        .max_instructions = 0,
+        .max_work = 0,
+    });
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .br = b3 }, func.getBlock(b1).instructions.items[0].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .br = b3 }, func.getBlock(b2).instructions.items[0].op);
+}
+
+test "tailDuplicateSmallJoins: work cap skips before mutating" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const v_join_add = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_join_add });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_join_add } });
+
+    const changed = try tailDuplicateSmallJoinsWithOptions(&func, allocator, .{
+        .max_blocks = 0,
+        .max_instructions = 0,
+        .max_work = 1,
+    });
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .br = b3 }, func.getBlock(b1).instructions.items[0].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .br = b3 }, func.getBlock(b2).instructions.items[0].op);
+}
+
+test "tailDuplicationOptionsFromEnv parses skip caps and logging" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("WAMR_AOT_SKIP_TAIL_DUP", "1");
+    try env.put("WAMR_AOT_TAIL_DUP_MAX_BLOCKS", "123");
+    try env.put("WAMR_AOT_TAIL_DUP_MAX_INSTS", "456");
+    try env.put("WAMR_AOT_TAIL_DUP_MAX_WORK", "789");
+    try env.put("WAMR_AOT_TAIL_DUP_LOG", "yes");
+
+    const opts = tailDuplicationOptionsFromEnv(&env);
+    try std.testing.expect(opts.skip);
+    try std.testing.expect(opts.log);
+    try std.testing.expectEqual(@as(usize, 123), opts.max_blocks);
+    try std.testing.expectEqual(@as(usize, 456), opts.max_instructions);
+    try std.testing.expectEqual(@as(usize, 789), opts.max_work);
+}
+
 test "tailDuplicateSmallJoins: triple predecessor with br terminator — all three duplicated" {
     // b0,b1,b2 each unconditionally br to b3 (sub + br_if to b4 or b5).
     // After duplication, all three predecessors should each contain the
@@ -14264,6 +15113,7 @@ test "GVN: cross-block load forwarded from dominator (#541)" {
 
     const changed = try globalValueNumbering(&func, allocator);
     try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(tail).instructions.items.len);
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v_dom }, func.getBlock(tail).instructions.items[0].op);
 }
 
@@ -14284,6 +15134,53 @@ test "GVN: unused duplicate does not report changed" {
     const changed = try globalValueNumbering(&func, allocator);
     try std.testing.expect(!changed);
     try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, block.instructions.items[1].op);
+}
+
+test "GVN: batched aliases canonicalize later expressions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    var block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_add_a = func.newVReg();
+    const v_add_b = func.newVReg();
+
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v1, .rhs = v1 } }, .dest = v_add_a, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v0 } }, .dest = v_add_b, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_add_b } });
+
+    const changed = try globalValueNumbering(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .add = .{ .lhs = v0, .rhs = v0 } }, block.instructions.items[2].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_add_a }, block.instructions.items[4].op);
+}
+
+test "GVN load: unused forwarded load alias does not report changed" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_unused = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = tail } });
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_unused, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_dom } });
+
+    const changed = try globalValueNumbering(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(tail).instructions.items.len);
+    try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .load);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_dom }, func.getBlock(tail).instructions.items[1].op);
 }
 
 test "CSE: diamond — add v0,v1 in both arms hoisted to dominator (#541)" {
@@ -14353,6 +15250,7 @@ test "GVN load: sibling-block store does NOT poison dominator-cached load (#541)
 
     const changed = try globalValueNumbering(&func, allocator);
     try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(right).instructions.items.len);
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v_dom }, func.getBlock(right).instructions.items[0].op);
 }
 
