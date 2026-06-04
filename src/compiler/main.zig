@@ -301,6 +301,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             },
             .verify_mode = verify_mode,
             .bisect = wamr.aot_bisect.global,
+            .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
         };
         const opt_changes = passes.runPassesWithOptions(&ir_module, passes.defaultPassesForTarget(target_arch), allocator, run_opts) catch |err| {
             // If the IR verifier tripped, surface its diagnostic before
@@ -901,6 +902,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         .target_arch = target_arch,
         .optimize = optimize,
         .cache_dir = cache_dir,
+        .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
     }) catch |err| {
         std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
@@ -1018,6 +1020,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
             std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
             var result = wamr.component_aot_compile.precompileComponent(allocator, wasm_data, artifact_path, .{
                 .target_arch = target_arch,
+                .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
             }) catch |err| {
                 std.debug.print("error: precompile failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
@@ -1031,6 +1034,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
             std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
             const cwasm = wamr.component_aot_compile.compileCoreWasm(allocator, wasm_data, .{
                 .target_arch = target_arch,
+                .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
             }) catch |err| {
                 std.debug.print("error: compile failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);

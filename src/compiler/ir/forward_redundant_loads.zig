@@ -3,12 +3,16 @@ const ir = @import("ir.zig");
 const passes = @import("passes.zig");
 const alias_class = @import("alias_class.zig");
 
-const LoadKey = alias_class.LoadKey;
+const LoadEpoch = u64;
+
+const MemCacheEntry = struct {
+    vreg: ir.VReg,
+    epoch: LoadEpoch,
+};
 
 /// Forward redundant loads within a basic block.
 ///
-/// Two alias classes are tracked in a single value-table keyed by
-/// `alias_class.LoadKey`:
+/// Two disjoint alias classes are tracked in split caches:
 ///
 ///   * `mem` — wasm linear-memory loads keyed by
 ///     `(base, offset, size, sign_extend)`. A redundant load at the
@@ -27,10 +31,11 @@ const LoadKey = alias_class.LoadKey;
 ///     `local_set j` (j ≠ i) does NOT invalidate `local: i` — wasm
 ///     locals are not aliased across distinct indices.
 ///
-/// Cross-class invalidation rules (see `alias_class.storeAliasesLoad`):
-///   * `store` invalidates only the overlapping `.mem` entries.
+/// Cross-class invalidation rules:
+///   * `store` / SIMD stores bump the memory epoch, making all older `.mem`
+///     entries stale in O(1), and never invalidate `.local` entries.
 ///   * Calls and other barriers (atomic ops, `memory_*` bulk ops)
-///     clear the entire table. Wasm semantics technically allow
+///     clear both caches. Wasm semantics technically allow
 ///     preserving `.local` entries across calls (a callee cannot
 ///     mutate the caller's locals), but we stay conservative here
 ///     until inter-procedural escape analysis lands. `forwardLocalGet`
@@ -41,55 +46,72 @@ const LoadKey = alias_class.LoadKey;
 ///
 /// Single-block scope only — cross-block forwarding is handled by
 /// `forward_redundant_loads_dominator.zig` (#391).
-pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    var value_table = std.AutoHashMap(LoadKey, ir.VReg).init(allocator);
-    defer value_table.deinit();
+fn bumpMemEpoch(
+    mem_cache: *std.AutoHashMap(alias_class.MemKey, MemCacheEntry),
+    mem_epoch: *LoadEpoch,
+) void {
+    if (mem_epoch.* == std.math.maxInt(LoadEpoch)) {
+        mem_cache.clearRetainingCapacity();
+        mem_epoch.* = 0;
+    } else {
+        mem_epoch.* += 1;
+    }
+}
 
-    var aliasing_keys: std.ArrayList(LoadKey) = .empty;
-    defer aliasing_keys.deinit(allocator);
+fn clearCaches(
+    mem_cache: *std.AutoHashMap(alias_class.MemKey, MemCacheEntry),
+    local_cache: *std.AutoHashMap(u32, ir.VReg),
+    mem_epoch: *LoadEpoch,
+) void {
+    mem_cache.clearRetainingCapacity();
+    local_cache.clearRetainingCapacity();
+    mem_epoch.* = 0;
+}
+
+pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var mem_cache = std.AutoHashMap(alias_class.MemKey, MemCacheEntry).init(allocator);
+    defer mem_cache.deinit();
+
+    var local_cache = std.AutoHashMap(u32, ir.VReg).init(allocator);
+    defer local_cache.deinit();
 
     var changed = false;
 
     for (func.blocks.items) |*block| {
-        value_table.clearRetainingCapacity();
+        var mem_epoch: LoadEpoch = 0;
+        clearCaches(&mem_cache, &local_cache, &mem_epoch);
 
         var i: usize = 0;
         while (i < block.instructions.items.len) {
             const inst = &block.instructions.items[i];
             switch (inst.op) {
                 .load => |ld| {
-                    const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(ld) };
-                    if (value_table.get(key)) |held_vreg| {
-                        if (inst.dest) |dest| {
-                            passes.replaceVReg(func, dest, held_vreg);
+                    const key = alias_class.memKeyFromLoad(ld);
+                    if (mem_cache.get(key)) |held| {
+                        if (held.epoch == mem_epoch) {
+                            if (inst.dest) |dest| {
+                                passes.replaceVReg(func, dest, held.vreg);
+                            }
+                            _ = block.instructions.orderedRemove(i);
+                            changed = true;
+                            continue;
                         }
-                        _ = block.instructions.orderedRemove(i);
-                        changed = true;
-                        continue;
                     }
                     if (inst.dest) |dest| {
-                        try value_table.put(key, dest);
+                        try mem_cache.put(key, .{ .vreg = dest, .epoch = mem_epoch });
                     }
                 },
-                .store => |st| {
-                    aliasing_keys.clearRetainingCapacity();
-                    var it = value_table.iterator();
-                    while (it.next()) |entry| {
-                        if (alias_class.storeAliasesLoad(entry.key_ptr.*, st)) {
-                            try aliasing_keys.append(allocator, entry.key_ptr.*);
-                        }
-                    }
-                    for (aliasing_keys.items) |k| _ = value_table.remove(k);
-                },
+                .store,
+                .v128_store,
+                .v128_store_lane,
+                => bumpMemEpoch(&mem_cache, &mem_epoch),
                 .local_set => |ls| {
-                    // Only invalidate this exact slot; wasm locals are
-                    // not aliased across distinct indices.
-                    _ = value_table.remove(.{ .local = ls.idx });
-                    try value_table.put(.{ .local = ls.idx }, ls.val);
+                    // Replace only this exact slot; wasm locals are not
+                    // aliased across distinct indices.
+                    try local_cache.put(ls.idx, ls.val);
                 },
                 .local_get => |idx| {
-                    const key: LoadKey = .{ .local = idx };
-                    if (value_table.get(key)) |held_vreg| {
+                    if (local_cache.get(idx)) |held_vreg| {
                         if (inst.dest) |dest| {
                             passes.replaceVReg(func, dest, held_vreg);
                         }
@@ -98,27 +120,14 @@ pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator)
                         continue;
                     }
                     if (inst.dest) |dest| {
-                        try value_table.put(key, dest);
+                        try local_cache.put(idx, dest);
                     }
                 },
-                .call,
-                .call_indirect,
-                .call_ref,
-                .atomic_load,
-                .atomic_store,
-                .atomic_rmw,
-                .atomic_cmpxchg,
-                .atomic_fence,
-                .atomic_notify,
-                .atomic_wait,
-                .memory_copy,
-                .memory_fill,
-                .memory_init,
-                .memory_grow,
-                => {
-                    value_table.clearRetainingCapacity();
+                else => {
+                    if (passes.opIsLoadBarrier(inst.op)) {
+                        clearCaches(&mem_cache, &local_cache, &mem_epoch);
+                    }
                 },
-                else => {},
             }
             i += 1;
         }

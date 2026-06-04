@@ -4,23 +4,22 @@
 //! dominator-tree walk. The algorithm (per #391):
 //!
 //!   1. DFS the dominator tree from the entry block.
-//!   2. On entry to each block, push a fresh `(LoadKey -> VReg)` map.
+//!   2. On entry to each block, push a fresh split memory/local cache frame.
 //!   3. While scanning instructions, lookups walk the stack from
 //!      innermost to outermost frame. A hit means an ancestor (or this
 //!      block) already loaded the same `(base, offset, size, sign_extend)`
 //!      and no aliasing store / call / barrier has run since.
-//!   4. Stores invalidate aliasing entries in every active frame (a
-//!      store anywhere on a dominator path kills cached values seen by
-//!      dominated blocks). Calls and barriers clear every frame fully.
+//!   4. Stores bump the memory epoch in every active frame (a store anywhere
+//!      on a dominator path kills cached memory values seen by dominated
+//!      blocks in O(1)). Calls and barriers clear every frame fully.
 //!   5. On exit from a block, pop its frame.
 //!
-//! Invalidation rules mirror `forward_redundant_loads.zig`; the `LoadKey`
-//! type lives in `alias_class.zig` and is managed by the shared driver.
+//! Invalidation rules mirror `forward_redundant_loads.zig`; memory and local
+//! cache state is managed by the shared driver in `passes.zig`.
 //!
-//! Sibling-block invariance: stores in one branch of a diamond do not
-//! propagate up into the dominator's frame (we only invalidate frames
-//! that are on the current DFS path), so the unrelated sibling-then-
-//! merge block still observes the dominator's load.
+//! Sibling-block invariance: stores only bump memory epochs in frames that are
+//! active on the current DFS path. Popped sibling frames are not revisited or
+//! mutated.
 //!
 //! Sibling-block BARRIER soundness (#719): a barrier (call / atomic /
 //! bulk-memory) on one diamond branch DOES need to wipe ancestor

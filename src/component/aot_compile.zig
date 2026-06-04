@@ -93,6 +93,9 @@ pub const PrecompileOptions = struct {
     /// `wamrc compile` path leaves it at the default 0 (which still
     /// matches `:mod=0` filters, as intended).
     module_idx: u32 = 0,
+    /// Optional pass-loop timing/progress diagnostics, normally parsed by
+    /// `wamrc` from `WAMR_AOT_PASS_TIMING*`.
+    pass_timing: passes.PassTimingOptions = .{},
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -189,6 +192,7 @@ pub fn compileCoreWasmCached(
                 .bisect = aot_bisect.global,
                 // Per-core index honoured by `:mod=N` bisect filters.
                 .module_idx = opts.module_idx,
+                .pass_timing = opts.pass_timing,
             },
         ) catch |err| {
             logVerifierFailure(err);

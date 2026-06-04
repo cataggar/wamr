@@ -5,6 +5,7 @@
 //! it made any changes (for fixpoint iteration).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
 const alias_class = @import("alias_class.zig");
@@ -13,22 +14,22 @@ const verifier = @import("verifier.zig");
 
 pub const LoadKey = alias_class.LoadKey;
 
-/// Stack of per-dominator-level load value tables, shared by
+/// Stack of per-dominator-level load value caches, shared by
 /// `commonSubexprElimination`, `globalValueNumbering`, and
 /// `forwardRedundantLoadsDominator` when handling `load` / `local_get` /
 /// `local_set` (issue #541).
 ///
-/// Each frame maps a `LoadKey` to the VReg that holds its current
-/// value at this point on the dominator path. Lookup walks top→bottom
-/// (innermost scope wins). Stores, `local_set`, and barriers (calls,
-/// atomics, bulk-memory) invalidate matching entries across every
-/// active frame.
+/// Each frame keeps split memory/local maps. Memory entries carry the
+/// frame's memory epoch from the time they were recorded; memory stores bump
+/// the epoch in every active frame instead of scanning/removing entries.
+/// Lookup walks top→bottom (innermost scope wins) and ignores memory entries
+/// whose recorded epoch no longer matches the frame epoch. `local_set`
+/// invalidates only matching local-map entries. Barriers (calls, atomics,
+/// bulk-memory) clear both maps in every active frame.
 ///
 /// Sibling-dominator-branch handling has two cases:
-///   * STORES on a sibling branch leave the dominator's frame alone
-///     — only frames on the current DFS path are invalidated. Sound
-///     because a sibling-branch store does not execute on the
-///     execution path through the other branch.
+///   * STORES bump memory epochs only in frames on the current DFS path.
+///     Popped sibling frames are not revisited or mutated.
 ///   * BARRIERS on a sibling branch must wipe ancestor frames too,
 ///     since a merge block dominated by the branch head IS reachable
 ///     via the barrier-containing branch on some execution path
@@ -37,28 +38,63 @@ pub const LoadKey = alias_class.LoadKey;
 ///     `BarrierOrderedDomChildren` so barrier subtrees are visited
 ///     before their non-barrier siblings.
 pub const LoadFrameStack = struct {
-    frames: std.ArrayList(std.AutoHashMap(LoadKey, ir.VReg)),
+    const LoadEpoch = u64;
+
+    const MemEntry = struct {
+        vreg: ir.VReg,
+        epoch: LoadEpoch,
+    };
+
+    const Frame = struct {
+        mem: std.AutoHashMap(alias_class.MemKey, MemEntry),
+        locals: std.AutoHashMap(u32, ir.VReg),
+        mem_epoch: LoadEpoch = 0,
+
+        fn init(alloc: std.mem.Allocator) Frame {
+            return .{
+                .mem = std.AutoHashMap(alias_class.MemKey, MemEntry).init(alloc),
+                .locals = std.AutoHashMap(u32, ir.VReg).init(alloc),
+            };
+        }
+
+        fn deinit(self: *Frame) void {
+            self.mem.deinit();
+            self.locals.deinit();
+        }
+
+        fn bumpMemEpoch(self: *Frame) void {
+            if (self.mem_epoch == std.math.maxInt(LoadEpoch)) {
+                self.mem.clearRetainingCapacity();
+                self.mem_epoch = 0;
+            } else {
+                self.mem_epoch += 1;
+            }
+        }
+
+        fn clearAll(self: *Frame) void {
+            self.mem.clearRetainingCapacity();
+            self.locals.clearRetainingCapacity();
+            self.mem_epoch = 0;
+        }
+    };
+
+    frames: std.ArrayList(Frame),
     alloc: std.mem.Allocator,
-    /// Scratch buffer for `invalidateMem` to avoid allocating one map's
-    /// worth of keys per store.
-    scratch: std.ArrayList(LoadKey),
 
     pub fn init(alloc: std.mem.Allocator) LoadFrameStack {
         return .{
             .frames = .empty,
             .alloc = alloc,
-            .scratch = .empty,
         };
     }
 
     pub fn deinit(self: *LoadFrameStack) void {
         for (self.frames.items) |*f| f.deinit();
         self.frames.deinit(self.alloc);
-        self.scratch.deinit(self.alloc);
     }
 
     pub fn push(self: *LoadFrameStack) !void {
-        try self.frames.append(self.alloc, std.AutoHashMap(LoadKey, ir.VReg).init(self.alloc));
+        try self.frames.append(self.alloc, Frame.init(self.alloc));
     }
 
     pub fn pop(self: *LoadFrameStack) void {
@@ -68,44 +104,56 @@ pub const LoadFrameStack = struct {
 
     /// Search top→bottom for a current binding of `key`.
     pub fn lookup(self: *LoadFrameStack, key: LoadKey) ?ir.VReg {
-        var i = self.frames.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.frames.items[i].get(key)) |v| return v;
+        switch (key) {
+            .mem => |mem_key| {
+                var i = self.frames.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const frame = &self.frames.items[i];
+                    if (frame.mem.get(mem_key)) |entry| {
+                        if (entry.epoch == frame.mem_epoch) return entry.vreg;
+                    }
+                }
+                return null;
+            },
+            .local => |idx| {
+                var i = self.frames.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.frames.items[i].locals.get(idx)) |v| return v;
+                }
+                return null;
+            },
         }
-        return null;
     }
 
     /// Add `(key -> vreg)` to the current (top) frame.
     pub fn record(self: *LoadFrameStack, key: LoadKey, vreg: ir.VReg) !void {
-        try self.frames.items[self.frames.items.len - 1].put(key, vreg);
+        const frame = &self.frames.items[self.frames.items.len - 1];
+        switch (key) {
+            .mem => |mem_key| try frame.mem.put(mem_key, .{ .vreg = vreg, .epoch = frame.mem_epoch }),
+            .local => |idx| try frame.locals.put(idx, vreg),
+        }
     }
 
-    /// Drop entries in every active frame whose `.mem` keys overlap the
-    /// store. `.local` entries are never affected.
-    pub fn invalidateMem(self: *LoadFrameStack, st: anytype) !void {
+    /// Invalidate memory entries in every active frame by bumping each frame's
+    /// memory epoch. `.local` entries are never affected.
+    pub fn invalidateMem(self: *LoadFrameStack, _: anytype) !void {
         for (self.frames.items) |*frame| {
-            self.scratch.clearRetainingCapacity();
-            var it = frame.iterator();
-            while (it.next()) |entry| {
-                if (alias_class.storeAliasesLoad(entry.key_ptr.*, st)) {
-                    try self.scratch.append(self.alloc, entry.key_ptr.*);
-                }
-            }
-            for (self.scratch.items) |k| _ = frame.remove(k);
+            frame.bumpMemEpoch();
         }
     }
 
     /// Drop `.local = idx` from every active frame.
     pub fn invalidateLocal(self: *LoadFrameStack, idx: u32) void {
         for (self.frames.items) |*frame| {
-            _ = frame.remove(.{ .local = idx });
+            _ = frame.locals.remove(idx);
         }
     }
 
     /// Coarse barrier (call, atomic, bulk-memory): clear all frames.
     pub fn clearAll(self: *LoadFrameStack) void {
-        for (self.frames.items) |*frame| frame.clearRetainingCapacity();
+        for (self.frames.items) |*frame| frame.clearAll();
     }
 };
 
@@ -251,6 +299,8 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
                             }
                         },
                         .store => |st| try load_frames.invalidateMem(st),
+                        .v128_store => |st| try load_frames.invalidateMem(alias_class.storeRangeFromV128Store(st)),
+                        .v128_store_lane => |st| try load_frames.invalidateMem(alias_class.storeRangeFromV128StoreLane(st)),
                         else => {
                             if (opIsLoadBarrier(inst.op)) load_frames.clearAll();
                         },
@@ -835,11 +885,24 @@ const BoundedVRegList = struct {
 
 /// Replace all uses of `old` VReg with `new` VReg in a function.
 pub fn replaceVReg(func: *ir.IrFunction, old: ir.VReg, new: ir.VReg) void {
+    _ = replaceVRegCount(func, old, new);
+}
+
+/// Replace all uses of `old` VReg with `new` VReg in a function.
+/// Returns the number of operand slots that were actually rewritten.
+pub fn replaceVRegCount(func: *ir.IrFunction, old: ir.VReg, new: ir.VReg) u32 {
+    if (old == new) return 0;
+
+    var replacements: u32 = 0;
     for (func.blocks.items) |*block| {
         for (block.instructions.items) |*inst| {
+            const inst_replacements = countUsesInInst(inst.*, old);
+            if (inst_replacements == 0) continue;
             replaceInInst(inst, old, new);
+            replacements += inst_replacements;
         }
     }
+    return replacements;
 }
 
 /// Count the number of operand slots in `func` that currently reference
@@ -850,11 +913,51 @@ pub fn countUsesOfVReg(func: *const ir.IrFunction, vreg: ir.VReg) u32 {
     var count: u32 = 0;
     for (func.blocks.items) |block| {
         for (block.instructions.items) |inst| {
-            for (getUsedVRegs(inst).slice()) |u| {
-                if (u == vreg) count += 1;
-            }
+            count += countUsesInInst(inst, vreg);
         }
     }
+    return count;
+}
+
+fn countVRegSliceUses(vregs: []const ir.VReg, vreg: ir.VReg) u32 {
+    var count: u32 = 0;
+    for (vregs) |u| {
+        if (u == vreg) count += 1;
+    }
+    return count;
+}
+
+fn countUsesInInst(inst: ir.Inst, vreg: ir.VReg) u32 {
+    var count: u32 = 0;
+    for (getUsedVRegs(inst).slice()) |u| {
+        if (u == vreg) count += 1;
+    }
+
+    switch (inst.op) {
+        .ret_multi => |vregs| count += countVRegSliceUses(vregs, vreg),
+        .call => |cl| count += countVRegSliceUses(cl.args, vreg),
+        .call_indirect => |ci| {
+            if (ci.elem_idx == vreg) count += 1;
+            count += countVRegSliceUses(ci.args, vreg);
+        },
+        .call_ref => |cr| {
+            if (cr.func_ref == vreg) count += 1;
+            count += countVRegSliceUses(cr.args, vreg);
+        },
+        .phi => |edges| {
+            for (edges) |edge| {
+                if (edge.val == vreg) count += 1;
+            }
+        },
+        .parallel_copy => |pairs| {
+            for (pairs) |p| {
+                if (p.src == vreg) count += 1;
+            }
+        },
+        .throw => |th| count += countVRegSliceUses(th.args, vreg),
+        else => {},
+    }
+
     return count;
 }
 
@@ -2618,8 +2721,8 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
             }
 
             if (found) |earlier_vreg| {
-                replaceVReg(ir_func, inst.dest.?, earlier_vreg);
-                return .changed;
+                const replacements = replaceVRegCount(ir_func, inst.dest.?, earlier_vreg);
+                return if (replacements > 0) .changed else .unchanged;
             }
 
             try self.table.append(self.allocator, .{ .inst = inst.*, .vreg = inst.dest.? });
@@ -2689,7 +2792,226 @@ pub const RunOptions = struct {
     /// component AOT driver (`wamrc compile-component`) passes the
     /// per-core index so `:mod=N` filters resolve correctly.
     module_idx: u32 = 0,
+    /// Optional stderr timing/progress diagnostics for the optimization
+    /// pass loop. Off by default; `wamrc` populates this from
+    /// `WAMR_AOT_PASS_TIMING*` environment variables.
+    pass_timing: PassTimingOptions = .{},
 };
+
+pub const PassTimingOptions = struct {
+    enabled: bool = false,
+    threshold_ns: u64 = 100 * std.time.ns_per_ms,
+    every_n_functions: u32 = 0,
+    module_filter: ?u32 = null,
+    func_filter: ?u32 = null,
+    log_starts: bool = false,
+
+    fn moduleMatches(self: PassTimingOptions, module_idx: u32) bool {
+        return self.module_filter == null or self.module_filter.? == module_idx;
+    }
+
+    fn functionMatches(self: PassTimingOptions, module_idx: u32, func_idx: u32) bool {
+        if (!self.enabled or !self.moduleMatches(module_idx)) return false;
+        return self.func_filter == null or self.func_filter.? == func_idx;
+    }
+
+    fn shouldLogElapsed(self: PassTimingOptions, elapsed_ns: u64) bool {
+        return self.enabled and elapsed_ns >= self.threshold_ns;
+    }
+
+    fn shouldLogFunctionProgress(self: PassTimingOptions, func_idx: u32) bool {
+        return self.enabled and self.every_n_functions != 0 and func_idx % self.every_n_functions == 0;
+    }
+};
+
+/// Parse env-gated pass timing diagnostics. `WAMR_AOT_PASS_TIMING=1`
+/// enables logging; `0`, `false`, `no`, `off`, or an empty value keep it
+/// disabled. Optional knobs:
+///
+///   - `WAMR_AOT_PASS_TIMING_THRESHOLD_MS` (default: 100)
+///   - `WAMR_AOT_PASS_TIMING_EVERY_N_FUNCS` (function progress cadence)
+///   - `WAMR_AOT_PASS_TIMING_MODULE` (component core/module index)
+///   - `WAMR_AOT_PASS_TIMING_FUNC` (local IR function index)
+///   - `WAMR_AOT_PASS_TIMING_LOG_STARTS` (emit pass/verify start lines)
+pub fn passTimingOptionsFromEnv(env: *const std.process.Environ.Map) PassTimingOptions {
+    const gate = env.get("WAMR_AOT_PASS_TIMING") orelse return .{};
+    if (!envFlagEnabled(gate)) return .{};
+
+    var out = PassTimingOptions{ .enabled = true };
+    if (parseEnvU64(env, "WAMR_AOT_PASS_TIMING_THRESHOLD_MS")) |ms| {
+        const max_ms = std.math.maxInt(u64) / std.time.ns_per_ms;
+        out.threshold_ns = if (ms > max_ms) std.math.maxInt(u64) else ms * std.time.ns_per_ms;
+    }
+    if (parseEnvU32(env, "WAMR_AOT_PASS_TIMING_EVERY_N_FUNCS")) |n| out.every_n_functions = n;
+    if (parseEnvU32(env, "WAMR_AOT_PASS_TIMING_MODULE")) |m| out.module_filter = m;
+    if (parseEnvU32(env, "WAMR_AOT_PASS_TIMING_FUNC")) |f| out.func_filter = f;
+    if (env.get("WAMR_AOT_PASS_TIMING_LOG_STARTS")) |v| out.log_starts = envFlagEnabled(v);
+    return out;
+}
+
+fn envFlagEnabled(value: []const u8) bool {
+    return value.len != 0 and
+        !std.mem.eql(u8, value, "0") and
+        !std.ascii.eqlIgnoreCase(value, "false") and
+        !std.ascii.eqlIgnoreCase(value, "no") and
+        !std.ascii.eqlIgnoreCase(value, "off");
+}
+
+fn parseEnvU64(env: *const std.process.Environ.Map, name: []const u8) ?u64 {
+    const value = env.get(name) orelse return null;
+    return std.fmt.parseInt(u64, value, 10) catch |err| {
+        std.debug.print("[aot-pass-timing] ignoring {s}={s}: {s}\n", .{ name, value, @errorName(err) });
+        return null;
+    };
+}
+
+fn parseEnvU32(env: *const std.process.Environ.Map, name: []const u8) ?u32 {
+    const value = env.get(name) orelse return null;
+    return std.fmt.parseInt(u32, value, 10) catch |err| {
+        std.debug.print("[aot-pass-timing] ignoring {s}={s}: {s}\n", .{ name, value, @errorName(err) });
+        return null;
+    };
+}
+
+const PassTimingStats = struct {
+    blocks: usize = 0,
+    instructions: usize = 0,
+};
+
+fn collectPassTimingStats(func: *const ir.IrFunction) PassTimingStats {
+    var stats = PassTimingStats{ .blocks = func.blocks.items.len };
+    for (func.blocks.items) |*block| stats.instructions += block.instructions.items.len;
+    return stats;
+}
+
+fn passTimingNowNs() u64 {
+    return switch (comptime builtin.os.tag) {
+        .linux => blk: {
+            const linux = std.os.linux;
+            var ts: linux.timespec = undefined;
+            const rc = linux.clock_gettime(.MONOTONIC, &ts);
+            if (rc != 0) return 0;
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+        .macos, .ios, .tvos, .watchos, .visionos => blk: {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+        .windows => blk: {
+            const ntdll = std.os.windows.ntdll;
+            var counter: std.os.windows.LARGE_INTEGER = undefined;
+            var freq: std.os.windows.LARGE_INTEGER = undefined;
+            _ = ntdll.RtlQueryPerformanceCounter(&counter);
+            _ = ntdll.RtlQueryPerformanceFrequency(&freq);
+            const ticks: u128 = @intCast(counter);
+            const hz: u128 = @intCast(freq);
+            break :blk @as(u64, @truncate(ticks * std.time.ns_per_s / hz));
+        },
+        else => 0,
+    };
+}
+
+fn elapsedNsSince(start_ns: u64) u64 {
+    const now_ns = passTimingNowNs();
+    return if (now_ns >= start_ns) now_ns - start_ns else 0;
+}
+
+fn printPassTiming(
+    phase: []const u8,
+    module: *const ir.IrModule,
+    module_idx: u32,
+    func: *const ir.IrFunction,
+    func_idx: u32,
+    outer_iter: u32,
+    iter: u32,
+    pass_idx: ?u32,
+    pass_name: []const u8,
+    changed: bool,
+    elapsed_ns: u64,
+    before: PassTimingStats,
+    after: PassTimingStats,
+) void {
+    var pass_idx_buf: [16]u8 = undefined;
+    const pass_idx_text = if (pass_idx) |idx|
+        std.fmt.bufPrint(&pass_idx_buf, "{d}", .{idx}) catch "?"
+    else
+        "-";
+    const func_name = func.name orelse "-";
+    const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
+    const elapsed_ms_frac = (elapsed_ns % std.time.ns_per_ms) / std.time.ns_per_us;
+    std.debug.print(
+        "[aot-pass-timing] phase={s} mod={d} local_func={d} wasm_func={d} func_name={s} outer={d} iter={d} pass={s} pass_name={s} changed={} elapsed_ms={d}.{d:0>3} blocks={d}->{d} insts={d}->{d}\n",
+        .{
+            phase,
+            module_idx,
+            func_idx,
+            module.import_count + func_idx,
+            func_name,
+            outer_iter,
+            iter,
+            pass_idx_text,
+            pass_name,
+            changed,
+            elapsed_ms,
+            elapsed_ms_frac,
+            before.blocks,
+            after.blocks,
+            before.instructions,
+            after.instructions,
+        },
+    );
+}
+
+fn maybePrintPassTiming(
+    timing: PassTimingOptions,
+    phase: []const u8,
+    module: *const ir.IrModule,
+    module_idx: u32,
+    func: *const ir.IrFunction,
+    func_idx: u32,
+    outer_iter: u32,
+    iter: u32,
+    pass_idx: ?u32,
+    pass_name: []const u8,
+    changed: bool,
+    elapsed_ns: u64,
+    before: PassTimingStats,
+) void {
+    if (!timing.shouldLogElapsed(elapsed_ns)) return;
+    printPassTiming(
+        phase,
+        module,
+        module_idx,
+        func,
+        func_idx,
+        outer_iter,
+        iter,
+        pass_idx,
+        pass_name,
+        changed,
+        elapsed_ns,
+        before,
+        collectPassTimingStats(func),
+    );
+}
+
+fn printPassTimingStart(
+    timing: PassTimingOptions,
+    phase: []const u8,
+    module: *const ir.IrModule,
+    module_idx: u32,
+    func: *const ir.IrFunction,
+    func_idx: u32,
+    outer_iter: u32,
+    iter: u32,
+    pass_idx: ?u32,
+    pass_name: []const u8,
+) void {
+    if (!timing.log_starts) return;
+    const stats = collectPassTimingStats(func);
+    printPassTiming(phase, module, module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_name, false, 0, stats, stats);
+}
 
 /// Filter that selectively skips IR optimisation passes, caps the
 /// pipeline length for specific functions, or skips the prelude passes
@@ -4198,12 +4520,26 @@ fn patchSegment(seg_first: *std.AutoHashMap(ir.VReg, SegEntry)) bool {
         };
         if (se.max_end > own_end) {
             switch (se.inst.op) {
-                .load => |*ld| ld.checked_end = se.max_end,
-                .v128_load_extend => |*ld| ld.checked_end = se.max_end,
-                .store => |*st| st.checked_end = se.max_end,
+                .load => |*ld| {
+                    if (ld.checked_end != se.max_end) {
+                        ld.checked_end = se.max_end;
+                        patched = true;
+                    }
+                },
+                .v128_load_extend => |*ld| {
+                    if (ld.checked_end != se.max_end) {
+                        ld.checked_end = se.max_end;
+                        patched = true;
+                    }
+                },
+                .store => |*st| {
+                    if (st.checked_end != se.max_end) {
+                        st.checked_end = se.max_end;
+                        patched = true;
+                    }
+                },
                 else => unreachable,
             }
-            patched = true;
         }
     }
     return patched;
@@ -6869,6 +7205,19 @@ pub fn runPassesWithOptions(
     // promise. Prelude skips are module-wide, so they keep the normal
     // two-round schedule.
     const outer_max: u32 = if (opts.bisect.hasPassPipelineFilterInModule(opts.module_idx)) 1 else 2;
+    const timing = opts.pass_timing;
+    if (timing.enabled and timing.moduleMatches(opts.module_idx)) {
+        std.debug.print(
+            "[aot-pass-timing] begin mod={d} funcs={d} passes={d} threshold_ms={d} every_n_funcs={d}\n",
+            .{
+                opts.module_idx,
+                module.functions.items.len,
+                passes.len,
+                timing.threshold_ns / std.time.ns_per_ms,
+                timing.every_n_functions,
+            },
+        );
+    }
     var outer_iter: u32 = 0;
     while (outer_iter < outer_max) : (outer_iter += 1) {
         // Module-level: inline small leaf callees. Iterate to fixpoint so
@@ -6920,6 +7269,26 @@ pub fn runPassesWithOptions(
 
         for (module.functions.items, 0..) |*func, func_idx_usize| {
             const func_idx: u32 = @intCast(func_idx_usize);
+            const timing_for_func = timing.functionMatches(opts.module_idx, func_idx);
+            const function_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+            const function_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+            if (timing_for_func and timing.shouldLogFunctionProgress(func_idx)) {
+                printPassTiming(
+                    "function-start",
+                    module,
+                    opts.module_idx,
+                    func,
+                    func_idx,
+                    outer_iter,
+                    0,
+                    null,
+                    "function",
+                    false,
+                    0,
+                    function_start_stats,
+                    function_start_stats,
+                );
+            }
             // #761: per-function verifier suppression — skipping a
             // pass (or capping the pipeline) on a function can leave
             // IR in a state that later cleanups would normalise,
@@ -6937,9 +7306,54 @@ pub fn runPassesWithOptions(
             // local_set/get inserted by inlining is handled by
             // `forwardLocalGet` + `deadLocalSetElimination`.
             if (outer_iter == 0 and !opts.bisect.skipsPromoteSSA(opts.module_idx, func_idx)) {
-                if (try promoteLocalsToSSA(func, allocator)) {
+                const pass_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                const pass_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                if (timing_for_func) {
+                    printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
+                }
+                const promote_changed = try promoteLocalsToSSA(func, allocator);
+                if (timing_for_func) {
+                    maybePrintPassTiming(
+                        timing,
+                        "pass",
+                        module,
+                        opts.module_idx,
+                        func,
+                        func_idx,
+                        outer_iter,
+                        0,
+                        null,
+                        "promoteLocalsToSSA",
+                        promote_changed,
+                        elapsedNsSince(pass_start_ns),
+                        pass_start_stats,
+                    );
+                }
+                if (promote_changed) {
                     total_changes += 1;
+                    const verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                    const verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                    if (timing_for_func) {
+                        printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
+                    }
                     try Verify.check(effective_verify_mode, "promoteLocalsToSSA", func, func_idx, allocator);
+                    if (timing_for_func) {
+                        maybePrintPassTiming(
+                            timing,
+                            "verify",
+                            module,
+                            opts.module_idx,
+                            func,
+                            func_idx,
+                            outer_iter,
+                            0,
+                            null,
+                            "promoteLocalsToSSA",
+                            false,
+                            elapsedNsSince(verify_start_ns),
+                            verify_start_stats,
+                        );
+                    }
                     if (opts.dump_hook) |hook| {
                         try hook.callback(hook.ctx, .{
                             .pass_name = "promoteLocalsToSSA",
@@ -6950,18 +7364,65 @@ pub fn runPassesWithOptions(
                             .outer_iter = outer_iter,
                         });
                     }
-                    if (!opts.bisect.skipsPhisToLocals(opts.module_idx, func_idx) and try lowerPhisToLocals(func, allocator)) {
-                        total_changes += 1;
-                        try Verify.check(effective_verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
-                        if (opts.dump_hook) |hook| {
-                            try hook.callback(hook.ctx, .{
-                                .pass_name = "lowerPhisToLocals",
-                                .func = func,
-                                .func_index = func_idx,
-                                .changed = true,
-                                .iter = 0,
-                                .outer_iter = outer_iter,
-                            });
+                    if (!opts.bisect.skipsPhisToLocals(opts.module_idx, func_idx)) {
+                        const lower_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                        const lower_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                        if (timing_for_func) {
+                            printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
+                        }
+                        const lower_changed = try lowerPhisToLocals(func, allocator);
+                        if (timing_for_func) {
+                            maybePrintPassTiming(
+                                timing,
+                                "pass",
+                                module,
+                                opts.module_idx,
+                                func,
+                                func_idx,
+                                outer_iter,
+                                0,
+                                null,
+                                "lowerPhisToLocals",
+                                lower_changed,
+                                elapsedNsSince(lower_start_ns),
+                                lower_start_stats,
+                            );
+                        }
+                        if (lower_changed) {
+                            total_changes += 1;
+                            const lower_verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                            const lower_verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                            if (timing_for_func) {
+                                printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
+                            }
+                            try Verify.check(effective_verify_mode, "lowerPhisToLocals", func, func_idx, allocator);
+                            if (timing_for_func) {
+                                maybePrintPassTiming(
+                                    timing,
+                                    "verify",
+                                    module,
+                                    opts.module_idx,
+                                    func,
+                                    func_idx,
+                                    outer_iter,
+                                    0,
+                                    null,
+                                    "lowerPhisToLocals",
+                                    false,
+                                    elapsedNsSince(lower_verify_start_ns),
+                                    lower_verify_start_stats,
+                                );
+                            }
+                            if (opts.dump_hook) |hook| {
+                                try hook.callback(hook.ctx, .{
+                                    .pass_name = "lowerPhisToLocals",
+                                    .func = func,
+                                    .func_index = func_idx,
+                                    .changed = true,
+                                    .iter = 0,
+                                    .outer_iter = outer_iter,
+                                });
+                            }
                         }
                     }
                 }
@@ -6985,17 +7446,62 @@ pub fn runPassesWithOptions(
                 for (passes[0..effective_passes_len], 0..) |pass, pass_idx_usize| {
                     const pass_idx: u32 = @intCast(pass_idx_usize);
                     if (opts.bisect.shouldSkip(opts.module_idx, func_idx, pass_idx)) continue;
+                    const pass_label = passName(pass);
+                    const pass_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                    const pass_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                    if (timing_for_func) {
+                        printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
+                    }
                     const changed = try pass(func, allocator);
+                    if (timing_for_func) {
+                        maybePrintPassTiming(
+                            timing,
+                            "pass",
+                            module,
+                            opts.module_idx,
+                            func,
+                            func_idx,
+                            outer_iter,
+                            iter,
+                            pass_idx,
+                            pass_label,
+                            changed,
+                            elapsedNsSince(pass_start_ns),
+                            pass_start_stats,
+                        );
+                    }
                     if (changed) {
                         any_changed = true;
                         total_changes += 1;
                     }
                     if (changed) {
-                        try Verify.check(effective_verify_mode, passName(pass), func, func_idx, allocator);
+                        const verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                        const verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                        if (timing_for_func) {
+                            printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
+                        }
+                        try Verify.check(effective_verify_mode, pass_label, func, func_idx, allocator);
+                        if (timing_for_func) {
+                            maybePrintPassTiming(
+                                timing,
+                                "verify",
+                                module,
+                                opts.module_idx,
+                                func,
+                                func_idx,
+                                outer_iter,
+                                iter,
+                                pass_idx,
+                                pass_label,
+                                false,
+                                elapsedNsSince(verify_start_ns),
+                                verify_start_stats,
+                            );
+                        }
                     }
                     if (opts.dump_hook) |hook| {
                         try hook.callback(hook.ctx, .{
-                            .pass_name = passName(pass),
+                            .pass_name = pass_label,
                             .func = func,
                             .func_index = func_idx,
                             .changed = changed,
@@ -7015,9 +7521,74 @@ pub fn runPassesWithOptions(
             // ops were never neutralised by `promoteLocalsToSSA`'s
             // dom-tree DFS — feeding `error.UnboundVReg` at codegen
             // (issue #620).
-            if (try scrubUnreachableBlocks(func, allocator)) {
+            const scrub_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+            const scrub_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+            if (timing_for_func) {
+                printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
+            }
+            const scrub_changed = try scrubUnreachableBlocks(func, allocator);
+            if (timing_for_func) {
+                maybePrintPassTiming(
+                    timing,
+                    "pass",
+                    module,
+                    opts.module_idx,
+                    func,
+                    func_idx,
+                    outer_iter,
+                    0,
+                    null,
+                    "scrubUnreachableBlocks",
+                    scrub_changed,
+                    elapsedNsSince(scrub_start_ns),
+                    scrub_start_stats,
+                );
+            }
+            if (scrub_changed) {
                 total_changes += 1;
+                const scrub_verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                const scrub_verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                if (timing_for_func) {
+                    printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
+                }
                 try Verify.check(effective_verify_mode, "scrubUnreachableBlocks", func, func_idx, allocator);
+                if (timing_for_func) {
+                    maybePrintPassTiming(
+                        timing,
+                        "verify",
+                        module,
+                        opts.module_idx,
+                        func,
+                        func_idx,
+                        outer_iter,
+                        0,
+                        null,
+                        "scrubUnreachableBlocks",
+                        false,
+                        elapsedNsSince(scrub_verify_start_ns),
+                        scrub_verify_start_stats,
+                    );
+                }
+            }
+            if (timing_for_func) {
+                const elapsed_ns = elapsedNsSince(function_start_ns);
+                if (timing.shouldLogElapsed(elapsed_ns) or timing.shouldLogFunctionProgress(func_idx)) {
+                    printPassTiming(
+                        "function",
+                        module,
+                        opts.module_idx,
+                        func,
+                        func_idx,
+                        outer_iter,
+                        0,
+                        null,
+                        "function",
+                        false,
+                        elapsed_ns,
+                        function_start_stats,
+                        collectPassTimingStats(func),
+                    );
+                }
             }
         }
     }
@@ -8513,6 +9084,25 @@ test "replaceVReg: updates all uses" {
     try std.testing.expectEqual(v1, add.rhs); // was already v1
 }
 
+test "replaceVRegCount: reports only actual rewritten uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    try std.testing.expectEqual(@as(u32, 1), replaceVRegCount(&func, v0, v1));
+    try std.testing.expectEqual(@as(u32, 0), replaceVRegCount(&func, v0, v1));
+}
+
 // ── Block Reordering Tests ─────────────────────────────────────────────────
 
 test "reorderBlocks: single block → identity" {
@@ -9272,6 +9862,9 @@ test "elideRedundantBoundsChecks: back-to-back loads on same base" {
     try std.testing.expectEqual(@as(u64, 8), block.instructions.items[1].op.load.checked_end);
     try std.testing.expect(block.instructions.items[2].op.load.bounds_known);
     try std.testing.expect(block.instructions.items[3].op.load.bounds_known);
+
+    const changed_again = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(!changed_again);
 }
 
 test "hoistLoopInvariantCode: pure add with invariant operands hoisted" {
@@ -13672,6 +14265,25 @@ test "GVN: cross-block load forwarded from dominator (#541)" {
     const changed = try globalValueNumbering(&func, allocator);
     try std.testing.expect(changed);
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v_dom }, func.getBlock(tail).instructions.items[0].op);
+}
+
+test "GVN: unused duplicate does not report changed" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    var block = func.getBlock(block_id);
+    const v_dom = func.newVReg();
+    const v_unused = func.newVReg();
+
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_dom, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_unused, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_dom } });
+
+    const changed = try globalValueNumbering(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 7 }, block.instructions.items[1].op);
 }
 
 test "CSE: diamond — add v0,v1 in both arms hoisted to dominator (#541)" {

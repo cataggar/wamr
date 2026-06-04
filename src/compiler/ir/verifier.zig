@@ -1685,6 +1685,36 @@ fn verifyLoadUseCleanPathsDfs(
                     );
                 }
             },
+            .v128_store => |st| {
+                if (alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128Store(st))) {
+                    return failLoadForwardingSoundness(
+                        func,
+                        func_index,
+                        load_vreg,
+                        inst.op,
+                        cur_block,
+                        @intCast(ii),
+                        path.items,
+                        use_block,
+                        can_reach_use,
+                    );
+                }
+            },
+            .v128_store_lane => |st| {
+                if (alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128StoreLane(st))) {
+                    return failLoadForwardingSoundness(
+                        func,
+                        func_index,
+                        load_vreg,
+                        inst.op,
+                        cur_block,
+                        @intCast(ii),
+                        path.items,
+                        use_block,
+                        can_reach_use,
+                    );
+                }
+            },
             else => {},
         }
         if (alias_class.opIsLoadBarrier(inst.op)) {
