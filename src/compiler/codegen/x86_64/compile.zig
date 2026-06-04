@@ -1433,7 +1433,17 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
             switch (ci.op) {
-                .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
+                .call,
+                .call_indirect,
+                .call_ref,
+                .memory_grow,
+                .table_grow,
+                .table_set,
+                .table_init,
+                .elem_drop,
+                .atomic_notify,
+                .atomic_wait,
+                => {
                     try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = x86_64_call_clobber_mask });
                 },
                 .memory_copy => |mc| {
@@ -1443,7 +1453,10 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
                 },
                 .memory_fill => |mf| {
                     if (smallFixedBulkMemLen(&const_vals, mf.len) == null) {
-                        try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = @as(u64, 1) << 3 });
+                        try clobbers.append(allocator, .{
+                            .pos = cp_pos,
+                            .regs_clobbered = x86_64_reg_clobber_mask(.rdi),
+                        });
                     }
                 },
                 else => {},
@@ -1761,6 +1774,11 @@ fn x86_64_alloc_idx(reg: emit.Reg) ?u8 {
     return null;
 }
 
+fn x86_64_reg_clobber_mask(reg: emit.Reg) u64 {
+    const idx = x86_64_alloc_idx(reg) orelse unreachable;
+    return @as(u64, 1) << @as(u6, @intCast(idx));
+}
+
 /// Hint indices for `param_regs[0..]`. Slots that map to non-allocatable
 /// registers (rcx on SysV, rcx on Win64 since param_regs[0]=rcx is
 /// non-allocatable) are null.
@@ -2062,9 +2080,19 @@ fn compileFunctionRAWithGlobalOffsets(
         for (block_order) |block_id| {
             for (func.blocks.items[block_id].instructions.items) |ci| {
                 switch (ci.op) {
-                    .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
+                    .call,
+                    .call_indirect,
+                    .call_ref,
+                    .memory_grow,
+                    .table_grow,
+                    .table_set,
+                    .table_init,
+                    .elem_drop,
+                    .atomic_notify,
+                    .atomic_wait,
+                    => {
                         // Calls clobber caller-saved allocatable regs.
-                        // memory.grow and table helpers are compiled as host calls
+                        // Runtime helpers are compiled as host calls
                         // (same ABI), so they clobber caller-saved registers.
                         try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = x86_64_call_clobber_mask });
                     },
@@ -2076,10 +2104,13 @@ fn compileFunctionRAWithGlobalOffsets(
                     },
                     .memory_fill => |mf| {
                         if (smallFixedBulkMemLen(&const_vals, mf.len) == null) {
-                            // REP STOSB clobbers rdi (index 3 in alloc_regs).
+                            // REP STOSB clobbers rdi. Keep this tied to
+                            // x86_64_alloc_regs order; a stale hard-coded
+                            // index let live vregs survive in rdi across
+                            // large memory.fill (#743).
                             try clobber_points.append(allocator, .{
                                 .pos = pos,
-                                .regs_clobbered = @as(u64, 1) << 3,
+                                .regs_clobbered = x86_64_reg_clobber_mask(.rdi),
                             });
                         }
                     },
@@ -5926,6 +5957,12 @@ test "compileFunctionRA: large memory_fill emits REP STOSB" {
 
     // Should contain REP STOSB (F3 AA)
     try std.testing.expect(containsBytes(code, &.{ 0xF3, 0xAA }));
+}
+
+test "x86_64 clobber mask for REP STOSB tracks rdi alloc index" {
+    const rdi_idx = x86_64_alloc_idx(.rdi) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(regalloc.PhysReg, @intFromEnum(emit.Reg.rdi)), x86_64_alloc_regs[rdi_idx]);
+    try std.testing.expectEqual(@as(u64, 1) << @as(u6, @intCast(rdi_idx)), x86_64_reg_clobber_mask(.rdi));
 }
 
 test "compileFunctionRA: small fixed memory_fill emits unrolled stores" {
