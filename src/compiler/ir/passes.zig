@@ -3149,6 +3149,46 @@ pub fn tailDuplicationOptionsFromEnv(env: *const std.process.Environ.Map) TailDu
     return out;
 }
 
+/// Stderr timing/progress diagnostics for the native-codegen phase
+/// (instruction selection / register allocation / emit). Mirrors
+/// `PassTimingOptions`; the codegen backends consume it via
+/// `src/compiler/codegen/timing.zig`. Off by default; `wamrc` populates
+/// it from `WAMR_AOT_CODEGEN_TIMING*` environment variables (issue #778).
+pub const CodegenTimingOptions = struct {
+    enabled: bool = false,
+    threshold_ns: u64 = 100 * std.time.ns_per_ms,
+    every_n_functions: u32 = 0,
+    module_filter: ?u32 = null,
+    func_filter: ?u32 = null,
+
+    pub fn moduleMatches(self: CodegenTimingOptions, module_idx: u32) bool {
+        return self.module_filter == null or self.module_filter.? == module_idx;
+    }
+};
+
+/// Parse env-gated codegen timing diagnostics. `WAMR_AOT_CODEGEN_TIMING=1`
+/// enables logging; `0`, `false`, `no`, `off`, or an empty value keep it
+/// disabled. Optional knobs (mirror `WAMR_AOT_PASS_TIMING*`):
+///
+///   - `WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS` (default: 100)
+///   - `WAMR_AOT_CODEGEN_TIMING_EVERY_N_FUNCS` (function progress cadence)
+///   - `WAMR_AOT_CODEGEN_TIMING_MODULE` (component core/module index)
+///   - `WAMR_AOT_CODEGEN_TIMING_FUNC` (local IR function index)
+pub fn codegenTimingOptionsFromEnv(env: *const std.process.Environ.Map) CodegenTimingOptions {
+    const gate = env.get("WAMR_AOT_CODEGEN_TIMING") orelse return .{};
+    if (!envFlagEnabled(gate)) return .{};
+
+    var out = CodegenTimingOptions{ .enabled = true };
+    if (parseEnvU64(env, "WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS")) |ms| {
+        const max_ms = std.math.maxInt(u64) / std.time.ns_per_ms;
+        out.threshold_ns = if (ms > max_ms) std.math.maxInt(u64) else ms * std.time.ns_per_ms;
+    }
+    if (parseEnvU32(env, "WAMR_AOT_CODEGEN_TIMING_EVERY_N_FUNCS")) |n| out.every_n_functions = n;
+    if (parseEnvU32(env, "WAMR_AOT_CODEGEN_TIMING_MODULE")) |m| out.module_filter = m;
+    if (parseEnvU32(env, "WAMR_AOT_CODEGEN_TIMING_FUNC")) |f| out.func_filter = f;
+    return out;
+}
+
 fn envFlagEnabled(value: []const u8) bool {
     return value.len != 0 and
         !std.mem.eql(u8, value, "0") and
@@ -14842,6 +14882,43 @@ test "tailDuplicationOptionsFromEnv parses skip caps and logging" {
     try std.testing.expectEqual(@as(usize, 123), opts.max_blocks);
     try std.testing.expectEqual(@as(usize, 456), opts.max_instructions);
     try std.testing.expectEqual(@as(usize, 789), opts.max_work);
+}
+
+test "codegenTimingOptionsFromEnv: disabled unless gate set" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    // No gate → disabled, even with knobs present.
+    try env.put("WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS", "5");
+    try std.testing.expect(!codegenTimingOptionsFromEnv(&env).enabled);
+
+    // Falsey gate values keep it disabled.
+    try env.put("WAMR_AOT_CODEGEN_TIMING", "off");
+    try std.testing.expect(!codegenTimingOptionsFromEnv(&env).enabled);
+}
+
+test "codegenTimingOptionsFromEnv: parses gate, threshold, cadence, and filters" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("WAMR_AOT_CODEGEN_TIMING", "1");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS", "250");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_EVERY_N_FUNCS", "64");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_MODULE", "4");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_FUNC", "11396");
+
+    const opts = codegenTimingOptionsFromEnv(&env);
+    try std.testing.expect(opts.enabled);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), opts.threshold_ns);
+    try std.testing.expectEqual(@as(u32, 64), opts.every_n_functions);
+    try std.testing.expectEqual(@as(?u32, 4), opts.module_filter);
+    try std.testing.expectEqual(@as(?u32, 11396), opts.func_filter);
+
+    // Module filter matching.
+    try std.testing.expect(opts.moduleMatches(4));
+    try std.testing.expect(!opts.moduleMatches(0));
 }
 
 test "tailDuplicateSmallJoins: triple predecessor with br terminator — all three duplicated" {

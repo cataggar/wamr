@@ -402,14 +402,18 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     }
     const reuse_ptr: ?*const codegen_cache.Cache = if (loaded_cache) |*c| c else null;
 
+    const codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map);
     const compiled: codegen_cache.CompileResultCached = switch (target_arch) {
-        .x86_64 => x86_64_compile.compileModuleCached(&ir_module, reuse_ptr, allocator) catch |err| {
+        .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
+            .codegen_timing = codegen_timing,
+        }) catch |err| {
             std.debug.print("Error compiling to x86-64: {}\n", .{err});
             std.process.exit(1);
         },
         .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
             .enable_scheduler = enable_aarch64_scheduler,
             .enable_xreg_alloc = enable_aarch64_xreg_alloc,
+            .codegen_timing = codegen_timing,
         }) catch |err| {
             std.debug.print("Error compiling to AArch64: {}\n", .{err});
             std.process.exit(1);
@@ -910,6 +914,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         .cache_dir = cache_dir,
         .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
         .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
+        .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
         .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
         .verify_mode = verify_mode,
     }) catch |err| {
@@ -1031,6 +1036,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
                 .target_arch = target_arch,
                 .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
                 .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
+                .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
                 .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
                 .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {
@@ -1048,6 +1054,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
                 .target_arch = target_arch,
                 .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
                 .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
+                .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
                 .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
                 .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {
@@ -1520,6 +1527,16 @@ const compile_component_usage =
     \\                                 Slow-call threshold (default: 100).
     \\  WAMR_AOT_ANALYSIS_TIMING_MODULE=<N>
     \\  WAMR_AOT_ANALYSIS_TIMING_FUNC=<N>
+    \\                                 Optional module/function filters.
+    \\  WAMR_AOT_CODEGEN_TIMING=1     Log native-codegen cost per function
+    \\                                 (x86_64: setup/liveness/regalloc/emit
+    \\                                 sub-phases + hash; module summary).
+    \\  WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS=<ms>
+    \\                                 Per-function threshold (default: 100).
+    \\  WAMR_AOT_CODEGEN_TIMING_EVERY_N_FUNCS=<N>
+    \\                                 Also log every Nth function.
+    \\  WAMR_AOT_CODEGEN_TIMING_MODULE=<N>
+    \\  WAMR_AOT_CODEGEN_TIMING_FUNC=<N>
     \\                                 Optional module/function filters.
     \\
 ;

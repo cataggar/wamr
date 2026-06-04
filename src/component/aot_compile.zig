@@ -97,6 +97,9 @@ pub const PrecompileOptions = struct {
     /// Optional analysis recomputation diagnostics, normally parsed by
     /// `wamrc` from `WAMR_AOT_ANALYSIS_TIMING*`.
     analysis_timing: passes.AnalysisTimingOptions = .{},
+    /// Optional native-codegen timing diagnostics (#778), normally parsed
+    /// by `wamrc` from `WAMR_AOT_CODEGEN_TIMING*`.
+    codegen_timing: passes.CodegenTimingOptions = .{},
     /// Tail-duplication compile-time guard/cap options.
     tail_duplication: passes.TailDuplicationOptions = .{},
     /// IR verifier mode for optimized builds. Defaults match the historical
@@ -232,9 +235,15 @@ pub fn compileCoreWasmCached(
     const module_epoch = codegen_cache.hashModuleEpoch(epoch_inputs);
 
     const compiled: codegen_cache.CompileResultCached = switch (opts.target_arch) {
-        .aarch64 => aarch64_compile.compileModuleCached(&ir_module, cache_ctx.reuse, allocator) catch
+        .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
+            .codegen_timing = opts.codegen_timing,
+            .module_idx = opts.module_idx,
+        }) catch
             return error.CoreCompileFailed,
-        .x86_64 => x86_64_compile.compileModuleCached(&ir_module, cache_ctx.reuse, allocator) catch
+        .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
+            .codegen_timing = opts.codegen_timing,
+            .module_idx = opts.module_idx,
+        }) catch
             return error.CoreCompileFailed,
     };
     const code = compiled.code;
