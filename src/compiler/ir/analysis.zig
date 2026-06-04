@@ -331,12 +331,125 @@ pub fn computeLiveness(
         });
     }
 
-    // Fixed-point iteration
+    // Predecessors drive the worklist: when a block's live_in grows, its
+    // predecessors' live_out may grow, so they must be revisited.
+    var predecessors = try buildPredecessorsFromSuccessors(func, allocator, &successors);
+    defer {
+        var it = predecessors.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    // Worklist solver for the backward liveness dataflow. Converges to the
+    // same least fixpoint as a round-robin iterate-until-stable sweep, but
+    // only re-visits blocks whose successors changed instead of rescanning
+    // every block each round (issue #778: liveness dominated codegen on
+    // functions with thousands of blocks). `computeLivenessRoundRobin` is
+    // the reference implementation a differential test pins this to.
+    const nblocks = func.blocks.items.len;
+    var in_queue = try allocator.alloc(bool, nblocks);
+    defer allocator.free(in_queue);
+    @memset(in_queue, false);
+
+    var worklist: std.ArrayList(ir.BlockId) = .empty;
+    defer worklist.deinit(allocator);
+    // Seed every block, low index first; LIFO pop then visits high index
+    // first, matching the old reverse-index sweep's first pass.
+    for (0..nblocks) |seed| {
+        const bid: ir.BlockId = @intCast(seed);
+        try worklist.append(allocator, bid);
+        in_queue[bid] = true;
+    }
+
+    while (worklist.pop()) |bid| {
+        in_queue[bid] = false;
+        const block = &func.blocks.items[bid];
+        const bl = liveness.getPtr(bid).?;
+
+        // live_out ∪= live_in[succ]  (monotone accumulate)
+        if (successors.get(bid)) |succs| {
+            for (succs) |succ_id| {
+                if (liveness.getPtr(succ_id)) |succ_bl| {
+                    var sit = succ_bl.live_in.iterator();
+                    while (sit.next()) |entry| {
+                        _ = try bl.live_out.getOrPut(entry.key_ptr.*);
+                    }
+                }
+            }
+        }
+
+        // live_in = use[B] ∪ (live_out[B] - def[B]) — recomputed by the same
+        // backward instruction walk the reference uses, so the per-block
+        // transfer function (and therefore the fixpoint) is identical.
+        var live = std.AutoHashMap(ir.VReg, void).init(allocator);
+        defer live.deinit();
+        var lit = bl.live_out.iterator();
+        while (lit.next()) |entry| try live.put(entry.key_ptr.*, {});
+
+        var inst_idx: usize = block.instructions.items.len;
+        while (inst_idx > 0) {
+            inst_idx -= 1;
+            const inst = block.instructions.items[inst_idx];
+            if (inst.dest) |dest| _ = live.remove(dest);
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| _ = live.remove(p.dst);
+            }
+            addInstUses(&live, inst);
+        }
+
+        // Merge into live_in; if it grew, revisit predecessors so their
+        // live_out picks up the new entries.
+        var grew = false;
+        var wit = live.iterator();
+        while (wit.next()) |entry| {
+            const result = try bl.live_in.getOrPut(entry.key_ptr.*);
+            if (!result.found_existing) {
+                result.value_ptr.* = {};
+                grew = true;
+            }
+        }
+        if (grew) {
+            if (predecessors.get(bid)) |preds| {
+                for (preds) |p| {
+                    if (!in_queue[p]) {
+                        in_queue[p] = true;
+                        try worklist.append(allocator, p);
+                    }
+                }
+            }
+        }
+    }
+
+    return liveness;
+}
+
+/// Reference round-robin liveness solver retained as the differential
+/// oracle for `computeLiveness` (the worklist version). Both compute the
+/// same least fixpoint of the backward liveness dataflow; this one simply
+/// sweeps every block in reverse index order until a full pass makes no
+/// change. Used by tests only — do not call from codegen.
+fn computeLivenessRoundRobin(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.BlockId, BlockLiveness) {
+    const successors = try buildSuccessors(func, allocator);
+    defer {
+        var it = successors.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        @constCast(&successors).deinit();
+    }
+
+    var liveness = std.AutoHashMap(ir.BlockId, BlockLiveness).init(allocator);
+    for (0..func.blocks.items.len) |idx| {
+        try liveness.put(@intCast(idx), .{
+            .live_in = std.AutoHashMap(ir.VReg, void).init(allocator),
+            .live_out = std.AutoHashMap(ir.VReg, void).init(allocator),
+        });
+    }
+
     var changed = true;
     while (changed) {
         changed = false;
-
-        // Process blocks in reverse order
         var block_idx: usize = func.blocks.items.len;
         while (block_idx > 0) {
             block_idx -= 1;
@@ -344,7 +457,6 @@ pub fn computeLiveness(
             const block = &func.blocks.items[block_idx];
             const bl = liveness.getPtr(bid).?;
 
-            // live_out = ∪ live_in[succ]
             if (successors.get(bid)) |succs| {
                 for (succs) |succ_id| {
                     if (liveness.getPtr(succ_id)) |succ_bl| {
@@ -360,29 +472,22 @@ pub fn computeLiveness(
                 }
             }
 
-            // live_in = use[B] ∪ (live_out[B] - def[B])
-            // Start with live_out, remove defs, add uses (backward through instructions)
             var live = std.AutoHashMap(ir.VReg, void).init(allocator);
             defer live.deinit();
-            // Copy live_out into working set
             var lit = bl.live_out.iterator();
             while (lit.next()) |entry| try live.put(entry.key_ptr.*, {});
 
-            // Walk instructions backward
             var inst_idx: usize = block.instructions.items.len;
             while (inst_idx > 0) {
                 inst_idx -= 1;
                 const inst = block.instructions.items[inst_idx];
-                // Remove def
                 if (inst.dest) |dest| _ = live.remove(dest);
                 if (inst.op == .parallel_copy) {
                     for (inst.op.parallel_copy) |p| _ = live.remove(p.dst);
                 }
-                // Add uses
                 addInstUses(&live, inst);
             }
 
-            // Update live_in if changed
             var wit = live.iterator();
             while (wit.next()) |entry| {
                 const result = try bl.live_in.getOrPut(entry.key_ptr.*);
@@ -2337,6 +2442,152 @@ test "computeLiveness: cross-block value is live" {
 
     // Block 0 should have nothing live_in (entry block)
     try std.testing.expectEqual(@as(u32, 0), liveness.get(b0).?.live_in.count());
+}
+
+fn expectLivenessEqual(
+    reference: *std.AutoHashMap(ir.BlockId, BlockLiveness),
+    actual: *std.AutoHashMap(ir.BlockId, BlockLiveness),
+) !void {
+    try std.testing.expectEqual(reference.count(), actual.count());
+    var it = reference.iterator();
+    while (it.next()) |entry| {
+        const bid = entry.key_ptr.*;
+        const ref_bl = entry.value_ptr.*;
+        const act_bl = actual.get(bid) orelse return error.MissingBlock;
+        try std.testing.expectEqual(ref_bl.live_in.count(), act_bl.live_in.count());
+        try std.testing.expectEqual(ref_bl.live_out.count(), act_bl.live_out.count());
+        var iit = ref_bl.live_in.iterator();
+        while (iit.next()) |e| try std.testing.expect(act_bl.live_in.contains(e.key_ptr.*));
+        var oit = ref_bl.live_out.iterator();
+        while (oit.next()) |e| try std.testing.expect(act_bl.live_out.contains(e.key_ptr.*));
+    }
+}
+
+fn freeLiveness(liveness: *std.AutoHashMap(ir.BlockId, BlockLiveness)) void {
+    var it = liveness.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.live_in.deinit();
+        entry.value_ptr.live_out.deinit();
+    }
+    liveness.deinit();
+}
+
+test "computeLiveness: worklist matches round-robin reference across CFG shapes" {
+    const allocator = std.testing.allocator;
+
+    // Each builder constructs a distinct CFG that stresses backward
+    // liveness propagation: a diamond merge, a natural loop with a value
+    // live across the backedge, a nested loop, and a long chain. The
+    // worklist solver must agree with the reference round-robin solver on
+    // live_in / live_out for every block.
+    const builders = [_]*const fn (std.mem.Allocator) anyerror!ir.IrFunction{
+        &buildDiamondLivenessFunc,
+        &buildLoopLivenessFunc,
+        &buildNestedLoopLivenessFunc,
+        &buildChainLivenessFunc,
+    };
+
+    for (builders) |build| {
+        var func = try build(allocator);
+        defer func.deinit();
+
+        var reference = try computeLivenessRoundRobin(&func, allocator);
+        defer freeLiveness(&reference);
+        var actual = try computeLiveness(&func, allocator);
+        defer freeLiveness(&actual);
+
+        try expectLivenessEqual(&reference, &actual);
+    }
+}
+
+fn buildDiamondLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const a = func.newVReg();
+    const c = func.newVReg();
+    const cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = c });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    const t1 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = a, .rhs = c } }, .dest = t1 });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    const t2 = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .sub = .{ .lhs = a, .rhs = c } }, .dest = t2 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = a } });
+    return func;
+}
+
+fn buildLoopLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+    const acc = func.newVReg();
+    const cond = func.newVReg();
+    // acc defined in entry, used in body and exit (live across the loop).
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 10 }, .dest = acc });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+    try func.getBlock(header).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = body, .else_block = exit } } });
+    const t = func.newVReg();
+    try func.getBlock(body).append(.{ .op = .{ .add = .{ .lhs = acc, .rhs = acc } }, .dest = t });
+    try func.getBlock(body).append(.{ .op = .{ .br = header } }); // backedge
+    try func.getBlock(exit).append(.{ .op = .{ .ret = acc } });
+    return func;
+}
+
+fn buildNestedLoopLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const entry = try func.newBlock();
+    const outer = try func.newBlock();
+    const inner = try func.newBlock();
+    const inner_body = try func.newBlock();
+    const outer_tail = try func.newBlock();
+    const exit = try func.newBlock();
+    const base = func.newVReg();
+    const c1 = func.newVReg();
+    const c2 = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 7 }, .dest = base });
+    try func.getBlock(entry).append(.{ .op = .{ .br = outer } });
+    try func.getBlock(outer).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c1 });
+    try func.getBlock(outer).append(.{ .op = .{ .br_if = .{ .cond = c1, .then_block = inner, .else_block = exit } } });
+    try func.getBlock(inner).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c2 });
+    try func.getBlock(inner).append(.{ .op = .{ .br_if = .{ .cond = c2, .then_block = inner_body, .else_block = outer_tail } } });
+    const t = func.newVReg();
+    try func.getBlock(inner_body).append(.{ .op = .{ .add = .{ .lhs = base, .rhs = base } }, .dest = t });
+    try func.getBlock(inner_body).append(.{ .op = .{ .br = inner } }); // inner backedge
+    try func.getBlock(outer_tail).append(.{ .op = .{ .br = outer } }); // outer backedge
+    try func.getBlock(exit).append(.{ .op = .{ .ret = base } });
+    return func;
+}
+
+fn buildChainLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const v = func.newVReg();
+    var prev = try func.newBlock();
+    try func.getBlock(prev).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v });
+    // Long chain so the value is live across many blocks — the case where
+    // reverse-index round-robin needs several sweeps but the worklist
+    // converges directly. Both must agree.
+    var i: u32 = 0;
+    while (i < 12) : (i += 1) {
+        const next = try func.newBlock();
+        try func.getBlock(prev).append(.{ .op = .{ .br = next } });
+        prev = next;
+    }
+    try func.getBlock(prev).append(.{ .op = .{ .ret = v } });
+    return func;
 }
 
 test "buildSuccessors: loop backedge" {
