@@ -11,6 +11,8 @@ const schedule = @import("schedule.zig");
 const coalesce_post = @import("coalesce_post.zig");
 const range_split = @import("../../ir/range_split.zig");
 const codegen_cache = @import("../../codegen_cache.zig");
+const passes = @import("../../ir/passes.zig");
+const codegen_timing = @import("../timing.zig");
 
 /// Compile-time debug flag: when true, print per-function range-split
 /// stats to stderr. Flip via `zig build -Drange-split-debug=true` after
@@ -556,6 +558,13 @@ pub const CompileOptions = struct {
     /// follow-up. Disabling this option also disables the scan on the
     /// `coalesce_post.zig` unit tests via build.zig's test step.
     enable_post_emit_coalesce: bool = true,
+    /// #778: native-codegen timing diagnostics. aarch64 reports per-function
+    /// totals + a module summary (no x86_64-style setup/liveness/regalloc
+    /// sub-phase breakdown — the #778 bottleneck is the x86_64 host path).
+    codegen_timing: passes.CodegenTimingOptions = .{},
+    /// Component core/module index, used only to match the
+    /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter.
+    module_idx: u32 = 0,
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -8371,11 +8380,31 @@ pub fn compileModuleCachedWithOptions(
 
     var stats: codegen_cache.CacheStats = .{};
 
+    // #778: codegen timing (coarse — per-function totals + module summary).
+    const ct = options.codegen_timing;
+    const ct_live = ct.enabled and ct.moduleMatches(options.module_idx);
+    const module_start_ns: u64 = if (ct_live) codegen_timing.nowNs() else 0;
+    var mod_hash_ns: u64 = 0;
+    var mod_compile_ns: u64 = 0;
+    var mod_compiled: usize = 0;
+    var mod_reused: usize = 0;
+    codegen_timing.printModuleBegin(ct, options.module_idx, func_count);
+
     for (ir_module.functions.items, 0..) |func, fi| {
         const func_base: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_base);
 
-        const ir_sha = codegen_cache.hashFunction(&func);
+        var hash_ns: u64 = 0;
+        const ir_sha = blk: {
+            if (ct_live) {
+                const t0 = codegen_timing.nowNs();
+                const sha = codegen_cache.hashFunction(&func);
+                hash_ns = codegen_timing.nowNs() -| t0;
+                mod_hash_ns += hash_ns;
+                break :blk sha;
+            }
+            break :blk codegen_cache.hashFunction(&func);
+        };
 
         var reused = false;
         var hit_code: []const u8 = undefined;
@@ -8392,6 +8421,7 @@ pub fn compileModuleCachedWithOptions(
 
         var cache_code_owned: []u8 = undefined;
         var cache_patches_owned: []codegen_cache.FuncCallPatch = undefined;
+        var compile_ns: u64 = 0;
 
         if (reused) {
             cache_code_owned = try allocator.dupe(u8, hit_code);
@@ -8405,6 +8435,7 @@ pub fn compileModuleCachedWithOptions(
                 });
             }
             stats.reused += 1;
+            mod_reused += 1;
         } else {
             var func_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
             defer func_patches.deinit(allocator);
@@ -8419,6 +8450,7 @@ pub fn compileModuleCachedWithOptions(
                 .options = options,
                 .allocator = allocator,
             };
+            const compile_t0: u64 = if (ct_live) codegen_timing.nowNs() else 0;
             const func_code = compileFunctionImpl(&func, ctx, allocator) catch |err| {
                 std.debug.print("Error compiling function {d} ({d} blocks, {d} vregs): {}\n", .{
                     fi,
@@ -8428,6 +8460,10 @@ pub fn compileModuleCachedWithOptions(
                 });
                 return err;
             };
+            if (ct_live) {
+                compile_ns = codegen_timing.nowNs() -| compile_t0;
+                mod_compile_ns += compile_ns;
+            }
 
             const new_patches = try allocator.alloc(codegen_cache.FuncCallPatch, func_patches.items.len);
             errdefer allocator.free(new_patches);
@@ -8448,6 +8484,21 @@ pub fn compileModuleCachedWithOptions(
             }
             try all_code.appendSlice(allocator, func_code);
             stats.recompiled += 1;
+            mod_compiled += 1;
+        }
+
+        if (ct_live and codegen_timing.shouldLogFunc(ct, options.module_idx, @intCast(fi), compile_ns)) {
+            // aarch64: sub-phase fields left 0 (no breakdown); emit_ms
+            // therefore equals total_ms in the line.
+            codegen_timing.printFunc(.{
+                .module_idx = options.module_idx,
+                .func_idx = @intCast(fi),
+                .blocks = func.blocks.items.len,
+                .insts = aarch64CountInstructions(&func),
+                .reused = reused,
+                .hash_ns = hash_ns,
+                .total_ns = compile_ns,
+            });
         }
 
         cache_funcs[fi] = .{
@@ -8460,6 +8511,7 @@ pub fn compileModuleCachedWithOptions(
 
     // Resolve BL patches — identical logic to
     // `compileModuleWithOptions` above.
+    const patch_t0: u64 = if (ct_live) codegen_timing.nowNs() else 0;
     for (global_call_patches.items) |p| {
         if (p.target_func_idx >= offsets.items.len) return error.BadFuncIndex;
         const target_off: i64 = @intCast(offsets.items[p.target_func_idx]);
@@ -8475,6 +8527,19 @@ pub fn compileModuleCachedWithOptions(
         const new_word: u32 = (existing & 0xFC000000) | imm26;
         std.mem.writeInt(u32, bytes, new_word, .little);
     }
+    if (ct_live) {
+        const now = codegen_timing.nowNs();
+        codegen_timing.printModuleSummary(ct, .{
+            .module_idx = options.module_idx,
+            .funcs = func_count,
+            .compiled = mod_compiled,
+            .reused = mod_reused,
+            .hash_ns = mod_hash_ns,
+            .compile_ns = mod_compile_ns,
+            .global_patch_ns = now -| patch_t0,
+            .total_ns = now -| module_start_ns,
+        });
+    }
 
     return .{
         .code = try all_code.toOwnedSlice(allocator),
@@ -8482,6 +8547,14 @@ pub fn compileModuleCachedWithOptions(
         .cache_functions = cache_funcs,
         .stats = stats,
     };
+}
+
+/// Sum of instructions across all blocks — reported in #778 codegen
+/// timing lines.
+fn aarch64CountInstructions(func: *const ir.IrFunction) usize {
+    var n: usize = 0;
+    for (func.blocks.items) |block| n += block.instructions.items.len;
+    return n;
 }
 
 // ── Register-Allocator Preparation ─────────────────────────────────────────

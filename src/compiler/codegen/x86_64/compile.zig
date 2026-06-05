@@ -11,6 +11,7 @@ const ir = @import("../../ir/ir.zig");
 const passes = @import("../../ir/passes.zig");
 const emit = @import("emit.zig");
 const codegen_cache = @import("../../codegen_cache.zig");
+const codegen_timing = @import("../timing.zig");
 
 // ── Comptime codegen-trace knobs ────────────────────────────────────────
 //
@@ -1599,6 +1600,26 @@ pub fn compileModuleCached(
     reuse: ?*const codegen_cache.Cache,
     allocator: std.mem.Allocator,
 ) !codegen_cache.CompileResultCached {
+    return compileModuleCachedWithOptions(ir_module, reuse, allocator, .{});
+}
+
+/// x86-64 codegen options. Currently only carries the issue-#778 codegen
+/// timing knobs; threaded through from `wamrc`'s `WAMR_AOT_CODEGEN_TIMING*`
+/// parsing so per-function / per-sub-phase costs can be attributed.
+pub const CompileOptions = struct {
+    codegen_timing: passes.CodegenTimingOptions = .{},
+    /// Component core/module index, used only to match the
+    /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter. Single-module
+    /// `wamrc compile` leaves it at 0.
+    module_idx: u32 = 0,
+};
+
+pub fn compileModuleCachedWithOptions(
+    ir_module: *const ir.IrModule,
+    reuse: ?*const codegen_cache.Cache,
+    allocator: std.mem.Allocator,
+    options: CompileOptions,
+) !codegen_cache.CompileResultCached {
     var all_code: std.ArrayList(u8) = .empty;
     errdefer all_code.deinit(allocator);
     var offsets: std.ArrayList(u32) = .empty;
@@ -1619,11 +1640,33 @@ pub fn compileModuleCached(
 
     var stats: codegen_cache.CacheStats = .{};
 
+    // #778: codegen timing. Off unless WAMR_AOT_CODEGEN_TIMING is set.
+    // Timing work is gated on `ct_live` so the disabled path pays nothing
+    // beyond the cheap option checks.
+    const ct = options.codegen_timing;
+    const ct_live = ct.enabled and ct.moduleMatches(options.module_idx);
+    const module_start_ns: u64 = if (ct_live) codegen_timing.nowNs() else 0;
+    var mod_hash_ns: u64 = 0;
+    var mod_compile_ns: u64 = 0;
+    var mod_compiled: usize = 0;
+    var mod_reused: usize = 0;
+    codegen_timing.printModuleBegin(ct, options.module_idx, func_count);
+
     for (ir_module.functions.items, 0..) |func, fi| {
         const func_start: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_start);
 
-        const ir_sha = codegen_cache.hashFunction(&func);
+        var hash_ns: u64 = 0;
+        const ir_sha = blk: {
+            if (ct_live) {
+                const t0 = codegen_timing.nowNs();
+                const sha = codegen_cache.hashFunction(&func);
+                hash_ns = codegen_timing.nowNs() -| t0;
+                mod_hash_ns += hash_ns;
+                break :blk sha;
+            }
+            break :blk codegen_cache.hashFunction(&func);
+        };
 
         // Cache lookup: by function position AND ir_sha256. Position
         // alone is unsafe because two same-shape modules could share
@@ -1648,6 +1691,9 @@ pub fn compileModuleCached(
         var cache_code_owned: []u8 = undefined;
         var cache_patches_owned: []codegen_cache.FuncCallPatch = undefined;
 
+        var compile_ns: u64 = 0;
+        var func_timer: ?codegen_timing.FuncTimer = null;
+
         if (reused) {
             // Dup so the new cache owns its own memory independent of
             // the `reuse` lifetime.
@@ -1662,13 +1708,21 @@ pub fn compileModuleCached(
                 });
             }
             stats.reused += 1;
+            mod_reused += 1;
         } else {
-            const result = try compileFunctionRAWithGlobalOffsets(
+            if (ct_live) func_timer = codegen_timing.FuncTimer.start();
+            const compile_t0: u64 = if (ct_live) codegen_timing.nowNs() else 0;
+            const result = try compileFunctionRAWithGlobalOffsetsTimed(
                 &func,
                 ir_module.import_count,
                 ir_module.global_offsets orelse &.{},
                 allocator,
+                if (func_timer) |*ft| ft else null,
             );
+            if (ct_live) {
+                compile_ns = codegen_timing.nowNs() -| compile_t0;
+                mod_compile_ns += compile_ns;
+            }
             // `result.code` and `result.call_patches` are owned here.
             // Convert internal CallPatch → public FuncCallPatch and
             // hand both to the cache slot.
@@ -1691,6 +1745,24 @@ pub fn compileModuleCached(
                 });
             }
             stats.recompiled += 1;
+            mod_compiled += 1;
+        }
+
+        if (ct_live) {
+            if (codegen_timing.shouldLogFunc(ct, options.module_idx, @intCast(fi), compile_ns)) {
+                codegen_timing.printFunc(.{
+                    .module_idx = options.module_idx,
+                    .func_idx = @intCast(fi),
+                    .blocks = func.blocks.items.len,
+                    .insts = countInstructions(&func),
+                    .reused = reused,
+                    .hash_ns = hash_ns,
+                    .total_ns = compile_ns,
+                    .setup_ns = if (func_timer) |ft| ft.setup_ns else 0,
+                    .liveness_ns = if (func_timer) |ft| ft.liveness_ns else 0,
+                    .regalloc_ns = if (func_timer) |ft| ft.regalloc_ns else 0,
+                });
+            }
         }
 
         cache_funcs[fi] = .{
@@ -1704,12 +1776,26 @@ pub fn compileModuleCached(
     // Inter-function PC-relative E8 patches — identical logic to
     // `compileModule` above so reused and fresh code share the same
     // resolution pass.
+    const patch_t0: u64 = if (ct_live) codegen_timing.nowNs() else 0;
     for (global_call_patches.items) |patch| {
         if (patch.target_func_idx < offsets.items.len) {
             const target_off = offsets.items[patch.target_func_idx];
             const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
             std.mem.writeInt(i32, all_code.items[patch.patch_offset..][0..4], rel, .little);
         }
+    }
+    if (ct_live) {
+        const now = codegen_timing.nowNs();
+        codegen_timing.printModuleSummary(ct, .{
+            .module_idx = options.module_idx,
+            .funcs = func_count,
+            .compiled = mod_compiled,
+            .reused = mod_reused,
+            .hash_ns = mod_hash_ns,
+            .compile_ns = mod_compile_ns,
+            .global_patch_ns = now -| patch_t0,
+            .total_ns = now -| module_start_ns,
+        });
     }
 
     return .{
@@ -1718,6 +1804,14 @@ pub fn compileModuleCached(
         .cache_functions = cache_funcs,
         .stats = stats,
     };
+}
+
+/// Sum of instructions across all blocks — reported in codegen timing
+/// lines so monster functions are easy to spot (#778).
+fn countInstructions(func: *const ir.IrFunction) usize {
+    var n: usize = 0;
+    for (func.blocks.items) |block| n += block.instructions.items.len;
+    return n;
 }
 
 pub const CompileResultCached = codegen_cache.CompileResultCached;
@@ -2055,7 +2149,23 @@ fn compileFunctionRAWithGlobalOffsets(
     global_offsets: []const u32,
     allocator: std.mem.Allocator,
 ) !FuncCompileResult {
+    return compileFunctionRAWithGlobalOffsetsTimed(func, import_count, global_offsets, allocator, null);
+}
+
+/// #778: same as `compileFunctionRAWithGlobalOffsets`, but records the
+/// contiguous setup / liveness / regalloc spans into `timer` when codegen
+/// timing is live. `timer == null` is the normal (untimed) path.
+fn compileFunctionRAWithGlobalOffsetsTimed(
+    func: *const ir.IrFunction,
+    import_count: u32,
+    global_offsets: []const u32,
+    allocator: std.mem.Allocator,
+    timer: ?*codegen_timing.FuncTimer,
+) !FuncCompileResult {
     if (functionUsesV128(func)) return error.UnsupportedV128;
+
+    // Setup span: block ordering + const-fold table + clobber/hint walk.
+    if (timer) |t| t.begin();
 
     // Compute block emission order ONCE, before anything that uses global
     // instruction numbering. Clobber points, live ranges, and code emission
@@ -2186,8 +2296,12 @@ fn compileFunctionRAWithGlobalOffsets(
     }
 
     // Compute live ranges using the SAME block_order, then allocate registers.
+    if (timer) |t| t.end(.setup);
+    if (timer) |t| t.begin();
     const live_ranges = try analysis.computeLiveRangesWithOrder(func, block_order, allocator);
     defer allocator.free(live_ranges);
+    if (timer) |t| t.end(.liveness);
+    if (timer) |t| t.begin();
     var alloc_result = try regalloc.allocateFromRangesWithHints(
         allocator,
         x86_64_reg_set(func.local_count),
@@ -2196,7 +2310,10 @@ fn compileFunctionRAWithGlobalOffsets(
         hint_points.items,
     );
     defer alloc_result.deinit();
-
+    if (timer) |t| t.end(.regalloc);
+    // Everything below (used-register scans + emit loop + branch/table/
+    // call patch resolution + toOwnedSlice) is attributed to the derived
+    // `emit` bucket (total − setup − liveness − regalloc).
     // Compute which caller-saved registers are actually used by this function.
     // Only these need to be saved/restored around call sites.
     var used_caller_saved: [caller_saved_alloc.len]bool = .{false} ** caller_saved_alloc.len;
@@ -5204,6 +5321,67 @@ test "compileModuleCached: no reuse produces same bytes as compileModule" {
     try std.testing.expectEqual(@as(u32, 0), cached.stats.reused);
     try std.testing.expectEqual(@as(u32, 2), cached.stats.recompiled);
     try std.testing.expectEqual(@as(usize, 2), cached.cache_functions.len);
+}
+
+test "compileModuleCachedWithOptions: codegen timing is non-invasive (byte-identical)" {
+    // #778: enabling WAMR_AOT_CODEGEN_TIMING must not perturb the emitted
+    // code. Compile the same module untimed and with timing enabled
+    // (threshold 0 → every function takes the logging branch) and require
+    // byte-identical code + offsets.
+    const allocator = std.testing.allocator;
+    var m_plain = try buildTwoFnAddModule(allocator);
+    defer m_plain.deinit();
+    var m_timed = try buildTwoFnAddModule(allocator);
+    defer m_timed.deinit();
+
+    const plain = try compileModuleCached(&m_plain, null, allocator);
+    defer allocator.free(plain.code);
+    defer allocator.free(plain.offsets);
+    defer freeCachedFuncs(allocator, plain.cache_functions);
+
+    const timed = try compileModuleCachedWithOptions(&m_timed, null, allocator, .{
+        .codegen_timing = .{ .enabled = true, .threshold_ns = 0 },
+    });
+    defer allocator.free(timed.code);
+    defer allocator.free(timed.offsets);
+    defer freeCachedFuncs(allocator, timed.cache_functions);
+
+    try std.testing.expectEqualSlices(u8, plain.code, timed.code);
+    try std.testing.expectEqualSlices(u32, plain.offsets, timed.offsets);
+    try std.testing.expectEqual(plain.stats.recompiled, timed.stats.recompiled);
+}
+
+test "codegen timing: shouldLogFunc gating and FuncTimer partition" {
+    const opts: passes.CodegenTimingOptions = .{
+        .enabled = true,
+        .threshold_ns = 100 * std.time.ns_per_ms,
+        .every_n_functions = 8,
+        .module_filter = 2,
+        .func_filter = 5,
+    };
+    // Disabled options never log.
+    try std.testing.expect(!codegen_timing.shouldLogFunc(.{}, 2, 5, std.math.maxInt(u64)));
+    // Wrong module is filtered out regardless of cost.
+    try std.testing.expect(!codegen_timing.shouldLogFunc(opts, 0, 5, std.math.maxInt(u64)));
+    // Matching func_filter logs even under threshold.
+    try std.testing.expect(codegen_timing.shouldLogFunc(opts, 2, 5, 0));
+    // every-N cadence logs (func 16 is a multiple of 8) under threshold.
+    try std.testing.expect(codegen_timing.shouldLogFunc(opts, 2, 16, 0));
+    // Otherwise gated on the threshold.
+    try std.testing.expect(!codegen_timing.shouldLogFunc(opts, 2, 3, 1));
+    try std.testing.expect(codegen_timing.shouldLogFunc(opts, 2, 3, 100 * std.time.ns_per_ms));
+
+    // FuncTimer accumulates the three named spans independently.
+    var ft = codegen_timing.FuncTimer.start();
+    try std.testing.expectEqual(@as(u64, 0), ft.setup_ns);
+    ft.begin();
+    ft.end(.setup);
+    // Recording `setup` must not touch the other two accumulators.
+    try std.testing.expectEqual(@as(u64, 0), ft.liveness_ns);
+    try std.testing.expectEqual(@as(u64, 0), ft.regalloc_ns);
+    ft.begin();
+    ft.end(.liveness);
+    try std.testing.expectEqual(@as(u64, 0), ft.regalloc_ns);
 }
 
 test "compileModuleCached: warm cache reuses every function (byte-identical)" {

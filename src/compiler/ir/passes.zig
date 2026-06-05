@@ -3149,6 +3149,46 @@ pub fn tailDuplicationOptionsFromEnv(env: *const std.process.Environ.Map) TailDu
     return out;
 }
 
+/// Stderr timing/progress diagnostics for the native-codegen phase
+/// (instruction selection / register allocation / emit). Mirrors
+/// `PassTimingOptions`; the codegen backends consume it via
+/// `src/compiler/codegen/timing.zig`. Off by default; `wamrc` populates
+/// it from `WAMR_AOT_CODEGEN_TIMING*` environment variables (issue #778).
+pub const CodegenTimingOptions = struct {
+    enabled: bool = false,
+    threshold_ns: u64 = 100 * std.time.ns_per_ms,
+    every_n_functions: u32 = 0,
+    module_filter: ?u32 = null,
+    func_filter: ?u32 = null,
+
+    pub fn moduleMatches(self: CodegenTimingOptions, module_idx: u32) bool {
+        return self.module_filter == null or self.module_filter.? == module_idx;
+    }
+};
+
+/// Parse env-gated codegen timing diagnostics. `WAMR_AOT_CODEGEN_TIMING=1`
+/// enables logging; `0`, `false`, `no`, `off`, or an empty value keep it
+/// disabled. Optional knobs (mirror `WAMR_AOT_PASS_TIMING*`):
+///
+///   - `WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS` (default: 100)
+///   - `WAMR_AOT_CODEGEN_TIMING_EVERY_N_FUNCS` (function progress cadence)
+///   - `WAMR_AOT_CODEGEN_TIMING_MODULE` (component core/module index)
+///   - `WAMR_AOT_CODEGEN_TIMING_FUNC` (local IR function index)
+pub fn codegenTimingOptionsFromEnv(env: *const std.process.Environ.Map) CodegenTimingOptions {
+    const gate = env.get("WAMR_AOT_CODEGEN_TIMING") orelse return .{};
+    if (!envFlagEnabled(gate)) return .{};
+
+    var out = CodegenTimingOptions{ .enabled = true };
+    if (parseEnvU64(env, "WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS")) |ms| {
+        const max_ms = std.math.maxInt(u64) / std.time.ns_per_ms;
+        out.threshold_ns = if (ms > max_ms) std.math.maxInt(u64) else ms * std.time.ns_per_ms;
+    }
+    if (parseEnvU32(env, "WAMR_AOT_CODEGEN_TIMING_EVERY_N_FUNCS")) |n| out.every_n_functions = n;
+    if (parseEnvU32(env, "WAMR_AOT_CODEGEN_TIMING_MODULE")) |m| out.module_filter = m;
+    if (parseEnvU32(env, "WAMR_AOT_CODEGEN_TIMING_FUNC")) |f| out.func_filter = f;
+    return out;
+}
+
 fn envFlagEnabled(value: []const u8) bool {
     return value.len != 0 and
         !std.mem.eql(u8, value, "0") and
@@ -6292,14 +6332,19 @@ fn shiftBlockIdsInInst(inst: *ir.Inst, offset: ir.BlockId) void {
 /// result, its (single) `ret` value is translated through local renames
 /// (to cover the `local.get; ret` identity case) and the call's dest is
 /// rewritten to it.
-fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator) !u32 {
+fn inlineSmallFunctionsCount(
+    module: *ir.IrModule,
+    allocator: std.mem.Allocator,
+    inlined_callers: ?*std.DynamicBitSet,
+) !u32 {
+    if (inlined_callers) |dirty| std.debug.assert(dirty.capacity() == module.functions.items.len);
+
     var eligible = try allocator.alloc(bool, module.functions.items.len);
     defer allocator.free(eligible);
     for (module.functions.items, 0..) |*f, i| eligible[i] = isInlinable(f, inline_small_max_insts, inline_small_max_blocks);
 
-    var caller_changed = try allocator.alloc(bool, module.functions.items.len);
-    defer allocator.free(caller_changed);
-    @memset(caller_changed, false);
+    var caller_changed = try std.DynamicBitSet.initEmpty(allocator, module.functions.items.len);
+    defer caller_changed.deinit();
 
     var inlined_count: u32 = 0;
     for (module.functions.items, 0..) |*caller, caller_idx| {
@@ -6529,7 +6574,8 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
             // can no longer free its args slice; release it here.
             if (call_args.len > 0) caller.allocator.free(call_args);
 
-            caller_changed[caller_idx] = true;
+            caller_changed.set(caller_idx);
+            if (inlined_callers) |dirty| dirty.set(caller_idx);
             inlined_count += 1;
         }
     }
@@ -6542,13 +6588,13 @@ fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator)
     // touched so the IR verifier (check 6, `MissingPredecessor` /
     // `StalePredecessor`) sees a consistent view. See issue #630.
     for (module.functions.items, 0..) |*f, i| {
-        if (caller_changed[i]) try analysis.refreshBlockPredecessors(f, allocator);
+        if (caller_changed.isSet(i)) try analysis.refreshBlockPredecessors(f, allocator);
     }
     return inlined_count;
 }
 
 pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) !bool {
-    return (try inlineSmallFunctionsCount(module, allocator)) != 0;
+    return (try inlineSmallFunctionsCount(module, allocator, null)) != 0;
 }
 
 // ── SSA Promotion (mem2reg) ─────────────────────────────────────────────
@@ -7768,6 +7814,16 @@ pub fn runPassesWithOptions(
     allocator: std.mem.Allocator,
     opts: RunOptions,
 ) !u32 {
+    return runPassesWithOptionsScoped(module, passes, allocator, opts, true);
+}
+
+fn runPassesWithOptionsScoped(
+    module: *ir.IrModule,
+    passes: []const PassFn,
+    allocator: std.mem.Allocator,
+    opts: RunOptions,
+    scope_outer_after_inlining: bool,
+) !u32 {
     var total_changes: u32 = 0;
     const previous_analysis_timing = analysis.setTimingOptions(opts.analysis_timing);
     defer _ = analysis.setTimingOptions(previous_analysis_timing);
@@ -7848,8 +7904,13 @@ pub fn runPassesWithOptions(
             },
         );
     }
+    var inlined_callers = try std.DynamicBitSet.initEmpty(allocator, module.functions.items.len);
+    defer inlined_callers.deinit();
+
     var outer_iter: u32 = 0;
     while (outer_iter < outer_max) : (outer_iter += 1) {
+        inlined_callers.setRangeValue(.{ .start = 0, .end = module.functions.items.len }, false);
+
         // Module-level: inline small leaf callees. Iterate to fixpoint so
         // callers of callers also benefit within a single outer round.
         var inline_iter: u32 = 0;
@@ -7863,7 +7924,7 @@ pub fn runPassesWithOptions(
                         .pass_name = "inlineSmallFunctions",
                     });
                     defer timing_context.deinit();
-                    break :blk try inlineSmallFunctionsCount(module, allocator);
+                    break :blk try inlineSmallFunctionsCount(module, allocator, &inlined_callers);
                 };
                 if (iter_inlined == 0) break;
                 inlined_count += iter_inlined;
@@ -7907,6 +7968,13 @@ pub fn runPassesWithOptions(
 
         for (module.functions.items, 0..) |*func, func_idx_usize| {
             const func_idx: u32 = @intCast(func_idx_usize);
+            if (scope_outer_after_inlining and outer_iter >= 1 and !inlined_callers.isSet(func_idx_usize)) {
+                // The outer >0 per-function round exists only to clean up IR
+                // exposed by inlining in this same outer round. Inlining mutates
+                // caller bodies only; callees used as inline sources and unrelated
+                // functions have no new per-function opportunities to settle.
+                continue;
+            }
             const timing_for_func = timing.functionMatches(opts.module_idx, func_idx);
             const function_start_ns = if (timing_for_func) passTimingNowNs() else 0;
             const function_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
@@ -12413,6 +12481,120 @@ test "runPasses: non-matching mod filter preserves second inlining round" {
     }
 }
 
+fn outerScopeBuildDelayedInlineModule(allocator: std.mem.Allocator) !ir.IrModule {
+    var module = ir.IrModule.init(allocator);
+    errdefer module.deinit();
+
+    // f0 starts too large (and with two returns) to inline. The first
+    // per-function round folds its constant branch and scrubs the now-dead
+    // large block, making f0 eligible for the second outer inlining round.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    {
+        const f = &module.functions.items[0];
+        const entry = try f.newBlock();
+        const dead = try f.newBlock();
+        const done = try f.newBlock();
+
+        const v_cond = f.newVReg();
+        try f.getBlock(entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_cond, .type = .i32 });
+        try f.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = dead, .else_block = done } } });
+
+        var i: u32 = 0;
+        while (i < inline_small_max_insts) : (i += 1) {
+            const v_pad = f.newVReg();
+            try f.getBlock(dead).append(.{ .op = .{ .iconst_32 = @intCast(i) }, .dest = v_pad, .type = .i32 });
+        }
+        const v_dead = f.newVReg();
+        try f.getBlock(dead).append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_dead, .type = .i32 });
+        try f.getBlock(dead).append(.{ .op = .{ .ret = v_dead } });
+
+        const v_ret = f.newVReg();
+        try f.getBlock(done).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_ret, .type = .i32 });
+        try f.getBlock(done).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    // f1 is the only caller changed by the second outer round.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    {
+        const f = &module.functions.items[1];
+        const entry = try f.newBlock();
+        const v_call = f.newVReg();
+        try f.getBlock(entry).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+        try f.getBlock(entry).append(.{ .op = .{ .ret = v_call } });
+    }
+
+    // f2 is independent and should not be revisited in outer_iter == 1.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    {
+        const f = &module.functions.items[2];
+        const entry = try f.newBlock();
+        const v_ret = f.newVReg();
+        try f.getBlock(entry).append(.{ .op = .{ .iconst_32 = 11 }, .dest = v_ret, .type = .i32 });
+        try f.getBlock(entry).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    return module;
+}
+
+fn outerScopeFunctionHasCall(func: *const ir.IrFunction) bool {
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .call) return true;
+        }
+    }
+    return false;
+}
+
+fn outerScopeExpectSameIr(expected: *const ir.IrModule, actual: *const ir.IrModule) !void {
+    try std.testing.expectEqual(expected.functions.items.len, actual.functions.items.len);
+    for (expected.functions.items, actual.functions.items) |expected_func, actual_func| {
+        try std.testing.expectEqual(expected_func.param_count, actual_func.param_count);
+        try std.testing.expectEqual(expected_func.result_count, actual_func.result_count);
+        try std.testing.expectEqual(expected_func.local_count, actual_func.local_count);
+        try std.testing.expectEqual(expected_func.next_vreg, actual_func.next_vreg);
+        try std.testing.expectEqual(expected_func.blocks.items.len, actual_func.blocks.items.len);
+        for (expected_func.blocks.items, actual_func.blocks.items) |expected_block, actual_block| {
+            try std.testing.expectEqual(expected_block.id, actual_block.id);
+            try std.testing.expectEqual(expected_block.instructions.items.len, actual_block.instructions.items.len);
+            for (expected_block.instructions.items, actual_block.instructions.items) |expected_inst, actual_inst| {
+                try std.testing.expectEqualDeep(expected_inst, actual_inst);
+            }
+        }
+    }
+}
+
+const OuterScopeDumpStats = struct {
+    outer1_fold_constant_branches: [3]u32 = .{ 0, 0, 0 },
+
+    fn callback(ctx: *anyopaque, info: DumpInfo) anyerror!void {
+        const stats: *OuterScopeDumpStats = @ptrCast(@alignCast(ctx));
+        if (info.outer_iter == 1 and std.mem.eql(u8, info.pass_name, "foldConstantBranches")) {
+            stats.outer1_fold_constant_branches[@intCast(info.func_index)] += 1;
+        }
+    }
+};
+
+test "runPasses: second outer round only revisits callers changed by inlining" {
+    const allocator = std.testing.allocator;
+    var scoped = try outerScopeBuildDelayedInlineModule(allocator);
+    defer scoped.deinit();
+    var full = try outerScopeBuildDelayedInlineModule(allocator);
+    defer full.deinit();
+
+    const test_passes = [_]PassFn{&foldConstantBranches};
+    var stats = OuterScopeDumpStats{};
+    _ = try runPassesWithOptionsScoped(&scoped, &test_passes, allocator, .{
+        .dump_hook = .{ .ctx = &stats, .callback = OuterScopeDumpStats.callback },
+    }, true);
+    _ = try runPassesWithOptionsScoped(&full, &test_passes, allocator, .{}, false);
+
+    try outerScopeExpectSameIr(&full, &scoped);
+    try std.testing.expect(!outerScopeFunctionHasCall(&scoped.functions.items[1]));
+    try std.testing.expectEqual(@as(u32, 0), stats.outer1_fold_constant_branches[0]);
+    try std.testing.expect(stats.outer1_fold_constant_branches[1] > 0);
+    try std.testing.expectEqual(@as(u32, 0), stats.outer1_fold_constant_branches[2]);
+}
+
 test "foldConstantBranches: zero cond picks else block" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 0);
@@ -14842,6 +15024,43 @@ test "tailDuplicationOptionsFromEnv parses skip caps and logging" {
     try std.testing.expectEqual(@as(usize, 123), opts.max_blocks);
     try std.testing.expectEqual(@as(usize, 456), opts.max_instructions);
     try std.testing.expectEqual(@as(usize, 789), opts.max_work);
+}
+
+test "codegenTimingOptionsFromEnv: disabled unless gate set" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    // No gate → disabled, even with knobs present.
+    try env.put("WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS", "5");
+    try std.testing.expect(!codegenTimingOptionsFromEnv(&env).enabled);
+
+    // Falsey gate values keep it disabled.
+    try env.put("WAMR_AOT_CODEGEN_TIMING", "off");
+    try std.testing.expect(!codegenTimingOptionsFromEnv(&env).enabled);
+}
+
+test "codegenTimingOptionsFromEnv: parses gate, threshold, cadence, and filters" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("WAMR_AOT_CODEGEN_TIMING", "1");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS", "250");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_EVERY_N_FUNCS", "64");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_MODULE", "4");
+    try env.put("WAMR_AOT_CODEGEN_TIMING_FUNC", "11396");
+
+    const opts = codegenTimingOptionsFromEnv(&env);
+    try std.testing.expect(opts.enabled);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), opts.threshold_ns);
+    try std.testing.expectEqual(@as(u32, 64), opts.every_n_functions);
+    try std.testing.expectEqual(@as(?u32, 4), opts.module_filter);
+    try std.testing.expectEqual(@as(?u32, 11396), opts.func_filter);
+
+    // Module filter matching.
+    try std.testing.expect(opts.moduleMatches(4));
+    try std.testing.expect(!opts.moduleMatches(0));
 }
 
 test "tailDuplicateSmallJoins: triple predecessor with br terminator — all three duplicated" {
