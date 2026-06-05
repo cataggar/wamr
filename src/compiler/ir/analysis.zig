@@ -351,38 +351,72 @@ pub fn computeLiveness(
     defer allocator.free(in_queue);
     @memset(in_queue, false);
 
+    // Tracks whether a block's transfer has run at least once. The first
+    // visit must always recompute live_in (to seed use[B]); on later visits
+    // an unchanged live_out means live_in cannot change, so the transfer
+    // walk can be skipped (issue #782).
+    var visited = try allocator.alloc(bool, nblocks);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
     var worklist: std.ArrayList(ir.BlockId) = .empty;
     defer worklist.deinit(allocator);
-    // Seed every block, low index first; LIFO pop then visits high index
-    // first, matching the old reverse-index sweep's first pass.
-    for (0..nblocks) |seed| {
-        const bid: ir.BlockId = @intCast(seed);
-        try worklist.append(allocator, bid);
-        in_queue[bid] = true;
+    // Seed in reverse-postorder of the forward CFG so the LIFO worklist pops
+    // blocks in postorder — each block after its successors — the order that
+    // lets a backward-liveness sweep propagate furthest before re-enqueues,
+    // minimizing total block visits to converge (issue #782). Seed order
+    // only affects convergence speed, never the fixpoint (pinned by the
+    // `computeLivenessRoundRobin` differential test).
+    {
+        const postorder = try forwardPostorder(func, allocator, &successors);
+        defer allocator.free(postorder);
+        var i: usize = postorder.len;
+        while (i > 0) {
+            i -= 1;
+            const bid = postorder[i];
+            try worklist.append(allocator, bid);
+            in_queue[bid] = true;
+        }
     }
+
+    // Single reusable scratch set for the per-block transfer, cleared (not
+    // freed) each visit to avoid allocator churn on the hot path (issue #782).
+    var live = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer live.deinit();
 
     while (worklist.pop()) |bid| {
         in_queue[bid] = false;
         const block = &func.blocks.items[bid];
         const bl = liveness.getPtr(bid).?;
 
-        // live_out ∪= live_in[succ]  (monotone accumulate)
+        // live_out ∪= live_in[succ]  (monotone accumulate); note whether the
+        // union added anything new.
+        var live_out_grew = false;
         if (successors.get(bid)) |succs| {
             for (succs) |succ_id| {
                 if (liveness.getPtr(succ_id)) |succ_bl| {
                     var sit = succ_bl.live_in.iterator();
                     while (sit.next()) |entry| {
-                        _ = try bl.live_out.getOrPut(entry.key_ptr.*);
+                        const result = try bl.live_out.getOrPut(entry.key_ptr.*);
+                        if (!result.found_existing) {
+                            result.value_ptr.* = {};
+                            live_out_grew = true;
+                        }
                     }
                 }
             }
         }
 
+        // live_in depends only on live_out and the fixed use/def of this
+        // block, so once the block has been visited an unchanged live_out
+        // means live_in cannot change — skip the transfer walk entirely.
+        if (visited[bid] and !live_out_grew) continue;
+        visited[bid] = true;
+
         // live_in = use[B] ∪ (live_out[B] - def[B]) — recomputed by the same
         // backward instruction walk the reference uses, so the per-block
         // transfer function (and therefore the fixpoint) is identical.
-        var live = std.AutoHashMap(ir.VReg, void).init(allocator);
-        defer live.deinit();
+        live.clearRetainingCapacity();
         var lit = bl.live_out.iterator();
         while (lit.next()) |entry| try live.put(entry.key_ptr.*, {});
 
@@ -421,6 +455,57 @@ pub fn computeLiveness(
     }
 
     return liveness;
+}
+
+/// Compute a postorder of the forward CFG covering every block (length
+/// `func.blocks.items.len`). A DFS is started from the entry block and then
+/// from any still-unvisited block, in index order, so unreachable components
+/// are included deterministically. Iterative (explicit stack) because IR
+/// functions can have tens of thousands of blocks. Used only to seed the
+/// liveness worklist; ordering affects convergence speed, not the result.
+fn forwardPostorder(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+    successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+) ![]ir.BlockId {
+    const nblocks = func.blocks.items.len;
+    const order = try allocator.alloc(ir.BlockId, nblocks);
+    errdefer allocator.free(order);
+    if (nblocks == 0) return order;
+
+    var visited = try allocator.alloc(bool, nblocks);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    const Frame = struct { bid: ir.BlockId, next: usize };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+
+    var count: usize = 0;
+    for (0..nblocks) |start| {
+        if (visited[start]) continue;
+        visited[start] = true;
+        try stack.append(allocator, .{ .bid = @intCast(start), .next = 0 });
+        while (stack.items.len > 0) {
+            const ti = stack.items.len - 1;
+            const bid = stack.items[ti].bid;
+            const succs: []const ir.BlockId = successors.get(bid) orelse &[_]ir.BlockId{};
+            if (stack.items[ti].next < succs.len) {
+                const succ = succs[stack.items[ti].next];
+                stack.items[ti].next += 1;
+                if (succ < nblocks and !visited[succ]) {
+                    visited[succ] = true;
+                    try stack.append(allocator, .{ .bid = succ, .next = 0 });
+                }
+            } else {
+                order[count] = bid;
+                count += 1;
+                _ = stack.pop();
+            }
+        }
+    }
+    std.debug.assert(count == nblocks);
+    return order;
 }
 
 /// Reference round-robin liveness solver retained as the differential
@@ -2485,6 +2570,10 @@ test "computeLiveness: worklist matches round-robin reference across CFG shapes"
         &buildLoopLivenessFunc,
         &buildNestedLoopLivenessFunc,
         &buildChainLivenessFunc,
+        &buildUnreachableBlockLivenessFunc,
+        &buildUnreachableIntoReachableLivenessFunc,
+        &buildMultiExitLivenessFunc,
+        &buildSelfLoopLivenessFunc,
     };
 
     for (builders) |build| {
@@ -2587,6 +2676,83 @@ fn buildChainLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
         prev = next;
     }
     try func.getBlock(prev).append(.{ .op = .{ .ret = v } });
+    return func;
+}
+
+fn buildUnreachableBlockLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const entry = try func.newBlock();
+    const exit = try func.newBlock();
+    // Unreachable block with no predecessors; both solvers must still
+    // compute its liveness from its own instructions.
+    const unreachable_block = try func.newBlock();
+    const v = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v });
+    try func.getBlock(entry).append(.{ .op = .{ .br = exit } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = v } });
+    const w = func.newVReg();
+    const t = func.newVReg();
+    try func.getBlock(unreachable_block).append(.{ .op = .{ .iconst_32 = 9 }, .dest = w });
+    try func.getBlock(unreachable_block).append(.{ .op = .{ .add = .{ .lhs = w, .rhs = w } }, .dest = t });
+    try func.getBlock(unreachable_block).append(.{ .op = .{ .ret = t } });
+    return func;
+}
+
+fn buildUnreachableIntoReachableLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const entry = try func.newBlock();
+    const mid = try func.newBlock();
+    // Unreachable block that branches into a reachable block: `mid` lists it
+    // as a predecessor, so when `mid.live_in` grows the worklist must
+    // re-enqueue the unreachable block to grow its `live_out`.
+    const unreachable_block = try func.newBlock();
+    const a = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 3 }, .dest = a });
+    try func.getBlock(entry).append(.{ .op = .{ .br = mid } });
+    try func.getBlock(mid).append(.{ .op = .{ .ret = a } });
+    const b = func.newVReg();
+    try func.getBlock(unreachable_block).append(.{ .op = .{ .iconst_32 = 4 }, .dest = b });
+    try func.getBlock(unreachable_block).append(.{ .op = .{ .br = mid } });
+    return func;
+}
+
+fn buildMultiExitLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const entry = try func.newBlock();
+    const e1 = try func.newBlock();
+    const e2 = try func.newBlock();
+    const x = func.newVReg();
+    const cond = func.newVReg();
+    // x is live into e1 (ret x) but not e2 — the two exits diverge.
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 8 }, .dest = x });
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = e1, .else_block = e2 } } });
+    try func.getBlock(e1).append(.{ .op = .{ .ret = x } });
+    const y = func.newVReg();
+    try func.getBlock(e2).append(.{ .op = .{ .iconst_32 = 2 }, .dest = y });
+    try func.getBlock(e2).append(.{ .op = .{ .ret = y } });
+    return func;
+}
+
+fn buildSelfLoopLivenessFunc(allocator: std.mem.Allocator) !ir.IrFunction {
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    errdefer func.deinit();
+    const entry = try func.newBlock();
+    const loop = try func.newBlock();
+    const exit = try func.newBlock();
+    const acc = func.newVReg();
+    const cond = func.newVReg();
+    const t = func.newVReg();
+    // `loop` branches to itself; acc is live across the self-edge.
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 6 }, .dest = acc });
+    try func.getBlock(entry).append(.{ .op = .{ .br = loop } });
+    try func.getBlock(loop).append(.{ .op = .{ .add = .{ .lhs = acc, .rhs = acc } }, .dest = t });
+    try func.getBlock(loop).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(loop).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = loop, .else_block = exit } } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = acc } });
     return func;
 }
 
