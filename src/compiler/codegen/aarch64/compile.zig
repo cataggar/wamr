@@ -646,6 +646,12 @@ const FuncCompileCtx = struct {
     /// caller-save regs that die at the call itself.
     current_kills: []const ir.VReg = &.{},
     options: CompileOptions = .{},
+    /// #781: optional per-function sub-phase stopwatch. Non-null only when
+    /// `WAMR_AOT_CODEGEN_TIMING` is live for this module; `compileFunctionImpl`
+    /// threads its scheduling / range-split / prepass / liveness / regalloc /
+    /// coalesce / post-emit-coalesce spans into it. Null is the normal
+    /// (untimed) path — a hard no-op.
+    codegen_timer: ?*codegen_timing.Aarch64FuncTimer = null,
     allocator: std.mem.Allocator,
 };
 
@@ -1063,7 +1069,13 @@ pub fn compileFunctionImpl(
     ctx: FuncCompileCtx,
     allocator: std.mem.Allocator,
 ) ![]u8 {
-    if (try functionHasUnsupportedV128(func, allocator)) return error.UnsupportedV128;
+    // #781: optional sub-phase stopwatch (null on the untimed path).
+    const tmr = ctx.codegen_timer;
+
+    if (tmr) |t| t.begin();
+    const unsupported_v128 = try functionHasUnsupportedV128(func, allocator);
+    if (tmr) |t| t.end(.prepass);
+    if (unsupported_v128) return error.UnsupportedV128;
 
     // Drive scalar and SIMD virtual registers from linear-scan allocation when
     // enabled. `RegMap.assign` and V128StackMap/V128RegCache consult their
@@ -1077,6 +1089,7 @@ pub fn compileFunctionImpl(
     // Compute RPO block order ONCE, before anything that uses global
     // instruction numbering. Clobber points, live ranges, FMA positions,
     // flat indexing, kill lists, and code emission all must use THIS order.
+    if (tmr) |t| t.begin();
     const block_order = blk: {
         var dom = try analysis.computeDominators(func, allocator);
         defer dom.deinit();
@@ -1095,11 +1108,14 @@ pub fn compileFunctionImpl(
         }
         break :blk order;
     };
+    if (tmr) |t| t.end(.prepass);
     defer allocator.free(block_order);
 
+    if (tmr) |t| t.begin();
     var scheduled = try schedule.scheduleFunction(func, allocator, .{
         .enabled = ctx.options.enable_scheduler,
     });
+    if (tmr) |t| t.end(.scheduling);
     defer scheduled.deinit();
 
     // Loop-aware live-range splitting (issue #383). Mutates `func` (adds
@@ -1107,6 +1123,7 @@ pub fn compileFunctionImpl(
     // `local_set`/`local_get` ops and rewrites post-loop uses) before live
     // ranges are computed below. No-op for functions without eligible
     // loops. Gated by a CompileOption to ease bisection of any regression.
+    if (tmr) |t| t.begin();
     if (ctx.options.enable_range_split) {
         const rs_stats = try range_split.splitLiveRangesAtLoopBoundaries(
             @constCast(func),
@@ -1126,7 +1143,12 @@ pub fn compileFunctionImpl(
             );
         }
     }
+    if (tmr) |t| t.end(.range_split);
 
+    // Pre-register-allocation analysis scans (#781 `prepass`): clobber/hint
+    // collection, frame + type tables, const-fold tables, FMA fusion, and
+    // iconst-mov suppression. Ends just before live-range computation.
+    if (tmr) |t| t.begin();
     var clobbers = try collectClobberPoints(func, block_order, &scheduled, allocator);
     defer clobbers.deinit(allocator);
 
@@ -1478,8 +1500,10 @@ pub fn compileFunctionImpl(
         }
     }
     fctx.suppress_iconst_emit = &suppress_iconst;
+    if (tmr) |t| t.end(.prepass);
 
     // Compute live ranges using the SAME block order as code emission.
+    if (tmr) |t| t.begin();
     const live_ranges = try computeLiveRangesScheduled(func, block_order, &scheduled, allocator);
     defer allocator.free(live_ranges);
     if (fma_info.count() > 0) {
@@ -1539,10 +1563,12 @@ pub fn compileFunctionImpl(
             try scalar_live_ranges.append(allocator, range);
         }
     }
+    if (tmr) |t| t.end(.liveness);
 
     var alloc_result_storage: ?regalloc.AllocResult = null;
     defer if (alloc_result_storage) |*ar| ar.deinit();
     if (ctx.options.enable_xreg_alloc) {
+        if (tmr) |t| t.begin();
         alloc_result_storage = try regalloc.allocateFromRangesWithHints(
             allocator,
             aarch64RegSetForSpillBase(spill_base),
@@ -1550,6 +1576,7 @@ pub fn compileFunctionImpl(
             scalar_live_ranges.items,
             hint_points.items,
         );
+        if (tmr) |t| t.end(.regalloc);
 
         // Post-allocation move coalescing (issue #386). Retarget the
         // dest vreg of each copy-like IR op (.reinterpret) onto its
@@ -1559,6 +1586,7 @@ pub fn compileFunctionImpl(
         // assignments map — codegen consumes the rewritten mapping
         // through `RegMap.assign` unchanged.
         if (ctx.options.enable_move_coalesce) {
+            if (tmr) |t| t.begin();
             var copy_hints = try collectCopyHints(func, block_order, &scheduled, allocator);
             defer copy_hints.deinit(allocator);
             _ = try regalloc.coalesceMoves(
@@ -1569,6 +1597,7 @@ pub fn compileFunctionImpl(
                 scalar_live_ranges.items,
                 copy_hints.items,
             );
+            if (tmr) |t| t.end(.coalesce);
         }
     }
 
@@ -1581,6 +1610,7 @@ pub fn compileFunctionImpl(
     var v128_alloc_result_storage: ?regalloc.AllocResult = null;
     defer if (v128_alloc_result_storage) |*ar| ar.deinit();
     if (ctx.options.enable_vreg_alloc) {
+        if (tmr) |t| t.begin();
         var v128_clobbers = try vregClobbersFromScalar(clobbers.items, allocator);
         defer v128_clobbers.deinit(allocator);
         v128_alloc_result_storage = try regalloc.allocateFromRanges(
@@ -1589,6 +1619,7 @@ pub fn compileFunctionImpl(
             v128_clobbers.items,
             v128_live_ranges.items,
         );
+        if (tmr) |t| t.end(.regalloc);
     }
 
     // Finalize frame layout now that we know how many spill slots the
@@ -1650,6 +1681,7 @@ pub fn compileFunctionImpl(
     // `.add` (MADD) does not emit and has no effective reads, so its listed
     // operands' kills are attributed to the FMA add (which reads them via
     // `fma_info` instead of the mul's intermediate `dest`).
+    if (tmr) |t| t.begin();
     var total_insts: usize = 0;
     for (0..func.blocks.items.len) |bid| total_insts += scheduled.instructions(@intCast(bid)).len;
 
@@ -1735,6 +1767,7 @@ pub fn compileFunctionImpl(
             }
         }
     }
+    if (tmr) |t| t.end(.liveness);
 
     try code.emitPrologue(frame_size);
     try emitCalleeSaveStoreTracked(&code, &fctx);
@@ -1758,7 +1791,9 @@ pub fn compileFunctionImpl(
     try code.ldrImm(.x20, .x19, 0);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
+    if (tmr) |t| t.begin();
     const needs_init = try local_init.computeNeedsInit(allocator, func);
+    if (tmr) |t| t.end(.prepass);
     defer allocator.free(needs_init);
     try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, needs_init, hrp_save_off, frame_size, allocator);
 
@@ -1807,11 +1842,13 @@ pub fn compileFunctionImpl(
     // preserved, so `block_offsets`, `patches`, `call_patches`, and
     // `callee_save_sites` all remain valid afterwards.
     if (ctx.options.enable_post_emit_coalesce) {
+        if (tmr) |t| t.begin();
         _ = coalesce_post.coalesceMovesPostEmit(
             code.bytes.items,
             block_offsets,
             code.bytes.items.len,
         );
+        if (tmr) |t| t.end(.post_emit_coalesce);
     }
 
     // Relax conditional branches whose imm19 reach (±1 MiB) is exceeded
@@ -8422,6 +8459,12 @@ pub fn compileModuleCachedWithOptions(
         var cache_code_owned: []u8 = undefined;
         var cache_patches_owned: []codegen_cache.FuncCallPatch = undefined;
         var compile_ns: u64 = 0;
+        // #781: per-function sub-phase stopwatch, live only when timing is
+        // enabled for this module. Declared per-iteration so it stays valid
+        // for the single log site below; reused functions leave every span
+        // at 0 (so the printed emit_ms == total_ms == 0).
+        var func_timer: ?codegen_timing.Aarch64FuncTimer =
+            if (ct_live) codegen_timing.Aarch64FuncTimer.start() else null;
 
         if (reused) {
             cache_code_owned = try allocator.dupe(u8, hit_code);
@@ -8448,6 +8491,7 @@ pub fn compileModuleCachedWithOptions(
                 .func_types = ir_module.func_types.items,
                 .func_type_indices = ir_module.func_type_indices.items,
                 .options = options,
+                .codegen_timer = if (func_timer) |*t| t else null,
                 .allocator = allocator,
             };
             const compile_t0: u64 = if (ct_live) codegen_timing.nowNs() else 0;
@@ -8488,9 +8532,11 @@ pub fn compileModuleCachedWithOptions(
         }
 
         if (ct_live and codegen_timing.shouldLogFunc(ct, options.module_idx, @intCast(fi), compile_ns)) {
-            // aarch64: sub-phase fields left 0 (no breakdown); emit_ms
-            // therefore equals total_ms in the line.
-            codegen_timing.printFunc(.{
+            // #781: aarch64 per-function sub-phase breakdown. `func_timer`
+            // is all-zero for reused functions; `printAarch64Func` derives
+            // emit_ms = total_ms − sum(spans).
+            const ft = func_timer orelse codegen_timing.Aarch64FuncTimer.start();
+            codegen_timing.printAarch64Func(.{
                 .module_idx = options.module_idx,
                 .func_idx = @intCast(fi),
                 .blocks = func.blocks.items.len,
@@ -8498,6 +8544,13 @@ pub fn compileModuleCachedWithOptions(
                 .reused = reused,
                 .hash_ns = hash_ns,
                 .total_ns = compile_ns,
+                .scheduling_ns = ft.scheduling_ns,
+                .range_split_ns = ft.range_split_ns,
+                .prepass_ns = ft.prepass_ns,
+                .liveness_ns = ft.liveness_ns,
+                .regalloc_ns = ft.regalloc_ns,
+                .coalesce_ns = ft.coalesce_ns,
+                .post_emit_coalesce_ns = ft.post_emit_coalesce_ns,
             });
         }
 
@@ -14800,4 +14853,104 @@ test "#672 commit 3: try_table_begin / try_table_end are no-ops" {
     defer allocator.free(code);
     try std.testing.expect(code.len > 0);
     try std.testing.expect(code.len % 4 == 0);
+}
+
+fn freeCachedFuncsAarch64(allocator: std.mem.Allocator, funcs: []codegen_cache.CachedFunction) void {
+    for (funcs) |*f| {
+        allocator.free(f.code);
+        allocator.free(f.call_patches);
+    }
+    allocator.free(funcs);
+}
+
+fn buildTwoFnAddModuleAarch64(allocator: std.mem.Allocator) !ir.IrModule {
+    var module = ir.IrModule.init(allocator);
+    errdefer module.deinit();
+
+    // f0: return iconst(1) + iconst(2)
+    var f0 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f0.newBlock();
+        const a = f0.newVReg();
+        const c = f0.newVReg();
+        const s = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 2 }, .dest = c, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = a, .rhs = c } }, .dest = s, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = s } });
+    }
+    _ = try module.addFunction(f0);
+
+    // f1: return iconst(7)
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f1.newBlock();
+        const v = f1.newVReg();
+        try f1.getBlock(b).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try module.addFunction(f1);
+
+    return module;
+}
+
+test "#781 aarch64 Aarch64FuncTimer accumulates each phase independently" {
+    var ft = codegen_timing.Aarch64FuncTimer.start();
+    try std.testing.expectEqual(@as(u64, 0), ft.scheduling_ns);
+
+    // Recording one phase must not disturb the others.
+    ft.begin();
+    ft.end(.scheduling);
+    try std.testing.expectEqual(@as(u64, 0), ft.range_split_ns);
+    try std.testing.expectEqual(@as(u64, 0), ft.prepass_ns);
+    try std.testing.expectEqual(@as(u64, 0), ft.liveness_ns);
+    try std.testing.expectEqual(@as(u64, 0), ft.regalloc_ns);
+    try std.testing.expectEqual(@as(u64, 0), ft.coalesce_ns);
+    try std.testing.expectEqual(@as(u64, 0), ft.post_emit_coalesce_ns);
+
+    // Each phase routes to its own accumulator; assign distinct values and
+    // confirm there is no cross-talk.
+    ft = .{
+        .scheduling_ns = 1,
+        .range_split_ns = 2,
+        .prepass_ns = 3,
+        .liveness_ns = 4,
+        .regalloc_ns = 5,
+        .coalesce_ns = 6,
+        .post_emit_coalesce_ns = 7,
+    };
+    try std.testing.expectEqual(@as(u64, 1), ft.scheduling_ns);
+    try std.testing.expectEqual(@as(u64, 2), ft.range_split_ns);
+    try std.testing.expectEqual(@as(u64, 3), ft.prepass_ns);
+    try std.testing.expectEqual(@as(u64, 4), ft.liveness_ns);
+    try std.testing.expectEqual(@as(u64, 5), ft.regalloc_ns);
+    try std.testing.expectEqual(@as(u64, 6), ft.coalesce_ns);
+    try std.testing.expectEqual(@as(u64, 7), ft.post_emit_coalesce_ns);
+}
+
+test "#781 aarch64 codegen timing is byte-identical to the untimed path" {
+    // Enabling WAMR_AOT_CODEGEN_TIMING is instrumentation only: it must not
+    // perturb the generated code, offsets, or cache stats.
+    const allocator = std.testing.allocator;
+    var m_plain = try buildTwoFnAddModuleAarch64(allocator);
+    defer m_plain.deinit();
+    var m_timed = try buildTwoFnAddModuleAarch64(allocator);
+    defer m_timed.deinit();
+
+    const plain = try compileModuleCached(&m_plain, null, allocator);
+    defer allocator.free(plain.code);
+    defer allocator.free(plain.offsets);
+    defer freeCachedFuncsAarch64(allocator, plain.cache_functions);
+
+    const timed = try compileModuleCachedWithOptions(&m_timed, null, allocator, .{
+        .codegen_timing = .{ .enabled = true, .threshold_ns = 0 },
+    });
+    defer allocator.free(timed.code);
+    defer allocator.free(timed.offsets);
+    defer freeCachedFuncsAarch64(allocator, timed.cache_functions);
+
+    try std.testing.expectEqualSlices(u8, plain.code, timed.code);
+    try std.testing.expectEqualSlices(u32, plain.offsets, timed.offsets);
+    try std.testing.expectEqual(plain.stats.recompiled, timed.stats.recompiled);
+    try std.testing.expectEqual(plain.stats.reused, timed.stats.reused);
 }

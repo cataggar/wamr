@@ -125,6 +125,100 @@ pub fn printFunc(r: FuncReport) void {
     );
 }
 
+/// aarch64 per-function sub-phase stopwatch (issue #781). The aarch64
+/// backend's pipeline differs from x86-64's, so it gets its own phase set
+/// rather than reusing `Phase`. Spans accumulate per phase via `begin()` /
+/// `end(phase)`; some phases are measured across two disjoint source
+/// regions (e.g. `prepass` covers both the dominator/block-order setup and
+/// the later clobber/hint/const/FMA scans; `liveness` covers the live-range
+/// solve and the kill-list build; `regalloc` covers scalar and v128 alloc).
+/// The caller derives `emit` (frame layout + prologue/body/epilogue emit +
+/// branch relaxation + patch finalisation) as `total - sum(all spans)` so
+/// the buckets partition the function's compile time. `prepass` means
+/// "pre-register-allocation analysis", not only instruction scans.
+pub const Aarch64Phase = enum {
+    scheduling,
+    range_split,
+    prepass,
+    liveness,
+    regalloc,
+    coalesce,
+    post_emit_coalesce,
+};
+
+pub const Aarch64FuncTimer = struct {
+    span_start: u64 = 0,
+    scheduling_ns: u64 = 0,
+    range_split_ns: u64 = 0,
+    prepass_ns: u64 = 0,
+    liveness_ns: u64 = 0,
+    regalloc_ns: u64 = 0,
+    coalesce_ns: u64 = 0,
+    post_emit_coalesce_ns: u64 = 0,
+
+    pub fn start() Aarch64FuncTimer {
+        return .{};
+    }
+
+    pub fn begin(self: *Aarch64FuncTimer) void {
+        self.span_start = nowNs();
+    }
+
+    pub fn end(self: *Aarch64FuncTimer, phase: Aarch64Phase) void {
+        const dt = nowNs() -| self.span_start;
+        switch (phase) {
+            .scheduling => self.scheduling_ns += dt,
+            .range_split => self.range_split_ns += dt,
+            .prepass => self.prepass_ns += dt,
+            .liveness => self.liveness_ns += dt,
+            .regalloc => self.regalloc_ns += dt,
+            .coalesce => self.coalesce_ns += dt,
+            .post_emit_coalesce => self.post_emit_coalesce_ns += dt,
+        }
+    }
+};
+
+pub const Aarch64FuncReport = struct {
+    module_idx: u32,
+    func_idx: u32,
+    blocks: usize,
+    insts: usize,
+    reused: bool,
+    hash_ns: u64,
+    /// Per-function compile call wall-clock (0 for cache reuse hits).
+    total_ns: u64,
+    scheduling_ns: u64 = 0,
+    range_split_ns: u64 = 0,
+    prepass_ns: u64 = 0,
+    liveness_ns: u64 = 0,
+    regalloc_ns: u64 = 0,
+    coalesce_ns: u64 = 0,
+    post_emit_coalesce_ns: u64 = 0,
+};
+
+pub fn printAarch64Func(r: Aarch64FuncReport) void {
+    // Derive emit as the remainder. Sequential saturating subtraction
+    // keeps emit_ms >= 0 even if clock jitter makes the spans sum slightly
+    // above total.
+    const emit_ns = r.total_ns -| r.scheduling_ns -| r.range_split_ns -|
+        r.prepass_ns -| r.liveness_ns -| r.regalloc_ns -| r.coalesce_ns -|
+        r.post_emit_coalesce_ns;
+    std.debug.print(
+        "[aot-codegen-timing] local_func={d} mod={d} blocks={d} insts={d} reused={} " ++
+            "hash_ms={d}.{d:0>3} total_ms={d}.{d:0>3} sched_ms={d}.{d:0>3} " ++
+            "range_split_ms={d}.{d:0>3} prepass_ms={d}.{d:0>3} liveness_ms={d}.{d:0>3} " ++
+            "regalloc_ms={d}.{d:0>3} coalesce_ms={d}.{d:0>3} post_coalesce_ms={d}.{d:0>3} " ++
+            "emit_ms={d}.{d:0>3}\n",
+        .{
+            r.func_idx,                       r.module_idx,                        r.blocks,                       r.insts,                     r.reused,
+            r.hash_ns / ns_per_ms,            msFrac(r.hash_ns),                   r.total_ns / ns_per_ms,         msFrac(r.total_ns),          r.scheduling_ns / ns_per_ms,
+            msFrac(r.scheduling_ns),          r.range_split_ns / ns_per_ms,        msFrac(r.range_split_ns),       r.prepass_ns / ns_per_ms,    msFrac(r.prepass_ns),
+            r.liveness_ns / ns_per_ms,        msFrac(r.liveness_ns),               r.regalloc_ns / ns_per_ms,      msFrac(r.regalloc_ns),       r.coalesce_ns / ns_per_ms,
+            msFrac(r.coalesce_ns),            r.post_emit_coalesce_ns / ns_per_ms, msFrac(r.post_emit_coalesce_ns), emit_ns / ns_per_ms,        msFrac(emit_ns),
+        },
+    );
+}
+
 pub fn printModuleBegin(opts: Options, module_idx: u32, funcs: usize) void {
     if (!opts.enabled or !opts.moduleMatches(module_idx)) return;
     std.debug.print(
