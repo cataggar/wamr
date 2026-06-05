@@ -59,11 +59,11 @@ pub const SplitStats = struct {
 /// (no-op or positive). Tests pass `min_candidates: 0` to exercise the
 /// rewriter on small synthetic shapes.
 pub const Config = struct {
-    /// Skip loops with fewer than this many crossing-without-use vregs.
-    /// Maps to the issue's "a few function-wide pointers" framing: with
-    /// 1 candidate the spill/reload overhead typically dominates the
-    /// freed-register benefit.
-    min_candidates: usize = 3,
+    /// Floor on crossing-without-use candidates per loop. The primary
+    /// gate is now register pressure (see `num_available_phys_regs`), so
+    /// this stays at 1 (need at least one candidate to split). Tests pass
+    /// 0 to keep the same meaning.
+    min_candidates: usize = 1,
     /// Skip loops whose total body instruction count is below this.
     /// Trivial loops rarely have register pressure the allocator can't
     /// already resolve.
@@ -73,7 +73,31 @@ pub const Config = struct {
     /// would otherwise produce 100+ splits per function and net-
     /// regress the benchmark).
     max_splits_per_function: u32 = 16,
+
+    /// Register-pressure ranker (#524). Total allocatable GPR-class
+    /// physical registers on the target. aarch64's allocatable integer
+    /// pool is 23 (x0–x14 caller-saved + x21–x28 callee-saved; x19/x20
+    /// pinned, x15–x18 scratch). The caller plumbs the real number from
+    /// its backend; the default encodes aarch64 since this pass is
+    /// aarch64-only today.
+    num_available_phys_regs: usize = 23,
+    /// Callee-saved subset of `num_available_phys_regs` (aarch64: x21–x28
+    /// = 8). Values live across a call inside the loop cannot use
+    /// caller-saved registers (the call clobbers them), so call-spanning
+    /// pressure is gated against this smaller pool.
+    num_callee_saved_regs: usize = 8,
+    /// Headroom subtracted from each pool before declaring a loop
+    /// pressure-bound. Leaves room for the allocator's own scratch /
+    /// short-lived temporaries so we only split when there is credible
+    /// spilling pressure, not merely high-but-fittable demand.
+    safety_margin: usize = 2,
 };
+
+/// Saturating `a - b` for `usize` thresholds (avoids underflow when the
+/// margin exceeds the pool, e.g. tiny synthetic test pools).
+fn satSub(a: usize, b: usize) usize {
+    return if (a > b) a - b else 0;
+}
 
 pub fn splitLiveRangesAtLoopBoundaries(
     func: *ir.IrFunction,
@@ -116,6 +140,45 @@ pub fn splitLiveRangesAtLoopBoundariesWithConfig(
         var sit = successors.iterator();
         while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
         successors.deinit();
+    }
+
+    // ── Function-scope inputs for the register-pressure ranker (#524) ──
+    // Computed once on the pre-split function and read-only thereafter.
+    // Per-loop splits append `local_set`/`local_get` ops to existing
+    // blocks (never new blocks), so block-keyed liveness stays usable; a
+    // freshly-added `alt` vreg is simply absent from these tables, which
+    // can only *under*-count a later loop's pressure — the regression-safe
+    // direction (under-firing skips, it never over-splits).
+    var liveness = try analysis.computeLiveness(func, allocator);
+    defer {
+        var lit = liveness.iterator();
+        while (lit.next()) |entry| {
+            entry.value_ptr.live_in.deinit();
+            entry.value_ptr.live_out.deinit();
+        }
+        liveness.deinit();
+    }
+
+    // Live-range widths drive the candidate ranker (wider original range →
+    // larger lifetime released per split). Built from global live ranges.
+    var width = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer width.deinit();
+    {
+        const ranges = try analysis.computeLiveRanges(func, allocator);
+        defer allocator.free(ranges);
+        for (ranges) |r| try width.put(r.vreg, r.end - r.start);
+    }
+
+    // vreg → defining-op type, used to classify GPR-class (i32/i64) vs
+    // FP/vector pressure. Phase 1 counts and splits only integer values.
+    var vreg_type = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer vreg_type.deinit();
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                if (!vreg_type.contains(d)) try vreg_type.put(d, inst.type);
+            }
+        }
     }
 
     // Process inner loops first (smaller `blocks` slice). Splitting at an
@@ -269,33 +332,89 @@ pub fn splitLiveRangesAtLoopBoundariesWithConfig(
             // used by other post-loop instructions).
             const dblk = def_block.get(v) orelse continue;
             if (!dom.dominates(dblk, entry_pred)) continue;
-            // Scalar-only: synthetic local slot is sized as `.i64` (8 B)
-            // by `localTypeAt` fallback in the aarch64 backend. v128 would
-            // need 16-byte alignment + size, which requires extending
-            // `func.local_types`. Phase 1: skip v128.
+            // Scalar integer (GPR-class) only. The synthetic local slot is
+            // sized as `.i64` (8 B) by the aarch64 backend's `localTypeAt`
+            // fallback, and the #524 pressure gate below models the integer
+            // register pool. f32/f64 occupy the FP/SIMD file and v128 needs
+            // a 16-byte slot — neither is handled here. Phase 1.
             const ty = def_type.get(v) orelse continue;
-            if (ty == .v128) continue;
-            if (ty == .void) continue;
+            if (ty != .i32 and ty != .i64) continue;
             try candidates.append(allocator, .{ .orig = v, .ty = ty });
         }
 
         if (candidates.items.len == 0) continue;
 
-        // Pressure gate: only split when there's evidence of meaningful
-        // register pressure. The issue's perf target is "a few function-
-        // wide pointers" simultaneously crossing a hot loop — that maps
-        // to ≥ 2 candidates for the same loop AND a loop body large
-        // enough that holding those values in registers actually
-        // displaces hot temporaries. For shallow / few-candidate cases
-        // the spill/reload overhead dominates and we regress: empirical
-        // -0.67% on CoreMark without this gate (5-run mean).
-        if (candidates.items.len < cfg.min_candidates) {
-            stats.loops_skipped_pressure += 1;
-            continue;
-        }
+        if (candidates.items.len < cfg.min_candidates) continue;
+
         var body_inst_count: usize = 0;
         for (loop.blocks) |bid| body_inst_count += func.blocks.items[bid].instructions.items.len;
         if (body_inst_count < cfg.min_loop_body_insts) {
+            stats.loops_skipped_pressure += 1;
+            continue;
+        }
+
+        // ── Register-pressure gate (#524) ──
+        // Two thresholds: the full allocatable GPR pool for ordinary
+        // loop-body pressure, and the callee-saved subset for values that
+        // must survive a call inside the loop (a call clobbers caller-saved
+        // registers, so live-across-call values can only use callee-saved).
+        // A loop is pressure-bound iff it exceeds either pool minus the
+        // safety margin. When neither is exceeded the allocator can satisfy
+        // the loop without spilling, so splitting only adds spill/reload
+        // overhead (empirical -0.67% on CoreMark when split unconditionally).
+        const t_all = satSub(cfg.num_available_phys_regs, cfg.safety_margin);
+        const t_xcall = satSub(cfg.num_callee_saved_regs, cfg.safety_margin);
+        const pres = try loopGprPressure(func, loop, &liveness, &vreg_type, allocator);
+        const relief_needed = @max(
+            satSub(pres.max_live, t_all),
+            satSub(pres.max_across_call, t_xcall),
+        );
+        if (relief_needed == 0) {
+            stats.loops_skipped_pressure += 1;
+            continue;
+        }
+
+        // ── Relief filter ──
+        // A candidate only lowers loop pressure if, after rewriting its
+        // post_set uses to `alt`, its original vreg is no longer live across
+        // the loop. That holds iff every loop-exit-reachable use of `orig`
+        // lies in `post_set` (the dominated rewrite region). If `orig` is
+        // also used in a post-loop block reachable but NOT dominated by
+        // exit.succ, that use keeps `orig` live through the loop, so the
+        // split frees no register there — exclude it from the relief target.
+        var used_outside = try collectUsesOutsidePostSet(
+            func,
+            loop,
+            exit.succ,
+            &post_set,
+            successors,
+            nblocks,
+            allocator,
+        );
+        defer used_outside.deinit(allocator);
+
+        var relieving: std.ArrayListUnmanaged(Candidate) = .empty;
+        defer relieving.deinit(allocator);
+        for (candidates.items) |c| {
+            if (used_outside.contains(c.orig)) continue;
+            try relieving.append(allocator, c);
+        }
+        if (relieving.items.len == 0) {
+            stats.loops_skipped_pressure += 1;
+            continue;
+        }
+
+        // Rank by live-range width (widest original range → largest
+        // lifetime released per split); deterministic vreg-id tie-break
+        // keeps codegen output stable.
+        std.mem.sort(Candidate, relieving.items, RankCtx{ .width = &width }, RankCtx.lessThan);
+
+        // Split just enough of the widest relieving candidates to bring
+        // pressure back toward the threshold; each live-through split lowers
+        // pressure by exactly 1. Capped by the remaining function budget.
+        const remaining_budget = satSub(cfg.max_splits_per_function, stats.splits_applied);
+        const k = @min(@min(relieving.items.len, relief_needed), remaining_budget);
+        if (k == 0) {
             stats.loops_skipped_pressure += 1;
             continue;
         }
@@ -309,7 +428,7 @@ pub fn splitLiveRangesAtLoopBoundariesWithConfig(
         //    in both func.blocks AND sched.blocks. (The reload itself uses
         //    NO vreg operand — `local_get` is a pure def — so it's safe to
         //    insert before the rewrite walk.)
-        for (candidates.items) |cand| {
+        for (relieving.items[0..k]) |cand| {
             const slot: u32 = func.local_count;
             func.local_count += 1;
             const alt: ir.VReg = func.newVReg();
@@ -366,6 +485,145 @@ const Candidate = struct {
     orig: ir.VReg,
     ty: ir.IrType,
 };
+
+/// Ranker context: orders candidates by descending live-range width, with
+/// a deterministic vreg-id tie-break so codegen output is stable.
+const RankCtx = struct {
+    width: *const std.AutoHashMap(ir.VReg, u32),
+    fn lessThan(ctx: RankCtx, a: Candidate, b: Candidate) bool {
+        const wa = ctx.width.get(a.orig) orelse 0;
+        const wb = ctx.width.get(b.orig) orelse 0;
+        if (wa != wb) return wa > wb;
+        return a.orig < b.orig;
+    }
+};
+
+const LoopPressure = struct {
+    /// Max simultaneously-live GPR-class vregs anywhere in the loop body.
+    max_live: usize = 0,
+    /// Max GPR-class vregs live across any call inside the loop (the call
+    /// clobbers caller-saved registers, so these compete for callee-saved).
+    max_across_call: usize = 0,
+};
+
+/// True for integer (GPR-class) vregs. Unknown vregs — e.g. params with no
+/// defining op in this function — default to GPR: they are overwhelmingly
+/// integer/pointer, and over-counting only makes the gate marginally more
+/// eager, never unsound.
+fn isGprVReg(vreg_type: *const std.AutoHashMap(ir.VReg, ir.IrType), v: ir.VReg) bool {
+    const ty = vreg_type.get(v) orelse return true;
+    return ty == .i32 or ty == .i64;
+}
+
+fn gprCount(set: *const VRegSet, vreg_type: *const std.AutoHashMap(ir.VReg, ir.IrType)) usize {
+    var n: usize = 0;
+    var it = set.set.iterator();
+    while (it.next()) |e| {
+        if (isGprVReg(vreg_type, e.key_ptr.*)) n += 1;
+    }
+    return n;
+}
+
+fn isCallOp(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .call, .call_indirect, .call_ref => true,
+        else => false,
+    };
+}
+
+/// Estimate the loop body's GPR register pressure via a per-block backward
+/// liveness sweep seeded from `live_out`. Returns both the ordinary max and
+/// the max measured at call sites (live-across-call). Computed on the
+/// pre-split function; read-only.
+fn loopGprPressure(
+    func: *const ir.IrFunction,
+    loop: *const analysis.Loop,
+    liveness: *const std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
+    vreg_type: *const std.AutoHashMap(ir.VReg, ir.IrType),
+    allocator: std.mem.Allocator,
+) !LoopPressure {
+    var live = try VRegSet.init(allocator);
+    defer live.deinit(allocator);
+    var res: LoopPressure = .{};
+
+    for (loop.blocks) |bid| {
+        live.set.clearRetainingCapacity();
+        const bl = liveness.get(bid) orelse continue;
+        var oit = bl.live_out.keyIterator();
+        while (oit.next()) |k| try live.put(allocator, k.*);
+        res.max_live = @max(res.max_live, gprCount(&live, vreg_type));
+
+        const insts = func.blocks.items[bid].instructions.items;
+        var i = insts.len;
+        while (i > 0) {
+            i -= 1;
+            const inst = insts[i];
+            // `live` is the set live-out of `inst`. A call clobbers
+            // caller-saved registers, so everything live across it must
+            // survive in callee-saved registers (or spill).
+            if (isCallOp(inst.op)) {
+                res.max_across_call = @max(res.max_across_call, gprCount(&live, vreg_type));
+            }
+            // Def point: pressure here includes the destination being
+            // written (live-out ∪ {dest}).
+            if (inst.dest) |d| {
+                const had = live.contains(d);
+                if (!had) try live.put(allocator, d);
+                res.max_live = @max(res.max_live, gprCount(&live, vreg_type));
+                _ = live.set.remove(d); // dest is not live before its def
+            }
+            // Use point: (live-out \ dest) ∪ uses == live-in of `inst`.
+            try collectUses(inst, &live, allocator);
+            res.max_live = @max(res.max_live, gprCount(&live, vreg_type));
+        }
+    }
+    return res;
+}
+
+/// Collect vregs used in blocks reachable after the loop (BFS from
+/// `exit_succ`, not re-entering the loop) that are NOT in `post_set`. These
+/// are the reachable-but-not-dominated post-loop blocks: a candidate used
+/// there stays live across the loop even after its `post_set` uses are
+/// rewritten, so it relieves no register pressure and must be excluded from
+/// the relief target.
+fn collectUsesOutsidePostSet(
+    func: *const ir.IrFunction,
+    loop: *const analysis.Loop,
+    exit_succ: ir.BlockId,
+    post_set: *const std.ArrayListUnmanaged(ir.BlockId),
+    successors: std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    nblocks: usize,
+    allocator: std.mem.Allocator,
+) !VRegSet {
+    var in_post = try allocator.alloc(bool, nblocks);
+    defer allocator.free(in_post);
+    @memset(in_post, false);
+    for (post_set.items) |b| in_post[b] = true;
+
+    var out = try VRegSet.init(allocator);
+    errdefer out.deinit(allocator);
+
+    var visited = try allocator.alloc(bool, nblocks);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    var stack: std.ArrayListUnmanaged(ir.BlockId) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, exit_succ);
+    while (stack.pop()) |bid| {
+        if (visited[bid]) continue;
+        if (loop.containsBlock(bid)) continue;
+        visited[bid] = true;
+        if (!in_post[bid]) {
+            for (func.blocks.items[bid].instructions.items) |inst| {
+                try collectUses(inst, &out, allocator);
+            }
+        }
+        const succs = successors.get(bid) orelse continue;
+        for (succs) |s| if (!visited[s]) try stack.append(allocator, s);
+    }
+    return out;
+}
 
 /// Return the unique block that's a predecessor of `loop.header` and is
 /// NOT itself in the loop. `null` if zero or multiple such predecessors
@@ -916,6 +1174,168 @@ fn countLocalGetsInBlock(block: ir.BasicBlock) usize {
     return n;
 }
 
+/// First `local_set` source vreg in a block (the orig of the first split).
+fn firstLocalSetVal(block: ir.BasicBlock) ?ir.VReg {
+    for (block.instructions.items) |inst| {
+        if (inst.op == .local_set) return inst.op.local_set.val;
+    }
+    return null;
+}
+
+/// Builds a 4-block loop with 3 long-lived i32 candidates A,B,C (defined in
+/// that order) plus a counter, all live across a `br`-only loop body. The
+/// post-loop block uses C, then B, then A, so the live-range widths satisfy
+/// width(A) > width(B) > width(C). Loop register pressure is exactly 4
+/// (A,B,C,ctr) with no defs inside the loop. Returns the candidate vregs in
+/// widest-first order and the entry/exit block ids.
+const RankFixture = struct { cands: [3]ir.VReg, b_entry: ir.BlockId, b_exit: ir.BlockId };
+fn buildRankFixture(func: *ir.IrFunction) !RankFixture {
+    const b_entry = try func.newBlock();
+    const b_hdr = try func.newBlock();
+    const b_body = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const ctr = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 2 }, .dest = b, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 3 }, .dest = c, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 100 }, .dest = ctr, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_hdr }, .type = .void });
+
+    try func.getBlock(b_hdr).append(.{ .op = .{ .br_if = .{ .cond = ctr, .then_block = b_body, .else_block = b_exit } }, .type = .void });
+
+    // Loop body holds no values of its own (no defs) → loop pressure is
+    // exactly the 4 live-through scalars.
+    try func.getBlock(b_body).append(.{ .op = .{ .br = b_hdr }, .type = .void });
+
+    // Post-loop: use C first, then B, then A so A is the widest range.
+    const s1 = func.newVReg();
+    const s2 = func.newVReg();
+    const s3 = func.newVReg();
+    try func.getBlock(b_exit).append(.{ .op = .{ .add = .{ .lhs = c, .rhs = c } }, .dest = s1, .type = .i32 });
+    try func.getBlock(b_exit).append(.{ .op = .{ .add = .{ .lhs = b, .rhs = s1 } }, .dest = s2, .type = .i32 });
+    try func.getBlock(b_exit).append(.{ .op = .{ .add = .{ .lhs = a, .rhs = s2 } }, .dest = s3, .type = .i32 });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = s3 }, .type = .void });
+
+    return .{ .cands = .{ a, b, c }, .b_entry = b_entry, .b_exit = b_exit };
+}
+
+test "range_split pressure gate: low pressure (P <= T) skips entirely" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    _ = try buildRankFixture(&func);
+
+    var sched = try MockSchedule.fromFunc(&func, allocator);
+    defer sched.deinit();
+
+    // Pool of 100 GPRs ⇒ T = 100; loop pressure is 4 ⇒ no spilling pressure.
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{
+        .min_candidates = 0,
+        .min_loop_body_insts = 0,
+        .num_available_phys_regs = 100,
+        .num_callee_saved_regs = 100,
+        .safety_margin = 0,
+    });
+    try std.testing.expectEqual(@as(u32, 0), stats.splits_applied);
+    try std.testing.expect(stats.loops_skipped_pressure >= 1);
+}
+
+test "range_split pressure gate: exactly at threshold (P == T) skips" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    _ = try buildRankFixture(&func);
+
+    var sched = try MockSchedule.fromFunc(&func, allocator);
+    defer sched.deinit();
+
+    // T = 4 == P ⇒ satSub(P,T) == 0 ⇒ not pressure-bound ⇒ skip.
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{
+        .min_candidates = 0,
+        .min_loop_body_insts = 0,
+        .num_available_phys_regs = 4,
+        .num_callee_saved_regs = 4,
+        .safety_margin = 0,
+    });
+    try std.testing.expectEqual(@as(u32, 0), stats.splits_applied);
+    try std.testing.expect(stats.loops_skipped_pressure >= 1);
+}
+
+test "range_split ranker: high pressure splits K = P - T widest candidates" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const fx = try buildRankFixture(&func);
+
+    var sched = try MockSchedule.fromFunc(&func, allocator);
+    defer sched.deinit();
+
+    // P = 4, T = 3 ⇒ relief_needed = 1 ⇒ split exactly the single widest
+    // candidate (A), not all three.
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{
+        .min_candidates = 0,
+        .min_loop_body_insts = 0,
+        .num_available_phys_regs = 3,
+        .num_callee_saved_regs = 3,
+        .safety_margin = 0,
+    });
+    try std.testing.expectEqual(@as(u32, 1), stats.splits_applied);
+    // The widest range (A = cands[0]) is the one spilled at the entry pred.
+    const set_val = firstLocalSetVal(func.getBlock(fx.b_entry).*);
+    try std.testing.expect(set_val != null);
+    try std.testing.expectEqual(fx.cands[0], set_val.?);
+}
+
+test "range_split call-clobber gate: call-spanning pressure splits via callee-saved pool" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b_entry = try func.newBlock();
+    const b_hdr = try func.newBlock();
+    const b_body = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const ctr = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 2 }, .dest = b, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 100 }, .dest = ctr, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_hdr }, .type = .void });
+
+    try func.getBlock(b_hdr).append(.{ .op = .{ .br_if = .{ .cond = ctr, .then_block = b_body, .else_block = b_exit } }, .type = .void });
+
+    // A call inside the loop clobbers caller-saved regs; A and B (live
+    // across it) compete for the callee-saved pool.
+    try func.getBlock(b_body).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .type = .void });
+    try func.getBlock(b_body).append(.{ .op = .{ .br = b_hdr }, .type = .void });
+
+    const s1 = func.newVReg();
+    try func.getBlock(b_exit).append(.{ .op = .{ .add = .{ .lhs = a, .rhs = b } }, .dest = s1, .type = .i32 });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = s1 }, .type = .void });
+
+    var sched = try MockSchedule.fromFunc(&func, allocator);
+    defer sched.deinit();
+
+    // Huge total GPR pool (ordinary gate never fires) but only 1 callee-
+    // saved reg ⇒ the 2 call-spanning scalars trip the clobber gate.
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{
+        .min_candidates = 0,
+        .min_loop_body_insts = 0,
+        .num_available_phys_regs = 100,
+        .num_callee_saved_regs = 1,
+        .safety_margin = 0,
+    });
+    try std.testing.expectEqual(@as(u32, 2), stats.splits_applied);
+}
+
 test "splitLiveRangesAtLoopBoundaries: no-op on function without loops" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 0);
@@ -929,7 +1349,7 @@ test "splitLiveRangesAtLoopBoundaries: no-op on function without loops" {
     var sched = try MockSchedule.fromFunc(&func, allocator);
     defer sched.deinit();
 
-    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0 });
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0, .num_available_phys_regs = 0, .num_callee_saved_regs = 0, .safety_margin = 0 });
     try std.testing.expectEqual(@as(u32, 0), stats.splits_applied);
     try std.testing.expectEqual(@as(u32, 0), stats.loops_considered);
 }
@@ -975,7 +1395,7 @@ test "splitLiveRangesAtLoopBoundaries: splits vreg crossing single-exit loop" {
     const before_locals = func.local_count;
     const before_vregs = func.next_vreg;
 
-    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0 });
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0, .num_available_phys_regs = 0, .num_callee_saved_regs = 0, .safety_margin = 0 });
 
     try std.testing.expect(stats.splits_applied >= 1);
     try std.testing.expect(stats.loops_considered >= 1);
@@ -1048,7 +1468,7 @@ test "splitLiveRangesAtLoopBoundaries: skips multi-exit loops" {
     var sched = try MockSchedule.fromFunc(&func, allocator);
     defer sched.deinit();
 
-    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0 });
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0, .num_available_phys_regs = 0, .num_callee_saved_regs = 0, .safety_margin = 0 });
     try std.testing.expect(stats.loops_considered >= 1);
     try std.testing.expectEqual(@as(u32, 0), stats.splits_applied);
     try std.testing.expect(stats.loops_skipped_shape >= 1);
@@ -1082,7 +1502,7 @@ test "splitLiveRangesAtLoopBoundaries: leaves vregs used inside the loop alone" 
     var sched = try MockSchedule.fromFunc(&func, allocator);
     defer sched.deinit();
 
-    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0 });
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0, .num_available_phys_regs = 0, .num_callee_saved_regs = 0, .safety_margin = 0 });
     try std.testing.expectEqual(@as(u32, 0), stats.splits_applied);
 }
 
@@ -1132,7 +1552,7 @@ test "splitLiveRangesAtLoopBoundaries: N+1 hot-loop synthetic — fresh vreg red
     defer sched.deinit();
 
     const before_locals = func.local_count;
-    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0 });
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0, .num_available_phys_regs = 0, .num_callee_saved_regs = 0, .safety_margin = 0 });
 
     // All three long-lived scalars should be split.
     try std.testing.expectEqual(@as(u32, 3), stats.splits_applied);

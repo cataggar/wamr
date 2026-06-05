@@ -1125,10 +1125,16 @@ pub fn compileFunctionImpl(
     // loops. Gated by a CompileOption to ease bisection of any regression.
     if (tmr) |t| t.begin();
     if (ctx.options.enable_range_split) {
-        const rs_stats = try range_split.splitLiveRangesAtLoopBoundaries(
+        const rs_stats = try range_split.splitLiveRangesAtLoopBoundariesWithConfig(
             @constCast(func),
             &scheduled,
             allocator,
+            .{
+                // Target-derived pressure thresholds (#524): the aarch64
+                // allocatable integer pool and its callee-saved subset.
+                .num_available_phys_regs = RegMap.scratch_regs.len,
+                .num_callee_saved_regs = RegMap.scratch_regs.len - RegMap.caller_saved_count,
+            },
         );
         if (range_split_debug and rs_stats.loops_considered > 0) {
             std.debug.print(
