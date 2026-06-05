@@ -1217,6 +1217,11 @@ fn parseVerifyMode(value: []const u8) ?wamr.ir_verifier.VerifyMode {
     {
         return .after_each_pass;
     }
+    if (std.ascii.eqlIgnoreCase(value, "load-forwarding") or
+        std.ascii.eqlIgnoreCase(value, "load_forwarding"))
+    {
+        return .load_forwarding;
+    }
     if (std.ascii.eqlIgnoreCase(value, "paranoid")) return .paranoid;
     return null;
 }
@@ -1224,7 +1229,7 @@ fn parseVerifyMode(value: []const u8) ?wamr.ir_verifier.VerifyMode {
 fn parseVerifyModeOrDie(source: []const u8, value: []const u8) wamr.ir_verifier.VerifyMode {
     return parseVerifyMode(value) orelse {
         std.debug.print(
-            "error: invalid {s} value '{s}' (expected: off, after-each-pass, paranoid, default)\n",
+            "error: invalid {s} value '{s}' (expected: off, after-each-pass, load-forwarding, paranoid, default)\n",
             .{ source, value },
         );
         std.process.exit(1);
@@ -1476,6 +1481,9 @@ const compile_usage =
     \\                                 function. Modes:
     \\                                   off
     \\                                   after-each-pass (default with --verify-ir)
+    \\                                   load-forwarding (adds the #738/#794
+    \\                                                    load-forwarding
+    \\                                                    soundness check)
     \\                                   paranoid        (adds operand-width
     \\                                                    sanity check, #628)
     \\                                 Default: on for safety builds, off
@@ -1512,10 +1520,10 @@ const compile_component_usage =
     \\  -O0                           Disable IR optimizations (every core)
     \\  --verify-ir[=<mode>]          Run the IR verifier after optimized IR
     \\                                 passes. Modes: off, after-each-pass,
-    \\                                 paranoid, default. Default: on for
-    \\                                 safety builds, off for release builds;
-    \\                                 overridden by WAMR_AOT_VERIFY_IR when
-    \\                                 set.
+    \\                                 load-forwarding, paranoid, default.
+    \\                                 Default: on for safety builds, off for
+    \\                                 release builds; overridden by
+    \\                                 WAMR_AOT_VERIFY_IR when set.
     \\  --no-verify-ir                Disable the IR verifier.
     \\  --cache-dir <dir>             #761 Phase 2 codegen cache root. Per
     \\                                 core: read/write `<dir>/core<N>.cache`

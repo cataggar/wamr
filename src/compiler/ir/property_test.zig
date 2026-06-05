@@ -138,3 +138,22 @@ test "property: named memory-barrier regression seed exercises call path" {
         2,
     );
 }
+
+test "property(#794): load-forwarding passes preserve behavior across a loop effect" {
+    // #743 regression: a load dominating a loop whose body reloads + stores the
+    // same address must not be forwarded into the loop. The #793 gate enforces
+    // that; a regression would surface here as a stale interpreted result.
+    const allocator = std.testing.allocator;
+    const forwarders = [_]PassCase{
+        .{ .name = "commonSubexprElimination", .func = passes.commonSubexprElimination },
+        .{ .name = "globalValueNumbering", .func = passes.globalValueNumbering },
+        .{ .name = "forwardRedundantLoadsDominator", .func = frl_dom.forwardRedundantLoadsDominator },
+    };
+    for (forwarders) |pass| {
+        var iter: u32 = 0;
+        while (iter < 32) : (iter += 1) {
+            const seed = 0x7943_0000 + iter;
+            try checkPassPreservesCase(allocator, pass, seed, .loop_forwarded_load, 4);
+        }
+    }
+}

@@ -16,8 +16,13 @@ pub const Shape = enum {
     nested_diamond,
     counted_loop,
     memory_barrier,
+    /// #794: a load that dominates a loop whose body reloads and then stores
+    /// the same address. Exercises the #743 load-forwarding-across-a-loop-effect
+    /// bug class with an execution-observable divergence (the in-loop store
+    /// changes the value an unsound forward would staleify).
+    loop_forwarded_load,
 
-    pub const all = [_]Shape{ .linear, .diamond, .nested_diamond, .counted_loop, .memory_barrier };
+    pub const all = [_]Shape{ .linear, .diamond, .nested_diamond, .counted_loop, .memory_barrier, .loop_forwarded_load };
 };
 
 pub const Case = struct {
@@ -44,6 +49,7 @@ pub fn generate(allocator: std.mem.Allocator, seed: u64, shape: Shape) !Case {
         .nested_diamond => generateNestedDiamond(allocator, seed, random),
         .counted_loop => generateCountedLoop(allocator, seed, random),
         .memory_barrier => generateMemoryBarrier(allocator, seed, random),
+        .loop_forwarded_load => generateLoopForwardedLoad(allocator, seed, random),
     };
 }
 
@@ -290,6 +296,84 @@ fn generateMemoryBarrier(allocator: std.mem.Allocator, seed: u64, random: std.Ra
     try func.getBlock(merge).append(.{ .op = .{ .ret = loaded } });
 
     return finishCase(allocator, seed, .memory_barrier, func, inputs, memory);
+}
+
+/// #794 / #743 regression generator. Builds:
+///
+///     entry:  store[0] = p0; dom = load[0]; br header
+///     header: phi_i, phi_sum; cond = i < bound; br_if cond, body, exit
+///     body:   cur = load[0]            ; redundant w.r.t. `dom` (forward target)
+///             sum_next = phi_sum + cur
+///             store[0] = cur + 1       ; aliasing store -> staleifies `dom`
+///             i_next = i + 1; br header
+///     exit:   ret phi_sum
+///
+/// `cur` is a load-forwarding candidate for the dominating `dom`. The #793 gate
+/// must refuse that forward because the in-loop store lies on the body→body
+/// back-edge corridor. If a regression forwards it, the interpreter on the
+/// optimized IR returns a stale sum (and stale final memory), diverging from
+/// the original — which the differential property test flags. `bound >= 2`
+/// guarantees the store runs before a reuse so the divergence is observable.
+fn generateLoopForwardedLoad(allocator: std.mem.Allocator, seed: u64, random: std.Random) !Case {
+    var func = try initFunc(allocator, 1, 1, 0);
+    errdefer func.deinit();
+    const inputs = try makeInputs(allocator, random, 1);
+    errdefer allocator.free(inputs);
+    const memory = try makeMemory(allocator, random);
+    errdefer allocator.free(memory);
+
+    const bound_value: i32 = @intCast(random.intRangeLessThan(u32, 2, 6));
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(header).addPredecessor(entry);
+    try func.getBlock(header).addPredecessor(body);
+    try func.getBlock(body).addPredecessor(header);
+    try func.getBlock(exit).addPredecessor(header);
+
+    const base = func.newVReg();
+    const zero = func.newVReg();
+    const bound = func.newVReg();
+    const dom = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = base, .type = .i32, .op = .{ .iconst_32 = 0 } });
+    // Seed memory[0..4] from the input parameter so the value differs across
+    // input vectors, then take the dominating load.
+    try func.getBlock(entry).append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = 0 } } });
+    try func.getBlock(entry).append(.{ .dest = dom, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .dest = zero, .type = .i32, .op = .{ .iconst_32 = 0 } });
+    try func.getBlock(entry).append(.{ .dest = bound, .type = .i32, .op = .{ .iconst_32 = bound_value } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+
+    const phi_i = func.newVReg();
+    const phi_sum = func.newVReg();
+    const inc = func.newVReg();
+    const sum_next = func.newVReg();
+    const i_edges = try allocator.dupe(ir.Inst.PhiEdge, &.{ .{ .block = entry, .val = zero }, .{ .block = body, .val = inc } });
+    // `dom` seeds the accumulator so the returned value depends on the
+    // dominating load as well as each in-loop reload.
+    const sum_edges = try allocator.dupe(ir.Inst.PhiEdge, &.{ .{ .block = entry, .val = dom }, .{ .block = body, .val = sum_next } });
+    const cond = func.newVReg();
+    try func.getBlock(header).append(.{ .dest = phi_i, .type = .i32, .op = .{ .phi = i_edges } });
+    try func.getBlock(header).append(.{ .dest = phi_sum, .type = .i32, .op = .{ .phi = sum_edges } });
+    try func.getBlock(header).append(.{ .dest = cond, .type = .i32, .op = .{ .lt_u = .{ .lhs = phi_i, .rhs = bound } } });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = body, .else_block = exit } } });
+
+    const cur = func.newVReg();
+    const one = func.newVReg();
+    const next_mem = func.newVReg();
+    try func.getBlock(body).append(.{ .dest = cur, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(body).append(.{ .dest = sum_next, .type = .i32, .op = .{ .add = .{ .lhs = phi_sum, .rhs = cur } } });
+    try func.getBlock(body).append(.{ .dest = one, .type = .i32, .op = .{ .iconst_32 = 1 } });
+    try func.getBlock(body).append(.{ .dest = next_mem, .type = .i32, .op = .{ .add = .{ .lhs = cur, .rhs = one } } });
+    try func.getBlock(body).append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = next_mem } } });
+    try func.getBlock(body).append(.{ .dest = inc, .type = .i32, .op = .{ .add = .{ .lhs = phi_i, .rhs = one } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = header } });
+
+    try func.getBlock(exit).append(.{ .op = .{ .ret = phi_sum } });
+
+    return finishCase(allocator, seed, .loop_forwarded_load, func, inputs, memory);
 }
 
 test "fuzz: generated cases verify and interpret" {

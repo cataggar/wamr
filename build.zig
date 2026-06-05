@@ -510,6 +510,41 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // #794: load-forwarding soundness gate. Compiles the shipped hand-written
+    // wasm corpus with the dedicated Check-11 verify mode
+    // (`--verify-ir=load-forwarding`) and requires a clean exit. Check 11 is a
+    // SOUND OVER-APPROXIMATION: it never misses an unsound forward but can
+    // false-positive on legitimate "snapshot" loads (a load value reused across
+    // an aliasing store), which are pervasive in LLVM-optimised wasm. The gated
+    // corpus is therefore deliberately limited to hand-written fixtures. The
+    // strong, false-positive-free regression net for the #743 / #793 bug class
+    // is the differential property fuzzer
+    // (`src/compiler/ir/property_test.zig`, `loop_forwarded_load` shape), which
+    // executes original vs optimised IR and compares observables.
+    const verify_ir_soundness_step = b.step(
+        "verify-ir-soundness",
+        "Compile the hand-written wasm corpus with the load-forwarding soundness check (#794)",
+    );
+    if (aot_executable_target) {
+        const soundness_fixtures = [_][]const u8{
+            "tests/spec-json/linking.trap401.wasm",
+            "tests/spec-json/linking.trap413.wasm",
+            "tests/spec-json/linking.trap554.wasm",
+            "tests/spec-json/linking.trap566.wasm",
+            "tests/spec-json/linking.trap592.wasm",
+            "tests/coldstart/noop.wasm",
+        };
+        for (soundness_fixtures) |fixture| {
+            const run = b.addRunArtifact(wamrc);
+            run.addArgs(&.{ "compile", "--verify-ir=load-forwarding", "-o" });
+            _ = run.addOutputFileArg("verified.cwasm");
+            run.addFileArg(b.path(fixture));
+            run.expectExitCode(0);
+            verify_ir_soundness_step.dependOn(&run.step);
+            test_step.dependOn(&run.step);
+        }
+    }
+
     // #757 `wamrc verify` smoke (no wasmtime required):
     //   * `verify help` → exit 0 + non-empty stdout.
     //   * `verify --wasmtime-bin=/dev/null/nope <wasm>` → spawn fails →

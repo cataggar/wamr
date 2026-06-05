@@ -39,14 +39,26 @@
 //!      `checkDomTreeStructure`.)
 //!  10. **Live-range monotonicity** (#629). For the default sequential
 //!      block order, every `LiveRange` has `start <= end`.
-//!  11. **Load-forwarding soundness** (#738). A load result used across a
-//!      CFG edge must be free of aliasing stores and load barriers on every
-//!      path from its definition to each cross-block use.
+//!  11. **Load-forwarding soundness** (#738, loop-complete #794). For a load
+//!      result reused across a CFG edge, no aliasing store or coarse load
+//!      barrier may run between the load and the use on any path —
+//!      **including loop back-edges and the use block's own post-load
+//!      effect** — unless the path also re-executes the load (the
+//!      "avoid-def" refinement). Mirrors the runtime forwarder gate
+//!      (`loadForwardCrossesEffect`, `passes.zig`) as an independent
+//!      re-derivation. NOTE: this is a SOUND OVER-APPROXIMATION — a load
+//!      value legitimately reused as a snapshot across an aliasing store is
+//!      indistinguishable in final IR from an unsound forward, so it can
+//!      false-positive on real (LLVM-optimised) wasm and must stay opt-in,
+//!      never a default-compile or real-corpus CI gate. Runs under both
+//!      `.paranoid` and the dedicated `.load_forwarding` mode.
 //!
 //! Paranoid checks re-derive analyses (dom, loops, liveness) for every
 //! invocation, so they're intentionally opt-in: even safety builds default
 //! to `after_each_pass` and only `wamrc --verify-ir=paranoid` (or a fuzz
-//! lane) flips them on.
+//! lane) flips them on. The `.load_forwarding` mode runs the base checks plus
+//! only check 11, so a corpus CI gate can exercise load-forwarding soundness
+//! without the stricter operand-width / dom-tree re-derivations.
 //!
 //! Wiring: `passes.runPassesWithOptions` calls `verifyFunction` after every
 //! pass invocation when `opts.verify_mode != .off`, and annotates the failure
@@ -62,6 +74,11 @@ pub const VerifyMode = enum {
     off,
     /// Run checks 1, 2, 4, 5, 6 after every pass.
     after_each_pass,
+    /// Run the base checks plus only the load-forwarding soundness check
+    /// (#794). Cheaper than `paranoid` and, unlike `paranoid`, does not trip
+    /// on the stricter operand-width / dom-tree re-derivations, so it can gate
+    /// a real-corpus CI run dedicated to load-forwarding regressions.
+    load_forwarding,
     /// Additionally run paranoid re-derivation checks: operand widths,
     /// loop / dom-tree consistency, live-range monotonicity, and
     /// load-forwarding soundness.
@@ -584,6 +601,8 @@ pub fn verifyFunction(
         try checkDomTreeStructure(func, func_index, allocator);
         try checkLoopInfo(func, func_index, allocator);
         try checkLiveRangeMonotonicity(func, func_index, allocator);
+    }
+    if (mode == .paranoid or mode == .load_forwarding) {
         try verifyLoadForwardingSoundness(func, func_index, allocator);
     }
 }
@@ -1532,364 +1551,301 @@ fn verifyLiveRangeMonotonicity(
     }
 }
 
-// ── Check 11: load-forwarding soundness (paranoid only, #738) ───────────
+// ── Check 11: load-forwarding soundness (#738, loop-complete #794) ──────
+//
+// Re-derive the load-availability invariant from final IR only. For a load
+// `v = load[p]` whose SSA result is consumed in a *different* block, the value
+// is stale — and the load was therefore forwarded/elided unsoundly — if some
+// aliasing memory effect (an aliasing `store` or a coarse load barrier such as
+// `call`) can run after the load and before the use *without the load being
+// re-executed in between*.
+//
+// This mirrors the per-forward CFG-reachability gate the runtime forwarder
+// applies (`loadForwardCrossesEffect`, src/compiler/ir/passes.zig) — an
+// effecting block on any def→use path, **including loop back-edges and the use
+// block's own post-load effect** — but is an *independent* re-derivation so a
+// regression in any forwarding pass is caught rather than mirrored.
+//
+// The one refinement over the runtime gate is the "avoid-def" rule. The
+// runtime gate only ever forwards *from a dominator that is outside the loop*,
+// so its `a` block is never re-executed on a back-edge. The verifier's `a` is
+// the surviving load's own def block, which may itself sit inside the loop; a
+// path from the effect back to the use that passes through `a` re-executes the
+// load and refreshes the value, so such effects must NOT be flagged. We model
+// this with a backward BFS from the use block that treats the def block as a
+// wall: the stamped blocks are exactly those that reach the use without
+// re-executing the load.
+//
+// NB: this is a heuristic, not a universal SSA invariant — a value loaded into
+// a wasm local and legitimately reused as a snapshot across an aliasing store
+// is indistinguishable in final IR from an unsound forward. It is therefore an
+// opt-in (`paranoid` / `load_forwarding`) check, not a default-compile one.
+// Correctness relies on `checkSsaDominance` (run earlier) guaranteeing the def
+// block dominates every use block, so a block that reaches the use avoiding the
+// def is necessarily reachable *from* the def after the load executes. Blocks
+// unreachable from entry break that argument and can yield a spurious flag, but
+// the normal pipeline runs `scrubUnreachableBlocks` (wiping them to a single
+// effect-free `unreachable` op) before this check ever sees them.
 
-/// Re-derive the post-pass load-forwarding invariant from final IR only.
-/// For each memory-load result consumed across a CFG edge, every CFG path
-/// from the load definition to that use must avoid aliasing stores and coarse
-/// load barriers before the use observes the value.
+const LoadUseSite = struct { block: ir.BlockId, inst: u32 };
+
+fn instHasAliasEffect(load_key: alias_class.LoadKey, op: ir.Inst.Op) bool {
+    return switch (op) {
+        .store => |st| alias_class.storeAliasesLoad(load_key, st),
+        .v128_store => |st| alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128Store(st)),
+        .v128_store_lane => |st| alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128StoreLane(st)),
+        else => alias_class.opIsLoadBarrier(op),
+    };
+}
+
+/// Index of the first instruction in `block[start..end)` carrying an aliasing
+/// memory effect for `load_key`, or null if the slice is clean.
+fn aliasEffectInRange(
+    block: *const ir.BasicBlock,
+    load_key: alias_class.LoadKey,
+    start: usize,
+    end_excl: usize,
+) ?usize {
+    const len = block.instructions.items.len;
+    const lo = @min(start, len);
+    const hi = @min(end_excl, len);
+    if (lo >= hi) return null;
+    for (block.instructions.items[lo..hi], lo..) |inst, ii| {
+        if (instHasAliasEffect(load_key, inst.op)) return ii;
+    }
+    return null;
+}
+
+const LoadForwardingChecker = struct {
+    func: *const ir.IrFunction,
+    func_index: u32,
+    allocator: std.mem.Allocator,
+    successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    /// Generation-stamped marker, length == block count. A block stamped with
+    /// the current `gen` reaches the current use block without passing through
+    /// the current def block.
+    reach_stamp: []u32,
+    gen: u32,
+    /// BFS worklist; after the backward BFS in `checkUse` it holds exactly the
+    /// stamped blocks (those that reach the use without re-executing the load).
+    queue: *std.ArrayList(ir.BlockId),
+
+    fn succsOf(self: *const LoadForwardingChecker, b: ir.BlockId) []const ir.BlockId {
+        return if (self.successors.get(b)) |s| s else &[_]ir.BlockId{};
+    }
+    fn predsOf(self: *const LoadForwardingChecker, b: ir.BlockId) []const ir.BlockId {
+        return if (self.predecessors.get(b)) |p| p else &[_]ir.BlockId{};
+    }
+    fn reaches(self: *const LoadForwardingChecker, b: ir.BlockId) bool {
+        return b < self.reach_stamp.len and self.reach_stamp[b] == self.gen;
+    }
+
+    /// Verify one cross-block use of a load result. `a`/`di` are the load's
+    /// def block and instruction index; `d`/`ui` are the use block and index.
+    fn checkUse(
+        self: *LoadForwardingChecker,
+        load_vreg: ir.VReg,
+        load_key: alias_class.LoadKey,
+        a: ir.BlockId,
+        di: u32,
+        d: ir.BlockId,
+        ui: u32,
+    ) VerifyError!void {
+        if (a == d) return;
+        if (a >= self.reach_stamp.len or d >= self.reach_stamp.len) return;
+
+        // Backward BFS from the use block over predecessors, treating the def
+        // block `a` as a wall (never traversed). The stamped set is the blocks
+        // that reach the use without re-executing the load.
+        self.gen += 1;
+        self.queue.clearRetainingCapacity();
+        self.reach_stamp[d] = self.gen;
+        try self.queue.append(self.allocator, d);
+        var head: usize = 0;
+        while (head < self.queue.items.len) : (head += 1) {
+            const x = self.queue.items[head];
+            for (self.predsOf(x)) |p| {
+                if (p == a) continue;
+                if (p >= self.reach_stamp.len) continue;
+                if (self.reach_stamp[p] == self.gen) continue;
+                self.reach_stamp[p] = self.gen;
+                try self.queue.append(self.allocator, p);
+            }
+        }
+
+        // Def block: an aliasing effect after the load is stale if control can
+        // still reach the use without re-executing the load.
+        var a_reaches_d = false;
+        for (self.succsOf(a)) |s| {
+            if (self.reaches(s)) {
+                a_reaches_d = true;
+                break;
+            }
+        }
+        if (a_reaches_d) {
+            const blk = &self.func.blocks.items[a];
+            if (aliasEffectInRange(blk, load_key, @as(usize, di) + 1, blk.instructions.items.len)) |idx|
+                return self.report(load_vreg, blk.instructions.items[idx].op, a, @intCast(idx), a, d);
+        }
+
+        // Use block: an aliasing effect strictly before the use is always
+        // stale on the def→use path.
+        {
+            const blk = &self.func.blocks.items[d];
+            if (aliasEffectInRange(blk, load_key, 0, ui)) |idx|
+                return self.report(load_vreg, blk.instructions.items[idx].op, d, @intCast(idx), a, d);
+        }
+
+        // Use block: an aliasing effect at/after the use only matters when the
+        // use block can loop back to itself without re-executing the load, in
+        // which case the next iteration's use observes the stale value.
+        var d_reaches_d = false;
+        for (self.succsOf(d)) |s| {
+            if (self.reaches(s)) {
+                d_reaches_d = true;
+                break;
+            }
+        }
+        if (d_reaches_d) {
+            const blk = &self.func.blocks.items[d];
+            if (aliasEffectInRange(blk, load_key, ui, blk.instructions.items.len)) |idx|
+                return self.report(load_vreg, blk.instructions.items[idx].op, d, @intCast(idx), a, d);
+        }
+
+        // Interior corridor: every block that reaches the use avoiding the def
+        // (the stamped set), excluding the use block itself (the def block is
+        // never stamped — it is the BFS wall).
+        for (self.queue.items) |b| {
+            if (b == d) continue;
+            const blk = &self.func.blocks.items[b];
+            if (aliasEffectInRange(blk, load_key, 0, blk.instructions.items.len)) |idx|
+                return self.report(load_vreg, blk.instructions.items[idx].op, b, @intCast(idx), a, d);
+        }
+    }
+
+    fn report(
+        self: *const LoadForwardingChecker,
+        load_vreg: ir.VReg,
+        offending_op: ir.Inst.Op,
+        offending_block: ir.BlockId,
+        offending_inst: u32,
+        def_block: ir.BlockId,
+        use_block: ir.BlockId,
+    ) VerifyError!void {
+        const written = std.fmt.bufPrint(
+            &detail_buf,
+            "load %{d} (def #{d}) crosses {s} at #{d}:{d} before use in #{d}",
+            .{ load_vreg, def_block, @tagName(std.meta.activeTag(offending_op)), offending_block, offending_inst, use_block },
+        ) catch &detail_buf;
+        last_failure = .{
+            .kind = error.LoadForwardingUnsound,
+            .func_index = self.func_index,
+            .block = offending_block,
+            .inst_index = offending_inst,
+            .vreg = load_vreg,
+            .detail = written,
+        };
+        return error.LoadForwardingUnsound;
+    }
+};
+
 fn verifyLoadForwardingSoundness(
     func: *const ir.IrFunction,
     func_index: u32,
     allocator: std.mem.Allocator,
 ) VerifyError!void {
+    const n_blocks = func.blocks.items.len;
+    if (n_blocks == 0) return;
+
+    var successors = try analysis.buildSuccessors(func, allocator);
+    defer analysis.freeBlockIdMap(&successors, allocator);
+    var predecessors = try analysis.buildPredecessors(func, allocator);
+    defer analysis.freeBlockIdMap(&predecessors, allocator);
+
+    const reach_stamp = try allocator.alloc(u32, n_blocks);
+    defer allocator.free(reach_stamp);
+    @memset(reach_stamp, 0);
+
+    var queue: std.ArrayList(ir.BlockId) = .empty;
+    defer queue.deinit(allocator);
+
+    // Collect the use sites of every load result in a single pass so the
+    // per-load scan below is O(uses), not O(instructions). Only load-result
+    // vregs get a list, so non-load operands cost nothing.
+    var uses = std.AutoHashMap(ir.VReg, std.ArrayList(LoadUseSite)).init(allocator);
+    defer {
+        var it = uses.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        uses.deinit();
+    }
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .load) {
+                if (inst.dest) |dst| {
+                    const gop = try uses.getOrPut(dst);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                }
+            }
+        }
+    }
+
+    const Collect = struct {
+        uses: *std.AutoHashMap(ir.VReg, std.ArrayList(LoadUseSite)),
+        allocator: std.mem.Allocator,
+        site: LoadUseSite,
+        err: ?std.mem.Allocator.Error = null,
+
+        fn cb(self: *@This(), v: ir.VReg) void {
+            if (self.err != null) return;
+            const list = self.uses.getPtr(v) orelse return;
+            // Dedup repeated operands of the same instruction (e.g. `add v, v`).
+            if (list.items.len != 0) {
+                const last = list.items[list.items.len - 1];
+                if (last.block == self.site.block and last.inst == self.site.inst) return;
+            }
+            list.append(self.allocator, self.site) catch |e| {
+                self.err = e;
+            };
+        }
+    };
+
     for (func.blocks.items) |*block| {
         for (block.instructions.items, 0..) |inst, ii| {
-            switch (inst.op) {
-                .load => |ld| {
-                    const dest = inst.dest orelse continue;
-                    const load_key = alias_class.LoadKey{ .mem = alias_class.memKeyFromLoad(ld) };
-                    try verifyLoadResultSoundness(
-                        func,
-                        func_index,
-                        allocator,
-                        dest,
-                        load_key,
-                        block.id,
-                        @intCast(ii),
-                    );
-                },
-                else => {},
-            }
-        }
-    }
-}
-
-fn verifyLoadResultSoundness(
-    func: *const ir.IrFunction,
-    func_index: u32,
-    allocator: std.mem.Allocator,
-    load_vreg: ir.VReg,
-    load_key: alias_class.LoadKey,
-    def_block: ir.BlockId,
-    def_inst: u32,
-) VerifyError!void {
-    for (func.blocks.items) |*use_block| {
-        for (use_block.instructions.items, 0..) |inst, ii| {
-            var found_use = false;
-            const Ctx = struct {
-                found: *bool,
-                target: ir.VReg,
+            var collect = Collect{
+                .uses = &uses,
+                .allocator = allocator,
+                .site = .{ .block = block.id, .inst = @intCast(ii) },
             };
-            var ctx = Ctx{ .found = &found_use, .target = load_vreg };
-            forEachOperand(inst, &ctx, struct {
-                fn cb(ptr: *Ctx, v: ir.VReg) void {
-                    if (v == ptr.target) ptr.found.* = true;
-                }
-            }.cb);
-
-            if (!found_use or use_block.id == def_block) continue;
-            try verifyLoadUseCleanPaths(
-                func,
-                func_index,
-                allocator,
-                load_vreg,
-                load_key,
-                def_block,
-                def_inst,
-                use_block.id,
-                @intCast(ii),
-            );
-        }
-    }
-}
-
-fn verifyLoadUseCleanPaths(
-    func: *const ir.IrFunction,
-    func_index: u32,
-    allocator: std.mem.Allocator,
-    load_vreg: ir.VReg,
-    load_key: alias_class.LoadKey,
-    def_block: ir.BlockId,
-    def_inst: u32,
-    use_block: ir.BlockId,
-    use_inst: u32,
-) VerifyError!void {
-    const nblocks = func.blocks.items.len;
-    const can_reach_use = try allocator.alloc(bool, nblocks);
-    defer allocator.free(can_reach_use);
-    @memset(can_reach_use, false);
-    try markBlocksReaching(func, use_block, can_reach_use, allocator);
-
-    const visited = try allocator.alloc(bool, nblocks);
-    defer allocator.free(visited);
-    @memset(visited, false);
-
-    var path: std.ArrayList(ir.BlockId) = .empty;
-    defer path.deinit(allocator);
-
-    try verifyLoadUseCleanPathsDfs(
-        func,
-        func_index,
-        allocator,
-        load_vreg,
-        load_key,
-        def_block,
-        def_inst,
-        use_block,
-        use_inst,
-        can_reach_use,
-        visited,
-        &path,
-        def_block,
-    );
-}
-
-fn markBlocksReaching(
-    func: *const ir.IrFunction,
-    target: ir.BlockId,
-    out: []bool,
-    allocator: std.mem.Allocator,
-) VerifyError!void {
-    var stack: std.ArrayList(ir.BlockId) = .empty;
-    defer stack.deinit(allocator);
-    out[target] = true;
-    try stack.append(allocator, target);
-
-    while (stack.pop()) |b| {
-        for (func.blocks.items[b].predecessors.items) |pred| {
-            if (out[pred]) continue;
-            out[pred] = true;
-            try stack.append(allocator, pred);
-        }
-    }
-}
-
-fn verifyLoadUseCleanPathsDfs(
-    func: *const ir.IrFunction,
-    func_index: u32,
-    allocator: std.mem.Allocator,
-    load_vreg: ir.VReg,
-    load_key: alias_class.LoadKey,
-    def_block: ir.BlockId,
-    def_inst: u32,
-    use_block: ir.BlockId,
-    use_inst: u32,
-    can_reach_use: []const bool,
-    visited: []bool,
-    path: *std.ArrayList(ir.BlockId),
-    cur_block: ir.BlockId,
-) VerifyError!void {
-    if (cur_block >= func.blocks.items.len or !can_reach_use[cur_block] or visited[cur_block]) return;
-    visited[cur_block] = true;
-    defer visited[cur_block] = false;
-    try path.append(allocator, cur_block);
-    defer _ = path.pop();
-
-    const block = &func.blocks.items[cur_block];
-    var start: usize = 0;
-    var end: usize = block.instructions.items.len;
-    if (cur_block == def_block) start = @as(usize, def_inst) + 1;
-    if (cur_block == use_block) end = @min(end, @as(usize, use_inst));
-    if (start > end) start = end;
-
-    for (block.instructions.items[start..end], start..) |inst, ii| {
-        switch (inst.op) {
-            .store => |st| {
-                if (alias_class.storeAliasesLoad(load_key, st)) {
-                    return failLoadForwardingSoundness(
-                        func,
-                        func_index,
-                        load_vreg,
-                        inst.op,
-                        cur_block,
-                        @intCast(ii),
-                        path.items,
-                        use_block,
-                        can_reach_use,
-                    );
-                }
-            },
-            .v128_store => |st| {
-                if (alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128Store(st))) {
-                    return failLoadForwardingSoundness(
-                        func,
-                        func_index,
-                        load_vreg,
-                        inst.op,
-                        cur_block,
-                        @intCast(ii),
-                        path.items,
-                        use_block,
-                        can_reach_use,
-                    );
-                }
-            },
-            .v128_store_lane => |st| {
-                if (alias_class.storeAliasesLoad(load_key, alias_class.storeRangeFromV128StoreLane(st))) {
-                    return failLoadForwardingSoundness(
-                        func,
-                        func_index,
-                        load_vreg,
-                        inst.op,
-                        cur_block,
-                        @intCast(ii),
-                        path.items,
-                        use_block,
-                        can_reach_use,
-                    );
-                }
-            },
-            else => {},
-        }
-        if (alias_class.opIsLoadBarrier(inst.op)) {
-            return failLoadForwardingSoundness(
-                func,
-                func_index,
-                load_vreg,
-                inst.op,
-                cur_block,
-                @intCast(ii),
-                path.items,
-                use_block,
-                can_reach_use,
-            );
+            forEachOperand(inst, &collect, Collect.cb);
+            if (collect.err) |e| return e;
         }
     }
 
-    if (cur_block == use_block) return;
-    if (block.instructions.items.len == 0) return;
-
-    const last = block.instructions.items[block.instructions.items.len - 1].op;
-    switch (last) {
-        .br => |target| try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, target),
-        .br_if => |bi| {
-            try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, bi.then_block);
-            try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, bi.else_block);
-        },
-        .br_table => |bt| {
-            for (bt.targets) |target| {
-                try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, target);
-            }
-            try verifyLoadUseCleanPathsDfs(func, func_index, allocator, load_vreg, load_key, def_block, def_inst, use_block, use_inst, can_reach_use, visited, path, bt.default);
-        },
-        else => {},
-    }
-}
-
-fn failLoadForwardingSoundness(
-    func: *const ir.IrFunction,
-    func_index: u32,
-    load_vreg: ir.VReg,
-    offending_op: ir.Inst.Op,
-    offending_block: ir.BlockId,
-    offending_inst: u32,
-    path_prefix: []const ir.BlockId,
-    use_block: ir.BlockId,
-    can_reach_use: []const bool,
-) VerifyError {
-    var path_buf: [256]u8 = undefined;
-    const path_text = formatLoadForwardingPath(func, path_prefix, use_block, can_reach_use, &path_buf);
-    const written = std.fmt.bufPrint(
-        &detail_buf,
-        "load %{d} crosses {s} on path {s}",
-        .{ load_vreg, @tagName(std.meta.activeTag(offending_op)), path_text },
-    ) catch &detail_buf;
-    last_failure = .{
-        .kind = error.LoadForwardingUnsound,
+    var checker = LoadForwardingChecker{
+        .func = func,
         .func_index = func_index,
-        .block = offending_block,
-        .inst_index = offending_inst,
-        .vreg = load_vreg,
-        .detail = written,
+        .allocator = allocator,
+        .successors = &successors,
+        .predecessors = &predecessors,
+        .reach_stamp = reach_stamp,
+        .gen = 0,
+        .queue = &queue,
     };
-    return error.LoadForwardingUnsound;
-}
 
-fn formatLoadForwardingPath(
-    func: *const ir.IrFunction,
-    path_prefix: []const ir.BlockId,
-    use_block: ir.BlockId,
-    can_reach_use: []const bool,
-    buf: []u8,
-) []const u8 {
-    var len: usize = 0;
-    appendPathBlocks(buf, &len, path_prefix);
-    if (path_prefix.len == 0) return buf[0..len];
-
-    var cur = path_prefix[path_prefix.len - 1];
-    var suffix_seen = [_]ir.BlockId{std.math.maxInt(ir.BlockId)} ** 16;
-    var suffix_seen_len: usize = 0;
-    while (cur != use_block) {
-        var next: ?ir.BlockId = null;
-        if (cur < func.blocks.items.len) {
-            const block = &func.blocks.items[cur];
-            if (block.instructions.items.len != 0) {
-                const last = block.instructions.items[block.instructions.items.len - 1].op;
-                switch (last) {
-                    .br => |target| {
-                        if (target < can_reach_use.len and can_reach_use[target]) next = target;
-                    },
-                    .br_if => |bi| {
-                        if (bi.then_block < can_reach_use.len and can_reach_use[bi.then_block]) next = bi.then_block;
-                        if (next == null and bi.else_block < can_reach_use.len and can_reach_use[bi.else_block]) next = bi.else_block;
-                    },
-                    .br_table => |bt| {
-                        for (bt.targets) |target| {
-                            if (target < can_reach_use.len and can_reach_use[target]) {
-                                next = target;
-                                break;
-                            }
-                        }
-                        if (next == null and bt.default < can_reach_use.len and can_reach_use[bt.default]) next = bt.default;
-                    },
-                    else => {},
-                }
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.op != .load) continue;
+            const dest = inst.dest orelse continue;
+            const load_key = alias_class.LoadKey{ .mem = alias_class.memKeyFromLoad(inst.op.load) };
+            const list = uses.get(dest) orelse continue;
+            for (list.items) |use| {
+                if (use.block == block.id) continue; // same-block use: not a cross-block forward
+                try checker.checkUse(dest, load_key, block.id, @intCast(ii), use.block, use.inst);
             }
         }
-        const n = next orelse {
-            appendPathText(buf, &len, " -> ...");
-            break;
-        };
-        var repeats = false;
-        for (suffix_seen[0..suffix_seen_len]) |seen| {
-            if (seen == n) repeats = true;
-        }
-        if (repeats) {
-            appendPathText(buf, &len, " -> ...");
-            break;
-        }
-        if (suffix_seen_len < suffix_seen.len) {
-            suffix_seen[suffix_seen_len] = n;
-            suffix_seen_len += 1;
-        }
-        appendPathBlock(buf, &len, n);
-        cur = n;
     }
-    return buf[0..len];
-}
-
-fn appendPathBlocks(buf: []u8, len: *usize, blocks: []const ir.BlockId) void {
-    for (blocks) |b| appendPathBlock(buf, len, b);
-}
-
-fn appendPathBlock(buf: []u8, len: *usize, block: ir.BlockId) void {
-    if (len.* == 0) {
-        appendPathText(buf, len, "#");
-    } else {
-        appendPathText(buf, len, " -> #");
-    }
-    var tmp: [32]u8 = undefined;
-    const digits = std.fmt.bufPrint(&tmp, "{d}", .{block}) catch return;
-    appendPathText(buf, len, digits);
-}
-
-fn appendPathText(buf: []u8, len: *usize, text: []const u8) void {
-    if (len.* >= buf.len) return;
-    const available = buf.len - len.*;
-    const n = @min(available, text.len);
-    @memcpy(buf[len.* .. len.* + n], text[0..n]);
-    len.* += n;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1977,6 +1933,281 @@ test "verifier: load forwarding soundness catches sibling barrier regression" {
 
     try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .paranoid, a));
     try testing.expect(std.mem.indexOf(u8, last_failure.detail, "call_indirect") != null);
+}
+
+// #794 loop-completeness regression cases. Each hand-builds the *post-pass*
+// IR a buggy forwarder would emit (a single surviving load whose value is
+// reused across an effect on a loop). param_count covers the undefined input
+// vregs (base, cond); defined vregs (the load result, store value) come after.
+
+test "verifier(#794): barrier in loop body after the use is flagged (func7463 shape)" {
+    // entry: v = load[p]; br header
+    // header: use v; br_if cond, body, exit
+    // body:   call;       br header        <-- barrier reachable after the use
+    // exit:   ret
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 2, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+    const cond = func.newVReg(); // 1 (param)
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(header).addPredecessor(entry);
+    try func.getBlock(header).addPredecessor(body);
+    try func.getBlock(body).addPredecessor(header);
+    try func.getBlock(exit).addPredecessor(header);
+
+    const loaded = func.newVReg();
+    const used = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+    try func.getBlock(header).append(.{ .dest = used, .type = .i32, .op = .{ .add = .{ .lhs = loaded, .rhs = loaded } } });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = body, .else_block = exit } } });
+    try func.getBlock(body).append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = header } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    // The simple def->use path (entry->header) is clean, so only a
+    // loop-complete check catches this.
+    try verifyFunction(&func, 0, .after_each_pass, a); // Check 11 not run
+    try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .load_forwarding, a));
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "call") != null);
+}
+
+test "verifier(#794): use block's own post-load store on a loop is flagged (fn2178 shape)" {
+    // entry: v = load[p]; val = const; br loop
+    // loop:  use v; store[p] = val; br_if cond, loop, exit   <-- store after the use
+    // exit:  ret
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 2, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+    const cond = func.newVReg(); // 1 (param)
+
+    const entry = try func.newBlock();
+    const loop = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(loop).addPredecessor(entry);
+    try func.getBlock(loop).addPredecessor(loop);
+    try func.getBlock(exit).addPredecessor(loop);
+
+    const loaded = func.newVReg();
+    const val = func.newVReg();
+    const used = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .dest = val, .type = .i32, .op = .{ .iconst_32 = 7 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = loop } });
+    try func.getBlock(loop).append(.{ .dest = used, .type = .i32, .op = .{ .add = .{ .lhs = loaded, .rhs = loaded } } });
+    try func.getBlock(loop).append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = val } } });
+    try func.getBlock(loop).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = loop, .else_block = exit } } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .load_forwarding, a));
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "store") != null);
+}
+
+test "verifier(#794): store after use accepted when the back-edge re-executes the load (avoid-def)" {
+    // entry: val = const; br A
+    // A:     v = load[p]; br D
+    // D:     use v; store[p] = val; br_if cond, A, exit   <-- back-edge to A reloads v
+    // exit:  ret
+    // Sound: every path from the store back to the use re-runs the load in A,
+    // so the use never observes a stale value. The naive runtime "B==d" clause
+    // (no avoid-def) would wrongly flag this; the verifier's avoid-def must not.
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 2, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+    const cond = func.newVReg(); // 1 (param)
+
+    const entry = try func.newBlock();
+    const blk_a = try func.newBlock();
+    const blk_d = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(blk_a).addPredecessor(entry);
+    try func.getBlock(blk_a).addPredecessor(blk_d);
+    try func.getBlock(blk_d).addPredecessor(blk_a);
+    try func.getBlock(exit).addPredecessor(blk_d);
+
+    const val = func.newVReg();
+    const loaded = func.newVReg();
+    const used = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = val, .type = .i32, .op = .{ .iconst_32 = 7 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = blk_a } });
+    try func.getBlock(blk_a).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(blk_a).append(.{ .op = .{ .br = blk_d } });
+    try func.getBlock(blk_d).append(.{ .dest = used, .type = .i32, .op = .{ .add = .{ .lhs = loaded, .rhs = loaded } } });
+    try func.getBlock(blk_d).append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = val } } });
+    try func.getBlock(blk_d).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = blk_a, .else_block = exit } } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    try verifyFunction(&func, 0, .load_forwarding, a);
+}
+
+test "verifier(#794): store after use flagged when the back-edge skips the load (avoid-def)" {
+    // Same as above but the back-edge targets D, so the load in A is NOT
+    // re-executed and the next iteration's use is stale — must be flagged.
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 2, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+    const cond = func.newVReg(); // 1 (param)
+
+    const entry = try func.newBlock();
+    const blk_a = try func.newBlock();
+    const blk_d = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(blk_a).addPredecessor(entry);
+    try func.getBlock(blk_d).addPredecessor(blk_a);
+    try func.getBlock(blk_d).addPredecessor(blk_d);
+    try func.getBlock(exit).addPredecessor(blk_d);
+
+    const val = func.newVReg();
+    const loaded = func.newVReg();
+    const used = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = val, .type = .i32, .op = .{ .iconst_32 = 7 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = blk_a } });
+    try func.getBlock(blk_a).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(blk_a).append(.{ .op = .{ .br = blk_d } });
+    try func.getBlock(blk_d).append(.{ .dest = used, .type = .i32, .op = .{ .add = .{ .lhs = loaded, .rhs = loaded } } });
+    try func.getBlock(blk_d).append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = val } } });
+    try func.getBlock(blk_d).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = blk_d, .else_block = exit } } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .load_forwarding, a));
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "store") != null);
+}
+
+test "verifier(#794): non-aliasing store in the loop body is accepted (alias-aware)" {
+    // entry: v = load[p+0]; val = const; br loop
+    // loop:  use v; store[p+64] = val; br_if cond, loop, exit  <-- disjoint range
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 2, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+    const cond = func.newVReg(); // 1 (param)
+
+    const entry = try func.newBlock();
+    const loop = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(loop).addPredecessor(entry);
+    try func.getBlock(loop).addPredecessor(loop);
+    try func.getBlock(exit).addPredecessor(loop);
+
+    const loaded = func.newVReg();
+    const val = func.newVReg();
+    const used = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .dest = val, .type = .i32, .op = .{ .iconst_32 = 7 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = loop } });
+    try func.getBlock(loop).append(.{ .dest = used, .type = .i32, .op = .{ .add = .{ .lhs = loaded, .rhs = loaded } } });
+    try func.getBlock(loop).append(.{ .op = .{ .store = .{ .base = base, .offset = 64, .size = 4, .val = val } } });
+    try func.getBlock(loop).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = loop, .else_block = exit } } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    try verifyFunction(&func, 0, .load_forwarding, a);
+}
+
+test "verifier(#794): barrier-free loop reusing a dominating load is accepted" {
+    // entry: v = load[p]; br header
+    // header: use v; br_if cond, header, exit   <-- loop, no effects at all
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 2, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+    const cond = func.newVReg(); // 1 (param)
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(header).addPredecessor(entry);
+    try func.getBlock(header).addPredecessor(header);
+    try func.getBlock(exit).addPredecessor(header);
+
+    const loaded = func.newVReg();
+    const used = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+    try func.getBlock(header).append(.{ .dest = used, .type = .i32, .op = .{ .add = .{ .lhs = loaded, .rhs = loaded } } });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = header, .else_block = exit } } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    try verifyFunction(&func, 0, .load_forwarding, a);
+}
+
+test "verifier(#794): aliasing store after the load in the def block is flagged (straight path)" {
+    // entry: v = load[p]; store[p] = val; br exit
+    // exit:  use v; ret      <-- v is stale at the use (boundary-def, non-loop)
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 1, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+
+    const entry = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(exit).addPredecessor(entry);
+
+    const loaded = func.newVReg();
+    const val = func.newVReg();
+    const used = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .dest = val, .type = .i32, .op = .{ .iconst_32 = 9 } });
+    try func.getBlock(entry).append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = val } } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = exit } });
+    try func.getBlock(exit).append(.{ .dest = used, .type = .i32, .op = .{ .add = .{ .lhs = loaded, .rhs = loaded } } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .load_forwarding, a));
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "store") != null);
+}
+
+test "verifier(#794): a load value carried through a loop-header phi across a store is checked" {
+    // entry:  v = load[p]; val = const; br header
+    // header: x = phi[entry: v, body: x2]; br_if cond, body, exit
+    // body:   store[p] = val; x2 = x + 1; br header   <-- in-loop store
+    // exit:   ret
+    // `v` is used only as a phi operand; this locks in that phi-operand uses are
+    // covered by Check 11 (the in-loop store is reachable on the header→header
+    // cycle that does not re-execute the entry load).
+    const a = testing.allocator;
+    var func = ir.IrFunction.init(a, 2, 0, 0);
+    defer func.deinit();
+    const base = func.newVReg(); // 0 (param)
+    const cond = func.newVReg(); // 1 (param)
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+    try func.getBlock(header).addPredecessor(entry);
+    try func.getBlock(header).addPredecessor(body);
+    try func.getBlock(body).addPredecessor(header);
+    try func.getBlock(exit).addPredecessor(header);
+
+    const loaded = func.newVReg();
+    const val = func.newVReg();
+    const phi_x = func.newVReg();
+    const x2 = func.newVReg();
+    const one = func.newVReg();
+    try func.getBlock(entry).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
+    try func.getBlock(entry).append(.{ .dest = val, .type = .i32, .op = .{ .iconst_32 = 3 } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = header } });
+
+    const x_edges = try a.dupe(ir.Inst.PhiEdge, &.{ .{ .block = entry, .val = loaded }, .{ .block = body, .val = x2 } });
+    try func.getBlock(header).append(.{ .dest = phi_x, .type = .i32, .op = .{ .phi = x_edges } });
+    try func.getBlock(header).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = body, .else_block = exit } } });
+
+    try func.getBlock(body).append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = val } } });
+    try func.getBlock(body).append(.{ .dest = one, .type = .i32, .op = .{ .iconst_32 = 1 } });
+    try func.getBlock(body).append(.{ .dest = x2, .type = .i32, .op = .{ .add = .{ .lhs = phi_x, .rhs = one } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = header } });
+    try func.getBlock(exit).append(.{ .op = .{ .ret = null } });
+
+    try testing.expectError(error.LoadForwardingUnsound, verifyFunction(&func, 0, .load_forwarding, a));
+    try testing.expect(std.mem.indexOf(u8, last_failure.detail, "store") != null);
 }
 
 test "verifier: empty function passes" {
