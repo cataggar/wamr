@@ -55,6 +55,27 @@ pub const Inst = struct {
     dest: ?VReg = null,
     type: IrType = .i32,
 
+    /// Free heap slices owned directly by this instruction's `op`. Mirrors
+    /// the per-op `free` arms in `BasicBlock.deinit` so callers that drop an
+    /// instruction out of a block's list (e.g. the inliner discarding dead
+    /// code after a terminator, #784) can release the same memory `deinit`
+    /// would have. NOTE: `br_table` targets are intentionally NOT freed here
+    /// — they live in `IrFunction.owned_br_table_targets` and are freed at
+    /// function deinit; freeing them here would double-free.
+    pub fn freeOwnedSlices(self: Inst, allocator: std.mem.Allocator) void {
+        switch (self.op) {
+            .phi => |edges| allocator.free(edges),
+            .parallel_copy => |pairs| allocator.free(pairs),
+            .call => |cl| if (cl.args.len > 0) allocator.free(cl.args),
+            .call_indirect => |ci| if (ci.args.len > 0) allocator.free(ci.args),
+            .call_ref => |cr| if (cr.args.len > 0) allocator.free(cr.args),
+            .ret_multi => |vregs| if (vregs.len > 0) allocator.free(vregs),
+            .try_table_begin => |tt| if (tt.clauses.len > 0) allocator.free(tt.clauses),
+            .throw => |th| if (th.args.len > 0) allocator.free(th.args),
+            else => {},
+        }
+    }
+
     pub const Op = union(enum) {
         // Constants
         iconst_32: i32,
@@ -958,18 +979,7 @@ pub const BasicBlock = struct {
 
     pub fn deinit(self: *BasicBlock) void {
         for (self.instructions.items) |inst| {
-            switch (inst.op) {
-                .phi => |edges| self.allocator.free(edges),
-                .parallel_copy => |pairs| self.allocator.free(pairs),
-                .call => |cl| if (cl.args.len > 0) self.allocator.free(cl.args),
-                .call_indirect => |ci| if (ci.args.len > 0) self.allocator.free(ci.args),
-                .call_ref => |cr| if (cr.args.len > 0) self.allocator.free(cr.args),
-                .ret_multi => |vregs| if (vregs.len > 0) self.allocator.free(vregs),
-                // #672 EH ops own their immediate slices.
-                .try_table_begin => |tt| if (tt.clauses.len > 0) self.allocator.free(tt.clauses),
-                .throw => |th| if (th.args.len > 0) self.allocator.free(th.args),
-                else => {},
-            }
+            inst.freeOwnedSlices(self.allocator);
         }
         self.instructions.deinit(self.allocator);
         self.predecessors.deinit(self.allocator);
