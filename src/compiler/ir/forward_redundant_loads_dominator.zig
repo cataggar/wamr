@@ -474,3 +474,157 @@ test "FRLDominator (cell H): barrier in then-branch, store in else-branch, merge
     try testing.expect(m.instructions.items[0].op == .load);
     try testing.expectEqual(ir.Inst.Op{ .ret = v_merge }, m.instructions.items[1].op);
 }
+
+test "FRLDominator (#743): load in loop NOT forwarded across loop-body barrier" {
+    // The forwarded load lives at a loop block whose loop body contains a
+    // `call` barrier. The barrier is a dominator-tree DESCENDANT of the
+    // load, so #719 sibling-ordering can't catch it: the forward happens
+    // before the walk descends to the barrier. At run time the back-edge
+    // re-runs the call (which may modify the loaded location) before the
+    // loaded block is re-entered, so the dominating load's value is stale.
+    //
+    //   entry:  v_dom = load p[0]
+    //           br header
+    //   header: v_use = load p[0]    ; must NOT be forwarded
+    //           br_if cond, body, exit
+    //   body:   call f               ; barrier in loop body
+    //           br header            ; back-edge
+    //   exit:   ret v_use
+    const allocator = testing.allocator;
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_use = func.newVReg();
+    const v_call = func.newVReg();
+
+    {
+        const blk = &func.blocks.items[entry];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+        try terminateBr(blk, header);
+    }
+    {
+        const blk = &func.blocks.items[header];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_use, .type = .i32 });
+        try terminateBrIf(blk, cond, body, exit);
+    }
+    {
+        const blk = &func.blocks.items[body];
+        try blk.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_call, .type = .i32 });
+        try terminateBr(blk, header);
+    }
+    {
+        const blk = &func.blocks.items[exit];
+        try blk.append(.{ .op = .{ .ret = v_use }, .type = .i32 });
+    }
+
+    _ = try forwardRedundantLoadsDominator(&func, allocator);
+    // The header's load must survive (load + br_if).
+    const h = &func.blocks.items[header];
+    try testing.expectEqual(@as(usize, 2), h.instructions.items.len);
+    try testing.expect(h.instructions.items[0].op == .load);
+}
+
+test "FRLDominator (#743): load in barrier-free loop IS still forwarded" {
+    // No-regression guard: the same shape but with a barrier-free loop body
+    // leaves `p[0]` unmodified across iterations, so forwarding the header
+    // load from the dominating entry load stays sound and must still happen.
+    const allocator = testing.allocator;
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_use = func.newVReg();
+
+    {
+        const blk = &func.blocks.items[entry];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+        try terminateBr(blk, header);
+    }
+    {
+        const blk = &func.blocks.items[header];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_use, .type = .i32 });
+        try terminateBrIf(blk, cond, body, exit);
+    }
+    {
+        const blk = &func.blocks.items[body];
+        try terminateBr(blk, header);
+    }
+    {
+        const blk = &func.blocks.items[exit];
+        try blk.append(.{ .op = .{ .ret = v_use }, .type = .i32 });
+    }
+
+    _ = try forwardRedundantLoadsDominator(&func, allocator);
+    // The header's load is redundant with the entry load (loop never writes
+    // p[0]) → forwarded away, leaving only the br_if terminator.
+    const h = &func.blocks.items[header];
+    try testing.expectEqual(@as(usize, 1), h.instructions.items.len);
+    try testing.expect(h.instructions.items[0].op == .br_if);
+}
+
+test "FRLDominator (#743): load NOT forwarded when the use block itself stores in a loop" {
+    // The effecting block IS the use block: `header` loads p[0], later stores
+    // p[0], and loops back to itself. The store runs after the load within one
+    // iteration (harmless that pass) but before the load re-executes on the
+    // next iteration, so the dominating entry value is stale. This exercises
+    // the `B == d` corner the corridor walk must not skip.
+    const allocator = testing.allocator;
+    const meta = FrlTestFuncMeta{};
+    var func = makeFrlTestFunc(allocator, meta);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const header = try func.newBlock();
+    const exit = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_use = func.newVReg();
+    const v_one = func.newVReg();
+    const v_new = func.newVReg();
+
+    {
+        const blk = &func.blocks.items[entry];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+        try terminateBr(blk, header);
+    }
+    {
+        const blk = &func.blocks.items[header];
+        try blk.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_use, .type = .i32 });
+        try blk.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+        try blk.append(.{ .op = .{ .add = .{ .lhs = v_use, .rhs = v_one } }, .dest = v_new, .type = .i32 });
+        try blk.append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_new } }, .type = .i32 });
+        try terminateBrIf(blk, cond, header, exit);
+    }
+    {
+        const blk = &func.blocks.items[exit];
+        try blk.append(.{ .op = .{ .ret = v_use }, .type = .i32 });
+    }
+
+    _ = try forwardRedundantLoadsDominator(&func, allocator);
+    // header's load must survive.
+    const h = &func.blocks.items[header];
+    var has_load = false;
+    for (h.instructions.items) |inst| {
+        if (inst.op == .load) has_load = true;
+    }
+    try testing.expect(has_load);
+}

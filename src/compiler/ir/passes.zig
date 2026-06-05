@@ -224,6 +224,89 @@ pub const LoadForwardingDomWalkInstructionResult = enum {
     removed,
 };
 
+/// #743: returns true when forwarding a load value defined in block `a` to a
+/// use in block `d` is UNSOUND — i.e. some block carrying an aliasing memory
+/// effect (a `call`/atomic/bulk-mem barrier or any `store`) lies strictly
+/// between `a` and `d` on some CFG path, **including paths that traverse loop
+/// back-edges**. The dominator-tree DFS that drives load forwarding only
+/// invalidates barriers it encounters on the descent, so a barrier in a
+/// sibling/merge subtree or a loop body is otherwise missed.
+///
+/// `fwd_stamp` / `bwd_stamp` are reusable per-block generation markers (length
+/// == block count) and `gen` is a value not previously used in either array;
+/// `queue` is reusable scratch. The check runs in O(corridor) per call —
+/// only the blocks that both descend from `a` and reach `d` are visited.
+fn loadForwardCrossesEffect(
+    a: ir.BlockId,
+    d: ir.BlockId,
+    successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    effect: []const bool,
+    fwd_stamp: []u32,
+    bwd_stamp: []u32,
+    gen: u32,
+    queue: *std.ArrayList(ir.BlockId),
+    allocator: std.mem.Allocator,
+) !bool {
+    if (a == d) return false;
+    if (a >= bwd_stamp.len or d >= bwd_stamp.len) return false;
+
+    // Backward BFS from `d`: mark every block that can reach `d`.
+    queue.clearRetainingCapacity();
+    bwd_stamp[d] = gen;
+    try queue.append(allocator, d);
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const x = queue.items[head];
+        if (predecessors.get(x)) |preds| {
+            for (preds) |p| {
+                if (p < bwd_stamp.len and bwd_stamp[p] != gen) {
+                    bwd_stamp[p] = gen;
+                    try queue.append(allocator, p);
+                }
+            }
+        }
+    }
+    // `a` dominates `d`, so it reaches `d`; bail defensively otherwise.
+    if (bwd_stamp[a] != gen) return false;
+
+    // The use block `d` may carry an aliasing effect (a store/barrier) that
+    // runs AFTER the forwarded load within `d`. On a single pass that is
+    // harmless (the load is read first), but when `d` lies on a loop — i.e.
+    // `d` can reach itself — that effect runs before `d`'s load re-executes
+    // on the next iteration, so the dominating value is stale. Detect this by
+    // checking whether any successor of `d` can still reach `d`.
+    if (d < effect.len and effect[d]) {
+        if (successors.get(d)) |succs| {
+            for (succs) |s| {
+                if (s < bwd_stamp.len and bwd_stamp[s] == gen) return true;
+            }
+        }
+    }
+
+    // Forward BFS from `a`, restricted to the corridor of blocks that reach
+    // `d`. Any effecting block strictly inside the corridor (≠ a, ≠ d) makes
+    // the forward unsound.
+    queue.clearRetainingCapacity();
+    fwd_stamp[a] = gen;
+    try queue.append(allocator, a);
+    head = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const x = queue.items[head];
+        if (successors.get(x)) |succs| {
+            for (succs) |s| {
+                if (s >= fwd_stamp.len) continue;
+                if (bwd_stamp[s] != gen) continue; // not on an a→d path
+                if (fwd_stamp[s] == gen) continue; // already visited
+                fwd_stamp[s] = gen;
+                if (s != d and effect[s]) return true;
+                try queue.append(allocator, s);
+            }
+        }
+    }
+    return false;
+}
+
 /// Generic driver for load-forwarding dominator DFS passes.
 /// The driver owns dominator computation, `BarrierOrderedDomChildren`, the
 /// DFS stack, `LoadFrameStack` push/pop, load/store/barrier dispatch, and the
@@ -261,6 +344,70 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
             defer dom_children.deinit();
 
             if (dom.idom[0] == null) return false;
+
+            // #743: per-forward load-availability soundness check. The
+            // dominator-tree DFS below only invalidates a barrier (`call` /
+            // atomic / bulk-mem) or aliasing `store` when it is *encountered
+            // on the descent*. A barrier reachable through a sibling/merge
+            // subtree — or through a loop back-edge — is therefore missed,
+            // and a load whose value was recorded above it can be unsoundly
+            // forwarded (the forward is applied before the barrier is
+            // visited). The frame heuristic (clearAll + the #719 barrier
+            // ordering) only prunes the easy cases; this exact check closes
+            // the gap by verifying, at each forward, that no effecting block
+            // lies on any CFG path between the value's defining block and the
+            // use block (loop back-edges included).
+            var successors = try analysis.buildSuccessors(func, allocator);
+            defer analysis.freeBlockIdMap(&successors, allocator);
+            var predecessors = try analysis.buildPredecessors(func, allocator);
+            defer analysis.freeBlockIdMap(&predecessors, allocator);
+
+            const nblk = func.blocks.items.len;
+            const effect_blocks = try allocator.alloc(bool, nblk);
+            defer allocator.free(effect_blocks);
+            for (func.blocks.items, 0..) |bb, bi| {
+                var has = false;
+                for (bb.instructions.items) |inst| {
+                    switch (inst.op) {
+                        .store, .v128_store, .v128_store_lane => has = true,
+                        else => if (opIsLoadBarrier(inst.op)) {
+                            has = true;
+                        },
+                    }
+                    if (has) break;
+                }
+                effect_blocks[bi] = has;
+            }
+
+            // vreg -> defining block, so a forwarded value's source block is
+            // known at the use site.
+            const invalid_block: ir.BlockId = std.math.maxInt(ir.BlockId);
+            const def_block = try allocator.alloc(ir.BlockId, func.next_vreg);
+            defer allocator.free(def_block);
+            @memset(def_block, invalid_block);
+            for (func.blocks.items, 0..) |bb, bi| {
+                for (bb.instructions.items) |inst| {
+                    if (inst.dest) |dst| {
+                        if (dst < def_block.len and def_block[dst] == invalid_block) def_block[dst] = @intCast(bi);
+                    }
+                    if (inst.op == .parallel_copy) {
+                        for (inst.op.parallel_copy) |p| {
+                            if (p.dst < def_block.len and def_block[p.dst] == invalid_block) def_block[p.dst] = @intCast(bi);
+                        }
+                    }
+                }
+            }
+
+            // Reusable BFS scratch for `loadForwardCrossesEffect`.
+            const fwd_stamp = try allocator.alloc(u32, nblk);
+            defer allocator.free(fwd_stamp);
+            @memset(fwd_stamp, 0);
+            const bwd_stamp = try allocator.alloc(u32, nblk);
+            defer allocator.free(bwd_stamp);
+            @memset(bwd_stamp, 0);
+            var bfs_queue: std.ArrayList(ir.BlockId) = .empty;
+            defer bfs_queue.deinit(allocator);
+            var fwd_gen: u32 = 0;
 
             var load_frames = LoadFrameStack.init(allocator);
             defer load_frames.deinit();
@@ -301,7 +448,30 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
                                     key_ld.base = visitor.canonicalizeVReg(key_ld.base);
                                 }
                                 const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(key_ld) };
-                                if (load_frames.lookup(key)) |held| {
+                                const held_opt = load_frames.lookup(key);
+                                // #743: only forward when no aliasing memory
+                                // effect lies on any CFG path between the
+                                // value's defining block and this use.
+                                const can_forward = blk: {
+                                    const held = held_opt orelse break :blk false;
+                                    const a_block = if (held < def_block.len) def_block[held] else invalid_block;
+                                    if (a_block == invalid_block) break :blk false;
+                                    fwd_gen += 1;
+                                    break :blk !(try loadForwardCrossesEffect(
+                                        a_block,
+                                        bid,
+                                        &successors,
+                                        &predecessors,
+                                        effect_blocks,
+                                        fwd_stamp,
+                                        bwd_stamp,
+                                        fwd_gen,
+                                        &bfs_queue,
+                                        allocator,
+                                    ));
+                                };
+                                if (can_forward) {
+                                    const held = held_opt.?;
                                     if (comptime @hasDecl(Visitor, "onForwardedLoad")) {
                                         switch (try visitor.onForwardedLoad(func, bid, i, inst, inst.dest, held, &load_frames)) {
                                             .unchanged => {},
@@ -3959,7 +4129,6 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
     var changed = false;
     for (lf.loops) |*loop| {
         const ph = (try obtainLoopPreheader(func, loop, &predecessors, dom, allocator)) orelse continue;
-
         // One-shot scan of the loop body: which wasm-local / wasm-global
         // indices are written, and does the body contain any call or
         // memory-mutating op?
