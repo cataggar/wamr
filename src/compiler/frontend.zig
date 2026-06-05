@@ -589,6 +589,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 }
             },
             .@"return" => {
+                // Consume exactly `result_count` operands — the function's
+                // return values — and no more. The previous code popped one
+                // value whenever the stack was non-empty, even for a 0-result
+                // function. That stray pop removed a live operand belonging to
+                // an *enclosing* block; once the dead code after the `return`
+                // ended and normal lowering resumed, that block's `end` saw a
+                // too-short operand stack, skipped routing its fall-through
+                // result through the result local, and leaked a raw cross-block
+                // vreg whose definition did not dominate its use (issue #786,
+                // surfaced as `UnboundVRegUse`). Popping precisely
+                // `result_count` keeps the operand stack consistent for the
+                // surrounding structured control flow.
                 if (result_count > 1) {
                     var rets = try allocator.alloc(ir.VReg, result_count);
                     var k: u32 = 0;
@@ -596,9 +608,11 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         rets[result_count - 1 - k] = safePop(&vreg_stack);
                     }
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
-                } else {
+                } else if (result_count == 1) {
                     const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                } else {
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = null } });
                 }
                 dead_code = true;
             },
@@ -4129,6 +4143,91 @@ test "lower local.get 0; local.get 1; i32.add; end" {
 
     // Verify ret has a value
     try std.testing.expect(insts[3].op.ret != null);
+}
+
+test "lower: return in 0-result func keeps enclosing block operand (issue #786)" {
+    // Regression for #786. A 0-result function pushes a store address, opens a
+    // `block (result i32)`, and inside a nested `if` performs a `return` before
+    // the block's `br_if` exit / fall-through result. The old `.return` handler
+    // popped one operand even for a void function, removing the still-live store
+    // address that belonged to the *enclosing* block. Lowering then routed the
+    // fall-through result through a raw cross-block vreg whose definition did not
+    // dominate its use, which the IR verifier rejects as `UnboundVRegUse`.
+    //
+    // WAT (global $g is index 0, memory present):
+    //   (func (param i32 i32 i32)
+    //     local.get 0
+    //     block (result i32)
+    //       local.get 1
+    //       if
+    //         local.get 2
+    //         if
+    //           local.get 0
+    //           i32.const 7
+    //           i32.store
+    //           return
+    //         end
+    //         i32.const 8
+    //         global.get 0
+    //         br_if 1
+    //         drop
+    //       end
+    //       i32.const 0
+    //     end
+    //     i32.store)
+    const allocator = std.testing.allocator;
+    const verifier = @import("ir/verifier.zig");
+    const analysis = @import("ir/analysis.zig");
+
+    const func_type = types.FuncType{ .params = &.{ .i32, .i32, .i32 }, .results = &.{} };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 3,
+        .locals = &.{},
+        .code = &[_]u8{
+            0x20, 0x00, // local.get 0   (store address)
+            0x02, 0x7F, // block (result i32)
+            0x20, 0x01, //   local.get 1
+            0x04, 0x40, //   if (void)
+            0x20, 0x02, //     local.get 2
+            0x04, 0x40, //     if (void)
+            0x20, 0x00, //       local.get 0
+            0x41, 0x07, //       i32.const 7
+            0x36, 0x02, 0x00, //  i32.store align=2 offset=0
+            0x0F, //             return
+            0x0B, //           end
+            0x41, 0x08, //     i32.const 8
+            0x23, 0x00, //     global.get 0
+            0x0D, 0x01, //     br_if 1
+            0x1A, //           drop
+            0x0B, //         end
+            0x41, 0x00, //   i32.const 0
+            0x0B, //       end
+            0x36, 0x02, 0x00, // i32.store align=2 offset=0
+            0x0B, //       end (func)
+        },
+    };
+    const glob = types.GlobalType{ .val_type = .i32, .mutability = .mutable };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+        .globals = &[_]types.WasmGlobal{.{ .global_type = glob, .init_expr = .{ .i32_const = 0 } }},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    // The frontend does not populate `BasicBlock.predecessors` (the optimizer
+    // refreshes them); do it here so the verifier's predecessor check passes
+    // and we reach the SSA-dominance check — the one that catches #786.
+    const ir_func = &ir_module.functions.items[0];
+    try analysis.refreshBlockPredecessors(ir_func, allocator);
+
+    // The lowered IR must satisfy SSA dominance straight out of the frontend —
+    // no `UnboundVRegUse`. Before the #786 fix this returned the error because
+    // the fall-through block result leaked as a raw, non-dominating vreg.
+    try verifier.verifyFunction(ir_func, 0, .after_each_pass, allocator);
 }
 
 test "lower v128 local type is not treated as i64" {
