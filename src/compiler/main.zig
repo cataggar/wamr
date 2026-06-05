@@ -582,9 +582,18 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         });
     }
 
-    // Build element segment entries
+    // Build element segment entries. Each entry owns a freshly-allocated
+    // `func_indices` slice (borrowed by `emit_aot.emit` for the duration of
+    // this function), so the defer must free those per-entry slices too —
+    // mirroring `func_type_entries` below. Freeing only the list backing
+    // leaked one block per active element segment (#789).
     var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
-    defer elem_entries.deinit(allocator);
+    defer {
+        for (elem_entries.items) |ee| {
+            if (ee.func_indices.len > 0) allocator.free(ee.func_indices);
+        }
+        elem_entries.deinit(allocator);
+    }
     for (module.elements) |seg| {
         if (seg.is_declarative) continue;
         const offset: u32 = if (seg.is_passive) 0 else blk: {
