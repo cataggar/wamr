@@ -5778,6 +5778,7 @@ pub fn foldInverseCompareEqz(func: *ir.IrFunction, allocator: std.mem.Allocator)
         blk: ir.BlockId,
         ii: u32,
         new_op: ir.Inst.Op,
+        new_type: ir.IrType,
     };
     var rewrites = std.ArrayList(Rewrite).empty;
     defer rewrites.deinit(allocator);
@@ -5805,17 +5806,27 @@ pub fn foldInverseCompareEqz(func: *ir.IrFunction, allocator: std.mem.Allocator)
                 else => null,
             };
             if (new_op) |op| {
+                // The eqz being rewritten has `.type == .i32` (its operand is
+                // the i32 0/1 result of the comparison). The synthesized
+                // inverse comparison instead operates on the *producer's*
+                // operands, so it must carry the producer's operand-width
+                // `.type` (e.g. `.i64` for an `i64` relop). Keeping the eqz's
+                // `.type` made codegen emit a 32-bit compare on 64-bit
+                // operands — a miscompile on every `eqz(<i64 relop>)` (#743).
                 try rewrites.append(allocator, .{
                     .blk = @intCast(bi),
                     .ii = @intCast(ii),
                     .new_op = op,
+                    .new_type = producer.type,
                 });
             }
         }
     }
 
     for (rewrites.items) |r| {
-        func.blocks.items[r.blk].instructions.items[r.ii].op = r.new_op;
+        const target = &func.blocks.items[r.blk].instructions.items[r.ii];
+        target.op = r.new_op;
+        target.type = r.new_type;
         changed = true;
     }
     return changed;
@@ -13987,6 +13998,44 @@ test "foldInverseCompareEqz: eqz(eq) becomes ne" {
     }
     // dest preserved.
     try std.testing.expectEqual(@as(?ir.VReg, v_neg), block.instructions.items[3].dest);
+}
+
+test "foldInverseCompareEqz: carries i64 operand width into rewritten compare (#743)" {
+    // Regression for #743. `i64.eq` yields an i32 0/1 but records its
+    // *operand* width (`.i64`) in `Inst.type`; the following `i32.eqz` has
+    // `.type == .i32`. When the pass rewrites the eqz in place to the inverse
+    // comparison (`ne`) it must adopt the producer's i64 operand width — not
+    // keep the eqz's i32 type — or codegen emits a 32-bit compare on 64-bit
+    // operands, silently comparing only the low halves.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_neg = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 0x1_0000_0000 }, .dest = v0, .type = .i64 });
+    try block.append(.{ .op = .{ .iconst_64 = 0 }, .dest = v1, .type = .i64 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp, .type = .i64 });
+    try block.append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_neg } });
+
+    try std.testing.expect(try foldInverseCompareEqz(&func, allocator));
+
+    const rewritten = block.instructions.items[3];
+    switch (rewritten.op) {
+        .ne => |b| {
+            try std.testing.expectEqual(v0, b.lhs);
+            try std.testing.expectEqual(v1, b.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    // The crux: the rewritten compare must carry the i64 operand width.
+    try std.testing.expectEqual(ir.IrType.i64, rewritten.type);
+    try std.testing.expectEqual(@as(?ir.VReg, v_neg), rewritten.dest);
 }
 
 test "foldInverseCompareEqz: all 10 mappings" {
