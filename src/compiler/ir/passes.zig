@@ -6425,6 +6425,16 @@ fn inlineSmallFunctionsCount(
 
             // Move post-call instructions into B_after, truncate B,
             // and append `br clone_offset` as B's new terminator.
+            //
+            // #784: stop moving at (and including) the first terminator in
+            // the post-call region. The module-level inliner runs on outer-0
+            // before any per-function `scrubUnreachableBlocks`, so the caller
+            // block may still carry frontend-emitted dead code after its
+            // terminator. Moving that dead tail into B_after would leave
+            // B_after with a terminator that is not its last instruction
+            // (MultipleTerminators). The clone-block paths already break at
+            // the first terminator for the same reason (#631); B_after was
+            // the remaining gap.
             {
                 const post_start = ci + 1;
                 const src_len = caller.blocks.items[b].instructions.items.len;
@@ -6432,6 +6442,18 @@ fn inlineSmallFunctionsCount(
                 while (k < src_len) : (k += 1) {
                     const moved = caller.blocks.items[b].instructions.items[k];
                     try caller.blocks.items[b_after_id].instructions.append(caller.allocator, moved);
+                    if (verifier.isTerminator(moved.op)) {
+                        // Free owned slices of any dead instructions that
+                        // followed this terminator — they are dropped rather
+                        // than moved, so BasicBlock.deinit will never see them.
+                        // `Inst.freeOwnedSlices` mirrors deinit and correctly
+                        // leaves `br_table` targets alone (function-owned).
+                        var d = k + 1;
+                        while (d < src_len) : (d += 1) {
+                            caller.blocks.items[b].instructions.items[d].freeOwnedSlices(caller.allocator);
+                        }
+                        break;
+                    }
                 }
                 caller.blocks.items[b].instructions.shrinkRetainingCapacity(ci);
                 try caller.blocks.items[b].instructions.append(caller.allocator, .{ .op = .{ .br = clone_offset } });
@@ -6597,6 +6619,35 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
     return (try inlineSmallFunctionsCount(module, allocator, null)) != 0;
 }
 
+/// Truncate every block at its first terminator, dropping any trailing
+/// instructions. The frontend legitimately emits dead instructions after an
+/// unconditional terminator (`br` / `unreachable` / `ret`); leaving them in
+/// place makes a block hold a non-final terminator, which the IR verifier
+/// rejects as `MultipleTerminators`. Returns true if anything was trimmed.
+///
+/// Owned operand slices on dropped instructions are freed via
+/// `Inst.freeOwnedSlices` (they are removed from the block's list, so
+/// `BasicBlock.deinit` would otherwise never see them — #784). `br_table`
+/// targets are function-owned and intentionally left for `IrFunction.deinit`.
+pub fn stripDeadCodeAfterFirstTerminator(func: *ir.IrFunction) bool {
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items, 0..) |inst, idx| {
+            if (!verifier.isTerminator(inst.op)) continue;
+            const keep = idx + 1;
+            if (keep < block.instructions.items.len) {
+                for (block.instructions.items[keep..]) |dead| {
+                    dead.freeOwnedSlices(func.allocator);
+                }
+                block.instructions.shrinkRetainingCapacity(keep);
+                changed = true;
+            }
+            break;
+        }
+    }
+    return changed;
+}
+
 // ── SSA Promotion (mem2reg) ─────────────────────────────────────────────
 
 /// Replace every instruction in blocks unreachable from the entry block
@@ -6686,18 +6737,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     _ = try scrubUnreachableBlocks(func, allocator);
 
     // Strip dead code after the first terminator in each block.
-    for (func.blocks.items) |*block| {
-        for (block.instructions.items, 0..) |inst, idx| {
-            switch (inst.op) {
-                .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
-                    if (idx + 1 < block.instructions.items.len)
-                        block.instructions.shrinkRetainingCapacity(idx + 1);
-                    break;
-                },
-                else => {},
-            }
-        }
-    }
+    _ = stripDeadCodeAfterFirstTerminator(func);
 
     var dom = try analysis.computeDominators(func, allocator);
     defer dom.deinit();
@@ -7906,6 +7946,19 @@ fn runPassesWithOptionsScoped(
     }
     var inlined_callers = try std.DynamicBitSet.initEmpty(allocator, module.functions.items.len);
     defer inlined_callers.deinit();
+
+    // #784: normalize every function before the outer loop. The frontend
+    // emits dead instructions after a block's terminator; that trailing junk
+    // is otherwise only trimmed inside `promoteLocalsToSSA`, which runs in the
+    // per-function loop *after* the module-level `inlineSmallFunctions` and
+    // its verifier check. Without this hoist, the post-inline verify trips
+    // `MultipleTerminators` on raw frontend IR (e.g. codegen-cli core 4
+    // func #10300 block #2028). Stripping up front also means the inliner
+    // never sees dead-code-after-terminator, so its `B_after` construction
+    // stays well-formed.
+    for (module.functions.items) |*func| {
+        _ = stripDeadCodeAfterFirstTerminator(func);
+    }
 
     var outer_iter: u32 = 0;
     while (outer_iter < outer_max) : (outer_iter += 1) {
@@ -12126,6 +12179,115 @@ test "inlineSmallFunctions: leaf with param-return is inlined" {
     try std.testing.expect(b_after[0].op == .ret);
     // After local rename, the ret value should be the caller's iconst dest.
     try std.testing.expectEqual(b0[0].dest.?, b_after[0].op.ret.?);
+}
+
+test "stripDeadCodeAfterFirstTerminator: trims trailing dead code and frees owned slices (#784)" {
+    // The frontend emits dead instructions after a block's terminator. They
+    // must be trimmed before the module-level inliner's verifier check —
+    // otherwise the block holds a non-final terminator (MultipleTerminators,
+    // codegen-cli core 4 func #10300). The helper also frees owned operand
+    // slices of dropped instructions; the testing allocator flags any leak
+    // or double-free. Regression test for #784.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const target = try func.newBlock();
+    const v0 = func.newVReg();
+    const v_dead = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = target } });
+    // Dead tail after the terminator, including a `call` whose `args` slice is
+    // heap-owned — the strip must free it (BasicBlock.deinit never sees it).
+    const dead_args = try allocator.alloc(ir.VReg, 1);
+    dead_args[0] = v0;
+    try func.getBlock(entry).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = dead_args } }, .dest = v_dead, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = target } });
+    try func.getBlock(target).append(.{ .op = .{ .ret = v0 } });
+
+    const changed = stripDeadCodeAfterFirstTerminator(&func);
+    try std.testing.expect(changed);
+
+    // entry is now exactly [iconst, br target]; every block ends at its sole
+    // terminator and the function passes the verifier.
+    const insts = func.getBlock(entry).instructions.items;
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expect(insts[1].op == .br);
+    for (func.blocks.items) |block| {
+        for (block.instructions.items, 0..) |inst, i| {
+            try std.testing.expectEqual(i == block.instructions.items.len - 1, verifier.isTerminator(inst.op));
+        }
+    }
+    try analysis.refreshBlockPredecessors(&func, allocator);
+    try verifier.verifyFunction(&func, 0, .after_each_pass, allocator);
+
+    // Idempotent: a second strip changes nothing.
+    try std.testing.expect(!stripDeadCodeAfterFirstTerminator(&func));
+}
+
+test "inlineSmallFunctions: dead code after caller terminator does not leak into B_after (#784)" {
+    // The frontend may emit dead instructions after a block's terminator
+    // (trimmed by promoteLocalsToSSA, which runs *after* the module-level
+    // inliner on outer-0; runPassesWithOptions hoists the strip before the
+    // outer loop). This test exercises the inliner's own defense: when a
+    // non-tail call precedes such a terminator, the post-call tail moved into
+    // B_after must stop at the terminator — otherwise B_after ends up with a
+    // terminator that is not its last instruction (MultipleTerminators).
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // Callee: fn id(x) -> x   { local.get 0; return }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    {
+        const callee = &module.functions.items[0];
+        const cb = try callee.newBlock();
+        _ = callee.newVReg(); // param 0 placeholder
+        const v_get = callee.newVReg();
+        try callee.getBlock(cb).append(.{ .op = .{ .local_get = 0 }, .dest = v_get, .type = .i32 });
+        try callee.getBlock(cb).append(.{ .op = .{ .ret = v_get } });
+    }
+
+    // Caller:
+    //   entry: iconst 42; call 0 -> v_ret; br cont; <DEAD iconst 7>
+    //   cont:  ret v_ret
+    // The trailing `iconst 7` sits after `br cont` (frontend-style dead code).
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    const args = try allocator.alloc(ir.VReg, 1);
+    {
+        const caller = &module.functions.items[1];
+        const entry = try caller.newBlock();
+        const cont = try caller.newBlock();
+        const v_arg = caller.newVReg();
+        const v_ret = caller.newVReg();
+        const v_dead = caller.newVReg();
+        try caller.getBlock(entry).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_arg, .type = .i32 });
+        args[0] = v_arg;
+        try caller.getBlock(entry).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_ret, .type = .i32 });
+        try caller.getBlock(entry).append(.{ .op = .{ .br = cont } });
+        // Dead code after the terminator — must not survive into B_after.
+        try caller.getBlock(entry).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_dead, .type = .i32 });
+        try caller.getBlock(cont).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    const inlined = try inlineSmallFunctions(&module, allocator);
+    try std.testing.expect(inlined);
+
+    // Every block must have exactly one terminator, and it must be last.
+    const caller = &module.functions.items[1];
+    for (caller.blocks.items) |block| {
+        const insts = block.instructions.items;
+        try std.testing.expect(insts.len > 0);
+        for (insts, 0..) |inst, i| {
+            const is_last = (i == insts.len - 1);
+            try std.testing.expectEqual(is_last, verifier.isTerminator(inst.op));
+        }
+    }
+
+    // And the function passes the IR verifier (the check the inliner pipeline
+    // runs after every inlining round).
+    try verifier.verifyFunction(caller, 1, .after_each_pass, allocator);
 }
 
 test "inlineSmallFunctions: multi-block if/else callee is inlined" {
