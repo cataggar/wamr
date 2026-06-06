@@ -137,11 +137,15 @@ fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
 }
 
 /// Emit an unconditional call to a non-returning trap helper at
-/// `[r10 + field_offset]` (where r10 holds vmctx*). Used for
-/// unreachable, divide-by-zero, integer overflow, and invalid
-/// float→int conversion traps.
+/// `[rbx + field_offset]`. `rbx` is permanently pinned to `VmCtx*` for the
+/// whole function body (#465), so — like the memory bounds check (#798 L2)
+/// — we source vmctx straight from it rather than relying on a prior op
+/// having staged it in `r10` (which `unreachable`/`div0`/`overflow`/
+/// `invalid-conversion` did not always do, a latent bug). Used for
+/// unreachable, divide-by-zero, integer overflow, and invalid float→int
+/// conversion traps.
 fn emitTrapHelperCall(code: *emit.CodeBuffer, field_offset: i32) !void {
-    try code.movRegReg(param_regs[0], .r10);
+    try code.movRegReg(param_regs[0], .rbx);
     try code.movRegMem(.rax, param_regs[0], field_offset);
     try code.callReg(.rax);
 }
