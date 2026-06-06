@@ -364,23 +364,59 @@ const measure_reg_set: RegSet = .{
 pub const PhiSpillDelta = struct {
     /// Number of phi instructions in the function.
     phis: u32,
-    /// Spill slots used when allocating over SSA live ranges.
+    /// Number of call instructions (clobber points) in the function.
+    calls: u32,
+    /// Spill slots, no clobber model (isolates the phi-interval effect).
     ssa_spills: u32,
-    /// Spill slots used when allocating over the legacy (naive in-block
-    /// phi) live ranges — the status-quo interval model.
     naive_spills: u32,
+    /// Spill slots when calls are modelled as clobber points (values live
+    /// across a call may only use callee-saved registers) — closer to the
+    /// pressure real codegen sees.
+    ssa_spills_xcall: u32,
+    naive_spills_xcall: u32,
 };
+
+/// Clobber points at every call in `func`, in the same global instruction
+/// numbering `computeLiveRanges`/`computeSsaLiveRanges` use with the default
+/// (sequential block) order: each call clobbers all caller-saved registers.
+/// Caller frees the slice.
+fn buildCallClobbers(
+    func: *const ir.IrFunction,
+    reg_set: RegSet,
+    allocator: std.mem.Allocator,
+) ![]ClobberPoint {
+    var mask: u64 = 0;
+    for (reg_set.caller_saved_indices) |idx| mask |= (@as(u64, 1) << @intCast(idx));
+
+    var list: std.ArrayListUnmanaged(ClobberPoint) = .empty;
+    errdefer list.deinit(allocator);
+    var global_idx: u32 = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .call, .call_indirect, .call_ref => try list.append(allocator, .{ .pos = global_idx, .regs_clobbered = mask }),
+                else => {},
+            }
+            global_idx += 1;
+        }
+    }
+    return list.toOwnedSlice(allocator);
+}
 
 /// Measure how SSA-aware allocation changes spill pressure versus the
 /// status-quo interval model, on a function still in **phi form**
-/// (#392 step 3b-i). Returns `null` for functions with no phis (nothing to
-/// compare). Both allocations use the same representative register file and
-/// empty clobbers, so the only variable is phi interval handling:
+/// (#392 step 3b). Returns `null` for functions with no phis (nothing to
+/// compare). Both allocations use the same representative register file, so
+/// the only variable is phi interval handling:
 ///   - `ssa_spills`   = `allocateSsa`  (phi-arm ranges end at the predecessor)
 ///   - `naive_spills` = `allocate`     (phi arms treated as join-block uses)
 ///
-/// Pure measurement — it mutates nothing and is intended to be called from an
-/// env-gated diagnostic hook before `lowerPhisToLocals`.
+/// Each is measured twice: without clobbers (isolates the interval effect)
+/// and with calls modelled as caller-saved clobbers (`*_xcall`, closer to the
+/// register pressure real codegen sees, since values live across a call can
+/// only use callee-saved registers).
+///
+/// Pure measurement — it mutates nothing.
 pub fn measurePhiSpillDelta(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
@@ -393,12 +429,26 @@ pub fn measurePhiSpillDelta(
     }
     if (phis == 0) return null;
 
+    const clobbers = try buildCallClobbers(func, measure_reg_set, allocator);
+    defer allocator.free(clobbers);
+
     var ssa = try allocateSsa(func, allocator, measure_reg_set, &.{});
     defer ssa.deinit();
     var naive = try allocate(func, allocator, measure_reg_set, &.{});
     defer naive.deinit();
+    var ssa_x = try allocateSsa(func, allocator, measure_reg_set, clobbers);
+    defer ssa_x.deinit();
+    var naive_x = try allocate(func, allocator, measure_reg_set, clobbers);
+    defer naive_x.deinit();
 
-    return .{ .phis = phis, .ssa_spills = ssa.spill_count, .naive_spills = naive.spill_count };
+    return .{
+        .phis = phis,
+        .calls = @intCast(clobbers.len),
+        .ssa_spills = ssa.spill_count,
+        .naive_spills = naive.spill_count,
+        .ssa_spills_xcall = ssa_x.spill_count,
+        .naive_spills_xcall = naive_x.spill_count,
+    };
 }
 
 /// Classify every vreg in `func` whose def is a "cheap" pure op
@@ -1149,6 +1199,8 @@ test "measurePhiSpillDelta: null without phis; SSA never spills more than naive"
         const d = (try measurePhiSpillDelta(&func, allocator)).?;
         try std.testing.expectEqual(@as(u32, 1), d.phis);
         try std.testing.expect(d.ssa_spills <= d.naive_spills);
+        // SSA intervals are a subset under the call-clobber model too.
+        try std.testing.expect(d.ssa_spills_xcall <= d.naive_spills_xcall);
     }
 }
 

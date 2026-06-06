@@ -37,8 +37,8 @@ const Subcommand = enum { compile, compile_component, run, verify, version, help
 fn ssaSpillMeasure(func: *const ir.IrFunction, allocator: std.mem.Allocator) void {
     const delta = (regalloc.measurePhiSpillDelta(func, allocator) catch return) orelse return;
     std.debug.print(
-        "[ssa-spill-measure] fn={s} phis={d} ssa_spills={d} naive_spills={d}\n",
-        .{ func.name orelse "<anon>", delta.phis, delta.ssa_spills, delta.naive_spills },
+        "[ssa-spill-measure] fn={s} phis={d} calls={d} ssa_spills={d} naive_spills={d} ssa_xcall={d} naive_xcall={d}\n",
+        .{ func.name orelse "<anon>", delta.phis, delta.calls, delta.ssa_spills, delta.naive_spills, delta.ssa_spills_xcall, delta.naive_spills_xcall },
     );
 }
 
