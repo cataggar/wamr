@@ -89,6 +89,9 @@ pub const aarch64_peephole = @import("compiler/codegen/aarch64/peephole.zig");
 /// AOT compiler optimization passes.
 pub const passes = @import("compiler/ir/passes.zig");
 
+/// Linear-scan register allocator (and SSA-aware variants, #392).
+pub const regalloc = @import("compiler/ir/regalloc.zig");
+
 /// AOT codegen bisection knobs — env-var parsing + process-global
 /// `PassBisectSpec` consumed by `runPassesWithOptions` (#761 / #743).
 pub const aot_bisect = @import("compiler/aot_bisect.zig");
