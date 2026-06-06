@@ -312,10 +312,87 @@ pub const BlockLiveness = struct {
 
 /// Compute liveness information for all blocks using backward dataflow analysis.
 /// Returns a map from BlockId to BlockLiveness.
+///
+/// Treats a `phi` instruction's edge values as plain in-block uses (the
+/// legacy handling). This is correct for the post-`lowerPhisToLocals` IR
+/// the register allocator consumes (no phis present); use
+/// `computeSsaLiveness` when analysing phi-form IR.
 pub fn computeLiveness(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
 ) !std.AutoHashMap(ir.BlockId, BlockLiveness) {
+    return computeLivenessImpl(func, allocator, null);
+}
+
+/// SSA-aware liveness (#392 step 1). A `phi` contributes no in-block uses;
+/// instead each phi-arm `val` is live-out of its specific predecessor
+/// `edge.block` — the value travels on that CFG edge to the join. The phi
+/// dest is killed at the top of the join block. Use this on phi-form IR
+/// (before `lowerPhisToLocals`).
+pub fn computeSsaLiveness(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.BlockId, BlockLiveness) {
+    var phi_arms = try buildPhiArmsByPred(func, allocator);
+    defer {
+        var it = phi_arms.iterator();
+        while (it.next()) |e| allocator.free(e.value_ptr.*);
+        phi_arms.deinit();
+    }
+    return computeLivenessImpl(func, allocator, &phi_arms);
+}
+
+/// Group every phi-arm value by the predecessor block it travels out of.
+/// For `dest = phi [(B0,v0),(B1,v1),...]` (in any block) this records that
+/// `vi` is live-out of `Bi`. Returns a map predecessor-BlockId → owned
+/// slice of VRegs (caller frees each slice). Duplicate arms are fine — the
+/// liveness set union dedups.
+fn buildPhiArmsByPred(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.BlockId, []const ir.VReg) {
+    var lists = std.AutoHashMap(ir.BlockId, std.ArrayListUnmanaged(ir.VReg)).init(allocator);
+    defer {
+        var it = lists.iterator();
+        while (it.next()) |e| e.value_ptr.deinit(allocator);
+        lists.deinit();
+    }
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .phi) {
+                for (inst.op.phi) |edge| {
+                    const gop = try lists.getOrPut(edge.block);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(allocator, edge.val);
+                }
+            }
+        }
+    }
+
+    var out = std.AutoHashMap(ir.BlockId, []const ir.VReg).init(allocator);
+    errdefer {
+        var it = out.iterator();
+        while (it.next()) |e| allocator.free(e.value_ptr.*);
+        out.deinit();
+    }
+    var it = lists.iterator();
+    while (it.next()) |e| {
+        try out.put(e.key_ptr.*, try e.value_ptr.toOwnedSlice(allocator));
+    }
+    return out;
+}
+
+/// Backward-dataflow liveness solver. When `phi_arms_by_pred` is non-null,
+/// phi instructions are handled with SSA edge semantics (see
+/// `computeSsaLiveness`); when null, the legacy in-block phi-use handling
+/// is used and behaviour is byte-identical to the historical
+/// `computeLiveness` (pinned by the round-robin differential test).
+fn computeLivenessImpl(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+    phi_arms_by_pred: ?*const std.AutoHashMap(ir.BlockId, []const ir.VReg),
+) !std.AutoHashMap(ir.BlockId, BlockLiveness) {
+    const ssa = phi_arms_by_pred != null;
     const successors = try buildSuccessors(func, allocator);
     defer {
         var it = successors.iterator();
@@ -407,6 +484,23 @@ pub fn computeLiveness(
             }
         }
 
+        // SSA edge semantics (#392): every phi-arm whose edge leaves THIS
+        // block is live-out here, regardless of the join's live_in (the
+        // join killed the phi dest and never lists the arm). This term is
+        // constant across iterations; it must still flag `live_out_grew` on
+        // first add so the new value propagates back to predecessors.
+        if (phi_arms_by_pred) |pa| {
+            if (pa.get(bid)) |arms| {
+                for (arms) |val| {
+                    const result = try bl.live_out.getOrPut(val);
+                    if (!result.found_existing) {
+                        result.value_ptr.* = {};
+                        live_out_grew = true;
+                    }
+                }
+            }
+        }
+
         // live_in depends only on live_out and the fixed use/def of this
         // block, so once the block has been visited an unchanged live_out
         // means live_in cannot change — skip the transfer walk entirely.
@@ -428,7 +522,10 @@ pub fn computeLiveness(
             if (inst.op == .parallel_copy) {
                 for (inst.op.parallel_copy) |p| _ = live.remove(p.dst);
             }
-            addInstUses(&live, inst);
+            // SSA mode: a phi contributes no in-block uses — its arms are
+            // accounted on the predecessor edges above. Legacy mode keeps
+            // the historical in-block phi-use handling.
+            if (!(ssa and inst.op == .phi)) addInstUses(&live, inst);
         }
 
         // Merge into live_in; if it grew, revisit predecessors so their
@@ -970,7 +1067,34 @@ pub fn computeLiveRangesWithOrder(
     block_order: ?[]const ir.BlockId,
     allocator: std.mem.Allocator,
 ) ![]LiveRange {
-    const liveness = try computeLiveness(func, allocator);
+    return computeLiveRangesImpl(func, block_order, allocator, false);
+}
+
+/// SSA-aware live ranges (#392 step 1). Computes intervals on phi-form IR:
+/// each phi dest's range starts at the phi instruction; each phi-arm's
+/// range ends at the terminator of its specific predecessor block (the arm
+/// is live-out of that predecessor, never into the join). Built on
+/// `computeSsaLiveness`. Intended to feed the future SSA-aware allocator
+/// (step 2); the legacy `computeLiveRanges*` remain the input to today's
+/// post-lowering linear scan.
+pub fn computeSsaLiveRanges(
+    func: *const ir.IrFunction,
+    block_order: ?[]const ir.BlockId,
+    allocator: std.mem.Allocator,
+) ![]LiveRange {
+    return computeLiveRangesImpl(func, block_order, allocator, true);
+}
+
+fn computeLiveRangesImpl(
+    func: *const ir.IrFunction,
+    block_order: ?[]const ir.BlockId,
+    allocator: std.mem.Allocator,
+    ssa: bool,
+) ![]LiveRange {
+    const liveness = if (ssa)
+        try computeSsaLiveness(func, allocator)
+    else
+        try computeLiveness(func, allocator);
     defer {
         var it = @constCast(&liveness).iterator();
         while (it.next()) |entry| {
@@ -1038,8 +1162,10 @@ pub fn computeLiveRangesWithOrder(
                     }
                 }
             }
-            // Record last use position
-            updateLastUse(&last_use_pos, inst, global_idx);
+            // Record last use position. In SSA mode a phi contributes no
+            // in-block use; each arm's last use is the terminator of its
+            // predecessor, applied via the live_out extension below.
+            if (!(ssa and inst.op == .phi)) updateLastUse(&last_use_pos, inst, global_idx);
             global_idx += 1;
         }
 
@@ -2527,6 +2653,170 @@ test "computeLiveness: cross-block value is live" {
 
     // Block 0 should have nothing live_in (entry block)
     try std.testing.expectEqual(@as(u32, 0), liveness.get(b0).?.live_in.count());
+}
+
+const DiamondPhi = struct {
+    b0: ir.BlockId,
+    b1: ir.BlockId,
+    b2: ir.BlockId,
+    b3: ir.BlockId,
+    b4: ir.BlockId,
+    v_a: ir.VReg,
+    v_cond: ir.VReg,
+    v_b: ir.VReg,
+    v_c: ir.VReg,
+    v_phi: ir.VReg,
+    v_res: ir.VReg,
+};
+
+/// 5-block diamond with a join phi:
+///   b0: v_a=10; v_cond=1; br b1
+///   b1: br_if v_cond -> b2, b3
+///   b2: v_b=20; br b4
+///   b3: v_c=30; br b4
+///   b4: v_phi = phi[(b2,v_b),(b3,v_c)]; v_res = v_phi + v_a; ret v_res
+fn buildDiamondPhi(func: *ir.IrFunction, allocator: std.mem.Allocator) !DiamondPhi {
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+
+    const v_a = func.newVReg();
+    const v_cond = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_phi = func.newVReg();
+    const v_res = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_a, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 }, .type = .void });
+
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b3 } }, .type = .void });
+
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b4 }, .type = .void });
+
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 30 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .br = b4 }, .type = .void });
+
+    const edges = try allocator.dupe(ir.Inst.PhiEdge, &.{
+        .{ .block = b2, .val = v_b },
+        .{ .block = b3, .val = v_c },
+    });
+    try func.getBlock(b4).append(.{ .op = .{ .phi = edges }, .dest = v_phi, .type = .i32 });
+    try func.getBlock(b4).append(.{ .op = .{ .add = .{ .lhs = v_phi, .rhs = v_a } }, .dest = v_res, .type = .i32 });
+    try func.getBlock(b4).append(.{ .op = .{ .ret = v_res }, .type = .void });
+
+    return .{ .b0 = b0, .b1 = b1, .b2 = b2, .b3 = b3, .b4 = b4, .v_a = v_a, .v_cond = v_cond, .v_b = v_b, .v_c = v_c, .v_phi = v_phi, .v_res = v_res };
+}
+
+fn findRange(ranges: []const LiveRange, vreg: ir.VReg) ?LiveRange {
+    for (ranges) |r| if (r.vreg == vreg) return r;
+    return null;
+}
+
+test "computeSsaLiveness: diamond phi — arms live only out of their own predecessor" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const d = try buildDiamondPhi(&func, allocator);
+
+    var liveness = try computeSsaLiveness(&func, allocator);
+    defer freeLiveness(&liveness);
+
+    const lo_b2 = liveness.get(d.b2).?.live_out;
+    const lo_b3 = liveness.get(d.b3).?.live_out;
+    const li_b4 = liveness.get(d.b4).?.live_in;
+
+    // Each arm is live-out of ITS predecessor only — the other branch's
+    // value must NOT bleed in (the bug the legacy in-block handling has).
+    try std.testing.expect(lo_b2.contains(d.v_b));
+    try std.testing.expect(!lo_b2.contains(d.v_c));
+    try std.testing.expect(lo_b3.contains(d.v_c));
+    try std.testing.expect(!lo_b3.contains(d.v_b));
+
+    // The join's live_in excludes both arms and the phi dest; only the
+    // cross-diamond value v_a is live in.
+    try std.testing.expect(li_b4.contains(d.v_a));
+    try std.testing.expect(!li_b4.contains(d.v_b));
+    try std.testing.expect(!li_b4.contains(d.v_c));
+    try std.testing.expect(!li_b4.contains(d.v_phi));
+
+    // The phi dest never leaks back into a predecessor's live_out.
+    try std.testing.expect(!lo_b2.contains(d.v_phi));
+    try std.testing.expect(!lo_b3.contains(d.v_phi));
+
+    // v_a is live across the whole diamond.
+    try std.testing.expect(liveness.get(d.b0).?.live_out.contains(d.v_a));
+    try std.testing.expect(lo_b2.contains(d.v_a));
+    try std.testing.expect(lo_b3.contains(d.v_a));
+}
+
+test "computeSsaLiveRanges: diamond phi reference ranges (#392 step 1)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const d = try buildDiamondPhi(&func, allocator);
+
+    const ranges = try computeSsaLiveRanges(&func, null, allocator);
+    defer allocator.free(ranges);
+
+    // One interval per SSA value, each with a def.
+    try std.testing.expectEqual(@as(usize, 6), ranges.len);
+
+    // Global indices (sequential block order b0..b4):
+    //   0 v_a=const   1 v_cond=const   2 br
+    //   3 br_if
+    //   4 v_b=const   5 br
+    //   6 v_c=const   7 br
+    //   8 v_phi=phi   9 v_res=add      10 ret
+    const ra = findRange(ranges, d.v_a).?;
+    try std.testing.expectEqual(@as(u32, 0), ra.start);
+    try std.testing.expectEqual(@as(u32, 9), ra.end); // last use at the add
+
+    const rcond = findRange(ranges, d.v_cond).?;
+    try std.testing.expectEqual(@as(u32, 1), rcond.start);
+    try std.testing.expectEqual(@as(u32, 3), rcond.end); // br_if
+
+    // The crux: each phi arm ends at ITS predecessor's terminator, NOT at
+    // the phi (index 8). v_b: def 4, live-out of b2 → b2 terminator = 5.
+    const rb = findRange(ranges, d.v_b).?;
+    try std.testing.expectEqual(@as(u32, 4), rb.start);
+    try std.testing.expectEqual(@as(u32, 5), rb.end);
+
+    const rc = findRange(ranges, d.v_c).?;
+    try std.testing.expectEqual(@as(u32, 6), rc.start);
+    try std.testing.expectEqual(@as(u32, 7), rc.end);
+
+    const rphi = findRange(ranges, d.v_phi).?;
+    try std.testing.expectEqual(@as(u32, 8), rphi.start);
+    try std.testing.expectEqual(@as(u32, 9), rphi.end);
+
+    const rres = findRange(ranges, d.v_res).?;
+    try std.testing.expectEqual(@as(u32, 9), rres.start);
+    try std.testing.expectEqual(@as(u32, 10), rres.end);
+}
+
+test "computeSsaLiveRanges vs legacy: phi arm not extended into the join block" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const d = try buildDiamondPhi(&func, allocator);
+
+    const ssa = try computeSsaLiveRanges(&func, null, allocator);
+    defer allocator.free(ssa);
+    const legacy = try computeLiveRanges(&func, allocator);
+    defer allocator.free(legacy);
+
+    // Legacy counts the phi arm as an in-block use at the phi (index 8),
+    // over-extending v_b's range into the join; SSA ends it at b2's
+    // terminator (index 5).
+    const ssa_b = findRange(ssa, d.v_b).?;
+    const legacy_b = findRange(legacy, d.v_b).?;
+    try std.testing.expectEqual(@as(u32, 5), ssa_b.end);
+    try std.testing.expect(legacy_b.end > ssa_b.end);
 }
 
 fn expectLivenessEqual(
