@@ -3197,6 +3197,12 @@ pub const RunOptions = struct {
     /// Compile-time guard for `tailDuplicateSmallJoins`. Defaults keep the
     /// pass enabled for normal functions but skip/cap pathological CFGs.
     tail_duplication: TailDuplicationOptions = .{},
+    /// Optional diagnostic invoked once per function while it is still in
+    /// **phi form**, just before `lowerPhisToLocals`. Used to measure
+    /// SSA-aware vs legacy allocator spill pressure (#392 step 3b-i). Wired
+    /// by `wamrc` from `WAMR_SSA_REGALLOC_MEASURE`; null in normal builds so
+    /// release codegen pays nothing.
+    phi_spill_measure: ?*const fn (*const ir.IrFunction, std.mem.Allocator) void = null,
 };
 
 pub const AnalysisTimingOptions = analysis.TimingOptions;
@@ -8317,6 +8323,7 @@ fn runPassesWithOptionsScoped(
                             .outer_iter = outer_iter,
                         });
                     }
+                    if (opts.phi_spill_measure) |measure| measure(func, allocator);
                     if (!opts.bisect.skipsPhisToLocals(opts.module_idx, func_idx)) {
                         const lower_start_ns = if (timing_for_func) passTimingNowNs() else 0;
                         const lower_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};

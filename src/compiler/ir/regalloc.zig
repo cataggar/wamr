@@ -348,6 +348,59 @@ fn allocationEql(a: Allocation, b: Allocation) bool {
     };
 }
 
+/// Representative aarch64 integer register file used purely to *measure*
+/// the spill impact of SSA-aware allocation (#392 step 3b-i): 23 allocatable
+/// GPRs (x0–x14 + x21–x28), no clobber points. The exact register numbers
+/// are irrelevant to the spill *count*; only the pool size and interval
+/// overlap matter, so this isolates the effect of phi interval handling.
+const measure_reg_set: RegSet = .{
+    .alloc_regs = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 21, 22, 23, 24, 25, 26, 27, 28 },
+    .callee_saved_indices = &.{ 15, 16, 17, 18, 19, 20, 21, 22 },
+    .caller_saved_indices = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 },
+    .spill_base = 0,
+    .spill_stride = 8,
+};
+
+pub const PhiSpillDelta = struct {
+    /// Number of phi instructions in the function.
+    phis: u32,
+    /// Spill slots used when allocating over SSA live ranges.
+    ssa_spills: u32,
+    /// Spill slots used when allocating over the legacy (naive in-block
+    /// phi) live ranges — the status-quo interval model.
+    naive_spills: u32,
+};
+
+/// Measure how SSA-aware allocation changes spill pressure versus the
+/// status-quo interval model, on a function still in **phi form**
+/// (#392 step 3b-i). Returns `null` for functions with no phis (nothing to
+/// compare). Both allocations use the same representative register file and
+/// empty clobbers, so the only variable is phi interval handling:
+///   - `ssa_spills`   = `allocateSsa`  (phi-arm ranges end at the predecessor)
+///   - `naive_spills` = `allocate`     (phi arms treated as join-block uses)
+///
+/// Pure measurement — it mutates nothing and is intended to be called from an
+/// env-gated diagnostic hook before `lowerPhisToLocals`.
+pub fn measurePhiSpillDelta(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !?PhiSpillDelta {
+    var phis: u32 = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .phi) phis += 1;
+        }
+    }
+    if (phis == 0) return null;
+
+    var ssa = try allocateSsa(func, allocator, measure_reg_set, &.{});
+    defer ssa.deinit();
+    var naive = try allocate(func, allocator, measure_reg_set, &.{});
+    defer naive.deinit();
+
+    return .{ .phis = phis, .ssa_spills = ssa.spill_count, .naive_spills = naive.spill_count };
+}
+
 /// Classify every vreg in `func` whose def is a "cheap" pure op
 /// (currently only `iconst_32` / `iconst_64`) into a map of
 /// rematerialisation values. Callers pass this to
@@ -1070,6 +1123,32 @@ test "resolvePhiEdges: flags a critical edge (predecessor with multiple successo
             try std.testing.expectEqual(@as(ir.BlockId, 1), e.pred);
             try std.testing.expect(!e.needs_split);
         }
+    }
+}
+
+test "measurePhiSpillDelta: null without phis; SSA never spills more than naive" {
+    const allocator = std.testing.allocator;
+
+    // A phi-free function yields no measurement.
+    {
+        var func = ir.IrFunction.init(allocator, 0, 0, 0);
+        defer func.deinit();
+        const b0 = try func.newBlock();
+        const v0 = func.newVReg();
+        try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .ret = v0 }, .type = .void });
+        try std.testing.expect((try measurePhiSpillDelta(&func, allocator)) == null);
+    }
+
+    // The arm diamond has one phi; SSA intervals are a subset of the naive
+    // ones, so SSA can never spill more.
+    {
+        var func = ir.IrFunction.init(allocator, 0, 0, 0);
+        defer func.deinit();
+        _ = try buildArmDiamond(&func, allocator);
+        const d = (try measurePhiSpillDelta(&func, allocator)).?;
+        try std.testing.expectEqual(@as(u32, 1), d.phis);
+        try std.testing.expect(d.ssa_spills <= d.naive_spills);
     }
 }
 

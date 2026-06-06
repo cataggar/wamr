@@ -12,6 +12,7 @@ const aarch64_compile = wamr.aarch64_compile;
 const passes = wamr.passes;
 const ir_print = wamr.ir_print;
 const ir = wamr.ir;
+const regalloc = wamr.regalloc;
 const codegen_cache = wamr.codegen_cache;
 
 const TargetArch = passes.TargetArch;
@@ -28,6 +29,18 @@ comptime {
 }
 
 const Subcommand = enum { compile, compile_component, run, verify, version, help };
+
+/// #392 step 3b-i diagnostic: log SSA-aware vs legacy (naive in-block phi)
+/// allocator spill counts for one phi-form function. Wired into the pass
+/// pipeline only when `WAMR_SSA_REGALLOC_MEASURE` is set. Errors and
+/// phi-free functions are silently skipped.
+fn ssaSpillMeasure(func: *const ir.IrFunction, allocator: std.mem.Allocator) void {
+    const delta = (regalloc.measurePhiSpillDelta(func, allocator) catch return) orelse return;
+    std.debug.print(
+        "[ssa-spill-measure] fn={s} phis={d} ssa_spills={d} naive_spills={d}\n",
+        .{ func.name orelse "<anon>", delta.phis, delta.ssa_spills, delta.naive_spills },
+    );
+}
 
 fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "compile")) return .compile;
@@ -291,6 +304,12 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
 
     // 4. Optimize IR (unless -O0)
     if (optimize) {
+        // #392 step 3b-i: when WAMR_SSA_REGALLOC_MEASURE is set, log, per phi
+        // function, the spill count of SSA-aware allocation vs the legacy
+        // (naive in-block phi) interval model. Diagnostic only — no codegen
+        // change.
+        const ssa_spill_measure: ?*const fn (*const ir.IrFunction, std.mem.Allocator) void =
+            if (init.environ_map.get("WAMR_SSA_REGALLOC_MEASURE") != null) &ssaSpillMeasure else null;
         const run_opts: passes.RunOptions = .{
             .dump_hook = if (dumper.pass_names.len == 0) null else .{
                 .ctx = @ptrCast(&dumper),
@@ -301,6 +320,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
             .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
             .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
+            .phi_spill_measure = ssa_spill_measure,
         };
         const opt_changes = passes.runPassesWithOptions(&ir_module, passes.defaultPassesForTarget(target_arch), allocator, run_opts) catch |err| {
             // If the IR verifier tripped, surface its diagnostic before
