@@ -541,6 +541,24 @@ pub const SpillMetric = struct {
     /// Excludes ABI-pinned regs (vmctx / memory_base) that are not in the
     /// allocatable pool.
     callee_saved_used: u32 = 0,
+
+    /// Sum two metrics field-wise. Used on aarch64 to combine the separate
+    /// scalar (X-reg) and v128 (V-reg) allocations into one report; their
+    /// vreg sets are disjoint and their register files distinct, so the
+    /// per-field sums are exact.
+    pub fn add(self: SpillMetric, other: SpillMetric) SpillMetric {
+        return .{
+            .spilled_vregs = self.spilled_vregs + other.spilled_vregs,
+            .spilled_vregs_scalar = self.spilled_vregs_scalar + other.spilled_vregs_scalar,
+            .spilled_vregs_v128 = self.spilled_vregs_v128 + other.spilled_vregs_v128,
+            .slots_scalar = self.slots_scalar + other.slots_scalar,
+            .slots_v128 = self.slots_v128 + other.slots_v128,
+            .spill_loads = self.spill_loads + other.spill_loads,
+            .spill_stores = self.spill_stores + other.spill_stores,
+            .remat_vregs = self.remat_vregs + other.remat_vregs,
+            .callee_saved_used = self.callee_saved_used + other.callee_saved_used,
+        };
+    }
 };
 
 const SpillUseCounter = struct {
@@ -1414,6 +1432,41 @@ test "computeSpillMetric: counts spilled vregs, slots, traffic, and callee-saved
     try std.testing.expectEqual(@as(u32, 2), m.spill_stores); // v0 + v2 defs
     try std.testing.expectEqual(@as(u32, 0), m.remat_vregs);
     try std.testing.expectEqual(@as(u32, 1), m.callee_saved_used); // physreg 12
+}
+
+test "SpillMetric.add: merges scalar and v128 sub-metrics field-wise" {
+    const a = SpillMetric{
+        .spilled_vregs = 3,
+        .spilled_vregs_scalar = 3,
+        .slots_scalar = 3,
+        .spill_loads = 9,
+        .spill_stores = 3,
+        .remat_vregs = 1,
+        .callee_saved_used = 4,
+    };
+    const b = SpillMetric{
+        .spilled_vregs = 2,
+        .spilled_vregs_v128 = 2,
+        .slots_v128 = 4,
+        .spill_loads = 5,
+        .spill_stores = 2,
+        .callee_saved_used = 1,
+    };
+    const m = a.add(b);
+    try std.testing.expectEqual(@as(u32, 5), m.spilled_vregs);
+    try std.testing.expectEqual(@as(u32, 3), m.spilled_vregs_scalar);
+    try std.testing.expectEqual(@as(u32, 2), m.spilled_vregs_v128);
+    try std.testing.expectEqual(@as(u32, 3), m.slots_scalar);
+    try std.testing.expectEqual(@as(u32, 4), m.slots_v128);
+    try std.testing.expectEqual(@as(u32, 14), m.spill_loads);
+    try std.testing.expectEqual(@as(u32, 5), m.spill_stores);
+    try std.testing.expectEqual(@as(u32, 1), m.remat_vregs);
+    try std.testing.expectEqual(@as(u32, 5), m.callee_saved_used);
+    // Adding a zero metric is the identity.
+    const m2 = m.add(.{});
+    try std.testing.expectEqual(m.spilled_vregs, m2.spilled_vregs);
+    try std.testing.expectEqual(m.spill_loads, m2.spill_loads);
+    try std.testing.expectEqual(m.callee_saved_used, m2.callee_saved_used);
 }
 
 test "computeSpillMetric: no spills yields an all-zero metric" {

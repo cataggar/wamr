@@ -562,6 +562,10 @@ pub const CompileOptions = struct {
     /// totals + a module summary (no x86_64-style setup/liveness/regalloc
     /// sub-phase breakdown — the #778 bottleneck is the x86_64 host path).
     codegen_timing: passes.CodegenTimingOptions = .{},
+    /// #808 Lever 1: per-function spill-cost diagnostics. Off unless
+    /// `WAMR_AOT_SPILL_METRIC` is set. Combines the scalar (X) and v128 (V)
+    /// allocations into one per-function report.
+    spill_metric: passes.SpillMetricOptions = .{},
     /// Component core/module index, used only to match the
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter.
     module_idx: u32 = 0,
@@ -652,6 +656,10 @@ const FuncCompileCtx = struct {
     /// coalesce / post-emit-coalesce spans into it. Null is the normal
     /// (untimed) path — a hard no-op.
     codegen_timer: ?*codegen_timing.Aarch64FuncTimer = null,
+    /// #808 Lever 1: local function index, used to label the spill-metric
+    /// line and to match the `WAMR_AOT_SPILL_METRIC_FUNC` filter. Defaults
+    /// to 0 on the single-function `compileFunctionWithOptions` entry.
+    func_idx: u32 = 0,
     allocator: std.mem.Allocator,
 };
 
@@ -1626,6 +1634,48 @@ pub fn compileFunctionImpl(
             v128_live_ranges.items,
         );
         if (tmr) |t| t.end(.regalloc);
+    }
+
+    // #808 Lever 1: per-function spill-cost diagnostic. Combines the scalar
+    // (X-reg) and v128 (V-reg) allocations — disjoint vreg sets, distinct
+    // register files — into one report. Gated so the disabled path pays
+    // nothing; `printSpill` is further gated by `shouldLog`.
+    if (ctx.options.spill_metric.enabled and
+        ctx.options.spill_metric.moduleMatches(ctx.options.module_idx))
+    {
+        var metric: regalloc.SpillMetric = .{};
+        var total_slots: u32 = 0;
+        if (alloc_result_storage) |*ar| {
+            metric = metric.add(try regalloc.computeSpillMetric(
+                allocator,
+                func,
+                aarch64RegSetForSpillBase(spill_base),
+                scalar_live_ranges.items,
+                ar,
+            ));
+            total_slots += ar.spill_count;
+        }
+        if (v128_alloc_result_storage) |*ar| {
+            metric = metric.add(try regalloc.computeSpillMetric(
+                allocator,
+                func,
+                aarch64VRegSetForSpillBase(v128_spill_base),
+                v128_live_ranges.items,
+                ar,
+            ));
+            total_slots += ar.spill_count;
+        }
+        if (ctx.options.spill_metric.shouldLog(ctx.options.module_idx, ctx.func_idx, metric.spilled_vregs)) {
+            codegen_timing.printSpill(.{
+                .module_idx = ctx.options.module_idx,
+                .func_idx = ctx.func_idx,
+                .func_name = func.name orelse "<anon>",
+                .insts = aarch64CountInstructions(func),
+                .clobbers = @intCast(clobbers.items.len),
+                .spill_count = total_slots,
+                .metric = metric,
+            });
+        }
     }
 
     // Finalize frame layout now that we know how many spill slots the
@@ -8330,6 +8380,7 @@ pub fn compileModuleWithOptions(
             .func_types = ir_module.func_types.items,
             .func_type_indices = ir_module.func_type_indices.items,
             .options = options,
+            .func_idx = @intCast(func_idx),
             .allocator = allocator,
         };
         const func_code = compileFunctionImpl(&func, ctx, allocator) catch |err| {
@@ -8498,6 +8549,7 @@ pub fn compileModuleCachedWithOptions(
                 .func_type_indices = ir_module.func_type_indices.items,
                 .options = options,
                 .codegen_timer = if (func_timer) |*t| t else null,
+                .func_idx = @intCast(fi),
                 .allocator = allocator,
             };
             const compile_t0: u64 = if (ct_live) codegen_timing.nowNs() else 0;
