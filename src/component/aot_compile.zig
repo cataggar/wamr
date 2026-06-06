@@ -240,6 +240,7 @@ pub fn compileCoreWasmCached(
     const compiled: codegen_cache.CompileResultCached = switch (opts.target_arch) {
         .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
             .codegen_timing = opts.codegen_timing,
+            .spill_metric = opts.spill_metric,
             .module_idx = opts.module_idx,
         }) catch
             return error.CoreCompileFailed,

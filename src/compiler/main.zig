@@ -435,6 +435,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             .enable_scheduler = enable_aarch64_scheduler,
             .enable_xreg_alloc = enable_aarch64_xreg_alloc,
             .codegen_timing = codegen_timing,
+            .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
         }) catch |err| {
             std.debug.print("Error compiling to AArch64: {}\n", .{err});
             std.process.exit(1);
