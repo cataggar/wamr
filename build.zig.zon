@@ -8,6 +8,10 @@
             .url = "https://github.com/cataggar/wabt/archive/refs/tags/v3.0.0-dev.9.tar.gz",
             .hash = "wabt-0.1.0-eK3F5pBbKADDwuAkGCRBicvgI-5ld-ZMiGjIjjS4JtxG",
         },
+        .tls = .{
+            .url = "https://github.com/cataggar/tls.zig/archive/2621e411af81c8b4d8fa5aaae08b9b183a80bb46.tar.gz",
+            .hash = "tls-0.1.0-ER2e0vpTBgCVdP6tvFCii9_PFjATLb23ht2_xbGy5mYU",
+        },
     },
     .paths = .{
         "build.zig",

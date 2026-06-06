@@ -149,6 +149,17 @@ pub fn build(b: *std.Build) void {
 
     const config_module = options.createModule();
 
+    // ── TLS library (cataggar/tls.zig, zig16 branch) ──────────────────
+    // Pure-Zig TLS 1.2/1.3 client + server. Used for `wasi:http@0.3`
+    // incoming-handler HTTPS termination (#609): upstream Zig std ships
+    // only `std.crypto.tls.Client`, so the server-side handshake comes
+    // from this dependency. Exposes the `tls` module via `addModule`.
+    const tls_dep = b.dependency("tls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tls_module = tls_dep.module("tls");
+
     // ── Root module for the library ────────────────────────────────────
     const lib_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -156,6 +167,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib_module.addImport("config", config_module);
+    lib_module.addImport("tls", tls_module);
 
     // ── Static library ─────────────────────────────────────────────────
     const lib = b.addLibrary(.{
@@ -380,6 +392,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_module.addImport("config", config_module);
+    test_module.addImport("tls", tls_module);
 
     const lib_unit_tests = b.addTest(.{
         .root_module = test_module,

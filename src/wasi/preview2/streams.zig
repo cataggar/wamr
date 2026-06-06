@@ -4,6 +4,7 @@
 //! wasi:io/poll (pollable) as resource types with read/write operations.
 
 const std = @import("std");
+const tls = @import("tls");
 
 // ── wasi:io/streams — input-stream ──────────────────────────────────────────
 
@@ -28,6 +29,11 @@ pub const InputStream = struct {
         /// `Socket.tcp_stream` — the stream does not close it on drop.
         /// Only `Socket.closeAll` closes the underlying connection.
         tcp_stream: std.posix.fd_t,
+        /// Backed by a TLS server connection (HTTPS termination, #609).
+        /// The `*tls.Connection` is borrowed — the underlying socket and
+        /// the connection are owned by the caller (`serveOneHttpConnectionP3`);
+        /// the stream neither closes the fd nor sends `close_notify` on drop.
+        tls: *tls.Connection,
         /// Closed / exhausted.
         closed,
     };
@@ -82,6 +88,15 @@ pub const InputStream = struct {
                 if (n == 0) return .{ .closed = {} };
                 return .{ .ok = n };
             },
+            .tls => |conn| {
+                // `tls.Connection.read` returns 0 on a clean TLS close
+                // (`close_notify`) or peer EOF; TLS / record errors surface
+                // as `.io_error` (the library has already emitted an alert
+                // on the wire for protocol-level failures).
+                const n = conn.read(buf) catch return .{ .err = .io_error };
+                if (n == 0) return .{ .closed = {} };
+                return .{ .ok = n };
+            },
             .closed => return .{ .closed = {} },
         }
     }
@@ -112,6 +127,13 @@ pub const InputStream = struct {
     pub fn fromTcpStream(fd: std.posix.fd_t) InputStream {
         return .{ .source = .{ .tcp_stream = fd } };
     }
+
+    /// Create an input stream backed by a TLS server connection (#609).
+    /// The `*tls.Connection` is borrowed; the stream neither closes the
+    /// underlying fd nor sends `close_notify` on drop.
+    pub fn fromTlsConn(conn: *tls.Connection) InputStream {
+        return .{ .source = .{ .tls = conn } };
+    }
 };
 
 // ── wasi:io/streams — output-stream ─────────────────────────────────────────
@@ -135,6 +157,10 @@ pub const OutputStream = struct {
         /// Backed by a TCP connection. The fd is borrowed from a
         /// `Socket.tcp_stream` — the stream does not close it on drop.
         tcp_stream: std.posix.fd_t,
+        /// Backed by a TLS server connection (HTTPS termination, #609).
+        /// The `*tls.Connection` is borrowed — owned by the caller
+        /// (`serveOneHttpConnectionP3`); the stream does not close it.
+        tls: *tls.Connection,
         /// Closed.
         closed,
     };
@@ -191,6 +217,13 @@ pub const OutputStream = struct {
                     return .{ .err = .io_error };
                 return .{ .ok = data.len };
             },
+            .tls => |conn| {
+                // `writeAll` encrypts `data` into one or more TLS records and
+                // flushes them to the underlying socket. Any failure (record
+                // overflow, socket error) maps to `.io_error`.
+                conn.writeAll(data) catch return .{ .err = .io_error };
+                return .{ .ok = data.len };
+            },
             .closed => return .{ .closed = {} },
         }
     }
@@ -225,6 +258,12 @@ pub const OutputStream = struct {
     /// The fd is borrowed; the stream does not close it.
     pub fn toTcpStream(fd: std.posix.fd_t) OutputStream {
         return .{ .sink = .{ .tcp_stream = fd } };
+    }
+
+    /// Create an output stream backed by a TLS server connection (#609).
+    /// The `*tls.Connection` is borrowed; the stream does not close it.
+    pub fn toTlsConn(conn: *tls.Connection) OutputStream {
+        return .{ .sink = .{ .tls = conn } };
     }
 
     /// Flush any host-side buffering. For host-file sinks with
