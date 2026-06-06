@@ -45,6 +45,8 @@ const async_canon = @import("async_canon.zig");
 const core_backend = @import("core_backend.zig");
 const debugAotEnabled = core_backend.debugAotEnabled;
 
+const tls = @import("tls");
+
 // ── Pending `wasi:cli/exit` code handoff to the AOT dispatcher (#760) ───────
 //
 // `WasiCliAdapter.cliExit` / `.cliExitWithCode` raise `error.WasiExit` after
@@ -5880,6 +5882,7 @@ pub const WasiCliAdapter = struct {
                     .buffer, .host_file, .closed => true,
                     .fd => |fd| fdPollReady(fd, pollInEvents()),
                     .tcp_stream => |fd| fdPollReady(fd, pollInEvents()),
+                    .tls => true,
                 };
             },
             .output_stream => |handle| blk: {
@@ -5888,6 +5891,7 @@ pub const WasiCliAdapter = struct {
                     .buffer, .host_file, .closed => true,
                     .fd => |fd| fdPollReady(fd, pollOutEvents()),
                     .tcp_stream => |fd| fdPollReady(fd, pollOutEvents()),
+                    .tls => true,
                 };
             },
             .tcp_socket => |handle| blk: {
@@ -24583,15 +24587,14 @@ pub const ServeHttpOptions = struct {
     /// the caller can't know the resolved port in advance. The driver
     /// scrapes this line to discover where to connect.
     announce_listening: bool = false,
-    /// Optional HTTPS termination config (#583 follow-up to PR #595).
-    /// When set, the cert + key have been parsed at startup and the
-    /// CLI plumbing is in place for the listener to wrap each
-    /// accepted fd in a TLS server-side stream. The handshake call
-    /// site itself is upstream-blocked on Zig 0.16 std not shipping
-    /// a server-side TLS API; see `HttpsTlsConfig` and tracking
-    /// issue #609. When null (default), the listener serves
-    /// plaintext HTTP/1.1 — byte-for-byte the PR #580 + #595 path.
-    tls_config: ?*const HttpsTlsConfig = null,
+    /// Optional HTTPS termination config (#583 follow-up to PR #595,
+    /// completed in #609). When set, the cert + key have been parsed at
+    /// startup into a `tls.config.CertKeyPair` and the listener wraps each
+    /// accepted fd in a server-side TLS handshake (via the `cataggar/tls.zig`
+    /// dependency) before serving HTTP/1.1 over the encrypted stream. When
+    /// null (default), the listener serves plaintext HTTP/1.1 — byte-for-byte
+    /// the PR #580 + #595 path.
+    tls_config: ?*HttpsTlsConfig = null,
 };
 
 /// HTTPS termination configuration for the `wasi:http/handler@0.3.0`
@@ -24600,27 +24603,27 @@ pub const ServeHttpOptions = struct {
 /// combined `--tls-pem=<path>`) and threaded through `ServeHttpOptions`
 /// so the listener can wrap each accepted fd in a TLS server stream.
 ///
-/// **Status: upstream-blocked.** Zig 0.16's `std.crypto.tls` ships
-/// only `Client.zig` — there is no `std.crypto.tls.Server`. So the
-/// cert / key are parsed and validated at startup (catching `ENOENT`,
-/// malformed PEM, etc. before bind), but the post-`accept(2)`
-/// handshake call site is currently a no-op that logs a warning and
-/// falls back to plaintext. Once upstream lands the server-side TLS
-/// API (tracked by ziglang/zig#14172 — replicated downstream as
-/// cataggar/wamr#609), the placeholder
-/// `HttpsTlsConfig.handshake(self, fd, allocator)` becomes the real
-/// `std.crypto.tls.Server.init(...).handshake()` call and HTTPS goes
-/// live.
+/// Server-side TLS is provided by the pure-Zig `cataggar/tls.zig`
+/// dependency (TLS 1.3, RSA + ECDSA server certificates) — upstream Zig
+/// std ships only `std.crypto.tls.Client`. The cert / key are parsed and
+/// validated at startup (catching `ENOENT`, malformed PEM, key/cert
+/// mismatch, etc. before bind) and the resulting `cert_key_pair` is reused
+/// across every accepted connection. The post-`accept(2)` handshake is
+/// driven by `TlsServerConn.handshake` (see #609).
 ///
 /// Lifetimes: `cert_bundle` owns the DER-encoded certificate chain
 /// (a `std.crypto.Certificate.Bundle`, deinit via `deinit(allocator)`).
-/// `private_key_pem` is the raw PEM bytes for the private key
-/// (PKCS#8 / RSA / EC — we sniff the BEGIN marker but do not parse
-/// the key internals; the handshake engine will). Both are duplicated
-/// at `load` time from the on-disk files; the source files can be
-/// deleted afterwards without affecting the running server.
+/// `cert_key_pair` owns its own DER bundle + parsed private key and is the
+/// material actually fed to the handshake. `private_key_pem` is the raw PEM
+/// bytes for the private key (PKCS#8 / RSA / EC). All are duplicated at
+/// `load` time from the on-disk files; the source files can be deleted
+/// afterwards without affecting the running server.
 pub const HttpsTlsConfig = struct {
     cert_bundle: std.crypto.Certificate.Bundle,
+    /// Parsed cert chain + private key, ready to hand to the TLS server
+    /// handshake (`tls.server`). Built at `load` time from the cert + key
+    /// PEM. Supports RSA and ECDSA server keys.
+    cert_key_pair: tls.config.CertKeyPair,
     private_key_pem: []u8,
     /// One of `pkcs8`, `rsa`, `ec`. Sniffed from the BEGIN marker
     /// in `private_key_pem`. The handshake engine cares; the
@@ -24628,7 +24631,7 @@ pub const HttpsTlsConfig = struct {
     /// key types in the future.
     private_key_kind: PrivateKeyKind,
     /// Owning allocator. Used by `deinit` to free `private_key_pem`
-    /// and tear down `cert_bundle`.
+    /// and tear down `cert_bundle` / `cert_key_pair`.
     allocator: std.mem.Allocator,
 
     pub const PrivateKeyKind = enum { pkcs8, rsa, ec };
@@ -24686,8 +24689,22 @@ pub const HttpsTlsConfig = struct {
 
         const kind = sniffPrivateKeyKind(key_bytes) orelse return error.TlsKeyParseFailed;
 
+        // Re-read the cert bytes (the bundle parser above retained only the
+        // decoded DER, not the source PEM) so the tls.zig CertKeyPair parser
+        // can build its own bundle + parsed private key for the handshake.
+        const cert_bytes = cwd.readFileAlloc(io, cert_path, allocator, @enumFromInt(1 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return error.TlsCertFileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TlsCertReadFailed,
+        };
+        defer allocator.free(cert_bytes);
+
+        var cert_key_pair = buildCertKeyPair(allocator, io, cert_bytes, key_bytes) catch |err| return err;
+        errdefer cert_key_pair.deinit(allocator);
+
         return .{
             .cert_bundle = bundle,
+            .cert_key_pair = cert_key_pair,
             .private_key_pem = key_bytes,
             .private_key_kind = kind,
             .allocator = allocator,
@@ -24733,32 +24750,82 @@ pub const HttpsTlsConfig = struct {
         errdefer allocator.free(key_pem);
         const kind = sniffPrivateKeyKind(key_pem) orelse return error.TlsKeyParseFailed;
 
+        // `full_bytes` carries both the CERTIFICATE and PRIVATE KEY blocks;
+        // the tls.zig cert parser ignores non-CERTIFICATE blocks, so we can
+        // hand it the whole file as the cert slice.
+        var cert_key_pair = buildCertKeyPair(allocator, io, full_bytes, key_pem) catch |err| return err;
+        errdefer cert_key_pair.deinit(allocator);
+
         return .{
             .cert_bundle = bundle,
+            .cert_key_pair = cert_key_pair,
             .private_key_pem = key_pem,
             .private_key_kind = kind,
             .allocator = allocator,
         };
     }
 
+    /// Build a `tls.config.CertKeyPair` from in-memory cert + key PEM,
+    /// mapping the library's parse errors onto `LoadError`. The cert slice
+    /// may contain extra non-CERTIFICATE blocks (e.g. the private key in a
+    /// combined PEM) — they are ignored.
+    fn buildCertKeyPair(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cert_pem: []const u8,
+        key_pem: []const u8,
+    ) LoadError!tls.config.CertKeyPair {
+        return tls.config.CertKeyPair.fromSlice(allocator, io, cert_pem, key_pem) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TlsKeyParseFailed,
+        };
+    }
+
     pub fn deinit(self: *HttpsTlsConfig) void {
         self.cert_bundle.deinit(self.allocator);
+        self.cert_key_pair.deinit(self.allocator);
         self.allocator.free(self.private_key_pem);
         self.* = undefined;
     }
+};
 
-    /// Placeholder server-side TLS handshake call. Today this is a
-    /// no-op that returns `error.TlsHandshakeUnsupported` —
-    /// `std.crypto.tls` in Zig 0.16 ships only `Client.zig`. When
-    /// upstream lands `std.crypto.tls.Server` (tracked by
-    /// ziglang/zig#14172 / cataggar/wamr#609), this becomes the
-    /// real handshake call. The listener (`serveLoadedHttpComponent`)
-    /// already calls into this path when `ServeHttpOptions.tls_config`
-    /// is set, so the wiring is in place — only the body changes.
-    pub fn handshake(self: *const HttpsTlsConfig, fd: std.posix.fd_t) error{TlsHandshakeUnsupported}!void {
-        _ = self;
-        _ = fd;
-        return error.TlsHandshakeUnsupported;
+/// Per-connection server-side TLS state for HTTPS termination (#609).
+///
+/// Owns the socket reader/writer (with their record-sized buffers) and the
+/// post-handshake `tls.Connection`. **Must be pinned** for its whole
+/// lifetime: `tls.server` stores `&self.reader.interface` / `&self.writer.interface`
+/// in the returned connection, and `std.Io.net.Stream.Reader`/`Writer`
+/// recover themselves from those interface pointers via `@fieldParentPtr`.
+/// Construct it as an `undefined` stack/heap local and call `handshake`
+/// in place; never copy or move it afterwards.
+///
+/// The underlying socket fd is borrowed from the accept loop, which closes
+/// it after the request is served; `TlsServerConn` does not own the fd.
+pub const TlsServerConn = struct {
+    reader: std.Io.net.Stream.Reader = undefined,
+    writer: std.Io.net.Stream.Writer = undefined,
+    conn: tls.Connection = undefined,
+    input_buf: [tls.input_buffer_len]u8 = undefined,
+    output_buf: [tls.output_buffer_len]u8 = undefined,
+
+    /// Run the server-side TLS handshake over `accepted`, using `cfg`'s
+    /// pre-parsed certificate + key. On success `self.conn` is a live
+    /// `tls.Connection` ready for `read`/`writeAll`. On failure the library
+    /// has already written a TLS alert to the socket; the caller should just
+    /// close the connection. `self` must already live at its final address.
+    pub fn handshake(self: *TlsServerConn, accepted: std.Io.net.Stream, cfg: *HttpsTlsConfig) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.reader = accepted.reader(io, &self.input_buf);
+        self.writer = accepted.writer(io, &self.output_buf);
+        // `io.random` is CSPRNG-backed (seeded from getrandom/urandom); the
+        // rng source only needs to outlive the handshake call — the server
+        // `tls.Connection` does not retain it.
+        var rng_src: std.Random.IoSource = .{ .io = io };
+        self.conn = try tls.server(&self.reader.interface, &self.writer.interface, .{
+            .rng = rng_src.interface(),
+            .auth = &cfg.cert_key_pair,
+            .now = std.Io.Clock.real.now(io),
+        });
     }
 };
 
@@ -24884,21 +24951,13 @@ pub fn serveLoadedHttpComponent(
     };
     defer server.deinit(io);
 
-    // HTTPS termination wiring (#583 follow-up / #609). When the
-    // caller supplied a parsed `HttpsTlsConfig`, the listener is
-    // *prepared* to wrap each accepted fd in a server-side TLS
-    // handshake — the cert + key were already validated at startup,
-    // so we know they at least parse. The handshake call itself is
-    // upstream-blocked (Zig 0.16 ships only `std.crypto.tls.Client`),
-    // so for now we surface a single startup warning on stderr and
-    // continue serving plaintext. This keeps the CLI surface stable
-    // — `--tls-cert` / `--tls-key` are accepted today and become
-    // load-bearing once upstream lands `std.crypto.tls.Server`.
-    if (options.tls_config) |_| {
-        var stderr_file = std.Io.File.stderr();
-        const warn = "warning: --tls-cert / --tls-key parsed but HTTPS handshake is upstream-blocked on Zig std (see cataggar/wamr#609); serving plaintext HTTP/1.1\n";
-        stderr_file.writeStreamingAll(io, warn) catch {};
-    }
+    // HTTPS termination (#583 follow-up / #609). When the caller supplied a
+    // parsed `HttpsTlsConfig`, each accepted connection is wrapped in a
+    // server-side TLS handshake (via the `cataggar/tls.zig` dependency)
+    // before HTTP/1.1 is served over the encrypted stream — see
+    // `serveOneHttpConnectionP3`. When null, the listener serves plaintext
+    // HTTP/1.1 (the PR #580 + #595 path).
+    const url_scheme: []const u8 = if (options.tls_config != null) "https" else "http";
 
     if (options.announce_listening) {
         // `server.socket.address` carries the kernel-resolved port
@@ -24906,7 +24965,7 @@ pub fn serveLoadedHttpComponent(
         // distinct lines:
         //   - stdout: `Listening on <ip:port>` (legacy CLI feedback,
         //     used by non-suite drivers / humans).
-        //   - stderr: `http://<host>:<port>` (wasi-testsuite
+        //   - stderr: `<scheme>://<host>:<port>` (wasi-testsuite
         //     `TestCaseRunner.get_http_server` scans stderr's first
         //     line for the `http://` prefix; without this the
         //     `http-service` fixture fails on `do_request`). (#570)
@@ -24916,7 +24975,7 @@ pub fn serveLoadedHttpComponent(
         stdout_file.writeStreamingAll(io, stdout_line) catch {};
 
         var stderr_buf: [192]u8 = undefined;
-        const stderr_line = std.fmt.bufPrint(&stderr_buf, "http://{f}\n", .{server.socket.address}) catch stderr_buf[0..0];
+        const stderr_line = std.fmt.bufPrint(&stderr_buf, "{s}://{f}\n", .{ url_scheme, server.socket.address }) catch stderr_buf[0..0];
         var stderr_file = std.Io.File.stderr();
         stderr_file.writeStreamingAll(io, stderr_line) catch {};
     }
@@ -24939,7 +24998,7 @@ pub fn serveLoadedHttpComponent(
         {
             defer accepted.close(io);
             if (dispatch_p3) {
-                serveOneHttpConnectionP3(adapter, inst, handler_name, accepted);
+                serveOneHttpConnectionP3(adapter, inst, handler_name, accepted, options.tls_config);
             } else {
                 serveOneHttpConnection(adapter, inst, handler_name, accepted);
             }
@@ -25031,13 +25090,35 @@ fn serveOneHttpConnection(
 /// inner `serveOneHttpConnectionP3Stream` loops over multiple
 /// requests until a `Connection: close` is negotiated, the client
 /// closes cleanly, or `SO_RCVTIMEO` fires. (#570 / #583 A5)
+///
+/// When `tls_config` is non-null, the connection is first upgraded to a
+/// server-side TLS session (HTTPS termination, #609); the HTTP/1.1 parser
+/// then runs unchanged over the decrypted stream. A failed handshake closes
+/// the connection (the TLS library has already emitted an alert).
 fn serveOneHttpConnectionP3(
     adapter: *WasiCliAdapter,
     inst: *ComponentInstance,
     handler_name: []const u8,
     accepted: std.Io.net.Stream,
+    tls_config: ?*HttpsTlsConfig,
 ) void {
     setKeepAliveIdleTimeout(accepted.socket.handle, http_p3_keep_alive_idle_seconds);
+
+    if (tls_config) |cfg| {
+        // `TlsServerConn` must be pinned (the TLS connection holds pointers
+        // into its reader/writer), so build it in place on this frame and
+        // never move it. ~50 KiB of record buffers live here for the
+        // duration of the connection.
+        var tconn: TlsServerConn = .{};
+        tconn.handshake(accepted, cfg) catch return;
+        // Best-effort `close_notify` on the way out.
+        defer tconn.conn.close() catch {};
+        var input = streams.InputStream.fromTlsConn(&tconn.conn);
+        var output = streams.OutputStream.toTlsConn(&tconn.conn);
+        adapter.serveOneHttpConnectionP3Stream(inst, handler_name, &input, &output);
+        return;
+    }
+
     var input = streams.InputStream.fromTcpStream(accepted.socket.handle);
     var output = streams.OutputStream.toTcpStream(accepted.socket.handle);
     adapter.serveOneHttpConnectionP3Stream(inst, handler_name, &input, &output);
@@ -42208,15 +42289,12 @@ test "populateWasiProviders: binds wasi:keyvalue store + atomics + batch (#583 B
 
 // ── HTTPS termination tests (#583 follow-up / #609) ─────────────────────────
 //
-// Server-side TLS itself is upstream-blocked on Zig 0.16 std not
-// shipping `std.crypto.tls.Server` (tracked by cataggar/wamr#609),
-// so these tests exercise the *parts that ship*: the CLI's cert /
-// key loader (`HttpsTlsConfig.loadFromPaths` /
-// `loadFromCombinedPath`), the `sniffPrivateKeyKind` PEM-marker
-// sniffer, and the `ServeHttpOptions.tls_config` plumbing. When the
-// upstream API lands, these tests gain a fourth case (full HTTPS
-// round-trip against a guest export) and the existing trio
-// continues to gate the load-path.
+// Server-side TLS is provided by the `cataggar/tls.zig` dependency. These
+// tests exercise the cert / key loader (`HttpsTlsConfig.loadFromPaths` /
+// `loadFromCombinedPath`, which now also build a `tls.config.CertKeyPair`),
+// the `sniffPrivateKeyKind` PEM-marker sniffer, the `ServeHttpOptions.tls_config`
+// plumbing, and a full TLS-handshake round-trip (server side from
+// `HttpsTlsConfig`, client side via the same library) over a socketpair.
 //
 // The cert + key below were generated once with `openssl genpkey` /
 // `openssl req -x509` (RSA 2048, PKCS#8 key, self-signed,
@@ -42351,25 +42429,15 @@ test "wasi:http #583 HTTPS: loadFromPaths parses RSA cert + key (#609 prep)" {
     // The bundle must hold at least one DER-encoded cert.
     try testing.expect(cfg.cert_bundle.bytes.items.len > 0);
     try testing.expect(cfg.cert_bundle.map.count() >= 1);
-    // Private-key PEM was retained verbatim (handshake parses).
+    // Private-key PEM was retained verbatim.
     try testing.expect(cfg.private_key_pem.len > 0);
     try testing.expect(std.mem.indexOf(u8, cfg.private_key_pem, "-----BEGIN PRIVATE KEY-----") != null);
 
-    // Handshake call is the upstream-blocked piece (#609). Today
-    // it returns `TlsHandshakeUnsupported` deterministically; this
-    // assertion flips to a real round-trip once
-    // `std.crypto.tls.Server` lands upstream.
-    //
-    // `std.posix.fd_t` is `c_int` on POSIX but `*anyopaque` (HANDLE)
-    // on Windows, so use a platform-portable sentinel for the test fd.
-    // Windows pointers can't be zero — use a non-null sentinel value
-    // (the test never dereferences it; `handshake` early-returns
-    // `TlsHandshakeUnsupported` before touching the fd).
-    const dummy_fd: std.posix.fd_t = if (builtin.os.tag == .windows)
-        @ptrFromInt(@as(usize, 1))
-    else
-        0;
-    try testing.expectError(error.TlsHandshakeUnsupported, cfg.handshake(dummy_fd));
+    // The tls.zig CertKeyPair was built from the cert + key and is ready
+    // to feed to the handshake (#609). It carries its own parsed DER cert
+    // bundle. RSA keys do not populate the ECDSA fast-path field.
+    try testing.expect(cfg.cert_key_pair.bundle.bytes.items.len > 0);
+    try testing.expect(cfg.cert_key_pair.ecdsa_key_pair == null);
 }
 
 test "wasi:http #583 HTTPS: loadFromCombinedPath splits cert + key blocks (#609 prep)" {
@@ -42454,13 +42522,188 @@ test "wasi:http #583 HTTPS: sniffPrivateKeyKind discriminates PKCS#8 / RSA / EC 
     try testing.expectEqual(@as(?HttpsTlsConfig.PrivateKeyKind, null), sniffPrivateKeyKind(""));
 }
 
-test "wasi:http #583 HTTPS: ServeHttpOptions.tls_config defaults to null (#609 prep)" {
+test "wasi:http #583 HTTPS: ServeHttpOptions.tls_config defaults to null (#609)" {
     const testing = std.testing;
     const opts: ServeHttpOptions = .{
         .listen_address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
     };
     // Plaintext default — TLS opt-in only via the new field.
-    try testing.expectEqual(@as(?*const HttpsTlsConfig, null), opts.tls_config);
+    try testing.expectEqual(@as(?*HttpsTlsConfig, null), opts.tls_config);
+}
+
+test "wasi:http HTTPS: server handshake from HttpsTlsConfig completes + exchanges app data (#609)" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const sub_path = ".zig-cache/wasi-http-tls-test-handshake";
+    defer cleanupTestTlsMaterial(sub_path);
+    const paths = try writeTestTlsMaterial(aa, sub_path);
+
+    var cfg = try HttpsTlsConfig.loadFromPaths(testing.allocator, paths.cert_path, paths.key_path);
+    defer cfg.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var rng_src: std.Random.IoSource = .{ .io = io };
+    const rng = rng_src.interface();
+
+    // Buffers: sc = server→client records, cs = client→server records.
+    var sc_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+    var cs_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+
+    // Drive a full TLS 1.3 handshake purely over buffers (no sockets) with
+    // the server side built from our `HttpsTlsConfig` RSA cert/key. `now` is
+    // `.zero` because cert-expiry validation already happened at load time
+    // and the client skips chain verification.
+    var cli = tls.nonblock.Client.init(.{
+        .rng = rng,
+        .root_ca = .empty,
+        .host = &.{},
+        .insecure_skip_verify = true,
+        .now = .zero,
+    });
+    var srv = tls.nonblock.Server.init(.{
+        .rng = rng,
+        .auth = &cfg.cert_key_pair,
+        .now = .zero,
+    });
+
+    var cr = try cli.run(&sc_buf, &cs_buf); // client flight 1 (ClientHello)
+    var sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf); // server flight 1
+    cr = try cli.run(sc_buf[0..sr.send_pos], &cs_buf); // client flight 2 (Finished)
+    try testing.expect(cli.done());
+    sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf); // server parses Finished
+    try testing.expect(srv.done());
+
+    // Both sides derived application ciphers — exchange a record each way.
+    var cli_conn = tls.nonblock.Connection.init(cli.cipher().?);
+    var srv_conn = tls.nonblock.Connection.init(srv.cipher().?);
+
+    const req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const enc = try cli_conn.encrypt(req, &cs_buf);
+    const dec = try srv_conn.decrypt(enc.ciphertext, &sc_buf);
+    try testing.expectEqualStrings(req, dec.cleartext);
+
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    const enc2 = try srv_conn.encrypt(resp, &sc_buf);
+    const dec2 = try cli_conn.decrypt(enc2.ciphertext, &cs_buf);
+    try testing.expectEqualStrings(resp, dec2.cleartext);
+}
+
+/// Context handed to the loopback HTTPS server thread (#609 e2e test).
+const TlsTestServerCtx = struct {
+    allocator: Allocator,
+    server: std.Io.net.Server,
+    cfg: *HttpsTlsConfig,
+    response: []const u8,
+
+    fn run(self: *TlsTestServerCtx) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        defer {
+            var srv = self.server;
+            srv.deinit(io);
+        }
+        const accepted = self.server.accept(io) catch return;
+        defer accepted.close(io);
+
+        // Real server-side TLS upgrade through the production code path
+        // (`TlsServerConn.handshake`), then serve over the TLS-backed streams.
+        var tconn: TlsServerConn = .{};
+        tconn.handshake(accepted, self.cfg) catch return;
+        defer tconn.conn.close() catch {};
+
+        var input = streams.InputStream.fromTlsConn(&tconn.conn);
+        var output = streams.OutputStream.toTlsConn(&tconn.conn);
+
+        // Read the request head (until CRLFCRLF) over the decrypted stream.
+        var buf: [2048]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len) {
+            switch (input.read(buf[total..])) {
+                .ok => |n| {
+                    total += n;
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+                },
+                .closed, .err => break,
+            }
+        }
+        _ = output.write(self.response, self.allocator);
+    }
+};
+
+test "wasi:http HTTPS: loopback round-trip through TlsServerConn + TLS streams (#609)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const sub_path = ".zig-cache/wasi-http-tls-test-loopback";
+    defer cleanupTestTlsMaterial(sub_path);
+    const paths = try writeTestTlsMaterial(aa, sub_path);
+
+    var cfg = try HttpsTlsConfig.loadFromPaths(testing.allocator, paths.cert_path, paths.key_path);
+    defer cfg.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var bind_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    const server = try std.Io.net.IpAddress.listen(&bind_addr, io, .{ .kernel_backlog = 1 });
+    const port = switch (server.socket.address) {
+        .ip4 => |v4| v4.port,
+        else => {
+            var srv_mut = server;
+            srv_mut.deinit(io);
+            return error.SkipZigTest;
+        },
+    };
+
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var ctx: TlsTestServerCtx = .{
+        .allocator = testing.allocator,
+        .server = server,
+        .cfg = &cfg,
+        .response = response,
+    };
+    const server_thread = try std.Thread.spawn(.{}, TlsTestServerCtx.run, .{&ctx});
+    defer server_thread.join();
+
+    // Client: connect over TCP, upgrade to TLS, do one HTTP/1.1 round-trip.
+    var connect_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    const stream = try std.Io.net.IpAddress.connect(&connect_addr, io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    // Own the client TLS buffers on this frame (the non-inline `tls.client`
+    // stores pointers to these reader/writer interfaces in the connection).
+    var cli_in_buf: [tls.input_buffer_len]u8 = undefined;
+    var cli_out_buf: [tls.output_buffer_len]u8 = undefined;
+    var cli_reader = stream.reader(io, &cli_in_buf);
+    var cli_writer = stream.writer(io, &cli_out_buf);
+    var rng_src: std.Random.IoSource = .{ .io = io };
+
+    var conn = try tls.client(&cli_reader.interface, &cli_writer.interface, .{
+        .rng = rng_src.interface(),
+        .now = std.Io.Clock.real.now(io),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+    });
+
+    try conn.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    var resp_buf: [512]u8 = undefined;
+    var total: usize = 0;
+    while (total < resp_buf.len) {
+        const n = conn.read(resp_buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOf(u8, resp_buf[0..total], "hello") != null) break;
+    }
+    const got = resp_buf[0..total];
+    try testing.expect(std.mem.indexOf(u8, got, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "hello") != null);
 }
 
 // ── #583 audit arms (PR #604): wasi:io + wasi:sockets/network tests ───────

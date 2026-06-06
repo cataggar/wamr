@@ -178,16 +178,15 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     var precompiled_manifest: ?[]const u8 = null;
     var listen_address: ?std.Io.net.IpAddress = null;
     // `--tls-cert=<path>` + `--tls-key=<path>` (or the combined
-    // `--tls-pem=<path>`) (#583 follow-up to #595): when both cert
-    // and key (or just the combined PEM) are provided alongside
-    // `--listen`, the HTTP service is *prepared* to terminate TLS
-    // on each accepted connection. Today the actual handshake call
-    // is upstream-blocked on Zig 0.16 std not shipping a server-side
-    // TLS API (only `std.crypto.tls.Client`). The cert + key are
-    // still loaded + validated at startup so the CLI surface is
-    // stable; once upstream lands `std.crypto.tls.Server` (tracked
-    // by cataggar/wamr#609) the handshake goes live without
-    // breaking the existing flag shape. Null when not provided.
+    // `--tls-pem=<path>`) (#583 follow-up to #595, completed in #609):
+    // when both cert and key (or just the combined PEM) are provided
+    // alongside `--listen`, the HTTP service terminates TLS on each
+    // accepted connection (HTTPS), then serves HTTP/1.1 over the
+    // decrypted stream. Server-side TLS (TLS 1.3, RSA + ECDSA certs) is
+    // provided by the `cataggar/tls.zig` dependency — Zig 0.16 std ships
+    // only `std.crypto.tls.Client`. The cert + key are loaded + validated
+    // at startup so a missing file / malformed PEM / key-cert mismatch
+    // surfaces before `bind`. Null when not provided.
     var tls_cert_path: ?[]const u8 = null;
     var tls_key_path: ?[]const u8 = null;
     var tls_pem_path: ?[]const u8 = null;
@@ -941,7 +940,7 @@ fn runHttpComponent(
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
     listen_address: std.Io.net.IpAddress,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
-    tls_config: ?*const wamr.wasi_cli_adapter.HttpsTlsConfig,
+    tls_config: ?*wamr.wasi_cli_adapter.HttpsTlsConfig,
     precompiled_cores: []const wamr.component_core_backend.PrecompiledCore,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;

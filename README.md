@@ -149,26 +149,25 @@ $ zig build test -Dnetwork_tests=true
 ### wasi:http
 
 The `wasi:http/handler@0.3.0` incoming-handler server (PRs #580 + #595)
-accepts plaintext HTTP/1.1 today — keep-alive, chunked
-Transfer-Encoding, response trailers, and 431 / 413 oversize limits
-are all in. HTTPS termination ships in two halves:
+accepts plaintext HTTP/1.1 — keep-alive, chunked Transfer-Encoding,
+response trailers, and 431 / 413 oversize limits are all in. **HTTPS
+termination** ([#609](https://github.com/cataggar/wamr/issues/609)) is
+live:
 
-1. **CLI plumbing + cert / key loader (in this build, opt-in).**
-   `wamr run --listen=<addr> --tls-cert=<cert.pem> --tls-key=<key.pem>`
-   parses + validates the cert chain (`std.crypto.Certificate.Bundle`)
-   and PEM-encoded private key (PKCS#8 / RSA / EC) at startup, so a
-   missing file or malformed PEM surfaces before `bind(2)`. The
-   convenience flag `--tls-pem=<combined.pem>` accepts a single file
-   containing both the cert chain and the key.
+```console
+$ wamr run --listen=<addr> --tls-cert=<cert.pem> --tls-key=<key.pem> app.wasm
+$ wamr run --listen=<addr> --tls-pem=<combined.pem> app.wasm   # cert + key in one file
+```
 
-2. **Server-side handshake (upstream-blocked).** Zig 0.16's
-   `std.crypto.tls` ships only `Client.zig` — there is no
-   `std.crypto.tls.Server` yet. Until upstream lands the server-side
-   API ([#609](https://github.com/cataggar/wamr/issues/609) tracks the
-   wiring), the listener logs a single startup warning on stderr and
-   continues to serve plaintext HTTP/1.1. The CLI surface
-   (`--tls-cert` / `--tls-key` / `--tls-pem`) is stable — when
-   handshake support lands it goes live without a flag-shape change.
+The cert chain (`std.crypto.Certificate.Bundle`) and PEM-encoded private
+key (PKCS#8 / RSA / EC) are parsed + validated at startup, so a missing
+file, malformed PEM, or key/cert mismatch surfaces before `bind(2)`.
+Each accepted connection is upgraded with a TLS 1.3 server-side handshake
+(RSA and ECDSA server certificates) before HTTP/1.1 is served over the
+encrypted stream. Server-side TLS comes from the pure-Zig
+[`cataggar/tls.zig`](https://github.com/cataggar/tls.zig) dependency —
+Zig 0.16's `std.crypto.tls` ships only a client. When `--tls-cert` /
+`--tls-pem` is omitted the listener serves plaintext HTTP/1.1.
 
 ## Configuration
 
