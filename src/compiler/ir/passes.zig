@@ -3365,6 +3365,50 @@ pub fn codegenTimingOptionsFromEnv(env: *const std.process.Environ.Map) CodegenT
     return out;
 }
 
+/// Stderr per-function spill-cost diagnostics for the native-codegen phase
+/// (#808 Lever 1). Off by default; `wamrc` populates it from
+/// `WAMR_AOT_SPILL_METRIC*`. The codegen backends compute the metric via
+/// `regalloc.computeSpillMetric` and print it through
+/// `src/compiler/codegen/timing.zig`.
+pub const SpillMetricOptions = struct {
+    enabled: bool = false,
+    /// Only emit a line for functions with at least this many spilled
+    /// vregs (default 1 — skip the spill-free majority).
+    min_spilled_vregs: u32 = 1,
+    module_filter: ?u32 = null,
+    func_filter: ?u32 = null,
+
+    pub fn moduleMatches(self: SpillMetricOptions, module_idx: u32) bool {
+        return self.module_filter == null or self.module_filter.? == module_idx;
+    }
+
+    /// Whether to emit a line for a function given its module index, local
+    /// function index, and spilled-vreg count.
+    pub fn shouldLog(self: SpillMetricOptions, module_idx: u32, func_idx: u32, spilled_vregs: u32) bool {
+        if (!self.enabled or !self.moduleMatches(module_idx)) return false;
+        if (self.func_filter) |f| return f == func_idx;
+        return spilled_vregs >= self.min_spilled_vregs;
+    }
+};
+
+/// Parse env-gated spill-metric diagnostics. `WAMR_AOT_SPILL_METRIC=1`
+/// enables logging; `0`, `false`, `no`, `off`, or an empty value keep it
+/// disabled. Optional knobs:
+///
+///   - `WAMR_AOT_SPILL_METRIC_MIN_SPILLS` (default: 1)
+///   - `WAMR_AOT_SPILL_METRIC_MODULE` (component core/module index)
+///   - `WAMR_AOT_SPILL_METRIC_FUNC` (local IR function index)
+pub fn spillMetricOptionsFromEnv(env: *const std.process.Environ.Map) SpillMetricOptions {
+    const gate = env.get("WAMR_AOT_SPILL_METRIC") orelse return .{};
+    if (!envFlagEnabled(gate)) return .{};
+
+    var out = SpillMetricOptions{ .enabled = true };
+    if (parseEnvU32(env, "WAMR_AOT_SPILL_METRIC_MIN_SPILLS")) |n| out.min_spilled_vregs = n;
+    if (parseEnvU32(env, "WAMR_AOT_SPILL_METRIC_MODULE")) |m| out.module_filter = m;
+    if (parseEnvU32(env, "WAMR_AOT_SPILL_METRIC_FUNC")) |f| out.func_filter = f;
+    return out;
+}
+
 fn envFlagEnabled(value: []const u8) bool {
     return value.len != 0 and
         !std.mem.eql(u8, value, "0") and
@@ -15448,6 +15492,51 @@ test "codegenTimingOptionsFromEnv: parses gate, threshold, cadence, and filters"
     // Module filter matching.
     try std.testing.expect(opts.moduleMatches(4));
     try std.testing.expect(!opts.moduleMatches(0));
+}
+
+test "spillMetricOptionsFromEnv: disabled unless gate set" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("WAMR_AOT_SPILL_METRIC_MIN_SPILLS", "5");
+    try std.testing.expect(!spillMetricOptionsFromEnv(&env).enabled);
+
+    try env.put("WAMR_AOT_SPILL_METRIC", "off");
+    try std.testing.expect(!spillMetricOptionsFromEnv(&env).enabled);
+}
+
+test "spillMetricOptionsFromEnv: parses gate, threshold, and filters" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("WAMR_AOT_SPILL_METRIC", "1");
+    try env.put("WAMR_AOT_SPILL_METRIC_MIN_SPILLS", "32");
+    try env.put("WAMR_AOT_SPILL_METRIC_MODULE", "4");
+    try env.put("WAMR_AOT_SPILL_METRIC_FUNC", "11396");
+
+    const opts = spillMetricOptionsFromEnv(&env);
+    try std.testing.expect(opts.enabled);
+    try std.testing.expectEqual(@as(u32, 32), opts.min_spilled_vregs);
+    try std.testing.expectEqual(@as(?u32, 4), opts.module_filter);
+    try std.testing.expectEqual(@as(?u32, 11396), opts.func_filter);
+
+    // A func filter logs that exact function regardless of spill count, and
+    // suppresses all others; module filter still gates.
+    try std.testing.expect(opts.shouldLog(4, 11396, 0));
+    try std.testing.expect(!opts.shouldLog(4, 11397, 9999));
+    try std.testing.expect(!opts.shouldLog(0, 11396, 9999));
+}
+
+test "SpillMetricOptions.shouldLog: min-spill threshold without a func filter" {
+    const opts = SpillMetricOptions{ .enabled = true, .min_spilled_vregs = 10 };
+    try std.testing.expect(opts.shouldLog(0, 3, 10));
+    try std.testing.expect(opts.shouldLog(0, 3, 11));
+    try std.testing.expect(!opts.shouldLog(0, 3, 9));
+    // Disabled options never log.
+    const off = SpillMetricOptions{ .enabled = false, .min_spilled_vregs = 1 };
+    try std.testing.expect(!off.shouldLog(0, 0, 1000));
 }
 
 test "tailDuplicateSmallJoins: triple predecessor with br terminator — all three duplicated" {

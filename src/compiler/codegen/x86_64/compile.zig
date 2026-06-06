@@ -1616,6 +1616,9 @@ pub fn compileModuleCached(
 /// parsing so per-function / per-sub-phase costs can be attributed.
 pub const CompileOptions = struct {
     codegen_timing: passes.CodegenTimingOptions = .{},
+    /// #808 Lever 1: per-function spill-cost diagnostics. Off unless
+    /// `WAMR_AOT_SPILL_METRIC` is set.
+    spill_metric: passes.SpillMetricOptions = .{},
     /// Component core/module index, used only to match the
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter. Single-module
     /// `wamrc compile` leaves it at 0.
@@ -1726,6 +1729,11 @@ pub fn compileModuleCachedWithOptions(
                 ir_module.global_offsets orelse &.{},
                 allocator,
                 if (func_timer) |*ft| ft else null,
+                if (options.spill_metric.enabled) SpillMetricCtx{
+                    .opts = options.spill_metric,
+                    .module_idx = options.module_idx,
+                    .func_idx = @intCast(fi),
+                } else null,
             );
             if (ct_live) {
                 compile_ns = codegen_timing.nowNs() -| compile_t0;
@@ -2157,18 +2165,29 @@ fn compileFunctionRAWithGlobalOffsets(
     global_offsets: []const u32,
     allocator: std.mem.Allocator,
 ) !FuncCompileResult {
-    return compileFunctionRAWithGlobalOffsetsTimed(func, import_count, global_offsets, allocator, null);
+    return compileFunctionRAWithGlobalOffsetsTimed(func, import_count, global_offsets, allocator, null, null);
 }
+
+/// #808 Lever 1 context: identifies the function for the spill-metric line
+/// and carries the (already enabled) options. `null` disables the metric.
+const SpillMetricCtx = struct {
+    opts: passes.SpillMetricOptions,
+    module_idx: u32,
+    func_idx: u32,
+};
 
 /// #778: same as `compileFunctionRAWithGlobalOffsets`, but records the
 /// contiguous setup / liveness / regalloc spans into `timer` when codegen
 /// timing is live. `timer == null` is the normal (untimed) path.
+/// `spill_ctx` (≠ null) additionally requests the #808 Lever 1 per-function
+/// spill-cost diagnostic.
 fn compileFunctionRAWithGlobalOffsetsTimed(
     func: *const ir.IrFunction,
     import_count: u32,
     global_offsets: []const u32,
     allocator: std.mem.Allocator,
     timer: ?*codegen_timing.FuncTimer,
+    spill_ctx: ?SpillMetricCtx,
 ) !FuncCompileResult {
     if (functionUsesV128(func)) return error.UnsupportedV128;
 
@@ -2319,6 +2338,33 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     );
     defer alloc_result.deinit();
     if (timer) |t| t.end(.regalloc);
+
+    // #808 Lever 1: per-function spill-cost diagnostic. The metric walk is
+    // gated on the (already enabled) module filter so the disabled path
+    // pays nothing; `printSpill` is further gated by `shouldLog`.
+    if (spill_ctx) |sc| {
+        if (sc.opts.moduleMatches(sc.module_idx)) {
+            const metric = try regalloc.computeSpillMetric(
+                allocator,
+                func,
+                x86_64_reg_set(func.local_count),
+                live_ranges,
+                &alloc_result,
+            );
+            if (sc.opts.shouldLog(sc.module_idx, sc.func_idx, metric.spilled_vregs)) {
+                codegen_timing.printSpill(.{
+                    .module_idx = sc.module_idx,
+                    .func_idx = sc.func_idx,
+                    .func_name = func.name orelse "<anon>",
+                    .insts = countInstructions(func),
+                    .clobbers = @intCast(clobber_points.items.len),
+                    .spill_count = alloc_result.spill_count,
+                    .metric = metric,
+                });
+            }
+        }
+    }
+
     // Everything below (used-register scans + emit loop + branch/table/
     // call patch resolution + toOwnedSlice) is attributed to the derived
     // `emit` bucket (total − setup − liveness − regalloc).

@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const passes = @import("../ir/passes.zig");
+const regalloc = @import("../ir/regalloc.zig");
 
 pub const Options = passes.CodegenTimingOptions;
 
@@ -121,6 +122,38 @@ pub fn printFunc(r: FuncReport) void {
             r.hash_ns / ns_per_ms, msFrac(r.hash_ns),         r.total_ns / ns_per_ms, msFrac(r.total_ns),        r.setup_ns / ns_per_ms,
             msFrac(r.setup_ns),    r.liveness_ns / ns_per_ms, msFrac(r.liveness_ns),  r.regalloc_ns / ns_per_ms, msFrac(r.regalloc_ns),
             emit_ns / ns_per_ms,   msFrac(emit_ns),
+        },
+    );
+}
+
+pub const SpillMetricOptions = passes.SpillMetricOptions;
+
+/// Per-function spill-cost diagnostic line (#808 Lever 1). `spill_count`
+/// is the raw `AllocResult.spill_count` (total 8-byte slots); the rest come
+/// from `regalloc.computeSpillMetric`. Printed only when the caller's
+/// `SpillMetricOptions.shouldLog` is satisfied; the backends gate the
+/// (cheap) metric computation on the same predicate so the disabled path
+/// pays nothing.
+pub const SpillReport = struct {
+    module_idx: u32,
+    func_idx: u32,
+    func_name: []const u8,
+    insts: usize,
+    clobbers: u32,
+    spill_count: u32,
+    metric: regalloc.SpillMetric,
+};
+
+pub fn printSpill(r: SpillReport) void {
+    const m = r.metric;
+    std.debug.print(
+        "[aot-spill-metric] local_func={d} mod={d} name={s} insts={d} clobbers={d} " ++
+            "slots={d} spilled_vregs={d} scalar={d} v128={d} slots_scalar={d} slots_v128={d} " ++
+            "spill_ld={d} spill_st={d} remat={d} callee_saved={d}\n",
+        .{
+            r.func_idx,          r.module_idx,             r.func_name,         r.insts,          r.clobbers,
+            r.spill_count,       m.spilled_vregs,          m.spilled_vregs_scalar, m.spilled_vregs_v128, m.slots_scalar,
+            m.slots_v128,        m.spill_loads,            m.spill_stores,      m.remat_vregs,    m.callee_saved_used,
         },
     );
 }

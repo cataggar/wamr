@@ -100,6 +100,9 @@ pub const PrecompileOptions = struct {
     /// Optional native-codegen timing diagnostics (#778), normally parsed
     /// by `wamrc` from `WAMR_AOT_CODEGEN_TIMING*`.
     codegen_timing: passes.CodegenTimingOptions = .{},
+    /// Optional per-function spill-cost diagnostics (#808 Lever 1),
+    /// normally parsed by `wamrc` from `WAMR_AOT_SPILL_METRIC*`.
+    spill_metric: passes.SpillMetricOptions = .{},
     /// Tail-duplication compile-time guard/cap options.
     tail_duplication: passes.TailDuplicationOptions = .{},
     /// IR verifier mode for optimized builds. Defaults match the historical
@@ -242,6 +245,7 @@ pub fn compileCoreWasmCached(
             return error.CoreCompileFailed,
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
             .codegen_timing = opts.codegen_timing,
+            .spill_metric = opts.spill_metric,
             .module_idx = opts.module_idx,
         }) catch
             return error.CoreCompileFailed,
