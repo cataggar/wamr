@@ -426,6 +426,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     const compiled: codegen_cache.CompileResultCached = switch (target_arch) {
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
             .codegen_timing = codegen_timing,
+            .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
         }) catch |err| {
             std.debug.print("Error compiling to x86-64: {}\n", .{err});
             std.process.exit(1);
@@ -944,6 +945,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
         .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
         .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
+        .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
         .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
         .verify_mode = verify_mode,
     }) catch |err| {
@@ -1066,6 +1068,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
                 .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
                 .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
                 .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
+                .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
                 .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
                 .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {
@@ -1084,6 +1087,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
                 .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
                 .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
                 .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
+                .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
                 .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
                 .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {

@@ -502,6 +502,131 @@ pub fn classifyRematCandidates(
     return map;
 }
 
+/// Enriched per-function spill cost, derived purely from a finished
+/// `AllocResult` plus the function's IR and live ranges (#808 Lever 1).
+///
+/// `AllocResult.spill_count` alone reports only the number of 8-byte spill
+/// *slots* — that conflates a slot-reuse win (which cuts frame size but not
+/// memory traffic) with a real reduction in load/store work. This metric
+/// separates the two so the #798 profile can be correlated against actual
+/// codegen traffic, not just slot accounting:
+///   - distinct spilled vregs (scalar vs v128),
+///   - 8-byte slots consumed by each class,
+///   - emitted spill *reloads* (one per IR use of a spilled vreg) and
+///     *stores* (one per IR def of a spilled vreg) — the real traffic,
+///   - rematerialised vregs (#542), which avoid both slot and traffic,
+///   - distinct callee-saved registers used (each a prologue push +
+///     epilogue pop — the only register save/restore traffic in WAMR's
+///     clobber-aware model, since values live across a call are forced
+///     onto callee-saved regs rather than push/pop'd around the call).
+pub const SpillMetric = struct {
+    /// Distinct vregs assigned to a stack slot.
+    spilled_vregs: u32 = 0,
+    spilled_vregs_scalar: u32 = 0,
+    spilled_vregs_v128: u32 = 0,
+    /// 8-byte slots consumed by scalar / v128 spills (v128 = 2 each). The
+    /// sum can be below `AllocResult.spill_count` because inter-class
+    /// alignment padding is attributed to neither bucket.
+    slots_scalar: u32 = 0,
+    slots_v128: u32 = 0,
+    /// Emitted spill reloads: one per IR operand reference to a spilled
+    /// vreg (codegen reloads from the slot at each use site).
+    spill_loads: u32 = 0,
+    /// Emitted spill stores: one per IR def of a spilled vreg.
+    spill_stores: u32 = 0,
+    /// Vregs rematerialised (#542) instead of spilled — no slot, no
+    /// reload (the def is re-emitted at each use instead).
+    remat_vregs: u32 = 0,
+    /// Distinct callee-saved physical registers used by the allocation.
+    /// Excludes ABI-pinned regs (vmctx / memory_base) that are not in the
+    /// allocatable pool.
+    callee_saved_used: u32 = 0,
+};
+
+const SpillUseCounter = struct {
+    spilled: *const std.AutoHashMap(ir.VReg, void),
+    count: u32 = 0,
+
+    fn visit(self: *SpillUseCounter, v: ir.VReg) anyerror!void {
+        if (self.spilled.contains(v)) self.count += 1;
+    }
+};
+
+/// Compute the #808 Lever 1 spill metric for one function. Pure: mutates
+/// nothing, allocates only scratch freed before returning. `ranges` is the
+/// same slice passed to `allocateFromRanges*` (used to classify each
+/// spilled vreg's type); `alloc_result` is its output.
+pub fn computeSpillMetric(
+    allocator: std.mem.Allocator,
+    func: *const ir.IrFunction,
+    reg_set: RegSet,
+    ranges: []const analysis.LiveRange,
+    alloc_result: *const AllocResult,
+) !SpillMetric {
+    var metric: SpillMetric = .{ .remat_vregs = alloc_result.remat.count() };
+
+    // vreg → type, sourced from the live ranges that drove allocation.
+    var type_of = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer type_of.deinit();
+    for (ranges) |r| try type_of.put(r.vreg, r.type);
+
+    // Distinct spilled vregs + per-class slot accounting.
+    var spilled = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer spilled.deinit();
+    {
+        var it = alloc_result.assignments.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .stack) continue;
+            try spilled.put(e.key_ptr.*, {});
+            metric.spilled_vregs += 1;
+            const ty = type_of.get(e.key_ptr.*) orelse ir.IrType.i64;
+            if (ty == .v128) {
+                metric.spilled_vregs_v128 += 1;
+                metric.slots_v128 += ty.spillSlots64();
+            } else {
+                metric.spilled_vregs_scalar += 1;
+                metric.slots_scalar += ty.spillSlots64();
+            }
+        }
+    }
+
+    // Emitted spill traffic: one store per def of a spilled vreg, one
+    // reload per operand reference to a spilled vreg.
+    var uc = SpillUseCounter{ .spilled = &spilled };
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                if (spilled.contains(d)) metric.spill_stores += 1;
+            }
+            try range_split.forEachUseInst(inst, &uc, SpillUseCounter.visit);
+        }
+    }
+    metric.spill_loads = uc.count;
+
+    // Distinct callee-saved physical registers used (prologue/epilogue
+    // save/restore traffic). Physreg values fit in u8 and are < 64 on
+    // every target, so a u64 bitmask keyed by physreg value suffices.
+    var callee_saved_set: u64 = 0;
+    for (reg_set.callee_saved_indices) |idx| {
+        const phys = reg_set.alloc_regs[idx];
+        if (phys < 64) callee_saved_set |= (@as(u64, 1) << @intCast(phys));
+    }
+    var callee_used: u64 = 0;
+    {
+        var it = alloc_result.assignments.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .reg) continue;
+            const phys = e.value_ptr.reg;
+            if (phys < 64 and (callee_saved_set & (@as(u64, 1) << @intCast(phys))) != 0) {
+                callee_used |= (@as(u64, 1) << @intCast(phys));
+            }
+        }
+    }
+    metric.callee_saved_used = @popCount(callee_used);
+
+    return metric;
+}
+
 /// Variant of `allocate` that takes pre-computed live ranges. Used by
 /// aarch64 to inject FMA-fusion awareness: the codegen's MADD/MSUB pre-pass
 /// reads a fused mul's sources at the following add instruction, so those
@@ -1226,6 +1351,92 @@ test "measurePhiSpillDelta: null without phis; SSA never spills more than naive"
         // SSA intervals are a subset under the call-clobber model too.
         try std.testing.expect(d.ssa_spills_xcall <= d.naive_spills_xcall);
     }
+}
+
+test "computeSpillMetric: counts spilled vregs, slots, traffic, and callee-saved use" {
+    const allocator = std.testing.allocator;
+    const reg_set: RegSet = .{
+        .alloc_regs = &.{ 10, 11, 12 },
+        .callee_saved_indices = &.{2}, // physreg 12 is callee-saved
+        .caller_saved_indices = &.{ 0, 1 }, // physregs 10, 11 are caller-saved
+        .spill_base = 0,
+        .spill_stride = 8,
+    };
+
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const block = func.getBlock(b0);
+
+    const v0 = func.newVReg(); // spilled scalar: 1 def + 2 uses
+    const v1 = func.newVReg(); // caller-saved reg
+    const v2 = func.newVReg(); // spilled v128: 1 def + 1 use
+    const v3 = func.newVReg(); // callee-saved reg
+    const v4 = func.newVReg();
+    const v5 = func.newVReg();
+
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v3, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v3 } }, .dest = v4, .type = .i32 });
+    try block.append(.{ .op = .{ .v128_const = 0 }, .dest = v2, .type = .v128 });
+    try block.append(.{ .op = .{ .v128_not = v2 }, .dest = v5, .type = .v128 });
+    try block.append(.{ .op = .{ .ret = v4 }, .type = .void });
+
+    // Ranges only supply per-vreg types for the scalar/v128 split.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = v0, .start = 0, .end = 4, .type = .i32 },
+        .{ .vreg = v2, .start = 4, .end = 5, .type = .v128 },
+    };
+
+    // Hand-built allocation: deterministic placement independent of the
+    // linear-scan decisions, so the metric's accounting is isolated.
+    var result: AllocResult = .{
+        .assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator),
+        .spill_count = 3,
+        .remat = std.AutoHashMap(ir.VReg, RematDef).init(allocator),
+    };
+    defer result.deinit();
+    try result.assignments.put(v0, .{ .stack = 0 });
+    try result.assignments.put(v1, .{ .reg = 10 });
+    try result.assignments.put(v2, .{ .stack = 8 });
+    try result.assignments.put(v3, .{ .reg = 12 }); // callee-saved
+    try result.assignments.put(v4, .{ .reg = 11 });
+    try result.assignments.put(v5, .{ .reg = 11 });
+
+    const m = try computeSpillMetric(allocator, &func, reg_set, &ranges, &result);
+    try std.testing.expectEqual(@as(u32, 2), m.spilled_vregs);
+    try std.testing.expectEqual(@as(u32, 1), m.spilled_vregs_scalar);
+    try std.testing.expectEqual(@as(u32, 1), m.spilled_vregs_v128);
+    try std.testing.expectEqual(@as(u32, 1), m.slots_scalar);
+    try std.testing.expectEqual(@as(u32, 2), m.slots_v128);
+    try std.testing.expectEqual(@as(u32, 3), m.spill_loads); // v0 ×2 + v2 ×1
+    try std.testing.expectEqual(@as(u32, 2), m.spill_stores); // v0 + v2 defs
+    try std.testing.expectEqual(@as(u32, 0), m.remat_vregs);
+    try std.testing.expectEqual(@as(u32, 1), m.callee_saved_used); // physreg 12
+}
+
+test "computeSpillMetric: no spills yields an all-zero metric" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const block = func.getBlock(b0);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 }, .type = .void });
+
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = v0, .start = 0, .end = 1, .type = .i32 },
+    };
+    var result = try allocateFromRanges(allocator, test_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    const m = try computeSpillMetric(allocator, &func, test_reg_set, &ranges, &result);
+    try std.testing.expectEqual(@as(u32, 0), m.spilled_vregs);
+    try std.testing.expectEqual(@as(u32, 0), m.spill_loads);
+    try std.testing.expectEqual(@as(u32, 0), m.spill_stores);
+    try std.testing.expectEqual(@as(u32, 0), m.callee_saved_used);
 }
 
 test "allocate: no spills with few live values" {
