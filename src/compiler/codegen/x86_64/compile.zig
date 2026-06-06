@@ -105,28 +105,32 @@ const table_info_stride: i32 = 24;
 
 /// Emit the compare-and-trap tail of a bounds check.
 ///
-/// Assumes the end-of-access address has just been materialized in `r11`
-/// and `r10` still holds the `VmCtx*` pointer. Emits:
-///   cmp r11, [r10 + memsize_field]
+/// Assumes the end-of-access address has just been materialized in `r11`.
+/// Reads `VmCtx.memory_size` and the trap-fn pointer straight from `rbx`,
+/// which is permanently pinned to `VmCtx*` for the whole function body
+/// (issue #465) — so callers no longer need to stage vmctx in `r10`
+/// before the check (#798 Lever 2). Emits:
+///   cmp r11, [rbx + memsize_field]
 ///   jbe over_trap
-///   mov param_regs[0], r10
+///   mov param_regs[0], rbx
 ///   mov rax, [param_regs[0] + trap_oob_fn_field]
 ///   call rax                 ; noreturn
 /// The `jbe` rel8 is hard-coded to skip 12 bytes — the fixed size of the
-/// trap block below (3 + 7 + 2).
+/// trap block below (3 + 7 + 2); the trap block size is unchanged by the
+/// r10→rbx switch (both `mov param0, <reg>` encode to 3 bytes).
 fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
-    // cmp r11, qword ptr [r10 + memsize_field]
-    //   REX.W|R|B=4D, opcode 0x3B, modrm=01_011_010 (mod=disp8, reg=r11 low=3,
-    //   rm=r10 low=2), disp8=memsize_field.
-    try code.emitSlice(&.{ 0x4D, 0x3B, 0x5A, @as(u8, @intCast(vmctx_memsize_field)) });
+    // cmp r11, qword ptr [rbx + memsize_field]
+    //   REX.W|R=4C, opcode 0x3B, modrm=01_011_011 (mod=disp8, reg=r11 low=3,
+    //   rm=rbx low=3), disp8=memsize_field.
+    try code.emitSlice(&.{ 0x4C, 0x3B, 0x5B, @as(u8, @intCast(vmctx_memsize_field)) });
     // jbe over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
     try code.emitByte(0x76);
     try code.emitByte(12);
     // Trap block:
-    //   mov param_regs[0], r10            ; arg0 = vmctx (already in r10)
+    //   mov param_regs[0], rbx            ; arg0 = vmctx (pinned in rbx)
     //   mov rax, [param_regs[0] + trap_oob_fn_field]
     //   call rax                          ; noreturn
-    try code.movRegReg(param_regs[0], .r10);
+    try code.movRegReg(param_regs[0], .rbx);
     try code.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
     try code.callReg(.rax);
     // over_trap:
@@ -344,16 +348,16 @@ fn emitTruncRangeCheck(
 ///
 /// Preconditions:
 ///   - `rax` holds `wasm_addr` already zero-extended to 64 bits (u32 → u64).
-///   - `r10` holds the `VmCtx*` pointer.
+///   - `rbx` is the pinned `VmCtx*` (always true in a function body, #465).
 ///
 /// Effect:
 ///   - Computes `end = wasm_addr + end_offset` in `r11`, where
 ///     `end_offset = static_offset + access_size` supplied by the caller.
-///   - Compares `end` with `VmCtx.memory_size` and, if strictly greater,
-///     calls `vmctx.trap_oob_fn(vmctx)` which does not return.
+///   - Compares `end` with `VmCtx.memory_size` (read via `rbx`) and, if
+///     strictly greater, calls `vmctx.trap_oob_fn(vmctx)` which does not return.
 ///   - Preserves `rax` (the wasm_addr) so the caller can continue to add
-///     `mem_base` to it. Preserves `r10` so the caller can subsequently
-///     load `mem_base` via `mov r10, [r10 + membase]`.
+///     `mem_base` to it. Never touches `r10`, so a caller that staged vmctx
+///     there (e.g. memory.fill) can still read `[r10 + membase]` afterward.
 ///   - Clobbers `r11` (non-allocatable scratch) and `param_regs[0]`
 ///     (Win64: rcx, reserved scratch / SysV: rdi, caller-saved).
 fn emitMemBoundsCheck(code: *emit.CodeBuffer, end_offset: u64) !void {
@@ -384,7 +388,7 @@ fn emitMemBoundsCheck(code: *emit.CodeBuffer, end_offset: u64) !void {
 /// Preconditions:
 ///   - `rax` holds the wasm base address, already zero-extended to u64.
 ///   - `rcx` holds the byte length, already zero-extended to u64.
-///   - `r10` holds the `VmCtx*` pointer.
+///   - `rbx` is the pinned `VmCtx*` (always true in a function body, #465).
 ///
 /// Effect:
 ///   - Computes `end = rax + rcx` in `r11` and traps if
@@ -3693,11 +3697,10 @@ fn compileInstRA(
         // ── Memory ────────────────────────────────────────────────────
         .load => |ld| {
             const dest = inst.dest orelse return;
-            // Bounds check reads memory_size from `[vmctx + 8]`, so we
-            // still need vmctx in r10 across the check. The actual
-            // address arithmetic uses the pinned memory_base in r15
+            // The bounds check reads memory_size straight from the pinned
+            // vmctx in `rbx` (#465 / #798 L2) — no per-access `mov r10, rbx`.
+            // The address arithmetic uses the pinned memory_base in r15
             // (issue #466) — no per-access reload of `[vmctx + 0]`.
-            try code.movRegReg(.r10, .rbx); // load VmCtx*
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
@@ -3737,11 +3740,10 @@ fn compileInstRA(
             }
         },
         .store => |st| {
-            // Bounds check reads memory_size from `[vmctx + 8]`, so we
-            // still need vmctx in r10 across the check. The actual
-            // address arithmetic uses the pinned memory_base in r15
+            // The bounds check reads memory_size straight from the pinned
+            // vmctx in `rbx` (#465 / #798 L2) — no per-access `mov r10, rbx`.
+            // The address arithmetic uses the pinned memory_base in r15
             // (issue #466) — no per-access reload of `[vmctx + 0]`.
-            try code.movRegReg(.r10, .rbx); // load VmCtx*
             // Compute final address in rax (not allocatable — safe to clobber).
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
@@ -5855,6 +5857,54 @@ test "compileFunctionRA: prologue pins vmctx in rbx (#465) and memory_base in r1
     try std.testing.expect(idx_mov_rbx < idx_mov_r15);
 }
 
+test "compileFunctionRA: load bounds check reads vmctx from rbx, no per-access r10 stage (#798 L2)" {
+    // #798 Lever 2: the inline memory bounds check must source memory_size
+    // (and the trap-fn vmctx arg) straight from the pinned `rbx` (#465),
+    // not a per-access `mov r10, rbx`. Verify the new `cmp r11, [rbx+8]`
+    // encoding is emitted, the old `cmp r11, [r10+8]` form is gone, and a
+    // load-only function contains no `mov r10, rbx` (49 89 DA) staging.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v_addr = func.newVReg();
+    const v_val = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr, .type = .i32 });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4, .bounds_known = false } },
+        .dest = v_val,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .ret = v_val } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // New bounds-check compare: `cmp r11, [rbx + 8]` = 4C 3B 5B 08.
+    const cmp_rbx: [4]u8 = .{ 0x4C, 0x3B, 0x5B, 0x08 };
+    try std.testing.expect(std.mem.indexOf(u8, code, &cmp_rbx) != null);
+
+    // Old form `cmp r11, [r10 + 8]` = 4D 3B 5A 08 must be gone.
+    const cmp_r10: [4]u8 = .{ 0x4D, 0x3B, 0x5A, 0x08 };
+    try std.testing.expect(std.mem.indexOf(u8, code, &cmp_r10) == null);
+
+    // No per-access `mov r10, rbx` (49 89 DA) in a load-only function.
+    const mov_r10_rbx: [3]u8 = .{ 0x49, 0x89, 0xDA };
+    try std.testing.expect(std.mem.indexOf(u8, code, &mov_r10_rbx) == null);
+
+    // Trap arg is now `mov param_regs[0], rbx`. SysV: mov rdi, rbx = 48 89 DF;
+    // Win64: mov rcx, rbx = 48 89 D9. The matching form must be present.
+    const mov_param0_rbx: [3]u8 = if (builtin.os.tag == .windows)
+        .{ 0x48, 0x89, 0xD9 }
+    else
+        .{ 0x48, 0x89, 0xDF };
+    try std.testing.expect(std.mem.indexOf(u8, code, &mov_param0_rbx) != null);
+}
+
 test "compileFunctionRA: memory.grow refreshes pinned r15 (issue #466)" {
     // The helper call to mem_grow_fn can realloc the linear memory and
     // invalidate r15's cached `[vmctx + 0]`. Codegen must emit a fresh
@@ -7126,9 +7176,9 @@ test "compileFunctionRA: i32.load emits inline memory bounds check" {
     //
     // The fixed bounds-check sequence we expect to see (before the load):
     //   lea r11, [rax + (offset + size)]     ; 4C 8D 98 <disp32>
-    //   cmp r11, [r10 + memsize_field=8]     ; 4D 3B 5A 08
+    //   cmp r11, [rbx + memsize_field=8]     ; 4C 3B 5B 08   (#798 L2: rbx=vmctx)
     //   jbe  +12                             ; 76 0C
-    //   mov  param_regs[0], r10              ; 4C 89 D1 (Win64) / 4C 89 D7 (SysV)
+    //   mov  param_regs[0], rbx              ; 48 89 D9 (Win64) / 48 89 DF (SysV)
     //   mov  rax, [param_regs[0] + trap_fn=80] ; 48 8B 81 50 00 00 00 (Win64)
     //   call rax                             ; FF D0
     const allocator = std.testing.allocator;
@@ -7151,8 +7201,8 @@ test "compileFunctionRA: i32.load emits inline memory bounds check" {
 
     // lea r11, [rax + 2] → 4C 8D 98 02 00 00 00
     try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8D, 0x98, 0x02, 0x00, 0x00, 0x00 }));
-    // cmp r11, [r10 + 8]   → 4D 3B 5A 08
-    try std.testing.expect(containsBytes(code, &.{ 0x4D, 0x3B, 0x5A, 0x08 }));
+    // cmp r11, [rbx + 8]   → 4C 3B 5B 08  (#798 L2)
+    try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x3B, 0x5B, 0x08 }));
     // jbe +12              → 76 0C
     try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
     // call qword ptr [vmctx + 80] is encoded as a two-step load+callReg.
@@ -7185,8 +7235,8 @@ test "compileFunctionRA: i32.store emits inline memory bounds check" {
 
     // lea r11, [rax + 4] → 4C 8D 98 04 00 00 00
     try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8D, 0x98, 0x04, 0x00, 0x00, 0x00 }));
-    // cmp r11, [r10 + 8]
-    try std.testing.expect(containsBytes(code, &.{ 0x4D, 0x3B, 0x5A, 0x08 }));
+    // cmp r11, [rbx + 8]  → 4C 3B 5B 08  (#798 L2)
+    try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x3B, 0x5B, 0x08 }));
     // jbe +12
     try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
     // call rax (trap dispatch)
