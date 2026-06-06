@@ -106,6 +106,42 @@ fn expectDiffI32(wasm: []const u8, name: []const u8, expected: i32) !void {
     try testing.expectEqual(interp_result, aot_result);
 }
 
+/// #798 Lever 1: a trap in AOT-compiled code must surface as
+/// `error.WasmTrap` out of `callFuncScalar` (catchable) rather than
+/// aborting the process. Catchable on x86_64 (Windows via the VEH path,
+/// POSIX via the hand-rolled `trap_jmp` setjmp/longjmp); on other arches
+/// AOT traps still abort, so gate the assertion to x86_64.
+fn expectAotTrap(wasm: []const u8, name: []const u8) !void {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    try testing.expectError(error.WasmTrap, runAotI32(testing.allocator, wasm, name));
+}
+
+test "differential AOT: unreachable surfaces as catchable WasmTrap (#798 L1)" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00); // 0 local declarations
+    try body.append(testing.allocator, 0x00); // unreachable (traps)
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x41, 0x00 }); // i32.const 0 (type-valid result)
+    try body.append(testing.allocator, 0x0B); // end
+    const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+    defer testing.allocator.free(wasm);
+    try expectAotTrap(wasm, "f");
+}
+
+test "differential AOT: out-of-bounds i32.load surfaces as catchable WasmTrap (#798 L1)" {
+    // 1-page (64 KiB) memory; load 4 bytes at 65536 → OOB → aotTrapOOB.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00); // 0 local declarations
+    try body.append(testing.allocator, 0x41); // i32.const
+    try encodeSLEB128(&body, testing.allocator, 65536);
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x28, 0x02, 0x00 }); // i32.load align=2 offset=0
+    try body.append(testing.allocator, 0x0B); // end
+    const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+    defer testing.allocator.free(wasm);
+    try expectAotTrap(wasm, "f");
+}
+
 fn expectSimdDiffI32(wasm: []const u8, name: []const u8, expected: i32) !void {
     const interp_result = try runInterpI32(testing.allocator, wasm, name);
     try testing.expectEqual(expected, interp_result);

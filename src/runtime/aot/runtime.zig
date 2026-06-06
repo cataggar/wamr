@@ -11,6 +11,7 @@ const aot_loader = @import("loader.zig");
 const host_bridge = @import("host_bridge.zig");
 const platform = @import("../../platform/platform.zig");
 const sig_registry = @import("../common/sig_registry.zig");
+const trap_jmp = @import("trap_jmp.zig");
 
 // ─── Windows crash handler (debug only) ─────────────────────────────────────
 const windows = std.os.windows;
@@ -49,6 +50,12 @@ var g_imported_function_count: u32 = 0;
 // Not thread-safe (neither is the rest of this runtime). Using a module-level
 // var rather than threadlocal so Windows TLS alignment quirks don't bite us.
 const windows_trap_supported = builtin.os.tag == .windows and builtin.cpu.arch == .x86_64;
+/// #798 Lever 1: catch AOT traps as `error.WasmTrap` on POSIX x86_64 too
+/// (Linux / macOS), the analogue of the Windows `RtlCaptureContext` path.
+/// Uses the hand-rolled `trap_jmp` setjmp/longjmp (no libc on Linux). When
+/// false (other targets), AOT traps abort the process as before.
+const posix_trap_supported = !windows_trap_supported and trap_jmp.supported;
+var g_posix_trap_buf: trap_jmp.JmpBuf = undefined;
 var g_saved_ctx: windows.CONTEXT align(16) = undefined;
 var g_trap_catching: bool = false;
 var g_trap_occurred: bool = false;
@@ -360,7 +367,12 @@ fn trapLongjmp() noreturn {
     if (comptime windows_trap_supported) {
         RtlRestoreContext(&g_saved_ctx, null);
     }
-    // Non-Windows: trap-as-error not yet supported; fall back to exit.
+    if (comptime posix_trap_supported) {
+        // Resume at the `trap_jmp.capture` site in callFuncScalar, which
+        // then returns `error.WasmTrap`.
+        trap_jmp.restore(&g_posix_trap_buf, 1);
+    }
+    // No trap-catch support on this target: fall back to exit.
     std.process.exit(2);
 }
 
@@ -2508,6 +2520,21 @@ pub fn callFuncScalar(
         }
     }
 
+    // #798 Lever 1: POSIX x86_64 analogue. The trap helpers (aotTrapOOB,
+    // aotTrapUnreachable, ...) longjmp back to the `trap_jmp.capture` site
+    // below when `g_trap_catching` is armed; we then return
+    // `error.WasmTrap` instead of aborting the process.
+    if (comptime posix_trap_supported) {
+        @atomicStore(bool, &g_trap_occurred, false, .seq_cst);
+        @atomicStore(bool, &g_trap_catching, true, .seq_cst);
+        if (trap_jmp.capture(&g_posix_trap_buf) != 0) {
+            // A trap helper unwound back here.
+            @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+            readGlobalsFromStorage(inst, globals_buf);
+            return error.WasmTrap;
+        }
+    }
+
     const raw_result: u64 = switch (effective_args) {
         0 => blk: {
             const f: CallFn0 = @ptrCast(@alignCast(addr));
@@ -2565,6 +2592,9 @@ pub fn callFuncScalar(
     };
 
     if (comptime windows_trap_supported) {
+        @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+    }
+    if (comptime posix_trap_supported) {
         @atomicStore(bool, &g_trap_catching, false, .seq_cst);
     }
 
