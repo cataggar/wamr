@@ -617,6 +617,20 @@ pub fn build(b: *std.Build) void {
     const run_regalloc_tests = b.addRunArtifact(regalloc_tests);
     test_step.dependOn(&run_regalloc_tests.step);
 
+    // Compiler loop-aware live-range splitting tests (#383 / #524). The
+    // file's tests were previously not wired into any module and so never
+    // ran; this module makes `zig build test` cover them.
+    const range_split_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/range_split.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const range_split_tests = b.addTest(.{
+        .root_module = range_split_test_module,
+    });
+    const run_range_split_tests = b.addRunArtifact(range_split_tests);
+    test_step.dependOn(&run_range_split_tests.step);
+
     // Compiler IR printer tests
     const ir_print_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/print_test.zig"),
