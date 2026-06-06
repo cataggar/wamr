@@ -220,6 +220,134 @@ pub fn allocateSsa(
     return allocateFromRangesWithHintsRemat(allocator, reg_set, clobbers, ranges, &.{}, &candidates);
 }
 
+/// One physical move needed on a CFG edge to satisfy a phi: the value
+/// arriving from the predecessor (`src`) must be placed where the phi dest
+/// lives (`dst`). All moves for one edge happen "in parallel" (every `src`
+/// is read before any `dst` is written), so a later parallel-copy emitter
+/// can sequence them with a 4-phase algorithm that breaks cycles via a
+/// scratch register.
+pub const PhiMove = struct {
+    dst: Allocation,
+    src: Allocation,
+    ty: ir.IrType,
+};
+
+/// The parallel copy that resolves all phis of `succ` on the edge from
+/// `pred`. `needs_split` is set when `pred` has more than one successor:
+/// the moves cannot be emitted unconditionally at `pred`'s terminator (they
+/// would also run on the other out-edges), so the critical edge must be
+/// split before the moves are placed. Splitting is deferred to the codegen
+/// wiring step (#392 step 3b); this function only reports the requirement.
+pub const EdgeResolution = struct {
+    pred: ir.BlockId,
+    succ: ir.BlockId,
+    needs_split: bool,
+    moves: []const PhiMove,
+
+    pub fn deinit(self: *const EdgeResolution, allocator: std.mem.Allocator) void {
+        allocator.free(self.moves);
+    }
+};
+
+/// Result of `resolvePhiEdges`: one `EdgeResolution` per (predecessor →
+/// phi-carrying successor) edge. Free with `deinit`.
+pub const PhiResolution = struct {
+    edges: []const EdgeResolution,
+
+    pub fn deinit(self: *const PhiResolution, allocator: std.mem.Allocator) void {
+        for (self.edges) |e| e.deinit(allocator);
+        allocator.free(self.edges);
+    }
+};
+
+/// Compute the edge parallel-copies that resolve every phi in `func` given
+/// an SSA allocation (`alloc`, as produced by `allocateSsa`) — #392 step 3.
+///
+/// For each phi `d = phi[..., (B, v), ...]` in a join block `S`, the value
+/// `v` arriving on edge `B→S` must end up in `d`'s location, so the edge
+/// gets a move `loc(d) ← loc(v)`. Moves where source and destination are
+/// the same location are elided (the allocator already coalesced them).
+/// Edges out of a predecessor with multiple successors are flagged
+/// `needs_split`.
+///
+/// `func` must still be in phi form. A phi arm or dest with no entry in
+/// `alloc` (e.g. a rematerialised constant) is currently unsupported and
+/// yields `error.UnallocatedPhiOperand`; the codegen wiring step will
+/// extend this to re-materialise such arms on the edge.
+pub fn resolvePhiEdges(
+    func: *const ir.IrFunction,
+    alloc: *const AllocResult,
+    allocator: std.mem.Allocator,
+) !PhiResolution {
+    var successors = try analysis.buildSuccessors(func, allocator);
+    defer {
+        var sit = successors.iterator();
+        while (sit.next()) |e| allocator.free(e.value_ptr.*);
+        successors.deinit();
+    }
+
+    var edges: std.ArrayListUnmanaged(EdgeResolution) = .empty;
+    errdefer {
+        for (edges.items) |e| e.deinit(allocator);
+        edges.deinit(allocator);
+    }
+
+    for (func.blocks.items, 0..) |succ_block, succ_idx| {
+        const succ: ir.BlockId = @intCast(succ_idx);
+
+        // Collect the distinct predecessor blocks named by this block's phis.
+        var preds: std.ArrayListUnmanaged(ir.BlockId) = .empty;
+        defer preds.deinit(allocator);
+        for (succ_block.instructions.items) |inst| {
+            if (inst.op != .phi) continue;
+            for (inst.op.phi) |edge| {
+                if (std.mem.indexOfScalar(ir.BlockId, preds.items, edge.block) == null) {
+                    try preds.append(allocator, edge.block);
+                }
+            }
+        }
+        if (preds.items.len == 0) continue;
+
+        for (preds.items) |pred| {
+            var moves: std.ArrayListUnmanaged(PhiMove) = .empty;
+            errdefer moves.deinit(allocator);
+
+            for (succ_block.instructions.items) |inst| {
+                if (inst.op != .phi) continue;
+                const dest = inst.dest orelse continue;
+                const arm = armFor(inst.op.phi, pred) orelse continue;
+                const src = alloc.get(arm) orelse return error.UnallocatedPhiOperand;
+                const dst = alloc.get(dest) orelse return error.UnallocatedPhiOperand;
+                if (allocationEql(src, dst)) continue; // already coalesced
+                try moves.append(allocator, .{ .dst = dst, .src = src, .ty = inst.type });
+            }
+
+            const needs_split = if (successors.get(pred)) |s| s.len > 1 else false;
+
+            try edges.append(allocator, .{
+                .pred = pred,
+                .succ = succ,
+                .needs_split = needs_split,
+                .moves = try moves.toOwnedSlice(allocator),
+            });
+        }
+    }
+
+    return .{ .edges = try edges.toOwnedSlice(allocator) };
+}
+
+fn armFor(phi_edges: []const ir.Inst.PhiEdge, pred: ir.BlockId) ?ir.VReg {
+    for (phi_edges) |e| if (e.block == pred) return e.val;
+    return null;
+}
+
+fn allocationEql(a: Allocation, b: Allocation) bool {
+    return switch (a) {
+        .reg => |ra| b == .reg and b.reg == ra,
+        .stack => |sa| b == .stack and b.stack == sa,
+    };
+}
+
 /// Classify every vreg in `func` whose def is a "cheap" pure op
 /// (currently only `iconst_32` / `iconst_64`) into a map of
 /// rematerialisation values. Callers pass this to
@@ -861,6 +989,88 @@ test "allocateSsa: SSA phi intervals avoid the join-block spill that naive range
     // spill the SSA form avoids.
     try std.testing.expect(naive_res.spill_count > 0);
     try std.testing.expect(ssa_res.spill_count < naive_res.spill_count);
+}
+
+test "resolvePhiEdges: arm diamond maps each phi arm into the phi dest location" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const d = try buildArmDiamond(&func, allocator);
+
+    var alloc = try allocateSsa(&func, allocator, test_reg_set, &.{});
+    defer alloc.deinit();
+
+    var res = try resolvePhiEdges(&func, &alloc, allocator);
+    defer res.deinit(allocator);
+
+    const loc_p = alloc.get(d.v_p).?;
+    const loc_x = alloc.get(d.v_x).?;
+    const loc_y = alloc.get(d.v_y).?;
+
+    // One resolution per phi predecessor edge: b1->b3 and b2->b3 (blocks are
+    // numbered 0..3 in creation order). Neither predecessor has a second
+    // successor, so neither edge needs splitting.
+    try std.testing.expectEqual(@as(usize, 2), res.edges.len);
+    for (res.edges) |e| {
+        try std.testing.expectEqual(@as(ir.BlockId, 3), e.succ);
+        try std.testing.expect(!e.needs_split);
+        try std.testing.expect(e.pred == 1 or e.pred == 2);
+        const arm_loc = if (e.pred == 1) loc_x else loc_y;
+        if (allocationEql(arm_loc, loc_p)) {
+            // Arm already lives in the phi dest's location → no move emitted.
+            try std.testing.expectEqual(@as(usize, 0), e.moves.len);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), e.moves.len);
+            try std.testing.expect(allocationEql(e.moves[0].dst, loc_p));
+            try std.testing.expect(allocationEql(e.moves[0].src, arm_loc));
+        }
+    }
+}
+
+test "resolvePhiEdges: flags a critical edge (predecessor with multiple successors)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 branches to b1 AND directly to the join b2, so the b0->b2 edge is
+    // critical (b0 has two successors). b1->b2 is an ordinary edge.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_cond = func.newVReg();
+    const v_x = func.newVReg();
+    const v_y = func.newVReg();
+    const v_p = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_x, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } }, .type = .void });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 30 }, .dest = v_y, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 }, .type = .void });
+
+    const edges = try allocator.dupe(ir.Inst.PhiEdge, &.{
+        .{ .block = b0, .val = v_x },
+        .{ .block = b1, .val = v_y },
+    });
+    try func.getBlock(b2).append(.{ .op = .{ .phi = edges }, .dest = v_p, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_p }, .type = .void });
+
+    var alloc = try allocateSsa(&func, allocator, test_reg_set, &.{});
+    defer alloc.deinit();
+    var res = try resolvePhiEdges(&func, &alloc, allocator);
+    defer res.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), res.edges.len);
+    for (res.edges) |e| {
+        try std.testing.expectEqual(@as(ir.BlockId, 2), e.succ);
+        if (e.pred == 0) {
+            try std.testing.expect(e.needs_split); // b0 has two successors
+        } else {
+            try std.testing.expectEqual(@as(ir.BlockId, 1), e.pred);
+            try std.testing.expect(!e.needs_split);
+        }
+    }
 }
 
 test "allocate: no spills with few live values" {
