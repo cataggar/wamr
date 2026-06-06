@@ -186,6 +186,40 @@ pub fn allocate(
     return allocateFromRangesWithHintsRemat(allocator, reg_set, clobbers, ranges, &.{}, &candidates);
 }
 
+/// SSA-form twin of `allocate` (#392 step 2). Runs the same linear scan,
+/// remat classification, and spill logic, but over **SSA** live ranges
+/// (`analysis.computeSsaLiveRanges`): each phi dest and each phi-arm is a
+/// distinct interval, and an arm ends at its predecessor's terminator
+/// instead of bleeding into the join block. Because the two arms of a phi
+/// live in different predecessors they no longer falsely overlap, so the
+/// allocator sees lower register pressure around joins and spills less.
+///
+/// `func` must still be in phi form (before `lowerPhisToLocals`). The
+/// result is a VReg→location map that is consistent within each SSA value's
+/// single interval; reconciling a phi dest with arms that landed in
+/// different locations is the edge parallel-copy step (#392 step 3), which
+/// will consume this map.
+pub fn allocateSsa(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+) !AllocResult {
+    const ranges = try analysis.computeSsaLiveRanges(func, null, allocator);
+    defer allocator.free(ranges);
+
+    if (func.next_vreg <= reg_set.alloc_regs.len) {
+        return allocateFromRangesWithHints(allocator, reg_set, clobbers, ranges, &.{});
+    }
+
+    var candidates = try classifyRematCandidates(allocator, func);
+    defer candidates.deinit();
+    if (candidates.count() == 0) {
+        return allocateFromRangesWithHints(allocator, reg_set, clobbers, ranges, &.{});
+    }
+    return allocateFromRangesWithHintsRemat(allocator, reg_set, clobbers, ranges, &.{}, &candidates);
+}
+
 /// Classify every vreg in `func` whose def is a "cheap" pure op
 /// (currently only `iconst_32` / `iconst_64`) into a map of
 /// rematerialisation values. Callers pass this to
@@ -738,6 +772,95 @@ test "allocateFromRanges: non-overlapping intervals reuse a register" {
     try std.testing.expectEqual(@as(u32, 0), result.spill_count);
     try std.testing.expectEqual(Allocation{ .reg = 7 }, result.get(0).?);
     try std.testing.expectEqual(Allocation{ .reg = 7 }, result.get(1).?);
+}
+
+/// Build a 4-block diamond whose only live values are the two phi arms
+/// (each defined in one branch) and the merged phi:
+///   b0: v_cond=1; br_if -> b1, b2
+///   b1: v_x=20; br b3      b2: v_y=30; br b3
+///   b3: v_p = phi[(b1,v_x),(b2,v_y)]; ret v_p
+fn buildArmDiamond(func: *ir.IrFunction, allocator: std.mem.Allocator) !struct {
+    v_cond: ir.VReg,
+    v_x: ir.VReg,
+    v_y: ir.VReg,
+    v_p: ir.VReg,
+} {
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_cond = func.newVReg();
+    const v_x = func.newVReg();
+    const v_y = func.newVReg();
+    const v_p = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } }, .type = .void });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_x, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 }, .type = .void });
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 30 }, .dest = v_y, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 }, .type = .void });
+
+    const edges = try allocator.dupe(ir.Inst.PhiEdge, &.{
+        .{ .block = b1, .val = v_x },
+        .{ .block = b2, .val = v_y },
+    });
+    try func.getBlock(b3).append(.{ .op = .{ .phi = edges }, .dest = v_p, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_p }, .type = .void });
+
+    return .{ .v_cond = v_cond, .v_x = v_x, .v_y = v_y, .v_p = v_p };
+}
+
+test "allocateSsa: diamond phi assigns every SSA value a register" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const d = try buildArmDiamond(&func, allocator);
+
+    var result = try allocateSsa(&func, allocator, test_reg_set, &.{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
+    try std.testing.expect(result.get(d.v_cond) != null);
+    try std.testing.expect(result.get(d.v_x) != null);
+    try std.testing.expect(result.get(d.v_y) != null);
+    try std.testing.expect(result.get(d.v_p) != null);
+}
+
+test "allocateSsa: SSA phi intervals avoid the join-block spill that naive ranges force" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    _ = try buildArmDiamond(&func, allocator);
+
+    // A single allocatable register: a value must spill exactly when two
+    // ranges are simultaneously live.
+    const one_reg_set: RegSet = .{
+        .alloc_regs = &.{7},
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{0},
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+
+    const ssa_ranges = try analysis.computeSsaLiveRanges(&func, null, allocator);
+    defer allocator.free(ssa_ranges);
+    const naive_ranges = try analysis.computeLiveRanges(&func, allocator);
+    defer allocator.free(naive_ranges);
+
+    var ssa_res = try allocateFromRanges(allocator, one_reg_set, &.{}, ssa_ranges);
+    defer ssa_res.deinit();
+    var naive_res = try allocateFromRanges(allocator, one_reg_set, &.{}, naive_ranges);
+    defer naive_res.deinit();
+
+    // SSA: the two arms live in disjoint predecessors, so no two ranges
+    // overlap and everything reuses the one register — zero spills.
+    try std.testing.expectEqual(@as(u32, 0), ssa_res.spill_count);
+    // Naive: both arms are (wrongly) live together in the join, forcing a
+    // spill the SSA form avoids.
+    try std.testing.expect(naive_res.spill_count > 0);
+    try std.testing.expect(ssa_res.spill_count < naive_res.spill_count);
 }
 
 test "allocate: no spills with few live values" {
