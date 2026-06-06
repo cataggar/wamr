@@ -17,6 +17,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
 const range_split = @import("range_split.zig");
+const passes = @import("passes.zig");
 
 /// Physical register identifier. Widest architecture we target is aarch64
 /// with 0..30 (v0..v31 is separate). `u8` leaves headroom.
@@ -374,6 +375,14 @@ pub const PhiSpillDelta = struct {
     /// pressure real codegen sees.
     ssa_spills_xcall: u32,
     naive_spills_xcall: u32,
+    /// Spill slots of the **actual status-quo lowering**: phis lowered to
+    /// `local_set`(at each predecessor)/`local_get`(at the join) exactly as
+    /// `lowerPhisToLocals` does in production, then allocated. This is the
+    /// honest baseline — `lowerPhisToLocals` already ends each arm at its
+    /// predecessor, so it is *not* the naive in-block model. (Excludes #540
+    /// parallel-copy coalescing / FMA / hints, so it is an approximation.)
+    lowered_spills: u32,
+    lowered_spills_xcall: u32,
 };
 
 /// Clobber points at every call in `func`, in the same global instruction
@@ -441,6 +450,19 @@ pub fn measurePhiSpillDelta(
     var naive_x = try allocate(func, allocator, measure_reg_set, clobbers);
     defer naive_x.deinit();
 
+    // Honest status-quo baseline: lower phis exactly as production does, then
+    // allocate. `lowerPhisToLocals` ends each arm at its predecessor's
+    // `local_set`, so this is SSA-like for arms (not the naive in-block model).
+    var clone = try func.clone(allocator);
+    defer clone.deinit();
+    _ = try passes.lowerPhisToLocals(&clone, allocator);
+    const clone_clobbers = try buildCallClobbers(&clone, measure_reg_set, allocator);
+    defer allocator.free(clone_clobbers);
+    var lowered = try allocate(&clone, allocator, measure_reg_set, &.{});
+    defer lowered.deinit();
+    var lowered_x = try allocate(&clone, allocator, measure_reg_set, clone_clobbers);
+    defer lowered_x.deinit();
+
     return .{
         .phis = phis,
         .calls = @intCast(clobbers.len),
@@ -448,6 +470,8 @@ pub fn measurePhiSpillDelta(
         .naive_spills = naive.spill_count,
         .ssa_spills_xcall = ssa_x.spill_count,
         .naive_spills_xcall = naive_x.spill_count,
+        .lowered_spills = lowered.spill_count,
+        .lowered_spills_xcall = lowered_x.spill_count,
     };
 }
 
