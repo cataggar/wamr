@@ -3830,6 +3830,7 @@ const pass_name_registry = [_]PassNameEntry{
     .{ .fn_ptr = &deadStoreElimination, .name = "deadStoreElimination" },
     .{ .fn_ptr = &deadCodeElimination, .name = "deadCodeElimination" },
     .{ .fn_ptr = &deadLocalSetElimination, .name = "deadLocalSetElimination" },
+    .{ .fn_ptr = &deadCodeAndLocalSetCleanup, .name = "deadCodeAndLocalSetCleanup" },
     .{ .fn_ptr = &hoistLoopBoundsChecks, .name = "hoistLoopBoundsChecks" },
     .{ .fn_ptr = &elideRedundantBoundsChecks, .name = "elideRedundantBoundsChecks" },
     .{ .fn_ptr = &foldLoadStoreOffset, .name = "foldLoadStoreOffset" },
@@ -4178,7 +4179,17 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
 
     var changed = false;
     for (lf.loops) |*loop| {
-        const ph = (try obtainLoopPreheader(func, loop, &predecessors, dom, allocator)) orelse continue;
+        // Defer preheader resolution until we actually hoist something.
+        // Synthesizing a preheader for a loop with nothing to hoist
+        // needlessly creates an empty `br header` block that
+        // `tailDuplicateSmallJoins` immediately absorbs again; the two
+        // passes then ping-pong forever (each iteration leaks one dead
+        // block) and the per-function fixpoint never converges, making
+        // codegen build-layout-sensitive (issue #813). Resolve — and, if
+        // necessary, synthesize — the preheader lazily on the first real
+        // hoist instead.
+        var ph_opt: ?ir.BlockId = null;
+        var ph_resolved = false;
         // One-shot scan of the loop body: which wasm-local / wasm-global
         // indices are written, and does the body contain any call or
         // memory-mutating op?
@@ -4229,10 +4240,10 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
         }
 
         var any = true;
-        while (any) {
+        hoist_loop: while (any) {
             any = false;
             for (loop.blocks) |bid| {
-                const block = &func.blocks.items[bid];
+                var block = &func.blocks.items[bid];
                 var i: usize = 0;
                 while (i < block.instructions.items.len) {
                     const inst = block.instructions.items[i];
@@ -4298,6 +4309,20 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
                         i += 1;
                         continue;
                     }
+
+                    // First hoist for this loop: resolve (and, if needed,
+                    // synthesize) the preheader now. A null result means the
+                    // header has no predecessor outside the loop, so nothing
+                    // here can be hoisted — abandon this loop's hoisting.
+                    if (!ph_resolved) {
+                        ph_opt = try obtainLoopPreheader(func, loop, &predecessors, dom, allocator);
+                        ph_resolved = true;
+                        if (ph_opt == null) break :hoist_loop;
+                        // Synthesis may append a block and reallocate
+                        // `func.blocks`, invalidating `block`; re-fetch it.
+                        block = &func.blocks.items[bid];
+                    }
+                    const ph = ph_opt.?;
 
                     const ph_block = &func.blocks.items[ph];
                     try ph_block.instructions.insert(ph_block.allocator, ph_block.instructions.items.len - 1, inst);
@@ -5402,6 +5427,44 @@ pub fn deadLocalSetElimination(func: *ir.IrFunction, allocator: std.mem.Allocato
             } else {
                 i += 1;
             }
+        }
+    }
+    return changed;
+}
+
+/// Run `deadCodeElimination` and `deadLocalSetElimination` to their
+/// **mutual** local fixpoint as a single pipeline slot.
+///
+/// The two cleanups expose work for each other: DCE drops dead
+/// value-producing insts (which can make a `local_set`'s last reader
+/// disappear, so the set becomes dead), and deadLocalSetElimination
+/// drops dead `local_set`s (whose operand value can then become dead
+/// for DCE). On very large functions (e.g. the keyvault component's
+/// `local_func=11396`, 10,900 blocks / ~549k insts) they micro-converge
+/// over many rounds — the last round may clean only a handful of insts.
+///
+/// When each cleanup is its own slot in the outer per-function pass
+/// fixpoint (`runPassesWithOptionsScoped`, cap 8), any tiny change here
+/// keeps the outer `changed` signal set and re-runs the entire ~25-pass
+/// pipeline (GVN, dominators, FRL, …) over the whole function. Folding
+/// the mutual fixpoint into one slot lets the outer fixpoint settle in a
+/// small, deterministic number of iterations instead of always hitting
+/// the cap (issue #813). Neither sub-pass mutates the CFG — they only
+/// remove instructions — so this slot is not registered in
+/// `passMutatesCfg` and does not invalidate the dominator/successor cache.
+pub fn deadCodeAndLocalSetCleanup(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    // Safety net: the mutual fixpoint converges monotonically (each
+    // round only removes instructions), so this cap is never reached in
+    // practice; it bounds the worst case the way the outer fixpoint does.
+    var iter: u32 = 0;
+    while (iter < 16) : (iter += 1) {
+        const dce_changed = try deadCodeElimination(func, allocator);
+        const dls_changed = try deadLocalSetElimination(func, allocator);
+        if (dce_changed or dls_changed) {
+            changed = true;
+        } else {
+            break;
         }
     }
     return changed;
@@ -8653,8 +8716,7 @@ pub const default_passes: []const PassFn = &.{
     @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
     &deadStoreElimination,
-    &deadCodeElimination,
-    &deadLocalSetElimination,
+    &deadCodeAndLocalSetCleanup,
     &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
@@ -8692,65 +8754,63 @@ const x86_64_default_passes: []const PassFn = &.{
     @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
     &deadStoreElimination,
-    &deadCodeElimination,
-    &deadLocalSetElimination,
+    &deadCodeAndLocalSetCleanup,
     &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
 
 const default_passes_no_iv: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,    &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,         &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,    &hoistLoopInvariantCode,
-    &unrollSmallFixedLoops,            &deadCodeElimination,     &deadLocalSetElimination, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const default_passes_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,    &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,         &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,    &inductionVariableSimplification,
-    &hoistLoopInvariantCode,           &deadCodeElimination,     &deadLocalSetElimination, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const default_passes_no_iv_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,     &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,  &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,       &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,  &hoistLoopInvariantCode,
-    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
+    &forwardLocalGet,                  &constantFold,               &algebraicSimplify,     &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,       &foldConstantBranches,  &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,       &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,  &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,            &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
 
+const default_passes_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,                  &constantFold,               &algebraicSimplify,     &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,       &foldConstantBranches,  &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,       &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,  &inductionVariableSimplification,
+    &hoistLoopInvariantCode,           &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
+};
+
+const default_passes_no_iv_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,          &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,       &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,            &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,       &hoistLoopInvariantCode,
+    &deadCodeAndLocalSetCleanup,       &hoistLoopBoundsChecks,   &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+};
+
 const x86_64_default_passes_no_iv: []const PassFn = &.{
+    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,          &strengthReduceMul,
+    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
+    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
+    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
+    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,                 &constantFold,                     &algebraicSimplify,          &strengthReduceMul,
+    &strengthReduceMulShiftAdd,       &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
+    &foldBranchOnEqz,                 &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
+    &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
+    &inductionVariableSimplification, &hoistLoopInvariantCode,           &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,      &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
     &forwardLocalGet,           &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
     &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
     &foldBranchOnEqz,           &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
     &foldSignExtendingLoad,     &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &hoistLoopInvariantCode,    &unrollSmallFixedLoops,            &deadCodeElimination,     &deadLocalSetElimination,
-    &hoistLoopBoundsChecks,     &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const x86_64_default_passes_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                 &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd,       &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,                 &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
-    &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &inductionVariableSimplification, &hoistLoopInvariantCode,           &deadCodeElimination,     &deadLocalSetElimination,
-    &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
-    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &hoistLoopInvariantCode,     &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+    &hoistLoopInvariantCode,    &deadCodeAndLocalSetCleanup,       &hoistLoopBoundsChecks,   &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 pub fn defaultPassesForTarget(target: TargetArch) []const PassFn {
