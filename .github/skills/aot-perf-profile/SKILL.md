@@ -1,6 +1,6 @@
 ---
 name: aot-perf-profile
-description: Profile a precompiled WAMR AOT run on an Azure Linux x86_64 VM and attribute cycles per wasm function and per instruction class. Installs `perf` (kernel-tools), records the precompiled load+execute run, then de-anonymizes the `[JIT]` mapping that perf cannot symbolize by mapping sample IPs to `local_func` indices via the `.cwasm` function section, and classifies the hot function's instruction mix (spill reloads / frame stores / bounds checks / call_indirect dispatch / memory). Use for #798-style runtime-gap investigations to decide whether spills, bounds-checks, or dispatch dominate before committing to codegen levers.
+description: Profile a precompiled WAMR AOT run (a component like keyvault/#798, or a core module like CoreMark/#393) on an Azure Linux x86_64 VM and attribute cycles per wasm function and per instruction class. Installs `perf` (kernel-tools), records the precompiled load+execute run, then de-anonymizes the `[JIT]` mapping that perf cannot symbolize by mapping sample IPs to `local_func` indices via the `.cwasm` function section, and classifies the hot function's instruction mix (spill reloads / frame stores / reg-reg moves / bounds checks / call_indirect or br_table dispatch / memory). Use for runtime-gap investigations to decide whether spills, zero-extension/move overhead, bounds-checks, or dispatch dominate before committing to codegen levers.
 ---
 
 # AOT perf profiling + JIT de-anonymization
@@ -100,6 +100,26 @@ awk '/\[aot-spill-metric\]/{for(i=1;i<=NF;i++){n=index($i,"=");
 Note the per-core `<stem>.<N>.cwasm` files written next to the manifest —
 the biggest one is the hot core's text and you need it in Step 5.
 
+### Core wasm modules (e.g. CoreMark, #393)
+
+For a **single core module** (not a component) — CoreMark, a microbench,
+any `.wasm` core — use `wamrc compile` instead of `compile-component`,
+and run it with `wamr run <m>.cwasm` directly (the CLI runs `.cwasm`
+core modules). Everything else (Steps 4–6) is identical; pass that one
+`.cwasm` to `aot_jit_attr.py` — its function indices are module-local.
+
+```sh
+./zig-out/bin/wamrc compile tests/benchmarks/coremark/coremark_wasi.wasm \
+  -o /work/cm/coremark.cwasm
+perf record -g --call-graph=dwarf -F 999 -o /work/cm/cm.perf -- \
+  ./zig-out/bin/wamr run /work/cm/coremark.cwasm
+python3 .github/skills/aot-perf-profile/aot_jit_attr.py \
+  --perf /work/cm/cm.perf --cwasm /work/cm/coremark.cwasm --func 10
+```
+
+(Spill ranking from Step 3 still works on a core module: `wamrc compile`
+honours `WAMR_AOT_SPILL_METRIC=1`; there's just one module, `mod=0`.)
+
 ## Step 4 — `perf record` the precompiled run (runtime, the gate)
 
 Profile **load+execute only** (precompiled — no compile in the loop). The
@@ -177,6 +197,23 @@ fn's `spill_ld` only 1.8% → supply is not the constraint.) Revert after.
 Lesson: the biggest *compile-time* spiller was never executed; the hot
 function was the **#3** spiller. Always confirm the runtime-hot function
 with Step 5 before optimizing the compile-time "monster".
+
+## Worked example (#393 CoreMark, captured 2026-06)
+
+Same tooling on the core module `coremark_wasi.wasm` (`wamr run`, 16.5 s):
+
+| metric | value |
+|---|---|
+| `[JIT]` | 99.9% of cycles |
+| hot fns | `local_func` 10 / 3 / 7 ≈ **30% / 28% / 28%** (list / matrix / state) |
+| hot-fn mix | **reg-reg mov 15–18%** each, ALU 5–7%, **spill traffic only 3–4%** |
+| dominant instrs | wasm i32 zero-extends (`mov esi,esi`, `mov edx,edx`, …) + a `br_table` (`add r10,r11; jmp r10`) |
+
+Lesson: CoreMark is **not** spill-bound (confirms #393/#524 — its hot
+loops aren't register-pressure-bound); the cost is **redundant i32
+zero-extension `mov eXX,eXX`** + branch/dispatch — a different lever
+(zero-ext elimination / coalescing) than keyvault's spills. The skill
+distinguishes the two workload classes directly.
 
 ## Anti-patterns
 
