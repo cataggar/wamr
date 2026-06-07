@@ -351,6 +351,17 @@ pub const CodeBuffer = struct {
         try self.emitI32(disp);
     }
 
+    /// MOV reg, [base + disp32] (32-bit load; zero-extends to 64). For i32
+    /// values the low 32 bits are the value, so this both loads and
+    /// zero-extends — no separate `mov eXX,eXX` needed (#393).
+    pub fn movRegMem32(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rex(false, dst, base);
+        try self.emitByte(0x8B);
+        try self.modrm(0b10, dst.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
+        try self.emitI32(disp);
+    }
+
     /// MOV [base + disp32], reg (64-bit store to memory).
     pub fn movMemReg(self: *CodeBuffer, base: Reg, disp: i32, src: Reg) !void {
         try self.rexW(src, base);

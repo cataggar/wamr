@@ -3221,8 +3221,15 @@ fn compileInstRA(
         .local_get => |idx| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            try code.movRegMem(dr, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            if (inst.type == .i32) {
+                // 32-bit load reads the low-32 (the i32 value) and
+                // zero-extends — no trailing `mov eXX,eXX` needed (#393).
+                try code.movRegMem32(dr, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
+                try writeDef(code, alloc_result, dest, dr);
+            } else {
+                try code.movRegMem(dr, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            }
         },
         .local_set => |ls| {
             const src_reg = try useVReg(code, alloc_result, ls.val, .rax);
