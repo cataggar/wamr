@@ -571,6 +571,26 @@ pub const CodeBuffer = struct {
         if (needs_disp8) try self.emitByte(0x00);
     }
 
+    /// LEA r32, [base + index] (32-bit operand size). The address is computed
+    /// in 64 bits but the result is truncated to 32 and zero-extended — and
+    /// since add-mod-2^32 depends only on the low 32 bits of each operand,
+    /// this is exactly Wasm `i32.add` (#393), with no separate zero-extend.
+    pub fn leaRegBaseIndex32(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg) !void {
+        std.debug.assert(index != .rsp);
+        const rex_byte: u8 = 0x40 |
+            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
+            (@as(u8, @intFromEnum(index) >> 3) << 1) |
+            (@as(u8, @intFromEnum(base) >> 3));
+        if (rex_byte != 0x40) try self.emitByte(rex_byte);
+        try self.emitByte(0x8D); // LEA
+        const needs_disp8 = base.low3() == 5;
+        const mod: u2 = if (needs_disp8) 0b01 else 0b00;
+        try self.modrm(mod, dst.low3(), 0b100); // rm=100 → SIB follows
+        const sib: u8 = (@as(u8, 0) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
+        try self.emitByte(sib);
+        if (needs_disp8) try self.emitByte(0x00);
+    }
+
     /// ADD reg, imm32 (64-bit).
     /// ADD reg, imm (64-bit). Uses the imm8 form (opcode 0x83) when imm fits
     /// in a signed byte, saving 3 bytes vs the imm32 form (opcode 0x81).

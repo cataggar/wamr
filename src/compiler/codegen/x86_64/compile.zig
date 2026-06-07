@@ -3128,8 +3128,15 @@ fn compileInstRA(
                 if (lhs_reg_raw != null and rhs_reg_raw != null and
                     lhs_reg_raw.? != dr and lhs_reg_raw.? != .rsp and rhs_reg_raw.? != .rsp)
                 {
-                    try code.leaRegBaseIndex64(dr, lhs_reg_raw.?, rhs_reg_raw.?);
-                    try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                    if (inst.type == .i32) {
+                        // 32-bit LEA zero-extends the low-32 sum — exactly
+                        // i32.add, no trailing `mov eXX,eXX` (#393).
+                        try code.leaRegBaseIndex32(dr, lhs_reg_raw.?, rhs_reg_raw.?);
+                        try writeDef(code, alloc_result, dest, dr);
+                    } else {
+                        try code.leaRegBaseIndex64(dr, lhs_reg_raw.?, rhs_reg_raw.?);
+                        try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                    }
                     return;
                 }
             }
