@@ -199,6 +199,51 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// ADD r32, r32 (32-bit). Result is the low-32 sum, zero-extended to 64
+    /// — matching Wasm `i32.add` wrap semantics, so no separate zero-extend
+    /// is needed (#393 zero-extension elimination).
+    pub fn addRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x01);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// SUB r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn subRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x29);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// IMUL r32, r32 (32-bit two-operand; low-32 result zero-extended).
+    pub fn imulRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xAF);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// AND r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn andRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x21);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// OR r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn orRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x09);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// XOR r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn xorRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x31);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// PUSH reg (uses REX prefix only for r8–r15).
     pub fn pushReg(self: *CodeBuffer, reg: Reg) !void {
         if (reg.isExtended()) try self.emitByte(0x41);
@@ -300,6 +345,17 @@ pub const CodeBuffer = struct {
     /// MOV reg, [base + disp32] (64-bit load from memory).
     pub fn movRegMem(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
         try self.rexW(dst, base);
+        try self.emitByte(0x8B);
+        try self.modrm(0b10, dst.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
+        try self.emitI32(disp);
+    }
+
+    /// MOV reg, [base + disp32] (32-bit load; zero-extends to 64). For i32
+    /// values the low 32 bits are the value, so this both loads and
+    /// zero-extends — no separate `mov eXX,eXX` needed (#393).
+    pub fn movRegMem32(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rex(false, dst, base);
         try self.emitByte(0x8B);
         try self.modrm(0b10, dst.low3(), base.low3());
         if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
@@ -510,6 +566,26 @@ pub const CodeBuffer = struct {
         const mod: u2 = if (needs_disp8) 0b01 else 0b00;
         try self.modrm(mod, dst.low3(), 0b100); // rm=100 → SIB follows
         // SIB: scale=00, index=index.low3, base=base.low3
+        const sib: u8 = (@as(u8, 0) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
+        try self.emitByte(sib);
+        if (needs_disp8) try self.emitByte(0x00);
+    }
+
+    /// LEA r32, [base + index] (32-bit operand size). The address is computed
+    /// in 64 bits but the result is truncated to 32 and zero-extended — and
+    /// since add-mod-2^32 depends only on the low 32 bits of each operand,
+    /// this is exactly Wasm `i32.add` (#393), with no separate zero-extend.
+    pub fn leaRegBaseIndex32(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg) !void {
+        std.debug.assert(index != .rsp);
+        const rex_byte: u8 = 0x40 |
+            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
+            (@as(u8, @intFromEnum(index) >> 3) << 1) |
+            (@as(u8, @intFromEnum(base) >> 3));
+        if (rex_byte != 0x40) try self.emitByte(rex_byte);
+        try self.emitByte(0x8D); // LEA
+        const needs_disp8 = base.low3() == 5;
+        const mod: u2 = if (needs_disp8) 0b01 else 0b00;
+        try self.modrm(mod, dst.low3(), 0b100); // rm=100 → SIB follows
         const sib: u8 = (@as(u8, 0) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
         try self.emitByte(sib);
         if (needs_disp8) try self.emitByte(0x00);

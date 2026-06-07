@@ -3128,8 +3128,15 @@ fn compileInstRA(
                 if (lhs_reg_raw != null and rhs_reg_raw != null and
                     lhs_reg_raw.? != dr and lhs_reg_raw.? != .rsp and rhs_reg_raw.? != .rsp)
                 {
-                    try code.leaRegBaseIndex64(dr, lhs_reg_raw.?, rhs_reg_raw.?);
-                    try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                    if (inst.type == .i32) {
+                        // 32-bit LEA zero-extends the low-32 sum — exactly
+                        // i32.add, no trailing `mov eXX,eXX` (#393).
+                        try code.leaRegBaseIndex32(dr, lhs_reg_raw.?, rhs_reg_raw.?);
+                        try writeDef(code, alloc_result, dest, dr);
+                    } else {
+                        try code.leaRegBaseIndex64(dr, lhs_reg_raw.?, rhs_reg_raw.?);
+                        try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                    }
                     return;
                 }
             }
@@ -3137,16 +3144,33 @@ fn compileInstRA(
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, dr);
             if (lhs_reg != dr) try code.movRegReg(dr, lhs_reg);
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, scratch);
-            switch (inst.op) {
-                .add => try code.addRegReg(dr, rhs_reg),
-                .sub => try code.subRegReg(dr, rhs_reg),
-                .mul => try code.imulRegReg(dr, rhs_reg),
-                .@"and" => try code.andRegReg(dr, rhs_reg),
-                .@"or" => try code.orRegReg(dr, rhs_reg),
-                .xor => try code.xorRegReg(dr, rhs_reg),
-                else => unreachable,
+            if (inst.type == .i32) {
+                // 32-bit ALU computes the low-32 (wrapping) result and
+                // zero-extends it — exactly Wasm i32 semantics — so the
+                // trailing `mov eXX,eXX` zero-extend is unnecessary
+                // (#393 zero-extension elimination).
+                switch (inst.op) {
+                    .add => try code.addRegReg32(dr, rhs_reg),
+                    .sub => try code.subRegReg32(dr, rhs_reg),
+                    .mul => try code.imulRegReg32(dr, rhs_reg),
+                    .@"and" => try code.andRegReg32(dr, rhs_reg),
+                    .@"or" => try code.orRegReg32(dr, rhs_reg),
+                    .xor => try code.xorRegReg32(dr, rhs_reg),
+                    else => unreachable,
+                }
+                try writeDef(code, alloc_result, dest, dr);
+            } else {
+                switch (inst.op) {
+                    .add => try code.addRegReg(dr, rhs_reg),
+                    .sub => try code.subRegReg(dr, rhs_reg),
+                    .mul => try code.imulRegReg(dr, rhs_reg),
+                    .@"and" => try code.andRegReg(dr, rhs_reg),
+                    .@"or" => try code.orRegReg(dr, rhs_reg),
+                    .xor => try code.xorRegReg(dr, rhs_reg),
+                    else => unreachable,
+                }
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
             }
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Comparisons ───────────────────────────────────────────────
@@ -3204,8 +3228,15 @@ fn compileInstRA(
         .local_get => |idx| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            try code.movRegMem(dr, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            if (inst.type == .i32) {
+                // 32-bit load reads the low-32 (the i32 value) and
+                // zero-extends — no trailing `mov eXX,eXX` needed (#393).
+                try code.movRegMem32(dr, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
+                try writeDef(code, alloc_result, dest, dr);
+            } else {
+                try code.movRegMem(dr, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            }
         },
         .local_set => |ls| {
             const src_reg = try useVReg(code, alloc_result, ls.val, .rax);
