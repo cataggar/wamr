@@ -3137,16 +3137,33 @@ fn compileInstRA(
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, dr);
             if (lhs_reg != dr) try code.movRegReg(dr, lhs_reg);
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, scratch);
-            switch (inst.op) {
-                .add => try code.addRegReg(dr, rhs_reg),
-                .sub => try code.subRegReg(dr, rhs_reg),
-                .mul => try code.imulRegReg(dr, rhs_reg),
-                .@"and" => try code.andRegReg(dr, rhs_reg),
-                .@"or" => try code.orRegReg(dr, rhs_reg),
-                .xor => try code.xorRegReg(dr, rhs_reg),
-                else => unreachable,
+            if (inst.type == .i32) {
+                // 32-bit ALU computes the low-32 (wrapping) result and
+                // zero-extends it — exactly Wasm i32 semantics — so the
+                // trailing `mov eXX,eXX` zero-extend is unnecessary
+                // (#393 zero-extension elimination).
+                switch (inst.op) {
+                    .add => try code.addRegReg32(dr, rhs_reg),
+                    .sub => try code.subRegReg32(dr, rhs_reg),
+                    .mul => try code.imulRegReg32(dr, rhs_reg),
+                    .@"and" => try code.andRegReg32(dr, rhs_reg),
+                    .@"or" => try code.orRegReg32(dr, rhs_reg),
+                    .xor => try code.xorRegReg32(dr, rhs_reg),
+                    else => unreachable,
+                }
+                try writeDef(code, alloc_result, dest, dr);
+            } else {
+                switch (inst.op) {
+                    .add => try code.addRegReg(dr, rhs_reg),
+                    .sub => try code.subRegReg(dr, rhs_reg),
+                    .mul => try code.imulRegReg(dr, rhs_reg),
+                    .@"and" => try code.andRegReg(dr, rhs_reg),
+                    .@"or" => try code.orRegReg(dr, rhs_reg),
+                    .xor => try code.xorRegReg(dr, rhs_reg),
+                    else => unreachable,
+                }
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
             }
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Comparisons ───────────────────────────────────────────────

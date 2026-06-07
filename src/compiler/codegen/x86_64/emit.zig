@@ -199,6 +199,51 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// ADD r32, r32 (32-bit). Result is the low-32 sum, zero-extended to 64
+    /// — matching Wasm `i32.add` wrap semantics, so no separate zero-extend
+    /// is needed (#393 zero-extension elimination).
+    pub fn addRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x01);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// SUB r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn subRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x29);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// IMUL r32, r32 (32-bit two-operand; low-32 result zero-extended).
+    pub fn imulRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xAF);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// AND r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn andRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x21);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// OR r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn orRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x09);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// XOR r32, r32 (32-bit; low-32 result zero-extended).
+    pub fn xorRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x31);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// PUSH reg (uses REX prefix only for r8–r15).
     pub fn pushReg(self: *CodeBuffer, reg: Reg) !void {
         if (reg.isExtended()) try self.emitByte(0x41);
