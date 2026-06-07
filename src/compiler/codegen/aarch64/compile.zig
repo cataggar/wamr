@@ -5487,6 +5487,40 @@ fn emitParallelCopy(
     try emitParallelCopyFull(code, pairs, reg_map, allocator);
 }
 
+/// True iff two locations (register or spill slot) are identical.
+fn locEq(a: RegMap.Location, b: RegMap.Location) bool {
+    return switch (a) {
+        .reg => |ra| b == .reg and b.reg == ra,
+        .stack => |sa| b == .stack and b.stack == sa,
+    };
+}
+
+/// Emit a single move `dst <- src` between any two locations.
+/// reg→reg: MOV; reg→stack: STR; stack→reg: LDR; stack→stack: LDR/STR via
+/// tmp0. Identity moves are elided. `tmp0` (X16) is non-allocatable scratch,
+/// so it never aliases a parallel-copy operand.
+fn emitLocMove(
+    code: *emit.CodeBuffer,
+    reg_map: *const RegMap,
+    dst: RegMap.Location,
+    src: RegMap.Location,
+) !void {
+    if (locEq(dst, src)) return;
+    switch (src) {
+        .reg => |src_reg| switch (dst) {
+            .reg => |dst_reg| try code.movRegReg(dst_reg, src_reg),
+            .stack => |off| try code.strImm(src_reg, .fp, reg_map.spillOffsetScaled(off)),
+        },
+        .stack => |src_off| switch (dst) {
+            .reg => |dst_reg| try code.ldrImm(dst_reg, .fp, reg_map.spillOffsetScaled(src_off)),
+            .stack => |dst_off| {
+                try code.ldrImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(src_off));
+                try code.strImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(dst_off));
+            },
+        },
+    }
+}
+
 fn emitParallelCopyFull(
     code: *emit.CodeBuffer,
     pairs: []const ir.Inst.ParallelCopy,
@@ -5508,69 +5542,105 @@ fn emitParallelCopyFull(
         resolved[i] = .{ .dst = dst_loc, .src = src_loc };
     }
 
-    // Phase A: reg→stack stores. Read src reg's PRE-copy value, write to mem.
-    for (resolved) |r| {
-        switch (r.src) {
-            .reg => |src_reg| switch (r.dst) {
-                .stack => |off| try code.strImm(src_reg, .fp, reg_map.spillOffsetScaled(off)),
-                else => {},
-            },
-            else => {},
+    // General parallel-copy sequentialization over arbitrary locations
+    // (registers AND spill slots). The previous phase-split resolver
+    // (reg→stack, stack→stack, reg→reg, stack→reg) only preserved the
+    // "read all sources before writing any destination" invariant within
+    // each phase: when a spill slot was BOTH a source and a destination
+    // (spilled loop-carried phi operands under register pressure) an
+    // earlier phase overwrote a slot a later phase still needed to read,
+    // miscompiling the value. This single resolver keeps the invariant
+    // across all locations: emit "leaf" moves (whose dst is not read by
+    // any pending move) until only cycles remain, then break each cycle
+    // with `tmp2` (X15) scratch — exactly the strategy `emitParallelRegMoves`
+    // uses for the reg-only subset, generalised via `emitLocMove`.
+    var done = try allocator.alloc(bool, pairs.len);
+    defer allocator.free(done);
+    @memset(done, false);
+
+    const n = resolved.len;
+    while (true) {
+        // Emit every ready leaf (and elide identities) until none remain.
+        var progressed = true;
+        while (progressed) {
+            progressed = false;
+            for (0..n) |i| {
+                if (done[i]) continue;
+                if (locEq(resolved[i].src, resolved[i].dst)) {
+                    done[i] = true;
+                    continue;
+                }
+                // dst[i] is "read by a pending move" iff some other
+                // unfinished pair reads from that exact location.
+                var read_by_pending = false;
+                for (0..n) |j| {
+                    if (done[j] or j == i) continue;
+                    if (locEq(resolved[j].src, resolved[i].dst)) {
+                        read_by_pending = true;
+                        break;
+                    }
+                }
+                if (!read_by_pending) {
+                    try emitLocMove(code, reg_map, resolved[i].dst, resolved[i].src);
+                    done[i] = true;
+                    progressed = true;
+                }
+            }
         }
-    }
 
-    // Phase B: stack→stack via tmp0.
-    for (resolved) |r| {
-        switch (r.src) {
-            .stack => |src_off| switch (r.dst) {
-                .stack => |dst_off| {
-                    try code.ldrImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(src_off));
-                    try code.strImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(dst_off));
-                },
-                else => {},
-            },
-            else => {},
+        // Any pending pair is part of a pure cycle. Pick a head, save its
+        // source value into scratch, then emit the cycle's moves in
+        // dependency order and close it from scratch.
+        var head: ?usize = null;
+        for (0..n) |i| {
+            if (!done[i]) {
+                head = i;
+                break;
+            }
         }
-    }
+        if (head == null) return;
 
-    // Phase C: collect reg→reg pairs (skip identity moves the allocator
-    // already coalesced for us).
-    var rr_dst = try allocator.alloc(emit.Reg, pairs.len);
-    defer allocator.free(rr_dst);
-    var rr_src = try allocator.alloc(emit.Reg, pairs.len);
-    defer allocator.free(rr_src);
-    var rr_done = try allocator.alloc(bool, pairs.len);
-    defer allocator.free(rr_done);
+        const start = head.?;
+        const scratch = Loc{ .reg = RegMap.tmp2 };
+        try emitLocMove(code, reg_map, scratch, resolved[start].src);
 
-    var rr_len: usize = 0;
-    for (resolved) |r| {
-        switch (r.src) {
-            .reg => |src_reg| switch (r.dst) {
-                .reg => |dst_reg| {
-                    if (src_reg == dst_reg) continue; // coalesced by regalloc
-                    rr_dst[rr_len] = dst_reg;
-                    rr_src[rr_len] = src_reg;
-                    rr_done[rr_len] = false;
-                    rr_len += 1;
-                },
-                else => {},
-            },
-            else => {},
+        // Walk predecessors: the pair whose dst is start's source location
+        // is emitted first (it would otherwise clobber the value we just
+        // saved), chaining until we return to `start`.
+        var found_predecessor: ?usize = null;
+        for (0..n) |k| {
+            if (done[k] or k == start) continue;
+            if (locEq(resolved[k].dst, resolved[start].src)) {
+                found_predecessor = k;
+                break;
+            }
         }
-    }
 
-    try emitParallelRegMoves(code, rr_dst[0..rr_len], rr_src[0..rr_len], rr_done[0..rr_len]);
-
-    // Phase D: stack→reg loads. Emit last so they don't clobber regs that
-    // were sources of reg→reg moves.
-    for (resolved) |r| {
-        switch (r.src) {
-            .stack => |src_off| switch (r.dst) {
-                .reg => |dst_reg| try code.ldrImm(dst_reg, .fp, reg_map.spillOffsetScaled(src_off)),
-                else => {},
-            },
-            else => {},
+        if (found_predecessor == null) {
+            // Degenerate single-edge cycle: settle from scratch.
+            try emitLocMove(code, reg_map, resolved[start].dst, scratch);
+            done[start] = true;
+            continue;
         }
+
+        var cur = found_predecessor.?;
+        while (cur != start) {
+            try emitLocMove(code, reg_map, resolved[cur].dst, resolved[cur].src);
+            done[cur] = true;
+            var next_opt: ?usize = null;
+            for (0..n) |k| {
+                if (done[k] or k == start) continue;
+                if (locEq(resolved[k].dst, resolved[cur].src)) {
+                    next_opt = k;
+                    break;
+                }
+            }
+            if (next_opt == null) break;
+            cur = next_opt.?;
+        }
+        // Close the cycle: write the saved head source into head's dst.
+        try emitLocMove(code, reg_map, resolved[start].dst, scratch);
+        done[start] = true;
     }
 }
 
@@ -9296,6 +9366,208 @@ test "emitParallelRegMoves: mixed chain + cycle" {
     try std.testing.expectEqual(testMovRegRegWord(.x5, .x1), w0);
     // Then a 2-cycle swap follows (3 MOVs with scratch).
     try std.testing.expectEqual(@as(usize, 16), code.bytes.items.len);
+}
+
+// ── emitParallelCopyFull: general reg/stack sequentializer (#817) ──
+//
+// These tests exercise the mixed register/spill-slot parallel-copy
+// resolver by building a RegMap backed by an explicit AllocResult, emitting
+// the copy, then decoding the MOV/LDR/STR stream and replaying it over a
+// register+stack model. The correctness oracle is the parallel-copy
+// semantics: after the sequence, every destination location must hold the
+// value its source location held BEFORE the copy. This catches the
+// phase-ordering bug the old 4-phase resolver had (a spill slot that is
+// both a source and a destination was overwritten before being read).
+
+const PcTestLoc = union(enum) { reg: u8, stack: u32 };
+const PcVLoc = struct { v: ir.VReg, loc: PcTestLoc };
+
+fn simulateParallelCopy(
+    allocator: std.mem.Allocator,
+    pairs: []const ir.Inst.ParallelCopy,
+    locs: []const PcVLoc,
+) !void {
+    var ar = regalloc.AllocResult{
+        .assignments = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator),
+        .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
+    defer ar.deinit();
+
+    var loc_of = std.AutoHashMap(ir.VReg, PcTestLoc).init(allocator);
+    defer loc_of.deinit();
+    for (locs) |e| {
+        const a: regalloc.Allocation = switch (e.loc) {
+            .reg => |k| .{ .reg = k },
+            .stack => |off| .{ .stack = @intCast(off) },
+        };
+        try ar.assignments.put(e.v, a);
+        try loc_of.put(e.v, e.loc);
+    }
+
+    var reg_map = RegMap.init(allocator, 0, 4096);
+    defer reg_map.deinit();
+    reg_map.alloc_result = &ar;
+    // Pre-resolve every vreg into `entries` so `get(src)` succeeds.
+    for (locs) |e| _ = try reg_map.assign(e.v);
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+    try emitParallelCopyFull(&code, pairs, &reg_map, allocator);
+
+    // Model: 32 GPRs + a stack keyed by the scaled (÷8) FP offset that the
+    // emitted LDR/STR immediates use.
+    var reg_model = [_]u64{0} ** 32;
+    var stack_model = std.AutoHashMap(u32, u64).init(allocator);
+    defer stack_model.deinit();
+
+    // Seed each distinct operand location with a unique non-zero sentinel.
+    var sentinel: u64 = 1;
+    for (locs) |e| switch (e.loc) {
+        .reg => |k| if (reg_model[k] == 0) {
+            reg_model[k] = sentinel;
+            sentinel += 1;
+        },
+        .stack => |off| {
+            const key = off / 8;
+            if (!stack_model.contains(key)) {
+                try stack_model.put(key, sentinel);
+                sentinel += 1;
+            }
+        },
+    };
+
+    const readLoc = struct {
+        fn f(rm: *const [32]u64, sm: *const std.AutoHashMap(u32, u64), loc: PcTestLoc) u64 {
+            return switch (loc) {
+                .reg => |k| rm[k],
+                .stack => |off| sm.get(off / 8) orelse 0,
+            };
+        }
+    }.f;
+
+    // Capture each destination's EXPECTED post-copy value (its source's
+    // pre-copy value) before replaying the emitted stream.
+    var expected = try allocator.alloc(u64, pairs.len);
+    defer allocator.free(expected);
+    for (pairs, 0..) |p, idx| {
+        expected[idx] = readLoc(&reg_model, &stack_model, loc_of.get(p.src).?);
+    }
+
+    // Replay the emitted MOV/LDR/STR instructions over the model.
+    var i: usize = 0;
+    while (i < code.bytes.items.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code.bytes.items[i..][0..4], .little);
+        const rd: usize = @intCast(w & 0x1F);
+        const rn: u32 = (w >> 5) & 0x1F;
+        const imm12: u32 = (w >> 10) & 0xFFF;
+        const rm: usize = @intCast((w >> 16) & 0x1F);
+        if ((w >> 21) == 0x550 and rn == 31 and ((w >> 10) & 0x3F) == 0) {
+            // MOV Xrd, Xrm  (ORR Xrd, XZR, Xrm)
+            reg_model[rd] = reg_model[rm];
+        } else if ((w >> 22) == 0x3E5) {
+            // LDR Xrd, [Xrn, #imm12*8]
+            try std.testing.expectEqual(@as(u32, 29), rn); // base is FP
+            reg_model[rd] = stack_model.get(imm12) orelse 0;
+        } else if ((w >> 22) == 0x3E4) {
+            // STR Xrd, [Xrn, #imm12*8]
+            try std.testing.expectEqual(@as(u32, 29), rn); // base is FP
+            try stack_model.put(imm12, reg_model[rd]);
+        } else {
+            std.debug.panic("parallel copy emitted unexpected insn 0x{x:0>8}", .{w});
+        }
+    }
+
+    // Verify parallel-copy semantics held.
+    for (pairs, 0..) |p, idx| {
+        const got = readLoc(&reg_model, &stack_model, loc_of.get(p.dst).?);
+        try std.testing.expectEqual(expected[idx], got);
+    }
+}
+
+test "emitParallelCopyFull: identity move (coalesced) emits nothing" {
+    const allocator = std.testing.allocator;
+    var ar = regalloc.AllocResult{
+        .assignments = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator),
+        .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
+    defer ar.deinit();
+    try ar.assignments.put(0, .{ .reg = 5 });
+    try ar.assignments.put(1, .{ .reg = 5 }); // src shares dst's register
+
+    var reg_map = RegMap.init(allocator, 0, 4096);
+    defer reg_map.deinit();
+    reg_map.alloc_result = &ar;
+    _ = try reg_map.assign(0);
+    _ = try reg_map.assign(1);
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+    const pairs = [_]ir.Inst.ParallelCopy{.{ .dst = 0, .src = 1, .ty = .i32 }};
+    try emitParallelCopyFull(&code, &pairs, &reg_map, allocator);
+    try std.testing.expectEqual(@as(usize, 0), code.bytes.items.len);
+}
+
+test "emitParallelCopyFull: spill slot is both source and destination" {
+    // pair0: stack[0] <- x5 ; pair1: x6 <- stack[0]
+    // stack[0] is a destination (pair0) AND a source (pair1). The resolver
+    // MUST read x6<-stack[0] (old value) before stack[0] is overwritten.
+    const allocator = std.testing.allocator;
+    const pairs = [_]ir.Inst.ParallelCopy{
+        .{ .dst = 0, .src = 1, .ty = .i64 }, // v0(stack0) <- v1(x5)
+        .{ .dst = 2, .src = 0, .ty = .i64 }, // v2(x6)     <- v0(stack0)
+    };
+    try simulateParallelCopy(allocator, &pairs, &[_]PcVLoc{
+        .{ .v = 0, .loc = .{ .stack = 0 } },
+        .{ .v = 1, .loc = .{ .reg = 5 } },
+        .{ .v = 2, .loc = .{ .reg = 6 } },
+    });
+}
+
+test "emitParallelCopyFull: 2-element reg<->stack cycle (swap)" {
+    // pair0: x5 <- stack[8] ; pair1: stack[8] <- x5  — a 2-cycle that must
+    // be broken with scratch (saving one operand) across the reg/stack edge.
+    const allocator = std.testing.allocator;
+    const pairs = [_]ir.Inst.ParallelCopy{
+        .{ .dst = 0, .src = 1, .ty = .i64 }, // v0(x5)      <- v1(stack8)
+        .{ .dst = 1, .src = 0, .ty = .i64 }, // v1(stack8)  <- v0(x5)
+    };
+    try simulateParallelCopy(allocator, &pairs, &[_]PcVLoc{
+        .{ .v = 0, .loc = .{ .reg = 5 } },
+        .{ .v = 1, .loc = .{ .stack = 8 } },
+    });
+}
+
+test "emitParallelCopyFull: 3-element cycle mixing reg and stack" {
+    // x5 <- stack8 <- x6 <- x5  (rotate values around a mixed 3-cycle).
+    const allocator = std.testing.allocator;
+    const pairs = [_]ir.Inst.ParallelCopy{
+        .{ .dst = 0, .src = 1, .ty = .i64 }, // v0(x5)     <- v1(stack8)
+        .{ .dst = 1, .src = 2, .ty = .i64 }, // v1(stack8) <- v2(x6)
+        .{ .dst = 2, .src = 0, .ty = .i64 }, // v2(x6)     <- v0(x5)
+    };
+    try simulateParallelCopy(allocator, &pairs, &[_]PcVLoc{
+        .{ .v = 0, .loc = .{ .reg = 5 } },
+        .{ .v = 1, .loc = .{ .stack = 8 } },
+        .{ .v = 2, .loc = .{ .reg = 6 } },
+    });
+}
+
+test "emitParallelCopyFull: fan-out and a leaf reading a cycle source" {
+    // x5 <- x6 ; x6 <- stack8 ; stack8 <- x6  -> x6 and stack8 form a swap,
+    // and x5<-x6 is a leaf that must read x6 BEFORE the swap overwrites it.
+    const allocator = std.testing.allocator;
+    const pairs = [_]ir.Inst.ParallelCopy{
+        .{ .dst = 0, .src = 1, .ty = .i64 }, // v0(x5)     <- v1(x6)
+        .{ .dst = 1, .src = 2, .ty = .i64 }, // v1(x6)     <- v2(stack8)
+        .{ .dst = 2, .src = 1, .ty = .i64 }, // v2(stack8) <- v1(x6)
+    };
+    try simulateParallelCopy(allocator, &pairs, &[_]PcVLoc{
+        .{ .v = 0, .loc = .{ .reg = 5 } },
+        .{ .v = 1, .loc = .{ .reg = 6 } },
+        .{ .v = 2, .loc = .{ .stack = 8 } },
+    });
 }
 
 test "compile: 2-arm scalar phi lowers to MOV-free path (copy-hint coalesced)" {
