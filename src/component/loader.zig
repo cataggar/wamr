@@ -344,7 +344,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         imports.items,
         comp_instance_indexspace.items,
         &type_defs,
-        type_indexspace.items,
+        &type_indexspace,
     );
 
     return .{
@@ -395,7 +395,7 @@ fn resolveTopLevelTypeAliases(
     imports: []const ctypes.ImportDecl,
     comp_instance_indexspace: []const ctypes.CompInstanceContributor,
     type_defs: *std.ArrayListUnmanaged(ctypes.TypeDef),
-    type_indexspace: []?u32,
+    type_indexspace: *std.ArrayListUnmanaged(?u32),
 ) LoadError!void {
     if (aliases.len == 0) return;
     var iteration: u32 = 0;
@@ -407,8 +407,8 @@ fn resolveTopLevelTypeAliases(
             if (ie.sort != .type) continue;
             if (ai >= alias_type_slot.len) continue;
             const slot = alias_type_slot[ai] orelse continue;
-            if (slot >= type_indexspace.len) continue;
-            if (type_indexspace[slot] != null) continue;
+            if (slot >= type_indexspace.items.len) continue;
+            if (type_indexspace.items[slot] != null) continue;
 
             const resolved = resolveAliasInstanceExportType(
                 ie.instance_idx,
@@ -416,40 +416,63 @@ fn resolveTopLevelTypeAliases(
                 imports,
                 comp_instance_indexspace,
                 type_defs.items,
-                type_indexspace,
+                type_indexspace.items,
             ) orelse continue;
 
             // Materialize the resolved TypeDef in the parent's type
             // pool. Primitive `TypeDef.val` can be copied directly.
             //
             // For structural compounds (`.record` / `.variant` / etc.)
-            // we accept only the "safe" subset where every nested
-            // ValType is a primitive — no `.type_idx` / `.record` /
-            // `.variant` / `.list` / ... references whose meaning is
-            // local to the source instance-type body. This covers
-            // `wasi:clocks/wall-clock` `datetime = record { seconds:
-            // u64, nanoseconds: u32 }` (the 0.2 shape) and
-            // `wasi:clocks/system-clock` `record instant { seconds:
-            // s64, nanoseconds: u32 }` (the 0.3 shape), which
-            // `wasi:filesystem` aliases via `(alias outer 1 K (type))`
-            // for `new-timestamp`'s `timestamp(datetime)` case
-            // payload. (`#571`.)
+            // a primitive-only payload (no nested `.type_idx` / `.record`
+            // / `.variant` / `.list` / ... refs) can also be copied
+            // directly — its referenced ValTypes carry no source-body-
+            // local indices. This covers `wasi:clocks/wall-clock`
+            // `datetime = record { seconds: u64, nanoseconds: u32 }`
+            // (the 0.2 shape) and `wasi:clocks/system-clock`
+            // `record instant { seconds: s64, nanoseconds: u32 }` (the
+            // 0.3 shape), which `wasi:filesystem` aliases via
+            // `(alias outer 1 K (type))` for `new-timestamp`'s
+            // `timestamp(datetime)` case payload. (`#571`.)
             //
-            // Compound types whose nested references would need
-            // remapping into the parent indexspace are still skipped —
-            // that remains future work.
+            // Compound types whose nested references point at other
+            // types in the source instance-type body (e.g.
+            // `wasi:http/types` `error-code`, a variant whose
+            // `HTTP-request-body-size(option<u64>)` cases reference a
+            // separate `option<u64>` type) are deep-materialized: the
+            // referenced types are copied into the parent pool with
+            // fresh type-indexspace slots and the nested ValType indices
+            // are remapped to those slots. Without this, `error-code`'s
+            // align-8 `option<u64>` case is invisible across the
+            // instance boundary and the canonical-ABI layout collapses
+            // to align-4 (issue #814).
             switch (resolved) {
                 .val => {
                     const new_idx: u32 = @intCast(type_defs.items.len);
                     try type_defs.append(allocator, resolved);
-                    type_indexspace[slot] = new_idx;
+                    type_indexspace.items[slot] = new_idx;
                     any_change = true;
                 },
                 .record, .variant, .tuple, .flags, .enum_, .option, .result, .list => {
-                    if (!typeDefHasOnlyPrimitiveRefs(resolved)) continue;
-                    const new_idx: u32 = @intCast(type_defs.items.len);
-                    try type_defs.append(allocator, resolved);
-                    type_indexspace[slot] = new_idx;
+                    if (typeDefHasOnlyPrimitiveRefs(resolved)) {
+                        const new_idx: u32 = @intCast(type_defs.items.len);
+                        try type_defs.append(allocator, resolved);
+                        type_indexspace.items[slot] = new_idx;
+                        any_change = true;
+                        continue;
+                    }
+                    // Deep path: materialize the export and its nested
+                    // referenced types, remapping source-body-local
+                    // ValType indices into fresh parent slots (#814).
+                    const pos = (try materializeAliasInstanceExportTypeDeep(
+                        allocator,
+                        ie.instance_idx,
+                        ie.name,
+                        imports,
+                        comp_instance_indexspace,
+                        type_defs,
+                        type_indexspace,
+                    )) orelse continue;
+                    type_indexspace.items[slot] = type_indexspace.items[pos];
                     any_change = true;
                 },
                 else => {},
@@ -457,6 +480,306 @@ fn resolveTopLevelTypeAliases(
         }
         if (!any_change) return;
     }
+}
+
+/// Deep-materialize the type exported as `name` by the imported instance
+/// referenced through `inst_ci_idx`, copying it and every type it
+/// transitively references from the source instance-type body into the
+/// parent `type_defs` pool. Each materialized type gets a fresh
+/// `type_indexspace` slot so the canonical-ABI registry can resolve it,
+/// and nested ValType indices (which are local to the source body) are
+/// remapped onto those parent slots. Returns the parent type-indexspace
+/// position of the exported type, or `null` when the chain can't be
+/// followed (e.g. a nested ref goes through an unresolved alias) — in
+/// which case the caller leaves the alias slot unresolved, exactly as
+/// before. (#814.)
+fn materializeAliasInstanceExportTypeDeep(
+    allocator: std.mem.Allocator,
+    inst_ci_idx: u32,
+    name: []const u8,
+    imports: []const ctypes.ImportDecl,
+    comp_instance_indexspace: []const ctypes.CompInstanceContributor,
+    type_defs: *std.ArrayListUnmanaged(ctypes.TypeDef),
+    type_indexspace: *std.ArrayListUnmanaged(?u32),
+) LoadError!?u32 {
+    const decls = resolveAliasInstanceExportBody(
+        inst_ci_idx,
+        imports,
+        comp_instance_indexspace,
+        type_defs.items,
+        type_indexspace.items,
+    ) orelse return null;
+
+    var slots = try buildInstanceBodyInnerSlots(allocator, decls);
+    defer slots.deinit(allocator);
+
+    const export_inner = slots.exportInnerIdx(name) orelse return null;
+
+    var memo: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer memo.deinit(allocator);
+
+    return try materializeInnerType(
+        allocator,
+        slots,
+        export_inner,
+        type_defs,
+        type_indexspace,
+        &memo,
+        0,
+    );
+}
+
+/// Inner type-indexspace table for one instance-type body. `concrete`
+/// holds the embedded `TypeDef` for `.type` slots (null for `.alias`
+/// slots, which this resolver does not follow), `eq` holds the back-ref
+/// target for `(export … (type (eq N)))` slots, and `export_names` maps
+/// each type export's name to its slot. Slot numbering mirrors
+/// `resolveInstanceTypeExportByName`: `.type`, `.alias`, and
+/// `.export`-with-type decls each consume one slot.
+const InstanceBodyInnerSlots = struct {
+    concrete: []?ctypes.TypeDef,
+    eq: []?u32,
+    export_slot_of: []?u32,
+    export_names: [][]const u8,
+
+    fn deinit(self: *InstanceBodyInnerSlots, allocator: std.mem.Allocator) void {
+        allocator.free(self.concrete);
+        allocator.free(self.eq);
+        allocator.free(self.export_slot_of);
+        allocator.free(self.export_names);
+    }
+
+    /// Follow `eq` back-refs from `idx` to the slot that holds a
+    /// concrete `TypeDef`. Returns null for unresolved (`.alias`) slots,
+    /// out-of-range indices, or `eq` cycles.
+    fn concreteIdx(self: InstanceBodyInnerSlots, idx: u32) ?u32 {
+        var cur = idx;
+        var hops: u32 = 0;
+        while (hops <= self.concrete.len) : (hops += 1) {
+            if (cur >= self.concrete.len) return null;
+            if (self.eq[cur]) |t| {
+                cur = t;
+                continue;
+            }
+            if (self.concrete[cur] != null) return cur;
+            return null;
+        }
+        return null;
+    }
+
+    /// Resolve the type export named `name` to the slot holding its
+    /// concrete `TypeDef` (following the `eq` chain).
+    fn exportInnerIdx(self: InstanceBodyInnerSlots, name: []const u8) ?u32 {
+        for (self.export_names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) {
+                return self.concreteIdx(self.export_slot_of[i].?);
+            }
+        }
+        return null;
+    }
+};
+
+fn buildInstanceBodyInnerSlots(
+    allocator: std.mem.Allocator,
+    decls: []const ctypes.Decl,
+) LoadError!InstanceBodyInnerSlots {
+    var slot_count: u32 = 0;
+    var export_count: u32 = 0;
+    for (decls) |d| switch (d) {
+        .type => slot_count += 1,
+        .alias => slot_count += 1,
+        .@"export" => |e| if (e.desc == .type) {
+            slot_count += 1;
+            export_count += 1;
+        },
+        else => {},
+    };
+
+    const concrete = try allocator.alloc(?ctypes.TypeDef, slot_count);
+    errdefer allocator.free(concrete);
+    const eq = try allocator.alloc(?u32, slot_count);
+    errdefer allocator.free(eq);
+    const export_slot_of = try allocator.alloc(?u32, export_count);
+    errdefer allocator.free(export_slot_of);
+    const export_names = try allocator.alloc([]const u8, export_count);
+    errdefer allocator.free(export_names);
+    @memset(concrete, null);
+    @memset(eq, null);
+    @memset(export_slot_of, null);
+
+    var slot_i: u32 = 0;
+    var export_i: u32 = 0;
+    for (decls) |d| switch (d) {
+        .type => |td| {
+            concrete[slot_i] = td;
+            slot_i += 1;
+        },
+        .alias => slot_i += 1,
+        .@"export" => |e| if (e.desc == .type) {
+            switch (e.desc.type) {
+                .eq => |target| if (target < slot_i) {
+                    eq[slot_i] = target;
+                },
+                .sub_resource => {},
+            }
+            export_names[export_i] = e.name;
+            export_slot_of[export_i] = slot_i;
+            export_i += 1;
+            slot_i += 1;
+        },
+        else => {},
+    };
+
+    return .{
+        .concrete = concrete,
+        .eq = eq,
+        .export_slot_of = export_slot_of,
+        .export_names = export_names,
+    };
+}
+
+/// Recursively copy the source-body type at inner slot `inner_idx` into
+/// the parent pool, returning its fresh parent type-indexspace position.
+/// `memo` maps an already-materialized concrete inner slot to its parent
+/// position, breaking shared/recursive references. Returns null when a
+/// nested reference can't be resolved. (#814.)
+fn materializeInnerType(
+    allocator: std.mem.Allocator,
+    slots: InstanceBodyInnerSlots,
+    inner_idx: u32,
+    type_defs: *std.ArrayListUnmanaged(ctypes.TypeDef),
+    type_indexspace: *std.ArrayListUnmanaged(?u32),
+    memo: *std.AutoHashMapUnmanaged(u32, u32),
+    depth: u32,
+) LoadError!?u32 {
+    if (depth > 64) return null;
+    const cidx = slots.concreteIdx(inner_idx) orelse return null;
+    if (memo.get(cidx)) |pos| return pos;
+
+    const td = slots.concrete[cidx].?;
+
+    // Reserve a parent slot before recursing so self/mutually-recursive
+    // references resolve to this same position.
+    const local: u32 = @intCast(type_defs.items.len);
+    try type_defs.append(allocator, td);
+    const pos: u32 = @intCast(type_indexspace.items.len);
+    try type_indexspace.append(allocator, local);
+    try memo.put(allocator, cidx, pos);
+
+    const remapped = (try remapInstanceBodyTypeDef(
+        allocator,
+        slots,
+        td,
+        type_defs,
+        type_indexspace,
+        memo,
+        depth,
+    )) orelse return null;
+    type_defs.items[local] = remapped;
+    return pos;
+}
+
+fn remapInstanceBodyTypeDef(
+    allocator: std.mem.Allocator,
+    slots: InstanceBodyInnerSlots,
+    td: ctypes.TypeDef,
+    type_defs: *std.ArrayListUnmanaged(ctypes.TypeDef),
+    type_indexspace: *std.ArrayListUnmanaged(?u32),
+    memo: *std.AutoHashMapUnmanaged(u32, u32),
+    depth: u32,
+) LoadError!?ctypes.TypeDef {
+    switch (td) {
+        .val => |v| return .{ .val = (try remapInstanceBodyValType(allocator, slots, v, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .option => |o| return .{ .option = .{ .inner = (try remapInstanceBodyValType(allocator, slots, o.inner, type_defs, type_indexspace, memo, depth)) orelse return null } },
+        .list => |l| return .{ .list = .{ .element = (try remapInstanceBodyValType(allocator, slots, l.element, type_defs, type_indexspace, memo, depth)) orelse return null } },
+        .result => |r| {
+            const ok: ?ctypes.ValType = if (r.ok) |t|
+                ((try remapInstanceBodyValType(allocator, slots, t, type_defs, type_indexspace, memo, depth)) orelse return null)
+            else
+                null;
+            const err: ?ctypes.ValType = if (r.err) |t|
+                ((try remapInstanceBodyValType(allocator, slots, t, type_defs, type_indexspace, memo, depth)) orelse return null)
+            else
+                null;
+            return .{ .result = .{ .ok = ok, .err = err } };
+        },
+        .record => |rec| {
+            const new_fields = try allocator.alloc(ctypes.Field, rec.fields.len);
+            for (rec.fields, 0..) |f, i| {
+                new_fields[i] = .{
+                    .name = f.name,
+                    .type = (try remapInstanceBodyValType(allocator, slots, f.type, type_defs, type_indexspace, memo, depth)) orelse return null,
+                };
+            }
+            return .{ .record = .{ .fields = new_fields } };
+        },
+        .tuple => |tup| {
+            const new_fields = try allocator.alloc(ctypes.ValType, tup.fields.len);
+            for (tup.fields, 0..) |f, i| {
+                new_fields[i] = (try remapInstanceBodyValType(allocator, slots, f, type_defs, type_indexspace, memo, depth)) orelse return null;
+            }
+            return .{ .tuple = .{ .fields = new_fields } };
+        },
+        .variant => |v| {
+            const new_cases = try allocator.alloc(ctypes.Case, v.cases.len);
+            for (v.cases, 0..) |c, i| {
+                new_cases[i] = .{
+                    .name = c.name,
+                    .type = if (c.type) |ct|
+                        ((try remapInstanceBodyValType(allocator, slots, ct, type_defs, type_indexspace, memo, depth)) orelse return null)
+                    else
+                        null,
+                    .refines = c.refines,
+                };
+            }
+            return .{ .variant = .{ .cases = new_cases } };
+        },
+        // `.flags` / `.enum_` carry only name lists; `.resource` /
+        // `.func` / `.component` / `.instance` carry no value-type refs
+        // that participate in canonical-ABI layout here.
+        else => return td,
+    }
+}
+
+fn remapInstanceBodyValType(
+    allocator: std.mem.Allocator,
+    slots: InstanceBodyInnerSlots,
+    vt: ctypes.ValType,
+    type_defs: *std.ArrayListUnmanaged(ctypes.TypeDef),
+    type_indexspace: *std.ArrayListUnmanaged(?u32),
+    memo: *std.AutoHashMapUnmanaged(u32, u32),
+    depth: u32,
+) LoadError!?ctypes.ValType {
+    const mapIdx = struct {
+        fn call(
+            a: std.mem.Allocator,
+            s: InstanceBodyInnerSlots,
+            inner: u32,
+            tds: *std.ArrayListUnmanaged(ctypes.TypeDef),
+            tis: *std.ArrayListUnmanaged(?u32),
+            m: *std.AutoHashMapUnmanaged(u32, u32),
+            d: u32,
+        ) LoadError!?u32 {
+            return materializeInnerType(a, s, inner, tds, tis, m, d + 1);
+        }
+    }.call;
+
+    return switch (vt) {
+        .record => |i| .{ .record = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .variant => |i| .{ .variant = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .list => |i| .{ .list = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .tuple => |i| .{ .tuple = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .flags => |i| .{ .flags = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .enum_ => |i| .{ .enum_ = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .option => |i| .{ .option = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .result => |i| .{ .result = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        .type_idx => |i| .{ .type_idx = (try mapIdx(allocator, slots, i, type_defs, type_indexspace, memo, depth)) orelse return null },
+        // `.own` / `.borrow` reference resource types (i32 handles whose
+        // layout the registry never consults), and `.future` / `.stream`
+        // / `.error_context` are likewise i32-shaped. Primitives carry no
+        // index. None need remapping for canonical-ABI layout.
+        else => vt,
+    };
 }
 
 /// True iff `td` references only primitive ValTypes (no `.type_idx`
@@ -527,6 +850,30 @@ fn resolveAliasInstanceExportType(
     type_defs: []const ctypes.TypeDef,
     type_indexspace: []const ?u32,
 ) ?ctypes.TypeDef {
+    const inst_decls = resolveAliasInstanceExportBody(
+        inst_ci_idx,
+        imports,
+        comp_instance_indexspace,
+        type_defs,
+        type_indexspace,
+    ) orelse return null;
+
+    // Walk the instance type body, building the inner type-indexspace
+    // map and locating the named export.
+    return resolveInstanceTypeExportByName(inst_decls, name);
+}
+
+/// Resolve the `(alias <inst_ci_idx> …)` instance reference to the
+/// declarator list of the imported instance's type body, or `null` when
+/// the chain can't be followed. Shared by `resolveAliasInstanceExportType`
+/// (which then finds a named export) and the deep materializer (#814).
+fn resolveAliasInstanceExportBody(
+    inst_ci_idx: u32,
+    imports: []const ctypes.ImportDecl,
+    comp_instance_indexspace: []const ctypes.CompInstanceContributor,
+    type_defs: []const ctypes.TypeDef,
+    type_indexspace: []const ?u32,
+) ?[]const ctypes.Decl {
     // 1. Resolve the instance reference to a direct import declarator.
     if (inst_ci_idx >= comp_instance_indexspace.len) return null;
     const contributor = comp_instance_indexspace[inst_ci_idx];
@@ -555,14 +902,10 @@ fn resolveAliasInstanceExportType(
     };
     if (local_idx >= type_defs.len) return null;
     const inst_td = type_defs[local_idx];
-    const inst_decls = switch (inst_td) {
+    return switch (inst_td) {
         .instance => |inst| inst.decls,
-        else => return null,
+        else => null,
     };
-
-    // 3. Walk the instance type body, building the inner type-indexspace
-    // map and locating the named export.
-    return resolveInstanceTypeExportByName(inst_decls, name);
 }
 
 /// Walk an instance-type body's declarator list, build an inner
@@ -1826,6 +2169,59 @@ test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
             return err;
         };
     }
+}
+
+test "loader #814: cross-instance use'd error-code resolves with align-8 layout" {
+    // Regression for #814. The fixture mirrors `wasi:http`: a `types`
+    // instance defines `error-code` (a variant whose `body-size`
+    // case carries `option<u64>` → alignment 8), and an
+    // `outgoing-handler` instance `use`s it via a top-level
+    // `(alias export $types "error-code")` so its `handle` result is
+    // `result<own<future-incoming-response>, error-code>`.
+    //
+    // Before the fix, `resolveTopLevelTypeAliases` refused to
+    // materialize the variant across the instance boundary (its
+    // `option<u64>` case is not primitive-only), leaving the alias
+    // slot unresolved. `alignOfType` then fell back to 4, so the
+    // `handle` ok payload landed at byte 4 instead of byte 8. The
+    // deep-materialization path copies `error-code` *and* its nested
+    // `option<u64>` into the parent type pool so the layout is align-8.
+    const canon_abi = @import("canonical_abi.zig");
+    const data = @embedFile("fixtures/http-error-code-align8.wasm");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+
+    // Locate the component-level `(alias export <types> "error-code")`
+    // type slot — the cross-instance `use` site.
+    var ec_slot: ?u32 = null;
+    for (comp.aliases, 0..) |a, ai| {
+        if (a != .instance_export) continue;
+        const ie = a.instance_export;
+        if (ie.sort != .type) continue;
+        if (!std.mem.eql(u8, ie.name, "error-code")) continue;
+        if (ai < comp.alias_type_slot.len) ec_slot = comp.alias_type_slot[ai];
+    }
+    try std.testing.expect(ec_slot != null);
+
+    const reg = canon_abi.TypeRegistry.init(&comp);
+
+    // The alias slot must now resolve to the concrete variant.
+    try std.testing.expect(reg.get(ec_slot.?) != null);
+
+    // Canonical-ABI layout of `error-code`: alignment 8 (from its
+    // `option<u64>` case), size 24 (disc 1 + pad 7 + option<u64> 16).
+    const ec_vt = ctypes.ValType{ .variant = ec_slot.? };
+    try std.testing.expectEqual(@as(u32, 8), canon_abi.alignOfType(reg, ec_vt));
+    try std.testing.expectEqual(@as(u32, 24), canon_abi.sizeOfType(reg, ec_vt));
+
+    // And therefore `result<own<…>, error-code>` places its ok payload
+    // at byte 8: payload offset = alignUp(disc 1, max(align own=4,
+    // align error-code=8)) = 8, matching wasmtime (#814). Before the
+    // fix this collapsed to alignUp(1, max(4, 4)) = 4.
+    const payload_align = @max(canon_abi.alignment(.{ .own = 0 }), canon_abi.alignOfType(reg, ec_vt));
+    try std.testing.expectEqual(@as(u32, 8), canon_abi.alignUp(1, payload_align));
 }
 
 test "loader #571: typeDefHasOnlyPrimitiveRefs accepts primitive-only compounds" {
