@@ -92,7 +92,6 @@ fn runVersion(io: std.Io, args: []const []const u8) !void {
         return;
     }
     writeStdout(io, "wamrc " ++ wamr.version.string ++ "\n");
-    writeStdout(io, "optimize " ++ @tagName(wamr.version.mode) ++ "\n");
 }
 
 fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {

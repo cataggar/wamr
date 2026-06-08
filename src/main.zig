@@ -135,7 +135,6 @@ fn runVersion(io: std.Io, args: []const []const u8) !u8 {
         return 0;
     }
     writeStdout(io, "wamr " ++ wamr.version.string ++ "\n");
-    writeStdout(io, "optimize " ++ @tagName(wamr.version.mode) ++ "\n");
     return 0;
 }
 

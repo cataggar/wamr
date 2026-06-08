@@ -25024,11 +25024,15 @@ fn installHttpShutdownHandler() void {
     const linux = std.os.linux;
     var act: linux.Sigaction = .{
         .handler = .{ .handler = httpShutdownSignalHandler },
-        .mask = std.posix.sigemptyset(),
+        .mask = linux.sigemptyset(),
         .flags = 0,
     };
-    std.posix.sigaction(linux.SIG.INT, &act, null);
-    std.posix.sigaction(linux.SIG.TERM, &act, null);
+    // Use the raw linux sigaction syscall: when libc is linked (musl) the
+    // std.posix wrapper expects c.common_linux_Sigaction which has a
+    // different layout than std.os.linux.Sigaction and rejects this struct.
+    // The raw syscall takes linux.Sigaction directly on every linux target.
+    _ = linux.sigaction(linux.SIG.INT, &act, null);
+    _ = linux.sigaction(linux.SIG.TERM, &act, null);
 }
 
 fn statusForRequestReadError(err: anyerror) u16 {

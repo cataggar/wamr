@@ -65,7 +65,7 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=${{ steps.version.outputs.version }}"
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=${{ steps.version.outputs.version }}"
 
       - name: Verify CLI version
         if: matrix.name == 'linux-x64' || matrix.name == 'linux-arm64' || matrix.name == 'macos-arm64' || matrix.name == 'windows-x64'

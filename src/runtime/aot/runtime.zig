@@ -217,7 +217,13 @@ pub fn initWatchAddrFromEnv(env_val: []const u8) !void {
         .mask = linux_watch.sigemptyset(),
         .flags = linux_watch.SA.SIGINFO | linux_watch.SA.RESTART,
     };
-    std.posix.sigaction(.USR1, &act, &g_watch_prev_action);
+    // Use the raw linux sigaction syscall (not std.posix.sigaction): the libc
+    // wrapper expects c.common_linux_Sigaction, which has a different layout
+    // than std.os.linux.Sigaction and rejects this struct when libc is linked
+    // (musl). The raw syscall takes std.os.linux.Sigaction directly and works
+    // on every linux libc/no-libc target.
+    const rc = linux_watch.sigaction(.USR1, &act, &g_watch_prev_action);
+    if (linux_watch.errno(rc) != .SUCCESS) return error.SigactionFailed;
 
     g_watch_armed.store(true, .release);
     _ = try std.Thread.spawn(.{}, watchPoller, .{});
@@ -1482,6 +1488,11 @@ pub const RuntimeError = error{
     ExecutionFailed,
     TableAllocationFailed,
     WasmTrap,
+    /// AOT execution is unavailable on this build's target architecture
+    /// (currently only x86_64 and aarch64 are supported). The symbol is
+    /// still linked so importers of `src/root.zig` build cleanly on
+    /// riscv64 / etc., but invoking it at runtime fails fast.
+    UnsupportedArchitecture,
 };
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -2091,7 +2102,7 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 ///
 /// Uses comptime to select the correct function pointer type based on `Result`.
 pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
-    comptime if (!can_execute_native) @compileError("AOT execution not supported on this architecture");
+    if (comptime !can_execute_native) return error.UnsupportedArchitecture;
 
     if (inst.code_base == null) return error.CodeMappingFailed;
     const addr = getFuncAddr(inst, func_idx) orelse blk: {
@@ -2408,7 +2419,7 @@ pub fn callFuncScalar(
     args: []const types.Value,
     results_out: []ScalarResult,
 ) ScalarCallError![]const ScalarResult {
-    comptime if (!can_execute_native) @compileError("AOT execution not supported on this architecture");
+    if (comptime !can_execute_native) return error.UnsupportedArchitecture;
 
     if (param_types.len != args.len) return error.ArgCountMismatch;
     if (param_types.len > MaxScalarArgs) return error.UnsupportedSignature;
