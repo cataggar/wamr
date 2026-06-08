@@ -533,6 +533,29 @@ pub fn icacheFlush(start: [*]u8, len: usize) void {
     }
 }
 
+/// Whether the platform allocates JIT/trampoline code via macOS's
+/// per-thread MAP_JIT write-protection (Apple Silicon). On such
+/// targets an RWX region cannot simply be `mmap`ed and written; the
+/// region is mapped `MAP_JIT` and each thread flips between
+/// write-enabled and execute-enabled with `jitWriteProtect`.
+pub const macos_jit = is_macos and builtin.cpu.arch == .aarch64;
+
+extern "c" fn pthread_jit_write_protect_np(enabled: c_int) void;
+
+/// Toggle the calling thread's view of MAP_JIT pages between
+/// executable (`enable = true`) and writable (`enable = false`).
+/// No-op on every target except macOS aarch64. Callers writing into a
+/// MAP_JIT region must wrap the write in
+/// `jitWriteProtect(false) … jitWriteProtect(true)` and then
+/// `icacheFlush` the modified range. The protection is per-thread, so
+/// the thread that later *executes* the code must be in the
+/// execute-enabled state (which `jitWriteProtect(true)` leaves it in).
+pub fn jitWriteProtect(enable: bool) void {
+    if (comptime macos_jit) {
+        pthread_jit_write_protect_np(if (enable) 1 else 0);
+    }
+}
+
 fn icacheFlushAarch64(start: [*]u8, len: usize) void {
     if (is_macos) {
         // macOS: use sys_icache_invalidate from libsystem.
