@@ -558,6 +558,15 @@ pub const CompileOptions = struct {
     /// follow-up. Disabling this option also disables the scan on the
     /// `coalesce_post.zig` unit tests via build.zig's test step.
     enable_post_emit_coalesce: bool = true,
+    /// #808: elide an unconditional `br` whose target is the immediately
+    /// following block in emission (layout) order — i.e. a redundant
+    /// `b .+4`. The aarch64 block layout is reverse-post-order, so a block
+    /// frequently branches to the block laid down right after it; `emitBr`
+    /// emits that branch unconditionally. These dead branches dominate the
+    /// CoreMark hot loops (lf7/lf9: 100% of their unconditional branches,
+    /// lf3: 93/111). Eliding them removes the instruction entirely (smaller
+    /// code, fewer front-end redirects). Off disables for A/B measurement.
+    enable_fallthrough_elision: bool = true,
     /// #778: native-codegen timing diagnostics. aarch64 reports per-function
     /// totals + a module summary (no x86_64-style setup/liveness/regalloc
     /// sub-phase breakdown — the #778 bottleneck is the x86_64 host path).
@@ -659,8 +668,27 @@ const FuncCompileCtx = struct {
     /// #808 Lever 1: local function index, used to label the spill-metric
     /// line and to match the `WAMR_AOT_SPILL_METRIC_FUNC` filter. Defaults
     /// to 0 on the single-function `compileFunctionWithOptions` entry.
+    /// #808: fall-through elision support. `block_rep[block_pos[b]]` gives the
+    /// block id whose address block `b` resolves to after empty single-`br`
+    /// blocks are elided; `fallthrough_rep` is that representative for the
+    /// block physically following the one being compiled. A branch target
+    /// that resolves to `fallthrough_rep` is a redundant `b .+4`.
+    block_rep: []const ir.BlockId = &.{},
+    block_pos: []const usize = &.{},
+    fallthrough_rep: ?ir.BlockId = null,
     func_idx: u32 = 0,
     allocator: std.mem.Allocator,
+
+    /// #808: true when a branch `target` resolves to the current block's
+    /// physical fall-through address, so a branch to it can be dropped (the
+    /// block simply falls through). Gated by the codegen option so the A/B
+    /// toggle disables all elision.
+    fn targetIsFallthrough(self: *const FuncCompileCtx, target: ir.BlockId) bool {
+        if (!self.options.enable_fallthrough_elision) return false;
+        const ft = self.fallthrough_rep orelse return false;
+        if (self.block_pos.len == 0) return false;
+        return self.block_rep[self.block_pos[target]] == ft;
+    }
 };
 
 /// Pre-computed info for a fused MADD/MSUB: `dest = addend ± mul_lhs * mul_rhs`.
@@ -1862,16 +1890,72 @@ pub fn compileFunctionImpl(
     var patches: std.ArrayListUnmanaged(BranchPatch) = .empty;
     defer patches.deinit(allocator);
 
+    // Fall-through elision precompute (#808): a terminating `br target` is a
+    // redundant `b .+4` when `target` resolves to the same address as the
+    // physical fall-through. Single-`br` blocks that are themselves elided
+    // emit nothing, so they resolve to their physical successor. Compute, per
+    // emission-order position, a "representative" block id = the address that
+    // position resolves to after elision. Walking backwards makes this O(n).
+    const elide_enabled = ctx.options.enable_fallthrough_elision;
+    const pos_of_block = try allocator.alloc(usize, func.blocks.items.len);
+    defer allocator.free(pos_of_block);
+    for (block_order, 0..) |b, oi| pos_of_block[b] = oi;
+    const rep = try allocator.alloc(ir.BlockId, block_order.len);
+    defer allocator.free(rep);
+    {
+        var oi: usize = block_order.len;
+        while (oi > 0) {
+            oi -= 1;
+            const phys_next_rep: ?ir.BlockId =
+                if (oi + 1 < block_order.len) rep[oi + 1] else null;
+            var emits_nothing = false;
+            const insts = scheduled.instructions(block_order[oi]);
+            if (elide_enabled and insts.len == 1 and phys_next_rep != null) {
+                switch (insts[0].op) {
+                    // A lone forward `br` whose target resolves to the
+                    // physical fall-through emits nothing once elided.
+                    .br => |target| {
+                        const tp = pos_of_block[target];
+                        if (tp > oi and rep[tp] == phys_next_rep.?) emits_nothing = true;
+                    },
+                    else => {},
+                }
+            }
+            rep[oi] = if (emits_nothing) phys_next_rep.? else block_order[oi];
+        }
+    }
+
+    // Expose the resolved layout to the terminator emitters (br_if uses it to
+    // drop its unconditional fall-through branch). block_pos/block_rep are
+    // stable for the whole emission; fallthrough_rep is set per block below.
+    fctx.block_pos = pos_of_block;
+    fctx.block_rep = rep;
+
     var last_was_ret = false;
-    for (block_order) |bi| {
+    for (block_order, 0..) |bi, order_idx| {
         block_offsets[bi] = code.len();
         code.peepholeBarrier();
-        for (scheduled.instructions(bi), 0..) |inst, ii| {
+        fctx.fallthrough_rep = if (order_idx + 1 < block_order.len) rep[order_idx + 1] else null;
+        const block_insts = scheduled.instructions(bi);
+        for (block_insts, 0..) |inst, ii| {
             last_was_ret = isRet(inst.op);
             const flat_idx = block_flat_base[bi] + ii;
             fctx.current_kills = kill_lists[flat_idx].items;
-            v128_cache.beginInst(scheduled.instructions(bi), ii);
-            try compileInst(&code, inst, &reg_map, &v128_map, &v128_cache, frame_size, &patches, &fctx);
+            v128_cache.beginInst(block_insts, ii);
+            // Fall-through elision (#808): drop a terminating `br` whose target
+            // resolves to the physical fall-through address (a `b .+4`, incl.
+            // over elided empty blocks). Only a terminator can be a `br`, so
+            // this never drops a needed instruction; block_offsets stay valid
+            // because the next block's offset is recorded at the now-earlier
+            // code position. Backward/self targets are never elided.
+            const elide_br = ii + 1 == block_insts.len and
+                switch (inst.op) {
+                    .br => |target| fctx.targetIsFallthrough(target),
+                    else => false,
+                };
+            if (!elide_br) {
+                try compileInst(&code, inst, &reg_map, &v128_map, &v128_cache, frame_size, &patches, &fctx);
+            }
             // Release physregs of vregs whose last static use is this inst.
             for (kill_lists[flat_idx].items) |v| {
                 reg_map.freeVReg(v);
@@ -3069,7 +3153,7 @@ fn compileInst(
 
         // ── Branches ─────────────────────────────────────────────────
         .br => |target| try emitBr(code, patches, target, fctx.allocator),
-        .br_if => |br| try emitBrIf(code, reg_map, patches, br, fctx.allocator),
+        .br_if => |br| try emitBrIf(code, reg_map, patches, br, fctx),
         .br_table => |bt| try emitBrTable(code, reg_map, patches, bt, fctx.allocator),
 
         // ── Direct function call ─────────────────────────────────────
@@ -8277,11 +8361,37 @@ fn emitBrIf(
     reg_map: *RegMap,
     patches: *std.ArrayListUnmanaged(BranchPatch),
     br: @TypeOf(@as(ir.Inst.Op, undefined).br_if),
-    allocator: std.mem.Allocator,
+    fctx: *const FuncCompileCtx,
 ) !void {
+    const allocator = fctx.allocator;
     const cond_r = try useInto(code, reg_map, br.cond, RegMap.tmp0);
     // wasm br_if: branch to then_block if cond != 0 (i32).
     try code.cmpImm32(cond_r, 0);
+
+    // Fall-through elision (#808): if a successor is the physical fall-through
+    // block, drop the unconditional branch and (if it's the then-side) invert
+    // the condition so the common path falls through instead of branching.
+    if (fctx.targetIsFallthrough(br.else_block)) {
+        const p = code.len();
+        try code.bCond(.ne, 0); // cond != 0 → then_block; else falls through
+        try patches.append(allocator, .{
+            .patch_offset = p,
+            .target_block = br.then_block,
+            .kind = .b_cond,
+        });
+        return;
+    }
+    if (fctx.targetIsFallthrough(br.then_block)) {
+        const p = code.len();
+        try code.bCond(.eq, 0); // cond == 0 → else_block; then falls through
+        try patches.append(allocator, .{
+            .patch_offset = p,
+            .target_block = br.else_block,
+            .kind = .b_cond,
+        });
+        return;
+    }
+
     const cond_patch = code.len();
     try code.bCond(.ne, 0); // placeholder
     try patches.append(allocator, .{
@@ -14803,6 +14913,61 @@ test "compileFunction: enable_move_coalesce elides wrap_i64 uxtw" {
     // The off-case asymmetry is allocator-ordering-dependent — see the
     // matching note on the reinterpret test above; covered at the
     // regalloc layer instead.
+}
+
+test "compileFunction: fall-through elision drops br to next block (#808)" {
+    // A `br` whose target is the immediately-following block in layout order
+    // is a redundant `b .+4`. With elision on it is dropped (the block falls
+    // through); with it off the unconditional B is emitted.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const next = try func.newBlock();
+    try func.getBlock(entry).append(.{ .op = .{ .br = next } });
+    try func.getBlock(next).append(.{ .op = .{ .ret = null } });
+
+    // Unconditional AArch64 B: top 6 bits 0b000101 (mask 0xFC00_0000, value
+    // 0x1400_0000); excludes BL (0x9400_0000) and B.cond (0x5400_0000).
+    const b_mask: u32 = 0xFC00_0000;
+    const b_value: u32 = 0x1400_0000;
+
+    const code_on = try compileFunctionWithOptions(&func, allocator, .{ .enable_fallthrough_elision = true });
+    defer allocator.free(code_on);
+    try std.testing.expect(!testCodeContainsMasked(code_on, b_mask, b_value));
+
+    const code_off = try compileFunctionWithOptions(&func, allocator, .{ .enable_fallthrough_elision = false });
+    defer allocator.free(code_off);
+    try std.testing.expect(testCodeContainsMasked(code_off, b_mask, b_value));
+}
+
+test "compileFunction: fall-through elision drops br_if unconditional edge (#808)" {
+    // `br_if` lowers to `B.cond then` + `B else`. When a successor is the
+    // physical fall-through, the unconditional `B else` is dropped (inverting
+    // the condition if `then` is the fall-through). One of the two successors
+    // is always laid out right after `entry`, so no unconditional B remains.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const then_b = try func.newBlock();
+    const else_b = try func.newBlock();
+    const c = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = c, .then_block = then_b, .else_block = else_b } } });
+    try func.getBlock(then_b).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(else_b).append(.{ .op = .{ .ret = null } });
+
+    const b_mask: u32 = 0xFC00_0000;
+    const b_value: u32 = 0x1400_0000;
+
+    const code_on = try compileFunctionWithOptions(&func, allocator, .{ .enable_fallthrough_elision = true });
+    defer allocator.free(code_on);
+    try std.testing.expect(!testCodeContainsMasked(code_on, b_mask, b_value));
+
+    const code_off = try compileFunctionWithOptions(&func, allocator, .{ .enable_fallthrough_elision = false });
+    defer allocator.free(code_off);
+    try std.testing.expect(testCodeContainsMasked(code_off, b_mask, b_value));
 }
 
 test "compileFunction: FMA fusion does not skip mul with non-arith uses" {
