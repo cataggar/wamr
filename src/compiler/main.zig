@@ -358,15 +358,13 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     // live-range fix (#818), and lowering pass
     // `coalescePhiLocalsToParallelCopy` (with the #820 lost-copy guard) are
     // all implemented and unit-tested. x86_64 is out of scope and keeps the
-    // existing frameStore/frameLoad lowering.
-    if (target_arch == .aarch64) {
-        for (ir_module.functions.items) |*f| {
-            _ = passes.coalescePhiLocalsToParallelCopy(f, allocator) catch |err| {
-                std.debug.print("Error lowering phi parallel-copies: {}\n", .{err});
-                std.process.exit(1);
-            };
-        }
-    }
+    // existing frameStore/frameLoad lowering. Shared with the in-process AOT
+    // harness via `passes.applyPostOptCodegenLowering` so the two paths
+    // can't drift (#808).
+    passes.applyPostOptCodegenLowering(&ir_module, target_arch, allocator) catch |err| {
+        std.debug.print("Error lowering phi parallel-copies: {}\n", .{err});
+        std.process.exit(1);
+    };
 
     if (dumper.matchesPass("final")) {
         for (ir_module.functions.items, 0..) |*f, fi| {

@@ -1030,19 +1030,26 @@ fn compileToAot(
     var ir_module = try frontend.lowerModule(module, a);
     defer ir_module.deinit();
 
+    const target: passes.TargetArch = switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+
     // Opt-in IR verifier (#624). Fuzz / differential harness callers can
     // toggle this via `InitOptions.verify_ir`; default `false` to avoid
     // regressing pre-existing differential tests whose IR shapes have not
     // yet been audited against the invariants.
     _ = try passes.runPassesWithOptions(
         &ir_module,
-        passes.defaultPassesForTarget(switch (builtin.cpu.arch) {
-            .aarch64 => .aarch64,
-            else => .x86_64,
-        }),
+        passes.defaultPassesForTarget(target),
         a,
         .{ .verify_mode = if (verify_ir) .after_each_pass else .off },
     );
+
+    // #540: apply the same aarch64 phi-residency lowering the standalone
+    // `wamrc` driver does (`main.zig`), so this in-process harness compiles
+    // production codegen rather than the pre-#540 frame round-trip (#808).
+    try passes.applyPostOptCodegenLowering(&ir_module, target, a);
 
     const code: []const u8, const offsets: []const u32 = switch (builtin.cpu.arch) {
         .aarch64 => blk: {

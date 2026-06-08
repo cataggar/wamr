@@ -7584,6 +7584,23 @@ fn synthCoalesceLostCopyUnsafe(
     return false;
 }
 
+/// #540: Route phi-resolution through a register MOV instead of a frame
+/// round-trip on aarch64 by applying `coalescePhiLocalsToParallelCopy` to
+/// every function in the module. Shared by the standalone `wamrc` driver
+/// (`main.zig`) and the in-process AOT harness (`aot_harness.compileToAot`)
+/// so the two codegen paths never drift (#808). No-op unless
+/// `target == .aarch64`; x86_64 keeps the frameStore/frameLoad lowering.
+pub fn applyPostOptCodegenLowering(
+    module: *ir.IrModule,
+    target: TargetArch,
+    allocator: std.mem.Allocator,
+) !void {
+    if (target != .aarch64) return;
+    for (module.functions.items) |*f| {
+        _ = try coalescePhiLocalsToParallelCopy(f, allocator);
+    }
+}
+
 /// Phi-resolution: route through register MOV instead of frame round-trip
 /// (#540 / #386 follow-up). Coalesces the (`local_set` in each predecessor
 /// + `local_get` at the join) pair that `lowerPhisToLocals` emits per
