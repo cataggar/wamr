@@ -9667,10 +9667,75 @@ test "compile: phi-resolution end-to-end produces no per-arm frame round-trip" {
     //   b0:  v_init = iconst 0; br b1
     //   b1:  v_i = phi (b0, v_init) (b1, v_next); v_next = v_i + 1;
     //        br_if cond → b1 else b2
-    //   b2:  ret v_i
-    // The phi-resolution should NOT emit `str ... [fp, ...]` and
-    // matching `ldr` purely for the phi bridge: instead a register MOV
-    // (or, when the coalescer wins, no instruction at all).
+    //   b2:  ret v_next
+    // The counter `v_i` is read only inside the loop (its post-loop result
+    // is observed via `v_next`, not `v_i`), so it is safe to coalesce and the
+    // phi-resolution should NOT emit `str ... [fp, ...]` and matching `ldr`
+    // purely for the phi bridge: instead a register MOV (or, when the
+    // coalescer wins, no instruction at all). A phi whose result is live
+    // across the loop exit takes the memory path instead (see the #820
+    // lost-copy tests above).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_i = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const edges = try allocator.alloc(ir.Inst.PhiEdge, 2);
+    edges[0] = .{ .block = b0, .val = v_init };
+    edges[1] = .{ .block = b1, .val = v_next };
+    try func.getBlock(b1).append(.{ .op = .{ .phi = edges }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_next } });
+
+    try func.getBlock(b1).addPredecessor(b0);
+    try func.getBlock(b1).addPredecessor(b1);
+    try func.getBlock(b2).addPredecessor(b1);
+
+    _ = try @import("../../ir/passes.zig").lowerPhisToLocals(&func, allocator);
+    _ = try @import("../../ir/passes.zig").coalescePhiLocalsToParallelCopy(&func, allocator);
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+}
+
+// Count `parallel_copy` ops across all blocks of `func`.
+fn countParallelCopies(func: *const ir.IrFunction) u32 {
+    var n: u32 = 0;
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .parallel_copy) n += 1;
+        }
+    }
+    return n;
+}
+
+test "coalescePhiLocalsToParallelCopy: rejects loop phi live across loop exit (#820)" {
+    // Lost-copy hazard: a loop-counter phi whose value is read AFTER the
+    // loop. Coalescing would route the back-edge increment through the phi
+    // register, clobbering the value the post-loop use still needs (this is
+    // what hung CoreMark `core_list_mergesort`). The pass must leave it on
+    // the memory path.
+    //   b0:  v_init = 0; br b1
+    //   b1:  v_i = phi(b0:v_init, b1:v_next); v_next = v_i + 1;
+    //        br_if cond → b1 else b2
+    //   b2:  ret v_i           ← v_i live across the loop exit
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -9704,11 +9769,59 @@ test "compile: phi-resolution end-to-end produces no per-arm frame round-trip" {
     try func.getBlock(b2).addPredecessor(b1);
 
     _ = try @import("../../ir/passes.zig").lowerPhisToLocals(&func, allocator);
-    _ = try @import("../../ir/passes.zig").coalescePhiLocalsToParallelCopy(&func, allocator);
+    const changed = try @import("../../ir/passes.zig").coalescePhiLocalsToParallelCopy(&func, allocator);
 
-    const code = try compileFunction(&func, allocator);
-    defer allocator.free(code);
-    try std.testing.expect(code.len > 0);
+    // The single phi is the lost-copy case → rejected → nothing coalesced.
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(u32, 0), countParallelCopies(&func));
+}
+
+test "coalescePhiLocalsToParallelCopy: coalesces loop phi used only inside the loop" {
+    // The safe counterpart of the #820 test: the loop-counter phi is read
+    // only inside the loop body (never after the exit), so coalescing it is
+    // safe and must still happen.
+    //   b0:  v_init = 0; br b1
+    //   b1:  v_i = phi(b0:v_init, b1:v_next); v_next = v_i + 1;
+    //        br_if cond=v_i → b1 else b2
+    //   b2:  ret v_ret        ← does NOT use v_i
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_i = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+    const v_ret = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const edges = try allocator.alloc(ir.Inst.PhiEdge, 2);
+    edges[0] = .{ .block = b0, .val = v_init };
+    edges[1] = .{ .block = b1, .val = v_next };
+    try func.getBlock(b1).append(.{ .op = .{ .phi = edges }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_i, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_ret, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_ret } });
+
+    try func.getBlock(b1).addPredecessor(b0);
+    try func.getBlock(b1).addPredecessor(b1);
+    try func.getBlock(b2).addPredecessor(b1);
+
+    _ = try @import("../../ir/passes.zig").lowerPhisToLocals(&func, allocator);
+    const changed = try @import("../../ir/passes.zig").coalescePhiLocalsToParallelCopy(&func, allocator);
+
+    // In-loop-only phi → safe → coalesced into parallel_copy(s).
+    try std.testing.expect(changed);
+    try std.testing.expect(countParallelCopies(&func) > 0);
 }
 
 test "compileFunction: iconst_32 + ret" {
