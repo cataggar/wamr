@@ -7497,6 +7497,93 @@ fn findTerminatorIndex(block: *const ir.BasicBlock) usize {
     return block.instructions.items.len;
 }
 
+/// Lost-copy hazard check for `coalescePhiLocalsToParallelCopy` (#820).
+///
+/// Coalescing replaces the join's `local_get → dest` with `parallel_copy
+/// dest ← src` at each predecessor terminator. For a back-edge predecessor
+/// (the loop latch) this copy writes `dest` at the end of the loop body. In
+/// the original (memory-slot) form the join *reloads* `dest` on every header
+/// visit, so a use of `dest` reached after the loop sees the value that was
+/// loaded on the exit iteration — independent of the latch store. After
+/// coalescing there is no reload: the latch copy's value persists past the
+/// loop. If `dest` is read outside the loop the read observes the wrong
+/// (incremented / next-iteration) value — the classic lost-copy problem
+/// (CoreMark `core_list_mergesort` hung this way: a loop-counter phi's
+/// `br_if cond=v533` read the clobbered value and never terminated).
+///
+/// We bail when `dest` has any use outside the natural loop(s) of the
+/// back-edge(s) into `join_block`. Simple in-loop counters (all uses inside
+/// the loop body) stay eligible; values live across the loop exit do not.
+fn synthCoalesceLostCopyUnsafe(
+    func: *const ir.IrFunction,
+    dom: *const analysis.DomTree,
+    preds: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    join_block: ir.BlockId,
+    dest: ir.VReg,
+    allocator: std.mem.Allocator,
+) !bool {
+    const nblocks = func.blocks.items.len;
+
+    // Back-edge predecessors of the join are CFG preds dominated by the
+    // join (the join is on every path to them ⇒ they close a loop).
+    const join_preds = preds.get(join_block) orelse return false;
+    var has_back_edge = false;
+    for (join_preds) |p| {
+        if (dom.dominates(join_block, p)) {
+            has_back_edge = true;
+            break;
+        }
+    }
+    // No loop back-edge into the join ⇒ every copy is on a forward edge and
+    // defines `dest` once per path; no clobber is possible.
+    if (!has_back_edge) return false;
+
+    // Natural loop L = {join} ∪ {blocks reachable backward from a back-edge
+    // predecessor without crossing the join}. Uses of `dest` outside L are
+    // live across the loop exit and would observe a clobbered value.
+    var in_loop = try allocator.alloc(bool, nblocks);
+    defer allocator.free(in_loop);
+    @memset(in_loop, false);
+    in_loop[join_block] = true;
+
+    var worklist: std.ArrayListUnmanaged(ir.BlockId) = .empty;
+    defer worklist.deinit(allocator);
+    for (join_preds) |p| {
+        if (!dom.dominates(join_block, p)) continue;
+        if (!in_loop[p]) {
+            in_loop[p] = true;
+            try worklist.append(allocator, p);
+        }
+    }
+    while (worklist.pop()) |n| {
+        const np = preds.get(n) orelse continue;
+        for (np) |q| {
+            if (!in_loop[q]) {
+                in_loop[q] = true;
+                try worklist.append(allocator, q);
+            }
+        }
+    }
+
+    // Any use of `dest` in a block outside the natural loop is unsafe.
+    const Probe = struct {
+        target: ir.VReg,
+        found: *bool,
+        fn check(self: @This(), v: ir.VReg) void {
+            if (v == self.target) self.found.* = true;
+        }
+    };
+    for (func.blocks.items, 0..) |*block, bid| {
+        if (in_loop[bid]) continue;
+        for (block.instructions.items) |inst| {
+            var used = false;
+            verifier.forEachOperand(inst, Probe{ .target = dest, .found = &used }, Probe.check);
+            if (used) return true;
+        }
+    }
+    return false;
+}
+
 /// Phi-resolution: route through register MOV instead of frame round-trip
 /// (#540 / #386 follow-up). Coalesces the (`local_set` in each predecessor
 /// + `local_get` at the join) pair that `lowerPhisToLocals` emits per
@@ -7569,6 +7656,34 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
             slot.dest = dest;
             slot.ty = inst.type;
             slot.eligible = true;
+        }
+    }
+
+    // #820 lost-copy guard: drop any synth whose phi-destination is read
+    // outside the loop whose latch would receive a back-edge parallel_copy.
+    // Coalescing such a synth makes the latch copy clobber a value the
+    // out-of-loop use still needs (CoreMark mergesort infinite loop).
+    var have_eligible = false;
+    for (info) |it| {
+        if (it.eligible) {
+            have_eligible = true;
+            break;
+        }
+    }
+    if (have_eligible) {
+        var dom = try analysis.computeDominators(func, allocator);
+        defer dom.deinit();
+        var preds = try analysis.buildPredecessors(func, allocator);
+        defer {
+            var pit = preds.iterator();
+            while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+            preds.deinit();
+        }
+        for (info) |*it| {
+            if (!it.eligible) continue;
+            if (try synthCoalesceLostCopyUnsafe(func, &dom, &preds, it.join_block, it.dest, allocator)) {
+                it.eligible = false;
+            }
         }
     }
 
