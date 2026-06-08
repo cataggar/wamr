@@ -1111,6 +1111,18 @@ fn computeLiveRangesImpl(
     defer def_type.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
+    // Earliest block-start position at which each vreg is live-in. A value
+    // that is live-in to a block is live from that block's start, so its
+    // range must begin no later than there — even when its only textual
+    // def is positioned *after* that point. This is the loop-carried case:
+    // a value defined on a back-edge predecessor (e.g. a `parallel_copy`
+    // dst from #540 phi lowering, after the join's `local_get` was removed)
+    // is used at the loop header, which precedes the latch def in linear
+    // order. Without this the range would collapse to ≈[latch, latch] and
+    // the allocator would reuse the register inside the loop, clobbering
+    // the loop-carried value (#818 / #540 self-loop hang).
+    var first_live_in_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer first_live_in_pos.deinit();
 
     // Build default sequential order if none provided.
     const nblocks = func.blocks.items.len;
@@ -1143,6 +1155,10 @@ fn computeLiveRangesImpl(
                 // Extend last use to at least this block's start
                 const existing = last_use_pos.get(vreg) orelse 0;
                 try last_use_pos.put(vreg, @max(existing, global_idx));
+                // Record the earliest block-start where it is live-in so the
+                // range start can be pulled back to cover a pre-def use.
+                const prev_li = first_live_in_pos.get(vreg) orelse std.math.maxInt(u32);
+                try first_live_in_pos.put(vreg, @min(prev_li, global_idx));
             }
         }
 
@@ -1195,7 +1211,13 @@ fn computeLiveRangesImpl(
     var dit = def_pos.iterator();
     while (dit.next()) |entry| {
         const vreg = entry.key_ptr.*;
-        const start = entry.value_ptr.*;
+        const def_p = entry.value_ptr.*;
+        // A loop-carried value is live-in to its loop header before its
+        // (back-edge) def; pull the range start back to that live-in point
+        // so the interval spans the whole loop, not just [def, def]. For
+        // forward values the def dominates every use, so first_live_in_pos
+        // >= def_p and this is a no-op.
+        const start = if (first_live_in_pos.get(vreg)) |li| @min(def_p, li) else def_p;
         const end = last_use_pos.get(vreg) orelse start;
         const final_end = @max(start, end);
         const depth = maxLoopDepthOverSpan(
@@ -2817,6 +2839,63 @@ test "computeSsaLiveRanges vs legacy: phi arm not extended into the join block" 
     const legacy_b = findRange(legacy, d.v_b).?;
     try std.testing.expectEqual(@as(u32, 5), ssa_b.end);
     try std.testing.expect(legacy_b.end > ssa_b.end);
+}
+
+test "computeLiveRanges: loop-carried parallel_copy dst spans the back-edge (#818)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // CFG with a loop whose carried value `v_loop` is the dst of a
+    // `parallel_copy` placed on the back-edge (latch) — i.e. defined LATE
+    // in linear order — but used at the loop header (early). This mirrors
+    // the post-#540 lowered shape where `coalescePhiLocalsToParallelCopy`
+    // routes phi resolution through a register `parallel_copy` instead of a
+    // frame round-trip.
+    //
+    //   b0 (entry):  br b1
+    //   b1 (header): use v_loop ; br_if -> b2 (latch) | b3 (exit)
+    //   b2 (latch):  parallel_copy (v_loop <- v_src) ; br b1   (back-edge)
+    //   b3 (exit):   ret
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_loop = func.newVReg();
+    const v_cond = func.newVReg();
+    const v_use = func.newVReg();
+    const v_src = func.newVReg();
+
+    // b0: pos0 br
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    // b1 (header): pos1 cond, pos2 use(v_loop), pos3 br_if
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_loop, .rhs = v_loop } }, .dest = v_use });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b3 } } });
+    // b2 (latch): pos4 v_src, pos5 parallel_copy(v_loop<-v_src), pos6 br
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_src });
+    const copies = try allocator.dupe(ir.Inst.ParallelCopy, &.{.{ .dst = v_loop, .src = v_src, .ty = .i32 }});
+    try func.getBlock(b2).append(.{ .op = .{ .parallel_copy = copies } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+    // b3 (exit): ret
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_use } });
+
+    const ranges = try computeLiveRanges(&func, allocator);
+    defer allocator.free(ranges);
+
+    const r_loop = findRange(ranges, v_loop).?;
+    const header_use_pos: u32 = 2; // the `add` reading v_loop
+    const latch_def_pos: u32 = 5; // the parallel_copy defining v_loop
+
+    // Pre-#818 the builder set start = def_pos = latch (5) and only
+    // extended `end`, collapsing the interval to ≈[5,6] and MISSING the
+    // header use at pos 2 — the allocator would then reuse v_loop's
+    // register inside the loop and clobber the loop-carried value. The fix
+    // pulls `start` back to the earliest live-in, so the range must span
+    // from at-or-before the header use through at-or-after the latch def.
+    try std.testing.expect(r_loop.start <= header_use_pos);
+    try std.testing.expect(r_loop.end >= latch_def_pos);
 }
 
 fn expectLivenessEqual(

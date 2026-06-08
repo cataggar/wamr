@@ -1985,6 +1985,17 @@ fn computeLiveRangesScheduled(
     defer def_type.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
+    // Earliest block-start position at which each vreg is live-in. A value
+    // live-in to a block is live from that block's start, so its range must
+    // begin no later than there — even when its only textual def sits
+    // *after* that point in the linear order. This is the loop-carried
+    // case: a `parallel_copy` dst from #540 phi lowering is defined on the
+    // back-edge predecessor (latch) but used at the loop header, which
+    // precedes the latch. Without pulling `start` back, the interval
+    // collapses to ≈[latch, latch] and the allocator reuses the register
+    // inside the loop, clobbering the loop-carried value (#818 / #540).
+    var first_live_in_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer first_live_in_pos.deinit();
 
     // Per-order-position flat-index span (mirrors the same array used
     // by `analysis.computeLiveRangesWithOrder`). One extra slot acts as
@@ -2001,6 +2012,8 @@ fn computeLiveRangesScheduled(
                 const vreg = entry.key_ptr.*;
                 const existing = last_use_pos.get(vreg) orelse 0;
                 try last_use_pos.put(vreg, @max(existing, global_idx));
+                const prev_li = first_live_in_pos.get(vreg) orelse std.math.maxInt(u32);
+                try first_live_in_pos.put(vreg, @min(prev_li, global_idx));
             }
         }
 
@@ -2052,7 +2065,13 @@ fn computeLiveRangesScheduled(
     var dit = def_pos.iterator();
     while (dit.next()) |entry| {
         const vreg = entry.key_ptr.*;
-        const start = entry.value_ptr.*;
+        const def_p = entry.value_ptr.*;
+        // Pull the range start back to the earliest point where the value
+        // is live-in, covering a loop-carried use that precedes the
+        // back-edge def in linear order (#818). For forward values the def
+        // dominates every use, so first_live_in_pos >= def_p and this is a
+        // no-op.
+        const start = if (first_live_in_pos.get(vreg)) |li| @min(def_p, li) else def_p;
         const end = last_use_pos.get(vreg) orelse start;
         const final_end = @max(start, end);
         const depth = analysis.maxLoopDepthOverSpan(
