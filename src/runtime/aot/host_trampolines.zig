@@ -338,12 +338,16 @@ pub const TrampolinePool = struct {
     // `linkLibC` on every binary reachable from `TrampolinePool.init`
     // (broke `wamr.exe` Windows build under #662 Phase C, where the lazy
     // pool ctor became reachable from the CLI).
+    //
+    // macOS aarch64 (Apple Silicon) IS supported: it forbids a plain RWX
+    // `mmap`, but the region can be mapped `MAP_JIT` and written under
+    // per-thread `pthread_jit_write_protect_np` toggling (see
+    // `platform.jitWriteProtect`). Required so cross-instance / canon-lower
+    // thunks resolve on Apple Silicon instead of trap-stubbing and then
+    // segfaulting (the wasi:http component path).
     const supports_pool: bool = blk: {
         if (builtin.os.tag == .windows) break :blk false;
         if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) break :blk false;
-        // macOS aarch64 forbids RWX mmap without MAP_JIT + pthread_jit_write_protect_np;
-        // not worth wiring up for stdio-echo's needs. AOT layer falls back to interp.
-        if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) break :blk false;
         break :blk true;
     };
 
@@ -362,15 +366,25 @@ pub const TrampolinePool = struct {
         errdefer allocator.free(slots);
 
         const map_len = std.mem.alignForward(usize, @as(usize, cap) * STUB_BYTES, page_size);
+        // macOS aarch64 needs MAP_JIT; the field only exists on darwin so
+        // build the flags via a comptime branch to stay portable.
+        const map_flags: std.posix.MAP = if (comptime platform.macos_jit)
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .JIT = true }
+        else
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
         const memory = try std.posix.mmap(
             null,
             map_len,
             .{ .READ = true, .WRITE = true, .EXEC = true },
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            map_flags,
             -1,
             0,
         );
+        // Under MAP_JIT the region starts execute-protected for this
+        // thread; flip it writable to zero-fill, then back to executable.
+        platform.jitWriteProtect(false);
         @memset(memory, 0);
+        platform.jitWriteProtect(true);
 
         return .{
             .memory = memory,
@@ -448,8 +462,7 @@ pub const TrampolinePool = struct {
         };
         self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
-        writeStub(self.stubBytes(slot), slot);
-        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        self.installStub(slot);
         g_active_pool = self;
 
         return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
@@ -463,8 +476,7 @@ pub const TrampolinePool = struct {
             .canon_lower_idx = canon_lower_idx,
         };
         self.next_slot += 1;
-        writeStub(self.stubBytes(slot), slot);
-        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        self.installStub(slot);
         g_active_pool = self;
 
         return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
@@ -487,8 +499,7 @@ pub const TrampolinePool = struct {
         };
         self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
-        writeStub(self.stubBytes(slot), slot);
-        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        self.installStub(slot);
         g_active_pool = self;
 
         return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
@@ -510,8 +521,7 @@ pub const TrampolinePool = struct {
         };
         self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
-        writeStub(self.stubBytes(slot), slot);
-        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        self.installStub(slot);
         g_active_pool = self;
 
         return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
@@ -534,8 +544,7 @@ pub const TrampolinePool = struct {
         };
         self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
-        writeStub(self.stubBytes(slot), slot);
-        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        self.installStub(slot);
         g_active_pool = self;
 
         return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
@@ -555,8 +564,7 @@ pub const TrampolinePool = struct {
             .dispatch_kind = .trap_stub,
         };
         self.next_slot += 1;
-        writeStub(self.stubBytes(slot), slot);
-        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
+        self.installStub(slot);
         g_active_pool = self;
 
         return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
@@ -581,6 +589,18 @@ pub const TrampolinePool = struct {
     fn stubBytes(self: *TrampolinePool, slot: u32) []u8 {
         const start = @as(usize, slot) * STUB_BYTES;
         return self.memory[start .. start + STUB_BYTES];
+    }
+
+    /// Write the arch-specific shim for `slot` into the pool's
+    /// executable memory and flush the icache. On macOS aarch64 the
+    /// MAP_JIT region is flipped writable for the write and back to
+    /// executable afterward (`platform.jitWriteProtect`); a no-op
+    /// elsewhere.
+    fn installStub(self: *TrampolinePool, slot: u32) void {
+        platform.jitWriteProtect(false);
+        writeStub(self.stubBytes(slot), slot);
+        platform.jitWriteProtect(true);
+        platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
     }
 };
 
