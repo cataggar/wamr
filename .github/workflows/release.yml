@@ -126,19 +126,9 @@ jobs:
               else
                 powershell -Command "Compress-Archive -Path '$PKGNAME' -DestinationPath '$PKGNAME.zip'"
               fi
-              if command -v sha256sum &>/dev/null; then
-                sha256sum "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
-              else
-                shasum -a 256 "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
-              fi
               ;;
             *)
               tar czf "$PKGNAME.tar.gz" "$PKGNAME"
-              if command -v sha256sum &>/dev/null; then
-                sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-              else
-                shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-              fi
               ;;
           esac
 
@@ -156,7 +146,6 @@ jobs:
           path: |
             wamr-*.tar.gz
             wamr-*.zip
-            wamr-*.sha256
             wamr-*.sbom.spdx.json
 
   source:
@@ -173,7 +162,6 @@ jobs:
         run: |
           PKGNAME="wamr-${{ steps.version.outputs.version }}"
           git archive --format=tar --prefix="$PKGNAME/" HEAD | xz > "$PKGNAME.tar.xz"
-          sha256sum "$PKGNAME.tar.xz" > "$PKGNAME.tar.xz.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -181,7 +169,6 @@ jobs:
           name: source
           path: |
             wamr-*.tar.xz
-            wamr-*.sha256
 
   release:
     name: Create Release
@@ -224,7 +211,6 @@ jobs:
             wamr-*.tar.gz
             wamr-*.tar.xz
             wamr-*.zip
-            wamr-*.sha256
             wamr-*.sbom.spdx.json
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}
