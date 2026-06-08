@@ -354,23 +354,12 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
 
     // #540: Route phi-resolution through register MOV instead of frame
     // round-trip on aarch64. The IR op `parallel_copy`, codegen emitter
-    // (general parallel-copy sequentializer, #817), and lowering pass
-    // `coalescePhiLocalsToParallelCopy` are all implemented and unit-tested.
-    //
-    // Still gated OFF pending #818: the loop-carried live-range fix below
-    // (computeLiveRangesScheduled / computeLiveRangesImpl start pull-back) is
-    // necessary but NOT sufficient. Enabling #540 still miscompiles
-    // `core_bench_list` (inlined `core_list_mergesort`) on aarch64 — a
-    // register-pressure-dependent codegen bug that is independent of the
-    // range collapse (the post-allocation interval set is provably
-    // conflict-free) and of the #817 resolver (fuzz-verified). Coalescing a
-    // single loop-counter phi reserves a register across the merge loop and
-    // the resulting reallocation trips a latent instruction-level miscompile
-    // (the #109 scratch-clobber class); adding a `volatile` to mergesort
-    // makes it vanish. Tracked separately with a minimal reproducer.
-    // x86_64 is out of scope and keeps the existing frameStore/frameLoad
-    // lowering anyway.
-    if (false and target_arch == .aarch64) {
+    // (general parallel-copy sequentializer, #817), the loop-carried
+    // live-range fix (#818), and lowering pass
+    // `coalescePhiLocalsToParallelCopy` (with the #820 lost-copy guard) are
+    // all implemented and unit-tested. x86_64 is out of scope and keeps the
+    // existing frameStore/frameLoad lowering.
+    if (target_arch == .aarch64) {
         for (ir_module.functions.items) |*f| {
             _ = passes.coalescePhiLocalsToParallelCopy(f, allocator) catch |err| {
                 std.debug.print("Error lowering phi parallel-copies: {}\n", .{err});
