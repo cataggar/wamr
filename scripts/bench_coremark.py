@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import re
 import statistics
 import subprocess
@@ -201,6 +202,54 @@ def compute_delta_pct(baseline_vals: list[float], target_vals: list[float]) -> f
     return (statistics.fmean(target_vals) / statistics.fmean(baseline_vals) - 1.0) * 100.0
 
 
+def host_cpu_model() -> str:
+    """Best-effort friendly CPU model name.
+
+    `lscpu` exposes a friendly core name for ARM (e.g. `Neoverse-N2`) where
+    `/proc/cpuinfo` only carries the raw implementer/part IDs, so try it
+    first; fall back to the x86-style `model name` line, then to
+    `platform.processor()`.
+    """
+    try:
+        out = subprocess.run(
+            ["lscpu"], capture_output=True, text=True, timeout=5
+        ).stdout
+        for line in out.splitlines():
+            if line.lower().startswith("model name:"):
+                val = line.split(":", 1)[1].strip()
+                if val:
+                    return val
+    except Exception:
+        pass
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                key = line.split(":", 1)[0].strip().lower()
+                if key in ("model name", "model") and ":" in line:
+                    val = line.split(":", 1)[1].strip()
+                    if val:
+                        return val
+    except Exception:
+        pass
+    proc = platform.processor()
+    return proc if proc else "unknown CPU"
+
+
+def host_info() -> str:
+    """One-line markdown describing the machine the benchmark ran on, so the
+    report is self-documenting about arch / vCPU count / CPU model (and the
+    CI runner when present)."""
+    arch = platform.machine() or "unknown-arch"
+    ncpu = os.cpu_count()
+    ncpu_str = str(ncpu) if ncpu else "?"
+    model = host_cpu_model()
+    parts = [f"arch `{arch}`", f"{ncpu_str} vCPU", f"`{model}`"]
+    runner = os.environ.get("RUNNER_NAME")
+    if runner:
+        parts.append(f"runner `{runner}`")
+    return "_Host: " + " · ".join(parts) + "_"
+
+
 def render_table(
     baseline_ref: str,
     baseline_vals: list[float],
@@ -220,6 +269,8 @@ def render_table(
         f"| `{baseline_ref}` (baseline) | {bm:.1f} | {bmin:.1f} | {bmax:.1f} | {len(baseline_vals)} |",
         f"| `{target_ref}` (target) | {tm:.1f} | {tmin:.1f} | {tmax:.1f} | {len(target_vals)} |",
         f"| **Δ** | **{sign}{delta_pct:.2f}%** | | | |",
+        "",
+        host_info(),
     ]
     return "\n".join(lines)
 
@@ -253,6 +304,8 @@ def render_optimize_table(
     if fast_vals is None or safe_vals is None:
         lines.append("")
         lines.append("At least one optimize mode failed before producing a CoreMark timing; see raw harness output above.")
+    lines.append("")
+    lines.append(host_info())
     return "\n".join(lines)
 
 
