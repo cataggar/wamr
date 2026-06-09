@@ -14,6 +14,15 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # Windows targets sign via Azure Trusted Signing over OIDC. Run those
+    # jobs in the `release` GitHub Environment so their OIDC subject is the
+    # tag-independent `repo:cataggar/wamr:environment:release`, matched by a
+    # single federated identity credential — subject-based FICs can't
+    # wildcard `refs/tags/v*`, so a per-tag FIC would otherwise be needed
+    # before every release (cataggar/wamr#830). Non-Windows jobs get no
+    # environment (empty string) so a future environment protection rule
+    # can't gate the whole matrix.
+    environment: ${{ endsWith(matrix.target, '-windows') && 'release' || '' }}
     strategy:
       fail-fast: false
       matrix:
