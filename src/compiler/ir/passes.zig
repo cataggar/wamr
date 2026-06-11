@@ -14250,6 +14250,28 @@ test "default pipeline enables foldBranchOnEqz only for x86_64" {
     try std.testing.expect(!pipelineContains(defaultPassesForTarget(.aarch64), &foldBranchOnEqz));
 }
 
+test "every default pipeline keeps DCE enabled (#116/#834)" {
+    // `deadCodeElimination` was historically disabled from the default
+    // pipeline because `buildUseDef` ignored call-arg / ret_multi
+    // operands. Now that it counts every unbounded VReg use (and
+    // `hasSideEffect` guards trapping ops), DCE must stay wired into
+    // every target/option variant via `deadCodeAndLocalSetCleanup`.
+    // This guard fails fast if a future pipeline edit silently drops it.
+    const targets = [_]TargetArch{ .x86_64, .aarch64 };
+    const option_variants = [_]CompileOptions{
+        .{ .enable_iv_simplify = true, .enable_loop_unroll = true },
+        .{ .enable_iv_simplify = true, .enable_loop_unroll = false },
+        .{ .enable_iv_simplify = false, .enable_loop_unroll = true },
+        .{ .enable_iv_simplify = false, .enable_loop_unroll = false },
+    };
+    for (targets) |target| {
+        for (option_variants) |options| {
+            const pipeline = defaultPassesForTargetWithOptions(target, options);
+            try std.testing.expect(pipelineContains(pipeline, &deadCodeAndLocalSetCleanup));
+        }
+    }
+}
+
 test "threadChainedConditionalBranches: true edge jumps to inner true target" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 1, 1, 0);
