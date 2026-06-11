@@ -7906,6 +7906,56 @@ pub const WasiCliAdapter = struct {
         return fh;
     }
 
+    /// Park in `poll()` on the self-pipe waker fds of in-flight HTTP
+    /// fetches until a worker signals its waker or `cap_ns.*` elapses,
+    /// instead of waking on a fixed re-poll cadence and burning CPU
+    /// (#833). Returns `true` if it parked on a waker poll (the caller
+    /// then skips its own sleep). A pending fetch lacking a waker
+    /// (pipe-init failure) shortens `cap_ns.*` to `http_repoll_ns` so
+    /// the caller's cadence fallback still observes it promptly.
+    ///
+    /// Windows has no `poll()` path (`std.posix.pollfd` does not exist
+    /// there), so the body is `comptime`-gated off on Windows — mirroring
+    /// `waitForBackendEvents` — and only the cadence shortening applies.
+    fn parkOnHttpWakers(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        cap_ns: *u64,
+        http_repoll_ns: u64,
+    ) bool {
+        if (comptime builtin.os.tag == .windows) {
+            const pending = self.pending_http_fetches.items.len > 0 or
+                self.pending_http_fetches_p3.items.len > 0;
+            if (pending) cap_ns.* = @min(cap_ns.*, http_repoll_ns);
+            return false;
+        }
+        var waker_fds: std.ArrayListUnmanaged(std.posix.pollfd) = .empty;
+        defer waker_fds.deinit(self.allocator);
+        var http_without_waker = false;
+        for (self.pending_http_fetches.items) |entry| {
+            if (entry.shared.waker) |w| {
+                waker_fds.append(self.allocator, .{ .fd = w.read_fd, .events = pollInEvents(), .revents = 0 }) catch {};
+            } else http_without_waker = true;
+        }
+        for (self.pending_http_fetches_p3.items) |entry| {
+            if (entry.ci != ci) continue;
+            if (entry.shared.waker) |w| {
+                waker_fds.append(self.allocator, .{ .fd = w.read_fd, .events = pollInEvents(), .revents = 0 }) catch {};
+            } else http_without_waker = true;
+        }
+        if (http_without_waker) cap_ns.* = @min(cap_ns.*, http_repoll_ns);
+        if (waker_fds.items.len == 0) return false;
+        // Block until any worker signals its waker or the cap (timer
+        // deadline / UDP re-poll budget / hint) elapses.
+        const timeout_ms: i32 = blk: {
+            const ms = (cap_ns.* +| 999_999) / 1_000_000;
+            if (ms > @as(u64, @intCast(std.math.maxInt(i32)))) break :blk std.math.maxInt(i32);
+            break :blk @intCast(ms);
+        };
+        _ = std.posix.poll(waker_fds.items, timeout_ms) catch {};
+        return true;
+    }
+
     /// `ComponentInstance.async_event_driver` hook (#551). Advances the
     /// host monotonic clock (honoring `monotonic_clock_override` so unit
     /// tests stay deterministic) and drains any due timer-futures into
@@ -7995,48 +8045,25 @@ pub const WasiCliAdapter = struct {
         }
         if (have_udp_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
 
-        // Gather the self-pipe waker fds of in-flight HTTP fetches so we
-        // can park in `poll()` until a worker publishes its outcome,
-        // instead of waking on a fixed 1ms cadence and burning CPU
-        // (#833). A fetch with no waker keeps the old short re-poll.
-        var waker_fds: std.ArrayListUnmanaged(std.posix.pollfd) = .empty;
-        defer waker_fds.deinit(self.allocator);
-        var http_without_waker = false;
-        if (have_http_pending and builtin.os.tag != .windows) {
-            for (self.pending_http_fetches.items) |entry| {
-                if (entry.shared.waker) |w| {
-                    waker_fds.append(self.allocator, .{ .fd = w.read_fd, .events = pollInEvents(), .revents = 0 }) catch {};
-                } else http_without_waker = true;
+        // Park in `poll()` on the self-pipe waker fds of in-flight HTTP
+        // fetches until a worker publishes its outcome, instead of
+        // waking on a fixed 1ms cadence and burning CPU (#833). A fetch
+        // with no waker (pipe-init failure / Windows) keeps the old
+        // short re-poll, so `cap_ns` is shortened accordingly. The
+        // waker-poll lives in `parkOnHttpWakers` so the `std.posix`
+        // poll machinery is never referenced on Windows (which has no
+        // `pollfd` type), matching the `waitForBackendEvents` guard.
+        const parked = self.parkOnHttpWakers(ci, &cap_ns, http_repoll_ns);
+        if (!parked) {
+            if (cap_ns == 0 and soonest == std.math.maxInt(u64) and !have_udp_pending and !have_http_pending) return false;
+            if (cap_ns > 0) {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const duration: std.Io.Clock.Duration = .{
+                    .raw = .{ .nanoseconds = cap_ns },
+                    .clock = .awake,
+                };
+                duration.sleep(io) catch {};
             }
-            for (self.pending_http_fetches_p3.items) |entry| {
-                if (entry.ci != ci) continue;
-                if (entry.shared.waker) |w| {
-                    waker_fds.append(self.allocator, .{ .fd = w.read_fd, .events = pollInEvents(), .revents = 0 }) catch {};
-                } else http_without_waker = true;
-            }
-        } else if (have_http_pending) {
-            // Windows: `poll()` path is disabled, so keep the cadence.
-            http_without_waker = true;
-        }
-        if (http_without_waker) cap_ns = @min(cap_ns, http_repoll_ns);
-        if (cap_ns == 0 and soonest == std.math.maxInt(u64) and !have_udp_pending and !have_http_pending) return false;
-
-        if (waker_fds.items.len > 0) {
-            // Block until any worker signals its waker or the cap (timer
-            // deadline / UDP re-poll budget / hint) elapses.
-            const timeout_ms: i32 = blk: {
-                const ms = (cap_ns +| 999_999) / 1_000_000;
-                if (ms > @as(u64, @intCast(std.math.maxInt(i32)))) break :blk std.math.maxInt(i32);
-                break :blk @intCast(ms);
-            };
-            _ = std.posix.poll(waker_fds.items, timeout_ms) catch {};
-        } else if (cap_ns > 0) {
-            const io = std.Io.Threaded.global_single_threaded.io();
-            const duration: std.Io.Clock.Duration = .{
-                .raw = .{ .nanoseconds = cap_ns },
-                .clock = .awake,
-            };
-            duration.sleep(io) catch {};
         }
         var post = self.completeDueTimerFutures(ci, allocator);
         if (self.completeReadyPendingUdpReceives(ci, allocator)) post = true;
