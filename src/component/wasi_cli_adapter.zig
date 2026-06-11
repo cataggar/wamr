@@ -1691,6 +1691,76 @@ pub const PendingHttpFetchShared = struct {
     /// Adapter takes ownership of `success.body` on settle and frees
     /// it after the guest consumes the incoming-response.
     outcome: HttpFetchOutcome = .{ .failure = .internal_error },
+    /// Wakeable backend so the host block/poll loop can sleep on the
+    /// worker's completion instead of busy-spinning (#833). The worker
+    /// `signal()`s this right after publishing `done`; `pollableBackend`
+    /// (P2) and `driveAsyncEvents` (P3) hand `read_fd` to `poll()` so the
+    /// host thread parks until the round-trip finishes — matching
+    /// wasmtime's "sleep on the socket" CPU profile. `null` for direct
+    /// unit-test constructions / Windows (where the poll path is disabled).
+    waker: ?Waker = null,
+};
+
+/// Cross-platform self-pipe waker (#833). A worker thread that settles a
+/// future without owning a pollable fd (outbound HTTP, future-trailers)
+/// uses this so the host's `std.posix.poll`-based block/poll loop has a
+/// real fd to sleep on: `signal()` writes one byte from the worker and
+/// `poll()` on `read_fd` then returns. Exactly one byte is written per
+/// fetch (one worker per pipe), and the host never reads the byte — it
+/// closes both ends via `deinit()` once the settled future is observed —
+/// so the pipe buffer never fills and the blocking `write` never stalls.
+///
+/// Unsupported on Windows — the host poll path (`waitForBackendEvents`) is
+/// already a no-op there, so the pre-existing Windows busy-wait is out of
+/// scope for this fix.
+pub const Waker = struct {
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t,
+
+    pub fn init() !Waker {
+        if (comptime builtin.os.tag == .windows) return error.Unsupported;
+        var fds: [2]std.posix.fd_t = undefined;
+        switch (std.posix.errno(std.posix.system.pipe(&fds))) {
+            .SUCCESS => {},
+            else => return error.Unsupported,
+        }
+        // Best-effort close-on-exec so the pipe ends don't leak into any
+        // child the host process spawns (mirrors the socket-create path).
+        setCloexec(fds[0]);
+        setCloexec(fds[1]);
+        return .{ .read_fd = fds[0], .write_fd = fds[1] };
+    }
+
+    fn setCloexec(fd: std.posix.fd_t) void {
+        if (comptime builtin.os.tag == .windows) return;
+        while (true) switch (std.posix.errno(std.posix.system.fcntl(
+            fd,
+            std.posix.F.SETFD,
+            @as(usize, std.posix.FD_CLOEXEC),
+        ))) {
+            .INTR => continue,
+            else => break,
+        };
+    }
+
+    /// Wake any `poll()` parked on `read_fd`. Called from the worker
+    /// thread after `done.store(.release)`.
+    pub fn signal(self: Waker) void {
+        if (comptime builtin.os.tag == .windows) return;
+        const byte = [_]u8{1};
+        while (true) switch (std.posix.errno(std.posix.system.write(self.write_fd, &byte, 1))) {
+            .INTR => continue,
+            else => break,
+        };
+    }
+
+    pub fn deinit(self: *Waker) void {
+        if (comptime builtin.os.tag == .windows) return;
+        _ = std.posix.system.close(self.read_fd);
+        _ = std.posix.system.close(self.write_fd);
+        self.read_fd = -1;
+        self.write_fd = -1;
+    }
 };
 
 /// One in-flight outbound HTTP fetch driven by a dedicated worker
@@ -4659,6 +4729,7 @@ pub const WasiCliAdapter = struct {
                 .success => |s| self.allocator.free(s.body),
                 .failure => {},
             }
+            if (entry.shared.waker) |*w| w.deinit();
             self.allocator.destroy(entry.shared);
             if (entry.guest_dropped) {
                 const fh = entry.future_handle;
@@ -4688,6 +4759,7 @@ pub const WasiCliAdapter = struct {
                 },
                 .failure => {},
             }
+            if (entry.shared.waker) |*w| w.deinit();
             self.allocator.destroy(entry.shared);
         }
         self.pending_http_fetches_p3.deinit(self.allocator);
@@ -5867,6 +5939,25 @@ pub const WasiCliAdapter = struct {
                 if (socket.stream_generation != ref.generation) return null;
                 const host_socket = socket.host_socket orelse return null;
                 return .{ .fd = host_socket.handle, .events = pollOutEvents() };
+            },
+            .http_future_response => |handle| {
+                // An outbound HTTP fetch is settled by its worker thread,
+                // not by an fd this adapter owns. Hand `poll()` the
+                // fetch's self-pipe waker so the host sleeps until the
+                // worker publishes its outcome instead of busy-spinning
+                // (#833). Already-settled futures return null so the
+                // `pollableIsReady` fast-path resolves the block instead.
+                const future = self.lookupFutureResponse(handle) orelse return null;
+                if (future.polled or future.state != .pending) return null;
+                for (self.pending_http_fetches.items) |entry| {
+                    if (entry.future_handle == handle) {
+                        if (entry.shared.waker) |w| {
+                            return .{ .fd = w.read_fd, .events = pollInEvents() };
+                        }
+                        return null;
+                    }
+                }
+                return null;
             },
             else => return null,
         }
@@ -7214,6 +7305,11 @@ pub const WasiCliAdapter = struct {
         defer alloc.destroy(req);
         defer req.deinit();
         const shared = req.shared;
+        // Wake the host's block/poll loop once the outcome is published.
+        // A top-level defer fires after every `done.store(.release)` path
+        // below (pre-fetch cancel, cancel, error, success), so the host's
+        // `poll()` on the waker fd always unparks. (#833)
+        defer if (shared.waker) |w| w.signal();
 
         // Honor a pre-fetch cancel before doing any network work.
         // `httpClientLowLevelFetch`'s pre-connect check below would
@@ -7288,6 +7384,7 @@ pub const WasiCliAdapter = struct {
             // Worker has published — join is non-blocking.
             entry.thread.join();
             self.settlePendingHttpFetch(entry);
+            if (entry.shared.waker) |*w| w.deinit();
             self.allocator.destroy(entry.shared);
             // Slot-reuse protection: if the guest had dropped the
             // future while the worker was in flight,
@@ -7440,6 +7537,12 @@ pub const WasiCliAdapter = struct {
         const shared = try self.allocator.create(PendingHttpFetchShared);
         errdefer self.allocator.destroy(shared);
         shared.* = .{};
+        // Self-pipe waker so the host can sleep on this fetch's
+        // completion instead of busy-spinning (#833). Pipe-creation
+        // failure (or Windows) degrades to a `null` waker — correctness
+        // is unaffected, only the old re-poll cadence returns.
+        shared.waker = Waker.init() catch null;
+        errdefer if (shared.waker) |*w| w.deinit();
 
         const req = try self.allocator.create(HttpFetchRequest);
         errdefer self.allocator.destroy(req);
@@ -7530,6 +7633,10 @@ pub const WasiCliAdapter = struct {
         const shared = try self.allocator.create(PendingHttpFetchShared);
         errdefer self.allocator.destroy(shared);
         shared.* = .{};
+        // Self-pipe waker so the host can sleep on this fetch's
+        // completion instead of re-polling on a 1ms cadence (#833).
+        shared.waker = Waker.init() catch null;
+        errdefer if (shared.waker) |*w| w.deinit();
 
         const req = try self.allocator.create(HttpFetchRequest);
         errdefer self.allocator.destroy(req);
@@ -7597,6 +7704,7 @@ pub const WasiCliAdapter = struct {
             // Worker has published — join is non-blocking.
             entry.thread.join();
             self.settlePendingHttpFetchP3(entry, allocator);
+            if (entry.shared.waker) |*w| w.deinit();
             self.allocator.destroy(entry.shared);
             _ = self.pending_http_fetches_p3.swapRemove(i);
         }
@@ -7876,9 +7984,9 @@ pub const WasiCliAdapter = struct {
         // readiness from `sleep`, so we re-enter to call
         // `fdPollReady` again.
         const udp_repoll_ns: u64 = 1 * std.time.ns_per_ms;
-        // Pending HTTP fetches use the same re-poll cadence: the
-        // worker thread will publish via the shared atomic flag, so
-        // we wake briefly to observe it. (#583 A2)
+        // Pending HTTP fetches lacking a self-pipe waker (pipe-init
+        // failure / Windows) fall back to a short re-poll cadence; ones
+        // with a waker are slept on directly via `poll()` below (#833).
         const http_repoll_ns: u64 = 1 * std.time.ns_per_ms;
         var cap_ns: u64 = hint_ns;
         if (soonest != std.math.maxInt(u64)) {
@@ -7886,10 +7994,43 @@ pub const WasiCliAdapter = struct {
             cap_ns = @min(cap_ns, delta_ns);
         }
         if (have_udp_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
-        if (have_http_pending) cap_ns = @min(cap_ns, http_repoll_ns);
+
+        // Gather the self-pipe waker fds of in-flight HTTP fetches so we
+        // can park in `poll()` until a worker publishes its outcome,
+        // instead of waking on a fixed 1ms cadence and burning CPU
+        // (#833). A fetch with no waker keeps the old short re-poll.
+        var waker_fds: std.ArrayListUnmanaged(std.posix.pollfd) = .empty;
+        defer waker_fds.deinit(self.allocator);
+        var http_without_waker = false;
+        if (have_http_pending and builtin.os.tag != .windows) {
+            for (self.pending_http_fetches.items) |entry| {
+                if (entry.shared.waker) |w| {
+                    waker_fds.append(self.allocator, .{ .fd = w.read_fd, .events = pollInEvents(), .revents = 0 }) catch {};
+                } else http_without_waker = true;
+            }
+            for (self.pending_http_fetches_p3.items) |entry| {
+                if (entry.ci != ci) continue;
+                if (entry.shared.waker) |w| {
+                    waker_fds.append(self.allocator, .{ .fd = w.read_fd, .events = pollInEvents(), .revents = 0 }) catch {};
+                } else http_without_waker = true;
+            }
+        } else if (have_http_pending) {
+            // Windows: `poll()` path is disabled, so keep the cadence.
+            http_without_waker = true;
+        }
+        if (http_without_waker) cap_ns = @min(cap_ns, http_repoll_ns);
         if (cap_ns == 0 and soonest == std.math.maxInt(u64) and !have_udp_pending and !have_http_pending) return false;
 
-        if (cap_ns > 0) {
+        if (waker_fds.items.len > 0) {
+            // Block until any worker signals its waker or the cap (timer
+            // deadline / UDP re-poll budget / hint) elapses.
+            const timeout_ms: i32 = blk: {
+                const ms = (cap_ns +| 999_999) / 1_000_000;
+                if (ms > @as(u64, @intCast(std.math.maxInt(i32)))) break :blk std.math.maxInt(i32);
+                break :blk @intCast(ms);
+            };
+            _ = std.posix.poll(waker_fds.items, timeout_ms) catch {};
+        } else if (cap_ns > 0) {
             const io = std.Io.Threaded.global_single_threaded.io();
             const duration: std.Io.Clock.Duration = .{
                 .raw = .{ .nanoseconds = cap_ns },
@@ -37272,6 +37413,69 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: outbound HTTP fetch flips shared.
         ),
         else => return error.UnexpectedHttpFutureState,
     }
+}
+
+test "wasi:http #833: in-flight HTTP future exposes a wakeable backend fd (no busy-spin)" {
+    // Before #833 the `.http_future_response` pollable had no backend
+    // fd, so `waitForBackendEvents` saw zero fds and returned at once →
+    // the guest tight-looped `block → get(pending) → block`. With a
+    // self-pipe waker, `pollableBackend` now hands `poll()` a real fd
+    // that the worker signals on completion, so the host parks instead
+    // of spinning.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const fut = try testing.allocator.create(FutureIncomingResponse);
+    fut.* = .{ .state = .pending };
+    const fh = try adapter.pushFutureResponse(fut);
+
+    const shared = try adapter.allocator.create(PendingHttpFetchShared);
+    shared.* = .{};
+    shared.waker = try Waker.init();
+
+    // Worker that publishes `done` + signals the waker after a short
+    // delay — the exact `httpFetchWorker` completion sequence.
+    const Worker = struct {
+        fn run(s: *PendingHttpFetchShared) void {
+            const w_io = std.Io.Threaded.global_single_threaded.io();
+            const d: std.Io.Clock.Duration = .{
+                .raw = .{ .nanoseconds = 20 * std.time.ns_per_ms },
+                .clock = .awake,
+            };
+            d.sleep(w_io) catch {};
+            s.outcome = .{ .failure = .internal_error };
+            s.done.store(true, .release);
+            if (s.waker) |w| w.signal();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{shared});
+    try adapter.pending_http_fetches.append(adapter.allocator, .{
+        .future_handle = fh,
+        .thread = t,
+        .shared = shared,
+    });
+
+    // The future's pollable now reports a backend fd.
+    const backend = adapter.pollableBackend(.{ .http_future_response = fh });
+    try testing.expect(backend != null);
+
+    // `poll()` on that fd must block until the worker signals — verify
+    // it parks for a meaningful interval rather than returning instantly.
+    const ph = try adapter.pushPollable(.{ .http_future_response = fh });
+    const handles = [_]u32{ph};
+    const start = adapter.monotonicNs();
+    const used = try adapter.waitForBackendEvents(&handles, 5_000);
+    const elapsed_ns = adapter.monotonicNs() - start;
+    try testing.expect(used);
+    try testing.expect(elapsed_ns >= 5 * std.time.ns_per_ms);
+
+    // Drain settles the future and closes the waker fds (no leak).
+    adapter.drainPendingHttpFetches();
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches.items.len);
+    const settled = adapter.lookupFutureResponse(fh).?;
+    try testing.expect(settled.state != .pending);
 }
 
 test "wasi:http #583 B1 follow-up: httpClientLowLevelFetch observes pre-connect cancel without syscall" {
