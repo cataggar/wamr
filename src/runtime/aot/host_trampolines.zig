@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const platform = @import("../../platform/platform.zig");
 const core_types = @import("../common/types.zig");
 
+const is_windows = builtin.os.tag == .windows;
 const page_size = std.heap.page_size_min;
 // Stubs forward up to 10 lowered C-ABI args (a0..a9) into `genericDispatcher`,
 // so the dispatcher kinds can carry up to 9 wasm-level params (after dropping
@@ -18,9 +19,13 @@ const page_size = std.heap.page_size_min;
 // params).
 const x86_64_stub_bytes: usize = 63;
 const aarch64_stub_bytes: usize = 84;
+// Windows x86-64 uses the Win64 ABI (rcx, rdx, r8, r9 + stack with a 32-byte
+// shadow space), which needs a different — and larger — arg-shifting shim
+// than the SysV encoder. See `encodeWin64Stub`.
+const windows_x86_64_stub_bytes: usize = 118;
 
 pub const STUB_BYTES: usize = switch (builtin.cpu.arch) {
-    .x86_64 => x86_64_stub_bytes,
+    .x86_64 => if (builtin.os.tag == .windows) windows_x86_64_stub_bytes else x86_64_stub_bytes,
     .aarch64 => aarch64_stub_bytes,
     else => 1,
 };
@@ -345,8 +350,14 @@ pub const TrampolinePool = struct {
     // `platform.jitWriteProtect`). Required so cross-instance / canon-lower
     // thunks resolve on Apple Silicon instead of trap-stubbing and then
     // segfaulting (the wasi:http component path).
+    //
+    // Windows x86-64 IS supported (#831 follow-up): `std.posix.mmap` is
+    // POSIX-only, so the pool routes its RWX page allocation through the
+    // platform layer's NT-API `platform.mmap` (PAGE_EXECUTE_READWRITE)
+    // instead — see `initWithCap`. The stub uses the Win64 ABI encoder
+    // (`encodeWin64Stub`). aarch64-windows is not wired yet.
     const supports_pool: bool = blk: {
-        if (builtin.os.tag == .windows) break :blk false;
+        if (builtin.os.tag == .windows) break :blk builtin.cpu.arch == .x86_64;
         if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) break :blk false;
         break :blk true;
     };
@@ -366,20 +377,34 @@ pub const TrampolinePool = struct {
         errdefer allocator.free(slots);
 
         const map_len = std.mem.alignForward(usize, @as(usize, cap) * STUB_BYTES, page_size);
-        // macOS aarch64 needs MAP_JIT; the field only exists on darwin so
-        // build the flags via a comptime branch to stay portable.
-        const map_flags: std.posix.MAP = if (comptime platform.macos_jit)
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .JIT = true }
-        else
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
-        const memory = try std.posix.mmap(
-            null,
-            map_len,
-            .{ .READ = true, .WRITE = true, .EXEC = true },
-            map_flags,
-            -1,
-            0,
-        );
+        const memory: []align(page_size) u8 = if (comptime is_windows) win: {
+            // Windows: `std.posix.mmap` is POSIX-only (and pulls in libc),
+            // so allocate the RWX region through the platform layer's
+            // NT-API mapping, which commits PAGE_EXECUTE_READWRITE pages.
+            const ptr = platform.mmap(
+                null,
+                map_len,
+                .{ .read = true, .write = true, .exec = true },
+                .{},
+            ) orelse return error.OutOfMemory;
+            // NtAllocateVirtualMemory hands back page-aligned memory.
+            break :win @as([*]align(page_size) u8, @alignCast(ptr))[0..map_len];
+        } else posix: {
+            // macOS aarch64 needs MAP_JIT; the field only exists on darwin so
+            // build the flags via a comptime branch to stay portable.
+            const map_flags: std.posix.MAP = if (comptime platform.macos_jit)
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .JIT = true }
+            else
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+            break :posix try std.posix.mmap(
+                null,
+                map_len,
+                .{ .READ = true, .WRITE = true, .EXEC = true },
+                map_flags,
+                -1,
+                0,
+            );
+        };
         // Under MAP_JIT the region starts execute-protected for this
         // thread; flip it writable to zero-fill, then back to executable.
         platform.jitWriteProtect(false);
@@ -577,7 +602,11 @@ pub const TrampolinePool = struct {
             return;
         }
         if (g_active_pool == self) g_active_pool = null;
-        std.posix.munmap(self.memory);
+        if (comptime is_windows) {
+            platform.munmap(self.memory.ptr, self.memory.len);
+        } else {
+            std.posix.munmap(self.memory);
+        }
         allocator.free(self.slots);
         self.* = undefined;
     }
@@ -607,7 +636,10 @@ pub const TrampolinePool = struct {
 fn writeStub(bytes: []u8, slot: u32) void {
     @memset(bytes, 0);
     switch (builtin.cpu.arch) {
-        .x86_64 => encodeX8664Stub(bytes, slot, dispatcherAddr()),
+        .x86_64 => if (comptime is_windows)
+            encodeWin64Stub(bytes, slot, dispatcherAddr())
+        else
+            encodeX8664Stub(bytes, slot, dispatcherAddr()),
         .aarch64 => encodeAarch64Stub(bytes, slot, dispatcherAddr()),
         else => unreachable,
     }
@@ -618,7 +650,7 @@ fn dispatcherAddr() usize {
 }
 
 fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
-    std.debug.assert(bytes.len >= STUB_BYTES);
+    std.debug.assert(bytes.len >= x86_64_stub_bytes);
 
     // Caller passes up to 10 args (a0..a9): a0..a5 in regs (rdi, rsi, rdx,
     // rcx, r8, r9), a6/a7/a8/a9 on stack at [rsp+8/+16/+24/+32]. We inject
@@ -687,8 +719,76 @@ fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     std.debug.assert(cursor == x86_64_stub_bytes);
 }
 
+fn encodeWin64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
+    std.debug.assert(bytes.len >= windows_x86_64_stub_bytes);
+
+    // Win64 ABI. Incoming (the AOT/JIT host-call site): a0..a3 in rcx, rdx,
+    // r8, r9; a4..a9 on the stack above the caller's 32-byte shadow space,
+    // so at [rsp+0x28], [rsp+0x30], … [rsp+0x50] once `call` has pushed the
+    // return address. We inject `slot` as the new first arg and forward
+    // a0..a9, so `genericDispatcher` receives 11 args (slot + a0..a9):
+    // rcx=slot, rdx=a0, r8=a1, r9=a2, then a3..a9 in the outgoing stack-arg
+    // area above OUR freshly allocated shadow space at [rsp+0x20..+0x50].
+    //
+    // We reserve a 0x58-byte outgoing frame: 0x20 shadow + 7 stack args
+    // (a3..a9) * 8 = 0x38. Alignment: at stub entry rsp%16==8 (caller's
+    // pre-call rsp was 16-aligned, `call` pushed 8). `sub rsp, 0x58`
+    // (0x58 % 16 == 8) → rsp%16==0 before `call rax`, which pushes 8 → the
+    // dispatcher enters with rsp%16==8, satisfying Win64's alignment rule.
+    //
+    // After `sub rsp, 0x58`, the caller's incoming stack args have shifted
+    // up by 0x58: incoming a4 (was at [rsp+0x28]) is now at [rsp+0x80],
+    // a5 at [rsp+0x88], … a9 at [rsp+0xA8].
+
+    // Prologue (19 bytes): allocate frame, spill a3 to the outgoing
+    // stack-arg slot, shift the register args up by one, inject slot.
+    const prologue = [_]u8{
+        0x48, 0x83, 0xEC, 0x58, // sub rsp, 0x58
+        0x4C, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+0x20], r9   (a3 -> dispatcher stack arg)
+        0x4D, 0x89, 0xC1, // mov r9, r8           (a2)
+        0x49, 0x89, 0xD0, // mov r8, rdx          (a1)
+        0x48, 0x89, 0xCA, // mov rdx, rcx         (a0)
+        0xB9, // mov ecx, imm32 (slot)
+    };
+    // Stack-arg relay (78 bytes): copy incoming a4..a9 from the shifted
+    // caller frame ([rsp+0x80..+0xA8]) down into the outgoing stack-arg
+    // slots ([rsp+0x28..+0x50]) via rax. Loads use disp32 (offsets > 0x7F);
+    // stores use disp8.
+    const stack_copies = [_]u8{
+        0x48, 0x8B, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x28, // a4
+        0x48, 0x8B, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x30, // a5
+        0x48, 0x8B, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x38, // a6
+        0x48, 0x8B, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x40, // a7
+        0x48, 0x8B, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x48, // a8
+        0x48, 0x8B, 0x84, 0x24, 0xA8, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x50, // a9
+    };
+    const movabs = [_]u8{ 0x48, 0xB8 }; // movabs rax, imm64
+    // Epilogue (7 bytes): call dispatcher, drop the 0x58 frame, return.
+    const epilogue = [_]u8{
+        0xFF, 0xD0, // call rax
+        0x48, 0x83, 0xC4, 0x58, // add rsp, 0x58
+        0xC3, // ret
+    };
+
+    var cursor: usize = 0;
+    @memcpy(bytes[cursor .. cursor + prologue.len], &prologue);
+    cursor += prologue.len;
+    writeIntLittle(u32, bytes[cursor .. cursor + 4], slot);
+    cursor += 4;
+    @memcpy(bytes[cursor .. cursor + stack_copies.len], &stack_copies);
+    cursor += stack_copies.len;
+    @memcpy(bytes[cursor .. cursor + movabs.len], &movabs);
+    cursor += movabs.len;
+    writeIntLittle(u64, bytes[cursor .. cursor + 8], @intCast(dispatcher));
+    cursor += 8;
+    @memcpy(bytes[cursor .. cursor + epilogue.len], &epilogue);
+    cursor += epilogue.len;
+
+    std.debug.assert(cursor == windows_x86_64_stub_bytes);
+}
+
 fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
-    std.debug.assert(bytes.len >= STUB_BYTES);
+    std.debug.assert(bytes.len >= aarch64_stub_bytes);
 
     // AAPCS64: a0..a7 in x0..x7, a8 on stack at [sp+0], a9 at [sp+8]. We
     // inject `slot` as x0 and forward a0..a9 to the dispatcher, so
@@ -799,6 +899,55 @@ test "#648 phase 2: x86_64 trampoline encoder emits slot and dispatcher immediat
     for (bytes[expected.len..]) |byte| {
         try std.testing.expectEqual(@as(u8, 0), byte);
     }
+}
+
+test "win64 trampoline encoder emits slot and dispatcher immediates" {
+    var bytes: [windows_x86_64_stub_bytes]u8 = undefined;
+    @memset(&bytes, 0);
+
+    encodeWin64Stub(&bytes, 0x11223344, 0x1122334455667788);
+
+    // Win64 layout: sub rsp,0x58; spill r9 (a3) to [rsp+0x20]; shift
+    // r9<-r8, r8<-rdx, rdx<-rcx; mov ecx, slot; relay incoming a4..a9 from
+    // [rsp+0x80..+0xA8] to [rsp+0x28..+0x50]; movabs rax, dispatcher;
+    // call rax; add rsp,0x58; ret.
+    const expected = [_]u8{
+        // prologue
+        0x48, 0x83, 0xEC, 0x58, // sub rsp, 0x58
+        0x4C, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+0x20], r9
+        0x4D, 0x89, 0xC1, // mov r9, r8
+        0x49, 0x89, 0xD0, // mov r8, rdx
+        0x48, 0x89, 0xCA, // mov rdx, rcx
+        0xB9, 0x44, 0x33, 0x22, 0x11, // mov ecx, 0x11223344
+        // stack relay a4..a9
+        0x48, 0x8B, 0x84, 0x24, 0x80,
+        0x00, 0x00, 0x00, 0x48, 0x89,
+        0x44, 0x24, 0x28, 0x48, 0x8B,
+        0x84, 0x24, 0x88, 0x00, 0x00,
+        0x00, 0x48, 0x89, 0x44, 0x24,
+        0x30, 0x48, 0x8B, 0x84, 0x24,
+        0x90, 0x00, 0x00, 0x00, 0x48,
+        0x89, 0x44, 0x24, 0x38, 0x48,
+        0x8B, 0x84, 0x24, 0x98, 0x00,
+        0x00, 0x00, 0x48, 0x89, 0x44,
+        0x24, 0x40, 0x48, 0x8B, 0x84,
+        0x24, 0xA0, 0x00, 0x00, 0x00,
+        0x48, 0x89, 0x44, 0x24, 0x48,
+        0x48, 0x8B, 0x84, 0x24, 0xA8,
+        0x00, 0x00, 0x00, 0x48, 0x89,
+        0x44, 0x24, 0x50,
+        // movabs rax, dispatcher
+        0x48, 0xB8,
+        0x88, 0x77, 0x66, 0x55, 0x44,
+        0x33, 0x22, 0x11,
+        // epilogue
+        0xFF, 0xD0, // call rax
+        0x48, 0x83, 0xC4, 0x58, // add rsp, 0x58
+        0xC3, // ret
+    };
+
+    try std.testing.expectEqual(@as(usize, windows_x86_64_stub_bytes), expected.len);
+    try std.testing.expectEqualSlices(u8, &expected, bytes[0..expected.len]);
 }
 
 test "#648 phase 2: aarch64 trampoline encoder emits slot and dispatcher immediates" {
