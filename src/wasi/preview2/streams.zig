@@ -211,6 +211,11 @@ pub const OutputStream = struct {
                 return .{ .ok = data.len };
             },
             .tcp_stream => |fd| {
+                // A zero-length write is a no-op on a socket, and on
+                // Windows `netWrite` with an empty buffer fails with
+                // `INVALID_PARAMETER` — short-circuit it (e.g. an empty
+                // HTTP response body, the `404, ""` case).
+                if (data.len == 0) return .{ .ok = 0 };
                 const io = std.Io.Threaded.global_single_threaded.io();
                 const slices = [_][]const u8{data};
                 _ = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch
