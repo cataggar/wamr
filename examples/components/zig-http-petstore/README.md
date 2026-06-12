@@ -101,33 +101,39 @@ must see those resources already in the world's type-indexspace. See the
 
 ## Source walkthrough
 
-The handler is hand-written canonical ABI — no Zig `wit-bindgen`
-equivalent exists, so each call into `wasi:http/types@0.2.6` /
-`wasi:io/streams@0.2.6` declares the lowered core signature directly at
-the `extern "wasi:…"` declarations in [`src/main.zig`](src/main.zig).
-The lowering rules (`MAX_FLAT_PARAMS=16`, `MAX_FLAT_RESULTS=1`) mean any
-result wider than one core value is returned through a guest-allocated
-ret-area pointer (the last param).
+The canonical-ABI bridge lives in the shared
+[`wit_http`](../../../src/guest/wit_http.zig) helper module
+(`@import("wit_http")`) — the same one the `zig-http` example uses.
+There is no Zig `wit-bindgen` backend, so `wit_http` hand-writes the
+host imports, ret-area decoding, the `cabi_realloc` scratch arena, and
+the `wasi:http/incoming-handler@0.2.6#handle` export once, behind a
+typed API (`Request`, `Responder`, `Method`). This file is just the
+petstore routing + JSON logic.
 
-`cabi_realloc` is a bump arena (64 KiB, reset per request) the host uses
-to materialize the request path, the request method's `other(string)`
-payload, and each `POST` body read chunk. Response JSON is built into a
-separate fixed buffer, and created-pet strings are copied into a
-persistent store buffer so they outlive the per-request arena.
+The example reads the request through `wit.Request`
+(`req.method()`, `req.path()`, `req.readBody()`) and replies through
+`wit.Responder` (`res.respondWithContentType(status, "application/json",
+body)`), which hides the whole `fields → outgoing-response →
+outgoing-body → output-stream → finish → response-outparam.set`
+sequence. Response JSON is built with `std.json.Stringify` into a fixed
+buffer; created-pet strings are copied into a persistent store buffer so
+they outlive the per-request scratch arena.
 
 Request flow:
 
-1. `incoming-request.method` → route on `GET` / `POST` / `DELETE`.
-2. `incoming-request.path-with-query` → split path + query, match route.
-3. For `POST /pets`: `incoming-request.consume` →
-   `incoming-body.stream` → repeated `input-stream.blocking-read` until
-   the `closed` (err) arm, then `std.json.parseFromSlice` (over a
-   `FixedBufferAllocator`) decodes the body into a `Pet` wire struct.
-4. Build the JSON response with `std.json.Stringify`, `fields.append`
-   `content-type`, construct the `outgoing-response`, optionally bump
-   `set-status-code`, write the body via `outgoing-body` →
-   `output-stream.blocking-write-and-flush`, `outgoing-body.finish`, and
-   deliver via `response-outparam.set`.
+1. `req.method()` → route on `GET` / `POST` / `DELETE`.
+2. `req.path()` → split path + query, match route.
+3. For `POST /pets`: `req.readBody()` pulls the body (the helper drives
+   `consume → stream → blocking-read` until end-of-stream), then
+   `std.json.parseFromSlice` (over a `FixedBufferAllocator`) decodes it
+   into a `Pet` wire struct.
+4. `res.respondWithContentType(status, "application/json", json)`
+   delivers the response.
+
+Because Zig drops unreferenced `extern`s, this example imports the full
+`wit_http` surface it uses (method, body read, `fields.append`) while
+`zig-http` — which calls only `path()` + `respond()` — links against a
+strictly smaller import set, so each keeps a minimal WIT world.
 
 ## Build pipeline
 

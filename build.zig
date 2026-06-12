@@ -1369,6 +1369,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http.core.wasm",
+        .imports = &.{.{ .name = "wit_http", .path = "src/guest/wit_http.zig" }},
     });
     const http_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "http-hello" });
     http_embed.addDirectoryArg(b.path("examples/components/zig-http/wit"));
@@ -1426,6 +1427,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http-petstore.core.wasm",
+        .imports = &.{.{ .name = "wit_http", .path = "src/guest/wit_http.zig" }},
     });
     const petstore_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "petstore" });
     petstore_embed.addDirectoryArg(b.path("examples/components/zig-http-petstore/wit"));
@@ -1533,10 +1535,24 @@ const ZigWasmCompile = struct {
     /// also names the entrypoint when `_start` is the only export.
     exports: []const []const u8,
     output: []const u8,
+    /// Extra Zig modules made importable from the root source via
+    /// `@import("<name>")`. Used by the wasi:http examples to share the
+    /// guest-side `wit_http` canonical-ABI helper (`src/guest/wit_http.zig`).
+    imports: []const ZigWasmImport = &.{},
+};
+
+const ZigWasmImport = struct {
+    /// Import name, e.g. `wit_http` for `@import("wit_http")`.
+    name: []const u8,
+    /// Repo-relative path to the module's root source file.
+    path: []const u8,
 };
 
 /// Invokes `zig build-exe -target <…> -O ReleaseSmall -fno-entry --export=<…>`
 /// via `b.graph.zig_exe`, capturing the output as a build-graph LazyPath.
+/// When `opts.imports` is non-empty the source is passed via `-Mroot=` and
+/// each import as `--dep <name> -M<name>=<path>` so the root can
+/// `@import("<name>")`.
 fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         b.graph.zig_exe, "build-exe",
@@ -1547,7 +1563,20 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     for (opts.exports) |sym| {
         cmd.addArg(b.fmt("--export={s}", .{sym}));
     }
-    cmd.addFileArg(b.path(opts.source));
+    if (opts.imports.len == 0) {
+        cmd.addFileArg(b.path(opts.source));
+    } else {
+        // `--dep` flags attach to the next `-M` module (the root), so they
+        // must precede `-Mroot=`. The root module is named `root`.
+        for (opts.imports) |imp| {
+            cmd.addArg("--dep");
+            cmd.addArg(imp.name);
+        }
+        cmd.addPrefixedFileArg("-Mroot=", b.path(opts.source));
+        for (opts.imports) |imp| {
+            cmd.addPrefixedFileArg(b.fmt("-M{s}=", .{imp.name}), b.path(imp.path));
+        }
+    }
     const out = cmd.addPrefixedOutputFileArg("-femit-bin=", opts.output);
     cmd.setName(b.fmt("zig build-exe {s}", .{opts.output}));
     return out;

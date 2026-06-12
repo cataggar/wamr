@@ -17,134 +17,21 @@
 //!   wamr run --listen=127.0.0.1:8080 zig-http-petstore.component.wasm
 //!   curl -i http://127.0.0.1:8080/pets
 //!
-//! Like the sibling `zig-http` example, the handler is hand-written
-//! canonical ABI: each call into `wasi:http/types@0.2.6` /
-//! `wasi:io/streams@0.2.6` declares the lowered core signature directly
-//! (no Zig wit-bindgen equivalent exists). Lowered sigs follow
-//! `MAX_FLAT_PARAMS=16`, `MAX_FLAT_RESULTS=1` — any result whose flat
-//! representation exceeds 1 core value is returned via a guest-allocated
-//! ret-area pointer passed as the last param.
+//! The canonical-ABI plumbing (host imports, ret-area decoding, the
+//! `cabi_realloc` arena, and the `wasi:http/incoming-handler` export
+//! wiring) lives in the shared `wit_http` helper module (imported as
+//! `@import("wit_http")`; source at `src/guest/wit_http.zig`). This
+//! file is just the petstore routing + JSON logic. See that module's
+//! doc comment for how the canonical ABI is bridged.
 //!
 //! See `../README.md` for the WIT layout and build pipeline.
 
 const std = @import("std");
+const wit = @import("wit_http");
 
-// ── cabi_realloc bump arena ────────────────────────────────────────
-//
-// Canonical-ABI lifts of host-side `string` / `list` values into guest
-// memory call `cabi_realloc`; the host materializes the request path,
-// the request method's `other(string)` payload, and each request-body
-// read chunk here. The arena resets at the top of every `handle` call.
-
-var arena_buf: [65536]u8 align(16) = undefined;
-var arena_top: usize = 0;
-
-inline fn alignUp(x: usize, a: usize) usize {
-    return (x + a - 1) & ~(a - 1);
+comptime {
+    wit.exportIncomingHandler(handle);
 }
-
-fn arenaAlloc(comptime T: type, n: usize, alignment: usize) [*]T {
-    const a = if (alignment == 0) @alignOf(T) else alignment;
-    const start = alignUp(arena_top, a);
-    const bytes = n * @sizeOf(T);
-    arena_top = start + bytes;
-    return @ptrCast(@alignCast(&arena_buf[start]));
-}
-
-export fn cabi_realloc(
-    _: usize, // old_ptr — we never free
-    _: usize, // old_size
-    alignment: usize,
-    new_size: usize,
-) usize {
-    if (new_size == 0) return 0;
-    const a = if (alignment == 0) 1 else alignment;
-    const start = alignUp(arena_top, a);
-    if (start + new_size > arena_buf.len) return 0;
-    arena_top = start + new_size;
-    return @intFromPtr(&arena_buf[start]);
-}
-
-// ── Host imports (canonical-ABI lowered signatures) ────────────────
-
-/// `[constructor]fields() -> own<fields>`.
-extern "wasi:http/types@0.2.6" fn @"[constructor]fields"() i32;
-
-/// `[method]fields.append(borrow, field-name (string), field-value (list<u8>))
-///   -> result<_, header-error>`. `string` + `list<u8>` each lower to
-/// (ptr, len); the `result<_, header-error>` is 2 i32s → retptr
-/// [disc, header-err-disc]. The handler ignores the result.
-extern "wasi:http/types@0.2.6" fn @"[method]fields.append"(
-    self: i32,
-    name_ptr: i32,
-    name_len: i32,
-    value_ptr: i32,
-    value_len: i32,
-    retptr: i32,
-) void;
-
-/// `[constructor]outgoing-response(own<fields>) -> own<outgoing-response>`.
-extern "wasi:http/types@0.2.6" fn @"[constructor]outgoing-response"(headers: i32) i32;
-
-/// `[method]outgoing-response.set-status-code(borrow, u16) -> result`.
-extern "wasi:http/types@0.2.6" fn @"[method]outgoing-response.set-status-code"(self: i32, status: i32) i32;
-
-/// `[method]outgoing-response.body(borrow) -> result<own<outgoing-body>>`.
-/// retptr → [disc, body_handle].
-extern "wasi:http/types@0.2.6" fn @"[method]outgoing-response.body"(self: i32, retptr: i32) void;
-
-/// `[method]outgoing-body.write(borrow) -> result<own<output-stream>>`.
-/// retptr → [disc, stream_handle].
-extern "wasi:http/types@0.2.6" fn @"[method]outgoing-body.write"(self: i32, retptr: i32) void;
-
-/// `[static]outgoing-body.finish(own<outgoing-body>, option<own<fields>>)
-///   -> result<_, error-code>`. `option<own<fields>>` lowers to
-/// (disc, value); result is up to 5 i32s → retptr.
-extern "wasi:http/types@0.2.6" fn @"[static]outgoing-body.finish"(this: i32, trailers_disc: i32, trailers_val: i32, retptr: i32) void;
-
-/// `[method]incoming-request.method(borrow) -> method`. The `method`
-/// variant's widest arm is `other(string)`, so the flat result is 3
-/// i32s → retptr [disc, ptr, len]. For get/post/delete the disc alone
-/// (0 / 2 / 4) is meaningful.
-extern "wasi:http/types@0.2.6" fn @"[method]incoming-request.method"(self: i32, retptr: i32) void;
-
-/// `[method]incoming-request.path-with-query(borrow) -> option<string>`.
-/// retptr → [disc, ptr, len].
-extern "wasi:http/types@0.2.6" fn @"[method]incoming-request.path-with-query"(self: i32, retptr: i32) void;
-
-/// `[method]incoming-request.consume(borrow) -> result<own<incoming-body>>`.
-/// retptr → [disc, body_handle].
-extern "wasi:http/types@0.2.6" fn @"[method]incoming-request.consume"(self: i32, retptr: i32) void;
-
-/// `[method]incoming-body.stream(borrow) -> result<own<input-stream>>`.
-/// retptr → [disc, stream_handle].
-extern "wasi:http/types@0.2.6" fn @"[method]incoming-body.stream"(self: i32, retptr: i32) void;
-
-/// `[static]response-outparam.set(own<response-outparam>,
-///   result<own<outgoing-response>, error-code>) -> ()`. Result lowers
-/// to (disc, payload[0..3]); ok packs payload[0]=own<outgoing-response>.
-extern "wasi:http/types@0.2.6" fn @"[static]response-outparam.set"(
-    outparam: i32,
-    resp_disc: i32,
-    resp_p0: i32,
-    resp_p1: i32,
-    resp_p2: i32,
-    resp_p3: i32,
-) void;
-
-/// `[method]input-stream.blocking-read(borrow, u64) -> result<list<u8>, stream-error>`.
-/// `u64` lowers to i64; result is 3 i32s → retptr [disc, ptr, len].
-/// End-of-body surfaces as the err arm (disc=1).
-extern "wasi:io/streams@0.2.6" fn @"[method]input-stream.blocking-read"(self: i32, len: i64, retptr: i32) void;
-
-/// `[method]output-stream.blocking-write-and-flush(borrow, list<u8>) -> result<_, stream-error>`.
-/// retptr → [disc, stream_err_disc].
-extern "wasi:io/streams@0.2.6" fn @"[method]output-stream.blocking-write-and-flush"(
-    self: i32,
-    contents_ptr: i32,
-    contents_len: i32,
-    retptr: i32,
-) void;
 
 // ── In-memory pet store ────────────────────────────────────────────
 //
@@ -274,18 +161,11 @@ const Response = struct {
     body: []const u8,
 };
 
-// WIT `method` discriminants (host lowering): GET=0, POST=2, DELETE=4.
-const METHOD_GET: u32 = 0;
-const METHOD_POST: u32 = 2;
-const METHOD_DELETE: u32 = 4;
-
-const ret_words_t = [*]u32;
-
-fn route(req: i32, method_disc: u32, path: []const u8, query: []const u8, ret_i32: i32, w: ret_words_t) Response {
+fn route(req: wit.Request, method: wit.Method, path: []const u8, query: []const u8) Response {
     if (std.mem.eql(u8, path, "/pets")) {
-        return switch (method_disc) {
-            METHOD_GET => listPets(),
-            METHOD_POST => createPet(req, ret_i32, w),
+        return switch (method) {
+            .get => listPets(),
+            .post => createPet(req),
             else => errorResponse(405, "Method not allowed"),
         };
     }
@@ -296,7 +176,7 @@ fn route(req: i32, method_disc: u32, path: []const u8, query: []const u8, ret_i3
             const id_str = rest[0 .. rest.len - "/toys".len];
             const id = std.fmt.parseInt(i64, id_str, 10) catch
                 return errorResponse(404, "Pet not found");
-            if (method_disc != METHOD_GET) return errorResponse(405, "Method not allowed");
+            if (method != .get) return errorResponse(405, "Method not allowed");
             return listToys(id, query);
         }
         // A pure `/pets/{petId}` segment — reject any deeper path.
@@ -305,9 +185,9 @@ fn route(req: i32, method_disc: u32, path: []const u8, query: []const u8, ret_i3
         }
         const id = std.fmt.parseInt(i32, rest, 10) catch
             return errorResponse(404, "Pet not found");
-        return switch (method_disc) {
-            METHOD_GET => readPet(id),
-            METHOD_DELETE => deletePet(id),
+        return switch (method) {
+            .get => readPet(id),
+            .delete => deletePet(id),
             else => errorResponse(405, "Method not allowed"),
         };
     }
@@ -358,8 +238,8 @@ fn listToys(pet_id: i64, query: []const u8) Response {
 // request — we copy the strings we keep into `store_buf` immediately.
 var json_scratch: [8192]u8 = undefined;
 
-fn createPet(req: i32, ret_i32: i32, w: ret_words_t) Response {
-    const body = readRequestBody(req, ret_i32, w) orelse
+fn createPet(req: wit.Request) Response {
+    const body = req.readBody(&body_buf) orelse
         return errorResponse(400, "Missing or unreadable request body");
 
     var fba = std.heap.FixedBufferAllocator.init(&json_scratch);
@@ -392,34 +272,8 @@ fn clampAge(age: i32) i32 {
     return age;
 }
 
-/// Drive `consume` → `stream` → repeated `blocking-read` to pull the
-/// full request body into a fixed buffer. Returns the body bytes, or
-/// null if the body could not be consumed.
+// Fixed buffer the request body is read into (see `wit.Request.readBody`).
 var body_buf: [8192]u8 = undefined;
-
-fn readRequestBody(req: i32, ret_i32: i32, w: ret_words_t) ?[]const u8 {
-    @"[method]incoming-request.consume"(req, ret_i32);
-    if (w[0] != 0) return null;
-    const body_handle: i32 = @bitCast(w[1]);
-
-    @"[method]incoming-body.stream"(body_handle, ret_i32);
-    if (w[0] != 0) return null;
-    const stream_handle: i32 = @bitCast(w[1]);
-
-    var len: usize = 0;
-    while (len < body_buf.len) {
-        @"[method]input-stream.blocking-read"(stream_handle, 4096, ret_i32);
-        if (w[0] != 0) break; // err arm = end-of-stream (closed)
-        const chunk_len: usize = w[2];
-        if (chunk_len == 0) break;
-        const src: [*]const u8 = @ptrFromInt(w[1]);
-        const take = @min(chunk_len, body_buf.len - len);
-        @memcpy(body_buf[len..][0..take], src[0..take]);
-        len += take;
-        if (take < chunk_len) break;
-    }
-    return body_buf[0..len];
-}
 
 fn errorResponse(status: u16, message: []const u8) Response {
     return .{ .status = status, .body = toJson(ErrorBody{ .code = status, .message = message }) };
@@ -427,27 +281,12 @@ fn errorResponse(status: u16, message: []const u8) Response {
 
 // ── Handler entry point ────────────────────────────────────────────
 
-export fn @"wasi:http/incoming-handler@0.2.6#handle"(req: i32, outp: i32) void {
-    arena_top = 0;
+/// Dispatched by `wit.exportIncomingHandler` (see the `comptime` block
+/// at the top). The wrapper has already reset the scratch arena.
+fn handle(req: wit.Request, res: *wit.Responder) void {
     ensureSeeded();
 
-    // 24-byte ret-area, big enough for every canon return we make
-    // (method / blocking-read need 12; finish needs 20).
-    const ret = arenaAlloc(u8, 24, 8);
-    const ret_i32: i32 = @intCast(@intFromPtr(ret));
-    const w: ret_words_t = @ptrCast(@alignCast(ret));
-
-    // Read the method discriminant.
-    @"[method]incoming-request.method"(req, ret_i32);
-    const method_disc: u32 = w[0];
-
-    // Read the request path (option<string>).
-    @"[method]incoming-request.path-with-query"(req, ret_i32);
-    var full_path: []const u8 = "/";
-    if (w[0] == 1) {
-        const p: [*]const u8 = @ptrFromInt(w[1]);
-        full_path = p[0..w[2]];
-    }
+    const full_path = req.path() orelse "/";
 
     // Split off the query string.
     var path = full_path;
@@ -457,61 +296,6 @@ export fn @"wasi:http/incoming-handler@0.2.6#handle"(req: i32, outp: i32) void {
         query = full_path[q + 1 ..];
     }
 
-    const resp = route(req, method_disc, path, query, ret_i32, w);
-    deliver(outp, ret_i32, w, resp);
-}
-
-/// Build and deliver the `outgoing-response` (with a JSON content-type
-/// header) back to the host via `response-outparam.set`.
-fn deliver(outp: i32, ret_i32: i32, w: ret_words_t, resp: Response) void {
-    const headers = @"[constructor]fields"();
-
-    // Best-effort `content-type: application/json` (ignore the result).
-    const ct_name = "content-type";
-    const ct_value = "application/json";
-    @"[method]fields.append"(
-        headers,
-        @intCast(@intFromPtr(ct_name.ptr)),
-        @intCast(ct_name.len),
-        @intCast(@intFromPtr(ct_value.ptr)),
-        @intCast(ct_value.len),
-        ret_i32,
-    );
-
-    const response = @"[constructor]outgoing-response"(headers);
-
-    if (resp.status != 200) {
-        _ = @"[method]outgoing-response.set-status-code"(response, @as(i32, resp.status));
-    }
-
-    @"[method]outgoing-response.body"(response, ret_i32);
-    if (w[0] != 0) {
-        deliverErr(outp);
-        return;
-    }
-    const body_handle: i32 = @bitCast(w[1]);
-
-    @"[method]outgoing-body.write"(body_handle, ret_i32);
-    if (w[0] != 0) {
-        deliverErr(outp);
-        return;
-    }
-    const stream_handle: i32 = @bitCast(w[1]);
-
-    if (resp.body.len > 0) {
-        @"[method]output-stream.blocking-write-and-flush"(
-            stream_handle,
-            @intCast(@intFromPtr(resp.body.ptr)),
-            @intCast(resp.body.len),
-            ret_i32,
-        );
-    }
-
-    @"[static]outgoing-body.finish"(body_handle, 0, 0, ret_i32);
-    @"[static]response-outparam.set"(outp, 0, response, 0, 0, 0);
-}
-
-/// Best-effort error delivery: `err(internal-error(none))`.
-fn deliverErr(outp: i32) void {
-    @"[static]response-outparam.set"(outp, 1, 0, 0, 0, 0);
+    const resp = route(req, req.method(), path, query);
+    res.respondWithContentType(resp.status, "application/json", resp.body);
 }

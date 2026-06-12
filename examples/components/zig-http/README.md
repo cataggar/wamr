@@ -67,33 +67,40 @@ how a reader might intuitively write it ("the entry point first").
 
 ## Source walkthrough
 
-The Zig handler is hand-written canonical-ABI — no Zig
-`wit-bindgen` equivalent exists, so each call into
-`wasi:http/types@0.2.6` / `wasi:io/streams@0.2.6` declares the
-lowered core signature directly. The lowering rules
-(`MAX_FLAT_PARAMS=16`, `MAX_FLAT_RESULTS=1`) are documented at the
-`extern "wasi:…"` declarations in `src/main.zig`; any result whose
-flat representation exceeds 1 core value is returned through a
-guest-allocated ret-area pointer passed as the last param.
+The canonical-ABI bridge lives in the shared
+[`wit_http`](../../../src/guest/wit_http.zig) helper module
+(`@import("wit_http")`), not in this example. There is no Zig
+`wit-bindgen` backend, so `wit_http` hand-writes the host imports
+(`extern "wasi:…"` declarations), the ret-area decoding for results
+wider than one core value, the `cabi_realloc` scratch arena, and the
+`wasi:http/incoming-handler@0.2.6#handle` export — once, behind a small
+typed API. See that module's doc comment for the details and for why a
+guest still imports only the host functions it actually calls (Zig drops
+unreferenced `extern`s, so this minimal handler keeps a minimal WIT
+world even though the helper declares the full surface).
 
-`cabi_realloc` is a tiny bump-arena allocator (64 KiB, reset at the
-top of every `handle` call). The host uses it to materialize the
-host-side string returned by `incoming-request.path-with-query`
-into our linear memory; we also reuse the same arena for the
-canon-ABI ret-area buffers we pass to spilled-result imports.
+The example itself is just the routing logic:
 
-The handler flow mirrors the Rust tutorial:
+```zig
+const wit = @import("wit_http");
 
-1. Read request path via `[method]incoming-request.path-with-query`.
-2. Branch: `/` → 200 + "Hello, world!\n"; else → 404 + empty body.
-3. Build a (default-empty) `fields` map and an `outgoing-response`
-   referencing it.
-4. For 404, bump `set-status-code`.
-5. Acquire `outgoing-body` from the response, then `output-stream`
-   from the body, then `blocking-write-and-flush` the body bytes.
-6. `[static]outgoing-body.finish(body, none)` releases the body.
-7. `[static]response-outparam.set(outp, ok(resp))` delivers the
-   response back to the host.
+comptime { wit.exportIncomingHandler(handle); }
+
+fn handle(req: wit.Request, res: *wit.Responder) void {
+    const path = req.path() orelse "/";
+    if (std.mem.eql(u8, path, "/")) {
+        res.respond(200, "Hello, world!\n");
+    } else {
+        res.respond(404, "");
+    }
+}
+```
+
+`exportIncomingHandler` takes the handler as a `comptime` function value
+and emits the canonical export plus the per-request arena reset, so the
+verbose export name never appears in the example. `Responder.respond`
+hides the whole `fields → outgoing-response → outgoing-body →
+output-stream → finish → response-outparam.set` sequence.
 
 ## Build pipeline
 
