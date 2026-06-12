@@ -24,6 +24,8 @@ zig-pkg/
 
 # Spec test data (generated — not committed)
 tests/spec-json/
+# Embedded upstream spec checkout (not a submodule; must stay untracked)
+tests/spec/
 
 # Wast test runner temp directories
 .wamr-test-*/
@@ -42,5 +44,5 @@ tests/benchmarks/**/*.wasm
 tests/benchmarks/**/*.aot
 tests/benchmarks/**/*.exe
 bin/
-examples/components/**/target/
+examples/**/target/
 .zig-global-cache/

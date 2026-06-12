@@ -175,7 +175,7 @@ jobs:
         run: rustup target add wasm32-wasip1
 
       - name: Build and run component-examples (wamr golden)
-        run: zig build install component-examples component-examples-run -Daot-broken-components=false
+        run: zig build install examples examples-run -Daot-broken-components=false
 
   wasi-p2-testsuite:
     name: Build & Test (wasi-p2-testsuite)
@@ -285,7 +285,7 @@ jobs:
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
 
       - name: Build and run component-examples (wasmtime parity)
-        run: zig build install component-examples component-examples-run-wasmtime
+        run: zig build install examples examples-run-wasmtime
 
   # Summary job matching the required status check name for branch protection.
   # `component-examples-wasmtime` is intentionally NOT in the blocking set

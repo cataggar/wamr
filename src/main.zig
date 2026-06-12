@@ -547,7 +547,8 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     return 2;
                 };
                 const n = loaded_manifest.?.precompiledCores().len;
-                std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ mp, n, if (n == 1) @as([]const u8, "") else "s" });
+                if (wamr.component_core_backend.debugAotEnabled())
+                    std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ mp, n, if (n == 1) @as([]const u8, "") else "s" });
             } else {
                 // Auto-probe `<input>.cwasm.json`. Without an embedded
                 // compiler the absence of a sibling manifest is fatal —
@@ -579,7 +580,8 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     return 2;
                 };
                 const n = loaded_manifest.?.precompiledCores().len;
-                std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
+                if (wamr.component_core_backend.debugAotEnabled())
+                    std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
             }
             const precompiled_cores: []const wamr.component_core_backend.PrecompiledCore =
                 loaded_manifest.?.precompiledCores();
