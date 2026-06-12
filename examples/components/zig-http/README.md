@@ -10,7 +10,7 @@ Runs end-to-end through wamr today:
 
 ```console
 $ ./zig-out/bin/wamr run --listen=127.0.0.1:8080 \
-        zig-out/component-examples/zig-http.component.wasm &
+        zig-out/component-examples/zig-http.wasm &
 $ curl -i http://127.0.0.1:8080/
 HTTP/1.1 200 OK
 Content-Length: 14

@@ -48,7 +48,7 @@ wabt component new --world app --wit command/wit rust-command.core.wasm
 # 3. Compose — wires the Rust command's `docs:adder/add@0.1.0` import
 #    against the Zig adder's matching export.
 wabt component compose -d zig-adder.wasm rust-command.wasm \
-    -o mixed-zig-rust-calc.composed.wasm
+    -o mixed-zig-rust-calc.wasm
 ```
 
 Or, more concisely, via the repo's root `build.zig`:
@@ -57,7 +57,7 @@ Or, more concisely, via the repo's root `build.zig`:
 zig build component-examples
 ```
 
-That step produces `zig-out/component-examples/mixed-zig-rust-calc.composed.wasm`.
+That step produces `zig-out/component-examples/mixed-zig-rust-calc.wasm`.
 
 ## Prerequisites
 

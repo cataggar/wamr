@@ -53,7 +53,7 @@ Keyvalue is in-memory by default (persists for the server process); add
 
 ```console
 $ ./zig-out/bin/wamr run --listen=127.0.0.1:8080 \
-        zig-out/component-examples/zig-http-petstore.component.wasm &
+        zig-out/component-examples/zig-http-petstore.wasm &
 
 $ curl -s http://127.0.0.1:8080/pets
 {"items":[{"name":"Fluffy","tag":"cat","age":3},{"name":"Rex","age":5}]}
@@ -69,7 +69,7 @@ $ curl -s 'http://127.0.0.1:8080/pets/1/toys?nameFilter=Mouse'
 ### wasmtime
 
 ```sh
-wasmtime serve -S keyvalue zig-out/component-examples/zig-http-petstore.component.wasm
+wasmtime serve -S keyvalue zig-out/component-examples/zig-http-petstore.wasm
 ```
 
 The repo's root `build.zig` automates the wamr build:

@@ -1219,7 +1219,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .name = "zig-hello",
         .core = hello_core,
     });
-    installAndValidate(b, examples_step, hello, "zig-hello.component.wasm");
+    installAndValidate(b, examples_step, hello, "zig-hello.wasm");
 
     // The wabt-bundled adapter lowers `fd_write(1, …)` through
     // `wasi:io/streams.blocking-write-and-flush` against
@@ -1244,7 +1244,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .name = "zig-exit",
         .core = exit_core,
     });
-    installAndValidate(b, examples_step, exit_component, "zig-exit.component.wasm");
+    installAndValidate(b, examples_step, exit_component, "zig-exit.wasm");
 
     wireComponentRun(b, runs, wamr_exe, exit_component, "exiting with code 7\n", 7, .{ .skip_wamr = !aot_broken_components });
 
@@ -1257,16 +1257,14 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .output = "zig-adder.core.wasm",
     });
     // `wabt component compose` (like `wasm-tools compose`) requires
-    // kebab-case file basenames (no dots before the .wasm extension), so
-    // the LazyPath is `zig-adder.wasm`; the install copy below uses the
-    // more descriptive `.component.wasm` suffix.
+    // kebab-case file basenames (no dots before the .wasm extension).
     const adder = makeComponent(b, .{
         .core = adder_core,
         .wit_dir = "examples/components/zig-adder/wit",
         .world = "adder",
         .output = "zig-adder.wasm",
     });
-    installAndValidate(b, examples_step, adder, "zig-adder.component.wasm");
+    installAndValidate(b, examples_step, adder, "zig-adder.wasm");
 
     // ── zig-calculator-cmd (Zig command importing zig-adder) ───────
     const calc_core = compileZigWasm(b, .{
@@ -1288,7 +1286,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     calc_compose.addFileArg(calc_cmd);
     calc_compose.addArg("-o");
     const calc_final = calc_compose.addOutputFileArg("zig-calculator-cmd.composed.wasm");
-    installAndValidate(b, examples_step, calc_final, "zig-calculator-cmd.composed.wasm");
+    installAndValidate(b, examples_step, calc_final, "zig-calculator-cmd.wasm");
 
     // Run the composed Zig calculator command. The wabt-bundled
     // wasi-preview1 adapter lowers `fd_write(1, …)` through
@@ -1334,7 +1332,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         mixed_compose.addFileArg(rust_cmd);
         mixed_compose.addArg("-o");
         const mixed_final = mixed_compose.addOutputFileArg("mixed-zig-rust-calc.composed.wasm");
-        installAndValidate(b, examples_step, mixed_final, "mixed-zig-rust-calc.composed.wasm");
+        installAndValidate(b, examples_step, mixed_final, "mixed-zig-rust-calc.wasm");
 
         // Run the composed Rust-command + Zig-adder. Same alias-walking
         // path as `zig-calculator-cmd` (issue #355); produces the same
@@ -1366,9 +1364,9 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .core = http_core,
         .wit_dir = "examples/components/zig-http/wit",
         .world = "http-hello",
-        .output = "zig-http.component.wasm",
+        .output = "zig-http.wasm",
     });
-    installAndValidate(b, examples_step, http_component, "zig-http.component.wasm");
+    installAndValidate(b, examples_step, http_component, "zig-http.wasm");
 
     // End-to-end serve smoke: a small driver (tests/component-http-smoke/
     // driver.zig) spawns `wamr run --listen=127.0.0.1:<port>` against the
@@ -1424,9 +1422,9 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .core = petstore_core,
         .wit_dir = "examples/components/zig-http-petstore/wit",
         .world = "petstore",
-        .output = "zig-http-petstore.component.wasm",
+        .output = "zig-http-petstore.wasm",
     });
-    installAndValidate(b, examples_step, petstore_component, "zig-http-petstore.component.wasm");
+    installAndValidate(b, examples_step, petstore_component, "zig-http-petstore.wasm");
 
     // End-to-end serve smoke: the driver spawns `wamr run --listen=…`
     // against the built component, then exercises the petstore routes
@@ -1608,7 +1606,7 @@ fn makeCommandComponent(b: *std.Build, opts: CommandComponent) std.Build.LazyPat
     const cmd = b.addSystemCommand(&.{ "wabt", "component", "new" });
     cmd.addFileArg(opts.core);
     cmd.addArg("-o");
-    return cmd.addOutputFileArg(b.fmt("{s}.component.wasm", .{opts.name}));
+    return cmd.addOutputFileArg(b.fmt("{s}.wasm", .{opts.name}));
 }
 
 const ReactorComponent = struct {

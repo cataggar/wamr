@@ -47,7 +47,7 @@ This is a library component. It has no `wasi:cli/run` export, so it
 cannot be invoked directly by the wamr CLI:
 
 ```console
-$ ./zig-out/bin/wamr zig-out/component-examples/zig-adder.component.wasm
+$ ./zig-out/bin/wamr zig-out/component-examples/zig-adder.wasm
 Error: component does not expose a top-level `run` export. ...
 ```
 

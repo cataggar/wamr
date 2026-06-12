@@ -13,12 +13,14 @@ extra component-level imports beyond the standard CLI surface.
 # 1. Build the core wasm with a custom _start.
 zig build-exe -target wasm32-wasi -O ReleaseSmall \
     -fno-entry --export=_start \
-    src/main.zig
+    -femit-bin=zig-hello.core.wasm src/main.zig
 
 # 2. Wrap it as a component. `wabt component new` auto-attaches the
-#    bundled wasi-preview1 → preview2 adapter when the embed imports
-#    `wasi_snapshot_preview1.*`.
-wabt component new main.wasm -o zig-hello.component.wasm
+#    bundled wasi-preview1 → preview2 adapter when the core imports
+#    `wasi_snapshot_preview1.*`; a `<name>.core.wasm` input yields
+#    `<name>.wasm`.
+wabt component new zig-hello.core.wasm
+# -> zig-hello.wasm
 ```
 
 The repo's root `build.zig` automates both steps:
@@ -31,7 +33,7 @@ zig build component-examples-run       # run this one through ./zig-out/bin/wamr
 ## Run
 
 ```console
-$ ./zig-out/bin/wamr zig-out/component-examples/zig-hello.component.wasm
+$ ./zig-out/bin/wamr zig-out/component-examples/zig-hello.wasm
 hello from zig component
 ```
 

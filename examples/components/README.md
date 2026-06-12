@@ -46,12 +46,13 @@ Outputs land under `zig-out/component-examples/`:
 
 ```
 zig-out/component-examples/
-├── zig-hello.component.wasm
-├── zig-exit.component.wasm
-├── zig-adder.component.wasm
-├── zig-calculator-cmd.composed.wasm
-├── mixed-zig-rust-calc.composed.wasm
-└── zig-http.component.wasm
+├── zig-hello.wasm
+├── zig-exit.wasm
+├── zig-adder.wasm
+├── zig-calculator-cmd.wasm
+├── mixed-zig-rust-calc.wasm
+├── zig-http.wasm
+└── zig-http-petstore.wasm
 ```
 
 ## Pinned tool versions

@@ -48,7 +48,7 @@ wabt component new --world app --wit wit zig-calculator-cmd.core.wasm
 # 3. compose with an adder implementation (e.g. ../zig-adder).
 wabt component compose -d zig-adder.wasm \
     zig-calculator-cmd.wasm \
-    -o final.component.wasm
+    -o final.wasm
 ```
 
 Or via the repo's root `build.zig`:
@@ -57,9 +57,8 @@ Or via the repo's root `build.zig`:
 zig build component-examples
 ```
 
-That step produces `zig-out/component-examples/zig-calculator-cmd.component.wasm`
-(unresolved `docs:adder/add@0.1.0` import) and a composed
-`zig-out/component-examples/zig-calculator-cmd.composed.wasm` with the
+That step produces the composed
+`zig-out/component-examples/zig-calculator-cmd.wasm` with the
 Zig adder linked in.
 
 ## Runtime status

@@ -21,7 +21,7 @@
 //!
 //! Run under wamr (in-memory store, or `--keyvalue-store=<file>` to persist):
 //!
-//!   wamr run --listen=127.0.0.1:8080 zig-http-petstore.component.wasm
+//!   wamr run --listen=127.0.0.1:8080 zig-http-petstore.wasm
 //!   curl -i http://127.0.0.1:8080/pets
 //!
 //! Run under wasmtime:
