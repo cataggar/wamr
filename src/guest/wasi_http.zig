@@ -166,6 +166,14 @@ extern "wasi:io/streams@0.2.6" fn @"[method]output-stream.blocking-write-and-flu
     retptr: i32,
 ) void;
 
+/// `[resource-drop]output-stream(own<output-stream>)`. The canonical
+/// `resource.drop` built-in. The output-stream returned by
+/// `outgoing-body.write` is a child of the outgoing-body and MUST be
+/// dropped before `outgoing-body.finish` per the Component Model: a
+/// strict host (wasmtime) traps `finish` while the child stream is
+/// still alive; wamr is lenient, but dropping is correct on both.
+extern "wasi:io/streams@0.2.6" fn @"[resource-drop]output-stream"(self: i32) void;
+
 // ── Public types ───────────────────────────────────────────────────
 
 /// HTTP request method. Discriminants match the `wasi:http/types`
@@ -293,6 +301,11 @@ fn deliver(outp: i32, status: u16, headers: i32, body: []const u8) void {
             retPtr(),
         );
     }
+
+    // The output-stream is a child of the outgoing-body and must be
+    // dropped before `finish` (the host traps otherwise on a strict
+    // runtime like wasmtime).
+    @"[resource-drop]output-stream"(stream_handle);
 
     // option<own<trailers>> = none → (disc=0, val=0).
     @"[static]outgoing-body.finish"(body_handle, 0, 0, retPtr());

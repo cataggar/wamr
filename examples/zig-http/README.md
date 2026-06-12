@@ -23,6 +23,9 @@ Produces `zig-out/examples/zig-http.wasm`.
 ```sh
 # wamr
 wamrc run zig-out/examples/zig-http.wasm -- --listen=127.0.0.1:8080
+
+# wasmtime
+wasmtime serve -S cli zig-out/examples/zig-http.wasm
 ```
 
 ```console
