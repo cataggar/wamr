@@ -8,8 +8,16 @@ name: Perf Investigate
 # bench.yml workflow runs automatically on any resulting PR, providing
 # a before/after comparison.
 #
-# Back-pressure: at most one perf-investigation issue is open at a time.
-# If a previous investigation is still in progress, this run is skipped.
+# Two-layer de-duplication so a completed idea is never re-filed:
+#   1. Back-pressure (this file, "Check for active investigation"): skips
+#      the run while a perf-investigation issue is still OPEN, so at most
+#      one investigation is in progress at a time.
+#   2. Idea selection (scripts/perf_investigate.py): treats every
+#      open/closed perf-investigation issue AND every merged `perf:` PR as
+#      "already attempted", and emits `skip=true` (gating issue creation
+#      below) when no un-attempted idea remains — rather than cycling back
+#      and filing a duplicate.  The `gh` lookups fail loudly instead of
+#      silently re-picking the first idea (regression cataggar/wamr#841).
 #
 # To assign the created issue to Copilot automatically, enable Copilot
 # coding agent for this repository and configure it to watch the
@@ -99,7 +107,7 @@ jobs:
           retention-days: 30
 
       - name: Create investigation issue
-        if: steps.guard.outputs.skip != 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.idea.outputs.skip != 'true'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
