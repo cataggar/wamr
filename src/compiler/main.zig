@@ -28,7 +28,7 @@ comptime {
     _ = @import("verify_args.zig");
 }
 
-const Subcommand = enum { compile, compile_component, run, verify, version, help };
+const Subcommand = enum { compile, compile_component, run, serve, verify, version, help };
 
 /// #392 step 3b-i diagnostic: log SSA-aware vs legacy (naive in-block phi)
 /// allocator spill counts for one phi-form function. Wired into the pass
@@ -46,6 +46,7 @@ fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "compile")) return .compile;
     if (std.mem.eql(u8, s, "compile-component")) return .compile_component;
     if (std.mem.eql(u8, s, "run")) return .run;
+    if (std.mem.eql(u8, s, "serve")) return .serve;
     if (std.mem.eql(u8, s, "verify")) return .verify;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
@@ -82,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
         .compile => try runCompile(init, allocator, args[2..]),
         .compile_component => try runCompileComponent(init, allocator, args[2..]),
         .run => try runRun(init, allocator, args[2..]),
+        .serve => try runServe(init, allocator, args[2..]),
         .verify => try runVerify(init, allocator, args[2..]),
     }
 }
@@ -978,8 +980,8 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
     // After we encounter `--` or the first non-option positional, every
     // remaining token is forwarded verbatim to `wamr run`. We split the
     // input on `--` so users can disambiguate `wamrc run -O0 foo.wasm`
-    // (still our flag) from `wamrc run foo.wasm -- --listen ...`
-    // (`--listen` belongs to `wamr`).
+    // (still our flag) from `wamrc run foo.wasm -- --env K=V ...`
+    // (`--env` belongs to `wamr`).
     var forward_args: std.ArrayList([]const u8) = .empty;
     defer forward_args.deinit(allocator);
 
@@ -1022,6 +1024,24 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
         std.process.exit(1);
     };
 
+    try compileAndSpawn(init, allocator, "run", in_path, output_path, force, target_arch, forward_args.items);
+}
+
+/// Shared tail for `wamrc run` / `wamrc serve` (#845): compile the input
+/// if its artifact is missing or stale, then spawn `wamr <verb>` with
+/// stdio inherited and propagate the exit code. `forward_args` are passed
+/// verbatim to `wamr <verb>` *before* the module positional (they are
+/// `wamr`-side options, which stop at the first positional).
+fn compileAndSpawn(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    verb: []const u8,
+    in_path: []const u8,
+    output_path: ?[]const u8,
+    force: bool,
+    target_arch: TargetArch,
+    forward_args: []const []const u8,
+) !void {
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
     const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
@@ -1108,15 +1128,15 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
         if (debug_log) std.debug.print("wamrc: reusing {s} (up to date)\n", .{artifact_path});
     }
 
-    // Build the argv for `wamr run`. Layout:
-    //   wamr run [--precompiled-manifest <artifact>] [forwarded args...] <module>
+    // Build the argv for `wamr <verb>`. Layout:
+    //   wamr <verb> [--precompiled-manifest <artifact>] [forwarded args...] <module>
     //
-    // The forwarded args (e.g. `--env`, `--allow-net`, `--map-dir`) are
-    // `wamr run` *options* and must precede the module positional: `wamr
-    // run` stops option parsing at the first positional and treats every
-    // later token as a guest arg. Appending them after the module (as we
-    // did before) silently routed `--env` / `--allow-net` to the guest's
-    // argv instead of the WASI host config.
+    // The forwarded args (e.g. `--env`/`--allow-net` for run, `--addr`/
+    // `--tls-*` for serve) are `wamr <verb>` *options* and must precede
+    // the module positional: `wamr <verb>` stops option parsing at the
+    // first positional and treats every later token as a guest arg.
+    // Appending them after the module (as we did before) silently routed
+    // `--env` / `--allow-net` to the guest's argv instead of host config.
     const wamr_bin = findWamrBinary(allocator, io, init.environ_map) catch |err| {
         std.debug.print("error: could not locate `wamr` binary: {s}\n" ++
             "  Set WAMR_BIN, install `wamr` on PATH, or place it next to wamrc.\n", .{@errorName(err)});
@@ -1127,16 +1147,16 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
     var child_argv: std.ArrayList([]const u8) = .empty;
     defer child_argv.deinit(allocator);
     try child_argv.append(allocator, wamr_bin);
-    try child_argv.append(allocator, "run");
-    // Options that `wamr run` parses before the module positional:
+    try child_argv.append(allocator, verb);
+    // Options that `wamr <verb>` parses before the module positional:
     // the precompiled-manifest selector (components) plus every
     // forwarded arg.
     if (is_comp and output_path != null) {
         try child_argv.append(allocator, "--precompiled-manifest");
         try child_argv.append(allocator, artifact_path);
     }
-    for (forward_args.items) |fa| try child_argv.append(allocator, fa);
-    // The module positional comes last. For components, `wamr run`
+    for (forward_args) |fa| try child_argv.append(allocator, fa);
+    // The module positional comes last. For components, `wamr <verb>`
     // takes the source `.wasm` and auto-discovers the sibling
     // `<stem>.cwasm.json` (or honours `--precompiled-manifest`). For
     // core wasm we hand it the freshly-written `.cwasm` directly.
@@ -1176,6 +1196,96 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
             std.process.exit(1);
         },
     }
+}
+
+/// `wamrc serve <component.wasm> [options]` (#845): mirror `wamrc run`,
+/// but precompile-if-stale and then spawn `wamr serve` (the proxy world)
+/// instead of `wamr run`. `--addr` and the `--tls-*` flags are forwarded
+/// verbatim to `wamr serve`, so the wasmtime muscle memory
+/// `wamrc serve --addr 127.0.0.1:8080 app.wasm` works.
+fn runServe(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 1 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, serve_usage);
+        return;
+    }
+
+    var input_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var force = false;
+    var target_arch: TargetArch = switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+
+    // Everything after `--`, or any positional after the input, is
+    // forwarded to `wamr serve`. We also explicitly recognise the
+    // `wamr serve`-side value-taking flags *before* the input so
+    // `wamrc serve --addr <v> app.wasm` (space form) parses correctly
+    // and forwards both the flag and its value instead of mistaking the
+    // value for the input positional.
+    var forward_args: std.ArrayList([]const u8) = .empty;
+    defer forward_args.deinit(allocator);
+
+    const forwardable_value_flags = [_][]const u8{ "--addr", "--tls-cert", "--tls-key", "--tls-pem", "--env", "--log-level" };
+
+    var i: usize = 0;
+    var saw_dashdash = false;
+    while (i < sub_args.len) : (i += 1) {
+        const a = sub_args[i];
+        if (saw_dashdash) {
+            try forward_args.append(allocator, a);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--")) {
+            saw_dashdash = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-o") and i + 1 < sub_args.len) {
+            i += 1;
+            output_path = sub_args[i];
+        } else if (std.mem.eql(u8, a, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, a, "--target") and i + 1 < sub_args.len) {
+            i += 1;
+            target_arch = parseTargetArchOrDie(sub_args[i]);
+        } else if (std.mem.startsWith(u8, a, "--target=")) {
+            target_arch = parseTargetArchOrDie(a["--target=".len..]);
+        } else fwd: {
+            // Forward `wamr serve` options. `--flag=value` forms forward
+            // as a single token; `--flag value` forms consume + forward
+            // the following value token too.
+            for (forwardable_value_flags) |flag| {
+                if (std.mem.eql(u8, a, flag)) {
+                    try forward_args.append(allocator, a);
+                    if (i + 1 < sub_args.len) {
+                        i += 1;
+                        try forward_args.append(allocator, sub_args[i]);
+                    }
+                    break :fwd;
+                }
+                if (std.mem.startsWith(u8, a, flag) and a.len > flag.len and a[flag.len] == '=') {
+                    try forward_args.append(allocator, a);
+                    break :fwd;
+                }
+            }
+            if (a.len > 0 and a[0] == '-' and input_path == null) {
+                // Any other leading-dash option before the input is
+                // forwarded verbatim (e.g. `--env=K=V`, `--log-level=info`).
+                try forward_args.append(allocator, a);
+            } else if (input_path == null) {
+                input_path = a;
+            } else {
+                try forward_args.append(allocator, a);
+            }
+        }
+    }
+
+    const in_path = input_path orelse {
+        std.debug.print("error: missing input component — usage: wamrc serve <component.wasm> [options]\n", .{});
+        std.process.exit(1);
+    };
+
+    try compileAndSpawn(init, allocator, "serve", in_path, output_path, force, target_arch, forward_args.items);
 }
 
 fn runVerify(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -1466,6 +1576,7 @@ const top_usage =
     \\  compile             Compile a .wasm module to a .cwasm AOT binary
     \\  compile-component   Precompile every embedded core of a component
     \\  run                 Compile (if needed) and execute via the wamr runtime
+    \\  serve               Compile (if needed) and serve a wasi:http component
     \\  verify              Differential-test wamr-AOT vs wasmtime on a wasm
     \\  version             Print version and exit
     \\  help                Print this help
@@ -1628,6 +1739,37 @@ const run_usage =
     \\                                 for components)
     \\  --force                       Recompile even if the artifact is fresh
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
+    \\
+;
+
+const serve_usage =
+    \\Usage: wamrc serve [options] <component.wasm> [-- <wamr serve args...>]
+    \\
+    \\Mirror `wamrc run`, but precompile-if-stale and then spawn
+    \\`wamr serve <component.wasm>` (the wasi:http proxy world) instead of
+    \\`wamr run`. Aligned with `wasmtime serve`. The freshness / artifact
+    \\rules are identical to `wamrc run`.
+    \\
+    \\`--addr` and the `--tls-cert` / `--tls-key` / `--tls-pem` flags are
+    \\forwarded verbatim to `wamr serve`, so the wasmtime muscle memory
+    \\works:
+    \\
+    \\  wamrc serve app.wasm                       # 127.0.0.1:8080
+    \\  wamrc serve --addr 0.0.0.0:8080 app.wasm
+    \\
+    \\Anything after `--` (or any other positional / option after the
+    \\input) is also forwarded to `wamr serve`. The `wamr` binary is
+    \\located via $WAMR_BIN, then a sibling of wamrc, then PATH.
+    \\
+    \\Options:
+    \\  -o <file>                     Override the manifest path
+    \\                                 (a `.cwasm.json` for components)
+    \\  --force                       Recompile even if the artifact is fresh
+    \\  --target=<x86_64|aarch64>     Target architecture (default: host)
+    \\  --addr <ip:port>              Forwarded to `wamr serve` (default
+    \\                                 127.0.0.1:8080)
+    \\  --tls-cert / --tls-key / --tls-pem PATH
+    \\                                Forwarded to `wamr serve` for HTTPS
     \\
 ;
 
@@ -1850,6 +1992,9 @@ pub fn matchGlob(pattern: []const u8, name: []const u8) bool {
 
 test "subcommand parsing" {
     try std.testing.expectEqual(@as(?Subcommand, .compile), parseSubcommand("compile"));
+    try std.testing.expectEqual(@as(?Subcommand, .run), parseSubcommand("run"));
+    try std.testing.expectEqual(@as(?Subcommand, .serve), parseSubcommand("serve"));
+    try std.testing.expectEqual(@as(?Subcommand, .verify), parseSubcommand("verify"));
     try std.testing.expectEqual(@as(?Subcommand, .version), parseSubcommand("version"));
     try std.testing.expectEqual(@as(?Subcommand, .help), parseSubcommand("help"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("--help"));

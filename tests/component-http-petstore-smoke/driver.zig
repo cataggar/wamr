@@ -1,6 +1,6 @@
 //! End-to-end smoke driver for `examples/zig-http-petstore`.
 //!
-//! Spawns `<wamr_exe> run --listen=127.0.0.1:<port> <component.wasm>` as
+//! Spawns `<wamr_exe> serve --addr=127.0.0.1:<port> <component.wasm>` as
 //! a subprocess and verifies the TypeSpec petstore API behaviour:
 //!
 //!   GET    /pets          -> 200, JSON list containing "Fluffy" + "Rex"
@@ -42,11 +42,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    const listen_arg = try std.fmt.allocPrint(allocator, "--listen=127.0.0.1:{d}", .{port});
-    defer allocator.free(listen_arg);
+    const addr_arg = try std.fmt.allocPrint(allocator, "--addr=127.0.0.1:{d}", .{port});
+    defer allocator.free(addr_arg);
 
     var child = try std.process.spawn(io, .{
-        .argv = &.{ wamr_exe, "run", listen_arg, component_path },
+        .argv = &.{ wamr_exe, "serve", addr_arg, component_path },
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,

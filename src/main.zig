@@ -15,7 +15,7 @@ pub const MapDir = struct {
     guest_name: []const u8,
 };
 
-const Subcommand = enum { run, version, help };
+const Subcommand = enum { run, serve, version, help };
 
 /// Set by `WAMR_TRACE_CLI_ADAPTER=1|verbose` at startup (#715). Each
 /// `WasiCliAdapter` constructed during `runRun` / `runComponent`
@@ -27,6 +27,7 @@ var wasi_cli_adapter_trace_verbose: bool = false;
 
 fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "run")) return .run;
+    if (std.mem.eql(u8, s, "serve")) return .serve;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
@@ -126,6 +127,7 @@ pub fn main(init: std.process.Init) !u8 {
         .version => try runVersion(init.io, args[2..]),
         .help => runHelp(init.io, args[2..]),
         .run => try runRun(init, allocator, args[2..]),
+        .serve => try runServe(init, allocator, args[2..]),
     };
 }
 
@@ -175,20 +177,6 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // next to the component file. Missing/stale bundle is fatal — the
     // `wamr` CLI no longer embeds the AOT compiler.
     var precompiled_manifest: ?[]const u8 = null;
-    var listen_address: ?std.Io.net.IpAddress = null;
-    // `--tls-cert=<path>` + `--tls-key=<path>` (or the combined
-    // `--tls-pem=<path>`) (#583 follow-up to #595, completed in #609):
-    // when both cert and key (or just the combined PEM) are provided
-    // alongside `--listen`, the HTTP service terminates TLS on each
-    // accepted connection (HTTPS), then serves HTTP/1.1 over the
-    // decrypted stream. Server-side TLS (TLS 1.3, RSA + ECDSA certs) is
-    // provided by the `cataggar/tls.zig` dependency — Zig 0.16 std ships
-    // only `std.crypto.tls.Client`. The cert + key are loaded + validated
-    // at startup so a missing file / malformed PEM / key-cert mismatch
-    // surfaces before `bind`. Null when not provided.
-    var tls_cert_path: ?[]const u8 = null;
-    var tls_key_path: ?[]const u8 = null;
-    var tls_pem_path: ?[]const u8 = null;
     // `--log-level=<name>` (#583 B5). Sets the host-side
     // `wasi:logging/logging.log` severity filter. The CLI flag wins
     // over the `WAMR_LOG_LEVEL` env var, which is consulted at the
@@ -208,79 +196,8 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 // so existing invocations keep working; warn once on
                 // stderr so out-of-tree callers can adapt.
                 std.debug.print("warning: --stack-size is ignored under the AOT-only CLI (issue #644)\n", .{});
-            } else if (std.mem.eql(u8, arg, "--listen") or std.mem.startsWith(u8, arg, "--listen=")) {
-                if (listen_address != null) {
-                    std.debug.print("error: --listen specified more than once; only one listening socket preopen is supported\n", .{});
-                    return 2;
-                }
-                if (std.mem.eql(u8, arg, "--listen")) {
-                    // Bare `--listen` -> 127.0.0.1:0 (kernel-assigned ephemeral
-                    // port). The actual bound address is printed to stdout
-                    // after bind so test drivers can scrape it.
-                    listen_address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
-                } else {
-                    const spec = arg["--listen=".len..];
-                    listen_address = parseListenAddress(spec) catch {
-                        std.debug.print("error: invalid --listen address '{s}'\n", .{spec});
-                        return 2;
-                    };
-                }
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
                 // Reserved for future WASI heap allocation
-            } else if (std.mem.eql(u8, arg, "--tls-cert") or std.mem.startsWith(u8, arg, "--tls-cert=")) {
-                if (tls_cert_path != null) {
-                    std.debug.print("error: --tls-cert specified more than once\n", .{});
-                    return 2;
-                }
-                const spec = if (std.mem.eql(u8, arg, "--tls-cert")) blk: {
-                    i += 1;
-                    if (i >= run_args.len) {
-                        std.debug.print("error: --tls-cert requires a path to a PEM file\n", .{});
-                        return 2;
-                    }
-                    break :blk run_args[i];
-                } else arg["--tls-cert=".len..];
-                if (spec.len == 0) {
-                    std.debug.print("error: --tls-cert path is empty\n", .{});
-                    return 2;
-                }
-                tls_cert_path = spec;
-            } else if (std.mem.eql(u8, arg, "--tls-key") or std.mem.startsWith(u8, arg, "--tls-key=")) {
-                if (tls_key_path != null) {
-                    std.debug.print("error: --tls-key specified more than once\n", .{});
-                    return 2;
-                }
-                const spec = if (std.mem.eql(u8, arg, "--tls-key")) blk: {
-                    i += 1;
-                    if (i >= run_args.len) {
-                        std.debug.print("error: --tls-key requires a path to a PEM file\n", .{});
-                        return 2;
-                    }
-                    break :blk run_args[i];
-                } else arg["--tls-key=".len..];
-                if (spec.len == 0) {
-                    std.debug.print("error: --tls-key path is empty\n", .{});
-                    return 2;
-                }
-                tls_key_path = spec;
-            } else if (std.mem.eql(u8, arg, "--tls-pem") or std.mem.startsWith(u8, arg, "--tls-pem=")) {
-                if (tls_pem_path != null) {
-                    std.debug.print("error: --tls-pem specified more than once\n", .{});
-                    return 2;
-                }
-                const spec = if (std.mem.eql(u8, arg, "--tls-pem")) blk: {
-                    i += 1;
-                    if (i >= run_args.len) {
-                        std.debug.print("error: --tls-pem requires a path to a combined PEM file\n", .{});
-                        return 2;
-                    }
-                    break :blk run_args[i];
-                } else arg["--tls-pem=".len..];
-                if (spec.len == 0) {
-                    std.debug.print("error: --tls-pem path is empty\n", .{});
-                    return 2;
-                }
-                tls_pem_path = spec;
             } else if (std.mem.eql(u8, arg, "--env") or std.mem.startsWith(u8, arg, "--env=")) {
                 const spec = if (std.mem.eql(u8, arg, "--env")) blk: {
                     i += 1;
@@ -415,28 +332,6 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         return 2;
     };
 
-    // ── TLS flag validation (#583 follow-up / #609) ──────────────────────
-    // Disallowed combinations:
-    //   * `--tls-cert` without `--tls-key` (or vice versa) — the pair is
-    //     load-bearing together.
-    //   * `--tls-pem` combined with either `--tls-cert` or `--tls-key` —
-    //     pick one of the two input shapes.
-    //   * Any of the TLS flags without `--listen` — TLS termination only
-    //     makes sense on the HTTP service path.
-    if (tls_pem_path != null and (tls_cert_path != null or tls_key_path != null)) {
-        std.debug.print("error: --tls-pem is mutually exclusive with --tls-cert / --tls-key\n", .{});
-        return 2;
-    }
-    if ((tls_cert_path == null) != (tls_key_path == null)) {
-        std.debug.print("error: --tls-cert and --tls-key must be specified together\n", .{});
-        return 2;
-    }
-    const tls_requested = tls_cert_path != null or tls_pem_path != null;
-    if (tls_requested and listen_address == null) {
-        std.debug.print("error: --tls-cert / --tls-key / --tls-pem require --listen\n", .{});
-        return 2;
-    }
-
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
     const wasm_data = cwd.readFileAlloc(io, path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
@@ -450,10 +345,6 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // embedded compiler was removed. The `.cwasm` path now flows
     // through this code via `wamrc compile` (or `wamrc run`).
     if (wasm_data.len >= 4 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.aot_magic) {
-        if (listen_address != null) {
-            std.debug.print("Error: --listen is not supported for AOT core modules (use a component)\n", .{});
-            return 2;
-        }
         return runAot(
             init.io,
             allocator,
@@ -515,112 +406,18 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 std.debug.print("Error: --config-store '{s}': {}\n", .{ config_store_path orelse "", err });
                 return 2;
             };
-            // #644 / #680: resolve the AOT precompiled-cores manifest.
-            // The `wamr` CLI is AOT-only and the runtime no longer
-            // embeds the compiler — every component core must be
-            // available as a precompiled `.cwasm`, or instantiation
-            // fails hard with `error.AotImportUnresolvable` (the interp
-            // fallback is disabled at the CLI surface; library callers
-            // still get the legacy silent demotion by leaving
-            // `Options.aot_only` unset).
-            //
-            //  * `--precompiled-manifest <path>` (explicit): any error
-            //    opening / validating the manifest is fatal so the user
-            //    knows the AOT path isn't being taken.
-            //  * sibling `<input>.cwasm.json` (auto-detect):
-            //    used when present and valid.
-            //  * neither found → hard error. The `wamr` binary no
-            //    longer embeds the AOT compiler (issue #680); users
-            //    must run `wamrc compile-component <component.wasm>`
-            //    or `wamrc run <component.wasm>` first.
-            //
-            // The `LoadedManifest`'s lifetime must outlive
-            // `runComponent` / `runHttpComponent` because the mmapped
-            // `.cwasm` buffers it owns are borrowed by the
-            // `PrecompiledCore` slice handed to the instance loader.
+            // #644 / #680: resolve the AOT precompiled-cores manifest
+            // (shared with `wamr serve`). The `LoadedManifest`'s lifetime
+            // must outlive `runComponent` because the mmapped `.cwasm`
+            // buffers it owns are borrowed by the `PrecompiledCore` slice
+            // handed to the instance loader.
             var loaded_manifest: ?wamr.component_aot.LoadedManifest = null;
             defer if (loaded_manifest) |*lm| lm.deinit();
-
-            if (precompiled_manifest) |mp| {
-                loaded_manifest = wamr.component_aot.loadManifest(allocator, mp, wasm_data) catch |err| {
-                    std.debug.print("Error: --precompiled-manifest '{s}': {s}\n", .{ mp, loadManifestErrorMessage(err) });
-                    return 2;
-                };
-                const n = loaded_manifest.?.precompiledCores().len;
-                if (wamr.component_core_backend.debugAotEnabled())
-                    std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ mp, n, if (n == 1) @as([]const u8, "") else "s" });
-            } else {
-                // Auto-probe `<input>.cwasm.json`. Without an embedded
-                // compiler the absence of a sibling manifest is fatal —
-                // direct the user at `wamrc`.
-                const sibling = wamr.component_aot.defaultManifestPathFor(allocator, path) catch return 1;
-                defer allocator.free(sibling);
-                const io_probe = init.io;
-                const cwd_probe = std.Io.Dir.cwd();
-                const exists = blk: {
-                    var f = cwd_probe.openFile(io_probe, sibling, .{}) catch break :blk false;
-                    f.close(io_probe);
-                    break :blk true;
-                };
-                if (!exists) {
-                    std.debug.print(
-                        "Error: no AOT manifest found for '{s}'. The `wamr` runtime no longer embeds the compiler (#680).\n" ++
-                            "  Run `wamrc compile-component {s}` to produce '{s}', or\n" ++
-                            "  run `wamrc run {s} [-- args...]` to compile and execute in one step.\n",
-                        .{ path, path, sibling, path },
-                    );
-                    return 2;
-                }
-                loaded_manifest = wamr.component_aot.loadManifest(allocator, sibling, wasm_data) catch |err| {
-                    std.debug.print(
-                        "Error: AOT manifest at '{s}' is stale or invalid: {s}.\n" ++
-                            "  Rebuild it with `wamrc compile-component {s}` or run `wamrc run {s}`.\n",
-                        .{ sibling, loadManifestErrorMessage(err), path, path },
-                    );
-                    return 2;
-                };
-                const n = loaded_manifest.?.precompiledCores().len;
-                if (wamr.component_core_backend.debugAotEnabled())
-                    std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
-            }
+            const manifest_rc = loadComponentManifestOrPrint(init, allocator, "run", path, wasm_data, precompiled_manifest, &loaded_manifest);
+            if (manifest_rc != 0) return manifest_rc;
             const precompiled_cores: []const wamr.component_core_backend.PrecompiledCore =
                 loaded_manifest.?.precompiledCores();
 
-            // #644: AOT-only policy. `wamr run` requires a precompiled
-            // bundle for every component — there is no interp fallback
-            // at the CLI surface and no in-process compiler. An empty
-            // bundle means the component had no core modules (an
-            // empty / malformed input that survived parsing).
-            if (precompiled_cores.len == 0) {
-                std.debug.print(
-                    "Error: component has no AOT-compiled cores and `wamr run` is AOT-only.\n" ++
-                        "  See issue #644.\n",
-                    .{},
-                );
-                return 2;
-            }
-
-            if (listen_address) |addr| {
-                // Load + parse the TLS cert + key at startup, so a
-                // missing file / malformed PEM surfaces before `bind`
-                // (matches the documented startup-validation rule for
-                // every other host-config flag).
-                var tls_config: ?wamr.wasi_cli_adapter.HttpsTlsConfig = null;
-                if (tls_pem_path) |p| {
-                    tls_config = wamr.wasi_cli_adapter.HttpsTlsConfig.loadFromCombinedPath(allocator, p) catch |err| {
-                        std.debug.print("Error: --tls-pem '{s}': {s}\n", .{ p, tlsLoadErrorMessage(err) });
-                        return 2;
-                    };
-                } else if (tls_cert_path) |cp| {
-                    const kp = tls_key_path.?;
-                    tls_config = wamr.wasi_cli_adapter.HttpsTlsConfig.loadFromPaths(allocator, cp, kp) catch |err| {
-                        std.debug.print("Error: --tls-cert '{s}' / --tls-key '{s}': {s}\n", .{ cp, kp, tlsLoadErrorMessage(err) });
-                        return 2;
-                    };
-                }
-                defer if (tls_config) |*c| c.deinit();
-                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level, if (tls_config) |*c| c else null, precompiled_cores);
-            }
             return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path, precompiled_cores);
         }
     }
@@ -629,10 +426,6 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // compiler (#680) — users must precompile with `wamrc compile`
     // (or use `wamrc run` for one-shot test execution).
     _ = aot_supported;
-    if (listen_address != null) {
-        std.debug.print("Error: --listen is not supported for plain core wasm modules (use a component)\n", .{});
-        return 2;
-    }
     std.debug.print(
         "Error: '{s}' is a plain core wasm module and the `wamr` runtime is AOT-only (#644)\n" ++
             "       without an embedded compiler (#680).\n" ++
@@ -643,6 +436,270 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     return 2;
 }
 
+/// `wamr serve <component.wasm> [options]` (#845): serve a
+/// `wasi:http/incoming-handler` component as a long-lived HTTP server.
+/// Mirrors `wasmtime serve`:
+///   * `--addr <ip:port>` bind address (default `127.0.0.1:8080`).
+///   * `--addr 127.0.0.1:0` binds a kernel-assigned ephemeral port and
+///     prints the resolved address to stdout (for test drivers).
+///   * `--tls-cert` / `--tls-key` / `--tls-pem` terminate HTTPS.
+/// AOT-only like `run`: the component needs a `wamrc compile-component`
+/// manifest (explicit `--precompiled-manifest` or sibling
+/// `<input>.cwasm.json`).
+fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []const []const u8) !u8 {
+    if (serve_args.len == 1 and std.mem.eql(u8, serve_args[0], "help")) {
+        writeStdout(init.io, serve_usage);
+        return 0;
+    }
+    var wasm_path: ?[]const u8 = null;
+    var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer wasm_args.deinit(allocator);
+    var env_flags: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer env_flags.deinit(allocator);
+    var addr: ?std.Io.net.IpAddress = null;
+    var tls_cert_path: ?[]const u8 = null;
+    var tls_key_path: ?[]const u8 = null;
+    var tls_pem_path: ?[]const u8 = null;
+    var log_level: ?wamr.wasi_cli_adapter.WasiLogLevel = null;
+    var precompiled_manifest: ?[]const u8 = null;
+    var past_options = false;
+
+    var i: usize = 0;
+    while (i < serve_args.len) : (i += 1) {
+        const arg = serve_args[i];
+        if (!past_options and arg.len > 0 and arg[0] == '-') {
+            if (std.mem.eql(u8, arg, "--addr") or std.mem.startsWith(u8, arg, "--addr=")) {
+                if (addr != null) {
+                    std.debug.print("error: --addr specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--addr")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --addr requires an <ip:port> value\n", .{});
+                        return 2;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--addr=".len..];
+                addr = parseAddr(spec) catch {
+                    std.debug.print("error: invalid --addr address '{s}'\n", .{spec});
+                    return 2;
+                };
+            } else if (std.mem.eql(u8, arg, "--tls-cert") or std.mem.startsWith(u8, arg, "--tls-cert=")) {
+                if (tls_cert_path != null) {
+                    std.debug.print("error: --tls-cert specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--tls-cert")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --tls-cert requires a path to a PEM file\n", .{});
+                        return 2;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--tls-cert=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --tls-cert path is empty\n", .{});
+                    return 2;
+                }
+                tls_cert_path = spec;
+            } else if (std.mem.eql(u8, arg, "--tls-key") or std.mem.startsWith(u8, arg, "--tls-key=")) {
+                if (tls_key_path != null) {
+                    std.debug.print("error: --tls-key specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--tls-key")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --tls-key requires a path to a PEM file\n", .{});
+                        return 2;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--tls-key=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --tls-key path is empty\n", .{});
+                    return 2;
+                }
+                tls_key_path = spec;
+            } else if (std.mem.eql(u8, arg, "--tls-pem") or std.mem.startsWith(u8, arg, "--tls-pem=")) {
+                if (tls_pem_path != null) {
+                    std.debug.print("error: --tls-pem specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--tls-pem")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --tls-pem requires a path to a combined PEM file\n", .{});
+                        return 2;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--tls-pem=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --tls-pem path is empty\n", .{});
+                    return 2;
+                }
+                tls_pem_path = spec;
+            } else if (std.mem.eql(u8, arg, "--env") or std.mem.startsWith(u8, arg, "--env=")) {
+                const spec = if (std.mem.eql(u8, arg, "--env")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --env requires KEY=VALUE\n", .{});
+                        return 2;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--env=".len..];
+                if (std.mem.indexOfScalar(u8, spec, '=') == null) {
+                    std.debug.print("error: --env value '{s}' is missing '='\n", .{spec});
+                    return 2;
+                }
+                try env_flags.append(allocator, spec);
+            } else if (std.mem.eql(u8, arg, "--log-level") or std.mem.startsWith(u8, arg, "--log-level=")) {
+                const spec = if (std.mem.eql(u8, arg, "--log-level")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --log-level requires <trace|debug|info|warn|error|critical>\n", .{});
+                        return 2;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--log-level=".len..];
+                log_level = wamr.wasi_cli_adapter.WasiLogLevel.fromString(spec) orelse {
+                    std.debug.print(
+                        "error: --log-level value '{s}' is not one of trace|debug|info|warn|error|critical\n",
+                        .{spec},
+                    );
+                    return 2;
+                };
+            } else if (std.mem.eql(u8, arg, "--precompiled-manifest") or std.mem.startsWith(u8, arg, "--precompiled-manifest=")) {
+                if (precompiled_manifest != null) {
+                    std.debug.print("error: --precompiled-manifest specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--precompiled-manifest")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --precompiled-manifest requires a path to a wamrc compile-component manifest\n", .{});
+                        return 2;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--precompiled-manifest=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --precompiled-manifest path is empty\n", .{});
+                    return 2;
+                }
+                precompiled_manifest = spec;
+            } else if (std.mem.eql(u8, arg, "--trace-aot-wasi")) {
+                wamr.aot_host_bridge.trace_enabled = true;
+            } else if (std.mem.eql(u8, arg, "--")) {
+                past_options = true;
+            } else {
+                std.debug.print("error: unknown option '{s}' — try `wamr serve help`\n", .{arg});
+                return 2;
+            }
+        } else if (wasm_path == null) {
+            wasm_path = arg;
+            past_options = true;
+        } else {
+            try wasm_args.append(allocator, arg);
+        }
+    }
+
+    const path = wasm_path orelse {
+        std.debug.print("error: missing component file — usage: wamr serve [options] <component.wasm>\n", .{});
+        return 2;
+    };
+
+    // TLS flag validation (#609): cert/key are load-bearing together;
+    // the combined PEM is mutually exclusive with the split pair.
+    if (tls_pem_path != null and (tls_cert_path != null or tls_key_path != null)) {
+        std.debug.print("error: --tls-pem is mutually exclusive with --tls-cert / --tls-key\n", .{});
+        return 2;
+    }
+    if ((tls_cert_path == null) != (tls_key_path == null)) {
+        std.debug.print("error: --tls-cert and --tls-key must be specified together\n", .{});
+        return 2;
+    }
+
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    const wasm_data = cwd.readFileAlloc(io, path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+        wamr.utils.read_file.dieReadFileError(path, err);
+    };
+    defer allocator.free(wasm_data);
+
+    // `serve` is component-only. Reject AOT core images and plain core
+    // wasm with a pointer at `run` (matches the proxy-vs-command split).
+    if (wasm_data.len >= 4 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.aot_magic) {
+        std.debug.print("Error: `wamr serve` requires a wasi:http/incoming-handler component, not an AOT core module (use `wamr run`).\n", .{});
+        return 2;
+    }
+    const is_component = wasm_data.len >= 8 and
+        std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.wasm_magic and
+        std.mem.readInt(u32, wasm_data[4..8], .little) == wamr.types.component_version;
+    if (!is_component) {
+        std.debug.print("Error: `wamr serve` requires a wasi:http/incoming-handler component (got a non-component wasm). See `wamr serve help`.\n", .{});
+        return 2;
+    }
+
+    // For components: prefer explicit --env entries; otherwise inherit
+    // the host environment. EnvVar slices borrow from environ_map (which
+    // lives for the entire process).
+    var env_list: std.ArrayListUnmanaged(wamr.wasi_cli_adapter.EnvVar) = .empty;
+    defer env_list.deinit(allocator);
+    if (env_flags.items.len > 0) {
+        for (env_flags.items) |kv| {
+            const eq = std.mem.indexOfScalar(u8, kv, '=').?;
+            env_list.append(allocator, .{ .name = kv[0..eq], .value = kv[eq + 1 ..] }) catch {};
+        }
+    } else {
+        var it = init.environ_map.array_hash_map.iterator();
+        while (it.next()) |kv| {
+            env_list.append(allocator, .{ .name = kv.key_ptr.*, .value = kv.value_ptr.* }) catch {};
+        }
+    }
+
+    // `--log-level` wins over `WAMR_LOG_LEVEL` (consulted only when the
+    // flag is absent). (#583 B5)
+    const effective_log_level: ?wamr.wasi_cli_adapter.WasiLogLevel = log_level orelse blk: {
+        const raw = init.environ_map.get("WAMR_LOG_LEVEL") orelse break :blk null;
+        if (raw.len == 0) break :blk null;
+        const parsed = wamr.wasi_cli_adapter.WasiLogLevel.fromString(raw) orelse {
+            std.debug.print(
+                "warning: WAMR_LOG_LEVEL='{s}' is not one of trace|debug|info|warn|error|critical; ignoring\n",
+                .{raw},
+            );
+            break :blk null;
+        };
+        break :blk parsed;
+    };
+
+    var loaded_manifest: ?wamr.component_aot.LoadedManifest = null;
+    defer if (loaded_manifest) |*lm| lm.deinit();
+    const manifest_rc = loadComponentManifestOrPrint(init, allocator, "serve", path, wasm_data, precompiled_manifest, &loaded_manifest);
+    if (manifest_rc != 0) return manifest_rc;
+    const precompiled_cores = loaded_manifest.?.precompiledCores();
+
+    // Load + parse the TLS cert + key at startup, so a missing file /
+    // malformed PEM surfaces before `bind`.
+    var tls_config: ?wamr.wasi_cli_adapter.HttpsTlsConfig = null;
+    if (tls_pem_path) |p| {
+        tls_config = wamr.wasi_cli_adapter.HttpsTlsConfig.loadFromCombinedPath(allocator, p) catch |err| {
+            std.debug.print("Error: --tls-pem '{s}': {s}\n", .{ p, tlsLoadErrorMessage(err) });
+            return 2;
+        };
+    } else if (tls_cert_path) |cp| {
+        const kp = tls_key_path.?;
+        tls_config = wamr.wasi_cli_adapter.HttpsTlsConfig.loadFromPaths(allocator, cp, kp) catch |err| {
+            std.debug.print("Error: --tls-cert '{s}' / --tls-key '{s}': {s}\n", .{ cp, kp, tlsLoadErrorMessage(err) });
+            return 2;
+        };
+    }
+    defer if (tls_config) |*c| c.deinit();
+
+    // Default to wasmtime's `127.0.0.1:8080` when `--addr` is omitted.
+    const bind_addr = addr orelse (std.Io.net.IpAddress.parse("127.0.0.1", 8080) catch unreachable);
+    return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, bind_addr, effective_log_level, if (tls_config) |*c| c else null, precompiled_cores);
+}
+
 fn parseMapDir(spec: []const u8) !MapDir {
     const sep = std.mem.indexOf(u8, spec, "::") orelse return error.MissingSeparator;
     const host = spec[0..sep];
@@ -651,7 +708,10 @@ fn parseMapDir(spec: []const u8) !MapDir {
     return .{ .host_path = host, .guest_name = guest };
 }
 
-fn parseListenAddress(spec: []const u8) !std.Io.net.IpAddress {
+/// Parse a `--addr <ip:port>` bind spec into an `IpAddress`. Matches
+/// `wasmtime serve --addr`: an IP literal + port (no hostname
+/// resolution). IPv6 is bracketed, e.g. `[::1]:8080`.
+fn parseAddr(spec: []const u8) !std.Io.net.IpAddress {
     if (spec.len == 0) return error.InvalidAddress;
 
     var host: []const u8 = undefined;
@@ -679,6 +739,93 @@ fn parseListenAddress(spec: []const u8) !std.Io.net.IpAddress {
     if (host.len == 0 or port_text.len == 0) return error.InvalidAddress;
     const port = try std.fmt.parseInt(u16, port_text, 10);
     return std.Io.net.IpAddress.parse(host, port);
+}
+
+/// Resolve the AOT precompiled-cores manifest for a component, shared by
+/// `wamr run` and `wamr serve` (#644 / #680 / #845).
+///
+/// The `wamr` CLI is AOT-only and the runtime no longer embeds the
+/// compiler, so every component core must be available as a precompiled
+/// `.cwasm` or instantiation fails hard. Resolution order:
+///
+///   * `--precompiled-manifest <path>` (explicit): any error opening /
+///     validating the manifest is fatal so the user knows the AOT path
+///     isn't being taken.
+///   * sibling `<input>.cwasm.json` (auto-detect): used when present and
+///     valid.
+///   * neither found → hard error directing the user at `wamrc`.
+///
+/// On success returns 0 and sets `out_manifest`. On failure prints a
+/// diagnostic and returns a non-zero exit code; `out_manifest` may still
+/// be set (the caller's `defer …deinit()` handles cleanup either way).
+/// `verb` is the invoking subcommand ("run" / "serve") and only flavours
+/// the error text.
+fn loadComponentManifestOrPrint(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    verb: []const u8,
+    path: []const u8,
+    wasm_data: []const u8,
+    precompiled_manifest: ?[]const u8,
+    out_manifest: *?wamr.component_aot.LoadedManifest,
+) u8 {
+    if (precompiled_manifest) |mp| {
+        out_manifest.* = wamr.component_aot.loadManifest(allocator, mp, wasm_data) catch |err| {
+            std.debug.print("Error: --precompiled-manifest '{s}': {s}\n", .{ mp, loadManifestErrorMessage(err) });
+            return 2;
+        };
+        const n = out_manifest.*.?.precompiledCores().len;
+        if (wamr.component_core_backend.debugAotEnabled())
+            std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ mp, n, if (n == 1) @as([]const u8, "") else "s" });
+    } else {
+        // Auto-probe `<input>.cwasm.json`. Without an embedded compiler
+        // the absence of a sibling manifest is fatal — direct the user
+        // at `wamrc`.
+        const sibling = wamr.component_aot.defaultManifestPathFor(allocator, path) catch return 1;
+        defer allocator.free(sibling);
+        const io_probe = init.io;
+        const cwd_probe = std.Io.Dir.cwd();
+        const exists = blk: {
+            var f = cwd_probe.openFile(io_probe, sibling, .{}) catch break :blk false;
+            f.close(io_probe);
+            break :blk true;
+        };
+        if (!exists) {
+            std.debug.print(
+                "Error: no AOT manifest found for '{s}'. The `wamr` runtime no longer embeds the compiler (#680).\n" ++
+                    "  Run `wamrc compile-component {s}` to produce '{s}', or\n" ++
+                    "  run `wamrc {s} {s}` to compile and serve/execute in one step.\n",
+                .{ path, path, sibling, verb, path },
+            );
+            return 2;
+        }
+        out_manifest.* = wamr.component_aot.loadManifest(allocator, sibling, wasm_data) catch |err| {
+            std.debug.print(
+                "Error: AOT manifest at '{s}' is stale or invalid: {s}.\n" ++
+                    "  Rebuild it with `wamrc compile-component {s}` or run `wamrc {s} {s}`.\n",
+                .{ sibling, loadManifestErrorMessage(err), path, verb, path },
+            );
+            return 2;
+        };
+        const n = out_manifest.*.?.precompiledCores().len;
+        if (wamr.component_core_backend.debugAotEnabled())
+            std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
+    }
+
+    // #644: AOT-only policy. `wamr run`/`serve` require a precompiled
+    // bundle for every component — there is no interp fallback at the CLI
+    // surface and no in-process compiler. An empty bundle means the
+    // component had no core modules (an empty / malformed input that
+    // survived parsing).
+    if (out_manifest.*.?.precompiledCores().len == 0) {
+        std.debug.print(
+            "Error: component has no AOT-compiled cores and `wamr {s}` is AOT-only.\n" ++
+                "  See issue #644.\n",
+            .{verb},
+        );
+        return 2;
+    }
+    return 0;
 }
 
 /// Assemble the merged `wasi:config/store@0.2.0-rc.1` backing slice
@@ -986,9 +1133,9 @@ fn runHttpComponent(
                 "Error: component trapped during initialization (see [component init trap] line above)\n",
                 .{},
             ),
-            error.ListenFailed => std.debug.print("Error: failed to bind --listen address\n", .{}),
+            error.ListenFailed => std.debug.print("Error: failed to bind --addr address\n", .{}),
             error.AddressInUse => std.debug.print(
-                "Error: --listen address already in use (another process is bound to this port)\n",
+                "Error: --addr address already in use (another process is bound to this port)\n",
                 .{},
             ),
             error.AcceptFailed => std.debug.print("Error: failed to accept HTTP connection\n", .{}),
@@ -1172,6 +1319,7 @@ const top_usage =
     \\
     \\Subcommands:
     \\  run       Run a .wasm or .cwasm file
+    \\  serve     Serve a wasi:http/incoming-handler component over HTTP
     \\  version   Print version and exit
     \\  help      Print this help
     \\
@@ -1194,11 +1342,6 @@ const run_usage =
     \\Options:
     \\  --stack-size=<bytes>     (ignored; kept for backward compat)
     \\  --heap-size=<bytes>      Reserved (currently ignored)
-    \\  --listen[=<ip:port>]     For components: serve WASI HTTP on the address.
-    \\                           Port 0 (and bare `--listen`, which means
-    \\                           127.0.0.1:0) requests a kernel-assigned
-    \\                           ephemeral port; the resolved address is
-    \\                           printed to stdout after bind.
     \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
     \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
     \\                           inside the guest WASI sandbox (repeatable)
@@ -1223,21 +1366,6 @@ const run_usage =
     \\                           Loads on startup (missing file is OK),
     \\                           rewrites synchronously on every mutation.
     \\                           Omit to keep the default in-memory store.
-    \\  --tls-cert PATH          For components serving HTTP: PEM-encoded
-    \\                           certificate chain (leaf first). Requires
-    \\                           --listen and a matching --tls-key. Today
-    \\                           the cert + key are parsed + validated at
-    \\                           startup but the handshake is upstream-
-    \\                           blocked on Zig std (see cataggar/wamr#609);
-    \\                           the listener serves plaintext with a
-    \\                           single stderr warning.
-    \\  --tls-key PATH           For components serving HTTP: PEM-encoded
-    \\                           private key (PKCS#8, RSA, or EC). Pairs
-    \\                           with --tls-cert.
-    \\  --tls-pem PATH           For components serving HTTP: combined PEM
-    \\                           file containing both certificate chain
-    \\                           and private key. Mutually exclusive with
-    \\                           --tls-cert / --tls-key.
     \\  --precompiled-manifest PATH
     \\                           For components: load AOT-compiled cores by
     \\                           reading a `wamrc compile-component` manifest
@@ -1248,6 +1376,48 @@ const run_usage =
     \\                           `<input>.cwasm.json`. The manifest is
     \\                           mandatory: components without one fail
     \\                           with a clear error (issues #644, #680).
+    \\
+    \\To serve a wasi:http/incoming-handler component over HTTP, use
+    \\`wamr serve` instead (see `wamr serve help`).
+    \\
+;
+
+const serve_usage =
+    \\Usage: wamr serve [options] <component.wasm>
+    \\
+    \\Serve a `wasi:http/incoming-handler` component as a long-lived HTTP
+    \\server (the proxy world), aligned with `wasmtime serve`. AOT-only
+    \\like `wamr run`: the component needs a `wamrc compile-component`
+    \\manifest (an explicit --precompiled-manifest or a sibling
+    \\`<input>.cwasm.json`). Use `wamrc serve <component.wasm>` to
+    \\precompile-if-stale and serve in one step.
+    \\
+    \\Options:
+    \\  --addr <ip:port>         Bind address (an IP literal + port, no
+    \\                           hostname resolution). Default 127.0.0.1:8080.
+    \\                           Use `0.0.0.0:<port>` / `[::1]:<port>` for
+    \\                           broader binding. `--addr 127.0.0.1:0`
+    \\                           requests a kernel-assigned ephemeral port
+    \\                           and prints the resolved address to stdout
+    \\                           (handy for test drivers).
+    \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
+    \\  --log-level NAME         Filter `wasi:logging` calls below NAME. One
+    \\                           of trace|debug|info|warn|error|critical
+    \\                           (default: trace = admit all). Falls back to
+    \\                           the WAMR_LOG_LEVEL env var when absent.
+    \\  --tls-cert PATH          PEM-encoded certificate chain (leaf first).
+    \\                           Terminates HTTPS on each connection. Requires
+    \\                           a matching --tls-key.
+    \\  --tls-key PATH           PEM-encoded private key (PKCS#8, RSA, or EC).
+    \\                           Pairs with --tls-cert.
+    \\  --tls-pem PATH           Combined PEM file containing both certificate
+    \\                           chain and private key. Mutually exclusive
+    \\                           with --tls-cert / --tls-key.
+    \\  --precompiled-manifest PATH
+    \\                           Load AOT-compiled cores from a `wamrc
+    \\                           compile-component` manifest sidecar
+    \\                           (`<stem>.cwasm.json`). When omitted, a
+    \\                           sibling `<input>.cwasm.json` is auto-detected.
     \\
 ;
 
@@ -1276,11 +1446,24 @@ fn runHelp(io: std.Io, args: []const []const u8) u8 {
 
 test "subcommand parsing" {
     try std.testing.expectEqual(@as(?Subcommand, .run), parseSubcommand("run"));
+    try std.testing.expectEqual(@as(?Subcommand, .serve), parseSubcommand("serve"));
     try std.testing.expectEqual(@as(?Subcommand, .version), parseSubcommand("version"));
     try std.testing.expectEqual(@as(?Subcommand, .help), parseSubcommand("help"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("--version"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("foo.wasm"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand(""));
+}
+
+test "parseAddr accepts ipv4/ipv6 literals and rejects junk" {
+    const a = try parseAddr("127.0.0.1:8080");
+    try std.testing.expectEqual(@as(u16, 8080), a.getPort());
+    const eph = try parseAddr("127.0.0.1:0");
+    try std.testing.expectEqual(@as(u16, 0), eph.getPort());
+    const v6 = try parseAddr("[::1]:8080");
+    try std.testing.expectEqual(@as(u16, 8080), v6.getPort());
+    try std.testing.expectError(error.InvalidAddress, parseAddr(""));
+    try std.testing.expectError(error.InvalidAddress, parseAddr("127.0.0.1"));
+    try std.testing.expectError(error.InvalidAddress, parseAddr(":8080"));
 }
 
 test "parseMapDir splits HOST::GUEST" {

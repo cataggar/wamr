@@ -327,10 +327,10 @@ pub const SOCKET_BASE_RIGHTS: u64 =
     RIGHTS_POLL_FD_READWRITE |
     RIGHTS_SOCK_SHUTDOWN;
 
-/// Rights granted to a listening socket preopen (the `--listen=` fd).
-/// It accepts new connections and is poll-able; it cannot itself be
-/// read from or written to, mirroring wasi-libc's expectation for a
-/// passive `socket(2)` + `listen(2)` fd.
+/// Rights granted to a listening socket preopen fd. It accepts new
+/// connections and is poll-able; it cannot itself be read from or
+/// written to, mirroring wasi-libc's expectation for a passive
+/// `socket(2)` + `listen(2)` fd.
 pub const SOCKET_LISTEN_RIGHTS: u64 =
     RIGHTS_SOCK_ACCEPT |
     RIGHTS_POLL_FD_READWRITE |
