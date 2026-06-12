@@ -27,10 +27,12 @@ in the `docs:adder/add@0.1.0` interface. The component has no imports.
 ```sh
 zig build-exe -target wasm32-freestanding -O ReleaseSmall \
     -fno-entry --export="docs:adder/add@0.1.0#add" \
-    src/main.zig
+    -femit-bin=zig-adder.core.wasm src/main.zig
 
-wabt component embed --world adder wit main.wasm -o main.embed.wasm
-wabt component new main.embed.wasm -o zig-adder.component.wasm
+# Embed the WIT (from wit/) and wrap into a component in one step
+# (wabt ≥ v3.0.0-dev.13); a <name>.core.wasm input yields <name>.wasm.
+wabt component new --world adder --wit wit zig-adder.core.wasm
+# -> zig-adder.wasm
 ```
 
 Or via the repo's root `build.zig`:

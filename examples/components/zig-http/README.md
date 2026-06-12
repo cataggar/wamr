@@ -110,18 +110,15 @@ zig build-exe -target wasm32-freestanding -O ReleaseSmall \
     -fno-entry \
     --export="wasi:http/incoming-handler@0.2.6#handle" \
     --export=cabi_realloc \
-    src/main.zig
+    -femit-bin=zig-http.core.wasm src/main.zig
 
-# 2. Embed the WIT subset.
-wabt component embed --world http-hello wit main.wasm \
-    -o main.embed.wasm
-
-# 3. Wrap into a component. No preview1 imports → wabt's plain
-#    (non-adapter) component_new wraps it directly; canon.lower
-#    trampolines for every imported method are auto-emitted
-#    (cataggar/wabt#202/#205/#207), and `cabi_realloc` is used
-#    as the canon-options realloc.
-wabt component new main.embed.wasm -o zig-http.component.wasm
+# 2. Embed the WIT (from wit/) and wrap into a component in one step
+#    (wabt ≥ v3.0.0-dev.13). A `<name>.core.wasm` input yields
+#    `<name>.wasm`. canon.lower trampolines for every imported method
+#    are auto-emitted and `cabi_realloc` is used as the canon-options
+#    realloc.
+wabt component new --world http-hello --wit wit zig-http.core.wasm
+# -> zig-http.wasm
 ```
 
 ## Implementation notes / gotchas

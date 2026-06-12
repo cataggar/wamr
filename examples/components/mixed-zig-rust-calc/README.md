@@ -32,23 +32,22 @@ live under this directory.
 
 ```sh
 # 1. Build the Zig adder library component (see ../zig-adder/README.md).
+#    `wabt component new` embeds the WIT (--wit) and wraps in one step
+#    (wabt ≥ v3.0.0-dev.13); a <name>.core.wasm input yields <name>.wasm.
 zig build-exe -target wasm32-freestanding -O ReleaseSmall \
     -fno-entry --export="docs:adder/add@0.1.0#add" \
-    ../zig-adder/src/main.zig
-wabt component embed --world adder ../zig-adder/wit main.wasm \
-    -o adder.embed.wasm
-wabt component new adder.embed.wasm -o zig-adder.component.wasm
+    -femit-bin=zig-adder.core.wasm ../zig-adder/src/main.zig
+wabt component new --world adder --wit ../zig-adder/wit zig-adder.core.wasm
 
-# 2. Build the Rust command (wasi-preview1 binary).
+# 2. Build the Rust command (wasi-preview1 binary; adapter auto-attached).
 (cd command && cargo build --release --target wasm32-wasip1)
-wabt component embed --world app command/wit \
-    command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm \
-    -o command.embed.wasm
-wabt component new command.embed.wasm -o rust-command.component.wasm
+cp command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm \
+    rust-command.core.wasm
+wabt component new --world app --wit command/wit rust-command.core.wasm
 
 # 3. Compose — wires the Rust command's `docs:adder/add@0.1.0` import
 #    against the Zig adder's matching export.
-wabt component compose -d zig-adder.component.wasm rust-command.component.wasm \
+wabt component compose -d zig-adder.wasm rust-command.wasm \
     -o mixed-zig-rust-calc.composed.wasm
 ```
 
@@ -63,7 +62,7 @@ That step produces `zig-out/component-examples/mixed-zig-rust-calc.composed.wasm
 ## Prerequisites
 
 - Zig 0.16.x (already required for the rest of the repo).
-- `wabt` (cataggar/wabt v3.0.0-dev.6+) on `PATH`. The wasi-preview1
+- `wabt` (cataggar/wabt v3.0.0-dev.13+) on `PATH`. The wasi-preview1
   → component adapter is bundled inside `wabt` and auto-attached
   by `wabt component new` — no external adapter download required.
 - A Rust toolchain with the `wasm32-wasip1` target installed:

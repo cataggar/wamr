@@ -1159,10 +1159,12 @@ pub fn build(b: *std.Build) void {
 /// is a strict superset of `component-examples-run`).
 ///
 /// Pinned versions:
-///   * `cataggar/wabt` ≥ v3.0.0-dev.6 on PATH (provides `component embed`,
-///     `component new`, `component compose`, `module validate`).
-///     The wasi-preview1 → component adapter is embedded in `wabt` and
-///     auto-attached by `wabt component new`; no external adapter fetch.
+///   * `cataggar/wabt` ≥ v3.0.0-dev.13 on PATH. `component new` embeds the
+///     WIT on the fly (`--wit <dir> --world <name>`) and wraps + validates
+///     in one call, so no separate `component embed` step is needed.
+///     Also provides `component compose`. The wasi-preview1 → component
+///     adapter is embedded in `wabt` and auto-attached by
+///     `wabt component new`; no external adapter fetch.
 ///   * `cargo` with `wasm32-wasip1` target for the mixed example
 ///
 /// Configure-time probe for the `wasm32-wasip1` rustup target. Runs
@@ -1254,21 +1256,16 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .exports = &.{"docs:adder/add@0.1.0#add"},
         .output = "zig-adder.core.wasm",
     });
-    const adder_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "adder" });
-    adder_embed.addDirectoryArg(b.path("examples/components/zig-adder/wit"));
-    adder_embed.addFileArg(adder_core);
-    adder_embed.addArg("-o");
-    const adder_embedded = adder_embed.addOutputFileArg("zig-adder.embed.wasm");
-
-    const adder_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
-    adder_new.addFileArg(adder_embedded);
-    adder_new.addArg("-o");
     // `wabt component compose` (like `wasm-tools compose`) requires
-    // kebab-case file basenames (no dots before the .wasm extension).
-    // Emit `zig-adder.wasm` for use as a compose dependency below; the
-    // install copy uses the more descriptive `.component.wasm` suffix
-    // for end-user discoverability.
-    const adder = adder_new.addOutputFileArg("zig-adder.wasm");
+    // kebab-case file basenames (no dots before the .wasm extension), so
+    // the LazyPath is `zig-adder.wasm`; the install copy below uses the
+    // more descriptive `.component.wasm` suffix.
+    const adder = makeComponent(b, .{
+        .core = adder_core,
+        .wit_dir = "examples/components/zig-adder/wit",
+        .world = "adder",
+        .output = "zig-adder.wasm",
+    });
     installAndValidate(b, examples_step, adder, "zig-adder.component.wasm");
 
     // ── zig-calculator-cmd (Zig command importing zig-adder) ───────
@@ -1278,17 +1275,12 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .exports = &.{"_start"},
         .output = "zig-calculator-cmd.core.wasm",
     });
-    const calc_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "app" });
-    calc_embed.addDirectoryArg(b.path("examples/components/zig-calculator-cmd/wit"));
-    calc_embed.addFileArg(calc_core);
-    calc_embed.addArg("-o");
-    const calc_embedded = calc_embed.addOutputFileArg("zig-calculator-cmd.embed.wasm");
-
-    const calc_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
-    calc_new.addFileArg(calc_embedded);
-    calc_new.addArg("-o");
-    // Kebab-case basename for `wabt component compose` consumption.
-    const calc_cmd = calc_new.addOutputFileArg("zig-calculator-cmd.wasm");
+    const calc_cmd = makeComponent(b, .{
+        .core = calc_core,
+        .wit_dir = "examples/components/zig-calculator-cmd/wit",
+        .world = "app",
+        .output = "zig-calculator-cmd.wasm",
+    });
 
     // Compose: link `docs:adder/add@0.1.0` import against the Zig adder.
     const calc_compose = b.addSystemCommand(&.{ "wabt", "component", "compose", "-d" });
@@ -1307,10 +1299,10 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     wireComponentRun(b, runs, wamr_exe, calc_final, "40 + 2 = 42\n100 + 200 = 300\n", 0, .{ .skip_wamr = !aot_broken_components });
 
     // ── mixed-zig-rust-calc (Zig adder + Rust command, composed) ───
-    // Rust command builds via cargo on `wasm32-wasip1`; we then run the
-    // standard wabt component embed/new pipeline and compose against
-    // the Zig adder. Skipped when the `wasm32-wasip1` rustup target is
-    // unavailable (see the `rust-examples` option / probe in `build`).
+    // Rust command builds via cargo on `wasm32-wasip1`; we then wrap it
+    // into a component and compose against the Zig adder. Skipped when the
+    // `wasm32-wasip1` rustup target is unavailable (see the `rust-examples`
+    // option / probe in `build`).
     if (rust_examples) {
         const cargo = b.addSystemCommand(&.{
             "cargo",                                                      "build",
@@ -1329,17 +1321,13 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         cargo_pickup.step.dependOn(&cargo.step);
         const rust_core = cargo_pickup.addOutputFileArg("mixed_zig_rust_command.core.wasm");
 
-        const rust_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "app" });
-        rust_embed.addDirectoryArg(b.path("examples/components/mixed-zig-rust-calc/command/wit"));
-        rust_embed.addFileArg(rust_core);
-        rust_embed.addArg("-o");
-        const rust_embedded = rust_embed.addOutputFileArg("mixed-rust-command.embed.wasm");
-
-        const rust_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
-        rust_new.addFileArg(rust_embedded);
-        rust_new.addArg("-o");
         // Kebab-case basename for `wabt component compose`.
-        const rust_cmd = rust_new.addOutputFileArg("mixed-rust-command.wasm");
+        const rust_cmd = makeComponent(b, .{
+            .core = rust_core,
+            .wit_dir = "examples/components/mixed-zig-rust-calc/command/wit",
+            .world = "app",
+            .output = "mixed-rust-command.wasm",
+        });
 
         const mixed_compose = b.addSystemCommand(&.{ "wabt", "component", "compose", "-d" });
         mixed_compose.addFileArg(adder);
@@ -1371,16 +1359,12 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .output = "zig-http.core.wasm",
         .imports = &.{.{ .name = "wasi_http", .path = "src/guest/wasi_http.zig" }},
     });
-    const http_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "http-hello" });
-    http_embed.addDirectoryArg(b.path("examples/components/zig-http/wit"));
-    http_embed.addFileArg(http_core);
-    http_embed.addArg("-o");
-    const http_embedded = http_embed.addOutputFileArg("zig-http.embed.wasm");
-
-    const http_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
-    http_new.addFileArg(http_embedded);
-    http_new.addArg("-o");
-    const http_component = http_new.addOutputFileArg("zig-http.component.wasm");
+    const http_component = makeComponent(b, .{
+        .core = http_core,
+        .wit_dir = "examples/components/zig-http/wit",
+        .world = "http-hello",
+        .output = "zig-http.component.wasm",
+    });
     installAndValidate(b, examples_step, http_component, "zig-http.component.wasm");
 
     // End-to-end serve smoke: a small driver (tests/component-http-smoke/
@@ -1429,16 +1413,12 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .output = "zig-http-petstore.core.wasm",
         .imports = &.{.{ .name = "wasi_http", .path = "src/guest/wasi_http.zig" }},
     });
-    const petstore_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "petstore" });
-    petstore_embed.addDirectoryArg(b.path("examples/components/zig-http-petstore/wit"));
-    petstore_embed.addFileArg(petstore_core);
-    petstore_embed.addArg("-o");
-    const petstore_embedded = petstore_embed.addOutputFileArg("zig-http-petstore.embed.wasm");
-
-    const petstore_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
-    petstore_new.addFileArg(petstore_embedded);
-    petstore_new.addArg("-o");
-    const petstore_component = petstore_new.addOutputFileArg("zig-http-petstore.component.wasm");
+    const petstore_component = makeComponent(b, .{
+        .core = petstore_core,
+        .wit_dir = "examples/components/zig-http-petstore/wit",
+        .world = "petstore",
+        .output = "zig-http-petstore.component.wasm",
+    });
     installAndValidate(b, examples_step, petstore_component, "zig-http-petstore.component.wasm");
 
     // End-to-end serve smoke: the driver spawns `wamr run --listen=…`
@@ -1596,6 +1576,30 @@ fn makeCommandComponent(b: *std.Build, opts: CommandComponent) std.Build.LazyPat
     cmd.addFileArg(opts.core);
     cmd.addArg("-o");
     return cmd.addOutputFileArg(b.fmt("{s}.component.wasm", .{opts.name}));
+}
+
+const ReactorComponent = struct {
+    core: std.Build.LazyPath,
+    /// WIT package directory to embed (`--wit`).
+    wit_dir: []const u8,
+    /// World to embed (`--world`).
+    world: []const u8,
+    /// Output basename for the produced component LazyPath.
+    output: []const u8,
+};
+
+/// One-step `wabt component new --world <world> --wit <dir>` (wabt
+/// ≥ v3.0.0-dev.13): embeds the `component-type:<world>` section from the
+/// WIT directory, wraps the core into a component, and validates — in a
+/// single call, collapsing the former `component embed` + `component new`
+/// two-step. Cores with `wasi_snapshot_preview1.*` imports still get the
+/// bundled adapter auto-attached.
+fn makeComponent(b: *std.Build, opts: ReactorComponent) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{ "wabt", "component", "new", "--world", opts.world, "--wit" });
+    cmd.addDirectoryArg(b.path(opts.wit_dir));
+    cmd.addFileArg(opts.core);
+    cmd.addArg("-o");
+    return cmd.addOutputFileArg(opts.output);
 }
 
 /// Validates the component and installs it under

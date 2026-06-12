@@ -25,7 +25,7 @@ The Zig source declares the import directly with `extern "pkg:ns/iface@ver"`:
 extern "docs:adder/add@0.1.0" fn add(x: u32, y: u32) u32;
 ```
 
-After `wabt component embed --world app …` the import becomes a
+After `wabt component new --world app …` the import becomes a
 component-level `docs:adder/add@0.1.0::add` import, which any
 implementation of the adder world (including
 [`../zig-adder`](../zig-adder)) can satisfy. The wasi-preview1 adapter
@@ -37,19 +37,17 @@ contributes the standard `wasi:cli/*`, `wasi:io/*`, `wasi:clocks/*`,
 ```sh
 # 1. core wasm with custom _start (no proc_exit).
 zig build-exe -target wasm32-wasi -O ReleaseSmall \
-    -fno-entry --export=_start src/main.zig
+    -fno-entry --export=_start -femit-bin=zig-calculator-cmd.core.wasm src/main.zig
 
-# 2. embed the world so component new can recognise the docs:adder import.
-wabt component embed --world app wit main.wasm -o main.embed.wasm
+# 2. embed the `app` world (--wit) and encode the component in one step
+#    (wabt ≥ v3.0.0-dev.13); the bundled wasi-preview1 → preview2 adapter
+#    auto-attaches for the unresolved `wasi_snapshot_preview1.*` imports.
+#    A <name>.core.wasm input yields <name>.wasm.
+wabt component new --world app --wit wit zig-calculator-cmd.core.wasm
 
-# 3. encode the component. `wabt component new` auto-attaches the
-#    bundled wasi-preview1 → preview2 adapter for the
-#    `wasi_snapshot_preview1.*` imports the embed leaves unresolved.
-wabt component new main.embed.wasm -o zig-calculator-cmd.component.wasm
-
-# 4. compose with an adder implementation (e.g. ../zig-adder).
-wabt component compose -d zig-adder.component.wasm \
-    zig-calculator-cmd.component.wasm \
+# 3. compose with an adder implementation (e.g. ../zig-adder).
+wabt component compose -d zig-adder.wasm \
+    zig-calculator-cmd.wasm \
     -o final.component.wasm
 ```
 

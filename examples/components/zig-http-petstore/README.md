@@ -142,13 +142,12 @@ strictly smaller import set, so each keeps a minimal WIT world.
 zig build-exe -target wasm32-freestanding -O ReleaseSmall -fno-entry \
     --export="wasi:http/incoming-handler@0.2.6#handle" \
     --export=cabi_realloc \
-    src/main.zig
+    -femit-bin=zig-http-petstore.core.wasm src/main.zig
 
-# 2. Embed the WIT subset.
-wabt component embed --world petstore wit main.wasm -o main.embed.wasm
-
-# 3. Wrap into a component.
-wabt component new main.embed.wasm -o zig-http-petstore.component.wasm
+# 2. Embed the WIT (from wit/) and wrap into a component in one step
+#    (wabt ≥ v3.0.0-dev.13); a `<name>.core.wasm` input yields `<name>.wasm`.
+wabt component new --world petstore --wit wit zig-http-petstore.core.wasm
+# -> zig-http-petstore.wasm
 ```
 
 ## Notes / gotchas
