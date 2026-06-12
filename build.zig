@@ -1220,12 +1220,17 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
             .{ .name = "wasi_cli", .path = "src/guest/wasi_cli.zig", .deps = &.{"abi"} },
             .{ .name = "abi", .path = "src/guest/abi.zig", .root_dep = false },
         },
-        // NOTE: `use_self_hosted = true` builds + validates here but
-        // traps at runtime under Zig 0.16 — the self-hosted wasm linker
-        // initializes `__stack_pointer` to -1048576 (0xFFF00000) instead
-        // of +1048576, so the first stack store faults OOB. Keep on LLVM
-        // until that's fixed upstream (tracked in #843).
-        .use_self_hosted = false,
+        // NOTE: both `no_lld = true` and `no_llvm = true` produce a module
+        // that builds + validates but traps at runtime under Zig 0.16: the
+        // self-hosted wasm *linker* initializes `__stack_pointer` to
+        // -1048576 (0xFFF00000) instead of +1048576, so the first stack
+        // store faults OOB. Isolated to the linker — LLVM codegen + `-fno-lld`
+        // still mis-sets it in a 545-byte module — and `-fno-llvm` triggers it
+        // too because self-hosted codegen forces self-hosted linking (it also
+        // bloats output ~67 KB by not eliding the `abi` BSS arena). Keep both
+        // on LLVM/LLD until the linker bug is fixed upstream (tracked in #843).
+        .no_llvm = false,
+        .no_lld = false,
     });
     const hello = makeComponent(b, .{
         .core = hello_core,
@@ -1543,12 +1548,12 @@ const ZigWasmCompile = struct {
     /// to a single instance — important because it owns the sole
     /// `cabi_realloc` export).
     imports: []const ZigWasmImport = &.{},
-    /// When true, build with Zig's self-hosted wasm codegen backend and
-    /// linker (`-fno-llvm -fno-lld`) instead of LLVM/LLD. The wasm
-    /// backend is the most mature self-hosted target and handles the
-    /// simple freestanding guests here; avoid for SIMD/atomics-heavy or
-    /// perf-sensitive modules where LLVM's codegen still wins.
-    use_self_hosted: bool = false,
+    /// When true, pass `-fno-llvm` to use Zig's self-hosted wasm codegen
+    /// backend instead of LLVM.
+    no_llvm: bool = false,
+    /// When true, pass `-fno-lld` to use Zig's self-hosted wasm linker
+    /// instead of LLD.
+    no_lld: bool = false,
 };
 
 const ZigWasmImport = struct {
@@ -1580,9 +1585,12 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
         "-O",            "ReleaseSmall",
         "-fno-entry",
     });
-    if (opts.use_self_hosted) {
-        // Select Zig's self-hosted wasm codegen backend + linker.
+    if (opts.no_llvm) {
+        // Use Zig's self-hosted wasm codegen backend instead of LLVM.
         cmd.addArg("-fno-llvm");
+    }
+    if (opts.no_lld) {
+        // Use Zig's self-hosted wasm linker instead of LLD.
         cmd.addArg("-fno-lld");
     }
     for (opts.exports) |sym| {
