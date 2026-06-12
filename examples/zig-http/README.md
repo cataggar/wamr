@@ -10,7 +10,7 @@ Runs end-to-end through wamr today:
 
 ```console
 $ ./zig-out/bin/wamr run --listen=127.0.0.1:8080 \
-        zig-out/component-examples/zig-http.wasm &
+        zig-out/examples/zig-http.wasm &
 $ curl -i http://127.0.0.1:8080/
 HTTP/1.1 200 OK
 Content-Length: 14
@@ -24,8 +24,8 @@ $ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/missing
 The repo's root `build.zig` automates everything:
 
 ```sh
-zig build component-examples       # build + validate
-zig build component-examples-run   # build + spin-up + smoke (curl-equivalent in Zig)
+zig build examples       # build + validate
+zig build examples-run   # build + spin-up + smoke (curl-equivalent in Zig)
 ```
 
 [bca-http]: https://component-model.bytecodealliance.org/language-support/using-http-in-components/rust.html

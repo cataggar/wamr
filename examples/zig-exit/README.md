@@ -28,14 +28,14 @@ wabt component new zig-exit.core.wasm
 The repo's root `build.zig` automates both steps:
 
 ```sh
-zig build component-examples           # build + validate all examples
-zig build component-examples-run       # run this one through ./zig-out/bin/wamr
+zig build examples           # build + validate all examples
+zig build examples-run       # run this one through ./zig-out/bin/wamr
 ```
 
 ## Run
 
 ```console
-$ ./zig-out/bin/wamr zig-out/component-examples/zig-exit.wasm
+$ ./zig-out/bin/wamr zig-out/examples/zig-exit.wasm
 exiting with code 7
 $ echo $?
 7

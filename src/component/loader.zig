@@ -2121,7 +2121,7 @@ test "parseInstance: inline-export form expects exportname' (0x00 prefix) on eac
 }
 
 test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
-    // Prebuilt binary of examples/components/stdio-echo/ — a minimal
+    // Prebuilt binary of examples/stdio-echo/ — a minimal
     // Rust `fn main { println!("echo: ..."); }` compiled with
     // `cargo build --release --target wasm32-wasip2`. This is the canonical
     // Phase 1A regression fixture for #142: before the loader rework every

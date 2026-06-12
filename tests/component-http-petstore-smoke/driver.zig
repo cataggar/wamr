@@ -1,4 +1,4 @@
-//! End-to-end smoke driver for `examples/components/zig-http-petstore`.
+//! End-to-end smoke driver for `examples/zig-http-petstore`.
 //!
 //! Spawns `<wamr_exe> run --listen=127.0.0.1:<port> <component.wasm>` as
 //! a subprocess and verifies the TypeSpec petstore API behaviour:

@@ -60,7 +60,7 @@ wasm-tools parse -o exit-ok.wasm exit-ok.wat
 ## Automated test wiring
 
 `build.zig`'s `addComponentExamples` flow registers both fixtures as
-`zig build component-examples-run` arms that compile through `wamrc`
+`zig build examples-run` arms that compile through `wamrc`
 and assert the host process exit code matches the requested
 discriminant.
 

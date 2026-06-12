@@ -144,7 +144,7 @@ pub fn build(b: *std.Build) void {
     const aot_broken_components = b.option(
         bool,
         "aot-broken-components",
-        "Run `component-examples-run` / `wasi-p2-testsuite` fixtures that currently fail under AOT-only `wamr run` (#662). Defaults true so local `zig build component-examples-run` still exercises them; CI sets to false to keep the gate green.",
+        "Run `examples-run` / `wasi-p2-testsuite` fixtures that currently fail under AOT-only `wamr run` (#662). Defaults true so local `zig build examples-run` still exercises them; CI sets to false to keep the gate green.",
     ) orelse true;
 
     const config_module = options.createModule();
@@ -329,7 +329,7 @@ pub fn build(b: *std.Build) void {
     // ── Wasmtime parity gate (#583 C1, original #489 proposal) ────────
     // Runs the *same* `wasm32-wasip3` fixtures through upstream Wasmtime
     // (CI pin: v44.0.1, the first release with `-Sp3` support — see the
-    // `component-examples-wasmtime` job in `.github/workflows/ci.yml`).
+    // `examples-wasmtime` job in `.github/workflows/ci.yml`).
     // The wasm test corpus is identical, so a wamr regression that
     // Wasmtime *also* exhibits flags as a fixture bug rather than a
     // wamr bug (see `scripts/diff-testsuite-reports.py`).
@@ -1106,9 +1106,9 @@ pub fn build(b: *std.Build) void {
 
     // ── Component-model examples ─────────────────────────────────────
     // Reproducible Zig (and one mixed Zig+Rust) WebAssembly component
-    // examples under `examples/components/`. Opt-in: not reachable from
-    // the default `zig build` or `zig build test` graphs. See
-    // `examples/components/README.md` for prereqs and runtime status.
+    // examples under `examples/`. Opt-in: not reachable from the default
+    // `zig build` or `zig build test` graphs. See `examples/README.md`
+    // for prereqs and runtime status.
     //
     // The mixed Zig+Rust example needs the `wasm32-wasip1` rustup target.
     // Probe for it at configure time and skip that one example when it's
@@ -1124,12 +1124,11 @@ pub fn build(b: *std.Build) void {
 
     // ── WASI Preview 2 conformance gate (#479) ───────────────────────
     // Curated set of Preview-2 component fixtures (sources under
-    // `examples/components/`) run through `./zig-out/bin/wamr` with
-    // byte-exact stdout + exit-code assertions. Strict superset of
-    // `component-examples-run`: every component the latter runs is
-    // also a member of this gate. The named step gives CI a
-    // discoverable entry point, mirroring `wasi-testsuite` for
-    // Preview 1.
+    // `examples/`) run through `./zig-out/bin/wamr` with byte-exact
+    // stdout + exit-code assertions. Strict superset of `examples-run`:
+    // every component the latter runs is also a member of this gate. The
+    // named step gives CI a discoverable entry point, mirroring
+    // `wasi-testsuite` for Preview 1.
     //
     // Curation rationale + future-skips: `tests/wasi-p2-testsuite-skip.json`
     // (header `_comment` documents the format; mirrors the
@@ -1146,17 +1145,17 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Wires up the Component-Model example pipeline (sources under
-/// `examples/components/`). Three opt-in steps are exposed:
-///   * `zig build component-examples`               — build + validate all four
-///   * `zig build component-examples-run`           — run them through `./zig-out/bin/wamr`
-///   * `zig build component-examples-run-wasmtime`  — run them through
-///                                                    `wasmtime run -S cli-exit-with-code`
-///                                                    (cross-runtime parity gate; wasmtime v44+).
+/// `examples/`). Three opt-in steps are exposed:
+///   * `zig build examples`               — build + validate all four
+///   * `zig build examples-run`           — run them through `./zig-out/bin/wamr`
+///   * `zig build examples-run-wasmtime`  — run them through
+///                                          `wasmtime run -S cli-exit-with-code`
+///                                          (cross-runtime parity gate; wasmtime v44+).
 /// None are reachable from `zig build` or `zig build test`.
 ///
 /// Returns the two run-step parents so the caller can layer additional
 /// named entry points on top (e.g. `wasi-p2-testsuite` in #479, which
-/// is a strict superset of `component-examples-run`).
+/// is a strict superset of `examples-run`).
 ///
 /// Pinned versions:
 ///   * `cataggar/wabt` ≥ v3.0.0-dev.13 on PATH. `component new` embeds the
@@ -1187,11 +1186,11 @@ fn rustWasip1TargetAvailable(b: *std.Build) bool {
 
 fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_broken_components: bool, rust_examples: bool) ComponentRunSteps {
     const examples_step = b.step(
-        "component-examples",
-        "Build the WebAssembly Component examples in examples/components/",
+        "examples",
+        "Build the WebAssembly Component examples in examples/",
     );
     const run_step = b.step(
-        "component-examples-run",
+        "examples-run",
         "Run the runnable component examples through ./zig-out/bin/wamr",
     );
     // Cross-runtime parity step (cataggar/wamr#457): the same four
@@ -1202,7 +1201,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // when `wasmtime` is missing from PATH is a clear systemcommand
     // error.
     const run_step_wasmtime = b.step(
-        "component-examples-run-wasmtime",
+        "examples-run-wasmtime",
         "Run the runnable component examples through `wasmtime run -S cli-exit-with-code` for cross-runtime parity validation",
     );
     const runs: ComponentRunSteps = .{ .wamr = run_step, .wasmtime = run_step_wasmtime };
@@ -1210,7 +1209,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // ── zig-hello ──────────────────────────────────────────────────
     // Pure-Zig WASI command: `_start` writes a greeting via fd_write.
     const hello_core = compileZigWasm(b, .{
-        .source = "examples/components/zig-hello/src/main.zig",
+        .source = "examples/zig-hello/src/main.zig",
         .target_triple = "wasm32-wasi",
         .exports = &.{"_start"},
         .output = "zig-hello.core.wasm",
@@ -1235,7 +1234,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // propagates as `RunOutcome.exit_code` and `main.zig:runComponent`
     // maps to host exit code 7.
     const exit_core = compileZigWasm(b, .{
-        .source = "examples/components/zig-exit/src/main.zig",
+        .source = "examples/zig-exit/src/main.zig",
         .target_triple = "wasm32-wasi",
         .exports = &.{"_start"},
         .output = "zig-exit.core.wasm",
@@ -1251,7 +1250,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // ── zig-adder ──────────────────────────────────────────────────
     // Library component (no `run`): exports `docs:adder/add@0.1.0`.
     const adder_core = compileZigWasm(b, .{
-        .source = "examples/components/zig-adder/src/main.zig",
+        .source = "examples/zig-adder/src/main.zig",
         .target_triple = "wasm32-freestanding",
         .exports = &.{"docs:adder/add@0.1.0#add"},
         .output = "zig-adder.core.wasm",
@@ -1260,7 +1259,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // kebab-case file basenames (no dots before the .wasm extension).
     const adder = makeComponent(b, .{
         .core = adder_core,
-        .wit_dir = "examples/components/zig-adder/wit",
+        .wit_dir = "examples/zig-adder/wit",
         .world = "adder",
         .output = "zig-adder.wasm",
     });
@@ -1268,14 +1267,14 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
 
     // ── zig-calculator-cmd (Zig command importing zig-adder) ───────
     const calc_core = compileZigWasm(b, .{
-        .source = "examples/components/zig-calculator-cmd/src/main.zig",
+        .source = "examples/zig-calculator-cmd/src/main.zig",
         .target_triple = "wasm32-wasi",
         .exports = &.{"_start"},
         .output = "zig-calculator-cmd.core.wasm",
     });
     const calc_cmd = makeComponent(b, .{
         .core = calc_core,
-        .wit_dir = "examples/components/zig-calculator-cmd/wit",
+        .wit_dir = "examples/zig-calculator-cmd/wit",
         .world = "app",
         .output = "zig-calculator-cmd.wasm",
     });
@@ -1306,7 +1305,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
             "cargo",                                                      "build",
             "--release",                                                  "--target",
             "wasm32-wasip1",                                              "--manifest-path",
-            "examples/components/mixed-zig-rust-calc/command/Cargo.toml",
+            "examples/mixed-zig-rust-calc/command/Cargo.toml",
         });
         cargo.setName("cargo build (mixed-zig-rust-calc command)");
         // Cargo writes its outputs to a deterministic path; we surface the
@@ -1314,7 +1313,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         // build-graph-tracked LazyPath.
         const cargo_pickup = b.addSystemCommand(&.{
             "cp",
-            "examples/components/mixed-zig-rust-calc/command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm",
+            "examples/mixed-zig-rust-calc/command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm",
         });
         cargo_pickup.step.dependOn(&cargo.step);
         const rust_core = cargo_pickup.addOutputFileArg("mixed_zig_rust_command.core.wasm");
@@ -1322,7 +1321,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         // Kebab-case basename for `wabt component compose`.
         const rust_cmd = makeComponent(b, .{
             .core = rust_core,
-            .wit_dir = "examples/components/mixed-zig-rust-calc/command/wit",
+            .wit_dir = "examples/mixed-zig-rust-calc/command/wit",
             .world = "app",
             .output = "mixed-rust-command.wasm",
         });
@@ -1351,7 +1350,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // ABI lifts of `option<string>` / `list<u8>` payloads the host
     // materializes into guest memory.
     const http_core = compileZigWasm(b, .{
-        .source = "examples/components/zig-http/src/main.zig",
+        .source = "examples/zig-http/src/main.zig",
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http.core.wasm",
@@ -1362,7 +1361,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     });
     const http_component = makeComponent(b, .{
         .core = http_core,
-        .wit_dir = "examples/components/zig-http/wit",
+        .wit_dir = "examples/zig-http/wit",
         .world = "http-hello",
         .output = "zig-http.wasm",
     });
@@ -1408,7 +1407,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // `content-type: application/json` response header. Same
     // `wasm32-freestanding` + `cabi_realloc` build shape as zig-http.
     const petstore_core = compileZigWasm(b, .{
-        .source = "examples/components/zig-http-petstore/src/main.zig",
+        .source = "examples/zig-http-petstore/src/main.zig",
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http-petstore.core.wasm",
@@ -1420,7 +1419,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     });
     const petstore_component = makeComponent(b, .{
         .core = petstore_core,
-        .wit_dir = "examples/components/zig-http-petstore/wit",
+        .wit_dir = "examples/zig-http-petstore/wit",
         .world = "petstore",
         .output = "zig-http-petstore.wasm",
     });
@@ -1634,7 +1633,7 @@ fn makeComponent(b: *std.Build, opts: ReactorComponent) std.Build.LazyPath {
 }
 
 /// Validates the component and installs it under
-/// `zig-out/component-examples/<basename>`.
+/// `zig-out/examples/<basename>`.
 fn installAndValidate(
     b: *std.Build,
     parent: *std.Build.Step,
@@ -1647,7 +1646,7 @@ fn installAndValidate(
 
     const install = b.addInstallFileWithDir(
         component,
-        .{ .custom = "component-examples" },
+        .{ .custom = "examples" },
         install_basename,
     );
     install.step.dependOn(&validate.step);

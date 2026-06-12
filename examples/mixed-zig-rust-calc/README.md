@@ -54,10 +54,10 @@ wabt component compose -d zig-adder.wasm rust-command.wasm \
 Or, more concisely, via the repo's root `build.zig`:
 
 ```sh
-zig build component-examples
+zig build examples
 ```
 
-That step produces `zig-out/component-examples/mixed-zig-rust-calc.wasm`.
+That step produces `zig-out/examples/mixed-zig-rust-calc.wasm`.
 
 ## Prerequisites
 
@@ -71,7 +71,7 @@ That step produces `zig-out/component-examples/mixed-zig-rust-calc.wasm`.
 ## Runtime status
 
 The composed component validates with `wabt validate` and runs in both
-[Wasmtime][wasmtime] and wamr. `zig build component-examples-run` runs
+[Wasmtime][wasmtime] and wamr. `zig build examples-run` runs
 this example end-to-end through `./zig-out/bin/wamr` and asserts the
 expected two-line output.
 

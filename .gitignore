@@ -42,5 +42,5 @@ tests/benchmarks/**/*.wasm
 tests/benchmarks/**/*.aot
 tests/benchmarks/**/*.exe
 bin/
-examples/components/**/target/
+examples/**/target/
 .zig-global-cache/

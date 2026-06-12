@@ -38,7 +38,7 @@ wabt component new --world adder --wit wit zig-adder.core.wasm
 Or via the repo's root `build.zig`:
 
 ```sh
-zig build component-examples
+zig build examples
 ```
 
 ## Run
@@ -47,7 +47,7 @@ This is a library component. It has no `wasi:cli/run` export, so it
 cannot be invoked directly by the wamr CLI:
 
 ```console
-$ ./zig-out/bin/wamr zig-out/component-examples/zig-adder.wasm
+$ ./zig-out/bin/wamr zig-out/examples/zig-adder.wasm
 Error: component does not expose a top-level `run` export. ...
 ```
 

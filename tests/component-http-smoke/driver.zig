@@ -1,4 +1,4 @@
-//! End-to-end smoke driver for `examples/components/zig-http`.
+//! End-to-end smoke driver for `examples/zig-http`.
 //!
 //! Spawns `<wamr_exe> run --listen=127.0.0.1:<port> <component.wasm>` as
 //! a subprocess and verifies the canonical HTTP-tutorial behaviour:
@@ -8,7 +8,7 @@
 //!
 //! Mirrors `tests/wasi-sock/driver.zig` (the WASI-sockets driver wired
 //! by `#437`). The driver is the run target for the
-//! `component-examples-run` build step's `zig-http` slice.
+//! `examples-run` build step's `zig-http` slice.
 //!
 //! Usage: `component-http-smoke-driver <wamr_exe> <component.wasm> <port>`
 //!
