@@ -1,0 +1,21 @@
+// World for the native-`wasi:cli` Zig hello command.
+//
+// Unlike a preview1 `_start` command (which reaches stdout through the
+// wabt-bundled wasi-preview1 → preview2 adapter), this guest speaks
+// `wasi:cli` directly: it imports `wasi:cli/stdout` (to obtain the
+// stdout `output-stream`) and `wasi:io/streams` (to write to it), and
+// exports `wasi:cli/run` as its entry point.
+//
+// `wasi:io/streams` is imported **before** `wasi:cli/stdout` because the
+// latter's `use wasi:io/streams.{output-stream}` clause must see the
+// resource already in the world's type-indexspace (cataggar/wabt emits
+// alias decls in world-declaration order). Plain `//` comments before
+// `package` per cataggar/wabt#192.
+package example:zig-hello;
+
+world hello {
+    import wasi:io/streams@0.2.6;
+    import wasi:cli/stdout@0.2.6;
+    import wasi:cli/exit@0.2.6;
+    export wasi:cli/run@0.2.6;
+}

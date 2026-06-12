@@ -1207,23 +1207,30 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     const runs: ComponentRunSteps = .{ .wamr = run_step, .wasmtime = run_step_wasmtime };
 
     // ── zig-hello ──────────────────────────────────────────────────
-    // Pure-Zig WASI command: `_start` writes a greeting via fd_write.
+    // Native-`wasi:cli` command: exports `wasi:cli/run@0.2.6#run` and
+    // writes a greeting through `wasi:cli/stdout` + `wasi:io/streams`
+    // (no preview1 `_start` / adapter). Built `wasm32-freestanding`; the
+    // canonical-ABI plumbing lives in the shared `wasi_cli` guest helper.
     const hello_core = compileZigWasm(b, .{
         .source = "examples/zig-hello/src/main.zig",
-        .target_triple = "wasm32-wasi",
-        .exports = &.{"_start"},
+        .target_triple = "wasm32-freestanding",
+        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "zig-hello.core.wasm",
+        .imports = &.{
+            .{ .name = "wasi_cli", .path = "src/guest/wasi_cli.zig", .deps = &.{"abi"} },
+            .{ .name = "abi", .path = "src/guest/abi.zig", .root_dep = false },
+        },
     });
-    const hello = makeCommandComponent(b, .{
-        .name = "zig-hello",
+    const hello = makeComponent(b, .{
         .core = hello_core,
+        .wit_dir = "examples/zig-hello/wit",
+        .world = "hello",
+        .output = "zig-hello.wasm",
     });
     installAndValidate(b, examples_step, hello, "zig-hello.wasm");
 
-    // The wabt-bundled adapter lowers `fd_write(1, …)` through
-    // `wasi:io/streams.blocking-write-and-flush` against
-    // `wasi:cli/stdout.get-stdout`, which both runtimes flush to
-    // the host's actual stdout.
+    // wamr's `populateWasiCliRun` binds `get-stdout` + the output-stream
+    // write; both wamr and wasmtime flush to the host's actual stdout.
     wireComponentRun(b, runs, wamr_exe, hello, "hello from zig component\n", 0, .{ .skip_wamr = !aot_broken_components });
 
     // ── zig-exit ───────────────────────────────────────────────────
@@ -1302,9 +1309,9 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // option / probe in `build`).
     if (rust_examples) {
         const cargo = b.addSystemCommand(&.{
-            "cargo",                                                      "build",
-            "--release",                                                  "--target",
-            "wasm32-wasip1",                                              "--manifest-path",
+            "cargo",                                           "build",
+            "--release",                                       "--target",
+            "wasm32-wasip1",                                   "--manifest-path",
             "examples/mixed-zig-rust-calc/command/Cargo.toml",
         });
         cargo.setName("cargo build (mixed-zig-rust-calc command)");

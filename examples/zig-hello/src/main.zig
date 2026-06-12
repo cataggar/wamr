@@ -1,26 +1,27 @@
-//! Minimal WASI command component, written in Zig.
+//! Minimal native-`wasi:cli` command component, written in Zig.
 //!
-//! This is the smallest end-to-end Zig component example shipped with
-//! wamr: a hand-rolled `_start` writes a greeting to fd 1 (stdout) via
-//! `wasi_snapshot_preview1.fd_write` and returns. Building with
-//! `-fno-entry --export=_start` overrides Zig's default `std.start`
-//! prologue, so the component never calls `proc_exit`. Many component
-//! runtimes (including wamr today) surface a preview1 `proc_exit` call
-//! as a trap rather than translating it through the wasi-preview1
-//! adapter back into `wasi:cli/exit.exit-with-code`, so a normal return
-//! is the most portable shape for a "hello world" example.
+//! The smallest end-to-end Zig component example shipped with wamr: it
+//! writes a greeting to stdout and returns an explicit exit code. Unlike
+//! a preview1 `_start` command (which reaches stdout through the
+//! wabt-bundled wasi-preview1 → preview2 adapter), this guest speaks
+//! `wasi:cli` directly — it exports `wasi:cli/run@0.2.6` and writes
+//! through `wasi:cli/stdout` + `wasi:io/streams`, then reports its exit
+//! code via `wasi:cli/exit.exit-with-code`.
+//!
+//! The canonical-ABI plumbing (host imports, the `wasi:cli/run` export
+//! wiring, the exit-code path) lives in the shared `wasi_cli` helper
+//! module (`@import("wasi_cli")`; source at `src/guest/wasi_cli.zig`).
+//! This file is just the entry point.
 //!
 //! See ../README.md for the build pipeline and runtime notes.
 
-const std = @import("std");
+const cli = @import("wasi_cli");
 
-export fn _start() void {
-    const msg = "hello from zig component\n";
-    var nwritten: usize = 0;
-    _ = std.os.wasi.fd_write(
-        1,
-        &.{.{ .base = msg.ptr, .len = msg.len }},
-        1,
-        &nwritten,
-    );
+comptime {
+    cli.exportRun(run);
+}
+
+fn run() u8 {
+    cli.print("hello from zig component\n");
+    return 0; // process exit code (0 = success)
 }
