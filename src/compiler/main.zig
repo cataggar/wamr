@@ -1055,10 +1055,13 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
     // Freshness check. On a hit we skip compilation entirely; on a miss
     // (or `--force`) we (re)compile in place.
     var did_compile = false;
+    // The per-compile progress line is diagnostic noise for the common
+    // `wamrc run` path; only surface it when AOT debug is enabled.
+    const debug_log = envFlagEnabled(init.environ_map, "WAMR_AOT_DEBUG");
     if (is_comp) {
         const fresh = !force and componentArtifactFresh(allocator, artifact_path, wasm_data);
         if (!fresh) {
-            std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
+            if (debug_log) std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
             var result = wamr.component_aot_compile.precompileComponent(allocator, wasm_data, artifact_path, .{
                 .target_arch = target_arch,
                 .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
@@ -1077,7 +1080,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
     } else {
         const fresh = !force and coreArtifactFresh(allocator, artifact_path, wasm_data, target_arch, in_path);
         if (!fresh) {
-            std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
+            if (debug_log) std.debug.print("wamrc: compiling {s} → {s}\n", .{ in_path, artifact_path });
             const cwasm = wamr.component_aot_compile.compileCoreWasm(allocator, wasm_data, .{
                 .target_arch = target_arch,
                 .pass_timing = passes.passTimingOptionsFromEnv(init.environ_map),
@@ -1102,7 +1105,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []cons
         }
     }
     if (!did_compile) {
-        std.debug.print("wamrc: reusing {s} (up to date)\n", .{artifact_path});
+        if (debug_log) std.debug.print("wamrc: reusing {s} (up to date)\n", .{artifact_path});
     }
 
     // Build the argv for `wamr run`. Layout:
@@ -1268,6 +1271,14 @@ fn parseVerifyModeOrDie(source: []const u8, value: []const u8) wamr.ir_verifier.
 fn verifyModeFromEnvOrDefault(env: *const std.process.Environ.Map) wamr.ir_verifier.VerifyMode {
     const value = env.get("WAMR_AOT_VERIFY_IR") orelse return defaultVerifyMode();
     return parseVerifyModeOrDie("WAMR_AOT_VERIFY_IR", value);
+}
+
+/// Parse an env var as a boolean toggle: present and not one of
+/// ``/`0`/`false` means enabled. Mirrors the `WAMR_AOT_DEBUG` parsing
+/// in `src/main.zig`.
+fn envFlagEnabled(env: *const std.process.Environ.Map, name: []const u8) bool {
+    const v = env.get(name) orelse return false;
+    return !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
 }
 
 fn targetArchName(arch: TargetArch) []const u8 {

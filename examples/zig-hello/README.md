@@ -7,7 +7,7 @@ exit code.
 ## Build
 
 ```sh
-zig build examples       # build + validate all examples
+zig build examples
 ```
 
 Produces `zig-out/examples/zig-hello.wasm`.
@@ -16,7 +16,7 @@ Produces `zig-out/examples/zig-hello.wasm`.
 
 ```sh
 # wamr
-wamr run zig-out/examples/zig-hello.wasm
+wamrc run zig-out/examples/zig-hello.wasm
 
 # wasmtime
 wasmtime run -S cli-exit-with-code zig-out/examples/zig-hello.wasm
