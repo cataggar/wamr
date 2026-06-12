@@ -20,7 +20,6 @@ examples/
 ├── README.md                       (this file)
 ├── stdio-echo/                     (existing Rust example, see #156)
 ├── zig-hello/                      smallest end-to-end Zig command
-├── zig-exit/                       exercises preview1 proc_exit → cli/exit (#436)
 ├── zig-adder/                      library exporting docs:adder/add@0.1.0
 ├── zig-calculator-cmd/             Zig command importing docs:adder
 ├── mixed-zig-rust-calc/            Zig adder + Rust command, composed
@@ -41,14 +40,13 @@ on machines that do not have the external toolchain installed.
 | Step                    | What it does                                                     |
 |-------------------------|------------------------------------------------------------------|
 | `zig build examples`     | Build, encode, and validate every component below.               |
-| `zig build examples-run` | Run the runnable examples through `./zig-out/bin/wamr` — `zig-hello` greeting, `zig-exit` exit-code path, the two composed calculator commands, and the `zig-http` curl-equivalent smoke (spin up `wamr run --listen=…`, send two requests, assert `200 "Hello, world!\n"` / `404`). |
+| `zig build examples-run` | Run the runnable examples through `./zig-out/bin/wamr` — `zig-hello` greeting + exit code, the two composed calculator commands, and the `zig-http` curl-equivalent smoke (spin up `wamr run --listen=…`, send two requests, assert `200 "Hello, world!\n"` / `404`). |
 
 Outputs land under `zig-out/examples/`:
 
 ```
 zig-out/examples/
 ├── zig-hello.wasm
-├── zig-exit.wasm
 ├── zig-adder.wasm
 ├── zig-calculator-cmd.wasm
 ├── mixed-zig-rust-calc.wasm
@@ -69,8 +67,7 @@ zig-out/examples/
 
 | Example                   | Builds | Validates | Runs in wamr today | Notes                                                      |
 |---------------------------|:------:|:---------:|:------------------:|------------------------------------------------------------|
-| `zig-hello`               |   ✓    |     ✓     |         ✓          | End-to-end (greeting written via the captured-stdout flush). |
-| `zig-exit`                |   ✓    |     ✓     |         ✓          | Exercises `proc_exit(7)` → `wasi:cli/exit.exit-with-code(7)` (#436). |
+| `zig-hello`               |   ✓    |     ✓     |         ✓          | End-to-end (greeting written via the captured-stdout flush); returns an explicit exit code via `wasi:cli/exit`. |
 | `zig-adder`               |   ✓    |     ✓     |        n/a         | Library component — no `wasi:cli/run`.                     |
 | `zig-calculator-cmd` (composed) | ✓ |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
 | `mixed-zig-rust-calc`     |   ✓    |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
@@ -105,5 +102,5 @@ greeting on host stdout (fd 1).
   `@unstable(feature = cli-exit-with-code)` extension of the
   wasi-cli@0.2.6 interface — wamr supports it unconditionally,
   while Wasmtime v44 gates the linker binding behind
-  `-S cli-exit-with-code`. To run `zig-exit` / `mixed-zig-rust-calc`
+  `-S cli-exit-with-code`. To run `zig-hello` / `mixed-zig-rust-calc`
   on wasmtime: `wasmtime run -S cli-exit-with-code <component>.wasm`.

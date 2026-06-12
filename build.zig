@@ -493,7 +493,7 @@ pub fn build(b: *std.Build) void {
     // hand-rolled WAT fixtures (`tests/regressions/760-aot-cli-exit/`)
     // import `wasi:cli/exit@0.2.0` directly (no preview1 → preview2
     // adapter, so unrelated to the cross-instance #662 blocker that
-    // gates the `zig-exit` example) and exit with the ok / err
+    // gates the adapter-based command examples) and exit with the ok / err
     // discriminants. Before the fix both crashed the host with SIGSEGV
     // (exit 139) after the wit-bindgen adapter's "host exit
     // implementation didn't exit!" assertion fired on the sentinel
@@ -1238,27 +1238,6 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     // write; both wamr and wasmtime flush to the host's actual stdout.
     wireComponentRun(b, runs, wamr_exe, hello, "hello from zig component\n", 0, .{ .skip_wamr = !aot_broken_components });
 
-    // ── zig-exit ───────────────────────────────────────────────────
-    // Exercises the component exit-code path (issue #436): `_start`
-    // writes a marker line then calls `proc_exit(7)`; through wabt's
-    // bundled wasi-preview1 → preview2 adapter that becomes
-    // `wasi:cli/exit.exit-with-code(7)`, which `runLoadedComponent`
-    // propagates as `RunOutcome.exit_code` and `main.zig:runComponent`
-    // maps to host exit code 7.
-    const exit_core = compileZigWasm(b, .{
-        .source = "examples/zig-exit/src/main.zig",
-        .target_triple = "wasm32-wasi",
-        .exports = &.{"_start"},
-        .output = "zig-exit.core.wasm",
-    });
-    const exit_component = makeCommandComponent(b, .{
-        .name = "zig-exit",
-        .core = exit_core,
-    });
-    installAndValidate(b, examples_step, exit_component, "zig-exit.wasm");
-
-    wireComponentRun(b, runs, wamr_exe, exit_component, "exiting with code 7\n", 7, .{ .skip_wamr = !aot_broken_components });
-
     // ── zig-adder ──────────────────────────────────────────────────
     // Library component (no `run`): exports `docs:adder/add@0.1.0`.
     const adder_core = compileZigWasm(b, .{
@@ -1612,22 +1591,6 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     const out = cmd.addPrefixedOutputFileArg("-femit-bin=", opts.output);
     cmd.setName(b.fmt("zig build-exe {s}", .{opts.output}));
     return out;
-}
-
-const CommandComponent = struct {
-    name: []const u8,
-    core: std.Build.LazyPath,
-};
-
-/// Wraps `wabt component new`. The wasi-preview1 → component
-/// adapter is bundled inside wabt and auto-attached when the
-/// embed has unresolved `wasi_snapshot_preview1.*` imports
-/// (see `cataggar/wabt#156`); no `--adapt` plumbing required.
-fn makeCommandComponent(b: *std.Build, opts: CommandComponent) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{ "wabt", "component", "new" });
-    cmd.addFileArg(opts.core);
-    cmd.addArg("-o");
-    return cmd.addOutputFileArg(b.fmt("{s}.wasm", .{opts.name}));
 }
 
 const ReactorComponent = struct {
