@@ -1,0 +1,25 @@
+// Subset of the canonical `wasi:http/incoming-handler@0.2.6`
+// interface — just enough for the zig-http-petstore example. Sorts
+// first alphabetically in this directory, so it carries the package
+// declaration; `types.wit` (read second) is package-less because
+// cataggar/wabt's `readWitDir` concatenates `*.wit` files with `\n`
+// and the parser rejects a duplicate `package` directive in the
+// combined document.
+//
+// Plain `//` comments before `package` instead of `///` per
+// cataggar/wabt#192.
+package wasi:http@0.2.6;
+
+/// Server-side handler. Components export this so the host (wamr's
+/// `runHttpComponent` accept loop) can deliver incoming HTTP
+/// requests. The `handle` lift signature is the canonical
+/// `(req: own<incoming-request>, outp: own<response-outparam>) -> ()`;
+/// lowered, it's two `i32` handles in and no return.
+interface incoming-handler {
+    use types.{incoming-request, response-outparam};
+
+    handle: func(
+        request: incoming-request,
+        response-out: response-outparam
+    );
+}

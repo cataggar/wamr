@@ -1,0 +1,48 @@
+// World for the Zig WASI HTTP **petstore** example.
+//
+// Implements the Microsoft TypeSpec petstore sample API
+// (https://github.com/microsoft/typespec/blob/main/packages/samples/specs/petstore/petstore.tsp)
+// as a `wasi:http/incoming-handler@0.2.6` component, written entirely
+// in hand-coded canonical ABI — no Zig wit-bindgen equivalent exists.
+//
+// It is a strict superset of the `zig-http` example's `http-hello`
+// world: in addition to constructing a response + writing the body, it
+// also reads the request **method** and **body** (for `POST /pets`),
+// and sets the `content-type: application/json` response header. That
+// pulls in a few more `wasi:http/types` + `wasi:io/streams` members
+// than `zig-http` imports — see the per-import notes below.
+//
+// As with `zig-http`, we deliberately do NOT include the canonical
+// `wasi:http/proxy` world (it `include`s `wasi:clocks/imports`, which
+// the cataggar/wabt encoder doesn't support yet, and pulls in the
+// entire futures / outgoing-handler surface we don't use).
+//
+// NOTE: the header text uses plain `//` line comments rather than
+// `///` doc comments — see cataggar/wabt#192.
+package example:zig-http-petstore;
+
+world petstore {
+    /// `[method]input-stream.blocking-read` (reading the `POST /pets`
+    /// request body) + `[method]output-stream.blocking-write-and-flush`
+    /// (writing the JSON response body), plus the synthesized
+    /// `[resource-drop]` for each. Bound by `populateWasiIoStreams`.
+    ///
+    /// Imported **first** so the world-body alias slots for
+    /// `input-stream` / `output-stream` exist by the time
+    /// `wasi:http/types` (whose body has
+    /// `use wasi:io/streams.{input-stream, output-stream};`) is
+    /// encoded. cataggar/wabt's encoder emits alias decls in
+    /// world-declaration order, and a `use`-target must be visited
+    /// before its consumer.
+    import wasi:io/streams@0.2.6;
+
+    /// All resource constructors / methods the handler calls. Bound
+    /// by wamr's `populateWasiHttpTypes`.
+    import wasi:http/types@0.2.6;
+
+    /// Exported entry point. wamr's `findHttpIncomingHandlerExportName`
+    /// scans for an export whose qualified name starts with
+    /// `wasi:http/incoming-handler` and looks up `<that>/handle` on
+    /// the component instance.
+    export wasi:http/incoming-handler@0.2.6;
+}

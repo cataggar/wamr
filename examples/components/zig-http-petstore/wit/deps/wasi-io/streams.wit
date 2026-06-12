@@ -1,0 +1,47 @@
+// Trimmed `wasi:io/streams@0.2.6` — the subset the petstore handler
+// imports. Sorts first (and only) in this directory so it carries the
+// package declaration.
+//
+// The handler imports:
+//   * `[method]input-stream.blocking-read` — reading the `POST /pets`
+//     request body into guest memory (via `cabi_realloc`).
+//   * `[method]output-stream.blocking-write-and-flush` — pushing the
+//     JSON response body.
+// `[resource-drop]input-stream` / `[resource-drop]output-stream` are
+// synthesized by cataggar/wabt's canon stage for every resource.
+//
+// We deliberately omit `subscribe`, `check-write`, `read`, `write`,
+// and the `stream-error.last-operation-failed(own<error>)` arm (which
+// would require pulling `wasi:io/error` into the dep graph) — the
+// catch-all `closed` arm is enough to make the `result<…, stream-error>`
+// return types valid, and wamr's host resolves the success path on
+// every legitimate read/write.
+//
+// Plain `//` comments before `package` per cataggar/wabt#192.
+package wasi:io@0.2.6;
+
+interface streams {
+    /// Reduced stream-error variant. Upstream defines
+    /// `last-operation-failed(own<error>)` referencing `wasi:io/error`
+    /// — we drop that arm to keep the dep graph down to just
+    /// `wasi:io/streams`. `closed` alone is enough to make the
+    /// `result<…, stream-error>` returns valid; end-of-body surfaces
+    /// as `closed` in the err arm of `blocking-read`.
+    variant stream-error {
+        closed,
+    }
+
+    /// Source of the incoming request body. `blocking-read(len)`
+    /// returns up to `len` bytes in the ok arm; end-of-stream is the
+    /// `closed` err arm with no payload.
+    resource input-stream {
+        blocking-read: func(len: u64) -> result<list<u8>, stream-error>;
+    }
+
+    /// Sink for the outgoing response body.
+    resource output-stream {
+        blocking-write-and-flush: func(
+            contents: list<u8>
+        ) -> result<_, stream-error>;
+    }
+}
