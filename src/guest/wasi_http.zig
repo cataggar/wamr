@@ -133,12 +133,17 @@ extern "wasi:http/types@0.2.6" fn @"[method]incoming-body.stream"(self: i32, ret
 /// `own<outgoing-response>` handle on the ok arm (joined with the
 /// error-code discriminant on the err arm). Total flat params =
 /// 1 (outparam) + 8 = 9.
+///
+/// `j2` is **i64**, not i32: the `error-code` case
+/// `HTTP-request-body-size(option<u64>)` carries a `u64`, so the
+/// canonical join widens that slot to i64. wabt validates guest import
+/// signatures against this canonical lowering (cataggar/wabt#244/#245).
 extern "wasi:http/types@0.2.6" fn @"[static]response-outparam.set"(
     outparam: i32,
     outer_disc: i32,
     j0: i32,
     j1: i32,
-    j2: i32,
+    j2: i64,
     j3: i32,
     j4: i32,
     j5: i32,
