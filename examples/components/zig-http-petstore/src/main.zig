@@ -1,5 +1,5 @@
 //! Zig WASI HTTP component implementing the Microsoft TypeSpec
-//! **petstore** sample API:
+//! **petstore** sample API, with state persisted in `wasi:keyvalue`:
 //!
 //!   https://github.com/microsoft/typespec/blob/main/packages/samples/specs/petstore/petstore.tsp
 //!
@@ -12,108 +12,64 @@
 //!   GET    /pets/{petId}/toys    -> 200 ResponsePage<Toy>  (?nameFilter= filters)
 //!   anything else                -> 404 Error
 //!
-//! Runs end-to-end through wamr:
+//! Why keyvalue: pets live in a host-side `wasi:keyvalue` bucket, not in
+//! guest globals. A component's linear memory does not necessarily
+//! survive across requests — `wasmtime serve` instantiates a fresh
+//! instance per request — so cross-request state must live in the host.
+//! This makes the example behave identically under wamr's serial serve
+//! loop and under `wasmtime serve`.
+//!
+//! Run under wamr (in-memory store, or `--keyvalue-store=<file>` to persist):
 //!
 //!   wamr run --listen=127.0.0.1:8080 zig-http-petstore.component.wasm
 //!   curl -i http://127.0.0.1:8080/pets
 //!
-//! The canonical-ABI plumbing (host imports, ret-area decoding, the
-//! `cabi_realloc` arena, and the `wasi:http/incoming-handler` export
-//! wiring) lives in the shared `wasi_http` helper module (imported as
-//! `@import("wasi_http")`; source at `src/guest/wasi_http.zig`). This
-//! file is just the petstore routing + JSON logic. See that module's
-//! doc comment for how the canonical ABI is bridged.
+//! Run under wasmtime:
+//!
+//!   wasmtime serve -S keyvalue zig-http-petstore.wasm
+//!
+//! The canonical-ABI plumbing lives in the shared guest helper modules
+//! (`@import("wasi_http")` + `@import("wasi_keyvalue")`, both over the
+//! `abi` module; sources under `src/guest/`). This file is just the
+//! petstore routing + JSON + storage logic.
 //!
 //! See `../README.md` for the WIT layout and build pipeline.
 
 const std = @import("std");
 const http = @import("wasi_http");
+const kv = @import("wasi_keyvalue");
 
 comptime {
     http.exportIncomingHandler(handle);
 }
 
-// ── In-memory pet store ────────────────────────────────────────────
+// ── Storage layout (keyvalue bucket) ───────────────────────────────
 //
-// wamr instantiates the component once and reuses the instance across
-// every request in the serve loop (`serveOneHttpConnection` keeps the
-// same `inst`), so module-level state persists request-to-request. The
-// store is seeded lazily on the first request. Created-pet strings are
-// copied into `store_buf` (never reset) so they outlive the per-request
-// arena.
+// One bucket named "petstore" holds:
+//   * `next_id`  → ASCII decimal of the next id to assign.
+//   * `ids`      → comma-separated decimal ids of all live pets, in
+//                  insertion order (used to enumerate for GET /pets).
+//   * `pet:<id>` → the pet's canonical JSON (`{"name":…,"age":…}`),
+//                  stored exactly as it is served.
+// The bucket is seeded with Fluffy + Rex on first use.
 
-const Pet = struct {
-    id: i32,
-    name: []const u8,
-    tag: ?[]const u8,
-    age: i32,
-    present: bool,
+const BUCKET = "petstore";
+
+// Toys are static read-only seed data — the TypeSpec sample only
+// exposes `list` for toys, never create/delete, so they don't need the
+// keyvalue store.
+const toys = [_]ToyWire{
+    .{ .id = 1, .petId = 1, .name = "Ball" },
+    .{ .id = 2, .petId = 1, .name = "Mouse" },
+    .{ .id = 3, .petId = 2, .name = "Bone" },
 };
 
-const Toy = struct {
-    id: i64,
-    pet_id: i64,
-    name: []const u8,
-};
-
-const MAX_PETS = 64;
-var pets: [MAX_PETS]Pet = undefined;
-var pets_len: usize = 0;
-var next_id: i32 = 1;
-var seeded = false;
-
-var store_buf: [8192]u8 = undefined;
-var store_top: usize = 0;
-
-// Seeded toys are static (read-only) — the TypeSpec sample only exposes
-// `list` for toys, never create/delete.
-const toys = [_]Toy{
-    .{ .id = 1, .pet_id = 1, .name = "Ball" },
-    .{ .id = 2, .pet_id = 1, .name = "Mouse" },
-    .{ .id = 3, .pet_id = 2, .name = "Bone" },
-};
-
-fn ensureSeeded() void {
-    if (seeded) return;
-    seeded = true;
-    pets_len = 0;
-    addPet(1, "Fluffy", "cat", 3);
-    addPet(2, "Rex", null, 5);
-    next_id = 3;
-}
-
-fn addPet(id: i32, name: []const u8, tag: ?[]const u8, age: i32) void {
-    if (pets_len >= MAX_PETS) return;
-    pets[pets_len] = .{ .id = id, .name = name, .tag = tag, .age = age, .present = true };
-    pets_len += 1;
-}
-
-/// Copy `s` into the persistent store buffer. Returns the copy, or null
-/// if the store is full.
-fn storeDup(s: []const u8) ?[]const u8 {
-    if (store_top + s.len > store_buf.len) return null;
-    const dst = store_buf[store_top..][0..s.len];
-    @memcpy(dst, s);
-    store_top += s.len;
-    return dst;
-}
-
-fn findPet(id: i32) ?*Pet {
-    var i: usize = 0;
-    while (i < pets_len) : (i += 1) {
-        if (pets[i].present and pets[i].id == id) return &pets[i];
-    }
-    return null;
-}
-
-// ── JSON (de)serialization via std.json ─────────────────────────────
+// ── JSON wire models (mirror the TypeSpec petstore `.tsp`) ─────────
 //
-// Wire models mirror the TypeSpec petstore `.tsp`. They are distinct
-// from the internal `Pet` / `Toy` storage structs above: the wire `Pet`
-// carries no `id` (the spec's `Pet` model has none — `petId` is a path
-// parameter), and field names use the exact casing the API emits
-// (`petId`). The optional `tag` is omitted when absent via
-// `emit_null_optional_fields = false`, matching `tag?` in the spec.
+// The wire `Pet` carries no `id` (the spec's `Pet` has none — `petId`
+// is a path parameter); field names use the API's casing (`petId`). The
+// optional `tag` is omitted when absent via `emit_null_optional_fields`,
+// matching `tag?` in the spec.
 
 const PetWire = struct { name: []const u8, tag: ?[]const u8 = null, age: i32 };
 const ToyWire = struct { id: i64, petId: i64, name: []const u8 };
@@ -123,49 +79,82 @@ fn ResponsePage(comptime T: type) type {
     return struct { items: []const T };
 }
 
-// Response bodies are serialized into this fixed buffer; the returned
-// `Response.body` slice borrows from it (one response per request).
-var resp_buf: [16384]u8 = undefined;
+// ── Fixed buffers ──────────────────────────────────────────────────
+//
+// One response per request, so a single response buffer is enough.
+// `pet_buf` holds a single pet's canonical JSON while it is being stored
+// (kept distinct from `resp_buf` so storing during a GET /pets loop
+// doesn't clobber the response being assembled).
 
-/// Serialize `value` to JSON in `resp_buf` and return the written bytes.
-/// On overflow the `std.Io.Writer.fixed` write fails and we return an
-/// empty body.
-fn toJson(value: anytype) []const u8 {
-    var w = std.Io.Writer.fixed(&resp_buf);
+var resp_buf: [16384]u8 = undefined;
+var pet_buf: [1024]u8 = undefined;
+var ids_buf: [4096]u8 = undefined;
+var json_parse_buf: [8192]u8 = undefined;
+
+/// Serialize `value` to JSON in `buf`, returning the written bytes (or
+/// empty on overflow).
+fn toJsonBuf(buf: []u8, value: anytype) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
     var s: std.json.Stringify = .{
         .writer = &w,
         .options = .{ .emit_null_optional_fields = false },
     };
     s.write(value) catch return "";
-    return resp_buf[0..w.end];
+    return buf[0..w.end];
 }
 
-/// Extract a query parameter value (`?key=value&…`). Returns a slice
-/// borrowing from `query`. No percent-decoding (out of scope).
-fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
-            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
-        } else if (std.mem.eql(u8, pair, key)) {
-            return "";
-        }
+fn toJson(value: anytype) []const u8 {
+    return toJsonBuf(&resp_buf, value);
+}
+
+// ── Handler entry point ────────────────────────────────────────────
+
+/// Dispatched by `http.exportIncomingHandler`. The wrapper has already
+/// reset the scratch arena.
+fn handle(req: http.Request, res: *http.Responder) void {
+    const bucket = store() orelse {
+        res.respondWithContentType(500, "application/json", toJson(ErrorBody{ .code = 500, .message = "key-value store unavailable" }));
+        return;
+    };
+    ensureSeeded(bucket);
+
+    const full_path = req.path() orelse "/";
+    var path = full_path;
+    var query: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, full_path, '?')) |q| {
+        path = full_path[0..q];
+        query = full_path[q + 1 ..];
     }
-    return null;
+
+    const resp = route(bucket, req, req.method(), path, query);
+    res.respondWithContentType(resp.status, "application/json", resp.body);
 }
 
-// ── Routing ────────────────────────────────────────────────────────
+// The bucket handle is opened once per component instance and cached.
+// Handles are not explicitly dropped (resource-drop is a canonical
+// built-in, not a portable host import); caching avoids accumulating one
+// handle per request on runtimes that reuse a single instance (wamr),
+// and is harmless on runtimes that re-instantiate per request (wasmtime
+// serve), where the global simply re-opens once per fresh instance.
+var cached_bucket: ?kv.Bucket = null;
+
+fn store() ?kv.Bucket {
+    if (cached_bucket) |b| return b;
+    const b = kv.open(BUCKET) orelse return null;
+    cached_bucket = b;
+    return b;
+}
 
 const Response = struct {
     status: u16,
     body: []const u8,
 };
 
-fn route(req: http.Request, method: http.Method, path: []const u8, query: []const u8) Response {
+fn route(bucket: kv.Bucket, req: http.Request, method: http.Method, path: []const u8, query: []const u8) Response {
     if (std.mem.eql(u8, path, "/pets")) {
         return switch (method) {
-            .get => listPets(),
-            .post => createPet(req),
+            .get => listPets(bucket),
+            .post => createPet(bucket, req),
             else => errorResponse(405, "Method not allowed"),
         };
     }
@@ -186,8 +175,8 @@ fn route(req: http.Request, method: http.Method, path: []const u8, query: []cons
         const id = std.fmt.parseInt(i32, rest, 10) catch
             return errorResponse(404, "Pet not found");
         return switch (method) {
-            .get => readPet(id),
-            .delete => deletePet(id),
+            .get => readPet(bucket, id),
+            .delete => deletePet(bucket, id),
             else => errorResponse(405, "Method not allowed"),
         };
     }
@@ -195,54 +184,52 @@ fn route(req: http.Request, method: http.Method, path: []const u8, query: []cons
     return errorResponse(404, "Not found");
 }
 
-fn listPets() Response {
-    var items: [MAX_PETS]PetWire = undefined;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < pets_len) : (i += 1) {
-        if (!pets[i].present) continue;
-        items[n] = .{ .name = pets[i].name, .tag = pets[i].tag, .age = pets[i].age };
-        n += 1;
+// ── Routes ─────────────────────────────────────────────────────────
+
+fn listPets(bucket: kv.Bucket) Response {
+    const ids = bucket.get("ids") orelse "";
+    var w = std.Io.Writer.fixed(&resp_buf);
+    w.writeAll("{\"items\":[") catch return errorResponse(500, "response too large");
+    var first = true;
+    var it = std.mem.splitScalar(u8, ids, ',');
+    while (it.next()) |id_str| {
+        if (id_str.len == 0) continue;
+        const pet_json = petJson(bucket, id_str) orelse continue;
+        if (!first) w.writeByte(',') catch return errorResponse(500, "response too large");
+        first = false;
+        w.writeAll(pet_json) catch return errorResponse(500, "response too large");
     }
-    return .{ .status = 200, .body = toJson(ResponsePage(PetWire){ .items = items[0..n] }) };
+    w.writeAll("]}") catch return errorResponse(500, "response too large");
+    return .{ .status = 200, .body = resp_buf[0..w.end] };
 }
 
-fn readPet(id: i32) Response {
-    const pet = findPet(id) orelse return errorResponse(404, "Pet not found");
-    return .{ .status = 200, .body = toJson(PetWire{ .name = pet.name, .tag = pet.tag, .age = pet.age }) };
+fn readPet(bucket: kv.Bucket, id: i32) Response {
+    var key_buf: [32]u8 = undefined;
+    const key = petKey(&key_buf, id);
+    const pet_json = bucket.get(key) orelse return errorResponse(404, "Pet not found");
+    // The stored value is already the pet's canonical JSON. Copy it into
+    // `resp_buf` so the returned slice doesn't alias the scratch arena
+    // (which a later helper call could bump past).
+    if (pet_json.len > resp_buf.len) return errorResponse(500, "response too large");
+    @memcpy(resp_buf[0..pet_json.len], pet_json);
+    return .{ .status = 200, .body = resp_buf[0..pet_json.len] };
 }
 
-fn deletePet(id: i32) Response {
-    const pet = findPet(id) orelse return errorResponse(404, "Pet not found");
-    pet.present = false;
+fn deletePet(bucket: kv.Bucket, id: i32) Response {
+    var key_buf: [32]u8 = undefined;
+    const key = petKey(&key_buf, id);
+    if (!bucket.exists(key)) return errorResponse(404, "Pet not found");
+    _ = bucket.delete(key);
+    removeId(bucket, id);
     return .{ .status = 200, .body = "" };
 }
 
-fn listToys(pet_id: i64, query: []const u8) Response {
-    const filter = queryParam(query, "nameFilter");
-    var items: [toys.len]ToyWire = undefined;
-    var n: usize = 0;
-    for (toys) |toy| {
-        if (toy.pet_id != pet_id) continue;
-        if (filter) |f| {
-            if (f.len != 0 and std.mem.indexOf(u8, toy.name, f) == null) continue;
-        }
-        items[n] = .{ .id = toy.id, .petId = toy.pet_id, .name = toy.name };
-        n += 1;
-    }
-    return .{ .status = 200, .body = toJson(ResponsePage(ToyWire){ .items = items[0..n] }) };
-}
-
-// Scratch arena for parsing the POST body. Reset (re-`init`ed) on every
-// `createPet` call, so the parsed values are valid only until the next
-// request — we copy the strings we keep into `store_buf` immediately.
-var json_scratch: [8192]u8 = undefined;
-
-fn createPet(req: http.Request) Response {
+fn createPet(bucket: kv.Bucket, req: http.Request) Response {
+    var body_buf: [8192]u8 = undefined;
     const body = req.readBody(&body_buf) orelse
         return errorResponse(400, "Missing or unreadable request body");
 
-    var fba = std.heap.FixedBufferAllocator.init(&json_scratch);
+    var fba = std.heap.FixedBufferAllocator.init(&json_parse_buf);
     const parsed = std.json.parseFromSlice(PetWire, fba.allocator(), body, .{
         .ignore_unknown_fields = true,
     }) catch return errorResponse(400, "Invalid pet JSON");
@@ -250,19 +237,97 @@ fn createPet(req: http.Request) Response {
     if (incoming.name.len == 0)
         return errorResponse(400, "Invalid pet: 'name' is required");
 
-    // Persist the strings (parsed values live in the per-request scratch).
-    const name = storeDup(incoming.name) orelse return errorResponse(507, "Store full");
-    const tag: ?[]const u8 = if (incoming.tag) |t|
-        (storeDup(t) orelse return errorResponse(507, "Store full"))
-    else
-        null;
-    const age = clampAge(incoming.age);
+    const id = nextId(bucket);
+    const pet = PetWire{ .name = incoming.name, .tag = incoming.tag, .age = clampAge(incoming.age) };
+    const pet_json = toJsonBuf(&pet_buf, pet);
 
-    const id = next_id;
-    next_id += 1;
-    addPet(id, name, tag, age);
+    var key_buf: [32]u8 = undefined;
+    const key = petKey(&key_buf, id);
+    if (!bucket.set(key, pet_json)) return errorResponse(507, "store write failed");
+    appendId(bucket, id);
+    bumpNextId(bucket, id + 1);
 
-    return .{ .status = 200, .body = toJson(PetWire{ .name = name, .tag = tag, .age = age }) };
+    return .{ .status = 200, .body = pet_json };
+}
+
+fn listToys(pet_id: i64, query: []const u8) Response {
+    const filter = queryParam(query, "nameFilter");
+    var items: [toys.len]ToyWire = undefined;
+    var n: usize = 0;
+    for (toys) |toy| {
+        if (toy.petId != pet_id) continue;
+        if (filter) |f| {
+            if (f.len != 0 and std.mem.indexOf(u8, toy.name, f) == null) continue;
+        }
+        items[n] = toy;
+        n += 1;
+    }
+    return .{ .status = 200, .body = toJson(ResponsePage(ToyWire){ .items = items[0..n] }) };
+}
+
+fn errorResponse(status: u16, message: []const u8) Response {
+    return .{ .status = status, .body = toJson(ErrorBody{ .code = status, .message = message }) };
+}
+
+// ── Storage helpers ────────────────────────────────────────────────
+
+/// Seed Fluffy + Rex on first use (detected by the absence of `next_id`).
+fn ensureSeeded(bucket: kv.Bucket) void {
+    if (bucket.exists("next_id")) return;
+    var key_buf: [32]u8 = undefined;
+    _ = bucket.set(petKey(&key_buf, 1), toJsonBuf(&pet_buf, PetWire{ .name = "Fluffy", .tag = "cat", .age = 3 }));
+    _ = bucket.set(petKey(&key_buf, 2), toJsonBuf(&pet_buf, PetWire{ .name = "Rex", .tag = null, .age = 5 }));
+    _ = bucket.set("ids", "1,2");
+    _ = bucket.set("next_id", "3");
+}
+
+/// Fetch `pet:<id_str>`'s stored JSON (already canonical; no decode).
+fn petJson(bucket: kv.Bucket, id_str: []const u8) ?[]const u8 {
+    var key_buf: [40]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "pet:{s}", .{id_str}) catch return null;
+    return bucket.get(key);
+}
+
+fn petKey(buf: []u8, id: i32) []const u8 {
+    return std.fmt.bufPrint(buf, "pet:{d}", .{id}) catch unreachable;
+}
+
+fn nextId(bucket: kv.Bucket) i32 {
+    const v = bucket.get("next_id") orelse return 1;
+    return std.fmt.parseInt(i32, v, 10) catch 1;
+}
+
+fn bumpNextId(bucket: kv.Bucket, value: i32) void {
+    var buf: [16]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+    _ = bucket.set("next_id", s);
+}
+
+/// Append `id` to the comma-separated `ids` index.
+fn appendId(bucket: kv.Bucket, id: i32) void {
+    const cur = bucket.get("ids") orelse "";
+    var w = std.Io.Writer.fixed(&ids_buf);
+    w.writeAll(cur) catch return;
+    if (cur.len != 0) w.writeByte(',') catch return;
+    w.print("{d}", .{id}) catch return;
+    _ = bucket.set("ids", ids_buf[0..w.end]);
+}
+
+/// Remove `id` from the comma-separated `ids` index.
+fn removeId(bucket: kv.Bucket, id: i32) void {
+    const cur = bucket.get("ids") orelse return;
+    var w = std.Io.Writer.fixed(&ids_buf);
+    var first = true;
+    var it = std.mem.splitScalar(u8, cur, ',');
+    while (it.next()) |s| {
+        if (s.len == 0) continue;
+        const v = std.fmt.parseInt(i32, s, 10) catch continue;
+        if (v == id) continue;
+        if (!first) w.writeByte(',') catch return;
+        first = false;
+        w.writeAll(s) catch return;
+    }
+    _ = bucket.set("ids", ids_buf[0..w.end]);
 }
 
 fn clampAge(age: i32) i32 {
@@ -272,30 +337,16 @@ fn clampAge(age: i32) i32 {
     return age;
 }
 
-// Fixed buffer the request body is read into (see `http.Request.readBody`).
-var body_buf: [8192]u8 = undefined;
-
-fn errorResponse(status: u16, message: []const u8) Response {
-    return .{ .status = status, .body = toJson(ErrorBody{ .code = status, .message = message }) };
-}
-
-// ── Handler entry point ────────────────────────────────────────────
-
-/// Dispatched by `http.exportIncomingHandler` (see the `comptime` block
-/// at the top). The wrapper has already reset the scratch arena.
-fn handle(req: http.Request, res: *http.Responder) void {
-    ensureSeeded();
-
-    const full_path = req.path() orelse "/";
-
-    // Split off the query string.
-    var path = full_path;
-    var query: []const u8 = "";
-    if (std.mem.indexOfScalar(u8, full_path, '?')) |q| {
-        path = full_path[0..q];
-        query = full_path[q + 1 ..];
+/// Extract a query parameter value (`?key=value&…`). Returns a slice
+/// borrowing from `query`. No percent-decoding (out of scope).
+fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+        } else if (std.mem.eql(u8, pair, key)) {
+            return "";
+        }
     }
-
-    const resp = route(req, req.method(), path, query);
-    res.respondWithContentType(resp.status, "application/json", resp.body);
+    return null;
 }

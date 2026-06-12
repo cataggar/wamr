@@ -1357,7 +1357,10 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http.core.wasm",
-        .imports = &.{.{ .name = "wasi_http", .path = "src/guest/wasi_http.zig" }},
+        .imports = &.{
+            .{ .name = "wasi_http", .path = "src/guest/wasi_http.zig", .deps = &.{"abi"} },
+            .{ .name = "abi", .path = "src/guest/abi.zig", .root_dep = false },
+        },
     });
     const http_component = makeComponent(b, .{
         .core = http_core,
@@ -1411,7 +1414,11 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http-petstore.core.wasm",
-        .imports = &.{.{ .name = "wasi_http", .path = "src/guest/wasi_http.zig" }},
+        .imports = &.{
+            .{ .name = "wasi_http", .path = "src/guest/wasi_http.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_keyvalue", .path = "src/guest/wasi_keyvalue.zig", .deps = &.{"abi"} },
+            .{ .name = "abi", .path = "src/guest/abi.zig", .root_dep = false },
+        },
     });
     const petstore_component = makeComponent(b, .{
         .core = petstore_core,
@@ -1516,8 +1523,15 @@ const ZigWasmCompile = struct {
     exports: []const []const u8,
     output: []const u8,
     /// Extra Zig modules made importable from the root source via
-    /// `@import("<name>")`. Used by the wasi:http examples to share the
-    /// guest-side `wasi_http` canonical-ABI helper (`src/guest/wasi_http.zig`).
+    /// `@import("<name>")`. The wasi:http / wasi:keyvalue examples use
+    /// this to pull in the guest-side helper modules under `src/guest/`.
+    /// Modules may declare their own `deps` (e.g. each `wasi_*` helper
+    /// depends on the shared `abi` module), and the dependency graph is
+    /// wired via `--dep` / `-M` flags. Every name referenced as a `dep`
+    /// must also appear as a module in this list (the shared `abi` module
+    /// is listed once and referenced by several helpers, so it resolves
+    /// to a single instance — important because it owns the sole
+    /// `cabi_realloc` export).
     imports: []const ZigWasmImport = &.{},
 };
 
@@ -1526,13 +1540,23 @@ const ZigWasmImport = struct {
     name: []const u8,
     /// Repo-relative path to the module's root source file.
     path: []const u8,
+    /// Names of other modules in the same `imports` list this module
+    /// `@import`s (e.g. `&.{"abi"}`). Wired as `--dep` flags preceding
+    /// this module's `-M` entry.
+    deps: []const []const u8 = &.{},
+    /// When true, the root source `@import`s this module directly (so it
+    /// gets a `--dep` on the root). Transitive-only modules (like `abi`,
+    /// reached via the `wasi_*` helpers) set this false so they are wired
+    /// as modules but not injected into the root's import namespace.
+    root_dep: bool = true,
 };
 
 /// Invokes `zig build-exe -target <…> -O ReleaseSmall -fno-entry --export=<…>`
 /// via `b.graph.zig_exe`, capturing the output as a build-graph LazyPath.
-/// When `opts.imports` is non-empty the source is passed via `-Mroot=` and
-/// each import as `--dep <name> -M<name>=<path>` so the root can
-/// `@import("<name>")`.
+/// When `opts.imports` is non-empty the source is passed via `-Mroot=`
+/// and each module as `--dep …  -M<name>=<path>` so the import graph
+/// (`root` → `wasi_*` → `abi`) is reconstructed for the standalone
+/// `build-exe` invocation.
 fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         b.graph.zig_exe, "build-exe",
@@ -1546,14 +1570,23 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     if (opts.imports.len == 0) {
         cmd.addFileArg(b.path(opts.source));
     } else {
-        // `--dep` flags attach to the next `-M` module (the root), so they
-        // must precede `-Mroot=`. The root module is named `root`.
+        // `--dep` flags attach to the next `-M` module. The root module
+        // (`-Mroot=`) gets a `--dep` for every module it imports directly;
+        // each helper module then gets `--dep` flags for its own deps
+        // before its `-M` entry. A `dep` name resolves to the single
+        // matching `-M<name>=` module, so a shared module (`abi`) is one
+        // instance across all importers.
         for (opts.imports) |imp| {
+            if (!imp.root_dep) continue;
             cmd.addArg("--dep");
             cmd.addArg(imp.name);
         }
         cmd.addPrefixedFileArg("-Mroot=", b.path(opts.source));
         for (opts.imports) |imp| {
+            for (imp.deps) |dep| {
+                cmd.addArg("--dep");
+                cmd.addArg(dep);
+            }
             cmd.addPrefixedFileArg(b.fmt("-M{s}=", .{imp.name}), b.path(imp.path));
         }
     }

@@ -1,0 +1,38 @@
+// Trimmed `wasi:keyvalue/store@0.2.0-draft2` — the subset the petstore
+// handler imports: `open` + `bucket.{get,set,delete,exists}`. Sorts
+// first (and only) in this directory so it carries the package
+// declaration.
+//
+// The version (`@0.2.0-draft2`) matches what wamr's host adapter and
+// `wasmtime serve -S keyvalue` both implement. We omit `list-keys`
+// (and its `key-response` record), the `atomics` and `batch`
+// interfaces, and the `cursor` pagination — the handler maintains its
+// own comma-separated `ids` index instead.
+//
+// Plain `//` comments before `package` per cataggar/wabt#192.
+package wasi:keyvalue@0.2.0-draft2;
+
+interface store {
+    /// The set of errors which may be raised by functions in this package.
+    /// Trimmed to the no-payload cases plus the catch-all `other`.
+    variant error {
+        no-such-store,
+        access-denied,
+        other(string),
+    }
+
+    /// Get the bucket with the specified identifier.
+    open: func(identifier: string) -> result<bucket, error>;
+
+    /// A collection of key-value pairs.
+    resource bucket {
+        /// Get the value associated with `key` (`none` if absent).
+        get: func(key: string) -> result<option<list<u8>>, error>;
+        /// Set (or overwrite) the value associated with `key`.
+        set: func(key: string, value: list<u8>) -> result<_, error>;
+        /// Delete the key-value pair (no-op if absent).
+        delete: func(key: string) -> result<_, error>;
+        /// Whether `key` exists in the bucket.
+        exists: func(key: string) -> result<bool, error>;
+    }
+}

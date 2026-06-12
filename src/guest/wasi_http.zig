@@ -12,7 +12,12 @@
 //! declarations plus the ret-area bookkeeping inline.
 //!
 //! This module writes those `extern`s **once** and exposes a small typed
-//! Zig API on top. Two language features make the result ergonomic:
+//! Zig API on top. The shared canonical-ABI machinery (the
+//! `cabi_realloc` scratch arena and the ret-area for spilled results)
+//! lives in the sibling `abi` module, so a guest can combine this with
+//! other `wasi_*` wrappers (e.g. `wasi_keyvalue`) without duplicate
+//! `cabi_realloc` exports. Two language features make the result
+//! ergonomic:
 //!
 //!   * **Dead-code elimination.** A guest only imports the host functions
 //!     it transitively calls — an `extern` that is never referenced is not
@@ -24,9 +29,9 @@
 //!
 //!   * **`comptime` export wiring.** `exportIncomingHandler` takes your
 //!     handler as a `comptime` function value and emits the canonical
-//!     `wasi:http/incoming-handler@0.2.6#handle` export for you (along with
-//!     a `cabi_realloc` backed by a scratch arena), so the verbose export
-//!     name and the per-request setup live here instead of in every guest.
+//!     `wasi:http/incoming-handler@0.2.6#handle` export for you, so the
+//!     verbose export name and the per-request setup live here instead of
+//!     in every guest.
 //!
 //! ## Usage
 //!
@@ -48,80 +53,17 @@
 //! ```
 
 const std = @import("std");
+const abi = @import("abi");
 
-// ── cabi_realloc scratch arena ─────────────────────────────────────
-//
-// Canonical-ABI lifts of host-side `string` / `list` values into guest
-// memory call `cabi_realloc`. The host uses it to materialize the
-// request path, the request method's `other(string)` payload, and each
-// request-body read chunk. `exportIncomingHandler` resets the arena at
-// the top of every request, so each invocation gets a fresh 64 KiB
-// scratch surface.
-//
-// `cabi_realloc` is `export`ed from this module; because exported
-// symbols are linker roots, it appears in the final component's core
-// wasm even though it is defined in a dependency module (not the guest's
-// root source file).
-
-var arena_buf: [65536]u8 align(16) = undefined;
-var arena_top: usize = 0;
-
-inline fn alignUp(x: usize, a: usize) usize {
-    return (x + a - 1) & ~(a - 1);
-}
-
-export fn cabi_realloc(
-    _: usize, // old_ptr — we never free
-    _: usize, // old_size
-    alignment: usize,
-    new_size: usize,
-) usize {
-    if (new_size == 0) return 0;
-    const a = if (alignment == 0) 1 else alignment;
-    const start = alignUp(arena_top, a);
-    if (start + new_size > arena_buf.len) return 0;
-    arena_top = start + new_size;
-    return @intFromPtr(&arena_buf[start]);
-}
-
-/// Reset the scratch arena. Called automatically by the
-/// `exportIncomingHandler` wrapper at the start of each request.
-pub fn resetScratch() void {
-    arena_top = 0;
-}
-
-// ── Ret-area for spilled results ───────────────────────────────────
-//
-// Every imported method whose flat result exceeds one core value writes
-// its result words here; the helpers below read them back. 32 bytes (8
-// words) comfortably covers the widest result we decode
-// (`outgoing-body.finish` → 5 words).
-
-var ret_area: [32]u8 align(8) = undefined;
-
-inline fn retPtr() i32 {
-    return @intCast(@intFromPtr(&ret_area));
-}
-
-inline fn retWords() [*]u32 {
-    return @ptrCast(@alignCast(&ret_area));
-}
-
-/// Decode the ret-area as `result<own<handle>>` → the handle on the ok
-/// arm (word layout `[disc, handle]`), or null on the err arm.
-inline fn readResultHandle() ?i32 {
-    const w = retWords();
-    return if (w[0] == 0) @bitCast(w[1]) else null;
-}
+// Re-export the shared ret-area accessors under short local names so the
+// extern call sites below read the same as before the `abi` split.
+const retPtr = abi.retPtr;
+const retWords = abi.retWords;
+const readResultHandle = abi.readResultHandle;
 
 /// Decode the ret-area as `option<string>` (`[disc, ptr, len]`) into a
 /// slice borrowing from the scratch arena, or null for `none`.
-inline fn readOptionString() ?[]const u8 {
-    const w = retWords();
-    if (w[0] != 1) return null;
-    const p: [*]const u8 = @ptrFromInt(w[1]);
-    return p[0..w[2]];
-}
+const readOptionString = abi.readOptionBytes;
 
 // ── Host imports (canonical-ABI lowered signatures) ────────────────
 //
@@ -159,7 +101,8 @@ extern "wasi:http/types@0.2.6" fn @"[method]outgoing-body.write"(self: i32, retp
 
 /// `[static]outgoing-body.finish(own<outgoing-body>, option<own<fields>>)
 ///   -> result<_, error-code>`. `option<own<fields>>` lowers to
-/// (disc, value); result is up to 5 i32s → retptr.
+/// (disc, value); the canonical `error-code` variant flattens to 7
+/// words, so the result is 8 words → retptr (read via the ret-area).
 extern "wasi:http/types@0.2.6" fn @"[static]outgoing-body.finish"(this: i32, trailers_disc: i32, trailers_val: i32, retptr: i32) void;
 
 /// `[method]incoming-request.method(borrow) -> method`. The `method`
@@ -181,15 +124,25 @@ extern "wasi:http/types@0.2.6" fn @"[method]incoming-request.consume"(self: i32,
 extern "wasi:http/types@0.2.6" fn @"[method]incoming-body.stream"(self: i32, retptr: i32) void;
 
 /// `[static]response-outparam.set(own<response-outparam>,
-///   result<own<outgoing-response>, error-code>) -> ()`. Result lowers
-/// to (disc, payload[0..3]); the ok arm packs payload[0]=own<outgoing-response>.
+///   result<own<outgoing-response>, error-code>) -> ()`.
+///
+/// The result is passed **inline** as flat params (not via retptr). With
+/// the canonical `error-code` (≈40-case variant flattening to 7 words),
+/// `result<own<outgoing-response>, error-code>` flattens to 8 words:
+/// `[outer_disc, joined0, …joined6]`, where `joined0` is the
+/// `own<outgoing-response>` handle on the ok arm (joined with the
+/// error-code discriminant on the err arm). Total flat params =
+/// 1 (outparam) + 8 = 9.
 extern "wasi:http/types@0.2.6" fn @"[static]response-outparam.set"(
     outparam: i32,
-    resp_disc: i32,
-    resp_p0: i32,
-    resp_p1: i32,
-    resp_p2: i32,
-    resp_p3: i32,
+    outer_disc: i32,
+    j0: i32,
+    j1: i32,
+    j2: i32,
+    j3: i32,
+    j4: i32,
+    j5: i32,
+    j6: i32,
 ) void;
 
 // `wasi:io/streams@0.2.6`.
@@ -338,15 +291,16 @@ fn deliver(outp: i32, status: u16, headers: i32, body: []const u8) void {
 
     // option<own<trailers>> = none → (disc=0, val=0).
     @"[static]outgoing-body.finish"(body_handle, 0, 0, retPtr());
-    // ok(response) = (disc=0, payload[0]=response, rest=0).
-    @"[static]response-outparam.set"(outp, 0, response, 0, 0, 0);
+    // ok(response): outer_disc=0, joined0 = own<outgoing-response>, rest 0.
+    @"[static]response-outparam.set"(outp, 0, response, 0, 0, 0, 0, 0, 0);
 }
 
 /// Deliver `err(internal-error(none))` if response construction tripped.
-/// disc=1 (err), payload[0]=error-code-disc=0 (internal-error),
-/// payload[1]=opt-disc=0 (none).
+/// outer_disc=1 (err); joined0 = error-code discriminant 38
+/// (`internal-error`, the last canonical case); the trailing slots cover
+/// its `option<string>` payload = none (all zero).
 fn deliverErr(outp: i32) void {
-    @"[static]response-outparam.set"(outp, 1, 0, 0, 0, 0);
+    @"[static]response-outparam.set"(outp, 1, 38, 0, 0, 0, 0, 0, 0);
 }
 
 // ── comptime export wiring ─────────────────────────────────────────
@@ -364,7 +318,7 @@ fn deliverErr(outp: i32) void {
 pub fn exportIncomingHandler(comptime handler: fn (req: Request, res: *Responder) void) void {
     const Wrapper = struct {
         fn entry(req_handle: i32, outp: i32) callconv(.c) void {
-            resetScratch();
+            abi.resetScratch();
             var res = Responder{ .outp = outp };
             handler(.{ .handle = req_handle }, &res);
             if (!res.sent) res.respond(500, "");
