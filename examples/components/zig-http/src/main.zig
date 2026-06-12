@@ -11,8 +11,8 @@
 //!
 //! The canonical-ABI plumbing (host imports, ret-area decoding, the
 //! `cabi_realloc` arena, and the `wasi:http/incoming-handler` export
-//! wiring) lives in the shared `wit_http` helper module (imported as
-//! `@import("wit_http")`; source at `src/guest/wit_http.zig`). This
+//! wiring) lives in the shared `wasi_http` helper module (imported as
+//! `@import("wasi_http")`; source at `src/guest/wasi_http.zig`). This
 //! example is just the routing logic; see that module's doc comment for
 //! how the canonical ABI is bridged and why a guest still imports only
 //! the host functions it actually calls.
@@ -22,13 +22,13 @@
 //! See `../README.md` for the WIT layout and build pipeline.
 
 const std = @import("std");
-const wit = @import("wit_http");
+const http = @import("wasi_http");
 
 comptime {
-    wit.exportIncomingHandler(handle);
+    http.exportIncomingHandler(handle);
 }
 
-fn handle(req: wit.Request, res: *wit.Responder) void {
+fn handle(req: http.Request, res: *http.Responder) void {
     const path = req.path() orelse "/";
     if (std.mem.eql(u8, path, "/")) {
         res.respond(200, "Hello, world!\n");

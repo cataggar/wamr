@@ -1369,7 +1369,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http.core.wasm",
-        .imports = &.{.{ .name = "wit_http", .path = "src/guest/wit_http.zig" }},
+        .imports = &.{.{ .name = "wasi_http", .path = "src/guest/wasi_http.zig" }},
     });
     const http_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "http-hello" });
     http_embed.addDirectoryArg(b.path("examples/components/zig-http/wit"));
@@ -1427,7 +1427,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .target_triple = "wasm32-freestanding",
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http-petstore.core.wasm",
-        .imports = &.{.{ .name = "wit_http", .path = "src/guest/wit_http.zig" }},
+        .imports = &.{.{ .name = "wasi_http", .path = "src/guest/wasi_http.zig" }},
     });
     const petstore_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "petstore" });
     petstore_embed.addDirectoryArg(b.path("examples/components/zig-http-petstore/wit"));
@@ -1537,12 +1537,12 @@ const ZigWasmCompile = struct {
     output: []const u8,
     /// Extra Zig modules made importable from the root source via
     /// `@import("<name>")`. Used by the wasi:http examples to share the
-    /// guest-side `wit_http` canonical-ABI helper (`src/guest/wit_http.zig`).
+    /// guest-side `wasi_http` canonical-ABI helper (`src/guest/wasi_http.zig`).
     imports: []const ZigWasmImport = &.{},
 };
 
 const ZigWasmImport = struct {
-    /// Import name, e.g. `wit_http` for `@import("wit_http")`.
+    /// Import name, e.g. `wasi_http` for `@import("wasi_http")`.
     name: []const u8,
     /// Repo-relative path to the module's root source file.
     path: []const u8,

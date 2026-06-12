@@ -68,9 +68,9 @@ how a reader might intuitively write it ("the entry point first").
 ## Source walkthrough
 
 The canonical-ABI bridge lives in the shared
-[`wit_http`](../../../src/guest/wit_http.zig) helper module
-(`@import("wit_http")`), not in this example. There is no Zig
-`wit-bindgen` backend, so `wit_http` hand-writes the host imports
+[`wasi_http`](../../../src/guest/wasi_http.zig) helper module
+(`@import("wasi_http")`), not in this example. There is no Zig
+`wit-bindgen` backend, so `wasi_http` hand-writes the host imports
 (`extern "wasi:…"` declarations), the ret-area decoding for results
 wider than one core value, the `cabi_realloc` scratch arena, and the
 `wasi:http/incoming-handler@0.2.6#handle` export — once, behind a small
@@ -82,11 +82,11 @@ world even though the helper declares the full surface).
 The example itself is just the routing logic:
 
 ```zig
-const wit = @import("wit_http");
+const http = @import("wasi_http");
 
-comptime { wit.exportIncomingHandler(handle); }
+comptime { http.exportIncomingHandler(handle); }
 
-fn handle(req: wit.Request, res: *wit.Responder) void {
+fn handle(req: http.Request, res: *http.Responder) void {
     const path = req.path() orelse "/";
     if (std.mem.eql(u8, path, "/")) {
         res.respond(200, "Hello, world!\n");

@@ -19,18 +19,18 @@
 //!
 //! The canonical-ABI plumbing (host imports, ret-area decoding, the
 //! `cabi_realloc` arena, and the `wasi:http/incoming-handler` export
-//! wiring) lives in the shared `wit_http` helper module (imported as
-//! `@import("wit_http")`; source at `src/guest/wit_http.zig`). This
+//! wiring) lives in the shared `wasi_http` helper module (imported as
+//! `@import("wasi_http")`; source at `src/guest/wasi_http.zig`). This
 //! file is just the petstore routing + JSON logic. See that module's
 //! doc comment for how the canonical ABI is bridged.
 //!
 //! See `../README.md` for the WIT layout and build pipeline.
 
 const std = @import("std");
-const wit = @import("wit_http");
+const http = @import("wasi_http");
 
 comptime {
-    wit.exportIncomingHandler(handle);
+    http.exportIncomingHandler(handle);
 }
 
 // ── In-memory pet store ────────────────────────────────────────────
@@ -161,7 +161,7 @@ const Response = struct {
     body: []const u8,
 };
 
-fn route(req: wit.Request, method: wit.Method, path: []const u8, query: []const u8) Response {
+fn route(req: http.Request, method: http.Method, path: []const u8, query: []const u8) Response {
     if (std.mem.eql(u8, path, "/pets")) {
         return switch (method) {
             .get => listPets(),
@@ -238,7 +238,7 @@ fn listToys(pet_id: i64, query: []const u8) Response {
 // request — we copy the strings we keep into `store_buf` immediately.
 var json_scratch: [8192]u8 = undefined;
 
-fn createPet(req: wit.Request) Response {
+fn createPet(req: http.Request) Response {
     const body = req.readBody(&body_buf) orelse
         return errorResponse(400, "Missing or unreadable request body");
 
@@ -272,7 +272,7 @@ fn clampAge(age: i32) i32 {
     return age;
 }
 
-// Fixed buffer the request body is read into (see `wit.Request.readBody`).
+// Fixed buffer the request body is read into (see `http.Request.readBody`).
 var body_buf: [8192]u8 = undefined;
 
 fn errorResponse(status: u16, message: []const u8) Response {
@@ -281,9 +281,9 @@ fn errorResponse(status: u16, message: []const u8) Response {
 
 // ── Handler entry point ────────────────────────────────────────────
 
-/// Dispatched by `wit.exportIncomingHandler` (see the `comptime` block
+/// Dispatched by `http.exportIncomingHandler` (see the `comptime` block
 /// at the top). The wrapper has already reset the scratch arena.
-fn handle(req: wit.Request, res: *wit.Responder) void {
+fn handle(req: http.Request, res: *http.Responder) void {
     ensureSeeded();
 
     const full_path = req.path() orelse "/";

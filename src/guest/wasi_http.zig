@@ -1,4 +1,4 @@
-//! `wit_http` — guest-side helper for writing
+//! `wasi_http` — guest-side helper for writing
 //! `wasi:http/incoming-handler@0.2.6` server components in pure Zig.
 //!
 //! ## Why this exists
@@ -31,13 +31,13 @@
 //! ## Usage
 //!
 //! ```zig
-//! const wit = @import("wit_http");
+//! const http = @import("wasi_http");
 //!
 //! comptime {
-//!     wit.exportIncomingHandler(handle);
+//!     http.exportIncomingHandler(handle);
 //! }
 //!
-//! fn handle(req: wit.Request, res: *wit.Responder) void {
+//! fn handle(req: http.Request, res: *http.Responder) void {
 //!     const path = req.path() orelse "/";
 //!     if (std.mem.eql(u8, path, "/")) {
 //!         res.respond(200, "Hello, world!\n");
@@ -355,8 +355,8 @@ fn deliverErr(outp: i32) void {
 /// that dispatches to `handler`. Call once at file scope:
 ///
 /// ```zig
-/// comptime { wit.exportIncomingHandler(handle); }
-/// fn handle(req: wit.Request, res: *wit.Responder) void { ... }
+/// comptime { http.exportIncomingHandler(handle); }
+/// fn handle(req: http.Request, res: *http.Responder) void { ... }
 /// ```
 ///
 /// The wrapper resets the scratch arena before each call and, as a

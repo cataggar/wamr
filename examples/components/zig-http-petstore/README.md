@@ -102,9 +102,9 @@ must see those resources already in the world's type-indexspace. See the
 ## Source walkthrough
 
 The canonical-ABI bridge lives in the shared
-[`wit_http`](../../../src/guest/wit_http.zig) helper module
-(`@import("wit_http")`) — the same one the `zig-http` example uses.
-There is no Zig `wit-bindgen` backend, so `wit_http` hand-writes the
+[`wasi_http`](../../../src/guest/wasi_http.zig) helper module
+(`@import("wasi_http")`) — the same one the `zig-http` example uses.
+There is no Zig `wit-bindgen` backend, so `wasi_http` hand-writes the
 host imports, ret-area decoding, the `cabi_realloc` scratch arena, and
 the `wasi:http/incoming-handler@0.2.6#handle` export once, behind a
 typed API (`Request`, `Responder`, `Method`). This file is just the
@@ -131,7 +131,7 @@ Request flow:
    delivers the response.
 
 Because Zig drops unreferenced `extern`s, this example imports the full
-`wit_http` surface it uses (method, body read, `fields.append`) while
+`wasi_http` surface it uses (method, body read, `fields.append`) while
 `zig-http` — which calls only `path()` + `respond()` — links against a
 strictly smaller import set, so each keeps a minimal WIT world.
 
