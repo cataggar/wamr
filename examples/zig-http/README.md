@@ -22,7 +22,7 @@ Produces `zig-out/examples/zig-http.wasm`.
 
 ```sh
 # wamr
-wamrc run zig-out/examples/zig-http.wasm -- --listen=127.0.0.1:8080
+wamrc serve zig-out/examples/zig-http.wasm   # 127.0.0.1:8080
 
 # wasmtime
 wasmtime serve zig-out/examples/zig-http.wasm

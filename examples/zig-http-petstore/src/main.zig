@@ -19,9 +19,9 @@
 //! This makes the example behave identically under wamr's serial serve
 //! loop and under `wasmtime serve`.
 //!
-//! Run under wamr (in-memory store, or `--keyvalue-store=<file>` to persist):
+//! Run under wamr (in-memory keyvalue store for the server lifetime):
 //!
-//!   wamr run --listen=127.0.0.1:8080 zig-http-petstore.wasm
+//!   wamrc serve --addr 127.0.0.1:8080 zig-http-petstore.wasm
 //!   curl -i http://127.0.0.1:8080/pets
 //!
 //! Run under wasmtime:

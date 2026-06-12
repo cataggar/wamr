@@ -155,8 +155,8 @@ termination** ([#609](https://github.com/cataggar/wamr/issues/609)) is
 live:
 
 ```console
-$ wamr run --listen=<addr> --tls-cert=<cert.pem> --tls-key=<key.pem> app.wasm
-$ wamr run --listen=<addr> --tls-pem=<combined.pem> app.wasm   # cert + key in one file
+$ wamr serve --addr <addr> --tls-cert=<cert.pem> --tls-key=<key.pem> app.wasm
+$ wamr serve --addr <addr> --tls-pem=<combined.pem> app.wasm   # cert + key in one file
 ```
 
 The cert chain (`std.crypto.Certificate.Bundle`) and PEM-encoded private

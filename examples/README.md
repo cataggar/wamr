@@ -40,7 +40,7 @@ on machines that do not have the external toolchain installed.
 | Step                    | What it does                                                     |
 |-------------------------|------------------------------------------------------------------|
 | `zig build examples`     | Build, encode, and validate every component below.               |
-| `zig build examples-run` | Run the runnable examples through `./zig-out/bin/wamr` — `zig-hello` greeting + exit code, the two composed calculator commands, and the `zig-http` curl-equivalent smoke (spin up `wamr run --listen=…`, send two requests, assert `200 "Hello, world!\n"` / `404`). |
+| `zig build examples-run` | Run the runnable examples through `./zig-out/bin/wamr` — `zig-hello` greeting + exit code, the two composed calculator commands, and the `zig-http` curl-equivalent smoke (spin up `wamr serve --addr …`, send two requests, assert `200 "Hello, world!\n"` / `404`). |
 
 Outputs land under `zig-out/examples/`:
 

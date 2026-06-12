@@ -6,7 +6,7 @@
 //!
 //! Runs end-to-end through wamr:
 //!
-//!   wamr run --listen=127.0.0.1:8080 zig-http.wasm
+//!   wamrc serve --addr 127.0.0.1:8080 zig-http.wasm
 //!   curl -i http://127.0.0.1:8080/
 //!
 //! The canonical-ABI plumbing (host imports, ret-area decoding, the

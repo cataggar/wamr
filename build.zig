@@ -1359,7 +1359,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     installAndValidate(b, examples_step, http_component, "zig-http.wasm");
 
     // End-to-end serve smoke: a small driver (tests/component-http-smoke/
-    // driver.zig) spawns `wamr run --listen=127.0.0.1:<port>` against the
+    // driver.zig) spawns `wamr serve --addr=127.0.0.1:<port>` against the
     // built component, then hits `/` and `/missing` over TCP and asserts
     // the expected `200 "Hello, world!\n"` / `404` shapes. Mirrors the
     // wasi-sock driver pattern (#437).
@@ -1416,7 +1416,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
     });
     installAndValidate(b, examples_step, petstore_component, "zig-http-petstore.wasm");
 
-    // End-to-end serve smoke: the driver spawns `wamr run --listen=…`
+    // End-to-end serve smoke: the driver spawns `wamr serve --addr=…`
     // against the built component, then exercises the petstore routes
     // (GET/POST/DELETE on /pets, /pets/{id}, /pets/{id}/toys) over TCP.
     // Wamr-only, same rationale as the zig-http smoke above.

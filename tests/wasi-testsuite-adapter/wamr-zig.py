@@ -174,38 +174,45 @@ def compute_argv(
 ) -> List[str]:
     argv: List[str] = []
     argv += WAMR
-    argv += ["run"]
     args, env, dirs = args_env_dirs
+
+    # `wasi:http/service` fixtures (`http-service.wasm`) export
+    # `wasi:http/incoming-handler@0.3.0.handle` and are served via the
+    # `serve` subcommand (#845); every other fixture runs as a
+    # `wasi:cli/run` command component (or core module) under `run`.
+    is_http_service = wasi_world == "wasi:http/service"
+    argv += ["serve"] if is_http_service else ["run"]
 
     for k, v in env.items():
         argv += ["--env", f"{k}={v}"]
 
-    for host, guest in _isolate_preopens(dirs):
-        argv += ["--map-dir", f"{host}::{guest}"]
+    # `--map-dir` / `--allow-net` are `run`-only host-config flags (the
+    # HTTP serve path does not wire filesystem / sockets preopens), so
+    # only emit them for the `run` verb.
+    if not is_http_service:
+        for host, guest in _isolate_preopens(dirs):
+            argv += ["--map-dir", f"{host}::{guest}"]
 
-    # wasi:sockets fixtures need an explicit allow-list to escape the
-    # adapter's default deny-all posture. Localhost is sufficient for
-    # every wasi-testsuite sockets fixture (they all bind/connect to
-    # 127.0.0.1 / ::1). (#520 wave 2)
-    if "sockets" in proposals:
-        argv += ["--allow-net", "127.0.0.0/8"]
-        argv += ["--allow-net", "::1/128"]
+        # wasi:sockets fixtures need an explicit allow-list to escape the
+        # adapter's default deny-all posture. Localhost is sufficient for
+        # every wasi-testsuite sockets fixture (they all bind/connect to
+        # 127.0.0.1 / ::1). (#520 wave 2)
+        if "sockets" in proposals:
+            argv += ["--allow-net", "127.0.0.0/8"]
+            argv += ["--allow-net", "::1/128"]
 
-    # `wasi:http/service` fixtures (`http-service.wasm`) export
-    # `wasi:http/incoming-handler@0.3.0.handle` and expect the host
-    # to bind a TCP listener, accept on it, and route incoming HTTP
-    # over the guest export. Bare `--listen` selects an ephemeral
-    # 127.0.0.1:0 bind and triggers `announce_listening` — the wamr
-    # CLI prints `http://<host>:<port>` to stderr so the
-    # wasi-testsuite `TestCaseRunner.get_http_server` URL-scrape
-    # succeeds. (#570)
-    if wasi_world == "wasi:http/service":
-        argv += ["--listen"]
+    # The host binds a TCP listener, accepts on it, and routes incoming
+    # HTTP over the guest export. `--addr 127.0.0.1:0` selects an
+    # ephemeral bind and triggers `announce_listening` — the wamr CLI
+    # prints `http://<host>:<port>` so the wasi-testsuite
+    # `TestCaseRunner.get_http_server` URL-scrape succeeds. (#570, #845)
+    if is_http_service:
+        argv += ["--addr", "127.0.0.1:0"]
 
     # Pre-compile the wasm fixture to its sibling AOT artifact: for
     # core wasm we get a `.cwasm`; for components we write a
     # `<stem>.cwasm.json` manifest + per-core `.cwasm` files that
-    # `wamr run` auto-discovers via sibling probing. (#680)
+    # `wamr run` / `wamr serve` auto-discover via sibling probing. (#680)
     argv += [_precompile(test_path)]
     argv += args
     return argv

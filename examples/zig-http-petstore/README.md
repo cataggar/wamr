@@ -48,11 +48,10 @@ instance). Toys are static read-only seed data.
 
 ### wamr
 
-Keyvalue is in-memory by default (persists for the server process); add
-`--keyvalue-store=<file>` to persist to a JSON file across restarts.
+Keyvalue is in-memory (persists for the server-process lifetime).
 
 ```console
-$ ./zig-out/bin/wamr run --listen=127.0.0.1:8080 \
+$ ./zig-out/bin/wamrc serve --addr 127.0.0.1:8080 \
         zig-out/examples/zig-http-petstore.wasm &
 
 $ curl -s http://127.0.0.1:8080/pets
