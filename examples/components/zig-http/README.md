@@ -117,35 +117,6 @@ wabt component embed --world http-hello wit main.wasm \
 wabt component new main.embed.wasm -o zig-http.component.wasm
 ```
 
-## What this exercises
-
-* The first end-to-end exercise of wamr's
-  `runHttpComponent` / `serveHttpComponentBytes` path with a
-  Zig-emitted handler. Pre-this example, only one synthetic unit
-  test (`http: discovers versioned incoming-handler export (#201)`)
-  drove the export scanner.
-* The cataggar/wabt v3 series feature stack:
-  `metadata_decode` alias-tolerance ([wabt#191][w191]),
-  doc-comment-before-`package` ([wabt#192][w192]),
-  resource-handle refs in func sigs ([wabt#194][w194]),
-  cross-iface-use resource hoisting ([wabt#198][w198]),
-  canon.lower trampolines + memory/realloc opts for imports
-  ([wabt#202][w202] / [wabt#205][w205] / [wabt#207][w207]).
-* wamr executor's flat lift of `option<T>` / `result<T,E>` args —
-  required for `[static]outgoing-body.finish`'s
-  `option<own<fields>>` trailers arg and
-  `[static]response-outparam.set`'s
-  `result<own<outgoing-response>, error-code>` arg. Lands as part
-  of this PR.
-
-[w191]: https://github.com/cataggar/wabt/issues/191
-[w192]: https://github.com/cataggar/wabt/issues/192
-[w194]: https://github.com/cataggar/wabt/issues/194
-[w198]: https://github.com/cataggar/wabt/issues/198
-[w202]: https://github.com/cataggar/wabt/issues/202
-[w205]: https://github.com/cataggar/wabt/issues/205
-[w207]: https://github.com/cataggar/wabt/issues/207
-
 ## Implementation notes / gotchas
 
 A handful of constraints fell out of bringing this up; each is
