@@ -19,7 +19,7 @@ Produces `zig-out/examples/zig-hello.wasm`.
 # wamr
 wamr run zig-out/examples/zig-hello.wasm
 
-# wasmtime (needs -S cli-exit-with-code for the exit-code import)
+# wasmtime
 wasmtime run -S cli-exit-with-code zig-out/examples/zig-hello.wasm
 ```
 
