@@ -25,19 +25,21 @@ Produces `zig-out/examples/zig-http.wasm`.
 wamrc run zig-out/examples/zig-http.wasm -- --listen=127.0.0.1:8080
 
 # wasmtime
-wasmtime serve -S cli zig-out/examples/zig-http.wasm
+wasmtime serve zig-out/examples/zig-http.wasm
 ```
 
 ```console
 $ curl -i http://127.0.0.1:8080/
 HTTP/1.1 200 OK
-Content-Length: 14
-Connection: close
+transfer-encoding: chunked
+date: Fri, 12 Jun 2026 18:16:56 GMT
 
 Hello, world!
 ```
 
 ```
-$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/missing
-404
+> curl -i http://127.0.0.1:8080/missing
+HTTP/1.1 404 Not Found
+transfer-encoding: chunked
+date: Fri, 12 Jun 2026 18:17:01 GMT
 ```
