@@ -8,10 +8,12 @@ Pure-Zig WebAssembly component implementing the Microsoft TypeSpec
 It is the REST counterpart to the sibling [`zig-http`](../zig-http/)
 "hello world" example — it reads the request **method** and **body**,
 routes on the path, returns JSON, and **persists pets in a host-backed
-`wasi:keyvalue` store**. Unlike `zig-http` (which embeds a trimmed,
-wamr-targeting WIT), this example embeds the **canonical** `wasi:http` /
-`wasi:io` / `wasi:clocks` WIT, so the same binary is intended to run on
-both wamr and `wasmtime serve` (see [Runtime status](#runtime-status)).
+`wasi:keyvalue` store**. Like `zig-http`, it targets the **canonical**
+`wasi:http` / `wasi:io` / `wasi:clocks` WIT — resolved from wabt's
+embedded `wasi-canon` fallback rather than a vendored `wit/deps/` copy —
+so the same binary is intended to run on both wamr and `wasmtime serve`
+(see [Runtime status](#runtime-status)). Only the non-canonical
+`wasi:keyvalue` package is still vendored under `wit/deps/`.
 
 ## API
 
