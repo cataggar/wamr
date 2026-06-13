@@ -5,7 +5,7 @@
 #   - https://github.com/WebAssembly/wasi-sdk/releases
 #   - https://github.com/cataggar/wabt/releases
 
-# Install WASI-SDK at /opt and wabt via ghr (cataggar/wabt v3.0.0-dev.15).
+# Install WASI-SDK at /opt and wabt via ghr (cataggar/wabt v3.0.0-dev.16).
 # /opt is the assumed location widely used in the project for wasi-sdk;
 # wabt lands in $HOME/.local/bin via ghr (added to GITHUB_PATH).
 name: Install WASI-SDK and wabt
