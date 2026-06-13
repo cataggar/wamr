@@ -280,44 +280,108 @@ IDEAS = [
 ]
 
 
-def get_tried_ideas() -> set[str]:
-    """Query perf-investigation issues to find previously tried idea IDs."""
+def _gh_json(args: list[str]) -> list:
+    """Run a `gh ... --json` command and parse its JSON output.
+
+    Fails loudly (non-zero exit) on any error instead of swallowing it.
+    The previous silent `except → return set()` fallback was the root
+    cause of the #841 regression: when this lookup failed, the tried-set
+    came back empty and `select_idea` re-filed `IDEAS[0]` as a duplicate.
+    """
     try:
         result = subprocess.run(
-            [
-                "gh", "issue", "list",
-                "--label", "perf-investigation",
-                "--state", "all",
-                "--json", "title",
-                "--limit", "200",
-            ],
+            ["gh"] + args,
             capture_output=True,
             text=True,
             check=True,
         )
-        issues = json.loads(result.stdout)
-        # Extract idea IDs from titles like "perf: <idea title>"
-        titles = {issue["title"] for issue in issues}
-        return titles
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return set()
+    except FileNotFoundError:
+        sys.stderr.write("error: `gh` CLI not found on PATH\n")
+        sys.exit(1)
+    except subprocess.CalledProcessError as err:
+        sys.stderr.write(
+            f"error: `gh {' '.join(args)}` failed (exit {err.returncode}): "
+            f"{(err.stderr or '').strip()}\n"
+        )
+        sys.exit(1)
+    return json.loads(result.stdout)
+
+
+def get_tried_titles() -> tuple[set[str], list[str]]:
+    """Collect signals for ideas that have already been attempted.
+
+    Returns `(issue_titles, merged_pr_titles)`:
+
+      * `issue_titles` — titles of every `perf-investigation` issue in
+        **any** state (open or closed). A closed issue means the idea was
+        investigated and its issue closed (typically by the merging PR),
+        so it must not be re-filed — this is what #841 missed.
+      * `merged_pr_titles` — titles of merged PRs whose title starts with
+        `perf:`. This catches ideas whose auto-issue was deleted/renamed
+        but whose fix already merged (PR titles append ` (#NNN)`, so the
+        caller matches by prefix).
+
+    Fails loudly on any `gh` error (see `_gh_json`).
+    """
+    issues = _gh_json([
+        "issue", "list",
+        "--label", "perf-investigation",
+        "--state", "all",
+        "--json", "title",
+        "--limit", "200",
+    ])
+    issue_titles = {issue["title"] for issue in issues}
+
+    prs = _gh_json([
+        "pr", "list",
+        "--state", "merged",
+        "--search", "perf in:title",
+        "--json", "title",
+        "--limit", "200",
+    ])
+    pr_titles = [pr["title"] for pr in prs if pr["title"].startswith("perf:")]
+
+    return issue_titles, pr_titles
+
+
+def _idea_already_tried(
+    full_title: str,
+    issue_titles: set[str],
+    pr_titles: list[str],
+) -> bool:
+    if full_title in issue_titles:
+        return True
+    # Merged PR titles commonly append " (#NNN)" to the idea title, so
+    # match by prefix rather than exact equality.
+    return any(
+        title == full_title or title.startswith(full_title + " ")
+        for title in pr_titles
+    )
 
 
 def select_idea(
-    tried_titles: set[str],
+    issue_titles: set[str],
+    pr_titles: list[str],
     force_index: int | None = None,
-) -> dict:
-    """Pick the next untried idea, or cycle back to the first."""
+) -> dict | None:
+    """Pick the next un-attempted idea.
+
+    A manual `force_index` always wins (so `workflow_dispatch` can re-run
+    a specific idea on purpose). Otherwise returns the first idea not yet
+    represented by any open/closed issue or merged PR, or `None` when
+    every curated idea has already been attempted — in which case the
+    caller skips issue creation instead of cycling back and filing a
+    guaranteed duplicate (the #841 failure mode).
+    """
     if force_index is not None and 0 <= force_index < len(IDEAS):
         return IDEAS[force_index]
 
     for idea in IDEAS:
         full_title = f"perf: {idea['title']}"
-        if full_title not in tried_titles:
+        if not _idea_already_tried(full_title, issue_titles, pr_titles):
             return idea
 
-    # All ideas tried — start over from the beginning.
-    return IDEAS[0]
+    return None
 
 
 def read_baseline(path: str) -> str:
@@ -337,8 +401,19 @@ def main() -> None:
         except ValueError:
             pass
 
-    tried = get_tried_ideas()
-    idea = select_idea(tried, force_index)
+    tried_issue_titles, tried_pr_titles = get_tried_titles()
+    idea = select_idea(tried_issue_titles, tried_pr_titles, force_index)
+
+    output_file = os.environ.get("GITHUB_OUTPUT")
+
+    # Every curated idea has already been attempted (open/closed issue or
+    # merged PR). Skip rather than re-file a duplicate (#841).
+    if idea is None:
+        print("All curated ideas already investigated — skipping issue creation.")
+        if output_file:
+            with open(output_file, "a") as f:
+                f.write("skip=true\n")
+        return
 
     bench = read_baseline("bench-baseline.txt")
     spec = read_baseline("spec-baseline.txt")
@@ -402,10 +477,10 @@ zig build test             # ensure no regressions
 
     Path("issue-body.md").write_text(body)
 
-    # Set GitHub Actions step outputs.
-    output_file = os.environ.get("GITHUB_OUTPUT")
+    # Set GitHub Actions step outputs (`output_file` resolved above).
     if output_file:
         with open(output_file, "a") as f:
+            f.write("skip=false\n")
             f.write(f"title={title}\n")
             f.write(f"idea_id={idea['id']}\n")
 
