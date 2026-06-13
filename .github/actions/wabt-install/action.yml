@@ -14,10 +14,10 @@ description: |
 inputs:
   version:
     description: |
-      cataggar/wabt release tag (e.g. v3.0.0-dev.16). Bump the default here to
+      cataggar/wabt release tag (e.g. v3.0.0-dev.17). Bump the default here to
       roll the pinned version across every caller.
     required: false
-    default: 'v3.0.0-dev.16'
+    default: 'v3.0.0-dev.17'
 
 runs:
   using: composite

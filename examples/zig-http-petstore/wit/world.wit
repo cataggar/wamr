@@ -1,13 +1,17 @@
-// World for the keyvalue-backed Zig petstore. Unlike the trimmed
-// `zig-http` world, this imports the **canonical** (full, unmodified)
-// `wasi:http` / `wasi:io` / `wasi:clocks` interfaces vendored under
-// `deps/`, so the component's types match exactly what `wasmtime serve`
-// provides — letting the same binary run on both wamr and wasmtime.
+// World for the keyvalue-backed Zig petstore. It imports the
+// **canonical** (full, unmodified) `wasi:http` / `wasi:io` /
+// `wasi:clocks` interfaces, so the component's types match exactly what
+// `wasmtime serve` provides — letting the same binary run on both wamr
+// and wasmtime. Those canonical interfaces resolve from cataggar/wabt's
+// embedded `wasi-canon` fallback (>= v3.0.0-dev.17, #256/#257), so only
+// the non-canonical `wasi:keyvalue` package still needs a vendored
+// `wit/deps/` copy.
 //
 // Imports:
 //   * `wasi:http/types` + `wasi:io/streams` — request/response handling.
 //   * `wasi:keyvalue/store` — host-backed pet storage (survives across
-//     requests even when the runtime re-instantiates per request).
+//     requests even when the runtime re-instantiates per request);
+//     vendored under `wit/deps/wasi-keyvalue/` (not in the canonical set).
 // Export: `wasi:http/incoming-handler`.
 //
 // World-import order matters: `wasi:io/streams` is imported before

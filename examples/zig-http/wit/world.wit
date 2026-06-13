@@ -9,15 +9,16 @@
 // (`runHttpComponent` in src/main.zig) can dispatch incoming
 // requests to the Zig `handle` function.
 //
-// The `deps/` interfaces are the **canonical** (full, unmodified)
-// `wasi:http` / `wasi:io` / `wasi:clocks` WITs — the same ones the
-// shared `wasi_http` guest binding is lowered against. wabt validates
-// guest core-import signatures against the canonical ABI lowering
-// (cataggar/wabt#244/#245), so a trimmed `error-code` would flatten
-// `response-outparam.set` differently and fail that check. We still do
-// NOT pull in the canonical `wasi:http/proxy` world: it `include`s
-// `wasi:clocks/imports`, which the cataggar/wabt encoder doesn't
-// support yet.
+// The referenced `wasi:http` / `wasi:io` / `wasi:clocks` interfaces are
+// the **canonical** (full, unmodified) 0.2.6 WITs — the same ones the
+// shared `wasi_http` guest binding is lowered against. They no longer
+// need a vendored `wit/deps/` copy: cataggar/wabt (>= v3.0.0-dev.17)
+// resolves them from its embedded `wasi-canon` set as a zero-config
+// fallback (cataggar/wabt#256/#257). wabt validates guest core-import
+// signatures against the canonical ABI lowering (cataggar/wabt#244/#245),
+// so a trimmed `error-code` would flatten `response-outparam.set`
+// differently and fail that check — using the canonical set keeps that
+// in sync automatically.
 //
 // NOTE: the file-header text above is plain `//` line comments
 // rather than `///` doc comments — see cataggar/wabt#192. Once
