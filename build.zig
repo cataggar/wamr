@@ -1185,6 +1185,7 @@ fn rustWasip1TargetAvailable(b: *std.Build) bool {
 }
 
 fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_broken_components: bool, rust_examples: bool) ComponentRunSteps {
+    const wasip2 = b.dependency("wasip2", .{});
     const examples_step = b.step(
         "examples",
         "Build the WebAssembly Component examples in examples/",
@@ -1217,8 +1218,9 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "zig-hello.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/guest/wasi_cli.zig", .deps = &.{"abi"} },
-            .{ .name = "abi", .path = "src/guest/abi.zig", .root_dep = false },
+            .{ .name = "wasi_cli", .path = wasip2.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_io", .path = wasip2.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = wasip2.path("src/abi.zig"), .root_dep = false },
         },
         // `no_lld = true` traps at runtime: Zig 0.16's self-hosted wasm
         // linker mis-sets `__stack_pointer` to -1048576. Keep on LLD.
@@ -1346,8 +1348,8 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_http", .path = "src/guest/wasi_http.zig", .deps = &.{"abi"} },
-            .{ .name = "abi", .path = "src/guest/abi.zig", .root_dep = false },
+            .{ .name = "wasi_http", .path = wasip2.path("src/wasi_http.zig"), .deps = &.{"abi"} },
+            .{ .name = "abi", .path = wasip2.path("src/abi.zig"), .root_dep = false },
         },
     });
     const http_component = makeComponent(b, .{
@@ -1403,9 +1405,9 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "zig-http-petstore.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_http", .path = "src/guest/wasi_http.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_keyvalue", .path = "src/guest/wasi_keyvalue.zig", .deps = &.{"abi"} },
-            .{ .name = "abi", .path = "src/guest/abi.zig", .root_dep = false },
+            .{ .name = "wasi_http", .path = wasip2.path("src/wasi_http.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_keyvalue", .path = wasip2.path("src/wasi_keyvalue.zig"), .deps = &.{"abi"} },
+            .{ .name = "abi", .path = wasip2.path("src/abi.zig"), .root_dep = false },
         },
     });
     const petstore_component = makeComponent(b, .{
@@ -1511,8 +1513,10 @@ const ZigWasmCompile = struct {
     exports: []const []const u8,
     output: []const u8,
     /// Extra Zig modules made importable from the root source via
-    /// `@import("<name>")`. The wasi:http / wasi:keyvalue examples use
-    /// this to pull in the guest-side helper modules under `src/guest/`.
+    /// `@import("<name>")`. The wasi:cli / wasi:http / wasi:keyvalue
+    /// examples use this to pull in the guest-side helper modules from
+    /// the `cataggar/wabt` `wasip2` dependency (sourced via
+    /// `wasip2.path("src/<module>.zig")`).
     /// Modules may declare their own `deps` (e.g. each `wasi_*` helper
     /// depends on the shared `abi` module), and the dependency graph is
     /// wired via `--dep` / `-M` flags. Every name referenced as a `dep`
@@ -1530,8 +1534,9 @@ const ZigWasmCompile = struct {
 const ZigWasmImport = struct {
     /// Import name, e.g. `wasi_http` for `@import("wasi_http")`.
     name: []const u8,
-    /// Repo-relative path to the module's root source file.
-    path: []const u8,
+    /// Build-graph path to the module's root source file (e.g.
+    /// `wasip2.path("src/wasi_http.zig")` from the `wasip2` dependency).
+    path: std.Build.LazyPath,
     /// Names of other modules in the same `imports` list this module
     /// `@import`s (e.g. `&.{"abi"}`). Wired as `--dep` flags preceding
     /// this module's `-M` entry.
@@ -1585,7 +1590,7 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
                 cmd.addArg("--dep");
                 cmd.addArg(dep);
             }
-            cmd.addPrefixedFileArg(b.fmt("-M{s}=", .{imp.name}), b.path(imp.path));
+            cmd.addPrefixedFileArg(b.fmt("-M{s}=", .{imp.name}), imp.path);
         }
     }
     const out = cmd.addPrefixedOutputFileArg("-femit-bin=", opts.output);

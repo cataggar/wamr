@@ -12,6 +12,10 @@
             .url = "https://github.com/cataggar/tls.zig/archive/2621e411af81c8b4d8fa5aaae08b9b183a80bb46.tar.gz",
             .hash = "tls-0.1.0-ER2e0vpTBgCVdP6tvFCii9_PFjATLb23ht2_xbGy5mYU",
         },
+        .wasip2 = .{
+            .url = "https://github.com/cataggar/wabt/archive/de1b26f7e721aba18f6472437d8d6cde14bfec16.tar.gz",
+            .hash = "wasip2-0.1.0-jlr7LXS8AACl3LA77qOp3ckw6PNrPJ543Cl--WBtRKsg",
+        },
     },
     .paths = .{
         "build.zig",
