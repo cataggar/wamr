@@ -30,8 +30,8 @@
 //!
 //! The canonical-ABI plumbing lives in the shared guest helper modules
 //! (`@import("wasi_http")` + `@import("wasi_keyvalue")`, both over the
-//! `abi` module; sources under `src/guest/`). This file is just the
-//! petstore routing + JSON + storage logic.
+//! `abi` module; from the `cataggar/wabt` `wasip2` dependency). This
+//! file is just the petstore routing + JSON + storage logic.
 //!
 //! See `../README.md` for the WIT layout and build pipeline.
 

@@ -7,9 +7,6 @@ A minimal `wasi:http` component written in Zig. It exports
 * `GET /`       → `200 "Hello, world!\n"`
 * anything else → `404`
 
-The canonical-ABI plumbing lives in the shared `wasi_http` helper
-(`src/guest/wasi_http.zig`).
-
 ## Build
 
 ```sh

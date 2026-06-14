@@ -119,12 +119,14 @@ cataggar/wabt, exactly one file per `deps/<pkg>/` directory may carry the
 
 ## Source walkthrough
 
-The canonical-ABI bridge lives in the shared guest helper modules under
-[`src/guest/`](../../../src/guest/): [`wasi_http`](../../../src/guest/wasi_http.zig)
+The canonical-ABI bridge lives in the shared guest helper modules from
+the [`cataggar/wabt` `wasip2`](https://github.com/cataggar/wabt/tree/wasip2/src)
+dependency (pinned in `build.zig.zon`):
+[`wasi_http`](https://github.com/cataggar/wabt/blob/wasip2/src/wasi_http.zig)
 (`@import("wasi_http")`, the same one `zig-http` uses) and
-[`wasi_keyvalue`](../../../src/guest/wasi_keyvalue.zig)
+[`wasi_keyvalue`](https://github.com/cataggar/wabt/blob/wasip2/src/wasi_keyvalue.zig)
 (`@import("wasi_keyvalue")`), both built on the shared
-[`abi`](../../../src/guest/abi.zig) module (the single `cabi_realloc`
+[`abi`](https://github.com/cataggar/wabt/blob/wasip2/src/abi.zig) module (the single `cabi_realloc`
 arena + ret-area). There is no Zig `wit-bindgen` backend, so these
 hand-write the host imports + ret-area decoding once, behind typed APIs
 (`http.Request` / `http.Responder` / `http.Method`; `kv.Bucket`). This
