@@ -422,15 +422,42 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         }
     }
 
-    // Plain core wasm. The `wamr` runtime no longer embeds the AOT
-    // compiler (#680) — users must precompile with `wamrc compile`
-    // (or use `wamrc run` for one-shot test execution).
+    // Plain core wasm.
+    if (comptime wamr.config.jit) {
+        // #853: in-process JIT. Compile in memory and execute in this
+        // same process — no `.cwasm` written to disk, no `wamr`/`wamrc`
+        // subprocess spawn (contrast with `wamrc run`, which does both
+        // of those). `runAot` doesn't care whether `data` came from a
+        // file or was just produced by the compiler above; it's the
+        // same load/instantiate/execute path a precompiled `.cwasm`
+        // takes today.
+        const cwasm = wamr.component_aot_compile.compileCoreWasm(allocator, wasm_data, .{}) catch |err| {
+            std.debug.print("Error: JIT compile of '{s}' failed: {s}\n", .{ path, @errorName(err) });
+            return 1;
+        };
+        defer allocator.free(cwasm);
+        return runAot(
+            init.io,
+            allocator,
+            cwasm,
+            wasm_args.items,
+            env_flags.items,
+            init.environ_map,
+            map_dirs.items,
+        );
+    }
+
+    // The `wamr` runtime doesn't embed the AOT compiler by default
+    // (#680) — users must precompile with `wamrc compile` (or use
+    // `wamrc run` for one-shot test execution), unless this binary was
+    // built with `-Djit=true` for in-process JIT support (#852/#853).
     _ = aot_supported;
     std.debug.print(
         "Error: '{s}' is a plain core wasm module and the `wamr` runtime is AOT-only (#644)\n" ++
             "       without an embedded compiler (#680).\n" ++
             "  Run `wamrc compile {s}` to produce a `.cwasm`, then `wamr run <output>.cwasm`, or\n" ++
-            "  run `wamrc run {s} [-- args...]` to compile and execute in one step.\n",
+            "  run `wamrc run {s} [-- args...]` to compile and execute in one step, or\n" ++
+            "  rebuild `wamr` with `-Djit=true` for in-process compile+run (#852).\n",
         .{ path, path, path },
     );
     return 2;
