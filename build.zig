@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
     const fast_interp = b.option(bool, "fast_interp", "Enable fast interpreter") orelse true;
     options.addOption(bool, "fast_interp", fast_interp);
 
-    const jit = b.option(bool, "jit", "Enable LLVM JIT") orelse false;
+    const jit = b.option(bool, "jit", "Enable the in-process JIT (compile+run a .wasm in one step, opt-in — see #852)") orelse false;
     options.addOption(bool, "jit", jit);
 
     const fast_jit = b.option(bool, "fast_jit", "Enable fast JIT") orelse false;
