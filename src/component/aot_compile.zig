@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const ctypes = @import("types.zig");
 const component_loader = @import("loader.zig");
 const aot = @import("aot.zig");
+const core_backend = @import("core_backend.zig");
 const core_loader = @import("../runtime/interpreter/loader.zig");
 const frontend = @import("../compiler/frontend.zig");
 const passes = @import("../compiler/ir/passes.zig");
@@ -779,4 +780,112 @@ pub fn precompileComponent(
         .arena = result_arena,
         .allocator = allocator,
     };
+}
+
+/// In-memory counterpart to `precompileComponent` (#854): the same
+/// core-module walk and per-core `compileCoreWasm` calls, but with no
+/// filesystem I/O at all — no manifest JSON, no per-core `.cwasm`
+/// files, no per-core codegen cache directory. Used by the in-process
+/// JIT path so `wamr run some_component.wasm` (no sibling
+/// `.cwasm.json`) can compile and instantiate in one process.
+///
+/// Each returned `PrecompiledCore.core_wasm` borrows directly from
+/// `component_bytes` (this function's own zero-copy component parse
+/// uses a throwaway scratch arena for bookkeeping only — the byte
+/// slices themselves alias the caller's buffer and outlive it). A
+/// caller that later re-parses the *same* `component_bytes` buffer
+/// (e.g. `runComponent`'s own `component_loader.load` call during
+/// instantiation) gets byte-identical (ptr+len) slices for each core
+/// — the same zero-copy-parse invariant `loadManifest`'s doc comment
+/// already relies on for its `core_wasm` slice-identity matching in
+/// `findPrecompiled` — so this in-memory path is a drop-in swap for
+/// the on-disk manifest at the `PrecompiledCore` level.
+pub const InMemoryPrecompiled = struct {
+    /// One owned `.cwasm` buffer per compiled core, in the same order
+    /// as `pcs`. Freed by `deinit`.
+    cwasm_buffers: []const []u8,
+    /// Ready to pass as `Options.precompiled_cores`. Borrows from
+    /// `cwasm_buffers` (bytes) and the caller's `component_bytes`
+    /// (`core_wasm`); valid for the lifetime of this struct.
+    pcs: []const core_backend.PrecompiledCore,
+    allocator: std.mem.Allocator,
+
+    pub fn precompiledCores(self: *const InMemoryPrecompiled) []const core_backend.PrecompiledCore {
+        return self.pcs;
+    }
+
+    pub fn deinit(self: *InMemoryPrecompiled) void {
+        for (self.cwasm_buffers) |buf| self.allocator.free(buf);
+        self.allocator.free(self.cwasm_buffers);
+        self.allocator.free(self.pcs);
+    }
+};
+
+pub fn precompileComponentInMemory(
+    allocator: std.mem.Allocator,
+    component_bytes: []const u8,
+    opts: PrecompileOptions,
+) PrecompileError!InMemoryPrecompiled {
+    // Same recursive walk as `precompileComponent`'s `Walker` — visits
+    // every leaf core module anywhere in the (possibly composed,
+    // #676) component tree.
+    const CoreRef = struct {
+        data: []const u8,
+        local_idx: u32,
+    };
+    var core_data_list: std.ArrayList(CoreRef) = .empty;
+    defer core_data_list.deinit(allocator);
+    {
+        var load_arena = std.heap.ArenaAllocator.init(allocator);
+        defer load_arena.deinit();
+        const component = component_loader.load(component_bytes, load_arena.allocator()) catch
+            return error.InvalidComponent;
+        const Walker = struct {
+            fn walk(
+                comp: *const ctypes.Component,
+                list: *std.ArrayList(CoreRef),
+                alloc: std.mem.Allocator,
+            ) PrecompileError!void {
+                for (comp.core_modules, 0..) |cm, mi| {
+                    list.append(alloc, .{ .data = cm.data, .local_idx = @intCast(mi) }) catch
+                        return error.OutOfMemory;
+                }
+                for (comp.components) |child| {
+                    try walk(child, list, alloc);
+                }
+            }
+        };
+        try Walker.walk(&component, &core_data_list, allocator);
+    }
+
+    const n = core_data_list.items.len;
+    const cwasm_buffers = allocator.alloc([]u8, n) catch return error.OutOfMemory;
+    var built: usize = 0;
+    errdefer {
+        for (cwasm_buffers[0..built]) |b| allocator.free(b);
+        allocator.free(cwasm_buffers);
+    }
+    const pcs = allocator.alloc(core_backend.PrecompiledCore, n) catch return error.OutOfMemory;
+    errdefer allocator.free(pcs);
+
+    for (core_data_list.items, 0..) |core_ref, idx| {
+        // Override opts.module_idx per core so `:mod=N` bisect
+        // filters resolve correctly, matching `precompileComponent`.
+        var per_core_opts = opts;
+        per_core_opts.module_idx = @intCast(idx);
+
+        const cwasm = compileCoreWasm(allocator, core_ref.data, per_core_opts) catch |err| {
+            std.log.err("precompileComponentInMemory: core {d} compile failed: {s}", .{ idx, @errorName(err) });
+            return err;
+        };
+        cwasm_buffers[idx] = cwasm;
+        built += 1;
+        pcs[idx] = .{
+            .module_idx = core_ref.local_idx,
+            .cwasm_bytes = cwasm,
+            .core_wasm = core_ref.data,
+        };
+    }
+
+    return .{ .cwasm_buffers = cwasm_buffers, .pcs = pcs, .allocator = allocator };
 }

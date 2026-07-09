@@ -406,12 +406,13 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 std.debug.print("Error: --config-store '{s}': {}\n", .{ config_store_path orelse "", err });
                 return 2;
             };
-            // #644 / #680: resolve the AOT precompiled-cores manifest
-            // (shared with `wamr serve`). The `LoadedManifest`'s lifetime
-            // must outlive `runComponent` because the mmapped `.cwasm`
-            // buffers it owns are borrowed by the `PrecompiledCore` slice
-            // handed to the instance loader.
-            var loaded_manifest: ?wamr.component_aot.LoadedManifest = null;
+            // #644 / #680 / #854: resolve the AOT precompiled-cores
+            // manifest (shared with `wamr serve`). The `ComponentCoresSource`'s
+            // lifetime must outlive `runComponent` because the mmapped
+            // (or, on a `-Djit=true` in-process JIT compile, heap-owned)
+            // `.cwasm` buffers it owns are borrowed by the `PrecompiledCore`
+            // slice handed to the instance loader.
+            var loaded_manifest: ?ComponentCoresSource = null;
             defer if (loaded_manifest) |*lm| lm.deinit();
             const manifest_rc = loadComponentManifestOrPrint(init, allocator, "run", path, wasm_data, precompiled_manifest, &loaded_manifest);
             if (manifest_rc != 0) return manifest_rc;
@@ -699,7 +700,7 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
         break :blk parsed;
     };
 
-    var loaded_manifest: ?wamr.component_aot.LoadedManifest = null;
+    var loaded_manifest: ?ComponentCoresSource = null;
     defer if (loaded_manifest) |*lm| lm.deinit();
     const manifest_rc = loadComponentManifestOrPrint(init, allocator, "serve", path, wasm_data, precompiled_manifest, &loaded_manifest);
     if (manifest_rc != 0) return manifest_rc;
@@ -768,22 +769,56 @@ fn parseAddr(spec: []const u8) !std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parse(host, port);
 }
 
+/// Result of `loadComponentManifestOrPrint`: either an on-disk manifest
+/// (explicit `--precompiled-manifest` or an auto-detected sibling
+/// `<stem>.cwasm.json`) or, on a `-Djit=true` build with no manifest
+/// found, an in-process JIT compile of the component (#854). Both
+/// variants expose the same `[]const PrecompiledCore` surface that
+/// `runComponent` / `runHttpComponent` already consume, so callers
+/// downstream of `loadComponentManifestOrPrint` don't need to care
+/// which path produced the cores.
+const ComponentCoresSource = union(enum) {
+    manifest: wamr.component_aot.LoadedManifest,
+    in_memory: wamr.component_aot_compile.InMemoryPrecompiled,
+
+    fn precompiledCores(self: *const ComponentCoresSource) []const wamr.component_core_backend.PrecompiledCore {
+        return switch (self.*) {
+            .manifest => |*m| m.precompiledCores(),
+            .in_memory => |*im| im.precompiledCores(),
+        };
+    }
+
+    fn deinit(self: *ComponentCoresSource) void {
+        switch (self.*) {
+            .manifest => |*m| m.deinit(),
+            .in_memory => |*im| im.deinit(),
+        }
+    }
+};
+
 /// Resolve the AOT precompiled-cores manifest for a component, shared by
 /// `wamr run` and `wamr serve` (#644 / #680 / #845).
 ///
 /// The `wamr` CLI is AOT-only and the runtime no longer embeds the
 /// compiler, so every component core must be available as a precompiled
-/// `.cwasm` or instantiation fails hard. Resolution order:
+/// `.cwasm` or instantiation fails hard — unless this binary was built
+/// with `-Djit=true` (#852), in which case the last resolution step
+/// compiles in memory instead of erroring. Resolution order:
 ///
 ///   * `--precompiled-manifest <path>` (explicit): any error opening /
 ///     validating the manifest is fatal so the user knows the AOT path
-///     isn't being taken.
+///     isn't being taken — this always reads from disk, even on a
+///     `-Djit=true` build, since the user explicitly asked for that
+///     artifact.
 ///   * sibling `<input>.cwasm.json` (auto-detect): used when present and
 ///     valid.
-///   * neither found → hard error directing the user at `wamrc`.
+///   * neither found, `-Djit=true`: in-process JIT compile (#854) — no
+///     manifest, no `.cwasm` files, zero filesystem I/O.
+///   * neither found, default build: hard error directing the user at
+///     `wamrc`.
 ///
-/// On success returns 0 and sets `out_manifest`. On failure prints a
-/// diagnostic and returns a non-zero exit code; `out_manifest` may still
+/// On success returns 0 and sets `out_source`. On failure prints a
+/// diagnostic and returns a non-zero exit code; `out_source` may still
 /// be set (the caller's `defer …deinit()` handles cleanup either way).
 /// `verb` is the invoking subcommand ("run" / "serve") and only flavours
 /// the error text.
@@ -794,14 +829,15 @@ fn loadComponentManifestOrPrint(
     path: []const u8,
     wasm_data: []const u8,
     precompiled_manifest: ?[]const u8,
-    out_manifest: *?wamr.component_aot.LoadedManifest,
+    out_source: *?ComponentCoresSource,
 ) u8 {
     if (precompiled_manifest) |mp| {
-        out_manifest.* = wamr.component_aot.loadManifest(allocator, mp, wasm_data) catch |err| {
+        const loaded = wamr.component_aot.loadManifest(allocator, mp, wasm_data) catch |err| {
             std.debug.print("Error: --precompiled-manifest '{s}': {s}\n", .{ mp, loadManifestErrorMessage(err) });
             return 2;
         };
-        const n = out_manifest.*.?.precompiledCores().len;
+        out_source.* = .{ .manifest = loaded };
+        const n = out_source.*.?.precompiledCores().len;
         if (wamr.component_core_backend.debugAotEnabled())
             std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ mp, n, if (n == 1) @as([]const u8, "") else "s" });
     } else {
@@ -818,33 +854,50 @@ fn loadComponentManifestOrPrint(
             break :blk true;
         };
         if (!exists) {
-            std.debug.print(
-                "Error: no AOT manifest found for '{s}'. The `wamr` runtime no longer embeds the compiler (#680).\n" ++
-                    "  Run `wamrc compile-component {s}` to produce '{s}', or\n" ++
-                    "  run `wamrc {s} {s}` to compile and serve/execute in one step.\n",
-                .{ path, path, sibling, verb, path },
-            );
-            return 2;
+            if (comptime wamr.config.jit) {
+                // #854: in-process JIT. Compile every core module of
+                // the component in memory and instantiate directly —
+                // no manifest, no `.cwasm` files written to disk.
+                const in_mem = wamr.component_aot_compile.precompileComponentInMemory(allocator, wasm_data, .{}) catch |err| {
+                    std.debug.print("Error: JIT compile of component '{s}' failed: {s}\n", .{ path, @errorName(err) });
+                    return 1;
+                };
+                out_source.* = .{ .in_memory = in_mem };
+                const n = out_source.*.?.precompiledCores().len;
+                if (wamr.component_core_backend.debugAotEnabled())
+                    std.debug.print("wamr: JIT-compiled {d} core{s} for {s} (in-process, no disk artifact)\n", .{ n, if (n == 1) @as([]const u8, "") else "s", path });
+            } else {
+                std.debug.print(
+                    "Error: no AOT manifest found for '{s}'. The `wamr` runtime no longer embeds the compiler (#680).\n" ++
+                        "  Run `wamrc compile-component {s}` to produce '{s}', or\n" ++
+                        "  run `wamrc {s} {s}` to compile and serve/execute in one step, or\n" ++
+                        "  rebuild `wamr` with `-Djit=true` for in-process compile+run (#852/#854).\n",
+                    .{ path, path, sibling, verb, path },
+                );
+                return 2;
+            }
+        } else {
+            const loaded = wamr.component_aot.loadManifest(allocator, sibling, wasm_data) catch |err| {
+                std.debug.print(
+                    "Error: AOT manifest at '{s}' is stale or invalid: {s}.\n" ++
+                        "  Rebuild it with `wamrc compile-component {s}` or run `wamrc {s} {s}`.\n",
+                    .{ sibling, loadManifestErrorMessage(err), path, verb, path },
+                );
+                return 2;
+            };
+            out_source.* = .{ .manifest = loaded };
+            const n = out_source.*.?.precompiledCores().len;
+            if (wamr.component_core_backend.debugAotEnabled())
+                std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
         }
-        out_manifest.* = wamr.component_aot.loadManifest(allocator, sibling, wasm_data) catch |err| {
-            std.debug.print(
-                "Error: AOT manifest at '{s}' is stale or invalid: {s}.\n" ++
-                    "  Rebuild it with `wamrc compile-component {s}` or run `wamrc {s} {s}`.\n",
-                .{ sibling, loadManifestErrorMessage(err), path, verb, path },
-            );
-            return 2;
-        };
-        const n = out_manifest.*.?.precompiledCores().len;
-        if (wamr.component_core_backend.debugAotEnabled())
-            std.debug.print("wamr: loaded AOT manifest from {s} ({d} core{s} precompiled)\n", .{ sibling, n, if (n == 1) @as([]const u8, "") else "s" });
     }
 
     // #644: AOT-only policy. `wamr run`/`serve` require a precompiled
     // bundle for every component — there is no interp fallback at the CLI
-    // surface and no in-process compiler. An empty bundle means the
-    // component had no core modules (an empty / malformed input that
-    // survived parsing).
-    if (out_manifest.*.?.precompiledCores().len == 0) {
+    // surface, and no in-process compiler unless `-Djit=true`. An empty
+    // bundle means the component had no core modules (an empty /
+    // malformed input that survived parsing).
+    if (out_source.*.?.precompiledCores().len == 0) {
         std.debug.print(
             "Error: component has no AOT-compiled cores and `wamr {s}` is AOT-only.\n" ++
                 "  See issue #644.\n",
