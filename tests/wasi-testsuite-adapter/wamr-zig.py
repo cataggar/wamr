@@ -138,7 +138,18 @@ def _precompile(test_path: str) -> str:
     `tests/wasi-testsuite-skip.json`; running the verifier here
     surfaces those same bugs as adapter failures and breaks suites
     that previously hit the silent codegen path.
+
+    #856: when `WAMR_JIT_TESTSUITE` is set, skip precompilation
+    entirely and hand the raw `.wasm` straight to `wamr run` /
+    `wamr serve`, which JIT-compiles it in memory on a `-Djit=true`
+    build (see `zig build wasi-testsuite-jit` /
+    `wasi-p3-testsuite-jit` in build.zig). This proves the in-process
+    JIT path is behavior-identical to the AOT-precompiled path this
+    function normally produces, since both flow through the exact
+    same compiler and AOT loader/runtime — only the "when" differs.
     """
+    if os.getenv("WAMR_JIT_TESTSUITE"):
+        return test_path
     p = Path(test_path)
     if p.suffix != ".wasm":
         return test_path
