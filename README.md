@@ -17,7 +17,34 @@ See [INSTALL.md](INSTALL.md) for alternative installation methods (winget, uv, p
 ## Tools
 
  - **wamrc**: AOT compiler — compile a `.wasm` module to a native `.cwasm` binary (`wamrc compile foo.wasm`)
- - **wamr**: run a WebAssembly module — either a `.wasm` file via the stack-based interpreter, or a precompiled `.cwasm` file produced by `wamrc` (`wamr run foo.wasm`)
+ - **wamr**: run a precompiled `.cwasm` file (`wamr run foo.cwasm`), or a plain `.wasm` module directly when built with `-Djit=true` — see [JIT mode](#jit-mode) below
+
+## JIT mode
+
+By default `wamr` is **AOT-only**: it links only the runtime, not the
+compiler, so it stays small (~17 MB) and requires a precompiled
+`.cwasm` artifact for every module. Building with `-Djit=true` instead
+links the compiler in and adds an opt-in **in-process JIT**: `wamr run
+foo.wasm` compiles the module in memory and executes it in the same
+process, one command, no `.cwasm` artifact ever hits disk —
+[`wasmtime run`](https://wasmtime.dev)-style ergonomics, at the cost of
+a bigger binary (~25 MB) and per-invocation compile latency.
+
+| | AOT-only (default) | JIT (`-Djit=true`) |
+|---|---|---|
+| Build | `zig build -Doptimize=ReleaseSafe` | `zig build -Doptimize=ReleaseSafe -Djit=true` |
+| Core wasm | `wamrc compile foo.wasm` → `wamr run foo.cwasm` | `wamr run foo.wasm` |
+| Component | `wamrc compile-component foo.wasm` → `wamr run foo.wasm` (auto-detects the sidecar manifest) | `wamr run foo.wasm` (no manifest needed) |
+| One-shot testing | `wamrc run foo.wasm` (compiles, then spawns `wamr` as a subprocess) | `wamr run foo.wasm` (single process, no subprocess) |
+| Binary size / compiler | Small; no compiler linked in | Larger; compiler linked in |
+
+Both flows produce identical guest-observable behavior — the JIT path
+reuses the exact same compiler (`src/compiler`) and AOT loader/runtime
+(`src/runtime/aot`) as the two-step flow, just without the disk
+round-trip. `wamr serve` (the `wasi:http` server) supports the same
+JIT fallback for components with no sidecar manifest. See issue
+[#863](https://github.com/cataggar/wamr/issues/863) for the full plan
+and design rationale.
 
 ## Building
 

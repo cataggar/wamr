@@ -63,3 +63,19 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 Binaries are written to `zig-out/bin/`.
+
+### JIT mode
+
+The pre-built binaries above (GitHub Releases, PyPI, `ghr`, `uv`, `pip`,
+`dist`) are all **AOT-only** — the release workflow does not pass
+`-Djit`. To get a `wamr` that compiles and runs a plain `.wasm` module
+directly in one step (no separate `wamrc` precompile), build from
+source with the flag added:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Djit=true
+```
+
+See the [JIT mode section of the README](README.md#jit-mode) for what
+this trades off (bigger binary, per-invocation compile latency) and
+how the two flows compare.
