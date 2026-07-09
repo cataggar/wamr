@@ -37165,8 +37165,14 @@ test "WasiCliAdapter FS write-via-stream: per-chunk cancel polling within multi-
     const ctx = adapter.fs_write_stream_ctxs.items[0];
     const slot = ci.streams.getPtr(stream_handle).?;
 
+    // Declared ahead of `WriteWatcher` so the watcher can tell a
+    // genuine mid-write observation apart from waking up only after
+    // the whole buffer already drained (see `run` below, #866).
+    const buf_size: usize = 16 * 1024 * 1024;
+
     const WriteWatcher = struct {
         ctx_ref: *FsWriteStreamCtx,
+        buf_size: usize,
         observed_at: std.atomic.Value(u64) = .{ .raw = 0 },
         fn run(self: *@This()) void {
             var spins: usize = 0;
@@ -37177,8 +37183,22 @@ test "WasiCliAdapter FS write-via-stream: per-chunk cancel polling within multi-
             // schedules) from deadlocking the test — we surface
             // the miss via `observed_at == 0` so the assertions
             // below can `error.SkipZigTest` instead of failing.
+            //
+            // #866: a slow/loaded CI runner can also descend the
+            // *other* way — this thread doesn't get scheduled at
+            // all until the writer has already finished the entire
+            // buffer, at which point `bytes_written == buf_size`
+            // satisfies the naive `seen >= FS_CANCEL_POLL_CHUNK_BYTES`
+            // check even though there was never a real mid-write
+            // window to interrupt. Treat that the same as "never
+            // observed" (leave `observed_at` at 0) rather than
+            // flipping `cancelled` after the fact and asserting the
+            // driver should have returned `.err` for a write that,
+            // from the writer's perspective, already legitimately
+            // completed.
             while (spins < 100_000_000) : (spins += 1) {
                 const seen = @atomicLoad(u64, &self.ctx_ref.bytes_written, .acquire);
+                if (seen >= self.buf_size) return;
                 if (seen >= WasiCliAdapter.FS_CANCEL_POLL_CHUNK_BYTES) {
                     self.observed_at.store(seen, .release);
                     self.ctx_ref.cancelled.store(true, .release);
@@ -37188,10 +37208,9 @@ test "WasiCliAdapter FS write-via-stream: per-chunk cancel polling within multi-
             }
         }
     };
-    var watcher_ctx = WriteWatcher{ .ctx_ref = ctx };
+    var watcher_ctx = WriteWatcher{ .ctx_ref = ctx, .buf_size = buf_size };
     const watcher = try std.Thread.spawn(.{}, WriteWatcher.run, .{&watcher_ctx});
 
-    const buf_size: usize = 16 * 1024 * 1024;
     const big_buf = try testing.allocator.alloc(u8, buf_size);
     defer testing.allocator.free(big_buf);
     @memset(big_buf, 'W');
@@ -37205,10 +37224,11 @@ test "WasiCliAdapter FS write-via-stream: per-chunk cancel polling within multi-
         ci.allocator,
     );
     watcher.join();
-    // If the watcher never observed the first-chunk boundary, the
-    // host's pwrite throughput must have outrun a spin-poll
-    // thread's wake-up — extraordinarily unlikely on any modern
-    // box, but we skip rather than flake.
+    // If the watcher never observed a genuine mid-write boundary
+    // crossing — either because the host's pwrite throughput
+    // outran a spin-poll thread's wake-up entirely, or (#866)
+    // because the watcher only got scheduled after the whole
+    // buffer had already drained — skip rather than flake.
     if (watcher_ctx.observed_at.load(.acquire) == 0) return error.SkipZigTest;
 
     try testing.expectEqual(async_mod.HostStreamAction.err, action);
@@ -37268,11 +37288,20 @@ test "WasiCliAdapter FS read-via-stream: per-chunk cancel polling within eager p
 
     const ReadWatcher = struct {
         ctx_ref: *FsReadStreamCtx,
+        file_size: usize,
         observed_at: std.atomic.Value(u64) = .{ .raw = 0 },
         fn run(self: *@This()) void {
             var spins: usize = 0;
+            // #866: same "watcher wakes up only after the whole
+            // read already drained" race as the write-side sibling
+            // test above — treat that as unobserved (leave
+            // `observed_at` at 0) rather than flipping `cancelled`
+            // after the fact and asserting the loop should have
+            // bailed early for a read that, from the reader's
+            // perspective, already legitimately reached EOF.
             while (spins < 100_000_000) : (spins += 1) {
                 const seen = @atomicLoad(u64, &self.ctx_ref.bytes_read, .acquire);
+                if (seen >= self.file_size) return;
                 if (seen >= WasiCliAdapter.FS_CANCEL_POLL_CHUNK_BYTES) {
                     self.observed_at.store(seen, .release);
                     self.ctx_ref.cancelled.store(true, .release);
@@ -37282,7 +37311,7 @@ test "WasiCliAdapter FS read-via-stream: per-chunk cancel polling within eager p
             }
         }
     };
-    var watcher_ctx = ReadWatcher{ .ctx_ref = ctx };
+    var watcher_ctx = ReadWatcher{ .ctx_ref = ctx, .file_size = file_size };
     const watcher = try std.Thread.spawn(.{}, ReadWatcher.run, .{&watcher_ctx});
 
     WasiCliAdapter.fsEagerPreBufferChunked(fs_file, ctx, &slot, 0, scratch, testing.allocator);
