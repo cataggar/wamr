@@ -16,6 +16,65 @@ const trap_jmp = @import("trap_jmp.zig");
 // ─── Windows crash handler (debug only) ─────────────────────────────────────
 const windows = std.os.windows;
 
+/// #857: lightweight process-wide registry tracking currently-mapped
+/// JIT/AOT executable code so a long-lived process that repeatedly
+/// compiles+drops modules (e.g. an embedding host, a dev-server
+/// hot-reload loop, or a test harness JIT-compiling many small modules
+/// back to back) can introspect total resident code size and,
+/// optionally, cap it rather than silently growing unbounded or OOMing.
+///
+/// This is bookkeeping only — it doesn't retain or reuse compiled code
+/// across a `destroy` (that would be an actual *cache* in the reuse
+/// sense; see the design spike tracked by issue #862 for lazy/tiered
+/// compilation, which is a different feature). `mapCodeExecutable` /
+/// `destroy` already individually `mmap`/`munmap` correctly per
+/// instance — verified by inspection and by the stress test in
+/// `runtime_test.zig` — this struct just lets that be observed and
+/// bounded in aggregate across every live `AotInstance` in the process.
+pub const JitCodeCache = struct {
+    /// Total resident bytes across every currently-mapped
+    /// `AotInstance.code_base`. Default `0` = unlimited (existing
+    /// behavior unchanged). Opt in via `WAMR_JIT_CODE_BUDGET_BYTES`
+    /// (see `main.zig`) or set directly before compiling.
+    pub var budget_bytes: usize = 0;
+
+    var resident_bytes: usize = 0;
+    var mapping_count: usize = 0;
+
+    /// Currently resident JIT/AOT executable code, summed across every
+    /// live `AotInstance` with a mapped `code_base` in this process.
+    pub fn residentBytes() usize {
+        return resident_bytes;
+    }
+
+    /// Number of currently-live mapped code regions (i.e. `AotInstance`s
+    /// with `code_base != null`) in this process.
+    pub fn mappingCount() usize {
+        return mapping_count;
+    }
+
+    fn register(size: usize) void {
+        resident_bytes += size;
+        mapping_count += 1;
+    }
+
+    fn unregister(size: usize) void {
+        resident_bytes -= size;
+        mapping_count -= 1;
+    }
+
+    /// Returns `error.CodeBudgetExceeded` if mapping `additional_bytes`
+    /// more code would push `residentBytes()` past `budget_bytes`, when
+    /// a nonzero budget is configured. Called by `mapCodeExecutable`
+    /// before the `mmap`, so a caller gets a clear typed error instead
+    /// of the process eventually running out of memory from unbounded
+    /// JIT growth.
+    fn checkBudget(additional_bytes: usize) error{CodeBudgetExceeded}!void {
+        if (budget_bytes == 0) return;
+        if (resident_bytes + additional_bytes > budget_bytes) return error.CodeBudgetExceeded;
+    }
+};
+
 var g_code_base: usize = 0;
 var g_code_size: usize = 0;
 var g_mem_base: usize = 0;
@@ -1493,6 +1552,11 @@ pub const RuntimeError = error{
     /// still linked so importers of `src/root.zig` build cleanly on
     /// riscv64 / etc., but invoking it at runtime fails fast.
     UnsupportedArchitecture,
+    /// #857: mapping this instance's code would push total resident
+    /// JIT/AOT executable code past `JitCodeCache.budget_bytes`. Only
+    /// possible when a nonzero budget is configured (default is
+    /// unlimited); see `JitCodeCache` below.
+    CodeBudgetExceeded,
 };
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -1702,6 +1766,7 @@ pub fn destroy(inst: *AotInstance) void {
     // Unmap executable code if mapped.
     if (inst.code_base) |base| {
         platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
+        JitCodeCache.unregister(inst.code_size);
     }
     unsubscribeVmCtxFromMemories(inst);
     freeMemories(inst.memories, inst.memories_owned, allocator);
@@ -1880,6 +1945,12 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     var mem: [*]u8 = undefined;
     if (has_text) {
         const text = text_opt.?;
+        // #857: check the (optional, default-unlimited) resident-code
+        // budget before doing any mapping work, so a caller gets a
+        // clear typed error instead of the process silently growing
+        // unbounded / eventually OOMing.
+        try JitCodeCache.checkBudget(text.len);
+
         // 1. Allocate RW pages
         mem = platform.mmap(null, text.len, .{ .read = true, .write = true }, .{}) orelse
             return error.CodeMappingFailed;
@@ -1898,6 +1969,7 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 
         inst.code_base = mem;
         inst.code_size = text.len;
+        JitCodeCache.register(text.len);
     }
 
     // Build function pointer table for call_indirect
@@ -3571,4 +3643,106 @@ test "instantiate: module with WASI imports resolves host functions" {
 
     try std.testing.expectEqual(@as(usize, 1), inst.host_functions.len);
     try std.testing.expect(inst.host_functions[0] != null);
+}
+
+// ─── #857: JitCodeCache registry tests ─────────────────────────────────────
+
+/// Minimal valid native function body for the host arch: a handful of
+/// `nop`s followed by `ret`/`RET`, immediately returning. Enough to
+/// exercise `mapCodeExecutable`'s full mmap → memcpy → icache-flush →
+/// mprotect → call round trip without needing real codegen output —
+/// this suite is testing the `JitCodeCache` registry's bookkeeping,
+/// not codegen. Padded to a few bytes (rather than a single `ret`) so
+/// the budget-rejection test below has room to pick a budget that's
+/// unambiguously nonzero yet still smaller than this body's size —
+/// with a 1-byte body and a 0-baseline, no such value exists, since
+/// `0` doubles as the registry's "unlimited" sentinel.
+const minimal_ret_body: []const u8 = switch (native_arch) {
+    .x86_64 => &[_]u8{ 0x90, 0x90, 0x90, 0x90, 0xC3 }, // nop*4; ret
+    .aarch64 => &[_]u8{ 0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6 }, // nop; ret
+    .unsupported => &[_]u8{},
+};
+
+test "JitCodeCache: mapCodeExecutable/destroy round-trip leaves no residual mapping" {
+    if (comptime !can_execute_native) return error.SkipZigTest;
+
+    const before = JitCodeCache.residentBytes();
+    const offsets = [_]u32{0};
+    const module = aot_loader.AotModule{
+        .text_section = minimal_ret_body,
+        .func_offsets = &offsets,
+        .func_count = 1,
+    };
+    const inst = try instantiate(&module, std.testing.allocator);
+    try mapCodeExecutable(inst);
+
+    try std.testing.expectEqual(before + minimal_ret_body.len, JitCodeCache.residentBytes());
+
+    var results_buf: [0]ScalarResult = .{};
+    _ = try callFuncScalar(inst, 0, &.{}, &.{}, &.{}, &results_buf);
+
+    destroy(inst);
+    try std.testing.expectEqual(before, JitCodeCache.residentBytes());
+}
+
+test "JitCodeCache: repeated compile+run+drop cycles never accumulate residual mappings" {
+    if (comptime !can_execute_native) return error.SkipZigTest;
+
+    const before_count = JitCodeCache.mappingCount();
+    const before_bytes = JitCodeCache.residentBytes();
+
+    // #857 acceptance: "JIT-compiles + runs + drops N small modules in
+    // a loop in one process ... mapped code doesn't grow unbounded."
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        const offsets = [_]u32{0};
+        const module = aot_loader.AotModule{
+            .text_section = minimal_ret_body,
+            .func_offsets = &offsets,
+            .func_count = 1,
+        };
+        const inst = try instantiate(&module, std.testing.allocator);
+        try mapCodeExecutable(inst);
+
+        // Never more than one live mapping from this loop at a time —
+        // this is the "doesn't grow unbounded" assertion.
+        try std.testing.expectEqual(before_count + 1, JitCodeCache.mappingCount());
+        try std.testing.expectEqual(before_bytes + minimal_ret_body.len, JitCodeCache.residentBytes());
+
+        var results_buf: [0]ScalarResult = .{};
+        _ = try callFuncScalar(inst, 0, &.{}, &.{}, &.{}, &results_buf);
+
+        destroy(inst);
+        // Back to baseline after every single drop — no accumulation.
+        try std.testing.expectEqual(before_count, JitCodeCache.mappingCount());
+        try std.testing.expectEqual(before_bytes, JitCodeCache.residentBytes());
+    }
+}
+
+test "JitCodeCache: mapCodeExecutable rejects a mapping that would exceed a configured budget" {
+    if (comptime !can_execute_native) return error.SkipZigTest;
+
+    // Budget smaller than the minimal function body guarantees rejection
+    // regardless of the current residual baseline from other tests.
+    // Must stay nonzero (0 doubles as the registry's "unlimited"
+    // sentinel) — `minimal_ret_body` is padded specifically so this
+    // value (baseline + 1) is always both nonzero and still short of
+    // baseline + the body's full size.
+    JitCodeCache.budget_bytes = JitCodeCache.residentBytes() + 1;
+    defer JitCodeCache.budget_bytes = 0; // restore "unlimited" for later tests
+
+    const offsets = [_]u32{0};
+    const module = aot_loader.AotModule{
+        .text_section = minimal_ret_body,
+        .func_offsets = &offsets,
+        .func_count = 1,
+    };
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    try std.testing.expectError(error.CodeBudgetExceeded, mapCodeExecutable(inst));
+    // Rejected before any mmap happened — no residual mapping, and the
+    // instance's code_base stays unset so `destroy` above is a clean no-op
+    // on the code-mapping front.
+    try std.testing.expectEqual(@as(?[*]const u8, null), inst.code_base);
 }
