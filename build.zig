@@ -505,6 +505,27 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&jit_hello_smoke.step);
     }
 
+    // #854: in-process JIT smoke test for components. Only meaningful
+    // for a `-Djit=true` build — spawns the just-built `wamr` directly
+    // against `stdio-echo.wasm` (the canonical end-to-end WASI-P2
+    // fixture, #156) with no sibling `.cwasm.json` manifest in sight,
+    // proving the component in-process JIT path compiles every core
+    // module and instantiates in one process/one command. Gated on
+    // `aot_trampoline_pool_target` (not just `aot_executable_target`)
+    // because `stdio-echo.wasm`'s WASI preview1 imports need the
+    // host-import trampoline pool, unsupported on Windows / macOS-aarch64
+    // (see the `760-aot-cli-exit` regression gate above for the same
+    // rationale).
+    if (jit and aot_trampoline_pool_target) {
+        const jit_component_smoke = b.addRunArtifact(exe);
+        jit_component_smoke.addArg("run");
+        jit_component_smoke.addFileArg(b.path("src/component/fixtures/stdio-echo.wasm"));
+        jit_component_smoke.setStdIn(.{ .bytes = "hello\n" });
+        jit_component_smoke.expectExitCode(0);
+        jit_component_smoke.expectStdOutEqual("echo: hello\n");
+        test_step.dependOn(&jit_component_smoke.step);
+    }
+
     // #760 regression: AOT `wasi:cli/exit.exit` must terminate the host
     // process with the requested discriminant rather than returning the
     // post-#714 sentinel through the canon-lower(aot) trampoline. Two
