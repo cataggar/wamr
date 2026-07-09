@@ -102,6 +102,23 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
     }
+    // #857: opt-in cap on total resident JIT/AOT executable code
+    // across every live `AotInstance` in this process (bytes). Default
+    // 0 = unlimited (existing behavior unchanged) — set this to make a
+    // long-lived embedding host/dev-server fail fast with a clear
+    // `error.CodeBudgetExceeded` instead of growing unbounded.
+    if (init.environ_map.get("WAMR_JIT_CODE_BUDGET_BYTES")) |v| {
+        if (v.len > 0) {
+            if (std.fmt.parseInt(usize, v, 10)) |n| {
+                wamr.aot_runtime.JitCodeCache.budget_bytes = n;
+            } else |err| {
+                std.debug.print(
+                    "warning: WAMR_JIT_CODE_BUDGET_BYTES={s}: {s} — using default (unlimited)\n",
+                    .{ v, @errorName(err) },
+                );
+            }
+        }
+    }
     if (init.environ_map.get("WAMR_WATCH_ADDR")) |v| {
         if (v.len > 0) {
             wamr.aot_runtime.initWatchAddrFromEnv(v) catch |err| {
