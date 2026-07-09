@@ -722,7 +722,10 @@ test "mapExecutableCode: mapped code is genuinely callable" {
     const mem = mapExecutableCode(body) orelse return error.MapExecutableCodeFailed;
     defer munmap(mem, body.len);
 
-    const f: *const fn () callconv(.c) i32 = @ptrCast(mem);
+    // `mem` is typed as `[*]u8` (alignment 1) but is always backed by a
+    // page-aligned `mmap` allocation at runtime, so re-asserting the
+    // (much stricter) function-pointer alignment here is sound.
+    const f: *const fn () callconv(.c) i32 = @ptrCast(@alignCast(mem));
     try std.testing.expectEqual(@as(i32, 42), f());
 }
 
