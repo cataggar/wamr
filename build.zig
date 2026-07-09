@@ -326,6 +326,75 @@ pub fn build(b: *std.Build) void {
     );
     wasi_p3_testsuite_step.dependOn(&wasi_p3_runner.step);
 
+    // ── In-process JIT parity gates (#856) ────────────────────────────
+    // Only meaningful on a `-Djit=true` build (see #852): reruns the
+    // exact same P1 / P3 conformance corpora and skip-lists as
+    // `wasi-testsuite` / `wasi-p3-testsuite` above, but with
+    // `WAMR_JIT_TESTSUITE=1` telling the adapter's `_precompile` to
+    // skip `wamrc` entirely and hand the raw `.wasm` straight to
+    // `wamr run` / `wamr serve`, which JIT-compiles it in memory. Both
+    // gates should report the *exact same* pass/skip counts as their
+    // AOT-precompiled siblings — same compiler, same AOT loader/runtime,
+    // only the "compile ahead of time to disk" vs "compile in memory on
+    // first use" timing differs. A divergence here means the JIT path
+    // has a real behavioral bug, not a pre-existing AOT compiler gap
+    // (those are already accounted for by the shared skip-lists).
+    //
+    // Gated on `if (jit)` so these steps don't even exist on a default
+    // build — running them there would just hard-error on every
+    // fixture (issue #644/#680's AOT-only policy has no JIT fallback).
+    if (jit) {
+        const wasi_runner_jit = b.addSystemCommand(&.{
+            "python3",
+            "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+            "--test-suite",
+            "tests/wasi-testsuite/tests/c/testsuite/wasm32-wasip1",
+            "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip1",
+            "tests/wasi-testsuite/tests/assemblyscript/testsuite/wasm32-wasip1",
+            "--runtime-adapter",
+            "tests/wasi-testsuite-adapter/wamr-zig.py",
+            "--exclude-filter",
+            "tests/wasi-testsuite-skip.json",
+        });
+        wasi_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+        wasi_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+        wasi_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
+        wasi_runner_jit.step.dependOn(b.getInstallStep());
+        const wasi_testsuite_jit_step = b.step(
+            "wasi-testsuite-jit",
+            "Run the WASI Preview 1 conformance suite through the in-process JIT path (-Djit=true; #856)",
+        );
+        wasi_testsuite_jit_step.dependOn(&wasi_runner_jit.step);
+
+        const wasi_p3_runner_jit = b.addSystemCommand(&.{
+            "python3",
+            "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+            "--test-suite",
+            "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
+            "--runtime-adapter",
+            "tests/wasi-testsuite-adapter/wamr-zig.py",
+            "--exclude-filter",
+            "tests/wasi-p3-testsuite-skip.json",
+        });
+        wasi_p3_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+        wasi_p3_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+        wasi_p3_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
+        // JIT compiles every fixture from scratch on every invocation
+        // (no cross-process cache like the `.cwasm` mtime check the
+        // AOT path gets), so per-test wall time is higher than the
+        // AOT-precompiled gate above. Bump the runner's per-`wait`
+        // timeout accordingly (see #583 A7 / README's
+        // `WAMR_TESTSUITE_TIMEOUT` docs) rather than risk flaking on a
+        // loaded CI runner.
+        wasi_p3_runner_jit.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "30");
+        wasi_p3_runner_jit.step.dependOn(b.getInstallStep());
+        const wasi_p3_testsuite_jit_step = b.step(
+            "wasi-p3-testsuite-jit",
+            "Run the WASI Preview 3 conformance gate through the in-process JIT path (-Djit=true; #856)",
+        );
+        wasi_p3_testsuite_jit_step.dependOn(&wasi_p3_runner_jit.step);
+    }
+
     // ── Wasmtime parity gate (#583 C1, original #489 proposal) ────────
     // Runs the *same* `wasm32-wasip3` fixtures through upstream Wasmtime
     // (CI pin: v44.0.1, the first release with `-Sp3` support — see the
