@@ -1407,18 +1407,7 @@ const top_usage =
     \\
 ;
 
-const run_usage =
-    \\Usage: wamr run [options] <file.wasm|file.cwasm> [args...]
-    \\
-    \\The `wamr` CLI is AOT-only (issue #644):
-    \\  * `.cwasm`/`.aot` core modules (magic `\0aot`) run via the AOT
-    \\    runtime directly.
-    \\  * Component-model `.wasm` files run via AOT cores loaded from a
-    \\    `wamrc compile-component` manifest (see --precompiled-manifest below).
-    \\    Components without a manifest fail with a clear error.
-    \\  * Plain core wasm modules are not supported — pre-compile to
-    \\    `.cwasm`/`.aot` first.
-    \\
+const run_usage_options =
     \\Options:
     \\  --stack-size=<bytes>     (ignored; kept for backward compat)
     \\  --heap-size=<bytes>      Reserved (currently ignored)
@@ -1453,25 +1442,61 @@ const run_usage =
     \\                           `.cwasm` files resolve relative to the
     \\                           manifest's directory. When omitted, `wamr
     \\                           run` auto-detects a sibling
-    \\                           `<input>.cwasm.json`. The manifest is
-    \\                           mandatory: components without one fail
-    \\                           with a clear error (issues #644, #680).
+    \\                           `<input>.cwasm.json`.
     \\
     \\To serve a wasi:http/incoming-handler component over HTTP, use
     \\`wamr serve` instead (see `wamr serve help`).
     \\
 ;
 
-const serve_usage =
-    \\Usage: wamr serve [options] <component.wasm>
+// #855: `wamr run help` describes the behavior of *this specific binary*,
+// which is a comptime-known build (`wamr.config.jit`) — so rather than
+// one generic paragraph hedging over both configurations, `run_usage` is
+// comptime-selected between two accurate intros. See README.md's "JIT
+// mode" section for the side-by-side comparison of both build flavors.
+const run_usage_intro_aot_only =
+    \\Usage: wamr run [options] <file.wasm|file.cwasm> [args...]
     \\
-    \\Serve a `wasi:http/incoming-handler` component as a long-lived HTTP
-    \\server (the proxy world), aligned with `wasmtime serve`. AOT-only
-    \\like `wamr run`: the component needs a `wamrc compile-component`
-    \\manifest (an explicit --precompiled-manifest or a sibling
-    \\`<input>.cwasm.json`). Use `wamrc serve <component.wasm>` to
-    \\precompile-if-stale and serve in one step.
+    \\This `wamr` binary is AOT-only (no `-Djit` build support compiled
+    \\in; issue #644):
+    \\  * `.cwasm`/`.aot` core modules (magic `\0aot`) run via the AOT
+    \\    runtime directly.
+    \\  * Component-model `.wasm` files run via AOT cores loaded from a
+    \\    `wamrc compile-component` manifest (see --precompiled-manifest
+    \\    below). Components without a manifest fail with a clear error.
+    \\  * Plain core wasm modules are not supported — pre-compile to
+    \\    `.cwasm`/`.aot` first with `wamrc compile`, or use `wamrc run`
+    \\    to compile and execute in one step.
     \\
+    \\For a `wasmtime run`-style one-shot experience (`wamr run foo.wasm`
+    \\compiles and executes in one process, no `wamrc` step, no `.cwasm`
+    \\artifact), rebuild `wamr` with `-Djit=true` (issue #852).
+    \\
+    \\
+;
+
+const run_usage_intro_jit =
+    \\Usage: wamr run [options] <file.wasm|file.cwasm> [args...]
+    \\
+    \\This `wamr` binary was built with in-process JIT support
+    \\(`-Djit=true`; issues #852-#854):
+    \\  * Plain core `.wasm` modules are compiled in memory and executed
+    \\    in this same process — no `.cwasm` file is written, no `wamrc`
+    \\    subprocess is spawned.
+    \\  * Component-model `.wasm` files: a sibling `wamrc compile-component`
+    \\    manifest (or an explicit --precompiled-manifest below) is used
+    \\    when present; otherwise every core module is JIT-compiled in
+    \\    memory and instantiated directly — same zero-disk-artifact
+    \\    behavior as the core-wasm case.
+    \\  * `.cwasm`/`.aot` core modules (magic `\0aot`) still run via the
+    \\    AOT runtime directly, same as an AOT-only build.
+    \\
+    \\
+;
+
+const run_usage = if (wamr.config.jit) run_usage_intro_jit ++ run_usage_options else run_usage_intro_aot_only ++ run_usage_options;
+
+const serve_usage_options =
     \\Options:
     \\  --addr <ip:port>         Bind address (an IP literal + port, no
     \\                           hostname resolution). Default 127.0.0.1:8080.
@@ -1500,6 +1525,37 @@ const serve_usage =
     \\                           sibling `<input>.cwasm.json` is auto-detected.
     \\
 ;
+
+const serve_usage_intro_aot_only =
+    \\Usage: wamr serve [options] <component.wasm>
+    \\
+    \\Serve a `wasi:http/incoming-handler` component as a long-lived HTTP
+    \\server (the proxy world), aligned with `wasmtime serve`. This
+    \\`wamr` binary is AOT-only (no `-Djit` build support compiled in):
+    \\the component needs a `wamrc compile-component` manifest (an
+    \\explicit --precompiled-manifest or a sibling `<input>.cwasm.json`).
+    \\Use `wamrc serve <component.wasm>` to precompile-if-stale and serve
+    \\in one step, or rebuild `wamr` with `-Djit=true` (issue #852) to
+    \\serve directly without a manifest.
+    \\
+    \\
+;
+
+const serve_usage_intro_jit =
+    \\Usage: wamr serve [options] <component.wasm>
+    \\
+    \\Serve a `wasi:http/incoming-handler` component as a long-lived HTTP
+    \\server (the proxy world), aligned with `wasmtime serve`. This
+    \\`wamr` binary was built with in-process JIT support (`-Djit=true`;
+    \\issue #854): a sibling `wamrc compile-component` manifest (or an
+    \\explicit --precompiled-manifest below) is used when present;
+    \\otherwise every core module is JIT-compiled in memory and served
+    \\directly — no manifest, no `.cwasm` files written to disk.
+    \\
+    \\
+;
+
+const serve_usage = if (wamr.config.jit) serve_usage_intro_jit ++ serve_usage_options else serve_usage_intro_aot_only ++ serve_usage_options;
 
 const version_usage =
     \\Usage: wamr version
