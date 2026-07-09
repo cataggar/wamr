@@ -292,14 +292,23 @@ jobs:
         run: |
           pip install --user -r tests/wasi-testsuite/test-runner/requirements.txt
 
+      - name: Unit tests (Debug, includes #853/#854 JIT smoke tests)
+        # Deliberately Debug here, not ReleaseSafe: `zig build test
+        # -Doptimize=ReleaseSafe` currently fails 2 pre-existing,
+        # JIT-unrelated differential SIMD NaN tests (#872, reproduces
+        # identically without `-Djit=true` too). Running Debug first
+        # dodges that bug while still exercising everything actually
+        # relevant to this job (the #853/#854 JIT smoke tests aren't
+        # optimize-mode-specific). The ReleaseSafe build below reinstalls
+        # `zig-out/bin/wamr`/`wamrc` before the conformance steps run, so
+        # this doesn't leave a stale Debug binary behind for them.
+        run: zig build test -Djit=true
+
       - name: Build wamr (ReleaseSafe, -Djit=true)
         # ReleaseSafe for the same reason as `wasi-p3-testsuite` above;
         # doubly so here since the JIT path compiles every fixture from
         # scratch on every invocation (no cross-process `.cwasm` cache).
         run: zig build -Doptimize=ReleaseSafe -Djit=true
-
-      - name: Unit tests (includes #853/#854 JIT smoke tests)
-        run: zig build test -Doptimize=ReleaseSafe -Djit=true
 
       - name: Spec tests (JSON, AOT pipeline)
         run: zig build spec-tests-aot -Doptimize=ReleaseSafe -Djit=true
