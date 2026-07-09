@@ -487,6 +487,24 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&wamrc_run_smoke.step);
     }
 
+    // #853: in-process JIT smoke test. Only meaningful for a `-Djit=true`
+    // build (see #852) — spawns the just-built `wamr` directly against a
+    // plain core wasm module with no `.cwasm` in sight, proving the
+    // compile-then-execute happens in one process/one command, matching
+    // the `wasmtime run foo.wasm` UX. `tests/coldstart/hello_stdout.wasm`
+    // is a tiny hand-authored WASI module (`fd_write("hello from jit\n")`)
+    // regenerable via:
+    //   wat2wasm hello_stdout.wat -o tests/coldstart/hello_stdout.wasm
+    // (source not checked in, mirrors `tests/coldstart/noop.wasm`).
+    if (jit and aot_executable_target) {
+        const jit_hello_smoke = b.addRunArtifact(exe);
+        jit_hello_smoke.addArg("run");
+        jit_hello_smoke.addFileArg(b.path("tests/coldstart/hello_stdout.wasm"));
+        jit_hello_smoke.expectExitCode(0);
+        jit_hello_smoke.expectStdOutEqual("hello from jit\n");
+        test_step.dependOn(&jit_hello_smoke.step);
+    }
+
     // #760 regression: AOT `wasi:cli/exit.exit` must terminate the host
     // process with the requested discriminant rather than returning the
     // post-#714 sentinel through the canon-lower(aot) trampoline. Two
