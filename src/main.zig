@@ -1444,6 +1444,28 @@ fn runHelp(io: std.Io, args: []const []const u8) u8 {
     return 0;
 }
 
+// #852: proves `-Djit=true` actually threads through to a real, reachable
+// reference to the in-process compiler from `main.zig`'s module graph —
+// not just a config plumbing exercise. `wamr.config.jit` is a comptime-known
+// build option, so under the default `-Djit=false` build Zig's comptime
+// branch elimination drops everything below the early return, and this
+// test (like the rest of `zig build test`'s output) never links
+// `component_aot_compile` into the *production* `wamr`/`wamrc` executables
+// either way — those are built from a separate, test-free module (see
+// `exe_module` vs `exe_test_module` in build.zig). Full end-to-end
+// `wamr run foo.wasm` in-process compile+execute CLI wiring is #853/#854;
+// this only proves the flag is live.
+test "config.jit gates in-process compiler reachability from main.zig (#852)" {
+    if (!wamr.config.jit) return error.SkipZigTest;
+
+    // Minimal valid core wasm module: magic + version, no sections.
+    const empty_core_wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const cwasm = try wamr.component_aot_compile.compileCoreWasm(std.testing.allocator, &empty_core_wasm, .{});
+    defer std.testing.allocator.free(cwasm);
+    try std.testing.expect(cwasm.len >= 8);
+    try std.testing.expectEqual(@as(u32, wamr.emit_aot.aot_magic), std.mem.readInt(u32, cwasm[0..4], .little));
+}
+
 test "subcommand parsing" {
     try std.testing.expectEqual(@as(?Subcommand, .run), parseSubcommand("run"));
     try std.testing.expectEqual(@as(?Subcommand, .serve), parseSubcommand("serve"));

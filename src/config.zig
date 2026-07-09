@@ -97,10 +97,21 @@ pub const dynamic_aot_debug = opt("dynamic_aot_debug", false);
 /// Force word-aligned reads (needed on some MCUs).
 pub const word_align_read = opt("word_align_read", false);
 
-/// Enable LLVM-based JIT (requires AOT).
+/// Enable the in-process JIT: compile a `.wasm` module with this fork's own
+/// AOT compiler (`src/compiler`) and execute it in the same process, in one
+/// step (no `wamrc compile` / `wamr run <cwasm>` split, no subprocess spawn,
+/// no mandatory `.cwasm` artifact on disk). Default `false` so the plain
+/// `wamr` binary stays the small, AOT-only artifact PR #695 produced; opt in
+/// with `-Djit=true` for a `wasmtime run`-style compile+run experience. Not
+/// related to the never-implemented upstream C WAMR `WAMR_BUILD_JIT` (LLVM
+/// ORC JIT) option this flag name was inherited from — this fork has no
+/// LLVM dependency. See issue #852.
 pub const jit = if (aot) opt("jit", false) else false;
 
-/// Enable lazy JIT compilation (requires JIT).
+/// Enable lazy, per-function on-demand compilation on top of `jit`: compile
+/// a function only on its first call instead of the whole module up front.
+/// Requires `jit`. Not yet implemented — see the design spike tracked in
+/// issue #862.
 pub const lazy_jit = if (jit) opt("lazy_jit", false) else false;
 
 /// Enable the lightweight fast JIT backend.
