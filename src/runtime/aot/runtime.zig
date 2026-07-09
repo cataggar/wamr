@@ -1951,21 +1951,14 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         // unbounded / eventually OOMing.
         try JitCodeCache.checkBudget(text.len);
 
-        // 1. Allocate RW pages
-        mem = platform.mmap(null, text.len, .{ .read = true, .write = true }, .{}) orelse
-            return error.CodeMappingFailed;
-
-        // 2. Copy native code
-        @memcpy(mem[0..text.len], text);
-
-        // 3. Flush instruction cache (required on AArch64, no-op on x86-64)
-        if (comptime native_arch == .aarch64) {
-            platform.icacheFlush(mem, text.len);
-        }
-
-        // 4. Transition to RX (W^X)
-        platform.mprotect(mem, text.len, .{ .read = true, .exec = true }) catch
-            return error.CodeMappingFailed;
+        // #858: `platform.mapExecutableCode` owns the W^X mapping
+        // strategy (plain RW→RX `mprotect` on most targets; `MAP_JIT` +
+        // per-thread `pthread_jit_write_protect_np` toggling on macOS
+        // aarch64, where a post-hoc `mprotect` can't re-grant exec on a
+        // MAP_JIT region) and flushes the instruction cache internally,
+        // so this call site no longer needs an arch-specific
+        // `icacheFlush` branch of its own.
+        mem = platform.mapExecutableCode(text) orelse return error.CodeMappingFailed;
 
         inst.code_base = mem;
         inst.code_size = text.len;
