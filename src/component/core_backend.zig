@@ -149,6 +149,16 @@ pub const PrecompiledCore = struct {
 /// `debugAotEnabled` from any code path that wants to surface AOT
 /// instantiation / call / trap details that would otherwise be
 /// swallowed by the `error.Trap` envelope (see #644).
+///
+/// #859 thread-safety note: genuinely shared, unsynchronized,
+/// process-wide mutable state (not `threadlocal`), read during AOT
+/// dispatch/instantiation — not compilation itself, but audited
+/// alongside `aot_bisect.global` since it's the same class of risk.
+/// `main.zig` only ever calls `setDebugAotEnabled` once, at
+/// single-threaded startup, before any compile/run/dispatch activity
+/// begins. An embedder must preserve that invariant — configure this
+/// before spawning concurrent work, not while other threads may be
+/// reading it via `debugAotEnabled`. No lock guards this field.
 var aot_debug_enabled: bool = false;
 
 pub fn setDebugAotEnabled(on: bool) void {
@@ -164,6 +174,10 @@ pub fn debugAotEnabled() bool {
 /// default; `main.zig` sets it during startup when `WAMR_TRAP_CROSS_MEMORY_THUNK`
 /// is set to a non-empty / non-`0` / non-`false` value. See the dispatcher
 /// in `executor.dispatchAotCrossInstance` and #719 Bug B for context.
+///
+/// #859 thread-safety note: same shape and same contract as
+/// `aot_debug_enabled` above — configure once at startup, before any
+/// concurrent compile/run/dispatch activity, never mid-flight.
 var trap_cross_memory_enabled: bool = false;
 
 pub fn setTrapCrossMemoryEnabled(on: bool) void {
