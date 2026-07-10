@@ -13,10 +13,16 @@ seam where each interface name is version-multiplexed onto the matching
 `HostInstance`.
 
 * Adapter source: ~16 k LOC, single Zig file (`wasi_cli_adapter.zig`).
-* P1 conformance gate: `zig build wasi-testsuite` — **72 / 72** passing
-  (C + Rust + AssemblyScript suites).
-* P3 conformance gate: `zig build wasi-p3-testsuite` — **40 / 40** passing
-  (`wasm32-wasip3` Rust suite).
+* P1 conformance gate: `zig build wasi-testsuite` — **70 / 72** passing
+  (C + Rust + AssemblyScript suites; the 2 skips are a narrow
+  environ-inheritance behavioral mismatch and a flaky upstream fixture
+  that compares clock reads without accounting for second rollover,
+  not crashes).
+* P3 conformance gate: `zig build wasi-p3-testsuite` — currently all
+  40 `wasm32-wasip3` fixtures are skipped; the AOT host bridge doesn't
+  yet wire cross-instance async task-management built-ins these
+  fixtures' generated bindings import (running unfiltered: 38/40
+  fail). See [#881](https://github.com/cataggar/wamr/issues/881).
 * Curated component gate: `zig build wasi-p2-testsuite` — 5 / 5 passing
   (`zig-hello`, `zig-exit`, `zig-calculator-cmd`, `mixed-zig-rust-calc`,
   `zig-http`).
