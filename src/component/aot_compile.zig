@@ -79,6 +79,15 @@ pub const PrecompileOptions = struct {
     /// `-O0` we know it's in the optimization pipeline; if it persists the
     /// bug is in the frontend / SSA / codegen.
     optimize: bool = true,
+    /// #860: which pass pipeline to run when `optimize` is true. Defaults
+    /// to `.full` (today's `defaultPassesForTarget` pipeline, unchanged)
+    /// so `wamrc compile`'s output is untouched by this option's
+    /// existence; the in-process JIT call sites in `src/main.zig`
+    /// explicitly pass `.fast` as their default (overridable via
+    /// `WAMR_JIT_FULL_OPT`) since compile latency there is part of the
+    /// user-visible cold start rather than a one-time cost amortized
+    /// over many runs of a cached `.cwasm`.
+    pass_preset: passes.PassPreset = .full,
     /// #761 Phase 2: per-core codegen cache directory. When non-null,
     /// `precompileComponent` reads `<dir>/core<N>.cache` for each core
     /// (if present, header-compatible) to reuse cached per-function
@@ -171,7 +180,7 @@ pub fn compileCoreWasmCached(
     if (opts.optimize) {
         _ = passes.runPassesWithOptions(
             &ir_module,
-            passes.defaultPassesForTarget(opts.target_arch),
+            passes.passesForPreset(opts.target_arch, opts.pass_preset),
             allocator,
             .{
                 // The default `opts.verify_mode` matches single-module
