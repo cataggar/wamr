@@ -99,25 +99,33 @@ to match — this re-audit corrects that.
 
 | Suite                                     | Fixtures | Passed | Failed | Skipped |
 | ------------------------------------------ | -------: | -----: | -----: | ------: |
-| WASI C tests [wasm32-wasip1]               |       14 |     14 |      0 |       0 |
+| WASI C tests [wasm32-wasip1]               |       14 |     13 |      0 |       1 |
 | WASI Rust tests [wasm32-wasip1]            |       46 |     46 |      0 |       0 |
 | WASI Assemblyscript  tests [wasm32-wasip1] |       12 |     11 |      0 |       1 |
-| **Total**                                  |   **72** | **71** |  **0** |   **1** |
+| **Total**                                  |   **72** | **70** |  **0** |   **2** |
 
 Runner output (after removing the now-stale skip-list entries):
 
 ```
 ===== Test results =====
-wamr-zig dev: PASS: 71 tests passed (1 skipped)
+wamr-zig dev: PASS: 70 tests passed (2 skipped)
 ```
 
-**Fix in this re-audit:** cleared the `WASI C tests [wasm32-wasip1]` and
-`WASI Rust tests [wasm32-wasip1]` sections of `tests/wasi-testsuite-skip.json`
-to `{}` (all 60 entries now pass) and reduced the AssemblyScript section
-from 3 entries to 1 (`environ_sizes_get-no-variables`, which still
-genuinely fails — its existing rationale, an environ-inheritance
-behavioral mismatch rather than an AOT crash, was already accurate and
-is unchanged).
+**Fix in this re-audit:** cleared the `WASI Rust tests [wasm32-wasip1]`
+section of `tests/wasi-testsuite-skip.json` to `{}` (all 46 entries now
+pass) and reduced the AssemblyScript section from 3 entries to 1
+(`environ_sizes_get-no-variables`, which still genuinely fails — its
+existing rationale, an environ-inheritance behavioral mismatch rather
+than an AOT crash, was already accurate and is unchanged). The C
+section was reduced from 14 to 1 entry: `clock_gettime-monotonic` was
+initially also cleared, but turned out to be genuinely flaky (not an
+AOT/JIT regression) — the upstream fixture compares two
+`clock_gettime` reads' `tv_nsec` fields directly without accounting
+for `tv_sec` rollover, so it intermittently fails whenever the two
+reads straddle a second boundary. Reproduces at similar rates under
+both the two-step AOT path and the in-process JIT path, confirmed via
+several repeated local runs of each. Re-added with an accurate
+rationale rather than left passing-by-luck in CI.
 
 The **P3** (`tests/wasi-p3-testsuite-skip.json`) side of #662's closing
 claim did *not* hold up under the same re-audit — all 40 fixtures are

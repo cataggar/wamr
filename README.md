@@ -100,7 +100,7 @@ WASI conformance ([WebAssembly/wasi-testsuite][wts]):
 ```console
 $ git submodule update --init tests/wasi-testsuite
 $ pip install -r tests/wasi-testsuite/test-runner/requirements.txt
-$ zig build wasi-testsuite      # WASI Preview 1 + Preview 2 — 71 / 72 passing
+$ zig build wasi-testsuite      # WASI Preview 1 + Preview 2 — 70 / 72 passing
 $ zig build wasi-p3-testsuite   # WASI Preview 3 (wasm32-wasip3) — currently all skipped (#881)
 $ zig build wasi-p3-parity      # Same fixtures via wamr + wasmtime, diff the reports
 ```
@@ -165,8 +165,10 @@ merge queue.
 `wamr` ships the WASI 0.2.x **and** 0.3.0 interface surface (`wasi:cli`,
 `wasi:clocks`, `wasi:filesystem`, `wasi:http`, `wasi:io`, `wasi:random`,
 `wasi:sockets`). The Preview 1 gate is green (`zig build wasi-testsuite`
-— **71 / 72** Preview 1 fixtures; the one remaining skip is a narrow
-environ-inheritance behavioral mismatch, not a crash). The Preview 3
+— **70 / 72** Preview 1 fixtures; the 2 skips are a narrow
+environ-inheritance behavioral mismatch and a flaky upstream fixture
+that compares clock reads without accounting for second rollover, not
+crashes). The Preview 3
 gate (`zig build wasi-p3-testsuite`) is currently **not** passing — the
 AOT host bridge doesn't yet wire cross-instance async task-management
 built-ins these fixtures' generated bindings import, tracked in
