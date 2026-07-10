@@ -1418,7 +1418,7 @@ fn compileInst(
 }
 
 /// Result of compiling a single function.
-const FuncCompileResult = struct {
+pub const FuncCompileResult = struct {
     code: []u8,
     call_patches: []CallPatch,
 };
@@ -1623,6 +1623,16 @@ pub const CompileOptions = struct {
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter. Single-module
     /// `wamrc compile` leaves it at 0.
     module_idx: u32 = 0,
+    /// #862 lazy-JIT spike: indexed by LOCAL function index (same
+    /// indexing as `ir_module.functions.items`). When
+    /// `lazy_skip[fi]` is true, `compileModuleCachedWithOptions`
+    /// emits a zero-byte placeholder for that function instead of
+    /// compiling it — safe ONLY because `lazy_jit.findLazyEligibleLeaves`
+    /// guarantees skipped functions are leaf (no outgoing calls to
+    /// patch) and never a direct call target (no inter-function call
+    /// patch will ever reference their offset). Empty by default —
+    /// zero behavior change for every existing caller.
+    lazy_skip: []const bool = &.{},
 };
 
 pub fn compileModuleCachedWithOptions(
@@ -1666,6 +1676,20 @@ pub fn compileModuleCachedWithOptions(
     for (ir_module.functions.items, 0..) |func, fi| {
         const func_start: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_start);
+
+        // #862 lazy-JIT spike: emit nothing for lazy-eligible functions.
+        // Safe only under the invariants `lazy_jit.findLazyEligibleLeaves`
+        // establishes (leaf, never a direct call target) — see that
+        // function's doc comment and docs/design/lazy-jit-spike.md.
+        if (fi < options.lazy_skip.len and options.lazy_skip[fi]) {
+            cache_funcs[fi] = .{
+                .ir_sha256 = codegen_cache.hashFunction(&func),
+                .code = try allocator.dupe(u8, &.{}),
+                .call_patches = try allocator.dupe(codegen_cache.FuncCallPatch, &.{}),
+            };
+            cache_init += 1;
+            continue;
+        }
 
         var hash_ns: u64 = 0;
         const ir_sha = blk: {
@@ -2157,6 +2181,24 @@ fn globalByteOffset(global_offsets: []const u32, idx: u32) !i32 {
 /// on assigned registers without push/pop through a CachedStack.
 pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocator: std.mem.Allocator) !FuncCompileResult {
     return compileFunctionRAWithGlobalOffsets(func, import_count, &.{}, allocator);
+}
+
+/// #862 lazy-JIT design-spike: public per-function entry point matching
+/// the SAME real regalloc-based codegen `compileModuleCachedWithOptions`
+/// uses (unlike the naive standalone `compileFunction` above — that one
+/// is a different, simpler stack-machine codegen kept for other
+/// purposes, NOT what real modules compile through). Used by
+/// `component_aot_compile.LazyCompileDriver` to compile a single
+/// deferred leaf function on demand with the module's real
+/// `import_count`/`global_offsets`, matching what it would have gotten
+/// had it been compiled eagerly in the module loop.
+pub fn compileFunctionRAWithGlobalOffsetsPublic(
+    func: *const ir.IrFunction,
+    import_count: u32,
+    global_offsets: []const u32,
+    allocator: std.mem.Allocator,
+) !FuncCompileResult {
+    return compileFunctionRAWithGlobalOffsets(func, import_count, global_offsets, allocator);
 }
 
 fn compileFunctionRAWithGlobalOffsets(

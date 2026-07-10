@@ -96,6 +96,10 @@ pub const regalloc = @import("compiler/ir/regalloc.zig");
 /// `PassBisectSpec` consumed by `runPassesWithOptions` (#761 / #743).
 pub const aot_bisect = @import("compiler/aot_bisect.zig");
 
+/// #862 lazy-JIT design-spike eligibility analysis (leaf-function
+/// detection for on-demand compilation). See docs/design/lazy-jit-spike.md.
+pub const lazy_jit = @import("compiler/lazy_jit.zig");
+
 /// AOT codegen cache (#761 Phase 2) — sidecar file format + canonical
 /// IR hasher + module-epoch hasher. Lets a recompile reuse cached
 /// native code for any function whose IR is unchanged from the

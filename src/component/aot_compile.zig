@@ -18,10 +18,14 @@ const ctypes = @import("types.zig");
 const component_loader = @import("loader.zig");
 const aot = @import("aot.zig");
 const core_backend = @import("core_backend.zig");
+const aot_runtime = @import("../runtime/aot/runtime.zig");
+const platform = @import("../platform/platform.zig");
 const core_loader = @import("../runtime/interpreter/loader.zig");
 const frontend = @import("../compiler/frontend.zig");
 const passes = @import("../compiler/ir/passes.zig");
 const verifier = @import("../compiler/ir/verifier.zig");
+const ir = @import("../compiler/ir/ir.zig");
+const lazy_jit = @import("../compiler/lazy_jit.zig");
 const x86_64_compile = @import("../compiler/codegen/x86_64/compile.zig");
 const aarch64_compile = @import("../compiler/codegen/aarch64/compile.zig");
 const emit_aot = @import("../compiler/emit_aot.zig");
@@ -119,6 +123,38 @@ pub const PrecompileOptions = struct {
     /// component path: safe builds verify after each pass; release builds do
     /// not verify unless explicitly requested.
     verify_mode: verifier.VerifyMode = if (std.debug.runtime_safety) .after_each_pass else .off,
+    /// #862 lazy-JIT design-spike opt-in. When true (and only ever
+    /// meaningful under `config.lazy_jit`), `compileCoreWasmCached`
+    /// computes the leaf-function eligibility set
+    /// (`lazy_jit.findLazyEligibleLeaves`) and skips codegen for
+    /// eligible functions, deferring their compilation until first
+    /// call (see `AotInstance`'s lazy-compile hook in `runtime.zig`
+    /// and `docs/design/lazy-jit-spike.md`). Requires
+    /// `cache_ctx.lazy_jit_out` to be set so the retained IR survives
+    /// past this call — see `compileCoreWasmCached`'s doc comment.
+    /// x86_64 only for this narrow prototype; `target_arch == .aarch64`
+    /// with `lazy_jit = true` returns `error.CoreCompileFailed`.
+    lazy_jit: bool = false,
+};
+
+/// #862 lazy-JIT design-spike: retained state a caller needs to compile
+/// deferred (lazy-eligible) functions on demand after `compileCoreWasmCached`
+/// returns. Populated only when `opts.lazy_jit` is true and
+/// `CompileCacheCtx.lazy_jit_out` is non-null.
+pub const LazyJitOut = struct {
+    /// The module's lowered IR, kept alive (ownership moved here) so
+    /// `ir_module.functions.items[i]` for `i in lazy_local_indices` can
+    /// be compiled later via the same per-backend `compileFunction`
+    /// entry point used eagerly. The *whole* module is retained for
+    /// simplicity, not just the deferred functions — a known
+    /// memory-inefficiency documented as follow-up work in
+    /// docs/design/lazy-jit-spike.md. Call `.deinit()` when done (after
+    /// destroying the corresponding `AotInstance`).
+    ir_module: ir.IrModule = undefined,
+    /// LOCAL function indices (matching `ir_module.functions.items`)
+    /// that were skipped during this compile. Caller-owned; free with
+    /// the allocator passed to `compileCoreWasmCached`.
+    lazy_local_indices: []const u32 = &.{},
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -132,6 +168,14 @@ pub const CompileCacheCtx = struct {
     /// When null, the new cache is built and discarded internally
     /// (zero observable change from old behaviour).
     produced: ?*?codegen_cache.Cache = null,
+    /// #862 lazy-JIT spike: when `opts.lazy_jit` is true, the retained
+    /// IR + deferred-function index list are written here so the
+    /// caller can compile them on demand later. Must be non-null
+    /// whenever `opts.lazy_jit` is true (`compileCoreWasmCached`
+    /// returns `error.CoreCompileFailed` otherwise, since silently
+    /// dropping the retained IR would leak the skipped functions'
+    /// compiled-ness forever).
+    lazy_jit_out: ?*LazyJitOut = null,
 };
 
 /// AOT-compile a single core wasm module. Returns freshly-allocated
@@ -175,7 +219,21 @@ pub fn compileCoreWasmCached(
     const module = core_loader.load(wasm_bytes, ma) catch return error.CoreCompileFailed;
 
     var ir_module = frontend.lowerModule(&module, allocator) catch return error.CoreCompileFailed;
-    defer ir_module.deinit();
+    var keep_ir_module_for_lazy_jit = false;
+    defer if (!keep_ir_module_for_lazy_jit) ir_module.deinit();
+
+    // #862 lazy-JIT spike: compute the leaf-eligibility set BEFORE
+    // codegen so it can be threaded into the x86_64 backend's
+    // `lazy_skip`. Requires `cache_ctx.lazy_jit_out` — see
+    // `PrecompileOptions.lazy_jit`'s doc comment for why.
+    var lazy_skip: []bool = &.{};
+    defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
+    if (opts.lazy_jit) {
+        if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
+        if (opts.target_arch != .x86_64) return error.CoreCompileFailed;
+        lazy_skip = lazy_jit.findLazyEligibleLeaves(&module, &ir_module, allocator) catch
+            return error.CoreCompileFailed;
+    }
 
     if (opts.optimize) {
         _ = passes.runPassesWithOptions(
@@ -258,6 +316,7 @@ pub fn compileCoreWasmCached(
             .codegen_timing = opts.codegen_timing,
             .spill_metric = opts.spill_metric,
             .module_idx = opts.module_idx,
+            .lazy_skip = lazy_skip,
         }) catch
             return error.CoreCompileFailed,
     };
@@ -509,7 +568,7 @@ pub fn compileCoreWasmCached(
         break :blk entries;
     };
 
-    return emit_aot.emit(
+    const cwasm = emit_aot.emit(
         allocator,
         code,
         offsets,
@@ -534,6 +593,114 @@ pub fn compileCoreWasmCached(
         if (table_entries.items.len > 0) table_entries.items else null,
         fn_name_entries,
     ) catch return error.CoreCompileFailed;
+
+    // #862 lazy-JIT spike: hand the retained IR + deferred-function
+    // index list back to the caller instead of freeing it, so the
+    // functions in `lazy_skip` can be compiled on demand later. Convert
+    // the dense `lazy_skip: []bool` into a compact index list here so
+    // the caller doesn't need to re-derive it.
+    if (opts.lazy_jit) {
+        var indices: std.ArrayList(u32) = .empty;
+        errdefer indices.deinit(allocator);
+        for (lazy_skip, 0..) |skip, idx| {
+            if (skip) indices.append(allocator, @intCast(idx)) catch return error.CoreCompileFailed;
+        }
+        const out = cache_ctx.lazy_jit_out orelse unreachable; // checked above
+        out.* = .{
+            .ir_module = ir_module,
+            .lazy_local_indices = indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
+        };
+        keep_ir_module_for_lazy_jit = true;
+    }
+
+    return cwasm;
+}
+
+/// #862 lazy-JIT design-spike: heap-owned driver bridging a `LazyJitOut`
+/// (retained IR + deferred indices) to `AotInstance`'s type-erased
+/// `LazyJitState.compile_fn` hook. x86_64 only, matching
+/// `PrecompileOptions.lazy_jit`'s scope.
+///
+/// Lifetime: caller creates one via `setupLazyJit` right after
+/// instantiating the `AotInstance` these functions belong to, and must
+/// call `deinit` only AFTER destroying that `AotInstance` (the instance
+/// may call back into this driver — via `inst.lazy_jit.compile_fn` —
+/// any time up until `destroy()`).
+pub const LazyCompileDriver = struct {
+    lazy_out: LazyJitOut,
+    allocator: std.mem.Allocator,
+
+    fn compileFn(ctx_opaque: *anyopaque, local_idx: u32) ?aot_runtime.LazyCompiledFunc {
+        const self: *LazyCompileDriver = @ptrCast(@alignCast(ctx_opaque));
+        if (local_idx >= self.lazy_out.ir_module.functions.items.len) return null;
+        const func = &self.lazy_out.ir_module.functions.items[local_idx];
+        // Real regalloc-based per-function codegen — the SAME entry
+        // point `compileModuleCachedWithOptions`'s per-function loop
+        // uses, not the naive standalone `compileFunction` (a
+        // different, simpler stack-machine codegen kept for other
+        // purposes). Leaf functions never populate `call_patches`
+        // (nothing to patch — see `lazy_jit.findLazyEligibleLeaves`'s
+        // eligibility contract), so it's safe to ignore here.
+        const result = x86_64_compile.compileFunctionRAWithGlobalOffsetsPublic(
+            func,
+            self.lazy_out.ir_module.import_count,
+            self.lazy_out.ir_module.global_offsets orelse &.{},
+            self.allocator,
+        ) catch |err| {
+            std.log.err("lazy-JIT spike: compiling deferred function {d} failed: {s}", .{ local_idx, @errorName(err) });
+            return null;
+        };
+        defer self.allocator.free(result.call_patches);
+        defer self.allocator.free(result.code);
+        const mapped = platform.mapExecutableCode(result.code) orelse {
+            std.log.err("lazy-JIT spike: mapExecutableCode failed for deferred function {d}", .{local_idx});
+            return null;
+        };
+        return .{ .addr = mapped, .size = result.code.len };
+    }
+
+    pub fn deinit(self: *LazyCompileDriver) void {
+        var out = self.lazy_out;
+        out.ir_module.deinit();
+        self.allocator.free(out.lazy_local_indices);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Wire `lazy_out` (produced by a `compileCoreWasmCached` call with
+/// `opts.lazy_jit = true`) into `inst`, marking every index in
+/// `lazy_out.lazy_local_indices` as pending. Returns the heap-owned
+/// driver — see `LazyCompileDriver`'s doc comment for its lifetime
+/// contract. `inst` must have been produced from the SAME compile (its
+/// `.cwasm` bytes came from the same `compileCoreWasmCached` call whose
+/// `lazy_jit_out` is `lazy_out`) — indices are meaningless otherwise.
+pub fn setupLazyJit(
+    inst: *aot_runtime.AotInstance,
+    lazy_out: LazyJitOut,
+    allocator: std.mem.Allocator,
+) !*LazyCompileDriver {
+    const driver = try allocator.create(LazyCompileDriver);
+    errdefer allocator.destroy(driver);
+    driver.* = .{ .lazy_out = lazy_out, .allocator = allocator };
+
+    const func_count = lazy_out.ir_module.functions.items.len;
+    const pending = try allocator.alloc(bool, func_count);
+    errdefer allocator.free(pending);
+    @memset(pending, false);
+    const compiled = try allocator.alloc(?aot_runtime.LazyCompiledFunc, func_count);
+    errdefer allocator.free(compiled);
+    @memset(compiled, null);
+    for (lazy_out.lazy_local_indices) |idx| {
+        if (idx < pending.len) pending[idx] = true;
+    }
+
+    inst.lazy_jit = .{
+        .pending = pending,
+        .compiled = compiled,
+        .compile_ctx = driver,
+        .compile_fn = &LazyCompileDriver.compileFn,
+    };
+    return driver;
 }
 
 // ── Global / element entry builders ─────────────────────────────────────
