@@ -2,7 +2,7 @@
 
 A fork of [bytecodealliance/wasm-micro-runtime](https://github.com/bytecodealliance/wasm-micro-runtime) ported from C to Zig and maintained with AI assistance. It passes the [WebAssembly/spec](https://github.com/WebAssembly/spec) test suite of 20k+ tests. It supports the [Component Model](https://github.com/webassembly/component-model). It has a very fast cold start, small engine binary size with no dependencies, and is easy to build & fork.
 
-[Wasmtime](https://github.com/bytecodealliance/wasmtime) is currently about 3x faster in CoreMark benchmarks. It has years of production usage and use with a proven track record and security audits.
+[Wasmtime](https://github.com/bytecodealliance/wasmtime) is currently about 2.1x faster in CoreMark steady-state throughput. For cold start, this repo's in-process JIT mode is instead ~4.9x *faster* than wasmtime's default run on small modules — see [docs/bench/jit-cold-start-comparison-2026-07-10.md](docs/bench/jit-cold-start-comparison-2026-07-10.md) for the full measured comparison (AOT, JIT `.fast`/`.full` presets, and wasmtime, across both cold-start and steady-state axes). Wasmtime has years of production usage and use with a proven track record and security audits.
 
 ## Install
 
@@ -45,6 +45,14 @@ round-trip. `wamr serve` (the `wasi:http` server) supports the same
 JIT fallback for components with no sidecar manifest. See issue
 [#863](https://github.com/cataggar/wamr/issues/863) for the full plan
 and design rationale.
+
+By default the JIT compiles with a fast/baseline pass preset tuned for
+low compile latency rather than peak steady-state throughput (set
+`WAMR_JIT_FULL_OPT=1` to opt into the same fully-optimized pipeline
+`wamrc compile` uses, at the cost of compile latency). See
+[docs/bench/jit-cold-start-comparison-2026-07-10.md](docs/bench/jit-cold-start-comparison-2026-07-10.md)
+for measured cold-start and throughput numbers across every mode
+(two-step AOT, `wamrc run`, both JIT presets, and wasmtime).
 
 ## Building
 
