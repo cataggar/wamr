@@ -556,6 +556,80 @@ pub fn jitWriteProtect(enable: bool) void {
     }
 }
 
+/// #858: map `size` bytes, copy `code` into them, flush the
+/// instruction cache, and leave the region executable-and-not-writable
+/// — the single primitive every "JIT compile → map → execute" call
+/// site (`runtime.zig:mapCodeExecutable`, and `host_trampolines.zig`'s
+/// pool, which pre-dates this and inlines the same dance) should use,
+/// so the W^X handling only has to be gotten right in one place.
+///
+/// Two genuinely different strategies, chosen at comptime per target:
+///
+///   * Everywhere except macOS aarch64: `mmap` RW, `memcpy` the code
+///     in, `mprotect` to RX. The region is never simultaneously
+///     writable and executable — it's RW-only until the single
+///     `mprotect` call flips it to RX-only, and nothing writes to it
+///     afterward.
+///   * macOS aarch64 (Apple Silicon): a plain RW→RX `mprotect`
+///     transition is not the supported JIT pattern — the region is
+///     mapped `MAP_JIT` (RWX at the VMA level) up front, and actual
+///     write-vs-execute enforcement is a **per-thread** toggle via
+///     `pthread_jit_write_protect_np` (`jitWriteProtect`). A MAP_JIT
+///     page's protection cannot be changed after the fact with a
+///     second `mprotect` the way a normal page's can. This mirrors the
+///     pattern `host_trampolines.zig`'s `TrampolinePool.initWithCap`
+///     already established for the host-import trampoline pool; this
+///     function is the generalization for the JIT-compiled-code path.
+///
+/// Returns `null` on any mmap/mprotect failure. The caller owns the
+/// returned region and must `munmap` it (via `platform.munmap`) when
+/// done — `munmap` doesn't need to know which strategy mapped it.
+pub fn mapExecutableCode(code: []const u8) ?[*]u8 {
+    if (code.len == 0) return null;
+
+    if (comptime macos_jit) {
+        const map_flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .JIT = true };
+        const mapped = std.posix.mmap(
+            null,
+            code.len,
+            .{ .READ = true, .WRITE = true, .EXEC = true },
+            map_flags,
+            -1,
+            0,
+        ) catch return null;
+        const mem: [*]u8 = mapped.ptr;
+
+        // This thread starts execute-protected (write-disabled) on a
+        // fresh MAP_JIT region; flip to writable for the copy, flush
+        // the icache, then flip back to executable before returning —
+        // any thread that later *executes* this code (including this
+        // one) must be in the execute-enabled state, which is both
+        // the default for new threads and what we leave this thread in.
+        jitWriteProtect(false);
+        @memcpy(mem[0..code.len], code);
+        jitWriteProtect(true);
+        icacheFlush(mem, code.len);
+        return mem;
+    }
+
+    // 1. Allocate RW pages.
+    const mem = mmap(null, code.len, .{ .read = true, .write = true }, .{}) orelse return null;
+
+    // 2. Copy native code in.
+    @memcpy(mem[0..code.len], code);
+
+    // 3. Flush instruction cache (required on AArch64, no-op on x86-64).
+    icacheFlush(mem, code.len);
+
+    // 4. Transition to RX (W^X) — the region is RW-only up to this
+    // point and RX-only from this point on; never both at once.
+    mprotect(mem, code.len, .{ .read = true, .exec = true }) catch {
+        munmap(mem, code.len);
+        return null;
+    };
+    return mem;
+}
+
 fn icacheFlushAarch64(start: [*]u8, len: usize) void {
     if (is_macos) {
         // macOS: use sys_icache_invalidate from libsystem.
@@ -622,6 +696,41 @@ test "mmap/munmap roundtrip" {
     try std.testing.expectEqual(@as(u8, 0xCD), ptr[size - 1]);
 
     munmap(ptr, size);
+}
+
+test "mapExecutableCode: mapped code is genuinely callable" {
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    // Minimal native function body for the host arch: load 42 into the
+    // integer return register and return. Proves the mapped region is
+    // truly executable (not just readable) — if `mapExecutableCode`
+    // mismapped or mis-flushed the icache, calling through the
+    // function pointer below would crash or return garbage instead of
+    // exactly 42.
+    const body: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64 => &[_]u8{
+            0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax, 42
+            0xC3, // ret
+        },
+        .aarch64 => &[_]u8{
+            0x40, 0x05, 0x80, 0x52, // mov w0, #42
+            0xC0, 0x03, 0x5F, 0xD6, // ret
+        },
+        else => unreachable,
+    };
+
+    const mem = mapExecutableCode(body) orelse return error.MapExecutableCodeFailed;
+    defer munmap(mem, body.len);
+
+    // `mem` is typed as `[*]u8` (alignment 1) but is always backed by a
+    // page-aligned `mmap` allocation at runtime, so re-asserting the
+    // (much stricter) function-pointer alignment here is sound.
+    const f: *const fn () callconv(.c) i32 = @ptrCast(@alignCast(mem));
+    try std.testing.expectEqual(@as(i32, 42), f());
+}
+
+test "mapExecutableCode: rejects empty input" {
+    try std.testing.expectEqual(@as(?[*]u8, null), mapExecutableCode(&.{}));
 }
 
 test "mprotect changes permissions" {
