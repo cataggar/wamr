@@ -64,6 +64,13 @@ pub fn build(b: *std.Build) void {
     const jit = b.option(bool, "jit", "Enable the in-process JIT (compile+run a .wasm in one step, opt-in — see #852)") orelse false;
     options.addOption(bool, "jit", jit);
 
+    // #862: lazy per-function on-demand compilation spike, layered on
+    // top of -Djit=true. Off by default even when -Djit=true is set —
+    // this is a narrow, leaf-functions-only prototype, not a general
+    // feature (see docs/design/lazy-jit-spike.md).
+    const lazy_jit = b.option(bool, "lazy_jit", "Enable the lazy-JIT leaf-function spike on top of -Djit=true (#862)") orelse false;
+    options.addOption(bool, "lazy_jit", lazy_jit);
+
     const fast_jit = b.option(bool, "fast_jit", "Enable fast JIT") orelse false;
     options.addOption(bool, "fast_jit", fast_jit);
 
@@ -895,6 +902,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_jit_fast_preset_tests = b.addRunArtifact(jit_fast_preset_tests);
     test_step.dependOn(&run_jit_fast_preset_tests.step);
+
+    // #862: lazy-JIT design-spike prototype (leaf functions only,
+    // x86_64 only). Self-skips via `config.lazy_jit`/arch checks when
+    // not built with `-Djit=true -Dlazy_jit=true`.
+    const lazy_jit_spike_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/lazy_jit_spike_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lazy_jit_spike_module.addImport("wamr", lib_module);
+    lazy_jit_spike_module.addAnonymousImport("lazy_bench_fixture_wasm", .{
+        .root_source_file = b.path("src/tests/lazy_bench_fixture.wasm"),
+    });
+    const lazy_jit_spike_tests = b.addTest(.{
+        .root_module = lazy_jit_spike_module,
+    });
+    const run_lazy_jit_spike_tests = b.addRunArtifact(lazy_jit_spike_tests);
+    test_step.dependOn(&run_lazy_jit_spike_tests.step);
 
     // #625 phase 1: AOT-backed component-core smoke test. Lives in its
     // own test step for the same reason `differential.zig` does:

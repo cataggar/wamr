@@ -12,6 +12,7 @@ const host_bridge = @import("host_bridge.zig");
 const platform = @import("../../platform/platform.zig");
 const sig_registry = @import("../common/sig_registry.zig");
 const trap_jmp = @import("trap_jmp.zig");
+const config = @import("../../config.zig");
 
 // ─── Windows crash handler (debug only) ─────────────────────────────────────
 const windows = std.os.windows;
@@ -1441,11 +1442,74 @@ const native_arch: enum { x86_64, aarch64, unsupported } = switch (builtin.cpu.a
 /// Whether the current target can execute AOT code.
 const can_execute_native = native_arch != .unsupported;
 
+/// A single lazily-compiled function's mapped-executable code, so
+/// `AotInstance.destroy()` can `munmap` it (each lazy function gets its
+/// own small mapping via `platform.mapExecutableCode`, separate from
+/// the instance's main `code_base` blob — see the design doc's
+/// "Deferred to follow-up" section on batching these).
+pub const LazyCompiledFunc = struct {
+    addr: [*]const u8,
+    size: usize,
+};
+
+/// #862 lazy-JIT design-spike per-instance state. Only ever populated
+/// (non-empty) when `config.lazy_jit` is true AND the instance was
+/// produced by the lazy-JIT-aware compile path
+/// (`component_aot_compile.compileCoreWasmCached` with `opts.lazy_jit
+/// = true`). Comptime-gated to a zero-cost `void` field on
+/// `AotInstance` for every other build — see that field's doc comment.
+///
+/// `AotInstance`/`runtime.zig` must not depend on compiler types
+/// directly (the AOT-only `wamr` binary links no compiler at all,
+/// #695), so the actual "compile function N now" logic is a
+/// type-erased callback supplied by the JIT-side driver in
+/// `aot_compile.zig`, mirroring the existing `TrampolinePool.ctx:
+/// *anyopaque` pattern in `host_trampolines.zig`.
+pub const LazyJitState = struct {
+    /// LOCAL function idx → still pending (true) or already resolved
+    /// (false). Empty (default) means "no lazy functions in this
+    /// instance" — `callFuncScalar`'s hook is then a single length
+    /// check away from a complete no-op.
+    pending: []bool = &.{},
+    /// LOCAL function idx → compiled code once resolved. Parallel to
+    /// `pending`; entries only meaningful where `pending[i]` has gone
+    /// from true to false. Freed (munmapped) by `AotInstance.destroy()`.
+    compiled: []?LazyCompiledFunc = &.{},
+    /// Opaque context for `compile_fn`, owned by whoever set up this
+    /// `LazyJitState` (the JIT driver in `aot_compile.zig`). Freed by
+    /// that same driver, not by `AotInstance.destroy()` — see
+    /// `docs/design/lazy-jit-spike.md`.
+    compile_ctx: ?*anyopaque = null,
+    /// Compile local function `local_idx` now; returns its
+    /// mapped-executable native code (address + byte size, so
+    /// `destroy()` can `munmap` it later), or `null` on failure.
+    /// Called at most once per `local_idx` (`pending[local_idx]` is
+    /// cleared right after a successful call) — see the thread-safety
+    /// caveat in the design doc: this narrow prototype assumes
+    /// single-threaded execution of any one `AotInstance`, matching
+    /// every other example in this codebase's #859 thread-safety
+    /// audit (configure-before-concurrent-use, not safe for
+    /// concurrent first-calls to the SAME lazy function).
+    compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) ?LazyCompiledFunc = null,
+
+    fn free(self: *LazyJitState, allocator: std.mem.Allocator) void {
+        for (self.compiled) |maybe| {
+            if (maybe) |c| platform.munmap(@constCast(c.addr), c.size);
+        }
+        allocator.free(self.pending);
+        allocator.free(self.compiled);
+    }
+};
+
 // ─── Instance ───────────────────────────────────────────────────────────────
 
 pub const AotInstance = struct {
     module: *const aot_loader.AotModule,
     memories: []*types.MemoryInstance,
+    /// #862 lazy-JIT design-spike hook (see `LazyJitState`'s doc
+    /// comment). `void` (zero size, zero cost) in every build except
+    /// `-Dlazy_jit=true`.
+    lazy_jit: if (config.lazy_jit) LazyJitState else void = if (config.lazy_jit) .{} else {},
     /// True when the matching `memories[i]` entry was allocated by this
     /// instance. Borrowed imported-memory overrides leave this false, but are
     /// still retain()'d on borrow and release()'d on destroy.
@@ -1767,6 +1831,9 @@ pub fn destroy(inst: *AotInstance) void {
     if (inst.code_base) |base| {
         platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
         JitCodeCache.unregister(inst.code_size);
+    }
+    if (comptime config.lazy_jit) {
+        inst.lazy_jit.free(allocator);
     }
     unsubscribeVmCtxFromMemories(inst);
     freeMemories(inst.memories, inst.memories_owned, allocator);
@@ -2502,12 +2569,42 @@ pub fn callFuncScalar(
     const effective_args: usize = args.len + @as(usize, if (needs_hrp) 1 else 0);
     if (effective_args > MaxScalarArgs) return error.UnsupportedSignature;
 
-    if (inst.code_base == null) return error.CodeMappingFailed;
-    const addr = getFuncAddr(inst, func_idx) orelse blk: {
-        if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
-            break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
-        else
-            return error.FunctionNotFound;
+    // #862 lazy-JIT design-spike: if `func_idx` names a still-pending
+    // deferred function, compile it now before resolving its address.
+    // See `LazyJitState`'s doc comment — this hook is a no-op (single
+    // length check) whenever lazy-JIT isn't active for this instance.
+    // Checked BEFORE the `code_base == null` guard below because a
+    // module where EVERY function is lazy-eligible (e.g. this spike's
+    // own test fixture) never maps any code up front, so `code_base`
+    // legitimately stays null until the first lazy compile.
+    var lazy_resolved_addr: ?[*]const u8 = null;
+    if (comptime config.lazy_jit) {
+        const import_count = inst.module.import_function_count;
+        if (func_idx >= import_count) {
+            const local_idx = func_idx - import_count;
+            if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
+                const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
+                const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
+                const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
+                inst.lazy_jit.compiled[local_idx] = compiled;
+                inst.lazy_jit.pending[local_idx] = false;
+            }
+            if (local_idx < inst.lazy_jit.compiled.len) {
+                if (inst.lazy_jit.compiled[local_idx]) |c| lazy_resolved_addr = c.addr;
+            }
+        }
+    }
+
+    if (lazy_resolved_addr == null and inst.code_base == null) return error.CodeMappingFailed;
+
+    const addr = blk_addr: {
+        if (lazy_resolved_addr) |a| break :blk_addr a;
+        break :blk_addr getFuncAddr(inst, func_idx) orelse blk: {
+            if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
+                break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
+            else
+                return error.FunctionNotFound;
+        };
     };
 
     const previous_globals_ptr = inst.vmctx.globals_ptr;
