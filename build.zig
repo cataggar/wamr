@@ -863,6 +863,22 @@ pub fn build(b: *std.Build) void {
     const run_aot_high_funcidx_tests = b.addRunArtifact(aot_high_funcidx_tests);
     test_step.dependOn(&run_aot_high_funcidx_tests.step);
 
+    // #859: thread-safety stress test for the in-process JIT compile
+    // entry points — N threads independently compile+load+instantiate+
+    // execute+destroy a small AOT module concurrently and each must
+    // observe the correct, uncorrupted result for its own distinct input.
+    const jit_thread_safety_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/jit_thread_safety_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    jit_thread_safety_module.addImport("wamr", lib_module);
+    const jit_thread_safety_tests = b.addTest(.{
+        .root_module = jit_thread_safety_module,
+    });
+    const run_jit_thread_safety_tests = b.addRunArtifact(jit_thread_safety_tests);
+    test_step.dependOn(&run_jit_thread_safety_tests.step);
+
     // #625 phase 1: AOT-backed component-core smoke test. Lives in its
     // own test step for the same reason `differential.zig` does:
     // `aot_harness.zig` cannot be pulled into the `wamr` lib module

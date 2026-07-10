@@ -79,6 +79,19 @@ pub const ParseError = error{
 /// Lifetime: the env parser leaks the backing slices into the GPA
 /// passed to `parseFromEnv` for the process lifetime — `wamrc` is a
 /// short-lived CLI tool and these are tens of bytes.
+///
+/// #859 thread-safety note: this is genuinely shared, unsynchronized,
+/// process-wide mutable state — not `threadlocal`. Every compile call
+/// (`compileCoreWasm` et al.) reads it once, early, via a plain
+/// (non-atomic) load into that call's own `PrecompileOptions.bisect`
+/// snapshot. Both shipped entry points (`wamr`, `wamrc`) only ever
+/// call `parseFromEnv` once, at single-threaded CLI startup, strictly
+/// before any compile begins — so there is no actual concurrent
+/// access today. An embedder driving the library API directly MUST
+/// preserve that same invariant: call `parseFromEnv` (or assign
+/// `global` directly) only before spawning any concurrent compiles,
+/// never while other threads may be mid-`compileCoreWasm`. There is
+/// no lock guarding this field.
 pub var global: Spec = .{};
 
 /// Pull the bisect env vars out of `env` and stamp `global` with the
