@@ -84,6 +84,51 @@ runners. Already tracked under
 in scope for this audit** — listed here so a future re-runner does not
 double-file.
 
+## Re-audit: 2026-07-10
+
+Date: **2026-07-10**. Submodule unchanged:
+`40c1f7d35823abfe58d3896501dd660dcf3ff7a7`.
+
+PR #661 (AOT-only CLI policy) landed after the audit above and
+reintroduced widespread failures, tracked in #662 — the skip-list was
+rewritten to exclude all 14 C + 46 Rust + (initially all, later 3)
+AssemblyScript fixtures. #662 was later closed claiming its four phase
+PRs (#663–#666) fixed the underlying AOT gaps and all skip-lists were
+emptied again, but the skip-list on `main` was never actually updated
+to match — this re-audit corrects that.
+
+| Suite                                     | Fixtures | Passed | Failed | Skipped |
+| ------------------------------------------ | -------: | -----: | -----: | ------: |
+| WASI C tests [wasm32-wasip1]               |       14 |     14 |      0 |       0 |
+| WASI Rust tests [wasm32-wasip1]            |       46 |     46 |      0 |       0 |
+| WASI Assemblyscript  tests [wasm32-wasip1] |       12 |     11 |      0 |       1 |
+| **Total**                                  |   **72** | **71** |  **0** |   **1** |
+
+Runner output (after removing the now-stale skip-list entries):
+
+```
+===== Test results =====
+wamr-zig dev: PASS: 71 tests passed (1 skipped)
+```
+
+**Fix in this re-audit:** cleared the `WASI C tests [wasm32-wasip1]` and
+`WASI Rust tests [wasm32-wasip1]` sections of `tests/wasi-testsuite-skip.json`
+to `{}` (all 60 entries now pass) and reduced the AssemblyScript section
+from 3 entries to 1 (`environ_sizes_get-no-variables`, which still
+genuinely fails — its existing rationale, an environ-inheritance
+behavioral mismatch rather than an AOT crash, was already accurate and
+is unchanged).
+
+The **P3** (`tests/wasi-p3-testsuite-skip.json`) side of #662's closing
+claim did *not* hold up under the same re-audit — all 40 fixtures are
+still excluded, and running unfiltered still shows 38/40 failing with
+the exact `UnsupportedCrossInstanceSource` pattern the skip-list's
+`_comment` describes. Filed as
+[#881](https://github.com/cataggar/wamr/issues/881) rather than
+silently re-closed here, since it's a distinct (component cross-
+instance async-builtin) gap from the plain-core-wasm path this file
+tracks.
+
 ## Method
 
 ```bash
