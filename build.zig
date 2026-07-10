@@ -879,6 +879,23 @@ pub fn build(b: *std.Build) void {
     const run_jit_thread_safety_tests = b.addRunArtifact(jit_thread_safety_tests);
     test_step.dependOn(&run_jit_thread_safety_tests.step);
 
+    // #860: fast/baseline compile preset correctness + compile-time
+    // comparison against the full pipeline (CoreMark fixture).
+    const jit_fast_preset_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/jit_fast_preset_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    jit_fast_preset_module.addImport("wamr", lib_module);
+    jit_fast_preset_module.addAnonymousImport("coremark_wasm", .{
+        .root_source_file = b.path("tests/benchmarks/coremark/coremark_wasi.wasm"),
+    });
+    const jit_fast_preset_tests = b.addTest(.{
+        .root_module = jit_fast_preset_module,
+    });
+    const run_jit_fast_preset_tests = b.addRunArtifact(jit_fast_preset_tests);
+    test_step.dependOn(&run_jit_fast_preset_tests.step);
+
     // #625 phase 1: AOT-backed component-core smoke test. Lives in its
     // own test step for the same reason `differential.zig` does:
     // `aot_harness.zig` cannot be pulled into the `wamr` lib module

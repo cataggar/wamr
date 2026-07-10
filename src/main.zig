@@ -157,6 +157,25 @@ fn runVersion(io: std.Io, args: []const []const u8) !u8 {
     return 0;
 }
 
+/// #860: default optimization-pass preset for the in-process JIT compile
+/// path (`wamr run`/`wamr serve` under `-Djit=true`). The JIT compiles
+/// synchronously on every invocation — compile latency is part of the
+/// user-visible cold start — unlike `wamrc compile`, whose `.cwasm` is
+/// written once and reused across many runs. Default to `.fast` (skips
+/// the passes that mainly pay off on long-running steady-state code:
+/// global value numbering, loop-invariant hoisting, dominator-based
+/// redundant-load forwarding, tail duplication, loop-bounds-check
+/// hoisting/elision — see `passes.jit_fast_passes` for the full
+/// rationale). Set `WAMR_JIT_FULL_OPT` to a non-empty / non-`0` /
+/// non-`false` value to opt back into the full pipeline (better
+/// steady-state throughput, higher compile latency) for both call
+/// sites below.
+fn jitPassPresetFromEnv(env: *const std.process.Environ.Map) wamr.passes.PassPreset {
+    const v = env.get("WAMR_JIT_FULL_OPT") orelse return .fast;
+    const on = !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false"));
+    return if (on) .full else .fast;
+}
+
 fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []const []const u8) !u8 {
     if (run_args.len == 1 and std.mem.eql(u8, run_args[0], "help")) {
         writeStdout(init.io, run_usage);
@@ -449,7 +468,12 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         // file or was just produced by the compiler above; it's the
         // same load/instantiate/execute path a precompiled `.cwasm`
         // takes today.
-        const cwasm = wamr.component_aot_compile.compileCoreWasm(allocator, wasm_data, .{}) catch |err| {
+        // #860: default to the fast/baseline compile preset (see
+        // `jitPassPresetFromEnv`) rather than `wamrc compile`'s
+        // steady-state-optimized default.
+        const cwasm = wamr.component_aot_compile.compileCoreWasm(allocator, wasm_data, .{
+            .pass_preset = jitPassPresetFromEnv(init.environ_map),
+        }) catch |err| {
             std.debug.print("Error: JIT compile of '{s}' failed: {s}\n", .{ path, @errorName(err) });
             return 1;
         };
@@ -875,7 +899,12 @@ fn loadComponentManifestOrPrint(
                 // #854: in-process JIT. Compile every core module of
                 // the component in memory and instantiate directly —
                 // no manifest, no `.cwasm` files written to disk.
-                const in_mem = wamr.component_aot_compile.precompileComponentInMemory(allocator, wasm_data, .{}) catch |err| {
+                // #860: default to the fast/baseline compile preset
+                // (see `jitPassPresetFromEnv`) rather than `wamrc
+                // compile`'s steady-state-optimized default.
+                const in_mem = wamr.component_aot_compile.precompileComponentInMemory(allocator, wasm_data, .{
+                    .pass_preset = jitPassPresetFromEnv(init.environ_map),
+                }) catch |err| {
                     std.debug.print("Error: JIT compile of component '{s}' failed: {s}\n", .{ path, @errorName(err) });
                     return 1;
                 };

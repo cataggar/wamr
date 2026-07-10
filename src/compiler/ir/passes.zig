@@ -8962,6 +8962,84 @@ pub fn defaultPassesForTargetWithOptions(target: TargetArch, options: CompileOpt
     };
 }
 
+/// #860: selects which pass pipeline `compileCoreWasm`/`precompileComponent`
+/// runs. `wamrc compile`'s on-disk `.cwasm` is written once and reused
+/// across many runs, so its default (`.full`) optimizes for steady-state
+/// throughput. The in-process JIT path compiles synchronously on every
+/// `wamr run`/`wamr serve` invocation — compile latency is part of the
+/// user-visible cold start — so it defaults to `.fast` instead (see
+/// `jit_fast_passes` / `x86_64_jit_fast_passes` below).
+pub const PassPreset = enum { full, fast };
+
+/// #860 fast/baseline JIT preset: keeps only the cheap, purely-local
+/// peephole passes (no dominator-tree or loop-analysis construction) plus
+/// the final dead-code cleanup. Empirically, on a CoreMark compile,
+/// `globalValueNumbering`, `forwardRedundantLoadsDominator` and
+/// `hoistLoopInvariantCode` alone account for the majority of optimizer
+/// time (dominator-tree / loop-analysis construction that mainly pays off
+/// over many iterations of a long-running module) — see the PR
+/// description for the measured breakdown. `tailDuplicateSmallJoins`,
+/// `threadChainedConditionalBranches`, `unrollSmallFixedLoops` /
+/// `inductionVariableSimplification`, the redundant-load-forwarding pair,
+/// `deadStoreElimination`, and the loop-bounds-check passes are all
+/// dropped for the same reason: they either restructure the CFG/duplicate
+/// code (raising codegen input size) or require a loop/dominator
+/// analysis pass to be (re)computed. Skipping any subset of these is
+/// always semantically safe — `PrecompileOptions.optimize = false`
+/// (skipping *all* passes) is itself a supported, tested configuration
+/// (see aot_bisect), so any smaller subset is as well.
+const jit_fast_passes: []const PassFn = &.{
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &deadCodeAndLocalSetCleanup,
+    &foldLoadStoreOffset,
+};
+
+/// x86-64 variant of `jit_fast_passes`: adds `foldBranchOnEqz`, which
+/// mirrors `x86_64_default_passes` including that same cheap peephole
+/// fold (it's x86_64-only for the same reason noted on
+/// `x86_64_default_passes` above).
+const x86_64_jit_fast_passes: []const PassFn = &.{
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &foldBranchOnEqz,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &deadCodeAndLocalSetCleanup,
+    &foldLoadStoreOffset,
+};
+
+/// Resolve `preset` to the concrete pass list for `target`. `.full`
+/// delegates to `defaultPassesForTarget` (identical to today's
+/// behavior); `.fast` returns the #860 baseline JIT preset above.
+pub fn passesForPreset(target: TargetArch, preset: PassPreset) []const PassFn {
+    return switch (preset) {
+        .full => defaultPassesForTarget(target),
+        .fast => switch (target) {
+            .x86_64 => x86_64_jit_fast_passes,
+            .aarch64 => jit_fast_passes,
+        },
+    };
+}
+
 // ── Block Reordering ────────────────────────────────────────────────────────
 
 const DfsEntry = struct { block: ir.BlockId, child_idx: usize };
