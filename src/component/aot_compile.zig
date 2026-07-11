@@ -123,17 +123,15 @@ pub const PrecompileOptions = struct {
     /// component path: safe builds verify after each pass; release builds do
     /// not verify unless explicitly requested.
     verify_mode: verifier.VerifyMode = if (std.debug.runtime_safety) .after_each_pass else .off,
-    /// #862 lazy-JIT design-spike opt-in. When true (and only ever
-    /// meaningful under `config.lazy_jit`), `compileCoreWasmCached`
-    /// computes the leaf-function eligibility set
-    /// (`lazy_jit.findLazyEligibleLeaves`) and skips codegen for
-    /// eligible functions, deferring their compilation until first
-    /// call (see `AotInstance`'s lazy-compile hook in `runtime.zig`
-    /// and `docs/design/lazy-jit-spike.md`). Requires
+    /// Lazy-JIT opt-in. When true (and only ever meaningful under
+    /// `config.lazy_jit`), `compileCoreWasmCached` computes the current
+    /// x86_64 eligibility set (`lazy_jit.findLazyEligibleFunctions`) and
+    /// emits stable entry stubs for deferred functions, deferring their
+    /// real body compilation until first entry. Requires
     /// `cache_ctx.lazy_jit_out` to be set so the retained IR survives
     /// past this call — see `compileCoreWasmCached`'s doc comment.
-    /// x86_64 only for this narrow prototype; `target_arch == .aarch64`
-    /// with `lazy_jit = true` returns `error.CoreCompileFailed`.
+    /// x86_64 only; `target_arch == .aarch64` with `lazy_jit = true`
+    /// returns `error.CoreCompileFailed`.
     lazy_jit: bool = false,
 };
 
@@ -222,16 +220,15 @@ pub fn compileCoreWasmCached(
     var keep_ir_module_for_lazy_jit = false;
     defer if (!keep_ir_module_for_lazy_jit) ir_module.deinit();
 
-    // #862 lazy-JIT spike: compute the leaf-eligibility set BEFORE
-    // codegen so it can be threaded into the x86_64 backend's
-    // `lazy_skip`. Requires `cache_ctx.lazy_jit_out` — see
-    // `PrecompileOptions.lazy_jit`'s doc comment for why.
+    // Compute the lazy-eligibility set before codegen so it can be threaded
+    // into the x86_64 backend's `lazy_skip`. Requires `cache_ctx.lazy_jit_out`
+    // so the retained IR survives for on-demand body compilation later.
     var lazy_skip: []bool = &.{};
     defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
     if (opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
         if (opts.target_arch != .x86_64) return error.CoreCompileFailed;
-        lazy_skip = lazy_jit.findLazyEligibleLeaves(&module, &ir_module, allocator) catch
+        lazy_skip = lazy_jit.findLazyEligibleFunctions(&module, &ir_module, allocator) catch
             return error.CoreCompileFailed;
     }
 
@@ -594,9 +591,9 @@ pub fn compileCoreWasmCached(
         fn_name_entries,
     ) catch return error.CoreCompileFailed;
 
-    // #862 lazy-JIT spike: hand the retained IR + deferred-function
-    // index list back to the caller instead of freeing it, so the
-    // functions in `lazy_skip` can be compiled on demand later. Convert
+    // Hand the retained IR + deferred-function index list back to the caller
+    // instead of freeing it, so the functions in `lazy_skip` can be compiled
+    // on demand later. Convert
     // the dense `lazy_skip: []bool` into a compact index list here so
     // the caller doesn't need to re-derive it.
     if (opts.lazy_jit) {
@@ -634,22 +631,27 @@ pub const LazyCompileDriver = struct {
         const self: *LazyCompileDriver = @ptrCast(@alignCast(ctx_opaque));
         if (local_idx >= self.lazy_out.ir_module.functions.items.len) return null;
         const func = &self.lazy_out.ir_module.functions.items[local_idx];
-        // Real regalloc-based per-function codegen — the SAME entry
-        // point `compileModuleCachedWithOptions`'s per-function loop
-        // uses, not the naive standalone `compileFunction` (a
-        // different, simpler stack-machine codegen kept for other
-        // purposes). Leaf functions never populate `call_patches`
-        // (nothing to patch — see `lazy_jit.findLazyEligibleLeaves`'s
-        // eligibility contract), so it's safe to ignore here.
+        // Real regalloc-based per-function codegen — the SAME entry point
+        // `compileModuleCachedWithOptions`'s per-function loop uses, not the
+        // naive standalone `compileFunction`. Lazy bodies lower local direct
+        // calls indirectly through vmctx.funcptrs_ptr so separately mapped
+        // code never needs inter-function rel32 patching.
         const result = x86_64_compile.compileFunctionRAWithGlobalOffsetsPublic(
             func,
             self.lazy_out.ir_module.import_count,
             self.lazy_out.ir_module.global_offsets orelse &.{},
             self.allocator,
+            .{ .local_call_lowering = .via_funcptrs },
         ) catch |err| {
             std.log.err("lazy-JIT spike: compiling deferred function {d} failed: {s}", .{ local_idx, @errorName(err) });
             return null;
         };
+        if (result.call_patches.len > 0) {
+            std.log.err("lazy-JIT: deferred function {d} unexpectedly emitted {d} call patches", .{ local_idx, result.call_patches.len });
+            self.allocator.free(result.call_patches);
+            self.allocator.free(result.code);
+            return null;
+        }
         defer self.allocator.free(result.call_patches);
         defer self.allocator.free(result.code);
         const mapped = platform.mapExecutableCode(result.code) orelse {
