@@ -921,6 +921,24 @@ pub fn build(b: *std.Build) void {
     const run_lazy_jit_spike_tests = b.addRunArtifact(lazy_jit_spike_tests);
     test_step.dependOn(&run_lazy_jit_spike_tests.step);
 
+    // #879 M4.6 (phase 1): standalone native-trampoline primitive for
+    // lazily-compiled, table/ref.func-reachable functions. Not gated
+    // on `-Djit`/`-Dlazy_jit` at the build-option level (unlike the
+    // lazy_jit_spike suite above) since it's plain runtime-layer code
+    // with no compiler dependency and no comptime `config.lazy_jit`
+    // gate of its own -- it validates the raw stub mechanism directly.
+    const lazy_call_trampoline_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/lazy_call_trampoline_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lazy_call_trampoline_module.addImport("wamr", lib_module);
+    const lazy_call_trampoline_tests = b.addTest(.{
+        .root_module = lazy_call_trampoline_module,
+    });
+    const run_lazy_call_trampoline_tests = b.addRunArtifact(lazy_call_trampoline_tests);
+    test_step.dependOn(&run_lazy_call_trampoline_tests.step);
+
     // #625 phase 1: AOT-backed component-core smoke test. Lives in its
     // own test step for the same reason `differential.zig` does:
     // `aot_harness.zig` cannot be pulled into the `wamr` lib module

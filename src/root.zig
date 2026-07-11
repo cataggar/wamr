@@ -55,6 +55,11 @@ pub const aot_host_bridge = @import("runtime/aot/host_bridge.zig");
 /// `WAMR_MAX_TRAMPOLINE_SLOTS` env var.
 pub const host_trampolines = @import("runtime/aot/host_trampolines.zig");
 
+/// #879 M4.6 (phase 1): native trampolines for lazily-compiled
+/// functions reachable via `call_indirect`/`ref.func`. Standalone,
+/// not yet wired into `AotInstance` -- see the module doc comment.
+pub const lazy_call_trampoline = @import("runtime/aot/lazy_call_trampoline.zig");
+
 /// WASI core logic (pure functions, shared by interpreter and AOT).
 pub const wasi_core = @import("wasi/wasi_core.zig");
 
