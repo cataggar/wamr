@@ -175,6 +175,78 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
     try std.testing.expectEqual(@as(i32, 100), add1_again[0].i32);
 }
 
+// #879: `LazyCompileDriver.compileFn` (`component_aot_compile.zig`)
+// previously called `platform.mapExecutableCode` directly for each
+// on-demand-compiled function, bypassing `aot_runtime.JitCodeCache`
+// entirely -- so `residentBytes()`/`mappingCount()` undercounted any
+// module compiled with `lazy_jit`, and a configured
+// `WAMR_JIT_CODE_BUDGET_BYTES` didn't bound lazily-compiled code. This
+// test proves both the compile-time registration and the
+// destroy()-time unregistration.
+test "#879 lazy-JIT spike: lazily-compiled functions register with JitCodeCache and unregister on destroy" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    var lazy_out: component_aot_compile.LazyJitOut = .{};
+    const cwasm = try component_aot_compile.compileCoreWasmCached(
+        gpa,
+        &lazy_fixture_wasm,
+        .{ .lazy_jit = true },
+        .{ .lazy_jit_out = &lazy_out },
+    );
+    defer gpa.free(cwasm);
+
+    var module = try aot_loader_mod.load(cwasm, gpa);
+    defer aot_loader_mod.unload(&module, gpa);
+
+    const inst = try aot_runtime_mod.instantiate(&module, gpa);
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    // Every function in this fixture is lazy-eligible (empty up-front
+    // text section), so mapping the instance's up-front code doesn't
+    // move the registry -- this baseline isolates the effect of the
+    // *lazy* compile below from the (already-tested) eager path.
+    const before_bytes = aot_runtime_mod.JitCodeCache.residentBytes();
+    const before_count = aot_runtime_mod.JitCodeCache.mappingCount();
+
+    const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
+
+    const add1_idx = aot_runtime_mod.findExportFunc(inst, "add1") orelse return error.ExportNotFound;
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+
+    // First call compiles add1 on demand; this must now register the
+    // freshly mapped code with `JitCodeCache`.
+    _ = try aot_runtime_mod.callFuncScalar(
+        inst,
+        add1_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = 1 }},
+        &results_buf,
+    );
+
+    const import_count = inst.module.import_function_count;
+    const compiled = inst.lazy_jit.compiled[add1_idx - import_count] orelse
+        return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(before_bytes + compiled.size, aot_runtime_mod.JitCodeCache.residentBytes());
+    try std.testing.expectEqual(before_count + 1, aot_runtime_mod.JitCodeCache.mappingCount());
+
+    // Destroying the instance must unregister the lazily-compiled
+    // function's mapping too -- not just the (empty, here) up-front
+    // `code_base` blob `destroy()` already handled before #879.
+    // Deliberately not deferred: this call must happen (and be
+    // observed) strictly before `driver.deinit()`, matching
+    // `LazyCompileDriver`'s documented lifetime contract.
+    aot_runtime_mod.destroy(inst);
+    try std.testing.expectEqual(before_bytes, aot_runtime_mod.JitCodeCache.residentBytes());
+    try std.testing.expectEqual(before_count, aot_runtime_mod.JitCodeCache.mappingCount());
+
+    driver.deinit();
+}
+
 // 200 leaf functions (each `fN(x) = x + N`), no calls, no tables — a
 // stand-in for "a module where most functions are never called".
 // Generated via: wasm-tools parse lazy_bench.wat -o lazy_bench_fixture.wasm

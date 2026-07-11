@@ -652,10 +652,25 @@ pub const LazyCompileDriver = struct {
         };
         defer self.allocator.free(result.call_patches);
         defer self.allocator.free(result.code);
+        // #879: route through the same `JitCodeCache` budget check the
+        // eager `mapCodeExecutable` path uses, so a configured
+        // `WAMR_JIT_CODE_BUDGET_BYTES` also bounds lazily-compiled
+        // code, not just the up-front-compiled functions.
+        aot_runtime.JitCodeCache.checkBudget(result.code.len) catch {
+            std.log.err("lazy-JIT spike: JIT code budget exceeded compiling deferred function {d}", .{local_idx});
+            return null;
+        };
         const mapped = platform.mapExecutableCode(result.code) orelse {
             std.log.err("lazy-JIT spike: mapExecutableCode failed for deferred function {d}", .{local_idx});
             return null;
         };
+        // #879: register with `JitCodeCache` so residentBytes()/
+        // mappingCount() account for lazily-compiled functions too —
+        // previously only the instance's up-front `code_base` blob was
+        // tracked, undercounting any module compiled with `lazy_jit`.
+        // Unregistered by the matching `LazyJitState.free` on
+        // `AotInstance.destroy()`.
+        aot_runtime.JitCodeCache.register(result.code.len);
         return .{ .addr = mapped, .size = result.code.len };
     }
 

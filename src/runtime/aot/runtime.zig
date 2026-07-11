@@ -54,12 +54,19 @@ pub const JitCodeCache = struct {
         return mapping_count;
     }
 
-    fn register(size: usize) void {
+    /// `pub` (rather than file-private) specifically so that #879's
+    /// lazy-JIT driver (`component_aot_compile.LazyCompileDriver.compileFn`,
+    /// a different compilation unit) can route each on-demand-compiled
+    /// function's `platform.mapExecutableCode` call through the same
+    /// registry as the eager `mapCodeExecutable` path below — otherwise
+    /// lazily-compiled code silently escaped this bookkeeping/budget
+    /// entirely (see `LazyJitState.free`'s matching `unregister` call).
+    pub fn register(size: usize) void {
         resident_bytes += size;
         mapping_count += 1;
     }
 
-    fn unregister(size: usize) void {
+    pub fn unregister(size: usize) void {
         resident_bytes -= size;
         mapping_count -= 1;
     }
@@ -69,8 +76,9 @@ pub const JitCodeCache = struct {
     /// a nonzero budget is configured. Called by `mapCodeExecutable`
     /// before the `mmap`, so a caller gets a clear typed error instead
     /// of the process eventually running out of memory from unbounded
-    /// JIT growth.
-    fn checkBudget(additional_bytes: usize) error{CodeBudgetExceeded}!void {
+    /// JIT growth. Also called by the lazy-JIT driver's `compileFn`
+    /// (see `register`'s doc comment) before its own mapping.
+    pub fn checkBudget(additional_bytes: usize) error{CodeBudgetExceeded}!void {
         if (budget_bytes == 0) return;
         if (resident_bytes + additional_bytes > budget_bytes) return error.CodeBudgetExceeded;
     }
@@ -1494,7 +1502,15 @@ pub const LazyJitState = struct {
 
     fn free(self: *LazyJitState, allocator: std.mem.Allocator) void {
         for (self.compiled) |maybe| {
-            if (maybe) |c| platform.munmap(@constCast(c.addr), c.size);
+            if (maybe) |c| {
+                platform.munmap(@constCast(c.addr), c.size);
+                // #879: undo the `JitCodeCache.register` call made when
+                // this function was lazily compiled (see
+                // `LazyCompileDriver.compileFn` in `aot_compile.zig`),
+                // so residentBytes()/mappingCount() don't overcount
+                // after this instance is destroyed.
+                JitCodeCache.unregister(c.size);
+            }
         }
         allocator.free(self.pending);
         allocator.free(self.compiled);
