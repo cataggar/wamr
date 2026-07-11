@@ -3203,6 +3203,22 @@ pub const RunOptions = struct {
     /// by `wamrc` from `WAMR_SSA_REGALLOC_MEASURE`; null in normal builds so
     /// release codegen pays nothing.
     phi_spill_measure: ?*const fn (*const ir.IrFunction, std.mem.Allocator) void = null,
+    /// #862/#879 lazy-JIT spike: indexed by LOCAL function index (same
+    /// indexing as `module.functions.items`, and the SAME indices a
+    /// caller also passes as `lazy_skip` to the codegen backend's
+    /// `compileModuleCachedWithOptions`). When `lazy_skip[fi]` is true,
+    /// the per-function optimization loop (SSA promotion, the pass
+    /// fixpoint, `scrubUnreachableBlocks`, and their verify calls)
+    /// skips that function entirely, leaving its IR exactly as
+    /// `frontend.lowerModule` produced it — safe only under the same
+    /// invariants `lazy_jit.findLazyEligibleLeaves` establishes for the
+    /// codegen-level skip (leaf, never a direct call target): nothing
+    /// in the rest of the module depends on this function having been
+    /// optimized, and running codegen against un-optimized (but still
+    /// lowered) IR is already a supported path (`-O0` skips this
+    /// entire pass pipeline for the whole module). Empty by default —
+    /// zero behavior change for every existing caller.
+    lazy_skip: []const bool = &.{},
 };
 
 pub const AnalysisTimingOptions = analysis.TimingOptions;
@@ -8446,6 +8462,14 @@ fn runPassesWithOptionsScoped(
 
         for (module.functions.items, 0..) |*func, func_idx_usize| {
             const func_idx: u32 = @intCast(func_idx_usize);
+            // #862/#879 lazy-JIT spike: skip the whole optimization
+            // loop for lazy-eligible functions -- see `RunOptions.lazy_skip`'s
+            // doc comment. Checked before the inlining-cleanup-scope
+            // continue above so a lazy function is skipped on every
+            // outer iteration, not just re-checked per round.
+            if (func_idx_usize < opts.lazy_skip.len and opts.lazy_skip[func_idx_usize]) {
+                continue;
+            }
             if (scope_outer_after_inlining and outer_iter >= 1 and !inlined_callers.isSet(func_idx_usize)) {
                 // The outer >0 per-function round exists only to clean up IR
                 // exposed by inlining in this same outer round. Inlining mutates

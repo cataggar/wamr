@@ -275,6 +275,13 @@ pub fn compileCoreWasmCached(
                 .pass_timing = opts.pass_timing,
                 .analysis_timing = opts.analysis_timing,
                 .tail_duplication = opts.tail_duplication,
+                // #879: skip the whole optimization loop for the same
+                // lazy-eligible functions the codegen backend below
+                // defers -- previously only codegen was skipped, so
+                // GVN/LICM/redundant-load-forwarding etc. still ran
+                // eagerly on every deferred function's IR for no
+                // benefit (see docs/design/lazy-jit-spike.md).
+                .lazy_skip = lazy_skip,
             },
         ) catch |err| {
             logVerifierFailure(err);

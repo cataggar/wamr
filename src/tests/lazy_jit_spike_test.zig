@@ -28,6 +28,9 @@ const config = wamr.config;
 const component_aot_compile = wamr.component_aot_compile;
 const aot_loader_mod = wamr.aot_loader;
 const aot_runtime_mod = wamr.aot_runtime;
+const core_loader_mod = wamr.loader;
+const frontend_mod = wamr.frontend;
+const passes_mod = wamr.passes;
 
 const can_exec_aot = switch (builtin.cpu.arch) {
     .x86_64 => true, // #862 spike: x86_64 only, see docs/design/lazy-jit-spike.md
@@ -173,6 +176,90 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
         &results_buf,
     );
     try std.testing.expectEqual(@as(i32, 100), add1_again[0].i32);
+}
+
+// #879: single-function fixture with an obviously constant-foldable
+// pattern (`x + 2 + 3`), used to prove the per-function IR-optimization
+// pass loop is genuinely skipped for lazy-eligible functions too --
+// not just codegen, which is all the original #862 spike deferred.
+// Generated via: wasm-tools parse foldable.wat -o foldable_fixture.wasm
+//   (module
+//     (func $foldable (export "foldable") (param i32) (result i32)
+//       local.get 0 i32.const 2 i32.const 3 i32.add i32.add))
+const foldable_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x02, 0x01, 0x00, 0x07, 0x0c, 0x01, 0x08,
+    0x66, 0x6f, 0x6c, 0x64, 0x61, 0x62, 0x6c, 0x65,
+    0x00, 0x00, 0x0a, 0x0c, 0x01, 0x0a, 0x00, 0x20,
+    0x00, 0x41, 0x02, 0x41, 0x03, 0x6a, 0x6a, 0x0b,
+    0x00, 0x12, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x01,
+    0x0b, 0x01, 0x00, 0x08, 0x66, 0x6f, 0x6c, 0x64,
+    0x61, 0x62, 0x6c, 0x65,
+};
+
+test "#879 lazy-JIT spike: lazy-eligible functions skip IR optimization passes too, not just codegen" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const target_arch: passes_mod.TargetArch = switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
+
+    // Reference A: raw frontend lowering, no passes at all -- ground
+    // truth for what completely un-optimized IR looks like for this
+    // function.
+    var raw_arena = std.heap.ArenaAllocator.init(gpa);
+    defer raw_arena.deinit();
+    const raw_wasm_module = try core_loader_mod.load(&foldable_wasm, raw_arena.allocator());
+    var raw_ir = try frontend_mod.lowerModule(&raw_wasm_module, gpa);
+    defer raw_ir.deinit();
+    const raw_insts = raw_ir.functions.items[0].blocks.items[0].instructions.items.len;
+
+    // Reference B: the SAME lowering, but with the full optimization
+    // pipeline run over it -- mirrors what an eager (non-lazy) compile
+    // does. Constant folding should collapse the `2 + 3` sub-expression
+    // into a single `iconst 5`, shrinking the instruction count.
+    var opt_arena = std.heap.ArenaAllocator.init(gpa);
+    defer opt_arena.deinit();
+    const opt_wasm_module = try core_loader_mod.load(&foldable_wasm, opt_arena.allocator());
+    var opt_ir = try frontend_mod.lowerModule(&opt_wasm_module, gpa);
+    defer opt_ir.deinit();
+    _ = try passes_mod.runPassesWithOptions(&opt_ir, passes_mod.passesForPreset(target_arch, .full), gpa, .{});
+    const opt_insts = opt_ir.functions.items[0].blocks.items[0].instructions.items.len;
+
+    // Sanity check on the fixture itself: the reference pipeline must
+    // actually fold something here, otherwise this fixture wouldn't be
+    // able to distinguish "passes skipped" from "passes ran".
+    try std.testing.expect(opt_insts < raw_insts);
+
+    // The real lazy-JIT path: `foldable` is a single, never-called,
+    // leaf function with no element segments in the module, so it's
+    // fully lazy-eligible -- and nothing in this test ever calls it,
+    // so it stays pending/deferred throughout.
+    var lazy_out: component_aot_compile.LazyJitOut = .{};
+    const cwasm = try component_aot_compile.compileCoreWasmCached(
+        gpa,
+        &foldable_wasm,
+        .{ .lazy_jit = true },
+        .{ .lazy_jit_out = &lazy_out },
+    );
+    defer gpa.free(cwasm);
+    defer lazy_out.ir_module.deinit();
+    defer gpa.free(lazy_out.lazy_local_indices);
+
+    try std.testing.expectEqual(@as(usize, 1), lazy_out.lazy_local_indices.len);
+    const lazy_insts = lazy_out.ir_module.functions.items[0].blocks.items[0].instructions.items.len;
+
+    // The core #879 assertion: the deferred function's retained IR
+    // must match the completely-untouched raw lowering (same
+    // instruction count), NOT the folded/optimized form -- proving
+    // the optimization pass loop was skipped for it too, not just
+    // codegen.
+    try std.testing.expectEqual(raw_insts, lazy_insts);
+    try std.testing.expect(lazy_insts > opt_insts);
 }
 
 // 200 leaf functions (each `fN(x) = x + N`), no calls, no tables — a
