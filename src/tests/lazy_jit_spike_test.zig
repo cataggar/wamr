@@ -82,6 +82,96 @@ const lazy_fixture_wasm = [_]u8{
     0x61, 0x6c, 0x6c, 0x65, 0x64,
 };
 
+// Generated via:
+//   wasm-tools parse lazy_call_indirect_fixture.wat -o lazy_call_indirect_fixture.wasm
+// (module
+//   (type $t0 (func (param i32) (result i32)))
+//   (table 1 funcref)
+//   (elem (i32.const 0) $target)
+//   (func $target (param i32) (result i32)
+//     local.get 0 i32.const 1 i32.add)
+//   (func (export "call_indirect") (param i32) (result i32)
+//     local.get 0 i32.const 0 call_indirect (type $t0)))
+const lazy_call_indirect_fixture_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x03, 0x02, 0x00, 0x00, 0x04, 0x04, 0x01,
+    0x70, 0x00, 0x01, 0x07, 0x11, 0x01, 0x0d, 0x63,
+    0x61, 0x6c, 0x6c, 0x5f, 0x69, 0x6e, 0x64, 0x69,
+    0x72, 0x65, 0x63, 0x74, 0x00, 0x01, 0x09, 0x07,
+    0x01, 0x00, 0x41, 0x00, 0x0b, 0x01, 0x00, 0x0a,
+    0x13, 0x02, 0x07, 0x00, 0x20, 0x00, 0x41, 0x01,
+    0x6a, 0x0b, 0x09, 0x00, 0x20, 0x00, 0x41, 0x00,
+    0x11, 0x00, 0x00, 0x0b, 0x00, 0x17, 0x04, 0x6e,
+    0x61, 0x6d, 0x65, 0x01, 0x09, 0x01, 0x00, 0x06,
+    0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x04, 0x05,
+    0x01, 0x00, 0x02, 0x74, 0x30,
+};
+
+// Generated via:
+//   wasm-tools parse lazy_ref_func_table_fixture.wat -o lazy_ref_func_table_fixture.wasm
+// (module
+//   (type $t0 (func (param i32) (result i32)))
+//   (table 1 funcref)
+//   (elem declare func $target)
+//   (func $target (param i32) (result i32)
+//     local.get 0 i32.const 2 i32.mul)
+//   (func (export "set_and_call") (param i32) (result i32)
+//     i32.const 0 ref.func $target table.set 0
+//     local.get 0 i32.const 0 call_indirect (type $t0)))
+const lazy_ref_func_table_fixture_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x03, 0x02, 0x00, 0x00, 0x04, 0x04, 0x01,
+    0x70, 0x00, 0x01, 0x07, 0x10, 0x01, 0x0c, 0x73,
+    0x65, 0x74, 0x5f, 0x61, 0x6e, 0x64, 0x5f, 0x63,
+    0x61, 0x6c, 0x6c, 0x00, 0x01, 0x09, 0x05, 0x01,
+    0x03, 0x00, 0x01, 0x00, 0x0a, 0x19, 0x02, 0x07,
+    0x00, 0x20, 0x00, 0x41, 0x02, 0x6c, 0x0b, 0x0f,
+    0x00, 0x41, 0x00, 0xd2, 0x00, 0x26, 0x00, 0x20,
+    0x00, 0x41, 0x00, 0x11, 0x00, 0x00, 0x0b, 0x00,
+    0x17, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x01, 0x09,
+    0x01, 0x00, 0x06, 0x74, 0x61, 0x72, 0x67, 0x65,
+    0x74, 0x04, 0x05, 0x01, 0x00, 0x02, 0x74, 0x30,
+};
+
+fn instantiateLazyFixture(
+    gpa: std.mem.Allocator,
+    wasm_bytes: []const u8,
+) !struct {
+    module: aot_loader_mod.AotModule,
+    inst: *aot_runtime_mod.AotInstance,
+    driver: *component_aot_compile.LazyCompileDriver,
+    lazy_out: component_aot_compile.LazyJitOut,
+} {
+    var lazy_out: component_aot_compile.LazyJitOut = .{};
+    const cwasm = try component_aot_compile.compileCoreWasmCached(
+        gpa,
+        wasm_bytes,
+        .{ .lazy_jit = true },
+        .{ .lazy_jit_out = &lazy_out },
+    );
+    defer gpa.free(cwasm);
+
+    var module = try aot_loader_mod.load(cwasm, gpa);
+    errdefer aot_loader_mod.unload(&module, gpa);
+
+    const inst = try aot_runtime_mod.instantiate(&module, gpa);
+    errdefer aot_runtime_mod.destroy(inst);
+
+    const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
+    errdefer driver.deinit();
+
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    return .{
+        .module = module,
+        .inst = inst,
+        .driver = driver,
+        .lazy_out = lazy_out,
+    };
+}
+
 test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on first call" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
     if (comptime !can_exec_aot) return error.SkipZigTest;
@@ -113,11 +203,10 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
     try std.testing.expect(module.text_section == null or module.text_section.?.len == 0);
 
     const inst = try aot_runtime_mod.instantiate(&module, gpa);
-    defer aot_runtime_mod.destroy(inst);
-    try aot_runtime_mod.mapCodeExecutable(inst);
-
     const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
     defer driver.deinit();
+    defer aot_runtime_mod.destroy(inst);
+    try aot_runtime_mod.mapCodeExecutable(inst);
 
     // Every function starts pending.
     try std.testing.expect(inst.lazy_jit.pending[0]);
@@ -173,6 +262,94 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
         &results_buf,
     );
     try std.testing.expectEqual(@as(i32, 100), add1_again[0].i32);
+}
+
+test "#888 lazy-JIT: call_indirect compiles through a stable trampoline" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    var fixture = try instantiateLazyFixture(gpa, &lazy_call_indirect_fixture_wasm);
+    defer aot_loader_mod.unload(&fixture.module, gpa);
+    defer fixture.driver.deinit();
+    defer aot_runtime_mod.destroy(fixture.inst);
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.lazy_out.lazy_local_indices.len);
+    try std.testing.expectEqual(@as(u32, 0), fixture.lazy_out.lazy_local_indices[0]);
+    try std.testing.expect(fixture.inst.lazy_jit.pending[0]);
+
+    const target_funcidx: usize = fixture.module.import_function_count;
+    const stub_ptr = fixture.inst.funcptrs[target_funcidx];
+    try std.testing.expect(stub_ptr != 0);
+    try std.testing.expectEqual(stub_ptr, fixture.inst.func_table[0]);
+
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+    const caller_idx = aot_runtime_mod.findExportFunc(fixture.inst, "call_indirect") orelse return error.ExportNotFound;
+
+    const first = try aot_runtime_mod.callFuncScalar(
+        fixture.inst,
+        caller_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = 41 }},
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 42), first[0].i32);
+    try std.testing.expect(!fixture.inst.lazy_jit.pending[0]);
+    try std.testing.expect(fixture.inst.lazy_jit.compiled[0] != null);
+    try std.testing.expectEqual(stub_ptr, fixture.inst.funcptrs[target_funcidx]);
+    try std.testing.expectEqual(stub_ptr, fixture.inst.func_table[0]);
+
+    const second = try aot_runtime_mod.callFuncScalar(
+        fixture.inst,
+        caller_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = 7 }},
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 8), second[0].i32);
+    try std.testing.expectEqual(stub_ptr, fixture.inst.funcptrs[target_funcidx]);
+}
+
+test "#888 lazy-JIT: ref.func + table.set reaches a lazy target through the same trampoline" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    var fixture = try instantiateLazyFixture(gpa, &lazy_ref_func_table_fixture_wasm);
+    defer aot_loader_mod.unload(&fixture.module, gpa);
+    defer fixture.driver.deinit();
+    defer aot_runtime_mod.destroy(fixture.inst);
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.lazy_out.lazy_local_indices.len);
+    try std.testing.expectEqual(@as(u32, 0), fixture.lazy_out.lazy_local_indices[0]);
+
+    const target_funcidx: usize = fixture.module.import_function_count;
+    const stub_ptr = fixture.inst.funcptrs[target_funcidx];
+    try std.testing.expect(stub_ptr != 0);
+
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+    const caller_idx = aot_runtime_mod.findExportFunc(fixture.inst, "set_and_call") orelse return error.ExportNotFound;
+
+    const result = try aot_runtime_mod.callFuncScalar(
+        fixture.inst,
+        caller_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = 21 }},
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 42), result[0].i32);
+    try std.testing.expect(!fixture.inst.lazy_jit.pending[0]);
+    try std.testing.expectEqual(stub_ptr, fixture.inst.funcptrs[target_funcidx]);
+    try std.testing.expectEqual(stub_ptr, fixture.inst.func_table[0]);
+    try std.testing.expectEqual(
+        fixture.inst.func_sig_ids[target_funcidx],
+        fixture.inst.tables[0].type_backing[0],
+    );
 }
 
 // 200 leaf functions (each `fN(x) = x + N`), no calls, no tables — a

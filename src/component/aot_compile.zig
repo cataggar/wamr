@@ -19,6 +19,7 @@ const component_loader = @import("loader.zig");
 const aot = @import("aot.zig");
 const core_backend = @import("core_backend.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
+const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const platform = @import("../platform/platform.zig");
 const core_loader = @import("../runtime/interpreter/loader.zig");
 const frontend = @import("../compiler/frontend.zig");
@@ -231,7 +232,15 @@ pub fn compileCoreWasmCached(
     if (opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
         if (opts.target_arch != .x86_64) return error.CoreCompileFailed;
-        lazy_skip = lazy_jit.findLazyEligibleLeaves(&module, &ir_module, allocator) catch
+        lazy_skip = lazy_jit.findLazyEligibleLeaves(
+            &module,
+            &ir_module,
+            switch (opts.target_arch) {
+                .x86_64 => .x86_64,
+                .aarch64 => .aarch64,
+            },
+            allocator,
+        ) catch
             return error.CoreCompileFailed;
     }
 
@@ -669,11 +678,14 @@ pub const LazyCompileDriver = struct {
 
 /// Wire `lazy_out` (produced by a `compileCoreWasmCached` call with
 /// `opts.lazy_jit = true`) into `inst`, marking every index in
-/// `lazy_out.lazy_local_indices` as pending. Returns the heap-owned
-/// driver — see `LazyCompileDriver`'s doc comment for its lifetime
-/// contract. `inst` must have been produced from the SAME compile (its
-/// `.cwasm` bytes came from the same `compileCoreWasmCached` call whose
-/// `lazy_jit_out` is `lazy_out`) — indices are meaningless otherwise.
+/// `lazy_out.lazy_local_indices` as pending and preallocating one
+/// stable trampoline stub per deferred local. Call this BEFORE
+/// `mapCodeExecutable()` so the published `funcptrs` / table state can
+/// reuse those stub addresses. Returns the heap-owned driver — see
+/// `LazyCompileDriver`'s doc comment for its lifetime contract. `inst`
+/// must have been produced from the SAME compile (its `.cwasm` bytes
+/// came from the same `compileCoreWasmCached` call whose `lazy_jit_out`
+/// is `lazy_out`) — indices are meaningless otherwise.
 pub fn setupLazyJit(
     inst: *aot_runtime.AotInstance,
     lazy_out: LazyJitOut,
@@ -690,13 +702,45 @@ pub fn setupLazyJit(
     const compiled = try allocator.alloc(?aot_runtime.LazyCompiledFunc, func_count);
     errdefer allocator.free(compiled);
     @memset(compiled, null);
+    const trampolines = try allocator.alloc(usize, func_count);
+    errdefer allocator.free(trampolines);
+    @memset(trampolines, 0);
+
+    var pool_ptr: ?*host_trampolines.TrampolinePool = null;
+    errdefer if (pool_ptr) |pool| {
+        pool.deinit(allocator);
+        allocator.destroy(pool);
+    };
+    if (lazy_out.lazy_local_indices.len > 0) {
+        const pool = try allocator.create(host_trampolines.TrampolinePool);
+        errdefer allocator.destroy(pool);
+        pool.* = try host_trampolines.TrampolinePool.initWithCap(
+            allocator,
+            @intCast(lazy_out.lazy_local_indices.len),
+        );
+        pool_ptr = pool;
+    }
+
     for (lazy_out.lazy_local_indices) |idx| {
         if (idx < pending.len) pending[idx] = true;
+        const pool = pool_ptr orelse continue;
+        if (idx >= inst.module.local_func_type_indices.len) return error.InvalidFuncType;
+        const type_idx = inst.module.local_func_type_indices[idx];
+        if (type_idx >= inst.module.func_types.len) return error.InvalidFuncType;
+        const ft = inst.module.func_types[type_idx];
+        const stub = try pool.allocLazyAotSlot(@ptrCast(inst), idx, .{
+            .param_types = ft.params,
+            .result_types = ft.results,
+            .has_retptr = ft.results.len > 1,
+        });
+        trampolines[idx] = @intFromPtr(stub);
     }
 
     inst.lazy_jit = .{
         .pending = pending,
         .compiled = compiled,
+        .trampoline_pool = pool_ptr,
+        .trampolines = trampolines,
         .compile_ctx = driver,
         .compile_fn = &LazyCompileDriver.compileFn,
     };

@@ -17,19 +17,11 @@
 //!     each function's final code offset (see `CallPatch` in both
 //!     codegen backends) — deferring a function that's a direct-call
 //!     target would leave that patch with nothing to point at.
-//!  3. **Never reachable via `call_indirect`**: conservatively, if the
-//!     module has ANY element segments at all, no function is
-//!     considered eligible (see `elements_present` below). A function
-//!     placed in *any* table by *any* active element segment could be
-//!     invoked via `call_indirect`, which this narrow spike's runtime
-//!     hook (`AotInstance`'s `callFuncScalar`-only interception, see
-//!     `runtime.zig`) does not cover — only top-level host-invoked
-//!     (`callFuncScalar`) calls trigger lazy compilation in this
-//!     prototype. A real implementation would need `call_indirect`'s
-//!     codegen and the `func_addrs` table itself to route through a
-//!     native trampoline (see the design doc's "Deferred to follow-up"
-//!     section) rather than relying on this narrower host-call-site
-//!     interception.
+//!  3. **Trampoline-compatible lowered signature**: the runtime-side
+//!     native trampoline currently supports only the x86_64 scalar
+//!     envelope used by `host_trampolines.genericDispatcher`: no retptr,
+//!     no `v128`, at most one scalar result, and at most 9 user params
+//!     after the hidden `vmctx`.
 //!
 //! Only local (non-imported) function indices are considered; the
 //! returned indices are LOCAL indices (0-based, excluding imports),
@@ -38,24 +30,39 @@ const std = @import("std");
 const ir = @import("ir/ir.zig");
 const core_types = @import("../runtime/common/types.zig");
 
+fn supportsLazyTrampolineValType(vt: core_types.ValType) bool {
+    return switch (vt) {
+        .i32, .i64, .f32, .f64, .funcref, .externref => true,
+        else => false,
+    };
+}
+
+fn supportsLazyTrampolineFuncType(ft: core_types.FuncType, target_arch: std.Target.Cpu.Arch) bool {
+    if (target_arch != .x86_64) return false;
+    if (ft.kind != .func) return false;
+    if (ft.params.len > 9) return false;
+    if (ft.results.len > 1) return false;
+    for (ft.params) |pt| {
+        if (!supportsLazyTrampolineValType(pt)) return false;
+    }
+    for (ft.results) |rt| {
+        if (!supportsLazyTrampolineValType(rt)) return false;
+    }
+    return true;
+}
+
 /// Returns a caller-owned `[]bool` (indexed by LOCAL function index,
 /// same length as `ir_module.functions.items`) where `true` marks a
 /// lazy-eligible leaf function. Free with `allocator.free`.
 pub fn findLazyEligibleLeaves(
     module: *const core_types.WasmModule,
     ir_module: *const ir.IrModule,
+    target_arch: std.Target.Cpu.Arch,
     allocator: std.mem.Allocator,
 ) ![]bool {
     const n = ir_module.functions.items.len;
     const eligible = try allocator.alloc(bool, n);
     @memset(eligible, false);
-
-    // Rule 3: any element segment at all disqualifies every function in
-    // this narrow spike (see doc comment above). Real wasm modules with
-    // no `table`/`elem` sections (e.g. many small CLI-style utilities)
-    // hit this trivially; anything using `call_indirect`/function
-    // references does not qualify for this prototype.
-    if (module.elements.len > 0) return eligible;
 
     // Rule 2 precursor: collect every LOCAL func_idx that is the direct
     // target of some `.call` instruction anywhere in the module.
@@ -80,12 +87,15 @@ pub fn findLazyEligibleLeaves(
 
     for (ir_module.functions.items, 0..) |func, local_idx| {
         if (called.isSet(local_idx)) continue; // rule 2
+        const wasm_func_idx: u32 = ir_module.import_count + @as(u32, @intCast(local_idx));
+        const ft = module.getFuncType(wasm_func_idx) orelse continue;
+        if (!supportsLazyTrampolineFuncType(ft, target_arch)) continue; // rule 3
 
         var is_leaf = true;
         outer: for (func.blocks.items) |block| {
             for (block.instructions.items) |inst| {
                 switch (inst.op) {
-                    .call, .call_indirect => {
+                    .call, .call_indirect, .call_ref => {
                         is_leaf = false;
                         break :outer;
                     },
@@ -110,17 +120,27 @@ test "findLazyEligibleLeaves: leaf, uncalled, exported function is eligible" {
     _ = try f0.newBlock();
     try ir_module.functions.append(allocator, f0);
 
+    const ft = core_types.FuncType{ .params = &.{}, .results = &.{.i32} };
+    const module_functions = [_]core_types.WasmFunction{.{
+        .type_idx = 0,
+        .func_type = ft,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &.{},
+    }};
     var module = core_types.WasmModule{};
+    module.types = &.{ft};
+    module.functions = &module_functions;
     module.elements = &.{};
 
-    const eligible = try findLazyEligibleLeaves(&module, &ir_module, allocator);
+    const eligible = try findLazyEligibleLeaves(&module, &ir_module, .x86_64, allocator);
     defer allocator.free(eligible);
 
     try std.testing.expect(eligible.len == 1);
     try std.testing.expect(eligible[0]);
 }
 
-test "findLazyEligibleLeaves: any element segment disqualifies everything" {
+test "findLazyEligibleLeaves: active element segments no longer blanket-disqualify leaf targets" {
     const allocator = std.testing.allocator;
 
     var ir_module = ir.IrModule.init(allocator);
@@ -129,19 +149,31 @@ test "findLazyEligibleLeaves: any element segment disqualifies everything" {
     _ = try f0.newBlock();
     try ir_module.functions.append(allocator, f0);
 
+    const ft = core_types.FuncType{ .params = &.{.i32}, .results = &.{.i32} };
+    const module_functions = [_]core_types.WasmFunction{.{
+        .type_idx = 0,
+        .func_type = ft,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &.{},
+    }};
+    const elem_func_indices = [_]?u32{0};
     var module = core_types.WasmModule{};
+    module.types = &.{ft};
+    module.functions = &module_functions;
     const one_elem = [_]core_types.ElemSegment{.{
         .table_idx = 0,
-        .offset = null,
+        .offset = .{ .i32_const = 0 },
         .kind = .func_ref,
-        .func_indices = &.{},
+        .func_indices = &elem_func_indices,
+        .nullable_elements = false,
     }};
     module.elements = &one_elem;
 
-    const eligible = try findLazyEligibleLeaves(&module, &ir_module, allocator);
+    const eligible = try findLazyEligibleLeaves(&module, &ir_module, .x86_64, allocator);
     defer allocator.free(eligible);
 
-    try std.testing.expect(!eligible[0]);
+    try std.testing.expect(eligible[0]);
 }
 
 test "findLazyEligibleLeaves: a directly-called function is not eligible; a caller is not a leaf" {
@@ -166,13 +198,120 @@ test "findLazyEligibleLeaves: a directly-called function is not eligible; a call
     _ = try f2.newBlock();
     try ir_module.functions.append(allocator, f2);
 
+    const ft = core_types.FuncType{ .params = &.{.i32}, .results = &.{.i32} };
+    const module_functions = [_]core_types.WasmFunction{
+        .{
+            .type_idx = 0,
+            .func_type = ft,
+            .local_count = 0,
+            .locals = &.{},
+            .code = &.{},
+        },
+        .{
+            .type_idx = 0,
+            .func_type = ft,
+            .local_count = 0,
+            .locals = &.{},
+            .code = &.{},
+        },
+        .{
+            .type_idx = 0,
+            .func_type = ft,
+            .local_count = 0,
+            .locals = &.{},
+            .code = &.{},
+        },
+    };
     var module = core_types.WasmModule{};
+    module.types = &.{ft};
+    module.functions = &module_functions;
     module.elements = &.{};
 
-    const eligible = try findLazyEligibleLeaves(&module, &ir_module, allocator);
+    const eligible = try findLazyEligibleLeaves(&module, &ir_module, .x86_64, allocator);
     defer allocator.free(eligible);
 
     try std.testing.expect(!eligible[0]); // called directly
     try std.testing.expect(!eligible[1]); // not a leaf (calls fn 0)
     try std.testing.expect(eligible[2]); // leaf, uncalled
+}
+
+test "findLazyEligibleLeaves: call_ref callers are not leaves but ref.func targets remain eligible" {
+    const allocator = std.testing.allocator;
+
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    var target = ir.IrFunction.init(allocator, 0, 0, 0);
+    _ = try target.newBlock();
+    try ir_module.functions.append(allocator, target);
+
+    var caller = ir.IrFunction.init(allocator, 0, 0, 0);
+    const b0 = try caller.newBlock();
+    const fref = caller.newVReg();
+    try caller.getBlock(b0).append(.{ .op = .{ .ref_func = 0 }, .dest = fref, .type = .i64 });
+    try caller.getBlock(b0).append(.{
+        .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = fref, .args = &.{} } },
+        .dest = caller.newVReg(),
+        .type = .i32,
+    });
+    try ir_module.functions.append(allocator, caller);
+
+    const ft = core_types.FuncType{ .params = &.{}, .results = &.{.i32} };
+    const module_functions = [_]core_types.WasmFunction{
+        .{
+            .type_idx = 0,
+            .func_type = ft,
+            .local_count = 0,
+            .locals = &.{},
+            .code = &.{},
+        },
+        .{
+            .type_idx = 0,
+            .func_type = ft,
+            .local_count = 0,
+            .locals = &.{},
+            .code = &.{},
+        },
+    };
+    var module = core_types.WasmModule{};
+    module.types = &.{ft};
+    module.functions = &module_functions;
+
+    const eligible = try findLazyEligibleLeaves(&module, &ir_module, .x86_64, allocator);
+    defer allocator.free(eligible);
+
+    try std.testing.expect(eligible[0]);
+    try std.testing.expect(!eligible[1]);
+}
+
+test "findLazyEligibleLeaves: signatures outside the trampoline envelope stay eager" {
+    const allocator = std.testing.allocator;
+
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    var f0 = ir.IrFunction.init(allocator, 0, 0, 0);
+    _ = try f0.newBlock();
+    try ir_module.functions.append(allocator, f0);
+
+    const many_params = [_]core_types.ValType{
+        .i32, .i32, .i32, .i32, .i32,
+        .i32, .i32, .i32, .i32, .i32,
+    };
+    const ft = core_types.FuncType{ .params = &many_params, .results = &.{.i32} };
+    const module_functions = [_]core_types.WasmFunction{.{
+        .type_idx = 0,
+        .func_type = ft,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &.{},
+    }};
+    var module = core_types.WasmModule{};
+    module.types = &.{ft};
+    module.functions = &module_functions;
+
+    const eligible = try findLazyEligibleLeaves(&module, &ir_module, .x86_64, allocator);
+    defer allocator.free(eligible);
+
+    try std.testing.expect(!eligible[0]);
 }

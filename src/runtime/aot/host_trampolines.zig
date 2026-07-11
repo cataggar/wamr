@@ -198,6 +198,26 @@ extern fn wamrAotDispatchCanonBuiltin(
     a9: u64,
 ) callconv(.c) DispatchResult;
 
+/// Lazy local-function dispatcher for plain `AotInstance`s (#888). Like the
+/// other AOT-flavoured dispatchers, `a0` is the caller's vmctx and `a1..a9`
+/// are the lowered wasm args; `local_func_idx` names the deferred LOCAL
+/// function whose stable trampoline slot this stub belongs to.
+extern fn wamrAotDispatchLazyLocalAot(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    local_func_idx: u32,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) callconv(.c) DispatchResult;
+
 /// Trap-on-call stub for non-WASI function imports that have no AOT-side
 /// wiring yet (e.g. adapter-core canon.lower imports left over after #662
 /// Phase C). Returns a failing `DispatchResult` so the caller traps with
@@ -222,12 +242,14 @@ pub const DispatchKind = enum(u8) {
     canon_lower_aot,
     cross_instance,
     canon_builtin_aot,
+    lazy_local_aot,
     trap_stub,
 };
 
 pub const Slot = struct {
     component_inst: *anyopaque,
     canon_lower_idx: u32,
+    local_func_idx: u32 = 0,
     ctx: ?*anyopaque = null,
     lowered_sig: LoweredSig = .{
         .param_types = &.{},
@@ -287,6 +309,7 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
         .canon_lower_aot => wamrAotDispatchComponentTrampolineAot(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .cross_instance => wamrAotDispatchCrossInstance(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .canon_builtin_aot => wamrAotDispatchCanonBuiltin(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+        .lazy_local_aot => wamrAotDispatchLazyLocalAot(ctx, &entry.lowered_sig, entry.local_func_idx, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
     };
     if (dispatched.status != 0) {
@@ -566,6 +589,30 @@ pub const TrampolinePool = struct {
             .ctx = ctx,
             .lowered_sig = lowered_sig,
             .dispatch_kind = .canon_builtin_aot,
+        };
+        self.slots[slot].lowered_sig.slot = slot;
+        self.next_slot += 1;
+        self.installStub(slot);
+        g_active_pool = self;
+
+        return @ptrFromInt(@intFromPtr(self.stubPtr(slot)));
+    }
+
+    /// Allocate a stable native stub for a deferred LOCAL function of a plain
+    /// `AotInstance` (#888). The slot metadata carries the local index so the
+    /// shared dispatcher can compile-on-first-call and then forward through
+    /// the resolved native code while keeping the trampoline address stable in
+    /// `funcptrs` / tables for the lifetime of the instance.
+    pub fn allocLazyAotSlot(self: *TrampolinePool, ctx: *anyopaque, local_func_idx: u32, lowered_sig: LoweredSig) !StubFn {
+        const slot = try self.reserveSlotAnon();
+
+        self.slots[slot] = .{
+            .component_inst = ctx,
+            .canon_lower_idx = 0,
+            .local_func_idx = local_func_idx,
+            .ctx = ctx,
+            .lowered_sig = lowered_sig,
+            .dispatch_kind = .lazy_local_aot,
         };
         self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
