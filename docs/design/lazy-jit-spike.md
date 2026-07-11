@@ -36,13 +36,13 @@ Given the two problems above, this prototype restricts "lazy-eligible" to functi
 
 See `src/compiler/lazy_jit.zig`'s `findLazyEligibleLeaves` for the exact analysis (with unit tests covering all three rules).
 
-### Compile-time: skip codegen, not IR lowering/optimization
+### Compile-time: skip per-function IR work and codegen
 
 `compileModuleCachedWithOptions` (both backends conceptually; **only x86_64 is wired up in this spike** — see [Scope](#scope)) gained an additive `CompileOptions.lazy_skip: []const bool` field (indexed by local function index, empty by default — zero behavior change for every existing caller). For an index where `lazy_skip[i]` is true, the per-function loop writes a **zero-byte placeholder** instead of calling into the real per-function codegen. This is safe only because of the two invariants above: the function is never a patch target (nothing references its now-nonexistent offset) and it makes no outgoing calls (nothing for the eager pass to fail to resolve).
 
-Note this spike does **not** skip running IR optimization passes on lazy-eligible functions — only the final codegen (instruction selection / register allocation / emission) is deferred. Skipping passes too is a real follow-up opportunity (see below); per the earlier CoreMark pass-timing analysis from #860, GVN/loop-invariant-hoisting/dominator-based redundant-load-forwarding are the expensive ones, and none of that is wasted work here in the sense that it *could* still be avoided later without touching this spike's core mechanism.
+Issue #892 extends this by threading the **same** local-index set into `passes.RunOptions.lazy_skip`, so the eager optimizer still runs module-level `inlineSmallFunctions` but skips the per-function pipeline (`promoteLocalsToSSA`, `lowerPhisToLocals`, the preset-selected fixpoint loop, and final `scrubUnreachableBlocks`) for those lazy functions. `LazyJitOut` now retains the chosen pass preset plus a small `RunOptions` snapshot, and `LazyCompileDriver.compileFn` replays that exact per-function pipeline through `passes.runFunctionPassesWithOptions(...)` immediately before x86_64 codegen on the function's first call.
 
-`PrecompileOptions` gained a `lazy_jit: bool` opt-in flag and `CompileCacheCtx` gained a `lazy_jit_out: ?*LazyJitOut`. When both are set, `compileCoreWasmCached` computes the eligible set, threads it into the x86_64 codegen call, and — instead of freeing the lowered IR module at the end like it normally does — **moves it** into the caller-supplied `LazyJitOut` (along with the compact list of deferred local indices), so the deferred functions' IR survives past the call for later on-demand compilation.
+`PrecompileOptions` gained a `lazy_jit: bool` opt-in flag and `CompileCacheCtx` gained a `lazy_jit_out: ?*LazyJitOut`. When both are set, `compileCoreWasmCached` computes the eligible set, threads it into both the eager pass manager and the x86_64 codegen call, and — instead of freeing the lowered IR module at the end like it normally does — **moves it** into the caller-supplied `LazyJitOut` (along with the compact list of deferred local indices and the deferred-pass metadata), so the deferred functions' IR survives past the call for later on-demand compilation. For benchmarks/tests that still need the historical "#862 codegen-only lazy" baseline, `PrecompileOptions.lazy_defer_passes = false` preserves the old behavior.
 
 ### Runtime: a per-instance hook in `callFuncScalar`, not a native trampoline
 
@@ -69,15 +69,20 @@ pub const LazyJitState = struct {
 
 `src/tests/lazy_jit_spike_test.zig` (gated on `config.lazy_jit`, `x86_64` only):
 
-1. **Correctness**: a 3-function fixture (`add1`, `mul2`, `never_called`, no calls between them, no tables) compiles with `opts.lazy_jit = true`; all 3 are confirmed lazy-eligible and the emitted `.cwasm`'s text section is genuinely empty (0 compiled bytes) up front. Calling `add1`/`mul2` through `callFuncScalar` triggers on-demand compilation and returns the correct result both on the first call (compiles) and a second call (reuses). `never_called` remains pending throughout — proving the deferral is real, not a same-work-different-order relabeling.
-2. **Measured effect**: a 200-leaf-function synthetic module (`fN(x) = x + N`, no calls, no tables — all 200 eligible) compiled with `opts.lazy_jit = true` vs. the eager default. Measured (this repo's benchmark hardware, x86_64, ReleaseFast, 2026-07-10):
+1. **Correctness**: the fixture now includes a branchy/local-heavy leaf function (`phi_local`) in addition to `add1`, `mul2`, and `never_called`. The compile with `opts.lazy_jit = true` confirms all 4 are lazy-eligible and the emitted `.cwasm`'s text section is genuinely empty (0 compiled bytes) up front. Calling `phi_local` through `callFuncScalar` triggers on-demand replay of the deferred pass pipeline, then x86_64 codegen, and returns the correct result on both branches; `never_called` remains pending throughout — proving the deferral is real, not a same-work-different-order relabeling.
+2. **Measured effect**: the 200-leaf-function synthetic module (`fN(x) = x + N`, no calls, no tables — all 200 eligible) now compares three modes:
+
+   1. eager compile,
+   2. lazy compile with `lazy_defer_passes = false` (historical codegen-only lazy baseline),
+   3. lazy compile with the default full deferral (`lazy_defer_passes = true`).
+
+   The regression guard uses the same loose timing style as #860/#862 and asserts monotonic improvement on the synthetic benchmark:
 
    ```
-   eager (compile all 200): 359,923 µs
-   lazy  (defer all 200):   289,020 µs
+   lazy_skip_passes_ns <= lazy_codegen_only_ns <= eager_ns
    ```
 
-   ~20% reduction. Smaller than one might expect for skipping 100% of codegen — for these deliberately tiny (3-IR-instruction) functions, IR lowering/pass-running and `emit_aot`'s per-export table construction dominate total compile time more than actual instruction selection/regalloc does. A module with larger unused functions (more IR per function → proportionally more codegen work skipped, same fixed lowering/emit overhead) would show a bigger win; the CoreMark-based measurement in #860's PR description already established that codegen (not lowering) is where the bulk of *large*-function compile time goes.
+   This captures the original #862 ~20% codegen-only win while ensuring #892's additional pass deferral moves the 200-leaf case further in the right direction.
 
 Both the default and `-Djit=true` (no `-Dlazy_jit`) builds are verified byte-for-byte/behaviorally unaffected — every new field/branch is either an additive, empty-by-default struct field (`CompileOptions.lazy_skip`, `PrecompileOptions.lazy_jit`, `CompileCacheCtx.lazy_jit_out`) or comptime-gated to `void`/a no-op on `AotInstance` (`lazy_jit: if (config.lazy_jit) LazyJitState else void`).
 
@@ -90,6 +95,5 @@ This spike deliberately does not attempt (tracked as follow-up work, not filed a
 - **Components.** `precompileComponentInMemory` compiles each core module independently already, so the per-core mechanism here composes in principle, but the `LazyJitOut`/`LazyCompileDriver` plumbing only threads through the single-core `compileCoreWasmCached` path today.
 - **aarch64.** The `lazy_skip` codegen-level plumbing is x86_64-only in this spike (the aarch64 backend's `compileModuleCachedWithOptions` is untouched). Extending it is mechanical (same shape of change) but unverified — no aarch64 hardware was available to test against in this session (cf. #874's similar macOS-aarch64 gap for W^X).
 - **Interaction with the JIT code cache (#857).** `JitCodeCache` currently tracks resident bytes at `mapCodeExecutable` time; a lazily-compiled function's separate `platform.mapExecutableCode` call in `LazyCompileDriver.compileFn` does **not** register with `JitCodeCache` in this spike, so the budget/tracking in #857 currently undercounts lazy-compiled code. A real implementation should route through `JitCodeCache.register`/`unregister` too.
-- **Skipping IR-optimization passes for lazy functions**, not just codegen (see the note above).
 - **Tiering / background re-compilation to a higher optimization level** (this spike's lazily-compiled functions always use the real regalloc-based codegen at whatever preset was requested — there's no "quick baseline now, optimize later in the background" tier).
 - **Thread-safety of concurrent first-calls to the *same* lazy function.** `LazyJitState.compile_fn` is called at most once per index in the tests here, but nothing prevents two threads racing to compile the *same* still-pending function concurrently if an embedder calls `callFuncScalar` on the same `AotInstance` from multiple threads — matching the general "configure before spawning concurrent work" contract from #859's thread-safety audit, but worth an explicit note since this is genuinely new mutable per-instance state, not a startup-only global.

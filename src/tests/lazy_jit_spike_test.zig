@@ -1,25 +1,18 @@
-//! #862 — lazy JIT design-spike prototype: narrow, leaf-functions-only
-//! demonstration that `config.lazy_jit` genuinely defers per-function
-//! codegen until first call.
+//! #892 follow-up coverage for the lazy-JIT spike (#862): lazy-eligible
+//! leaf functions now defer their per-function IR pass pipeline as well
+//! as x86_64 codegen.
 //!
-//! Test fixture: a 3-function core wasm module (no imports, no tables,
-//! no calls between functions — every function is a leaf), each
-//! exported: `add1(x) = x+1`, `mul2(x) = x*2`, `never_called(x) = x-1`.
-//! Since the module has no element segments and none of these
-//! functions call each other, `lazy_jit.findLazyEligibleLeaves` marks
-//! all three eligible.
-//!
-//! The test compiles with `opts.lazy_jit = true`, verifies NONE of the
-//! three were actually codegen'd up front (their function bodies are
-//! zero bytes in the emitted `.cwasm`), then calls `add1` and `mul2`
-//! through `callFuncScalar` (the top-level host-invocation entry point
-//! this narrow spike hooks — see `docs/design/lazy-jit-spike.md` for
-//! why `call_indirect`/direct intra-module calls are explicitly out of
-//! scope here) and checks both:
-//!   1. Both calls return the correct result (compiling correctly
-//!      on-demand doesn't corrupt anything).
-//!   2. `never_called` is never compiled at all (proving the deferral
-//!      is real, not just a same-work-different-order relabeling).
+//! The tests below cover three things:
+//!   1. `runPassesWithOptions(... .{ .lazy_skip = ... })` skips
+//!      `promoteLocalsToSSA` / `lowerPhisToLocals` / preset fixpoint /
+//!      `scrubUnreachableBlocks` for lazy functions, while
+//!      `runFunctionPassesWithOptions` can replay that exact pipeline
+//!      later on one retained function.
+//!   2. A lazily-deferred function that contains non-trivial control
+//!      flow and locals still executes correctly on the first call.
+//!   3. The 200-leaf synthetic benchmark now compares eager compile,
+//!      historical lazy codegen-only compile, and the new full-lazy
+//!      "skip passes + codegen" mode.
 const std = @import("std");
 const builtin = @import("builtin");
 const wamr = @import("wamr");
@@ -28,6 +21,10 @@ const config = wamr.config;
 const component_aot_compile = wamr.component_aot_compile;
 const aot_loader_mod = wamr.aot_loader;
 const aot_runtime_mod = wamr.aot_runtime;
+const core_loader_mod = wamr.loader;
+const frontend_mod = wamr.frontend;
+const passes = wamr.passes;
+const lazy_jit = wamr.lazy_jit;
 
 const can_exec_aot = switch (builtin.cpu.arch) {
     .x86_64 => true, // #862 spike: x86_64 only, see docs/design/lazy-jit-spike.md
@@ -60,29 +57,140 @@ fn nowNs() u64 {
 // (module
 //   (func $add1 (export "add1") (param i32) (result i32)
 //     local.get 0 i32.const 1 i32.add)
+//   (func $phi_local (export "phi_local") (param i32) (param i32) (result i32)
+//     (local i32)
+//     local.get 1
+//     if
+//       local.get 0 i32.const 1 i32.add local.set 2
+//     else
+//       local.get 0 i32.const 2 i32.add local.set 2
+//     end
+//     local.get 2)
 //   (func $mul2 (export "mul2") (param i32) (result i32)
 //     local.get 0 i32.const 2 i32.mul)
 //   (func $never_called (export "never_called") (param i32) (result i32)
 //     local.get 0 i32.const 1 i32.sub))
 const lazy_fixture_wasm = [_]u8{
-    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
-    0x03, 0x04, 0x03, 0x00, 0x00, 0x00, 0x07, 0x1e,
-    0x03, 0x04, 0x61, 0x64, 0x64, 0x31, 0x00, 0x00,
-    0x04, 0x6d, 0x75, 0x6c, 0x32, 0x00, 0x01, 0x0c,
-    0x6e, 0x65, 0x76, 0x65, 0x72, 0x5f, 0x63, 0x61,
-    0x6c, 0x6c, 0x65, 0x64, 0x00, 0x02, 0x0a, 0x19,
-    0x03, 0x07, 0x00, 0x20, 0x00, 0x41, 0x01, 0x6a,
-    0x0b, 0x07, 0x00, 0x20, 0x00, 0x41, 0x02, 0x6c,
-    0x0b, 0x07, 0x00, 0x20, 0x00, 0x41, 0x01, 0x6b,
-    0x0b, 0x00, 0x22, 0x04, 0x6e, 0x61, 0x6d, 0x65,
-    0x01, 0x1b, 0x03, 0x00, 0x04, 0x61, 0x64, 0x64,
-    0x31, 0x01, 0x04, 0x6d, 0x75, 0x6c, 0x32, 0x02,
-    0x0c, 0x6e, 0x65, 0x76, 0x65, 0x72, 0x5f, 0x63,
-    0x61, 0x6c, 0x6c, 0x65, 0x64,
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x02, 0x60,
+    0x01, 0x7f, 0x01, 0x7f, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x05,
+    0x04, 0x00, 0x01, 0x00, 0x00, 0x07, 0x2a, 0x04, 0x04, 0x61, 0x64, 0x64,
+    0x31, 0x00, 0x00, 0x09, 0x70, 0x68, 0x69, 0x5f, 0x6c, 0x6f, 0x63, 0x61,
+    0x6c, 0x00, 0x01, 0x04, 0x6d, 0x75, 0x6c, 0x32, 0x00, 0x02, 0x0c, 0x6e,
+    0x65, 0x76, 0x65, 0x72, 0x5f, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x64, 0x00,
+    0x03, 0x0a, 0x34, 0x04, 0x07, 0x00, 0x20, 0x00, 0x41, 0x01, 0x6a, 0x0b,
+    0x1a, 0x01, 0x01, 0x7f, 0x20, 0x01, 0x04, 0x40, 0x20, 0x00, 0x41, 0x01,
+    0x6a, 0x21, 0x02, 0x05, 0x20, 0x00, 0x41, 0x02, 0x6a, 0x21, 0x02, 0x0b,
+    0x20, 0x02, 0x0b, 0x07, 0x00, 0x20, 0x00, 0x41, 0x02, 0x6c, 0x0b, 0x07,
+    0x00, 0x20, 0x00, 0x41, 0x01, 0x6b, 0x0b, 0x00, 0x2d, 0x04, 0x6e, 0x61,
+    0x6d, 0x65, 0x01, 0x26, 0x04, 0x00, 0x04, 0x61, 0x64, 0x64, 0x31, 0x01,
+    0x09, 0x70, 0x68, 0x69, 0x5f, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x02, 0x04,
+    0x6d, 0x75, 0x6c, 0x32, 0x03, 0x0c, 0x6e, 0x65, 0x76, 0x65, 0x72, 0x5f,
+    0x63, 0x61, 0x6c, 0x6c, 0x65, 0x64,
 };
 
-test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on first call" {
+fn deinitLazyOut(allocator: std.mem.Allocator, out: *component_aot_compile.LazyJitOut) void {
+    out.ir_module.deinit();
+    allocator.free(out.lazy_local_indices);
+    out.* = .{};
+}
+
+fn measureCompileMinNs(
+    allocator: std.mem.Allocator,
+    wasm_bytes: []const u8,
+    opts: component_aot_compile.PrecompileOptions,
+) !struct { ns: u64, deferred: usize } {
+    var best_ns = std.math.maxInt(u64);
+    var deferred: usize = 0;
+
+    var iter: usize = 0;
+    while (iter < 3) : (iter += 1) {
+        if (opts.lazy_jit) {
+            var lazy_out: component_aot_compile.LazyJitOut = .{};
+            const start_ns = nowNs();
+            const cwasm = try component_aot_compile.compileCoreWasmCached(
+                allocator,
+                wasm_bytes,
+                opts,
+                .{ .lazy_jit_out = &lazy_out },
+            );
+            const elapsed_ns = nowNs() - start_ns;
+            if (elapsed_ns < best_ns) best_ns = elapsed_ns;
+            deferred = lazy_out.lazy_local_indices.len;
+            allocator.free(cwasm);
+            deinitLazyOut(allocator, &lazy_out);
+        } else {
+            const start_ns = nowNs();
+            const cwasm = try component_aot_compile.compileCoreWasmCached(allocator, wasm_bytes, opts, .{});
+            const elapsed_ns = nowNs() - start_ns;
+            if (elapsed_ns < best_ns) best_ns = elapsed_ns;
+            allocator.free(cwasm);
+        }
+    }
+
+    return .{ .ns = best_ns, .deferred = deferred };
+}
+
+const PassProbe = struct {
+    eager_counts: [4]usize = [_]usize{0} ** 4,
+
+    fn callback(ctx: *anyopaque, info: passes.DumpInfo) !void {
+        if (std.mem.eql(u8, info.pass_name, "inlineSmallFunctions")) return;
+        const self: *PassProbe = @ptrCast(@alignCast(ctx));
+        if (info.func_index < self.eager_counts.len) {
+            self.eager_counts[info.func_index] += 1;
+        }
+    }
+};
+
+test "#892 lazy-JIT: eager pipeline skips lazy functions and helper replays it later" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const module = try core_loader_mod.load(&lazy_fixture_wasm, arena.allocator());
+    var ir_module = try frontend_mod.lowerModule(&module, gpa);
+    defer ir_module.deinit();
+
+    const lazy_skip = try lazy_jit.findLazyEligibleLeaves(&module, &ir_module, gpa);
+    defer gpa.free(lazy_skip);
+    try std.testing.expectEqual(@as(usize, 4), lazy_skip.len);
+    for (lazy_skip) |skip| try std.testing.expect(skip);
+
+    var eager_probe = PassProbe{};
+    _ = try passes.runPassesWithOptions(
+        &ir_module,
+        passes.passesForPreset(.x86_64, .full),
+        gpa,
+        .{
+            .lazy_skip = lazy_skip,
+            .dump_hook = .{ .ctx = &eager_probe, .callback = PassProbe.callback },
+        },
+    );
+    for (eager_probe.eager_counts) |count| {
+        try std.testing.expectEqual(@as(usize, 0), count);
+    }
+
+    var replay_probe = PassProbe{};
+    _ = try passes.runFunctionPassesWithOptions(
+        &ir_module.functions.items[1],
+        1,
+        ir_module.import_count,
+        passes.passesForPreset(.x86_64, .full),
+        gpa,
+        .{
+            .lazy_skip = lazy_skip,
+            .dump_hook = .{ .ctx = &replay_probe, .callback = PassProbe.callback },
+        },
+    );
+    try std.testing.expect(replay_probe.eager_counts[1] > 0);
+    try std.testing.expectEqual(@as(usize, 0), replay_probe.eager_counts[0]);
+    try std.testing.expectEqual(@as(usize, 0), replay_probe.eager_counts[2]);
+    try std.testing.expectEqual(@as(usize, 0), replay_probe.eager_counts[3]);
+}
+
+test "#892 lazy-JIT: deferred functions compile correctly on first call after skipped eager passes" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
     if (comptime !can_exec_aot) return error.SkipZigTest;
 
@@ -96,20 +204,20 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
         .{ .lazy_jit_out = &lazy_out },
     );
     defer gpa.free(cwasm);
+    var lazy_out_owned_by_driver = false;
+    defer if (!lazy_out_owned_by_driver) deinitLazyOut(gpa, &lazy_out);
 
-    // All 3 functions are leaf + uncalled + the module has no element
-    // segments, so all 3 should be lazy-eligible.
-    try std.testing.expectEqual(@as(usize, 3), lazy_out.lazy_local_indices.len);
+    // All 4 functions are leaf + uncalled + the module has no element
+    // segments, so all 4 should be lazy-eligible.
+    try std.testing.expectEqual(@as(usize, 4), lazy_out.lazy_local_indices.len);
+    try std.testing.expect(!lazy_out.eager_passes_ran_for_lazy);
 
     var module = try aot_loader_mod.load(cwasm, gpa);
     defer aot_loader_mod.unload(&module, gpa);
 
-    // None of the 3 functions should have real code in the emitted
+    // None of the 4 functions should have real code in the emitted
     // `.cwasm` — each deferred function's text-section slice is empty,
     // proving codegen was genuinely skipped, not just reordered.
-    for (module.func_offsets, 0..) |_, i| {
-        _ = i;
-    }
     try std.testing.expect(module.text_section == null or module.text_section.?.len == 0);
 
     const inst = try aot_runtime_mod.instantiate(&module, gpa);
@@ -117,14 +225,17 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
     try aot_runtime_mod.mapCodeExecutable(inst);
 
     const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
+    lazy_out_owned_by_driver = true;
     defer driver.deinit();
 
     // Every function starts pending.
     try std.testing.expect(inst.lazy_jit.pending[0]);
     try std.testing.expect(inst.lazy_jit.pending[1]);
     try std.testing.expect(inst.lazy_jit.pending[2]);
+    try std.testing.expect(inst.lazy_jit.pending[3]);
 
     const add1_idx = aot_runtime_mod.findExportFunc(inst, "add1") orelse return error.ExportNotFound;
+    const phi_local_idx = aot_runtime_mod.findExportFunc(inst, "phi_local") orelse return error.ExportNotFound;
     const mul2_idx = aot_runtime_mod.findExportFunc(inst, "mul2") orelse return error.ExportNotFound;
 
     var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
@@ -140,6 +251,19 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
     );
     try std.testing.expectEqual(@as(i32, 42), add1_results[0].i32);
 
+    // First call to phi_local: compiles on demand after the deferred
+    // per-function IR pipeline runs, then executes the branchy/local-heavy
+    // function correctly.
+    const phi_local_true = try aot_runtime_mod.callFuncScalar(
+        inst,
+        phi_local_idx,
+        &.{ .i32, .i32 },
+        &.{.i32},
+        &.{ .{ .i32 = 40 }, .{ .i32 = 1 } },
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 41), phi_local_true[0].i32);
+
     // First call to mul2: compiles on demand, returns the correct result.
     const mul2_results = try aot_runtime_mod.callFuncScalar(
         inst,
@@ -151,7 +275,19 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
     );
     try std.testing.expectEqual(@as(i32, 42), mul2_results[0].i32);
 
-    // add1 and mul2's local indices are no longer pending; whichever
+    // Second call to phi_local must reuse the already-compiled code and
+    // still take the other branch correctly.
+    const phi_local_false = try aot_runtime_mod.callFuncScalar(
+        inst,
+        phi_local_idx,
+        &.{ .i32, .i32 },
+        &.{.i32},
+        &.{ .{ .i32 = 40 }, .{ .i32 = 0 } },
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 42), phi_local_false[0].i32);
+
+    // add1, phi_local, and mul2 are no longer pending; whichever
     // local index corresponds to `never_called` (the one we never
     // invoked) must still be pending -- proving its compilation was
     // genuinely skipped, not merely done in a different order.
@@ -160,6 +296,7 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
         if (p) still_pending += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), still_pending);
+    try std.testing.expect(inst.lazy_jit.pending[3]);
 
     // Second call to add1 must reuse the already-compiled code (not
     // recompile) -- verified indirectly: pending stays false and the
@@ -180,47 +317,39 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
 // Generated via: wasm-tools parse lazy_bench.wat -o lazy_bench_fixture.wasm
 const lazy_bench_wasm = @embedFile("lazy_bench_fixture_wasm");
 
-test "#862 lazy-JIT spike: skipping 199/200 unused leaf functions measurably reduces compile time" {
+test "#892 lazy-JIT: skipping passes plus codegen beats codegen-only lazy compile" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
     if (comptime !can_exec_aot) return error.SkipZigTest;
 
     const gpa = std.testing.allocator;
 
-    // Eager: compile every function.
-    const eager_start = nowNs();
-    const eager_cwasm = try component_aot_compile.compileCoreWasmCached(
-        gpa,
-        lazy_bench_wasm,
-        .{},
-        .{},
-    );
-    defer gpa.free(eager_cwasm);
-    const eager_ns = nowNs() - eager_start;
-
-    // Lazy: defer every eligible (leaf + uncalled) function -- with no
-    // calls between any of these 200 functions and no tables, all 200
-    // qualify.
-    var lazy_out: component_aot_compile.LazyJitOut = .{};
-    const lazy_start = nowNs();
-    const lazy_cwasm = try component_aot_compile.compileCoreWasmCached(
-        gpa,
-        lazy_bench_wasm,
-        .{ .lazy_jit = true },
-        .{ .lazy_jit_out = &lazy_out },
-    );
-    defer gpa.free(lazy_cwasm);
-    const lazy_ns = nowNs() - lazy_start;
-    defer lazy_out.ir_module.deinit();
-    defer gpa.free(lazy_out.lazy_local_indices);
+    // Take the minimum of 3 runs per mode to dampen clock noise on this
+    // intentionally timing-based regression guard.
+    const eager = try measureCompileMinNs(gpa, lazy_bench_wasm, .{});
+    const lazy_codegen_only = try measureCompileMinNs(gpa, lazy_bench_wasm, .{
+        .lazy_jit = true,
+        .lazy_defer_passes = false,
+    });
+    const lazy_skip_passes = try measureCompileMinNs(gpa, lazy_bench_wasm, .{
+        .lazy_jit = true,
+        .lazy_defer_passes = true,
+    });
 
     std.debug.print(
-        "[#862] 200-leaf-fn module compileCoreWasmCached: eager={d}us lazy={d}us ({d} functions deferred)\n",
-        .{ eager_ns / 1000, lazy_ns / 1000, lazy_out.lazy_local_indices.len },
+        "[#892] 200-leaf-fn compileCoreWasmCached (best-of-3): eager={d}us lazy_codegen_only={d}us lazy_skip_passes={d}us ({d} functions deferred)\n",
+        .{
+            eager.ns / 1000,
+            lazy_codegen_only.ns / 1000,
+            lazy_skip_passes.ns / 1000,
+            lazy_skip_passes.deferred,
+        },
     );
 
-    try std.testing.expectEqual(@as(usize, 200), lazy_out.lazy_local_indices.len);
+    try std.testing.expectEqual(@as(usize, 200), lazy_codegen_only.deferred);
+    try std.testing.expectEqual(@as(usize, 200), lazy_skip_passes.deferred);
     // Loose regression guard (see jit_fast_preset_test.zig for the same
-    // pattern/rationale): skipping codegen for 200 functions must not be
-    // slower than compiling all of them.
-    try std.testing.expect(lazy_ns <= eager_ns);
+    // pattern/rationale): deferring more work must not regress compile
+    // latency on this all-lazy synthetic benchmark.
+    try std.testing.expect(lazy_skip_passes.ns <= lazy_codegen_only.ns);
+    try std.testing.expect(lazy_codegen_only.ns <= eager.ns);
 }
