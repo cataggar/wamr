@@ -224,3 +224,136 @@ test "#862 lazy-JIT spike: skipping 199/200 unused leaf functions measurably red
     // slower than compiling all of them.
     try std.testing.expect(lazy_ns <= eager_ns);
 }
+
+// #879: two (or more) threads racing to be the first caller of the
+// SAME still-pending lazy function on the SAME `AotInstance` must
+// compile it exactly once -- see `LazyJitState.mutex`'s doc comment in
+// `runtime.zig`. Before that fix, every racing thread would call
+// `compile_fn` and only the last writer's `compiled[local_idx]` would
+// survive, silently leaking every other racing thread's
+// `platform.mapExecutableCode` mapping (never `munmap`'d, since never
+// stored) and wasting redundant compiles. A plain correctness
+// assertion on the returned value wouldn't catch this -- every racing
+// compile independently produces a *correct* result for `add1`, so the
+// bug is a resource leak / wasted work, not a wrong-answer bug. This
+// test instead wraps the real `compile_fn` in a counting shim and
+// asserts it was invoked exactly once, no matter how many threads race
+// past the unsynchronized fast-path peek at the same instant.
+const CountingCompileCtx = struct {
+    real_ctx: *anyopaque,
+    real_fn: *const fn (ctx: *anyopaque, local_idx: u32) ?aot_runtime_mod.LazyCompiledFunc,
+    calls: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn wrap(ctx_opaque: *anyopaque, local_idx: u32) ?aot_runtime_mod.LazyCompiledFunc {
+        const self: *CountingCompileCtx = @ptrCast(@alignCast(ctx_opaque));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        return self.real_fn(self.real_ctx, local_idx);
+    }
+};
+
+const ConcurrentCallResult = struct {
+    ok: bool = false,
+    got: i32 = 0,
+    err_name: []const u8 = "",
+};
+
+fn callAdd1Concurrently(
+    inst: *aot_runtime_mod.AotInstance,
+    add1_idx: u32,
+    input: i32,
+    go: *std.atomic.Value(bool),
+    result: *ConcurrentCallResult,
+) void {
+    // Spin until the main thread releases every spawned thread at
+    // once, maximizing how many threads observe `pending[local_idx] ==
+    // true` at the same instant -- the race window this test targets.
+    while (!go.load(.acquire)) std.atomic.spinLoopHint();
+
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+    const results = aot_runtime_mod.callFuncScalar(
+        inst,
+        add1_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = input }},
+        &results_buf,
+    ) catch |err| {
+        result.err_name = @errorName(err);
+        return;
+    };
+    result.got = switch (results[0]) {
+        .i32 => |v| v,
+        else => {
+            result.err_name = "unexpected result type";
+            return;
+        },
+    };
+    result.ok = true;
+}
+
+test "#879 lazy-JIT spike: concurrent first-calls to the same lazy function compile exactly once" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    var lazy_out: component_aot_compile.LazyJitOut = .{};
+    const cwasm = try component_aot_compile.compileCoreWasmCached(
+        gpa,
+        &lazy_fixture_wasm,
+        .{ .lazy_jit = true },
+        .{ .lazy_jit_out = &lazy_out },
+    );
+    defer gpa.free(cwasm);
+
+    var module = try aot_loader_mod.load(cwasm, gpa);
+    defer aot_loader_mod.unload(&module, gpa);
+
+    const inst = try aot_runtime_mod.instantiate(&module, gpa);
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
+
+    // Splice a counting shim between `inst.lazy_jit` and the real
+    // driver so the assertion below can observe how many times the
+    // real per-function compile actually ran.
+    var counting_ctx = CountingCompileCtx{
+        .real_ctx = inst.lazy_jit.compile_ctx.?,
+        .real_fn = inst.lazy_jit.compile_fn.?,
+    };
+    inst.lazy_jit.compile_ctx = &counting_ctx;
+    inst.lazy_jit.compile_fn = &CountingCompileCtx.wrap;
+
+    const add1_idx = aot_runtime_mod.findExportFunc(inst, "add1") orelse return error.ExportNotFound;
+
+    const thread_count = 16;
+    var go = std.atomic.Value(bool).init(false);
+    var results: [thread_count]ConcurrentCallResult = [_]ConcurrentCallResult{.{}} ** thread_count;
+    var threads: [thread_count]std.Thread = undefined;
+
+    for (0..thread_count) |i| {
+        threads[i] = try std.Thread.spawn(.{}, callAdd1Concurrently, .{
+            inst, add1_idx, @as(i32, @intCast(i)), &go, &results[i],
+        });
+    }
+    // Release every spawned thread at once, right after they're all
+    // spinning on `go`.
+    go.store(true, .release);
+    for (threads) |t| t.join();
+
+    for (results, 0..) |r, i| {
+        if (r.err_name.len > 0) {
+            std.debug.print("thread {d} failed: {s}\n", .{ i, r.err_name });
+        }
+        try std.testing.expect(r.ok);
+        try std.testing.expectEqual(@as(i32, @intCast(i)) + 1, r.got);
+    }
+
+    // The core assertion: no matter how many threads raced to be the
+    // first caller, exactly one of them actually compiled the
+    // function.
+    try std.testing.expectEqual(@as(u32, 1), counting_ctx.calls.load(.monotonic));
+
+    aot_runtime_mod.destroy(inst);
+    driver.deinit();
+}

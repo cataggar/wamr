@@ -1483,14 +1483,22 @@ pub const LazyJitState = struct {
     /// Compile local function `local_idx` now; returns its
     /// mapped-executable native code (address + byte size, so
     /// `destroy()` can `munmap` it later), or `null` on failure.
-    /// Called at most once per `local_idx` (`pending[local_idx]` is
-    /// cleared right after a successful call) — see the thread-safety
-    /// caveat in the design doc: this narrow prototype assumes
-    /// single-threaded execution of any one `AotInstance`, matching
-    /// every other example in this codebase's #859 thread-safety
-    /// audit (configure-before-concurrent-use, not safe for
-    /// concurrent first-calls to the SAME lazy function).
+    /// Called at most once per `local_idx` even when multiple threads
+    /// race to be the first caller of the same still-pending function
+    /// on the same `AotInstance` — `callFuncScalar` guards the
+    /// check-compile-store sequence with `mutex` below (#879; this
+    /// used to be an explicit unsafe gap, see git history / #859).
     compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) ?LazyCompiledFunc = null,
+    /// #879: guards the "is `local_idx` still pending? if so, compile
+    /// it" read-modify-write sequence in `callFuncScalar`, so two
+    /// threads racing to be the first caller of the same still-pending
+    /// lazy function on this instance don't both invoke `compile_fn`
+    /// (which would leak one thread's `platform.mapExecutableCode`
+    /// mapping — never stored in `compiled[local_idx]`, so never
+    /// `munmap`'d by `free` below — and waste a redundant compile).
+    /// Plain `std.Thread.Mutex` is IO-gated in this Zig version, hence
+    /// the spinlock in `platform.Mutex` (see that type's doc comment).
+    mutex: platform.Mutex = .{},
 
     fn free(self: *LazyJitState, allocator: std.mem.Allocator) void {
         for (self.compiled) |maybe| {
@@ -2582,12 +2590,40 @@ pub fn callFuncScalar(
         const import_count = inst.module.import_function_count;
         if (func_idx >= import_count) {
             const local_idx = func_idx - import_count;
-            if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
-                const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
-                const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
-                const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
-                inst.lazy_jit.compiled[local_idx] = compiled;
-                inst.lazy_jit.pending[local_idx] = false;
+            if (local_idx < inst.lazy_jit.pending.len) {
+                // #879: fast-path unsynchronized peek. `pending[local_idx]`
+                // is always cleared with a `.release` atomic store (below,
+                // and in the compiling thread) after `compiled[local_idx]`
+                // has been written, so observing `false` here via an
+                // `.acquire` load establishes a happens-before edge that
+                // also makes that plain write to `compiled[local_idx]`
+                // visible to this thread — the standard "ready flag"
+                // pattern for lazy one-time initialization. Observing
+                // `true` just means "maybe still pending" and falls
+                // through to the locked, authoritative check below.
+                if (@atomicLoad(bool, &inst.lazy_jit.pending[local_idx], .acquire)) {
+                    // Double-checked locking: multiple threads can race
+                    // past the unsynchronized peek above and all reach
+                    // here, but `mutex` ensures only one of them actually
+                    // calls `compile_fn` for this `local_idx` — every
+                    // other thread re-checks `pending` under the lock,
+                    // finds it already resolved, and skips straight to
+                    // reading `compiled[local_idx]` below. Without this,
+                    // two threads could both compile the same function
+                    // and only one compiled mapping would survive being
+                    // stored, leaking the other's `platform.mapExecutableCode`
+                    // mapping (never `munmap`'d by `LazyJitState.free`)
+                    // and wasting a redundant compile.
+                    inst.lazy_jit.mutex.lock();
+                    defer inst.lazy_jit.mutex.unlock();
+                    if (inst.lazy_jit.pending[local_idx]) {
+                        const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
+                        const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
+                        const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
+                        inst.lazy_jit.compiled[local_idx] = compiled;
+                        @atomicStore(bool, &inst.lazy_jit.pending[local_idx], false, .release);
+                    }
+                }
             }
             if (local_idx < inst.lazy_jit.compiled.len) {
                 if (inst.lazy_jit.compiled[local_idx]) |c| lazy_resolved_addr = c.addr;
