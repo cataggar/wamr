@@ -1452,6 +1452,8 @@ pub const LazyCompiledFunc = struct {
     size: usize,
 };
 
+const LazySlotStateAtomic = std.atomic.Value(u8);
+
 /// #862 lazy-JIT design-spike per-instance state. Only ever populated
 /// (non-empty) when `config.lazy_jit` is true AND the instance was
 /// produced by the lazy-JIT-aware compile path
@@ -1466,14 +1468,30 @@ pub const LazyCompiledFunc = struct {
 /// `aot_compile.zig`, mirroring the existing `TrampolinePool.ctx:
 /// *anyopaque` pattern in `host_trampolines.zig`.
 pub const LazyJitState = struct {
-    /// LOCAL function idx → still pending (true) or already resolved
-    /// (false). Empty (default) means "no lazy functions in this
-    /// instance" — `callFuncScalar`'s hook is then a single length
-    /// check away from a complete no-op.
-    pending: []bool = &.{},
+    pub const SlotState = enum(u8) {
+        /// Not lazy-eligible; resolve through the instance's eagerly
+        /// mapped `code_base` as normal.
+        inactive = 0,
+        /// Lazy-eligible but not yet compiled.
+        pending = 1,
+        /// One thread won the right to compile this local now.
+        compiling = 2,
+        /// The lazily compiled mapping in `compiled[local_idx]` has
+        /// been fully published and can be reused by all callers.
+        ready = 3,
+    };
+
+    /// LOCAL function idx → per-slot lazy state. Only lazy-eligible
+    /// locals ever leave `inactive`; they transition
+    /// `pending -> compiling -> ready`. A failed compile stores
+    /// `pending` again so a later caller can retry.
+    slot_states: []LazySlotStateAtomic = &.{},
     /// LOCAL function idx → compiled code once resolved. Parallel to
-    /// `pending`; entries only meaningful where `pending[i]` has gone
-    /// from true to false. Freed (munmapped) by `AotInstance.destroy()`.
+    /// `slot_states`; entries only meaningful where
+    /// `slot_states[i] == .ready`. Published before the corresponding
+    /// `.ready` release-store and read after an acquire-load of that
+    /// state, so waiters never observe a torn/half-written
+    /// `LazyCompiledFunc`. Freed (munmapped) by `AotInstance.destroy()`.
     compiled: []?LazyCompiledFunc = &.{},
     /// Opaque context for `compile_fn`, owned by whoever set up this
     /// `LazyJitState` (the JIT driver in `aot_compile.zig`). Freed by
@@ -1483,20 +1501,73 @@ pub const LazyJitState = struct {
     /// Compile local function `local_idx` now; returns its
     /// mapped-executable native code (address + byte size, so
     /// `destroy()` can `munmap` it later), or `null` on failure.
-    /// Called at most once per `local_idx` (`pending[local_idx]` is
-    /// cleared right after a successful call) — see the thread-safety
-    /// caveat in the design doc: this narrow prototype assumes
-    /// single-threaded execution of any one `AotInstance`, matching
-    /// every other example in this codebase's #859 thread-safety
-    /// audit (configure-before-concurrent-use, not safe for
-    /// concurrent first-calls to the SAME lazy function).
+    /// Same-slot contenders are serialized by `slot_states`; at most
+    /// one thread enters `compile_fn` for a given `local_idx` at a
+    /// time, while different lazy locals may still compile
+    /// independently.
     compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) ?LazyCompiledFunc = null,
+
+    pub fn slotState(self: *const LazyJitState, local_idx: usize) SlotState {
+        if (local_idx >= self.slot_states.len) return .inactive;
+        const state: SlotState = @enumFromInt(self.slot_states[local_idx].load(.acquire));
+        return state;
+    }
+
+    fn resolveLocalAddr(self: *LazyJitState, local_idx: usize) error{CodeMappingFailed}!?[*]const u8 {
+        if (local_idx >= self.slot_states.len) return null;
+
+        const slot = &self.slot_states[local_idx];
+        var spins: u32 = 0;
+        while (true) {
+            const state: SlotState = @enumFromInt(slot.load(.acquire));
+            switch (state) {
+                .inactive => return null,
+                .ready => {
+                    const compiled = self.compiled[local_idx] orelse return error.CodeMappingFailed;
+                    return compiled.addr;
+                },
+                .pending => {
+                    if (slot.cmpxchgWeak(
+                        @intFromEnum(SlotState.pending),
+                        @intFromEnum(SlotState.compiling),
+                        .acquire,
+                        .acquire,
+                    ) != null) continue;
+
+                    const compile_ctx = self.compile_ctx orelse {
+                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        return error.CodeMappingFailed;
+                    };
+                    const compile_fn = self.compile_fn orelse {
+                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        return error.CodeMappingFailed;
+                    };
+                    const compiled = compile_fn(compile_ctx, @intCast(local_idx)) orelse {
+                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        return error.CodeMappingFailed;
+                    };
+                    self.compiled[local_idx] = compiled;
+                    slot.store(@intFromEnum(SlotState.ready), .release);
+                    return compiled.addr;
+                },
+                .compiling => {
+                    if (spins < 1024) {
+                        spins += 1;
+                        std.atomic.spinLoopHint();
+                    } else {
+                        spins = 0;
+                        std.Thread.yield() catch {};
+                    }
+                },
+            }
+        }
+    }
 
     fn free(self: *LazyJitState, allocator: std.mem.Allocator) void {
         for (self.compiled) |maybe| {
             if (maybe) |c| platform.munmap(@constCast(c.addr), c.size);
         }
-        allocator.free(self.pending);
+        allocator.free(self.slot_states);
         allocator.free(self.compiled);
     }
 };
@@ -2569,29 +2640,22 @@ pub fn callFuncScalar(
     const effective_args: usize = args.len + @as(usize, if (needs_hrp) 1 else 0);
     if (effective_args > MaxScalarArgs) return error.UnsupportedSignature;
 
-    // #862 lazy-JIT design-spike: if `func_idx` names a still-pending
-    // deferred function, compile it now before resolving its address.
-    // See `LazyJitState`'s doc comment — this hook is a no-op (single
-    // length check) whenever lazy-JIT isn't active for this instance.
-    // Checked BEFORE the `code_base == null` guard below because a
-    // module where EVERY function is lazy-eligible (e.g. this spike's
-    // own test fixture) never maps any code up front, so `code_base`
-    // legitimately stays null until the first lazy compile.
+    // #862 lazy-JIT design-spike: if `func_idx` names a deferred local
+    // function, resolve it through the per-slot state machine before
+    // looking at the eager `code_base`. Lazy-eligible slots transition
+    // `pending -> compiling -> ready` with acquire/release ordering so
+    // same-slot first-call races serialize correctly while other lazy
+    // locals remain independent. Checked BEFORE the `code_base == null`
+    // guard below because a module where EVERY function is
+    // lazy-eligible (e.g. this spike's own test fixture) never maps
+    // any code up front, so `code_base` legitimately stays null until
+    // the first lazy compile publishes a `ready` slot.
     var lazy_resolved_addr: ?[*]const u8 = null;
     if (comptime config.lazy_jit) {
         const import_count = inst.module.import_function_count;
         if (func_idx >= import_count) {
-            const local_idx = func_idx - import_count;
-            if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
-                const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
-                const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
-                const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
-                inst.lazy_jit.compiled[local_idx] = compiled;
-                inst.lazy_jit.pending[local_idx] = false;
-            }
-            if (local_idx < inst.lazy_jit.compiled.len) {
-                if (inst.lazy_jit.compiled[local_idx]) |c| lazy_resolved_addr = c.addr;
-            }
+            const local_idx: usize = @intCast(func_idx - import_count);
+            lazy_resolved_addr = try inst.lazy_jit.resolveLocalAddr(local_idx);
         }
     }
 
