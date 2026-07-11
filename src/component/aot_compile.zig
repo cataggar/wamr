@@ -132,8 +132,8 @@ pub const PrecompileOptions = struct {
     /// and `docs/design/lazy-jit-spike.md`). Requires
     /// `cache_ctx.lazy_jit_out` to be set so the retained IR survives
     /// past this call — see `compileCoreWasmCached`'s doc comment.
-    /// x86_64 only for this narrow prototype; `target_arch == .aarch64`
-    /// with `lazy_jit = true` returns `error.CoreCompileFailed`.
+    /// Supported on the current native backends (`.x86_64` and
+    /// `.aarch64`) for this narrow prototype.
     lazy_jit: bool = false,
 };
 
@@ -155,6 +155,14 @@ pub const LazyJitOut = struct {
     /// that were skipped during this compile. Caller-owned; free with
     /// the allocator passed to `compileCoreWasmCached`.
     lazy_local_indices: []const u32 = &.{},
+    /// Backend these deferred functions must be compiled for on first
+    /// call. Threaded through to `LazyCompileDriver` so it dispatches
+    /// to the matching per-arch codegen helper instead of assuming
+    /// x86_64.
+    target_arch: passes.TargetArch = switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    },
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -223,14 +231,13 @@ pub fn compileCoreWasmCached(
     defer if (!keep_ir_module_for_lazy_jit) ir_module.deinit();
 
     // #862 lazy-JIT spike: compute the leaf-eligibility set BEFORE
-    // codegen so it can be threaded into the x86_64 backend's
+    // codegen so it can be threaded into the selected backend's
     // `lazy_skip`. Requires `cache_ctx.lazy_jit_out` — see
     // `PrecompileOptions.lazy_jit`'s doc comment for why.
     var lazy_skip: []bool = &.{};
     defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
     if (opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
-        if (opts.target_arch != .x86_64) return error.CoreCompileFailed;
         lazy_skip = lazy_jit.findLazyEligibleLeaves(&module, &ir_module, allocator) catch
             return error.CoreCompileFailed;
     }
@@ -310,6 +317,7 @@ pub fn compileCoreWasmCached(
             .codegen_timing = opts.codegen_timing,
             .spill_metric = opts.spill_metric,
             .module_idx = opts.module_idx,
+            .lazy_skip = lazy_skip,
         }) catch
             return error.CoreCompileFailed,
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
@@ -609,6 +617,7 @@ pub fn compileCoreWasmCached(
         out.* = .{
             .ir_module = ir_module,
             .lazy_local_indices = indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
+            .target_arch = opts.target_arch,
         };
         keep_ir_module_for_lazy_jit = true;
     }
@@ -617,8 +626,8 @@ pub fn compileCoreWasmCached(
 }
 
 /// #862 lazy-JIT design-spike: heap-owned driver bridging a `LazyJitOut`
-/// (retained IR + deferred indices) to `AotInstance`'s type-erased
-/// `LazyJitState.compile_fn` hook. x86_64 only, matching
+/// (retained IR + deferred indices + target arch) to `AotInstance`'s
+/// type-erased `LazyJitState.compile_fn` hook, matching
 /// `PrecompileOptions.lazy_jit`'s scope.
 ///
 /// Lifetime: caller creates one via `setupLazyJit` right after
@@ -634,29 +643,44 @@ pub const LazyCompileDriver = struct {
         const self: *LazyCompileDriver = @ptrCast(@alignCast(ctx_opaque));
         if (local_idx >= self.lazy_out.ir_module.functions.items.len) return null;
         const func = &self.lazy_out.ir_module.functions.items[local_idx];
-        // Real regalloc-based per-function codegen — the SAME entry
-        // point `compileModuleCachedWithOptions`'s per-function loop
-        // uses, not the naive standalone `compileFunction` (a
-        // different, simpler stack-machine codegen kept for other
-        // purposes). Leaf functions never populate `call_patches`
-        // (nothing to patch — see `lazy_jit.findLazyEligibleLeaves`'s
-        // eligibility contract), so it's safe to ignore here.
-        const result = x86_64_compile.compileFunctionRAWithGlobalOffsetsPublic(
-            func,
-            self.lazy_out.ir_module.import_count,
-            self.lazy_out.ir_module.global_offsets orelse &.{},
-            self.allocator,
-        ) catch |err| {
-            std.log.err("lazy-JIT spike: compiling deferred function {d} failed: {s}", .{ local_idx, @errorName(err) });
-            return null;
+        const code = switch (self.lazy_out.target_arch) {
+            .x86_64 => blk: {
+                // Real regalloc-based per-function codegen — the SAME entry
+                // point `compileModuleCachedWithOptions`'s per-function loop
+                // uses, not the naive standalone `compileFunction` (a
+                // different, simpler stack-machine codegen kept for other
+                // purposes). Leaf functions never populate `call_patches`
+                // (nothing to patch — see
+                // `lazy_jit.findLazyEligibleLeaves`'s eligibility
+                // contract), so it's safe to ignore here.
+                const result = x86_64_compile.compileFunctionRAWithGlobalOffsetsPublic(
+                    func,
+                    self.lazy_out.ir_module.import_count,
+                    self.lazy_out.ir_module.global_offsets orelse &.{},
+                    self.allocator,
+                ) catch |err| {
+                    std.log.err("lazy-JIT spike: compiling deferred x86_64 function {d} failed: {s}", .{ local_idx, @errorName(err) });
+                    return null;
+                };
+                defer self.allocator.free(result.call_patches);
+                break :blk result.code;
+            },
+            .aarch64 => aarch64_compile.compileFunctionWithGlobalOffsetsPublic(
+                func,
+                self.lazy_out.ir_module.import_count,
+                self.lazy_out.ir_module.global_offsets orelse &.{},
+                self.allocator,
+            ) catch |err| {
+                std.log.err("lazy-JIT spike: compiling deferred aarch64 function {d} failed: {s}", .{ local_idx, @errorName(err) });
+                return null;
+            },
         };
-        defer self.allocator.free(result.call_patches);
-        defer self.allocator.free(result.code);
-        const mapped = platform.mapExecutableCode(result.code) orelse {
+        defer self.allocator.free(code);
+        const mapped = platform.mapExecutableCode(code) orelse {
             std.log.err("lazy-JIT spike: mapExecutableCode failed for deferred function {d}", .{local_idx});
             return null;
         };
-        return .{ .addr = mapped, .size = result.code.len };
+        return .{ .addr = mapped, .size = code.len };
     }
 
     pub fn deinit(self: *LazyCompileDriver) void {
