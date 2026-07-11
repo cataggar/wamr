@@ -82,6 +82,52 @@ const lazy_fixture_wasm = [_]u8{
     0x61, 0x6c, 0x6c, 0x65, 0x64,
 };
 
+const LazyFixtureInstance = struct {
+    module: aot_loader_mod.AotModule,
+    inst: *aot_runtime_mod.AotInstance,
+    driver: *component_aot_compile.LazyCompileDriver,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *LazyFixtureInstance) void {
+        aot_runtime_mod.destroy(self.inst);
+        self.driver.deinit();
+        aot_loader_mod.unload(&self.module, self.allocator);
+    }
+};
+
+fn deinitLazyOut(allocator: std.mem.Allocator, lazy_out: *component_aot_compile.LazyJitOut) void {
+    lazy_out.ir_module.deinit();
+    allocator.free(lazy_out.lazy_local_indices);
+}
+
+fn instantiateLazyFixture(allocator: std.mem.Allocator) !LazyFixtureInstance {
+    var lazy_out: component_aot_compile.LazyJitOut = .{};
+    const cwasm = try component_aot_compile.compileCoreWasmCached(
+        allocator,
+        &lazy_fixture_wasm,
+        .{ .lazy_jit = true },
+        .{ .lazy_jit_out = &lazy_out },
+    );
+    errdefer deinitLazyOut(allocator, &lazy_out);
+    defer allocator.free(cwasm);
+
+    var module = try aot_loader_mod.load(cwasm, allocator);
+    errdefer aot_loader_mod.unload(&module, allocator);
+
+    const inst = try aot_runtime_mod.instantiate(&module, allocator);
+    errdefer aot_runtime_mod.destroy(inst);
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, allocator);
+
+    return .{
+        .module = module,
+        .inst = inst,
+        .driver = driver,
+        .allocator = allocator,
+    };
+}
+
 test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on first call" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
     if (comptime !can_exec_aot) return error.SkipZigTest;
@@ -113,11 +159,12 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
     try std.testing.expect(module.text_section == null or module.text_section.?.len == 0);
 
     const inst = try aot_runtime_mod.instantiate(&module, gpa);
-    defer aot_runtime_mod.destroy(inst);
+    errdefer aot_runtime_mod.destroy(inst);
     try aot_runtime_mod.mapCodeExecutable(inst);
 
     const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
     defer driver.deinit();
+    defer aot_runtime_mod.destroy(inst);
 
     // Every function starts pending.
     try std.testing.expect(inst.lazy_jit.pending[0]);
@@ -173,6 +220,131 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
         &results_buf,
     );
     try std.testing.expectEqual(@as(i32, 100), add1_again[0].i32);
+}
+
+test "#891 lazy-JIT: deferred mappings are tracked by JitCodeCache" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const baseline_bytes = aot_runtime_mod.JitCodeCache.residentBytes();
+    const baseline_count = aot_runtime_mod.JitCodeCache.mappingCount();
+
+    {
+        var fixture = try instantiateLazyFixture(gpa);
+        defer fixture.deinit();
+
+        const inst = fixture.inst;
+        const add1_idx = aot_runtime_mod.findExportFunc(inst, "add1") orelse return error.ExportNotFound;
+        const local_idx = add1_idx - inst.module.import_function_count;
+
+        try std.testing.expectEqual(baseline_count, aot_runtime_mod.JitCodeCache.mappingCount());
+        try std.testing.expectEqual(baseline_bytes, aot_runtime_mod.JitCodeCache.residentBytes());
+
+        var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+        const add1_results = try aot_runtime_mod.callFuncScalar(
+            inst,
+            add1_idx,
+            &.{.i32},
+            &.{.i32},
+            &.{.{ .i32 = 41 }},
+            &results_buf,
+        );
+        try std.testing.expectEqual(@as(i32, 42), add1_results[0].i32);
+
+        const compiled = inst.lazy_jit.compiled[local_idx] orelse return error.FunctionNotFound;
+        try std.testing.expect(!inst.lazy_jit.pending[local_idx]);
+        try std.testing.expectEqual(baseline_count + 1, aot_runtime_mod.JitCodeCache.mappingCount());
+        try std.testing.expectEqual(baseline_bytes + compiled.size, aot_runtime_mod.JitCodeCache.residentBytes());
+
+        const add1_again = try aot_runtime_mod.callFuncScalar(
+            inst,
+            add1_idx,
+            &.{.i32},
+            &.{.i32},
+            &.{.{ .i32 = 99 }},
+            &results_buf,
+        );
+        try std.testing.expectEqual(@as(i32, 100), add1_again[0].i32);
+        try std.testing.expectEqual(baseline_count + 1, aot_runtime_mod.JitCodeCache.mappingCount());
+        try std.testing.expectEqual(baseline_bytes + compiled.size, aot_runtime_mod.JitCodeCache.residentBytes());
+    }
+
+    try std.testing.expectEqual(baseline_count, aot_runtime_mod.JitCodeCache.mappingCount());
+    try std.testing.expectEqual(baseline_bytes, aot_runtime_mod.JitCodeCache.residentBytes());
+}
+
+test "#891 lazy-JIT: deferred mappings honor JitCodeCache budgets" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const baseline_bytes = aot_runtime_mod.JitCodeCache.residentBytes();
+    const baseline_count = aot_runtime_mod.JitCodeCache.mappingCount();
+
+    const compiled_size = blk: {
+        var fixture = try instantiateLazyFixture(gpa);
+        defer fixture.deinit();
+
+        const inst = fixture.inst;
+        const add1_idx = aot_runtime_mod.findExportFunc(inst, "add1") orelse return error.ExportNotFound;
+        const local_idx = add1_idx - inst.module.import_function_count;
+        var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+
+        const add1_results = try aot_runtime_mod.callFuncScalar(
+            inst,
+            add1_idx,
+            &.{.i32},
+            &.{.i32},
+            &.{.{ .i32 = 41 }},
+            &results_buf,
+        );
+        try std.testing.expectEqual(@as(i32, 42), add1_results[0].i32);
+
+        const compiled = inst.lazy_jit.compiled[local_idx] orelse return error.FunctionNotFound;
+        break :blk compiled.size;
+    };
+
+    try std.testing.expectEqual(baseline_count, aot_runtime_mod.JitCodeCache.mappingCount());
+    try std.testing.expectEqual(baseline_bytes, aot_runtime_mod.JitCodeCache.residentBytes());
+
+    const reject_budget = baseline_bytes + compiled_size - 1;
+    try std.testing.expect(reject_budget != 0);
+    aot_runtime_mod.JitCodeCache.budget_bytes = reject_budget;
+    defer aot_runtime_mod.JitCodeCache.budget_bytes = 0;
+
+    {
+        var fixture = try instantiateLazyFixture(gpa);
+        defer fixture.deinit();
+
+        const inst = fixture.inst;
+        const add1_idx = aot_runtime_mod.findExportFunc(inst, "add1") orelse return error.ExportNotFound;
+        const local_idx = add1_idx - inst.module.import_function_count;
+        const before_bytes = aot_runtime_mod.JitCodeCache.residentBytes();
+        const before_count = aot_runtime_mod.JitCodeCache.mappingCount();
+        var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+
+        try std.testing.expect(inst.lazy_jit.pending[local_idx]);
+        try std.testing.expect(inst.lazy_jit.compiled[local_idx] == null);
+        try std.testing.expectError(
+            error.CodeBudgetExceeded,
+            aot_runtime_mod.callFuncScalar(
+                inst,
+                add1_idx,
+                &.{.i32},
+                &.{.i32},
+                &.{.{ .i32 = 41 }},
+                &results_buf,
+            ),
+        );
+        try std.testing.expect(inst.lazy_jit.pending[local_idx]);
+        try std.testing.expect(inst.lazy_jit.compiled[local_idx] == null);
+        try std.testing.expectEqual(before_count, aot_runtime_mod.JitCodeCache.mappingCount());
+        try std.testing.expectEqual(before_bytes, aot_runtime_mod.JitCodeCache.residentBytes());
+    }
+
+    try std.testing.expectEqual(baseline_count, aot_runtime_mod.JitCodeCache.mappingCount());
+    try std.testing.expectEqual(baseline_bytes, aot_runtime_mod.JitCodeCache.residentBytes());
 }
 
 // 200 leaf functions (each `fN(x) = x + N`), no calls, no tables — a

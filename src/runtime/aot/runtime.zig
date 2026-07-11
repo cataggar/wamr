@@ -27,29 +27,32 @@ const windows = std.os.windows;
 /// This is bookkeeping only — it doesn't retain or reuse compiled code
 /// across a `destroy` (that would be an actual *cache* in the reuse
 /// sense; see the design spike tracked by issue #862 for lazy/tiered
-/// compilation, which is a different feature). `mapCodeExecutable` /
-/// `destroy` already individually `mmap`/`munmap` correctly per
-/// instance — verified by inspection and by the stress test in
-/// `runtime_test.zig` — this struct just lets that be observed and
-/// bounded in aggregate across every live `AotInstance` in the process.
+/// compilation, which is a different feature). `mapCodeExecutable`,
+/// lazy first-call compilation, and their matching teardown paths
+/// already individually `mmap`/`munmap` correctly — verified by
+/// inspection and by the stress test in `runtime_test.zig` — this
+/// struct just lets that be observed and bounded in aggregate across
+/// every live executable mapping in the process.
 pub const JitCodeCache = struct {
-    /// Total resident bytes across every currently-mapped
-    /// `AotInstance.code_base`. Default `0` = unlimited (existing
-    /// behavior unchanged). Opt in via `WAMR_JIT_CODE_BUDGET_BYTES`
-    /// (see `main.zig`) or set directly before compiling.
+    /// Total resident bytes across every currently-mapped executable
+    /// region tracked through this registry (whole-module text blobs
+    /// and lazily-compiled per-function mappings). Default `0` =
+    /// unlimited (existing behavior unchanged). Opt in via
+    /// `WAMR_JIT_CODE_BUDGET_BYTES` (see `main.zig`) or set directly
+    /// before compiling.
     pub var budget_bytes: usize = 0;
 
     var resident_bytes: usize = 0;
     var mapping_count: usize = 0;
 
     /// Currently resident JIT/AOT executable code, summed across every
-    /// live `AotInstance` with a mapped `code_base` in this process.
+    /// live tracked executable mapping in this process.
     pub fn residentBytes() usize {
         return resident_bytes;
     }
 
-    /// Number of currently-live mapped code regions (i.e. `AotInstance`s
-    /// with `code_base != null`) in this process.
+    /// Number of currently-live tracked executable mappings in this
+    /// process.
     pub fn mappingCount() usize {
         return mapping_count;
     }
@@ -66,10 +69,9 @@ pub const JitCodeCache = struct {
 
     /// Returns `error.CodeBudgetExceeded` if mapping `additional_bytes`
     /// more code would push `residentBytes()` past `budget_bytes`, when
-    /// a nonzero budget is configured. Called by `mapCodeExecutable`
-    /// before the `mmap`, so a caller gets a clear typed error instead
-    /// of the process eventually running out of memory from unbounded
-    /// JIT growth.
+    /// a nonzero budget is configured. Called before the `mmap`, so a
+    /// caller gets a clear typed error instead of the process
+    /// eventually running out of memory from unbounded JIT growth.
     fn checkBudget(additional_bytes: usize) error{CodeBudgetExceeded}!void {
         if (budget_bytes == 0) return;
         if (resident_bytes + additional_bytes > budget_bytes) return error.CodeBudgetExceeded;
@@ -1442,11 +1444,11 @@ const native_arch: enum { x86_64, aarch64, unsupported } = switch (builtin.cpu.a
 /// Whether the current target can execute AOT code.
 const can_execute_native = native_arch != .unsupported;
 
-/// A single lazily-compiled function's mapped-executable code, so
-/// `AotInstance.destroy()` can `munmap` it (each lazy function gets its
-/// own small mapping via `platform.mapExecutableCode`, separate from
-/// the instance's main `code_base` blob — see the design doc's
-/// "Deferred to follow-up" section on batching these).
+/// A single lazily-compiled function's tracked executable mapping, so
+/// `AotInstance.destroy()` can `munmap` + unregister it (each lazy
+/// function gets its own small mapping, separate from the instance's
+/// main `code_base` blob — see the design doc's "Deferred to
+/// follow-up" section on batching these).
 pub const LazyCompiledFunc = struct {
     addr: [*]const u8,
     size: usize,
@@ -1482,7 +1484,8 @@ pub const LazyJitState = struct {
     compile_ctx: ?*anyopaque = null,
     /// Compile local function `local_idx` now; returns its
     /// mapped-executable native code (address + byte size, so
-    /// `destroy()` can `munmap` it later), or `null` on failure.
+    /// `destroy()` can `munmap` + unregister it later). Preserves
+    /// `error.CodeBudgetExceeded` from the tracked mapping path.
     /// Called at most once per `local_idx` (`pending[local_idx]` is
     /// cleared right after a successful call) — see the thread-safety
     /// caveat in the design doc: this narrow prototype assumes
@@ -1490,11 +1493,14 @@ pub const LazyJitState = struct {
     /// every other example in this codebase's #859 thread-safety
     /// audit (configure-before-concurrent-use, not safe for
     /// concurrent first-calls to the SAME lazy function).
-    compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) ?LazyCompiledFunc = null,
+    compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) RuntimeError!LazyCompiledFunc = null,
 
     fn free(self: *LazyJitState, allocator: std.mem.Allocator) void {
         for (self.compiled) |maybe| {
-            if (maybe) |c| platform.munmap(@constCast(c.addr), c.size);
+            if (maybe) |c| {
+                platform.munmap(@constCast(c.addr), c.size);
+                JitCodeCache.unregister(c.size);
+            }
         }
         allocator.free(self.pending);
         allocator.free(self.compiled);
@@ -2002,6 +2008,25 @@ pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
 
 // ─── Native execution ───────────────────────────────────────────────────────
 
+/// Map arbitrary machine-code bytes into executable memory and register
+/// the resulting region with `JitCodeCache`, so budget enforcement and
+/// resident-byte accounting cover both eager module text blobs and
+/// deferred lazy-JIT function bodies.
+pub fn mapTrackedExecutableCode(code: []const u8) RuntimeError!LazyCompiledFunc {
+    try JitCodeCache.checkBudget(code.len);
+
+    // #858: `platform.mapExecutableCode` owns the W^X mapping strategy
+    // (plain RW→RX `mprotect` on most targets; `MAP_JIT` +
+    // per-thread `pthread_jit_write_protect_np` toggling on macOS
+    // aarch64, where a post-hoc `mprotect` can't re-grant exec on a
+    // MAP_JIT region) and flushes the instruction cache internally, so
+    // callers no longer need an arch-specific `icacheFlush` branch of
+    // their own.
+    const mapped = platform.mapExecutableCode(code) orelse return error.CodeMappingFailed;
+    JitCodeCache.register(code.len);
+    return .{ .addr = mapped, .size = code.len };
+}
+
 /// Map the module's native code into executable memory.
 /// After this call, `getFuncAddr` returns pointers suitable for execution.
 pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
@@ -2009,27 +2034,11 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     const text_opt = module.text_section;
     const has_text = text_opt != null and text_opt.?.len > 0;
 
-    var mem: [*]u8 = undefined;
     if (has_text) {
         const text = text_opt.?;
-        // #857: check the (optional, default-unlimited) resident-code
-        // budget before doing any mapping work, so a caller gets a
-        // clear typed error instead of the process silently growing
-        // unbounded / eventually OOMing.
-        try JitCodeCache.checkBudget(text.len);
-
-        // #858: `platform.mapExecutableCode` owns the W^X mapping
-        // strategy (plain RW→RX `mprotect` on most targets; `MAP_JIT` +
-        // per-thread `pthread_jit_write_protect_np` toggling on macOS
-        // aarch64, where a post-hoc `mprotect` can't re-grant exec on a
-        // MAP_JIT region) and flushes the instruction cache internally,
-        // so this call site no longer needs an arch-specific
-        // `icacheFlush` branch of its own.
-        mem = platform.mapExecutableCode(text) orelse return error.CodeMappingFailed;
-
-        inst.code_base = mem;
-        inst.code_size = text.len;
-        JitCodeCache.register(text.len);
+        const mapped = try mapTrackedExecutableCode(text);
+        inst.code_base = mapped.addr;
+        inst.code_size = mapped.size;
     }
 
     // Build function pointer table for call_indirect
@@ -2057,9 +2066,10 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     }
     // Local functions → code_base + offset
     if (has_text) {
+        const code_base = inst.code_base orelse unreachable;
         for (0..@min(module.func_count, n_addrs - @min(import_count, n_addrs))) |i| {
             const offset = module.func_offsets[i];
-            func_addrs[import_count + i] = @intFromPtr(mem) + offset;
+            func_addrs[import_count + i] = @intFromPtr(code_base) + offset;
         }
     }
 
@@ -2585,7 +2595,7 @@ pub fn callFuncScalar(
             if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
                 const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
                 const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
-                const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
+                const compiled = try compile_fn(compile_ctx, local_idx);
                 inst.lazy_jit.compiled[local_idx] = compiled;
                 inst.lazy_jit.pending[local_idx] = false;
             }
@@ -3753,7 +3763,7 @@ const minimal_ret_body: []const u8 = switch (native_arch) {
     .unsupported => &[_]u8{},
 };
 
-test "JitCodeCache: mapCodeExecutable/destroy round-trip leaves no residual mapping" {
+test "JitCodeCache: tracked eager code mapping round-trip leaves no residual mapping" {
     if (comptime !can_execute_native) return error.SkipZigTest;
 
     const before = JitCodeCache.residentBytes();
@@ -3775,7 +3785,7 @@ test "JitCodeCache: mapCodeExecutable/destroy round-trip leaves no residual mapp
     try std.testing.expectEqual(before, JitCodeCache.residentBytes());
 }
 
-test "JitCodeCache: repeated compile+run+drop cycles never accumulate residual mappings" {
+test "JitCodeCache: repeated eager mapping cycles never accumulate residual mappings" {
     if (comptime !can_execute_native) return error.SkipZigTest;
 
     const before_count = JitCodeCache.mappingCount();
@@ -3809,7 +3819,7 @@ test "JitCodeCache: repeated compile+run+drop cycles never accumulate residual m
     }
 }
 
-test "JitCodeCache: mapCodeExecutable rejects a mapping that would exceed a configured budget" {
+test "JitCodeCache: tracked eager mapping rejects a configured budget overrun" {
     if (comptime !can_execute_native) return error.SkipZigTest;
 
     // Budget smaller than the minimal function body guarantees rejection

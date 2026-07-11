@@ -19,7 +19,6 @@ const component_loader = @import("loader.zig");
 const aot = @import("aot.zig");
 const core_backend = @import("core_backend.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
-const platform = @import("../platform/platform.zig");
 const core_loader = @import("../runtime/interpreter/loader.zig");
 const frontend = @import("../compiler/frontend.zig");
 const passes = @import("../compiler/ir/passes.zig");
@@ -630,9 +629,9 @@ pub const LazyCompileDriver = struct {
     lazy_out: LazyJitOut,
     allocator: std.mem.Allocator,
 
-    fn compileFn(ctx_opaque: *anyopaque, local_idx: u32) ?aot_runtime.LazyCompiledFunc {
+    fn compileFn(ctx_opaque: *anyopaque, local_idx: u32) aot_runtime.RuntimeError!aot_runtime.LazyCompiledFunc {
         const self: *LazyCompileDriver = @ptrCast(@alignCast(ctx_opaque));
-        if (local_idx >= self.lazy_out.ir_module.functions.items.len) return null;
+        if (local_idx >= self.lazy_out.ir_module.functions.items.len) return error.CodeMappingFailed;
         const func = &self.lazy_out.ir_module.functions.items[local_idx];
         // Real regalloc-based per-function codegen — the SAME entry
         // point `compileModuleCachedWithOptions`'s per-function loop
@@ -648,15 +647,16 @@ pub const LazyCompileDriver = struct {
             self.allocator,
         ) catch |err| {
             std.log.err("lazy-JIT spike: compiling deferred function {d} failed: {s}", .{ local_idx, @errorName(err) });
-            return null;
+            return error.CodeMappingFailed;
         };
         defer self.allocator.free(result.call_patches);
         defer self.allocator.free(result.code);
-        const mapped = platform.mapExecutableCode(result.code) orelse {
-            std.log.err("lazy-JIT spike: mapExecutableCode failed for deferred function {d}", .{local_idx});
-            return null;
+        return aot_runtime.mapTrackedExecutableCode(result.code) catch |err| {
+            if (err != error.CodeBudgetExceeded) {
+                std.log.err("lazy-JIT spike: tracked executable mapping failed for deferred function {d}: {s}", .{ local_idx, @errorName(err) });
+            }
+            return err;
         };
-        return .{ .addr = mapped, .size = result.code.len };
     }
 
     pub fn deinit(self: *LazyCompileDriver) void {
