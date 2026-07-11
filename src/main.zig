@@ -452,10 +452,9 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             defer if (loaded_manifest) |*lm| lm.deinit();
             const manifest_rc = loadComponentManifestOrPrint(init, allocator, "run", path, wasm_data, precompiled_manifest, &loaded_manifest);
             if (manifest_rc != 0) return manifest_rc;
-            const precompiled_cores: []const wamr.component_core_backend.PrecompiledCore =
-                loaded_manifest.?.precompiledCores();
+            const component_core_opts = loaded_manifest.?.instantiationOptions();
 
-            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path, precompiled_cores);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path, component_core_opts);
         }
     }
 
@@ -745,7 +744,7 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
     defer if (loaded_manifest) |*lm| lm.deinit();
     const manifest_rc = loadComponentManifestOrPrint(init, allocator, "serve", path, wasm_data, precompiled_manifest, &loaded_manifest);
     if (manifest_rc != 0) return manifest_rc;
-    const precompiled_cores = loaded_manifest.?.precompiledCores();
+    const component_core_opts = loaded_manifest.?.instantiationOptions();
 
     // Load + parse the TLS cert + key at startup, so a missing file /
     // malformed PEM surfaces before `bind`.
@@ -766,7 +765,7 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
 
     // Default to wasmtime's `127.0.0.1:8080` when `--addr` is omitted.
     const bind_addr = addr orelse (std.Io.net.IpAddress.parse("127.0.0.1", 8080) catch unreachable);
-    return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, bind_addr, effective_log_level, if (tls_config) |*c| c else null, precompiled_cores);
+    return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, bind_addr, effective_log_level, if (tls_config) |*c| c else null, component_core_opts);
 }
 
 fn parseMapDir(spec: []const u8) !MapDir {
@@ -814,10 +813,10 @@ fn parseAddr(spec: []const u8) !std.Io.net.IpAddress {
 /// (explicit `--precompiled-manifest` or an auto-detected sibling
 /// `<stem>.cwasm.json`) or, on a `-Djit=true` build with no manifest
 /// found, an in-process JIT compile of the component (#854). Both
-/// variants expose the same `[]const PrecompiledCore` surface that
-/// `runComponent` / `runHttpComponent` already consume, so callers
-/// downstream of `loadComponentManifestOrPrint` don't need to care
-/// which path produced the cores.
+/// variants expose precompiled cores; the in-memory path may also carry
+/// an internal lazy-JIT attach hook for the instantiated AOT cores
+/// (#889), so callers downstream of `loadComponentManifestOrPrint`
+/// consume backend options rather than raw slices alone.
 const ComponentCoresSource = union(enum) {
     manifest: wamr.component_aot.LoadedManifest,
     in_memory: wamr.component_aot_compile.InMemoryPrecompiled,
@@ -826,6 +825,13 @@ const ComponentCoresSource = union(enum) {
         return switch (self.*) {
             .manifest => |*m| m.precompiledCores(),
             .in_memory => |*im| im.precompiledCores(),
+        };
+    }
+
+    fn instantiationOptions(self: *ComponentCoresSource) wamr.component_core_backend.Options {
+        return switch (self.*) {
+            .manifest => |*m| .{ .precompiled_cores = m.precompiledCores() },
+            .in_memory => |*im| im.instantiationOptions(),
         };
     }
 
@@ -904,6 +910,7 @@ fn loadComponentManifestOrPrint(
                 // compile`'s steady-state-optimized default.
                 const in_mem = wamr.component_aot_compile.precompileComponentInMemory(allocator, wasm_data, .{
                     .pass_preset = jitPassPresetFromEnv(init.environ_map),
+                    .lazy_jit = comptime wamr.config.lazy_jit and builtin.cpu.arch == .x86_64,
                 }) catch |err| {
                     std.debug.print("Error: JIT compile of component '{s}' failed: {s}\n", .{ path, @errorName(err) });
                     return 1;
@@ -1057,7 +1064,7 @@ fn runComponent(
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
     config_store: []const wamr.wasi_cli_adapter.ConfigEntry,
     keyvalue_store_path: ?[]const u8,
-    precompiled_cores: []const wamr.component_core_backend.PrecompiledCore,
+    component_core_opts: wamr.component_core_backend.Options,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     // Wire the adapter's stdio directly to the host process's
@@ -1159,10 +1166,9 @@ fn runComponent(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const outcome = adapter_mod.runComponentBytes(data, arena_alloc, &adapter, .{
-        .precompiled_cores = precompiled_cores,
-        .aot_only = true,
-    }) catch |err| {
+    var instantiation_opts = component_core_opts;
+    instantiation_opts.aot_only = true;
+    const outcome = adapter_mod.runComponentBytes(data, arena_alloc, &adapter, instantiation_opts) catch |err| {
         switch (err) {
             error.NoRunExport => std.debug.print(
                 "Error: component does not expose a top-level `run` export. " ++
@@ -1215,7 +1221,7 @@ fn runHttpComponent(
     listen_address: std.Io.net.IpAddress,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
     tls_config: ?*wamr.wasi_cli_adapter.HttpsTlsConfig,
-    precompiled_cores: []const wamr.component_core_backend.PrecompiledCore,
+    component_core_opts: wamr.component_core_backend.Options,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
@@ -1238,14 +1244,13 @@ fn runHttpComponent(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
+    var instantiation_opts = component_core_opts;
+    instantiation_opts.aot_only = true;
     adapter_mod.serveHttpComponentBytes(data, arena_alloc, &adapter, .{
         .listen_address = listen_address,
         .announce_listening = listen_address.getPort() == 0,
         .tls_config = tls_config,
-    }, .{
-        .precompiled_cores = precompiled_cores,
-        .aot_only = true,
-    }) catch |err| {
+    }, instantiation_opts) catch |err| {
         switch (err) {
             error.NoIncomingHandlerExport => std.debug.print(
                 "Error: component does not export `wasi:http/incoming-handler.handle`.\n",

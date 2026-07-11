@@ -2233,19 +2233,43 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 /// The code must have been mapped via `mapCodeExecutable` first.
 ///
 /// Uses comptime to select the correct function pointer type based on `Result`.
+fn resolveLazyFuncAddr(inst: *AotInstance, func_idx: u32) RuntimeError!?[*]const u8 {
+    if (comptime !config.lazy_jit) return null;
+
+    const import_count = inst.module.import_function_count;
+    if (func_idx < import_count) return null;
+
+    const local_idx = func_idx - import_count;
+    if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
+        const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
+        const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
+        const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
+        inst.lazy_jit.compiled[local_idx] = compiled;
+        inst.lazy_jit.pending[local_idx] = false;
+    }
+    if (local_idx < inst.lazy_jit.compiled.len) {
+        if (inst.lazy_jit.compiled[local_idx]) |c| return c.addr;
+    }
+    return null;
+}
+
 pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
 
-    if (inst.code_base == null) return error.CodeMappingFailed;
-    const addr = getFuncAddr(inst, func_idx) orelse blk: {
-        // Import functions have no native code in this module, but
-        // their funcptrs slot may have been patched with the exporter's
-        // native code pointer (cross-module import wiring). Use that.
-        if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
-            break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
-        else
-            return error.FunctionNotFound;
-    };
+    const lazy_resolved_addr = try resolveLazyFuncAddr(inst, func_idx);
+    if (lazy_resolved_addr == null and inst.code_base == null) return error.CodeMappingFailed;
+    const addr = if (lazy_resolved_addr) |a|
+        a
+    else
+        getFuncAddr(inst, func_idx) orelse blk: {
+            // Import functions have no native code in this module, but
+            // their funcptrs slot may have been patched with the exporter's
+            // native code pointer (cross-module import wiring). Use that.
+            if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
+                break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
+            else
+                return error.FunctionNotFound;
+        };
 
     const previous_globals_ptr = inst.vmctx.globals_ptr;
     // Host imports may re-enter the same AOT instance (notably cabi_realloc).
@@ -2577,24 +2601,7 @@ pub fn callFuncScalar(
     // module where EVERY function is lazy-eligible (e.g. this spike's
     // own test fixture) never maps any code up front, so `code_base`
     // legitimately stays null until the first lazy compile.
-    var lazy_resolved_addr: ?[*]const u8 = null;
-    if (comptime config.lazy_jit) {
-        const import_count = inst.module.import_function_count;
-        if (func_idx >= import_count) {
-            const local_idx = func_idx - import_count;
-            if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
-                const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
-                const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
-                const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
-                inst.lazy_jit.compiled[local_idx] = compiled;
-                inst.lazy_jit.pending[local_idx] = false;
-            }
-            if (local_idx < inst.lazy_jit.compiled.len) {
-                if (inst.lazy_jit.compiled[local_idx]) |c| lazy_resolved_addr = c.addr;
-            }
-        }
-    }
-
+    const lazy_resolved_addr = try resolveLazyFuncAddr(inst, func_idx);
     if (lazy_resolved_addr == null and inst.code_base == null) return error.CodeMappingFailed;
 
     const addr = blk_addr: {

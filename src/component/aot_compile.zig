@@ -157,6 +157,12 @@ pub const LazyJitOut = struct {
     lazy_local_indices: []const u32 = &.{},
 };
 
+fn deinitLazyJitOut(allocator: std.mem.Allocator, lazy_out: LazyJitOut) void {
+    var out = lazy_out;
+    out.ir_module.deinit();
+    allocator.free(out.lazy_local_indices);
+}
+
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
 pub const CompileCacheCtx = struct {
     /// Optional prior cache to consult for per-function reuse.
@@ -680,8 +686,10 @@ pub fn setupLazyJit(
     allocator: std.mem.Allocator,
 ) !*LazyCompileDriver {
     const driver = try allocator.create(LazyCompileDriver);
-    errdefer allocator.destroy(driver);
     driver.* = .{ .lazy_out = lazy_out, .allocator = allocator };
+    errdefer {
+        driver.deinit();
+    }
 
     const func_count = lazy_out.ir_module.functions.items.len;
     const pending = try allocator.alloc(bool, func_count);
@@ -980,6 +988,15 @@ pub const InMemoryPrecompiled = struct {
     /// One owned `.cwasm` buffer per compiled core, in the same order
     /// as `pcs`. Freed by `deinit`.
     cwasm_buffers: []const []u8,
+    /// When `precompileComponentInMemory(..., .{ .lazy_jit = true })`
+    /// is used on a `-Dlazy_jit=true` build, each compiled core also
+    /// carries a consume-once lazy sidecar in the same order as
+    /// `pcs`. `instantiationOptions()` installs a type-erased attach
+    /// hook that consumes the matching entry on the first AOT
+    /// instantiation of that core; any sidecars never consumed (e.g.
+    /// interpreter fallback) are freed by `deinit`.
+    lazy_sidecars: []?LazyJitOut = &.{},
+    lazy_jit_enabled: bool = false,
     /// Ready to pass as `Options.precompiled_cores`. Borrows from
     /// `cwasm_buffers` (bytes) and the caller's `component_bytes`
     /// (`core_wasm`); valid for the lifetime of this struct.
@@ -990,12 +1007,71 @@ pub const InMemoryPrecompiled = struct {
         return self.pcs;
     }
 
+    pub fn instantiationOptions(self: *InMemoryPrecompiled) core_backend.Options {
+        var opts: core_backend.Options = .{ .precompiled_cores = self.pcs };
+        if (comptime config.lazy_jit) {
+            if (self.lazy_jit_enabled) {
+                opts.lazy_jit_attach = .{
+                    .ctx = self,
+                    .attach_fn = &attachLazyJitOpaque,
+                };
+            }
+        }
+        return opts;
+    }
+
     pub fn deinit(self: *InMemoryPrecompiled) void {
+        for (self.lazy_sidecars) |maybe_out| {
+            if (maybe_out) |out| deinitLazyJitOut(self.allocator, out);
+        }
+        if (self.lazy_sidecars.len > 0) self.allocator.free(self.lazy_sidecars);
         for (self.cwasm_buffers) |buf| self.allocator.free(buf);
         self.allocator.free(self.cwasm_buffers);
         self.allocator.free(self.pcs);
     }
+
+    fn indexOfPrecompiled(
+        self: *const InMemoryPrecompiled,
+        precompiled: *const core_backend.PrecompiledCore,
+    ) ?usize {
+        for (self.pcs, 0..) |*pc, idx| {
+            if (pc == precompiled) return idx;
+        }
+        return null;
+    }
+
+    fn attachLazyJit(
+        self: *InMemoryPrecompiled,
+        precompiled: *const core_backend.PrecompiledCore,
+        inst: *aot_runtime.AotInstance,
+        allocator: std.mem.Allocator,
+    ) core_backend.LazyJitAttachError!?core_backend.LazyJitHandle {
+        if (!self.lazy_jit_enabled) return null;
+        const idx = self.indexOfPrecompiled(precompiled) orelse return error.LazyJitSidecarUnavailable;
+        const lazy_out = self.lazy_sidecars[idx] orelse return error.LazyJitSidecarUnavailable;
+        const driver = try setupLazyJit(inst, lazy_out, allocator);
+        self.lazy_sidecars[idx] = null;
+        return .{
+            .ctx = driver,
+            .deinit_fn = &deinitLazyDriverOpaque,
+        };
+    }
 };
+
+fn deinitLazyDriverOpaque(ctx: *anyopaque) void {
+    const driver: *LazyCompileDriver = @ptrCast(@alignCast(ctx));
+    driver.deinit();
+}
+
+fn attachLazyJitOpaque(
+    ctx: *anyopaque,
+    precompiled: *const core_backend.PrecompiledCore,
+    inst: *aot_runtime.AotInstance,
+    allocator: std.mem.Allocator,
+) core_backend.LazyJitAttachError!?core_backend.LazyJitHandle {
+    const self: *InMemoryPrecompiled = @ptrCast(@alignCast(ctx));
+    return self.attachLazyJit(precompiled, inst, allocator);
+}
 
 pub fn precompileComponentInMemory(
     allocator: std.mem.Allocator,
@@ -1043,6 +1119,17 @@ pub fn precompileComponentInMemory(
     }
     const pcs = allocator.alloc(core_backend.PrecompiledCore, n) catch return error.OutOfMemory;
     errdefer allocator.free(pcs);
+    const lazy_sidecars: []?LazyJitOut = if (opts.lazy_jit)
+        allocator.alloc(?LazyJitOut, n) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer {
+        for (lazy_sidecars) |maybe_out| {
+            if (maybe_out) |out| deinitLazyJitOut(allocator, out);
+        }
+        if (lazy_sidecars.len > 0) allocator.free(lazy_sidecars);
+    }
+    if (lazy_sidecars.len > 0) @memset(lazy_sidecars, null);
 
     for (core_data_list.items, 0..) |core_ref, idx| {
         // Override opts.module_idx per core so `:mod=N` bisect
@@ -1050,12 +1137,25 @@ pub fn precompileComponentInMemory(
         var per_core_opts = opts;
         per_core_opts.module_idx = @intCast(idx);
 
-        const cwasm = compileCoreWasm(allocator, core_ref.data, per_core_opts) catch |err| {
-            std.log.err("precompileComponentInMemory: core {d} compile failed: {s}", .{ idx, @errorName(err) });
-            return err;
+        var lazy_out: LazyJitOut = .{};
+        const cwasm = blk: {
+            const compiled = if (opts.lazy_jit)
+                compileCoreWasmCached(
+                    allocator,
+                    core_ref.data,
+                    per_core_opts,
+                    .{ .lazy_jit_out = &lazy_out },
+                )
+            else
+                compileCoreWasm(allocator, core_ref.data, per_core_opts);
+            break :blk compiled catch |err| {
+                std.log.err("precompileComponentInMemory: core {d} compile failed: {s}", .{ idx, @errorName(err) });
+                return err;
+            };
         };
         cwasm_buffers[idx] = cwasm;
         built += 1;
+        if (opts.lazy_jit) lazy_sidecars[idx] = lazy_out;
         pcs[idx] = .{
             .module_idx = core_ref.local_idx,
             .cwasm_bytes = cwasm,
@@ -1063,5 +1163,11 @@ pub fn precompileComponentInMemory(
         };
     }
 
-    return .{ .cwasm_buffers = cwasm_buffers, .pcs = pcs, .allocator = allocator };
+    return .{
+        .cwasm_buffers = cwasm_buffers,
+        .lazy_sidecars = lazy_sidecars,
+        .lazy_jit_enabled = opts.lazy_jit,
+        .pcs = pcs,
+        .allocator = allocator,
+    };
 }

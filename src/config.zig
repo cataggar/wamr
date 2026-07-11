@@ -110,8 +110,9 @@ pub const jit = if (aot) opt("jit", false) else false;
 
 /// Enable lazy, per-function on-demand compilation on top of `jit`: compile
 /// a function only on its first call instead of the whole module up front.
-/// Requires `jit`. Not yet implemented — see the design spike tracked in
-/// issue #862.
+/// Requires `jit`. Currently implemented for the x86_64 design-spike path
+/// tracked in issue #862 and threaded through in-memory component precompile
+/// in issue #889.
 pub const lazy_jit = if (jit) opt("lazy_jit", false) else false;
 
 /// Enable the lightweight fast JIT backend.
