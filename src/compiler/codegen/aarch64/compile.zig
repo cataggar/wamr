@@ -578,6 +578,17 @@ pub const CompileOptions = struct {
     /// Component core/module index, used only to match the
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter.
     module_idx: u32 = 0,
+    /// #862/#879 lazy-JIT spike: indexed by LOCAL function index (same
+    /// indexing as `ir_module.functions.items`), mirroring x86_64's
+    /// field of the same name (`x86_64/compile.zig`'s `CompileOptions`).
+    /// When `lazy_skip[fi]` is true, `compileModuleCachedWithOptions`
+    /// emits a zero-byte placeholder for that function instead of
+    /// compiling it — safe ONLY because `lazy_jit.findLazyEligibleLeaves`
+    /// guarantees skipped functions are leaf (no outgoing calls to
+    /// patch) and never a direct call target (no inter-function call
+    /// patch will ever reference their offset). Empty by default —
+    /// zero behavior change for every existing caller.
+    lazy_skip: []const bool = &.{},
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -751,6 +762,54 @@ pub fn compileFunctionWithOptions(
     options: CompileOptions,
 ) ![]u8 {
     return compileFunctionImpl(func, .{ .allocator = allocator, .options = options }, allocator);
+}
+
+/// #862/#879 lazy-JIT design-spike: public per-function entry point
+/// matching the SAME real regalloc-based codegen `compileModuleCachedWithOptions`
+/// uses (unlike the naive standalone `compileFunction` above — that one
+/// is test-friendly but rejects any `.call`, and doesn't know about the
+/// module's real `import_count`/globals/func-type tables). Used by
+/// `component_aot_compile.LazyCompileDriver` to compile a single
+/// deferred leaf function on demand, matching what it would have
+/// gotten had it been compiled eagerly in the module loop. Mirrors
+/// `x86_64/compile.zig`'s `compileFunctionRAWithGlobalOffsetsPublic` /
+/// `FuncCompileResult`.
+pub const FuncCompileResult = struct {
+    code: []u8,
+    call_patches: []CallPatch,
+};
+
+pub fn compileFunctionForLazyJit(
+    func: *const ir.IrFunction,
+    import_count: u32,
+    global_types: []const ir.IrType,
+    global_offsets: []const u32,
+    func_types: []const ir.IrFuncType,
+    func_type_indices: []const u32,
+    func_idx: u32,
+    allocator: std.mem.Allocator,
+) !FuncCompileResult {
+    var call_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
+    defer call_patches.deinit(allocator);
+    const ctx: FuncCompileCtx = .{
+        .import_count = import_count,
+        .call_patches = &call_patches,
+        .global_types = global_types,
+        .global_offsets = global_offsets,
+        .func_types = func_types,
+        .func_type_indices = func_type_indices,
+        .func_idx = func_idx,
+        .allocator = allocator,
+    };
+    const code = try compileFunctionImpl(func, ctx, allocator);
+    errdefer allocator.free(code);
+    // Leaf-only invariant (`lazy_jit.findLazyEligibleLeaves`) means
+    // `call_patches` should always come back empty here, but this
+    // still duplicates it into an owned, allocator-freeable slice
+    // rather than assuming that -- consistent with x86_64's identical
+    // "safe to ignore, but still owned" handling in `LazyCompileDriver`.
+    const patches = try allocator.dupe(CallPatch, call_patches.items);
+    return .{ .code = code, .call_patches = patches };
 }
 
 fn isSupportedV128Def(inst: ir.Inst) bool {
@@ -8686,6 +8745,21 @@ pub fn compileModuleCachedWithOptions(
     for (ir_module.functions.items, 0..) |func, fi| {
         const func_base: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_base);
+
+        // #862/#879 lazy-JIT spike: emit nothing for lazy-eligible
+        // functions — mirrors x86_64/compile.zig's identical block.
+        // Safe only under the invariants `lazy_jit.findLazyEligibleLeaves`
+        // establishes (leaf, never a direct call target) — see that
+        // function's doc comment and docs/design/lazy-jit-spike.md.
+        if (fi < options.lazy_skip.len and options.lazy_skip[fi]) {
+            cache_funcs[fi] = .{
+                .ir_sha256 = codegen_cache.hashFunction(&func),
+                .code = try allocator.dupe(u8, &.{}),
+                .call_patches = try allocator.dupe(codegen_cache.FuncCallPatch, &.{}),
+            };
+            cache_init += 1;
+            continue;
+        }
 
         var hash_ns: u64 = 0;
         const ir_sha = blk: {

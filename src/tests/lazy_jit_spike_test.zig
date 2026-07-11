@@ -30,7 +30,11 @@ const aot_loader_mod = wamr.aot_loader;
 const aot_runtime_mod = wamr.aot_runtime;
 
 const can_exec_aot = switch (builtin.cpu.arch) {
-    .x86_64 => true, // #862 spike: x86_64 only, see docs/design/lazy-jit-spike.md
+    // #879 ported the #862 spike's lazy_skip codegen-level plumbing to
+    // aarch64 too (see docs/design/lazy-jit-spike.md's updated Scope
+    // section) -- both native backends this runtime can execute AOT
+    // code for now run these tests.
+    .x86_64, .aarch64 => true,
     else => false,
 };
 
