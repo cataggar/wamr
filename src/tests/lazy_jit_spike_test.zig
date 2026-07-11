@@ -114,10 +114,18 @@ test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on 
 
     const inst = try aot_runtime_mod.instantiate(&module, gpa);
     defer aot_runtime_mod.destroy(inst);
-    try aot_runtime_mod.mapCodeExecutable(inst);
 
+    // #879 M4.6 phase 2: setupLazyJit must run BEFORE mapCodeExecutable
+    // so any table/ref.func-reachable deferred function's trampoline
+    // address is ready in time to be installed into func_addrs -- see
+    // setupLazyJit's doc comment. This fixture has none (no element
+    // segments, nothing calls ref.func), so the ordering doesn't
+    // change this particular test's outcome, but keeping every call
+    // site consistent with the documented contract avoids this being
+    // the one example that silently still works by accident.
     const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
     defer driver.deinit();
+    try aot_runtime_mod.mapCodeExecutable(inst);
 
     // Every function starts pending.
     try std.testing.expect(inst.lazy_jit.pending[0]);
@@ -212,6 +220,7 @@ test "#862 lazy-JIT spike: skipping 199/200 unused leaf functions measurably red
     const lazy_ns = nowNs() - lazy_start;
     defer lazy_out.ir_module.deinit();
     defer gpa.free(lazy_out.lazy_local_indices);
+    defer gpa.free(lazy_out.needs_trampoline_indices);
 
     std.debug.print(
         "[#862] 200-leaf-fn module compileCoreWasmCached: eager={d}us lazy={d}us ({d} functions deferred)\n",
@@ -223,4 +232,184 @@ test "#862 lazy-JIT spike: skipping 199/200 unused leaf functions measurably red
     // pattern/rationale): skipping codegen for 200 functions must not be
     // slower than compiling all of them.
     try std.testing.expect(lazy_ns <= eager_ns);
+}
+
+// #879 M4.6 phase 2: a leaf, never-directly-called function placed in
+// a table by an active element segment, called only through
+// call_indirect from a second (eagerly-compiled, non-leaf) function.
+// Generated via: wasm-tools parse lazy_call_indirect.wat -o lazy_call_indirect_fixture.wasm
+//   (module
+//     (type $unary (func (param i32) (result i32)))
+//     (table 1 1 funcref)
+//     (elem (i32.const 0) func $add1)
+//     (func $add1 (param i32) (result i32)
+//       local.get 0 i32.const 1 i32.add)
+//     (func $caller (export "caller") (param i32 i32) (result i32)
+//       local.get 1 local.get 0 call_indirect (type $unary)))
+const lazy_call_indirect_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x0c, 0x02, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x03,
+    0x02, 0x00, 0x01, 0x04, 0x05, 0x01, 0x70, 0x01,
+    0x01, 0x01, 0x07, 0x0a, 0x01, 0x06, 0x63, 0x61,
+    0x6c, 0x6c, 0x65, 0x72, 0x00, 0x01, 0x09, 0x07,
+    0x01, 0x00, 0x41, 0x00, 0x0b, 0x01, 0x00, 0x0a,
+    0x13, 0x02, 0x07, 0x00, 0x20, 0x00, 0x41, 0x01,
+    0x6a, 0x0b, 0x09, 0x00, 0x20, 0x01, 0x20, 0x00,
+    0x11, 0x00, 0x00, 0x0b, 0x00, 0x20, 0x04, 0x6e,
+    0x61, 0x6d, 0x65, 0x01, 0x0f, 0x02, 0x00, 0x04,
+    0x61, 0x64, 0x64, 0x31, 0x01, 0x06, 0x63, 0x61,
+    0x6c, 0x6c, 0x65, 0x72, 0x04, 0x08, 0x01, 0x00,
+    0x05, 0x75, 0x6e, 0x61, 0x72, 0x79,
+};
+
+test "#879 M4.6 phase 2: call_indirect to a still-pending lazy function compiles it on demand via a native trampoline" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    var lazy_out: component_aot_compile.LazyJitOut = .{};
+    const cwasm = try component_aot_compile.compileCoreWasmCached(
+        gpa,
+        &lazy_call_indirect_wasm,
+        .{ .lazy_jit = true },
+        .{ .lazy_jit_out = &lazy_out },
+    );
+    defer gpa.free(cwasm);
+
+    // add1 (local index 0) is leaf and never a *direct* call target,
+    // but IS placed in the table -- eligible, and needs a trampoline
+    // (unlike every other fixture in this file). caller (local index
+    // 1) contains call_indirect, so it's not a leaf and is compiled
+    // eagerly as usual.
+    try std.testing.expectEqual(@as(usize, 1), lazy_out.lazy_local_indices.len);
+    try std.testing.expectEqual(@as(u32, 0), lazy_out.lazy_local_indices[0]);
+    try std.testing.expectEqual(@as(usize, 1), lazy_out.needs_trampoline_indices.len);
+    try std.testing.expectEqual(@as(u32, 0), lazy_out.needs_trampoline_indices[0]);
+
+    var module = try aot_loader_mod.load(cwasm, gpa);
+    defer aot_loader_mod.unload(&module, gpa);
+
+    const inst = try aot_runtime_mod.instantiate(&module, gpa);
+    defer aot_runtime_mod.destroy(inst);
+
+    // Order matters -- see setupLazyJit's doc comment: it must run
+    // before mapCodeExecutable so add1's trampoline address is ready
+    // in time to be installed into the table.
+    const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
+    defer driver.deinit();
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    try std.testing.expect(inst.lazy_jit.pending[0]); // add1 still pending
+
+    const caller_idx = aot_runtime_mod.findExportFunc(inst, "caller") orelse return error.ExportNotFound;
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+
+    // caller(idx=0, x=41): call_indirect through table[0] -- add1's
+    // trampoline -- must compile add1 on demand and return 41+1=42.
+    const results = try aot_runtime_mod.callFuncScalar(
+        inst,
+        caller_idx,
+        &.{ .i32, .i32 },
+        &.{.i32},
+        &.{ .{ .i32 = 0 }, .{ .i32 = 41 } },
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 42), results[0].i32);
+
+    // add1 must now be resolved -- proving the call_indirect actually
+    // went through the trampoline and triggered on-demand compilation,
+    // not that this test is vacuously passing some other way.
+    try std.testing.expect(!inst.lazy_jit.pending[0]);
+
+    // A second call_indirect must reuse the already-compiled code
+    // (the trampoline's own first call already patched func_addrs, so
+    // this call doesn't even reach the trampoline anymore) and still
+    // return the correct result.
+    const results2 = try aot_runtime_mod.callFuncScalar(
+        inst,
+        caller_idx,
+        &.{ .i32, .i32 },
+        &.{.i32},
+        &.{ .{ .i32 = 0 }, .{ .i32 = 99 } },
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 100), results2[0].i32);
+}
+
+// #879 M4.6 phase 2: a leaf, never-directly-called, never-tabled
+// function reachable only via `ref.func` + `call_ref`. Needs a
+// declarative element segment naming `$add1` -- wasm validation
+// requires any `ref.func`-referenced function to be "declared"
+// somewhere (an active/passive/declarative element segment all
+// count); a declarative one contributes nothing to any live table.
+// Generated via: wasm-tools parse lazy_call_ref.wat -o lazy_call_ref_fixture.wasm
+//   (module
+//     (type $unary (func (param i32) (result i32)))
+//     (elem declare func $add1)
+//     (func $add1 (param i32) (result i32)
+//       local.get 0 i32.const 1 i32.add)
+//     (func $caller (export "caller") (param i32) (result i32)
+//       local.get 0 ref.func $add1 call_ref $unary))
+const lazy_call_ref_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x03, 0x02, 0x00, 0x00, 0x07, 0x0a, 0x01,
+    0x06, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x72, 0x00,
+    0x01, 0x09, 0x05, 0x01, 0x03, 0x00, 0x01, 0x00,
+    0x0a, 0x12, 0x02, 0x07, 0x00, 0x20, 0x00, 0x41,
+    0x01, 0x6a, 0x0b, 0x08, 0x00, 0x20, 0x00, 0xd2,
+    0x00, 0x14, 0x00, 0x0b, 0x00, 0x20, 0x04, 0x6e,
+    0x61, 0x6d, 0x65, 0x01, 0x0f, 0x02, 0x00, 0x04,
+    0x61, 0x64, 0x64, 0x31, 0x01, 0x06, 0x63, 0x61,
+    0x6c, 0x6c, 0x65, 0x72, 0x04, 0x08, 0x01, 0x00,
+    0x05, 0x75, 0x6e, 0x61, 0x72, 0x79,
+};
+
+test "#879 M4.6 phase 2: ref.func + call_ref to a still-pending lazy function compiles it on demand via a native trampoline" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    var lazy_out: component_aot_compile.LazyJitOut = .{};
+    const cwasm = try component_aot_compile.compileCoreWasmCached(
+        gpa,
+        &lazy_call_ref_wasm,
+        .{ .lazy_jit = true },
+        .{ .lazy_jit_out = &lazy_out },
+    );
+    defer gpa.free(cwasm);
+
+    try std.testing.expectEqual(@as(usize, 1), lazy_out.lazy_local_indices.len);
+    try std.testing.expectEqual(@as(u32, 0), lazy_out.lazy_local_indices[0]);
+    try std.testing.expectEqual(@as(usize, 1), lazy_out.needs_trampoline_indices.len);
+    try std.testing.expectEqual(@as(u32, 0), lazy_out.needs_trampoline_indices[0]);
+
+    var module = try aot_loader_mod.load(cwasm, gpa);
+    defer aot_loader_mod.unload(&module, gpa);
+
+    const inst = try aot_runtime_mod.instantiate(&module, gpa);
+    defer aot_runtime_mod.destroy(inst);
+
+    const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
+    defer driver.deinit();
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    try std.testing.expect(inst.lazy_jit.pending[0]); // add1 still pending
+
+    const caller_idx = aot_runtime_mod.findExportFunc(inst, "caller") orelse return error.ExportNotFound;
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+
+    const results = try aot_runtime_mod.callFuncScalar(
+        inst,
+        caller_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = 41 }},
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 42), results[0].i32);
+    try std.testing.expect(!inst.lazy_jit.pending[0]);
 }

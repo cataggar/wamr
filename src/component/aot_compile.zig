@@ -20,6 +20,7 @@ const aot = @import("aot.zig");
 const core_backend = @import("core_backend.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
 const platform = @import("../platform/platform.zig");
+const lazy_call_trampoline = @import("../runtime/aot/lazy_call_trampoline.zig");
 const core_loader = @import("../runtime/interpreter/loader.zig");
 const frontend = @import("../compiler/frontend.zig");
 const passes = @import("../compiler/ir/passes.zig");
@@ -125,13 +126,16 @@ pub const PrecompileOptions = struct {
     verify_mode: verifier.VerifyMode = if (std.debug.runtime_safety) .after_each_pass else .off,
     /// #862 lazy-JIT design-spike opt-in. When true (and only ever
     /// meaningful under `config.lazy_jit`), `compileCoreWasmCached`
-    /// computes the leaf-function eligibility set
-    /// (`lazy_jit.findLazyEligibleLeaves`) and skips codegen for
-    /// eligible functions, deferring their compilation until first
-    /// call (see `AotInstance`'s lazy-compile hook in `runtime.zig`
-    /// and `docs/design/lazy-jit-spike.md`). Requires
-    /// `cache_ctx.lazy_jit_out` to be set so the retained IR survives
-    /// past this call — see `compileCoreWasmCached`'s doc comment.
+    /// computes the lazy-eligibility set
+    /// (`lazy_jit.findLazyEligibleWithTrampoline`, #879 M4.6 phase 2 —
+    /// a superset of the original spike's `findLazyEligibleLeaves`,
+    /// now also admitting functions reachable via `call_indirect`/
+    /// `ref.func`) and skips codegen for eligible functions, deferring
+    /// their compilation until first call (see `AotInstance`'s
+    /// lazy-compile hook in `runtime.zig` and
+    /// `docs/design/lazy-jit-spike.md`). Requires `cache_ctx.lazy_jit_out`
+    /// to be set so the retained IR survives past this call — see
+    /// `compileCoreWasmCached`'s doc comment.
     /// x86_64 only for this narrow prototype; `target_arch == .aarch64`
     /// with `lazy_jit = true` returns `error.CoreCompileFailed`.
     lazy_jit: bool = false,
@@ -155,6 +159,14 @@ pub const LazyJitOut = struct {
     /// that were skipped during this compile. Caller-owned; free with
     /// the allocator passed to `compileCoreWasmCached`.
     lazy_local_indices: []const u32 = &.{},
+    /// #879 M4.6 phase 2: the subset of `lazy_local_indices` that are
+    /// reachable via `call_indirect`/`ref.func` (see
+    /// `lazy_jit.findLazyEligibleWithTrampoline`'s `needs_trampoline`
+    /// output) and therefore need a real native trampoline installed
+    /// at `func_addrs[i]`/their table slot — see `setupLazyJit`.
+    /// Caller-owned; free with the allocator passed to
+    /// `compileCoreWasmCached`.
+    needs_trampoline_indices: []const u32 = &.{},
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -222,17 +234,25 @@ pub fn compileCoreWasmCached(
     var keep_ir_module_for_lazy_jit = false;
     defer if (!keep_ir_module_for_lazy_jit) ir_module.deinit();
 
-    // #862 lazy-JIT spike: compute the leaf-eligibility set BEFORE
+    // #862/#879 lazy-JIT spike: compute the eligibility set BEFORE
     // codegen so it can be threaded into the x86_64 backend's
     // `lazy_skip`. Requires `cache_ctx.lazy_jit_out` — see
     // `PrecompileOptions.lazy_jit`'s doc comment for why.
+    // `findLazyEligibleWithTrampoline` (#879 M4.6 phase 2) additionally
+    // reports which eligible functions need a native trampoline
+    // installed (call_indirect/ref.func-reachable ones) — see
+    // `needs_trampoline` below.
     var lazy_skip: []bool = &.{};
     defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
+    var needs_trampoline: []bool = &.{};
+    defer if (needs_trampoline.len > 0) allocator.free(needs_trampoline);
     if (opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
         if (opts.target_arch != .x86_64) return error.CoreCompileFailed;
-        lazy_skip = lazy_jit.findLazyEligibleLeaves(&module, &ir_module, allocator) catch
+        const eligibility = lazy_jit.findLazyEligibleWithTrampoline(&module, &ir_module, allocator) catch
             return error.CoreCompileFailed;
+        lazy_skip = eligibility.eligible;
+        needs_trampoline = eligibility.needs_trampoline;
     }
 
     if (opts.optimize) {
@@ -594,21 +614,27 @@ pub fn compileCoreWasmCached(
         fn_name_entries,
     ) catch return error.CoreCompileFailed;
 
-    // #862 lazy-JIT spike: hand the retained IR + deferred-function
+    // #862/#879 lazy-JIT spike: hand the retained IR + deferred-function
     // index list back to the caller instead of freeing it, so the
     // functions in `lazy_skip` can be compiled on demand later. Convert
-    // the dense `lazy_skip: []bool` into a compact index list here so
-    // the caller doesn't need to re-derive it.
+    // the dense `lazy_skip`/`needs_trampoline` bool arrays into compact
+    // index lists here so the caller doesn't need to re-derive them.
     if (opts.lazy_jit) {
         var indices: std.ArrayList(u32) = .empty;
         errdefer indices.deinit(allocator);
         for (lazy_skip, 0..) |skip, idx| {
             if (skip) indices.append(allocator, @intCast(idx)) catch return error.CoreCompileFailed;
         }
+        var trampoline_indices: std.ArrayList(u32) = .empty;
+        errdefer trampoline_indices.deinit(allocator);
+        for (needs_trampoline, 0..) |needs, idx| {
+            if (needs) trampoline_indices.append(allocator, @intCast(idx)) catch return error.CoreCompileFailed;
+        }
         const out = cache_ctx.lazy_jit_out orelse unreachable; // checked above
         out.* = .{
             .ir_module = ir_module,
             .lazy_local_indices = indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
+            .needs_trampoline_indices = trampoline_indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
         };
         keep_ir_module_for_lazy_jit = true;
     }
@@ -629,6 +655,11 @@ pub fn compileCoreWasmCached(
 pub const LazyCompileDriver = struct {
     lazy_out: LazyJitOut,
     allocator: std.mem.Allocator,
+    /// #879 M4.6 phase 2: owns every trampoline stub allocated for
+    /// `lazy_out.needs_trampoline_indices`. `null` when that list is
+    /// empty (no table/ref.func-reachable deferred functions in this
+    /// compile) — no pool is ever allocated in that case.
+    trampoline_pool: ?lazy_call_trampoline.LazyCallTrampolinePool = null,
 
     fn compileFn(ctx_opaque: *anyopaque, local_idx: u32) ?aot_runtime.LazyCompiledFunc {
         const self: *LazyCompileDriver = @ptrCast(@alignCast(ctx_opaque));
@@ -639,7 +670,7 @@ pub const LazyCompileDriver = struct {
         // uses, not the naive standalone `compileFunction` (a
         // different, simpler stack-machine codegen kept for other
         // purposes). Leaf functions never populate `call_patches`
-        // (nothing to patch — see `lazy_jit.findLazyEligibleLeaves`'s
+        // (nothing to patch — see `lazy_jit.findLazyEligibleWithTrampoline`'s
         // eligibility contract), so it's safe to ignore here.
         const result = x86_64_compile.compileFunctionRAWithGlobalOffsetsPublic(
             func,
@@ -663,6 +694,8 @@ pub const LazyCompileDriver = struct {
         var out = self.lazy_out;
         out.ir_module.deinit();
         self.allocator.free(out.lazy_local_indices);
+        self.allocator.free(out.needs_trampoline_indices);
+        if (self.trampoline_pool) |*pool| pool.deinit();
         self.allocator.destroy(self);
     }
 };
@@ -674,6 +707,16 @@ pub const LazyCompileDriver = struct {
 /// contract. `inst` must have been produced from the SAME compile (its
 /// `.cwasm` bytes came from the same `compileCoreWasmCached` call whose
 /// `lazy_jit_out` is `lazy_out`) — indices are meaningless otherwise.
+///
+/// #879 M4.6 phase 2: MUST be called BEFORE `aot_runtime.mapCodeExecutable(inst)`
+/// (a change from the original #862 spike's ordering). This function
+/// pre-allocates a native trampoline for every index in
+/// `lazy_out.needs_trampoline_indices` and records each one's address
+/// on `inst.lazy_jit.trampoline_addrs`; `mapCodeExecutable` reads that
+/// array while building `func_addrs` so those functions get a
+/// genuinely callable address instead of the (otherwise harmlessly
+/// unreachable, but no longer safe to leave that way) offset a
+/// zero-byte deferred-function placeholder aliases.
 pub fn setupLazyJit(
     inst: *aot_runtime.AotInstance,
     lazy_out: LazyJitOut,
@@ -694,12 +737,32 @@ pub fn setupLazyJit(
         if (idx < pending.len) pending[idx] = true;
     }
 
+    const trampoline_addrs = try allocator.alloc(?usize, func_count);
+    errdefer allocator.free(trampoline_addrs);
+    @memset(trampoline_addrs, null);
+
     inst.lazy_jit = .{
         .pending = pending,
         .compiled = compiled,
         .compile_ctx = driver,
         .compile_fn = &LazyCompileDriver.compileFn,
+        .trampoline_addrs = trampoline_addrs,
     };
+
+    if (lazy_out.needs_trampoline_indices.len > 0) {
+        var pool = try lazy_call_trampoline.LazyCallTrampolinePool.initWithCap(
+            allocator,
+            @intCast(lazy_out.needs_trampoline_indices.len),
+        );
+        errdefer pool.deinit();
+        for (lazy_out.needs_trampoline_indices) |idx| {
+            if (idx >= trampoline_addrs.len) continue;
+            const stub = try pool.allocSlot(inst, idx, &aot_runtime.LazyJitState.trampolineDispatch);
+            trampoline_addrs[idx] = @intFromPtr(stub);
+        }
+        driver.trampoline_pool = pool;
+    }
+
     return driver;
 }
 

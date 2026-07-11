@@ -8,9 +8,10 @@
 //!
 //! A function is lazy-eligible only if ALL of the following hold:
 //!
-//!  1. **Leaf**: its own IR contains no `.call` or `.call_indirect`
-//!     instruction (so deferring its compilation never blocks on some
-//!     *other* not-yet-compiled function it would need to call).
+//!  1. **Leaf**: its own IR contains no `.call`, `.call_indirect`, or
+//!     `.call_ref` instruction (so deferring its compilation never
+//!     blocks on some *other* not-yet-compiled function it would need
+//!     to call).
 //!  2. **Never a direct call target**: no other function's IR contains
 //!     a `.call` whose `func_idx` names this function. Direct calls are
 //!     resolved via a compile-time relative-branch patch computed from
@@ -85,7 +86,7 @@ pub fn findLazyEligibleLeaves(
         outer: for (func.blocks.items) |block| {
             for (block.instructions.items) |inst| {
                 switch (inst.op) {
-                    .call, .call_indirect => {
+                    .call, .call_indirect, .call_ref => {
                         is_leaf = false;
                         break :outer;
                     },
@@ -202,7 +203,7 @@ pub fn findLazyEligibleWithTrampoline(
         outer: for (func.blocks.items) |block| {
             for (block.instructions.items) |inst| {
                 switch (inst.op) {
-                    .call, .call_indirect => {
+                    .call, .call_indirect, .call_ref => {
                         is_leaf = false;
                         break :outer;
                     },
@@ -413,4 +414,35 @@ test "findLazyEligibleWithTrampoline: a directly-called function stays ineligibl
     // tabled doesn't override it.
     try std.testing.expect(!result.eligible[0]);
     try std.testing.expect(!result.needs_trampoline[0]);
+}
+
+test "findLazyEligibleWithTrampoline: a function containing call_ref is not a leaf" {
+    const allocator = std.testing.allocator;
+
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    // Function 0: leaf, never called directly, never tabled -- eligible
+    // (and reachable only via whatever obtains its funcref elsewhere).
+    var f0 = ir.IrFunction.init(allocator, 0, 0, 0);
+    _ = try f0.newBlock();
+    try ir_module.functions.append(allocator, f0);
+
+    // Function 1: performs a call_ref (e.g. to a funcref obtained from
+    // a table.get or ref.func elsewhere) -- this IS an outgoing call,
+    // so function 1 itself must NOT be treated as a leaf, regardless
+    // of the fact call_ref isn't literally spelled `.call`/`.call_indirect`.
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 1);
+    const b1 = try f1.newBlock();
+    try f1.getBlock(b1).append(.{ .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = 0, .args = &.{} } } });
+    try ir_module.functions.append(allocator, f1);
+
+    var module = core_types.WasmModule{};
+    module.elements = &.{};
+
+    var result = try findLazyEligibleWithTrampoline(&module, &ir_module, allocator);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.eligible[0]);
+    try std.testing.expect(!result.eligible[1]); // not a leaf (performs call_ref)
 }

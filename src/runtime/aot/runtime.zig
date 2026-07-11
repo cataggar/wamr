@@ -1491,6 +1491,61 @@ pub const LazyJitState = struct {
     /// audit (configure-before-concurrent-use, not safe for
     /// concurrent first-calls to the SAME lazy function).
     compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) ?LazyCompiledFunc = null,
+    /// #879 M4.6 phase 2: pre-allocated native trampoline address for
+    /// each LOCAL function index reachable via `call_indirect`/
+    /// `ref.func` (see `lazy_jit.findLazyEligibleWithTrampoline`'s
+    /// `needs_trampoline` output). `null` for every index that either
+    /// isn't lazy-eligible or is eligible but never referenced that
+    /// way. Populated by `component_aot_compile.setupLazyJit` — which
+    /// must run BEFORE `mapCodeExecutable` so that function's
+    /// `func_addrs`-patching step (see its doc comment) can install
+    /// these addresses. The trampoline itself (`lazy_call_trampoline.zig`)
+    /// is a separate, self-contained mmap'd region owned by the
+    /// driver, not by this array — this is just the resolved address
+    /// list `mapCodeExecutable` reads.
+    trampoline_addrs: []?usize = &.{},
+
+    /// Resolve `local_idx`'s callable native address, compiling on
+    /// demand if it's still pending. Shared by `callFuncScalar`'s
+    /// host-call hook below AND (#879 M4.6 phase 2)
+    /// `trampolineDispatch`'s native call_indirect/ref.func entry
+    /// point, so both paths agree on whether a given function has
+    /// been compiled yet and never redundantly compile the same one
+    /// twice.
+    fn resolve(self: *LazyJitState, local_idx: u32) ?[*]const u8 {
+        if (local_idx < self.pending.len and self.pending[local_idx]) {
+            const compile_ctx = self.compile_ctx orelse return null;
+            const compile_fn = self.compile_fn orelse return null;
+            const compiled = compile_fn(compile_ctx, local_idx) orelse return null;
+            self.compiled[local_idx] = compiled;
+            self.pending[local_idx] = false;
+        }
+        if (local_idx < self.compiled.len) {
+            if (self.compiled[local_idx]) |c| return c.addr;
+        }
+        return null;
+    }
+
+    /// #879 M4.6 phase 2: `callconv(.c)` entry point matching
+    /// `lazy_call_trampoline.LazyDispatchFn`'s signature exactly, so a
+    /// pre-allocated trampoline stub can call straight into it.
+    /// `ctx_opaque` is always `*AotInstance` (see `setupLazyJit`,
+    /// which is the only place that allocates a trampoline stub bound
+    /// to this function). Per `LazyDispatchFn`'s documented contract,
+    /// this must never return an unusable address — there is no
+    /// calling convention through which the trampoline could
+    /// propagate a Zig error or trap cleanly back to the guest, so a
+    /// `resolve` failure here is treated as the same kind of
+    /// should-never-happen backstop `LazyCompileDriver.compileFn`
+    /// already logs-and-fails for at the `callFuncScalar` entry point
+    /// — except here there's no error union to return it through, so
+    /// it panics instead.
+    pub fn trampolineDispatch(ctx_opaque: *anyopaque, local_idx: u32) callconv(.c) usize {
+        const inst: *AotInstance = @ptrCast(@alignCast(ctx_opaque));
+        const addr = inst.lazy_jit.resolve(local_idx) orelse
+            std.debug.panic("lazy-JIT trampoline: failed to compile local function {d}", .{local_idx});
+        return @intFromPtr(addr);
+    }
 
     fn free(self: *LazyJitState, allocator: std.mem.Allocator) void {
         for (self.compiled) |maybe| {
@@ -1498,6 +1553,7 @@ pub const LazyJitState = struct {
         }
         allocator.free(self.pending);
         allocator.free(self.compiled);
+        allocator.free(self.trampoline_addrs);
     }
 };
 
@@ -2063,6 +2119,31 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         }
     }
 
+    // #879 M4.6 phase 2: override with a native trampoline for any
+    // local function `setupLazyJit` pre-allocated one for (functions
+    // reachable via call_indirect/ref.func -- see
+    // `lazy_jit.findLazyEligibleWithTrampoline`'s `needs_trampoline`
+    // output). Without this, such a function's `func_addrs` entry
+    // above points at its (currently zero-byte, deferred) offset,
+    // which harmlessly aliases whatever code happens to follow it in
+    // `mem` -- fine as long as nothing ever calls through it, which
+    // used to be guaranteed by construction (no element segments at
+    // all were allowed for any lazy-eligible function) but no longer
+    // is. `setupLazyJit` must run BEFORE this call precisely so this
+    // override is in place before `func_addrs` feeds `inst.funcptrs`,
+    // `inst.ptr_to_sig`, and every table's native backing below --
+    // all of them read from `func_addrs`, not from
+    // `inst.lazy_jit.trampoline_addrs` directly, so a single patch
+    // here is sufficient for every downstream consumer.
+    if (comptime config.lazy_jit) {
+        const trampoline_addrs = inst.lazy_jit.trampoline_addrs;
+        for (0..@min(trampoline_addrs.len, module.func_count)) |i| {
+            if (trampoline_addrs[i]) |addr| {
+                if (import_count + i < n_addrs) func_addrs[import_count + i] = addr;
+            }
+        }
+    }
+
     // Persist the funcidx → native address map on the instance for ref.func.
     if (n_addrs > 0) {
         const persistent = inst.allocator.alloc(usize, n_addrs) catch return error.OutOfMemory;
@@ -2570,27 +2651,29 @@ pub fn callFuncScalar(
     if (effective_args > MaxScalarArgs) return error.UnsupportedSignature;
 
     // #862 lazy-JIT design-spike: if `func_idx` names a still-pending
-    // deferred function, compile it now before resolving its address.
-    // See `LazyJitState`'s doc comment — this hook is a no-op (single
-    // length check) whenever lazy-JIT isn't active for this instance.
-    // Checked BEFORE the `code_base == null` guard below because a
-    // module where EVERY function is lazy-eligible (e.g. this spike's
-    // own test fixture) never maps any code up front, so `code_base`
-    // legitimately stays null until the first lazy compile.
+    // deferred function, compile it now before resolving its address
+    // (via `LazyJitState.resolve`, shared with the #879 M4.6 phase-2
+    // native-trampoline dispatch path below). This hook is a no-op
+    // (single length check) whenever lazy-JIT isn't active for this
+    // instance. Checked BEFORE the `code_base == null` guard below
+    // because a module where EVERY function is lazy-eligible (e.g.
+    // this spike's own test fixture) never maps any code up front, so
+    // `code_base` legitimately stays null until the first lazy compile.
     var lazy_resolved_addr: ?[*]const u8 = null;
     if (comptime config.lazy_jit) {
         const import_count = inst.module.import_function_count;
         if (func_idx >= import_count) {
             const local_idx = func_idx - import_count;
-            if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
-                const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
-                const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
-                const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
-                inst.lazy_jit.compiled[local_idx] = compiled;
-                inst.lazy_jit.pending[local_idx] = false;
-            }
-            if (local_idx < inst.lazy_jit.compiled.len) {
-                if (inst.lazy_jit.compiled[local_idx]) |c| lazy_resolved_addr = c.addr;
+            lazy_resolved_addr = inst.lazy_jit.resolve(local_idx);
+            // `resolve` leaves `pending[local_idx]` untouched (still
+            // true) only when it genuinely attempted and failed to
+            // compile a still-pending function; a `func_idx` that was
+            // never lazy-eligible at all leaves `pending[local_idx]`
+            // false (or out of range), so this check doesn't fire for
+            // it and control falls through to the normal `code_base`
+            // path below.
+            if (lazy_resolved_addr == null and local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
+                return error.CodeMappingFailed;
             }
         }
     }
