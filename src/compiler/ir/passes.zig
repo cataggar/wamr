@@ -3179,6 +3179,15 @@ pub const RunOptions = struct {
     /// miscompiles (#743 / #761). Default `.{}` means "no filtering" —
     /// the full pipeline runs for every function.
     bisect: PassBisectSpec = .{},
+    /// Optional LOCAL-function skip mask. When `lazy_skip[fi]` is true,
+    /// the module-level `runPassesWithOptions` scheduler defers the
+    /// entire per-function pipeline (`promoteLocalsToSSA`,
+    /// `lowerPhisToLocals`, the preset-selected fixpoint loop, and
+    /// `scrubUnreachableBlocks`) for that function, so callers can run
+    /// the same work later via `runFunctionPassesWithOptions`. Empty by
+    /// default; the single-function helper ignores this mask and always
+    /// runs the pipeline for its target function.
+    lazy_skip: []const bool = &.{},
     /// Module index used to narrow `bisect.skip`/`bisect.limit` entries
     /// whose `mod_filter` is non-null. Defaults to 0; single-module
     /// callers (`wamrc compile`) can leave it at the default. The
@@ -3495,7 +3504,7 @@ fn elapsedNsSince(start_ns: u64) u64 {
 
 fn printPassTiming(
     phase: []const u8,
-    module: *const ir.IrModule,
+    module_import_count: u32,
     module_idx: u32,
     func: *const ir.IrFunction,
     func_idx: u32,
@@ -3522,7 +3531,7 @@ fn printPassTiming(
             phase,
             module_idx,
             func_idx,
-            module.import_count + func_idx,
+            module_import_count + func_idx,
             func_name,
             outer_iter,
             iter,
@@ -3542,7 +3551,7 @@ fn printPassTiming(
 fn maybePrintPassTiming(
     timing: PassTimingOptions,
     phase: []const u8,
-    module: *const ir.IrModule,
+    module_import_count: u32,
     module_idx: u32,
     func: *const ir.IrFunction,
     func_idx: u32,
@@ -3557,7 +3566,7 @@ fn maybePrintPassTiming(
     if (!timing.shouldLogElapsed(elapsed_ns)) return;
     printPassTiming(
         phase,
-        module,
+        module_import_count,
         module_idx,
         func,
         func_idx,
@@ -3575,7 +3584,7 @@ fn maybePrintPassTiming(
 fn printPassTimingStart(
     timing: PassTimingOptions,
     phase: []const u8,
-    module: *const ir.IrModule,
+    module_import_count: u32,
     module_idx: u32,
     func: *const ir.IrFunction,
     func_idx: u32,
@@ -3586,7 +3595,7 @@ fn printPassTimingStart(
 ) void {
     if (!timing.log_starts) return;
     const stats = collectPassTimingStats(func);
-    printPassTiming(phase, module, module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_name, false, 0, stats, stats);
+    printPassTiming(phase, module_import_count, module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_name, false, 0, stats, stats);
 }
 
 /// Filter that selectively skips IR optimisation passes, caps the
@@ -8282,6 +8291,420 @@ pub fn runPassesWithOptions(
     return runPassesWithOptionsScoped(module, passes, allocator, opts, true);
 }
 
+fn verifyFunctionAfterPass(
+    mode: verifier.VerifyMode,
+    pass_label: []const u8,
+    module_idx: u32,
+    func: *ir.IrFunction,
+    func_idx: u32,
+    allocator: std.mem.Allocator,
+) verifier.VerifyError!void {
+    if (mode == .off) return;
+    var timing_context = analysis.pushTimingContext(.{
+        .module_idx = module_idx,
+        .func_idx = func_idx,
+        .phase = "verify",
+        .pass_name = pass_label,
+    });
+    defer timing_context.deinit();
+    try analysis.refreshBlockPredecessors(func, allocator);
+    verifier.verifyFunction(func, func_idx, mode, allocator) catch |err| {
+        verifier.last_failure.pass_name = pass_label;
+        return err;
+    };
+}
+
+/// Run the same per-function pipeline `runPassesWithOptions` applies on its
+/// first outer iteration, but restricted to a single function. This skips the
+/// module-level `inlineSmallFunctions` step entirely, making it suitable for
+/// lazy/on-demand compilation of functions whose eligibility analysis has
+/// already proven they cannot participate in inlining-sensitive work.
+pub fn runFunctionPassesWithOptions(
+    func: *ir.IrFunction,
+    func_idx: u32,
+    module_import_count: u32,
+    passes: []const PassFn,
+    allocator: std.mem.Allocator,
+    opts: RunOptions,
+) !u32 {
+    const previous_analysis_timing = analysis.setTimingOptions(opts.analysis_timing);
+    defer _ = analysis.setTimingOptions(previous_analysis_timing);
+    var tail_dup_scope = pushTailDuplicationOptions(opts.tail_duplication);
+    defer tail_dup_scope.deinit();
+
+    _ = stripDeadCodeAfterFirstTerminator(func);
+    return runFunctionPassPipeline(func, func_idx, module_import_count, passes, allocator, opts, 0);
+}
+
+fn runFunctionPassPipeline(
+    func: *ir.IrFunction,
+    func_idx: u32,
+    module_import_count: u32,
+    passes: []const PassFn,
+    allocator: std.mem.Allocator,
+    opts: RunOptions,
+    outer_iter: u32,
+) !u32 {
+    var total_changes: u32 = 0;
+    const timing = opts.pass_timing;
+    const timing_for_func = timing.functionMatches(opts.module_idx, func_idx);
+    const function_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+    const function_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+    if (timing_for_func and timing.shouldLogFunctionProgress(func_idx)) {
+        printPassTiming(
+            "function-start",
+            module_import_count,
+            opts.module_idx,
+            func,
+            func_idx,
+            outer_iter,
+            0,
+            null,
+            "function",
+            false,
+            0,
+            function_start_stats,
+            function_start_stats,
+        );
+    }
+
+    // #761: per-function verifier suppression — skipping a pass (or capping
+    // the pipeline) on a function can leave IR in a state later cleanups
+    // would normalise, tripping benign structural checks. Unaffected
+    // functions still verify normally so most of the module retains
+    // soundness coverage during a bisect.
+    const effective_verify_mode: verifier.VerifyMode =
+        if (opts.bisect.affectsFunction(opts.module_idx, func_idx)) .off else opts.verify_mode;
+
+    var cfg_cache = analysis.CfgAnalysisCache.init(allocator);
+    defer cfg_cache.deinit();
+    var cfg_cache_scope = analysis.pushCfgAnalysisCache(&cfg_cache);
+    defer cfg_cache_scope.deinit();
+
+    // SSA promotion: only meaningful on the first outer round. On later
+    // rounds the function is already past mem2reg and any new local_set/get
+    // inserted by inlining is handled by `forwardLocalGet` +
+    // `deadLocalSetElimination`.
+    if (outer_iter == 0 and !opts.bisect.skipsPromoteSSA(opts.module_idx, func_idx)) {
+        const pass_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+        const pass_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+        if (timing_for_func) {
+            printPassTimingStart(timing, "pass-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
+        }
+        const promote_changed = blk: {
+            var timing_context = analysis.pushTimingContext(.{
+                .module_idx = opts.module_idx,
+                .func_idx = func_idx,
+                .phase = "pass",
+                .pass_name = "promoteLocalsToSSA",
+            });
+            defer timing_context.deinit();
+            break :blk try promoteLocalsToSSA(func, allocator);
+        };
+        cfg_cache.invalidate();
+        if (timing_for_func) {
+            maybePrintPassTiming(
+                timing,
+                "pass",
+                module_import_count,
+                opts.module_idx,
+                func,
+                func_idx,
+                outer_iter,
+                0,
+                null,
+                "promoteLocalsToSSA",
+                promote_changed,
+                elapsedNsSince(pass_start_ns),
+                pass_start_stats,
+            );
+        }
+        if (promote_changed) {
+            total_changes += 1;
+            const verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+            const verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+            if (timing_for_func) {
+                printPassTimingStart(timing, "verify-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
+            }
+            try verifyFunctionAfterPass(effective_verify_mode, "promoteLocalsToSSA", opts.module_idx, func, func_idx, allocator);
+            if (timing_for_func) {
+                maybePrintPassTiming(
+                    timing,
+                    "verify",
+                    module_import_count,
+                    opts.module_idx,
+                    func,
+                    func_idx,
+                    outer_iter,
+                    0,
+                    null,
+                    "promoteLocalsToSSA",
+                    false,
+                    elapsedNsSince(verify_start_ns),
+                    verify_start_stats,
+                );
+            }
+            if (opts.dump_hook) |hook| {
+                try hook.callback(hook.ctx, .{
+                    .pass_name = "promoteLocalsToSSA",
+                    .func = func,
+                    .func_index = func_idx,
+                    .changed = true,
+                    .iter = 0,
+                    .outer_iter = outer_iter,
+                });
+            }
+            if (opts.phi_spill_measure) |measure| measure(func, allocator);
+            if (!opts.bisect.skipsPhisToLocals(opts.module_idx, func_idx)) {
+                const lower_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                const lower_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                if (timing_for_func) {
+                    printPassTimingStart(timing, "pass-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
+                }
+                const lower_changed = blk: {
+                    var timing_context = analysis.pushTimingContext(.{
+                        .module_idx = opts.module_idx,
+                        .func_idx = func_idx,
+                        .phase = "pass",
+                        .pass_name = "lowerPhisToLocals",
+                    });
+                    defer timing_context.deinit();
+                    break :blk try lowerPhisToLocals(func, allocator);
+                };
+                if (timing_for_func) {
+                    maybePrintPassTiming(
+                        timing,
+                        "pass",
+                        module_import_count,
+                        opts.module_idx,
+                        func,
+                        func_idx,
+                        outer_iter,
+                        0,
+                        null,
+                        "lowerPhisToLocals",
+                        lower_changed,
+                        elapsedNsSince(lower_start_ns),
+                        lower_start_stats,
+                    );
+                }
+                if (lower_changed) {
+                    total_changes += 1;
+                    const lower_verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                    const lower_verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                    if (timing_for_func) {
+                        printPassTimingStart(timing, "verify-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
+                    }
+                    try verifyFunctionAfterPass(effective_verify_mode, "lowerPhisToLocals", opts.module_idx, func, func_idx, allocator);
+                    if (timing_for_func) {
+                        maybePrintPassTiming(
+                            timing,
+                            "verify",
+                            module_import_count,
+                            opts.module_idx,
+                            func,
+                            func_idx,
+                            outer_iter,
+                            0,
+                            null,
+                            "lowerPhisToLocals",
+                            false,
+                            elapsedNsSince(lower_verify_start_ns),
+                            lower_verify_start_stats,
+                        );
+                    }
+                    if (opts.dump_hook) |hook| {
+                        try hook.callback(hook.ctx, .{
+                            .pass_name = "lowerPhisToLocals",
+                            .func = func,
+                            .func_index = func_idx,
+                            .changed = true,
+                            .iter = 0,
+                            .outer_iter = outer_iter,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Iterate the pipeline until fixpoint so that passes can re-expose
+    // opportunities for each other (e.g. constantFold → CSE → DCE → more
+    // constantFold). Cap iterations as a safety net.
+    const effective_passes_len: usize = blk: {
+        const cap = opts.bisect.effectiveLimit(opts.module_idx, func_idx) orelse break :blk passes.len;
+        break :blk @min(@as(usize, cap), passes.len);
+    };
+    var iter: u32 = 0;
+    while (iter < 8) : (iter += 1) {
+        var any_changed = false;
+        for (passes[0..effective_passes_len], 0..) |pass, pass_idx_usize| {
+            const pass_idx: u32 = @intCast(pass_idx_usize);
+            if (opts.bisect.shouldSkip(opts.module_idx, func_idx, pass_idx)) continue;
+            const pass_label = passName(pass);
+            const pass_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+            const pass_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+            if (timing_for_func) {
+                printPassTimingStart(timing, "pass-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
+            }
+            const changed = blk: {
+                var timing_context = analysis.pushTimingContext(.{
+                    .module_idx = opts.module_idx,
+                    .func_idx = func_idx,
+                    .phase = "pass",
+                    .pass_idx = pass_idx,
+                    .pass_name = pass_label,
+                });
+                defer timing_context.deinit();
+                break :blk try pass(func, allocator);
+            };
+            if (passMutatesCfg(pass)) cfg_cache.invalidate();
+            if (timing_for_func) {
+                maybePrintPassTiming(
+                    timing,
+                    "pass",
+                    module_import_count,
+                    opts.module_idx,
+                    func,
+                    func_idx,
+                    outer_iter,
+                    iter,
+                    pass_idx,
+                    pass_label,
+                    changed,
+                    elapsedNsSince(pass_start_ns),
+                    pass_start_stats,
+                );
+            }
+            if (changed) {
+                any_changed = true;
+                total_changes += 1;
+            }
+            if (changed) {
+                const verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+                const verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+                if (timing_for_func) {
+                    printPassTimingStart(timing, "verify-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
+                }
+                try verifyFunctionAfterPass(effective_verify_mode, pass_label, opts.module_idx, func, func_idx, allocator);
+                if (timing_for_func) {
+                    maybePrintPassTiming(
+                        timing,
+                        "verify",
+                        module_import_count,
+                        opts.module_idx,
+                        func,
+                        func_idx,
+                        outer_iter,
+                        iter,
+                        pass_idx,
+                        pass_label,
+                        false,
+                        elapsedNsSince(verify_start_ns),
+                        verify_start_stats,
+                    );
+                }
+            }
+            if (opts.dump_hook) |hook| {
+                try hook.callback(hook.ctx, .{
+                    .pass_name = pass_label,
+                    .func = func,
+                    .func_index = func_idx,
+                    .changed = changed,
+                    .iter = iter,
+                    .outer_iter = outer_iter,
+                });
+            }
+        }
+        if (!any_changed) break;
+    }
+
+    // Final cleanup: drop the body of any block that is unreachable from
+    // entry, replacing it with a single `.@"unreachable"` op. Late passes
+    // can strand blocks whose original `local_set`/`local_get` ops were
+    // never neutralised by `promoteLocalsToSSA`'s dom-tree DFS.
+    const scrub_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+    const scrub_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+    if (timing_for_func) {
+        printPassTimingStart(timing, "pass-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
+    }
+    const scrub_changed = blk: {
+        var timing_context = analysis.pushTimingContext(.{
+            .module_idx = opts.module_idx,
+            .func_idx = func_idx,
+            .phase = "pass",
+            .pass_name = "scrubUnreachableBlocks",
+        });
+        defer timing_context.deinit();
+        break :blk try scrubUnreachableBlocks(func, allocator);
+    };
+    cfg_cache.invalidate();
+    if (timing_for_func) {
+        maybePrintPassTiming(
+            timing,
+            "pass",
+            module_import_count,
+            opts.module_idx,
+            func,
+            func_idx,
+            outer_iter,
+            0,
+            null,
+            "scrubUnreachableBlocks",
+            scrub_changed,
+            elapsedNsSince(scrub_start_ns),
+            scrub_start_stats,
+        );
+    }
+    if (scrub_changed) {
+        total_changes += 1;
+        const scrub_verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
+        const scrub_verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
+        if (timing_for_func) {
+            printPassTimingStart(timing, "verify-start", module_import_count, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
+        }
+        try verifyFunctionAfterPass(effective_verify_mode, "scrubUnreachableBlocks", opts.module_idx, func, func_idx, allocator);
+        if (timing_for_func) {
+            maybePrintPassTiming(
+                timing,
+                "verify",
+                module_import_count,
+                opts.module_idx,
+                func,
+                func_idx,
+                outer_iter,
+                0,
+                null,
+                "scrubUnreachableBlocks",
+                false,
+                elapsedNsSince(scrub_verify_start_ns),
+                scrub_verify_start_stats,
+            );
+        }
+    }
+    if (timing_for_func) {
+        const elapsed_ns = elapsedNsSince(function_start_ns);
+        if (timing.shouldLogElapsed(elapsed_ns) or timing.shouldLogFunctionProgress(func_idx)) {
+            printPassTiming(
+                "function",
+                module_import_count,
+                opts.module_idx,
+                func,
+                func_idx,
+                outer_iter,
+                0,
+                null,
+                "function",
+                false,
+                elapsed_ns,
+                function_start_stats,
+                collectPassTimingStats(func),
+            );
+        }
+    }
+    return total_changes;
+}
+
 fn runPassesWithOptionsScoped(
     module: *ir.IrModule,
     passes: []const PassFn,
@@ -8294,46 +8717,6 @@ fn runPassesWithOptionsScoped(
     defer _ = analysis.setTimingOptions(previous_analysis_timing);
     var tail_dup_scope = pushTailDuplicationOptions(opts.tail_duplication);
     defer tail_dup_scope.deinit();
-
-    // Local helper: run the verifier and stamp the pass name on the
-    // surfaced failure record. A no-op when `verify_mode == .off`.
-    //
-    // Refreshes `BasicBlock.predecessors` from the current CFG before
-    // each check. `BasicBlock.predecessors` is essentially a derived
-    // field — the only non-verifier/non-printer consumer is
-    // `analysis.refreshBlockPredecessors` itself. Several CFG-mutating
-    // passes (`scrubUnreachableBlocks`, `tailDuplicateSmallJoins`,
-    // `foldConstantBranches`, etc.) historically forgot to refresh and
-    // tripped the verifier's check 6. Rather than require every pass
-    // author to remember the refresh, normalise the predecessor list
-    // here so the verifier sees a consistent CFG (issue #765). The
-    // standalone `verifier.verifyFunction` is left unchanged so the
-    // direct-call tests continue to exercise check 6's recorded-vs-
-    // derived comparison.
-    const Verify = struct {
-        fn check(
-            mode: verifier.VerifyMode,
-            pass_label: []const u8,
-            module_idx: u32,
-            func: *ir.IrFunction,
-            func_idx: u32,
-            alloc: std.mem.Allocator,
-        ) verifier.VerifyError!void {
-            if (mode == .off) return;
-            var timing_context = analysis.pushTimingContext(.{
-                .module_idx = module_idx,
-                .func_idx = func_idx,
-                .phase = "verify",
-                .pass_name = pass_label,
-            });
-            defer timing_context.deinit();
-            try analysis.refreshBlockPredecessors(func, alloc);
-            verifier.verifyFunction(func, func_idx, mode, alloc) catch |e| {
-                verifier.last_failure.pass_name = pass_label;
-                return e;
-            };
-        }
-    };
 
     // Outer loop: alternate between module-level inlining and per-function
     // fixpoint passes. The first per-function round constant-folds
@@ -8414,7 +8797,7 @@ fn runPassesWithOptionsScoped(
                         // #761: suppress verifier on bisect-affected funcs.
                         const vm: verifier.VerifyMode =
                             if (opts.bisect.affectsFunction(opts.module_idx, fi32)) .off else opts.verify_mode;
-                        try Verify.check(vm, "inlineSmallFunctions", opts.module_idx, f, fi32, allocator);
+                        try verifyFunctionAfterPass(vm, "inlineSmallFunctions", opts.module_idx, f, fi32, allocator);
                     }
                 }
 
@@ -8453,372 +8836,22 @@ fn runPassesWithOptionsScoped(
                 // functions have no new per-function opportunities to settle.
                 continue;
             }
-            const timing_for_func = timing.functionMatches(opts.module_idx, func_idx);
-            const function_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-            const function_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-            if (timing_for_func and timing.shouldLogFunctionProgress(func_idx)) {
-                printPassTiming(
-                    "function-start",
-                    module,
-                    opts.module_idx,
-                    func,
-                    func_idx,
-                    outer_iter,
-                    0,
-                    null,
-                    "function",
-                    false,
-                    0,
-                    function_start_stats,
-                    function_start_stats,
-                );
+            if (func_idx_usize < opts.lazy_skip.len and opts.lazy_skip[func_idx_usize]) {
+                // #892 lazy-JIT: defer the entire per-function pipeline for
+                // this local function. `runFunctionPassesWithOptions` runs the
+                // exact same promote/lower/fixpoint/scrub sequence later on
+                // first call, using the same `RunOptions` snapshot.
+                continue;
             }
-            // #761: per-function verifier suppression — skipping a
-            // pass (or capping the pipeline) on a function can leave
-            // IR in a state that later cleanups would normalise,
-            // tripping benign structural checks. Unaffected functions
-            // still verify normally so most of the module retains
-            // soundness coverage during a bisect. Computed once
-            // per-function and reused for every Verify.check site
-            // below (promoteLocalsToSSA, lowerPhisToLocals, the per-
-            // pass fixpoint, scrubUnreachableBlocks).
-            const effective_verify_mode: verifier.VerifyMode =
-                if (opts.bisect.affectsFunction(opts.module_idx, func_idx)) .off else opts.verify_mode;
-            var cfg_cache = analysis.CfgAnalysisCache.init(allocator);
-            defer cfg_cache.deinit();
-            var cfg_cache_scope = analysis.pushCfgAnalysisCache(&cfg_cache);
-            defer cfg_cache_scope.deinit();
-
-            // SSA promotion: only meaningful on the first outer round. On
-            // later rounds the function is already past mem2reg and any new
-            // local_set/get inserted by inlining is handled by
-            // `forwardLocalGet` + `deadLocalSetElimination`.
-            if (outer_iter == 0 and !opts.bisect.skipsPromoteSSA(opts.module_idx, func_idx)) {
-                const pass_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-                const pass_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-                if (timing_for_func) {
-                    printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
-                }
-                const promote_changed = blk: {
-                    var timing_context = analysis.pushTimingContext(.{
-                        .module_idx = opts.module_idx,
-                        .func_idx = func_idx,
-                        .phase = "pass",
-                        .pass_name = "promoteLocalsToSSA",
-                    });
-                    defer timing_context.deinit();
-                    break :blk try promoteLocalsToSSA(func, allocator);
-                };
-                cfg_cache.invalidate();
-                if (timing_for_func) {
-                    maybePrintPassTiming(
-                        timing,
-                        "pass",
-                        module,
-                        opts.module_idx,
-                        func,
-                        func_idx,
-                        outer_iter,
-                        0,
-                        null,
-                        "promoteLocalsToSSA",
-                        promote_changed,
-                        elapsedNsSince(pass_start_ns),
-                        pass_start_stats,
-                    );
-                }
-                if (promote_changed) {
-                    total_changes += 1;
-                    const verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-                    const verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-                    if (timing_for_func) {
-                        printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "promoteLocalsToSSA");
-                    }
-                    try Verify.check(effective_verify_mode, "promoteLocalsToSSA", opts.module_idx, func, func_idx, allocator);
-                    if (timing_for_func) {
-                        maybePrintPassTiming(
-                            timing,
-                            "verify",
-                            module,
-                            opts.module_idx,
-                            func,
-                            func_idx,
-                            outer_iter,
-                            0,
-                            null,
-                            "promoteLocalsToSSA",
-                            false,
-                            elapsedNsSince(verify_start_ns),
-                            verify_start_stats,
-                        );
-                    }
-                    if (opts.dump_hook) |hook| {
-                        try hook.callback(hook.ctx, .{
-                            .pass_name = "promoteLocalsToSSA",
-                            .func = func,
-                            .func_index = func_idx,
-                            .changed = true,
-                            .iter = 0,
-                            .outer_iter = outer_iter,
-                        });
-                    }
-                    if (opts.phi_spill_measure) |measure| measure(func, allocator);
-                    if (!opts.bisect.skipsPhisToLocals(opts.module_idx, func_idx)) {
-                        const lower_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-                        const lower_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-                        if (timing_for_func) {
-                            printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
-                        }
-                        const lower_changed = blk: {
-                            var timing_context = analysis.pushTimingContext(.{
-                                .module_idx = opts.module_idx,
-                                .func_idx = func_idx,
-                                .phase = "pass",
-                                .pass_name = "lowerPhisToLocals",
-                            });
-                            defer timing_context.deinit();
-                            break :blk try lowerPhisToLocals(func, allocator);
-                        };
-                        if (timing_for_func) {
-                            maybePrintPassTiming(
-                                timing,
-                                "pass",
-                                module,
-                                opts.module_idx,
-                                func,
-                                func_idx,
-                                outer_iter,
-                                0,
-                                null,
-                                "lowerPhisToLocals",
-                                lower_changed,
-                                elapsedNsSince(lower_start_ns),
-                                lower_start_stats,
-                            );
-                        }
-                        if (lower_changed) {
-                            total_changes += 1;
-                            const lower_verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-                            const lower_verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-                            if (timing_for_func) {
-                                printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "lowerPhisToLocals");
-                            }
-                            try Verify.check(effective_verify_mode, "lowerPhisToLocals", opts.module_idx, func, func_idx, allocator);
-                            if (timing_for_func) {
-                                maybePrintPassTiming(
-                                    timing,
-                                    "verify",
-                                    module,
-                                    opts.module_idx,
-                                    func,
-                                    func_idx,
-                                    outer_iter,
-                                    0,
-                                    null,
-                                    "lowerPhisToLocals",
-                                    false,
-                                    elapsedNsSince(lower_verify_start_ns),
-                                    lower_verify_start_stats,
-                                );
-                            }
-                            if (opts.dump_hook) |hook| {
-                                try hook.callback(hook.ctx, .{
-                                    .pass_name = "lowerPhisToLocals",
-                                    .func = func,
-                                    .func_index = func_idx,
-                                    .changed = true,
-                                    .iter = 0,
-                                    .outer_iter = outer_iter,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Iterate the pipeline until fixpoint so that passes can
-            // re-expose opportunities for each other (e.g. constantFold →
-            // CSE → DCE → more constantFold). Cap iterations as a safety
-            // net.
-            // Apply #761 bisect filter: per-function pipeline-length
-            // cap (`limit`) and per-pass skip mask. When the spec is
-            // empty `effective_passes_len == passes.len` and the
-            // shouldSkip check inside the loop short-circuits.
-            const effective_passes_len: usize = blk: {
-                const cap = opts.bisect.effectiveLimit(opts.module_idx, func_idx) orelse break :blk passes.len;
-                break :blk @min(@as(usize, cap), passes.len);
-            };
-            var iter: u32 = 0;
-            while (iter < 8) : (iter += 1) {
-                var any_changed = false;
-                for (passes[0..effective_passes_len], 0..) |pass, pass_idx_usize| {
-                    const pass_idx: u32 = @intCast(pass_idx_usize);
-                    if (opts.bisect.shouldSkip(opts.module_idx, func_idx, pass_idx)) continue;
-                    const pass_label = passName(pass);
-                    const pass_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-                    const pass_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-                    if (timing_for_func) {
-                        printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
-                    }
-                    const changed = blk: {
-                        var timing_context = analysis.pushTimingContext(.{
-                            .module_idx = opts.module_idx,
-                            .func_idx = func_idx,
-                            .phase = "pass",
-                            .pass_idx = pass_idx,
-                            .pass_name = pass_label,
-                        });
-                        defer timing_context.deinit();
-                        break :blk try pass(func, allocator);
-                    };
-                    if (passMutatesCfg(pass)) cfg_cache.invalidate();
-                    if (timing_for_func) {
-                        maybePrintPassTiming(
-                            timing,
-                            "pass",
-                            module,
-                            opts.module_idx,
-                            func,
-                            func_idx,
-                            outer_iter,
-                            iter,
-                            pass_idx,
-                            pass_label,
-                            changed,
-                            elapsedNsSince(pass_start_ns),
-                            pass_start_stats,
-                        );
-                    }
-                    if (changed) {
-                        any_changed = true;
-                        total_changes += 1;
-                    }
-                    if (changed) {
-                        const verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-                        const verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-                        if (timing_for_func) {
-                            printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, iter, pass_idx, pass_label);
-                        }
-                        try Verify.check(effective_verify_mode, pass_label, opts.module_idx, func, func_idx, allocator);
-                        if (timing_for_func) {
-                            maybePrintPassTiming(
-                                timing,
-                                "verify",
-                                module,
-                                opts.module_idx,
-                                func,
-                                func_idx,
-                                outer_iter,
-                                iter,
-                                pass_idx,
-                                pass_label,
-                                false,
-                                elapsedNsSince(verify_start_ns),
-                                verify_start_stats,
-                            );
-                        }
-                    }
-                    if (opts.dump_hook) |hook| {
-                        try hook.callback(hook.ctx, .{
-                            .pass_name = pass_label,
-                            .func = func,
-                            .func_index = func_idx,
-                            .changed = changed,
-                            .iter = iter,
-                            .outer_iter = outer_iter,
-                        });
-                    }
-                }
-                if (!any_changed) break;
-            }
-
-            // Final cleanup: drop the body of any block that is
-            // unreachable from entry, replacing it with a single
-            // `.@"unreachable"` op. Late passes (inliner on outer
-            // iter > 0, foldConstantBranches, threadChained...) can
-            // strand blocks whose original `local_set`/`local_get`
-            // ops were never neutralised by `promoteLocalsToSSA`'s
-            // dom-tree DFS — feeding `error.UnboundVReg` at codegen
-            // (issue #620).
-            const scrub_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-            const scrub_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-            if (timing_for_func) {
-                printPassTimingStart(timing, "pass-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
-            }
-            const scrub_changed = blk: {
-                var timing_context = analysis.pushTimingContext(.{
-                    .module_idx = opts.module_idx,
-                    .func_idx = func_idx,
-                    .phase = "pass",
-                    .pass_name = "scrubUnreachableBlocks",
-                });
-                defer timing_context.deinit();
-                break :blk try scrubUnreachableBlocks(func, allocator);
-            };
-            cfg_cache.invalidate();
-            if (timing_for_func) {
-                maybePrintPassTiming(
-                    timing,
-                    "pass",
-                    module,
-                    opts.module_idx,
-                    func,
-                    func_idx,
-                    outer_iter,
-                    0,
-                    null,
-                    "scrubUnreachableBlocks",
-                    scrub_changed,
-                    elapsedNsSince(scrub_start_ns),
-                    scrub_start_stats,
-                );
-            }
-            if (scrub_changed) {
-                total_changes += 1;
-                const scrub_verify_start_ns = if (timing_for_func) passTimingNowNs() else 0;
-                const scrub_verify_start_stats = if (timing_for_func) collectPassTimingStats(func) else PassTimingStats{};
-                if (timing_for_func) {
-                    printPassTimingStart(timing, "verify-start", module, opts.module_idx, func, func_idx, outer_iter, 0, null, "scrubUnreachableBlocks");
-                }
-                try Verify.check(effective_verify_mode, "scrubUnreachableBlocks", opts.module_idx, func, func_idx, allocator);
-                if (timing_for_func) {
-                    maybePrintPassTiming(
-                        timing,
-                        "verify",
-                        module,
-                        opts.module_idx,
-                        func,
-                        func_idx,
-                        outer_iter,
-                        0,
-                        null,
-                        "scrubUnreachableBlocks",
-                        false,
-                        elapsedNsSince(scrub_verify_start_ns),
-                        scrub_verify_start_stats,
-                    );
-                }
-            }
-            if (timing_for_func) {
-                const elapsed_ns = elapsedNsSince(function_start_ns);
-                if (timing.shouldLogElapsed(elapsed_ns) or timing.shouldLogFunctionProgress(func_idx)) {
-                    printPassTiming(
-                        "function",
-                        module,
-                        opts.module_idx,
-                        func,
-                        func_idx,
-                        outer_iter,
-                        0,
-                        null,
-                        "function",
-                        false,
-                        elapsed_ns,
-                        function_start_stats,
-                        collectPassTimingStats(func),
-                    );
-                }
-            }
+            total_changes += try runFunctionPassPipeline(
+                func,
+                func_idx,
+                module.import_count,
+                passes,
+                allocator,
+                opts,
+                outer_iter,
+            );
         }
     }
     return total_changes;

@@ -126,14 +126,23 @@ pub const PrecompileOptions = struct {
     verify_mode: verifier.VerifyMode = if (std.debug.runtime_safety) .after_each_pass else .off,
     /// Lazy-JIT opt-in. When true (and only ever meaningful under
     /// `config.lazy_jit`), `compileCoreWasmCached` computes the current
-    /// x86_64 eligibility set (`lazy_jit.findLazyEligibleFunctions`) and
-    /// emits stable entry stubs for deferred functions, deferring their
-    /// real body compilation until first entry. Requires
+    /// eligibility set (`lazy_jit.findLazyEligibleFunctions`) and emits
+    /// stable entry stubs for deferred functions, deferring their real
+    /// body compilation until first entry. With the default
+    /// `lazy_defer_passes = true`, the eager per-function IR-pass
+    /// pipeline is deferred too (see `AotInstance`'s lazy-compile hook
+    /// in `runtime.zig` and `docs/design/lazy-jit-spike.md`). Requires
     /// `cache_ctx.lazy_jit_out` to be set so the retained IR survives
     /// past this call — see `compileCoreWasmCached`'s doc comment.
     /// Supported on the current native backends (`.x86_64` and
     /// `.aarch64`) for this narrow prototype.
     lazy_jit: bool = false,
+    /// #892: when `lazy_jit` is enabled, defer the per-function IR pass
+    /// pipeline (`promoteLocalsToSSA`, `lowerPhisToLocals`, preset fixpoint,
+    /// `scrubUnreachableBlocks`) for lazy-marked functions as well as their
+    /// codegen. Defaults to true for the new full-lazy behavior. Tests can
+    /// set it false to reproduce the previous "codegen-only lazy" baseline.
+    lazy_defer_passes: bool = true,
 };
 
 /// #862 lazy-JIT design-spike: retained state a caller needs to compile
@@ -169,6 +178,26 @@ pub const LazyJitOut = struct {
         .aarch64 => .aarch64,
         else => .x86_64,
     },
+    /// Whether the eager compile ran the IR pass pipeline at all. When
+    /// false (`-O0`), lazy first-call compilation must likewise skip the
+    /// deferred per-function pass helper and feed raw frontend IR to
+    /// codegen to preserve the caller's requested semantics.
+    optimize: bool = true,
+    /// The selected pass preset (`.fast` vs `.full`) from the original
+    /// compile. `LazyCompileDriver.compileFn` reuses this so the first-call
+    /// pipeline mirrors the eager path that would have run for a non-lazy
+    /// function in the same module.
+    pass_preset: passes.PassPreset = .full,
+    /// Whether the eager compile already ran the per-function pass pipeline
+    /// for lazy functions. When false (the default new behavior),
+    /// `LazyCompileDriver.compileFn` must replay that pipeline before
+    /// codegen; when true (benchmarking the historical codegen-only lazy
+    /// mode) first-call compilation can go straight to codegen.
+    eager_passes_ran_for_lazy: bool = false,
+    /// Minimal snapshot of the per-function pass-run options needed to
+    /// replay the deferred pipeline on first call. `lazy_skip` is always
+    /// reset to empty here because the single-function helper ignores it.
+    pass_run_options: passes.RunOptions = .{},
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -236,10 +265,10 @@ pub fn compileCoreWasmCached(
     var keep_ir_module_for_lazy_jit = false;
     defer if (!keep_ir_module_for_lazy_jit) ir_module.deinit();
 
-    // #862 lazy-JIT spike: compute the eligibility set BEFORE codegen so
-    // it can be threaded into the selected backend's `lazy_skip`. Requires
-    // `cache_ctx.lazy_jit_out` — see `PrecompileOptions.lazy_jit`'s doc
-    // comment for why.
+    // #862/#892 lazy-JIT: compute the eligibility set BEFORE the eager
+    // per-function pass loop and codegen so the same mask can defer both
+    // kinds of work. Requires `cache_ctx.lazy_jit_out` — see
+    // `PrecompileOptions.lazy_jit`'s doc comment for why.
     var lazy_skip: []bool = &.{};
     defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
     var lazy_needs_trampoline: []bool = &.{};
@@ -260,6 +289,7 @@ pub fn compileCoreWasmCached(
     }
 
     if (opts.optimize) {
+        const pass_lazy_skip = if (opts.lazy_jit and opts.lazy_defer_passes) lazy_skip else &.{};
         _ = passes.runPassesWithOptions(
             &ir_module,
             passes.passesForPreset(opts.target_arch, opts.pass_preset),
@@ -294,6 +324,7 @@ pub fn compileCoreWasmCached(
                 // affected by the spec to keep partial-pipeline IR
                 // states from tripping benign structural checks.
                 .bisect = aot_bisect.global,
+                .lazy_skip = pass_lazy_skip,
                 // Per-core index honoured by `:mod=N` bisect filters.
                 .module_idx = opts.module_idx,
                 .pass_timing = opts.pass_timing,
@@ -619,11 +650,11 @@ pub fn compileCoreWasmCached(
         fn_name_entries,
     ) catch return error.CoreCompileFailed;
 
-    // Hand the retained IR + deferred-function index list back to the caller
-    // instead of freeing it, so the functions in `lazy_skip` can be compiled
-    // on demand later. Convert
-    // the dense `lazy_skip: []bool` into a compact index list here so
-    // the caller doesn't need to re-derive it.
+    // #862/#892 lazy-JIT: hand the retained IR + deferred-function index
+    // list back to the caller instead of freeing it, so the functions in
+    // `lazy_skip` can be compiled on demand later. Convert the dense
+    // `lazy_skip: []bool` into a compact index list here so the caller
+    // doesn't need to re-derive it.
     if (opts.lazy_jit) {
         var indices: std.ArrayList(u32) = .empty;
         errdefer indices.deinit(allocator);
@@ -642,6 +673,19 @@ pub fn compileCoreWasmCached(
             .lazy_local_indices = indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
             .needs_trampoline = needs_trampoline.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
             .target_arch = opts.target_arch,
+            .optimize = opts.optimize,
+            .pass_preset = opts.pass_preset,
+            .eager_passes_ran_for_lazy = !opts.lazy_defer_passes,
+            .pass_run_options = .{
+                .dump_hook = null,
+                .verify_mode = opts.verify_mode,
+                .bisect = aot_bisect.global,
+                .lazy_skip = &.{},
+                .module_idx = opts.module_idx,
+                .pass_timing = opts.pass_timing,
+                .analysis_timing = opts.analysis_timing,
+                .tail_duplication = opts.tail_duplication,
+            },
         };
         keep_ir_module_for_lazy_jit = true;
     }
@@ -667,6 +711,20 @@ pub const LazyCompileDriver = struct {
         const self: *LazyCompileDriver = @ptrCast(@alignCast(ctx_opaque));
         if (local_idx >= self.lazy_out.ir_module.functions.items.len) return error.CodeMappingFailed;
         const func = &self.lazy_out.ir_module.functions.items[local_idx];
+        if (self.lazy_out.optimize and !self.lazy_out.eager_passes_ran_for_lazy) {
+            _ = passes.runFunctionPassesWithOptions(
+                func,
+                local_idx,
+                self.lazy_out.ir_module.import_count,
+                passes.passesForPreset(self.lazy_out.target_arch, self.lazy_out.pass_preset),
+                self.allocator,
+                self.lazy_out.pass_run_options,
+            ) catch |err| {
+                logVerifierFailure(err);
+                std.log.err("lazy-JIT: deferred pass pipeline for function {d} failed: {s}", .{ local_idx, @errorName(err) });
+                return error.CodeMappingFailed;
+            };
+        }
         const code = switch (self.lazy_out.target_arch) {
             .x86_64 => blk: {
                 // Real regalloc-based per-function codegen — the SAME entry point
