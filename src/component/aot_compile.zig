@@ -668,11 +668,11 @@ pub const LazyCompileDriver = struct {
 };
 
 /// Wire `lazy_out` (produced by a `compileCoreWasmCached` call with
-/// `opts.lazy_jit = true`) into `inst`, marking every index in
-/// `lazy_out.lazy_local_indices` as pending. Returns the heap-owned
-/// driver — see `LazyCompileDriver`'s doc comment for its lifetime
-/// contract. `inst` must have been produced from the SAME compile (its
-/// `.cwasm` bytes came from the same `compileCoreWasmCached` call whose
+/// `opts.lazy_jit = true`) into `inst`, marking every deferred local's
+/// slot state as `pending`. Returns the heap-owned driver — see
+/// `LazyCompileDriver`'s doc comment for its lifetime contract. `inst`
+/// must have been produced from the SAME compile (its `.cwasm` bytes
+/// came from the same `compileCoreWasmCached` call whose
 /// `lazy_jit_out` is `lazy_out`) — indices are meaningless otherwise.
 pub fn setupLazyJit(
     inst: *aot_runtime.AotInstance,
@@ -684,18 +684,22 @@ pub fn setupLazyJit(
     driver.* = .{ .lazy_out = lazy_out, .allocator = allocator };
 
     const func_count = lazy_out.ir_module.functions.items.len;
-    const pending = try allocator.alloc(bool, func_count);
-    errdefer allocator.free(pending);
-    @memset(pending, false);
+    const slot_states = try allocator.alloc(std.atomic.Value(u8), func_count);
+    errdefer allocator.free(slot_states);
+    for (slot_states) |*slot| {
+        slot.* = std.atomic.Value(u8).init(@intFromEnum(aot_runtime.LazyJitState.SlotState.inactive));
+    }
     const compiled = try allocator.alloc(?aot_runtime.LazyCompiledFunc, func_count);
     errdefer allocator.free(compiled);
     @memset(compiled, null);
     for (lazy_out.lazy_local_indices) |idx| {
-        if (idx < pending.len) pending[idx] = true;
+        if (idx < slot_states.len) {
+            slot_states[idx].store(@intFromEnum(aot_runtime.LazyJitState.SlotState.pending), .monotonic);
+        }
     }
 
     inst.lazy_jit = .{
-        .pending = pending,
+        .slot_states = slot_states,
         .compiled = compiled,
         .compile_ctx = driver,
         .compile_fn = &LazyCompileDriver.compileFn,

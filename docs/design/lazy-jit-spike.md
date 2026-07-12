@@ -52,14 +52,15 @@ Instead, this prototype intercepts at the **Zig level**, in `runtime.zig`'s `cal
 
 ```zig
 pub const LazyJitState = struct {
-    pending: []bool = &.{},               // local func idx -> still pending?
-    compiled: []?LazyCompiledFunc = &.{},  // local func idx -> resolved code
-    compile_ctx: ?*anyopaque = null,       // type-erased, see below
+    pub const SlotState = enum(u8) { inactive, pending, compiling, ready };
+    slot_states: []std.atomic.Value(u8) = &.{}, // local func idx -> per-slot lazy state
+    compiled: []?LazyCompiledFunc = &.{},       // local func idx -> resolved code
+    compile_ctx: ?*anyopaque = null,            // type-erased, see below
     compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) RuntimeError!LazyCompiledFunc = null,
 };
 ```
 
-`callFuncScalar` checks `pending[local_idx]` before resolving the call address; if true, it invokes `compile_fn` (which compiles the one function via the same real per-function codegen entry point the eager path uses, maps it executable via the runtime-owned tracked mapping helper, and returns the address+size), stores the result, clears `pending`, and proceeds with the call as normal. `AotInstance.destroy()` frees the tracking arrays and tears down every compiled function's own mapping.
+`callFuncScalar` now resolves lazy locals through a **per-slot atomic state machine**: lazy-eligible slots start `pending`, one winning thread CASes a contended slot to `compiling`, publishes `compiled[local_idx]`, then release-stores `ready`; waiters acquire-load that `ready` state before reading the published `LazyCompiledFunc`, so same-slot races never observe torn/half-written code pointers. If `compile_fn` returns an error (including `error.CodeBudgetExceeded` from the tracked mapping path, propagated as-is so callers can distinguish "budget exceeded, retryable" from a hard mapping failure), the winning thread release-stores `pending` again before re-raising that same error, so the slot stays retryable and waiters never wedge forever (they may immediately compete to retry in the same burst). `AotInstance.destroy()` still frees the tracking arrays and `munmap`s every compiled function's own mapping (and unregisters it from `JitCodeCache`).
 
 **Why type-erased?** `AotInstance`/`runtime.zig` must not depend on compiler types directly — the plain (non-`-Djit`) `wamr` binary links no compiler at all (#695's whole point). The actual "compile function N" logic — which needs `ir.IrFunction`, the x86_64 codegen module, etc. — lives in `src/component/aot_compile.zig`'s new `LazyCompileDriver`, which owns the retained `LazyJitOut` and is wired into an `AotInstance` via the also-new `setupLazyJit(inst, lazy_out, allocator)` helper. This exactly mirrors the existing `TrampolinePool.ctx: *anyopaque` pattern.
 
@@ -70,7 +71,9 @@ pub const LazyJitState = struct {
 `src/tests/lazy_jit_spike_test.zig` (gated on `config.lazy_jit`, `x86_64` only):
 
 1. **Correctness**: a 3-function fixture (`add1`, `mul2`, `never_called`, no calls between them, no tables) compiles with `opts.lazy_jit = true`; all 3 are confirmed lazy-eligible and the emitted `.cwasm`'s text section is genuinely empty (0 compiled bytes) up front. Calling `add1`/`mul2` through `callFuncScalar` triggers on-demand compilation and returns the correct result both on the first call (compiles) and a second call (reuses). `never_called` remains pending throughout — proving the deferral is real, not a same-work-different-order relabeling.
-2. **Measured effect**: a 200-leaf-function synthetic module (`fN(x) = x + N`, no calls, no tables — all 200 eligible) compiled with `opts.lazy_jit = true` vs. the eager default. Measured (this repo's benchmark hardware, x86_64, ReleaseFast, 2026-07-10):
+2. **Same-slot contention**: an 8-thread stress test shares one lazily prepared `AotInstance`, forces all 8 threads to first-call the SAME exported lazy leaf together, and wraps `compile_fn` with an atomic counter. Exactly one compile entry is observed for the contended slot; every thread gets the correct result; unrelated lazy locals remain pending until explicitly used.
+3. **Failure/retry path**: the same 8-thread setup wraps `compile_fn` so the first winning compile attempt returns `null`. One caller gets `CodeMappingFailed`, another waiter wins the reset-to-`pending` retry, the slot reaches `ready`, and later calls reuse the successfully published code.
+4. **Measured effect**: a 200-leaf-function synthetic module (`fN(x) = x + N`, no calls, no tables — all 200 eligible) compiled with `opts.lazy_jit = true` vs. the eager default. Measured (this repo's benchmark hardware, x86_64, ReleaseFast, 2026-07-10):
 
    ```
    eager (compile all 200): 359,923 µs
@@ -92,4 +95,3 @@ This spike deliberately does not attempt (tracked as follow-up work, not filed a
 - **Interaction with the JIT code cache (#857).** Resolved later by #891: deferred function mappings now go through the same runtime-owned tracked mapping helper as eager text blobs, so `residentBytes()`, `mappingCount()`, and `WAMR_JIT_CODE_BUDGET_BYTES` all account for lazy first-call compilation too.
 - **Skipping IR-optimization passes for lazy functions**, not just codegen (see the note above).
 - **Tiering / background re-compilation to a higher optimization level** (this spike's lazily-compiled functions always use the real regalloc-based codegen at whatever preset was requested — there's no "quick baseline now, optimize later in the background" tier).
-- **Thread-safety of concurrent first-calls to the *same* lazy function.** `LazyJitState.compile_fn` is called at most once per index in the tests here, but nothing prevents two threads racing to compile the *same* still-pending function concurrently if an embedder calls `callFuncScalar` on the same `AotInstance` from multiple threads — matching the general "configure before spawning concurrent work" contract from #859's thread-safety audit, but worth an explicit note since this is genuinely new mutable per-instance state, not a startup-only global.
