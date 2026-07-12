@@ -504,6 +504,11 @@ pub const ComponentInstance = struct {
         /// until phase 3 wires `aot_runtime.callFunc` into
         /// `executor.callComponentFuncByLocal`.
         aot_inst: ?*aot_runtime.AotInstance = null,
+        /// Optional lazy-JIT driver attached to `aot_inst` for
+        /// in-memory component precompile results (#889). Destroy only
+        /// after `aot_inst` itself is torn down because the runtime may
+        /// call back into the driver up until `AotInstance.destroy()`.
+        lazy_driver: ?core_backend.LazyJitHandle = null,
         /// When this entry corresponds to a `CoreInstanceExpr.exports` (an
         /// inline instance bundling named core items rather than an actual
         /// core-module instantiation), the named items live here. `module_inst`
@@ -1681,9 +1686,12 @@ pub const ComponentInstance = struct {
         self.pending_aot_starts.deinit(self.allocator);
         if (self.core_instances.len > 0) {
             const inst_mod = @import("../runtime/interpreter/instance.zig");
-            for (self.core_instances) |entry| {
+            for (self.core_instances) |*entry| {
                 if (entry.module_inst) |mi| inst_mod.destroy(mi);
-                if (entry.aot_inst) |ai| aot_runtime.destroy(ai);
+                if (entry.aot_inst) |ai| {
+                    aot_runtime.destroy(ai);
+                    if (entry.lazy_driver) |driver| driver.deinit();
+                }
             }
             self.allocator.free(self.core_instances);
         }
@@ -1737,6 +1745,10 @@ pub const InstantiationError = error{
     /// that don't set `aot_only` keep the silent interp fallback.
     /// See issue #644.
     AotImportUnresolvable,
+    /// An in-memory precompiled core needed a lazy-JIT sidecar attach
+    /// during AOT instantiation (#889), but the sidecar was missing or
+    /// otherwise could not be attached.
+    LazyJitAttachFailed,
 };
 
 /// Instantiate a parsed component, producing a runnable ComponentInstance.
@@ -1763,11 +1775,14 @@ pub fn instantiate(
 
 /// `instantiate` variant that accepts caller-supplied options (#625).
 ///
-/// Today's only option is `precompiled_cores` — a slice of
-/// `(module_idx, cwasm_bytes)` pairs that opt individual embedded
-/// core modules into the AOT runtime. Cores not covered by the slice
-/// continue to load through `runtime/interpreter/loader.zig`. Bytes
-/// are borrowed and must outlive the returned `ComponentInstance`.
+/// Options primarily carry `precompiled_cores` — a slice of
+/// `(module_idx, cwasm_bytes)` pairs that opt individual embedded core
+/// modules into the AOT runtime. For in-memory component precompile
+/// results they may also carry an internal lazy-JIT attach hook used to
+/// consume per-core sidecars at AOT instantiation time (#889). Cores
+/// not covered by the slice continue to load through
+/// `runtime/interpreter/loader.zig`. Bytes are borrowed and must
+/// outlive the returned `ComponentInstance`.
 pub fn instantiateWithOptions(
     component: *const ctypes.Component,
     allocator: std.mem.Allocator,
@@ -1913,7 +1928,8 @@ pub fn instantiateWithOptions(
                     // warning + fall through to the interp path that
                     // already knows how to wire these.
                     if (!force_all_interp) blk_aot_try: {
-                        const cwasm_bytes = inst.options.findPrecompiled(core_mod.data, ie.module_idx) orelse break :blk_aot_try;
+                        const precompiled_entry = inst.options.findPrecompiledEntry(core_mod.data, ie.module_idx) orelse break :blk_aot_try;
+                        const cwasm_bytes = precompiled_entry.cwasm_bytes;
                         aot_blk: {
                             const mod_alloc = inst.module_arena.allocator();
                             const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch break :aot_blk;
@@ -2060,7 +2076,22 @@ pub fn instantiateWithOptions(
                                 if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             };
-                            cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
+                            var lazy_driver: ?core_backend.LazyJitHandle = null;
+                            lazy_driver = inst.options.attachLazyJit(precompiled_entry, aot_inst_ptr, allocator) catch |err| switch (err) {
+                                error.OutOfMemory => {
+                                    aot_runtime.destroy(aot_inst_ptr);
+                                    return error.OutOfMemory;
+                                },
+                                error.LazyJitSidecarUnavailable => {
+                                    std.log.warn(
+                                        "aot core {d} lazy-JIT sidecar unavailable; {s}",
+                                        .{ ie.module_idx, if (aot_only) @as([]const u8, "failing instantiation") else "falling back to interpreter" },
+                                    );
+                                    aot_runtime.destroy(aot_inst_ptr);
+                                    if (aot_only) return error.LazyJitAttachFailed;
+                                    break :aot_blk;
+                                },
+                            };
                             // Defer the AOT core module's `(start ...)` until
                             // `runDeferredCoreStarts`, after all sibling cores
                             // are wired and trampolines are bound (#308 AOT
@@ -2070,10 +2101,16 @@ pub fn instantiateWithOptions(
                                     .inst = aot_inst_ptr,
                                     .start_idx = start_idx,
                                 }) catch {
+                                    if (lazy_driver) |driver| driver.deinit();
+                                    aot_runtime.destroy(aot_inst_ptr);
                                     if (aot_only) return error.AotImportUnresolvable;
                                     break :aot_blk;
                                 };
                             }
+                            cis[ci_idx] = .{
+                                .aot_inst = aot_inst_ptr,
+                                .lazy_driver = lazy_driver,
+                            };
                             // AOT cross-instance overrides were resolved
                             // above before instantiation; unresolved imports
                             // either fall back to interp or use a trap stub.

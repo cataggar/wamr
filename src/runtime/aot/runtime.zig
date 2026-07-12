@@ -2380,10 +2380,26 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
 
-    const addr = getCallableAddr(inst, func_idx) orelse {
+    // Lazy-JIT: resolve through the per-slot atomic state machine first (see
+    // `callFuncScalar`'s matching logic and `LazyJitState.resolveLocalAddr`'s
+    // doc comment) before falling back to the instance's already-published
+    // callable-pointer table.
+    var lazy_resolved_addr: ?[*]const u8 = null;
+    if (comptime config.lazy_jit) {
+        const import_count = inst.module.import_function_count;
+        if (func_idx >= import_count) {
+            const local_idx: usize = @intCast(func_idx - import_count);
+            lazy_resolved_addr = try inst.lazy_jit.resolveLocalAddr(local_idx);
+            if (lazy_resolved_addr) |addr| {
+                if (func_idx < inst.funcptrs.len) inst.funcptrs[func_idx] = @intFromPtr(addr);
+            }
+        }
+    }
+
+    const addr = lazy_resolved_addr orelse (getCallableAddr(inst, func_idx) orelse {
         if (inst.code_base == null) return error.CodeMappingFailed;
         return error.FunctionNotFound;
-    };
+    });
 
     const previous_globals_ptr = inst.vmctx.globals_ptr;
     const vmctx_storage_addr = @intFromPtr(&inst.vmctx);

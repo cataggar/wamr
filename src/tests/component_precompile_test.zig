@@ -9,9 +9,11 @@
 //! path the phase 1 smoke test exercises with in-memory bytes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const wamr = @import("wamr");
 const aot_harness = @import("aot_harness.zig");
 
+const config = wamr.config;
 const instance = wamr.component_instance;
 const core_types = wamr.types;
 const aot_runtime_mod = wamr.aot_runtime;
@@ -22,16 +24,11 @@ const component_aot_compile = wamr.component_aot_compile;
 const core_wasm = [_]u8{
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
     0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
-    0x03, 0x02, 0x01, 0x00,
-    0x05, 0x03, 0x01, 0x00, 0x01,
-    0x07, 0x12, 0x02,
-    0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
-    0x05, 'a', 'd', 'd', '4', '2', 0x00, 0x00,
-    0x0a, 0x09, 0x01, 0x07, 0x00,
-    0x20, 0x00,
-    0x41, 0x2a,
-    0x6a,
-    0x0b,
+    0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00,
+    0x01, 0x07, 0x12, 0x02, 0x06, 'm',  'e',  'm',
+    'o',  'r',  'y',  0x02, 0x00, 0x05, 'a',  'd',
+    'd',  '4',  '2',  0x00, 0x00, 0x0a, 0x09, 0x01,
+    0x07, 0x00, 0x20, 0x00, 0x41, 0x2a, 0x6a, 0x0b,
 };
 
 /// LEB128-encode a u32 into `out` (assumed large enough; 5 bytes max).
@@ -142,6 +139,60 @@ test "#625 phase 2: precompile + loadManifest + instantiate round-trip" {
     );
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqual(@as(i32, 142), results[0].i32);
+}
+
+test "#889: precompileComponentInMemory lazy-JIT attaches for a single-core component" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const component_bytes = try buildMinimalComponent(allocator);
+    defer allocator.free(component_bytes);
+
+    var in_mem = try component_aot_compile.precompileComponentInMemory(allocator, component_bytes, .{
+        .lazy_jit = true,
+    });
+    defer in_mem.deinit();
+
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+    const component = try wamr.component_loader.load(component_bytes, parse_arena.allocator());
+
+    const inst = try instance.instantiateWithOptions(&component, allocator, in_mem.instantiationOptions());
+    defer inst.deinit();
+
+    const ai = inst.core_instances[0].aot_inst orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 1), ai.lazy_jit.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), ai.lazy_jit.compiled.len);
+    try std.testing.expect(ai.lazy_jit.pending[0]);
+    try std.testing.expect(ai.lazy_jit.compiled[0] == null);
+
+    const fn_idx = aot_runtime_mod.findExportFunc(ai, "add42") orelse return error.TestFailed;
+    var results_buf: [1]aot_runtime_mod.ScalarResult = .{.{ .i32 = 0 }};
+
+    const first = try aot_runtime_mod.callFuncScalar(
+        ai,
+        fn_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = 100 }},
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 142), first[0].i32);
+    try std.testing.expect(!ai.lazy_jit.pending[0]);
+    const compiled_addr = ai.lazy_jit.compiled[0].?.addr;
+
+    const second = try aot_runtime_mod.callFuncScalar(
+        ai,
+        fn_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = 0 }},
+        &results_buf,
+    );
+    try std.testing.expectEqual(@as(i32, 42), second[0].i32);
+    try std.testing.expectEqual(@intFromPtr(compiled_addr), @intFromPtr(ai.lazy_jit.compiled[0].?.addr));
 }
 
 test "#625 phase 2: loadManifest rejects mismatched component bytes" {
