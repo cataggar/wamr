@@ -141,6 +141,34 @@ pub const PrecompiledCore = struct {
     /// those sub-components without their inner local `module_idx`
     /// colliding with the root's. (#662 phase D)
     core_wasm: ?[]const u8 = null,
+    /// #879 M4.8 phase 2: optional lazy-JIT setup hook for this core,
+    /// present only when `component_aot_compile.precompileComponentInMemory`
+    /// compiled it with `opts.lazy_jit = true`. See
+    /// `LazyJitSetupHook`'s doc comment.
+    lazy_jit_setup: ?LazyJitSetupHook = null,
+};
+
+/// #879 M4.8 phase 2: type-erased bridge from a per-core `LazyJitOut`
+/// (a compiler-side type — `component_aot_compile.LazyJitOut`) to the
+/// AOT core-instantiation path in `instance.zig`, which — like
+/// `aot_runtime.LazyJitState.compile_fn`/`compile_ctx` before it —
+/// must not depend on compiler types directly (#695: the plain,
+/// non-`-Djit` `wamr` binary links no compiler at all).
+pub const LazyJitSetupHook = struct {
+    /// Opaque per-core data; always actually a
+    /// `*component_aot_compile.LazyJitOut` in practice, but this file
+    /// never inspects it directly.
+    ctx: *anyopaque,
+    /// Wires `ctx` into `inst` (via `component_aot_compile.setupLazyJit`,
+    /// through its `setupLazyJitOpaque` wrapper) and returns the
+    /// resulting driver as an opaque handle for `deinit_fn` to free
+    /// later. MUST be called BEFORE `aot_runtime.mapCodeExecutable(inst)`
+    /// — mirrors `setupLazyJit`'s own documented ordering requirement.
+    setup_fn: *const fn (ctx: *anyopaque, inst: *aot_runtime.AotInstance, allocator: std.mem.Allocator) anyerror!*anyopaque,
+    /// Frees the driver handle `setup_fn` returned. MUST be called
+    /// AFTER `aot_runtime.destroy` on the same instance — mirrors
+    /// `LazyCompileDriver`'s documented lifetime contract.
+    deinit_fn: *const fn (driver: *anyopaque) void,
 };
 
 /// Process-global toggle for AOT debug diagnostics. Off by default;
@@ -221,6 +249,27 @@ pub const Options = struct {
                     return pc.cwasm_bytes;
             } else {
                 if (pc.module_idx == module_idx) return pc.cwasm_bytes;
+            }
+        }
+        return null;
+    }
+
+    /// Find the lazy-JIT setup hook (if any) for a given core-module
+    /// slot — same matching rule as `findPrecompiled` (by `core_wasm`
+    /// slice identity when set, else by `module_idx`), since a
+    /// `PrecompiledCore`'s `lazy_jit_setup` is always for the exact
+    /// same core its `cwasm_bytes`/`core_wasm` identify.
+    pub fn findLazyJitSetup(
+        self: Options,
+        core_wasm: []const u8,
+        module_idx: u32,
+    ) ?LazyJitSetupHook {
+        for (self.precompiled_cores) |pc| {
+            if (pc.core_wasm) |cw| {
+                if (cw.ptr == core_wasm.ptr and cw.len == core_wasm.len)
+                    return pc.lazy_jit_setup;
+            } else {
+                if (pc.module_idx == module_idx) return pc.lazy_jit_setup;
             }
         }
         return null;

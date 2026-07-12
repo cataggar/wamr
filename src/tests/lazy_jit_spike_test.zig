@@ -445,6 +445,11 @@ test "#879 M4.8: precompileComponentInMemory produces one independently-eligible
     defer aot_runtime_mod.destroy(inst);
 
     const driver = try component_aot_compile.setupLazyJit(inst, in_mem.lazy_jit_outs[0], gpa);
+    // Hollow the source slot out immediately after handing its
+    // contents to setupLazyJit -- see InMemoryPrecompiled.lazy_jit_outs'
+    // doc comment for why this makes in_mem.deinit() (deferred above)
+    // safe to unconditionally clean up every entry.
+    in_mem.lazy_jit_outs[0] = .{ .ir_module = wamr.ir.IrModule.init(gpa), .allocator = gpa };
     defer driver.deinit();
     try aot_runtime_mod.mapCodeExecutable(inst);
 
@@ -456,10 +461,62 @@ test "#879 M4.8: precompileComponentInMemory produces one independently-eligible
     try std.testing.expectEqual(@as(i32, 7), results[0].i32);
     try std.testing.expect(!inst.lazy_jit.pending[0]);
 
-    // Core 1's LazyJitOut was never consumed by setupLazyJit in this
-    // test -- free it manually, per InMemoryPrecompiled.lazy_jit_outs'
-    // documented ownership contract.
-    in_mem.lazy_jit_outs[1].ir_module.deinit();
-    gpa.free(in_mem.lazy_jit_outs[1].lazy_local_indices);
-    gpa.free(in_mem.lazy_jit_outs[1].needs_trampoline_indices);
+    // Core 1's LazyJitOut was never consumed -- in_mem.deinit() (see
+    // its deferred call above) now cleans it up automatically.
+}
+
+// #879 M4.8 phase 2: the same h1-compose fixture, but instantiated
+// through the REAL component-instantiation path
+// (`component_instance.instantiateWithOptions`, exactly like `wamr
+// run`/`wamr serve` would use it) instead of directly driving a single
+// core's `AotInstance` by hand. Proves the `PrecompiledCore.lazy_jit_setup`
+// hook wired in `instance.zig`'s AOT core-instantiation block actually
+// runs: core 0's leaf function "f" stays deferred until the
+// component-level call to "g" (which cross-instance-calls "f")
+// resolves it on demand.
+test "#879 M4.8 phase 2: a real component instantiation defers a core function and compiles it on demand" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const data = @embedFile("h1_compose_wasm");
+
+    var in_mem = try component_aot_compile.precompileComponentInMemory(gpa, data, .{ .lazy_jit = true });
+    defer in_mem.deinit();
+    try std.testing.expectEqual(@as(usize, 1), in_mem.lazy_jit_outs[0].lazy_local_indices.len);
+
+    // Independent parse of the SAME `data` buffer -- `precompileComponentInMemory`'s
+    // own doc comment establishes this is a zero-copy, byte-identical
+    // re-parse, which is what lets `findPrecompiled`/`findLazyJitSetup`
+    // match `pcs[i].core_wasm` against this component's
+    // `core_modules[i].data` by slice identity.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var component = try wamr.component_loader.load(data, arena.allocator());
+
+    const inst = try wamr.component_instance.instantiateWithOptions(&component, gpa, .{
+        .precompiled_cores = in_mem.precompiledCores(),
+        .aot_only = true,
+    });
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(wamr.component_instance.ImportBinding) = .empty;
+    defer providers.deinit(gpa);
+    try inst.linkImports(providers);
+
+    // Core 0's AotInstance backs core-instance slot 0 (see the H1
+    // fixture test in instance.zig) -- its "f" must still be pending
+    // immediately after instantiation+linking, before "g" is ever called.
+    const core0 = inst.core_instances[0].aot_inst orelse return error.ExpectedAotCore;
+    try std.testing.expect(core0.lazy_jit.pending[0]);
+
+    var args: [0]wamr.canonical_abi.InterfaceValue = .{};
+    var results: [1]wamr.canonical_abi.InterfaceValue = undefined;
+    try wamr.component_executor.callComponentFunc(inst, "g", &args, &results, gpa);
+    try std.testing.expectEqual(@as(u32, 8), results[0].u32);
+
+    // "f" must now be resolved -- proving the cross-instance call from
+    // "g" genuinely went through the lazy-compile hook, not that this
+    // test is vacuously passing some other way.
+    try std.testing.expect(!core0.lazy_jit.pending[0]);
 }

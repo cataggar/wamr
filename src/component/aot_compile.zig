@@ -157,16 +157,29 @@ pub const LazyJitOut = struct {
     ir_module: ir.IrModule = undefined,
     /// LOCAL function indices (matching `ir_module.functions.items`)
     /// that were skipped during this compile. Caller-owned; free with
-    /// the allocator passed to `compileCoreWasmCached`.
+    /// `allocator` below.
     lazy_local_indices: []const u32 = &.{},
     /// #879 M4.6 phase 2: the subset of `lazy_local_indices` that are
     /// reachable via `call_indirect`/`ref.func` (see
     /// `lazy_jit.findLazyEligibleWithTrampoline`'s `needs_trampoline`
     /// output) and therefore need a real native trampoline installed
     /// at `func_addrs[i]`/their table slot — see `setupLazyJit`.
-    /// Caller-owned; free with the allocator passed to
-    /// `compileCoreWasmCached`.
+    /// Caller-owned; free with `allocator` below.
     needs_trampoline_indices: []const u32 = &.{},
+    /// #879 M4.8 phase 2: the allocator `compileCoreWasmCached` used
+    /// to build `ir_module`/`lazy_local_indices`/`needs_trampoline_indices`.
+    /// `LazyCompileDriver.deinit` frees them with THIS allocator, not
+    /// with whatever allocator `setupLazyJit` itself was called with
+    /// — those can differ (e.g. `precompileComponentInMemory` compiles
+    /// with the caller's top-level allocator, but `component/instance.zig`'s
+    /// AOT core-instantiation path calls `setupLazyJit` with
+    /// `inst.allocator`, which is often a per-request arena). Using
+    /// the wrong one here silently no-ops on an arena (no crash, just
+    /// a leak of the *real* allocator's bookkeeping) rather than
+    /// erroring, which is exactly the bug this field closes.
+    /// Default `undefined`, same rationale as `ir_module`'s: never
+    /// meant to be read before a real compile populates it.
+    allocator: std.mem.Allocator = undefined,
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -635,6 +648,7 @@ pub fn compileCoreWasmCached(
             .ir_module = ir_module,
             .lazy_local_indices = indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
             .needs_trampoline_indices = trampoline_indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
+            .allocator = allocator,
         };
         keep_ir_module_for_lazy_jit = true;
     }
@@ -693,8 +707,14 @@ pub const LazyCompileDriver = struct {
     pub fn deinit(self: *LazyCompileDriver) void {
         var out = self.lazy_out;
         out.ir_module.deinit();
-        self.allocator.free(out.lazy_local_indices);
-        self.allocator.free(out.needs_trampoline_indices);
+        // #879 M4.8 phase 2: free with `out.allocator` (the allocator
+        // `compileCoreWasmCached` actually built these with), NOT
+        // `self.allocator` (whatever `setupLazyJit` was called with —
+        // see `LazyJitOut.allocator`'s doc comment for why these can
+        // legitimately differ, and what silently freeing with the
+        // wrong one does instead of erroring).
+        out.allocator.free(out.lazy_local_indices);
+        out.allocator.free(out.needs_trampoline_indices);
         if (self.trampoline_pool) |*pool| pool.deinit();
         self.allocator.destroy(self);
     }
@@ -764,6 +784,40 @@ pub fn setupLazyJit(
     }
 
     return driver;
+}
+
+/// #879 M4.8 phase 2: type-erased `component_backend.LazyJitSetupHook.setup_fn`
+/// implementation — casts `ctx` back to `*LazyJitOut`, calls the real
+/// `setupLazyJit`, and returns the resulting driver as an opaque
+/// handle. `component/instance.zig`'s AOT core-instantiation path
+/// calls this (via the hook, never this function by name) so it never
+/// needs to depend on `LazyJitOut`'s or `LazyCompileDriver`'s concrete
+/// types (#695).
+fn setupLazyJitOpaque(
+    ctx: *anyopaque,
+    inst: *aot_runtime.AotInstance,
+    allocator: std.mem.Allocator,
+) anyerror!*anyopaque {
+    const lazy_out: *LazyJitOut = @ptrCast(@alignCast(ctx));
+    const driver = try setupLazyJit(inst, lazy_out.*, allocator);
+    // Hollow the source slot out now that its contents have been
+    // moved into `driver` -- see `InMemoryPrecompiled.lazy_jit_outs`'s
+    // doc comment. `LazyJitOut.ir_module`/`.allocator` default to
+    // `undefined` (only ever meant to be read once, right after a
+    // real compile populates them), so a plain `.{}` here would leave
+    // both unsafe for `InMemoryPrecompiled.deinit` to later act on --
+    // explicitly give the hollowed slot a genuinely empty, deinit-safe
+    // `IrModule` AND a real (if now-unused) allocator.
+    lazy_out.* = .{ .ir_module = ir.IrModule.init(allocator), .allocator = allocator };
+    return @ptrCast(driver);
+}
+
+/// #879 M4.8 phase 2: type-erased `component_backend.LazyJitSetupHook.deinit_fn`
+/// implementation — casts `driver` back to `*LazyCompileDriver` and
+/// calls its `deinit()`.
+fn deinitLazyJitDriverOpaque(driver: *anyopaque) void {
+    const d: *LazyCompileDriver = @ptrCast(@alignCast(driver));
+    d.deinit();
 }
 
 // ── Global / element entry builders ─────────────────────────────────────
@@ -1052,25 +1106,32 @@ pub const InMemoryPrecompiled = struct {
     /// (`core_wasm`); valid for the lifetime of this struct.
     pcs: []const core_backend.PrecompiledCore,
     allocator: std.mem.Allocator,
-    /// #879 M4.8 (phase 1): one `LazyJitOut` per core, in the same
-    /// order as `pcs`/`cwasm_buffers`, populated only when
-    /// `opts.lazy_jit` was true for the `precompileComponentInMemory`
-    /// call that produced this struct (`&.{}` otherwise — zero cost
-    /// for every existing non-lazy caller).
+    /// #879 M4.8: one `LazyJitOut` per core, in the same order as
+    /// `pcs`/`cwasm_buffers`, populated only when `opts.lazy_jit` was
+    /// true for the `precompileComponentInMemory` call that produced
+    /// this struct (`&.{}` otherwise — zero cost for every existing
+    /// non-lazy caller).
     ///
-    /// Ownership mirrors the single-core `LazyJitOut` contract (see
-    /// `LazyCompileDriver`'s doc comment): each entry is meant to be
-    /// MOVE-consumed by a `setupLazyJit` call for that core's
-    /// `AotInstance`. `deinit` below assumes every non-empty entry has
-    /// already been consumed that way and does NOT free it itself —
-    /// a caller that obtains a non-empty `lazy_jit_outs` but skips
-    /// `setupLazyJit` for some entry is responsible for freeing that
-    /// entry's `ir_module`/`lazy_local_indices`/`needs_trampoline_indices`
-    /// itself, same as a single-core caller would.
-    ///
-    /// #879 M4.8 phase 2 (follow-up, not done in this change): nothing
-    /// in `component/instance.zig`'s per-core instantiation loop reads
-    /// this array yet — see `docs/design/lazy-jit-spike.md`.
+    /// Ownership: `deinit` below unconditionally frees every entry's
+    /// `ir_module`/`lazy_local_indices`/`needs_trampoline_indices` —
+    /// safe even for an entry that WAS already consumed by a
+    /// `setupLazyJit` call, because both consumption paths hollow the
+    /// source slot out to an empty, deinit-safe `LazyJitOut` afterward
+    /// (NOT a bare `.{}` — that would leave `ir_module`/`allocator` at
+    /// their unsafe `undefined` defaults; use
+    /// `.{ .ir_module = ir.IrModule.init(allocator), .allocator = allocator }`):
+    ///   * `PrecompiledCore.lazy_jit_setup`'s `setup_fn` (the
+    ///     `component/instance.zig` AOT-instantiation path, wired in
+    ///     #879 M4.8 phase 2) does this automatically.
+    ///   * A caller driving `setupLazyJit` directly on one of these
+    ///     entries (bypassing the hook, e.g. in tests) must do the
+    ///     same by hand right after: `const driver = try setupLazyJit(inst,
+    ///     in_mem.lazy_jit_outs[i], allocator); in_mem.lazy_jit_outs[i] =
+    ///     .{ .ir_module = ir.IrModule.init(allocator), .allocator = allocator };`.
+    /// This means a core that falls back to the interpreter (and so
+    /// never runs its `lazy_jit_setup` hook at all) still gets its
+    /// retained IR cleaned up correctly here, without the caller
+    /// needing to track which cores actually ended up on the AOT path.
     lazy_jit_outs: []LazyJitOut = &.{},
 
     pub fn precompiledCores(self: *const InMemoryPrecompiled) []const core_backend.PrecompiledCore {
@@ -1081,6 +1142,11 @@ pub const InMemoryPrecompiled = struct {
         for (self.cwasm_buffers) |buf| self.allocator.free(buf);
         self.allocator.free(self.cwasm_buffers);
         self.allocator.free(self.pcs);
+        for (self.lazy_jit_outs) |*out| {
+            out.ir_module.deinit();
+            out.allocator.free(out.lazy_local_indices);
+            out.allocator.free(out.needs_trampoline_indices);
+        }
         if (self.lazy_jit_outs.len > 0) self.allocator.free(self.lazy_jit_outs);
     }
 };
@@ -1175,6 +1241,18 @@ pub fn precompileComponentInMemory(
             .module_idx = core_ref.local_idx,
             .cwasm_bytes = cwasm,
             .core_wasm = core_ref.data,
+            // #879 M4.8 phase 2: bridges this core's LazyJitOut to
+            // component/instance.zig's AOT instantiation path via a
+            // type-erased hook (see LazyJitSetupHook's doc comment) --
+            // `&lazy_jit_outs[idx]` stays valid for the lifetime of
+            // this returned `InMemoryPrecompiled`, which the caller
+            // must keep alive at least as long as the component it
+            // instantiates from `pcs`, exactly like `cwasm_bytes`.
+            .lazy_jit_setup = if (opts.lazy_jit) .{
+                .ctx = &lazy_jit_outs[idx],
+                .setup_fn = &setupLazyJitOpaque,
+                .deinit_fn = &deinitLazyJitDriverOpaque,
+            } else null,
         };
     }
 

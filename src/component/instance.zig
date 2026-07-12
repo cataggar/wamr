@@ -504,6 +504,14 @@ pub const ComponentInstance = struct {
         /// until phase 3 wires `aot_runtime.callFunc` into
         /// `executor.callComponentFuncByLocal`.
         aot_inst: ?*aot_runtime.AotInstance = null,
+        /// #879 M4.8 phase 2: opaque lazy-JIT driver handle for this
+        /// core (see `core_backend.LazyJitSetupHook`), set only when
+        /// `aot_inst` came from a `PrecompiledCore` with a non-null
+        /// `lazy_jit_setup`. Freed via `lazy_jit_deinit_fn` in
+        /// `ComponentInstance.deinit` AFTER `aot_runtime.destroy(aot_inst)`
+        /// — mirrors `LazyCompileDriver`'s documented lifetime contract.
+        lazy_jit_driver: ?*anyopaque = null,
+        lazy_jit_deinit_fn: ?*const fn (*anyopaque) void = null,
         /// When this entry corresponds to a `CoreInstanceExpr.exports` (an
         /// inline instance bundling named core items rather than an actual
         /// core-module instantiation), the named items live here. `module_inst`
@@ -1684,6 +1692,9 @@ pub const ComponentInstance = struct {
             for (self.core_instances) |entry| {
                 if (entry.module_inst) |mi| inst_mod.destroy(mi);
                 if (entry.aot_inst) |ai| aot_runtime.destroy(ai);
+                // #879 M4.8 phase 2: deinit AFTER destroy, per
+                // LazyCompileDriver's documented lifetime contract.
+                if (entry.lazy_jit_driver) |d| entry.lazy_jit_deinit_fn.?(d);
             }
             self.allocator.free(self.core_instances);
         }
@@ -1914,6 +1925,12 @@ pub fn instantiateWithOptions(
                     // already knows how to wire these.
                     if (!force_all_interp) blk_aot_try: {
                         const cwasm_bytes = inst.options.findPrecompiled(core_mod.data, ie.module_idx) orelse break :blk_aot_try;
+                        // #879 M4.8 phase 2: this core's lazy-JIT setup
+                        // hook, if `precompileComponentInMemory` was
+                        // called with `opts.lazy_jit = true` and this
+                        // core had something to defer. `null` for
+                        // every existing (non-lazy) caller.
+                        const lazy_jit_hook = inst.options.findLazyJitSetup(core_mod.data, ie.module_idx);
                         aot_blk: {
                             const mod_alloc = inst.module_arena.allocator();
                             const aot_module_ptr = mod_alloc.create(aot_loader.AotModule) catch break :aot_blk;
@@ -2054,13 +2071,32 @@ pub fn instantiateWithOptions(
                                 if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             };
+                            // #879 M4.8 phase 2: wire this core's
+                            // lazy-JIT setup (if any) BEFORE
+                            // mapCodeExecutable — mirrors
+                            // setupLazyJit's documented ordering
+                            // requirement (component/aot_compile.zig).
+                            var lazy_jit_driver: ?*anyopaque = null;
+                            if (lazy_jit_hook) |hook| {
+                                lazy_jit_driver = hook.setup_fn(hook.ctx, aot_inst_ptr, inst.allocator) catch |err| {
+                                    std.log.warn("aot core lazy-JIT setup failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
+                                    aot_runtime.destroy(aot_inst_ptr);
+                                    if (aot_only) return error.AotImportUnresolvable;
+                                    break :aot_blk;
+                                };
+                            }
                             aot_runtime.mapCodeExecutable(aot_inst_ptr) catch |err| {
                                 std.log.warn("aot core code-map failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                                 aot_runtime.destroy(aot_inst_ptr);
+                                if (lazy_jit_driver) |d| lazy_jit_hook.?.deinit_fn(d);
                                 if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             };
-                            cis[ci_idx] = .{ .aot_inst = aot_inst_ptr };
+                            cis[ci_idx] = .{
+                                .aot_inst = aot_inst_ptr,
+                                .lazy_jit_driver = lazy_jit_driver,
+                                .lazy_jit_deinit_fn = if (lazy_jit_hook) |hook| hook.deinit_fn else null,
+                            };
                             // Defer the AOT core module's `(start ...)` until
                             // `runDeferredCoreStarts`, after all sibling cores
                             // are wired and trampolines are bound (#308 AOT

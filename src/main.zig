@@ -902,8 +902,18 @@ fn loadComponentManifestOrPrint(
                 // #860: default to the fast/baseline compile preset
                 // (see `jitPassPresetFromEnv`) rather than `wamrc
                 // compile`'s steady-state-optimized default.
+                // #879 M4.8: opt every core into the lazy-JIT spike
+                // whenever this binary was built with
+                // `-Dlazy_jit=true` -- that build flag is already the
+                // deliberate, narrow opt-in (see
+                // docs/design/lazy-jit-spike.md); no separate runtime
+                // toggle needed on top of it. `PrecompiledCore.lazy_jit_setup`
+                // (set per-core by `precompileComponentInMemory` below)
+                // flows through the existing `precompiled_cores`
+                // plumbing into `instantiateWithOptions` unchanged.
                 const in_mem = wamr.component_aot_compile.precompileComponentInMemory(allocator, wasm_data, .{
                     .pass_preset = jitPassPresetFromEnv(init.environ_map),
+                    .lazy_jit = comptime wamr.config.lazy_jit,
                 }) catch |err| {
                     std.debug.print("Error: JIT compile of component '{s}' failed: {s}\n", .{ path, @errorName(err) });
                     return 1;
