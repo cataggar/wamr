@@ -1022,9 +1022,13 @@ pub fn precompileComponent(
 }
 
 /// In-memory counterpart to `precompileComponent` (#854): the same
-/// core-module walk and per-core `compileCoreWasm` calls, but with no
-/// filesystem I/O at all — no manifest JSON, no per-core `.cwasm`
-/// files, no per-core codegen cache directory. Used by the in-process
+/// core-module walk and per-core `compileCoreWasmCached` calls (#879:
+/// switched from the `compileCoreWasm` wrapper to call
+/// `compileCoreWasmCached` directly, so a per-core `lazy_jit_out` can
+/// be threaded through when `opts.lazy_jit` is set — see
+/// `InMemoryPrecompiled.lazy_jit_outs`), but with no filesystem I/O at
+/// all — no manifest JSON, no per-core `.cwasm` files, no per-core
+/// codegen cache directory. Used by the in-process
 /// JIT path so `wamr run some_component.wasm` (no sibling
 /// `.cwasm.json`) can compile and instantiate in one process.
 ///
@@ -1048,6 +1052,26 @@ pub const InMemoryPrecompiled = struct {
     /// (`core_wasm`); valid for the lifetime of this struct.
     pcs: []const core_backend.PrecompiledCore,
     allocator: std.mem.Allocator,
+    /// #879 M4.8 (phase 1): one `LazyJitOut` per core, in the same
+    /// order as `pcs`/`cwasm_buffers`, populated only when
+    /// `opts.lazy_jit` was true for the `precompileComponentInMemory`
+    /// call that produced this struct (`&.{}` otherwise — zero cost
+    /// for every existing non-lazy caller).
+    ///
+    /// Ownership mirrors the single-core `LazyJitOut` contract (see
+    /// `LazyCompileDriver`'s doc comment): each entry is meant to be
+    /// MOVE-consumed by a `setupLazyJit` call for that core's
+    /// `AotInstance`. `deinit` below assumes every non-empty entry has
+    /// already been consumed that way and does NOT free it itself —
+    /// a caller that obtains a non-empty `lazy_jit_outs` but skips
+    /// `setupLazyJit` for some entry is responsible for freeing that
+    /// entry's `ir_module`/`lazy_local_indices`/`needs_trampoline_indices`
+    /// itself, same as a single-core caller would.
+    ///
+    /// #879 M4.8 phase 2 (follow-up, not done in this change): nothing
+    /// in `component/instance.zig`'s per-core instantiation loop reads
+    /// this array yet — see `docs/design/lazy-jit-spike.md`.
+    lazy_jit_outs: []LazyJitOut = &.{},
 
     pub fn precompiledCores(self: *const InMemoryPrecompiled) []const core_backend.PrecompiledCore {
         return self.pcs;
@@ -1057,6 +1081,7 @@ pub const InMemoryPrecompiled = struct {
         for (self.cwasm_buffers) |buf| self.allocator.free(buf);
         self.allocator.free(self.cwasm_buffers);
         self.allocator.free(self.pcs);
+        if (self.lazy_jit_outs.len > 0) self.allocator.free(self.lazy_jit_outs);
     }
 };
 
@@ -1107,13 +1132,40 @@ pub fn precompileComponentInMemory(
     const pcs = allocator.alloc(core_backend.PrecompiledCore, n) catch return error.OutOfMemory;
     errdefer allocator.free(pcs);
 
+    // #879 M4.8: one LazyJitOut per core when opts.lazy_jit is set --
+    // compileCoreWasm's empty CompileCacheCtx can never satisfy
+    // `cache_ctx.lazy_jit_out != null`, so this path used to make
+    // `opts.lazy_jit = true` fail on every single core; calling
+    // compileCoreWasmCached directly (instead of the compileCoreWasm
+    // wrapper) with a per-core lazy_jit_out fixes that.
+    var lazy_jit_outs: []LazyJitOut = &.{};
+    errdefer {
+        // `built` also bounds how many `lazy_jit_outs` entries are
+        // populated: both counters advance together in the loop below.
+        for (lazy_jit_outs[0..@min(built, lazy_jit_outs.len)]) |*out| {
+            out.ir_module.deinit();
+            allocator.free(out.lazy_local_indices);
+            allocator.free(out.needs_trampoline_indices);
+        }
+        if (lazy_jit_outs.len > 0) allocator.free(lazy_jit_outs);
+    }
+    if (opts.lazy_jit) {
+        lazy_jit_outs = allocator.alloc(LazyJitOut, n) catch return error.OutOfMemory;
+        for (lazy_jit_outs) |*out| out.* = .{};
+    }
+
     for (core_data_list.items, 0..) |core_ref, idx| {
         // Override opts.module_idx per core so `:mod=N` bisect
         // filters resolve correctly, matching `precompileComponent`.
         var per_core_opts = opts;
         per_core_opts.module_idx = @intCast(idx);
 
-        const cwasm = compileCoreWasm(allocator, core_ref.data, per_core_opts) catch |err| {
+        const cache_ctx: CompileCacheCtx = if (opts.lazy_jit)
+            .{ .lazy_jit_out = &lazy_jit_outs[idx] }
+        else
+            .{};
+
+        const cwasm = compileCoreWasmCached(allocator, core_ref.data, per_core_opts, cache_ctx) catch |err| {
             std.log.err("precompileComponentInMemory: core {d} compile failed: {s}", .{ idx, @errorName(err) });
             return err;
         };
@@ -1126,5 +1178,5 @@ pub fn precompileComponentInMemory(
         };
     }
 
-    return .{ .cwasm_buffers = cwasm_buffers, .pcs = pcs, .allocator = allocator };
+    return .{ .cwasm_buffers = cwasm_buffers, .pcs = pcs, .allocator = allocator, .lazy_jit_outs = lazy_jit_outs };
 }

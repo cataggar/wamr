@@ -915,6 +915,13 @@ pub fn build(b: *std.Build) void {
     lazy_jit_spike_module.addAnonymousImport("lazy_bench_fixture_wasm", .{
         .root_source_file = b.path("src/tests/lazy_bench_fixture.wasm"),
     });
+    // #879 M4.8: reuses the existing multi-core component fixture
+    // from instance.zig's own "#156 H1" test (anonymous import since
+    // `@embedFile` can't reach outside this module's own package path
+    // with a `../` relative path).
+    lazy_jit_spike_module.addAnonymousImport("h1_compose_wasm", .{
+        .root_source_file = b.path("src/component/fixtures/h1-compose.wasm"),
+    });
     const lazy_jit_spike_tests = b.addTest(.{
         .root_module = lazy_jit_spike_module,
     });

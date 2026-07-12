@@ -413,3 +413,53 @@ test "#879 M4.6 phase 2: ref.func + call_ref to a still-pending lazy function co
     try std.testing.expectEqual(@as(i32, 42), results[0].i32);
     try std.testing.expect(!inst.lazy_jit.pending[0]);
 }
+
+// #879 M4.8 (phase 1): precompileComponentInMemory must produce one
+// independently-computed LazyJitOut per core module, not a single
+// shared/conflated one -- reuses the existing h1-compose fixture
+// (see instance.zig's own "#156 H1" test): core 0 ($A) exports a
+// single leaf function "f" (returns the constant 7, no calls at all
+// -- fully lazy-eligible); core 1 ($B) imports "a"."f" and calls it
+// from "g" (a `.call` to a cross-instance import, which must still
+// disqualify "g" from being a leaf, exactly like a same-core call
+// would).
+test "#879 M4.8: precompileComponentInMemory produces one independently-eligible LazyJitOut per core" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const data = @embedFile("h1_compose_wasm");
+
+    var in_mem = try component_aot_compile.precompileComponentInMemory(gpa, data, .{ .lazy_jit = true });
+    defer in_mem.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), in_mem.lazy_jit_outs.len);
+    try std.testing.expectEqual(@as(usize, 1), in_mem.lazy_jit_outs[0].lazy_local_indices.len);
+    try std.testing.expectEqual(@as(usize, 0), in_mem.lazy_jit_outs[1].lazy_local_indices.len);
+
+    // Exercise core 0's LazyJitOut end-to-end (consumed via
+    // setupLazyJit, same as every single-core test above).
+    var module = try aot_loader_mod.load(in_mem.pcs[0].cwasm_bytes, gpa);
+    defer aot_loader_mod.unload(&module, gpa);
+    const inst = try aot_runtime_mod.instantiate(&module, gpa);
+    defer aot_runtime_mod.destroy(inst);
+
+    const driver = try component_aot_compile.setupLazyJit(inst, in_mem.lazy_jit_outs[0], gpa);
+    defer driver.deinit();
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    try std.testing.expect(inst.lazy_jit.pending[0]); // f still pending
+
+    const f_idx = aot_runtime_mod.findExportFunc(inst, "f") orelse return error.ExportNotFound;
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+    const results = try aot_runtime_mod.callFuncScalar(inst, f_idx, &.{}, &.{.i32}, &.{}, &results_buf);
+    try std.testing.expectEqual(@as(i32, 7), results[0].i32);
+    try std.testing.expect(!inst.lazy_jit.pending[0]);
+
+    // Core 1's LazyJitOut was never consumed by setupLazyJit in this
+    // test -- free it manually, per InMemoryPrecompiled.lazy_jit_outs'
+    // documented ownership contract.
+    in_mem.lazy_jit_outs[1].ir_module.deinit();
+    gpa.free(in_mem.lazy_jit_outs[1].lazy_local_indices);
+    gpa.free(in_mem.lazy_jit_outs[1].needs_trampoline_indices);
+}
