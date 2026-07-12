@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const types = @import("../common/types.zig");
 const aot_loader = @import("loader.zig");
 const host_bridge = @import("host_bridge.zig");
+const host_trampolines = @import("host_trampolines.zig");
 const platform = @import("../../platform/platform.zig");
 const sig_registry = @import("../common/sig_registry.zig");
 const trap_jmp = @import("trap_jmp.zig");
@@ -1459,12 +1460,16 @@ pub const LazyCompiledFunc = struct {
 
 const LazySlotStateAtomic = std.atomic.Value(u8);
 
-/// #862 lazy-JIT design-spike per-instance state. Only ever populated
-/// (non-empty) when `config.lazy_jit` is true AND the instance was
-/// produced by the lazy-JIT-aware compile path
-/// (`component_aot_compile.compileCoreWasmCached` with `opts.lazy_jit
-/// = true`). Comptime-gated to a zero-cost `void` field on
-/// `AotInstance` for every other build — see that field's doc comment.
+/// Lazy-JIT per-instance state. Only ever populated (non-empty) when
+/// `config.lazy_jit` is true AND the instance was produced by the
+/// lazy-JIT-aware compile path (`component_aot_compile.compileCoreWasmCached`
+/// with `opts.lazy_jit = true`). Deferred locals resolve through either a
+/// #887 text-section entry stub (direct-call-graph functions) or a #888
+/// per-instance native trampoline (table/`ref.func`/`call_indirect`-reachable
+/// leaf functions) whose stable pointer is published in `funcptrs` / tables
+/// for the lifetime of the instance. Comptime-gated to a zero-cost `void`
+/// field on `AotInstance` for every other build — see that field's doc
+/// comment.
 ///
 /// `AotInstance`/`runtime.zig` must not depend on compiler types
 /// directly (the AOT-only `wamr` binary links no compiler at all,
@@ -1498,6 +1503,12 @@ pub const LazyJitState = struct {
     /// state, so waiters never observe a torn/half-written
     /// `LazyCompiledFunc`. Freed (munmapped) by `AotInstance.destroy()`.
     compiled: []?LazyCompiledFunc = &.{},
+    /// Per-instance pool owning the executable trampoline stubs
+    /// published for deferred locals. Freed on `AotInstance.destroy()`.
+    trampoline_pool: ?*host_trampolines.TrampolinePool = null,
+    /// LOCAL function idx → stable trampoline pointer published into
+    /// `funcptrs` / tables for still-pending lazy locals.
+    trampolines: []const usize = &.{},
     /// Opaque context for `compile_fn`, owned by whoever set up this
     /// `LazyJitState` (the JIT driver in `aot_compile.zig`). Freed by
     /// that same driver, not by `AotInstance.destroy()` — see
@@ -1579,8 +1590,13 @@ pub const LazyJitState = struct {
                 JitCodeCache.unregister(c.size);
             }
         }
+        if (self.trampoline_pool) |pool| {
+            pool.deinit(allocator);
+            allocator.destroy(pool);
+        }
         allocator.free(self.slot_states);
         allocator.free(self.compiled);
+        if (self.trampolines.len > 0) allocator.free(self.trampolines);
     }
 };
 
@@ -2106,6 +2122,14 @@ pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
     return text.ptr + offset;
 }
 
+fn getCallableAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
+    if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0) {
+        return @ptrFromInt(inst.funcptrs[func_idx]);
+    }
+    if (inst.code_base == null) return null;
+    return getFuncAddr(inst, func_idx);
+}
+
 // ─── Native execution ───────────────────────────────────────────────────────
 
 /// Map arbitrary machine-code bytes into executable memory and register
@@ -2164,10 +2188,20 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     for (0..@min(import_count, @min(inst.host_functions.len, n_addrs))) |i| {
         func_addrs[i] = if (inst.host_functions[i]) |ptr| @intFromPtr(ptr) else 0;
     }
-    // Local functions → code_base + offset
-    if (has_text) {
-        const code_base = inst.code_base orelse unreachable;
-        for (0..@min(module.func_count, n_addrs - @min(import_count, n_addrs))) |i| {
+    // Local functions → either their eager code address (or #887 stub, both
+    // stored via `code_base` + offset) or, for still-pending trampoline-
+    // mechanism lazy locals, the stable trampoline stub published by
+    // `setupLazyJit()`.
+    const local_slots = n_addrs - @min(import_count, n_addrs);
+    for (0..@min(module.func_count, local_slots)) |i| {
+        if (comptime config.lazy_jit) {
+            if (i < inst.lazy_jit.trampolines.len and inst.lazy_jit.trampolines[i] != 0) {
+                func_addrs[import_count + i] = inst.lazy_jit.trampolines[i];
+                continue;
+            }
+        }
+        if (has_text) {
+            const code_base = inst.code_base orelse unreachable;
             const offset = module.func_offsets[i];
             func_addrs[import_count + i] = @intFromPtr(code_base) + offset;
         }
@@ -2346,18 +2380,13 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
 
-    if (inst.code_base == null) return error.CodeMappingFailed;
-    const addr = getFuncAddr(inst, func_idx) orelse blk: {
-        // Import functions have no native code in this module, but
-        // their funcptrs slot may have been patched with the exporter's
-        // native code pointer (cross-module import wiring). Use that.
-        if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
-            break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
-        else
-            return error.FunctionNotFound;
+    const addr = getCallableAddr(inst, func_idx) orelse {
+        if (inst.code_base == null) return error.CodeMappingFailed;
+        return error.FunctionNotFound;
     };
 
     const previous_globals_ptr = inst.vmctx.globals_ptr;
+    const vmctx_storage_addr = @intFromPtr(&inst.vmctx);
     // Host imports may re-enter the same AOT instance (notably cabi_realloc).
     // Reuse the active globals slab so mutable globals are not forked.
     const reuse_globals = previous_globals_ptr != 0;
@@ -2376,8 +2405,8 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     // Always provide a valid globals pointer — compiled code may access globals
     // even if none are explicitly initialized (they default to zero).
     refreshVmCtxForInstance(inst, globals_buf);
-    const vmctx = &inst.vmctx;
-    defer inst.vmctx.globals_ptr = previous_globals_ptr;
+    const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -2405,7 +2434,13 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     const result = func_ptr(vmctx);
 
     // Sync globals back from flat storage to GlobalInstance objects.
-    readGlobalsFromStorage(inst, globals_buf);
+    const vmctx_after: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    const inst_after: *AotInstance = @ptrFromInt(vmctx_after.instance_ptr);
+    const globals_buf_after: []u8 = if (vmctx_after.globals_ptr != 0)
+        @as([*]u8, @ptrFromInt(vmctx_after.globals_ptr))[0 .. globals_word_count * @sizeOf(u128)]
+    else
+        globals_buf;
+    readGlobalsFromStorage(inst_after, globals_buf_after);
 
     return result;
 }
@@ -2466,6 +2501,119 @@ fn isScalarValType(t: types.ValType) bool {
         .i32, .i64, .f32, .f64, .funcref, .externref => true,
         else => false,
     };
+}
+
+fn invokeScalarCallable(addr: [*]const u8, vmctx: *VmCtx, raw_args: []const u64) u64 {
+    return switch (raw_args.len) {
+        0 => blk: {
+            const f: CallFn0 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx);
+        },
+        1 => blk: {
+            const f: CallFn1 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0]);
+        },
+        2 => blk: {
+            const f: CallFn2 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1]);
+        },
+        3 => blk: {
+            const f: CallFn3 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2]);
+        },
+        4 => blk: {
+            const f: CallFn4 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3]);
+        },
+        5 => blk: {
+            const f: CallFn5 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]);
+        },
+        6 => blk: {
+            const f: CallFn6 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5]);
+        },
+        7 => blk: {
+            const f: CallFn7 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6]);
+        },
+        8 => blk: {
+            const f: CallFn8 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7]);
+        },
+        9 => blk: {
+            const f: CallFn9 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8]);
+        },
+        10 => blk: {
+            const f: CallFn10 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9]);
+        },
+        11 => blk: {
+            const f: CallFn11 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10]);
+        },
+        12 => blk: {
+            const f: CallFn12 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10], raw_args[11]);
+        },
+        else => unreachable,
+    };
+}
+
+fn dispatchAotLazyLocal(
+    inst: *AotInstance,
+    lowered_sig: host_trampolines.LoweredSig,
+    local_func_idx: u32,
+    caller_vmctx_raw: u64,
+    raw_args: []const u64,
+) !u64 {
+    if (comptime !config.lazy_jit) return error.LazyJitDisabled;
+    if (caller_vmctx_raw == 0) return error.InvalidVmCtx;
+    if (lowered_sig.has_retptr) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len != raw_args.len) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len > 9) return error.UnsupportedSignature;
+    if (lowered_sig.result_types.len > 1) return error.UnsupportedSignature;
+    for (lowered_sig.param_types) |pt| {
+        if (!isScalarValType(pt)) return error.UnsupportedSignature;
+    }
+    for (lowered_sig.result_types) |rt| {
+        if (!isScalarValType(rt)) return error.UnsupportedSignature;
+    }
+    if (local_func_idx >= inst.lazy_jit.slot_states.len) return error.FunctionNotFound;
+    const addr = try inst.lazy_jit.resolveLocalAddr(local_func_idx) orelse return error.CodeMappingFailed;
+    const caller_vmctx: *VmCtx = @ptrFromInt(@as(usize, @intCast(caller_vmctx_raw)));
+    const raw_result = invokeScalarCallable(addr, caller_vmctx, raw_args);
+    return if (lowered_sig.result_types.len == 0) 0 else raw_result;
+}
+
+pub export fn wamrAotDispatchLazyLocalAot(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    local_func_idx: u32,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    const inst: *AotInstance = @ptrCast(@alignCast(ctx_opaque));
+    const raw_args = [_]u64{ a1, a2, a3, a4, a5, a6, a7, a8, a9 };
+    const result = dispatchAotLazyLocal(
+        inst,
+        lowered_sig.*,
+        local_func_idx,
+        a0,
+        raw_args[0..lowered_sig.param_types.len],
+    ) catch |err| {
+        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
+    };
+    return .{ .status = 0, .value = result };
 }
 
 pub fn globalStorageWordCount(inst: *const AotInstance) usize {
@@ -2679,15 +2827,15 @@ pub fn callFuncScalar(
     const effective_args: usize = args.len + @as(usize, if (needs_hrp) 1 else 0);
     if (effective_args > MaxScalarArgs) return error.UnsupportedSignature;
 
-    // #862 lazy-JIT design-spike: if `func_idx` names a deferred local
-    // function, resolve it through the per-slot state machine before
-    // looking at the eager `code_base`. Lazy-eligible slots transition
-    // `pending -> compiling -> ready` with acquire/release ordering so
-    // same-slot first-call races serialize correctly while other lazy
-    // locals remain independent. Checked BEFORE the `code_base == null`
-    // guard below because a module where EVERY function is
-    // lazy-eligible (e.g. this spike's own test fixture) never maps
-    // any code up front, so `code_base` legitimately stays null until
+    // Lazy-JIT: if `func_idx` names a deferred local function, resolve it
+    // through the per-slot state machine before falling back to the
+    // instance's already-published callable-pointer table. Lazy-eligible
+    // slots transition `pending -> compiling -> ready` with acquire/release
+    // ordering so same-slot first-call races serialize correctly while
+    // other lazy locals remain independent. Checked BEFORE the
+    // `getCallableAddr` fallback below because a module where EVERY
+    // function is lazy-eligible (e.g. this spike's own test fixture) never
+    // maps any code up front, so `code_base` legitimately stays null until
     // the first lazy compile publishes a `ready` slot.
     var lazy_resolved_addr: ?[*]const u8 = null;
     if (comptime config.lazy_jit) {
@@ -2701,19 +2849,13 @@ pub fn callFuncScalar(
         }
     }
 
-    if (lazy_resolved_addr == null and inst.code_base == null) return error.CodeMappingFailed;
-
-    const addr = blk_addr: {
-        if (lazy_resolved_addr) |a| break :blk_addr a;
-        break :blk_addr getFuncAddr(inst, func_idx) orelse blk: {
-            if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
-                break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
-            else
-                return error.FunctionNotFound;
-        };
-    };
+    const addr = lazy_resolved_addr orelse (getCallableAddr(inst, func_idx) orelse {
+        if (inst.code_base == null) return error.CodeMappingFailed;
+        return error.FunctionNotFound;
+    });
 
     const previous_globals_ptr = inst.vmctx.globals_ptr;
+    const vmctx_storage_addr = @intFromPtr(&inst.vmctx);
     // Host imports may re-enter the same AOT instance (notably cabi_realloc).
     // Reuse the active globals slab so mutable globals are not forked.
     const reuse_globals = previous_globals_ptr != 0;
@@ -2730,8 +2872,8 @@ pub fn callFuncScalar(
     if (!reuse_globals) writeGlobalsToStorage(inst, globals_buf);
 
     refreshVmCtxForInstance(inst, globals_buf);
-    const vmctx = &inst.vmctx;
-    defer inst.vmctx.globals_ptr = previous_globals_ptr;
+    const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
 
     // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
@@ -2878,14 +3020,20 @@ pub fn callFuncScalar(
     }
 
     // Sync globals back.
-    readGlobalsFromStorage(inst, globals_buf);
+    const vmctx_after: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    const inst_after: *AotInstance = @ptrFromInt(vmctx_after.instance_ptr);
+    const globals_buf_after: []u8 = if (vmctx_after.globals_ptr != 0)
+        @as([*]u8, @ptrFromInt(vmctx_after.globals_ptr))[0 .. globals_word_count * @sizeOf(u128)]
+    else
+        globals_buf;
+    readGlobalsFromStorage(inst_after, globals_buf_after);
 
     if (result_types.len == 0) return results_out[0..0];
 
-    results_out[0] = decodeScalarResult(inst, result_types[0], raw_result);
+    results_out[0] = decodeScalarResult(inst_after, result_types[0], raw_result);
     var i: usize = 1;
     while (i < result_types.len) : (i += 1) {
-        results_out[i] = decodeScalarResult(inst, result_types[i], hrp_buf[i - 1]);
+        results_out[i] = decodeScalarResult(inst_after, result_types[i], hrp_buf[i - 1]);
     }
     return results_out[0..result_types.len];
 }

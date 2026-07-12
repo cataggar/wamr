@@ -19,6 +19,8 @@ const component_loader = @import("loader.zig");
 const aot = @import("aot.zig");
 const core_backend = @import("core_backend.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
+const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
+const platform = @import("../platform/platform.zig");
 const core_loader = @import("../runtime/interpreter/loader.zig");
 const frontend = @import("../compiler/frontend.zig");
 const passes = @import("../compiler/ir/passes.zig");
@@ -152,6 +154,13 @@ pub const LazyJitOut = struct {
     /// that were skipped during this compile. Caller-owned; free with
     /// the allocator passed to `compileCoreWasmCached`.
     lazy_local_indices: []const u32 = &.{},
+    /// Parallel to `lazy_local_indices`: `true` at position `i` means
+    /// `lazy_local_indices[i]` needs the native trampoline mechanism
+    /// (#888 — table/`ref.func`/`call_indirect`-reachable leaf
+    /// function) rather than the lighter-weight text-section entry
+    /// stub (#887 — direct-call-graph function). Caller-owned; free
+    /// with the allocator passed to `compileCoreWasmCached`.
+    needs_trampoline: []const bool = &.{},
 };
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -224,11 +233,22 @@ pub fn compileCoreWasmCached(
     // so the retained IR survives for on-demand body compilation later.
     var lazy_skip: []bool = &.{};
     defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
+    var lazy_needs_trampoline: []bool = &.{};
+    defer if (lazy_needs_trampoline.len > 0) allocator.free(lazy_needs_trampoline);
     if (opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
         if (opts.target_arch != .x86_64) return error.CoreCompileFailed;
-        lazy_skip = lazy_jit.findLazyEligibleFunctions(&module, &ir_module, allocator) catch
-            return error.CoreCompileFailed;
+        const eligibility = lazy_jit.findLazyEligibleFunctions(
+            &module,
+            &ir_module,
+            switch (opts.target_arch) {
+                .x86_64 => .x86_64,
+                .aarch64 => .aarch64,
+            },
+            allocator,
+        ) catch return error.CoreCompileFailed;
+        lazy_skip = eligibility.eligible;
+        lazy_needs_trampoline = eligibility.needs_trampoline;
     }
 
     if (opts.optimize) {
@@ -598,13 +618,20 @@ pub fn compileCoreWasmCached(
     if (opts.lazy_jit) {
         var indices: std.ArrayList(u32) = .empty;
         errdefer indices.deinit(allocator);
+        var needs_trampoline: std.ArrayList(bool) = .empty;
+        errdefer needs_trampoline.deinit(allocator);
         for (lazy_skip, 0..) |skip, idx| {
-            if (skip) indices.append(allocator, @intCast(idx)) catch return error.CoreCompileFailed;
+            if (skip) {
+                indices.append(allocator, @intCast(idx)) catch return error.CoreCompileFailed;
+                const needs_tramp = idx < lazy_needs_trampoline.len and lazy_needs_trampoline[idx];
+                needs_trampoline.append(allocator, needs_tramp) catch return error.CoreCompileFailed;
+            }
         }
         const out = cache_ctx.lazy_jit_out orelse unreachable; // checked above
         out.* = .{
             .ir_module = ir_module,
             .lazy_local_indices = indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
+            .needs_trampoline = needs_trampoline.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
         };
         keep_ir_module_for_lazy_jit = true;
     }
@@ -649,7 +676,7 @@ pub const LazyCompileDriver = struct {
             std.log.err("lazy-JIT: deferred function {d} unexpectedly emitted {d} call patches", .{ local_idx, result.call_patches.len });
             self.allocator.free(result.call_patches);
             self.allocator.free(result.code);
-            return null;
+            return error.CodeMappingFailed;
         }
         defer self.allocator.free(result.call_patches);
         defer self.allocator.free(result.code);
@@ -665,13 +692,18 @@ pub const LazyCompileDriver = struct {
         var out = self.lazy_out;
         out.ir_module.deinit();
         self.allocator.free(out.lazy_local_indices);
+        if (out.needs_trampoline.len > 0) self.allocator.free(out.needs_trampoline);
         self.allocator.destroy(self);
     }
 };
 
 /// Wire `lazy_out` (produced by a `compileCoreWasmCached` call with
 /// `opts.lazy_jit = true`) into `inst`, marking every deferred local's
-/// slot state as `pending`. Returns the heap-owned driver — see
+/// slot state as `pending` and preallocating one stable trampoline
+/// stub for each deferred local that needs the trampoline mechanism
+/// (`lazy_out.needs_trampoline`; #888). Call this BEFORE
+/// `mapCodeExecutable()` so the published `funcptrs` / table state can
+/// reuse those stub addresses. Returns the heap-owned driver — see
 /// `LazyCompileDriver`'s doc comment for its lifetime contract. `inst`
 /// must have been produced from the SAME compile (its `.cwasm` bytes
 /// came from the same `compileCoreWasmCached` call whose
@@ -694,15 +726,55 @@ pub fn setupLazyJit(
     const compiled = try allocator.alloc(?aot_runtime.LazyCompiledFunc, func_count);
     errdefer allocator.free(compiled);
     @memset(compiled, null);
-    for (lazy_out.lazy_local_indices) |idx| {
+    const trampolines = try allocator.alloc(usize, func_count);
+    errdefer allocator.free(trampolines);
+    @memset(trampolines, 0);
+
+    var trampoline_count: u32 = 0;
+    for (lazy_out.needs_trampoline) |nt| {
+        if (nt) trampoline_count += 1;
+    }
+
+    var pool_ptr: ?*host_trampolines.TrampolinePool = null;
+    errdefer if (pool_ptr) |pool| {
+        pool.deinit(allocator);
+        allocator.destroy(pool);
+    };
+    if (trampoline_count > 0) {
+        const pool = try allocator.create(host_trampolines.TrampolinePool);
+        errdefer allocator.destroy(pool);
+        pool.* = try host_trampolines.TrampolinePool.initWithCap(
+            allocator,
+            trampoline_count,
+        );
+        pool_ptr = pool;
+    }
+
+    for (lazy_out.lazy_local_indices, 0..) |idx, pos| {
         if (idx < slot_states.len) {
             slot_states[idx].store(@intFromEnum(aot_runtime.LazyJitState.SlotState.pending), .monotonic);
         }
+
+        const needs_tramp = pos < lazy_out.needs_trampoline.len and lazy_out.needs_trampoline[pos];
+        if (!needs_tramp) continue;
+        const pool = pool_ptr orelse continue;
+        if (idx >= inst.module.local_func_type_indices.len) return error.InvalidFuncType;
+        const type_idx = inst.module.local_func_type_indices[idx];
+        if (type_idx >= inst.module.func_types.len) return error.InvalidFuncType;
+        const ft = inst.module.func_types[type_idx];
+        const stub = try pool.allocLazyAotSlot(@ptrCast(inst), idx, .{
+            .param_types = ft.params,
+            .result_types = ft.results,
+            .has_retptr = ft.results.len > 1,
+        });
+        trampolines[idx] = @intFromPtr(stub);
     }
 
     inst.lazy_jit = .{
         .slot_states = slot_states,
         .compiled = compiled,
+        .trampoline_pool = pool_ptr,
+        .trampolines = trampolines,
         .compile_ctx = driver,
         .compile_fn = &LazyCompileDriver.compileFn,
     };
