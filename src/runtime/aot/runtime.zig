@@ -689,10 +689,13 @@ pub const VmCtx = extern struct {
     /// stateless `wasi_core.zig` defaults (zero-args, stdout-only)
     /// instead of the full filesystem / preopen / fd-table surface.
     /// Set during `wamr run <core.wasm>` after `instantiate` so the
-    /// AOT path matches the interpreter's WASI semantics. Must be the
-    /// **last** field in this extern struct so AOT codegen offsets
-    /// remain stable for older fields.
+    /// AOT path matches the interpreter's WASI semantics.
     wasi_ctx: usize = 0,
+    /// Helper used by lazy-JIT entry stubs. Signature:
+    /// `fn (vmctx: *VmCtx, local_idx: u32) callconv(.c) usize`.
+    /// Returns the native address of the resolved body (compiling on
+    /// demand if still pending), or 0 on failure.
+    lazy_compile_fn: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -1581,6 +1584,28 @@ pub const LazyJitState = struct {
     }
 };
 
+fn resolveLazyCompiledAddr(inst: *AotInstance, local_idx: u32) ?[*]const u8 {
+    if (comptime !config.lazy_jit) return null;
+    if (local_idx >= inst.module.func_count) return null;
+
+    const addr = (inst.lazy_jit.resolveLocalAddr(local_idx) catch return null) orelse return null;
+
+    const func_idx = inst.module.import_function_count + local_idx;
+    if (func_idx < inst.funcptrs.len) {
+        inst.funcptrs[func_idx] = @intFromPtr(addr);
+    }
+
+    return addr;
+}
+
+pub fn lazyCompileHelper(vmctx: *VmCtx, local_idx: u32) callconv(.c) usize {
+    if (comptime !config.lazy_jit) return 0;
+    if (vmctx.instance_ptr == 0) return 0;
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    const addr = resolveLazyCompiledAddr(inst, local_idx) orelse return 0;
+    return @intFromPtr(addr);
+}
+
 // ─── Instance ───────────────────────────────────────────────────────────────
 
 pub const AotInstance = struct {
@@ -1629,7 +1654,7 @@ pub const AotInstance = struct {
     /// Native function pointer array indexed by module funcidx (imports + locals).
     /// Used by `ref.func` which must yield a function's native address even when
     /// the function was never placed in a wasm table by an element segment.
-    funcptrs: []const usize = &.{},
+    funcptrs: []usize = &.{},
     /// Per-table native descriptor array (one 16-byte slot per declared table):
     /// `extern struct { ptr: u64, len: u32, _pad: u32 }`.
     /// Slot 0 aliases `func_table`; slots 1+ back additional wasm tables so
@@ -2015,6 +2040,7 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
         vmctx.ptr_to_sig_len = 0;
     }
     vmctx.wasi_ctx = inst.wasi_ctx;
+    vmctx.lazy_compile_fn = if (comptime config.lazy_jit) @intFromPtr(&lazyCompileHelper) else 0;
 }
 
 fn subscribeVmCtxToMemories(inst: *AotInstance) !void {
@@ -2669,6 +2695,9 @@ pub fn callFuncScalar(
         if (func_idx >= import_count) {
             const local_idx: usize = @intCast(func_idx - import_count);
             lazy_resolved_addr = try inst.lazy_jit.resolveLocalAddr(local_idx);
+            if (lazy_resolved_addr) |addr| {
+                if (func_idx < inst.funcptrs.len) inst.funcptrs[func_idx] = @intFromPtr(addr);
+            }
         }
     }
 
@@ -3750,6 +3779,8 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 256), @offsetOf(VmCtx, "aot_throw_uncaught_fn"));
     try std.testing.expectEqual(@as(usize, 264), @offsetOf(VmCtx, "exception_params"));
     try std.testing.expectEqual(@as(usize, 392), @offsetOf(VmCtx, "exception_param_count"));
+    try std.testing.expectEqual(@as(usize, 400), @offsetOf(VmCtx, "wasi_ctx"));
+    try std.testing.expectEqual(@as(usize, 408), @offsetOf(VmCtx, "lazy_compile_fn"));
 }
 
 test "getFuncAddr: import indices return null" {
