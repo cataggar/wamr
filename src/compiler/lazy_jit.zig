@@ -164,9 +164,17 @@ pub fn findLazyEligibleFunctions(
             if (!supportsLazyTrampolineFuncType(ft, target_arch)) {
                 eligible[local_idx] = false;
             }
+        } else if (target_arch != .x86_64 and !is_leaf) {
+            // Stub mechanism (#887): non-leaf lazy bodies rely on
+            // `.local_call_lowering = .via_funcptrs`, an x86_64-only
+            // codegen option (#890's aarch64 backend parity only covers
+            // the original leaf-only stub emission, not indirect local-call
+            // lowering) -- so non-x86_64 targets stay leaf-only here too.
+            eligible[local_idx] = false;
         }
-        // Else: stub mechanism (#887) — non-leaf and direct-call-target
-        // functions are both fine, nothing further to check.
+        // Else: stub mechanism (#887) on x86_64 — non-leaf and
+        // direct-call-target functions are both fine, nothing further to
+        // check.
     }
 
     return .{ .eligible = eligible, .needs_trampoline = needs_trampoline };
