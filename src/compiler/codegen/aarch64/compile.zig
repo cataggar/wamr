@@ -72,7 +72,8 @@ const RegMap = struct {
         .x0,  .x1,  .x2,  .x3,  .x4,  .x5,  .x6,  .x7,
         .x8,  .x9,  .x10, .x11, .x12, .x13, .x14,
         // Callee-saved (x19 is pinned to vmctx, x20 to memory_base; neither allocatable):
-        .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28,
+        .x21,
+        .x22, .x23, .x24, .x25, .x26, .x27, .x28,
     };
 
     /// Non-allocatable scratch registers usable by any handler.
@@ -578,6 +579,16 @@ pub const CompileOptions = struct {
     /// Component core/module index, used only to match the
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter.
     module_idx: u32 = 0,
+    /// #862 lazy-JIT spike: indexed by LOCAL function index (same
+    /// indexing as `ir_module.functions.items`). When
+    /// `lazy_skip[fi]` is true, `compileModuleCachedWithOptions`
+    /// emits a zero-byte placeholder for that function instead of
+    /// compiling it — safe ONLY because `lazy_jit.findLazyEligibleLeaves`
+    /// guarantees skipped functions are leaf (no outgoing calls to
+    /// patch) and never a direct call target (no inter-function call
+    /// patch will ever reference their offset). Empty by default —
+    /// zero behavior change for every existing caller.
+    lazy_skip: []const bool = &.{},
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -751,6 +762,25 @@ pub fn compileFunctionWithOptions(
     options: CompileOptions,
 ) ![]u8 {
     return compileFunctionImpl(func, .{ .allocator = allocator, .options = options }, allocator);
+}
+
+/// #862 lazy-JIT design-spike: public per-function entry point matching
+/// the SAME real aarch64 codegen `compileModuleCachedWithOptions` uses.
+/// Used by `component_aot_compile.LazyCompileDriver` to compile a single
+/// deferred leaf function on demand with the module's real
+/// `import_count`/`global_offsets`, matching what it would have gotten
+/// had it been compiled eagerly in the module loop.
+pub fn compileFunctionWithGlobalOffsetsPublic(
+    func: *const ir.IrFunction,
+    import_count: u32,
+    global_offsets: []const u32,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    return compileFunctionImpl(func, .{
+        .import_count = import_count,
+        .global_offsets = global_offsets,
+        .allocator = allocator,
+    }, allocator);
 }
 
 fn isSupportedV128Def(inst: ir.Inst) bool {
@@ -8687,6 +8717,20 @@ pub fn compileModuleCachedWithOptions(
         const func_base: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_base);
 
+        // #862 lazy-JIT spike: emit nothing for lazy-eligible functions.
+        // Safe only under the invariants `lazy_jit.findLazyEligibleLeaves`
+        // establishes (leaf, never a direct call target) — see that
+        // function's doc comment and docs/design/lazy-jit-spike.md.
+        if (fi < options.lazy_skip.len and options.lazy_skip[fi]) {
+            cache_funcs[fi] = .{
+                .ir_sha256 = codegen_cache.hashFunction(&func),
+                .code = try allocator.dupe(u8, &.{}),
+                .call_patches = try allocator.dupe(codegen_cache.FuncCallPatch, &.{}),
+            };
+            cache_init += 1;
+            continue;
+        }
+
         var hash_ns: u64 = 0;
         const ir_sha = blk: {
             if (ct_live) {
@@ -8888,7 +8932,7 @@ fn aarch64CountInstructions(func: *const ir.IrFunction) usize {
 /// pinned to `memory_base` (issue #466), x29/x30 are FP/LR, and x31 is
 /// SP — all excluded.
 pub const aarch64_alloc_regs = [_]regalloc.PhysReg{
-    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,
+    0,  1,  2,  3,  4,  5,  6,  7,  8, 9, 10, 11, 12, 13, 14,
     21, 22, 23, 24, 25, 26, 27, 28,
 };
 

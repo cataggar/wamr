@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const types = @import("../common/types.zig");
 const aot_loader = @import("loader.zig");
 const host_bridge = @import("host_bridge.zig");
+const host_trampolines = @import("host_trampolines.zig");
 const platform = @import("../../platform/platform.zig");
 const sig_registry = @import("../common/sig_registry.zig");
 const trap_jmp = @import("trap_jmp.zig");
@@ -27,29 +28,32 @@ const windows = std.os.windows;
 /// This is bookkeeping only — it doesn't retain or reuse compiled code
 /// across a `destroy` (that would be an actual *cache* in the reuse
 /// sense; see the design spike tracked by issue #862 for lazy/tiered
-/// compilation, which is a different feature). `mapCodeExecutable` /
-/// `destroy` already individually `mmap`/`munmap` correctly per
-/// instance — verified by inspection and by the stress test in
-/// `runtime_test.zig` — this struct just lets that be observed and
-/// bounded in aggregate across every live `AotInstance` in the process.
+/// compilation, which is a different feature). `mapCodeExecutable`,
+/// lazy first-call compilation, and their matching teardown paths
+/// already individually `mmap`/`munmap` correctly — verified by
+/// inspection and by the stress test in `runtime_test.zig` — this
+/// struct just lets that be observed and bounded in aggregate across
+/// every live executable mapping in the process.
 pub const JitCodeCache = struct {
-    /// Total resident bytes across every currently-mapped
-    /// `AotInstance.code_base`. Default `0` = unlimited (existing
-    /// behavior unchanged). Opt in via `WAMR_JIT_CODE_BUDGET_BYTES`
-    /// (see `main.zig`) or set directly before compiling.
+    /// Total resident bytes across every currently-mapped executable
+    /// region tracked through this registry (whole-module text blobs
+    /// and lazily-compiled per-function mappings). Default `0` =
+    /// unlimited (existing behavior unchanged). Opt in via
+    /// `WAMR_JIT_CODE_BUDGET_BYTES` (see `main.zig`) or set directly
+    /// before compiling.
     pub var budget_bytes: usize = 0;
 
     var resident_bytes: usize = 0;
     var mapping_count: usize = 0;
 
     /// Currently resident JIT/AOT executable code, summed across every
-    /// live `AotInstance` with a mapped `code_base` in this process.
+    /// live tracked executable mapping in this process.
     pub fn residentBytes() usize {
         return resident_bytes;
     }
 
-    /// Number of currently-live mapped code regions (i.e. `AotInstance`s
-    /// with `code_base != null`) in this process.
+    /// Number of currently-live tracked executable mappings in this
+    /// process.
     pub fn mappingCount() usize {
         return mapping_count;
     }
@@ -66,10 +70,9 @@ pub const JitCodeCache = struct {
 
     /// Returns `error.CodeBudgetExceeded` if mapping `additional_bytes`
     /// more code would push `residentBytes()` past `budget_bytes`, when
-    /// a nonzero budget is configured. Called by `mapCodeExecutable`
-    /// before the `mmap`, so a caller gets a clear typed error instead
-    /// of the process eventually running out of memory from unbounded
-    /// JIT growth.
+    /// a nonzero budget is configured. Called before the `mmap`, so a
+    /// caller gets a clear typed error instead of the process
+    /// eventually running out of memory from unbounded JIT growth.
     fn checkBudget(additional_bytes: usize) error{CodeBudgetExceeded}!void {
         if (budget_bytes == 0) return;
         if (resident_bytes + additional_bytes > budget_bytes) return error.CodeBudgetExceeded;
@@ -687,10 +690,13 @@ pub const VmCtx = extern struct {
     /// stateless `wasi_core.zig` defaults (zero-args, stdout-only)
     /// instead of the full filesystem / preopen / fd-table surface.
     /// Set during `wamr run <core.wasm>` after `instantiate` so the
-    /// AOT path matches the interpreter's WASI semantics. Must be the
-    /// **last** field in this extern struct so AOT codegen offsets
-    /// remain stable for older fields.
+    /// AOT path matches the interpreter's WASI semantics.
     wasi_ctx: usize = 0,
+    /// Helper used by lazy-JIT entry stubs. Signature:
+    /// `fn (vmctx: *VmCtx, local_idx: u32) callconv(.c) usize`.
+    /// Returns the native address of the resolved body (compiling on
+    /// demand if still pending), or 0 on failure.
+    lazy_compile_fn: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -1442,22 +1448,28 @@ const native_arch: enum { x86_64, aarch64, unsupported } = switch (builtin.cpu.a
 /// Whether the current target can execute AOT code.
 const can_execute_native = native_arch != .unsupported;
 
-/// A single lazily-compiled function's mapped-executable code, so
-/// `AotInstance.destroy()` can `munmap` it (each lazy function gets its
-/// own small mapping via `platform.mapExecutableCode`, separate from
-/// the instance's main `code_base` blob — see the design doc's
-/// "Deferred to follow-up" section on batching these).
+/// A single lazily-compiled function's tracked executable mapping, so
+/// `AotInstance.destroy()` can `munmap` + unregister it (each lazy
+/// function gets its own small mapping, separate from the instance's
+/// main `code_base` blob — see the design doc's "Deferred to
+/// follow-up" section on batching these).
 pub const LazyCompiledFunc = struct {
     addr: [*]const u8,
     size: usize,
 };
 
-/// #862 lazy-JIT design-spike per-instance state. Only ever populated
-/// (non-empty) when `config.lazy_jit` is true AND the instance was
-/// produced by the lazy-JIT-aware compile path
-/// (`component_aot_compile.compileCoreWasmCached` with `opts.lazy_jit
-/// = true`). Comptime-gated to a zero-cost `void` field on
-/// `AotInstance` for every other build — see that field's doc comment.
+const LazySlotStateAtomic = std.atomic.Value(u8);
+
+/// Lazy-JIT per-instance state. Only ever populated (non-empty) when
+/// `config.lazy_jit` is true AND the instance was produced by the
+/// lazy-JIT-aware compile path (`component_aot_compile.compileCoreWasmCached`
+/// with `opts.lazy_jit = true`). Deferred locals resolve through either a
+/// #887 text-section entry stub (direct-call-graph functions) or a #888
+/// per-instance native trampoline (table/`ref.func`/`call_indirect`-reachable
+/// leaf functions) whose stable pointer is published in `funcptrs` / tables
+/// for the lifetime of the instance. Comptime-gated to a zero-cost `void`
+/// field on `AotInstance` for every other build — see that field's doc
+/// comment.
 ///
 /// `AotInstance`/`runtime.zig` must not depend on compiler types
 /// directly (the AOT-only `wamr` binary links no compiler at all,
@@ -1466,15 +1478,37 @@ pub const LazyCompiledFunc = struct {
 /// `aot_compile.zig`, mirroring the existing `TrampolinePool.ctx:
 /// *anyopaque` pattern in `host_trampolines.zig`.
 pub const LazyJitState = struct {
-    /// LOCAL function idx → still pending (true) or already resolved
-    /// (false). Empty (default) means "no lazy functions in this
-    /// instance" — `callFuncScalar`'s hook is then a single length
-    /// check away from a complete no-op.
-    pending: []bool = &.{},
+    pub const SlotState = enum(u8) {
+        /// Not lazy-eligible; resolve through the instance's eagerly
+        /// mapped `code_base` as normal.
+        inactive = 0,
+        /// Lazy-eligible but not yet compiled.
+        pending = 1,
+        /// One thread won the right to compile this local now.
+        compiling = 2,
+        /// The lazily compiled mapping in `compiled[local_idx]` has
+        /// been fully published and can be reused by all callers.
+        ready = 3,
+    };
+
+    /// LOCAL function idx → per-slot lazy state. Only lazy-eligible
+    /// locals ever leave `inactive`; they transition
+    /// `pending -> compiling -> ready`. A failed compile stores
+    /// `pending` again so a later caller can retry.
+    slot_states: []LazySlotStateAtomic = &.{},
     /// LOCAL function idx → compiled code once resolved. Parallel to
-    /// `pending`; entries only meaningful where `pending[i]` has gone
-    /// from true to false. Freed (munmapped) by `AotInstance.destroy()`.
+    /// `slot_states`; entries only meaningful where
+    /// `slot_states[i] == .ready`. Published before the corresponding
+    /// `.ready` release-store and read after an acquire-load of that
+    /// state, so waiters never observe a torn/half-written
+    /// `LazyCompiledFunc`. Freed (munmapped) by `AotInstance.destroy()`.
     compiled: []?LazyCompiledFunc = &.{},
+    /// Per-instance pool owning the executable trampoline stubs
+    /// published for deferred locals. Freed on `AotInstance.destroy()`.
+    trampoline_pool: ?*host_trampolines.TrampolinePool = null,
+    /// LOCAL function idx → stable trampoline pointer published into
+    /// `funcptrs` / tables for still-pending lazy locals.
+    trampolines: []const usize = &.{},
     /// Opaque context for `compile_fn`, owned by whoever set up this
     /// `LazyJitState` (the JIT driver in `aot_compile.zig`). Freed by
     /// that same driver, not by `AotInstance.destroy()` — see
@@ -1482,24 +1516,111 @@ pub const LazyJitState = struct {
     compile_ctx: ?*anyopaque = null,
     /// Compile local function `local_idx` now; returns its
     /// mapped-executable native code (address + byte size, so
-    /// `destroy()` can `munmap` it later), or `null` on failure.
-    /// Called at most once per `local_idx` (`pending[local_idx]` is
-    /// cleared right after a successful call) — see the thread-safety
-    /// caveat in the design doc: this narrow prototype assumes
-    /// single-threaded execution of any one `AotInstance`, matching
-    /// every other example in this codebase's #859 thread-safety
-    /// audit (configure-before-concurrent-use, not safe for
-    /// concurrent first-calls to the SAME lazy function).
-    compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) ?LazyCompiledFunc = null,
+    /// `destroy()` can `munmap` + unregister it later). Preserves
+    /// `error.CodeBudgetExceeded` (and any other `RuntimeError`) from
+    /// the tracked mapping path, so callers can distinguish "budget
+    /// exceeded, retryable" from a hard mapping failure. Same-slot
+    /// contenders are serialized by `slot_states`; at most one thread
+    /// enters `compile_fn` for a given `local_idx` at a time, while
+    /// different lazy locals may still compile independently. Any
+    /// error resets the slot back to `pending` so a later caller can
+    /// retry.
+    compile_fn: ?*const fn (ctx: *anyopaque, local_idx: u32) RuntimeError!LazyCompiledFunc = null,
+
+    pub fn slotState(self: *const LazyJitState, local_idx: usize) SlotState {
+        if (local_idx >= self.slot_states.len) return .inactive;
+        const state: SlotState = @enumFromInt(self.slot_states[local_idx].load(.acquire));
+        return state;
+    }
+
+    fn resolveLocalAddr(self: *LazyJitState, local_idx: usize) RuntimeError!?[*]const u8 {
+        if (local_idx >= self.slot_states.len) return null;
+
+        const slot = &self.slot_states[local_idx];
+        var spins: u32 = 0;
+        while (true) {
+            const state: SlotState = @enumFromInt(slot.load(.acquire));
+            switch (state) {
+                .inactive => return null,
+                .ready => {
+                    const compiled = self.compiled[local_idx] orelse return error.CodeMappingFailed;
+                    return compiled.addr;
+                },
+                .pending => {
+                    if (slot.cmpxchgWeak(
+                        @intFromEnum(SlotState.pending),
+                        @intFromEnum(SlotState.compiling),
+                        .acquire,
+                        .acquire,
+                    ) != null) continue;
+
+                    const compile_ctx = self.compile_ctx orelse {
+                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        return error.CodeMappingFailed;
+                    };
+                    const compile_fn = self.compile_fn orelse {
+                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        return error.CodeMappingFailed;
+                    };
+                    const compiled = compile_fn(compile_ctx, @intCast(local_idx)) catch |err| {
+                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        return err;
+                    };
+                    self.compiled[local_idx] = compiled;
+                    slot.store(@intFromEnum(SlotState.ready), .release);
+                    return compiled.addr;
+                },
+                .compiling => {
+                    if (spins < 1024) {
+                        spins += 1;
+                        std.atomic.spinLoopHint();
+                    } else {
+                        spins = 0;
+                        std.Thread.yield() catch {};
+                    }
+                },
+            }
+        }
+    }
 
     fn free(self: *LazyJitState, allocator: std.mem.Allocator) void {
         for (self.compiled) |maybe| {
-            if (maybe) |c| platform.munmap(@constCast(c.addr), c.size);
+            if (maybe) |c| {
+                platform.munmap(@constCast(c.addr), c.size);
+                JitCodeCache.unregister(c.size);
+            }
         }
-        allocator.free(self.pending);
+        if (self.trampoline_pool) |pool| {
+            pool.deinit(allocator);
+            allocator.destroy(pool);
+        }
+        allocator.free(self.slot_states);
         allocator.free(self.compiled);
+        if (self.trampolines.len > 0) allocator.free(self.trampolines);
     }
 };
+
+fn resolveLazyCompiledAddr(inst: *AotInstance, local_idx: u32) ?[*]const u8 {
+    if (comptime !config.lazy_jit) return null;
+    if (local_idx >= inst.module.func_count) return null;
+
+    const addr = (inst.lazy_jit.resolveLocalAddr(local_idx) catch return null) orelse return null;
+
+    const func_idx = inst.module.import_function_count + local_idx;
+    if (func_idx < inst.funcptrs.len) {
+        inst.funcptrs[func_idx] = @intFromPtr(addr);
+    }
+
+    return addr;
+}
+
+pub fn lazyCompileHelper(vmctx: *VmCtx, local_idx: u32) callconv(.c) usize {
+    if (comptime !config.lazy_jit) return 0;
+    if (vmctx.instance_ptr == 0) return 0;
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    const addr = resolveLazyCompiledAddr(inst, local_idx) orelse return 0;
+    return @intFromPtr(addr);
+}
 
 // ─── Instance ───────────────────────────────────────────────────────────────
 
@@ -1549,7 +1670,7 @@ pub const AotInstance = struct {
     /// Native function pointer array indexed by module funcidx (imports + locals).
     /// Used by `ref.func` which must yield a function's native address even when
     /// the function was never placed in a wasm table by an element segment.
-    funcptrs: []const usize = &.{},
+    funcptrs: []usize = &.{},
     /// Per-table native descriptor array (one 16-byte slot per declared table):
     /// `extern struct { ptr: u64, len: u32, _pad: u32 }`.
     /// Slot 0 aliases `func_table`; slots 1+ back additional wasm tables so
@@ -1935,6 +2056,7 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
         vmctx.ptr_to_sig_len = 0;
     }
     vmctx.wasi_ctx = inst.wasi_ctx;
+    vmctx.lazy_compile_fn = if (comptime config.lazy_jit) @intFromPtr(&lazyCompileHelper) else 0;
 }
 
 fn subscribeVmCtxToMemories(inst: *AotInstance) !void {
@@ -2000,7 +2122,34 @@ pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
     return text.ptr + offset;
 }
 
+fn getCallableAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
+    if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0) {
+        return @ptrFromInt(inst.funcptrs[func_idx]);
+    }
+    if (inst.code_base == null) return null;
+    return getFuncAddr(inst, func_idx);
+}
+
 // ─── Native execution ───────────────────────────────────────────────────────
+
+/// Map arbitrary machine-code bytes into executable memory and register
+/// the resulting region with `JitCodeCache`, so budget enforcement and
+/// resident-byte accounting cover both eager module text blobs and
+/// deferred lazy-JIT function bodies.
+pub fn mapTrackedExecutableCode(code: []const u8) RuntimeError!LazyCompiledFunc {
+    try JitCodeCache.checkBudget(code.len);
+
+    // #858: `platform.mapExecutableCode` owns the W^X mapping strategy
+    // (plain RW→RX `mprotect` on most targets; `MAP_JIT` +
+    // per-thread `pthread_jit_write_protect_np` toggling on macOS
+    // aarch64, where a post-hoc `mprotect` can't re-grant exec on a
+    // MAP_JIT region) and flushes the instruction cache internally, so
+    // callers no longer need an arch-specific `icacheFlush` branch of
+    // their own.
+    const mapped = platform.mapExecutableCode(code) orelse return error.CodeMappingFailed;
+    JitCodeCache.register(code.len);
+    return .{ .addr = mapped, .size = code.len };
+}
 
 /// Map the module's native code into executable memory.
 /// After this call, `getFuncAddr` returns pointers suitable for execution.
@@ -2009,27 +2158,11 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     const text_opt = module.text_section;
     const has_text = text_opt != null and text_opt.?.len > 0;
 
-    var mem: [*]u8 = undefined;
     if (has_text) {
         const text = text_opt.?;
-        // #857: check the (optional, default-unlimited) resident-code
-        // budget before doing any mapping work, so a caller gets a
-        // clear typed error instead of the process silently growing
-        // unbounded / eventually OOMing.
-        try JitCodeCache.checkBudget(text.len);
-
-        // #858: `platform.mapExecutableCode` owns the W^X mapping
-        // strategy (plain RW→RX `mprotect` on most targets; `MAP_JIT` +
-        // per-thread `pthread_jit_write_protect_np` toggling on macOS
-        // aarch64, where a post-hoc `mprotect` can't re-grant exec on a
-        // MAP_JIT region) and flushes the instruction cache internally,
-        // so this call site no longer needs an arch-specific
-        // `icacheFlush` branch of its own.
-        mem = platform.mapExecutableCode(text) orelse return error.CodeMappingFailed;
-
-        inst.code_base = mem;
-        inst.code_size = text.len;
-        JitCodeCache.register(text.len);
+        const mapped = try mapTrackedExecutableCode(text);
+        inst.code_base = mapped.addr;
+        inst.code_size = mapped.size;
     }
 
     // Build function pointer table for call_indirect
@@ -2055,11 +2188,22 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     for (0..@min(import_count, @min(inst.host_functions.len, n_addrs))) |i| {
         func_addrs[i] = if (inst.host_functions[i]) |ptr| @intFromPtr(ptr) else 0;
     }
-    // Local functions → code_base + offset
-    if (has_text) {
-        for (0..@min(module.func_count, n_addrs - @min(import_count, n_addrs))) |i| {
+    // Local functions → either their eager code address (or #887 stub, both
+    // stored via `code_base` + offset) or, for still-pending trampoline-
+    // mechanism lazy locals, the stable trampoline stub published by
+    // `setupLazyJit()`.
+    const local_slots = n_addrs - @min(import_count, n_addrs);
+    for (0..@min(module.func_count, local_slots)) |i| {
+        if (comptime config.lazy_jit) {
+            if (i < inst.lazy_jit.trampolines.len and inst.lazy_jit.trampolines[i] != 0) {
+                func_addrs[import_count + i] = inst.lazy_jit.trampolines[i];
+                continue;
+            }
+        }
+        if (has_text) {
+            const code_base = inst.code_base orelse unreachable;
             const offset = module.func_offsets[i];
-            func_addrs[import_count + i] = @intFromPtr(mem) + offset;
+            func_addrs[import_count + i] = @intFromPtr(code_base) + offset;
         }
     }
 
@@ -2236,18 +2380,29 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
 
-    if (inst.code_base == null) return error.CodeMappingFailed;
-    const addr = getFuncAddr(inst, func_idx) orelse blk: {
-        // Import functions have no native code in this module, but
-        // their funcptrs slot may have been patched with the exporter's
-        // native code pointer (cross-module import wiring). Use that.
-        if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
-            break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
-        else
-            return error.FunctionNotFound;
-    };
+    // Lazy-JIT: resolve through the per-slot atomic state machine first (see
+    // `callFuncScalar`'s matching logic and `LazyJitState.resolveLocalAddr`'s
+    // doc comment) before falling back to the instance's already-published
+    // callable-pointer table.
+    var lazy_resolved_addr: ?[*]const u8 = null;
+    if (comptime config.lazy_jit) {
+        const import_count = inst.module.import_function_count;
+        if (func_idx >= import_count) {
+            const local_idx: usize = @intCast(func_idx - import_count);
+            lazy_resolved_addr = try inst.lazy_jit.resolveLocalAddr(local_idx);
+            if (lazy_resolved_addr) |addr| {
+                if (func_idx < inst.funcptrs.len) inst.funcptrs[func_idx] = @intFromPtr(addr);
+            }
+        }
+    }
+
+    const addr = lazy_resolved_addr orelse (getCallableAddr(inst, func_idx) orelse {
+        if (inst.code_base == null) return error.CodeMappingFailed;
+        return error.FunctionNotFound;
+    });
 
     const previous_globals_ptr = inst.vmctx.globals_ptr;
+    const vmctx_storage_addr = @intFromPtr(&inst.vmctx);
     // Host imports may re-enter the same AOT instance (notably cabi_realloc).
     // Reuse the active globals slab so mutable globals are not forked.
     const reuse_globals = previous_globals_ptr != 0;
@@ -2266,8 +2421,8 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     // Always provide a valid globals pointer — compiled code may access globals
     // even if none are explicitly initialized (they default to zero).
     refreshVmCtxForInstance(inst, globals_buf);
-    const vmctx = &inst.vmctx;
-    defer inst.vmctx.globals_ptr = previous_globals_ptr;
+    const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -2295,7 +2450,13 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     const result = func_ptr(vmctx);
 
     // Sync globals back from flat storage to GlobalInstance objects.
-    readGlobalsFromStorage(inst, globals_buf);
+    const vmctx_after: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    const inst_after: *AotInstance = @ptrFromInt(vmctx_after.instance_ptr);
+    const globals_buf_after: []u8 = if (vmctx_after.globals_ptr != 0)
+        @as([*]u8, @ptrFromInt(vmctx_after.globals_ptr))[0 .. globals_word_count * @sizeOf(u128)]
+    else
+        globals_buf;
+    readGlobalsFromStorage(inst_after, globals_buf_after);
 
     return result;
 }
@@ -2356,6 +2517,119 @@ fn isScalarValType(t: types.ValType) bool {
         .i32, .i64, .f32, .f64, .funcref, .externref => true,
         else => false,
     };
+}
+
+fn invokeScalarCallable(addr: [*]const u8, vmctx: *VmCtx, raw_args: []const u64) u64 {
+    return switch (raw_args.len) {
+        0 => blk: {
+            const f: CallFn0 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx);
+        },
+        1 => blk: {
+            const f: CallFn1 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0]);
+        },
+        2 => blk: {
+            const f: CallFn2 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1]);
+        },
+        3 => blk: {
+            const f: CallFn3 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2]);
+        },
+        4 => blk: {
+            const f: CallFn4 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3]);
+        },
+        5 => blk: {
+            const f: CallFn5 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]);
+        },
+        6 => blk: {
+            const f: CallFn6 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5]);
+        },
+        7 => blk: {
+            const f: CallFn7 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6]);
+        },
+        8 => blk: {
+            const f: CallFn8 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7]);
+        },
+        9 => blk: {
+            const f: CallFn9 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8]);
+        },
+        10 => blk: {
+            const f: CallFn10 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9]);
+        },
+        11 => blk: {
+            const f: CallFn11 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10]);
+        },
+        12 => blk: {
+            const f: CallFn12 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10], raw_args[11]);
+        },
+        else => unreachable,
+    };
+}
+
+fn dispatchAotLazyLocal(
+    inst: *AotInstance,
+    lowered_sig: host_trampolines.LoweredSig,
+    local_func_idx: u32,
+    caller_vmctx_raw: u64,
+    raw_args: []const u64,
+) !u64 {
+    if (comptime !config.lazy_jit) return error.LazyJitDisabled;
+    if (caller_vmctx_raw == 0) return error.InvalidVmCtx;
+    if (lowered_sig.has_retptr) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len != raw_args.len) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len > 9) return error.UnsupportedSignature;
+    if (lowered_sig.result_types.len > 1) return error.UnsupportedSignature;
+    for (lowered_sig.param_types) |pt| {
+        if (!isScalarValType(pt)) return error.UnsupportedSignature;
+    }
+    for (lowered_sig.result_types) |rt| {
+        if (!isScalarValType(rt)) return error.UnsupportedSignature;
+    }
+    if (local_func_idx >= inst.lazy_jit.slot_states.len) return error.FunctionNotFound;
+    const addr = try inst.lazy_jit.resolveLocalAddr(local_func_idx) orelse return error.CodeMappingFailed;
+    const caller_vmctx: *VmCtx = @ptrFromInt(@as(usize, @intCast(caller_vmctx_raw)));
+    const raw_result = invokeScalarCallable(addr, caller_vmctx, raw_args);
+    return if (lowered_sig.result_types.len == 0) 0 else raw_result;
+}
+
+pub export fn wamrAotDispatchLazyLocalAot(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    local_func_idx: u32,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    const inst: *AotInstance = @ptrCast(@alignCast(ctx_opaque));
+    const raw_args = [_]u64{ a1, a2, a3, a4, a5, a6, a7, a8, a9 };
+    const result = dispatchAotLazyLocal(
+        inst,
+        lowered_sig.*,
+        local_func_idx,
+        a0,
+        raw_args[0..lowered_sig.param_types.len],
+    ) catch |err| {
+        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
+    };
+    return .{ .status = 0, .value = result };
 }
 
 pub fn globalStorageWordCount(inst: *const AotInstance) usize {
@@ -2569,45 +2843,35 @@ pub fn callFuncScalar(
     const effective_args: usize = args.len + @as(usize, if (needs_hrp) 1 else 0);
     if (effective_args > MaxScalarArgs) return error.UnsupportedSignature;
 
-    // #862 lazy-JIT design-spike: if `func_idx` names a still-pending
-    // deferred function, compile it now before resolving its address.
-    // See `LazyJitState`'s doc comment — this hook is a no-op (single
-    // length check) whenever lazy-JIT isn't active for this instance.
-    // Checked BEFORE the `code_base == null` guard below because a
-    // module where EVERY function is lazy-eligible (e.g. this spike's
-    // own test fixture) never maps any code up front, so `code_base`
-    // legitimately stays null until the first lazy compile.
+    // Lazy-JIT: if `func_idx` names a deferred local function, resolve it
+    // through the per-slot state machine before falling back to the
+    // instance's already-published callable-pointer table. Lazy-eligible
+    // slots transition `pending -> compiling -> ready` with acquire/release
+    // ordering so same-slot first-call races serialize correctly while
+    // other lazy locals remain independent. Checked BEFORE the
+    // `getCallableAddr` fallback below because a module where EVERY
+    // function is lazy-eligible (e.g. this spike's own test fixture) never
+    // maps any code up front, so `code_base` legitimately stays null until
+    // the first lazy compile publishes a `ready` slot.
     var lazy_resolved_addr: ?[*]const u8 = null;
     if (comptime config.lazy_jit) {
         const import_count = inst.module.import_function_count;
         if (func_idx >= import_count) {
-            const local_idx = func_idx - import_count;
-            if (local_idx < inst.lazy_jit.pending.len and inst.lazy_jit.pending[local_idx]) {
-                const compile_ctx = inst.lazy_jit.compile_ctx orelse return error.CodeMappingFailed;
-                const compile_fn = inst.lazy_jit.compile_fn orelse return error.CodeMappingFailed;
-                const compiled = compile_fn(compile_ctx, local_idx) orelse return error.CodeMappingFailed;
-                inst.lazy_jit.compiled[local_idx] = compiled;
-                inst.lazy_jit.pending[local_idx] = false;
-            }
-            if (local_idx < inst.lazy_jit.compiled.len) {
-                if (inst.lazy_jit.compiled[local_idx]) |c| lazy_resolved_addr = c.addr;
+            const local_idx: usize = @intCast(func_idx - import_count);
+            lazy_resolved_addr = try inst.lazy_jit.resolveLocalAddr(local_idx);
+            if (lazy_resolved_addr) |addr| {
+                if (func_idx < inst.funcptrs.len) inst.funcptrs[func_idx] = @intFromPtr(addr);
             }
         }
     }
 
-    if (lazy_resolved_addr == null and inst.code_base == null) return error.CodeMappingFailed;
-
-    const addr = blk_addr: {
-        if (lazy_resolved_addr) |a| break :blk_addr a;
-        break :blk_addr getFuncAddr(inst, func_idx) orelse blk: {
-            if (func_idx < inst.funcptrs.len and inst.funcptrs[func_idx] != 0)
-                break :blk @as([*]const u8, @ptrFromInt(inst.funcptrs[func_idx]))
-            else
-                return error.FunctionNotFound;
-        };
-    };
+    const addr = lazy_resolved_addr orelse (getCallableAddr(inst, func_idx) orelse {
+        if (inst.code_base == null) return error.CodeMappingFailed;
+        return error.FunctionNotFound;
+    });
 
     const previous_globals_ptr = inst.vmctx.globals_ptr;
+    const vmctx_storage_addr = @intFromPtr(&inst.vmctx);
     // Host imports may re-enter the same AOT instance (notably cabi_realloc).
     // Reuse the active globals slab so mutable globals are not forked.
     const reuse_globals = previous_globals_ptr != 0;
@@ -2624,8 +2888,8 @@ pub fn callFuncScalar(
     if (!reuse_globals) writeGlobalsToStorage(inst, globals_buf);
 
     refreshVmCtxForInstance(inst, globals_buf);
-    const vmctx = &inst.vmctx;
-    defer inst.vmctx.globals_ptr = previous_globals_ptr;
+    const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
 
     // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
@@ -2772,14 +3036,20 @@ pub fn callFuncScalar(
     }
 
     // Sync globals back.
-    readGlobalsFromStorage(inst, globals_buf);
+    const vmctx_after: *VmCtx = @ptrFromInt(vmctx_storage_addr);
+    const inst_after: *AotInstance = @ptrFromInt(vmctx_after.instance_ptr);
+    const globals_buf_after: []u8 = if (vmctx_after.globals_ptr != 0)
+        @as([*]u8, @ptrFromInt(vmctx_after.globals_ptr))[0 .. globals_word_count * @sizeOf(u128)]
+    else
+        globals_buf;
+    readGlobalsFromStorage(inst_after, globals_buf_after);
 
     if (result_types.len == 0) return results_out[0..0];
 
-    results_out[0] = decodeScalarResult(inst, result_types[0], raw_result);
+    results_out[0] = decodeScalarResult(inst_after, result_types[0], raw_result);
     var i: usize = 1;
     while (i < result_types.len) : (i += 1) {
-        results_out[i] = decodeScalarResult(inst, result_types[i], hrp_buf[i - 1]);
+        results_out[i] = decodeScalarResult(inst_after, result_types[i], hrp_buf[i - 1]);
     }
     return results_out[0..result_types.len];
 }
@@ -3673,6 +3943,8 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 256), @offsetOf(VmCtx, "aot_throw_uncaught_fn"));
     try std.testing.expectEqual(@as(usize, 264), @offsetOf(VmCtx, "exception_params"));
     try std.testing.expectEqual(@as(usize, 392), @offsetOf(VmCtx, "exception_param_count"));
+    try std.testing.expectEqual(@as(usize, 400), @offsetOf(VmCtx, "wasi_ctx"));
+    try std.testing.expectEqual(@as(usize, 408), @offsetOf(VmCtx, "lazy_compile_fn"));
 }
 
 test "getFuncAddr: import indices return null" {
@@ -3753,7 +4025,7 @@ const minimal_ret_body: []const u8 = switch (native_arch) {
     .unsupported => &[_]u8{},
 };
 
-test "JitCodeCache: mapCodeExecutable/destroy round-trip leaves no residual mapping" {
+test "JitCodeCache: tracked eager code mapping round-trip leaves no residual mapping" {
     if (comptime !can_execute_native) return error.SkipZigTest;
 
     const before = JitCodeCache.residentBytes();
@@ -3775,7 +4047,7 @@ test "JitCodeCache: mapCodeExecutable/destroy round-trip leaves no residual mapp
     try std.testing.expectEqual(before, JitCodeCache.residentBytes());
 }
 
-test "JitCodeCache: repeated compile+run+drop cycles never accumulate residual mappings" {
+test "JitCodeCache: repeated eager mapping cycles never accumulate residual mappings" {
     if (comptime !can_execute_native) return error.SkipZigTest;
 
     const before_count = JitCodeCache.mappingCount();
@@ -3809,7 +4081,7 @@ test "JitCodeCache: repeated compile+run+drop cycles never accumulate residual m
     }
 }
 
-test "JitCodeCache: mapCodeExecutable rejects a mapping that would exceed a configured budget" {
+test "JitCodeCache: tracked eager mapping rejects a configured budget overrun" {
     if (comptime !can_execute_native) return error.SkipZigTest;
 
     // Budget smaller than the minimal function body guarantees rejection

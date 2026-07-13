@@ -903,8 +903,8 @@ pub fn build(b: *std.Build) void {
     const run_jit_fast_preset_tests = b.addRunArtifact(jit_fast_preset_tests);
     test_step.dependOn(&run_jit_fast_preset_tests.step);
 
-    // #862: lazy-JIT design-spike prototype (leaf functions only,
-    // x86_64 only). Self-skips via `config.lazy_jit`/arch checks when
+    // #862/#890: lazy-JIT design-spike prototype (leaf functions only,
+    // x86_64/aarch64). Self-skips via `config.lazy_jit`/arch checks when
     // not built with `-Djit=true -Dlazy_jit=true`.
     const lazy_jit_spike_module = b.createModule(.{
         .root_source_file = b.path("src/tests/lazy_jit_spike_test.zig"),

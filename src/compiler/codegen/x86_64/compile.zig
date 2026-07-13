@@ -96,6 +96,7 @@ const vmctx_tags_ptr_field: i32 = 240; // VmCtx.tags_ptr offset (usize)
 const vmctx_aot_throw_uncaught_fn_field: i32 = 256; // VmCtx.aot_throw_uncaught_fn (usize)
 const vmctx_exception_params_field: i32 = 264; // VmCtx.exception_params base ([16]u64)
 const vmctx_exception_param_count_field: i32 = 392; // VmCtx.exception_param_count (u32)
+const vmctx_lazy_compile_fn_field: i32 = 408; // VmCtx.lazy_compile_fn offset (usize)
 // Per-table descriptor layout (TableInfo, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
 const table_info_ptr_off: i32 = 0;
@@ -1623,17 +1624,54 @@ pub const CompileOptions = struct {
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter. Single-module
     /// `wamrc compile` leaves it at 0.
     module_idx: u32 = 0,
-    /// #862 lazy-JIT spike: indexed by LOCAL function index (same
-    /// indexing as `ir_module.functions.items`). When
-    /// `lazy_skip[fi]` is true, `compileModuleCachedWithOptions`
-    /// emits a zero-byte placeholder for that function instead of
-    /// compiling it — safe ONLY because `lazy_jit.findLazyEligibleLeaves`
-    /// guarantees skipped functions are leaf (no outgoing calls to
-    /// patch) and never a direct call target (no inter-function call
-    /// patch will ever reference their offset). Empty by default —
-    /// zero behavior change for every existing caller.
+    /// #887 lazy-JIT: indexed by LOCAL function index (same indexing as
+    /// `ir_module.functions.items`). When `lazy_skip[fi]` is true, the eager
+    /// text section receives a stable per-function entry stub instead of the
+    /// real body. Direct eager callers still branch to that stub through the
+    /// normal rel32 patching pass, while the first entry through the stub
+    /// resolves and patches in the deferred body at runtime.
     lazy_skip: []const bool = &.{},
 };
+
+fn compileLazyEntryStub(local_idx: u32, allocator: std.mem.Allocator) ![]u8 {
+    var code = emit.CodeBuffer.init(allocator);
+    errdefer code.deinit();
+
+    const shadow: i32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+    const save_bytes: i32 = @as(i32, @intCast(param_regs.len * 8));
+    const stack_adjust: i32 = shadow + save_bytes + 8;
+
+    try code.subRegImm32(.rsp, stack_adjust);
+    inline for (param_regs, 0..) |reg, i| {
+        try code.movMemReg(.rsp, shadow + @as(i32, @intCast(i * 8)), reg);
+    }
+
+    try code.movRegMem(.r11, param_regs[0], vmctx_lazy_compile_fn_field);
+    try code.movRegImm32(param_regs[1], @as(i32, @bitCast(local_idx)));
+    try code.callReg(.r11);
+
+    try code.testRegReg(.rax, .rax);
+    try code.emitByte(0x0F);
+    try code.emitByte(0x85); // JNE rel32
+    const ok_patch = code.len();
+    try code.emitI32(0);
+
+    try code.movRegMem(param_regs[0], .rsp, shadow);
+    try code.movRegMem(.r11, param_regs[0], vmctx_trap_unreachable_fn_field);
+    try code.callReg(.r11);
+
+    const ok_target = code.len();
+    const rel_ok: i32 = @intCast(@as(i64, @intCast(ok_target)) - @as(i64, @intCast(ok_patch + 4)));
+    code.patchI32(ok_patch, rel_ok);
+
+    inline for (param_regs, 0..) |reg, i| {
+        try code.movRegMem(reg, .rsp, shadow + @as(i32, @intCast(i * 8)));
+    }
+    try code.addRegImm32(.rsp, stack_adjust);
+    try code.jmpReg(.rax);
+
+    return code.bytes.toOwnedSlice(allocator);
+}
 
 pub fn compileModuleCachedWithOptions(
     ir_module: *const ir.IrModule,
@@ -1677,16 +1715,18 @@ pub fn compileModuleCachedWithOptions(
         const func_start: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_start);
 
-        // #862 lazy-JIT spike: emit nothing for lazy-eligible functions.
-        // Safe only under the invariants `lazy_jit.findLazyEligibleLeaves`
-        // establishes (leaf, never a direct call target) — see that
-        // function's doc comment and docs/design/lazy-jit-spike.md.
+        // #887 lazy-JIT: emit a stable entry stub for deferred functions.
+        // Their real bodies compile later on first entry, but every eager
+        // local-call patch still resolves against executable bytes here.
         if (fi < options.lazy_skip.len and options.lazy_skip[fi]) {
+            const stub = try compileLazyEntryStub(@intCast(fi), allocator);
+            errdefer allocator.free(stub);
             cache_funcs[fi] = .{
                 .ir_sha256 = codegen_cache.hashFunction(&func),
-                .code = try allocator.dupe(u8, &.{}),
+                .code = stub,
                 .call_patches = try allocator.dupe(codegen_cache.FuncCallPatch, &.{}),
             };
+            try all_code.appendSlice(allocator, stub);
             cache_init += 1;
             continue;
         }
@@ -1758,6 +1798,7 @@ pub fn compileModuleCachedWithOptions(
                     .module_idx = options.module_idx,
                     .func_idx = @intCast(fi),
                 } else null,
+                .{},
             );
             if (ct_live) {
                 compile_ns = codegen_timing.nowNs() -| compile_t0;
@@ -2183,22 +2224,28 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     return compileFunctionRAWithGlobalOffsets(func, import_count, &.{}, allocator);
 }
 
-/// #862 lazy-JIT design-spike: public per-function entry point matching
-/// the SAME real regalloc-based codegen `compileModuleCachedWithOptions`
-/// uses (unlike the naive standalone `compileFunction` above — that one
-/// is a different, simpler stack-machine codegen kept for other
-/// purposes, NOT what real modules compile through). Used by
-/// `component_aot_compile.LazyCompileDriver` to compile a single
-/// deferred leaf function on demand with the module's real
-/// `import_count`/`global_offsets`, matching what it would have gotten
-/// had it been compiled eagerly in the module loop.
+pub const LocalCallLowering = enum {
+    direct,
+    via_funcptrs,
+};
+
+pub const FunctionCompileOptions = struct {
+    local_call_lowering: LocalCallLowering = .direct,
+};
+
+/// Public per-function entry point matching the SAME real regalloc-based
+/// codegen `compileModuleCachedWithOptions` uses (unlike the naive standalone
+/// `compileFunction` above). Lazy-JIT uses this to compile a deferred body on
+/// demand with the module's real `import_count` / `global_offsets`, optionally
+/// lowering local direct calls through `vmctx.funcptrs_ptr`.
 pub fn compileFunctionRAWithGlobalOffsetsPublic(
     func: *const ir.IrFunction,
     import_count: u32,
     global_offsets: []const u32,
     allocator: std.mem.Allocator,
+    options: FunctionCompileOptions,
 ) !FuncCompileResult {
-    return compileFunctionRAWithGlobalOffsets(func, import_count, global_offsets, allocator);
+    return compileFunctionRAWithGlobalOffsetsEx(func, import_count, global_offsets, allocator, options);
 }
 
 fn compileFunctionRAWithGlobalOffsets(
@@ -2207,7 +2254,17 @@ fn compileFunctionRAWithGlobalOffsets(
     global_offsets: []const u32,
     allocator: std.mem.Allocator,
 ) !FuncCompileResult {
-    return compileFunctionRAWithGlobalOffsetsTimed(func, import_count, global_offsets, allocator, null, null);
+    return compileFunctionRAWithGlobalOffsetsEx(func, import_count, global_offsets, allocator, .{});
+}
+
+fn compileFunctionRAWithGlobalOffsetsEx(
+    func: *const ir.IrFunction,
+    import_count: u32,
+    global_offsets: []const u32,
+    allocator: std.mem.Allocator,
+    options: FunctionCompileOptions,
+) !FuncCompileResult {
+    return compileFunctionRAWithGlobalOffsetsTimed(func, import_count, global_offsets, allocator, null, null, options);
 }
 
 /// #808 Lever 1 context: identifies the function for the spill-metric line
@@ -2230,6 +2287,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     allocator: std.mem.Allocator,
     timer: ?*codegen_timing.FuncTimer,
     spill_ctx: ?SpillMetricCtx,
+    options: FunctionCompileOptions,
 ) !FuncCompileResult {
     if (functionUsesV128(func)) return error.UnsupportedV128;
 
@@ -2611,7 +2669,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         const next_block_id: ?ir.BlockId = if (order_idx + 1 < block_order.len) block_order[order_idx + 1] else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options);
         }
         // C3 fall-through peephole: if the block's terminator emitted a
         // trailing `E9 disp32` (br, or br_if's unconditional else) whose
@@ -3030,6 +3088,7 @@ fn compileInstRA(
     used_callee_saved: *const [callee_saved_alloc.len]bool,
     local_count: u32,
     global_offsets: []const u32,
+    options: FunctionCompileOptions,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -3422,10 +3481,11 @@ fn compileInstRA(
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
             const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
             const is_import: bool = cl.func_idx < import_count;
+            const lower_local_indirect: bool = !is_import and options.local_call_lowering == .via_funcptrs;
 
             // Real tail-call is feasible when outgoing stack args are empty,
-            // HRP (if any) goes in a register (so we pass our caller's HRP through),
-            // and the target is a local function (rel32 JMP).
+            // and HRP (if any) goes in a register (so we pass our caller's
+            // HRP through).
             const can_real_tail: bool = cl.tail and total_stack_args == 0 and !hrp_on_stack and !is_import;
             if (can_real_tail) {
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
@@ -3439,6 +3499,10 @@ fn compileInstRA(
                     const hrp_dst = param_regs[1 + n_args];
                     try code.movRegMem(hrp_dst, .rbp, hrp_save_off);
                 }
+                if (lower_local_indirect) {
+                    try code.movRegMem(.r11, .rbx, vmctx_funcptrs_field);
+                    try code.movRegMem(.r11, .r11, @as(i32, @intCast(cl.func_idx * 8)));
+                }
                 var ci_t: usize = callee_saved_alloc.len;
                 while (ci_t > 0) {
                     ci_t -= 1;
@@ -3446,13 +3510,17 @@ fn compileInstRA(
                 }
                 try code.movRegReg(.rsp, .rbp);
                 try code.popReg(.rbp);
-                try code.emitByte(0xE9); // JMP rel32
-                const patch_off = code.len();
-                try code.emitI32(0);
-                try call_patches.append(code.allocator, .{
-                    .patch_offset = patch_off,
-                    .target_func_idx = cl.func_idx - import_count,
-                });
+                if (lower_local_indirect) {
+                    try code.jmpReg(.r11);
+                } else {
+                    try code.emitByte(0xE9); // JMP rel32
+                    const patch_off = code.len();
+                    try code.emitI32(0);
+                    try call_patches.append(code.allocator, .{
+                        .patch_offset = patch_off,
+                        .target_func_idx = cl.func_idx - import_count,
+                    });
+                }
                 return;
             }
 
@@ -3488,6 +3556,34 @@ fn compileInstRA(
                     }
                 }
                 try code.callReg(.rax);
+                if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+            } else if (lower_local_indirect) {
+                // Lazy bodies lower local direct calls indirectly through
+                // vmctx.funcptrs_ptr so separately-mapped on-demand code never
+                // depends on unresolved rel32 call/jmp patching.
+                try code.movRegMem(.r11, .rbx, vmctx_funcptrs_field);
+                try code.movRegMem(.r11, .r11, @as(i32, @intCast(cl.func_idx * 8)));
+
+                if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+                var j_indirect: u32 = 0;
+                while (j_indirect < extra) : (j_indirect += 1) {
+                    const arg_reg = try useVReg(code, alloc_result, cl.args[max_reg_args + j_indirect], .r10);
+                    try code.movMemReg(.rsp, @intCast(shadow + j_indirect * 8), arg_reg);
+                }
+                try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                try code.movRegReg(param_regs[0], .rbx);
+                if (has_hrp) {
+                    if (hrp_in_reg) {
+                        const hrp_dst = param_regs[1 + n_args];
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    } else {
+                        try code.movRegReg(.r10, .rbp);
+                        try code.addRegImm32(.r10, scratch_base_off);
+                        try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                    }
+                }
+                try code.callReg(.r11);
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
             } else {
                 if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
@@ -7027,6 +7123,67 @@ test "compileFunctionRA: caller passes >3 args via stack on Win64" {
     // sub rsp, imm32 (48 81 EC ??) or sub rsp, imm8 (48 83 EC ??) in caller.
     // Just assert the caller compiled successfully with nonzero size.
     try std.testing.expect(result.code.len > 32);
+}
+
+test "compileFunctionRAWithGlobalOffsetsPublic: lazy-body local call uses funcptr indirection" {
+    const allocator = std.testing.allocator;
+
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const arg = func.newVReg();
+    const result = func.newVReg();
+    const args = try allocator.alloc(ir.VReg, 1);
+    args[0] = arg;
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = arg, .type = .i32 });
+    try block.append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = args } },
+        .dest = result,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const compiled = try compileFunctionRAWithGlobalOffsetsPublic(&func, 0, &.{}, allocator, .{
+        .local_call_lowering = .via_funcptrs,
+    });
+    defer allocator.free(compiled.call_patches);
+    defer allocator.free(compiled.code);
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.call_patches.len);
+    try std.testing.expect(containsBytes(compiled.code, &.{ 0x4C, 0x8B, 0x9B, 0x78, 0x00, 0x00, 0x00 }));
+    try std.testing.expect(containsBytes(compiled.code, &.{ 0x41, 0xFF, 0xD3 }));
+}
+
+test "compileFunctionRAWithGlobalOffsetsPublic: lazy-body tail call jumps via funcptr indirection" {
+    const allocator = std.testing.allocator;
+
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const arg = func.newVReg();
+    const args = try allocator.alloc(ir.VReg, 1);
+    args[0] = arg;
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = arg, .type = .i32 });
+    try block.append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = args, .tail = true } },
+        .type = .i32,
+    });
+
+    const compiled = try compileFunctionRAWithGlobalOffsetsPublic(&func, 0, &.{}, allocator, .{
+        .local_call_lowering = .via_funcptrs,
+    });
+    defer allocator.free(compiled.call_patches);
+    defer allocator.free(compiled.code);
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.call_patches.len);
+    try std.testing.expect(containsBytes(compiled.code, &.{ 0x4C, 0x8B, 0x9B, 0x78, 0x00, 0x00, 0x00 }));
+    try std.testing.expect(containsBytes(compiled.code, &.{ 0x41, 0xFF, 0xE3 }));
 }
 
 // ── Parallel-copy correctness for call arg materialization (regression tests) ──

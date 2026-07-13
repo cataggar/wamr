@@ -143,6 +143,34 @@ pub const PrecompiledCore = struct {
     core_wasm: ?[]const u8 = null,
 };
 
+/// Type-erased ownership handle for any lazy-JIT driver attached to a
+/// precompiled core's `AotInstance`. Kept compiler-agnostic so the
+/// component runtime can own and destroy the driver without importing
+/// `aot_compile.zig` or any compiler types.
+pub const LazyJitHandle = struct {
+    ctx: *anyopaque,
+    deinit_fn: *const fn (ctx: *anyopaque) void,
+
+    pub fn deinit(self: LazyJitHandle) void {
+        self.deinit_fn(self.ctx);
+    }
+};
+
+pub const LazyJitAttachError = error{
+    OutOfMemory,
+    LazyJitSidecarUnavailable,
+};
+
+pub const LazyJitAttachHook = struct {
+    ctx: *anyopaque,
+    attach_fn: *const fn (
+        ctx: *anyopaque,
+        precompiled: *const PrecompiledCore,
+        inst: *aot_runtime.AotInstance,
+        allocator: std.mem.Allocator,
+    ) LazyJitAttachError!?LazyJitHandle,
+};
+
 /// Process-global toggle for AOT debug diagnostics. Off by default;
 /// `main.zig` sets it during startup when the `WAMR_AOT_DEBUG` env var
 /// is set to a non-empty / non-`0` / non-`false` value. Read via
@@ -191,6 +219,7 @@ pub fn trapCrossMemoryEnabled() bool {
 /// Caller-supplied instantiation options.
 pub const Options = struct {
     precompiled_cores: []const PrecompiledCore = &.{},
+    lazy_jit_attach: ?LazyJitAttachHook = null,
 
     /// When true, the instantiation refuses to silently fall back to
     /// the interpreter on AOT-unresolvable imports / cross-instance
@@ -210,20 +239,39 @@ pub const Options = struct {
     /// `core_wasm` set are matched by slice identity (stable across
     /// re-parses of the same input); entries without (legacy
     /// callers) are matched by `module_idx` alone.
+    pub fn findPrecompiledEntry(
+        self: Options,
+        core_wasm: []const u8,
+        module_idx: u32,
+    ) ?*const PrecompiledCore {
+        for (self.precompiled_cores) |*pc| {
+            if (pc.core_wasm) |cw| {
+                if (cw.ptr == core_wasm.ptr and cw.len == core_wasm.len)
+                    return pc;
+            } else {
+                if (pc.module_idx == module_idx) return pc;
+            }
+        }
+        return null;
+    }
+
     pub fn findPrecompiled(
         self: Options,
         core_wasm: []const u8,
         module_idx: u32,
     ) ?[]const u8 {
-        for (self.precompiled_cores) |pc| {
-            if (pc.core_wasm) |cw| {
-                if (cw.ptr == core_wasm.ptr and cw.len == core_wasm.len)
-                    return pc.cwasm_bytes;
-            } else {
-                if (pc.module_idx == module_idx) return pc.cwasm_bytes;
-            }
-        }
-        return null;
+        const entry = self.findPrecompiledEntry(core_wasm, module_idx) orelse return null;
+        return entry.cwasm_bytes;
+    }
+
+    pub fn attachLazyJit(
+        self: Options,
+        precompiled: *const PrecompiledCore,
+        inst: *aot_runtime.AotInstance,
+        allocator: std.mem.Allocator,
+    ) LazyJitAttachError!?LazyJitHandle {
+        const hook = self.lazy_jit_attach orelse return null;
+        return hook.attach_fn(hook.ctx, precompiled, inst, allocator);
     }
 };
 
