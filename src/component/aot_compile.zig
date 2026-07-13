@@ -279,6 +279,8 @@ pub fn compileCoreWasmCached(
     defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
     var lazy_needs_trampoline: []bool = &.{};
     defer if (lazy_needs_trampoline.len > 0) allocator.free(lazy_needs_trampoline);
+    var lazy_entry_stubs: []bool = &.{};
+    defer if (lazy_entry_stubs.len > 0) allocator.free(lazy_entry_stubs);
     if (opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
         const eligibility = lazy_jit.findLazyEligibleFunctions(
@@ -292,6 +294,7 @@ pub fn compileCoreWasmCached(
         ) catch return error.CoreCompileFailed;
         lazy_skip = eligibility.eligible;
         lazy_needs_trampoline = eligibility.needs_trampoline;
+        lazy_entry_stubs = eligibility.needs_stub;
     }
 
     if (opts.optimize) {
@@ -379,6 +382,7 @@ pub fn compileCoreWasmCached(
             .spill_metric = opts.spill_metric,
             .module_idx = opts.module_idx,
             .lazy_skip = lazy_skip,
+            .lazy_entry_stubs = lazy_entry_stubs,
         }) catch
             return error.CoreCompileFailed,
     };
