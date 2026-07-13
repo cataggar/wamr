@@ -309,8 +309,9 @@ pub fn build(b: *std.Build) void {
     // the just-built `wamr` CLI via the same in-tree adapter as the
     // Preview 1 gate. Acts as a CI gate against regressions in the WASI
     // Preview 3 adapter surface (`src/component/wasi_cli_adapter.zig`,
-    // P3 wave A–C: #481–#487). Skip-list entries must each carry a
-    // rationale + tracking issue — see `tests/wasi-p3-testsuite-skip.json`.
+    // P3 wave A–C: #481–#487). The skip list contains only the separately
+    // tracked pending-async-run socket server case; the unfiltered contract
+    // below executes all 40 fixtures and asserts that exact exception.
     // Not wired into the default `test` aggregate (it requires Python 3
     // + the runner's deps); CI gates regressions on every PR. Run
     // locally with `zig build wasi-p3-testsuite`.
@@ -332,6 +333,24 @@ pub fn build(b: *std.Build) void {
         "Run the WASI Preview 3 conformance gate (wasm32-wasip3 fixtures)",
     );
     wasi_p3_testsuite_step.dependOn(&wasi_p3_runner.step);
+
+    // This is intentionally a separate no-filter path. Its Python harness
+    // asserts every fixture executed, so a future all-skipped filter cannot
+    // make the P3 gate look green. It also pins the sole known unrelated
+    // pending-async-run failure until its scheduler follow-up lands.
+    const wasi_p3_unfiltered_runner = b.addSystemCommand(&.{
+        "python3",
+        "tests/wasi-p3-unfiltered.py",
+    });
+    wasi_p3_unfiltered_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    wasi_p3_unfiltered_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+    wasi_p3_unfiltered_runner.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "30");
+    wasi_p3_unfiltered_runner.step.dependOn(b.getInstallStep());
+    const wasi_p3_unfiltered_step = b.step(
+        "wasi-p3-testsuite-unfiltered",
+        "Run all WASI Preview 3 fixtures and assert the unfiltered execution contract",
+    );
+    wasi_p3_unfiltered_step.dependOn(&wasi_p3_unfiltered_runner.step);
 
     // ── In-process JIT parity gates (#856) ────────────────────────────
     // Only meaningful on a `-Djit=true` build (see #852): reruns the
@@ -400,6 +419,21 @@ pub fn build(b: *std.Build) void {
             "Run the WASI Preview 3 conformance gate through the in-process JIT path (-Djit=true; #856)",
         );
         wasi_p3_testsuite_jit_step.dependOn(&wasi_p3_runner_jit.step);
+
+        const wasi_p3_unfiltered_runner_jit = b.addSystemCommand(&.{
+            "python3",
+            "tests/wasi-p3-unfiltered.py",
+        });
+        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
+        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "30");
+        wasi_p3_unfiltered_runner_jit.step.dependOn(b.getInstallStep());
+        const wasi_p3_unfiltered_jit_step = b.step(
+            "wasi-p3-testsuite-jit-unfiltered",
+            "Run all WASI Preview 3 fixtures through JIT and assert no-sidecar execution",
+        );
+        wasi_p3_unfiltered_jit_step.dependOn(&wasi_p3_unfiltered_runner_jit.step);
     }
 
     // ── Wasmtime parity gate (#583 C1, original #489 proposal) ────────

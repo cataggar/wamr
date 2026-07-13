@@ -10,36 +10,37 @@ const core_types = @import("../common/types.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const page_size = std.heap.page_size_min;
-// Stubs forward up to 10 lowered C-ABI args (a0..a9) into `genericDispatcher`,
-// so the dispatcher kinds can carry up to 9 wasm-level params (after dropping
-// the importer's vmctx for the AOT-codegen variants). See #700 — widened from
-// 9 (a0..a8) so `wasi_snapshot_preview1.path_open` (9 wasm params) stops
-// trap-stubbing on the WASIp1→WASIp2 adapter path. Previously widened from
-// 6 → 9 in #689 to lower WASIp2 filesystem methods like `link-at` (7 wasm
-// params).
+// Regular stubs forward up to 10 lowered C-ABI args (a0..a9) into
+// `genericDispatcher`, so normal dispatcher kinds carry up to 9 wasm-level
+// params after dropping the importer's vmctx. `cross_instance_wide` uses a
+// dedicated 16-arg relay for real sibling exports such as socket bind, whose
+// lowered record parameters exceed that regular envelope.
 const x86_64_stub_bytes: usize = 63;
+const x86_64_wide_stub_bytes: usize = 99;
 const aarch64_stub_bytes: usize = 84;
+const aarch64_wide_stub_bytes: usize = 140;
 // Windows x86-64 uses the Win64 ABI (rcx, rdx, r8, r9 + stack with a 32-byte
 // shadow space), which needs a different — and larger — arg-shifting shim
 // than the SysV encoder. See `encodeWin64Stub`.
 const windows_x86_64_stub_bytes: usize = 118;
+const windows_x86_64_wide_stub_bytes: usize = 205;
 
 pub const STUB_BYTES: usize = switch (builtin.cpu.arch) {
-    .x86_64 => if (builtin.os.tag == .windows) windows_x86_64_stub_bytes else x86_64_stub_bytes,
-    .aarch64 => aarch64_stub_bytes,
+    .x86_64 => if (builtin.os.tag == .windows) windows_x86_64_wide_stub_bytes else x86_64_wide_stub_bytes,
+    .aarch64 => aarch64_wide_stub_bytes,
     else => 1,
 };
 /// Default per-`TrampolinePool` slot count. The pool memory cost is
 /// `cap * (@sizeOf(Slot) + STUB_BYTES) + (MAX_SLOTS_HARD / 8)` for
 /// the warn-once bit set — at the default `@sizeOf(Slot) = 64` and
-/// `STUB_BYTES = 63` (x86_64) / `84` (aarch64):
+/// `STUB_BYTES = 99` (x86_64) / `140` (aarch64):
 ///
-///   | cap   | x86_64 (~127 B/slot) | aarch64 (~148 B/slot) |
-///   |------:|---------------------:|----------------------:|
-///   |  256  |               ~32 KB |                ~37 KB |
-///   | 2048  |              ~254 KB |               ~296 KB |
-///   | 4096  |              ~508 KB |               ~592 KB |
-///   | 8192  |             ~1016 KB |              ~1184 KB |
+///   | cap   | x86_64 (~163 B/slot) | aarch64 (~204 B/slot) |
+///   |------:|----------------------:|-----------------------:|
+///   |  256  |                ~41 KB |                 ~51 KB |
+///   | 2048  |               ~326 KB |                ~408 KB |
+///   | 4096  |               ~652 KB |                ~816 KB |
+///   | 8192  |              ~1304 KB |               ~1632 KB |
 ///
 /// Real-world measurements (instrumented `pool.next_slot` at the end
 /// of `instantiateWithOptions`):
@@ -158,9 +159,32 @@ extern fn wamrAotDispatchComponentTrampolineAot(
     a9: u64,
 ) callconv(.c) DispatchResult;
 
+/// Wide AOT canon-lower dispatcher for lowered record/variant signatures
+/// whose explicit params plus retptr exceed the normal nine-slot relay.
+extern fn wamrAotDispatchComponentTrampolineAotWide(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
+) callconv(.c) DispatchResult;
+
 /// Cross-instance core-to-core fn-import dispatcher (#662). Implemented in
 /// `src/component/executor.zig`. The first slot (`a0`) is the importer's
-/// vmctx, which the dispatcher ignores; `a1..a8` are the lowered wasm args
+/// vmctx, which the dispatcher ignores; `a1..a9` are the lowered wasm args
 /// per the AOT codegen calling convention.
 extern fn wamrAotDispatchCrossInstance(
     ctx_opaque: *anyopaque,
@@ -175,6 +199,30 @@ extern fn wamrAotDispatchCrossInstance(
     a7: u64,
     a8: u64,
     a9: u64,
+) callconv(.c) DispatchResult;
+
+/// Wide sibling-core dispatcher for scalar imports with 10–15 wasm params.
+/// This has its own native relay because the regular dispatcher only carries
+/// nine wasm args after the importer's vmctx.
+extern fn wamrAotDispatchCrossInstanceWide(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
 ) callconv(.c) DispatchResult;
 
 /// Canon-builtin dispatcher for AOT-compiled core modules whose imports
@@ -240,7 +288,9 @@ extern fn wamrAotDispatchTrapStub(
 pub const DispatchKind = enum(u8) {
     canon_lower,
     canon_lower_aot,
+    canon_lower_aot_wide,
     cross_instance,
+    cross_instance_wide,
     canon_builtin_aot,
     lazy_local_aot,
     trap_stub,
@@ -307,7 +357,9 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
     const dispatched = switch (entry.dispatch_kind) {
         .canon_lower => wamrAotDispatchComponentTrampoline(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .canon_lower_aot => wamrAotDispatchComponentTrampolineAot(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+        .canon_lower_aot_wide => DispatchResult{ .status = 1, .value = 0, .err_name = "wide dispatcher routed through regular stub".ptr },
         .cross_instance => wamrAotDispatchCrossInstance(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+        .cross_instance_wide => DispatchResult{ .status = 1, .value = 0, .err_name = "wide dispatcher routed through regular stub".ptr },
         .canon_builtin_aot => wamrAotDispatchCanonBuiltin(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .lazy_local_aot => wamrAotDispatchLazyLocalAot(ctx, &entry.lowered_sig, entry.local_func_idx, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
         .trap_stub => wamrAotDispatchTrapStub(ctx, &entry.lowered_sig, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
@@ -326,6 +378,119 @@ pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
             std.log.warn(
                 "[aot dispatch] slot={d} kind={s} status={d} err={s}: returning sentinel 0x{x:0>16} to guest (likely UnsupportedSignature in canon-lower/aot lift/lower path); set WAMR_AOT_DEBUG=1 for the underlying error.",
                 .{ slot, @tagName(entry.dispatch_kind), dispatched.status, err_str, DISPATCH_FAILURE_SENTINEL },
+            );
+        }
+        return DISPATCH_FAILURE_SENTINEL;
+    }
+    return dispatched.value;
+}
+
+/// Wide relay used only for cross-instance scalar calls that exceed the
+/// regular nine-wasm-argument trampoline envelope. Keeping it separate
+/// avoids changing the ABI or code size of ordinary canon / lazy slots.
+pub fn genericDispatcherWide(
+    slot: u32,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
+) callconv(.c) u64 {
+    const pool = g_active_pool orelse {
+        std.log.warn(
+            "[aot dispatch] wide call with no active TrampolinePool (slot={d}); returning sentinel 0x{x:0>16}",
+            .{ slot, DISPATCH_FAILURE_SENTINEL },
+        );
+        return DISPATCH_FAILURE_SENTINEL;
+    };
+    if (slot >= pool.next_slot) {
+        std.log.warn(
+            "[aot dispatch] wide slot={d} out of range (next_slot={d}); returning sentinel 0x{x:0>16}",
+            .{ slot, pool.next_slot, DISPATCH_FAILURE_SENTINEL },
+        );
+        return DISPATCH_FAILURE_SENTINEL;
+    }
+
+    const entry = pool.slots[slot];
+    const ctx = entry.ctx orelse {
+        std.log.warn(
+            "[aot dispatch] wide slot={d} has null ctx (kind={s}); returning sentinel 0x{x:0>16}",
+            .{ slot, @tagName(entry.dispatch_kind), DISPATCH_FAILURE_SENTINEL },
+        );
+        return DISPATCH_FAILURE_SENTINEL;
+    };
+    if (entry.dispatch_kind != .cross_instance_wide and entry.dispatch_kind != .canon_lower_aot_wide) {
+        std.log.warn(
+            "[aot dispatch] wide slot={d} has non-wide kind={s}; returning sentinel 0x{x:0>16}",
+            .{ slot, @tagName(entry.dispatch_kind), DISPATCH_FAILURE_SENTINEL },
+        );
+        return DISPATCH_FAILURE_SENTINEL;
+    }
+
+    const dispatched = switch (entry.dispatch_kind) {
+        .cross_instance_wide => wamrAotDispatchCrossInstanceWide(
+            ctx,
+            &entry.lowered_sig,
+            a0,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            a8,
+            a9,
+            a10,
+            a11,
+            a12,
+            a13,
+            a14,
+            a15,
+        ),
+        .canon_lower_aot_wide => wamrAotDispatchComponentTrampolineAotWide(
+            ctx,
+            &entry.lowered_sig,
+            a0,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            a8,
+            a9,
+            a10,
+            a11,
+            a12,
+            a13,
+            a14,
+            a15,
+        ),
+        else => unreachable,
+    };
+    if (dispatched.status != 0) {
+        if (slot < MAX_SLOTS and !g_dispatch_warn_once.isSet(slot)) {
+            g_dispatch_warn_once.set(slot);
+            const err_str: []const u8 = if (dispatched.err_name) |p|
+                std.mem.span(p)
+            else
+                "(unknown — wrapper did not populate err_name)";
+            std.log.warn(
+                "[aot dispatch] wide slot={d} status={d} err={s}: returning sentinel 0x{x:0>16}",
+                .{ slot, dispatched.status, err_str, DISPATCH_FAILURE_SENTINEL },
             );
         }
         return DISPATCH_FAILURE_SENTINEL;
@@ -534,7 +699,8 @@ pub const TrampolinePool = struct {
     /// the *importer* is an AOT-compiled core module. Same shape as
     /// `allocSlotWithCtx` but routes through `wamrAotDispatchComponentTrampolineAot`
     /// so the dispatcher skips the AOT codegen's leading vmctx argument
-    /// before treating the remaining registers as lowered wasm args. (#687.)
+    /// before treating the remaining registers as lowered wasm args. Wide
+    /// canon-lower signatures use the 15-slot relay. (#687.)
     pub fn allocCanonLowerAotSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
         const slot = try self.reserveSlotAnon();
 
@@ -543,7 +709,10 @@ pub const TrampolinePool = struct {
             .canon_lower_idx = 0,
             .ctx = ctx,
             .lowered_sig = lowered_sig,
-            .dispatch_kind = .canon_lower_aot,
+            .dispatch_kind = if (lowered_sig.param_types.len + @intFromBool(lowered_sig.has_retptr) > 9)
+                .canon_lower_aot_wide
+            else
+                .canon_lower_aot,
         };
         self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
@@ -554,9 +723,9 @@ pub const TrampolinePool = struct {
     }
 
     /// Allocate a slot for a cross-instance core-to-core fn-import thunk
-    /// (#662). The stub forwards the importer's vmctx + lowered wasm args
-    /// to `wamrAotDispatchCrossInstance`, which re-issues the call into
-    /// the sibling AotInstance via `aot_runtime.callFuncScalar`.
+    /// (#662). The regular relay covers up to nine wasm args; a dedicated
+    /// wide relay carries 10–15 scalar args without dropping the caller's
+    /// stack arguments before re-issuing into the sibling AotInstance.
     pub fn allocCrossInstanceSlot(self: *TrampolinePool, ctx: *anyopaque, lowered_sig: LoweredSig) !StubFn {
         const slot = try self.reserveSlotAnon();
 
@@ -565,7 +734,10 @@ pub const TrampolinePool = struct {
             .canon_lower_idx = 0,
             .ctx = ctx,
             .lowered_sig = lowered_sig,
-            .dispatch_kind = .cross_instance,
+            .dispatch_kind = if (lowered_sig.param_types.len > 9)
+                .cross_instance_wide
+            else
+                .cross_instance,
         };
         self.slots[slot].lowered_sig.slot = slot;
         self.next_slot += 1;
@@ -674,26 +846,48 @@ pub const TrampolinePool = struct {
     /// elsewhere.
     fn installStub(self: *TrampolinePool, slot: u32) void {
         platform.jitWriteProtect(false);
-        writeStub(self.stubBytes(slot), slot);
+        const is_wide = switch (self.slots[slot].dispatch_kind) {
+            .cross_instance_wide, .canon_lower_aot_wide => true,
+            else => false,
+        };
+        const dispatcher = if (is_wide)
+            wideDispatcherAddr()
+        else
+            dispatcherAddr();
+        writeStub(self.stubBytes(slot), slot, is_wide, dispatcher);
         platform.jitWriteProtect(true);
         platform.icacheFlush(self.stubPtr(slot), STUB_BYTES);
     }
 };
 
-fn writeStub(bytes: []u8, slot: u32) void {
+fn writeStub(bytes: []u8, slot: u32, wide: bool, dispatcher: usize) void {
     @memset(bytes, 0);
     switch (builtin.cpu.arch) {
-        .x86_64 => if (comptime is_windows)
-            encodeWin64Stub(bytes, slot, dispatcherAddr())
+        .x86_64 => if (comptime is_windows) {
+            if (wide)
+                encodeWin64WideStub(bytes, slot, dispatcher)
+            else
+                encodeWin64Stub(bytes, slot, dispatcher);
+        } else {
+            if (wide)
+                encodeX8664WideStub(bytes, slot, dispatcher)
+            else
+                encodeX8664Stub(bytes, slot, dispatcher);
+        },
+        .aarch64 => if (wide)
+            encodeAarch64WideStub(bytes, slot, dispatcher)
         else
-            encodeX8664Stub(bytes, slot, dispatcherAddr()),
-        .aarch64 => encodeAarch64Stub(bytes, slot, dispatcherAddr()),
+            encodeAarch64Stub(bytes, slot, dispatcher),
         else => unreachable,
     }
 }
 
 fn dispatcherAddr() usize {
     return @intFromPtr(&genericDispatcher);
+}
+
+fn wideDispatcherAddr() usize {
+    return @intFromPtr(&genericDispatcherWide);
 }
 
 fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
@@ -766,6 +960,56 @@ fn encodeX8664Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     std.debug.assert(cursor == x86_64_stub_bytes);
 }
 
+fn encodeX8664WideStub(bytes: []u8, slot: u32, dispatcher: usize) void {
+    std.debug.assert(bytes.len >= x86_64_wide_stub_bytes);
+
+    // Incoming a0..a5 are in registers and a6..a15 are at
+    // [rsp+8..+80]. Injecting `slot` shifts a0..a4 into registers and
+    // spills a5..a15 for `genericDispatcherWide`. Push a15 down through
+    // a6 from a stable [rsp+80] location (each push shifts the next source
+    // up by eight), then push a5 from r9. Eleven pushes also preserve the
+    // SysV call-site alignment rule.
+    const load_and_push = [_]u8{
+        0x48, 0x8B, 0x44, 0x24, 0x50, // mov rax, [rsp+80]
+        0x50, // push rax
+    };
+    const shift = [_]u8{
+        0x4D, 0x89, 0xC1, // mov r9, r8
+        0x49, 0x89, 0xC8, // mov r8, rcx
+        0x48, 0x89, 0xD1, // mov rcx, rdx
+        0x48, 0x89, 0xF2, // mov rdx, rsi
+        0x48, 0x89, 0xFE, // mov rsi, rdi
+        0xBF, // mov edi, imm32 (slot)
+    };
+    const push_r9 = [_]u8{ 0x41, 0x51 };
+    const movabs = [_]u8{ 0x48, 0xB8 };
+    const epilogue = [_]u8{
+        0xFF, 0xD0, // call rax
+        0x48, 0x83, 0xC4, 0x58, // add rsp, 88
+        0xC3, // ret
+    };
+
+    var cursor: usize = 0;
+    for (0..10) |_| {
+        @memcpy(bytes[cursor .. cursor + load_and_push.len], &load_and_push);
+        cursor += load_and_push.len;
+    }
+    @memcpy(bytes[cursor .. cursor + push_r9.len], &push_r9); // push r9 (a5)
+    cursor += push_r9.len;
+    @memcpy(bytes[cursor .. cursor + shift.len], &shift);
+    cursor += shift.len;
+    writeIntLittle(u32, bytes[cursor .. cursor + 4], slot);
+    cursor += 4;
+    @memcpy(bytes[cursor .. cursor + movabs.len], &movabs);
+    cursor += movabs.len;
+    writeIntLittle(u64, bytes[cursor .. cursor + 8], @intCast(dispatcher));
+    cursor += 8;
+    @memcpy(bytes[cursor .. cursor + epilogue.len], &epilogue);
+    cursor += epilogue.len;
+
+    std.debug.assert(cursor == x86_64_wide_stub_bytes);
+}
+
 fn encodeWin64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     std.debug.assert(bytes.len >= windows_x86_64_stub_bytes);
 
@@ -834,6 +1078,70 @@ fn encodeWin64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     std.debug.assert(cursor == windows_x86_64_stub_bytes);
 }
 
+fn encodeWin64WideStub(bytes: []u8, slot: u32, dispatcher: usize) void {
+    std.debug.assert(bytes.len >= windows_x86_64_wide_stub_bytes);
+
+    // Incoming a0..a3 use rcx/rdx/r8/r9; a4..a15 are above the caller's
+    // 32-byte shadow space. The wide dispatcher receives slot, a0..a15:
+    // rcx=slot, rdx=a0, r8=a1, r9=a2, then a3..a15 in its stack area.
+    // Reserve 32 bytes of shadow space + 13 stack args, rounded to preserve
+    // Win64's 16-byte alignment before the nested call.
+    const prologue = [_]u8{
+        0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00, // sub rsp, 0x88
+        0x4C, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+0x20], r9 (a3)
+        0x4D, 0x89, 0xC1, // mov r9, r8 (a2)
+        0x49, 0x89, 0xD0, // mov r8, rdx (a1)
+        0x48, 0x89, 0xCA, // mov rdx, rcx (a0)
+        0xB9, // mov ecx, imm32 (slot)
+    };
+    const movabs = [_]u8{ 0x48, 0xB8 };
+    const epilogue = [_]u8{
+        0xFF, 0xD0, // call rax
+        0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00, // add rsp, 0x88
+        0xC3, // ret
+    };
+
+    var cursor: usize = 0;
+    @memcpy(bytes[cursor .. cursor + prologue.len], &prologue);
+    cursor += prologue.len;
+    writeIntLittle(u32, bytes[cursor .. cursor + 4], slot);
+    cursor += 4;
+
+    // Copy a4..a15. After the 0x88 allocation their incoming slots are
+    // [rsp+0xb0..+0x108]; outgoing a4..a15 occupy [rsp+0x28..+0x80].
+    for (0..12) |i| {
+        const src: u32 = @intCast(0xB0 + i * 8);
+        const dst: u32 = @intCast(0x28 + i * 8);
+        const load = [_]u8{ 0x48, 0x8B, 0x84, 0x24 }; // mov rax,[rsp+disp32]
+        @memcpy(bytes[cursor .. cursor + load.len], &load);
+        cursor += load.len;
+        writeIntLittle(u32, bytes[cursor .. cursor + 4], src);
+        cursor += 4;
+        if (dst <= 0x7f) {
+            const store = [_]u8{ 0x48, 0x89, 0x44, 0x24 }; // mov [rsp+disp8],rax
+            @memcpy(bytes[cursor .. cursor + store.len], &store);
+            cursor += store.len;
+            bytes[cursor] = @intCast(dst);
+            cursor += 1;
+        } else {
+            const store = [_]u8{ 0x48, 0x89, 0x84, 0x24 }; // mov [rsp+disp32],rax
+            @memcpy(bytes[cursor .. cursor + store.len], &store);
+            cursor += store.len;
+            writeIntLittle(u32, bytes[cursor .. cursor + 4], dst);
+            cursor += 4;
+        }
+    }
+
+    @memcpy(bytes[cursor .. cursor + movabs.len], &movabs);
+    cursor += movabs.len;
+    writeIntLittle(u64, bytes[cursor .. cursor + 8], @intCast(dispatcher));
+    cursor += 8;
+    @memcpy(bytes[cursor .. cursor + epilogue.len], &epilogue);
+    cursor += epilogue.len;
+
+    std.debug.assert(cursor == windows_x86_64_wide_stub_bytes);
+}
+
 fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     std.debug.assert(bytes.len >= aarch64_stub_bytes);
 
@@ -894,6 +1202,53 @@ fn encodeAarch64Stub(bytes: []u8, slot: u32, dispatcher: usize) void {
     emitAarch64(bytes, &cursor, 0xD65F03C0);
 
     std.debug.assert(cursor == aarch64_stub_bytes);
+}
+
+fn encodeAarch64WideStub(bytes: []u8, slot: u32, dispatcher: usize) void {
+    std.debug.assert(bytes.len >= aarch64_wide_stub_bytes);
+
+    // AAPCS64 incoming a0..a7 are x0..x7 and a8..a15 are at the old
+    // stack pointer. Reserve 96 bytes: the wide dispatcher needs a7..a15
+    // as nine outgoing stack args at [sp+0..+64], and x30 lives at +80.
+    // x9 is caller-saved scratch for relaying the incoming stack args.
+    var cursor: usize = 0;
+    emitAarch64(bytes, &cursor, 0xD10183FF); // sub sp, sp, #96
+    emitAarch64(bytes, &cursor, 0xF9002BFE); // str x30, [sp, #80]
+    emitAarch64(bytes, &cursor, 0xF90003E7); // str x7, [sp]
+
+    for (0..8) |i| {
+        const src_units: u32 = @intCast(12 + i); // old sp + i*8
+        const dst_units: u32 = @intCast(1 + i); // outgoing a8..a15
+        const ldr_x9 = 0xF9400000 | (src_units << 10) | (@as(u32, 31) << 5) | 9;
+        const str_x9 = 0xF9000000 | (dst_units << 10) | (@as(u32, 31) << 5) | 9;
+        emitAarch64(bytes, &cursor, ldr_x9);
+        emitAarch64(bytes, &cursor, str_x9);
+    }
+
+    inline for ([_]struct { dst: u5, src: u5 }{
+        .{ .dst = 7, .src = 6 },
+        .{ .dst = 6, .src = 5 },
+        .{ .dst = 5, .src = 4 },
+        .{ .dst = 4, .src = 3 },
+        .{ .dst = 3, .src = 2 },
+        .{ .dst = 2, .src = 1 },
+        .{ .dst = 1, .src = 0 },
+    }) |move| {
+        emitAarch64(bytes, &cursor, 0xAA0003E0 | (@as(u32, move.src) << 16) | move.dst);
+    }
+
+    emitAarch64(bytes, &cursor, movz32(0, @truncate(slot), 0));
+    const addr = @as(u64, @intCast(dispatcher));
+    emitAarch64(bytes, &cursor, movz64(16, @truncate(addr), 0));
+    emitAarch64(bytes, &cursor, movk64(16, @truncate(addr >> 16), 1));
+    emitAarch64(bytes, &cursor, movk64(16, @truncate(addr >> 32), 2));
+    emitAarch64(bytes, &cursor, movk64(16, @truncate(addr >> 48), 3));
+    emitAarch64(bytes, &cursor, 0xD63F0200); // blr x16
+    emitAarch64(bytes, &cursor, 0xF9402BFE); // ldr x30, [sp, #80]
+    emitAarch64(bytes, &cursor, 0x910183FF); // add sp, sp, #96
+    emitAarch64(bytes, &cursor, 0xD65F03C0); // ret
+
+    std.debug.assert(cursor == aarch64_wide_stub_bytes);
 }
 
 fn emitAarch64(bytes: []u8, cursor: *usize, word: u32) void {

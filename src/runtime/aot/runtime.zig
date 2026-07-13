@@ -2489,11 +2489,9 @@ pub const ScalarCallError = error{
 /// value always lands in RAX, so the "result" register is also treated as
 /// a u64 bit pattern and reinterpreted by the caller.
 ///
-/// Registers available for args:
-///   - Win64: RCX/RDX/R8/R9 → VmCtx + up to 3 wasm params.
-///   - SysV AMD64: RDI/RSI/RDX/RCX/R8/R9 → VmCtx + up to 5 wasm params.
-/// We conservatively cap at 3 wasm params so the same typed harness works
-/// on both platforms. Anything outside → `error.UnsupportedSignature`.
+/// Register and stack args follow the platform C ABI after the leading
+/// `VmCtx*`; this typed bridge supports up to 16 scalar wasm params on both
+/// platforms. Anything wider → `error.UnsupportedSignature`.
 const CallFn0 = *const fn (*VmCtx) callconv(.c) u64;
 const CallFn1 = *const fn (*VmCtx, u64) callconv(.c) u64;
 const CallFn2 = *const fn (*VmCtx, u64, u64) callconv(.c) u64;
@@ -2507,7 +2505,11 @@ const CallFn9 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64) 
 const CallFn10 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
 const CallFn11 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
 const CallFn12 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
-const MaxScalarArgs: usize = 12;
+const CallFn13 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn14 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn15 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn16 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const MaxScalarArgs: usize = 16;
 /// Max number of results a multi-value return may produce via the
 /// `callFuncScalar` path. Bounded by the HRP stack buffer size below.
 pub const MaxScalarResults: usize = 16;
@@ -2572,6 +2574,22 @@ fn invokeScalarCallable(addr: [*]const u8, vmctx: *VmCtx, raw_args: []const u64)
         12 => blk: {
             const f: CallFn12 = @ptrCast(@alignCast(addr));
             break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10], raw_args[11]);
+        },
+        13 => blk: {
+            const f: CallFn13 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10], raw_args[11], raw_args[12]);
+        },
+        14 => blk: {
+            const f: CallFn14 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10], raw_args[11], raw_args[12], raw_args[13]);
+        },
+        15 => blk: {
+            const f: CallFn15 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10], raw_args[11], raw_args[12], raw_args[13], raw_args[14]);
+        },
+        16 => blk: {
+            const f: CallFn16 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5], raw_args[6], raw_args[7], raw_args[8], raw_args[9], raw_args[10], raw_args[11], raw_args[12], raw_args[13], raw_args[14], raw_args[15]);
         },
         else => unreachable,
     };
@@ -3024,6 +3042,22 @@ pub fn callFuncScalar(
         12 => blk: {
             const f: CallFn12 = @ptrCast(@alignCast(addr));
             break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]);
+        },
+        13 => blk: {
+            const f: CallFn13 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12]);
+        },
+        14 => blk: {
+            const f: CallFn14 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13]);
+        },
+        15 => blk: {
+            const f: CallFn15 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14]);
+        },
+        16 => blk: {
+            const f: CallFn16 = @ptrCast(@alignCast(addr));
+            break :blk f(vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
         },
         else => unreachable,
     };

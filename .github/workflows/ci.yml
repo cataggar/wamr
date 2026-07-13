@@ -215,10 +215,9 @@ jobs:
     # Drives the vendored wasm32-wasip3 fixtures at
     # `tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/` through
     # the just-built `wamr` via the in-tree `wamr-zig.py` adapter.
-    # Skip-list (`tests/wasi-p3-testsuite-skip.json`) is conservative
-    # while wave-A/B/C P3 adapter PRs are still in flight (#481-#487);
-    # entries shrink as each P3 namespace lands. Mirrors the existing
-    # `wasi-testsuite` (P1) and `wasi-p2-testsuite` (P2) jobs.
+    # The normal filtered step remains available for local triage, while
+    # this CI job uses the explicit unfiltered contract so all 40 fixtures
+    # must execute even if a future skip file accidentally grows again.
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -251,8 +250,8 @@ jobs:
         # build so a regression in adapter state still trips the gate.
         run: zig build -Doptimize=ReleaseSafe
 
-      - name: Run WASI Preview 3 conformance gate
-        run: zig build wasi-p3-testsuite -Doptimize=ReleaseSafe
+      - name: Run unfiltered WASI Preview 3 conformance contract
+        run: zig build wasi-p3-testsuite-unfiltered -Doptimize=ReleaseSafe
 
   jit-parity:
     name: Build & Test (jit-parity)
@@ -316,8 +315,8 @@ jobs:
       - name: Run WASI Preview 1 conformance suite through the JIT path
         run: zig build wasi-testsuite-jit -Doptimize=ReleaseSafe -Djit=true
 
-      - name: Run WASI Preview 3 conformance gate through the JIT path
-        run: zig build wasi-p3-testsuite-jit -Doptimize=ReleaseSafe -Djit=true
+      - name: Run unfiltered WASI Preview 3 contract through the JIT path
+        run: zig build wasi-p3-testsuite-jit-unfiltered -Doptimize=ReleaseSafe -Djit=true
 
   lazy-jit:
     name: Build & Test (lazy-jit-${{ matrix.name }})

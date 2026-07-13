@@ -148,3 +148,9 @@ path**; trap-on-call stubs would just push the failure from
 instantiation time to call time. The p3 skip entries in
 `tests/wasi-p3-testsuite-skip.json` therefore stay in place until
 canon-builtin + canon.lower bridging lands.
+
+> Historical note: the P3 conclusion above was accurate for Phase C. #881
+> subsequently added shared AOT/JIT canonical-builtin dispatch, async
+> canon-lower handling, and wide scalar relays; 39 of 40 P3 fixtures now
+> pass unfiltered in both modes. The remaining pending async-run TCP server
+> continuation is tracked separately by #905.

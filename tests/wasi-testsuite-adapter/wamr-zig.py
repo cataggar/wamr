@@ -70,8 +70,9 @@ def get_wasi_versions() -> List[str]:
     # Declares both Preview 1 (covered by `zig build wasi-testsuite`) and
     # Preview 3 (covered by `zig build wasi-p3-testsuite`, issue #489) so
     # the upstream `UnsupportedWasiTestExcludeFilter` doesn't auto-skip
-    # the wasm32-wasip3 fixtures. Per-test gating for incomplete P3
-    # adapter coverage lives in `tests/wasi-p3-testsuite-skip.json`.
+    # the wasm32-wasip3 fixtures. The filtered convenience step retains
+    # only the separately tracked pending-async-run sockets-echo exception;
+    # the CI contract executes the complete corpus without that filter.
     return ["wasm32-wasip1", "wasm32-wasip3"]
 
 
