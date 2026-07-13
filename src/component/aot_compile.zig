@@ -841,13 +841,38 @@ pub const LazyCompileDriver = struct {
 /// must have been produced from the SAME compile (its `.cwasm` bytes
 /// came from the same `compileCoreWasmCached` call whose
 /// `lazy_jit_out` is `lazy_out`) — indices are meaningless otherwise.
+///
+/// Ownership: this function *always* consumes `lazy_out` — on success
+/// the returned driver owns it (freed by `LazyCompileDriver.deinit()`);
+/// on any error `lazy_out` has already been torn down before this
+/// function returns. Callers must treat `lazy_out` as moved-from the
+/// moment they call this, on every path, not just the success path —
+/// mirroring the caller-side null-before-call discipline
+/// `InMemoryPrecompiled.attachLazyJit` uses for its sidecar slot.
 pub fn setupLazyJit(
     inst: *aot_runtime.AotInstance,
     lazy_out: LazyJitOut,
     allocator: std.mem.Allocator,
 ) !*LazyCompileDriver {
+    // From here on, `lazy_out` is owned by this call on *every* return
+    // path — success or error — never by the caller (see
+    // `InMemoryPrecompiled.attachLazyJit`'s doc comment, which nulls
+    // its sidecar slot unconditionally before calling this function
+    // on that assumption). Track whether ownership has already moved
+    // into a `LazyCompileDriver` (whose own `deinit()` frees
+    // `lazy_out`'s `ir_module` / `lazy_local_indices` /
+    // `needs_trampoline` via `compile_allocator`) so this top-level
+    // `errdefer` only covers the narrow window *before* that handoff
+    // — i.e. only if `allocator.create` immediately below fails. Once
+    // the driver exists, `errdefer driver.deinit()` becomes the sole
+    // owner and this one must stay out of its way, or both would free
+    // the same memory.
+    var driver_owns_lazy_out = false;
+    errdefer if (!driver_owns_lazy_out) deinitLazyJitOut(lazy_out);
+
     const driver = try allocator.create(LazyCompileDriver);
     driver.* = .{ .lazy_out = lazy_out, .allocator = allocator };
+    driver_owns_lazy_out = true;
     errdefer {
         driver.deinit();
     }
@@ -1254,6 +1279,26 @@ pub const InMemoryPrecompiled = struct {
         if (!self.lazy_jit_enabled) return null;
         const idx = self.indexOfPrecompiled(precompiled) orelse return error.LazyJitSidecarUnavailable;
         const lazy_out = self.lazy_sidecars[idx] orelse return error.LazyJitSidecarUnavailable;
+        // Consume the sidecar *before* calling `setupLazyJit`, not
+        // after: `setupLazyJit` takes ownership of `lazy_out` on every
+        // return path, success or error (see its doc comment). On
+        // success the returned driver owns `lazy_out` (freed by the
+        // driver's own `deinit()`, e.g. via `deinitLazyDriverOpaque`);
+        // on any failure `setupLazyJit` itself has already torn
+        // `lazy_out` down (via `deinitLazyJitOut` or `driver.deinit()`,
+        // whichever had taken ownership at the point of failure). So
+        // by the time this call returns, `lazy_out`'s resources have
+        // already been consumed exactly once, regardless of outcome.
+        // Nulling the slot only on success left the stale,
+        // already-freed sidecar reachable from
+        // `self.lazy_sidecars[idx]`, so a failed `setupLazyJit` call
+        // was followed by `InMemoryPrecompiled.deinit()`
+        // double-freeing/double-deiniting it. Nulling here —
+        // unconditionally, before the call — makes `self` release
+        // ownership at the single point where it hands `lazy_out`
+        // off, so exactly one owner ever frees it on every
+        // success/error path.
+        self.lazy_sidecars[idx] = null;
         // `setupLazyJit`'s error set is broader than `LazyJitAttachError`
         // (it can also fail via the #888 trampoline pool's allocation /
         // mmap / signature-lookup errors, e.g. `OutOfTrampolineSlots`,
@@ -1265,7 +1310,6 @@ pub const InMemoryPrecompiled = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.LazyJitSidecarUnavailable,
         };
-        self.lazy_sidecars[idx] = null;
         return .{
             .ctx = driver,
             .deinit_fn = &deinitLazyDriverOpaque,

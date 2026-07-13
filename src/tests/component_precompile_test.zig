@@ -16,6 +16,7 @@ const config = wamr.config;
 const instance = wamr.component_instance;
 const core_types = wamr.types;
 const aot_runtime_mod = wamr.aot_runtime;
+const aot_loader_mod = wamr.aot_loader;
 const component_aot = wamr.component_aot;
 const component_aot_compile = wamr.component_aot_compile;
 
@@ -195,6 +196,75 @@ test "#889: precompileComponentInMemory lazy-JIT attaches for a single-core comp
     );
     try std.testing.expectEqual(@as(i32, 42), second[0].i32);
     try std.testing.expectEqual(@intFromPtr(compiled_addr), @intFromPtr(ai.lazy_jit.compiled[0].?.addr));
+}
+
+test "regression: a failing setupLazyJit still consumes the sidecar exactly once (no double free/leak)" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+    // Reproduces the ownership bug fixed alongside 4e5b14c8:
+    // `InMemoryPrecompiled.attachLazyJit` used to null its
+    // `lazy_sidecars[idx]` slot only *after* a successful
+    // `setupLazyJit` call. But `setupLazyJit` always takes ownership
+    // of the `LazyJitOut` it's given — on success the returned driver
+    // owns it, and on failure it has already torn it down itself
+    // (via `driver.deinit()`'s `errdefer`, once the driver exists, or
+    // directly, before that). So a failed `setupLazyJit` left the
+    // stale, already-freed `LazyJitOut` reachable from
+    // `self.lazy_sidecars[idx]`, and `InMemoryPrecompiled.deinit()`
+    // would later free/deinit it a second time.
+    //
+    // Drives `setupLazyJit`'s real allocator parameter through a
+    // `std.testing.FailingAllocator` so every one of its allocations
+    // — `LazyCompileDriver` itself, then `slot_states`, `compiled`,
+    // and `trampolines` (`add42` is a leaf function needing no
+    // trampoline, so no trampoline-pool allocations follow) — fails
+    // in turn, covering both the pre-driver-creation and
+    // post-driver-creation ownership-handoff windows. The backing
+    // allocator is `std.testing.allocator` itself, whose safety
+    // checks abort the process on a double free, so this test would
+    // crash (not merely fail an assertion) if the ownership bug were
+    // reintroduced.
+    const gpa = std.testing.allocator;
+    const component_bytes = try buildMinimalComponent(gpa);
+    defer gpa.free(component_bytes);
+
+    var fail_index: usize = 0;
+    while (fail_index <= 4) : (fail_index += 1) {
+        var in_mem = try component_aot_compile.precompileComponentInMemory(gpa, component_bytes, .{
+            .lazy_jit = true,
+        });
+        defer in_mem.deinit();
+        try std.testing.expect(in_mem.lazy_sidecars[0] != null);
+
+        const pcs = in_mem.precompiledCores();
+        const module = try gpa.create(aot_loader_mod.AotModule);
+        defer gpa.destroy(module);
+        module.* = try aot_loader_mod.load(pcs[0].cwasm_bytes, gpa);
+        defer aot_loader_mod.unload(module, gpa);
+
+        const inst = try aot_runtime_mod.instantiate(module, gpa);
+        defer aot_runtime_mod.destroy(inst);
+        try aot_runtime_mod.mapCodeExecutable(inst);
+
+        const opts = in_mem.instantiationOptions();
+        const hook = opts.lazy_jit_attach orelse return error.TestFailed;
+
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const result = hook.attach_fn(hook.ctx, &pcs[0], inst, failing.allocator());
+
+        // Whatever the outcome, the sidecar slot must be consumed:
+        // exactly one owner (either the failed `setupLazyJit` call
+        // itself, or the returned driver) now handles `lazy_out`'s
+        // lifetime, never `InMemoryPrecompiled.deinit()`.
+        try std.testing.expect(in_mem.lazy_sidecars[0] == null);
+
+        if (fail_index < 4) {
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else {
+            const handle = (try result) orelse return error.TestFailed;
+            handle.deinit();
+        }
+    }
 }
 
 test "#625 phase 2: loadManifest rejects mismatched component bytes" {
