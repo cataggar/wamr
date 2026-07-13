@@ -9,7 +9,6 @@
 //! path the phase 1 smoke test exercises with in-memory bytes.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const wamr = @import("wamr");
 const aot_harness = @import("aot_harness.zig");
 
@@ -143,8 +142,11 @@ test "#625 phase 2: precompile + loadManifest + instantiate round-trip" {
 
 test "#889: precompileComponentInMemory lazy-JIT attaches for a single-core component" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
-    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+    // `add42` is a leaf function (no calls), so it only needs the
+    // arch-neutral #862 lazy-JIT path; unlike the #887/#888 non-leaf
+    // and trampoline mechanisms, this doesn't require x86_64-only
+    // gating (see #890's aarch64 leaf-function parity).
 
     const allocator = std.testing.allocator;
     const component_bytes = try buildMinimalComponent(allocator);
@@ -163,9 +165,9 @@ test "#889: precompileComponentInMemory lazy-JIT attaches for a single-core comp
     defer inst.deinit();
 
     const ai = inst.core_instances[0].aot_inst orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(usize, 1), ai.lazy_jit.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), ai.lazy_jit.slot_states.len);
     try std.testing.expectEqual(@as(usize, 1), ai.lazy_jit.compiled.len);
-    try std.testing.expect(ai.lazy_jit.pending[0]);
+    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.pending, ai.lazy_jit.slotState(0));
     try std.testing.expect(ai.lazy_jit.compiled[0] == null);
 
     const fn_idx = aot_runtime_mod.findExportFunc(ai, "add42") orelse return error.TestFailed;
@@ -180,7 +182,7 @@ test "#889: precompileComponentInMemory lazy-JIT attaches for a single-core comp
         &results_buf,
     );
     try std.testing.expectEqual(@as(i32, 142), first[0].i32);
-    try std.testing.expect(!ai.lazy_jit.pending[0]);
+    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.ready, ai.lazy_jit.slotState(0));
     const compiled_addr = ai.lazy_jit.compiled[0].?.addr;
 
     const second = try aot_runtime_mod.callFuncScalar(
