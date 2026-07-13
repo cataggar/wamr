@@ -139,6 +139,18 @@ pub const PrecompileOptions = struct {
     /// x86_64 only for this narrow prototype; `target_arch == .aarch64`
     /// with `lazy_jit = true` returns `error.CoreCompileFailed`.
     lazy_jit: bool = false,
+    /// #879 M4.7 (phase 1) opt-in: when true, `lazy_jit.
+    /// rewriteLocalCallsToIndirect` is applied to EVERY function's IR
+    /// (not just lazy-eligible ones) immediately after
+    /// `frontend.lowerModule`, before optimization passes run. This
+    /// exists so the "any local `.call` becomes `.ref_func` +
+    /// `.call_ref`" rewrite mechanism can be proven correct through the
+    /// full real compile → emit → instantiate → execute pipeline in
+    /// isolation from lazy-JIT eligibility/wiring (a separate, later
+    /// phase). Independent of `lazy_jit`/`optimize`; has no effect on
+    /// `wamrc compile`'s normal output since it defaults to false. See
+    /// `docs/design/lazy-jit-spike.md`'s M4.7 phase split.
+    force_indirect_calls: bool = false,
 };
 
 /// #862 lazy-JIT design-spike: retained state a caller needs to compile
@@ -246,6 +258,19 @@ pub fn compileCoreWasmCached(
     var ir_module = frontend.lowerModule(&module, allocator) catch return error.CoreCompileFailed;
     var keep_ir_module_for_lazy_jit = false;
     defer if (!keep_ir_module_for_lazy_jit) ir_module.deinit();
+
+    // #879 M4.7 (phase 1): see `PrecompileOptions.force_indirect_calls`'s
+    // doc comment. Runs before optimization so later passes see the
+    // rewritten `.ref_func`/`.call_ref` shape like any other IR.
+    if (opts.force_indirect_calls) {
+        for (ir_module.functions.items) |*func| {
+            lazy_jit.rewriteLocalCallsToIndirect(
+                func,
+                ir_module.import_count,
+                ir_module.func_type_indices.items,
+            ) catch return error.CoreCompileFailed;
+        }
+    }
 
     // #862/#879 lazy-JIT spike: compute the eligibility set BEFORE
     // codegen so it can be threaded into the x86_64 backend's

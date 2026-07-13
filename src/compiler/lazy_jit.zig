@@ -446,3 +446,198 @@ test "findLazyEligibleWithTrampoline: a function containing call_ref is not a le
     try std.testing.expect(result.eligible[0]);
     try std.testing.expect(!result.eligible[1]); // not a leaf (performs call_ref)
 }
+
+/// #879 M4.7 (phase 1): rewrites every `.call` instruction in `func`
+/// that targets a LOCAL (non-imported) function into an equivalent
+/// `.ref_func` + `.call_ref` pair, preserving `dest`/`type`/`args`/
+/// `extra_results`/`tail` exactly.
+///
+/// Why this is needed: direct `.call` codegen patches a compile-time
+/// PC-relative branch (`CallPatch`, resolved against each function's
+/// final offset within one contiguous code blob) to reach its target.
+/// A lazily-compiled function's machine code instead lives in its own,
+/// separately-`mmap`'d region (see `mapExecutableCode` /
+/// `lazy_call_trampoline.zig`) that can be gigabytes away from the
+/// main blob -- a rel32 branch cannot reliably reach it, and the
+/// offset isn't even a compile-time constant. `.ref_func`/`.call_ref`
+/// already dispatch indirectly through `vmctx.funcptrs[idx]` (see both
+/// backends' `.ref_func` codegen) -- the SAME array `mapCodeExecutable`
+/// populates with either a function's real compiled address or a
+/// trampoline address -- so this rewrite is correct regardless of
+/// whether the callee is itself deferred, already compiled, or
+/// deferred-but-reachable-only-through-a-trampoline. Self-recursive
+/// calls are also safe: `funcptrs[F]` is read at call *execution*
+/// time, not compile time, and is updated to F's real address before
+/// F's own first-call compile returns control to any caller.
+///
+/// Import calls (`func_idx < import_count`) are left untouched: their
+/// `.call` codegen already dispatches indirectly through
+/// `vmctx.host_functions[]`, so rewriting them would add overhead for
+/// no benefit.
+///
+/// `func_type_indices` is the module's function-index → wasm-type-index
+/// table (`IrModule.func_type_indices.items`, imports first then
+/// locals) -- used only to populate `.call_ref`'s `type_idx` field,
+/// which every backend's `.call_ref` codegen treats as informational
+/// (it does not affect dispatch: `.call_ref` targets are already
+/// statically typed by validation, unlike `call_indirect`'s runtime
+/// table-entry signature check).
+///
+/// This is a standalone, independently-testable IR transformation
+/// (deliberately not yet wired into any real compile path -- that's a
+/// later phase, mirroring M4.6/M4.8's phase split; see
+/// `docs/design/lazy-jit-spike.md`).
+///
+/// Uses `func`'s own per-block `allocator` (recorded on each
+/// `BasicBlock` at construction) to grow the instruction list -- no
+/// separate allocator parameter is needed.
+pub fn rewriteLocalCallsToIndirect(
+    func: *ir.IrFunction,
+    import_count: u32,
+    func_type_indices: []const u32,
+) !void {
+    for (func.blocks.items) |*block| {
+        var i: usize = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const call = switch (block.instructions.items[i].op) {
+                .call => |c| c,
+                else => continue,
+            };
+            if (call.func_idx < import_count) continue; // import: already indirect
+
+            const dest = block.instructions.items[i].dest;
+            const result_type = block.instructions.items[i].type;
+            const type_idx = if (call.func_idx < func_type_indices.len) func_type_indices[call.func_idx] else 0;
+
+            const ref_dest = func.newVReg();
+            try block.instructions.insert(block.allocator, i, .{
+                .op = .{ .ref_func = call.func_idx },
+                .dest = ref_dest,
+                .type = .i64,
+            });
+            i += 1;
+
+            // Overwrite the original `.call` slot in place with the
+            // equivalent `.call_ref`. `call.args` transfers ownership
+            // as-is (same allocation, no dupe/free) -- see `Inst.
+            // freeOwnedSlices`'s `.call`/`.call_ref` arms, which both
+            // free `args` the same way.
+            block.instructions.items[i] = .{
+                .op = .{ .call_ref = .{
+                    .type_idx = type_idx,
+                    .func_ref = ref_dest,
+                    .args = call.args,
+                    .extra_results = call.extra_results,
+                    .tail = call.tail,
+                } },
+                .dest = dest,
+                .type = result_type,
+            };
+        }
+    }
+}
+
+test "rewriteLocalCallsToIndirect: a call to a local function becomes ref_func + call_ref" {
+    const allocator = std.testing.allocator;
+
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const args = try allocator.dupe(ir.VReg, &.{0});
+    const dest = func.newVReg(); // vreg 1
+    try func.getBlock(b0).append(.{
+        .op = .{ .call = .{ .func_idx = 3, .args = args, .extra_results = 0, .tail = false } },
+        .dest = dest,
+        .type = .i32,
+    });
+
+    const func_type_indices = [_]u32{ 0, 0, 0, 7 };
+    try rewriteLocalCallsToIndirect(&func, 1, &func_type_indices);
+
+    const insts = func.getBlock(b0).instructions.items;
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .ref_func = 3 }, insts[0].op);
+    try std.testing.expectEqual(@as(ir.IrType, .i64), insts[0].type);
+    const ref_dest = insts[0].dest.?;
+
+    switch (insts[1].op) {
+        .call_ref => |cr| {
+            try std.testing.expectEqual(@as(u32, 7), cr.type_idx);
+            try std.testing.expectEqual(ref_dest, cr.func_ref);
+            try std.testing.expectEqual(@as(usize, 1), cr.args.len);
+            try std.testing.expectEqual(@as(ir.VReg, 0), cr.args[0]);
+            try std.testing.expectEqual(@as(u8, 0), cr.extra_results);
+            try std.testing.expectEqual(false, cr.tail);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(dest, insts[1].dest.?);
+    try std.testing.expectEqual(@as(ir.IrType, .i32), insts[1].type);
+}
+
+test "rewriteLocalCallsToIndirect: an import call is left untouched" {
+    const allocator = std.testing.allocator;
+
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const args = try allocator.dupe(ir.VReg, &.{0});
+    try func.getBlock(b0).append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = args, .extra_results = 0, .tail = false } },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+
+    try rewriteLocalCallsToIndirect(&func, 2, &.{});
+
+    const insts = func.getBlock(b0).instructions.items;
+    try std.testing.expectEqual(@as(usize, 1), insts.len);
+    switch (insts[0].op) {
+        .call => |c| try std.testing.expectEqual(@as(u32, 0), c.func_idx),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "rewriteLocalCallsToIndirect: preserves tail flag and multiple calls in one block" {
+    const allocator = std.testing.allocator;
+
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    try func.getBlock(b0).append(.{
+        .op = .{ .call = .{ .func_idx = 1, .args = &.{}, .extra_results = 0, .tail = false } },
+        .dest = func.newVReg(),
+        .type = .i32,
+    });
+    try func.getBlock(b0).append(.{
+        .op = .{ .call = .{ .func_idx = 2, .args = &.{}, .extra_results = 0, .tail = true } },
+        .dest = null,
+        .type = .i32,
+    });
+
+    try rewriteLocalCallsToIndirect(&func, 0, &.{ 5, 6, 8 });
+
+    const insts = func.getBlock(b0).instructions.items;
+    // Each of the 2 original `.call`s becomes a `.ref_func` + `.call_ref`
+    // pair, so 2 calls -> 4 instructions.
+    try std.testing.expectEqual(@as(usize, 4), insts.len);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .ref_func = 1 }, insts[0].op);
+    switch (insts[1].op) {
+        .call_ref => |cr| {
+            try std.testing.expectEqual(@as(u32, 6), cr.type_idx);
+            try std.testing.expectEqual(false, cr.tail);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqual(ir.Inst.Op{ .ref_func = 2 }, insts[2].op);
+    switch (insts[3].op) {
+        .call_ref => |cr| {
+            try std.testing.expectEqual(@as(u32, 8), cr.type_idx);
+            try std.testing.expectEqual(true, cr.tail); // tail flag preserved
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}

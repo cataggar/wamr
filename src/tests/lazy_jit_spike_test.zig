@@ -82,6 +82,144 @@ const lazy_fixture_wasm = [_]u8{
     0x61, 0x6c, 0x6c, 0x65, 0x64,
 };
 
+// #879 M4.7 (phase 1) fixtures -- each proves `lazy_jit.
+// rewriteLocalCallsToIndirect` produces functionally-identical results
+// to the normal, direct-`.call` codegen path when routed through the
+// real compile -> emit -> instantiate -> execute pipeline via
+// `PrecompileOptions.force_indirect_calls`.
+
+// Generated via: wasm-tools parse m47_caller_callee.wat -o ...wasm
+// (module
+//   (func $callee (param i32) (result i32)
+//     local.get 0 i32.const 2 i32.mul)
+//   (func $caller (export "caller") (param i32) (result i32)
+//     local.get 0 call $callee i32.const 1 i32.add))
+const m47_caller_callee_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x03, 0x02, 0x00, 0x00, 0x07, 0x0a, 0x01,
+    0x06, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x72, 0x00,
+    0x01, 0x0a, 0x13, 0x02, 0x07, 0x00, 0x20, 0x00,
+    0x41, 0x02, 0x6c, 0x0b, 0x09, 0x00, 0x20, 0x00,
+    0x10, 0x00, 0x41, 0x01, 0x6a, 0x0b, 0x00, 0x18,
+    0x04, 0x6e, 0x61, 0x6d, 0x65, 0x01, 0x11, 0x02,
+    0x00, 0x06, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x65,
+    0x01, 0x06, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x72,
+};
+
+// Generated via: wasm-tools parse m47_tail_call.wat -o ...wasm
+// (module
+//   (func $callee (param i32) (result i32)
+//     local.get 0 i32.const 3 i32.add)
+//   (func $caller (export "caller") (param i32) (result i32)
+//     local.get 0 return_call $callee))
+const m47_tail_call_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x03, 0x02, 0x00, 0x00, 0x07, 0x0a, 0x01,
+    0x06, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x72, 0x00,
+    0x01, 0x0a, 0x10, 0x02, 0x07, 0x00, 0x20, 0x00,
+    0x41, 0x03, 0x6a, 0x0b, 0x06, 0x00, 0x20, 0x00,
+    0x12, 0x00, 0x0b, 0x00, 0x18, 0x04, 0x6e, 0x61,
+    0x6d, 0x65, 0x01, 0x11, 0x02, 0x00, 0x06, 0x63,
+    0x61, 0x6c, 0x6c, 0x65, 0x65, 0x01, 0x06, 0x63,
+    0x61, 0x6c, 0x6c, 0x65, 0x72,
+};
+
+// Generated via: wasm-tools parse m47_recursive.wat -o ...wasm
+// (module
+//   (func $sumto (export "sumto") (param i32) (result i32)
+//     local.get 0 i32.const 0 i32.le_s
+//     if (result i32)
+//       i32.const 0
+//     else
+//       local.get 0 local.get 0 i32.const 1 i32.sub call $sumto i32.add
+//     end))
+const m47_recursive_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x02, 0x01, 0x00, 0x07, 0x09, 0x01, 0x05,
+    0x73, 0x75, 0x6d, 0x74, 0x6f, 0x00, 0x00, 0x0a,
+    0x19, 0x01, 0x17, 0x00, 0x20, 0x00, 0x41, 0x00,
+    0x4c, 0x04, 0x7f, 0x41, 0x00, 0x05, 0x20, 0x00,
+    0x20, 0x00, 0x41, 0x01, 0x6b, 0x10, 0x00, 0x6a,
+    0x0b, 0x0b, 0x00, 0x0f, 0x04, 0x6e, 0x61, 0x6d,
+    0x65, 0x01, 0x08, 0x01, 0x00, 0x05, 0x73, 0x75,
+    0x6d, 0x74, 0x6f,
+};
+
+/// Compiles `wasm_bytes` (with `force_indirect_calls` on/off per
+/// `opts`), instantiates, calls the single exported i32(i32) function
+/// named `export_name` with `arg`, and returns the i32 result.
+fn compileAndCallI32I32(
+    allocator: std.mem.Allocator,
+    wasm_bytes: []const u8,
+    opts: component_aot_compile.PrecompileOptions,
+    export_name: []const u8,
+    arg: i32,
+) !i32 {
+    const cwasm = try component_aot_compile.compileCoreWasm(allocator, wasm_bytes, opts);
+    defer allocator.free(cwasm);
+
+    var module = try aot_loader_mod.load(cwasm, allocator);
+    defer aot_loader_mod.unload(&module, allocator);
+
+    const inst = try aot_runtime_mod.instantiate(&module, allocator);
+    defer aot_runtime_mod.destroy(inst);
+    try aot_runtime_mod.mapCodeExecutable(inst);
+
+    const fn_idx = aot_runtime_mod.findExportFunc(inst, export_name) orelse return error.ExportNotFound;
+    var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
+    const results = try aot_runtime_mod.callFuncScalar(
+        inst,
+        fn_idx,
+        &.{.i32},
+        &.{.i32},
+        &.{.{ .i32 = arg }},
+        &results_buf,
+    );
+    return results[0].i32;
+}
+
+test "#879 M4.7 phase 1: rewriting a direct call to ref_func+call_ref preserves behaviour" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const normal = try compileAndCallI32I32(gpa, &m47_caller_callee_wasm, .{}, "caller", 5);
+    const rewritten = try compileAndCallI32I32(gpa, &m47_caller_callee_wasm, .{ .force_indirect_calls = true }, "caller", 5);
+
+    try std.testing.expectEqual(@as(i32, 11), normal); // 5*2 + 1
+    try std.testing.expectEqual(normal, rewritten);
+}
+
+test "#879 M4.7 phase 1: rewriting a tail call to ref_func+call_ref (real-tail codegen) preserves behaviour" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const normal = try compileAndCallI32I32(gpa, &m47_tail_call_wasm, .{}, "caller", 10);
+    const rewritten = try compileAndCallI32I32(gpa, &m47_tail_call_wasm, .{ .force_indirect_calls = true }, "caller", 10);
+
+    try std.testing.expectEqual(@as(i32, 13), normal); // 10 + 3
+    try std.testing.expectEqual(normal, rewritten);
+}
+
+test "#879 M4.7 phase 1: rewriting a self-recursive call to ref_func+call_ref preserves behaviour" {
+    if (comptime !config.lazy_jit) return error.SkipZigTest;
+    if (comptime !can_exec_aot) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const normal = try compileAndCallI32I32(gpa, &m47_recursive_wasm, .{}, "sumto", 5);
+    const rewritten = try compileAndCallI32I32(gpa, &m47_recursive_wasm, .{ .force_indirect_calls = true }, "sumto", 5);
+
+    try std.testing.expectEqual(@as(i32, 15), normal); // 5+4+3+2+1+0
+    try std.testing.expectEqual(normal, rewritten);
+}
+
 test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on first call" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
     if (comptime !can_exec_aot) return error.SkipZigTest;
