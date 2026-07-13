@@ -1245,7 +1245,6 @@ test "#892 lazy-JIT: skipping passes plus codegen beats codegen-only lazy compil
 
     // Take the minimum of 3 runs per mode to dampen clock noise on this
     // intentionally timing-based regression guard.
-    const eager = try measureCompileMinNs(gpa, lazy_bench_wasm, .{});
     const lazy_codegen_only = try measureCompileMinNs(gpa, lazy_bench_wasm, .{
         .lazy_jit = true,
         .lazy_defer_passes = false,
@@ -1254,28 +1253,27 @@ test "#892 lazy-JIT: skipping passes plus codegen beats codegen-only lazy compil
         .lazy_jit = true,
         .lazy_defer_passes = true,
     });
+    // Use u128 so doubling a clock value is safe even if a pathological
+    // runner delay makes the u64 nanosecond measurement very large.
+    const max_skip_passes_ns: u128 = @as(u128, lazy_codegen_only.ns) / 2;
 
     std.debug.print(
-        "[#892] 200-leaf-fn compileCoreWasmCached (best-of-3): eager={d}us lazy_codegen_only={d}us lazy_skip_passes={d}us ({d} functions deferred)\n",
+        "[#892] 200-leaf-fn compileCoreWasmCached (best-of-3): lazy_codegen_only={d}us lazy_skip_passes={d}us (max={d}us; {d} functions deferred)\n",
         .{
-            eager.ns / 1000,
             lazy_codegen_only.ns / 1000,
             lazy_skip_passes.ns / 1000,
+            max_skip_passes_ns / 1000,
             lazy_skip_passes.deferred,
         },
     );
 
     try std.testing.expectEqual(@as(usize, 200), lazy_codegen_only.deferred);
     try std.testing.expectEqual(@as(usize, 200), lazy_skip_passes.deferred);
-    // Loose regression guard (see jit_fast_preset_test.zig for the same
-    // pattern/rationale): deferring more work must not regress compile
-    // latency on this all-lazy synthetic benchmark. On aarch64 (where this
-    // now also runs by default -- see #890), wall-clock deltas can be
-    // neutral or slightly negative depending on host/backend mix and
-    // machine load, so only enforce the strict ordering on x86_64, the
-    // backend this guard was introduced and measured on.
-    if (comptime builtin.cpu.arch == .x86_64) {
-        try std.testing.expect(lazy_skip_passes.ns <= lazy_codegen_only.ns);
-        try std.testing.expect(lazy_codegen_only.ns <= eager.ns);
-    }
+    // This is the behavior #892 introduced: after both modes defer the same
+    // 200 functions, deferring their pass pipeline must retain a meaningful
+    // initial-compile benefit over deferring codegen alone. Require a 2x
+    // benefit rather than comparing the latter to the adjacent eager run:
+    // that unrelated ordering was sensitive to runner load, while observed
+    // x86_64 and ARM64 results are tens of times faster than this bound.
+    try std.testing.expect(@as(u128, lazy_skip_passes.ns) <= max_skip_passes_ns);
 }
