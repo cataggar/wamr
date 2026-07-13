@@ -130,13 +130,31 @@ pub const EligibilityResult = struct {
 
 /// #879 M4.6 (phase 1) -- see `EligibilityResult`'s doc comment.
 ///
-/// NOT wired into `compileCoreWasmCached`/`mapCodeExecutable` yet
-/// (phase 2, a separate follow-up): this is deliberately a standalone,
-/// independently-testable analysis so the (already-large,
-/// correctness-critical) `func_addrs`/table-population code in
-/// `runtime.zig` only needs to change once, after the trampoline
-/// mechanism itself (`lazy_call_trampoline.zig`) is proven correct in
-/// isolation. See `docs/design/lazy-jit-spike.md`'s phase-split note.
+/// #879 M4.7 (phase 2): rule 1 ("leaf") is now relaxed to "no
+/// `call_indirect`" -- a function containing `.call`/`.call_ref` is
+/// no longer automatically disqualified. `.call_ref` was already
+/// safe (its codegen dispatches indirectly through a register, not a
+/// PC-relative patch); `.call` becomes safe too because the compile
+/// path (`LazyCompileDriver.compileFn`) now runs `lazy_jit.
+/// rewriteLocalCallsToIndirect` on every lazily-compiled function
+/// before codegen, turning each outgoing `.call` to a local function
+/// into a `.ref_func`+`.call_ref` pair -- see that function's doc
+/// comment for the full rationale (`#879` M4.7 phase 1). `call_
+/// indirect` remains conservatively disqualifying: rewriting it is a
+/// separate, harder follow-up (a different dispatch/table mechanism
+/// entirely, not just a callee-reachability concern). Rule 2 ("never
+/// a direct call target") is UNCHANGED in this phase -- relaxing it
+/// would require applying the same call-site rewrite to the EAGER
+/// compile path too (every caller of a would-be-eligible-despite-
+/// being-called target), a larger, separate, higher-risk change to
+/// the hot compile path affecting every module, not just lazy ones.
+///
+/// This means today's fully-wired eligibility set gains: functions
+/// that call other (local or imported) functions, or perform
+/// `call_ref`, as long as they are themselves never a direct `.call`
+/// target and never use `call_indirect` -- e.g. exported "driver"
+/// functions that orchestrate calls to helpers, which previously had
+/// to be eagerly compiled purely because they weren't leaves.
 pub fn findLazyEligibleWithTrampoline(
     module: *const core_types.WasmModule,
     ir_module: *const ir.IrModule,
@@ -199,19 +217,25 @@ pub fn findLazyEligibleWithTrampoline(
     for (ir_module.functions.items, 0..) |func, local_idx| {
         if (called.isSet(local_idx)) continue; // rule 2
 
-        var is_leaf = true;
+        // Rule 1 (#879 M4.7 phase 2): only `.call_indirect` disqualifies
+        // now. `.call` is rewritten to `.ref_func`+`.call_ref` by
+        // `LazyCompileDriver.compileFn` (via `rewriteLocalCallsToIndirect`)
+        // before codegen; `.call_ref` is already indirect and needs no
+        // rewrite. See this function's doc comment for the full
+        // rationale.
+        var safe_to_defer = true;
         outer: for (func.blocks.items) |block| {
             for (block.instructions.items) |inst| {
                 switch (inst.op) {
-                    .call, .call_indirect, .call_ref => {
-                        is_leaf = false;
+                    .call_indirect => {
+                        safe_to_defer = false;
                         break :outer;
                     },
                     else => {},
                 }
             }
         }
-        if (!is_leaf) continue;
+        if (!safe_to_defer) continue;
 
         eligible[local_idx] = true;
         if (reachable.isSet(local_idx)) needs_trampoline[local_idx] = true;
@@ -416,7 +440,7 @@ test "findLazyEligibleWithTrampoline: a directly-called function stays ineligibl
     try std.testing.expect(!result.needs_trampoline[0]);
 }
 
-test "findLazyEligibleWithTrampoline: a function containing call_ref is not a leaf" {
+test "findLazyEligibleWithTrampoline: #879 M4.7 phase 2 -- a function containing call_ref is now eligible (call_ref is already indirect)" {
     const allocator = std.testing.allocator;
 
     var ir_module = ir.IrModule.init(allocator);
@@ -429,9 +453,11 @@ test "findLazyEligibleWithTrampoline: a function containing call_ref is not a le
     try ir_module.functions.append(allocator, f0);
 
     // Function 1: performs a call_ref (e.g. to a funcref obtained from
-    // a table.get or ref.func elsewhere) -- this IS an outgoing call,
-    // so function 1 itself must NOT be treated as a leaf, regardless
-    // of the fact call_ref isn't literally spelled `.call`/`.call_indirect`.
+    // a table.get or ref.func elsewhere). Before #879 M4.7 phase 2 this
+    // disqualified the function ("not a leaf"); `.call_ref` codegen
+    // dispatches indirectly (register call/jmp, no PC-relative patch)
+    // regardless of where the caller's own code lives, so it was never
+    // actually unsafe -- only overly conservative. It's eligible now.
     var f1 = ir.IrFunction.init(allocator, 0, 1, 1);
     const b1 = try f1.newBlock();
     try f1.getBlock(b1).append(.{ .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = 0, .args = &.{} } } });
@@ -444,7 +470,72 @@ test "findLazyEligibleWithTrampoline: a function containing call_ref is not a le
     defer result.deinit(allocator);
 
     try std.testing.expect(result.eligible[0]);
-    try std.testing.expect(!result.eligible[1]); // not a leaf (performs call_ref)
+    try std.testing.expect(result.eligible[1]);
+}
+
+test "findLazyEligibleWithTrampoline: #879 M4.7 phase 2 -- a function calling another local function is now eligible" {
+    const allocator = std.testing.allocator;
+
+    var ir_module = ir.IrModule.init(allocator);
+    ir_module.import_count = 0;
+    defer ir_module.deinit();
+
+    // Function 0 (local idx 0): a leaf callee.
+    var f0 = ir.IrFunction.init(allocator, 1, 1, 1);
+    _ = try f0.newBlock();
+    try ir_module.functions.append(allocator, f0);
+
+    // Function 1 (local idx 1, module func_idx 1): calls function 0
+    // directly. Before #879 M4.7 phase 2 this disqualified function 1
+    // ("not a leaf"). It's now eligible, since `LazyCompileDriver.
+    // compileFn` rewrites this `.call` to `.ref_func`+`.call_ref`
+    // before codegen -- see `rewriteLocalCallsToIndirect`.
+    var f1 = ir.IrFunction.init(allocator, 1, 1, 1);
+    const b1 = try f1.newBlock();
+    const call_args = try allocator.dupe(ir.VReg, &.{0});
+    try f1.getBlock(b1).append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = call_args, .extra_results = 0, .tail = false } },
+        .dest = 1,
+        .type = .i32,
+    });
+    try ir_module.functions.append(allocator, f1);
+
+    var module = core_types.WasmModule{};
+    module.elements = &.{};
+
+    var result = try findLazyEligibleWithTrampoline(&module, &ir_module, allocator);
+    defer result.deinit(allocator);
+
+    // Function 0 is a direct call target -- still disqualified by rule 2
+    // (unrelaxed in this phase).
+    try std.testing.expect(!result.eligible[0]);
+    // Function 1 itself is never called by anyone, and its only outgoing
+    // call is a rewritable `.call` -- eligible.
+    try std.testing.expect(result.eligible[1]);
+}
+
+test "findLazyEligibleWithTrampoline: call_indirect still disqualifies (unchanged by M4.7 phase 2)" {
+    const allocator = std.testing.allocator;
+
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    var f0 = ir.IrFunction.init(allocator, 0, 1, 1);
+    const b0 = try f0.newBlock();
+    try f0.getBlock(b0).append(.{
+        .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = 0, .table_idx = 0, .args = &.{} } },
+        .dest = 0,
+        .type = .i32,
+    });
+    try ir_module.functions.append(allocator, f0);
+
+    var module = core_types.WasmModule{};
+    module.elements = &.{};
+
+    var result = try findLazyEligibleWithTrampoline(&module, &ir_module, allocator);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.eligible[0]);
 }
 
 /// #879 M4.7 (phase 1): rewrites every `.call` instruction in `func`

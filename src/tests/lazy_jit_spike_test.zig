@@ -520,8 +520,19 @@ test "#879 M4.6 phase 2: ref.func + call_ref to a still-pending lazy function co
     );
     defer gpa.free(cwasm);
 
-    try std.testing.expectEqual(@as(usize, 1), lazy_out.lazy_local_indices.len);
+    // #879 M4.7 phase 2: `caller` (local idx 1) now qualifies too --
+    // its only outgoing "call" is `call_ref`, which was already
+    // indirect and never needed the leaf restriction in the first
+    // place (rule 1 relaxed to "no `call_indirect`"). It's never
+    // itself a direct `.call` target (rule 2, unchanged), so both
+    // functions are eligible now.
+    try std.testing.expectEqual(@as(usize, 2), lazy_out.lazy_local_indices.len);
     try std.testing.expectEqual(@as(u32, 0), lazy_out.lazy_local_indices[0]);
+    try std.testing.expectEqual(@as(u32, 1), lazy_out.lazy_local_indices[1]);
+    // Only `add1` (local idx 0) is reachable via `ref.func` anywhere in
+    // the module, so only it needs a trampoline -- `caller` is only
+    // ever reached via a direct host `callFuncScalar` export call,
+    // already covered by `LazyJitState.resolve` without one.
     try std.testing.expectEqual(@as(usize, 1), lazy_out.needs_trampoline_indices.len);
     try std.testing.expectEqual(@as(u32, 0), lazy_out.needs_trampoline_indices[0]);
 
@@ -536,6 +547,7 @@ test "#879 M4.6 phase 2: ref.func + call_ref to a still-pending lazy function co
     try aot_runtime_mod.mapCodeExecutable(inst);
 
     try std.testing.expect(inst.lazy_jit.pending[0]); // add1 still pending
+    try std.testing.expect(inst.lazy_jit.pending[1]); // caller also still pending now
 
     const caller_idx = aot_runtime_mod.findExportFunc(inst, "caller") orelse return error.ExportNotFound;
     var results_buf: [1]aot_runtime_mod.ScalarResult = undefined;
@@ -549,7 +561,8 @@ test "#879 M4.6 phase 2: ref.func + call_ref to a still-pending lazy function co
         &results_buf,
     );
     try std.testing.expectEqual(@as(i32, 42), results[0].i32);
-    try std.testing.expect(!inst.lazy_jit.pending[0]);
+    try std.testing.expect(!inst.lazy_jit.pending[0]); // add1 compiled via the call_ref/trampoline dispatch
+    try std.testing.expect(!inst.lazy_jit.pending[1]); // caller compiled via the callFuncScalar resolve() hook
 }
 
 // #879 M4.8 (phase 1): precompileComponentInMemory must produce one
@@ -558,9 +571,20 @@ test "#879 M4.6 phase 2: ref.func + call_ref to a still-pending lazy function co
 // (see instance.zig's own "#156 H1" test): core 0 ($A) exports a
 // single leaf function "f" (returns the constant 7, no calls at all
 // -- fully lazy-eligible); core 1 ($B) imports "a"."f" and calls it
-// from "g" (a `.call` to a cross-instance import, which must still
-// disqualify "g" from being a leaf, exactly like a same-core call
-// would).
+// from "g" (a `.call` to a cross-instance import).
+//
+// #879 M4.7 phase 2: "g"'s `.call` targets an IMPORT (func_idx <
+// import_count), which was never actually unsafe to defer -- import
+// calls already dispatch indirectly through `vmctx.host_functions[]`,
+// regardless of where the caller's own code lives, so
+// `rewriteLocalCallsToIndirect` deliberately leaves them untouched (no
+// rewrite needed). Before this phase, the leaf check disqualified ANY
+// `.call` (import or local) indiscriminately, so "g" was ineligible
+// purely because of this overly-conservative rule, not because it was
+// genuinely unsafe. "g" is eligible now too, independently proving
+// each core's eligibility set is still computed independently (core
+// 0's "f" and core 1's "g" are unrelated functions in unrelated
+// modules).
 test "#879 M4.8: precompileComponentInMemory produces one independently-eligible LazyJitOut per core" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
     if (comptime !can_exec_aot) return error.SkipZigTest;
@@ -573,7 +597,9 @@ test "#879 M4.8: precompileComponentInMemory produces one independently-eligible
 
     try std.testing.expectEqual(@as(usize, 2), in_mem.lazy_jit_outs.len);
     try std.testing.expectEqual(@as(usize, 1), in_mem.lazy_jit_outs[0].lazy_local_indices.len);
-    try std.testing.expectEqual(@as(usize, 0), in_mem.lazy_jit_outs[1].lazy_local_indices.len);
+    // #879 M4.7 phase 2: "g" (core 1's only function) is eligible too
+    // now -- see the doc comment above.
+    try std.testing.expectEqual(@as(usize, 1), in_mem.lazy_jit_outs[1].lazy_local_indices.len);
 
     // Exercise core 0's LazyJitOut end-to-end (consumed via
     // setupLazyJit, same as every single-core test above).

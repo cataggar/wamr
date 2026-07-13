@@ -704,13 +704,33 @@ pub const LazyCompileDriver = struct {
         const self: *LazyCompileDriver = @ptrCast(@alignCast(ctx_opaque));
         if (local_idx >= self.lazy_out.ir_module.functions.items.len) return null;
         const func = &self.lazy_out.ir_module.functions.items[local_idx];
+        // #879 M4.7 phase 2: rewrite any outgoing `.call` to a local
+        // function into `.ref_func`+`.call_ref` before codegen -- see
+        // `lazy_jit.rewriteLocalCallsToIndirect`'s doc comment for why
+        // a direct `.call`'s PC-relative branch patch can't reach this
+        // function's own (separately mmap'd) code, and why the rewrite
+        // is correct regardless of the callee's own laziness. A no-op
+        // for genuinely leaf functions (no `.call` to rewrite).
+        // `findLazyEligibleWithTrampoline`'s eligibility contract
+        // guarantees `func` contains no `.call_indirect` (still
+        // disqualifying) and needs no rewriting for any `.call_ref`
+        // already present (already indirect).
+        lazy_jit.rewriteLocalCallsToIndirect(
+            func,
+            self.lazy_out.ir_module.import_count,
+            self.lazy_out.ir_module.func_type_indices.items,
+        ) catch |err| {
+            std.log.err("lazy-JIT spike: rewriting calls for deferred function {d} failed: {s}", .{ local_idx, @errorName(err) });
+            return null;
+        };
         // Real regalloc-based per-function codegen — the SAME entry
         // point `compileModuleCachedWithOptions`'s per-function loop
         // uses, not the naive standalone `compileFunction` (a
         // different, simpler stack-machine codegen kept for other
-        // purposes). Leaf functions never populate `call_patches`
-        // (nothing to patch — see `lazy_jit.findLazyEligibleWithTrampoline`'s
-        // eligibility contract), so it's safe to ignore here.
+        // purposes). No `.call` in `func` ever populates `call_patches`
+        // any more (rewritten to `.call_ref` above, or already an
+        // import dispatching through `vmctx.host_functions[]`), so
+        // it's safe to ignore here.
         const result = x86_64_compile.compileFunctionRAWithGlobalOffsetsPublic(
             func,
             self.lazy_out.ir_module.import_count,
