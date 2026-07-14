@@ -196,10 +196,14 @@ pub fn build(b: *std.Build) void {
     exe_module.addImport("wamr", lib_module);
 
     const exe = b.addExecutable(.{
-        .name = "wamr",
+        .name = "wamr-exe",
         .root_module = exe_module,
     });
-    b.installArtifact(exe);
+    // Keep dependency artifact names unique without changing the installed CLI name.
+    const install_exe = b.addInstallArtifact(exe, .{
+        .dest_sub_path = b.fmt("wamr{s}", .{target.result.exeFileExt()}),
+    });
+    b.getInstallStep().dependOn(&install_exe.step);
 
     // ── wamrc AOT compiler ────────────────────────────────────────────
     const wamrc_module = b.createModule(.{
@@ -525,6 +529,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    const artifact_consumer_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+    artifact_consumer_test.setCwd(b.path("tests/artifact-consumer"));
+    test_step.dependOn(&artifact_consumer_test.step);
 
     // wamrc unit tests (subcommand parsing, deriveOutputPath).
     const wamrc_test_module = b.createModule(.{

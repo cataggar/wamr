@@ -1,0 +1,15 @@
+.{
+    .name = .wamr_artifact_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0xbc921572d20defa9,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .wamr = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}
