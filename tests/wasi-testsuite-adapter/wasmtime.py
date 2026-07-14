@@ -30,7 +30,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # `shlex.split` so `WASMTIME="wasmtime --some-flag"` works — the user
@@ -72,43 +72,42 @@ def get_wasi_worlds() -> List[str]:
     return ["wasi:cli/command", "wasi:http/service"]
 
 
-def _isolate_preopens(dirs: List[Tuple[Path, str]]) -> List[Tuple[Path, str]]:
-    """Snapshot each preopen host directory into a fresh tempdir so a
+def _isolate_root(root: Optional[Path]) -> Optional[Path]:
+    """Snapshot the preopened root into a fresh tempdir so a
     filesystem test that mutates the mapped directory doesn't pollute
     state for subsequent tests in the run. Matches the behaviour of
-    `wamr-zig.py._isolate_preopens` so a side-by-side parity diff
+    `wamr-zig.py._isolate_root` so a side-by-side parity diff
     isn't perturbed by host-FS state drift. The tempdirs are leaked
     intentionally — they're tiny and the per-suite TMPDIR is cleared
     between CI invocations.
     """
-    isolated: List[Tuple[Path, str]] = []
-    for host, guest in dirs:
-        host_path = Path(host)
-        if not host_path.is_dir():
-            isolated.append((host, guest))
-            continue
-        snapshot = Path(tempfile.mkdtemp(prefix="wasmtime-fs-"))
-        shutil.copytree(host_path, snapshot, dirs_exist_ok=True, symlinks=True)
-        isolated.append((snapshot, guest))
-    return isolated
+    if root is None:
+        return None
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return root_path
+    snapshot = Path(tempfile.mkdtemp(prefix="wasmtime-fs-"))
+    shutil.copytree(root_path, snapshot, dirs_exist_ok=True, symlinks=True)
+    return snapshot
 
 
 def compute_argv(
     test_path: str,
-    args_env_dirs: Tuple[List[str], Dict[str, str], List[Tuple[Path, str]]],
+    args_env_root: Tuple[List[str], Dict[str, str], Optional[Path]],
     proposals: List[str],
     wasi_world: str,
     wasi_version: str,
 ) -> List[str]:
     argv: List[str] = []
     argv += WASMTIME
-    args, env, dirs = args_env_dirs
+    args, env, root = args_env_root
 
     for k, v in env.items():
         argv += ["--env", f"{k}={v}"]
 
-    for host, guest in _isolate_preopens(dirs):
-        argv += ["--dir", f"{host}::{guest}"]
+    isolated_root = _isolate_root(root)
+    if isolated_root:
+        argv += ["--dir", f"{isolated_root}::/"]
 
     argv += [test_path]
     argv += args

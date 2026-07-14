@@ -14,8 +14,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _SUITE = _ROOT / "tests" / "wasi-testsuite" / "tests" / "rust" / "testsuite" / "wasm32-wasip3"
 _RUNNER = _ROOT / "tests" / "wasi-testsuite-runner-patch" / "wasi_test_runner.py"
 _ADAPTER = _ROOT / "tests" / "wasi-testsuite-adapter" / "wamr-zig.py"
-_EXPECTED_FIXTURES = 40
-_ALLOWED_FAILURES = {"sockets-echo"}
+_EXPECTED_FIXTURES = 41
 
 
 def _remove_jit_sidecars() -> None:
@@ -79,24 +78,22 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    if failures != _ALLOWED_FAILURES:
+    if failures:
         print(
-            "error: unexpected unfiltered P3 failure set: "
-            f"got={sorted(failures)}, allowed={sorted(_ALLOWED_FAILURES)}",
+            f"error: unfiltered P3 failures: {sorted(failures)}",
             file=sys.stderr,
         )
         return 2
-    if runner.returncode == 0:
+    if runner.returncode != 0:
         print(
-            "error: sockets-echo now passes; remove it from the explicit "
-            "unfiltered P3 allowlist and skip file",
+            f"error: P3 runner exited with status {runner.returncode}",
             file=sys.stderr,
         )
         return 2
 
     print(
         f"unfiltered P3 contract: executed={len(executed)}/{_EXPECTED_FIXTURES}, "
-        f"passed={suite.get('passed')}, allowed_failures={sorted(failures)}"
+        f"passed={suite.get('passed')}"
     )
     return 0
 

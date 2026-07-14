@@ -101,8 +101,8 @@ WASI conformance ([WebAssembly/wasi-testsuite][wts]):
 $ git submodule update --init tests/wasi-testsuite
 $ pip install -r tests/wasi-testsuite/test-runner/requirements.txt
 $ zig build wasi-testsuite      # WASI Preview 1 + Preview 2 — 70 / 72 passing
-$ zig build wasi-p3-testsuite-unfiltered # WASI Preview 3 — 40 executed; 39 pass + sockets-echo (#905)
-$ zig build wasi-p3-testsuite-jit-unfiltered -Djit=true # Same 40-fixture contract with no sidecars
+$ zig build wasi-p3-testsuite-unfiltered # WASI Preview 3 — 41 / 41 passing
+$ zig build wasi-p3-testsuite-jit-unfiltered -Djit=true # Same 41-fixture contract with no sidecars
 $ zig build wasi-p3-parity      # Same fixtures via wamr + wasmtime, diff the reports
 ```
 
@@ -115,21 +115,20 @@ to override it — see
 
 The suite drives the freshly-built `wamr` CLI through the in-tree adapter at
 [`tests/wasi-testsuite-adapter/wamr-zig.py`](tests/wasi-testsuite-adapter/wamr-zig.py)
-and applies the curated skiplists at
-[`tests/wasi-testsuite-skip.json`](tests/wasi-testsuite-skip.json) (Preview 1 / 2)
-and [`tests/wasi-p3-testsuite-skip.json`](tests/wasi-p3-testsuite-skip.json)
-(Preview 3 — only `sockets-echo` is skipped while its pending async-run
-continuation is tracked in #905). The unfiltered P3 contract executes all 40
-fixtures and asserts that exact exception. Every entry
-in either skiplist must carry a one-line rationale and a follow-up issue number.
+and applies the curated expectations at
+[`tests/wasi-testsuite-expectations.toml`](tests/wasi-testsuite-expectations.toml) (Preview 1 / 2)
+and [`tests/wasi-p3-testsuite-expectations.toml`](tests/wasi-p3-testsuite-expectations.toml)
+(Preview 3, currently empty). The unfiltered P3 contract requires all 41
+fixtures to execute and pass. Every entry
+in either expectation file must carry a one-line rationale and a follow-up issue number.
 When a previously-skipped test starts passing, delete the entry — the suite is
 the gate against regressions in already-shipped WASI host functions.
 
 `zig build wasi-p3-parity` is the cross-runtime gate ([#583
 C1](https://github.com/cataggar/wamr/issues/583)): it runs the same
 `wasm32-wasip3` corpus through wamr **and** upstream
-[Wasmtime](https://wasmtime.dev/) (CI pin `v44.0.1`, the first stable
-release with `-Sp3` support) and diffs the JSON reports via
+[Wasmtime](https://wasmtime.dev/) (CI pin `v46.0.1`, matching the
+updated upstream suite) and diffs the JSON reports via
 [`scripts/diff-testsuite-reports.py`](scripts/diff-testsuite-reports.py).
 The classifier exits non-zero on:
 
@@ -144,14 +143,12 @@ The classifier exits non-zero on:
   wamr passes but Wasmtime fails for which the skip-list has no
   tracking entry.
 
-The skip-list at
+The currently empty skip-list at
 [`tests/wasi-p3-parity-skip.json`](tests/wasi-p3-parity-skip.json)
 maps each known Wasmtime-side or fixture-side bug to an upstream
 tracking issue. Entries listed there are *documented* deltas — they
-are reported on stderr but never fail the parity gate, so a Wasmtime
-v44.0.1 fixture failure (currently `http-service`,
-`sockets-tcp-connect`, `sockets-tcp-listen`, `sockets-udp-send`)
-does not masquerade as a wamr bug. To document a new Wasmtime delta,
+are reported on stderr but never fail the parity gate. Wasmtime
+v46.0.1 passes all 41 fixtures in the updated corpus. To document a new Wasmtime delta,
 file an upstream issue at `bytecodealliance/wasmtime` (or
 `WebAssembly/wasi-testsuite` for fixture bugs) and add an entry
 keyed by fixture name with the tracking URL as the value. The CI
@@ -172,10 +169,10 @@ merge queue.
 environ-inheritance behavioral mismatch and a flaky upstream fixture
 that compares clock reads without accounting for second rollover, not
 crashes). The Preview 3
-gate (`zig build wasi-p3-testsuite-unfiltered`) executes all 40 fixtures:
-39 pass through both manifest AOT and no-sidecar JIT after
-[#881](https://github.com/cataggar/wamr/issues/881); `sockets-echo` remains
-separately tracked by [#905](https://github.com/cataggar/wamr/issues/905).
+gate (`zig build wasi-p3-testsuite-unfiltered`) executes all 41 fixtures:
+all 41 pass through both manifest AOT and no-sidecar JIT after
+[#881](https://github.com/cataggar/wamr/issues/881) and
+[#905](https://github.com/cataggar/wamr/issues/905).
 Outbound HTTP and
 HTTPS issue real requests via `std.http.Client` and Zig 0.16's
 `std.crypto.tls`.

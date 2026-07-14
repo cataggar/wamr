@@ -260,10 +260,18 @@ def main() -> int:
     fixture_bugs: List[FixtureKey] = []
     documented: List[FixtureKey] = []
     shared_failures: List[FixtureKey] = []
+    shared_skips: List[FixtureKey] = []
+    execution_mismatches: List[FixtureKey] = []
 
     for key in common:
         a = fixtures_a[key]
         b = fixtures_b[key]
+        if not a["executed"] or not b["executed"]:
+            if not a["executed"] and not b["executed"]:
+                shared_skips.append(key)
+            else:
+                execution_mismatches.append(key)
+            continue
         if a["passed"] and b["passed"]:
             continue
         if not a["passed"] and not b["passed"]:
@@ -414,6 +422,24 @@ def main() -> int:
         for suite_name, test_name in shared_failures:
             print(f"  • {suite_name} :: {test_name}", file=sys.stderr)
 
+    if shared_skips:
+        print(
+            f"\nshared skips ({len(shared_skips)}): both runtimes excluded "
+            "the same expected fixture(s):",
+            file=sys.stderr,
+        )
+        for suite_name, test_name in shared_skips:
+            print(f"  • {suite_name} :: {test_name}", file=sys.stderr)
+
+    if execution_mismatches:
+        print(
+            f"\nexecution mismatches ({len(execution_mismatches)}): one "
+            "runtime executed a fixture that the other skipped:",
+            file=sys.stderr,
+        )
+        for suite_name, test_name in execution_mismatches:
+            print(f"  • {suite_name} :: {test_name}", file=sys.stderr)
+
     summary = {
         "labels": {"a": label_a, "b": label_b},
         "only_in_a": [list(k) for k in only_in_a],
@@ -429,6 +455,8 @@ def main() -> int:
             for t, w in stale_skip
         ],
         "shared_failures": [list(k) for k in shared_failures],
+        "shared_skips": [list(k) for k in shared_skips],
+        "execution_mismatches": [list(k) for k in execution_mismatches],
     }
     if args.json is not None:
         with args.json.open("w", encoding="UTF-8") as fp:
@@ -450,6 +478,13 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if execution_mismatches:
+        print(
+            f"\n::error::Wasmtime parity diff: "
+            f"{len(execution_mismatches)} execution mismatch(es) detected.",
+            file=sys.stderr,
+        )
+        return 1
     if args.strict and fixture_bugs:
         print(
             f"\n::error::Wasmtime parity diff (strict): "
@@ -464,7 +499,8 @@ def main() -> int:
         f"\nWasmtime parity diff: 0 regressions, "
         f"{len(fixture_bugs)} undocumented fixture/runtime-bug warning(s), "
         f"{len(documented)} documented fixture/runtime-bug(s), "
-        f"{len(shared_failures)} shared failure(s).",
+        f"{len(shared_failures)} shared failure(s), "
+        f"{len(shared_skips)} shared skip(s).",
         file=sys.stderr,
     )
     return 0

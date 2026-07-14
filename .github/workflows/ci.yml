@@ -106,7 +106,7 @@ jobs:
 
       - name: Install wasmtime
         run: |
-          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v44.0.1
+          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v46.0.1
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
 
       - name: Build for wasm32-wasi
@@ -216,8 +216,8 @@ jobs:
     # `tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/` through
     # the just-built `wamr` via the in-tree `wamr-zig.py` adapter.
     # The normal filtered step remains available for local triage, while
-    # this CI job uses the explicit unfiltered contract so all 40 fixtures
-    # must execute even if a future skip file accidentally grows again.
+    # this CI job uses the explicit unfiltered contract so all 41 fixtures
+    # must execute even if a future expectation file accidentally grows.
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -375,9 +375,9 @@ jobs:
       - name: Install Rust wasm32-wasip1 target
         run: rustup target add wasm32-wasip1
 
-      - name: Install wasmtime v44.0.1
+      - name: Install wasmtime v46.0.1
         run: |
-          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v44.0.1
+          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v46.0.1
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
 
       - name: Build and run component-examples (wasmtime parity)

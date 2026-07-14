@@ -2964,7 +2964,11 @@ fn dispatchAsyncCanon(
             // No data yet — park; signal BLOCKED (post-#541) so the
             // guest's `WaitableOperation` waits for the completion
             // callback rather than treating us as cancelled.
-            s.pending_read = .{ .guest_ptr = guest_ptr, .max_count = max_count };
+            s.pending_read = .{
+                .guest_ptr = guest_ptr,
+                .max_count = max_count,
+                .elem_size = elem_size,
+            };
             env.pushI32(@bitCast(async_canon.BLOCKED_STATUS)) catch
                 return error.StackOverflow;
         },
@@ -3149,6 +3153,8 @@ fn dispatchAsyncCanon(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             if (comp_inst.streams.getPtr(handle)) |s| {
                 s.read_closed = true;
+                if (s.host_driver) |driver| if (driver.on_drop_readable) |cb|
+                    cb(driver.context);
                 // Wake a parked writer so it can observe CANCELLED.
                 if (s.waitable_set) |ws| if (s.write_waitable_idx) |idx|
                     ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
@@ -3165,6 +3171,8 @@ fn dispatchAsyncCanon(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             if (comp_inst.streams.getPtr(handle)) |s| {
                 s.write_closed = true;
+                if (s.host_driver) |driver| if (driver.on_drop_writable) |cb|
+                    cb(driver.context);
                 // Notify any host-attached sink that the guest has
                 // closed its writer end (#537). The host handler is
                 // responsible for settling its companion future.
@@ -3671,6 +3679,271 @@ fn dispatchAsyncCanon(
 const async_mod = @import("async.zig");
 const async_canon = @import("async_canon.zig");
 
+/// Advance host-backed streams whose guest reader is parked in
+/// `stream.read`. A waitable event is only ready after the original read's
+/// destination has been populated, so this completes the pending transfer
+/// before waking wit-bindgen's callback reactor.
+pub fn drivePendingHostStreamReads(
+    comp_inst: *ComponentInstance,
+    allocator: Allocator,
+) bool {
+    var delivered = false;
+    var streams = comp_inst.streams.iterator();
+    while (streams.next()) |entry| {
+        const stream = entry.value_ptr;
+        const pending = stream.pending_read orelse continue;
+        const ws = stream.waitable_set orelse continue;
+        const waitable_idx = stream.read_waitable_idx orelse continue;
+        const driver = stream.host_driver orelse continue;
+
+        if (stream.buffer.items.len == 0 and !stream.write_closed) {
+            if (driver.on_read_into) |read_into| {
+                const max_bytes_u64 =
+                    @as(u64, pending.max_count) * @as(u64, pending.elem_size);
+                if (max_bytes_u64 <= std.math.maxInt(u32)) {
+                    const max_bytes: u32 = @intCast(max_bytes_u64);
+                    if (comp_inst.writableGuestBytes(pending.guest_ptr, max_bytes)) |dst| {
+                        const result = read_into(driver.context, dst);
+                        switch (result.action) {
+                            .progressed => {
+                                const bytes_written = @min(result.bytes_written, max_bytes);
+                                const count = bytes_written / pending.elem_size;
+                                const tail = bytes_written - count * pending.elem_size;
+                                if (tail != 0) {
+                                    const tail_off = count * pending.elem_size;
+                                    stream.buffer.appendSlice(
+                                        comp_inst.allocator,
+                                        dst[tail_off..bytes_written],
+                                    ) catch {
+                                        stream.write_closed = true;
+                                    };
+                                }
+                                if (count > 0) {
+                                    stream.pending_read = null;
+                                    ws.setReady(
+                                        waitable_idx,
+                                        allocator,
+                                        async_canon.packStatus(.completed, count),
+                                    );
+                                    delivered = true;
+                                    continue;
+                                }
+                            },
+                            .would_block => {},
+                            .eof, .err => stream.write_closed = true,
+                        }
+                    } else {
+                        stream.write_closed = true;
+                    }
+                } else {
+                    stream.write_closed = true;
+                }
+            } else if (driver.on_read) |read| {
+                const action = read(driver.context, stream, comp_inst.allocator);
+                switch (action) {
+                    .progressed, .would_block => {},
+                    .eof, .err => stream.write_closed = true,
+                }
+            }
+        }
+
+        const buffered_count: u32 =
+            @intCast(stream.buffer.items.len / pending.elem_size);
+        if (buffered_count > 0) {
+            const count = @min(pending.max_count, buffered_count);
+            const byte_count = count * pending.elem_size;
+            if (comp_inst.writableGuestBytes(pending.guest_ptr, byte_count)) |dst| {
+                @memcpy(dst, stream.buffer.items[0..byte_count]);
+                std.mem.copyForwards(
+                    u8,
+                    stream.buffer.items[0 .. stream.buffer.items.len - byte_count],
+                    stream.buffer.items[byte_count..],
+                );
+                stream.buffer.items.len -= byte_count;
+                stream.pending_read = null;
+                ws.setReady(
+                    waitable_idx,
+                    allocator,
+                    async_canon.packStatus(.completed, count),
+                );
+                delivered = true;
+                continue;
+            }
+            stream.write_closed = true;
+        }
+
+        if (stream.write_closed) {
+            stream.pending_read = null;
+            ws.setReady(
+                waitable_idx,
+                allocator,
+                async_canon.packStatus(.dropped, 0),
+            );
+            delivered = true;
+        }
+    }
+    return delivered;
+}
+
+/// Whether the event driver should keep polling for a host-backed stream read.
+pub fn hasPendingHostStreamReads(comp_inst: *ComponentInstance) bool {
+    var streams = comp_inst.streams.iterator();
+    while (streams.next()) |entry| {
+        const stream = entry.value_ptr;
+        if (stream.pending_read != null and
+            stream.waitable_set != null and
+            stream.read_waitable_idx != null and
+            stream.host_driver != null)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+const AsyncLiftCallbackAction = union(enum) {
+    exit,
+    yield,
+    wait: u32,
+};
+
+fn decodeAsyncLiftCallbackStatus(status: u32) ExecutionError!AsyncLiftCallbackAction {
+    return switch (status & 0xf) {
+        0 => .exit,
+        1 => .yield,
+        2 => .{ .wait = status >> 4 },
+        else => error.InvalidFuncType,
+    };
+}
+
+const AsyncLiftCallbackEvent = struct {
+    kind: u32,
+    handle: u32,
+    code: u32,
+};
+
+fn executeAsyncLiftCallback(
+    owner_inst: *const ComponentInstance,
+    fallback_core_entry: ComponentInstance.CoreInstanceEntry,
+    callback_idx: CoreFuncIdxComponent,
+    event: AsyncLiftCallbackEvent,
+    allocator: Allocator,
+) ExecutionError!u32 {
+    var owned_env: ?*ExecEnv = null;
+    var callback_local: CoreFuncIdxLocal = undefined;
+    var frame: CallFrame = blk: {
+        if (owner_inst.resolveTopLevelCoreFuncAny(callback_idx.value())) |target| {
+            switch (target) {
+                .interp => |t| {
+                    const env = ExecEnv.create(t.mi, 4096, allocator) catch
+                        return error.OutOfMemory;
+                    owned_env = env;
+                    callback_local = t.local_idx;
+                    break :blk .{ .interp = InterpFrame.init(env) };
+                },
+                .aot => |t| {
+                    callback_local = t.local_idx;
+                    break :blk .{ .aot = AotFrame.init(t.ai, allocator) };
+                },
+            }
+        }
+
+        // Hand-authored fixtures may omit the alias that maps a component
+        // core-funcidx into its module-local indexspace.
+        callback_local = CoreFuncIdxLocal.from(callback_idx.value());
+        if (fallback_core_entry.module_inst) |mi| {
+            const env = ExecEnv.create(mi, 4096, allocator) catch
+                return error.OutOfMemory;
+            owned_env = env;
+            break :blk .{ .interp = InterpFrame.init(env) };
+        }
+        if (fallback_core_entry.aot_inst) |ai| {
+            break :blk .{ .aot = AotFrame.init(ai, allocator) };
+        }
+        return error.CoreInstanceNotAvailable;
+    };
+    defer {
+        if (owned_env) |env| env.destroy();
+        frame.deinit();
+    }
+
+    frame.pushSlot(.{ .i32 = @bitCast(event.kind) }) catch
+        return error.StackOverflow;
+    frame.pushSlot(.{ .i32 = @bitCast(event.handle) }) catch
+        return error.StackOverflow;
+    frame.pushSlot(.{ .i32 = @bitCast(event.code) }) catch
+        return error.StackOverflow;
+
+    const result_types: []const core_types.ValType = switch (frame) {
+        .interp => &.{},
+        .aot => |f| resolveAotCoreFuncResults(f.ai, callback_local.value()) orelse
+            return error.InvalidFuncType,
+    };
+    frame.executeCore(callback_local, &.{}, result_types) catch
+        return error.TrapInCoreFunction;
+    const status = frame.popSlot(.i32) catch return error.StackUnderflow;
+    return @bitCast(status.i32);
+}
+
+fn driveAsyncLiftCallbacks(
+    owner_inst: *const ComponentInstance,
+    fallback_core_entry: ComponentInstance.CoreInstanceEntry,
+    callback_idx: CoreFuncIdxComponent,
+    initial_status: u32,
+    task_manager: *async_mod.TaskManager,
+    task_handle: u32,
+    allocator: Allocator,
+) ExecutionError!void {
+    var status = initial_status;
+    while (task_handle < task_manager.tasks.items.len and
+        task_manager.tasks.items[task_handle].state == .started)
+    {
+        const event: AsyncLiftCallbackEvent = switch (try decodeAsyncLiftCallbackStatus(status)) {
+            .exit => return,
+            .yield => blk: {
+                if (owner_inst.async_event_driver) |driver| {
+                    _ = driver(
+                        owner_inst.async_event_driver_ctx,
+                        @constCast(owner_inst),
+                        null,
+                        allocator,
+                    );
+                }
+                break :blk .{ .kind = 0, .handle = 0, .code = 0 };
+            },
+            .wait => |waitable_set_handle| blk: {
+                const mutable_inst = @constCast(owner_inst);
+                const ws = mutable_inst.waitable_sets.getPtr(waitable_set_handle) orelse
+                    return error.TrapInCoreFunction;
+                while (true) {
+                    if (ws.popReadyEvent()) |ready| {
+                        break :blk .{
+                            .kind = async_canon.eventCodeForKind(ready.kind),
+                            .handle = ready.handle,
+                            .code = ready.code,
+                        };
+                    }
+                    const driver = owner_inst.async_event_driver orelse
+                        return error.TrapInCoreFunction;
+                    _ = driver(
+                        owner_inst.async_event_driver_ctx,
+                        mutable_inst,
+                        10 * std.time.ns_per_ms,
+                        allocator,
+                    );
+                }
+            },
+        };
+        status = try executeAsyncLiftCallback(
+            owner_inst,
+            fallback_core_entry,
+            callback_idx,
+            event,
+            allocator,
+        );
+    }
+}
+
 /// Start an async component function call. Returns a subtask handle
 /// that the caller can poll via the waitable set.
 ///
@@ -3733,15 +4006,24 @@ pub fn callComponentFuncAsync(
         // Async-lifted ABI: drive the core fn and let `task.return`
         // populate task.return_values on its own.
         var status: u32 = 0;
-        _ = &status;
         callComponentFuncByLocalAsyncLifted(owner_for_type, exported_local, args, &status, allocator) catch |e| {
             task_manager.cancelTask(handle);
             return e;
         };
-        // If a callback is configured, sub-PR 2's poll-cycle stub would
-        // invoke it once after each yield. Real future/stream-driven
-        // polling lands in sub-PR 3; for now we surface the status by
-        // ignoring it (the caller can re-inspect it via the task).
+        if (lift_opts.callback_idx) |callback_idx| {
+            driveAsyncLiftCallbacks(
+                owner_for_type,
+                owner_for_type.core_instances[exported_local.core_instance_idx],
+                callback_idx,
+                status,
+                task_manager,
+                handle,
+                allocator,
+            ) catch |e| {
+                task_manager.cancelTask(handle);
+                return e;
+            };
+        }
         return handle;
     }
 
@@ -3834,6 +4116,25 @@ test "LiftOptions: async + callback (#478 sub-PR 2)" {
     try std.testing.expectEqual(@as(?u32, 0), lo.memory_idx);
     try std.testing.expectEqual(true, lo.is_async);
     try std.testing.expectEqual(@as(?CoreFuncIdxComponent, CoreFuncIdxComponent.from(7)), lo.callback_idx);
+}
+
+test "async lift callback status decodes canonical callback protocol" {
+    try std.testing.expectEqual(
+        AsyncLiftCallbackAction.exit,
+        try decodeAsyncLiftCallbackStatus(0),
+    );
+    try std.testing.expectEqual(
+        AsyncLiftCallbackAction.yield,
+        try decodeAsyncLiftCallbackStatus(1),
+    );
+    try std.testing.expectEqual(
+        AsyncLiftCallbackAction{ .wait = 37 },
+        try decodeAsyncLiftCallbackStatus((37 << 4) | 2),
+    );
+    try std.testing.expectError(
+        error.InvalidFuncType,
+        decodeAsyncLiftCallbackStatus(3),
+    );
 }
 
 test "LowerOptions: async opt flips is_async (#551 canon-lower-of-async-func)" {

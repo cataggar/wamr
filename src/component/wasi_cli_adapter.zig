@@ -1177,6 +1177,9 @@ pub const Socket = struct {
     stream_generation: u32 = 0,
     /// TCP connected stream. Owned by the rep; closed in `closeAll`.
     tcp_stream: ?std.Io.net.Stream = null,
+    /// `tcp-socket.receive` owns the socket's read half for the rest of
+    /// the resource lifetime. A second call must return `invalid-state`.
+    receive_started: bool = false,
 
     /// Requested listen backlog size. Stored on the rep by
     /// `set-listen-backlog-size` and consumed by `start-listen`.
@@ -1470,6 +1473,9 @@ pub const SocketsP3StreamCtx = struct {
     fd: std.posix.fd_t,
     family: IpAddressFamily,
     cancelled: std.atomic.Value(bool) = .{ .raw = false },
+    component_instance: ?*ComponentInstance = null,
+    completion_future: ?u32 = null,
+    send_failed: bool = false,
 };
 
 /// Lifetime-stable context for a `host_driver` attached to an
@@ -6985,19 +6991,20 @@ pub const WasiCliAdapter = struct {
         results[0] = .{ .u64 = 1 };
     }
 
-    /// Allocate a `future<()>` in `ci.futures` and register a host-side
-    /// timer in `self.timer_futures` against the given absolute deadline.
-    /// Returns the future handle, ready to be lowered as the `future<()>`
-    /// result of `wait-for` / `wait-until`. (#483.)
+    /// Allocate a `future<()>` in `ci.futures`. Deadlines already reached
+    /// are ready immediately; future deadlines register a host-side timer
+    /// in `self.timer_futures`. Returns the handle to lower as the
+    /// `future<()>` result of `wait-for` / `wait-until`. (#483.)
     fn spawnTimerFuture(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
         deadline_ns: u64,
     ) !u32 {
+        const ready = deadline_ns <= self.monotonicNs();
         const handle = ci.allocAsyncHandle();
         try ci.futures.put(ci.allocator, handle, .{
             .elem_type_idx = 0, // unit type
-            .state = .pending,
+            .state = if (ready) .ready else .pending,
             // Flagged so `executor.joinWaitable` knows to register this
             // handle as a `.subtask` waitable and `popReadyEvent` knows
             // to emit `EVENT_SUBTASK` with `STATUS_RETURNED` rather than
@@ -7005,10 +7012,12 @@ pub const WasiCliAdapter = struct {
             .subtask_managed = true,
         });
         errdefer _ = ci.futures.remove(handle);
-        try self.timer_futures.append(self.allocator, .{
-            .handle = handle,
-            .deadline_ns = deadline_ns,
-        });
+        if (!ready) {
+            try self.timer_futures.append(self.allocator, .{
+                .handle = handle,
+                .deadline_ns = deadline_ns,
+            });
+        }
         return handle;
     }
 
@@ -7986,6 +7995,7 @@ pub const WasiCliAdapter = struct {
         // `wait-for(0)` / `wait-until(past)` and for tests that
         // pre-advance `monotonic_clock_override`.
         var fired = self.completeDueTimerFutures(ci, allocator);
+        if (executor_root.drivePendingHostStreamReads(ci, allocator)) fired = true;
         // Drain any pending UDP `recvfrom`s whose fd is now readable.
         // Runs before the optional sleep so a datagram already in the
         // kernel queue resolves synchronously without spending the
@@ -8019,7 +8029,12 @@ pub const WasiCliAdapter = struct {
         const have_udp_pending = self.pending_udp_receives.items.len > 0;
         const have_http_pending = self.pending_http_fetches.items.len > 0 or
             self.pending_http_fetches_p3.items.len > 0;
-        if (self.timer_futures.items.len == 0 and !have_udp_pending and !have_http_pending) {
+        const have_stream_pending = executor_root.hasPendingHostStreamReads(ci);
+        if (self.timer_futures.items.len == 0 and
+            !have_udp_pending and
+            !have_http_pending and
+            !have_stream_pending)
+        {
             return false;
         }
 
@@ -8044,6 +8059,7 @@ pub const WasiCliAdapter = struct {
             cap_ns = @min(cap_ns, delta_ns);
         }
         if (have_udp_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
+        if (have_stream_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
 
         // Park in `poll()` on the self-pipe waker fds of in-flight HTTP
         // fetches until a worker publishes its outcome, instead of
@@ -8067,6 +8083,7 @@ pub const WasiCliAdapter = struct {
         }
         var post = self.completeDueTimerFutures(ci, allocator);
         if (self.completeReadyPendingUdpReceives(ci, allocator)) post = true;
+        if (executor_root.drivePendingHostStreamReads(ci, allocator)) post = true;
         // Drain HTTP last so worker outcomes published during the
         // sleep window are observed on this same tick. (#583 A2 / #589)
         self.drainPendingHttpFetches();
@@ -9279,6 +9296,7 @@ pub const WasiCliAdapter = struct {
     ) ?FsErrorCode {
         if (path.len == 0) return null;
         const io = std.Io.Threaded.global_single_threaded.io();
+        const final_has_trailing_slash = path[path.len - 1] == '/';
         var end: usize = 0;
         while (end < path.len) {
             while (end < path.len and path[end] == '/') end += 1;
@@ -9296,7 +9314,7 @@ pub const WasiCliAdapter = struct {
             };
             if (st.kind == .sym_link) {
                 if (!is_last) return .not_permitted;
-                if (follow_final) return .not_permitted;
+                if (follow_final or final_has_trailing_slash) return .not_permitted;
             }
         }
         return null;
@@ -15780,6 +15798,29 @@ pub const WasiCliAdapter = struct {
         return .{ .action = .progressed, .bytes_written = @intCast(n) };
     }
 
+    fn shutdownTcpStreamHalf(
+        ctx: *SocketsP3StreamCtx,
+        how: std.Io.net.ShutdownHow,
+    ) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        for (ctx.adapter.socket_table.items) |*maybe| {
+            if (maybe.*) |*socket| {
+                if (socket.tcp_stream) |*stream| {
+                    if (stream.socket.handle == ctx.fd) {
+                        stream.shutdown(io, how) catch return false;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    fn tcpReceiveStreamOnDropReadable(opaque_ctx: ?*anyopaque) void {
+        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        _ = shutdownTcpStreamHalf(ctx, .recv);
+    }
+
     /// `host_driver.on_write_from` for a TCP-send `stream<u8>` slot
     /// (#583 B2 follow-up). Pushes the guest-provided bytes
     /// synchronously to the connected fd. The `src` slice is borrowed
@@ -15796,7 +15837,10 @@ pub const WasiCliAdapter = struct {
         if (src.len == 0) return .progressed;
         const io = std.Io.Threaded.global_single_threaded.io();
         const slices = [_][]const u8{src};
-        _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch return .err;
+        _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch {
+            ctx.send_failed = true;
+            return .err;
+        };
         return .progressed;
     }
 
@@ -15814,6 +15858,53 @@ pub const WasiCliAdapter = struct {
         _: Allocator,
     ) async_mod.HostStreamAction {
         return tcpSendStreamOnWriteFrom(opaque_ctx, bytes);
+    }
+
+    fn settleTcpSendFuture(ctx: *SocketsP3StreamCtx) void {
+        const ci = ctx.component_instance orelse return;
+        const future_handle = ctx.completion_future orelse return;
+        const future = ci.futures.getPtr(future_handle) orelse return;
+        if (future.state != .pending) return;
+
+        const payload = ci.allocator.alloc(u8, 20) catch {
+            future.state = .closed;
+            future.write_closed = true;
+            if (future.waitable_set) |ws| if (future.read_waitable_idx) |idx|
+                ws.setReady(idx, ci.allocator, async_canon.packStatus(.dropped, 0));
+            return;
+        };
+        @memset(payload, 0);
+        if (ctx.send_failed) {
+            payload[0] = 1;
+            payload[4] = @intCast(socketCodeToP3Disc(.unknown));
+        }
+
+        if (future.pending_read) |pending| {
+            if (ci.writableGuestBytes(pending.guest_ptr, @intCast(payload.len))) |dst| {
+                @memcpy(dst, payload);
+                ci.allocator.free(payload);
+            } else {
+                ci.allocator.free(payload);
+                future.state = .closed;
+                future.write_closed = true;
+                if (future.waitable_set) |ws| if (future.read_waitable_idx) |idx|
+                    ws.setReady(idx, ci.allocator, async_canon.packStatus(.dropped, 0));
+                return;
+            }
+            future.pending_read = null;
+        } else {
+            future.payload = payload;
+        }
+        future.state = .ready;
+        future.write_closed = true;
+        if (future.waitable_set) |ws| if (future.read_waitable_idx) |idx|
+            ws.setReady(idx, ci.allocator, async_canon.packStatus(.completed, 0));
+    }
+
+    fn tcpSendStreamOnDropWritable(opaque_ctx: ?*anyopaque) void {
+        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (!shutdownTcpStreamHalf(ctx, .send)) ctx.send_failed = true;
+        settleTcpSendFuture(ctx);
     }
 
     /// `host_driver.on_read` for a `stream<tcp-socket>` slot produced
@@ -16200,9 +16291,9 @@ pub const WasiCliAdapter = struct {
     /// Synchronous. Attaches an `on_write` host driver to the guest's
     /// `stream<u8>` so subsequent stream-writes flow straight to the
     /// connected fd (#535). Drains any bytes the guest already pushed
-    /// into the FIFO before the call. Returns a settled future — per-
-    /// write errors surface through `read_closed = true` on the stream
-    /// (the next `stream.write` returns `cancelled`).
+    /// into the FIFO before the call. The returned future settles when
+    /// the guest drops the stream's writable end, after the driver
+    /// propagates the TCP half-close; write errors select its error arm.
     fn tcpSendP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -16232,8 +16323,12 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
             return;
         };
+        const slot = ci.streams.getPtr(stream_handle) orelse {
+            results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
+            return;
+        };
         const driver_ctx = try self.allocSocketsP3StreamCtx(stream.socket.handle, s.family);
-        if (ci.streams.getPtr(stream_handle)) |slot| {
+        {
             // Drain any bytes the guest pre-buffered (e.g. wrote into
             // the stream before calling `send`) straight to the fd.
             if (slot.buffer.items.len > 0) {
@@ -16247,6 +16342,13 @@ pub const WasiCliAdapter = struct {
                 };
                 slot.buffer.clearRetainingCapacity();
             }
+            const future_handle = ci.allocAsyncHandle();
+            try ci.futures.put(ci.allocator, future_handle, .{
+                .elem_type_idx = 0,
+                .state = .pending,
+            });
+            driver_ctx.component_instance = ci;
+            driver_ctx.completion_future = future_handle;
             // Attach the driver so subsequent guest writes flow to fd.
             // Both callback shapes are installed: the executor prefers
             // the thinner `on_write_from` (zero-copy, #583 B2
@@ -16258,9 +16360,11 @@ pub const WasiCliAdapter = struct {
                 .context = driver_ctx,
                 .on_write = &tcpSendStreamOnWrite,
                 .on_write_from = &tcpSendStreamOnWriteFrom,
+                .on_drop_writable = &tcpSendStreamOnDropWritable,
             };
+            if (slot.write_closed) tcpSendStreamOnDropWritable(driver_ctx);
+            results[0] = .{ .handle = future_handle };
         }
-        results[0] = .{ .handle = try socketReadyResultFuture(ci, true, .unknown) };
     }
 
     /// `[method]tcp-socket.receive: func()
@@ -16306,10 +16410,15 @@ pub const WasiCliAdapter = struct {
             results[0] = try buildErrTuple(ci, allocator, .invalid_state);
             return;
         }
+        if (s.receive_started) {
+            results[0] = try buildErrTuple(ci, allocator, .invalid_state);
+            return;
+        }
         const stream = s.tcp_stream orelse {
             results[0] = try buildErrTuple(ci, allocator, .invalid_state);
             return;
         };
+        s.receive_started = true;
 
         // Install a long-lived receive driver on the stream. The driver
         // does a non-blocking netRead per invocation so the executor's
@@ -16331,6 +16440,7 @@ pub const WasiCliAdapter = struct {
                 .context = driver_ctx,
                 .on_read = &tcpReceiveStreamOnRead,
                 .on_read_into = &tcpReceiveStreamOnReadInto,
+                .on_drop_readable = &tcpReceiveStreamOnDropReadable,
             },
         });
         // Pre-buffer anything already pending on the fd at call time so
@@ -24726,11 +24836,10 @@ pub fn runLoadedComponentP3(
 
     if (task_handle >= task_mgr.tasks.items.len) return error.Trap;
     const task = &task_mgr.tasks.items[task_handle];
+    if (task.state != .returned or task.return_values.len == 0) return error.Trap;
     // Lowered `result<_, _>` flat representation: a single i32
-    // discriminant (`0 = ok`, `1 = err`). If the callee never invoked
-    // `task.return`, default to `is_ok = true` — the run completed
-    // without error per the task-state machine.
-    const is_ok: bool = if (task.return_values.len > 0) task.return_values[0] == 0 else true;
+    // discriminant (`0 = ok`, `1 = err`).
+    const is_ok = task.return_values[0] == 0;
     return .{ .is_ok = is_ok };
 }
 
@@ -29469,6 +29578,9 @@ test "sockets P3: tcp loopback bind/listen/connect/send round-trip (#519)" {
         try WasiCliAdapter.tcpSendP3(&adapter, &ci, &args, &results, testing.allocator);
         try testing.expect(results[0] == .handle);
         const fut = ci.futures.getPtr(results[0].handle).?;
+        try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+        const slot = ci.streams.getPtr(send_stream_h).?;
+        slot.host_driver.?.on_drop_writable.?(slot.host_driver.?.context);
         try testing.expectEqual(async_mod.Future.State.ready, fut.state);
         try testing.expect(fut.payload != null);
         try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok
@@ -31136,13 +31248,15 @@ test "sockets P3 #535: tcp-send driver pushes write bytes straight to fd" {
 
     // Allocate an empty stream and call tcpSendP3 to attach the driver.
     const stream_h = try WasiCliAdapter.socketAllocByteStream(&ci, &.{}, false);
+    var send_future_h: u32 = undefined;
     {
         const args = [_]InterfaceValue{ .{ .handle = sock_idx }, .{ .handle = stream_h } };
         var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
         try WasiCliAdapter.tcpSendP3(&adapter, &ci, &args, &results, testing.allocator);
+        send_future_h = results[0].handle;
         const fut = ci.futures.getPtr(results[0].handle).?;
-        try testing.expect(fut.payload != null);
-        try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok
+        try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+        try testing.expect(fut.payload == null);
     }
 
     const slot = ci.streams.getPtr(stream_h).?;
@@ -31170,6 +31284,10 @@ test "sockets P3 #535: tcp-send driver pushes write bytes straight to fd" {
         );
         try testing.expectEqual(async_mod.HostStreamAction.progressed, a);
     }
+    slot.host_driver.?.on_drop_writable.?(slot.host_driver.?.context);
+    const send_future = ci.futures.getPtr(send_future_h).?;
+    try testing.expectEqual(async_mod.Future.State.ready, send_future.state);
+    try testing.expectEqual(@as(u8, 0), send_future.payload.?[0]);
 
     // Drain on the server side and verify both chunks arrived in order.
     var attempt: usize = 0;
@@ -33523,6 +33641,24 @@ test "filesystem #571: intermediate symlink rejected by create-directory-at" {
     try testing.expectEqual(
         @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #571: trailing slash on final symlink rejects traversal" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.symLink(io, "..", "parent", .{});
+
+    try testing.expectEqual(
+        @as(?FsErrorCode, .not_permitted),
+        WasiCliAdapter.checkPathSymlinks(tmp.dir, "parent/", false),
+    );
+    try testing.expectEqual(
+        @as(?FsErrorCode, null),
+        WasiCliAdapter.checkPathSymlinks(tmp.dir, "parent", false),
     );
 }
 
@@ -36845,12 +36981,12 @@ test "wasi:clocks/monotonic-clock@0.3 wait-until past deadline fires immediately
     try WasiCliAdapter.monotonicWaitUntil(&adapter, &ci, &args, &results, testing.allocator);
     const fh = results[0].handle;
 
-    try testing.expect(adapter.completeDueTimerFutures(&ci, testing.allocator));
     try testing.expectEqual(
         @import("async.zig").Future.State.ready,
         ci.futures.getPtr(fh).?.state,
     );
     try testing.expectEqual(@as(usize, 0), adapter.timer_futures.items.len);
+    try testing.expect(!adapter.completeDueTimerFutures(&ci, testing.allocator));
 }
 
 test "WasiCliAdapter.driveAsyncEvents: drains due timer-futures non-blocking (#551)" {

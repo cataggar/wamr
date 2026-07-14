@@ -460,6 +460,13 @@ pub const HostStreamDriver = struct {
         ctx: ?*anyopaque,
         src: []const u8,
     ) HostStreamAction = null,
+    /// Called when the guest drops the readable end of a host-driven
+    /// stream. Socket sources use this to propagate `shutdown(SHUT_RD)`.
+    on_drop_readable: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Called when the guest drops the writable end of a host-driven
+    /// stream. Socket sinks use this to propagate EOF with a half-close
+    /// after all preceding writes have reached the host fd.
+    on_drop_writable: ?*const fn (ctx: ?*anyopaque) void = null,
 };
 
 /// A component-level async stream — FIFO byte channel parameterised on
@@ -532,7 +539,14 @@ pub const AsyncStream = struct {
     write_closed: bool = false,
 
     pub const State = enum { open, closed };
-    pub const PendingRead = struct { guest_ptr: u32, max_count: u32 };
+    pub const PendingRead = struct {
+        guest_ptr: u32,
+        max_count: u32,
+        /// Canonical byte width captured when `stream.read` parks.
+        /// Host event drivers need this to complete the original read
+        /// before delivering its waitable event.
+        elem_size: u32,
+    };
     pub const PendingWrite = struct { guest_ptr: u32, count: u32 };
 
     /// Free any heap-owned state (currently just the FIFO `buffer`).
@@ -732,11 +746,12 @@ test "AsyncStream: deinit frees buffer" {
     s.deinit(allocator);
 }
 
-test "AsyncStream: pending_read records guest_ptr and max_count" {
+test "AsyncStream: pending_read records read shape" {
     var s = AsyncStream{};
-    s.pending_read = .{ .guest_ptr = 0x2000, .max_count = 7 };
+    s.pending_read = .{ .guest_ptr = 0x2000, .max_count = 7, .elem_size = 4 };
     try std.testing.expectEqual(@as(u32, 0x2000), s.pending_read.?.guest_ptr);
     try std.testing.expectEqual(@as(u32, 7), s.pending_read.?.max_count);
+    try std.testing.expectEqual(@as(u32, 4), s.pending_read.?.elem_size);
 }
 
 test "AsyncStream: host_driver field defaults to null and can be installed (#535)" {

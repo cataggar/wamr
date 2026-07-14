@@ -1,6 +1,0 @@
-{
-  "_comment": "Only sockets-echo remains skipped in the filtered P3 convenience steps. #881's cross-instance canonical-builtin and wide scalar relay fixes make the other 39 fixtures pass in both manifest AOT and no-sidecar JIT. The unfiltered harness (`zig build wasi-p3-testsuite{-jit}-unfiltered`) executes all 40 and asserts this exact one-fixture pending-async-run exception.",
-  "WASI Rust tests [wasm32-wasip3]": {
-    "sockets-echo": "The CLI returns after the initial pending async wasi:cli/run lift and closes the TCP listener before callback resumption; reproduces identically in AOT and JIT. Tracked by #905."
-  }
-}

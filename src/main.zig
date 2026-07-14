@@ -2,6 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const wamr = @import("wamr");
 
+// Compiler debug logs are runtime diagnostics, not guest stderr. Keeping the
+// CLI threshold at info prevents in-process JIT optimization messages from
+// contaminating conformance fixtures that assert byte-exact stderr.
+pub const std_options: std.Options = .{ .log_level = .info };
+
 const aot_supported = switch (builtin.cpu.arch) {
     .x86_64, .aarch64 => true,
     else => false,
