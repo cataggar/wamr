@@ -18,11 +18,11 @@ seam where each interface name is version-multiplexed onto the matching
   environ-inheritance behavioral mismatch and a flaky upstream fixture
   that compares clock reads without accounting for second rollover,
   not crashes).
-* P3 conformance gate: `zig build wasi-p3-testsuite` — currently all
-  40 `wasm32-wasip3` fixtures are skipped; the AOT host bridge doesn't
-  yet wire cross-instance async task-management built-ins these
-  fixtures' generated bindings import (running unfiltered: 38/40
-  fail). See [#881](https://github.com/cataggar/wamr/issues/881).
+* P3 unfiltered contract: `zig build wasi-p3-testsuite-unfiltered` —
+  all 40 `wasm32-wasip3` fixtures execute in both manifest AOT and
+  no-sidecar JIT mode. 39 pass after [#881](https://github.com/cataggar/wamr/issues/881);
+  `sockets-echo` is the sole pending async-run continuation exception,
+  tracked by [#905](https://github.com/cataggar/wamr/issues/905).
 * Curated component gate: `zig build wasi-p2-testsuite` — 5 / 5 passing
   (`zig-hello`, `zig-exit`, `zig-calculator-cmd`, `mixed-zig-rust-calc`,
   `zig-http`).
@@ -118,15 +118,17 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:random/insecure-seed@0.3.0`        |  1 | `wasi-p3-testsuite` | — |
 | `wasi:filesystem/preopens@0.3.0`         |  1 | `wasi-p3-testsuite` | — |
 | `wasi:filesystem/types@0.3.0`            | 27 | `wasi-p3-testsuite` (`filesystem-*`) | `read-via-stream` / `write-via-stream` host-drivers (#577 / #579). |
-| `wasi:sockets/types@0.3.0`               | 43 | `wasi-p3-testsuite` (`sockets-*`) | Unified TCP + UDP resource surface (#486 / #544 / #565). |
+| `wasi:sockets/types@0.3.0`               | 43 | `wasi-p3-testsuite` (`sockets-*`) | Unified TCP + UDP resource surface (#486 / #544 / #565); `sockets-echo` needs pending async-run callback resumption (#905). |
 | `wasi:sockets/ip-name-lookup@0.3.0`      |  1 | `wasi-p3-testsuite` | — |
 | `wasi:http/types@0.3.0`                  | 40 | `wasi-p3-testsuite` (`http-*`) | Unified `request` / `response` resource (#487 / #568). |
 | `wasi:http/handler@0.3.0`                |  1 | `wasi-p3-testsuite` (`http-service`) | Incoming-handler trampoline (#549 / #580); HTTP/1.1 keep-alive + chunked + trailers + 431/413 limits (#595); HTTPS termination live — TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency (#609). |
 | `wasi:http/client@0.3.0`                 |  1 | `wasi-p3-testsuite` (`http-request`, `http-fields`) | Outbound; async state machine (#583 A2 / #590). |
 
-Both `wasi-testsuite-skip.json` and `wasi-p3-testsuite-skip.json` are
-intentionally **empty** at the time of writing — every vendored fixture
-passes. New entries must carry a one-line rationale and a tracking issue.
+`wasi-testsuite-skip.json` carries the narrow Preview-1 exceptions.
+`wasi-p3-testsuite-skip.json` carries only `sockets-echo`, which needs
+callback-driven resumption of a pending async `wasi:cli/run` task (#905).
+The unfiltered P3 contract asserts that all 40 fixtures execute, so either
+skip list cannot make the P3 result appear green by excluding its corpus.
 
 ## Preview 1 / 2 / 3 milestones
 
@@ -174,7 +176,7 @@ either added a new interface family or closed a tracker issue.
 | `wasi:filesystem@0.3.0` `filesystem-stat` fixture detail               | [#579](https://github.com/cataggar/wamr/pull/579) | Closes #571 (residual). |
 | `wasi:http@0.3.0` `http-service` end-to-end dispatch                  | [#580](https://github.com/cataggar/wamr/pull/580) | Closes #570. |
 | `wasi:sockets@0.3.0` `tcp-bind` SO_REUSEADDR                          | [#581](https://github.com/cataggar/wamr/pull/581) | Closes #575. |
-| **Preview 3 gate flip — 40 / 40 `wasm32-wasip3` fixtures pass**       | [#582](https://github.com/cataggar/wamr/pull/582) | Closes #451 / #520. |
+| Preview 3 gate — 40 execute; 39 pass + pending `sockets-echo` continuation | [#582](https://github.com/cataggar/wamr/pull/582), [#881](https://github.com/cataggar/wamr/issues/881), [#905](https://github.com/cataggar/wamr/issues/905) | #881 restores shared AOT/JIT dispatch; #905 tracks callback resumption. |
 
 ### Post-Preview-3 hardening (umbrella: [#583](https://github.com/cataggar/wamr/issues/583))
 

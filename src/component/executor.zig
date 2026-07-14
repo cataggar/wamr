@@ -71,7 +71,6 @@ pub const CoreFuncIdxComponent = enum(u32) {
 /// where the frame methods consume it.
 pub const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
 
-
 /// Component-model `MAX_FLAT_PARAMS_ASYNC` per the spec's
 /// canonical-ABI rules for `canon.lower (async)`: when a lifted async
 /// func has more than 4 flat-params, the caller spills the entire
@@ -1480,6 +1479,30 @@ fn coreFlatSlotType(t: ctypes.ValType, registry: TypeRegistry) !core_types.ValTy
     };
 }
 
+fn resolveAotCoreFuncResults(
+    ai: *const aot_runtime.AotInstance,
+    func_idx: u32,
+) ?[]const core_types.ValType {
+    if (func_idx < ai.module.import_function_count) {
+        var imported_func_idx: u32 = 0;
+        for (ai.module.imports) |imp| {
+            if (imp.kind != .function) continue;
+            if (imported_func_idx == func_idx) {
+                if (imp.func_type_idx >= ai.module.func_types.len) return null;
+                return ai.module.func_types[imp.func_type_idx].results;
+            }
+            imported_func_idx += 1;
+        }
+        return null;
+    }
+
+    const local_idx = func_idx - ai.module.import_function_count;
+    if (local_idx >= ai.module.local_func_type_indices.len) return null;
+    const type_idx = ai.module.local_func_type_indices[local_idx];
+    if (type_idx >= ai.module.func_types.len) return null;
+    return ai.module.func_types[type_idx].results;
+}
+
 /// Async-lifted variant of `callComponentFuncByLocal`. Lifts args and
 /// drives the core wasm body the same way, but the callee delivers its
 /// results via `canon task.return` (#478 sub-PR 2). On return from the
@@ -1501,7 +1524,6 @@ pub fn callComponentFuncByLocalAsyncLifted(
     if (exported.core_instance_idx >= owner_inst.core_instances.len)
         return error.CoreInstanceNotAvailable;
     const core_entry = owner_inst.core_instances[exported.core_instance_idx];
-    const module_inst = core_entry.module_inst orelse return error.CoreInstanceNotAvailable;
 
     const lift_opts = LiftOptions.fromOpts(exported.opts);
     if (!lift_opts.is_async) return error.InvalidFuncType;
@@ -1521,16 +1543,26 @@ pub fn callComponentFuncByLocalAsyncLifted(
 
     const flat_param_count = countFlatTypes(registry, param_types);
 
-    const env = ExecEnv.create(module_inst, 4096, allocator) catch return error.OutOfMemory;
-    defer env.destroy();
+    var frame: CallFrame = blk: {
+        if (core_entry.module_inst) |mi| {
+            const env = ExecEnv.create(mi, 4096, allocator) catch return error.OutOfMemory;
+            break :blk .{ .interp = InterpFrame.init(env) };
+        }
+        if (core_entry.aot_inst) |ai| {
+            break :blk .{ .aot = AotFrame.init(ai, allocator) };
+        }
+        return error.CoreInstanceNotAvailable;
+    };
+    defer {
+        switch (frame) {
+            .interp => |f| f.env.destroy(),
+            .aot => {},
+        }
+        frame.deinit();
+    }
 
-    var frame: CallFrame = .{ .interp = InterpFrame.init(env) };
-    defer frame.deinit();
-
-    const memory: ?[]u8 = if (lift_opts.memory_idx) |mem_idx|
-        frame.memory(mem_idx)
-    else
-        null;
+    const memory_idx = lift_opts.memory_idx orelse 0;
+    var memory = frame.memory(memory_idx);
 
     // Lower args — same logic as the sync path.
     if (flat_param_count <= MAX_FLAT_PARAMS) {
@@ -1538,64 +1570,53 @@ pub fn callComponentFuncByLocalAsyncLifted(
             pushInterfaceValue(&frame, arg, pt, registry) catch return error.LowerError;
         }
     } else {
-        const mem = memory orelse return error.MemoryNotAvailable;
-        // Translate component-level realloc core-funcidx → module-local
-        // (mirrors the sync-lift fix in `callComponentFuncByLocal`; #719).
-        // Falls back to `ridx_comp` when no alias entry resolves, matching
-        // the pre-#719 hand-authored fixture convention.
-        const ridx_comp = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
-        const realloc_idx: CoreFuncIdxLocal = blk2: {
-            const target = owner_inst.resolveTopLevelCoreFuncAny(ridx_comp.value()) orelse
-                break :blk2 CoreFuncIdxLocal.from(ridx_comp.value());
-            switch (target) {
-                .interp => |t| {
-                    if (t.mi != module_inst) return error.ReallocNotAvailable;
-                    break :blk2 t.local_idx;
-                },
-                .aot => return error.ReallocNotAvailable,
-            }
-        };
+        if (memory == null) return error.MemoryNotAvailable;
+        const realloc_idx = try translateComponentFuncIdx(owner_inst, core_entry, lift_opts.realloc_idx) orelse
+            return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
         const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
+        memory = frame.memory(memory_idx);
+        const refreshed_mem = memory orelse return error.MemoryNotAvailable;
 
         var offset: u32 = 0;
         for (args, param_types) |arg, pt| {
             const al = typeAlign(registry, pt);
             offset = abi.alignUp(offset, al);
-            storeInterfaceValue(mem, offset, arg, pt, registry) catch return error.LowerError;
+            storeInterfaceValue(refreshed_mem, offset, arg, pt, registry) catch return error.LowerError;
             offset += typeSize(registry, pt);
         }
-        env.pushI32(@bitCast(ptr)) catch return error.StackOverflow;
+        frame.pushSlot(.{ .i32 = @bitCast(ptr) }) catch return error.StackOverflow;
     }
 
     // Drive the core body. It is the callee's responsibility to invoke
     // `canon task.return` before returning — which deposits the lifted
     // results onto the task via `dispatchCanonBuiltin`.
-    //
-    // On trap, surface diagnostic info from `env.host_trap` so the
-    // failure mode is visible to the operator. Mirrors the sync-call
-    // path in `callComponentFunc` (added in #520 wave 1 / PR #532).
-    // The `WasiExit` case is normal control flow (the exit code is
-    // already stashed on `WasiCliAdapter.exit_code`) and is suppressed
-    // to avoid spurious diagnostics on a successful `wasi:cli/exit`.
-    interp.executeFunction(env, exported.core_func_idx) catch {
-        if (env.host_trap) |ht| {
-            const is_wasi_exit = std.mem.eql(u8, ht.err_name, "WasiExit");
-            if (!is_wasi_exit) {
-                std.debug.print("[async-lifted trap] core_func_idx={d}", .{ht.core_func_idx});
-                if (ht.component_func_idx != std.math.maxInt(u32))
-                    std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
-                if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+    const core_result_types: []const core_types.ValType = switch (frame) {
+        .interp => &.{},
+        .aot => |f| resolveAotCoreFuncResults(f.ai, exported.core_func_idx) orelse
+            return error.InvalidFuncType,
+    };
+    frame.executeCore(CoreFuncIdxLocal.from(exported.core_func_idx), &.{}, core_result_types) catch {
+        switch (frame) {
+            .interp => |f| if (f.env.host_trap) |ht| {
+                const is_wasi_exit = std.mem.eql(u8, ht.err_name, "WasiExit");
+                if (!is_wasi_exit) {
+                    std.debug.print("[async-lifted trap] core_func_idx={d}", .{ht.core_func_idx});
+                    if (ht.component_func_idx != std.math.maxInt(u32))
+                        std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
+                    if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+                        std.debug.print(
+                            " import='{s}.{s}'",
+                            .{ ht.import_module_name, ht.import_field_name },
+                        );
                     std.debug.print(
-                        " import='{s}.{s}'",
-                        .{ ht.import_module_name, ht.import_field_name },
+                        " stage={s} error={s}\n",
+                        .{ @tagName(ht.stage), ht.err_name },
                     );
-                std.debug.print(
-                    " stage={s} error={s}\n",
-                    .{ @tagName(ht.stage), ht.err_name },
-                );
-            }
+                }
+            },
+            .aot => {},
         }
         return error.TrapInCoreFunction;
     };
@@ -1605,7 +1626,8 @@ pub fn callComponentFuncByLocalAsyncLifted(
     // probe optimistically: if the core fn returned an i32, peel it
     // off; otherwise leave status at 0 (the default).
     if (lift_opts.callback_idx != null) {
-        out_status.* = @bitCast(env.popI32() catch 0);
+        const status = frame.popSlot(.i32) catch return error.StackUnderflow;
+        out_status.* = @bitCast(status.i32);
     }
 }
 
@@ -2543,10 +2565,11 @@ pub fn dispatchCanonBuiltinWithCtx(
     comp_inst: *ComponentInstance,
     canon: ctypes.Canon,
     ctx: ?*const CanonBuiltinTrampolineCtx,
-    env: *ExecEnv,
+    stack: anytype,
     task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
+    const env = stack;
     switch (canon) {
         .resource_new => |resource_idx| {
             const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
@@ -2692,7 +2715,7 @@ pub fn dispatchCanonBuiltinWithCtx(
 fn dispatchAsyncCanon(
     comp_inst: *ComponentInstance,
     op: ctypes.AsyncCanonOp,
-    env: *ExecEnv,
+    env: anytype,
     task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
@@ -7262,7 +7285,7 @@ pub export fn wamrAotDispatchComponentTrampoline(
     a9: u64,
 ) callconv(.c) host_trampolines.DispatchResult {
     const ctx: *const ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
-    const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 }) catch |err| {
+    const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, &.{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 }, null) catch |err| {
         if (err == error.WasiExit) handleWasiExitFromAotDispatch();
         if (debugAotEnabled()) {
             std.debug.print(
@@ -7299,13 +7322,55 @@ pub export fn wamrAotDispatchComponentTrampolineAot(
     a8: u64,
     a9: u64,
 ) callconv(.c) host_trampolines.DispatchResult {
-    _ = a0;
     const ctx: *const ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
-    const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, .{ a1, a2, a3, a4, a5, a6, a7, a8, a9, 0 }) catch |err| {
+    const result = dispatchAotComponentTrampoline(ctx, lowered_sig.*, &.{ a1, a2, a3, a4, a5, a6, a7, a8, a9 }, a0) catch |err| {
         if (err == error.WasiExit) handleWasiExitFromAotDispatch();
         if (debugAotEnabled()) {
             std.debug.print(
                 "[aot-dispatch] canon.lower(aot) trampoline failed: {s}\n",
+                .{@errorName(err)},
+            );
+        }
+        const err_name = if (err == error.LiftedResultInvariantViolated) lifted_result_invariant_violated.ptr else @errorName(err).ptr;
+        return .{ .status = 1, .value = 0, .err_name = err_name };
+    };
+    return .{ .status = 0, .value = result };
+}
+
+/// Wide AOT canon-lower relay for signatures with 10–15 wasm-level ABI
+/// slots. The source core's stack arguments arrive intact from the native
+/// trampoline, so record/variant lowerings do not silently lose their tail.
+pub export fn wamrAotDispatchComponentTrampolineAotWide(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    const ctx: *const ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
+    const result = dispatchAotComponentTrampoline(
+        ctx,
+        lowered_sig.*,
+        &.{ a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15 },
+        a0,
+    ) catch |err| {
+        if (err == error.WasiExit) handleWasiExitFromAotDispatch();
+        if (debugAotEnabled()) {
+            std.debug.print(
+                "[aot-dispatch] wide canon.lower(aot) trampoline failed: {s}\n",
                 .{@errorName(err)},
             );
         }
@@ -7352,11 +7417,9 @@ pub const CrossInstanceThunkCtx = struct {
 /// vmctx — the sibling AotInstance builds its own vmctx internally in
 /// `callFuncScalar`, but we peek at the importer's `memory_base` for the
 /// cross-memory guard (#719 Bug B); `a1..a9` are the lowered wasm args.
-/// Calls outside the trampoline pool's 9-arg-in-regs envelope return a
-/// failing status; richer signatures land in a follow-up. The 5 → 8 widening
-/// in #689 covered WASIp2 filesystem methods like `link-at` (7 wasm params);
-/// the 8 → 9 widening in #700 covers `wasi_snapshot_preview1.path_open`
-/// (9 wasm params), exposed by #699's WASI-guard reorder.
+/// Imports with 10–15 scalar args use `wamrAotDispatchCrossInstanceWide`;
+/// both paths preserve the same target ownership, recursion, and trap
+/// semantics.
 pub export fn wamrAotDispatchCrossInstance(
     ctx_opaque: *anyopaque,
     lowered_sig: *const host_trampolines.LoweredSig,
@@ -7372,14 +7435,55 @@ pub export fn wamrAotDispatchCrossInstance(
     a9: u64,
 ) callconv(.c) host_trampolines.DispatchResult {
     const ctx: *CrossInstanceThunkCtx = @ptrCast(@alignCast(ctx_opaque));
-    const result = dispatchAotCrossInstance(ctx, lowered_sig.*, a0, .{ a1, a2, a3, a4, a5, a6, a7, a8, a9, 0 }) catch |err| {
+    const result = dispatchAotCrossInstance(ctx, lowered_sig.*, a0, &.{ a1, a2, a3, a4, a5, a6, a7, a8, a9 }) catch |err| {
         if (debugAotEnabled()) {
             std.debug.print(
                 "[aot-dispatch] cross-instance thunk '{s}' failed: {s}\n",
                 .{ ctx.label, @errorName(err) },
             );
         }
-        return .{ .status = 1, .value = 0 };
+        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
+    };
+    return .{ .status = 0, .value = result };
+}
+
+/// Wide counterpart to `wamrAotDispatchCrossInstance`, reached through the
+/// trampoline pool's 16-arg relay when a real sibling core export has 10–15
+/// scalar wasm params (notably socket-address record lowerings).
+pub export fn wamrAotDispatchCrossInstanceWide(
+    ctx_opaque: *anyopaque,
+    lowered_sig: *const host_trampolines.LoweredSig,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+    a13: u64,
+    a14: u64,
+    a15: u64,
+) callconv(.c) host_trampolines.DispatchResult {
+    const ctx: *CrossInstanceThunkCtx = @ptrCast(@alignCast(ctx_opaque));
+    const result = dispatchAotCrossInstance(
+        ctx,
+        lowered_sig.*,
+        a0,
+        &.{ a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15 },
+    ) catch |err| {
+        if (debugAotEnabled()) {
+            std.debug.print(
+                "[aot-dispatch] wide cross-instance thunk '{s}' failed: {s}\n",
+                .{ ctx.label, @errorName(err) },
+            );
+        }
+        return .{ .status = 1, .value = 0, .err_name = @errorName(err).ptr };
     };
     return .{ .status = 0, .value = result };
 }
@@ -7388,13 +7492,13 @@ fn dispatchAotCrossInstance(
     ctx: *CrossInstanceThunkCtx,
     lowered_sig: host_trampolines.LoweredSig,
     caller_vmctx: u64,
-    arg_regs: [10]u64,
+    arg_regs: []const u64,
 ) !u64 {
-    // We support up to 9 args in registers (a1..a9 in the dispatcher's
-    // frame, since a0 is the importer's vmctx). Spilled-arg / spilled-result
-    // shapes route through the lift trampoline pathway, not this one.
+    // The narrow relay carries nine wasm args; the wide relay carries 15.
+    // Spilled-result shapes still need canonical lift/lower and are not
+    // valid raw cross-instance forwards.
     if (lowered_sig.has_retptr) return error.UnsupportedSignature;
-    if (lowered_sig.param_types.len > 9) return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len > arg_regs.len) return error.UnsupportedSignature;
     if (lowered_sig.result_types.len > 1) return error.UnsupportedSignature;
     if (lowered_sig.param_types.len != ctx.param_types.len) return error.UnsupportedSignature;
     if (lowered_sig.result_types.len != ctx.result_types.len) return error.UnsupportedSignature;
@@ -7428,7 +7532,7 @@ fn dispatchAotCrossInstance(
         }
     }
 
-    var args_buf: [9]core_types.Value = undefined;
+    var args_buf: [15]core_types.Value = undefined;
     for (ctx.param_types, 0..) |pt, i| {
         args_buf[i] = switch (pt) {
             .i32 => .{ .i32 = @bitCast(@as(u32, @truncate(arg_regs[i]))) },
@@ -7476,14 +7580,181 @@ fn trapCrossMemoryEnabled() bool {
     return core_backend.trapCrossMemoryEnabled();
 }
 
-/// Canon-builtin dispatcher for AOT-compiled core modules (#701, follow-up
-/// to #687). Mirrors `wamrAotDispatchCrossInstance`'s vmctx-as-first-arg
-/// convention: `a0` is the importer's vmctx (ignored — canon-builtins
-/// operate on the component instance carried in the ctx), and `a1` is the
-/// wasm-level handle / rep value. Today this handles the three
-/// `resource.{drop,new,rep}` kinds that #701 explicitly targets; other
-/// canon-builtin kinds (`context.*`, `task.*`, async ABI) trap-stub
-/// pending a follow-up.
+/// Fixed-capacity operand stack for an AOT canon-builtin import. The AOT
+/// trampoline hands us raw scalar ABI values rather than an interpreter
+/// `ExecEnv`, but the canonical-builtin implementation only needs stack
+/// operations. Keeping this adapter deliberately small lets AOT and interp
+/// calls share the exact same canonical-ABI state machine.
+const AotCanonBuiltinFrame = struct {
+    const max_slots = 10;
+
+    values: [max_slots]core_types.Value = undefined,
+    sp: usize = 0,
+
+    fn init(
+        lowered_sig: host_trampolines.LoweredSig,
+        regs: [10]u64,
+    ) !AotCanonBuiltinFrame {
+        const has_multi_result = lowered_sig.result_types.len > 1;
+        if (lowered_sig.has_retptr != has_multi_result) return error.UnsupportedSignature;
+        if (lowered_sig.param_types.len + @intFromBool(lowered_sig.has_retptr) > regs.len)
+            return error.UnsupportedSignature;
+        if (lowered_sig.param_types.len > max_slots or lowered_sig.result_types.len > max_slots)
+            return error.UnsupportedSignature;
+
+        var frame = AotCanonBuiltinFrame{};
+        for (lowered_sig.param_types, 0..) |ty, i| {
+            frame.values[i] = switch (ty) {
+                .i32 => .{ .i32 = @bitCast(@as(u32, @truncate(regs[i]))) },
+                .i64 => .{ .i64 = @bitCast(regs[i]) },
+                .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(regs[i]))) },
+                .f64 => .{ .f64 = @bitCast(regs[i]) },
+                else => return error.UnsupportedSignature,
+            };
+        }
+        frame.sp = lowered_sig.param_types.len;
+        return frame;
+    }
+
+    fn pop(self: *AotCanonBuiltinFrame) !core_types.Value {
+        if (self.sp == 0) return error.StackUnderflow;
+        self.sp -= 1;
+        return self.values[self.sp];
+    }
+
+    pub fn popI32(self: *AotCanonBuiltinFrame) !i32 {
+        const value = try self.pop();
+        return switch (value) {
+            .i32 => |i| i,
+            .f32 => |f| @bitCast(f),
+            .funcref, .nonfuncref => 0,
+            .externref, .nonexternref => 0,
+            .i64 => |i| @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(i)))))),
+            .f64 => |f| @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(f)))))),
+            else => 0,
+        };
+    }
+
+    fn push(self: *AotCanonBuiltinFrame, value: core_types.Value) !void {
+        if (self.sp >= self.values.len) return error.StackOverflow;
+        self.values[self.sp] = value;
+        self.sp += 1;
+    }
+
+    pub fn pushI32(self: *AotCanonBuiltinFrame, value: i32) !void {
+        try self.push(.{ .i32 = value });
+    }
+
+    pub fn pushI64(self: *AotCanonBuiltinFrame, value: i64) !void {
+        try self.push(.{ .i64 = value });
+    }
+
+    fn rawValue(value: core_types.Value, ty: core_types.ValType) !u64 {
+        return switch (ty) {
+            .i32 => switch (value) {
+                .i32 => |v| @as(u64, @intCast(@as(u32, @bitCast(v)))),
+                else => error.UnsupportedSignature,
+            },
+            .i64 => switch (value) {
+                .i64 => |v| @bitCast(v),
+                else => error.UnsupportedSignature,
+            },
+            .f32 => switch (value) {
+                .f32 => |v| @as(u64, @intCast(@as(u32, @bitCast(v)))),
+                else => error.UnsupportedSignature,
+            },
+            .f64 => switch (value) {
+                .f64 => |v| @bitCast(v),
+                else => error.UnsupportedSignature,
+            },
+            else => error.UnsupportedSignature,
+        };
+    }
+
+    fn finish(
+        self: *const AotCanonBuiltinFrame,
+        lowered_sig: host_trampolines.LoweredSig,
+        regs: [10]u64,
+    ) !u64 {
+        if (self.sp != lowered_sig.result_types.len) return error.UnsupportedSignature;
+
+        var raw_results: [max_slots]u64 = undefined;
+        for (lowered_sig.result_types, 0..) |ty, i| {
+            raw_results[i] = try rawValue(self.values[i], ty);
+        }
+
+        if (lowered_sig.has_retptr) {
+            const retptr_raw = regs[lowered_sig.param_types.len];
+            if (retptr_raw == 0) return error.UnsupportedSignature;
+            const retptr: [*]u64 = @ptrFromInt(@as(usize, @intCast(retptr_raw)));
+            for (raw_results[1..lowered_sig.result_types.len], 0..) |raw, i| {
+                retptr[i] = raw;
+            }
+        }
+
+        if (lowered_sig.result_types.len == 0) return 0;
+        return raw_results[0];
+    }
+};
+
+fn canonBuiltinOpts(canon: ctypes.Canon) []const ctypes.CanonOpt {
+    return switch (canon) {
+        .task_return => |info| info.opts,
+        .async_canon => |op| switch (op) {
+            .stream_read => |info| info.opts,
+            .stream_write => |info| info.opts,
+            .future_read => |info| info.opts,
+            .future_write => |info| info.opts,
+            .error_context_new => |info| info.opts,
+            .error_context_debug_message => |info| info.opts,
+            else => &.{},
+        },
+        else => &.{},
+    };
+}
+
+fn canonBuiltinMemoryIdx(canon: ctypes.Canon) ?u32 {
+    return switch (canon) {
+        .async_canon => |op| switch (op) {
+            .waitable_set_wait => |info| info.memory,
+            .waitable_set_poll => |info| info.memory,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn resolveAotCanonBuiltinCallCtx(
+    ctx: *const CanonBuiltinTrampolineCtx,
+    caller_vmctx: u64,
+) ?ComponentInstance.CanonLowerCallCtx {
+    var lower_opts = LowerOptions.fromOpts(canonBuiltinOpts(ctx.canon));
+    if (canonBuiltinMemoryIdx(ctx.canon)) |memory_idx| {
+        lower_opts.memory_idx = memory_idx;
+    }
+    var call_ctx = resolveLowerCallCtx(ctx.comp_inst, lower_opts);
+
+    // The importer's vmctx is authoritative for raw pointer arguments. It
+    // matters for stream/future/error-context operations because their
+    // pointers are in the importing AOT core's memory, not necessarily the
+    // first component memory. Keep a resolved realloc from canon options,
+    // while pinning memory to the actual caller.
+    if (aotCallerMemory(caller_vmctx)) |memory| {
+        if (call_ctx) |*existing| {
+            existing.memory = memory;
+        } else {
+            call_ctx = .{ .memory = memory };
+        }
+    }
+    return call_ctx;
+}
+
+/// Canon-builtin dispatcher for AOT-compiled core modules. Mirrors
+/// `wamrAotDispatchCrossInstance`'s vmctx-as-first-arg convention: `a0` is
+/// the importing core's vmctx and `a1..a9` are lowered wasm args (plus an
+/// optional hidden multi-result pointer). All supported canon-builtin source
+/// kinds share `dispatchCanonBuiltinWithCtx`, preserving interpreter
+/// semantics for context, task, waitable, stream, future, and resource state.
 pub export fn wamrAotDispatchCanonBuiltin(
     ctx_opaque: *anyopaque,
     lowered_sig: *const host_trampolines.LoweredSig,
@@ -7498,17 +7769,14 @@ pub export fn wamrAotDispatchCanonBuiltin(
     a8: u64,
     a9: u64,
 ) callconv(.c) host_trampolines.DispatchResult {
-    _ = a0; // importer's vmctx; canon-builtins resolve state via ctx.comp_inst.
-    _ = a2;
-    _ = a3;
-    _ = a4;
-    _ = a5;
-    _ = a6;
-    _ = a7;
-    _ = a8;
-    _ = a9;
     const ctx: *const CanonBuiltinTrampolineCtx = @ptrCast(@alignCast(ctx_opaque));
-    const result = dispatchAotCanonBuiltin(ctx, lowered_sig.*, @as(u32, @truncate(a1))) catch |err| {
+    const result = dispatchAotCanonBuiltin(
+        ctx,
+        lowered_sig.*,
+        a0,
+        .{ a1, a2, a3, a4, a5, a6, a7, a8, a9, 0 },
+    ) catch |err| {
+        if (err == error.WasiExit) handleWasiExitFromAotDispatch();
         if (debugAotEnabled()) {
             std.debug.print(
                 "[aot-dispatch] canon-builtin '{s}' failed: {s}\n",
@@ -7523,52 +7791,23 @@ pub export fn wamrAotDispatchCanonBuiltin(
 fn dispatchAotCanonBuiltin(
     ctx: *const CanonBuiltinTrampolineCtx,
     lowered_sig: host_trampolines.LoweredSig,
-    arg0: u32,
+    caller_vmctx: u64,
+    regs: [10]u64,
 ) !u64 {
-    // All in-scope canon-builtins ({resource}.drop/new/rep) lower to a single
-    // i32 input and 0 or 1 i32 outputs. Any other shape is a wiring bug.
-    if (lowered_sig.has_retptr) return error.UnsupportedSignature;
-    if (lowered_sig.param_types.len != 1) return error.UnsupportedSignature;
-    if (lowered_sig.param_types[0] != .i32) return error.UnsupportedSignature;
-    if (lowered_sig.result_types.len > 1) return error.UnsupportedSignature;
-    if (lowered_sig.result_types.len == 1 and lowered_sig.result_types[0] != .i32)
-        return error.UnsupportedSignature;
+    var frame = try AotCanonBuiltinFrame.init(lowered_sig, regs);
+    const saved_call_ctx = ctx.comp_inst.current_lower_call_ctx;
+    ctx.comp_inst.current_lower_call_ctx = resolveAotCanonBuiltinCallCtx(ctx, caller_vmctx);
+    defer ctx.comp_inst.current_lower_call_ctx = saved_call_ctx;
 
-    const comp_inst = ctx.comp_inst;
-    const allocator = comp_inst.allocator;
-
-    switch (ctx.canon) {
-        .resource_new => |resource_idx| {
-            if (lowered_sig.result_types.len != 1) return error.UnsupportedSignature;
-            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
-                return error.OutOfMemory;
-            const handle = try canonResourceNew(rt, arg0, allocator);
-            return @as(u64, @intCast(handle));
-        },
-        .resource_drop => |resource_idx| {
-            if (lowered_sig.result_types.len != 0) return error.UnsupportedSignature;
-            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
-                return error.OutOfMemory;
-            _ = canonResourceDrop(rt, arg0, allocator);
-            // Mirror the interp arm in `dispatchCanonBuiltinWithCtx`: notify
-            // the host adapter so it can release kernel-side state attached
-            // to the dropped handle. WAMR's host fns return reps as wire
-            // handles directly (no automatic `canon resource.new` wrap), so
-            // the per-type table is typically empty here. (#575)
-            if (comp_inst.on_resource_drop) |hook| {
-                hook(comp_inst.on_resource_drop_ctx, comp_inst, resource_idx, arg0);
-            }
-            return 0;
-        },
-        .resource_rep => |resource_idx| {
-            if (lowered_sig.result_types.len != 1) return error.UnsupportedSignature;
-            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
-                return error.OutOfMemory;
-            const rep_val = canonResourceRep(rt, arg0) orelse 0;
-            return @as(u64, @intCast(rep_val));
-        },
-        else => return error.UnsupportedSignature,
-    }
+    try dispatchCanonBuiltinWithCtx(
+        ctx.comp_inst,
+        ctx.canon,
+        ctx,
+        &frame,
+        ctx.comp_inst.current_task_manager,
+        ctx.comp_inst.allocator,
+    );
+    return frame.finish(lowered_sig, regs);
 }
 
 /// Trap-on-call stub dispatcher (#662 follow-up). The trampoline pool
@@ -7663,12 +7902,181 @@ fn traceCanonLowerCall(ctx: *const ComponentTrampolineCtx, lowered_sig: host_tra
     std.debug.print("\n", .{});
 }
 
+fn aotCallerMemory(caller_vmctx: ?u64) ?*core_types.MemoryInstance {
+    const raw_vmctx = caller_vmctx orelse return null;
+    if (raw_vmctx == 0 or raw_vmctx % @alignOf(aot_runtime.VmCtx) != 0) return null;
+    const vmctx: *const aot_runtime.VmCtx = @ptrFromInt(@as(usize, @intCast(raw_vmctx)));
+    if (vmctx.instance_ptr == 0 or vmctx.instance_ptr % @alignOf(aot_runtime.AotInstance) != 0)
+        return null;
+    const caller: *const aot_runtime.AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    if (caller.memories.len == 0) return null;
+    return caller.memories[0];
+}
+
+fn resolveAotLowerCallCtx(
+    ctx: *const ComponentTrampolineCtx,
+    caller_vmctx: ?u64,
+) ?ComponentInstance.CanonLowerCallCtx {
+    var call_ctx = resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts);
+    if (aotCallerMemory(caller_vmctx)) |memory| {
+        if (call_ctx) |*existing| {
+            existing.memory = memory;
+        } else {
+            call_ctx = .{ .memory = memory };
+        }
+    }
+    return call_ctx;
+}
+
+fn dispatchAotAsyncComponentTrampoline(
+    ctx: *const ComponentTrampolineCtx,
+    lowered_sig: host_trampolines.LoweredSig,
+    regs: []const u64,
+    caller_vmctx: ?u64,
+) !u64 {
+    // Async canon.lower always returns exactly one i32 status word. Its
+    // optional retptr carries the eventual component result payload, not the
+    // AOT ABI's multi-result HRP contract.
+    if (lowered_sig.result_types.len != 1 or lowered_sig.result_types[0] != .i32)
+        return error.UnsupportedSignature;
+    const async_with_result_retptr = ctx.result_types.len > 0;
+    if (lowered_sig.has_retptr != async_with_result_retptr)
+        return error.UnsupportedSignature;
+    if (lowered_sig.param_types.len + @intFromBool(lowered_sig.has_retptr) > regs.len)
+        return error.UnsupportedSignature;
+
+    const allocator = ctx.comp_inst.allocator;
+    const registry = if (ctx.extended_types.len > 0)
+        TypeRegistry.fromExtended(ctx.comp_inst.component, ctx.extended_types, ctx.extended_indexspace)
+    else
+        TypeRegistry.init(ctx.comp_inst.component);
+    const flat_params = countFlatTypes(registry, ctx.param_types);
+    const params_spill = flat_params > MAX_FLAT_PARAMS_ASYNC;
+    const caller_memory = aotCallerMemory(caller_vmctx) orelse
+        ctx.comp_inst.resolveTopLevelMemory(ctx.lower_opts.memory_idx orelse 0);
+
+    if (params_spill or async_with_result_retptr) {
+        if (ctx.lower_opts.memory_idx == null) return error.MemoryNotAvailable;
+        if (caller_memory == null) return error.MemoryNotAvailable;
+    }
+
+    var args_stack_buf: [8]InterfaceValue = undefined;
+    const args_heap: ?[]InterfaceValue = if (ctx.param_types.len <= args_stack_buf.len)
+        null
+    else
+        try allocator.alloc(InterfaceValue, ctx.param_types.len);
+    defer if (args_heap) |args| allocator.free(args);
+    const args: []InterfaceValue = args_heap orelse args_stack_buf[0..ctx.param_types.len];
+
+    var reg_index: usize = 0;
+    if (params_spill) {
+        if (lowered_sig.param_types.len != 1 or lowered_sig.param_types[0] != .i32)
+            return error.UnsupportedSignature;
+        const params_ptr: u32 = @truncate(regs[0]);
+        reg_index = 1;
+        const memory = caller_memory orelse return error.MemoryNotAvailable;
+        var offset = params_ptr;
+        for (ctx.param_types, 0..) |param_type, i| {
+            offset = abi.alignUp(offset, typeAlign(registry, param_type));
+            args[i] = try loadInterfaceValue(memory.data, offset, param_type, registry, allocator);
+            offset += typeSize(registry, param_type);
+        }
+    } else {
+        for (ctx.param_types, 0..) |param_type, i| {
+            args[i] = try liftAotDispatcherArg(
+                param_type,
+                lowered_sig.param_types,
+                &reg_index,
+                regs,
+                registry,
+                allocator,
+            );
+        }
+    }
+
+    var result_dest_ptr: u32 = 0;
+    if (async_with_result_retptr) {
+        if (reg_index >= regs.len) return error.UnsupportedSignature;
+        result_dest_ptr = @truncate(regs[reg_index]);
+        reg_index += 1;
+    }
+    if (reg_index != lowered_sig.param_types.len + @intFromBool(async_with_result_retptr))
+        return error.UnsupportedSignature;
+
+    var strict_mem: ?[]const u8 = null;
+    for (args, ctx.param_types) |arg, param_type| {
+        if (!typeContainsPtrLen(param_type, registry)) continue;
+        if (strict_mem == null) {
+            const memory = caller_memory orelse return error.MemoryNotAvailable;
+            strict_mem = memory.data;
+        }
+        try validateCanonPtrLenValue(strict_mem.?, arg, param_type, registry, "canon-lift");
+    }
+
+    // Async lower uses a future/subtask handle in result slot zero even when
+    // the lifted component function has no declared result.
+    const host_result_len: usize = if (ctx.result_types.len == 0) 1 else ctx.result_types.len;
+    var results_stack_buf: [4]InterfaceValue = undefined;
+    const results_heap: ?[]InterfaceValue = if (host_result_len <= results_stack_buf.len)
+        null
+    else
+        try allocator.alloc(InterfaceValue, host_result_len);
+    const results: []InterfaceValue = results_heap orelse results_stack_buf[0..host_result_len];
+    var results_filled: usize = 0;
+    defer {
+        for (results[0..results_filled]) |result| result.deinit(allocator);
+        if (results_heap) |allocated| allocator.free(allocated);
+    }
+    if (ctx.result_types.len == 0) {
+        results[0] = .{ .u32 = 0 };
+        results_filled = 1;
+    }
+
+    const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
+    ctx.comp_inst.current_lower_call_ctx = resolveAotLowerCallCtx(ctx, caller_vmctx);
+    defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
+    if (ctx.lift_target) |target| {
+        try callComponentFuncByLocal(ctx.comp_inst, target, args, results, allocator);
+    } else {
+        const call = ctx.host_func.call orelse return error.HostFuncNotBound;
+        try call(ctx.host_func.context, ctx.comp_inst, args, results, allocator);
+    }
+    results_filled = results.len;
+
+    const handle: u32 = switch (results[0]) {
+        .handle => |value| value,
+        .u32 => |value| value,
+        else => 0,
+    };
+    if (handle != 0) {
+        if (ctx.comp_inst.futures.getPtr(handle)) |future| {
+            future.subtask_managed = true;
+            if (async_with_result_retptr) {
+                if (future.state == .ready or future.state == .closed) {
+                    if (future.payload) |bytes| {
+                        const memory = caller_memory orelse return error.MemoryNotAvailable;
+                        if (@as(u64, result_dest_ptr) + bytes.len > memory.data.len)
+                            return error.MemoryNotAvailable;
+                        @memcpy(memory.data[result_dest_ptr .. result_dest_ptr + bytes.len], bytes);
+                    }
+                } else {
+                    future.async_lower_retptr = result_dest_ptr;
+                }
+            }
+        }
+    }
+
+    return @as(u64, packAsyncLowerStatus(ctx.comp_inst, handle));
+}
+
 fn dispatchAotComponentTrampoline(
     ctx: *const ComponentTrampolineCtx,
     lowered_sig: host_trampolines.LoweredSig,
-    regs: [10]u64,
+    regs: []const u64,
+    caller_vmctx: ?u64,
 ) !u64 {
-    if (ctx.lower_opts.is_async or ctx.is_async_func) return error.UnsupportedSignature;
+    if (ctx.lower_opts.is_async or ctx.is_async_func)
+        return dispatchAotAsyncComponentTrampoline(ctx, lowered_sig, regs, caller_vmctx);
     if (lowered_sig.param_types.len + @intFromBool(lowered_sig.has_retptr) > regs.len)
         return error.UnsupportedSignature;
     if (lowered_sig.has_retptr and lowered_sig.result_types.len != 0)
@@ -7693,7 +8101,7 @@ fn dispatchAotComponentTrampoline(
     var strict_mem: ?[]const u8 = null;
     var reg_index: usize = 0;
     for (ctx.param_types, 0..) |pt, i| {
-        args[i] = try liftAotDispatcherArg(pt, lowered_sig.param_types, &reg_index, &regs, registry, allocator);
+        args[i] = try liftAotDispatcherArg(pt, lowered_sig.param_types, &reg_index, regs, registry, allocator);
         if (typeContainsPtrLen(pt, registry)) {
             if (strict_mem == null) strict_mem = try strictCanonMemory(ctx);
             try validateCanonPtrLenValue(strict_mem.?, args[i], pt, registry, "canon-lift");
@@ -7781,7 +8189,7 @@ fn liftAotDispatcherArg(
     t: ctypes.ValType,
     lowered_param_types: []const core_types.ValType,
     reg_index: *usize,
-    regs: *const [10]u64,
+    regs: []const u64,
     registry: TypeRegistry,
     allocator: Allocator,
 ) !InterfaceValue {
@@ -9087,10 +9495,168 @@ test "wamrAotDispatchCanonBuiltin: resource.new/rep/drop round-trip + on_resourc
     try testing.expectEqual(@as(u64, 0), rep_after.value);
 }
 
+test "wamrAotDispatchCanonBuiltin: async context, task, waitable, future, and multi-result ABI (#881)" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const Invoke = struct {
+        fn call(
+            ctx: *CanonBuiltinTrampolineCtx,
+            sig: *const host_trampolines.LoweredSig,
+            args: [9]u64,
+        ) host_trampolines.DispatchResult {
+            return wamrAotDispatchCanonBuiltin(
+                @ptrCast(ctx),
+                sig,
+                0,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+                args[6],
+                args[7],
+                args[8],
+            );
+        }
+    };
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, allocator);
+    defer inst.deinit();
+    try inst.enableTestMem(allocator, 256);
+    defer inst.disableTestMem();
+
+    const no_slots = [_]core_types.ValType{};
+    const one_i32 = [_]core_types.ValType{.i32};
+    const two_i32 = [_]core_types.ValType{ .i32, .i32 };
+    const one_i64 = [_]core_types.ValType{.i64};
+    const no_to_i32 = host_trampolines.LoweredSig{
+        .param_types = &no_slots,
+        .result_types = &one_i32,
+    };
+    const no_to_i64 = host_trampolines.LoweredSig{
+        .param_types = &no_slots,
+        .result_types = &one_i64,
+    };
+    const one_to_none = host_trampolines.LoweredSig{
+        .param_types = &one_i32,
+        .result_types = &no_slots,
+    };
+    const two_to_none = host_trampolines.LoweredSig{
+        .param_types = &two_i32,
+        .result_types = &no_slots,
+    };
+    const two_to_i32 = host_trampolines.LoweredSig{
+        .param_types = &two_i32,
+        .result_types = &one_i32,
+    };
+
+    var context_set = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .context_set = .{ .val_type = .i32, .slot = 0 } },
+    };
+    var context_get = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .context_get = .{ .val_type = .i32, .slot = 0 } },
+    };
+    const set_result = Invoke.call(&context_set, &one_to_none, .{ 0xCAFE_F00D, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 0), set_result.status);
+    const get_result = Invoke.call(&context_get, &no_to_i32, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 0), get_result.status);
+    try testing.expectEqual(@as(u64, 0xCAFE_F00D), get_result.value);
+
+    var waitable_new = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .waitable_set_new },
+    };
+    const ws_result = Invoke.call(&waitable_new, &no_to_i32, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 0), ws_result.status);
+    const waitable_set_handle: u32 = @truncate(ws_result.value);
+
+    var future_new = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+    };
+    const future_result = Invoke.call(&future_new, &no_to_i64, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 0), future_result.status);
+    const future_handle: u32 = @truncate(future_result.value);
+
+    var waitable_join = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .waitable_join },
+    };
+    const join_result = Invoke.call(&waitable_join, &two_to_none, .{ future_handle, waitable_set_handle, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 0), join_result.status);
+    try testing.expect(inst.futures.getPtr(future_handle).?.waitable_set != null);
+
+    var waitable_poll = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .{ .waitable_set_poll = .{ .cancellable = false, .memory = 0 } } },
+    };
+    const poll_result = Invoke.call(&waitable_poll, &two_to_i32, .{ waitable_set_handle, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 0), poll_result.status);
+    try testing.expectEqual(@as(u64, @intFromEnum(async_canon.EventCode.none)), poll_result.value);
+
+    var task_manager = async_mod.TaskManager{};
+    defer task_manager.deinit(allocator);
+    const task = try task_manager.createTask(allocator);
+    task_manager.startTask(task);
+    task_manager.current_task = task;
+    inst.current_task_manager = &task_manager;
+    defer inst.current_task_manager = null;
+
+    var task_cancel = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .task_cancel },
+    };
+    const cancel_result = Invoke.call(&task_cancel, &host_trampolines.LoweredSig{
+        .param_types = &no_slots,
+        .result_types = &no_slots,
+    }, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 0), cancel_result.status);
+    try testing.expectEqual(async_mod.TaskState.cancelled, task_manager.getState(task).?);
+
+    const message = "aot async builtin";
+    try inst.error_contexts.put(allocator, 77, try allocator.dupe(u8, message));
+    var error_debug = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .{ .error_context_debug_message = .{ .opts = &.{} } } },
+    };
+    const two_result_sig = host_trampolines.LoweredSig{
+        .param_types = &one_i32,
+        .result_types = &two_i32,
+        .has_retptr = true,
+    };
+    var result_tail: [1]u64 = .{0};
+    const debug_result = Invoke.call(
+        &error_debug,
+        &two_result_sig,
+        .{ 77, @intFromPtr(&result_tail), 0, 0, 0, 0, 0, 0, 0 },
+    );
+    try testing.expectEqual(@as(u32, 0), debug_result.status);
+    const message_ptr: u32 = @truncate(debug_result.value);
+    const message_len: u32 = @truncate(result_tail[0]);
+    try testing.expectEqual(@as(u32, message.len), message_len);
+    try testing.expectEqualStrings(message, inst.readGuestBytes(message_ptr, message_len).?);
+}
+
 test "wamrAotDispatchCanonBuiltin: rejects malformed lowered_sig (#701)" {
-    // Any sig that isn't `(i32) → ()` (drop) or `(i32) → i32`
-    // (new/rep) must return a failing DispatchResult so the wiring
-    // bug surfaces as a clean trap instead of a misread arg.
+    // Unsupported raw source shapes must return a failing DispatchResult
+    // instead of reading an invalid register slot or silently falling back
+    // to a trap stub.
     const testing = std.testing;
     const allocator = testing.allocator;
 
@@ -9136,18 +9702,19 @@ test "wamrAotDispatchCanonBuiltin: rejects malformed lowered_sig (#701)" {
     );
     try testing.expectEqual(@as(u32, 1), res.status);
 
-    // Unsupported canon kind (e.g. context.get) → reject.
+    // Non-scalar source args are not valid for the native AOT ABI relay.
     const ctx_get = CanonBuiltinTrampolineCtx{
         .comp_inst = inst,
         .canon = .{ .context_get = .{ .val_type = .i32, .slot = 0 } },
     };
-    const ok_sig = host_trampolines.LoweredSig{
-        .param_types = &i32_one,
+    const v128_one = [_]core_types.ValType{.v128};
+    const unsupported_source_sig = host_trampolines.LoweredSig{
+        .param_types = &v128_one,
         .result_types = &i32_one,
     };
     const res2 = wamrAotDispatchCanonBuiltin(
         @ptrCast(@constCast(&ctx_get)),
-        &ok_sig,
+        &unsupported_source_sig,
         0,
         0,
         0,

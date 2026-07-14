@@ -128,14 +128,30 @@ several repeated local runs of each. Re-added with an accurate
 rationale rather than left passing-by-luck in CI.
 
 The **P3** (`tests/wasi-p3-testsuite-skip.json`) side of #662's closing
-claim did *not* hold up under the same re-audit — all 40 fixtures are
-still excluded, and running unfiltered still shows 38/40 failing with
-the exact `UnsupportedCrossInstanceSource` pattern the skip-list's
-`_comment` describes. Filed as
-[#881](https://github.com/cataggar/wamr/issues/881) rather than
-silently re-closed here, since it's a distinct (component cross-
-instance async-builtin) gap from the plain-core-wasm path this file
-tracks.
+claim did *not* hold up under that re-audit — all 40 fixtures were excluded,
+and unfiltered execution showed 38/40 failing with
+`UnsupportedCrossInstanceSource`. This was filed as
+[#881](https://github.com/cataggar/wamr/issues/881).
+
+## P3 re-audit: 2026-07-13
+
+#881 now resolves inline canonical-builtin sources through the shared AOT
+dispatcher, supports async canon-lower ABI/status handling, and preserves
+wide scalar cross-instance calls used by socket address records. The complete
+corpus executes in both modes:
+
+| Mode | Executed | Passed | Failed | Skipped |
+| ---- | -------: | -----: | -----: | -------: |
+| persisted `wamrc compile-component` manifest AOT | 40 | 39 | 1 (`sockets-echo`) | 0 |
+| no-sidecar `-Djit=true`, `WAMR_JIT_TESTSUITE=1` | 40 | 39 | 1 (`sockets-echo`) | 0 |
+
+`sockets-echo` is unrelated to #881: its TCP listener is created, but the
+CLI returns after the initial pending async `wasi:cli/run` lift before the
+callback can resume the accept/read task. It is tracked by
+[#905](https://github.com/cataggar/wamr/issues/905) and is the only entry in
+the filtered convenience skip list. `zig build wasi-p3-testsuite-unfiltered`
+and its JIT counterpart do not consume that list: they require all 40
+fixtures to execute and assert the exact one-fixture exception.
 
 ## Method
 

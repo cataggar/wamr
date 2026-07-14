@@ -3498,16 +3498,29 @@ fn resolveAotImportedFunctionOverrides(
                             break :blk null;
                         };
                     },
-                    // Canon-builtin contributors: `resource.{drop,new,rep}`
-                    // are bridged through `CanonBuiltinTrampolineCtx` +
-                    // `wamrAotDispatchCanonBuiltin`. Other canon-builtin
-                    // kinds (`context.*`, `task.*`, async ABI) still fall
-                    // through to the trap stub pending follow-up to #701.
-                    .resource_drop, .resource_new, .resource_rep => {
+                    // Canon-builtin contributors must stay in component
+                    // runtime space rather than being treated as sibling
+                    // AOT exports. Their source is an inline canon def, not
+                    // an AOT instance/function pair; route all supported
+                    // canonical builtins through the shared AOT dispatcher.
+                    .context_get,
+                    .context_set,
+                    .task_yield,
+                    .task_return,
+                    .resource_drop,
+                    .resource_new,
+                    .resource_rep,
+                    .async_canon,
+                    => {
                         const canon_idx_b: u32 = switch (canon_ref) {
+                            .context_get => |i| i,
+                            .context_set => |i| i,
+                            .task_yield => |i| i,
+                            .task_return => |i| i,
                             .resource_drop => |i| i,
                             .resource_new => |i| i,
                             .resource_rep => |i| i,
+                            .async_canon => |i| i,
                             else => unreachable,
                         };
                         thunk = installCanonBuiltinBackedCrossInstanceThunk(
@@ -3628,14 +3641,12 @@ fn installCrossInstanceThunk(
     if (imp.func_type_idx >= module.func_types.len) return error.InvalidFuncType;
     const ft = module.func_types[imp.func_type_idx];
 
-    // Only register-fit signatures land in this fast path. Anything else
-    // returns an error → the caller installs a trap stub instead. The cap
-    // of 9 covers `wasi_snapshot_preview1.path_open` (9 wasm params, the
-    // widest WASIp1 sig); widened from 8 in #700 — pre-fix #689 had
-    // widened from 5 to 8 to fit WASIp2 filesystem methods like `link-at`
-    // (7 wasm params), but `path_open` only started routing through this
-    // path with #699's WASI-guard reorder.
-    if (ft.params.len > 9) return error.SignatureTooWide;
+    // Scalar signatures use either the normal nine-arg relay or the
+    // dedicated 10–15 arg relay. The latter is required for lowered socket
+    // address records (`tcp/udp-socket.bind` has 14 i32 slots); preserving
+    // every slot is essential because a truncated address silently changes
+    // the socket operation rather than trapping at the call boundary.
+    if (ft.params.len > 15) return error.SignatureTooWide;
     if (ft.results.len > 1) return error.MultipleResultsUnsupported;
     for (ft.params) |p| switch (p) {
         .i32, .i64, .f32, .f64 => {},
@@ -3863,7 +3874,15 @@ fn installCanonLowerBackedCrossInstanceThunk(
         canonical_abi.TypeRegistry.init(ctx_ptr.comp_inst.component);
     var flat_result_count: u32 = 0;
     for (ctx_ptr.result_types) |rt| flat_result_count += canonical_abi.flattenCount(registry, rt);
-    const has_retptr = ctx_ptr.result_types.len > 0 and flat_result_count > canonical_abi.MAX_FLAT_RESULTS;
+    const is_async_lower = ctx_ptr.lower_opts.is_async or ctx_ptr.is_async_func;
+    // Async canon.lower returns an i32 status word and carries every
+    // non-empty lifted result through an explicit trailing retptr,
+    // including a single-flat-slot result. Sync canon.lower only needs
+    // that trailing pointer when its joined result flattening spills.
+    const has_retptr = if (is_async_lower)
+        ctx_ptr.result_types.len > 0
+    else
+        ctx_ptr.result_types.len > 0 and flat_result_count > canonical_abi.MAX_FLAT_RESULTS;
 
     const arena = inst.module_arena.allocator();
     const lowered_param_len: usize = if (has_retptr) blk: {
@@ -3891,13 +3910,10 @@ fn installCanonLowerBackedCrossInstanceThunk(
 }
 
 /// Bridge an AOT core module's import that resolves through a sibling
-/// inline-export to a canon-builtin (`resource.{drop,new,rep}`) contributor.
-/// Mirrors `installCanonLowerBackedCrossInstanceThunk` but uses the
-/// existing `CanonBuiltinTrampolineCtx` (shared with the interp wiring at
-/// `linkImports`) and the canon-builtin trampoline-pool slot. Other
-/// canon-builtin kinds (`context.*`, `task.*`, async ABI) return
-/// `error.UnsupportedCanonKind` so the caller falls through to the trap
-/// stub; bridging them is a follow-up to #701.
+/// inline-export to a canon-builtin contributor. Unlike a cross-instance
+/// core export, the source is a component-runtime canonical definition, so
+/// the slot must dispatch through `CanonBuiltinTrampolineCtx` rather than
+/// `resolveCoreInstanceFuncToAi`.
 fn installCanonBuiltinBackedCrossInstanceThunk(
     allocator: std.mem.Allocator,
     inst: *ComponentInstance,
@@ -3909,23 +3925,36 @@ fn installCanonBuiltinBackedCrossInstanceThunk(
     if (canon_idx >= component.canons.len) return error.InvalidCanonIdx;
     const canon = component.canons[canon_idx];
     switch (canon) {
-        .resource_drop, .resource_new, .resource_rep => {},
+        .context_get,
+        .context_set,
+        .task_yield,
+        .task_return,
+        .resource_drop,
+        .resource_new,
+        .resource_rep,
+        .async_canon,
+        => {},
         else => return error.UnsupportedCanonKind,
     }
 
-    // Defensive shape check: every in-scope canon-builtin is `(i32) → ()`
-    // (drop) or `(i32) → i32` (new/rep). Reject anything else early so
-    // the trampoline-pool slot can rely on the lowered-sig invariants.
+    // The native stub forwards nine wasm-level C-ABI slots after the
+    // importer's vmctx. Multi-value results consume one of those slots for
+    // the hidden return pointer. Reject wider or non-scalar source types
+    // explicitly rather than accidentally treating a canonical builtin as a
+    // sibling AOT function and installing a trap stub.
     if (imp.func_type_idx >= module.func_types.len) return error.InvalidFuncType;
     const ft = module.func_types[imp.func_type_idx];
-    if (ft.params.len != 1 or ft.params[0] != .i32) return error.UnsupportedSignature;
-    switch (canon) {
-        .resource_drop => if (ft.results.len != 0) return error.UnsupportedSignature,
-        .resource_new, .resource_rep => {
-            if (ft.results.len != 1 or ft.results[0] != .i32) return error.UnsupportedSignature;
-        },
-        else => unreachable,
-    }
+    const has_retptr = ft.results.len > 1;
+    if (ft.params.len + @intFromBool(has_retptr) > 9) return error.SignatureTooWide;
+    if (ft.results.len > 10) return error.MultipleResultsUnsupported;
+    for (ft.params) |ty| switch (ty) {
+        .i32, .i64, .f32, .f64 => {},
+        else => return error.UnsupportedParamType,
+    };
+    for (ft.results) |ty| switch (ty) {
+        .i32, .i64, .f32, .f64 => {},
+        else => return error.UnsupportedResultType,
+    };
 
     // Probe the pool first so failures on platforms without RWX trampoline
     // pages bail before we publish a new ctx — the caller installs a trap
@@ -3954,6 +3983,13 @@ fn installCanonBuiltinBackedCrossInstanceThunk(
         inst.canon_builtin_ctx_by_canon_idx.put(allocator, canon_idx, new_ctx) catch {};
         break :ctx_blk new_ctx;
     };
+    // `task.return` must drain the importing core's declared flat result
+    // slots, not a best-effort reconstruction from component type metadata.
+    // This is shared with the interp link path and is intentionally
+    // first-writer-wins for a canon def reused by multiple imports.
+    if (ctx_ptr.core_flat_param_count == null) {
+        ctx_ptr.core_flat_param_count = @intCast(ft.params.len);
+    }
 
     const arena = inst.module_arena.allocator();
     const lowered_params = try arena.alloc(core_types.ValType, ft.params.len);
@@ -3964,7 +4000,7 @@ fn installCanonBuiltinBackedCrossInstanceThunk(
     const stub = try pool.allocCanonBuiltinAotSlot(@ptrCast(ctx_ptr), .{
         .param_types = lowered_params,
         .result_types = lowered_results,
-        .has_retptr = false,
+        .has_retptr = has_retptr,
     });
     return @ptrCast(stub);
 }

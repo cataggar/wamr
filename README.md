@@ -101,7 +101,8 @@ WASI conformance ([WebAssembly/wasi-testsuite][wts]):
 $ git submodule update --init tests/wasi-testsuite
 $ pip install -r tests/wasi-testsuite/test-runner/requirements.txt
 $ zig build wasi-testsuite      # WASI Preview 1 + Preview 2 — 70 / 72 passing
-$ zig build wasi-p3-testsuite   # WASI Preview 3 (wasm32-wasip3) — currently all skipped (#881)
+$ zig build wasi-p3-testsuite-unfiltered # WASI Preview 3 — 40 executed; 39 pass + sockets-echo (#905)
+$ zig build wasi-p3-testsuite-jit-unfiltered -Djit=true # Same 40-fixture contract with no sidecars
 $ zig build wasi-p3-parity      # Same fixtures via wamr + wasmtime, diff the reports
 ```
 
@@ -117,7 +118,9 @@ The suite drives the freshly-built `wamr` CLI through the in-tree adapter at
 and applies the curated skiplists at
 [`tests/wasi-testsuite-skip.json`](tests/wasi-testsuite-skip.json) (Preview 1 / 2)
 and [`tests/wasi-p3-testsuite-skip.json`](tests/wasi-p3-testsuite-skip.json)
-(Preview 3 — currently empty: every `wasm32-wasip3` fixture passes). Every entry
+(Preview 3 — only `sockets-echo` is skipped while its pending async-run
+continuation is tracked in #905). The unfiltered P3 contract executes all 40
+fixtures and asserts that exact exception. Every entry
 in either skiplist must carry a one-line rationale and a follow-up issue number.
 When a previously-skipped test starts passing, delete the entry — the suite is
 the gate against regressions in already-shipped WASI host functions.
@@ -169,10 +172,11 @@ merge queue.
 environ-inheritance behavioral mismatch and a flaky upstream fixture
 that compares clock reads without accounting for second rollover, not
 crashes). The Preview 3
-gate (`zig build wasi-p3-testsuite`) is currently **not** passing — the
-AOT host bridge doesn't yet wire cross-instance async task-management
-built-ins these fixtures' generated bindings import, tracked in
-[#881](https://github.com/cataggar/wamr/issues/881). Outbound HTTP and
+gate (`zig build wasi-p3-testsuite-unfiltered`) executes all 40 fixtures:
+39 pass through both manifest AOT and no-sidecar JIT after
+[#881](https://github.com/cataggar/wamr/issues/881); `sockets-echo` remains
+separately tracked by [#905](https://github.com/cataggar/wamr/issues/905).
+Outbound HTTP and
 HTTPS issue real requests via `std.http.Client` and Zig 0.16's
 `std.crypto.tls`.
 
