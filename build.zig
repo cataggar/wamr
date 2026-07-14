@@ -273,14 +273,14 @@ pub fn build(b: *std.Build) void {
     // Drives the vendored `WebAssembly/wasi-testsuite` against the just-built
     // `wamr` CLI through the in-tree adapter. Skiplist entries must each
     // carry a rationale + follow-up issue number — see
-    // `tests/wasi-testsuite-skip.json`. Not wired into the default `test`
+    // `tests/wasi-testsuite-expectations.toml`. Not wired into the default `test`
     // aggregate (it requires Python 3 + the runner's deps), but the CI job
     // gates regressions on every PR. Run locally with `zig build wasi-testsuite`.
-    // The runner entry point is wrapped through
+    // The runner entry point is launched through
     // `tests/wasi-testsuite-runner-patch/wasi_test_runner.py`, which
-    // imports the upstream package unmodified and monkey-patches
-    // `TestCaseRunner.do_wait` to honour the `WAMR_TESTSUITE_TIMEOUT`
-    // env var (seconds; defaults to upstream's hard-coded 5s when
+    // imports the upstream package without requiring installation.
+    // The wamr adapter's `get_timeout_seconds` hook honours the
+    // `WAMR_TESTSUITE_TIMEOUT` env var (seconds; defaults to 5s when
     // unset). Without that override, slow developer VMs flake on
     // `http-fields` and other fixtures whose runtime drifts past 5s.
     // See #583 A7 + the wrapper's module docstring for rationale.
@@ -293,8 +293,8 @@ pub fn build(b: *std.Build) void {
         "tests/wasi-testsuite/tests/assemblyscript/testsuite/wasm32-wasip1",
         "--runtime-adapter",
         "tests/wasi-testsuite-adapter/wamr-zig.py",
-        "--exclude-filter",
-        "tests/wasi-testsuite-skip.json",
+        "--expectations",
+        "tests/wasi-testsuite-expectations.toml",
     });
     // Point the adapter at the freshly-installed wamr binary so we don't pick
     // up a stale system iwasm.
@@ -313,9 +313,8 @@ pub fn build(b: *std.Build) void {
     // the just-built `wamr` CLI via the same in-tree adapter as the
     // Preview 1 gate. Acts as a CI gate against regressions in the WASI
     // Preview 3 adapter surface (`src/component/wasi_cli_adapter.zig`,
-    // P3 wave A–C: #481–#487). The skip list contains only the separately
-    // tracked pending-async-run socket server case; the unfiltered contract
-    // below executes all 40 fixtures and asserts that exact exception.
+    // P3 wave A–C: #481–#487). The expectations file is currently empty;
+    // every one of the 41 fixtures is required to pass.
     // Not wired into the default `test` aggregate (it requires Python 3
     // + the runner's deps); CI gates regressions on every PR. Run
     // locally with `zig build wasi-p3-testsuite`.
@@ -326,8 +325,8 @@ pub fn build(b: *std.Build) void {
         "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
         "--runtime-adapter",
         "tests/wasi-testsuite-adapter/wamr-zig.py",
-        "--exclude-filter",
-        "tests/wasi-p3-testsuite-skip.json",
+        "--expectations",
+        "tests/wasi-p3-testsuite-expectations.toml",
     });
     wasi_p3_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
     wasi_p3_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
@@ -339,9 +338,8 @@ pub fn build(b: *std.Build) void {
     wasi_p3_testsuite_step.dependOn(&wasi_p3_runner.step);
 
     // This is intentionally a separate no-filter path. Its Python harness
-    // asserts every fixture executed, so a future all-skipped filter cannot
-    // make the P3 gate look green. It also pins the sole known unrelated
-    // pending-async-run failure until its scheduler follow-up lands.
+    // asserts every fixture executed and passed, so a future all-skipped
+    // filter cannot make the P3 gate look green.
     const wasi_p3_unfiltered_runner = b.addSystemCommand(&.{
         "python3",
         "tests/wasi-p3-unfiltered.py",
@@ -383,8 +381,8 @@ pub fn build(b: *std.Build) void {
             "tests/wasi-testsuite/tests/assemblyscript/testsuite/wasm32-wasip1",
             "--runtime-adapter",
             "tests/wasi-testsuite-adapter/wamr-zig.py",
-            "--exclude-filter",
-            "tests/wasi-testsuite-skip.json",
+            "--expectations",
+            "tests/wasi-testsuite-expectations.toml",
         });
         wasi_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
         wasi_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
@@ -403,8 +401,8 @@ pub fn build(b: *std.Build) void {
             "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
             "--runtime-adapter",
             "tests/wasi-testsuite-adapter/wamr-zig.py",
-            "--exclude-filter",
-            "tests/wasi-p3-testsuite-skip.json",
+            "--expectations",
+            "tests/wasi-p3-testsuite-expectations.toml",
         });
         wasi_p3_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
         wasi_p3_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
@@ -416,7 +414,7 @@ pub fn build(b: *std.Build) void {
         // timeout accordingly (see #583 A7 / README's
         // `WAMR_TESTSUITE_TIMEOUT` docs) rather than risk flaking on a
         // loaded CI runner.
-        wasi_p3_runner_jit.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "30");
+        wasi_p3_runner_jit.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "120");
         wasi_p3_runner_jit.step.dependOn(b.getInstallStep());
         const wasi_p3_testsuite_jit_step = b.step(
             "wasi-p3-testsuite-jit",
@@ -431,7 +429,7 @@ pub fn build(b: *std.Build) void {
         wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
         wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
         wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
-        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "30");
+        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "120");
         wasi_p3_unfiltered_runner_jit.step.dependOn(b.getInstallStep());
         const wasi_p3_unfiltered_jit_step = b.step(
             "wasi-p3-testsuite-jit-unfiltered",
@@ -442,7 +440,7 @@ pub fn build(b: *std.Build) void {
 
     // ── Wasmtime parity gate (#583 C1, original #489 proposal) ────────
     // Runs the *same* `wasm32-wasip3` fixtures through upstream Wasmtime
-    // (CI pin: v44.0.1, the first release with `-Sp3` support — see the
+    // (CI pin: v46.0.1, matching the updated upstream suite — see the
     // `examples-wasmtime` job in `.github/workflows/ci.yml`).
     // The wasm test corpus is identical, so a wamr regression that
     // Wasmtime *also* exhibits flags as a fixture bug rather than a
@@ -461,8 +459,8 @@ pub fn build(b: *std.Build) void {
         "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
         "--runtime-adapter",
         "tests/wasi-testsuite-adapter/wasmtime.py",
-        "--exclude-filter",
-        "tests/wasi-p3-testsuite-skip.json",
+        "--expectations",
+        "tests/wasi-p3-testsuite-expectations.toml",
     });
     // No `WAMR` env var needed here; the wasmtime adapter reads
     // `WASMTIME` instead (the test binaries themselves are the same
@@ -477,13 +475,11 @@ pub fn build(b: *std.Build) void {
     // Convenience step that runs both runtimes through
     // `scripts/wasi-p3-parity.py` (which writes JSON reports + a
     // classifier summary, then forwards the diff exit code). The
-    // orchestrator is a Python script because Wasmtime can exit
-    // non-zero on its own (e.g. v44.0.1 fails 4 / 40 fixtures —
-    // `http-service`, `sockets-tcp-{connect,listen}`,
-    // `sockets-udp-send`); we need to keep going through the diff
-    // step to classify the deltas as regressions vs fixture/runtime
-    // bugs. Output JSONs live under `zig-out/test-reports/` so CI
-    // can upload them as artifacts on failure.
+    // orchestrator is a Python script so both runtime reports are
+    // produced even if either runner exits non-zero; the diff step
+    // then classifies deltas as regressions vs fixture/runtime bugs.
+    // Output JSONs live under `zig-out/test-reports/` so CI can upload
+    // them as artifacts on failure.
     const reports_dir = b.pathJoin(&.{ b.install_path, "test-reports" });
     const parity_orchestrator = b.addSystemCommand(&.{
         "python3",
@@ -1367,8 +1363,7 @@ pub fn build(b: *std.Build) void {
     // `wasi-testsuite` for Preview 1.
     //
     // Curation rationale + future-skips: `tests/wasi-p2-testsuite-skip.json`
-    // (header `_comment` documents the format; mirrors the
-    // wasi-testsuite-skip.json shape). Currently empty — every
+    // (header `_comment` documents the format). Currently empty — every
     // wired component is expected to pass on every platform we ship.
     //
     // Opt-in: not in `zig build` / `zig build test`. Reach via

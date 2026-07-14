@@ -3,12 +3,9 @@
 suite and feed both JSON reports into `diff-testsuite-reports.py`.
 
 Wired into `build.zig`'s `wasi-p3-parity` step (issue #583 C1). The
-step needs an orchestrator because the standalone Wasmtime run can
-exit non-zero (Wasmtime 44.0.1 fails 4 / 40 fixtures —
-`http-service`, `sockets-tcp-{connect,listen}`, `sockets-udp-send`,
-all tracked under `tests/wasi-p3-parity-skip.json`), which would
-otherwise abort the build before the diff script gets a chance to
-*classify* the deltas. The diff exit code is the step's exit code:
+orchestrator always produces both runtime reports even if either
+standalone run exits non-zero, so the diff script gets a chance to
+*classify* every delta. The diff exit code is the step's exit code:
 0 if no wamr regressions and no stale skip-list entries, 1 if wamr
 fails a fixture the parity runtime still passes, or if a fixture in
 the parity-skip list is no longer in the wamr-pass / parity-fail
@@ -48,7 +45,7 @@ _RUNNER = _REPO_ROOT / "tests" / "wasi-testsuite-runner-patch" / "wasi_test_runn
 _SUITE = _REPO_ROOT / "tests" / "wasi-testsuite" / "tests" / "rust" / "testsuite" / "wasm32-wasip3"
 _WAMR_ADAPTER = _REPO_ROOT / "tests" / "wasi-testsuite-adapter" / "wamr-zig.py"
 _WASMTIME_ADAPTER = _REPO_ROOT / "tests" / "wasi-testsuite-adapter" / "wasmtime.py"
-_SKIPLIST = _REPO_ROOT / "tests" / "wasi-p3-testsuite-skip.json"
+_SKIPLIST = _REPO_ROOT / "tests" / "wasi-p3-testsuite-expectations.toml"
 _PARITY_SKIP = _REPO_ROOT / "tests" / "wasi-p3-parity-skip.json"
 _DIFF = _HERE / "diff-testsuite-reports.py"
 
@@ -61,7 +58,7 @@ def _run_suite(label: str, adapter: Path, out: Path) -> int:
         str(_SUITE),
         "--runtime-adapter",
         str(adapter),
-        "--exclude-filter",
+        "--expectations",
         str(_SKIPLIST),
         "--json-output-location",
         str(out),

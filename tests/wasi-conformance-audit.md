@@ -3,9 +3,9 @@
 Tracking issue: [#583](https://github.com/cataggar/wamr/issues/583) section C
 item 2.
 
-This document is the audit log behind the empty
-[`tests/wasi-testsuite-skip.json`](./wasi-testsuite-skip.json). The skip-list
-is the source of truth for what gets gated; this file records the matching
+This document is the audit log behind
+[`tests/wasi-testsuite-expectations.toml`](./wasi-testsuite-expectations.toml).
+The expectation file is the source of truth for what gets gated; this file records the matching
 fixture counts and how the audit was performed so a future contributor can
 re-run it without re-deriving the methodology.
 
@@ -127,7 +127,7 @@ both the two-step AOT path and the in-process JIT path, confirmed via
 several repeated local runs of each. Re-added with an accurate
 rationale rather than left passing-by-luck in CI.
 
-The **P3** (`tests/wasi-p3-testsuite-skip.json`) side of #662's closing
+The **P3** (`tests/wasi-p3-testsuite-expectations.toml`) side of #662's closing
 claim did *not* hold up under that re-audit — all 40 fixtures were excluded,
 and unfiltered execution showed 38/40 failing with
 `UnsupportedCrossInstanceSource`. This was filed as
@@ -150,20 +150,41 @@ CLI returns after the initial pending async `wasi:cli/run` lift before the
 callback can resume the accept/read task. It is tracked by
 [#905](https://github.com/cataggar/wamr/issues/905) and is the only entry in
 the filtered convenience skip list. `zig build wasi-p3-testsuite-unfiltered`
-and its JIT counterpart do not consume that list: they require all 40
-fixtures to execute and assert the exact one-fixture exception.
+and its JIT counterpart do not consume that list: at that pin they required
+all 40 fixtures to execute and asserted the exact one-fixture exception.
+
+## Testsuite refresh: 2026-07-14
+
+The `tests/wasi-testsuite` submodule advanced to
+`7d0a78116fa9955dd2d113beb8583bc9648b6116`, which regenerates Preview 3
+against final WASI 0.3.0 and adds `cli-stdout-flush`. The updated runner also
+uses TOML expectations and passes a single preopened root to runtime adapters.
+
+| Mode | Executed | Passed | Failed | Skipped |
+| ---- | -------: | -----: | -----: | -------: |
+| persisted `wamrc compile-component` manifest AOT | 41 | 41 | 0 | 0 |
+| no-sidecar `-Djit=true`, `WAMR_JIT_TESTSUITE=1` | 41 | 41 | 0 | 0 |
+| Wasmtime 46.0.1 | 41 | 41 | 0 | 0 |
+
+The regenerated `sockets-echo` component confirmed that the host discarded
+the async lift's callback status. The runtime now follows the callback
+protocol (`exit`, `yield`, or wait on a guest waitable-set), drives parked
+host-backed stream reads, and resumes the guest until `task.return`; this
+resolves #905 in both wamr modes. The refresh also exposed a trailing-slash
+symlink case in `filesystem-mkdir-rmdir`; the adapter now rejects that
+traversal as `not-permitted`.
 
 ## Method
 
 ```bash
 git submodule update --init --recursive --depth 1 tests/wasi-testsuite
 zig build wasi-testsuite        # exercised here
-zig build wasi-p3-testsuite     # the existing P3 gate, not modified
+zig build wasi-p3-testsuite     # updated P3 gate
 ```
 
 To re-audit, bump the `Submodule` SHA above, re-run, and update the table.
 If a new fixture starts failing add a one-line rationale + tracking issue to
-the matching suite block in `tests/wasi-testsuite-skip.json`.
+the matching suite block in `tests/wasi-testsuite-expectations.toml`.
 
 ## References
 
@@ -174,4 +195,4 @@ the matching suite block in `tests/wasi-testsuite-skip.json`.
 - Adapter:
   [`tests/wasi-testsuite-adapter/wamr-zig.py`](./wasi-testsuite-adapter/wamr-zig.py).
 - P3 sibling audit format:
-  [`tests/wasi-p3-testsuite-skip.json`](./wasi-p3-testsuite-skip.json).
+  [`tests/wasi-p3-testsuite-expectations.toml`](./wasi-p3-testsuite-expectations.toml).

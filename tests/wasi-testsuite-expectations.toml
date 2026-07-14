@@ -1,0 +1,22 @@
+version = 1
+
+# Preview 1 expectations for `zig build wasi-testsuite`.
+
+[[suite]]
+name = "WASI C tests [wasm32-wasip1]"
+
+# This fixture compares two `clock_gettime` reads' `tv_nsec` fields without
+# accounting for `tv_sec` rollover, so it intermittently fails when the reads
+# straddle a second boundary under both AOT and JIT.
+[[suite.test]]
+name = "clock_gettime-monotonic"
+action = "skip"
+
+[[suite]]
+name = "WASI AssemblyScript tests [wasm32-wasip1]"
+
+# The wamr CLI inherits the host environment when no `--env` flags are passed;
+# this fixture expects an empty environment.
+[[suite.test]]
+name = "environ_sizes_get-no-variables"
+action = "skip"

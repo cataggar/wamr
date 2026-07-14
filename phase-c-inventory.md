@@ -143,14 +143,14 @@ those adapter-side canon.lower imports is enough to let the component
 instantiate; the actual `dispatchCanonBuiltin` /
 `componentTrampoline` plumbing remains follow-up work.
 
-For the 38 p3 fixtures, the canon-builtin imports are on the **hot
-path**; trap-on-call stubs would just push the failure from
-instantiation time to call time. The p3 skip entries in
-`tests/wasi-p3-testsuite-skip.json` therefore stay in place until
-canon-builtin + canon.lower bridging lands.
+At the Phase C baseline, the canon-builtin imports used by the 38 P3
+fixtures were on the **hot path**; trap-on-call stubs would only have
+pushed the failure from instantiation time to call time. The P3 skip
+entries therefore remained until canon-builtin + canon.lower bridging
+landed.
 
 > Historical note: the P3 conclusion above was accurate for Phase C. #881
 > subsequently added shared AOT/JIT canonical-builtin dispatch, async
-> canon-lower handling, and wide scalar relays; 39 of 40 P3 fixtures now
-> pass unfiltered in both modes. The remaining pending async-run TCP server
-> continuation is tracked separately by #905.
+> canon-lower handling, and wide scalar relays; #905 subsequently added
+> callback-driven async-run continuation. All 41 P3 fixtures now pass
+> unfiltered in both modes.

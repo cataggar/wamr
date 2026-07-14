@@ -23,12 +23,14 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 WAMR = shlex.split(os.getenv("WAMR", "wamr"))
+_DEFAULT_TIMEOUT_SECONDS = 5.0
 
 
 def _resolve_wamrc() -> List[str]:
@@ -70,9 +72,7 @@ def get_wasi_versions() -> List[str]:
     # Declares both Preview 1 (covered by `zig build wasi-testsuite`) and
     # Preview 3 (covered by `zig build wasi-p3-testsuite`, issue #489) so
     # the upstream `UnsupportedWasiTestExcludeFilter` doesn't auto-skip
-    # the wasm32-wasip3 fixtures. The filtered convenience step retains
-    # only the separately tracked pending-async-run sockets-echo exception;
-    # the CI contract executes the complete corpus without that filter.
+    # the wasm32-wasip3 fixtures.
     return ["wasm32-wasip1", "wasm32-wasip3"]
 
 
@@ -86,26 +86,40 @@ def get_wasi_worlds() -> List[str]:
     return ["wasi:cli/command", "wasi:http/service"]
 
 
-def _isolate_preopens(dirs: List[Tuple[Path, str]]) -> List[Tuple[Path, str]]:
-    """Snapshot each preopen host directory into a fresh tempdir so a
+def get_timeout_seconds() -> float:
+    raw = os.getenv("WAMR_TESTSUITE_TIMEOUT")
+    if not raw:
+        return _DEFAULT_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError:
+        timeout = 0
+    if timeout <= 0:
+        print(
+            f"warning: ignoring invalid WAMR_TESTSUITE_TIMEOUT={raw!r}; "
+            f"falling back to {_DEFAULT_TIMEOUT_SECONDS}s",
+            file=sys.stderr,
+        )
+        return _DEFAULT_TIMEOUT_SECONDS
+    return timeout
+
+
+def _isolate_root(root: Optional[Path]) -> Optional[Path]:
+    """Snapshot the preopened root into a fresh tempdir so a
     filesystem test that mutates the mapped directory doesn't pollute
     state for subsequent tests in the run (the upstream runner reuses
-    the same host paths across invocations). The tempdirs are leaked
-    intentionally — they're tiny and the per-suite TMPDIR is cleared
+    the same host path across invocations). The tempdirs are leaked
+    intentionally; they are tiny and the per-suite TMPDIR is cleared
     between CI invocations. (#564.)
     """
-    isolated: List[Tuple[Path, str]] = []
-    for host, guest in dirs:
-        host_path = Path(host)
-        if not host_path.is_dir():
-            isolated.append((host, guest))
-            continue
-        snapshot = Path(tempfile.mkdtemp(prefix="wamr-zig-fs-"))
-        # `copytree(..., dirs_exist_ok=True)` lets us land into the
-        # just-created mkdtemp root rather than under a child dir.
-        shutil.copytree(host_path, snapshot, dirs_exist_ok=True, symlinks=True)
-        isolated.append((snapshot, guest))
-    return isolated
+    if root is None:
+        return None
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return root_path
+    snapshot = Path(tempfile.mkdtemp(prefix="wamr-zig-fs-"))
+    shutil.copytree(root_path, snapshot, dirs_exist_ok=True, symlinks=True)
+    return snapshot
 
 
 def _is_component(path: Path) -> bool:
@@ -136,7 +150,7 @@ def _precompile(test_path: str) -> str:
     in-process compiler used pre-#680 (`compileCoreWasm` defaults to
     `.verify_mode = .off`). Verifier failures on production wasm
     binaries are tracked separately (#662) and already gated through
-    `tests/wasi-testsuite-skip.json`; running the verifier here
+    `tests/wasi-testsuite-expectations.toml`; running the verifier here
     surfaces those same bugs as adapter failures and breaks suites
     that previously hit the silent codegen path.
 
@@ -179,14 +193,14 @@ def _precompile(test_path: str) -> str:
 
 def compute_argv(
     test_path: str,
-    args_env_dirs: Tuple[List[str], Dict[str, str], List[Tuple[Path, str]]],
+    args_env_root: Tuple[List[str], Dict[str, str], Optional[Path]],
     proposals: List[str],
     wasi_world: str,
     wasi_version: str,
 ) -> List[str]:
     argv: List[str] = []
     argv += WAMR
-    args, env, dirs = args_env_dirs
+    args, env, root = args_env_root
 
     # `wasi:http/service` fixtures (`http-service.wasm`) export
     # `wasi:http/incoming-handler@0.3.0.handle` and are served via the
@@ -202,8 +216,9 @@ def compute_argv(
     # HTTP serve path does not wire filesystem / sockets preopens), so
     # only emit them for the `run` verb.
     if not is_http_service:
-        for host, guest in _isolate_preopens(dirs):
-            argv += ["--map-dir", f"{host}::{guest}"]
+        isolated_root = _isolate_root(root)
+        if isolated_root:
+            argv += ["--map-dir", f"{isolated_root}::/"]
 
         # wasi:sockets fixtures need an explicit allow-list to escape the
         # adapter's default deny-all posture. Localhost is sufficient for
