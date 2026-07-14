@@ -316,22 +316,27 @@ test "#887 lazy-JIT: stable stubs and lazy-body indirect calls cover non-leaf di
     defer aot_loader_mod.unload(&module, gpa);
 
     try std.testing.expect(module.text_section != null);
-    for (lazy_out.lazy_local_indices) |local_idx| {
-        try std.testing.expect(localCodeLen(&module, local_idx) > 0);
-    }
+    // Only direct-call targets need stable entry stubs. Lazy roots resolve
+    // through callFuncScalar before their first entry, so keeping stubs for
+    // them would turn the deferred 200-function case into eager text.
+    try std.testing.expect(localCodeLen(&module, lazy_add_local) > 0);
+    try std.testing.expectEqual(@as(usize, 0), localCodeLen(&module, lazy_to_eager_local));
+    try std.testing.expect(localCodeLen(&module, nested_callee_local) > 0);
+    try std.testing.expectEqual(@as(usize, 0), localCodeLen(&module, nested_tail_local));
+    try std.testing.expect(localCodeLen(&module, unused_leaf_local) > 0);
+    try std.testing.expectEqual(@as(usize, 0), localCodeLen(&module, unused_nonleaf_local));
 
     const inst = try aot_runtime_mod.instantiate(&module, gpa);
-    try aot_runtime_mod.mapCodeExecutable(inst);
-
     const driver = try component_aot_compile.setupLazyJit(inst, lazy_out, gpa);
+    try aot_runtime_mod.mapCodeExecutable(inst);
     defer {
         aot_runtime_mod.destroy(inst);
         driver.deinit();
     }
 
-    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.ready, inst.lazy_jit.slotState(eager_entry_local));
+    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.inactive, inst.lazy_jit.slotState(eager_entry_local));
     try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.pending, inst.lazy_jit.slotState(lazy_add_local));
-    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.ready, inst.lazy_jit.slotState(eager_callee_local));
+    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.inactive, inst.lazy_jit.slotState(eager_callee_local));
     try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.pending, inst.lazy_jit.slotState(lazy_to_eager_local));
     try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.pending, inst.lazy_jit.slotState(nested_callee_local));
     try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.pending, inst.lazy_jit.slotState(nested_tail_local));
@@ -563,7 +568,6 @@ test "#888 lazy-JIT: ref.func + table.set reaches a lazy target through the same
         fixture.inst.tables[0].type_backing[0],
     );
 }
-
 
 test "#862 lazy-JIT spike: leaf functions are deferred and compile correctly on first call" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
@@ -839,6 +843,7 @@ test "#891 lazy-JIT: deferred mappings honor JitCodeCache budgets" {
     const gpa = std.testing.allocator;
     const baseline_bytes = aot_runtime_mod.JitCodeCache.residentBytes();
     const baseline_count = aot_runtime_mod.JitCodeCache.mappingCount();
+    const previous_budget = aot_runtime_mod.JitCodeCache.budget_bytes;
 
     const compiled_size = blk: {
         var fixture = try setupLazyFixtureInstance(gpa);
@@ -869,7 +874,7 @@ test "#891 lazy-JIT: deferred mappings honor JitCodeCache budgets" {
     const reject_budget = baseline_bytes + compiled_size - 1;
     try std.testing.expect(reject_budget != 0);
     aot_runtime_mod.JitCodeCache.budget_bytes = reject_budget;
-    defer aot_runtime_mod.JitCodeCache.budget_bytes = 0;
+    defer aot_runtime_mod.JitCodeCache.budget_bytes = previous_budget;
 
     {
         var fixture = try setupLazyFixtureInstance(gpa);
@@ -957,14 +962,11 @@ test "#862 lazy-JIT spike: deferring 200 eligible leaf functions leaves zero eag
     defer aot_loader_mod.unload(&lazy_module, gpa);
 
     try std.testing.expect(eager_module.text_section != null and eager_module.text_section.?.len > 0);
-    // #887 changed the deferred-function codegen path from a zero-byte
-    // placeholder to a small stable entry stub (needed so direct
-    // `.call`/tail-call patches to a still-pending lazy function keep
-    // resolving against real executable bytes), so the lazy module's text
-    // section is no longer literally empty -- it's just much smaller than
-    // the fully-eager module's, since 200 tiny stubs take far less space
-    // than 200 real function bodies.
+    // This fixture has no direct calls, tables, or ref.func uses. Its lazy
+    // functions therefore need neither entry stubs nor trampolines: their
+    // bodies (and all eager text) must remain deferred until a host call.
     try std.testing.expect(lazy_module.text_section != null);
+    try std.testing.expectEqual(@as(usize, 0), lazy_module.text_section.?.len);
     try std.testing.expect(lazy_module.text_section.?.len < eager_module.text_section.?.len);
 
     // Keep the original loose timing guard on the backend where this
@@ -1243,7 +1245,6 @@ test "#892 lazy-JIT: skipping passes plus codegen beats codegen-only lazy compil
 
     // Take the minimum of 3 runs per mode to dampen clock noise on this
     // intentionally timing-based regression guard.
-    const eager = try measureCompileMinNs(gpa, lazy_bench_wasm, .{});
     const lazy_codegen_only = try measureCompileMinNs(gpa, lazy_bench_wasm, .{
         .lazy_jit = true,
         .lazy_defer_passes = false,
@@ -1252,28 +1253,27 @@ test "#892 lazy-JIT: skipping passes plus codegen beats codegen-only lazy compil
         .lazy_jit = true,
         .lazy_defer_passes = true,
     });
+    // Use u128 so doubling a clock value is safe even if a pathological
+    // runner delay makes the u64 nanosecond measurement very large.
+    const max_skip_passes_ns: u128 = @as(u128, lazy_codegen_only.ns) / 2;
 
     std.debug.print(
-        "[#892] 200-leaf-fn compileCoreWasmCached (best-of-3): eager={d}us lazy_codegen_only={d}us lazy_skip_passes={d}us ({d} functions deferred)\n",
+        "[#892] 200-leaf-fn compileCoreWasmCached (best-of-3): lazy_codegen_only={d}us lazy_skip_passes={d}us (max={d}us; {d} functions deferred)\n",
         .{
-            eager.ns / 1000,
             lazy_codegen_only.ns / 1000,
             lazy_skip_passes.ns / 1000,
+            max_skip_passes_ns / 1000,
             lazy_skip_passes.deferred,
         },
     );
 
     try std.testing.expectEqual(@as(usize, 200), lazy_codegen_only.deferred);
     try std.testing.expectEqual(@as(usize, 200), lazy_skip_passes.deferred);
-    // Loose regression guard (see jit_fast_preset_test.zig for the same
-    // pattern/rationale): deferring more work must not regress compile
-    // latency on this all-lazy synthetic benchmark. On aarch64 (where this
-    // now also runs by default -- see #890), wall-clock deltas can be
-    // neutral or slightly negative depending on host/backend mix and
-    // machine load, so only enforce the strict ordering on x86_64, the
-    // backend this guard was introduced and measured on.
-    if (comptime builtin.cpu.arch == .x86_64) {
-        try std.testing.expect(lazy_skip_passes.ns <= lazy_codegen_only.ns);
-        try std.testing.expect(lazy_codegen_only.ns <= eager.ns);
-    }
+    // This is the behavior #892 introduced: after both modes defer the same
+    // 200 functions, deferring their pass pipeline must retain a meaningful
+    // initial-compile benefit over deferring codegen alone. Require a 2x
+    // benefit rather than comparing the latter to the adjacent eager run:
+    // that unrelated ordering was sensitive to runner load, while observed
+    // x86_64 and ARM64 results are tens of times faster than this bound.
+    try std.testing.expect(@as(u128, lazy_skip_passes.ns) <= max_skip_passes_ns);
 }

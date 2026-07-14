@@ -68,15 +68,17 @@ fn markLocalIfPresent(
 
 /// Per-function lazy-eligibility result. `eligible[i]` is `true` iff local
 /// function `i` may be deferred at all; `needs_trampoline[i]` (meaningful
-/// only where `eligible[i]` is `true`) selects which of the two dispatch
-/// mechanisms the caller must wire up for it.
+/// only where `eligible[i]` is `true`) selects the native trampoline,
+/// while `needs_stub[i]` selects a text-section entry stub.
 pub const LazyEligibility = struct {
     eligible: []bool,
     needs_trampoline: []bool,
+    needs_stub: []bool,
 
     pub fn deinit(self: *LazyEligibility, allocator: std.mem.Allocator) void {
         allocator.free(self.eligible);
         allocator.free(self.needs_trampoline);
+        allocator.free(self.needs_stub);
     }
 };
 
@@ -97,6 +99,9 @@ pub fn findLazyEligibleFunctions(
     const needs_trampoline = try allocator.alloc(bool, n);
     errdefer allocator.free(needs_trampoline);
     @memset(needs_trampoline, false);
+    const needs_stub = try allocator.alloc(bool, n);
+    errdefer allocator.free(needs_stub);
+    @memset(needs_stub, false);
 
     // Table-reachable functions need a stable pointer at load time, so they
     // can only be lazy via the trampoline mechanism.
@@ -172,15 +177,21 @@ pub fn findLazyEligibleFunctions(
             // lowering) -- so non-x86_64 targets stay leaf-only here too.
             eligible[local_idx] = false;
         }
-        // Else: stub mechanism (#887) on x86_64 — non-leaf and
-        // direct-call-target functions are both fine, nothing further to
-        // check.
+        // Root-only lazy functions resolve through callFuncScalar before
+        // dispatch, so only direct-call targets need an eager text stub.
+        if (eligible[local_idx] and !needs_trampoline[local_idx] and called.isSet(local_idx)) {
+            needs_stub[local_idx] = true;
+        }
     }
 
-    return .{ .eligible = eligible, .needs_trampoline = needs_trampoline };
+    return .{
+        .eligible = eligible,
+        .needs_trampoline = needs_trampoline,
+        .needs_stub = needs_stub,
+    };
 }
 
-test "findLazyEligibleFunctions: direct caller and callee can both be lazy via stubs" {
+test "findLazyEligibleFunctions: only direct callees need lazy stubs" {
     const allocator = std.testing.allocator;
 
     var ir_module = ir.IrModule.init(allocator);
@@ -206,6 +217,8 @@ test "findLazyEligibleFunctions: direct caller and callee can both be lazy via s
     try std.testing.expect(result.eligible[1]);
     try std.testing.expect(!result.needs_trampoline[0]);
     try std.testing.expect(!result.needs_trampoline[1]);
+    try std.testing.expect(result.needs_stub[0]);
+    try std.testing.expect(!result.needs_stub[1]);
 }
 
 test "findLazyEligibleFunctions: ref.func makes the target trampoline-eligible, not disqualified" {
@@ -345,6 +358,8 @@ test "findLazyEligibleFunctions: a directly-called non-leaf function is stub-eli
     try std.testing.expect(!result.needs_trampoline[0]);
     try std.testing.expect(result.eligible[1]);
     try std.testing.expect(!result.needs_trampoline[1]);
+    try std.testing.expect(result.needs_stub[0]);
+    try std.testing.expect(!result.needs_stub[1]);
 }
 
 test "findLazyEligibleFunctions: call_ref callers are non-leaf but ref.func targets remain eligible" {

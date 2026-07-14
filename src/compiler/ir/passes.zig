@@ -6638,18 +6638,23 @@ fn inlineSmallFunctionsCount(
     module: *ir.IrModule,
     allocator: std.mem.Allocator,
     inlined_callers: ?*std.DynamicBitSet,
+    lazy_skip: []const bool,
 ) !u32 {
     if (inlined_callers) |dirty| std.debug.assert(dirty.capacity() == module.functions.items.len);
 
     var eligible = try allocator.alloc(bool, module.functions.items.len);
     defer allocator.free(eligible);
-    for (module.functions.items, 0..) |*f, i| eligible[i] = isInlinable(f, inline_small_max_insts, inline_small_max_blocks);
+    for (module.functions.items, 0..) |*f, i| {
+        eligible[i] = (i >= lazy_skip.len or !lazy_skip[i]) and
+            isInlinable(f, inline_small_max_insts, inline_small_max_blocks);
+    }
 
     var caller_changed = try std.DynamicBitSet.initEmpty(allocator, module.functions.items.len);
     defer caller_changed.deinit();
 
     var inlined_count: u32 = 0;
     for (module.functions.items, 0..) |*caller, caller_idx| {
+        if (caller_idx < lazy_skip.len and lazy_skip[caller_idx]) continue;
         // Only scan blocks that existed at the start of this pass. Newly
         // created clone blocks can't contain eligible calls (isInlinable
         // excludes all calls), and B_after inherits only post-call IR
@@ -6918,7 +6923,7 @@ fn inlineSmallFunctionsCount(
 }
 
 pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) !bool {
-    return (try inlineSmallFunctionsCount(module, allocator, null)) != 0;
+    return (try inlineSmallFunctionsCount(module, allocator, null, &.{})) != 0;
 }
 
 /// Truncate every block at its first terminator, dropping any trailing
@@ -8785,7 +8790,7 @@ fn runPassesWithOptionsScoped(
                         .pass_name = "inlineSmallFunctions",
                     });
                     defer timing_context.deinit();
-                    break :blk try inlineSmallFunctionsCount(module, allocator, &inlined_callers);
+                    break :blk try inlineSmallFunctionsCount(module, allocator, &inlined_callers, opts.lazy_skip);
                 };
                 if (iter_inlined == 0) break;
                 inlined_count += iter_inlined;

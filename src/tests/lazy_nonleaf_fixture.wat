@@ -1,5 +1,8 @@
 (module
   (type (func (param i32) (result i32)))
+  ;; ref.func requires its targets to be declared even though these uses are
+  ;; deliberately only eligibility markers for the eager callers below.
+  (elem declare func $eager_entry $eager_callee)
 
   (func $eager_entry (export "eager_entry") (param i32) (result i32)
     (drop (ref.func $eager_entry))

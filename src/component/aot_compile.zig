@@ -159,16 +159,36 @@ pub const LazyJitOut = struct {
     /// docs/design/lazy-jit-spike.md. Call `.deinit()` when done (after
     /// destroying the corresponding `AotInstance`).
     ir_module: ir.IrModule = undefined,
+    /// The allocator `compileCoreWasmCached` actually used to allocate
+    /// `lazy_local_indices` / `needs_trampoline` (and that `ir_module`
+    /// itself was built with — see `IrModule.allocator`). This is
+    /// `compileCoreWasmCached`'s own `allocator` parameter, captured
+    /// here explicitly because `LazyJitOut` can travel a long way
+    /// from that call before it's freed: `precompileComponentInMemory`
+    /// stashes it in an `InMemoryPrecompiled.lazy_sidecars` entry,
+    /// which `setupLazyJit`/`LazyCompileDriver` may later attach using
+    /// a *different* allocator supplied by whatever instantiates the
+    /// component (e.g. the `wamr` CLI's per-run `ArenaAllocator`, see
+    /// `main.zig`'s `runComponent`). Freeing these slices with that
+    /// instantiation-time allocator instead of the one that actually
+    /// produced them silently leaks them (an `ArenaAllocator.free()`
+    /// on a pointer it didn't allocate is a no-op, not a crash) — the
+    /// bug this field exists to prevent. Always free
+    /// `lazy_local_indices` / `needs_trampoline` (and call
+    /// `ir_module.deinit()`, which already self-tracks its own
+    /// allocator) via `compile_allocator`, never via a caller-supplied
+    /// allocator that may differ.
+    compile_allocator: std.mem.Allocator = undefined,
     /// LOCAL function indices (matching `ir_module.functions.items`)
-    /// that were skipped during this compile. Caller-owned; free with
-    /// the allocator passed to `compileCoreWasmCached`.
+    /// that were skipped during this compile. Owned by
+    /// `compile_allocator`; see that field's doc comment.
     lazy_local_indices: []const u32 = &.{},
     /// Parallel to `lazy_local_indices`: `true` at position `i` means
     /// `lazy_local_indices[i]` needs the native trampoline mechanism
     /// (#888 — table/`ref.func`/`call_indirect`-reachable leaf
     /// function) rather than the lighter-weight text-section entry
-    /// stub (#887 — direct-call-graph function). Caller-owned; free
-    /// with the allocator passed to `compileCoreWasmCached`.
+    /// stub (#887 — direct-call-graph function). Owned by
+    /// `compile_allocator`; see that field's doc comment.
     needs_trampoline: []const bool = &.{},
     /// Backend these deferred functions must be compiled for on first
     /// call. Threaded through to `LazyCompileDriver` so it dispatches
@@ -200,10 +220,16 @@ pub const LazyJitOut = struct {
     pass_run_options: passes.RunOptions = .{},
 };
 
-fn deinitLazyJitOut(allocator: std.mem.Allocator, lazy_out: LazyJitOut) void {
+/// Frees an unconsumed `LazyJitOut` sidecar (never attached to an
+/// instance via `setupLazyJit`/`LazyCompileDriver`) using the
+/// allocator that actually produced it — see `LazyJitOut.compile_allocator`'s
+/// doc comment for why this must not be a different caller-supplied
+/// allocator.
+fn deinitLazyJitOut(lazy_out: LazyJitOut) void {
     var out = lazy_out;
     out.ir_module.deinit();
-    allocator.free(out.lazy_local_indices);
+    out.compile_allocator.free(out.lazy_local_indices);
+    if (out.needs_trampoline.len > 0) out.compile_allocator.free(out.needs_trampoline);
 }
 
 /// Optional cache I/O for `compileCoreWasm` (#761 Phase 2).
@@ -279,6 +305,8 @@ pub fn compileCoreWasmCached(
     defer if (lazy_skip.len > 0) allocator.free(lazy_skip);
     var lazy_needs_trampoline: []bool = &.{};
     defer if (lazy_needs_trampoline.len > 0) allocator.free(lazy_needs_trampoline);
+    var lazy_entry_stubs: []bool = &.{};
+    defer if (lazy_entry_stubs.len > 0) allocator.free(lazy_entry_stubs);
     if (opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
         const eligibility = lazy_jit.findLazyEligibleFunctions(
@@ -292,6 +320,7 @@ pub fn compileCoreWasmCached(
         ) catch return error.CoreCompileFailed;
         lazy_skip = eligibility.eligible;
         lazy_needs_trampoline = eligibility.needs_trampoline;
+        lazy_entry_stubs = eligibility.needs_stub;
     }
 
     if (opts.optimize) {
@@ -379,6 +408,7 @@ pub fn compileCoreWasmCached(
             .spill_metric = opts.spill_metric,
             .module_idx = opts.module_idx,
             .lazy_skip = lazy_skip,
+            .lazy_entry_stubs = lazy_entry_stubs,
         }) catch
             return error.CoreCompileFailed,
     };
@@ -676,6 +706,7 @@ pub fn compileCoreWasmCached(
         const out = cache_ctx.lazy_jit_out orelse unreachable; // checked above
         out.* = .{
             .ir_module = ir_module,
+            .compile_allocator = allocator,
             .lazy_local_indices = indices.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
             .needs_trampoline = needs_trampoline.toOwnedSlice(allocator) catch return error.CoreCompileFailed,
             .target_arch = opts.target_arch,
@@ -786,8 +817,15 @@ pub const LazyCompileDriver = struct {
     pub fn deinit(self: *LazyCompileDriver) void {
         var out = self.lazy_out;
         out.ir_module.deinit();
-        self.allocator.free(out.lazy_local_indices);
-        if (out.needs_trampoline.len > 0) self.allocator.free(out.needs_trampoline);
+        // Free with `out.compile_allocator` — the allocator
+        // `compileCoreWasmCached` actually used to produce these
+        // slices — not `self.allocator` (the instantiation-time
+        // allocator threaded through `setupLazyJit`, which may be a
+        // different, e.g. arena-backed, allocator supplied by
+        // whatever attached this driver). See
+        // `LazyJitOut.compile_allocator`'s doc comment.
+        out.compile_allocator.free(out.lazy_local_indices);
+        if (out.needs_trampoline.len > 0) out.compile_allocator.free(out.needs_trampoline);
         self.allocator.destroy(self);
     }
 };
@@ -803,13 +841,38 @@ pub const LazyCompileDriver = struct {
 /// must have been produced from the SAME compile (its `.cwasm` bytes
 /// came from the same `compileCoreWasmCached` call whose
 /// `lazy_jit_out` is `lazy_out`) — indices are meaningless otherwise.
+///
+/// Ownership: this function *always* consumes `lazy_out` — on success
+/// the returned driver owns it (freed by `LazyCompileDriver.deinit()`);
+/// on any error `lazy_out` has already been torn down before this
+/// function returns. Callers must treat `lazy_out` as moved-from the
+/// moment they call this, on every path, not just the success path —
+/// mirroring the caller-side null-before-call discipline
+/// `InMemoryPrecompiled.attachLazyJit` uses for its sidecar slot.
 pub fn setupLazyJit(
     inst: *aot_runtime.AotInstance,
     lazy_out: LazyJitOut,
     allocator: std.mem.Allocator,
 ) !*LazyCompileDriver {
+    // From here on, `lazy_out` is owned by this call on *every* return
+    // path — success or error — never by the caller (see
+    // `InMemoryPrecompiled.attachLazyJit`'s doc comment, which nulls
+    // its sidecar slot unconditionally before calling this function
+    // on that assumption). Track whether ownership has already moved
+    // into a `LazyCompileDriver` (whose own `deinit()` frees
+    // `lazy_out`'s `ir_module` / `lazy_local_indices` /
+    // `needs_trampoline` via `compile_allocator`) so this top-level
+    // `errdefer` only covers the narrow window *before* that handoff
+    // — i.e. only if `allocator.create` immediately below fails. Once
+    // the driver exists, `errdefer driver.deinit()` becomes the sole
+    // owner and this one must stay out of its way, or both would free
+    // the same memory.
+    var driver_owns_lazy_out = false;
+    errdefer if (!driver_owns_lazy_out) deinitLazyJitOut(lazy_out);
+
     const driver = try allocator.create(LazyCompileDriver);
     driver.* = .{ .lazy_out = lazy_out, .allocator = allocator };
+    driver_owns_lazy_out = true;
     errdefer {
         driver.deinit();
     }
@@ -1189,7 +1252,7 @@ pub const InMemoryPrecompiled = struct {
 
     pub fn deinit(self: *InMemoryPrecompiled) void {
         for (self.lazy_sidecars) |maybe_out| {
-            if (maybe_out) |out| deinitLazyJitOut(self.allocator, out);
+            if (maybe_out) |out| deinitLazyJitOut(out);
         }
         if (self.lazy_sidecars.len > 0) self.allocator.free(self.lazy_sidecars);
         for (self.cwasm_buffers) |buf| self.allocator.free(buf);
@@ -1216,6 +1279,26 @@ pub const InMemoryPrecompiled = struct {
         if (!self.lazy_jit_enabled) return null;
         const idx = self.indexOfPrecompiled(precompiled) orelse return error.LazyJitSidecarUnavailable;
         const lazy_out = self.lazy_sidecars[idx] orelse return error.LazyJitSidecarUnavailable;
+        // Consume the sidecar *before* calling `setupLazyJit`, not
+        // after: `setupLazyJit` takes ownership of `lazy_out` on every
+        // return path, success or error (see its doc comment). On
+        // success the returned driver owns `lazy_out` (freed by the
+        // driver's own `deinit()`, e.g. via `deinitLazyDriverOpaque`);
+        // on any failure `setupLazyJit` itself has already torn
+        // `lazy_out` down (via `deinitLazyJitOut` or `driver.deinit()`,
+        // whichever had taken ownership at the point of failure). So
+        // by the time this call returns, `lazy_out`'s resources have
+        // already been consumed exactly once, regardless of outcome.
+        // Nulling the slot only on success left the stale,
+        // already-freed sidecar reachable from
+        // `self.lazy_sidecars[idx]`, so a failed `setupLazyJit` call
+        // was followed by `InMemoryPrecompiled.deinit()`
+        // double-freeing/double-deiniting it. Nulling here —
+        // unconditionally, before the call — makes `self` release
+        // ownership at the single point where it hands `lazy_out`
+        // off, so exactly one owner ever frees it on every
+        // success/error path.
+        self.lazy_sidecars[idx] = null;
         // `setupLazyJit`'s error set is broader than `LazyJitAttachError`
         // (it can also fail via the #888 trampoline pool's allocation /
         // mmap / signature-lookup errors, e.g. `OutOfTrampolineSlots`,
@@ -1227,7 +1310,6 @@ pub const InMemoryPrecompiled = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.LazyJitSidecarUnavailable,
         };
-        self.lazy_sidecars[idx] = null;
         return .{
             .ctx = driver,
             .deinit_fn = &deinitLazyDriverOpaque,
@@ -1302,7 +1384,7 @@ pub fn precompileComponentInMemory(
         &.{};
     errdefer {
         for (lazy_sidecars) |maybe_out| {
-            if (maybe_out) |out| deinitLazyJitOut(allocator, out);
+            if (maybe_out) |out| deinitLazyJitOut(out);
         }
         if (lazy_sidecars.len > 0) allocator.free(lazy_sidecars);
     }

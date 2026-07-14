@@ -600,6 +600,34 @@ pub fn build(b: *std.Build) void {
         jit_component_smoke.expectExitCode(0);
         jit_component_smoke.expectStdOutEqual("echo: hello\n");
         test_step.dependOn(&jit_component_smoke.step);
+
+        // #889 follow-up: `expectExitCode`/`expectStdOutEqual` above
+        // can't see this — Zig's `DebugAllocator` leak diagnostics print
+        // to stderr but deliberately "do not affect return code" (see
+        // lib/std/start.zig's `callMain`), so a `compileCoreWasmCached`
+        // in-memory lazy-JIT leak (like the `lazy_local_indices` /
+        // `needs_trampoline` ownership bug this regression-tests) would
+        // otherwise pass the checks above silently. `Step.Run`'s check
+        // list only supports match/exact assertions, not "must not
+        // contain", so capture stderr from a second identical run and
+        // fail the build via `grep` if it contains a leak diagnostic —
+        // deliberately not asserting exact stderr content, since
+        // unrelated compiler debug-log lines also land there and vary
+        // with optimizer behavior / log level.
+        if (lazy_jit) {
+            const jit_component_smoke_leak_check = b.addRunArtifact(exe);
+            jit_component_smoke_leak_check.addArg("run");
+            jit_component_smoke_leak_check.addFileArg(b.path("src/component/fixtures/stdio-echo.wasm"));
+            jit_component_smoke_leak_check.setStdIn(.{ .bytes = "hello\n" });
+            jit_component_smoke_leak_check.expectExitCode(0);
+            const captured_stderr = jit_component_smoke_leak_check.captureStdErr(.{});
+            const check_no_leak = b.addSystemCommand(&.{
+                "sh", "-c", "! grep -qiE 'DebugAllocator|leaked' \"$0\"",
+            });
+            check_no_leak.addFileArg(captured_stderr);
+            check_no_leak.setName("check jit_component_smoke has no DebugAllocator leaks");
+            test_step.dependOn(&check_no_leak.step);
+        }
     }
 
     // #760 regression: AOT `wasi:cli/exit.exit` must terminate the host

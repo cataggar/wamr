@@ -18,7 +18,6 @@
 //! `instance.zig:2292`.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const wamr = @import("wamr");
 const aot_harness = @import("aot_harness.zig");
 
@@ -174,8 +173,10 @@ test "#676: precompile recurses into nested sub-components" {
 
 test "#889: nested sub-components attach lazy-JIT sidecars by core_wasm identity" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
-    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
+    // `add42` is a leaf function (no calls); the arch-neutral #862
+    // lazy-JIT path is what nested sidecar attach relies on here, so
+    // no x86_64-only gate is needed (see #890's aarch64 leaf parity).
 
     const allocator = std.testing.allocator;
     const component_bytes = try buildNestedComponent(allocator);
@@ -195,8 +196,8 @@ test "#889: nested sub-components attach lazy-JIT sidecars by core_wasm identity
 
     const sub = inst.sub_instances[0] orelse return error.TestFailed;
     const ai = sub.core_instances[0].aot_inst orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(usize, 1), ai.lazy_jit.pending.len);
-    try std.testing.expect(ai.lazy_jit.pending[0]);
+    try std.testing.expectEqual(@as(usize, 1), ai.lazy_jit.slot_states.len);
+    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.pending, ai.lazy_jit.slotState(0));
     try std.testing.expect(ai.lazy_jit.compiled[0] == null);
 
     const fn_idx = aot_runtime_mod.findExportFunc(ai, "add42") orelse return error.TestFailed;
@@ -211,7 +212,7 @@ test "#889: nested sub-components attach lazy-JIT sidecars by core_wasm identity
         &results_buf,
     );
     try std.testing.expectEqual(@as(i32, 142), first[0].i32);
-    try std.testing.expect(!ai.lazy_jit.pending[0]);
+    try std.testing.expectEqual(aot_runtime_mod.LazyJitState.SlotState.ready, ai.lazy_jit.slotState(0));
     const compiled_addr = ai.lazy_jit.compiled[0].?.addr;
 
     const second = try aot_runtime_mod.callFuncScalar(

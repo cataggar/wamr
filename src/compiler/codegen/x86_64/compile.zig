@@ -1631,6 +1631,11 @@ pub const CompileOptions = struct {
     /// normal rel32 patching pass, while the first entry through the stub
     /// resolves and patches in the deferred body at runtime.
     lazy_skip: []const bool = &.{},
+    /// Subset of `lazy_skip` whose functions are direct-call targets and
+    /// therefore need a stable text-section entry stub. Other lazy functions
+    /// are resolved by `callFuncScalar` before their first entry and emit no
+    /// eager text.
+    lazy_entry_stubs: []const bool = &.{},
 };
 
 fn compileLazyEntryStub(local_idx: u32, allocator: std.mem.Allocator) ![]u8 {
@@ -1715,11 +1720,14 @@ pub fn compileModuleCachedWithOptions(
         const func_start: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_start);
 
-        // #887 lazy-JIT: emit a stable entry stub for deferred functions.
-        // Their real bodies compile later on first entry, but every eager
-        // local-call patch still resolves against executable bytes here.
+        // #887 lazy-JIT: direct-call targets retain a stable entry stub.
+        // Root-only lazy functions emit no text and resolve before their
+        // first external call, preserving #862's deferred-code-size benefit.
         if (fi < options.lazy_skip.len and options.lazy_skip[fi]) {
-            const stub = try compileLazyEntryStub(@intCast(fi), allocator);
+            const stub = if (fi < options.lazy_entry_stubs.len and options.lazy_entry_stubs[fi])
+                try compileLazyEntryStub(@intCast(fi), allocator)
+            else
+                try allocator.dupe(u8, &.{});
             errdefer allocator.free(stub);
             cache_funcs[fi] = .{
                 .ir_sha256 = codegen_cache.hashFunction(&func),
