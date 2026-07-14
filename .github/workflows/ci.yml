@@ -350,6 +350,38 @@ jobs:
       - name: Lazy-JIT unit and regression tests
         run: zig build test -Djit=true -Dlazy_jit=true
 
+  lazy-jit:
+    name: Build & Test (lazy-jit-${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: [self-hosted, Linux, X64]
+            name: linux-x64
+          - os: [self-hosted, Linux, ARM64]
+            name: linux-arm64
+    # Keep this focused on the unit/regression tests that exercise the
+    # lazy-JIT implementation. The full in-process JIT conformance suites
+    # remain in the separate, non-blocking `jit-parity` job above.
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: true
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./.github/actions/zig-cache
+
+      - name: Lazy-JIT unit and regression tests
+        run: zig build test -Djit=true -Dlazy_jit=true
+
   component-examples-wasmtime:
     name: Build & Test (component-examples-wasmtime)
     runs-on: ubuntu-22.04
