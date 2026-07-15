@@ -620,12 +620,12 @@ Upstream WIT: [`types.wit`](https://github.com/WebAssembly/wasi-http/blob/main/w
 | `[method]future-trailers.get` | ✅ | :20425 | — |
 | `[resource-drop]future-trailers` | ✅ | :20426 | — |
 | `[constructor]request-options` | ✅ | :20906 | — |
-| `[method]request-options.connect-timeout` | ✅ | :20909 | 0.2-style unprefixed getter name (`get-` prefix only in 0.3). Stored on the `RequestOptions` rep struct (`connect_timeout_ns`); advisory today (`std.http.Client.fetch` does not yet thread it through to the TCP handshake). |
+| `[method]request-options.connect-timeout` | ✅ | :20909 | 0.2-style unprefixed getter name (`get-` prefix only in 0.3). Stored in nanoseconds, copied into worker-owned state, and applied to initial DNS/TCP acquisition. Zig's lazy TLS handshake and automatic redirect reconnects are not covered by this deadline. |
 | `[method]request-options.set-connect-timeout` | ✅ | :20910 | Stores `option<duration>` (nanoseconds). Returns `result` ok unconditionally. |
-| `[method]request-options.first-byte-timeout` | ✅ | :20911 | Same as above; field `first_byte_timeout_ns`. |
-| `[method]request-options.set-first-byte-timeout` | ✅ | :20912 | Same as above. |
-| `[method]request-options.between-bytes-timeout` | ✅ | :20913 | Same as above; field `between_bytes_timeout_ns`. |
-| `[method]request-options.set-between-bytes-timeout` | ✅ | :20914 | Same as above. |
+| `[method]request-options.first-byte-timeout` | ✅ | :20911 | Stored for round-tripping only; enforcing it requires a deadline-aware HTTP/TLS reader and remains #616 A1b/A7 work. |
+| `[method]request-options.set-first-byte-timeout` | ✅ | :20912 | Same as above; field `first_byte_timeout_ns`. |
+| `[method]request-options.between-bytes-timeout` | ✅ | :20913 | Stored for round-tripping only; enforcing it requires a deadline-aware HTTP/TLS reader and remains #616 A1b/A7 work. |
+| `[method]request-options.set-between-bytes-timeout` | ✅ | :20914 | Same as above; field `between_bytes_timeout_ns`. |
 | `[resource-drop]request-options` | ✅ | :20915 | — |
 | `[method]response-outparam.send-informational` (`@unstable`) | N/A | — | Unstable feature; not yet registered. Tracked under [#583 A5](https://github.com/cataggar/wamr/issues/583). |
 | `[static]response-outparam.set` | ✅ | :20916 | — |
@@ -920,12 +920,12 @@ Unified `request` / `response` resource ([PR #487](https://github.com/cataggar/w
 | `[static]request.consume-body` | ✅ | :20303 |
 | `[resource-drop]request` | ✅ | :20304 |
 | `[constructor]request-options` | ✅ | :20306 |
-| `[method]request-options.get-connect-timeout` | ✅ | :20307 |
-| `[method]request-options.set-connect-timeout` | ✅ | :20308 |
-| `[method]request-options.get-first-byte-timeout` | ✅ | :20309 |
-| `[method]request-options.set-first-byte-timeout` | ✅ | :20310 |
-| `[method]request-options.get-between-bytes-timeout` | ✅ | :20311 |
-| `[method]request-options.set-between-bytes-timeout` | ✅ | :20312 |
+| `[method]request-options.get-connect-timeout` | ✅ | :20307 | Stored in nanoseconds, snapshotted when the request is constructed, and applied to initial DNS/TCP acquisition. The child options resource may be dropped before send. Zig's lazy TLS handshake and automatic redirect reconnects are not deadline-covered. |
+| `[method]request-options.set-connect-timeout` | ✅ | :20308 | — |
+| `[method]request-options.get-first-byte-timeout` | ✅ | :20309 | Round-trip only; deadline-aware HTTP/TLS reader support remains #616 A1b/A7 work. |
+| `[method]request-options.set-first-byte-timeout` | ✅ | :20310 | — |
+| `[method]request-options.get-between-bytes-timeout` | ✅ | :20311 | Round-trip only; deadline-aware HTTP/TLS reader support remains #616 A1b/A7 work. |
+| `[method]request-options.set-between-bytes-timeout` | ✅ | :20312 | — |
 | `[method]request-options.clone` | ✅ | :20313 |
 | `[resource-drop]request-options` | ✅ | :20314 |
 | `[static]response.new` | ✅ | :20316 |
