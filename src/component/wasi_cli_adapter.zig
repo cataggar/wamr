@@ -43907,6 +43907,117 @@ test "wasi:io/streams output-stream.splice: uses Linux descriptor path (#616 A2)
     }
 }
 
+test "wasi:io/streams output-stream.splice: closed pipe peer survives SIGPIPE and returns closed (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        streams.sigpipe_test_state.mutex.lock();
+        defer streams.sigpipe_test_state.mutex.unlock();
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[1]);
+        try testing.expectEqual(.SUCCESS, linux.errno(linux.write(source_fds[1], "data", 4)));
+        _ = linux.close(dest_fds[0]);
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 4 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        var default_action: linux.Sigaction = .{
+            .handler = .{ .handler = linux.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, &default_action, &old_action);
+        defer std.posix.sigaction(linux.SIG.PIPE, &old_action, null);
+        var mask_before: linux.sigset_t = undefined;
+        try testing.expectEqual(
+            .SUCCESS,
+            linux.errno(linux.sigprocmask(linux.SIG.BLOCK, null, &mask_before)),
+        );
+        try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expect(results[0].result_val.payload == null);
+        var current_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, null, &current_action);
+        try testing.expect(current_action.handler.handler == linux.SIG.DFL);
+        var mask_after: linux.sigset_t = undefined;
+        try testing.expectEqual(
+            .SUCCESS,
+            linux.errno(linux.sigprocmask(linux.SIG.BLOCK, null, &mask_after)),
+        );
+        try testing.expectEqual(mask_before, mask_after);
+    }
+}
+
+test "wasi:io/streams output-stream.blocking-splice: closed pipe peer survives SIGPIPE and returns closed (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        streams.sigpipe_test_state.mutex.lock();
+        defer streams.sigpipe_test_state.mutex.unlock();
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[1]);
+        try testing.expectEqual(.SUCCESS, linux.errno(linux.write(source_fds[1], "data", 4)));
+        _ = linux.close(dest_fds[0]);
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 4 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        var default_action: linux.Sigaction = .{
+            .handler = .{ .handler = linux.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, &default_action, &old_action);
+        defer std.posix.sigaction(linux.SIG.PIPE, &old_action, null);
+        try WasiCliAdapter.outputStreamBlockingSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expect(results[0].result_val.payload == null);
+        var current_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, null, &current_action);
+        try testing.expect(current_action.handler.handler == linux.SIG.DFL);
+    }
+}
+
 test "wasi:io/streams output-stream.splice: zero length on open descriptors is ok(0) (#616 A2)" {
     const testing = std.testing;
     const io = std.Io.Threaded.global_single_threaded.io();
