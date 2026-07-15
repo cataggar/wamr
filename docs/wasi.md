@@ -270,10 +270,10 @@ in that tracker.
 
 ### Conformance & CI (section C)
 
-* **Wasmtime parity matrix.** The wamr-side P3 gate lands in PR #518;
-  the original #489 proposal also called for running the same fixtures
-  through Wasmtime in CI and diffing the report so a regression that
-  Wasmtime also exhibits is flagged as a fixture bug, not a wamr bug.
+* **Wasmtime parity matrix.** Completed by
+  [PR #908](https://github.com/cataggar/wamr/pull/908): CI runs the same
+  41-fixture Preview 3 corpus through manifest AOT, no-sidecar JIT, and
+  Wasmtime 46.0.1. All three modes pass 41 / 41 with zero parity deltas.
   ([#583 C1](https://github.com/cataggar/wamr/issues/583))
 
 ## Build & test
@@ -291,9 +291,11 @@ $ pip install -r tests/wasi-testsuite/test-runner/requirements.txt
 ### Run the gates
 
 ```console
-$ zig build wasi-testsuite      # WASI Preview 1 (C + Rust + AssemblyScript) — 70 / 72
-$ zig build wasi-p2-testsuite   # Curated component fixtures               —  5 /  5
-$ zig build wasi-p3-testsuite   # WASI Preview 3 (wasm32-wasip3)            — 40 / 41
+$ zig build wasi-testsuite                            # WASI Preview 1 — 70 / 72
+$ zig build wasi-p2-testsuite                         # Curated components — 5 / 5
+$ zig build wasi-p3-testsuite                         # Preview 3 AOT — 41 / 41
+$ zig build wasi-p3-testsuite-jit -Djit=true          # Preview 3 JIT — 41 / 41
+$ zig build wasi-p3-testsuite-wasmtime                # Wasmtime 46.0.1 — 41 / 41
 ```
 
 ### `WAMR_TESTSUITE_TIMEOUT`
