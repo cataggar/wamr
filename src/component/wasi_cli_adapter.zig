@@ -1838,8 +1838,13 @@ pub const PendingHttpFetchP3 = struct {
 /// in `httpFetchWorker` after the fetch returns. (#583 A2)
 const HttpFetchRequest = struct {
     allocator: Allocator,
+    io: std.Io,
     url: []u8,
     method: std.http.Method,
+    /// Scalar snapshot copied from the guest resource before the
+    /// worker is spawned. Never points back into an adapter resource
+    /// table, whose slot may be dropped while the worker is running.
+    options: HttpFetchOptions,
     /// Header name/value slices, dupe'd into worker-owned memory.
     headers_buf: []std.http.Header,
     headers_names: [][]u8,
@@ -1859,6 +1864,38 @@ const HttpFetchRequest = struct {
         self.allocator.free(self.headers_buf);
         if (self.payload) |p| self.allocator.free(p);
     }
+};
+
+/// Worker-owned subset of `wasi:http/types.request-options` currently
+/// implemented by the transport. Keeping this separate from
+/// `RequestOptions` makes it impossible for a worker to borrow a guest
+/// resource-table entry across adapter/worker lifetimes.
+const HttpFetchOptions = struct {
+    connect_timeout_ns: ?u64 = null,
+
+    fn fromRequestOptions(options: ?*const RequestOptions) HttpFetchOptions {
+        const value = options orelse return .{};
+        return .{ .connect_timeout_ns = value.connect_timeout_ns };
+    }
+
+    /// Convert the WIT nanosecond duration without narrowing. Zig's
+    /// `Io.Duration.nanoseconds` is i96, so every u64 value is exactly
+    /// representable, including `maxInt(u64)`.
+    fn connectTimeout(self: HttpFetchOptions) std.Io.Timeout {
+        const ns = self.connect_timeout_ns orelse return .none;
+        return .{ .duration = .{
+            .raw = .{ .nanoseconds = @as(i96, ns) },
+            .clock = .awake,
+        } };
+    }
+};
+
+const HttpConnectResult =
+    std.http.Client.ConnectTcpError!*std.http.Client.Connection;
+
+const HttpConnectDeadlineOutcome = union(enum) {
+    connection: HttpConnectResult,
+    deadline: std.Io.Cancelable!void,
 };
 
 /// Map a `std.Io.net.HostName.LookupError` to the closest
@@ -3101,6 +3138,138 @@ fn checkHttpCancel(cancelled: ?*std.atomic.Value(bool)) error{HttpFetchCancelled
     }
 }
 
+fn discardHttpConnectDeadlineTasks(
+    client: *std.http.Client,
+    select: *std.Io.Select(HttpConnectDeadlineOutcome),
+) void {
+    while (select.cancel()) |outcome| switch (outcome) {
+        .connection => |result| if (result) |connection| {
+            client.connection_pool.release(connection, client.io);
+        } else |_| {},
+        .deadline => |result| result catch {},
+    };
+}
+
+/// Race `Client.connectTcpOptions` against an absolute deadline. This
+/// wrapper is required on Zig 0.16: `connectTcpOptions` accepts a
+/// timeout field but does not forward it to `HostName.connect`.
+/// Cancelling the losing connector interrupts the Threaded-I/O
+/// connect syscall; its partial socket is closed by the stdlib's
+/// existing cleanup path.
+fn httpClientConnectBeforeDeadlineUsing(
+    client: *std.http.Client,
+    connect_options: std.http.Client.ConnectTcpOptions,
+    deadline: std.Io.Timeout,
+    comptime connect: anytype,
+) anyerror!*std.http.Client.Connection {
+    var outcome_buffer: [2]HttpConnectDeadlineOutcome = undefined;
+    var select = std.Io.Select(HttpConnectDeadlineOutcome).init(
+        client.io,
+        &outcome_buffer,
+    );
+    try select.concurrent(
+        .deadline,
+        std.Io.Timeout.sleep,
+        .{ deadline, client.io },
+    );
+    select.concurrent(
+        .connection,
+        connect,
+        .{ client, connect_options },
+    ) catch |err| {
+        discardHttpConnectDeadlineTasks(client, &select);
+        return err;
+    };
+
+    const first = select.await() catch |err| {
+        discardHttpConnectDeadlineTasks(client, &select);
+        return err;
+    };
+    return switch (first) {
+        .connection => |result| connected: {
+            // Only the void-returning timer remains; it owns no
+            // resources, so discarding its cancelled result is safe.
+            select.cancelDiscard();
+            break :connected try result;
+        },
+        .deadline => |result| timed_out: {
+            discardHttpConnectDeadlineTasks(client, &select);
+            try result;
+            break :timed_out error.Timeout;
+        },
+    };
+}
+
+fn httpClientConnectBeforeDeadline(
+    client: *std.http.Client,
+    connect_options: std.http.Client.ConnectTcpOptions,
+    deadline: std.Io.Timeout,
+) anyerror!*std.http.Client.Connection {
+    return httpClientConnectBeforeDeadlineUsing(
+        client,
+        connect_options,
+        deadline,
+        std.http.Client.connectTcpOptions,
+    );
+}
+
+/// Establish the initial request connection with the WIT connect
+/// timeout. `Client.RequestOptions` has no timeout in Zig 0.16, so the
+/// acquired connection is passed explicitly to `Client.request`.
+///
+/// The client in `httpClientLowLevelFetch` has never configured proxy
+/// fields (both are null), and the old `Client.request` path therefore
+/// connected directly too; using `connectTcpOptions` preserves that
+/// behavior rather than silently bypassing an active proxy. TLS still
+/// uses `std.http.Client.Connection.Tls`: the CA bundle initialization
+/// normally performed by `Client.request` must happen before the
+/// explicit TLS connection is acquired. Zig performs the wire TLS
+/// handshake lazily during request I/O, after this connector returns,
+/// so that handshake and any reconnect performed by automatic
+/// redirects are intentionally not claimed as deadline-covered.
+fn httpClientConnectWithTimeout(
+    client: *std.http.Client,
+    uri: std.Uri,
+    timeout: std.Io.Timeout,
+) anyerror!*std.http.Client.Connection {
+    // Convert once so name lookup, TCP connection, and synchronous
+    // setup consume one budget rather than resetting the duration.
+    const deadline = timeout.toDeadline(client.io);
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse
+        return error.UnsupportedUriScheme;
+
+    if (protocol == .tls and client.now == null) {
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(client.allocator);
+        const now = std.Io.Clock.real.now(client.io);
+        bundle.rescan(client.allocator, client.io, now) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => return error.CertificateBundleLoadFailure,
+        };
+        client.now = now;
+        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+    }
+
+    var host_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&host_name_buffer);
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+    return httpClientConnectBeforeDeadline(
+        client,
+        .{
+            .host = host,
+            .port = port,
+            .protocol = protocol,
+            // Ignored by Zig 0.16, but retained for forward
+            // compatibility. The Select race enforces it today.
+            .timeout = deadline,
+        },
+        deadline,
+    );
+}
+
 /// Drive a single outbound HTTP request through the lower-level
 /// `std.http.Client.request` / `Request.receiveHead` /
 /// `Response.readerDecompressing` API and capture the full
@@ -3143,6 +3312,7 @@ fn httpClientLowLevelFetch(
     method: std.http.Method,
     extra_headers: []const std.http.Header,
     payload: ?[]const u8,
+    options: HttpFetchOptions,
     cancelled: ?*std.atomic.Value(bool),
 ) anyerror!HttpLowLevelFetchResult {
     // Pre-connect sync point: bail before issuing any syscall if the
@@ -3157,9 +3327,18 @@ fn httpClientLowLevelFetch(
 
     const uri = try std.Uri.parse(url);
 
-    var req = try client.request(method, uri, .{
+    // Leave the unset case on Client.request's original connection
+    // path. When set, acquire the initial connection with the timeout
+    // and transfer it to Request; Request.deinit retains its existing
+    // cancellation, redirect, connection-pool, and TLS cleanup paths.
+    const connection = switch (options.connectTimeout()) {
+        .none => null,
+        else => |timeout| try httpClientConnectWithTimeout(&client, uri, timeout),
+    };
+    var req = client.request(method, uri, .{
         .extra_headers = extra_headers,
         .keep_alive = false,
+        .connection = connection,
         // Mirror `std.http.Client.fetch`: when there is no payload the
         // request is repeatable so we follow up to 3 redirects; with a
         // payload we surface the redirect to the caller as
@@ -3168,7 +3347,10 @@ fn httpClientLowLevelFetch(
             @as(std.http.Client.Request.RedirectBehavior, @enumFromInt(3))
         else
             .unhandled,
-    });
+    }) catch |err| {
+        if (connection) |conn| client.connection_pool.release(conn, io);
+        return err;
+    };
     defer req.deinit();
 
     // Pre-send sync point: connect / TLS handshake already done; bail
@@ -3759,9 +3941,13 @@ pub const TimerFuture = struct {
     deadline_ns: u64,
 };
 
-/// `wasi:http/types.request-options`. Pure record of optional
-/// timeouts; the constructor returns a fresh slot, getters return
-/// option-none, setters store values.
+/// `wasi:http/types.request-options`. Connect timeout is snapshotted
+/// into `HttpFetchOptions` and applied to initial DNS/TCP connection
+/// acquisition. Zig's lazy TLS handshake and automatic redirect
+/// reconnects are not covered by that deadline. First-byte and
+/// between-bytes values remain stored for WIT round-tripping only:
+/// those phases require a deadline-aware HTTP/TLS reader and remain
+/// #616 A1b / A7 work.
 pub const RequestOptions = struct {
     connect_timeout_ns: ?u64 = null,
     first_byte_timeout_ns: ?u64 = null,
@@ -3795,6 +3981,10 @@ pub const HttpRequestP3 = struct {
     authority: ?[]u8 = null,
     headers_handle: u32 = 0,
     options_handle: ?u32 = null,
+    /// Owned scalar snapshot taken by `request.new`. The child
+    /// request-options resource may be dropped before this request is
+    /// sent, so transport behavior must not depend on its table slot.
+    fetch_options: HttpFetchOptions = .{},
     /// Handle into `ComponentInstance.streams` (AsyncStream) for the
     /// body stream<u8>. `null` means no body / zero-length.
     body_stream_handle: ?u32 = null,
@@ -4181,6 +4371,10 @@ const InterfaceValueBrief = struct {
 
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
+    /// Cancellable I/O backend shared by outbound HTTP workers. Zig's
+    /// global_single_threaded backend cannot race/cancel connect
+    /// syscalls, which is required to enforce request deadlines.
+    http_worker_io: std.Io.Threaded,
     stdout: streams.OutputStream,
     stderr: streams.OutputStream,
     /// Captured stdin buffer. Defaults to empty; callers populate via
@@ -4592,6 +4786,7 @@ pub const WasiCliAdapter = struct {
     pub fn init(allocator: Allocator) WasiCliAdapter {
         return .{
             .allocator = allocator,
+            .http_worker_io = .init(allocator, .{}),
             .stdout = streams.OutputStream.toBuffer(),
             .stderr = streams.OutputStream.toBuffer(),
         };
@@ -4633,6 +4828,7 @@ pub const WasiCliAdapter = struct {
     ) WasiCliAdapter {
         return .{
             .allocator = allocator,
+            .http_worker_io = .init(allocator, .{}),
             .stdout = streams.OutputStream.toFd(stdout_fd),
             .stderr = streams.OutputStream.toFd(stderr_fd),
             .stdin = streams.InputStream.fromFd(stdin_fd),
@@ -4769,6 +4965,7 @@ pub const WasiCliAdapter = struct {
             self.allocator.destroy(entry.shared);
         }
         self.pending_http_fetches_p3.deinit(self.allocator);
+        self.http_worker_io.deinit();
 
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
@@ -5250,7 +5447,7 @@ pub const WasiCliAdapter = struct {
         try self.io_streams_iface.members.put(
             self.allocator,
             "[method]output-stream.blocking-splice",
-            .{ .func = .{ .context = self, .call = &outputStreamSplice } },
+            .{ .func = .{ .context = self, .call = &outputStreamBlockingSplice } },
         );
         try self.io_streams_iface.members.put(
             self.allocator,
@@ -7331,15 +7528,14 @@ pub const WasiCliAdapter = struct {
             return;
         }
 
-        const io = std.Io.Threaded.global_single_threaded.io();
-
         const result = httpClientLowLevelFetch(
             alloc,
-            io,
+            req.io,
             req.url,
             req.method,
             req.headers_buf,
             req.payload,
+            req.options,
             &shared.cancelled,
         ) catch |err| switch (err) {
             // Phase-boundary cancel: surface as `HTTP_request_denied`,
@@ -7500,6 +7696,27 @@ pub const WasiCliAdapter = struct {
         }
     }
 
+    fn httpFetchOptionsP2(
+        self: *WasiCliAdapter,
+        args: []const InterfaceValue,
+    ) HttpFetchOptions {
+        if (args.len < 2) return .{};
+        return switch (args[1]) {
+            .option_val => |opt| if (opt.is_some and opt.payload != null) switch (opt.payload.?.*) {
+                .handle => |h| HttpFetchOptions.fromRequestOptions(self.lookupRequestOptions(h)),
+                else => .{},
+            } else .{},
+            else => .{},
+        };
+    }
+
+    fn httpFetchOptionsP3(
+        _: *WasiCliAdapter,
+        request: *const HttpRequestP3,
+    ) HttpFetchOptions {
+        return request.fetch_options;
+    }
+
     /// Mint a `.pending` `FutureIncomingResponse`, snapshot the
     /// outgoing request into worker-owned memory, and spawn a worker
     /// thread that drives `std.http.Client.fetch` to completion.
@@ -7512,6 +7729,7 @@ pub const WasiCliAdapter = struct {
         method: std.http.Method,
         headers: []const std.http.Header,
         payload: ?[]const u8,
+        options: HttpFetchOptions,
     ) !u32 {
         const url_copy = try self.allocator.dupe(u8, url);
         errdefer self.allocator.free(url_copy);
@@ -7557,8 +7775,10 @@ pub const WasiCliAdapter = struct {
         errdefer self.allocator.destroy(req);
         req.* = .{
             .allocator = self.allocator,
+            .io = self.http_worker_io.io(),
             .url = url_copy,
             .method = method,
+            .options = options,
             .headers_buf = header_buf,
             .headers_names = names,
             .headers_values = values,
@@ -7608,6 +7828,7 @@ pub const WasiCliAdapter = struct {
         method: std.http.Method,
         headers: []const std.http.Header,
         payload: ?[]const u8,
+        options: HttpFetchOptions,
     ) !u32 {
         const url_copy = try self.allocator.dupe(u8, url);
         errdefer self.allocator.free(url_copy);
@@ -7651,8 +7872,10 @@ pub const WasiCliAdapter = struct {
         errdefer self.allocator.destroy(req);
         req.* = .{
             .allocator = self.allocator,
+            .io = self.http_worker_io.io(),
             .url = url_copy,
             .method = method,
+            .options = options,
             .headers_buf = header_buf,
             .headers_names = names,
             .headers_values = values,
@@ -8133,8 +8356,9 @@ pub const WasiCliAdapter = struct {
     ///     interrupted from another thread — but observability is
     ///     bounded to one phase's I/O latency rather than the whole
     ///     fetch. As a belt-and-braces, the drainer
-    ///     (`settlePendingHttpFetch`) also checks `shared.cancelled`
-    ///     post-completion and overrides a wire-success outcome
+    ///     (`settlePendingHttpFetch` /
+    ///     `settlePendingHttpFetchP3`) also checks
+    ///     `shared.cancelled` post-completion and overrides a wire-success outcome
     ///     with `HTTP_request_denied` if the cancel signal landed
     ///     after the worker had already published `done` (#583 B1
     ///     follow-up; the original #583 B1 landing observed cancel
@@ -8239,6 +8463,11 @@ pub const WasiCliAdapter = struct {
         // completion still surfaces as `HTTP_request_denied`.
         for (self.pending_http_fetches.items) |entry| {
             entry.shared.cancelled.store(true, .release);
+        }
+        for (self.pending_http_fetches_p3.items) |entry| {
+            if (entry.ci == ci) {
+                entry.shared.cancelled.store(true, .release);
+            }
         }
     }
 
@@ -8931,26 +9160,40 @@ pub const WasiCliAdapter = struct {
 
     /// `wasi:io/streams.[method]output-stream.splice:
     ///   (borrow<output-stream>, borrow<input-stream>, u64)
-    ///   -> result<u64, stream-error>` and `[method]output-stream.blocking-splice`.
+    ///   -> result<u64, stream-error>`.
     ///
-    /// MVP: buffer-through implementation — `read` up to `len` bytes
-    /// from `src` into a host scratch buffer, then `write` them to
-    /// `self`. Returns the number of bytes spliced in the ok arm.
-    /// A closed source surfaces in the err arm (`is_ok = false`)
-    /// matching the `blockingRead` convention.
-    ///
-    /// Follow-up: a zero-copy host-driver fast path could call
-    /// `splice(2)` (Linux) when both endpoints expose raw fds. Tracked
-    /// under [#583 B2](https://github.com/cataggar/wamr/issues/583);
-    /// the buffer-through path is correct (and the only correct option
-    /// for buffer-backed sinks) but does an extra memcpy for fd ↔ fd
-    /// hops.
+    /// Uses Linux `splice(2)` when both streams expose compatible host
+    /// descriptors without risking a blocking call. Unsupported endpoint
+    /// pairs and other platforms retain the buffer-through path.
     fn outputStreamSplice(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        return outputStreamSpliceCommon(ctx_opaque, ci, args, results, allocator, .nonblocking);
+    }
+
+    /// `wasi:io/streams.[method]output-stream.blocking-splice`.
+    /// Waits for descriptor readiness and retries `EAGAIN`.
+    fn outputStreamBlockingSplice(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        return outputStreamSpliceCommon(ctx_opaque, ci, args, results, allocator, .blocking);
+    }
+
+    fn outputStreamSpliceCommon(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
+        mode: streams.SpliceMode,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (args.len < 3 or results.len == 0) return error.InvalidArgs;
@@ -8972,22 +9215,33 @@ pub const WasiCliAdapter = struct {
         const want: usize = @min(want_u64, std.math.maxInt(usize));
         const capped: usize = @min(want, STREAM_SCRATCH_CAP);
 
-        const buf = try allocator.alloc(u8, capped);
-        defer allocator.free(buf);
-
-        const n_read: usize = switch (src.read(buf)) {
+        const n_read: usize = switch (streams.splice(src, dst, capped, mode)) {
             .ok => |n| n,
             .closed => {
                 results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
                 return;
             },
             .err => return error.IoError,
-        };
+            .unsupported => buffered: {
+                const buf = try allocator.alloc(u8, capped);
+                defer allocator.free(buf);
 
-        switch (dst.write(buf[0..n_read], self.allocator)) {
-            .ok => {},
-            .err, .closed => return error.IoError,
-        }
+                const n = switch (src.read(buf)) {
+                    .ok => |read_n| read_n,
+                    .closed => {
+                        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+                        return;
+                    },
+                    .err => return error.IoError,
+                };
+
+                switch (dst.write(buf[0..n], self.allocator)) {
+                    .ok => {},
+                    .err, .closed => return error.IoError,
+                }
+                break :buffered n;
+            },
+        };
 
         const payload = try allocator.create(InterfaceValue);
         payload.* = .{ .u64 = @intCast(n_read) };
@@ -18989,11 +19243,13 @@ pub const WasiCliAdapter = struct {
     // surfaces.
     //
     // Values are stored unmodified in nanoseconds (the canonical
-    // representation of `wasi:clocks/monotonic-clock.duration`). They
-    // are advisory today: `std.http.Client.fetch` in
-    // `httpOutgoingHandlerHandle` does not yet thread them through
-    // to the underlying TCP/TLS handshake (#583 A5 follow-up); the
-    // host honours its built-in `std.http.Client.fetch` defaults.
+    // representation of `wasi:clocks/monotonic-clock.duration`).
+    // Connect timeout is copied into worker-owned `HttpFetchOptions`
+    // and applied to initial DNS/TCP acquisition by
+    // `httpClientConnectWithTimeout`. Zig's lazy TLS handshake and
+    // automatic redirect reconnects are not covered. First-byte and
+    // between-bytes remain round-trip-only pending a deadline-aware
+    // reader/transport (#616 A1b / A7).
 
     fn requestOptionsGetTimeoutP2(
         self: *WasiCliAdapter,
@@ -19337,6 +19593,12 @@ pub const WasiCliAdapter = struct {
             }
         }
 
+        // Snapshot the option resource before spawning. The
+        // option<own<request-options>> handle may be dropped as soon
+        // as this host call returns, so the worker must only receive
+        // scalar-owned state.
+        const fetch_options = self.httpFetchOptionsP2(args);
+
         // Spawn worker that drives the fetch off-thread. Returns the
         // freshly minted `.pending` future handle the guest will
         // poll on via `future-incoming-response.subscribe`. Worker
@@ -19345,7 +19607,13 @@ pub const WasiCliAdapter = struct {
         // handle. The blocking `std.http.Client.fetch` itself runs
         // on the worker thread and routes its classified errors
         // through `mapHttpFetchError` (#583 A3) before publishing.
-        const fh = self.spawnHttpFetchPending(url, method, extra_hdrs.items, payload) catch {
+        const fh = self.spawnHttpFetchPending(
+            url,
+            method,
+            extra_hdrs.items,
+            payload,
+            fetch_options,
+        ) catch {
             return httpHandlerDeny(self, results, allocator, .internal_error);
         };
         results[0] = try httpResultOk(allocator, .{ .handle = fh });
@@ -20173,6 +20441,9 @@ pub const WasiCliAdapter = struct {
             } else null,
             else => null,
         };
+        const fetch_options = HttpFetchOptions.fromRequestOptions(
+            if (options_handle) |h| self.lookupRequestOptionsP3(h) else null,
+        );
 
         // Pre-allocate a pending transmission future. Real send sets
         // it to ready; for the constructor path it stays pending until
@@ -20194,6 +20465,7 @@ pub const WasiCliAdapter = struct {
             .trailers_future_handle = trailers_handle,
             .transmission_future_handle = tx_handle,
             .options_handle = options_handle,
+            .fetch_options = fetch_options,
         };
         const rh = try self.pushHttpRequestP3(r);
 
@@ -21191,7 +21463,19 @@ pub const WasiCliAdapter = struct {
             tx.write_closed = true;
         }
 
-        const fh = self.spawnHttpFetchPendingP3(ci, url, method, extra_hdrs.items, payload) catch {
+        // `request.new` retains only the resource handle. Copy the
+        // scalar timeout now so dropping/cloning request-options
+        // cannot race the worker.
+        const fetch_options = self.httpFetchOptionsP3(r);
+
+        const fh = self.spawnHttpFetchPendingP3(
+            ci,
+            url,
+            method,
+            extra_hdrs.items,
+            payload,
+            fetch_options,
+        ) catch {
             return self.httpClientSendP3DenyDeferred(ci, results, .internal_error);
         };
         results[0] = .{ .handle = fh };
@@ -32493,6 +32777,185 @@ test "wasi:http/types@0.2 request-options: three timeouts are independent (#583 
     try WasiCliAdapter.httpRequestOptionsDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
 }
 
+test "wasi:http #616 A1: connect timeout conversion is exact and unset preserves defaults" {
+    const testing = std.testing;
+
+    switch ((HttpFetchOptions{}).connectTimeout()) {
+        .none => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    const max_ns = std.math.maxInt(u64);
+    switch ((HttpFetchOptions{ .connect_timeout_ns = max_ns }).connectTimeout()) {
+        .duration => |duration| {
+            try testing.expectEqual(std.Io.Clock.awake, duration.clock);
+            try testing.expectEqual(@as(i96, max_ns), duration.raw.nanoseconds);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+const TestBlockedHttpConnector = struct {
+    var event: std.Io.Event = .unset;
+
+    fn connect(
+        client: *std.http.Client,
+        _: std.http.Client.ConnectTcpOptions,
+    ) HttpConnectResult {
+        event.wait(client.io) catch |err| return err;
+        unreachable;
+    }
+};
+
+test "wasi:http #616 A1: transport connector is interrupted by real deadline" {
+    const testing = std.testing;
+    TestBlockedHttpConnector.event = .unset;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client: std.http.Client = .{
+        .allocator = testing.allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const host = try std.Io.net.HostName.init("deadline.test");
+    const deadline: std.Io.Timeout = .{ .duration = .{
+        .raw = .{ .nanoseconds = std.time.ns_per_ms },
+        .clock = .awake,
+    } };
+    try testing.expectError(
+        error.Timeout,
+        httpClientConnectBeforeDeadlineUsing(
+            &client,
+            .{
+                .host = host,
+                .port = 80,
+                .protocol = .plain,
+            },
+            deadline.toDeadline(io),
+            TestBlockedHttpConnector.connect,
+        ),
+    );
+}
+
+test "wasi:http #616 A1: P2 and P3 snapshot connect timeout before worker lifetime" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const p2_options = try testing.allocator.create(RequestOptions);
+    p2_options.* = .{
+        .connect_timeout_ns = 12_345,
+        .first_byte_timeout_ns = 22,
+        .between_bytes_timeout_ns = 33,
+    };
+    const p2_handle = try adapter.pushRequestOptions(p2_options);
+    var p2_handle_value: InterfaceValue = .{ .handle = p2_handle };
+    const p2_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = true, .payload = &p2_handle_value } },
+    };
+    const p2_snapshot = adapter.httpFetchOptionsP2(&p2_args);
+
+    const p3_options = try testing.allocator.create(RequestOptions);
+    p3_options.* = .{
+        .connect_timeout_ns = 67_890,
+        .first_byte_timeout_ns = 44,
+        .between_bytes_timeout_ns = 55,
+    };
+    const p3_handle = try adapter.pushRequestOptionsP3(p3_options);
+    const trailers_handle = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_handle, .{
+        .elem_type_idx = 0,
+        .state = .ready,
+        .write_closed = true,
+    });
+    var p3_options_value: InterfaceValue = .{ .handle = p3_handle };
+    const request_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+        .{ .handle = trailers_handle },
+        .{ .option_val = .{ .is_some = true, .payload = &p3_options_value } },
+    };
+    var request_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestNewP3(
+        &adapter,
+        &ci,
+        &request_args,
+        &request_results,
+        testing.allocator,
+    );
+    defer request_results[0].deinit(testing.allocator);
+    const request_handle = request_results[0].tuple_val[0].handle;
+    const request = adapter.lookupHttpRequestP3(request_handle).?;
+
+    // Drop both resource-table entries before inspecting snapshots:
+    // P2 copies at handler dispatch; P3 must already have copied at
+    // request construction because its child resource can be dropped.
+    const p2_drop_args = [_]InterfaceValue{.{ .handle = p2_handle }};
+    try WasiCliAdapter.httpRequestOptionsDrop(
+        &adapter,
+        &ci,
+        &p2_drop_args,
+        &.{},
+        testing.allocator,
+    );
+    const p3_drop_args = [_]InterfaceValue{.{ .handle = p3_handle }};
+    try WasiCliAdapter.httpRequestOptionsDropP3(
+        &adapter,
+        &ci,
+        &p3_drop_args,
+        &.{},
+        testing.allocator,
+    );
+
+    const p3_snapshot = adapter.httpFetchOptionsP3(request);
+    try testing.expectEqual(@as(?u64, 12_345), p2_snapshot.connect_timeout_ns);
+    try testing.expectEqual(@as(?u64, 67_890), p3_snapshot.connect_timeout_ns);
+    try testing.expectEqual(
+        @as(?u64, null),
+        adapter.httpFetchOptionsP2(&.{.{ .handle = 0 }}).connect_timeout_ns,
+    );
+    try testing.expectEqual(
+        @as(?u64, null),
+        adapter.httpFetchOptionsP3(&HttpRequestP3{}).connect_timeout_ns,
+    );
+}
+
+test "wasi:http #616 A1: timeout maps to canonical P2 and P3 connection-timeout" {
+    const testing = std.testing;
+    const code = mapHttpFetchError(error.Timeout);
+    try testing.expectEqual(HttpErrorCode.connection_timeout, code);
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var p2_results: [1]InterfaceValue = undefined;
+    try adapter.httpHandlerDeny(&p2_results, testing.allocator, code);
+    defer p2_results[0].deinit(testing.allocator);
+    const p2_future = adapter.lookupFutureResponse(
+        p2_results[0].result_val.payload.?.handle,
+    ).?;
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.connection_timeout)),
+        p2_future.state.ready_err,
+    );
+
+    const p3_handle = try adapter.spawnReadyHttpP3ClientSendErrFuture(&ci, code);
+    const p3_future = ci.futures.getPtr(p3_handle).?;
+    const decoded = decodeP3ClientSendBytes(p3_future.payload.?);
+    try testing.expect(!decoded.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.connection_timeout)),
+        decoded.payload,
+    );
+}
+
 test "wasi:http/types@0.2 http-error-code: unknown io-error handle returns none (#583 A5)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -37607,6 +38070,97 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: outbound HTTP fetch flips shared.
     }
 }
 
+test "wasi:http #616 A1: P3 HTTP cancellation is scoped to ComponentInstance" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci_a = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci_a);
+    var ci_b = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci_b);
+
+    const Fixture = struct {
+        future_handle: u32,
+        shared: *PendingHttpFetchShared,
+
+        fn init(
+            target_adapter: *WasiCliAdapter,
+            target_ci: *ComponentInstance,
+            allocator: Allocator,
+        ) !@This() {
+            const future_handle = target_ci.allocAsyncHandle();
+            try target_ci.futures.put(allocator, future_handle, .{
+                .elem_type_idx = 0,
+                .state = .pending,
+            });
+            const shared = try target_adapter.allocator.create(PendingHttpFetchShared);
+            errdefer target_adapter.allocator.destroy(shared);
+            shared.* = .{};
+            const Worker = struct {
+                fn run(state: *PendingHttpFetchShared) void {
+                    state.outcome = .{ .failure = .internal_error };
+                    state.done.store(true, .release);
+                }
+            };
+            const thread = try std.Thread.spawn(.{}, Worker.run, .{shared});
+            errdefer thread.join();
+            try target_adapter.pending_http_fetches_p3.append(
+                target_adapter.allocator,
+                .{
+                    .future_handle = future_handle,
+                    .ci = target_ci,
+                    .thread = thread,
+                    .shared = shared,
+                },
+            );
+            return .{ .future_handle = future_handle, .shared = shared };
+        }
+    };
+
+    const fetch_a = try Fixture.init(&adapter, &ci_a, testing.allocator);
+    const fetch_b = try Fixture.init(&adapter, &ci_b, testing.allocator);
+
+    WasiCliAdapter.cancelAllPendingAsyncOps(
+        &adapter,
+        &ci_a,
+        null,
+        testing.allocator,
+    );
+    try testing.expect(fetch_a.shared.cancelled.load(.acquire));
+    try testing.expect(!fetch_b.shared.cancelled.load(.acquire));
+
+    var attempts: usize = 0;
+    while (attempts < 10_000 and adapter.pending_http_fetches_p3.items.len > 0) : (attempts += 1) {
+        adapter.drainPendingHttpFetchesP3(&ci_a, testing.allocator);
+        adapter.drainPendingHttpFetchesP3(&ci_b, testing.allocator);
+        if (adapter.pending_http_fetches_p3.items.len == 0) break;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const duration: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        duration.sleep(io) catch {};
+    }
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches_p3.items.len);
+
+    const decoded_a = decodeP3ClientSendBytes(
+        ci_a.futures.getPtr(fetch_a.future_handle).?.payload.?,
+    );
+    try testing.expect(!decoded_a.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        decoded_a.payload,
+    );
+    const decoded_b = decodeP3ClientSendBytes(
+        ci_b.futures.getPtr(fetch_b.future_handle).?.payload.?,
+    );
+    try testing.expect(!decoded_b.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        decoded_b.payload,
+    );
+}
+
 test "wasi:http #833: in-flight HTTP future exposes a wakeable backend fd (no busy-spin)" {
     // Before #833 the `.http_future_response` pollable had no backend
     // fd, so `waitForBackendEvents` saw zero fds and returned at once →
@@ -37691,6 +38245,7 @@ test "wasi:http #583 B1 follow-up: httpClientLowLevelFetch observes pre-connect 
         .GET,
         &.{},
         null,
+        .{},
         &cancelled,
     );
     try testing.expectError(error.HttpFetchCancelled, result);
@@ -37716,6 +38271,7 @@ test "wasi:http #583 B1 follow-up: httpFetchWorker translates Cancelled to HTTP_
         .GET,
         &.{},
         null,
+        .{},
     );
     try testing.expectEqual(@as(usize, 1), adapter.pending_http_fetches.items.len);
     // Pre-flip cancel BEFORE the worker has a chance to fail-
@@ -37913,6 +38469,7 @@ const TestHttpFetchWorkerCtx = struct {
             .GET,
             &.{},
             null,
+            .{},
             self.cancelled,
         );
         if (result) |r| {
@@ -43141,6 +43698,9 @@ test "populateWasiProviders: binds 6 missing wasi:io/streams@0.2 audit arms (#58
     try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.blocking-write-zeroes-and-flush"));
     try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.splice"));
     try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.blocking-splice"));
+    const splice_call = adapter.io_streams_iface.members.get("[method]output-stream.splice").?.func.call.?;
+    const blocking_splice_call = adapter.io_streams_iface.members.get("[method]output-stream.blocking-splice").?.func.call.?;
+    try testing.expect(splice_call != blocking_splice_call);
 }
 
 test "populateWasiProviders: binds error.to-debug-string + network-error-code (#583, #604)" {
@@ -43279,7 +43839,7 @@ test "wasi:io/streams output-stream.blocking-write-zeroes-and-flush: writes full
     for (sink.getBufferContents()) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
-test "wasi:io/streams output-stream.splice: copies bytes from input-stream to output-stream (#583, #604)" {
+test "wasi:io/streams output-stream.splice: buffer fallback copies requested bytes (#616 A2)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
@@ -43306,6 +43866,340 @@ test "wasi:io/streams output-stream.splice: copies bytes from input-stream to ou
     try testing.expectEqualStrings("hello", sink.getBufferContents());
 }
 
+test "wasi:io/streams output-stream.splice: uses Linux descriptor path (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+        try testing.expectEqual(.SUCCESS, linux.errno(linux.write(source_fds[1], "abcdef", 6)));
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 4 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u64, 4), results[0].result_val.payload.?.u64);
+        var buf: [8]u8 = undefined;
+        const n = linux.read(dest_fds[0], &buf, buf.len);
+        try testing.expectEqual(.SUCCESS, linux.errno(n));
+        try testing.expectEqualStrings("abcd", buf[0..n]);
+    }
+}
+
+test "wasi:io/streams output-stream.splice: closed pipe peer survives SIGPIPE and returns closed (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        streams.sigpipe_test_state.mutex.lock();
+        defer streams.sigpipe_test_state.mutex.unlock();
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[1]);
+        try testing.expectEqual(.SUCCESS, linux.errno(linux.write(source_fds[1], "data", 4)));
+        _ = linux.close(dest_fds[0]);
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 4 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        var default_action: linux.Sigaction = .{
+            .handler = .{ .handler = linux.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, &default_action, &old_action);
+        defer std.posix.sigaction(linux.SIG.PIPE, &old_action, null);
+        var mask_before: linux.sigset_t = undefined;
+        try testing.expectEqual(
+            .SUCCESS,
+            linux.errno(linux.sigprocmask(linux.SIG.BLOCK, null, &mask_before)),
+        );
+        try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expect(results[0].result_val.payload == null);
+        var current_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, null, &current_action);
+        try testing.expect(current_action.handler.handler == linux.SIG.DFL);
+        var mask_after: linux.sigset_t = undefined;
+        try testing.expectEqual(
+            .SUCCESS,
+            linux.errno(linux.sigprocmask(linux.SIG.BLOCK, null, &mask_after)),
+        );
+        try testing.expectEqual(mask_before, mask_after);
+    }
+}
+
+test "wasi:io/streams output-stream.blocking-splice: closed pipe peer survives SIGPIPE and returns closed (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        streams.sigpipe_test_state.mutex.lock();
+        defer streams.sigpipe_test_state.mutex.unlock();
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[1]);
+        try testing.expectEqual(.SUCCESS, linux.errno(linux.write(source_fds[1], "data", 4)));
+        _ = linux.close(dest_fds[0]);
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 4 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        var default_action: linux.Sigaction = .{
+            .handler = .{ .handler = linux.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, &default_action, &old_action);
+        defer std.posix.sigaction(linux.SIG.PIPE, &old_action, null);
+        try WasiCliAdapter.outputStreamBlockingSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expect(results[0].result_val.payload == null);
+        var current_action: linux.Sigaction = undefined;
+        std.posix.sigaction(linux.SIG.PIPE, null, &current_action);
+        try testing.expect(current_action.handler.handler == linux.SIG.DFL);
+    }
+}
+
+test "wasi:io/streams output-stream.splice: zero length on open descriptors is ok(0) (#616 A2)" {
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_file = try tmp.dir.createFile(io, "zero-source", .{ .read = true });
+    defer source_file.close(io);
+    const dest_file = try tmp.dir.createFile(io, "zero-dest", .{ .read = true });
+    defer dest_file.close(io);
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var src = streams.InputStream.fromHostFile(source_file, 0);
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+    var dst = streams.OutputStream.toHostFile(dest_file, 0, false, false);
+    const dst_handle = try adapter.allocStreamHandle(&dst);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(u64, 0), results[0].result_val.payload.?.u64);
+    try testing.expectEqual(@as(u64, 0), src.source.host_file.offset);
+    try testing.expectEqual(@as(u64, 0), dst.sink.host_file.offset);
+}
+
+test "wasi:io/streams output-stream.splice: zero length with closed source returns closed (#616 A2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream{ .source = .closed };
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+    var dst = streams.OutputStream.toBuffer();
+    defer dst.deinit(testing.allocator);
+    const dst_handle = try adapter.allocStreamHandle(&dst);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expect(results[0].result_val.payload == null);
+    try testing.expectEqual(@as(usize, 0), dst.getBufferContents().len);
+}
+
+test "wasi:io/streams output-stream.splice: zero length with closed destination returns closed (#616 A2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream.fromBuffer("unread");
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+    var dst = streams.OutputStream{ .sink = .closed };
+    const dst_handle = try adapter.allocStreamHandle(&dst);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expect(results[0].result_val.payload == null);
+    try testing.expectEqual(@as(usize, 0), src.source.buffer.pos);
+}
+
+test "wasi:io/streams output-stream.splice: empty blocking pipe returns promptly with ok(0) (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+
+        // The descriptors intentionally remain blocking. The per-call
+        // SPLICE_F_NONBLOCK flag must turn the empty source into ok(0).
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 16 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u64, 0), results[0].result_val.payload.?.u64);
+        const flags = linux.fcntl(source_fds[0], linux.F.GETFL, 0);
+        try testing.expectEqual(.SUCCESS, linux.errno(flags));
+        const open_flags: linux.O = @bitCast(@as(u32, @intCast(flags & 0xFFFF_FFFF)));
+        try testing.expect(!open_flags.NONBLOCK);
+    }
+}
+
+test "wasi:io/streams output-stream.blocking-splice: retries EAGAIN after producer readiness (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{ .NONBLOCK = true })) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{ .NONBLOCK = true })) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+
+        // O_NONBLOCK makes an empty source report EAGAIN until the producer
+        // wakes the blocking-splice readiness loop.
+        const Producer = struct {
+            fn run(fd: i32) void {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const delay: std.Io.Clock.Duration = .{
+                    .raw = .{ .nanoseconds = 20 * std.time.ns_per_ms },
+                    .clock = .awake,
+                };
+                delay.sleep(io) catch {};
+                _ = std.os.linux.write(fd, "ready", 5);
+            }
+        };
+        const producer = try std.Thread.spawn(.{}, Producer.run, .{source_fds[1]});
+        defer producer.join();
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 16 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.outputStreamBlockingSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u64, 5), results[0].result_val.payload.?.u64);
+        var buf: [8]u8 = undefined;
+        const n = linux.read(dest_fds[0], &buf, buf.len);
+        try testing.expectEqual(.SUCCESS, linux.errno(n));
+        try testing.expectEqualStrings("ready", buf[0..n]);
+    }
+}
+
 test "wasi:io/streams output-stream.blocking-splice: blocks then copies bytes (#583, #604)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -43318,10 +44212,6 @@ test "wasi:io/streams output-stream.blocking-splice: blocks then copies bytes (#
     defer sink.deinit(testing.allocator);
     const dst_handle = try adapter.allocStreamHandle(&sink);
 
-    // `splice` and `blocking-splice` share the same host helper
-    // (`outputStreamSplice`) since the captured-buffer / fd sources are
-    // already blocking-on-data — this test exercises the same wired
-    // entry point under the blocking-splice ABI name.
     var args = [_]InterfaceValue{
         .{ .handle = dst_handle },
         .{ .handle = src_handle },
@@ -43329,7 +44219,7 @@ test "wasi:io/streams output-stream.blocking-splice: blocks then copies bytes (#
     };
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     var ci: ComponentInstance = undefined;
-    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    try WasiCliAdapter.outputStreamBlockingSplice(&adapter, &ci, &args, &results, testing.allocator);
     defer results[0].deinit(testing.allocator);
 
     try testing.expect(results[0].result_val.is_ok);
