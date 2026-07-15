@@ -4,6 +4,7 @@
 //! wasi:io/poll (pollable) as resource types with read/write operations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tls = @import("tls");
 
 // ── wasi:io/streams — input-stream ──────────────────────────────────────────
@@ -317,6 +318,146 @@ pub const StreamError = enum {
     io_error,
 };
 
+/// Result of attempting the Linux zero-copy stream transfer. `unsupported`
+/// means no bytes moved and the caller may safely use its buffered path.
+pub const SpliceResult = union(enum) {
+    ok: usize,
+    closed,
+    unsupported,
+    err: StreamError,
+};
+
+pub const SpliceMode = enum {
+    nonblocking,
+    blocking,
+};
+
+const LinuxSpliceEndpoint = struct {
+    fd: std.posix.fd_t,
+    offset: ?*u64 = null,
+};
+
+fn linuxInputSpliceEndpoint(stream: *InputStream) ?LinuxSpliceEndpoint {
+    return switch (stream.source) {
+        .fd => |fd| .{ .fd = fd },
+        .host_file => |*hf| .{ .fd = hf.file.handle, .offset = &hf.offset },
+        .tcp_stream => |fd| .{ .fd = fd },
+        else => null,
+    };
+}
+
+fn linuxOutputSpliceEndpoint(stream: *OutputStream) ?LinuxSpliceEndpoint {
+    return switch (stream.sink) {
+        .fd => |fd| .{ .fd = fd },
+        .host_file => |*hf| .{ .fd = hf.file.handle, .offset = &hf.offset },
+        .tcp_stream => |fd| .{ .fd = fd },
+        else => null,
+    };
+}
+
+fn linuxIsPipe(fd: std.posix.fd_t) bool {
+    const linux = std.os.linux;
+    return linux.errno(linux.fcntl(fd, linux.F.GETPIPE_SZ, 0)) == .SUCCESS;
+}
+
+const LinuxReady = enum {
+    ready,
+    not_ready,
+    err,
+};
+
+fn linuxFdReady(fd: std.posix.fd_t, events: i16, timeout_ms: i32) LinuxReady {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = events,
+        .revents = 0,
+    }};
+    const n = std.posix.poll(&fds, timeout_ms) catch return .err;
+    if (n == 0) return .not_ready;
+    const invalid: i16 = @intCast(std.c.POLL.NVAL);
+    if ((fds[0].revents & invalid) != 0) return .err;
+    const ready_events = events |
+        @as(i16, @intCast(std.c.POLL.ERR)) |
+        @as(i16, @intCast(std.c.POLL.HUP));
+    return if ((fds[0].revents & ready_events) != 0) .ready else .not_ready;
+}
+
+fn linuxSpliceReady(in_fd: std.posix.fd_t, out_fd: std.posix.fd_t, timeout_ms: i32) LinuxReady {
+    const write_ready = linuxFdReady(out_fd, @intCast(std.c.POLL.OUT), timeout_ms);
+    if (write_ready != .ready) return write_ready;
+    return linuxFdReady(in_fd, @intCast(std.c.POLL.IN), timeout_ms);
+}
+
+/// Try Linux `splice(2)` for descriptor-backed streams. Nonblocking mode is
+/// restricted to pipe-to-pipe transfers because `SPLICE_F_NONBLOCK` does not
+/// guarantee nonblocking I/O on a non-pipe endpoint. The transfer is limited
+/// to one successful syscall, matching the short-read behavior of `read`.
+pub fn splice(src: *InputStream, dst: *OutputStream, len: usize, mode: SpliceMode) SpliceResult {
+    if (src.source == .closed or dst.sink == .closed) return .closed;
+    if (len == 0) return .{ .ok = 0 };
+    if (comptime builtin.os.tag != .linux) return .unsupported;
+
+    const in = linuxInputSpliceEndpoint(src) orelse return .unsupported;
+    const out = linuxOutputSpliceEndpoint(dst) orelse return .unsupported;
+    const in_is_pipe = linuxIsPipe(in.fd);
+    const out_is_pipe = linuxIsPipe(out.fd);
+
+    if (mode == .nonblocking) {
+        if (!in_is_pipe or !out_is_pipe) return .unsupported;
+    }
+
+    if (dst.sink == .host_file and dst.sink.host_file.append) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        dst.sink.host_file.offset = dst.sink.host_file.file.length(io) catch
+            return .{ .err = .io_error };
+    }
+
+    if (in.offset != null and in.offset.?.* > std.math.maxInt(i64)) return .unsupported;
+    if (out.offset != null and out.offset.?.* > std.math.maxInt(i64)) return .unsupported;
+
+    var in_offset: i64 = if (in.offset) |offset| @intCast(offset.*) else 0;
+    var out_offset: i64 = if (out.offset) |offset| @intCast(offset.*) else 0;
+    const in_offset_arg: usize = if (in.offset != null) @intFromPtr(&in_offset) else 0;
+    const out_offset_arg: usize = if (out.offset != null) @intFromPtr(&out_offset) else 0;
+    const linux = std.os.linux;
+    const splice_f_nonblock: usize = 2;
+
+    while (true) {
+        const rc = linux.syscall6(
+            .splice,
+            @as(usize, @bitCast(@as(isize, in.fd))),
+            in_offset_arg,
+            @as(usize, @bitCast(@as(isize, out.fd))),
+            out_offset_arg,
+            len,
+            if (mode == .nonblocking) splice_f_nonblock else 0,
+        );
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) return .closed;
+                if (in.offset) |offset| offset.* = @intCast(in_offset);
+                if (out.offset) |offset| offset.* = @intCast(out_offset);
+                return .{ .ok = n };
+            },
+            .INTR => continue,
+            // These errors describe an endpoint pair that splice(2) cannot
+            // handle. The syscall transferred nothing, so buffered I/O is
+            // still safe.
+            .INVAL, .NOSYS, .OPNOTSUPP, .SPIPE => return .unsupported,
+            .AGAIN => switch (mode) {
+                .nonblocking => return .{ .ok = 0 },
+                .blocking => switch (linuxSpliceReady(in.fd, out.fd, -1)) {
+                    .ready => continue,
+                    .not_ready => unreachable,
+                    .err => return .{ .err = .io_error },
+                },
+            },
+            else => return .{ .err = .io_error },
+        }
+    }
+}
+
 // ── wasi:io/poll — pollable ─────────────────────────────────────────────────
 
 /// A pollable resource — represents an async readiness notification.
@@ -472,6 +613,77 @@ test "InputStream: read from fd returns closed at EOF (#474)" {
         var buf: [16]u8 = undefined;
         const r = stream.read(&buf);
         try std.testing.expect(r == .closed);
+    }
+}
+
+test "splice: Linux pipe fast path honors requested length (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.write(source_fds[1], "abcdef", 6)));
+
+        var src = InputStream.fromFd(source_fds[0]);
+        var dst = OutputStream.toFd(dest_fds[1]);
+        const result = splice(&src, &dst, 3, .blocking);
+        try std.testing.expectEqual(@as(usize, 3), result.ok);
+
+        var buf: [8]u8 = undefined;
+        const dest_n = linux.read(dest_fds[0], &buf, buf.len);
+        try std.testing.expectEqual(.SUCCESS, linux.errno(dest_n));
+        try std.testing.expectEqualStrings("abc", buf[0..dest_n]);
+
+        const source_n = linux.read(source_fds[0], &buf, buf.len);
+        try std.testing.expectEqual(.SUCCESS, linux.errno(source_n));
+        try std.testing.expectEqualStrings("def", buf[0..source_n]);
+    }
+}
+
+test "splice: Linux pipe EOF reports closed (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+
+        var src = InputStream.fromFd(source_fds[0]);
+        var dst = OutputStream.toFd(dest_fds[1]);
+        try std.testing.expect(splice(&src, &dst, 16, .blocking) == .closed);
+    }
+}
+
+test "splice: Linux regular files request safe fallback (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const source_file = try tmp.dir.createFile(io, "source", .{ .read = true });
+        defer source_file.close(io);
+        try source_file.writePositionalAll(io, "payload", 0);
+        const dest_file = try tmp.dir.createFile(io, "dest", .{ .read = true });
+        defer dest_file.close(io);
+
+        var src = InputStream.fromHostFile(source_file, 0);
+        var dst = OutputStream.toHostFile(dest_file, 0, false, false);
+        try std.testing.expect(splice(&src, &dst, 7, .blocking) == .unsupported);
+        try std.testing.expectEqual(@as(u64, 0), src.source.host_file.offset);
+        try std.testing.expectEqual(@as(u64, 0), dst.sink.host_file.offset);
     }
 }
 

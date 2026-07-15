@@ -154,9 +154,9 @@ All eight previously-missing arms (`input-stream.skip` /
 `blocking-skip`, `output-stream.write-zeroes` /
 `blocking-write-zeroes-and-flush` / `splice` / `blocking-splice`,
 `error.to-debug-string`, `network-error-code`) are now bound.
-`splice` is a buffer-through MVP; kernel `splice(2)` zero-copy
-remains under [#583 B2](https://github.com/cataggar/wamr/issues/583)
-for follow-up.
+Linux descriptor-backed streams use a `splice(2)` fast path; other
+platforms and unsupported endpoint combinations retain the buffer-through
+implementation.
 
 `[method]response-outparam.send-informational` remains the only
 unbound member: it is `@unstable(feature = informational-outbound-responses)`
@@ -180,8 +180,7 @@ per-interface tables below reflect the post-fill-in state.
   - `[method]input-stream.blocking-skip`
   - `[method]output-stream.write-zeroes`
   - `[method]output-stream.blocking-write-zeroes-and-flush`
-  - `[method]output-stream.splice` (buffer-through MVP; `splice(2)`
-    fast-path tracked under [#583 B2](https://github.com/cataggar/wamr/issues/583))
+  - `[method]output-stream.splice`
   - `[method]output-stream.blocking-splice`
 * `wasi:io/error@0.2.x`:
   - `[method]error.to-debug-string`
@@ -229,8 +228,8 @@ Registered together by
 | `[method]output-stream.subscribe` | ✅ | :4639 | — |
 | `[method]output-stream.write-zeroes` | ✅ | :4811 / impl :8281 | Audit fill-in (#583, PR #604). |
 | `[method]output-stream.blocking-write-zeroes-and-flush` | ✅ | :4816 / impl :8323 | Audit fill-in (#583, PR #604). |
-| `[method]output-stream.splice` | ✅ | :4821 / impl :8377 | Buffer-through MVP — `splice(2)` zero-copy left to #583 B2 follow-up. |
-| `[method]output-stream.blocking-splice` | ✅ | :4826 / impl :8377 | Same host helper as `splice` (captured-buffer / fd sources block on data already). |
+| `[method]output-stream.splice` | ✅ | :4821 / impl :8377 | Nonblocking Linux pipe-to-pipe `splice(2)`; buffer fallback otherwise. |
+| `[method]output-stream.blocking-splice` | ✅ | :4826 / impl :8377 | Blocking Linux `splice(2)` with `EAGAIN` readiness wait/retry; buffer fallback otherwise. |
 | `[resource-drop]output-stream` | ✅ | :4649 | — |
 | `[method]input-stream.subscribe` | ✅ | :4644 | — |
 | `[method]input-stream.read` | ✅ | :4660 | Aliased to `blocking-read`. |
@@ -243,11 +242,11 @@ Coverage: `wasi:cli/stdout` 1/1 (100 %); `wasi:io/streams` 17/17
 (100 %). Six audit-arm methods (`skip`, `blocking-skip`,
 `write-zeroes`, `blocking-write-zeroes-and-flush`, `splice`,
 `blocking-splice`) flipped from ❌ to ✅ in PR #604's follow-up
-(audit-driven). The `splice` host helper is a buffer-through MVP:
-`read` into a host scratch buffer, then `write` — correct for
-every supported source/sink combination but does an extra memcpy
-for fd ↔ fd hops that a future kernel `splice(2)` fast path could
-elide (tracked under #583 B2).
+(audit-driven). Linux descriptor-backed streams now use `splice(2)`;
+ordinary splice restricts the fast path to pipe pairs and uses
+`SPLICE_F_NONBLOCK`, while blocking-splice waits and retries `EAGAIN`.
+Unsupported endpoint pairs and non-Linux targets still read and write
+through the bounded host scratch buffer.
 
 ### `wasi:cli/stderr`
 

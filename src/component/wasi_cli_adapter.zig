@@ -5447,7 +5447,7 @@ pub const WasiCliAdapter = struct {
         try self.io_streams_iface.members.put(
             self.allocator,
             "[method]output-stream.blocking-splice",
-            .{ .func = .{ .context = self, .call = &outputStreamSplice } },
+            .{ .func = .{ .context = self, .call = &outputStreamBlockingSplice } },
         );
         try self.io_streams_iface.members.put(
             self.allocator,
@@ -9160,26 +9160,40 @@ pub const WasiCliAdapter = struct {
 
     /// `wasi:io/streams.[method]output-stream.splice:
     ///   (borrow<output-stream>, borrow<input-stream>, u64)
-    ///   -> result<u64, stream-error>` and `[method]output-stream.blocking-splice`.
+    ///   -> result<u64, stream-error>`.
     ///
-    /// MVP: buffer-through implementation — `read` up to `len` bytes
-    /// from `src` into a host scratch buffer, then `write` them to
-    /// `self`. Returns the number of bytes spliced in the ok arm.
-    /// A closed source surfaces in the err arm (`is_ok = false`)
-    /// matching the `blockingRead` convention.
-    ///
-    /// Follow-up: a zero-copy host-driver fast path could call
-    /// `splice(2)` (Linux) when both endpoints expose raw fds. Tracked
-    /// under [#583 B2](https://github.com/cataggar/wamr/issues/583);
-    /// the buffer-through path is correct (and the only correct option
-    /// for buffer-backed sinks) but does an extra memcpy for fd ↔ fd
-    /// hops.
+    /// Uses Linux `splice(2)` when both streams expose compatible host
+    /// descriptors without risking a blocking call. Unsupported endpoint
+    /// pairs and other platforms retain the buffer-through path.
     fn outputStreamSplice(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        return outputStreamSpliceCommon(ctx_opaque, ci, args, results, allocator, .nonblocking);
+    }
+
+    /// `wasi:io/streams.[method]output-stream.blocking-splice`.
+    /// Waits for descriptor readiness and retries `EAGAIN`.
+    fn outputStreamBlockingSplice(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        return outputStreamSpliceCommon(ctx_opaque, ci, args, results, allocator, .blocking);
+    }
+
+    fn outputStreamSpliceCommon(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
+        mode: streams.SpliceMode,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (args.len < 3 or results.len == 0) return error.InvalidArgs;
@@ -9201,22 +9215,33 @@ pub const WasiCliAdapter = struct {
         const want: usize = @min(want_u64, std.math.maxInt(usize));
         const capped: usize = @min(want, STREAM_SCRATCH_CAP);
 
-        const buf = try allocator.alloc(u8, capped);
-        defer allocator.free(buf);
-
-        const n_read: usize = switch (src.read(buf)) {
+        const n_read: usize = switch (streams.splice(src, dst, capped, mode)) {
             .ok => |n| n,
             .closed => {
                 results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
                 return;
             },
             .err => return error.IoError,
-        };
+            .unsupported => buffered: {
+                const buf = try allocator.alloc(u8, capped);
+                defer allocator.free(buf);
 
-        switch (dst.write(buf[0..n_read], self.allocator)) {
-            .ok => {},
-            .err, .closed => return error.IoError,
-        }
+                const n = switch (src.read(buf)) {
+                    .ok => |read_n| read_n,
+                    .closed => {
+                        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+                        return;
+                    },
+                    .err => return error.IoError,
+                };
+
+                switch (dst.write(buf[0..n], self.allocator)) {
+                    .ok => {},
+                    .err, .closed => return error.IoError,
+                }
+                break :buffered n;
+            },
+        };
 
         const payload = try allocator.create(InterfaceValue);
         payload.* = .{ .u64 = @intCast(n_read) };
@@ -43673,6 +43698,9 @@ test "populateWasiProviders: binds 6 missing wasi:io/streams@0.2 audit arms (#58
     try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.blocking-write-zeroes-and-flush"));
     try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.splice"));
     try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.blocking-splice"));
+    const splice_call = adapter.io_streams_iface.members.get("[method]output-stream.splice").?.func.call.?;
+    const blocking_splice_call = adapter.io_streams_iface.members.get("[method]output-stream.blocking-splice").?.func.call.?;
+    try testing.expect(splice_call != blocking_splice_call);
 }
 
 test "populateWasiProviders: binds error.to-debug-string + network-error-code (#583, #604)" {
@@ -43811,7 +43839,7 @@ test "wasi:io/streams output-stream.blocking-write-zeroes-and-flush: writes full
     for (sink.getBufferContents()) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
-test "wasi:io/streams output-stream.splice: copies bytes from input-stream to output-stream (#583, #604)" {
+test "wasi:io/streams output-stream.splice: buffer fallback copies requested bytes (#616 A2)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
@@ -43838,6 +43866,229 @@ test "wasi:io/streams output-stream.splice: copies bytes from input-stream to ou
     try testing.expectEqualStrings("hello", sink.getBufferContents());
 }
 
+test "wasi:io/streams output-stream.splice: uses Linux descriptor path (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+        try testing.expectEqual(.SUCCESS, linux.errno(linux.write(source_fds[1], "abcdef", 6)));
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 4 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u64, 4), results[0].result_val.payload.?.u64);
+        var buf: [8]u8 = undefined;
+        const n = linux.read(dest_fds[0], &buf, buf.len);
+        try testing.expectEqual(.SUCCESS, linux.errno(n));
+        try testing.expectEqualStrings("abcd", buf[0..n]);
+    }
+}
+
+test "wasi:io/streams output-stream.splice: zero length on open descriptors is ok(0) (#616 A2)" {
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_file = try tmp.dir.createFile(io, "zero-source", .{ .read = true });
+    defer source_file.close(io);
+    const dest_file = try tmp.dir.createFile(io, "zero-dest", .{ .read = true });
+    defer dest_file.close(io);
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var src = streams.InputStream.fromHostFile(source_file, 0);
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+    var dst = streams.OutputStream.toHostFile(dest_file, 0, false, false);
+    const dst_handle = try adapter.allocStreamHandle(&dst);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(u64, 0), results[0].result_val.payload.?.u64);
+    try testing.expectEqual(@as(u64, 0), src.source.host_file.offset);
+    try testing.expectEqual(@as(u64, 0), dst.sink.host_file.offset);
+}
+
+test "wasi:io/streams output-stream.splice: zero length with closed source returns closed (#616 A2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream{ .source = .closed };
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+    var dst = streams.OutputStream.toBuffer();
+    defer dst.deinit(testing.allocator);
+    const dst_handle = try adapter.allocStreamHandle(&dst);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expect(results[0].result_val.payload == null);
+    try testing.expectEqual(@as(usize, 0), dst.getBufferContents().len);
+}
+
+test "wasi:io/streams output-stream.splice: zero length with closed destination returns closed (#616 A2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream.fromBuffer("unread");
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+    var dst = streams.OutputStream{ .sink = .closed };
+    const dst_handle = try adapter.allocStreamHandle(&dst);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expect(results[0].result_val.payload == null);
+    try testing.expectEqual(@as(usize, 0), src.source.buffer.pos);
+}
+
+test "wasi:io/streams output-stream.splice: empty blocking pipe returns promptly with ok(0) (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+
+        // The descriptors intentionally remain blocking. The per-call
+        // SPLICE_F_NONBLOCK flag must turn the empty source into ok(0).
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 16 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u64, 0), results[0].result_val.payload.?.u64);
+        const flags = linux.fcntl(source_fds[0], linux.F.GETFL, 0);
+        try testing.expectEqual(.SUCCESS, linux.errno(flags));
+        const open_flags: linux.O = @bitCast(@as(u32, @intCast(flags & 0xFFFF_FFFF)));
+        try testing.expect(!open_flags.NONBLOCK);
+    }
+}
+
+test "wasi:io/streams output-stream.blocking-splice: retries EAGAIN after producer readiness (#616 A2)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .linux) {
+        const testing = std.testing;
+        const linux = std.os.linux;
+        var source_fds: [2]i32 = undefined;
+        var dest_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&source_fds, .{ .NONBLOCK = true })) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(source_fds[0]);
+        defer _ = linux.close(source_fds[1]);
+        if (linux.errno(linux.pipe2(&dest_fds, .{ .NONBLOCK = true })) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(dest_fds[0]);
+        defer _ = linux.close(dest_fds[1]);
+
+        // O_NONBLOCK makes an empty source report EAGAIN until the producer
+        // wakes the blocking-splice readiness loop.
+        const Producer = struct {
+            fn run(fd: i32) void {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const delay: std.Io.Clock.Duration = .{
+                    .raw = .{ .nanoseconds = 20 * std.time.ns_per_ms },
+                    .clock = .awake,
+                };
+                delay.sleep(io) catch {};
+                _ = std.os.linux.write(fd, "ready", 5);
+            }
+        };
+        const producer = try std.Thread.spawn(.{}, Producer.run, .{source_fds[1]});
+        defer producer.join();
+
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var src = streams.InputStream.fromFd(source_fds[0]);
+        const src_handle = try adapter.allocInputStreamHandle(&src);
+        var dst = streams.OutputStream.toFd(dest_fds[1]);
+        const dst_handle = try adapter.allocStreamHandle(&dst);
+
+        var args = [_]InterfaceValue{
+            .{ .handle = dst_handle },
+            .{ .handle = src_handle },
+            .{ .u64 = 16 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.outputStreamBlockingSplice(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u64, 5), results[0].result_val.payload.?.u64);
+        var buf: [8]u8 = undefined;
+        const n = linux.read(dest_fds[0], &buf, buf.len);
+        try testing.expectEqual(.SUCCESS, linux.errno(n));
+        try testing.expectEqualStrings("ready", buf[0..n]);
+    }
+}
+
 test "wasi:io/streams output-stream.blocking-splice: blocks then copies bytes (#583, #604)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -43850,10 +44101,6 @@ test "wasi:io/streams output-stream.blocking-splice: blocks then copies bytes (#
     defer sink.deinit(testing.allocator);
     const dst_handle = try adapter.allocStreamHandle(&sink);
 
-    // `splice` and `blocking-splice` share the same host helper
-    // (`outputStreamSplice`) since the captured-buffer / fd sources are
-    // already blocking-on-data — this test exercises the same wired
-    // entry point under the blocking-splice ABI name.
     var args = [_]InterfaceValue{
         .{ .handle = dst_handle },
         .{ .handle = src_handle },
@@ -43861,7 +44108,7 @@ test "wasi:io/streams output-stream.blocking-splice: blocks then copies bytes (#
     };
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     var ci: ComponentInstance = undefined;
-    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    try WasiCliAdapter.outputStreamBlockingSplice(&adapter, &ci, &args, &results, testing.allocator);
     defer results[0].deinit(testing.allocator);
 
     try testing.expect(results[0].result_val.is_ok);
