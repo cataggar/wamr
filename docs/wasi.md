@@ -342,19 +342,48 @@ per-scenario budget in
 [`tests/benchmarks/wasi-microbench/budget.json`](../tests/benchmarks/wasi-microbench/budget.json)
 by more than the regression threshold (default +10 %). CI lives at
 [`.github/workflows/wasi-microbench.yml`](../.github/workflows/wasi-microbench.yml)
-(currently `continue-on-error: true` while the hosted-x86_64 baseline
-stabilises).
+and the benchmark is blocking within that job whenever the
+path-filtered workflow runs. Its report artifact is uploaded even when
+the benchmark fails. Branch protection does not currently require this
+workflow context, so the failure does not by itself prevent every PR
+from merging.
 
-To accept an intentional perf change (refactor, new API, etc.):
+The current baseline was calibrated on 2026-07-15 from all 98 retained
+successful `ubuntu-22.04` x86_64 workflow artifact reports in the latest
+100 runs (the other two were cancelled), spanning 2026-06-06 through
+2026-07-14. Every report used 10 samples per scenario. Each run's
+`median_ns` was treated as one observation; the arithmetic mean and
+sample standard deviation (σ) of those 98 run medians were:
+
+| Scenario | Mean | σ | Effective gate | Observed pass rate |
+| --- | ---: | ---: | ---: | ---: |
+| HTTP keep-alive 100 RT | 28.653 µs | 4.132 µs | 38.5 µs | 98/98 |
+| UDP receive 1 MiB | 28.163 µs | 6.034 µs | 40.7 µs | 95/98 |
+| fs write-via-stream 1 MiB | 170.439 µs | 14.788 µs | 200.2 µs | 98/98 |
+| fs read-via-stream 1 MiB | 23.612 µs | 2.371 µs | 28.6 µs | 98/98 |
+
+The target effective gate is approximately `mean + 2σ`. Because the
+harness already fails at `median_ns_budget × 1.10`, `budget.json`
+stores the target gate divided by 1.10, rounded up to whole
+microseconds; the threshold is the noise margin, not a second margin.
+The HTTP base was kept one additional microsecond above the direct
+rounding (2.38σ effective headroom) so the observed whole-workflow pass
+rate is 95/98 (96.9 %), meeting the ≥95 % gate target.
+
+To recalibrate after an intentional performance change, collect a
+representative set of successful GitHub-hosted artifact reports. For a
+local diagnostic run:
 
 ```console
 $ zig build wasi-microbench -- --no-budget --samples 20 --warmup 5
 ```
 
-Take the reported `median_ns` for each scenario, multiply by ~1.5
-(headroom for runner jitter), and edit `budget.json`. Include the
-ratio + rationale in the PR description so future budget-bumps can
-distinguish "intentional regression" from "platform drift".
+Compute the distribution above from per-run medians, choose an
+effective gate near `mean + 2σ` with an observed whole-workflow pass
+rate of at least 95 %, then divide by the workflow's threshold
+multiplier before updating `budget.json`. Record the sample, dates,
+statistics, threshold, and any additional rounding so future changes
+can distinguish intentional regressions from platform drift.
 
 The bench is intentionally synthetic: it stubs out real sockets /
 `pwrite(2)` to isolate the canonical-ABI lowering + host_driver

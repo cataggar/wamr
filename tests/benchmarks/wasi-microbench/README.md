@@ -42,8 +42,16 @@ zig build wasi-microbench -- --json wasi-microbench.json
 [`budget.json`](budget.json) holds per-scenario `median_ns_budget`
 + `samples`. A scenario whose median wall-clock exceeds
 `median_ns_budget × (1 + threshold/100)` fails the run. Default
-threshold is +10 %; budgets are calibrated 1.5× the median observed on
-the project AArch64 dev VM so noise doesn't trip CI.
+threshold is +10 %.
+
+The current budgets were calibrated on 2026-07-15 from 98 retained
+`ubuntu-22.04` x86_64 workflow artifact reports spanning 2026-06-06
+through 2026-07-14. Each run's scenario median is one observation. The
+effective failure gates target approximately the mean of those medians
+plus two sample standard deviations, with an observed whole-run pass
+rate of 95/98 (96.9 %). Because the harness applies the +10 % threshold,
+`budget.json` stores each effective gate divided by 1.10; the threshold
+is the noise margin rather than a second margin.
 
 When an intentional perf change lands, follow the recipe under
 [`docs/wasi.md` § "Updating the wasi-microbench budget"](../../../docs/wasi.md).
@@ -51,6 +59,11 @@ When an intentional perf change lands, follow the recipe under
 ## CI
 
 [`.github/workflows/wasi-microbench.yml`](../../../.github/workflows/wasi-microbench.yml)
-runs the bench on push-to-main + PRs that touch
-`src/{component,runtime,wasi}/`, `build.zig`, or this directory.
-`continue-on-error: true` while the hosted-x86_64 baseline stabilises.
+runs on pushes to main and PRs that touch `src/{component,runtime,wasi}/`,
+`build.zig`, `build.zig.zon`, this directory, or the workflow itself;
+it can also be dispatched manually.
+The benchmark no longer uses `continue-on-error`: a regression fails
+the workflow job whenever this path-filtered workflow runs, while the
+report artifact is still uploaded. Branch protection does not currently
+require this workflow context, so its failure does not by itself block
+every PR from merging.

@@ -8,11 +8,10 @@ name: WASI micro-bench
 # via-stream) and compares medians against
 # `tests/benchmarks/wasi-microbench/budget.json`.
 #
-# Marked `continue-on-error: true` while the budgets stabilise on
-# GitHub-hosted x86_64 runners (the initial calibration was taken on
-# the project's AArch64 D16pds_v6 dev VM; hosted-runner jitter may
-# require widening). Flip to required once the trend is steady — see
-# `docs/wasi.md` § "Updating the wasi-microbench budget".
+# The benchmark step is blocking whenever this path-filtered workflow
+# runs; branch protection does not currently require the context.
+# Calibrated from retained GitHub-hosted x86_64 reports on 2026-07-15.
+# See `docs/wasi.md` § "Updating the wasi-microbench budget".
 
 on:
   push:
@@ -75,7 +74,6 @@ jobs:
 
       - name: Run wasi-microbench
         id: bench
-        continue-on-error: true
         env:
           SAMPLES: ${{ github.event.inputs.samples || '10' }}
           WARMUP: ${{ github.event.inputs.warmup || '2' }}
@@ -99,7 +97,7 @@ jobs:
           retention-days: 90
 
       - name: Annotate regression
-        if: steps.bench.outcome == 'failure'
+        if: failure() && steps.bench.outcome == 'failure'
         run: |
           echo "::warning::wasi-microbench reported a regression versus" \
                "tests/benchmarks/wasi-microbench/budget.json — see job log."
