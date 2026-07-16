@@ -17540,7 +17540,7 @@ pub const WasiCliAdapter = struct {
         var lifted_entries: []HttpFieldEntry = &.{};
         if (list.len > 0) {
             const mem = ci.canonicalMemory() orelse return error.OutOfBoundsMemory;
-            lifted_entries = liftFieldEntries(self.allocator, mem.data, list.ptr, list.len) catch |e| switch (e) {
+            lifted_entries = liftFieldEntries(self.allocator, mem.bytes(), list.ptr, list.len) catch |e| switch (e) {
                 error.InvalidFieldSyntax => {
                     results[0] = try httpHeaderErr(allocator, .invalid_syntax);
                     return;
@@ -17837,7 +17837,7 @@ pub const WasiCliAdapter = struct {
             const stride0: u32 = 8;
             const total0 = std.math.mul(u32, vals_pl.len, stride0) catch return error.InvalidArgs;
             const list_end0 = std.math.add(u32, vals_pl.ptr, total0) catch return error.InvalidArgs;
-            if (list_end0 > mem_for_scan.data.len) return error.OutOfBoundsMemory;
+            if (list_end0 > mem_for_scan.byteLen()) return error.OutOfBoundsMemory;
             var sc: u32 = 0;
             while (sc < vals_pl.len) : (sc += 1) {
                 const off = vals_pl.ptr + sc * stride0;
@@ -17845,7 +17845,7 @@ pub const WasiCliAdapter = struct {
                 const inner_len = std.mem.readInt(u32, mem_for_scan.data[off + 4 ..][0..4], .little);
                 const inner_bytes: []const u8 = if (inner_len == 0) "" else blk: {
                     const end = std.math.add(u32, inner_ptr, inner_len) catch return error.OutOfBoundsMemory;
-                    if (end > mem_for_scan.data.len) return error.OutOfBoundsMemory;
+                    if (end > mem_for_scan.byteLen()) return error.OutOfBoundsMemory;
                     break :blk mem_for_scan.data[inner_ptr..end];
                 };
                 if (!isValidFieldValue(inner_bytes)) {
@@ -17880,7 +17880,7 @@ pub const WasiCliAdapter = struct {
                 ""
             else blk: {
                 const end = std.math.add(u32, inner_ptr, inner_len) catch return error.OutOfBoundsMemory;
-                if (end > mem.data.len) return error.OutOfBoundsMemory;
+                if (end > mem.byteLen()) return error.OutOfBoundsMemory;
                 break :blk mem.data[inner_ptr..end];
             };
 

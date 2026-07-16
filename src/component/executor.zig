@@ -1705,7 +1705,7 @@ fn typeSize(registry: TypeRegistry, t: ctypes.ValType) u32 {
 fn strictCanonMemory(ctx: *const ComponentTrampolineCtx) ![]const u8 {
     const mem_idx = ctx.lower_opts.memory_idx orelse 0;
     const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.MemoryNotAvailable;
-    return mem.data;
+    return mem.bytes();
 }
 
 fn validateCanonPtrLenValue(mem: []const u8, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry, context: []const u8) !void {
@@ -7369,7 +7369,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         for (ctx.param_types, 0..) |pt, i| {
             const al = typeAlign(registry, pt);
             offset = abi.alignUp(offset, al);
-            args[i] = loadInterfaceValue(mem.data, offset, pt, registry, allocator) catch |err|
+            args[i] = loadInterfaceValue(mem.bytes(), offset, pt, registry, allocator) catch |err|
                 return trampolineTrap(env, ctx, err, .lift_args);
             offset += typeSize(registry, pt);
         }
@@ -7488,7 +7488,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
                             const mem_idx = ctx.lower_opts.memory_idx.?;
                             const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse
                                 return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
-                            if (@as(u64, result_dest_ptr) + bytes.len > mem.data.len) {
+                            if (@as(u64, result_dest_ptr) + bytes.len > mem.byteLen()) {
                                 return trampolineTrap(env, ctx, error.MemoryNotAvailable, .lower_results);
                             }
                             @memcpy(mem.data[result_dest_ptr .. result_dest_ptr + bytes.len], bytes);
@@ -7520,11 +7520,11 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
             if (typeContainsPtrLen(t, registry)) {
-                validateCanonPtrLenValue(mem.data, r, t, registry, "canon-lift") catch |err| return trampolineTrap(env, ctx, err, .lower_results);
+                validateCanonPtrLenValue(mem.bytes(), r, t, registry, "canon-lift") catch |err| return trampolineTrap(env, ctx, err, .lower_results);
             }
             const al = typeAlign(registry, t);
             offset = abi.alignUp(offset, al);
-            storeInterfaceValue(mem.data, offset, r, t, registry) catch |err|
+            storeInterfaceValue(mem.bytes(), offset, r, t, registry) catch |err|
                 return trampolineTrap(env, ctx, err, .lower_results);
             offset += typeSize(registry, t);
         }
@@ -8279,7 +8279,7 @@ fn dispatchAotAsyncComponentTrampoline(
         var offset = params_ptr;
         for (ctx.param_types, 0..) |param_type, i| {
             offset = abi.alignUp(offset, typeAlign(registry, param_type));
-            args[i] = try loadInterfaceValue(memory.data, offset, param_type, registry, allocator);
+            args[i] = try loadInterfaceValue(memory.bytes(), offset, param_type, registry, allocator);
             offset += typeSize(registry, param_type);
         }
     } else {
@@ -8309,7 +8309,7 @@ fn dispatchAotAsyncComponentTrampoline(
         if (!typeContainsPtrLen(param_type, registry)) continue;
         if (strict_mem == null) {
             const memory = caller_memory orelse return error.MemoryNotAvailable;
-            strict_mem = memory.data;
+            strict_mem = memory.bytes();
         }
         try validateCanonPtrLenValue(strict_mem.?, arg, param_type, registry, "canon-lift");
     }
@@ -8356,7 +8356,7 @@ fn dispatchAotAsyncComponentTrampoline(
                 if (future.state == .ready or future.state == .closed) {
                     if (future.payload) |bytes| {
                         const memory = caller_memory orelse return error.MemoryNotAvailable;
-                        if (@as(u64, result_dest_ptr) + bytes.len > memory.data.len)
+                        if (@as(u64, result_dest_ptr) + bytes.len > memory.byteLen())
                             return error.MemoryNotAvailable;
                         @memcpy(memory.data[result_dest_ptr .. result_dest_ptr + bytes.len], bytes);
                     }
@@ -8450,7 +8450,7 @@ fn dispatchAotComponentTrampoline(
     results_filled = results.len;
     if (debugAotEnabled()) {
         const mem_idx = ctx.lower_opts.memory_idx orelse 0;
-        const trace_mem = if (ctx.comp_inst.resolveTopLevelMemory(mem_idx)) |mem| mem.data else null;
+        const trace_mem = if (ctx.comp_inst.resolveTopLevelMemory(mem_idx)) |mem| mem.bytes() else null;
         traceCanonLowerCall(ctx, lowered_sig, trace_mem, mem_idx, args, results, result_dest_ptr);
     }
 
@@ -8463,11 +8463,11 @@ fn dispatchAotComponentTrampoline(
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
             if (typeContainsPtrLen(t, registry)) {
-                validateCanonPtrLenValue(mem.data, r, t, registry, "canon-lift") catch return error.LiftedResultInvariantViolated;
+                validateCanonPtrLenValue(mem.bytes(), r, t, registry, "canon-lift") catch return error.LiftedResultInvariantViolated;
             }
             const al = typeAlign(registry, t);
             offset = abi.alignUp(offset, al);
-            try storeInterfaceValue(mem.data, offset, r, t, registry);
+            try storeInterfaceValue(mem.bytes(), offset, r, t, registry);
             offset += typeSize(registry, t);
         }
         return 0;

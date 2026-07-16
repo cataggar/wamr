@@ -285,22 +285,12 @@ test "ModuleInstance: cloneForThread shares memory" {
 
     // Create a parent module with shared memory
     var module = types.WasmModule{};
-    const mem_data = try allocator.alloc(u8, 65536);
-    defer allocator.free(mem_data);
-    @memset(mem_data, 0);
-    mem_data[0] = 42; // write a value
-
-    var mem_inst = try allocator.create(types.MemoryInstance);
-    defer {
-        mem_inst.ref_count -= 1; // balance the clone's retain
-        allocator.destroy(mem_inst);
-    }
-    mem_inst.* = .{
-        .memory_type = .{ .limits = .{ .min = 1 }, .is_shared = true },
-        .data = mem_data,
-        .current_pages = 1,
-        .max_pages = 4,
-    };
+    const mem_inst = try types.MemoryInstance.createShared(.{
+        .limits = .{ .min = 1, .max = 4 },
+        .is_shared = true,
+    }, allocator);
+    defer mem_inst.release(allocator);
+    mem_inst.data[0] = 42;
 
     var mem_ptrs = [_]*types.MemoryInstance{mem_inst};
     var globals = [_]*types.GlobalInstance{};
@@ -332,7 +322,7 @@ test "ModuleInstance: cloneForThread shares memory" {
     try std.testing.expectEqual(@as(u8, 99), parent.memories[0].data[1]);
 
     // Verify ref count was incremented
-    try std.testing.expectEqual(@as(u32, 2), mem_inst.ref_count);
+    try std.testing.expectEqual(@as(u32, 2), mem_inst.shared_control.?.referenceCount());
 
     allocator.destroy(parent);
 }
@@ -383,29 +373,6 @@ test "AuxStackPool: stack addresses are correct" {
     try std.testing.expect(s3 == 4096 + 1 * 1024);
 }
 
-test "WaiterQueue: notify with no waiters" {
-    const allocator = std.testing.allocator;
-    var wq = try allocator.create(types.WaiterQueue);
-    defer wq.deinit(allocator);
-    wq.* = .{};
-
-    // Notify on empty queue should return 0
-    const woken = wq.notify(0, 10);
-    try std.testing.expectEqual(@as(u32, 0), woken);
-}
-
-test "WaiterQueue: wait with immediate timeout" {
-    const allocator = std.testing.allocator;
-    var wq = try allocator.create(types.WaiterQueue);
-    defer wq.deinit(allocator);
-    wq.* = .{};
-
-    // Wait with 0 timeout should return 2 (timed out) quickly
-    const result = wq.wait(100, 0, allocator);
-    // 0 timeout = immediate timeout or woken (could be either depending on timing)
-    try std.testing.expect(result == 0 or result == 2);
-}
-
 // ── Integration tests ───────────────────────────────────────────────────────
 // These tests exercise the full thread lifecycle: spawn → execute → join.
 // Each builds a WasmModule with an exported wasi_thread_start function,
@@ -453,7 +420,7 @@ fn buildThreadTestModule(
         .index = 0,
     };
     const memories = try allocator.alloc(types.MemoryType, 1);
-    memories[0] = .{ .limits = .{ .min = 1 }, .is_shared = true };
+    memories[0] = .{ .limits = .{ .min = 1, .max = 4 }, .is_shared = true };
 
     module.* = .{
         .types = func_types,
@@ -463,15 +430,10 @@ fn buildThreadTestModule(
     };
 
     // Create shared memory instance
-    const mem_data = try allocator.alloc(u8, 65536);
-    @memset(mem_data, 0);
-    const mem_inst = try allocator.create(types.MemoryInstance);
-    mem_inst.* = .{
-        .memory_type = .{ .limits = .{ .min = 1 }, .is_shared = true },
-        .data = mem_data,
-        .current_pages = 1,
-        .max_pages = 4,
-    };
+    const mem_inst = try types.MemoryInstance.createShared(.{
+        .limits = .{ .min = 1, .max = 4 },
+        .is_shared = true,
+    }, allocator);
     var mem_ptrs = try allocator.alloc(*types.MemoryInstance, 1);
     mem_ptrs[0] = mem_inst;
 

@@ -744,13 +744,13 @@ pub const ComponentInstance = struct {
         if (self.current_lower_call_ctx) |cctx| {
             if (cctx.memory) |mem| {
                 const end = @as(usize, ptr) + @as(usize, len);
-                if (end > mem.data.len) return null;
+                if (end > mem.byteLen()) return null;
                 return mem.data[ptr..end];
             }
         }
         const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);
-        if (end > mem.data.len) return null;
+        if (end > mem.byteLen()) return null;
         return mem.data[ptr..end];
     }
 
@@ -896,13 +896,13 @@ pub const ComponentInstance = struct {
         if (self.current_lower_call_ctx) |cctx| {
             if (cctx.memory) |mem| {
                 const end = @as(usize, ptr) + @as(usize, len);
-                if (end > mem.data.len) return null;
+                if (end > mem.byteLen()) return null;
                 return mem.data[ptr..end];
             }
         }
         const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);
-        if (end > mem.data.len) return null;
+        if (end > mem.byteLen()) return null;
         return mem.data[ptr..end];
     }
 

@@ -4,7 +4,7 @@
 //! The output format matches what `runtime/aot/loader.zig` expects:
 //!
 //!   [4 bytes] magic (0x746f6100)
-//!   [4 bytes] version (7)
+//!   [4 bytes] version (8)
 //!   [sections...] each: [4 bytes type] [4 bytes size] [payload]
 
 const std = @import("std");
@@ -14,7 +14,7 @@ const types = @import("../runtime/common/types.zig");
 pub const aot_magic: u32 = 0x746f6100;
 
 /// AOT format version.
-pub const aot_version: u32 = 7;
+pub const aot_version: u32 = 8;
 
 /// Export kinds (matches WebAssembly spec §2.5 and runtime ExternalKind).
 pub const ExternalKind = enum(u8) {
@@ -57,6 +57,7 @@ pub const ImportEntry = struct {
     memory_min: u32 = 0,
     memory_max: ?u32 = null,
     memory_is64: bool = false,
+    memory_shared: bool = false,
     global_val_type: types.ValType = .i32,
     global_mutable: bool = false,
     /// Function-type index describing the tag's parameter signature
@@ -68,6 +69,7 @@ pub const ImportEntry = struct {
 pub const MemoryEntry = struct {
     min_pages: u32,
     max_pages: ?u32,
+    is_shared: bool = false,
 };
 
 pub const TableEntry = struct {
@@ -249,6 +251,7 @@ pub fn emit(
                             try tmp.append(allocator, 0);
                         }
                         try tmp.append(allocator, if (imp.memory_is64) 1 else 0);
+                        try tmp.append(allocator, if (imp.memory_shared) 1 else 0);
                     },
                     .global => {
                         try tmp.append(allocator, @intFromEnum(imp.global_val_type));
@@ -266,7 +269,7 @@ pub fn emit(
         }
     }
 
-    // Section 9: memories (min_pages, has_max, max_pages per entry)
+    // Section 9: memories (min_pages, has_max, max_pages, shared per entry)
     if (memories) |mem_list| {
         if (mem_list.len > 0) {
             var tmp: std.ArrayList(u8) = .empty;
@@ -280,6 +283,7 @@ pub fn emit(
                 } else {
                     try tmp.append(allocator, 0);
                 }
+                try tmp.append(allocator, if (mem.is_shared) 1 else 0);
             }
             try emitSection(allocator, &buf, 9, tmp.items);
         }
@@ -561,6 +565,7 @@ test "emit: import section round-trip" {
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
         .{ .module_name = "env", .field_name = "tbl", .kind = .table, .table_elem_type = .funcref, .table_min = 8, .table_max = 8 },
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
+        .{ .module_name = "env", .field_name = "shared_mem", .kind = .memory, .memory_min = 1, .memory_max = 8, .memory_shared = true },
     };
     const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
@@ -569,7 +574,7 @@ test "emit: import section round-trip" {
     defer aot_loader.unload(&module, allocator);
 
     try std.testing.expectEqual(@as(u32, 2), module.import_function_count);
-    try std.testing.expectEqual(@as(usize, 3), module.imports.len);
+    try std.testing.expectEqual(@as(usize, 4), module.imports.len);
     try std.testing.expect(std.mem.eql(u8, module.imports[0].module_name, "wasi_snapshot_preview1"));
     try std.testing.expect(std.mem.eql(u8, module.imports[0].field_name, "fd_write"));
     try std.testing.expectEqual(types.ExternalKind.table, module.imports[1].kind);
@@ -580,6 +585,9 @@ test "emit: import section round-trip" {
     try std.testing.expectEqual(types.ValType.funcref, module.imported_tables[0].elem_type);
     try std.testing.expectEqual(@as(u32, 8), module.imported_tables[0].min);
     try std.testing.expectEqual(@as(?u32, 8), module.imported_tables[0].max);
+    try std.testing.expectEqual(@as(usize, 1), module.imported_memories.len);
+    try std.testing.expect(module.imported_memories[0].is_shared);
+    try std.testing.expectEqual(@as(?u32, 8), module.imported_memories[0].max);
 }
 
 test "emit: memory section round-trip" {
@@ -588,7 +596,7 @@ test "emit: memory section round-trip" {
 
     const mem_entries = [_]MemoryEntry{
         .{ .min_pages = 2, .max_pages = null },
-        .{ .min_pages = 1, .max_pages = 256 },
+        .{ .min_pages = 1, .max_pages = 256, .is_shared = true },
     };
     const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
@@ -601,6 +609,7 @@ test "emit: memory section round-trip" {
     try std.testing.expect(module.memories[0].limits.max == null);
     try std.testing.expectEqual(@as(u64, 1), module.memories[1].limits.min);
     try std.testing.expectEqual(@as(u64, 256), module.memories[1].limits.max.?);
+    try std.testing.expect(module.memories[1].is_shared);
 }
 
 test "emit: locally-defined table section round-trip (#681)" {

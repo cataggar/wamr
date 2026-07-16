@@ -488,6 +488,7 @@ pub fn compileCoreWasmCached(
                     .memory_min = @intCast(memory_type.limits.min),
                     .memory_max = if (memory_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
                     .memory_is64 = memory_type.is_memory64,
+                    .memory_shared = memory_type.is_shared,
                 }) catch return error.OutOfMemory;
             },
             .global => {
@@ -517,6 +518,7 @@ pub fn compileCoreWasmCached(
         mem_entries.append(ea, .{
             .min_pages = @intCast(mem.limits.min),
             .max_pages = if (mem.limits.max) |m| @as(?u32, @intCast(m)) else null,
+            .is_shared = mem.is_shared,
         }) catch return error.OutOfMemory;
     }
 

@@ -20,6 +20,9 @@ pub const host = @import("api/host.zig");
 /// Core WebAssembly types.
 pub const types = @import("runtime/common/types.zig");
 
+/// Stable shared-memory reservation, publication, and grow control block.
+pub const shared_memory = @import("runtime/common/shared_memory.zig");
+
 /// Execution environment (operand stack, call frames).
 pub const exec_env = @import("runtime/common/exec_env.zig");
 
@@ -187,6 +190,9 @@ pub const component_async_canon = @import("component/async_canon.zig");
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).
 pub const platform = @import("platform/platform.zig");
+
+/// Backend-neutral keyed wait/notify parking lot.
+pub const parking_lot = @import("platform/parking_lot.zig");
 
 /// Memory allocators (EMS pool allocator, default allocator).
 pub const mem_alloc = @import("shared/mem_alloc/allocator.zig");

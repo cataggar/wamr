@@ -604,6 +604,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
+    const shared_memory_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{
+            "SharedMemory:",
+            "ParkingLot:",
+            "MemoryInstance: shared",
+            "emit: memory section round-trip",
+            "emit: import section round-trip",
+            "reserved address space",
+        },
+    });
+    const run_shared_memory_unit_tests = b.addRunArtifact(shared_memory_unit_tests);
+    const shared_memory_test_step = b.step(
+        "test-shared-memory",
+        "Run stable shared-memory and parking-lot tests",
+    );
+    shared_memory_test_step.dependOn(&run_shared_memory_unit_tests.step);
+
     const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

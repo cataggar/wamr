@@ -259,10 +259,9 @@ fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
 // existing addresses.
 
 /// True on platforms where `reserveAddressSpace` + `commitPages` are
-/// supported. On unsupported platforms callers must fall back to the
-/// pre-#752 `allocator.realloc` path (which moves the buffer and is
-/// unsafe for external-string aliases).
-pub const supports_reserved_memory: bool = !is_windows;
+/// supported. POSIX uses an anonymous `PROT_NONE` mapping followed by
+/// `mprotect`; Windows uses one NT reserve followed by in-place commits.
+pub const supports_reserved_memory: bool = true;
 
 /// Reserve `size` bytes of virtual address space, no physical pages
 /// backed. Returns the base pointer or null on failure. Free with
@@ -270,11 +269,18 @@ pub const supports_reserved_memory: bool = !is_windows;
 pub fn reserveAddressSpace(size: usize) ?[*]align(page_size) u8 {
     if (size == 0) return null;
     if (is_windows) {
-        // Windows: reservation needs a separate commit step — gate at
-        // call sites via `supports_reserved_memory` and fall back to
-        // the allocator path here. (Tracking a Windows-native
-        // reserve/commit implementation as a follow-up.)
-        return null;
+        var base: ?[*]u8 = null;
+        var region_size = size;
+        const status = ntdll.NtAllocateVirtualMemory(
+            win.GetCurrentProcess(),
+            @ptrCast(&base),
+            0,
+            &region_size,
+            .{ .RESERVE = true },
+            .{ .NOACCESS = true },
+        );
+        if (status != .SUCCESS) return null;
+        return @alignCast(base orelse return null);
     }
     const ptr = mmap(null, size, .{}, .{}) orelse return null;
     return @alignCast(ptr);
@@ -284,7 +290,17 @@ pub fn reserveAddressSpace(size: usize) ?[*]align(page_size) u8 {
 /// `reserveAddressSpace` call's `size`.
 pub fn releaseAddressSpace(addr: [*]align(page_size) u8, size: usize) void {
     if (size == 0) return;
-    if (is_windows) unreachable;
+    if (is_windows) {
+        var base: ?[*]u8 = addr;
+        var region_size: usize = 0;
+        _ = ntdll.NtFreeVirtualMemory(
+            win.GetCurrentProcess(),
+            @ptrCast(&base),
+            &region_size,
+            .{ .RELEASE = true },
+        );
+        return;
+    }
     munmap(addr, size);
 }
 
@@ -294,7 +310,20 @@ pub fn releaseAddressSpace(addr: [*]align(page_size) u8, size: usize) void {
 /// access. Returns `error.MprotectFailed` on failure.
 pub fn commitPages(addr: [*]align(page_size) u8, size: usize) !void {
     if (size == 0) return;
-    if (is_windows) unreachable;
+    if (is_windows) {
+        var base: ?[*]u8 = addr;
+        var region_size = size;
+        const status = ntdll.NtAllocateVirtualMemory(
+            win.GetCurrentProcess(),
+            @ptrCast(&base),
+            0,
+            &region_size,
+            .{ .COMMIT = true },
+            .{ .READWRITE = true },
+        );
+        if (status != .SUCCESS or base != addr) return error.CommitFailed;
+        return;
+    }
     try mprotect(addr, size, .{ .read = true, .write = true });
 }
 
@@ -750,6 +779,23 @@ test "mprotect changes permissions" {
     try mprotect(ptr, size, .{ .read = true, .write = true });
     ptr[0] = 99;
     try std.testing.expectEqual(@as(u8, 99), ptr[0]);
+}
+
+test "reserved address space commits in place with zero fill" {
+    if (!supports_reserved_memory) return error.SkipZigTest;
+    const size = 2 * 65536;
+    const ptr = reserveAddressSpace(size) orelse return error.ReserveFailed;
+    defer releaseAddressSpace(ptr, size);
+
+    try commitPages(ptr, 65536);
+    try std.testing.expectEqual(@as(u8, 0), ptr[0]);
+    try std.testing.expectEqual(@as(u8, 0), ptr[65535]);
+    ptr[0] = 0xA5;
+
+    try commitPages(@alignCast(ptr + 65536), 65536);
+    try std.testing.expectEqual(@as(u8, 0xA5), ptr[0]);
+    try std.testing.expectEqual(@as(u8, 0), ptr[65536]);
+    try std.testing.expectEqual(@as(u8, 0), ptr[size - 1]);
 }
 
 test "selfThread returns non-zero" {

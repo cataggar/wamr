@@ -1734,6 +1734,7 @@ fn hasGcOpcodes(code: []const u8) bool {
 
 fn validateMemoryLimits(mem: types.MemoryType) LoadError!void {
     const max_pages: u64 = if (mem.is_memory64) (1 << 48) else 65536;
+    if (mem.is_shared and mem.limits.max == null) return error.InvalidLimits;
     if (mem.limits.min > max_pages) return error.InvalidLimits;
     if (mem.limits.max) |max| {
         if (max > max_pages) return error.InvalidLimits;

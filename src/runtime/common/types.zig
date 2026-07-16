@@ -2,50 +2,8 @@
 
 const std = @import("std");
 const platform = @import("../../platform/platform.zig");
-
-/// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
-const Mutex = struct {
-    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    pub const init: Mutex = .{ .state = std.atomic.Value(u8).init(0) };
-    pub fn lock(self: *Mutex) void {
-        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null)
-            std.atomic.spinLoopHint();
-    }
-    pub fn unlock(self: *Mutex) void {
-        self.state.store(0, .release);
-    }
-};
-
-/// Simple condition variable (spin-based, for atomic wait/notify).
-const Condition = struct {
-    flag: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    pub fn wait(self: *Condition, mutex: *Mutex) void {
-        mutex.unlock();
-        while (self.flag.load(.acquire) == 0)
-            std.atomic.spinLoopHint();
-        self.flag.store(0, .release);
-        mutex.lock();
-    }
-    pub fn timedWait(self: *Condition, mutex: *Mutex, _: u64) error{Timeout}!void {
-        mutex.unlock();
-        // Spin-based: no real timed wait, just yield briefly then timeout
-        var spins: u32 = 0;
-        while (spins < 1000) : (spins += 1) {
-            if (self.flag.load(.acquire) != 0) {
-                self.flag.store(0, .release);
-                mutex.lock();
-                return;
-            }
-            std.atomic.spinLoopHint();
-        }
-        mutex.lock();
-        return error.Timeout;
-    }
-
-    pub fn signal(self: *Condition) void {
-        self.flag.store(1, .release);
-    }
-};
+const shared_memory = @import("shared_memory.zig");
+const parking_lot = @import("../../platform/parking_lot.zig");
 
 /// WebAssembly value types (§2.3.1)
 pub const ValType = enum(u8) {
@@ -280,7 +238,7 @@ pub const component_version: u32 = 0x0001_000d;
 pub const aot_magic: u32 = 0x746f6100; // "\0aot"
 
 /// AOT format version
-pub const aot_version: u32 = 7;
+pub const aot_version: u32 = 8;
 
 test "ValType: numeric classification" {
     try std.testing.expect(ValType.i32.isNumeric());
@@ -499,20 +457,28 @@ pub const NameSection = struct {
 /// Runtime memory instance (refcounted for cross-module sharing)
 pub const MemoryInstance = struct {
     memory_type: MemoryType,
+    /// For non-shared memory this is the allocated/visible buffer. For
+    /// shared memory it is the immutable full reservation; callers must use
+    /// `byteLen`/`bytes` for the acquire-published visible extent.
     data: []u8,
+    /// Legacy non-shared page count. Shared readers use `pageCount`.
     current_pages: u32,
     max_pages: u32,
+    /// Legacy non-shared reference count. Shared lifetime is maintained by
+    /// the atomic count in `shared_control`.
     ref_count: u32 = 1,
+    /// Present exactly for shared memories. Owns the immutable reservation,
+    /// atomic size publication, serialized grow, and keyed parking lot.
+    shared_control: ?*shared_memory.Control = null,
     /// AOT vmctx mirrors that currently reference this memory. Stored as
     /// opaque pointers to avoid a common/types.zig -> aot/runtime.zig cycle.
     vmctx_subscribers: std.ArrayListUnmanaged(*anyopaque) = .empty,
-    /// Waiter queue for memory.atomic.wait/notify (shared memory only).
-    /// Heap-allocated and shared across threads via ref counting.
-    waiter_queue: ?*WaiterQueue = null,
+    subscriber_mutex: platform.Mutex = .init,
     /// When non-null, `data.ptr == reserved_base` and `[reserved_base,
     /// reserved_base+reserved_size)` is a stable virtual address
-    /// reservation (POSIX mmap, Windows VirtualAlloc). `grow` extends
-    /// `data.len` in place by committing more pages — the pointer
+    /// reservation (POSIX mmap, Windows VirtualAlloc). Non-shared `grow`
+    /// extends `data.len`; shared `data.len` is the constant reservation
+    /// capacity and `byteLen` publishes the committed extent. The pointer
     /// never moves, so external aliases into this memory (e.g.
     /// SpiderMonkey/StarlingMonkey external strings, host-held slices
     /// taken before a `memory.grow`) remain valid. Issue #752: TCGC's
@@ -544,9 +510,8 @@ pub const MemoryInstance = struct {
     /// memory survive any `memory.grow` calls. (Issue #752.)
     ///
     /// `cap_pages` should be `min(mem_type.limits.max orelse 65536, 65536)`.
-    /// On platforms without reservation support (Windows for now), or
-    /// when the OS reservation fails, this function returns null and the
-    /// caller is expected to fall back to the legacy
+    /// When the OS reservation fails, this function returns null and the
+    /// non-shared caller may fall back to the legacy
     /// `allocator.realloc`-backed path (which may relocate `data.ptr`
     /// on grow). The caller owns release via `MemoryInstance.release`.
     pub fn createReserved(
@@ -555,6 +520,7 @@ pub const MemoryInstance = struct {
         cap_pages: u32,
         allocator: std.mem.Allocator,
     ) ?*MemoryInstance {
+        if (mem_type.is_shared) return null;
         if (!platform.supports_reserved_memory) return null;
         if (cap_pages == 0) return null;
         const reserved_size: usize = @as(usize, cap_pages) * page_size;
@@ -586,7 +552,64 @@ pub const MemoryInstance = struct {
         return mem;
     }
 
+    /// Create shared memory. The declared maximum is mandatory and its
+    /// entire virtual address range is reserved before this function
+    /// succeeds. There is deliberately no relocating allocator fallback.
+    pub fn createShared(
+        mem_type: MemoryType,
+        allocator: std.mem.Allocator,
+    ) shared_memory.CreateError!*MemoryInstance {
+        if (!mem_type.is_shared) return error.InvalidLimits;
+        const max_u64 = mem_type.limits.max orelse return error.InvalidLimits;
+        if (mem_type.limits.min > max_u64 or max_u64 > 65536)
+            return error.InvalidLimits;
+        const initial_pages: u32 = @intCast(mem_type.limits.min);
+        const max_pages: u32 = @intCast(max_u64);
+        const control = try shared_memory.Control.create(initial_pages, max_pages, allocator);
+        errdefer {
+            std.debug.assert(control.release());
+            control.destroy(allocator);
+        }
+
+        const mem = allocator.create(MemoryInstance) catch return error.OutOfMemory;
+        mem.* = .{
+            .memory_type = mem_type,
+            .data = control.capacity(),
+            .current_pages = initial_pages,
+            .max_pages = max_pages,
+            .shared_control = control,
+            .reserved_base = control.base,
+            .reserved_size = control.reserved_bytes,
+        };
+        return mem;
+    }
+
+    /// Acquire-published current page count.
+    pub fn pageCount(self: *const MemoryInstance) u32 {
+        if (self.shared_control) |control| return control.pageCount();
+        return self.current_pages;
+    }
+
+    /// Acquire-published current byte length.
+    pub fn byteLen(self: *const MemoryInstance) usize {
+        if (self.shared_control) |control| return control.byteLen();
+        return self.data.len;
+    }
+
+    /// Visible memory slice. For shared memory the slice length is formed
+    /// only after the acquire load in `byteLen`.
+    pub fn bytes(self: *MemoryInstance) []u8 {
+        return self.data[0..self.byteLen()];
+    }
+
+    pub const SharedWaitError = shared_memory.WaitError || error{NotShared};
+
     pub fn grow(self: *MemoryInstance, delta: u32, allocator: std.mem.Allocator) !u32 {
+        if (self.shared_control) |control| {
+            return control.grow(delta) catch |err| switch (err) {
+                error.MemoryGrowFailed => error.MemoryGrowFailed,
+            };
+        }
         const old_pages = self.current_pages;
         const new_pages = std.math.add(u32, old_pages, delta) catch return error.MemoryGrowFailed;
         if (self.memory_type.limits.max) |max| {
@@ -617,10 +640,36 @@ pub const MemoryInstance = struct {
     }
 
     pub fn retain(self: *MemoryInstance) void {
+        if (self.shared_control) |control| {
+            std.debug.assert(control.retain());
+            return;
+        }
         self.ref_count += 1;
     }
 
+    pub fn wait32(self: *MemoryInstance, offset: usize, expected: u32, timeout_ns: i64) SharedWaitError!parking_lot.WaitResult {
+        const control = self.shared_control orelse return error.NotShared;
+        return control.wait32(offset, expected, timeout_ns);
+    }
+
+    pub fn wait64(self: *MemoryInstance, offset: usize, expected: u64, timeout_ns: i64) SharedWaitError!parking_lot.WaitResult {
+        const control = self.shared_control orelse return error.NotShared;
+        return control.wait64(offset, expected, timeout_ns);
+    }
+
+    pub fn notify(self: *MemoryInstance, offset: usize, count: u32) SharedWaitError!u32 {
+        const control = self.shared_control orelse return error.NotShared;
+        return control.notify(offset, count);
+    }
+
+    pub fn cancelWaiters(self: *MemoryInstance) parking_lot.BackendError!u32 {
+        const control = self.shared_control orelse return 0;
+        return control.cancelAll();
+    }
+
     pub fn subscribeVmCtx(self: *MemoryInstance, vmctx: *anyopaque, allocator: std.mem.Allocator) !void {
+        self.subscriber_mutex.lock();
+        defer self.subscriber_mutex.unlock();
         for (self.vmctx_subscribers.items) |subscriber| {
             if (subscriber == vmctx) return;
         }
@@ -628,6 +677,8 @@ pub const MemoryInstance = struct {
     }
 
     pub fn unsubscribeVmCtx(self: *MemoryInstance, vmctx: *anyopaque) void {
+        self.subscriber_mutex.lock();
+        defer self.subscriber_mutex.unlock();
         for (self.vmctx_subscribers.items, 0..) |subscriber, i| {
             if (subscriber == vmctx) {
                 _ = self.vmctx_subscribers.swapRemove(i);
@@ -637,9 +688,15 @@ pub const MemoryInstance = struct {
     }
 
     pub fn release(self: *MemoryInstance, allocator: std.mem.Allocator) void {
+        if (self.shared_control) |control| {
+            if (!control.release()) return;
+            self.vmctx_subscribers.deinit(allocator);
+            control.destroy(allocator);
+            allocator.destroy(self);
+            return;
+        }
         self.ref_count -= 1;
         if (self.ref_count == 0) {
-            if (self.waiter_queue) |wq| wq.deinit(allocator);
             self.vmctx_subscribers.deinit(allocator);
             if (self.reserved_base) |base| {
                 platform.releaseAddressSpace(base, self.reserved_size);
@@ -648,90 +705,6 @@ pub const MemoryInstance = struct {
             }
             allocator.destroy(self);
         }
-    }
-};
-
-/// Waiter queue for memory.atomic.wait/notify.
-/// Each waiter is heap-allocated for pointer stability while threads block.
-pub const WaiterQueue = struct {
-    mutex: Mutex = .init,
-    /// Heap-allocated waiter nodes for pointer stability.
-    waiters: std.ArrayListUnmanaged(*Waiter) = .empty,
-
-    pub const Waiter = struct {
-        address: u32,
-        cond: Condition = .{},
-        woken: bool = false,
-    };
-
-    pub fn deinit(self: *WaiterQueue, allocator: std.mem.Allocator) void {
-        for (self.waiters.items) |w| allocator.destroy(w);
-        self.waiters.deinit(allocator);
-        allocator.destroy(self);
-    }
-
-    /// Park the calling thread until woken or timed out.
-    /// Returns: 0 = woken, 2 = timed out.
-    pub fn wait(self: *WaiterQueue, address: u32, timeout_ns: i64, allocator: std.mem.Allocator) u32 {
-        self.mutex.lock();
-
-        const waiter = allocator.create(Waiter) catch {
-            self.mutex.unlock();
-            return 2; // treat alloc failure as timeout
-        };
-        waiter.* = .{ .address = address };
-
-        self.waiters.append(allocator, waiter) catch {
-            allocator.destroy(waiter);
-            self.mutex.unlock();
-            return 2;
-        };
-
-        defer {
-            // Remove self from waiters list
-            for (self.waiters.items, 0..) |w, i| {
-                if (w == waiter) {
-                    _ = self.waiters.swapRemove(i);
-                    break;
-                }
-            }
-            allocator.destroy(waiter);
-            self.mutex.unlock();
-        }
-
-        if (timeout_ns < 0) {
-            // Infinite wait
-            while (!waiter.woken) {
-                waiter.cond.wait(&self.mutex);
-            }
-            return 0; // woken
-        } else {
-            const timeout: u64 = @intCast(timeout_ns);
-            while (!waiter.woken) {
-                waiter.cond.timedWait(&self.mutex, timeout) catch {
-                    // Timed out
-                    return if (waiter.woken) 0 else 2;
-                };
-            }
-            return 0; // woken
-        }
-    }
-
-    /// Wake up to `count` waiters at the given address. Returns number woken.
-    pub fn notify(self: *WaiterQueue, address: u32, count: u32) u32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        var woken: u32 = 0;
-        for (self.waiters.items) |w| {
-            if (woken >= count) break;
-            if (w.address == address) {
-                w.woken = true;
-                w.cond.signal();
-                woken += 1;
-            }
-        }
-        return woken;
     }
 };
 
@@ -1108,6 +1081,44 @@ test "MemoryInstance: createReserved keeps data.ptr stable across grow" {
     // Growing past the cap fails.
     try std.testing.expectError(error.MemoryGrowFailed, mem.grow(1, allocator));
     try std.testing.expectEqual(@as(u32, 8), mem.current_pages);
+}
+
+test "MemoryInstance: shared control keeps base stable and lifetime refcounted" {
+    if (!platform.supports_reserved_memory) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mem_type: MemoryType = .{
+        .limits = .{ .min = 1, .max = 3 },
+        .is_shared = true,
+    };
+    const mem = try MemoryInstance.createShared(mem_type, allocator);
+
+    const base = mem.data.ptr;
+    try std.testing.expectEqual(@as(usize, 3 * MemoryInstance.page_size), mem.data.len);
+    try std.testing.expectEqual(@as(usize, MemoryInstance.page_size), mem.byteLen());
+    try std.testing.expectEqual(@as(u32, 1), mem.pageCount());
+    try std.testing.expectEqual(@as(u32, 1), mem.shared_control.?.referenceCount());
+
+    mem.retain();
+    try std.testing.expectEqual(@as(u32, 2), mem.shared_control.?.referenceCount());
+    mem.release(allocator);
+    try std.testing.expectEqual(@as(u32, 1), mem.shared_control.?.referenceCount());
+
+    try std.testing.expectEqual(@as(u32, 1), try mem.grow(1, allocator));
+    try std.testing.expectEqual(base, mem.data.ptr);
+    try std.testing.expectEqual(@as(usize, 2 * MemoryInstance.page_size), mem.byteLen());
+    try std.testing.expectEqual(@as(u8, 0), mem.data[2 * MemoryInstance.page_size - 1]);
+    mem.release(allocator);
+}
+
+test "MemoryInstance: shared creation requires declared maximum" {
+    const mem_type: MemoryType = .{
+        .limits = .{ .min = 1 },
+        .is_shared = true,
+    };
+    try std.testing.expectError(
+        error.InvalidLimits,
+        MemoryInstance.createShared(mem_type, std.testing.allocator),
+    );
 }
 
 test "WasmModule: getFuncType for import and local functions" {
