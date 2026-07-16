@@ -185,6 +185,24 @@ pub fn build(b: *std.Build) void {
 
     const config_module = options.createModule();
 
+    const stable_resources_test_step = b.step(
+        "test-stable-resources",
+        "Run conditional synchronization and stable resource tests",
+    );
+    inline for (.{ false, true }) |threads_enabled| {
+        const stable_options = b.addOptions();
+        stable_options.addOption(bool, "lib_wasi_threads", threads_enabled);
+        const stable_test_module = b.createModule(.{
+            .root_source_file = b.path("src/shared/stable_resource.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        stable_test_module.addImport("config", stable_options.createModule());
+        const stable_tests = b.addTest(.{ .root_module = stable_test_module });
+        const run_stable_tests = b.addRunArtifact(stable_tests);
+        stable_resources_test_step.dependOn(&run_stable_tests.step);
+    }
+
     const threads_contract_test_module = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
         .target = target,
@@ -587,6 +605,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(stable_resources_test_step);
 
     const artifact_consumer_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     artifact_consumer_test.setCwd(b.path("tests/artifact-consumer"));

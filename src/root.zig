@@ -194,6 +194,9 @@ pub const mem_alloc = @import("shared/mem_alloc/allocator.zig");
 /// Shared utilities (logging, LEB128, hashmap, file I/O, crypto).
 pub const utils = @import("shared/utils/utils.zig");
 
+/// Conditional synchronization and stable lease-based resource tables.
+pub const stable_resource = @import("shared/stable_resource.zig");
+
 /// Cryptographic hashing (SHA-256, replaces BoringSSL).
 pub const crypto = @import("shared/utils/crypto.zig");
 
