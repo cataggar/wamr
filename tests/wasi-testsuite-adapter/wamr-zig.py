@@ -19,12 +19,14 @@ resulting `.cwasm` to `wamr run`. Set `WAMRC` to point at the freshly-built
 then to `PATH`.
 """
 
+import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -51,6 +53,93 @@ def _resolve_wamrc() -> List[str]:
 
 
 WAMRC = _resolve_wamrc()
+_SAMPLE_LAUNCHER = (
+    Path(__file__).resolve().parent.parent.parent
+    / "scripts"
+    / "wasi_p3_sample_launch.py"
+)
+
+
+def _emit_timing(
+    fixture: Path,
+    phase: str,
+    artifact_kind: str,
+    duration_ns: int,
+    cache: str,
+) -> None:
+    """Append one opt-in timing event without touching guest streams."""
+    output = os.getenv("WAMR_PROFILE_TIMINGS")
+    if not output:
+        return
+    event = {
+        "schema_version": 1,
+        "event": "phase_timing",
+        "run_id": os.getenv("WAMR_PROFILE_RUN_ID", ""),
+        "mode": os.getenv(
+            "WAMR_PROFILE_MODE",
+            "jit" if os.getenv("WAMR_JIT_TESTSUITE") else "aot",
+        ),
+        "fixture": fixture.stem,
+        "phase": phase,
+        "artifact_kind": artifact_kind,
+        "cache": cache,
+        "duration_ns": duration_ns,
+        "pid": os.getpid(),
+    }
+    encoded = (json.dumps(event, sort_keys=True) + "\n").encode("UTF-8")
+    fd = os.open(output, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, encoded)
+    finally:
+        os.close(fd)
+
+
+def _profile_requested(fixture: Path, phase: str) -> bool:
+    selection_path = os.getenv("WAMR_PROFILE_SELECTION")
+    if not selection_path:
+        return False
+    try:
+        selection = json.loads(Path(selection_path).read_text(encoding="UTF-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    mode = os.getenv("WAMR_PROFILE_MODE", "aot")
+    return any(
+        item.get("mode") == mode
+        and item.get("fixture") == fixture.stem
+        and item.get("phase") == phase
+        for item in selection.get("profiles", [])
+    )
+
+
+def _profile_command(cmd: List[str], fixture: Path, phase: str) -> List[str]:
+    profile_dir = os.getenv("WAMR_PROFILE_OUTPUT_DIR")
+    if not profile_dir or not _profile_requested(fixture, phase):
+        return cmd
+
+    output_dir = Path(profile_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    mode = os.getenv("WAMR_PROFILE_MODE", "aot")
+    profile = output_dir / f"{fixture.stem}-{phase}-{mode}.sample.txt"
+    log = output_dir / f"{fixture.stem}-{phase}-{mode}.sample.log"
+    return [
+        sys.executable,
+        str(_SAMPLE_LAUNCHER),
+        "--output",
+        str(profile),
+        "--log",
+        str(log),
+        "--",
+        *cmd,
+    ]
+
+
+def _run_compile(cmd: List[str], fixture: Path, phase: str) -> None:
+    """Run wamrc, optionally attaching macOS's sampling profiler."""
+    subprocess.run(
+        _profile_command(cmd, fixture, phase),
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
 
 
 def get_name() -> str:
@@ -164,29 +253,60 @@ def _precompile(test_path: str) -> str:
     same compiler and AOT loader/runtime — only the "when" differs.
     """
     if os.getenv("WAMR_JIT_TESTSUITE"):
+        if os.getenv("WAMR_PROFILE_TIMINGS"):
+            p = Path(test_path)
+            artifact_kind = "component" if _is_component(p) else "core"
+            _emit_timing(
+                p,
+                f"{artifact_kind}_precompile",
+                artifact_kind,
+                0,
+                "bypass",
+            )
         return test_path
     p = Path(test_path)
     if p.suffix != ".wasm":
         return test_path
-    if _is_component(p):
+    started_ns = time.perf_counter_ns()
+    is_component = _is_component(p)
+    artifact_kind = "component" if is_component else "core"
+    phase = f"{artifact_kind}_precompile"
+    if is_component:
         manifest = p.with_suffix(".cwasm.json")
         if not manifest.exists() or manifest.stat().st_mtime < p.stat().st_mtime:
             # `wamrc compile-component` already disables the IR
             # verifier internally (compileCoreWasm hard-codes
             # verify_mode=.off), so no extra flag is needed here.
-            subprocess.run(
+            _run_compile(
                 WAMRC + ["compile-component", "-o", str(manifest), str(p)],
-                check=True,
-                stdout=subprocess.DEVNULL,
+                p,
+                phase,
+            )
+            _emit_timing(
+                p, phase, artifact_kind, time.perf_counter_ns() - started_ns, "miss"
+            )
+        else:
+            _emit_timing(
+                p, phase, artifact_kind, time.perf_counter_ns() - started_ns, "hit"
             )
         return test_path
     cwasm = p.with_suffix(".cwasm")
     if cwasm.exists() and cwasm.stat().st_mtime >= p.stat().st_mtime:
+        _emit_timing(
+            p, phase, artifact_kind, time.perf_counter_ns() - started_ns, "hit"
+        )
         return str(cwasm)
-    subprocess.run(
+    _run_compile(
         WAMRC + ["compile", "--no-verify-ir", "-o", str(cwasm), str(p)],
-        check=True,
-        stdout=subprocess.DEVNULL,
+        p,
+        phase,
+    )
+    _emit_timing(
+        p,
+        phase,
+        artifact_kind,
+        time.perf_counter_ns() - started_ns,
+        "miss",
     )
     return str(cwasm)
 
@@ -242,4 +362,4 @@ def compute_argv(
     # `wamr run` / `wamr serve` auto-discover via sibling probing. (#680)
     argv += [_precompile(test_path)]
     argv += args
-    return argv
+    return _profile_command(argv, Path(test_path), "fixture_execution")

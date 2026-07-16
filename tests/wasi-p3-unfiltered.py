@@ -39,9 +39,15 @@ def main() -> int:
             )
             return 2
 
-    report = _ROOT / "zig-out" / (
-        "wasi-p3-unfiltered-jit.json" if jit else "wasi-p3-unfiltered-aot.json"
+    report_override = os.environ.get("WAMR_P3_REPORT")
+    report = (
+        Path(report_override)
+        if report_override
+        else _ROOT
+        / "zig-out"
+        / ("wasi-p3-unfiltered-jit.json" if jit else "wasi-p3-unfiltered-aot.json")
     )
+    report.parent.mkdir(parents=True, exist_ok=True)
     report.unlink(missing_ok=True)
     cmd = [
         sys.executable,
