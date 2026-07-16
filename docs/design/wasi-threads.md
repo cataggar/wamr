@@ -1,8 +1,9 @@
 # `wasi:threads` design — multi-threaded interpreter state isolation
 
-Status: **DRAFT** (design-only; no implementation in this PR).
+Status: **DRAFT** (prototypes exist; no production-wired guest-thread
+support).
 
-Tracking: [#583 B3](https://github.com/cataggar/wamr/issues/583).
+Tracking: [#616 B1](https://github.com/cataggar/wamr/issues/616).
 
 Author wave: W10-3.
 
@@ -15,6 +16,7 @@ without re-doing the upstream survey or the state inventory.
 ## Table of contents
 
 - [Overview](#overview)
+- [Current implementation status](#current-implementation-status)
 - [Upstream state](#upstream-state)
 - [Inventory of single-threaded assumptions](#inventory-of-single-threaded-assumptions)
 - [Design options](#design-options)
@@ -59,6 +61,20 @@ multithreaded interpreter build, and rejects AOT/JIT configurations. The
 public `config.wasi_threads` report keeps target, backend, configured
 capabilities, and implementation readiness separate; thread-spawn imports
 are rejected before allocation while readiness remains false.
+
+## Current implementation status
+
+The tree contains scaffolding in `ThreadManager`, `cloneForThread`,
+the atomic-opcode dispatcher, and the `wasi.thread-spawn` host import.
+These are prototypes, not production support. No default CLI or
+component path currently offers gated guest-thread execution.
+
+The production work remains the ordered plan below: make shared
+runtime and host resources safe; implement correct atomic
+wait/notify/fence behavior; spawn in both interpreter and AOT modes;
+isolate cancellation and per-thread component/WASI context; and pass
+the end-to-end correctness, conformance, and performance gates. This
+document does not treat any unmerged implementation wave as present.
 
 ## Upstream state
 
@@ -422,7 +438,7 @@ Each wave is a discrete PR with its own conformance gate.
 * No fixture regressions on `wasi-testsuite` / `wasi-p2-testsuite` /
   `wasi-p3-testsuite`.
 
-### Wave 2 — `std.Thread`-spawning wrapper for the interpreter loop
+### Wave 2 — `std.Thread` spawning for interpreter and AOT execution
 
 **Scope.**
 
@@ -430,6 +446,8 @@ Each wave is a discrete PR with its own conformance gate.
   gated by `config.lib_wasi_threads` (off by default). Re-enable it
   under a new build flag (`-Dlib_wasi_threads=true` already exists in
   [`build.zig:67`](../../build.zig)).
+* Wire both interpreter and AOT entry paths. A prototype that spawns
+  only an interpreter loop is not production-complete.
 * Pin down `cloneForThread` semantics: confirm the cloned globals,
   shared memories, shared tables, shared host_functions match
   `wasi-threads` spec section "instance-per-thread".
@@ -442,7 +460,8 @@ Each wave is a discrete PR with its own conformance gate.
 * `zig build test -Dlib_wasi_threads=true` green.
 * New fixture: `tests/wasi-threads-fixtures/spawn-and-join.wasm` that
   imports `wasi.thread-spawn`, exports `wasi_thread_start`, increments
-  a shared atomic counter from 8 threads, and asserts the final value.
+  a shared atomic counter from 8 threads, and asserts the final value
+  under both interpreter and AOT execution.
 * CRC mismatch indicates either the `cloneForThread` race or the
   non-atomic RMW gap — drive the diagnosis with the
   [`aot-diff-debug`](../../) skill plus the new
@@ -486,10 +505,11 @@ Each wave is a discrete PR with its own conformance gate.
   test suite when the suite contains threaded fixtures.
 * Wire `ThreadManager` lifetime to `ComponentInstance` /
   `WasiCliAdapter` so a `wasi.thread-spawn` from inside a component
-  is observable. Today's wiring works for **core-module-only** runs
-  (`runWasm` in `src/main.zig`) but not for `runLoadedComponent` —
-  fix that by retaining a per-`WasiCliAdapter` `ThreadManager` and
-  threading it into every `ExecEnv` the adapter creates.
+  is observable. The prototype wiring reaches **core-module-only**
+  runs (`runWasm` in `src/main.zig`) but not `runLoadedComponent` and
+  is not a production path. Fix that by retaining a per-`WasiCliAdapter`
+  `ThreadManager` and threading it into every `ExecEnv` the adapter
+  creates.
 * Document the
   Wasmtime-compat caveat: per spec, "a trap or WASI exit in one
   thread must end execution for all threads." We already have
@@ -595,7 +615,8 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
    that, a stable wamr microbenchmark like `tests/perf/dispatch_loop`)
    regression ≤ 2 % under `-Doptimize=ReleaseFast`,
    `-Dlib_wasi_threads=false`. Documented in the wave's PR body.
-3. A working `wasi.thread-spawn` smoke test under `wamr` CLI:
+3. A working `wasi.thread-spawn` smoke test under `wamr` CLI in both
+   interpreter and AOT modes:
    ```console
    $ zig build -Dlib_wasi_threads=true
    $ ./zig-out/bin/wamr run tests/wasi-threads-fixtures/spawn-and-join.wasm
@@ -604,7 +625,7 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
    ```
 4. `zig build wasi-testsuite` + `zig build wasi-p2-testsuite` +
    `zig build wasi-p3-testsuite` stay green with the default build
-   (`lib_wasi_threads = false`). No regression on the 72 + 5 + 40
+   (`lib_wasi_threads = false`). No regression on the 72 + 5 + 41
    fixture baseline.
 
 ## Out of scope
@@ -635,7 +656,8 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
 * [`docs/wasi.md`](../wasi.md) — WASI feature matrix; this design
   doc is linked from the Roadmap section.
 * [`src/wasi/thread_manager.zig`](../../src/wasi/thread_manager.zig)
-  — the existing `wasi:threads@0.1.0` prototype (off by default).
+  — the existing `wasi:threads@0.1.0` prototype (off by default and
+  not production-wired).
 * [`src/wasi/host_functions.zig`](../../src/wasi/host_functions.zig)
   (`wasiThreadSpawn`, line ~46; registration line ~3209) — the
   `wasi.thread-spawn` host import.

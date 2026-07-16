@@ -2,8 +2,8 @@
 
 | Field         | Value                                                  |
 | ------------- | ------------------------------------------------------ |
-| Origin commit | [`b8e6e566`](https://github.com/cataggar/wamr/commit/b8e6e566526c26deeebd12b9cfe103ae6142b0ed) |
-| Audit date    | 2026-07-15                                             |
+| Origin commit | [`05ea2181`](https://github.com/cataggar/wamr/commit/05ea21812c8df4d9bbdf713d6a70f8e4eacb3aec) |
+| Audit date    | 2026-07-16                                             |
 | Adapter file  | [`src/component/wasi_cli_adapter.zig`](../src/component/wasi_cli_adapter.zig) |
 | WIT/test pin  | [`wasi-testsuite@7d0a7811`](https://github.com/WebAssembly/wasi-testsuite/commit/7d0a78116fa9955dd2d113beb8583bc9648b6116) |
 | Tracker       | [#616 C1](https://github.com/cataggar/wamr/issues/616) (quarterly WIT-vs-implementation audit) |
@@ -186,10 +186,15 @@ the three unstable P3 timezone methods. Guest exports
 P2 `cli/run.run`, P2 `http/incoming-handler.handle`, and P3
 `cli/run.run` are also outside the host-import denominator.
 
-The final testsuite pin passes **41/41** under P3 AOT, **41/41** under
-P3 JIT, and **41/41** under Wasmtime parity. Those fixture results
-exercise only methods imported by those 41 binaries; they do **not**
-establish 351/352 method implementation coverage.
+After [PR #908](https://github.com/cataggar/wamr/pull/908), the final
+testsuite pin passes **41/41** under P3 AOT, **41/41** under P3 JIT,
+and **41/41** under Wasmtime parity. Those fixture results exercise
+only methods imported by those 41 binaries; they do **not** establish
+351/352 method implementation coverage. The stable host-import audit
+was completed by [PR #909](https://github.com/cataggar/wamr/pull/909):
+351/352 (99.7 %) are implemented, with only
+`wasi:filesystem/types.filesystem-error-code` returning canned
+`option::none`.
 
 **Changes found by this refresh:**
 
@@ -268,7 +273,9 @@ Coverage: `wasi:cli/stdout` 1/1 (100 %); `wasi:io/streams` 17/17
 ordinary splice restricts the fast path to pipe pairs and uses
 `SPLICE_F_NONBLOCK`, while blocking-splice waits and retries `EAGAIN`.
 Unsupported endpoint pairs and non-Linux targets still read and write
-through the bounded host scratch buffer.
+through the bounded host scratch buffer. The Linux fast path completed
+[#616 A2](https://github.com/cataggar/wamr/issues/616) in
+[PR #909](https://github.com/cataggar/wamr/pull/909).
 
 ### `wasi:cli/stderr`
 
@@ -664,7 +671,7 @@ Pinned WIT: [`types.wit`](https://github.com/WebAssembly/wasi-http/blob/d97efe47
 | `[method]future-trailers.get` | ✅ | :22067 | — |
 | `[resource-drop]future-trailers` | ✅ | :22068 | — |
 | `[constructor]request-options` | ✅ | :22070 | — |
-| `[method]request-options.connect-timeout` | ✅ | :22073 | 0.2-style unprefixed getter name (`get-` prefix only in 0.3). Stored in nanoseconds, copied into worker-owned state, and applied to initial DNS/TCP acquisition. Zig's lazy TLS handshake and automatic redirect reconnects are not covered by this deadline. |
+| `[method]request-options.connect-timeout` | ✅ | :22073 | 0.2-style unprefixed getter name (`get-` prefix only in 0.3). Stored in nanoseconds, copied into worker-owned state, and applied to initial DNS/TCP acquisition by PR #909. This is only the initial portion of #616 A1; Zig's lazy TLS handshake and automatic redirect reconnects are not covered by this deadline. |
 | `[method]request-options.set-connect-timeout` | ✅ | :22074 | Stores `option<duration>` (nanoseconds). Returns `result` ok unconditionally. |
 | `[method]request-options.first-byte-timeout` | ✅ | :22075 | Stored for round-tripping only; enforcing it requires a deadline-aware HTTP/TLS reader and remains #616 A1b/A7 work. |
 | `[method]request-options.set-first-byte-timeout` | ✅ | :22076 | Same as above; field `first_byte_timeout_ns`. |
@@ -993,7 +1000,7 @@ Unified `request` / `response` resource ([PR #487](https://github.com/cataggar/w
 | `[static]request.consume-body` | ✅ | :21945 |
 | `[resource-drop]request` | ✅ | :21946 |
 | `[constructor]request-options` | ✅ | :21948 |
-| `[method]request-options.get-connect-timeout` | ✅ | :21949 | Stored in nanoseconds, snapshotted when the request is constructed, and applied to initial DNS/TCP acquisition. The child options resource may be dropped before send. Zig's lazy TLS handshake and automatic redirect reconnects are not deadline-covered. |
+| `[method]request-options.get-connect-timeout` | ✅ | :21949 | Stored in nanoseconds, snapshotted when the request is constructed, and applied to initial DNS/TCP acquisition by PR #909. This is only the initial portion of #616 A1; the child options resource may be dropped before send. Zig's lazy TLS handshake and automatic redirect reconnects are not deadline-covered. |
 | `[method]request-options.set-connect-timeout` | ✅ | :21950 |
 | `[method]request-options.get-first-byte-timeout` | ✅ | :21951 | Round-trip only; deadline-aware HTTP/TLS reader support remains #616 A1b/A7 work. |
 | `[method]request-options.set-first-byte-timeout` | ✅ | :21952 |
@@ -1123,6 +1130,7 @@ Re-run this audit against any future `main` SHA by:
 5. Recomputing the table totals rather than carrying forward the prior
    summary.
 
-Previous refresh: `bf7ab7ef` (2026-07-13). Quarterly cadence:
-next review in mid-October 2026, tracked by
-[#616 C1](https://github.com/cataggar/wamr/issues/616).
+Previous refresh: `bf7ab7ef` (2026-07-13). This refresh completed
+[#616 C1](https://github.com/cataggar/wamr/issues/616) in
+[PR #909](https://github.com/cataggar/wamr/pull/909). Quarterly
+cadence: next review in mid-October 2026.

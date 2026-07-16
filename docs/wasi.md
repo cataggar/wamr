@@ -18,11 +18,10 @@ seam where each interface name is version-multiplexed onto the matching
   environ-inheritance behavioral mismatch and a flaky upstream fixture
   that compares clock reads without accounting for second rollover,
   not crashes).
-* P3 unfiltered contract: `zig build wasi-p3-testsuite-unfiltered` —
-  all 41 `wasm32-wasip3` fixtures execute in both manifest AOT and
-  no-sidecar JIT mode, and all 41 pass after
-  [#881](https://github.com/cataggar/wamr/issues/881) and
-  [#905](https://github.com/cataggar/wamr/issues/905).
+* P3 conformance and parity: all 41 `wasm32-wasip3` fixtures pass in
+  manifest AOT, no-sidecar JIT, and Wasmtime 46.0.1 after
+  [PR #908](https://github.com/cataggar/wamr/pull/908). The unfiltered
+  WAMR gates execute the full corpus in both runtime modes.
 * Curated component gate: `zig build wasi-p2-testsuite` — 5 / 5 passing
   (`zig-hello`, `zig-exit`, `zig-calculator-cmd`, `mixed-zig-rust-calc`,
   `zig-http`).
@@ -45,7 +44,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:cli`         | ✅ | ✅ | Real stdio capture, env / args / exit / terminal stubs. |
 | `wasi:clocks`      | ✅ | ✅ | Monotonic + wall / system clock; `wait-for` / `wait-until` host-driven. |
 | `wasi:filesystem`  | ✅ | ✅ | Full descriptor + preopens surface; sandboxed by `--preopen`. |
-| `wasi:http`        | ✅ | ✅ | Real outbound HTTP/HTTPS via `std.http.Client`; incoming-handler HTTP/1.1 (keep-alive / chunked / trailers / limits). HTTPS termination live (`--tls-cert` / `--tls-key` / `--tls-pem`): TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency ([#609](https://github.com/cataggar/wamr/issues/609)). |
+| `wasi:http`        | ✅ | ✅ | Real outbound HTTP/HTTPS via `std.http.Client`; incoming-handler HTTP/1.1 (keep-alive / chunked / trailers / limits). HTTPS termination live (`--tls-cert` / `--tls-key` / `--tls-pem`): TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency ([#799](https://github.com/cataggar/wamr/pull/799)). |
 | `wasi:io`          | ✅ | ✅ | `poll` / `error` / `streams`; P3 stream/future plumbing lives in the canonical ABI. |
 | `wasi:random`      | ✅ | ✅ | OS CSPRNG (`std.crypto.random`) + insecure variants + 128-bit seed. |
 | `wasi:sockets`     | ✅ | ✅ | TCP + UDP + DNS; allow-list gated; SO_REUSEADDR; Windows + POSIX parity. |
@@ -53,7 +52,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
 | `wasi:config`      | ✅ (rc.1) | — | Layered env (`WAMR_CONFIG_*`) + `--config-store=PATH.json` host adapter (#583 B6). |
 | `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
-| `wasi:threads`     | — | — | Not implemented (#583 B3). |
+| `wasi:threads`     | — | — | Runtime and host-import prototypes exist, but guest threads are not production-wired or gated ([#616 B1](https://github.com/cataggar/wamr/issues/616)). |
 
 ✅ = shipped + gated by the conformance suite. — = not in scope today.
 
@@ -121,7 +120,7 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:sockets/types@0.3.0`               | 43 | `wasi-p3-testsuite` (`sockets-*`) | Unified TCP + UDP resource surface (#486 / #544 / #565); callback-driven async `run` resumption (#905). |
 | `wasi:sockets/ip-name-lookup@0.3.0`      |  1 | `wasi-p3-testsuite` | — |
 | `wasi:http/types@0.3.0`                  | 40 | `wasi-p3-testsuite` (`http-*`) | Unified `request` / `response` resource (#487 / #568). |
-| `wasi:http/handler@0.3.0`                |  1 | `wasi-p3-testsuite` (`http-service`) | Incoming-handler trampoline (#549 / #580); HTTP/1.1 keep-alive + chunked + trailers + 431/413 limits (#595); HTTPS termination live — TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency (#609). |
+| `wasi:http/handler@0.3.0`                |  1 | `wasi-p3-testsuite` (`http-service`) | Incoming-handler trampoline (#549 / #580); HTTP/1.1 keep-alive + chunked + trailers + 431/413 limits (#595); HTTPS termination live — TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency (#799). |
 | `wasi:http/client@0.3.0`                 |  1 | `wasi-p3-testsuite` (`http-request`, `http-fields`) | Outbound; async state machine (#583 A2 / #590). |
 
 `wasi-testsuite-expectations.toml` carries the narrow Preview-1 exceptions.
@@ -190,6 +189,14 @@ either added a new interface family or closed a tracker issue.
 | Outbound HTTP client async state machine                        | [#590](https://github.com/cataggar/wamr/pull/590) | #583 A2 |
 | `wasi:logging@0.1.x` host adapter                               | [#598](https://github.com/cataggar/wamr/pull/598) | #583 B5 |
 | `wasi:keyvalue@0.2.0-draft2` memory-store host adapter          | (this PR) | #583 B4 |
+| Incoming-handler HTTPS termination                              | [#799](https://github.com/cataggar/wamr/pull/799) | Closes #609. |
+
+### Hardening cycle 2 (umbrella: [#616](https://github.com/cataggar/wamr/issues/616))
+
+| Milestone | PR | Tracker status |
+| --------- | -- | -------------- |
+| P3 AOT/JIT/Wasmtime parity, 41 / 41 in each mode | [#908](https://github.com/cataggar/wamr/pull/908) | Parity matrix complete. |
+| Initial DNS/TCP connect deadlines; Linux `splice(2)`; calibrated blocking microbenchmark job; stable host-import audit | [#909](https://github.com/cataggar/wamr/pull/909) | Completes A2, A5, and C1. Only the initial DNS/TCP portion of A1 is complete; TLS handshakes, redirect reconnects, and first-/between-byte deadlines remain open. |
 
 ## Known limitations
 
@@ -197,6 +204,13 @@ Tracked under the post-Preview-3 umbrella
 [#583](https://github.com/cataggar/wamr/issues/583). Each bullet is a
 PR-sized child item; cross-references below match the section letters
 in that tracker.
+
+The current follow-up tracker is
+[#616](https://github.com/cataggar/wamr/issues/616). PR #909 completed
+A2, A5, and C1. Its A1 work applies the configured connect deadline
+only to initial DNS/TCP acquisition; lazy TLS handshakes, redirect
+reconnects, first-byte deadlines, and between-byte deadlines remain
+open.
 
 ### Already-shipped 0.3.0 surfaces (section A)
 
@@ -233,8 +247,11 @@ in that tracker.
   before the host call, and the executor never yields to a
   `memory.grow` between the bounds check and the driver return.
   ([#583 B2](https://github.com/cataggar/wamr/issues/583))
-* **`wasi:threads@0.3.x`** (preemptive threads) — not implemented;
-  upstream WIT still draft. ([#583 B3](https://github.com/cataggar/wamr/issues/583))
+* **Guest threads** — interpreter/runtime and `wasi.thread-spawn`
+  prototypes exist, but resource safety, correct atomics and
+  wait/notify/fence behavior, interpreter+AOT spawning,
+  cancellation/context isolation, and production gates remain open.
+  ([#616 B1](https://github.com/cataggar/wamr/issues/616))
 * **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped, with
   optional file-backed persistence and real compare-and-swap.
   Limitations: in-process `std.StringHashMapUnmanaged` only; no
@@ -275,6 +292,12 @@ in that tracker.
   41-fixture Preview 3 corpus through manifest AOT, no-sidecar JIT, and
   Wasmtime 46.0.1. All three modes pass 41 / 41 with zero parity deltas.
   ([#583 C1](https://github.com/cataggar/wamr/issues/583))
+* **Stable host-import audit.** Refreshed by
+  [PR #909](https://github.com/cataggar/wamr/pull/909): 351 / 352
+  methods are implemented (99.7 %), with no missing stable imports.
+  The only stub is P2
+  `wasi:filesystem/types.filesystem-error-code`, which ignores its
+  borrowed error and returns canned `option::none`.
 
 ## Build & test
 
@@ -400,10 +423,10 @@ The post-Preview-3 hardening tracker is
 additions (one PR per interface, gated behind the existing
 `populateWasiProviders` version-multiplex):
 
-* **`wasi:threads@0.3.x`** — [#583 B3](https://github.com/cataggar/wamr/issues/583).
+* **Guest threads** — [#616 B1](https://github.com/cataggar/wamr/issues/616).
   Design doc: [`docs/design/wasi-threads.md`](design/wasi-threads.md)
-  (multi-threaded interpreter state isolation; upstream-survey +
-  multi-wave implementation plan).
+  (prototype inventory, multi-threaded interpreter state isolation,
+  and production-gating plan).
 * **`wasi:keyvalue@0.2.x`** — [#583 B4](https://github.com/cataggar/wamr/issues/583).
 * ~~**`wasi:logging@0.1.x`**~~ — host adapter shipped (#583 B5); see the
   Preview-2 detail table for the registered methods.
