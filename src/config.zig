@@ -9,6 +9,7 @@
 
 const builtin = @import("builtin");
 const build_options = @import("config");
+pub const threads_feature = @import("threads_feature.zig");
 
 /// Product version string supplied by `zig build -Dversion=...`.
 pub const version: []const u8 = if (@hasDecl(build_options, "version")) build_options.version else "dev";
@@ -152,7 +153,8 @@ pub const lib_pthread = opt("lib_pthread", false);
 /// Enable pthread semaphore support.
 pub const lib_pthread_semaphore = opt("lib_pthread_semaphore", false);
 
-/// Enable WASI threads proposal.
+/// Enable the WASI threads configuration contract. Production spawning,
+/// atomics, synchronization, and AOT support remain separately reported.
 pub const lib_wasi_threads = opt("lib_wasi_threads", false);
 
 /// Allocate auxiliary stacks on the heap (follows lib_wasi_threads).
@@ -176,11 +178,15 @@ pub const bulk_memory = opt("bulk_memory", false);
 /// Optimized bulk-memory operations.
 pub const bulk_memory_opt = opt("bulk_memory_opt", false);
 
-/// Enable WASM shared memory proposal.
-pub const shared_memory = opt("shared_memory", false);
+/// Enable WASM shared memory proposal. Required by WASI threads.
+pub const shared_memory = opt("shared_memory", lib_wasi_threads);
 
-/// Enable the thread manager component.
-pub const thread_mgr = opt("thread_mgr", false);
+/// Enable the thread manager component. Required by WASI threads.
+pub const thread_mgr = opt("thread_mgr", lib_wasi_threads);
+
+/// Enable WebAssembly atomic instructions. This is a configuration
+/// capability, not a claim that the production threads semantics are complete.
+pub const wasm_atomics = opt("wasm_atomics", shared_memory);
 
 /// Enable source-level interpreter debugging.
 pub const debug_interp = opt("debug_interp", false);
@@ -456,6 +462,47 @@ pub const wasm_table_max_size: u32 = optInt(u32, "wasm_table_max_size", 1024);
 /// Maximum single allocation size under fuzz-testing (~2 GB).
 pub const wasm_mem_alloc_max_size: usize = if (fuzz_test) 2 * 1024 * 1024 * 1024 else 0;
 
+fn wasiThreadsInputs() threads_feature.Inputs {
+    return .{
+        .enabled = lib_wasi_threads,
+        .pointer_bits = @bitSizeOf(usize),
+        .wasm_host = switch (builtin.cpu.arch) {
+            .wasm32, .wasm64 => true,
+            else => false,
+        },
+        .single_threaded = builtin.single_threaded,
+        .interp = interp,
+        .aot = aot,
+        .jit = jit,
+        .fast_jit = fast_jit,
+        .libc_wasi = libc_wasi,
+        .heap_aux_stack_allocation = heap_aux_stack_allocation,
+        .shared_memory = shared_memory,
+        .thread_manager = thread_mgr,
+        .wasm_atomics = wasm_atomics,
+    };
+}
+
+/// Deterministic compile-time report for embedders and runtime preflight
+/// gates. `configuration_only` and `architecture_abi_not_implemented` are
+/// intentionally not support claims.
+pub const wasi_threads = threads_feature.report(wasiThreadsInputs());
+
+test "WASI threads build options match the published contract" {
+    const std = @import("std");
+
+    try std.testing.expectEqual(lib_wasi_threads, wasi_threads.enabled);
+    try std.testing.expectEqual(shared_memory, wasi_threads.configured.shared_memory);
+    try std.testing.expectEqual(thread_mgr, wasi_threads.configured.thread_manager);
+    try std.testing.expectEqual(wasm_atomics, wasi_threads.configured.wasm_atomics);
+    if (lib_wasi_threads) {
+        try std.testing.expect(wasi_threads.required.shared_memory);
+        try std.testing.expect(wasi_threads.configured.shared_memory);
+        try std.testing.expect(wasi_threads.configured.thread_manager);
+        try std.testing.expect(wasi_threads.configured.wasm_atomics);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time validation (mirrors the C #error checks)
 // ---------------------------------------------------------------------------
@@ -465,6 +512,6 @@ comptime {
         @compileError("orc_jit_backend_thread_num must be >= 1");
     if (orc_jit_compile_thread_num < 1)
         @compileError("orc_jit_compile_thread_num must be >= 1");
-    if (heap_aux_stack_allocation == false and lib_wasi_threads == true)
-        @compileError("heap_aux_stack_allocation must be enabled for WASI threads");
+    if (threads_feature.validationError(wasiThreadsInputs())) |err|
+        @compileError(threads_feature.validationMessage(err));
 }

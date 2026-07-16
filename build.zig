@@ -1,4 +1,5 @@
 const std = @import("std");
+const threads_feature = @import("src/threads_feature.zig");
 
 const fuzz_seed_wasms = [_][]const u8{
     "diamond_call_indirect_then_load.wasm",
@@ -95,10 +96,10 @@ pub fn build(b: *std.Build) void {
     const lib_pthread = b.option(bool, "lib_pthread", "Enable pthread library") orelse false;
     options.addOption(bool, "lib_pthread", lib_pthread);
 
-    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable WASI threads") orelse false;
+    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable the WASI threads configuration contract (production spawning is not implemented)") orelse false;
     options.addOption(bool, "lib_wasi_threads", lib_wasi_threads);
 
-    const thread_mgr = b.option(bool, "thread_mgr", "Enable thread manager") orelse false;
+    const thread_mgr = (b.option(bool, "thread_mgr", "Enable thread manager") orelse false) or lib_wasi_threads;
     options.addOption(bool, "thread_mgr", thread_mgr);
 
     const debug_interp = b.option(bool, "debug_interp", "Enable interpreter debugging") orelse false;
@@ -107,8 +108,14 @@ pub fn build(b: *std.Build) void {
     const bulk_memory = b.option(bool, "bulk_memory", "Enable bulk memory ops") orelse false;
     options.addOption(bool, "bulk_memory", bulk_memory);
 
-    const shared_memory = b.option(bool, "shared_memory", "Enable shared memory") orelse false;
+    const shared_memory = (b.option(bool, "shared_memory", "Enable shared memory") orelse false) or lib_wasi_threads;
     options.addOption(bool, "shared_memory", shared_memory);
+
+    const wasm_atomics = shared_memory or lib_wasi_threads;
+    options.addOption(bool, "wasm_atomics", wasm_atomics);
+
+    const heap_aux_stack_allocation = (b.option(bool, "heap_aux_stack_allocation", "Allocate auxiliary WASM stacks on the heap") orelse false) or lib_wasi_threads;
+    options.addOption(bool, "heap_aux_stack_allocation", heap_aux_stack_allocation);
 
     const tail_call = b.option(bool, "tail_call", "Enable tail call") orelse false;
     options.addOption(bool, "tail_call", tail_call);
@@ -134,6 +141,28 @@ pub fn build(b: *std.Build) void {
     const component_model = b.option(bool, "component_model", "Enable Component Model") orelse false;
     options.addOption(bool, "component_model", component_model);
 
+    const threads_inputs = threads_feature.Inputs{
+        .enabled = lib_wasi_threads,
+        .pointer_bits = target.result.ptrBitWidth(),
+        .wasm_host = switch (target_arch) {
+            .wasm32, .wasm64 => true,
+            else => false,
+        },
+        .single_threaded = target.result.os.tag == .freestanding,
+        .interp = interp,
+        .aot = aot,
+        .jit = jit,
+        .fast_jit = fast_jit,
+        .libc_wasi = libc_wasi,
+        .heap_aux_stack_allocation = heap_aux_stack_allocation,
+        .shared_memory = shared_memory,
+        .thread_manager = thread_mgr,
+        .wasm_atomics = wasm_atomics,
+    };
+    if (threads_feature.validationError(threads_inputs)) |err| {
+        std.debug.panic("invalid WASI threads configuration: {s}", .{threads_feature.validationMessage(err)});
+    }
+
     const network_tests = b.option(
         bool,
         "network_tests",
@@ -156,6 +185,22 @@ pub fn build(b: *std.Build) void {
 
     const config_module = options.createModule();
 
+    const threads_contract_test_module = b.createModule(.{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    threads_contract_test_module.addImport("config", config_module);
+    const threads_contract_tests = b.addTest(.{
+        .root_module = threads_contract_test_module,
+    });
+    const run_threads_contract_tests = b.addRunArtifact(threads_contract_tests);
+    const threads_contract_test_step = b.step(
+        "test-threads-contract",
+        "Run WASI threads feature-contract tests",
+    );
+    threads_contract_test_step.dependOn(&run_threads_contract_tests.step);
+
     // ── TLS library (cataggar/tls.zig, zig16 branch) ──────────────────
     // Pure-Zig TLS 1.2/1.3 client + server. Used for `wasi:http@0.3`
     // incoming-handler HTTPS termination (#609): upstream Zig std ships
@@ -166,6 +211,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const tls_module = tls_dep.module("tls");
+
+    const threads_runtime_test_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    threads_runtime_test_module.addImport("config", config_module);
+    threads_runtime_test_module.addImport("tls", tls_module);
+    const threads_runtime_tests = b.addTest(.{
+        .root_module = threads_runtime_test_module,
+        .filters = &.{
+            "instantiate rejects configured WASI threads",
+            "host functions resolved for wasi thread-spawn import",
+        },
+    });
+    const run_threads_runtime_tests = b.addRunArtifact(threads_runtime_tests);
+    threads_contract_test_step.dependOn(&run_threads_runtime_tests.step);
 
     // ── Root module for the library ────────────────────────────────────
     const lib_module = b.createModule(.{

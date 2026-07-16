@@ -50,7 +50,15 @@ operate on the shared linear memory and synchronise across threads.
    only. The existing `thread_manager.zig` shows the pattern (custom
    spinlock `Mutex` because Zig 0.16 moved `std.Thread.Mutex` behind
    `Io`).
-4. **`zig build test` stays green; no source changes in this PR.**
+4. **`zig build test` stays green.**
+
+`-Dlib_wasi_threads=true` is currently a configuration contract, not a
+production-support switch. It implies shared memory, the thread manager,
+WebAssembly atomics, and heap auxiliary stacks, requires a 64-bit native
+multithreaded interpreter build, and rejects AOT/JIT configurations. The
+public `config.wasi_threads` report keeps target, backend, configured
+capabilities, and implementation readiness separate; thread-spawn imports
+are rejected before allocation while readiness remains false.
 
 ## Upstream state
 

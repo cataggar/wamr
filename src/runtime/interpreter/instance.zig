@@ -9,6 +9,7 @@ const types = @import("../common/types.zig");
 const leb128_mod = @import("../../shared/utils/leb128.zig");
 const ExecEnv = @import("../common/exec_env.zig").ExecEnv;
 const interp = @import("interp.zig");
+const config = @import("../../config.zig");
 
 pub const InstantiationError = error{
     OutOfMemory,
@@ -21,6 +22,7 @@ pub const InstantiationError = error{
     InvalidGlobalIndex,
     UnknownImport,
     StartFunctionFailed,
+    WasiThreadsNotImplemented,
 };
 
 /// Resolved imports passed during instantiation.
@@ -115,6 +117,13 @@ fn instantiateImpl(
     comptime HostImportsT: ?type,
     defer_start: bool,
 ) InstantiationError!*types.ModuleInstance {
+    if (comptime config.lib_wasi_threads and !config.wasi_threads.implementation.interpreter_thread_spawning) {
+        for (module.imports) |imp| {
+            if (imp.kind == .function and config.threads_feature.isThreadSpawnImport(imp.module_name, imp.field_name))
+                return error.WasiThreadsNotImplemented;
+        }
+    }
+
     const has_non_func_imports =
         module.import_global_count > 0 or
         module.import_memory_count > 0 or
@@ -1117,7 +1126,13 @@ test "instantiate: host functions resolved for wasi thread-spawn import" {
         .import_function_count = 1,
         .types = &func_types,
     };
-    const inst = try instantiate(&module, testing.allocator);
+    const inst = instantiate(&module, testing.allocator) catch |err| {
+        if (comptime config.lib_wasi_threads) {
+            try testing.expectEqual(error.WasiThreadsNotImplemented, err);
+            return;
+        }
+        return err;
+    };
     defer destroy(inst);
 
     // Host functions should be resolved
