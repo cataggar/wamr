@@ -73,6 +73,8 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
 
       - name: Measure AOT — 5 cold and 10 warm unfiltered suites
+        id: measure-aot
+        continue-on-error: true
         env:
           WAMR: ${{ github.workspace }}/zig-out/bin/wamr
           WAMRC: ${{ github.workspace }}/zig-out/bin/wamrc
@@ -85,6 +87,8 @@ jobs:
             --output-dir 'wasi-p3-measure-${{ matrix.platform_id }}/aot'
 
       - name: Characterize wasi-microbench without budget enforcement
+        id: microbench
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -98,9 +102,14 @@ jobs:
             > "$OUT/report.txt" 2>&1
 
       - name: Build ReleaseSafe JIT tools
+        id: build-jit
+        if: always()
         run: zig build -Doptimize=ReleaseSafe -Djit=true
 
       - name: Measure JIT equivalent — 5 cold and 10 warm unfiltered suites
+        id: measure-jit
+        if: always() && steps.build-jit.outcome == 'success'
+        continue-on-error: true
         env:
           WAMR: ${{ github.workspace }}/zig-out/bin/wamr
           WAMRC: ${{ github.workspace }}/zig-out/bin/wamrc
@@ -120,6 +129,24 @@ jobs:
           path: wasi-p3-measure-${{ matrix.platform_id }}/
           if-no-files-found: error
           retention-days: 90
+
+      - name: Enforce successful measurement phases
+        if: always()
+        env:
+          AOT: ${{ steps.measure-aot.outcome }}
+          MICROBENCH: ${{ steps.microbench.outcome }}
+          BUILD_JIT: ${{ steps.build-jit.outcome }}
+          JIT: ${{ steps.measure-jit.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+          for phase in AOT MICROBENCH BUILD_JIT JIT; do
+            outcome="${!phase}"
+            printf '%s=%s\n' "$phase" "$outcome"
+            if [ "$outcome" != success ]; then failed=1; fi
+          done
+          exit "$failed"
 
   aggregate:
     name: Validate and aggregate
