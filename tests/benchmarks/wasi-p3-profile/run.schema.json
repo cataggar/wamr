@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/wamr/tests/benchmarks/wasi-p3-profile/run.schema.json",
+  "title": "WASI P3 profile runs",
+  "type": "object",
+  "required": ["schema_version", "kind", "metadata", "plan", "samples"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "wasi-p3-profile-runs" },
+    "metadata": {
+      "type": "object",
+      "required": ["platform_id", "mode", "optimize", "commit", "host", "tools", "cache"],
+      "properties": {
+        "platform_id": { "type": "string" },
+        "mode": { "enum": ["aot", "jit"] },
+        "optimize": { "const": "ReleaseSafe" },
+        "commit": { "type": "string", "minLength": 40, "maxLength": 40 },
+        "host": { "type": "object" },
+        "tools": { "type": "object" },
+        "cache": { "type": "object" }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "required": ["cold_samples", "warm_samples", "optimize"]
+    },
+    "samples": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "temperature", "index", "valid", "errors", "returncode",
+          "suite_duration_ns", "counts", "events"
+        ],
+        "properties": {
+          "temperature": { "enum": ["cold", "warm"] },
+          "valid": { "type": "boolean" },
+          "suite_duration_ns": { "type": "integer", "minimum": 0 },
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/event" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "event": {
+      "type": "object",
+      "required": [
+        "schema_version", "event", "run_id", "mode", "fixture", "phase",
+        "artifact_kind", "cache", "duration_ns", "pid"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "event": { "const": "phase_timing" },
+        "mode": { "enum": ["aot", "jit"] },
+        "fixture": { "type": "string", "minLength": 1 },
+        "phase": {
+          "enum": ["component_precompile", "core_precompile", "fixture_execution"]
+        },
+        "artifact_kind": { "enum": ["component", "core"] },
+        "cache": { "enum": ["miss", "hit", "bypass", "n/a"] },
+        "duration_ns": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

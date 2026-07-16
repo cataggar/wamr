@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/wamr/tests/benchmarks/wasi-p3-profile/aggregate.schema.json",
+  "title": "WASI P3 matched-platform aggregate",
+  "type": "object",
+  "required": [
+    "schema_version", "kind", "generated_at", "commit", "valid",
+    "contract", "suite", "phases", "microbench"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "wasi-p3-profile-aggregate" },
+    "commit": { "type": "string", "minLength": 40, "maxLength": 40 },
+    "valid": { "const": true },
+    "contract": { "type": "object" },
+    "suite": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/stat" }
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "allOf": [
+          { "$ref": "#/$defs/stat" },
+          {
+            "type": "object",
+            "required": ["phase", "fixture"],
+            "properties": {
+              "phase": {
+                "enum": ["component_precompile", "core_precompile", "fixture_execution"]
+              },
+              "fixture": { "type": "string", "minLength": 1 }
+            }
+          }
+        ]
+      }
+    },
+    "microbench": { "type": "object" }
+  },
+  "$defs": {
+    "stat": {
+      "type": "object",
+      "required": [
+        "platform_id", "mode", "temperature", "samples",
+        "min_ns", "median_ns", "p95_ns", "max_ns"
+      ],
+      "properties": {
+        "platform_id": { "enum": ["macos-arm64", "linux-arm64"] },
+        "mode": { "enum": ["aot", "jit"] },
+        "temperature": { "enum": ["cold", "warm"] },
+        "samples": { "type": "integer", "minimum": 1 },
+        "min_ns": { "type": "integer", "minimum": 0 },
+        "median_ns": { "type": "integer", "minimum": 0 },
+        "p95_ns": { "type": "integer", "minimum": 0 },
+        "max_ns": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
