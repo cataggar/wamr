@@ -1737,6 +1737,9 @@ pub const RuntimeError = error{
     /// still linked so importers of `src/root.zig` build cleanly on
     /// riscv64 / etc., but invoking it at runtime fails fast.
     UnsupportedArchitecture,
+    /// The feature contract is enabled, but production AOT thread spawning
+    /// and its architecture/ABI contract have not been implemented.
+    WasiThreadsAotNotImplemented,
     /// #857: mapping this instance's code would push total resident
     /// JIT/AOT executable code past `JitCodeCache.budget_bytes`. Only
     /// possible when a nonzero budget is configured (default is
@@ -1773,6 +1776,13 @@ pub fn instantiateWithOverrides(
     imported_function_overrides: []const ?*const anyopaque,
     imported_tag_overrides: []const ?*types.TagInstance,
 ) RuntimeError!*AotInstance {
+    if (comptime config.lib_wasi_threads and !config.wasi_threads.implementation.aot_thread_spawning) {
+        for (module.imports) |imp| {
+            if (imp.kind == .function and config.threads_feature.isThreadSpawnImport(imp.module_name, imp.field_name))
+                return error.WasiThreadsAotNotImplemented;
+        }
+    }
+
     std.debug.assert(imported_table_overrides.len == 0 or imported_table_overrides.len == module.importedTables().len);
     std.debug.assert(imported_memory_overrides.len == 0 or imported_memory_overrides.len == module.importedMemories().len);
     std.debug.assert(imported_global_overrides.len == 0 or imported_global_overrides.len == module.importedGlobals().len);
@@ -3633,6 +3643,24 @@ fn freeTags(tags: []*types.TagInstance, owned: []bool, allocator: std.mem.Alloca
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+test "instantiate rejects configured WASI threads before AOT allocation" {
+    if (comptime !config.lib_wasi_threads) return error.SkipZigTest;
+
+    const imports = [_]aot_loader.AotImportDesc{.{
+        .module_name = "wasi",
+        .field_name = "thread-spawn",
+        .kind = .function,
+    }};
+    const module = aot_loader.AotModule{
+        .imports = &imports,
+        .import_function_count = 1,
+    };
+    try std.testing.expectError(
+        error.WasiThreadsAotNotImplemented,
+        instantiate(&module, std.testing.allocator),
+    );
+}
 
 test "instantiate: empty module" {
     const module = aot_loader.AotModule{};
