@@ -221,7 +221,7 @@ fn printResult(name: []const u8, result: TestResult) void {
     });
 }
 
-/// Run a .wast file using wabt's parser + interpreter for conformance.
+/// Run a .wast file using wabt's parser + WAMR's interpreter for conformance.
 /// In AOT mode, .wast files are currently skipped (see issue #102 —
 /// a .wast-aware AOT harness is follow-up work).
 fn runWastFile(path: []const u8, mode: spec_json_runner.Mode, allocator: std.mem.Allocator, io: std.Io) TestResult {

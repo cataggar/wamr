@@ -349,6 +349,21 @@ pub fn build(b: *std.Build) void {
     const spec_aot_step = b.step("spec-tests-aot", "Run the spec-json suite through the AOT pipeline");
     spec_aot_step.dependOn(&run_spec_aot.step);
 
+    // Full WebAssembly/spec conformance suite (257 .wast files, ~65k
+    // assertions) from the vendored `third_party/testsuite` submodule,
+    // gated against `tests/spec-baseline.tsv` so any regression fails CI.
+    // Requires: git submodule update --init third_party/testsuite
+    const run_spec_baseline = b.addSystemCommand(&.{
+        "python3",
+        "scripts/check_spec_baseline.py",
+    });
+    run_spec_baseline.step.dependOn(b.getInstallStep());
+    const spec_baseline_step = b.step(
+        "spec-testsuite",
+        "Run the full WebAssembly/spec suite and check it against tests/spec-baseline.tsv",
+    );
+    spec_baseline_step.dependOn(&run_spec_baseline.step);
+
     // ── WASI conformance suite ────────────────────────────────────────
     // Drives the vendored `WebAssembly/wasi-testsuite` against the just-built
     // `wamr` CLI through the in-tree adapter. Skiplist entries must each

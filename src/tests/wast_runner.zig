@@ -94,6 +94,26 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
     // Storage for module definitions (module definition $name ...)
     var module_defs: std.StringHashMapUnmanaged([]const u8) = .{};
 
+    // A .wast file may be a bare *inline module*: a sequence of module
+    // fields with no `(module ...)` wrapper and no commands at all
+    // (`inline-module.wast` is literally `(func) (memory 0) (func (export
+    // "f"))`). Detect that up front and wrap the whole source, otherwise
+    // every field classifies as an unknown command and the file yields
+    // nothing.
+    if (isInlineModule(source)) {
+        const wrapped = try std.fmt.allocPrint(allocator, "(module {s})", .{source});
+        defer allocator.free(wrapped);
+        const filename = try std.fmt.allocPrint(allocator, "{s}.0.wasm", .{base_name});
+        errdefer allocator.free(filename);
+        var mod = try wabt.text.Parser.parseModule(allocator, wrapped);
+        defer mod.deinit();
+        const wasm_bytes = try wabt.binary.writer.writeModule(allocator, &mod);
+        try modules.put(allocator, filename, wasm_bytes);
+        try w.print("{{\"type\":\"module\",\"line\":1,\"filename\":\"{s}.0.wasm\"}}", .{base_name});
+        try w.writeAll("]}");
+        return;
+    }
+
     while (pos < source.len) {
         pos = wr.skipWhitespaceAndComments(source, pos);
         if (pos >= source.len) break;
@@ -149,8 +169,35 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                     module_idx += 1;
                     continue;
                 } else if (hasDefinitionKw(sexpr.text)) {
-                    // Unnamed module definition — just validate, don't instantiate
-                    first = true; // undo the comma
+                    // Unnamed `(module definition ...)`: per the wast grammar
+                    // this declares a module without instantiating it, so it
+                    // must be decoded and validated but never linked. Emitting
+                    // a plain "module" command would make the runner
+                    // instantiate it — and these fixtures deliberately declare
+                    // absurd limits (e.g. `(table i64 0xffff_ffff_ffff_ffff
+                    // funcref)`) that must never be allocated.
+                    const stripped = wr.stripDefinitionKeyword(allocator, sexpr.text) orelse {
+                        first = true; // undo the comma
+                        continue;
+                    };
+                    defer allocator.free(stripped);
+                    const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    var mod = wabt.text.Parser.parseModule(allocator, stripped) catch {
+                        allocator.free(filename);
+                        first = true;
+                        continue;
+                    };
+                    defer mod.deinit();
+                    const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                        allocator.free(filename);
+                        first = true;
+                        continue;
+                    };
+                    try modules.put(allocator, filename, wasm_bytes);
+                    const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    defer allocator.free(fn2);
+                    try w.print("{{\"type\":\"module_definition\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                    module_idx += 1;
                     continue;
                 } else if (wr.isModuleInstance(sexpr.text)) {
                     // (module instance $inst $def) — compile a fresh copy from the definition
@@ -414,6 +461,25 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
     }
 
     try w.writeAll("]}");
+}
+
+/// True when the whole file is a bare inline module: at least one
+/// top-level s-expression, and not one of them is a recognised wast
+/// command (`module`, `assert_*`, `invoke`, `register`, `get`).
+fn isInlineModule(source: []const u8) bool {
+    const w = wabt.wast_runner;
+    var pos: usize = 0;
+    var saw_any = false;
+    while (pos < source.len) {
+        pos = w.skipWhitespaceAndComments(source, pos);
+        if (pos >= source.len) break;
+        if (source[pos] != '(') return false;
+        const sexpr = w.extractSExpr(source, pos) orelse return false;
+        if (w.classifyCommand(sexpr.text) != .unknown) return false;
+        saw_any = true;
+        pos = sexpr.end;
+    }
+    return saw_any;
 }
 
 fn hasDefinitionKw(text: []const u8) bool {

@@ -57,6 +57,42 @@ pub const HostTrapInfo = struct {
 };
 
 /// A single call frame on the call stack.
+/// A `block`/`loop`/`if`/`try_table` label active inside a function body.
+///
+/// Lives here rather than in the interpreter so `ExecEnv` can own one
+/// shared label stack for the whole call chain. Keeping labels off the
+/// native stack is what bounds native stack growth per nested wasm call
+/// (see `label_stack` below).
+pub const Label = struct {
+    kind: Kind,
+    /// IP to branch to (after `end` for block/if, loop header for loop).
+    target_ip: usize,
+    /// Operand-stack height when this label was entered.
+    stack_height: u32,
+    /// Expected result arity of this block.
+    arity: u32,
+    /// For try_table: bytecode position of catch clause list.
+    catch_ip: u32 = 0,
+    /// For try_table: number of catch clauses.
+    catch_count: u16 = 0,
+
+    pub const Kind = enum { block, loop, @"if", try_table };
+};
+
+/// Maximum number of labels active in a *single* function call.
+///
+/// wit-bindgen 0.45 emits async-lift code that nests labels per
+/// `task.yield` point; the wasi:http@0.3.0 fixtures peak at ~280 labels
+/// in a single function (#538). 1024 leaves generous headroom.
+pub const max_labels_per_frame: u32 = 1024;
+
+/// Capacity of the shared label stack, in labels, across *all* active
+/// frames. Sized so a full `max_call_depth` chain of ordinary functions
+/// fits comfortably while a single pathological frame can still reach
+/// `max_labels_per_frame`. Exceeding it traps as `CallStackOverflow`
+/// rather than growing the native stack.
+pub const label_stack_capacity: u32 = 16 * 1024;
+
 pub const CallFrame = struct {
     /// Index of the function being executed.
     func_idx: u32,
@@ -89,6 +125,17 @@ pub const ExecEnv = struct {
 
     /// Maximum call depth (configurable, default 1024).
     max_call_depth: u32 = 1024,
+
+    /// Shared label stack for the interpreter dispatch loop.
+    ///
+    /// Each nested wasm call takes a window starting at `label_top`.
+    /// Holding labels here instead of in a native `[1024]Label` local
+    /// keeps `dispatchLoopWithFuel`'s native frame small, so a runaway
+    /// recursion hits `max_call_depth` and traps instead of overflowing
+    /// the native stack and taking a SIGSEGV.
+    label_stack: []Label,
+    /// Offset of the first label slot not owned by an active frame.
+    label_top: u32 = 0,
 
     /// Exception/trap message (null if no trap).
     exception: ?[]const u8 = null,
@@ -150,10 +197,14 @@ pub const ExecEnv = struct {
         const frames = try allocator.alloc(CallFrame, 1024);
         errdefer allocator.free(frames);
 
+        const labels = try allocator.alloc(Label, label_stack_capacity);
+        errdefer allocator.free(labels);
+
         self.* = .{
             .module_inst = module_inst,
             .operand_stack = stack,
             .call_stack = frames,
+            .label_stack = labels,
             .allocator = allocator,
         };
         return self;
@@ -163,6 +214,7 @@ pub const ExecEnv = struct {
     pub fn destroy(self: *ExecEnv) void {
         self.allocator.free(self.operand_stack);
         self.allocator.free(self.call_stack);
+        self.allocator.free(self.label_stack);
         self.allocator.destroy(self);
     }
 

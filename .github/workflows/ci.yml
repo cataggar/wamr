@@ -68,6 +68,11 @@ jobs:
             echo "::notice::No JSON spec tests found"
           fi
 
+      - name: Spec testsuite (full WebAssembly/spec, baseline-gated)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python3 scripts/check_spec_baseline.py
+
       - name: Spec tests (JSON — Windows)
         if: runner.os == 'Windows'
         shell: pwsh
