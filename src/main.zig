@@ -524,6 +524,16 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
         writeStdout(init.io, serve_usage);
         return 0;
     }
+    // #918: block SIGINT/SIGTERM before any of the (potentially
+    // multi-second) startup work below — component read, manifest /
+    // AOT-or-JIT precompile, and instantiation — so a signal that races
+    // startup is held pending on this (single) thread rather than lost to
+    // the inherited `SIG_IGN` disposition. The real async-signal-safe
+    // handler is installed and the signals unblocked later, right before
+    // the accept loop (`serveLoadedHttpComponent` → `armHttpShutdown`), at
+    // which point the pending signal is delivered and shuts the server
+    // down cleanly. No-op on Windows.
+    wamr.wasi_cli_adapter.blockHttpShutdownSignals();
     var wasm_path: ?[]const u8 = null;
     var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer wasm_args.deinit(allocator);

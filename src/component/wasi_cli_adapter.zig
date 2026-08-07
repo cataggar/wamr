@@ -1713,6 +1713,99 @@ pub const PendingHttpFetchShared = struct {
     waker: ?Waker = null,
 };
 
+/// `wamr serve` graceful-shutdown state (#918). Set by the async-signal-safe
+/// SIGINT/SIGTERM handler and observed by the accept loop in
+/// `serveLoadedHttpComponent`. `http_shutdown_requested` is the source of
+/// truth; `http_shutdown_wake_fd` is the write end of a self-pipe the
+/// handler pokes to wake a `poll()` parked on the listener. Process-global
+/// because a process serves at most one long-lived listener at a time; the
+/// finite-`max_requests` unit-test path never installs the handler, so it
+/// leaves these untouched.
+var http_shutdown_requested: std.atomic.Value(bool) = .init(false);
+var http_shutdown_wake_fd: std.atomic.Value(i32) = .init(-1);
+
+/// The self-pipe waker the accept loop parks on and the signal handler
+/// pokes. Owned by the arm/disarm pair below; the loop borrows its
+/// `read_fd`. Process-global for the same single-listener reason as the
+/// flag above. Only touched on the main (control-flow) path — never
+/// inside the signal handler, which reads `http_shutdown_wake_fd` instead.
+var http_shutdown_waker: ?Waker = null;
+var http_shutdown_armed: bool = false;
+
+/// Block SIGINT/SIGTERM on the calling (main) thread. Call this as early
+/// as possible — *before* the multi-second component decode + JIT compile
+/// — so a signal that races startup is held **pending** instead of being
+/// lost. A blocked signal becomes pending even when its disposition is
+/// `SIG_IGN` (the accept loop's process inherits `SIG_IGN` for SIGINT from
+/// a background shell, and Zig's startup momentarily resets the
+/// disposition via a `system(3)`-style helper); `armHttpShutdown` later
+/// installs the real handler and unblocks, at which point the pending
+/// signal is delivered to it. This is what makes the task's
+/// `sleep 1; kill -INT` startup-race reproduction exit cleanly (#918).
+/// A no-op on Windows (the `switch` keeps the POSIX arm out of the
+/// Windows build).
+pub fn blockHttpShutdownSignals() void {
+    switch (builtin.os.tag) {
+        .windows => return,
+        else => setHttpShutdownSignalMask(std.posix.SIG.BLOCK),
+    }
+}
+
+/// Unblock SIGINT/SIGTERM on the calling thread, delivering any instance
+/// that went pending while blocked. Called by `armHttpShutdown` *after*
+/// the handler is installed so a startup-race signal fires into the
+/// handler rather than the (possibly `SIG_IGN`) startup disposition.
+fn unblockHttpShutdownSignals() void {
+    switch (builtin.os.tag) {
+        .windows => return,
+        else => setHttpShutdownSignalMask(std.posix.SIG.UNBLOCK),
+    }
+}
+
+fn setHttpShutdownSignalMask(how: u32) void {
+    switch (builtin.os.tag) {
+        .windows => return,
+        else => {
+            var set = std.posix.sigemptyset();
+            std.posix.sigaddset(&set, std.posix.SIG.INT);
+            std.posix.sigaddset(&set, std.posix.SIG.TERM);
+            std.posix.sigprocmask(how, &set, null);
+        },
+    }
+}
+
+/// Arm the portable `wamr serve` SIGINT/SIGTERM graceful-shutdown path.
+/// Creates the self-pipe waker, publishes its write end for the handler,
+/// installs the async-signal-safe handler, and finally unblocks the
+/// signals (see `blockHttpShutdownSignals`). Call this *late* — right
+/// before entering the accept loop, once all of startup's signal
+/// manipulation is done — so the handler installed here survives to
+/// service the shutdown. Idempotent and a no-op on Windows; pair with
+/// `disarmHttpShutdown` on teardown.
+pub fn armHttpShutdown() void {
+    if (comptime builtin.os.tag == .windows) return;
+    if (http_shutdown_armed) return;
+    http_shutdown_armed = true;
+    http_shutdown_requested.store(false, .release);
+    http_shutdown_waker = Waker.init() catch null;
+    if (http_shutdown_waker) |w| http_shutdown_wake_fd.store(w.write_fd, .release);
+    installHttpShutdownHandler();
+    // Deliver any SIGINT/SIGTERM that went pending during startup now that
+    // the real handler is in place.
+    unblockHttpShutdownSignals();
+}
+
+/// Tear down the shutdown waker installed by `armHttpShutdown`. Stops
+/// publishing the write fd before closing it so a late signal can't write
+/// into a closed / reused descriptor. Idempotent; no-op on Windows.
+pub fn disarmHttpShutdown() void {
+    if (comptime builtin.os.tag == .windows) return;
+    http_shutdown_wake_fd.store(-1, .release);
+    if (http_shutdown_waker) |*w| w.deinit();
+    http_shutdown_waker = null;
+    http_shutdown_armed = false;
+}
+
 /// Cross-platform self-pipe waker (#833). A worker thread that settles a
 /// future without owning a pollable fd (outbound HTTP, future-trailers)
 /// uses this so the host's `std.posix.poll`-based block/poll loop has a
@@ -25509,6 +25602,14 @@ pub fn serveHttpComponentBytes(
     options: ServeHttpOptions,
     opts: core_backend.Options,
 ) anyerror!void {
+    // #918: block SIGINT/SIGTERM *before* the component decode below (and
+    // the JIT compile that follows in `serveLoadedHttpComponent`), so a
+    // signal that races startup is held pending rather than lost. The real
+    // handler is installed and the signals unblocked later, right before
+    // the accept loop (`armHttpShutdown`). Only for the long-lived
+    // serve-forever path; the finite-`max_requests` unit-test path never
+    // signals.
+    if (options.max_requests == null) blockHttpShutdownSignals();
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
@@ -25522,6 +25623,23 @@ pub fn serveLoadedHttpComponent(
     options: ServeHttpOptions,
     opts: core_backend.Options,
 ) anyerror!void {
+    // #918: portable graceful-shutdown wiring. SIGINT/SIGTERM are blocked
+    // early (in `serveHttpComponentBytes`, before the component decode +
+    // JIT compile) so a signal that races startup is held pending. Block
+    // again here (idempotent) so direct callers of this entry point are
+    // covered too. The real async-signal-safe handler is installed and the
+    // signals unblocked *late* — right before the accept loop, once all of
+    // startup's own signal manipulation is done — by `armHttpShutdown`;
+    // `disarmHttpShutdown` tears the waker down on the normal control-flow
+    // path once the loop unwinds. The handler only sets an atomic flag and
+    // writes one byte to the waker pipe; every teardown step (listener
+    // close, `inst.deinit`, arena / allocator cleanup) runs here, never
+    // inside the handler. Skipped for the finite-`max_requests` unit-test
+    // mode (no signals) and on Windows (no POSIX signal APIs).
+    const serve_forever = options.max_requests == null;
+    if (serve_forever) blockHttpShutdownSignals();
+    defer if (serve_forever) disarmHttpShutdown();
+
     const inst = instance_mod.instantiateWithOptions(
         component,
         allocator,
@@ -25606,20 +25724,45 @@ pub fn serveLoadedHttpComponent(
         stderr_file.writeStreamingAll(io, stderr_line) catch {};
     }
 
-    // Install a SIGINT/SIGTERM handler that exits cleanly with code 0
+    // Install the SIGINT/SIGTERM handler and unblock the signals now, once
+    // the listener is up and all of startup's signal manipulation is done
     // — the wasi-testsuite `http-service` fixture issues
     // `{ "type": "kill", "signal": "SIGINT" }` followed by
-    // `{ "type": "wait" }` (default exit_code 0). Without a handler
-    // the default disposition is process-terminate with a non-zero
-    // signal status, which the runner reports as a failure. Linux
-    // only — the conformance suite isn't run on Windows or macOS in
-    // CI, and the stdlib Sigaction shape differs per-platform. (#570)
-    if (builtin.target.os.tag == .linux) {
-        installHttpShutdownHandler();
-    }
+    // `{ "type": "wait" }` (default exit_code 0). Without a portable
+    // handler the default disposition is process-terminate with a
+    // non-zero signal status (observed as `Popen` `-2` on macOS, #918),
+    // which the runner reports as a failure. `armHttpShutdown` also
+    // unblocks the signals blocked at startup, so a SIGINT that raced the
+    // JIT compile is delivered to the handler right here; the accept loop
+    // below then observes the flag / self-pipe and shuts down cleanly.
+    if (serve_forever) armHttpShutdown();
 
     var served: usize = 0;
     while (options.max_requests == null or served < options.max_requests.?) {
+        // Portable graceful shutdown: block on the listener *and* the
+        // shutdown self-pipe so a SIGINT/SIGTERM wakes `accept` promptly
+        // instead of waiting for the next connection. `std.posix.poll`
+        // retries `EINTR` internally, so a signal delivered to this
+        // thread simply re-enters `poll` and then observes the readable
+        // pipe / atomic flag. Guarded to non-Windows because
+        // `std.posix.poll` is a compile error on Windows (and the waker
+        // is always null there). (#918)
+        if (comptime builtin.os.tag != .windows) {
+            if (http_shutdown_waker) |w| {
+                if (http_shutdown_requested.load(.acquire)) break;
+                var pfds = [_]std.posix.pollfd{
+                    .{ .fd = server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                    .{ .fd = w.read_fd, .events = std.posix.POLL.IN, .revents = 0 },
+                };
+                _ = std.posix.poll(&pfds, -1) catch break;
+                if (http_shutdown_requested.load(.acquire)) break;
+                if (pfds[1].revents != 0) break;
+                if (pfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
+                    return error.AcceptFailed;
+                }
+                if (pfds[0].revents & std.posix.POLL.IN == 0) continue;
+            }
+        }
         const accepted = server.accept(io) catch return error.AcceptFailed;
         {
             defer accepted.close(io);
@@ -25633,32 +25776,75 @@ pub fn serveLoadedHttpComponent(
     }
 }
 
-/// SIGINT/SIGTERM handler: exit the process with code 0. Used by the
-/// wasi:http/service event loop so a `kill` operation from the
-/// conformance test driver doesn't surface a non-zero exit status to
-/// the runner's `wait` check. `std.process.exit` lowers to
-/// `exit_group` on Linux — async-signal-safe. Linux-only — the
-/// conformance suite isn't run on Windows or macOS in CI, and the
-/// stdlib's Sigaction shape varies across platforms (Linux uses
-/// `u32` mask, BSD uses `[N]c_ulong`). (#570)
-fn httpShutdownSignalHandler(_: std.os.linux.SIG) callconv(.c) void {
-    std.process.exit(0);
+/// SIGINT/SIGTERM handler: request an orderly shutdown of the
+/// `wasi:http/service` accept loop. Async-signal-safe — it only stores
+/// an atomic flag and writes one byte to the shutdown self-pipe so a
+/// `poll()` parked on the accept path wakes immediately. All teardown
+/// (listener close, component `deinit`, allocator cleanup) then runs on
+/// the normal control-flow path once the loop unwinds; nothing unsafe
+/// (allocation, `deinit`, buffered I/O) happens inside the handler.
+/// (#918)
+fn httpShutdownRequest() void {
+    http_shutdown_requested.store(true, .release);
+    const fd = http_shutdown_wake_fd.load(.acquire);
+    if (fd >= 0) {
+        const byte = [_]u8{1};
+        // Best-effort, async-signal-safe wake. Errors (EINTR / EAGAIN /
+        // EPIPE) are ignored — the atomic flag is the source of truth;
+        // the byte only unblocks a `poll()` on the read end.
+        _ = std.posix.system.write(fd, &byte, 1);
+    }
+}
+
+/// Per-platform `callconv(.c)` trampolines into `httpShutdownRequest`.
+/// The signal-handler function-pointer type is `fn (SIG)` where `SIG`
+/// is the platform's signal enum, which differs between the raw Linux
+/// (`std.os.linux.SIG`) and the libc/BSD (`std.posix.SIG`) ABIs — hence
+/// two thin wrappers. Only the one referenced by the active target is
+/// analyzed (lazy analysis), so neither is compiled on Windows. (#918)
+fn httpShutdownSignalHandlerLinux(_: std.os.linux.SIG) callconv(.c) void {
+    httpShutdownRequest();
+}
+
+fn httpShutdownSignalHandlerPosix(_: std.posix.SIG) callconv(.c) void {
+    httpShutdownRequest();
 }
 
 fn installHttpShutdownHandler() void {
-    if (builtin.target.os.tag != .linux) return;
-    const linux = std.os.linux;
-    var act: linux.Sigaction = .{
-        .handler = .{ .handler = httpShutdownSignalHandler },
-        .mask = linux.sigemptyset(),
-        .flags = 0,
-    };
-    // Use the raw linux sigaction syscall: when libc is linked (musl) the
-    // std.posix wrapper expects c.common_linux_Sigaction which has a
-    // different layout than std.os.linux.Sigaction and rejects this struct.
-    // The raw syscall takes linux.Sigaction directly on every linux target.
-    _ = linux.sigaction(linux.SIG.INT, &act, null);
-    _ = linux.sigaction(linux.SIG.TERM, &act, null);
+    switch (builtin.os.tag) {
+        .windows => return,
+        .linux => {
+            // Use the raw linux sigaction syscall: when libc is linked
+            // (musl) the std.posix wrapper expects `c.common_linux_Sigaction`
+            // which has a different layout than `std.os.linux.Sigaction`
+            // and rejects this struct. The raw syscall takes
+            // `linux.Sigaction` directly on every linux target.
+            const linux = std.os.linux;
+            var act: linux.Sigaction = .{
+                .handler = .{ .handler = httpShutdownSignalHandlerLinux },
+                .mask = linux.sigemptyset(),
+                // SA_RESETHAND: a *second* SIGINT (impatient Ctrl-C)
+                // falls through to the default disposition and terminates
+                // the process, so shutdown can never wedge.
+                .flags = linux.SA.RESETHAND,
+            };
+            _ = linux.sigaction(linux.SIG.INT, &act, null);
+            _ = linux.sigaction(linux.SIG.TERM, &act, null);
+        },
+        else => {
+            // macOS / BSD: the libc `sigaction` wrapper matches
+            // `std.posix.Sigaction`'s layout, so use it directly. This is
+            // what fixes the macOS `Popen(-2)` shutdown failure (#918):
+            // previously no handler was installed off-Linux.
+            var act: std.posix.Sigaction = .{
+                .handler = .{ .handler = httpShutdownSignalHandlerPosix },
+                .mask = std.posix.sigemptyset(),
+                .flags = std.posix.SA.RESETHAND,
+            };
+            std.posix.sigaction(std.posix.SIG.INT, &act, null);
+            std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+        },
+    }
 }
 
 fn statusForRequestReadError(err: anyerror) u16 {
