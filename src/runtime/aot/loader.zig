@@ -79,6 +79,7 @@ pub const ImportedMemoryDesc = struct {
     min: u32,
     max: ?u32,
     is64: bool = false,
+    is_shared: bool = false,
 };
 
 pub const ImportedGlobalDesc = struct {
@@ -643,12 +644,14 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
                 const has_max = try reader.readByte();
                 const max: ?u32 = if (has_max != 0) try reader.readU32Le() else null;
                 const is64 = (try reader.readByte()) != 0;
+                const is_shared = (try reader.readByte()) != 0;
                 memory_descs.append(allocator, .{
                     .module_name = mod_name,
                     .name = field_name,
                     .min = min,
                     .max = max,
                     .is64 = is64,
+                    .is_shared = is_shared,
                 }) catch return error.OutOfMemory;
             },
             .global => {
@@ -725,8 +728,10 @@ fn parseMemorySection(reader: *BinaryReader, section_size: u32, module: *AotModu
         const min_pages = try reader.readU32Le();
         const has_max = try reader.readByte();
         const max_pages: ?u64 = if (has_max != 0) @as(u64, try reader.readU32Le()) else null;
+        const is_shared = (try reader.readByte()) != 0;
         mem_types[i] = .{
             .limits = .{ .min = min_pages, .max = max_pages },
+            .is_shared = is_shared,
         };
     }
 

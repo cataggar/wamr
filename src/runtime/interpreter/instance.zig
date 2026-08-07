@@ -149,15 +149,6 @@ fn instantiateImpl(
     inst.memories = try allocateMemories(module, allocator, import_ctx);
     errdefer freeMemories(inst.memories, allocator);
 
-    // Initialize waiter queues for shared memories
-    for (inst.memories) |mem| {
-        if (mem.memory_type.is_shared and mem.waiter_queue == null) {
-            const wq = allocator.create(types.WaiterQueue) catch return error.OutOfMemory;
-            wq.* = .{};
-            mem.waiter_queue = wq;
-        }
-    }
-
     inst.tables = try allocateTables(module, allocator, import_ctx);
     errdefer freeTables(inst.tables, allocator);
 
@@ -394,6 +385,13 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
 
     // Heap-allocate local memories
     for (module.memories, 0..) |mem_type, i| {
+        if (mem_type.is_shared) {
+            mems[import_count + i] = types.MemoryInstance.createShared(mem_type, allocator) catch
+                return error.MemoryAllocationFailed;
+            local_init += 1;
+            continue;
+        }
+
         const min_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
         const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
         const initial_size = @as(usize, min_pages) * types.MemoryInstance.page_size;
@@ -833,7 +831,7 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryI
             @as(u64, evalInitExprAsU32(seg.offset, globals) catch return error.DataSegmentOutOfBounds);
 
         const end = offset + seg.data.len;
-        if (end > mem.data.len) return error.DataSegmentOutOfBounds;
+        if (end > mem.byteLen()) return error.DataSegmentOutOfBounds;
 
         const off: usize = @intCast(offset);
         @memcpy(mem.data[off..][0..seg.data.len], seg.data);
@@ -994,6 +992,36 @@ test "instantiate: module with one memory page" {
     try testing.expectEqual(@as(usize, 65536), inst.memories[0].data.len);
     // Memory should be zero-initialized.
     for (inst.memories[0].data) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "MemoryInstance: shared instantiation reserves declared maximum" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const data = wasm_header ++ [_]u8{
+        // shared memory requires and declares max: min=1, max=3
+        0x05, 0x04, 0x01, 0x03, 0x01, 0x03,
+    };
+    const module = try loader.load(&data, arena.allocator());
+    const inst = try instantiate(&module, testing.allocator);
+    defer destroy(inst);
+
+    const mem = inst.memories[0];
+    try testing.expect(mem.shared_control != null);
+    try testing.expectEqual(@as(usize, 3 * types.MemoryInstance.page_size), mem.data.len);
+    try testing.expectEqual(@as(usize, types.MemoryInstance.page_size), mem.byteLen());
+    try testing.expectEqual(mem.data.ptr, mem.reserved_base.?);
+}
+
+test "MemoryInstance: shared declaration without maximum is rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const data = wasm_header ++ [_]u8{
+        // shared flag without has-max is invalid.
+        0x05, 0x03, 0x01, 0x02, 0x01,
+    };
+    try testing.expectError(error.InvalidLimits, loader.load(&data, arena.allocator()));
 }
 
 test "instantiate: module with table" {

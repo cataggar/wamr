@@ -97,7 +97,7 @@ fn getMemSlice(env: *ExecEnv, ma: Memarg, size: u64) SimdError![]u8 {
     const base: u32 = @bitCast(popI32(env) catch return error.StackUnderflow);
     const addr = @as(u64, base) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.byteLen()) return error.OutOfBoundsMemoryAccess;
     const a: usize = @intCast(addr);
     return mem.data[a..][0..@intCast(size)];
 }
@@ -233,7 +233,7 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
             const base: u32 = @bitCast(try popI32(env));
             const addr = @as(u64, base) + ma.offset;
             const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-            if (addr + 16 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+            if (addr + 16 > mem.byteLen()) return error.OutOfBoundsMemoryAccess;
             const a: usize = @intCast(addr);
             std.mem.writeInt(u128, mem.data[a..][0..16], val, .little);
         },
@@ -796,7 +796,7 @@ fn storeLane(env: *ExecEnv, code: []const u8, ip: *usize, comptime byte_width: c
     const base: u32 = @bitCast(popI32(env) catch return error.StackUnderflow);
     const addr = @as(u64, base) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + byte_width > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr + byte_width > mem.byteLen()) return error.OutOfBoundsMemoryAccess;
     const a: usize = @intCast(addr);
     @memcpy(mem.data[a..][0..byte_width], v[lane_idx * byte_width ..][0..byte_width]);
 }

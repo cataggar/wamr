@@ -1028,46 +1028,68 @@ pub fn aotThrowUncaught(vmctx: *VmCtx, tag_inst: *types.TagInstance) callconv(.c
 /// Returns: 0 = woken by notify, 1 = not-equal, 2 = timed-out.
 pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32, timeout_hi: u32) callconv(.c) i32 {
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
-    if (vmctx.memory_base == 0) return 1;
-    if (@as(u64, addr) + 4 > vmctx.memory_size) return 1;
-    const mem: [*]u8 = @ptrFromInt(vmctx.memory_base);
-    const current = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(mem + addr)), .little);
-    if (current != expected) return 1; // not-equal
-
-    // In single-threaded mode, no other thread can wake us, so we'd block
-    // forever. Return timed-out (2) immediately for timeout >= 0, or
-    // block forever for timeout == -1 (infinite).
-    // TODO: with real threading, use OS futex to block.
-    if (timeout_ns < 0) {
-        // Infinite wait in single-threaded mode would deadlock.
-        // Spec says this is valid behavior (trap or block indefinitely).
-        return 2; // timed-out
-    }
-    return 2; // timed-out
+    const mem = aotWaitMemory(vmctx, addr, 4) orelse return 1;
+    const result = mem.wait32(addr, expected, timeout_ns) catch |err| switch (err) {
+        error.NotShared => return 1,
+        error.OutOfBounds,
+        error.Unaligned,
+        error.InvalidAddress,
+        error.InvalidArgument,
+        error.Unsupported,
+        error.SystemFailure,
+        => return 2,
+    };
+    return switch (result) {
+        .notified, .not_equal, .timed_out => @intCast(@intFromEnum(result)),
+        .cancelled, .closed => 2,
+    };
 }
 
 /// Host helper for `memory.atomic.wait64`.
 pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeout_lo: u32, timeout_hi: u32) callconv(.c) i32 {
     const expected: u64 = @as(u64, exp_hi) << 32 | @as(u64, exp_lo);
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
-    if (vmctx.memory_base == 0) return 1;
-    if (@as(u64, addr) + 8 > vmctx.memory_size) return 1;
-    const mem: [*]u8 = @ptrFromInt(vmctx.memory_base);
-    const current = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(mem + addr)), .little);
-    if (current != expected) return 1;
-    _ = timeout_ns;
-    return 2; // timed-out (single-threaded)
+    const mem = aotWaitMemory(vmctx, addr, 8) orelse return 1;
+    const result = mem.wait64(addr, expected, timeout_ns) catch |err| switch (err) {
+        error.NotShared => return 1,
+        error.OutOfBounds,
+        error.Unaligned,
+        error.InvalidAddress,
+        error.InvalidArgument,
+        error.Unsupported,
+        error.SystemFailure,
+        => return 2,
+    };
+    return switch (result) {
+        .notified, .not_equal, .timed_out => @intCast(@intFromEnum(result)),
+        .cancelled, .closed => 2,
+    };
 }
 
 /// Host helper for `memory.atomic.notify`.
 /// Wakes up to `count` threads waiting on `mem[addr]`.
 /// Returns the number of threads actually woken.
 pub fn aotAtomicNotify(vmctx: *VmCtx, addr: u32, count: u32) callconv(.c) i32 {
-    // In single-threaded mode, no threads are ever waiting.
-    _ = vmctx;
-    _ = addr;
-    _ = count;
-    return 0;
+    const mem = aotWaitMemory(vmctx, addr, 4) orelse return 0;
+    return @intCast(mem.notify(addr, count) catch |err| switch (err) {
+        error.NotShared,
+        error.OutOfBounds,
+        error.Unaligned,
+        error.InvalidAddress,
+        error.InvalidArgument,
+        error.Unsupported,
+        error.SystemFailure,
+        => return 0,
+    });
+}
+
+fn aotWaitMemory(vmctx: *VmCtx, addr: u32, width: u32) ?*types.MemoryInstance {
+    if (vmctx.instance_ptr == 0) return null;
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    if (inst.memories.len == 0) return null;
+    const mem = inst.memories[0];
+    if (@as(u64, addr) + width > mem.byteLen()) return null;
+    return mem;
 }
 
 /// Host helper invoked from AOT-compiled `memory.grow` sites.
@@ -1090,10 +1112,12 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     // `data.ptr`; the reserved path keeps it pinned, preserving
     // external aliases held outside the vmctx-subscriber mechanism.)
     const old_pages = mem.grow(delta, inst.allocator) catch return -1;
-    const new_pages = mem.current_pages;
+    const new_pages = mem.pageCount();
     refreshVmCtxMemory(vmctx, mem);
 
     if (mem.data.ptr != old_data_ptr or new_pages != old_pages) {
+        mem.subscriber_mutex.lock();
+        defer mem.subscriber_mutex.unlock();
         for (mem.vmctx_subscribers.items) |subscriber_opaque| {
             const subscriber: *VmCtx = @ptrCast(@alignCast(subscriber_opaque));
             if (subscriber == vmctx) continue;
@@ -1834,7 +1858,7 @@ pub fn instantiateWithOverrides(
         if (seg.memory_idx < inst.memories_owned.len and !inst.memories_owned[seg.memory_idx]) continue;
         const mem = inst.memories[seg.memory_idx];
         const end = @as(usize, seg.offset) + seg.data.len;
-        if (end > mem.data.len) continue;
+        if (end > mem.byteLen()) continue;
         @memcpy(mem.data[seg.offset..][0..seg.data.len], seg.data);
     }
 
@@ -1986,9 +2010,9 @@ pub fn destroy(inst: *AotInstance) void {
 
 fn refreshVmCtxMemory(vmctx: *VmCtx, mem: *types.MemoryInstance) void {
     vmctx.memory_base = @intFromPtr(mem.data.ptr);
-    vmctx.memory_size = @as(usize, mem.current_pages) * types.MemoryInstance.page_size;
-    vmctx.memory_max_size = mem.data.len;
-    vmctx.memory_pages = mem.current_pages;
+    vmctx.memory_size = mem.byteLen();
+    vmctx.memory_max_size = if (mem.shared_control) |control| control.reserved_bytes else mem.data.len;
+    vmctx.memory_pages = mem.pageCount();
     // #719 forensic aid: when the trap-OOB dump env var is set, also log
     // the host base addr for every memory we attach so a gdb hardware
     // watchpoint can be placed on `mem_base + wasm_offset` cheaply.
@@ -3232,6 +3256,7 @@ fn allocateMemories(
                 .max = if (desc.max) |max| @as(u64, max) else null,
             },
             .is_memory64 = desc.is64,
+            .is_shared = desc.is_shared,
         };
         memories[i] = try allocateOneMemory(mem_type, allocator);
         owned[i] = true;
@@ -3249,6 +3274,13 @@ fn allocateMemories(
 }
 
 fn allocateOneMemory(mem_type: types.MemoryType, allocator: std.mem.Allocator) RuntimeError!*types.MemoryInstance {
+    if (mem_type.is_shared) {
+        // Shared memories must never fall back to allocator.realloc: every
+        // owner and parked address depends on an immutable base.
+        return types.MemoryInstance.createShared(mem_type, allocator) catch
+            return error.OutOfMemory;
+    }
+
     const initial_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
     const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
 

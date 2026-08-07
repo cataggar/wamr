@@ -371,7 +371,7 @@ pub const Harness = struct {
             if (seg.memory_idx >= h.inst.memories.len) continue;
             const mem = h.inst.memories[seg.memory_idx];
             const end = @as(usize, seg.offset) + seg.data.len;
-            if (end > mem.data.len) continue;
+            if (end > mem.byteLen()) continue;
             @memcpy(mem.data[seg.offset..][0..seg.data.len], seg.data);
         }
 
@@ -629,9 +629,9 @@ pub const Harness = struct {
         vmctx.* = .{};
         if (inst.memories.len > 0) {
             vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
-            vmctx.memory_size = @as(usize, inst.memories[0].current_pages) * types.MemoryInstance.page_size;
-            vmctx.memory_max_size = inst.memories[0].data.len;
-            vmctx.memory_pages = inst.memories[0].current_pages;
+            vmctx.memory_size = inst.memories[0].byteLen();
+            vmctx.memory_max_size = if (inst.memories[0].shared_control) |control| control.reserved_bytes else inst.memories[0].data.len;
+            vmctx.memory_pages = inst.memories[0].pageCount();
         }
         const globals_buf = allocator.alloc(u128, aot_runtime.globalStorageWordCount(inst)) catch {
             allocator.destroy(vmctx);
@@ -1105,6 +1105,7 @@ fn compileToAot(
                     .memory_min = @intCast(memory_type.limits.min),
                     .memory_max = if (memory_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
                     .memory_is64 = memory_type.is_memory64,
+                    .memory_shared = memory_type.is_shared,
                 });
             },
             .global => {
@@ -1143,6 +1144,7 @@ fn compileToAot(
         try mem_entries.append(a, .{
             .min_pages = @intCast(mem.limits.min),
             .max_pages = if (mem.limits.max) |m| @as(?u32, @intCast(m)) else null,
+            .is_shared = mem.is_shared,
         });
     }
 

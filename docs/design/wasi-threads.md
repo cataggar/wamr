@@ -1,9 +1,9 @@
 # `wasi:threads` design — multi-threaded interpreter state isolation
 
-Status: **DRAFT** (prototypes exist; no production-wired guest-thread
-support).
+Status: **DRAFT** (shared-memory/parking foundation implemented; opcode
+atomicity and production spawning remain incomplete).
 
-Tracking: [#616 B1](https://github.com/cataggar/wamr/issues/616).
+Tracking: [#616 B1.3](https://github.com/cataggar/wamr/issues/616).
 
 Author wave: W10-3.
 
@@ -69,12 +69,24 @@ the atomic-opcode dispatcher, and the `wasi.thread-spawn` host import.
 These are prototypes, not production support. No default CLI or
 component path currently offers gated guest-thread execution.
 
-The production work remains the ordered plan below: make shared
-runtime and host resources safe; implement correct atomic
-wait/notify/fence behavior; spawn in both interpreter and AOT modes;
-isolate cancellation and per-thread component/WASI context; and pass
-the end-to-end correctness, conformance, and performance gates. This
-document does not treat any unmerged implementation wave as present.
+Shared memories now use a refcounted control block with an immutable base.
+Instantiation reserves the declared maximum up front and fails if that
+reservation cannot be created; it never falls back to relocating `realloc`.
+Grow commits in place under one lock, preserves zero fill, and publishes
+current bytes/pages with release stores consumed by acquire accessors.
+
+`src/platform/parking_lot.zig` provides keyed wait32/wait64, exact notify,
+monotonic deadlines, address/all cancellation, and draining shutdown. The
+value comparison and waiter insertion share one bucket lock. Its native wait
+word uses Linux futex, macOS ulock, or Windows WaitOnAddress; Windows linear
+memory uses NT reserve/commit. These APIs are intentionally independent of
+opcode lowering so the remaining atomic load/store/RMW audit can use them.
+
+The remaining production work follows the ordered plan below: make all
+shared runtime and host resources safe; complete atomic opcode and fence
+behavior; spawn in both interpreter and AOT modes; isolate cancellation and
+per-thread component/WASI context; and pass the end-to-end correctness,
+conformance, and performance gates.
 
 ## Upstream state
 
@@ -474,11 +486,10 @@ Each wave is a discrete PR with its own conformance gate.
 * Audit `interp.zig:3349`–`3700+` (`atomic_prefix` dispatch). Replace
   every non-atomic load/store/RMW with `@atomicLoad`, `@atomicStore`,
   `@atomicRmw`, `@cmpxchgStrong` against the underlying `[]u8`.
-* Implement `memory.atomic.wait32`, `memory.atomic.wait64`,
-  `memory.atomic.notify` using a per-`MemoryInstance` futex table
-  (linear-probing hashmap of `address → ParkingLot`). Zig 0.16's
-  `std.Thread.Futex` has the primitive we need, gated through the
-  custom-Mutex pattern.
+* Route `memory.atomic.wait32`, `memory.atomic.wait64`, and
+  `memory.atomic.notify` through the implemented per-memory keyed parking
+  lot. The runtime helpers are wired; opcode validation and the surrounding
+  atomic load/store/RMW audit remain part of this wave.
 * Treat `atomic.fence` as `@fence(.seq_cst)` (today it is a documented
   no-op).
 * Reject `shared` memories that are not declared `shared` in the
@@ -587,13 +598,10 @@ Each wave is a discrete PR with its own conformance gate.
    `ComponentInstance` to `ExecEnv`. The Preview-1 surface only ever
    re-enters at the exported `wasi_thread_start` core function, so
    this is naturally enforced today.
-5. **Memory-grow under concurrent atomics.** `MemoryInstance.grow`
-   reallocates the underlying `[]u8`. Other threads holding a
-   `*MemoryInstance` pointer plus a cached slice into `data` will see
-   a use-after-free. Either (a) lock `memory.grow` against all atomic
-   accesses (kills perf), or (b) follow the upstream `threads` spec
-   and use page-table indirection so `grow` only appends. Tracking
-   issue for Wave 3.
+5. **Memory-grow under concurrent atomics.** Resolved for shared memory:
+   reserve the declared maximum, keep the base immutable, serialize commit,
+   and release/acquire-publish the visible extent. Non-shared memories keep
+   their compatible allocator/reservation behavior.
 6. **Should each thread have its own `WasiCliAdapter` slot for
    `stdin` / `stdout` / `stderr`?** No — stdio writes go through the
    kernel which already serialises. The OutputStream's internal

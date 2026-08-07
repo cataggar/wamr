@@ -548,6 +548,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         try mem_entries.append(allocator, .{
             .min_pages = @intCast(mem.limits.min),
             .max_pages = if (mem.limits.max) |m| @as(?u32, @intCast(m)) else null,
+            .is_shared = mem.is_shared,
         });
     }
 

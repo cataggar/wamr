@@ -55,7 +55,7 @@ pub const HostContext = struct {
         const mem = if (env.module_inst.memories.len > 0) env.module_inst.memories[0] else null;
         return .{
             .mem_base = if (mem) |m| m.data.ptr else null,
-            .mem_len = if (mem) |m| m.data.len else 0,
+            .mem_len = if (mem) |m| m.byteLen() else 0,
         };
     }
 
