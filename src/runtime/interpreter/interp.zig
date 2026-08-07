@@ -8,6 +8,7 @@ const std = @import("std");
 const types = @import("../common/types.zig");
 const ExecEnv = @import("../common/exec_env.zig").ExecEnv;
 const CallFrame = @import("../common/exec_env.zig").CallFrame;
+const exec_env_mod = @import("../common/exec_env.zig");
 const HostTrapInfo = @import("../common/exec_env.zig").HostTrapInfo;
 
 // NaN canonicalization per Wasm spec
@@ -628,7 +629,7 @@ fn gcArrayCopy(env: *ExecEnv) TrapError!void {
     }
 }
 
-fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labels: *[MAX_LABELS]Label, label_sp: *u32) TrapError!void {
+fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labels: []Label, label_sp: *u32) TrapError!void {
     // Wabt encoding: labelidx(U32 LEB128) castflags(1 byte) target_heaptype(S32 LEB128)
     const depth = readU32(code, ip);
     const castflags = readU32(code, ip); // bit 0 = source nullable, bit 1 = target nullable
@@ -645,12 +646,12 @@ fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labe
     const should_branch = if (sub_op == 0x18) matches else !matches;
     if (should_branch) {
         if (depth >= label_sp.*) return error.StackUnderflow;
-        const label = labels.*[label_sp.* - 1 - depth];
+        const label = labels[label_sp.* - 1 - depth];
         env.sp = label.stack_height;
         try env.push(ref);
         label_sp.* -= depth + 1;
         if (label.kind == .loop) {
-            labels.*[label_sp.*] = label;
+            labels[label_sp.*] = label;
             label_sp.* += 1;
         }
         ip.* = label.target_ip;
@@ -1448,28 +1449,23 @@ fn readBlockTypeInfo(code: []const u8, ip: *usize, module_types: []const types.F
 
 // ── Label for structured control flow ────────────────────────────────────
 
-const Label = struct {
-    kind: Kind,
-    /// IP to branch to (after `end` for block/if, loop header for loop).
-    target_ip: usize,
-    /// Operand-stack height when this label was entered.
-    stack_height: u32,
-    /// Expected result arity of this block.
-    arity: u32,
-    /// For try_table: bytecode position of catch clause list.
-    catch_ip: u32 = 0,
-    /// For try_table: number of catch clauses.
-    catch_count: u16 = 0,
-
-    const Kind = enum { block, loop, @"if", try_table };
-};
+const Label = @import("../common/exec_env.zig").Label;
 
 /// Maximum number of `block`/`loop`/`if`/`try` labels active in a
-/// single function call. wit-bindgen 0.45 emits async-lift code that
-/// nests labels per `task.yield` point; the wasi:http@0.3.0 fixtures
-/// peak at ~280 labels in a single function (#538). 1024 leaves
-/// generous headroom without burning much stack.
-const MAX_LABELS = 1024;
+/// single function call. See `exec_env.max_labels_per_frame`.
+const MAX_LABELS = @import("../common/exec_env.zig").max_labels_per_frame;
+
+/// Overflow-safe check that `[offset, offset + len)` lies within `limit`.
+///
+/// memory64 hands wasm full 64-bit addresses, and `memarg` offsets are
+/// folded in with wrapping addition (`+%`), so the obvious
+/// `offset + len > limit` can itself wrap past the end and wrongly report
+/// "in bounds". The dispatch loop runs under `@setRuntimeSafety(false)`,
+/// so such a wrap is silent rather than a panic, and the caller then
+/// slices with the wrapped value — an out-of-bounds read/write.
+inline fn memInBounds(offset: u64, len: u64, limit: usize) bool {
+    return len <= limit and offset <= @as(u64, limit) - len;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -1514,8 +1510,18 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
     // recording) still flow through `TrapError`.
     @setRuntimeSafety(false);
     var ip: usize = 0;
-    var labels: [MAX_LABELS]Label = undefined;
+
+    // Labels live in the shared stack owned by ExecEnv, not in a native
+    // local. A `[MAX_LABELS]Label` local costs ~32 KB of native stack per
+    // nested wasm call, which overflowed the real stack at ~250 frames —
+    // long before `max_call_depth` (1024) could trap — turning
+    // `assert_exhaustion` cases into SIGSEGV instead of a trap.
+    const label_base = env.label_top;
+    if (label_base >= env.label_stack.len) return error.CallStackOverflow;
+    const labels = env.label_stack[label_base..];
+    const label_cap: u32 = @intCast(@min(labels.len, MAX_LABELS));
     var label_sp: u32 = 0;
+    defer env.label_top = label_base;
 
     // Push implicit function-body label so br/br_if/br_table can target the function.
     const return_arity: u32 = if (env.currentFrame()) |frame| frame.return_arity else 0;
@@ -1548,7 +1554,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const module_types = env.module_inst.module.types;
                 const bt_info = readBlockTypeInfo(code, &ip, module_types);
                 const end_ip = findBlockEnd(code, ip);
-                if (label_sp >= MAX_LABELS) return error.StackOverflow;
+                if (label_sp >= label_cap) return error.StackOverflow;
                 labels[label_sp] = .{
                     .kind = .block,
                     .target_ip = end_ip,
@@ -1561,7 +1567,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
             .loop => {
                 const module_types = env.module_inst.module.types;
                 const bt_info = readBlockTypeInfo(code, &ip, module_types);
-                if (label_sp >= MAX_LABELS) return error.StackOverflow;
+                if (label_sp >= label_cap) return error.StackOverflow;
                 labels[label_sp] = .{
                     .kind = .loop,
                     .target_ip = ip, // right after the block-type byte(s)
@@ -1578,7 +1584,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const end_ip = findBlockEnd(code, ip);
                 if (cond != 0) {
                     // true branch: push label and execute body
-                    if (label_sp >= MAX_LABELS) return error.StackOverflow;
+                    if (label_sp >= label_cap) return error.StackOverflow;
                     labels[label_sp] = .{
                         .kind = .@"if",
                         .target_ip = end_ip,
@@ -1589,7 +1595,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 } else {
                     // false branch: skip to else or end
                     if (findElse(code, ip)) |else_ip| {
-                        if (label_sp >= MAX_LABELS) return error.StackOverflow;
+                        if (label_sp >= label_cap) return error.StackOverflow;
                         labels[label_sp] = .{
                             .kind = .@"if",
                             .target_ip = end_ip,
@@ -1619,7 +1625,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     _ = readU32(code, &ip); // label index
                 }
                 const end_ip = findBlockEnd(code, ip);
-                if (label_sp >= MAX_LABELS) return error.StackOverflow;
+                if (label_sp >= label_cap) return error.StackOverflow;
                 labels[label_sp] = .{
                     .kind = .try_table,
                     .target_ip = end_ip,
@@ -1847,6 +1853,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const func_idx = readU32(code, &ip);
                 const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
                 frame.ip = @intCast(ip);
+                env.label_top = label_base + label_sp;
                 executeFunctionWithFuel(env, func_idx, fuel) catch |err| {
                     if (err == error.UncaughtException) {
                         if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
@@ -1896,6 +1903,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 if (funcref.module_inst != env.module_inst) {
                     const saved = env.module_inst;
                     env.module_inst = funcref.module_inst;
+                    env.label_top = label_base + label_sp;
                     executeFunctionWithFuel(env, funcref.func_idx, fuel) catch |err| {
                         env.module_inst = saved;
                         if (err == error.UncaughtException) {
@@ -1905,6 +1913,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     };
                     env.module_inst = saved;
                 } else {
+                    env.label_top = label_base + label_sp;
                     executeFunctionWithFuel(env, funcref.func_idx, fuel) catch |err| {
                         if (err == error.UncaughtException) {
                             if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
@@ -2144,7 +2153,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 try env.pushI32(std.mem.readInt(i32, mem.data[a..][0..4], .little));
             },
@@ -2152,7 +2161,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 1, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const signed_byte: i8 = @bitCast(mem.data[@intCast(addr)]);
                 try env.pushI32(@as(i32, signed_byte));
             },
@@ -2160,14 +2169,14 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 1, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 try env.pushI32(@as(i32, @intCast(mem.data[@intCast(addr)])));
             },
             .i32_load16_s => {
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 2, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 const val: i16 = std.mem.readInt(i16, mem.data[a..][0..2], .little);
                 try env.pushI32(@as(i32, val));
@@ -2176,7 +2185,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 2, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 const val: u16 = std.mem.readInt(u16, mem.data[a..][0..2], .little);
                 try env.pushI32(@as(i32, @intCast(val)));
@@ -2188,7 +2197,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popI32();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(i32, mem.data[a..][0..4], val, .little);
             },
@@ -2197,7 +2206,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popI32();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 1, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 mem.data[@intCast(addr)] = @truncate(@as(u32, @bitCast(val)));
             },
             .i32_store16 => {
@@ -2205,7 +2214,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popI32();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 2, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(u16, mem.data[a..][0..2], @truncate(@as(u32, @bitCast(val))), .little);
             },
@@ -2215,7 +2224,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 8, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 try env.pushI64(std.mem.readInt(i64, mem.data[a..][0..8], .little));
             },
@@ -2223,7 +2232,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 1, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const signed_byte: i8 = @bitCast(mem.data[@intCast(addr)]);
                 try env.pushI64(@as(i64, signed_byte));
             },
@@ -2231,14 +2240,14 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 1, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 try env.pushI64(@as(i64, @intCast(mem.data[@intCast(addr)])));
             },
             .i64_load16_s => {
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 2, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 const val: i16 = std.mem.readInt(i16, mem.data[a..][0..2], .little);
                 try env.pushI64(@as(i64, val));
@@ -2247,7 +2256,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 2, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 const val: u16 = std.mem.readInt(u16, mem.data[a..][0..2], .little);
                 try env.pushI64(@as(i64, @intCast(val)));
@@ -2256,7 +2265,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 const val: i32 = std.mem.readInt(i32, mem.data[a..][0..4], .little);
                 try env.pushI64(@as(i64, val));
@@ -2265,7 +2274,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 const val: u32 = std.mem.readInt(u32, mem.data[a..][0..4], .little);
                 try env.pushI64(@as(i64, @intCast(val)));
@@ -2277,7 +2286,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popI64();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 8, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(i64, mem.data[a..][0..8], val, .little);
             },
@@ -2286,7 +2295,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popI64();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 1, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 mem.data[@intCast(addr)] = @truncate(@as(u64, @bitCast(val)));
             },
             .i64_store16 => {
@@ -2294,7 +2303,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popI64();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 2, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(u16, mem.data[a..][0..2], @truncate(@as(u64, @bitCast(val))), .little);
             },
@@ -2303,7 +2312,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popI64();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(u32, mem.data[a..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
             },
@@ -2313,7 +2322,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 try env.pushF32(@bitCast(std.mem.readInt(u32, mem.data[a..][0..4], .little)));
             },
@@ -2322,7 +2331,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popF32();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(u32, mem.data[a..][0..4], @bitCast(val), .little);
             },
@@ -2332,7 +2341,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const ma = readMemarg(code, &ip);
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 8, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 try env.pushF64(@bitCast(std.mem.readInt(u64, mem.data[a..][0..8], .little)));
             },
@@ -2341,7 +2350,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const val = try env.popF64();
                 const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                if (!memInBounds(addr, 8, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(u64, mem.data[a..][0..8], @bitCast(val), .little);
             },
@@ -2880,6 +2889,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 };
                 _ = type_idx;
                 // Call the function by index (same as call)
+                env.label_top = label_base + label_sp;
                 try executeFunctionWithFuel(env, func_idx, fuel);
             },
             .return_call_ref => {
@@ -3024,7 +3034,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                             continue;
                         }
                         const seg = module.data_segments[data_idx];
-                        if (src + n > seg.data.len or dst + n > mem.data.len)
+                        if (!memInBounds(src, n, seg.data.len) or !memInBounds(dst, n, mem.data.len))
                             return error.OutOfBoundsMemoryAccess;
                         const d: usize = @intCast(dst);
                         const s: usize = @intCast(src);
@@ -3047,15 +3057,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        if (dst + n > dst_mem.data.len or src + n > src_mem.data.len) {
-                            std.debug.print("\nMEMCOPY-OOB dst=0x{x} src=0x{x} n=0x{x} mem_len=0x{x} call_depth={}\n", .{ dst, src, n, dst_mem.data.len, env.call_depth });
-                            var k: usize = env.call_depth;
-                            while (k > 0) {
-                                k -= 1;
-                                const fr = &env.call_stack[k];
-                                std.debug.print("  frame[{}] func_idx={} ip={} local_count={} return_arity={}\n", .{ k, fr.func_idx, fr.ip, fr.local_count, fr.return_arity });
-                            }
-                            std.debug.print("  module: imports={} funcs={} memlen=0x{x}\n", .{ env.module_inst.module.import_function_count, env.module_inst.module.functions.len, dst_mem.data.len });
+                        if (!memInBounds(dst, n, dst_mem.data.len) or !memInBounds(src, n, src_mem.data.len)) {
                             return error.OutOfBoundsMemoryAccess;
                         }
                         const d: usize = @intCast(dst);
@@ -3078,7 +3080,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         const val: u8 = @truncate(@as(u32, @bitCast(try env.popI32())));
                         const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        if (dst + n > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        if (!memInBounds(dst, n, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                         const d: usize = @intCast(dst);
                         const len: usize = @intCast(n);
                         @memset(mem.data[d .. d + len], val);
@@ -3326,7 +3328,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     0x12 => { const ti = readU32(code, &ip); const di = readU32(code, &ip); try gcArrayInitData(env, ti, di); },
                     0x13 => { const ti = readU32(code, &ip); const ei = readU32(code, &ip); try gcArrayInitElem(env, ti, ei); },
                     0x18, 0x19 => { // br_on_cast (0x18), br_on_cast_fail (0x19)
-                        try handleBrOnCast(env, sub_op, code, &ip, &labels, &label_sp);
+                        try handleBrOnCast(env, sub_op, code, &ip, labels, &label_sp);
                     },
                     else => return error.UnknownOpcode,
                 }
@@ -3453,7 +3455,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const effective_addr = addr +% offset;
                         if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
                         const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
-                        if (effective_addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        if (!memInBounds(effective_addr, 4, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                         const wq = mem.waiter_queue orelse {
                             try env.pushI32(1); // no shared memory = "not equal"
                             continue;
@@ -3481,7 +3483,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const effective_addr = addr +% offset;
                         if (effective_addr & 7 != 0) return error.UnalignedAtomicAccess;
                         const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
-                        if (effective_addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        if (!memInBounds(effective_addr, 8, mem.data.len)) return error.OutOfBoundsMemoryAccess;
                         const wq = mem.waiter_queue orelse {
                             try env.pushI32(1);
                             continue;
@@ -3565,7 +3567,7 @@ fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32
     const ma = readMemarg(code, ip);
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (!memInBounds(addr, size, mem.data.len)) return error.OutOfBoundsMemoryAccess;
     // Alignment check (atomics require natural alignment)
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     return .{ .ptr = mem.data.ptr + @as(usize, @intCast(addr)), .addr = @intCast(addr) };
@@ -3590,7 +3592,7 @@ fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (!memInBounds(addr, size, mem.data.len)) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     doAtomicStore(T, ptr, val);
@@ -3601,7 +3603,7 @@ fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (!memInBounds(addr, size, mem.data.len)) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     doAtomicStore(T, ptr, val);
@@ -3612,7 +3614,7 @@ fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comp
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (!memInBounds(addr, size, mem.data.len)) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const old = doAtomicRmw(T, ptr, op, val);
@@ -3624,7 +3626,7 @@ fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (!memInBounds(addr, size, mem.data.len)) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const old = doAtomicRmw(T, ptr, op, val);
@@ -3637,7 +3639,7 @@ fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     const expected: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (!memInBounds(addr, size, mem.data.len)) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const result = doAtomicCmpxchg(T, ptr, expected, replacement);
@@ -3651,7 +3653,7 @@ fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type
     const expected: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (!memInBounds(addr, size, mem.data.len)) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const result = doAtomicCmpxchg(T, ptr, expected, replacement);
@@ -3681,10 +3683,12 @@ fn runCode(code: []const u8) !i32 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
 
     // Push a dummy frame so locals/currentFrame works
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
@@ -3697,6 +3701,28 @@ fn runCode(code: []const u8) !i32 {
 fn runCodeExpectTrap(code: []const u8, expected: TrapError) !void {
     const result = runCode(code);
     try testing.expectError(expected, result);
+}
+
+test "interp: memInBounds rejects wrapping ranges" {
+    // Ordinary in-bounds and out-of-bounds cases.
+    try testing.expect(memInBounds(0, 4, 8));
+    try testing.expect(memInBounds(4, 4, 8));
+    try testing.expect(!memInBounds(5, 4, 8));
+    try testing.expect(!memInBounds(0, 9, 8));
+    try testing.expect(memInBounds(8, 0, 8));
+
+    // The regression this helper exists for: memory64 gives wasm full
+    // 64-bit offsets and memarg offsets are folded in with wrapping
+    // addition, so `offset + len` can wrap to a small value and pass a
+    // naive `offset + len > limit` check. The dispatch loop runs with
+    // runtime safety disabled, so the wrap is silent and the subsequent
+    // slice reads/writes out of bounds.
+    const near_max: u64 = std.math.maxInt(u64) - 3;
+    // near_max + 12 wraps to exactly 8, so the naive `offset + len > limit`
+    // check reads `8 > 8` — false — and wrongly admits the access.
+    try testing.expectEqual(@as(u64, 8), near_max +% @as(u64, 12));
+    try testing.expect(!memInBounds(near_max, 12, 8));
+    try testing.expect(!memInBounds(std.math.maxInt(u64), 1, 65536));
 }
 
 test "interp: dispatch fuel exhaustion reports OutOfFuel" {
@@ -3712,10 +3738,12 @@ test "interp: dispatch fuel exhaustion reports OutOfFuel" {
         .module_inst = &inst,
         .operand_stack = try alloc.alloc(types.Value, 16),
         .call_stack = try alloc.alloc(CallFrame, 16),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
 
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     var dummy_target: u32 = 0;
@@ -3829,10 +3857,12 @@ test "interp: local.get and local.set" {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
 
     // Reserve 2 locals on the stack and push a frame.
     try env.pushI32(0); // local 0
@@ -3976,10 +4006,12 @@ test "interp: loop with br_if counts down" {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
 
     // One local (counter), initialized to 0 on the stack
     try env.pushI32(0);
@@ -4123,10 +4155,12 @@ test "interp: call another function" {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
 
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
 
@@ -4167,10 +4201,12 @@ test "interp: br_table dispatch" {
                 .module_inst = inst,
                 .operand_stack = try testing.allocator.alloc(types.Value, 256),
                 .call_stack = try testing.allocator.alloc(CallFrame, 64),
+                .label_stack = try testing.allocator.alloc(Label, exec_env_mod.label_stack_capacity),
                 .allocator = testing.allocator,
             };
             defer testing.allocator.free(env.operand_stack);
             defer testing.allocator.free(env.call_stack);
+            defer testing.allocator.free(env.label_stack);
 
             try env.pushI32(0); // local 0 (result)
             try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 1, .return_arity = 1, .prev_sp = 1 });
@@ -4230,10 +4266,12 @@ fn runCodeI64(code: []const u8) !i64 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popI64();
@@ -4255,10 +4293,12 @@ fn runCodeF32(code: []const u8) !f32 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF32();
@@ -4280,10 +4320,12 @@ fn runCodeF64(code: []const u8) !f64 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF64();
@@ -4305,10 +4347,12 @@ fn runCodeExpectTrapAny(code: []const u8, expected: TrapError) !void {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     var dummy_target: u32 = 0;
     const result = dispatchLoop(&env, code, &dummy_target);
@@ -4656,10 +4700,12 @@ fn runCodeWithMem(code: []const u8) !i32 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popI32();
@@ -4690,10 +4736,12 @@ fn runCodeWithMemI64(code: []const u8) !i64 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popI64();
@@ -4724,10 +4772,12 @@ fn runCodeWithMemF32(code: []const u8) !f32 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF32();
@@ -4758,10 +4808,12 @@ fn runCodeWithMemF64(code: []const u8) !f64 {
         .module_inst = &dummy_inst,
         .operand_stack = try alloc.alloc(types.Value, 256),
         .call_stack = try alloc.alloc(CallFrame, 64),
+        .label_stack = try alloc.alloc(Label, exec_env_mod.label_stack_capacity),
         .allocator = alloc,
     };
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
+    defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
     { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF64();

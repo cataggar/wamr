@@ -1045,6 +1045,28 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
     for (commands) |cmd| {
         result.total += 1;
 
+        if (std.mem.eql(u8, cmd.type, "module_definition")) {
+            // Declared but never instantiated: decode and validate only.
+            const filename = cmd.filename orelse {
+                result.skipped += 1;
+                continue;
+            };
+            const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+            defer allocator.free(wasm_path);
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(wasm_data);
+            var defined = runtime.loadModule(wasm_data) catch {
+                result.failed += 1;
+                continue;
+            };
+            defined.deinit();
+            result.passed += 1;
+            continue;
+        }
+
         if (std.mem.eql(u8, cmd.type, "module")) {
             // Clean up previous current state
             if (current_instance_owned) {
@@ -1793,6 +1815,32 @@ fn runSpecTestFileAot(
 
     for (parsed.value.commands) |cmd| {
         result.total += 1;
+
+        if (std.mem.eql(u8, cmd.type, "module_definition")) {
+            // Declared but never instantiated: compile/validate only.
+            const filename = cmd.filename orelse {
+                recordSkip("module_no_filename");
+                result.skipped += 1;
+                continue;
+            };
+            const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+            defer allocator.free(wasm_path);
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+                recordSkip("module_read_fail");
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(wasm_data);
+            if (aot_harness.Harness.initWithRegistry(allocator, wasm_data, &import_registry)) |h| {
+                var handle = h;
+                handle.deinit();
+                result.passed += 1;
+            } else |_| {
+                recordSkip("compile_fail");
+                result.skipped += 1;
+            }
+            continue;
+        }
 
         if (std.mem.eql(u8, cmd.type, "module")) {
             if (current) |h| {
