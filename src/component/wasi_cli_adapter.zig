@@ -1152,6 +1152,11 @@ const PendingTcpOp = enum { idle, bind_done, listen_done, connect_done };
 pub const Socket = struct {
     kind: SocketKind,
     family: IpAddressFamily,
+    /// Monotonic adapter-local identity assigned by `pushSocket`.
+    /// Pending operations retain this in addition to the recyclable
+    /// table handle so a dropped socket cannot transfer an in-flight
+    /// operation to a replacement that reuses the same slot.
+    resource_generation: u64 = 0,
     state: SocketState = .unbound,
     /// Authorized local address recorded by `start-bind`. Refreshed
     /// from the kernel after `start-listen` (TCP) or immediately
@@ -1587,6 +1592,7 @@ pub const FsReadStreamCtx = struct {
 pub const PendingUdpReceive = struct {
     future_handle: u32,
     sock_handle: u32,
+    socket_generation: u64,
     /// Flipped by `cancelAllPendingAsyncOps` when the guest issues
     /// `canon task.cancel` while this receive is parked (#583 B1).
     /// `completeReadyPendingUdpReceives` observes the flag on its
@@ -2671,6 +2677,52 @@ fn mapSocketSendError(err: anyerror) SocketErrorCode {
         error.SystemResources => .out_of_memory,
         else => .unknown,
     };
+}
+
+/// Send one UDP datagram while respecting whether the kernel socket has
+/// already been connected by `udpConnectP3`.
+///
+/// Root cause (#917): Darwin (BSD sockets) rejects `sendmsg` with
+/// `msg_name != null` on a *connected* UDP socket with `EISCONN`,
+/// whereas Linux silently accepts and ignores the redundant
+/// destination. `Socket.send` is the connectionless API and always
+/// fills `msg_name`, so on a kernel-connected socket the `Socket.send`
+/// on `test_connected_*` fixtures traps on macOS. When the socket has
+/// been `connect(2)`-ed we instead emit one destination-free `sendmsg`
+/// via the connected write path (`netWrite`), which is exactly the
+/// POSIX-correct way to send on a connected socket.
+///
+/// The workaround is gated to Darwin on purpose (justified
+/// `builtin.os.tag` conditional): the connectionless `Socket.send`
+/// path maps `EMSGSIZE` to `error.MessageOversize` (→ `datagram_too_large`),
+/// but std's `netWrite` maps the same errno to `errnoBug` (a panic in
+/// Debug / `error.Unexpected` in ReleaseSafe), so routing Linux — the
+/// platform whose UDP fixtures already pass — through `netWrite` would
+/// lose that error mapping for no benefit, since Linux does not raise
+/// `EISCONN` here. Keeping Linux on the untouched, passing path avoids
+/// any regression. Non-Darwin (Linux, Windows) therefore keeps using
+/// the connectionless send.
+fn sendUdpDatagram(
+    socket: *const std.Io.net.Socket,
+    io: std.Io,
+    dest: *const std.Io.net.IpAddress,
+    kernel_connected: bool,
+    data: []const u8,
+) anyerror!void {
+    if (builtin.os.tag.isDarwin() and kernel_connected) {
+        // A zero-length datagram is valid (`send([])`): `netWrite`
+        // issues a `sendmsg` with an empty iovec and returns 0, which
+        // equals `data.len`, so the length check below still passes.
+        const chunks = [_][]const u8{data};
+        const sent = try io.vtable.netWrite(io.userdata, socket.handle, &.{}, &chunks, 1);
+        // Datagram sends are atomic: a success returns the whole
+        // payload length. A short count should not happen for
+        // SOCK_DGRAM, but if it ever did the datagram was truncated,
+        // which is `datagram_too_large` semantics.
+        if (sent != data.len) return error.MessageOversize;
+        return;
+    }
+    try socket.send(io, dest, data);
 }
 
 /// Read a u32-valued socket option via `getsockopt(2)`. Returns the
@@ -4586,6 +4638,10 @@ pub const WasiCliAdapter = struct {
     /// Slots are nulled on `[resource-drop]tcp-socket` /
     /// `[resource-drop]udp-socket`.
     socket_table: std.ArrayListUnmanaged(?Socket) = .empty,
+    /// Next identity assigned to a socket table entry. Handle slots are
+    /// reusable, but this generation is not, so pending receives remain
+    /// attached to the resource instance that created them.
+    next_socket_generation: u64 = 1,
     /// `wasi:sockets/udp.incoming-datagram-stream` sub-resource table.
     /// Each slot owns a heap-allocated rep; nulled on resource-drop.
     udp_incoming_streams: std.ArrayListUnmanaged(?*UdpIncomingStream) = .empty,
@@ -7397,7 +7453,11 @@ pub const WasiCliAdapter = struct {
             }
             // Socket torn down — settle err(invalid_state).
             const sock = self.lookupSocket(entry.sock_handle);
-            if (sock == null or sock.?.kind != .udp or sock.?.host_socket == null) {
+            if (sock == null or
+                sock.?.resource_generation != entry.socket_generation or
+                sock.?.kind != .udp or
+                sock.?.host_socket == null)
+            {
                 self.settlePendingUdpReceiveErr(ci, fut, .invalid_state, allocator) catch {};
                 _ = self.pending_udp_receives.swapRemove(i);
                 fired = true;
@@ -12635,14 +12695,18 @@ pub const WasiCliAdapter = struct {
     }
 
     fn pushSocket(self: *WasiCliAdapter, s: Socket) !u32 {
+        var socket = s;
+        socket.resource_generation = self.next_socket_generation;
+        self.next_socket_generation +%= 1;
+        if (self.next_socket_generation == 0) self.next_socket_generation = 1;
         for (self.socket_table.items, 0..) |slot, i| {
             if (slot == null) {
-                self.socket_table.items[i] = s;
+                self.socket_table.items[i] = socket;
                 return @intCast(i);
             }
         }
         const idx: u32 = @intCast(self.socket_table.items.len);
-        try self.socket_table.append(self.allocator, s);
+        try self.socket_table.append(self.allocator, socket);
         return idx;
     }
 
@@ -16832,7 +16896,7 @@ pub const WasiCliAdapter = struct {
                 return;
             });
         const io = std.Io.Threaded.global_single_threaded.io();
-        s.host_socket.?.send(io, &dest, data_bytes) catch |err| {
+        sendUdpDatagram(&s.host_socket.?, io, &dest, s.remote_addr != null, data_bytes) catch |err| {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, mapSocketSendError(err)) };
             return;
         };
@@ -16920,6 +16984,7 @@ pub const WasiCliAdapter = struct {
             try self.pending_udp_receives.append(self.allocator, .{
                 .future_handle = fh,
                 .sock_handle = sock_handle,
+                .socket_generation = s.resource_generation,
             });
             results[0] = .{ .handle = fh };
             return;
@@ -30295,6 +30360,96 @@ test "sockets P3 #576: udp-receive parked future resolves err(invalid_state) whe
         fut.payload.?[4],
     );
     try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.items.len);
+}
+
+test "sockets P3 #917: dropped udp socket cannot steal a datagram via table-slot reuse" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // slot 0 = sender, slot 1 = receiver (both loopback-bound UDP).
+    _ = try p3UdpReceiveTestSetup(&adapter, &ci);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // Park a pending receive on the receiver (handle 1). The entry
+    // captures the receiver's `resource_generation`.
+    const recv_args = [_]InterfaceValue{.{ .handle = 1 }};
+    var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &recv_args, &recv_results, testing.allocator);
+    const fut = ci.futures.getPtr(recv_results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_udp_receives.items.len);
+    const stale_gen = adapter.socket_table.items[1].?.resource_generation;
+    try testing.expectEqual(stale_gen, adapter.pending_udp_receives.items[0].socket_generation);
+
+    // Guest drops the receiver: the slot is nulled but the pending
+    // receive still references handle 1 with the stale generation.
+    adapter.closeSocketByHandle(1);
+    try testing.expect(adapter.socket_table.items[1] == null);
+
+    // A brand-new UDP socket reuses slot 1 with a fresh generation and
+    // its own kernel socket bound to a *different* ephemeral port.
+    const new_handle = try adapter.pushSocket(.{ .kind = .udp, .family = .ipv4 });
+    try testing.expectEqual(@as(u32, 1), new_handle); // slot recycled
+    var any: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    adapter.socket_table.items[1].?.host_socket = std.Io.net.IpAddress.bind(&any, io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    }) catch return error.SkipZigTest;
+    adapter.socket_table.items[1].?.state = .bound;
+    try testing.expect(adapter.socket_table.items[1].?.resource_generation != stale_gen);
+    const new_port = switch (adapter.socket_table.items[1].?.host_socket.?.address) {
+        .ip4 => |v4| v4.port,
+        else => return error.SkipZigTest,
+    };
+
+    // Deliver a datagram addressed to the reused-slot socket.
+    var dest: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = new_port } };
+    const payload: []const u8 = "for-new-socket";
+    try adapter.socket_table.items[0].?.host_socket.?.send(io, &dest, payload);
+
+    // Best-effort wait for loopback delivery so a generation-blind
+    // driver would have a datagram available to (incorrectly) steal.
+    var spins: usize = 0;
+    while (spins < 100_000) : (spins += 1) {
+        if (WasiCliAdapter.fdPollReady(
+            adapter.socket_table.items[1].?.host_socket.?.handle,
+            WasiCliAdapter.pollInEvents(),
+        )) break;
+    }
+
+    // Drive the async event loop: the stale receive MUST settle
+    // err(invalid_state) on the generation mismatch and MUST NOT
+    // consume the datagram destined for the reused-slot socket.
+    _ = adapter.completeReadyPendingUdpReceives(&ci, testing.allocator);
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]); // err arm
+    try testing.expectEqual(
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.invalid_state))),
+        fut.payload.?[4],
+    );
+    try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.items.len);
+
+    // The datagram survived for its rightful owner: a fresh receive on
+    // the reused-slot socket still delivers it with an ok arm.
+    const recv2_args = [_]InterfaceValue{.{ .handle = 1 }};
+    var recv2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &recv2_args, &recv2_results, testing.allocator);
+    const fut2 = ci.futures.getPtr(recv2_results[0].handle).?;
+    if (fut2.state != .ready) {
+        try testing.expect(p3DrainPendingUdpUntilReady(&adapter, &ci, fut2, 10_000));
+    }
+    try testing.expectEqual(async_mod.Future.State.ready, fut2.state);
+    try testing.expect(fut2.payload != null);
+    try testing.expectEqual(@as(u8, 0), fut2.payload.?[0]); // ok arm
 }
 
 test "sockets P3: resolve-addresses denies without allow-list (#519)" {
