@@ -170,6 +170,12 @@ pub const Inst = struct {
         rotl: BinOp,
         rotr: BinOp,
 
+        // Fused address computation: dest = base + index*scale + disp.
+        // Produced by the x86-64 `foldCompoundLea` peephole (#543) so the
+        // register allocator sees base/index as coincident operands of a
+        // single instruction (correct liveness) and codegen emits one LEA.
+        lea: Lea,
+
         // Unary
         clz: VReg,
         ctz: VReg,
@@ -401,6 +407,18 @@ pub const Inst = struct {
     pub const BinOp = struct {
         lhs: VReg,
         rhs: VReg,
+    };
+
+    /// Operands of a fused `lea` (x86-64 address-generation) instruction.
+    /// Computes `base + index * scale + disp`. `scale` must be 1, 2, 4, or
+    /// 8 (the legal x86-64 SIB scales); `disp` is a signed 32-bit
+    /// displacement. The result wraps to `type`'s width (i32/i64), matching
+    /// a chain of wasm `add`/`shl` with the same operands.
+    pub const Lea = struct {
+        base: VReg,
+        index: VReg,
+        scale: u8,
+        disp: i32,
     };
 
     pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };

@@ -306,6 +306,14 @@ fn execInst(machine: *Machine, inst: ir.Inst) !?Outcome {
             };
             if (inst.dest) |d| try machine.setVReg(d, .{ .ty = if (inst.op == .eqz) .i32 else inst.type, .bits = bits });
         },
+        .lea => |l| {
+            const base = try machine.getVReg(l.base);
+            const index = try machine.getVReg(l.index);
+            // base + index*scale + disp, computed in 64 bits and wrapped to
+            // the result width by `setVReg`/`normalized`.
+            const addr = base.asI64() +% index.asI64() *% @as(i64, l.scale) +% @as(i64, l.disp);
+            if (inst.dest) |d| try machine.setVReg(d, .{ .ty = inst.type, .bits = @bitCast(addr) });
+        },
         .select => |sel| {
             const cond = try machine.getVReg(sel.cond);
             const chosen = if (cond.bits != 0) try machine.getVReg(sel.if_true) else try machine.getVReg(sel.if_false);

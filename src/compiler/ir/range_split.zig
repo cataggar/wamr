@@ -894,6 +894,10 @@ pub fn forEachUseInst(
         .ret => |maybe_v| if (maybe_v) |v| try visit(context, v),
         .ret_multi => |vregs| for (vregs) |v| try visit(context, v),
         .load => |ld| try visit(context, ld.base),
+        .lea => |l| {
+            try visit(context, l.base);
+            try visit(context, l.index);
+        },
         .store => |st| {
             try visit(context, st.base);
             try visit(context, st.val);

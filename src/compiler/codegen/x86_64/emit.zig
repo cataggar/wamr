@@ -552,23 +552,7 @@ pub const CodeBuffer = struct {
     /// a `mov dst, base` compared to the mov+add sequence.
     /// Precondition: index must not be RSP (SIB encodes rsp as "no index").
     pub fn leaRegBaseIndex64(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg) !void {
-        std.debug.assert(index != .rsp);
-        // REX.W + R (dst) + X (index) + B (base).
-        const rex_byte: u8 = 0x48 |
-            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
-            (@as(u8, @intFromEnum(index) >> 3) << 1) |
-            (@as(u8, @intFromEnum(base) >> 3));
-        try self.emitByte(rex_byte);
-        try self.emitByte(0x8D); // LEA
-        // If base.low3 == 5 (rbp/r13), mod=00 would mean RIP-relative, so use
-        // mod=01 with disp8=0 to encode a plain [base + index] form.
-        const needs_disp8 = base.low3() == 5;
-        const mod: u2 = if (needs_disp8) 0b01 else 0b00;
-        try self.modrm(mod, dst.low3(), 0b100); // rm=100 → SIB follows
-        // SIB: scale=00, index=index.low3, base=base.low3
-        const sib: u8 = (@as(u8, 0) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
-        try self.emitByte(sib);
-        if (needs_disp8) try self.emitByte(0x00);
+        try self.leaRegBaseIndexScaleDisp64(dst, base, index, 0, 0);
     }
 
     /// LEA r32, [base + index] (32-bit operand size). The address is computed
@@ -576,19 +560,58 @@ pub const CodeBuffer = struct {
     /// since add-mod-2^32 depends only on the low 32 bits of each operand,
     /// this is exactly Wasm `i32.add` (#393), with no separate zero-extend.
     pub fn leaRegBaseIndex32(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg) !void {
+        try self.leaRegBaseIndexScaleDisp32(dst, base, index, 0, 0);
+    }
+
+    /// LEA dst, [base + index*scale + disp] — 64-bit compound address
+    /// computation folded into a single flag-free instruction (#543).
+    /// `scale_log2` is the SIB scale exponent (0/1/2/3 → scale 1/2/4/8);
+    /// `disp` is a signed 32-bit displacement. Precondition: index != RSP.
+    pub fn leaRegBaseIndexScaleDisp64(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg, scale_log2: u2, disp: i32) !void {
+        std.debug.assert(index != .rsp);
+        const rex_byte: u8 = 0x48 |
+            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
+            (@as(u8, @intFromEnum(index) >> 3) << 1) |
+            (@as(u8, @intFromEnum(base) >> 3));
+        try self.emitByte(rex_byte);
+        try self.emitSibLeaBody(dst, base, index, scale_log2, disp);
+    }
+
+    /// LEA r32, [base + index*scale + disp] (32-bit operand size). See the
+    /// 64-bit variant; the 32-bit form truncates+zero-extends the address,
+    /// which is exactly Wasm i32 wrapping arithmetic (#393/#543).
+    pub fn leaRegBaseIndexScaleDisp32(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg, scale_log2: u2, disp: i32) !void {
         std.debug.assert(index != .rsp);
         const rex_byte: u8 = 0x40 |
             (@as(u8, @intFromEnum(dst) >> 3) << 2) |
             (@as(u8, @intFromEnum(index) >> 3) << 1) |
             (@as(u8, @intFromEnum(base) >> 3));
         if (rex_byte != 0x40) try self.emitByte(rex_byte);
+        try self.emitSibLeaBody(dst, base, index, scale_log2, disp);
+    }
+
+    /// Shared opcode + ModRM/SIB + displacement encoding for the scaled LEA
+    /// forms. The caller has already emitted any REX prefix.
+    fn emitSibLeaBody(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg, scale_log2: u2, disp: i32) !void {
         try self.emitByte(0x8D); // LEA
-        const needs_disp8 = base.low3() == 5;
-        const mod: u2 = if (needs_disp8) 0b01 else 0b00;
+        // base.low3 == 5 (rbp/r13) cannot use mod=00 (that encodes a
+        // disp32-only form with no base), so force at least a disp8=0.
+        const base_is_bp = base.low3() == 5;
+        const mod: u2 = if (disp == 0 and !base_is_bp)
+            0b00
+        else if (disp >= -128 and disp <= 127)
+            0b01
+        else
+            0b10;
         try self.modrm(mod, dst.low3(), 0b100); // rm=100 → SIB follows
-        const sib: u8 = (@as(u8, 0) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
+        const sib: u8 = (@as(u8, scale_log2) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
         try self.emitByte(sib);
-        if (needs_disp8) try self.emitByte(0x00);
+        switch (mod) {
+            0b00 => {},
+            0b01 => try self.emitByte(@bitCast(@as(i8, @intCast(disp)))),
+            0b10 => try self.emitI32(disp),
+            else => unreachable,
+        }
     }
 
     /// ADD reg, imm32 (64-bit).
@@ -1784,6 +1807,65 @@ test "leaRegBaseIndex64 rax, r8, r9" {
     // Opcode 0x8D. ModR/M mod=00, reg=0, rm=100 → 0x04.
     // SIB scale=0, index=r9.low3=1, base=r8.low3=0 → 00_001_000 = 0x08.
     try hexEqual(buf.getCode(), &.{ 0x4B, 0x8D, 0x04, 0x08 });
+}
+
+test "leaRegBaseIndexScaleDisp64 rdx, [rsi + rdi*4]" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndexScaleDisp64(.rdx, .rsi, .rdi, 2, 0);
+    // REX.W 0x48. 0x8D. mod=00 reg=rdx=2 rm=100 → 0x14.
+    // SIB scale=2(→*4) index=rdi=7 base=rsi=6 → 10_111_110 = 0xBE.
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x8D, 0x14, 0xBE });
+}
+
+test "leaRegBaseIndexScaleDisp64 rdx, [rsi + rdi*2 + 16] (disp8)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndexScaleDisp64(.rdx, .rsi, .rdi, 1, 16);
+    // mod=01 (disp8) → 0x54. SIB scale=1(→*2) → 01_111_110 = 0x7E. disp8=0x10.
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x8D, 0x54, 0x7E, 0x10 });
+}
+
+test "leaRegBaseIndexScaleDisp64 rdx, [rsi + rdi*8 + 0x1000] (disp32)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndexScaleDisp64(.rdx, .rsi, .rdi, 3, 0x1000);
+    // mod=10 (disp32) → 0x94. SIB scale=3(→*8) → 11_111_110 = 0xFE.
+    // disp32 little-endian: 00 10 00 00.
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x8D, 0x94, 0xFE, 0x00, 0x10, 0x00, 0x00 });
+}
+
+test "leaRegBaseIndexScaleDisp64 base rbp forces disp8=0" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndexScaleDisp64(.rdx, .rbp, .rdi, 2, 0);
+    // base rbp (low3=5) can't use mod=00 → mod=01 with disp8=0.
+    // modrm 01_010_100 = 0x54. SIB 10_111_101 = 0xBD. disp8 = 0x00.
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x8D, 0x54, 0xBD, 0x00 });
+}
+
+test "leaRegBaseIndexScaleDisp64 index r12 is a valid index (REX.X)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndexScaleDisp64(.rdx, .rsi, .r12, 2, 0);
+    // REX.W + REX.X(index=r12) = 0x4A. SIB index=r12.low3=4 → 10_100_110 = 0xA6.
+    try hexEqual(buf.getCode(), &.{ 0x4A, 0x8D, 0x14, 0xA6 });
+}
+
+test "leaRegBaseIndexScaleDisp32 rdx, [rsi + rdi*4] (no REX)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndexScaleDisp32(.rdx, .rsi, .rdi, 2, 0);
+    // 32-bit form, no register needs REX → REX omitted.
+    try hexEqual(buf.getCode(), &.{ 0x8D, 0x14, 0xBE });
+}
+
+test "leaRegBaseIndexScaleDisp32 r8d, [rsi + rdi*4] (REX.R only)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndexScaleDisp32(.r8, .rsi, .rdi, 2, 0);
+    // REX.R for r8 dst → 0x44. modrm reg=r8.low3=0 → 0x04.
+    try hexEqual(buf.getCode(), &.{ 0x44, 0x8D, 0x04, 0xBE });
 }
 
 

@@ -948,6 +948,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .local_set => |ls| list.append(ls.val),
         .global_set => |gs| list.append(gs.val),
         .load => |ld| list.append(ld.base),
+        .lea => |l| {
+            list.append(l.base);
+            list.append(l.index);
+        },
         .v128_load => |ld| list.append(ld.base),
         .v128_load_splat => |ld| list.append(ld.base),
         .v128_load_zero => |ld| list.append(ld.base),
@@ -1589,6 +1593,10 @@ pub fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .load => |*ld| if (ld.base == old) {
             ld.base = new;
         },
+        .lea => |*l| {
+            if (l.base == old) l.base = new;
+            if (l.index == old) l.index = new;
+        },
         .v128_load => |*ld| if (ld.base == old) {
             ld.base = new;
         },
@@ -2228,6 +2236,203 @@ pub fn strengthReduceMulShiftAdd(func: *ir.IrFunction, allocator: std.mem.Alloca
                 },
                 else => {},
             }
+        }
+    }
+    return changed;
+}
+
+// ── Compound-address LEA folding (x86-64) ───────────────────────────────────
+
+const LeaShlInfo = struct { idx: ir.VReg, scale: u8 };
+
+/// If `v` is defined in this block by a single-use `shl(idx, k)` with
+/// `k ∈ {1,2,3}` and a non-constant `idx`, return the equivalent LEA
+/// index/scale. `k == 0` is rejected: scale-1 with no displacement is a
+/// plain `add`, already handled by the backend's #393 base+index fusion,
+/// and folding it here would only churn the IR.
+fn matchLeaShl(
+    block: *ir.BasicBlock,
+    defs: *const std.AutoHashMap(ir.VReg, usize),
+    constants: *const std.AutoHashMap(ir.VReg, i64),
+    use_counts: *const VRegUseCounts,
+    v: ir.VReg,
+) ?LeaShlInfo {
+    const di = defs.get(v) orelse return null;
+    switch (block.instructions.items[di].op) {
+        .shl => |bin| {
+            const k = constants.get(bin.rhs) orelse return null;
+            if (k < 1 or k > 3) return null;
+            if ((use_counts.get(v) orelse 0) != 1) return null;
+            if (constants.get(bin.lhs) != null) return null;
+            return .{ .idx = bin.lhs, .scale = @as(u8, 1) << @intCast(k) };
+        },
+        else => return null,
+    }
+}
+
+fn fitsSignedI32(c: i64) bool {
+    return c >= std.math.minInt(i32) and c <= std.math.maxInt(i32);
+}
+
+/// Fold compound address computation `base + index*scale + disp` into a
+/// single `lea` IR op, mirroring the x86-64 `LEA` addressing mode
+/// (`[base + index*scale + disp]`, scale ∈ {1,2,4,8}, disp signed 32-bit).
+///
+/// Two shapes are matched, per straight-line block:
+///
+///   Case B (with displacement):
+///     add(add(base, shl(idx, k)), C)  →  lea(base, idx, 1<<k, C)
+///     add(add(base, S),          C)  →  lea(base, S,   1,    C)
+///   Case A (scale only):
+///     add(x, shl(idx, k))            →  lea(x, idx, 1<<k, 0)
+///
+/// with `k ∈ {1,2,3}` (scale 2/4/8) and `C` a constant that fits a
+/// signed 32-bit displacement. Case B is matched first so the combined
+/// displacement form always wins over folding the inner add on its own.
+///
+/// Safety:
+///   * `LEA` does not set flags, but wasm has no flag-dependent
+///     arithmetic sequences (comparisons are explicit value-producing
+///     ops), so replacing `add`/`shl` chains with a flag-free `lea`
+///     never changes observable semantics.
+///   * `add`, `shl` and `lea` all wrap identically mod 2^32 / 2^64, and
+///     a 32-bit `lea` zero-extends into the full register — exactly the
+///     i32 wasm wrapping semantics (#393). i64 folds still require the
+///     displacement to fit signed 32-bit.
+///   * base/index are kept as operands of the new `lea`, so the register
+///     allocator (which runs after this pass) sees the correct coincident
+///     liveness — this is why the fold is done at the IR level rather than
+///     opportunistically at codegen time.
+///
+/// Only fires when the consumed intermediates (`shl`, inner `add`) are
+/// single-use so the subsequent dead-code pass can remove them, making
+/// every fold a strict instruction-count win. base/index must be
+/// non-constant (a `LEA` base/index is a register).
+pub fn foldCompoundLea(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer constants.deinit();
+    var defs = std.AutoHashMap(ir.VReg, usize).init(allocator);
+    defer defs.deinit();
+    var use_counts = try buildVRegUseCounts(func, allocator);
+    defer use_counts.deinit();
+    var consumed = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer consumed.deinit();
+
+    for (func.blocks.items) |*block| {
+        constants.clearRetainingCapacity();
+        defs.clearRetainingCapacity();
+        consumed.clearRetainingCapacity();
+
+        // Pass B (with maps built lazily top-down): the inner add and the
+        // shl always precede the outer add, so `defs`/`constants` are
+        // populated by the time we reach the outer add. Rewrites are done
+        // in place (no index shifts, dest unchanged), so the maps stay
+        // valid across mutations.
+        var i: usize = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const inst = block.instructions.items[i];
+            if (inst.dest) |d| {
+                switch (inst.op) {
+                    .iconst_32 => |v| try constants.put(d, v),
+                    .iconst_64 => |v| try constants.put(d, v),
+                    else => {},
+                }
+                try defs.put(d, i);
+            }
+
+            const bin = switch (inst.op) {
+                .add => |b| b,
+                else => continue,
+            };
+            const dest = inst.dest orelse continue;
+            if (inst.type != .i32 and inst.type != .i64) continue;
+
+            // Outer add(P, C): identify the constant operand C and the
+            // non-constant intermediate P = add(base, S).
+            var p_vreg: ir.VReg = undefined;
+            var disp: i64 = undefined;
+            if (constants.get(bin.rhs)) |c| {
+                p_vreg = bin.lhs;
+                disp = c;
+            } else if (constants.get(bin.lhs)) |c| {
+                p_vreg = bin.rhs;
+                disp = c;
+            } else continue;
+            if (!fitsSignedI32(disp)) continue;
+            if (constants.get(p_vreg) != null) continue;
+            if ((use_counts.get(p_vreg) orelse 0) != 1) continue;
+
+            const p_di = defs.get(p_vreg) orelse continue;
+            const p_bin = switch (block.instructions.items[p_di].op) {
+                .add => |b| b,
+                else => continue,
+            };
+
+            // Choose (base, index, scale): prefer a foldable shl on either
+            // operand of the inner add; otherwise fall back to scale-1.
+            var base: ir.VReg = undefined;
+            var index: ir.VReg = undefined;
+            var scale: u8 = 1;
+            if (matchLeaShl(block, &defs, &constants, &use_counts, p_bin.rhs)) |s| {
+                base = p_bin.lhs;
+                index = s.idx;
+                scale = s.scale;
+            } else if (matchLeaShl(block, &defs, &constants, &use_counts, p_bin.lhs)) |s| {
+                base = p_bin.rhs;
+                index = s.idx;
+                scale = s.scale;
+            } else {
+                base = p_bin.lhs;
+                index = p_bin.rhs;
+                scale = 1;
+            }
+            if (constants.get(base) != null or constants.get(index) != null) continue;
+
+            block.instructions.items[i].op = .{ .lea = .{
+                .base = base,
+                .index = index,
+                .scale = scale,
+                .disp = @intCast(disp),
+            } };
+            block.instructions.items[i].dest = dest;
+            try consumed.put(p_vreg, {}); // inner add is now dead
+            changed = true;
+        }
+
+        // Pass A (scale only): fold add(x, shl(idx, k)) that was not already
+        // absorbed into a Case B displacement fold. Skip the inner adds
+        // consumed above — they are dead and awaiting DCE.
+        i = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const inst = block.instructions.items[i];
+            const bin = switch (inst.op) {
+                .add => |b| b,
+                else => continue,
+            };
+            const dest = inst.dest orelse continue;
+            if (inst.type != .i32 and inst.type != .i64) continue;
+            if (consumed.contains(dest)) continue;
+
+            var base: ir.VReg = undefined;
+            var info: LeaShlInfo = undefined;
+            if (matchLeaShl(block, &defs, &constants, &use_counts, bin.rhs)) |s| {
+                base = bin.lhs;
+                info = s;
+            } else if (matchLeaShl(block, &defs, &constants, &use_counts, bin.lhs)) |s| {
+                base = bin.rhs;
+                info = s;
+            } else continue;
+            if (constants.get(base) != null) continue;
+
+            block.instructions.items[i].op = .{ .lea = .{
+                .base = base,
+                .index = info.idx,
+                .scale = info.scale,
+                .disp = 0,
+            } };
+            block.instructions.items[i].dest = dest;
+            changed = true;
         }
     }
     return changed;
@@ -3820,6 +4025,7 @@ const pass_name_registry = [_]PassNameEntry{
     .{ .fn_ptr = &algebraicSimplify, .name = "algebraicSimplify" },
     .{ .fn_ptr = &strengthReduceMul, .name = "strengthReduceMul" },
     .{ .fn_ptr = &strengthReduceMulShiftAdd, .name = "strengthReduceMulShiftAdd" },
+    .{ .fn_ptr = &foldCompoundLea, .name = "foldCompoundLea" },
     .{ .fn_ptr = &strengthReduceDivRem, .name = "strengthReduceDivRem" },
     .{ .fn_ptr = &foldConstantBranches, .name = "foldConstantBranches" },
     .{ .fn_ptr = &foldInverseCompareEqz, .name = "foldInverseCompareEqz" },
@@ -6365,6 +6571,10 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .local_set => |*ls| ls.val += offset,
         .global_set => |*gs| gs.val += offset,
         .load => |*ld| ld.base += offset,
+        .lea => |*l| {
+            l.base += offset;
+            l.index += offset;
+        },
         .v128_load => |*ld| ld.base += offset,
         .v128_load_splat => |*ld| ld.base += offset,
         .v128_load_zero => |*ld| ld.base += offset,
@@ -8924,6 +9134,7 @@ const x86_64_default_passes: []const PassFn = &.{
     @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
     &deadStoreElimination,
+    &foldCompoundLea,
     &deadCodeAndLocalSetCleanup,
     &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,
@@ -8961,8 +9172,8 @@ const x86_64_default_passes_no_iv: []const PassFn = &.{
     &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
     &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
     &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
-    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &foldCompoundLea,            &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_unroll: []const PassFn = &.{
@@ -8970,8 +9181,8 @@ const x86_64_default_passes_no_unroll: []const PassFn = &.{
     &strengthReduceMulShiftAdd,       &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
     &foldBranchOnEqz,                 &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
     &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
-    &inductionVariableSimplification, &hoistLoopInvariantCode,           &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks,      &foldLoadStoreOffset,
+    &inductionVariableSimplification, &hoistLoopInvariantCode,           &foldCompoundLea,            &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
@@ -8979,8 +9190,8 @@ const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
     &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
     &foldBranchOnEqz,           &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
     &foldSignExtendingLoad,     &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &hoistLoopInvariantCode,    &deadCodeAndLocalSetCleanup,       &hoistLoopBoundsChecks,   &elideRedundantBoundsChecks,
-    &foldLoadStoreOffset,
+    &hoistLoopInvariantCode,    &foldCompoundLea,                  &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
 };
 
 pub fn defaultPassesForTarget(target: TargetArch) []const PassFn {
@@ -9061,6 +9272,7 @@ const x86_64_jit_fast_passes: []const PassFn = &.{
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
+    &foldCompoundLea,
     &deadCodeAndLocalSetCleanup,
     &foldLoadStoreOffset,
 };
@@ -14065,6 +14277,230 @@ test "strengthReduceMulShiftAdd: pipeline composition with strengthReduceMul" {
     for (block.instructions.items) |inst| {
         try std.testing.expect(inst.op != .mul);
     }
+}
+
+// ── foldCompoundLea (#543) ──────────────────────────────────────────────────
+
+/// Helper: find the single `.lea` instruction in a block, or null.
+fn findLea(block: *const ir.BasicBlock) ?ir.Inst.Lea {
+    for (block.instructions.items) |inst| {
+        if (inst.op == .lea) return inst.op.lea;
+    }
+    return null;
+}
+
+test "foldCompoundLea: add(add(base, shl(idx,2)), 16) -> lea(base, idx, 4, 16)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    // base/idx are non-constant (unwritten params) so the fold's
+    // "operand must be a register" precondition holds.
+    const base = func.newVReg();
+    const idx = func.newVReg();
+    const two = func.newVReg();
+    const shifted = func.newVReg();
+    const inner = func.newVReg();
+    const c16 = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = two, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = idx, .rhs = two } }, .dest = shifted, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = shifted } }, .dest = inner, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = c16, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = inner, .rhs = c16 } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const changed = try foldCompoundLea(&func, allocator);
+    try std.testing.expect(changed);
+    const lea = findLea(block) orelse return error.NoLea;
+    try std.testing.expectEqual(base, lea.base);
+    try std.testing.expectEqual(idx, lea.index);
+    try std.testing.expectEqual(@as(u8, 4), lea.scale);
+    try std.testing.expectEqual(@as(i32, 16), lea.disp);
+    // The rewrite keeps dest/type of the outer add.
+    try std.testing.expectEqual(result, block.instructions.items[4].dest.?);
+}
+
+test "foldCompoundLea: add(x, shl(idx,3)) -> lea(x, idx, 8, 0) (scale only)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const x = func.newVReg();
+    const idx = func.newVReg();
+    const three = func.newVReg();
+    const shifted = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = three, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = idx, .rhs = three } }, .dest = shifted, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = x, .rhs = shifted } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const changed = try foldCompoundLea(&func, allocator);
+    try std.testing.expect(changed);
+    const lea = findLea(block) orelse return error.NoLea;
+    try std.testing.expectEqual(x, lea.base);
+    try std.testing.expectEqual(idx, lea.index);
+    try std.testing.expectEqual(@as(u8, 8), lea.scale);
+    try std.testing.expectEqual(@as(i32, 0), lea.disp);
+}
+
+test "foldCompoundLea: add(add(base, other), 8) -> lea(base, other, 1, 8) (scale 1)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const base = func.newVReg();
+    const other = func.newVReg();
+    const inner = func.newVReg();
+    const c8 = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = other } }, .dest = inner, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = c8, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = inner, .rhs = c8 } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const changed = try foldCompoundLea(&func, allocator);
+    try std.testing.expect(changed);
+    const lea = findLea(block) orelse return error.NoLea;
+    try std.testing.expectEqual(base, lea.base);
+    try std.testing.expectEqual(other, lea.index);
+    try std.testing.expectEqual(@as(u8, 1), lea.scale);
+    try std.testing.expectEqual(@as(i32, 8), lea.disp);
+}
+
+test "foldCompoundLea: illegal scale (shl by 4) is NOT folded" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const x = func.newVReg();
+    const idx = func.newVReg();
+    const four = func.newVReg();
+    const shifted = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = four, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = idx, .rhs = four } }, .dest = shifted, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = x, .rhs = shifted } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const changed = try foldCompoundLea(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(findLea(block) == null);
+}
+
+test "foldCompoundLea: oversized i64 displacement is NOT folded" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    // Inner add has no shl so Case A can't fold it either; the only
+    // candidate fold is the outer disp, which must be rejected because
+    // 2^32 does not fit a signed 32-bit displacement.
+    const base = func.newVReg();
+    const other = func.newVReg();
+    const inner = func.newVReg();
+    const cbig = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = other } }, .dest = inner, .type = .i64 });
+    try block.append(.{ .op = .{ .iconst_64 = 0x1_0000_0000 }, .dest = cbig, .type = .i64 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = inner, .rhs = cbig } }, .dest = result, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const changed = try foldCompoundLea(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(findLea(block) == null);
+}
+
+test "foldCompoundLea: multi-use inner add blocks the displacement fold" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    // `inner` is consumed by both the outer add and a second add, so the
+    // outer disp fold is unsafe (it would leave `inner` alive). No shl is
+    // present, so no scale-only fold applies either → nothing folds.
+    const base = func.newVReg();
+    const other = func.newVReg();
+    const inner = func.newVReg();
+    const c16 = func.newVReg();
+    const result = func.newVReg();
+    const other_use = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = other } }, .dest = inner, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = c16, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = inner, .rhs = c16 } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = inner, .rhs = base } }, .dest = other_use, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const changed = try foldCompoundLea(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(findLea(block) == null);
+}
+
+test "foldCompoundLea: end-to-end via pipeline removes dead shl/add" {
+    // Build base/idx from opaque loads so constantFold cannot collapse the
+    // expression, then run the full x86-64 pass pipeline and confirm the
+    // chain is folded to a single lea with the intermediates DCE'd.
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const mem = func.newVReg();
+    const base = func.newVReg();
+    const idx = func.newVReg();
+    const two = func.newVReg();
+    const shifted = func.newVReg();
+    const inner = func.newVReg();
+    const c16 = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = mem, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = mem, .offset = 0, .size = 4 } }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = mem, .offset = 4, .size = 4 } }, .dest = idx, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = two, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = idx, .rhs = two } }, .dest = shifted, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = shifted } }, .dest = inner, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = c16, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = inner, .rhs = c16 } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    _ = try module.addFunction(func);
+    _ = try runPasses(&module, defaultPassesForTarget(.x86_64), allocator);
+
+    var lea_count: usize = 0;
+    var shl_count: usize = 0;
+    var found: ?ir.Inst.Lea = null;
+    for (module.functions.items[0].blocks.items) |*bl| {
+        for (bl.instructions.items) |inst| {
+            switch (inst.op) {
+                .lea => {
+                    lea_count += 1;
+                    found = inst.op.lea;
+                },
+                .shl => shl_count += 1,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), lea_count);
+    try std.testing.expectEqual(@as(usize, 0), shl_count); // dead shl removed
+    const lea = found orelse return error.NoLea;
+    try std.testing.expectEqual(@as(u8, 4), lea.scale);
+    try std.testing.expectEqual(@as(i32, 16), lea.disp);
 }
 
 test "strengthReduceDivRem: div_u by 5 uses reciprocal multiply" {

@@ -357,6 +357,31 @@ fn bodyAddIntoLoad(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = loaded } }) catch unreachable;
 }
 
+/// Compound address `base + index*4 + 16` fed by two opaque memory loads.
+/// `foldCompoundLea` collapses the `shl` + inner `add` + outer `add` chain
+/// into a single `lea` (#543). The base/index come from loads rather than
+/// constants because `constantFold` would otherwise collapse the whole
+/// expression before the LEA fold could fire.
+fn bodyLeaCompound(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const mem = func.newVReg();
+    const base = func.newVReg();
+    const index = func.newVReg();
+    const two = func.newVReg();
+    const shifted = func.newVReg();
+    const inner = func.newVReg();
+    const c16 = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = mem, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = mem, .offset = 0, .size = 4 } }, .dest = base, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = mem, .offset = 4, .size = 4 } }, .dest = index, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = two, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .shl = .{ .lhs = index, .rhs = two } }, .dest = shifted, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = shifted } }, .dest = inner, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = c16, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = inner, .rhs = c16 } }, .dest = result, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
 // ── Branch benchmark bodies ───────────────────────────────────────────
 
 /// compare + br_if diamond — exercises Jcc fusion and branch layout.
@@ -423,7 +448,16 @@ fn bodyBrTable(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     const t3 = func.newBlock() catch unreachable;
 
     block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = idx, .type = .i32 }) catch unreachable;
-    const targets = &[_]ir.BlockId{ t0, t1, t2, t3 };
+    // `br_table.targets` must outlive this function: codegen reads it long
+    // after `bodyBrTable` returns, and IR does not copy or free it (see the
+    // "leaked by IR" note on the br_table compile test). A `&[_]…{…}` array
+    // literal would dangle here, so allocate a slice that survives (leaked;
+    // acceptable in a short-lived benchmark process).
+    const targets = func.allocator.alloc(ir.BlockId, 4) catch unreachable;
+    targets[0] = t0;
+    targets[1] = t1;
+    targets[2] = t2;
+    targets[3] = t3;
     block.append(.{ .op = .{ .br_table = .{ .index = idx, .targets = targets, .default = t0 } } }) catch unreachable;
 
     func.getBlock(t0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = r0, .type = .i32 }) catch unreachable;
@@ -913,6 +947,7 @@ pub fn main() !void {
         .{ .name = "3× load same base (hoisted)", .body = &bodyConsecutiveLoads },
         .{ .name = "div_u by const 7 (magic mul)", .body = &bodyDivByConst },
         .{ .name = "add base,const → load offset", .body = &bodyAddIntoLoad },
+        .{ .name = "base+index*4+16 → lea (#543)", .body = &bodyLeaCompound },
         .{ .name = "chained br_if same cond", .body = &bodyChainedBrIfSameCond },
         .{ .name = "4× load + sum (bounds elide)", .body = &bodyLoadStoreMulti },
         .{ .name = "reg pressure (12 live vals)", .body = &bodyRegPressure },
