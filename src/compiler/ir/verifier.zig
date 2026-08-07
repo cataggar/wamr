@@ -411,6 +411,10 @@ pub fn forEachOperand(
         .global_set => |gs| cb(ctx, gs.val),
 
         .load => |ld| cb(ctx, ld.base),
+        .lea => |l| {
+            cb(ctx, l.base);
+            cb(ctx, l.index);
+        },
         .v128_load => |ld| cb(ctx, ld.base),
         .v128_load_splat => |ld| cb(ctx, ld.base),
         .v128_load_zero => |ld| cb(ctx, ld.base),
@@ -1115,6 +1119,11 @@ fn checkOneInst(ctx: OperandCheckCtx, inst: ir.Inst) VerifyError!void {
 
         // Loads: `base` is the linear-memory pointer, always i32 in wasm32.
         .load => |ld| try ctx.expect(ld.base, .i32, "base"),
+        // Fused LEA: base/index share the op's integer width (i32/i64).
+        .lea => |l| {
+            try ctx.expect(l.base, inst.type, "base");
+            try ctx.expect(l.index, inst.type, "index");
+        },
         .v128_load => |ld| try ctx.expect(ld.base, .i32, "base"),
         .v128_load_splat => |ld| try ctx.expect(ld.base, .i32, "base"),
         .v128_load_zero => |ld| try ctx.expect(ld.base, .i32, "base"),

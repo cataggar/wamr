@@ -3278,6 +3278,38 @@ fn compileInst(
 
         // ── Linear memory load/store ─────────────────────────────────
         .load => |ld| try emitLoad(code, inst, ld, reg_map),
+
+        // ── Compound address (base + index*scale + disp) ─────────────
+        // The x86-64 `foldCompoundLea` pass is the only producer of `.lea`
+        // and it is gated to the x86-64 pipeline, so this arm is not
+        // reached in practice; it is provided so the op is lowered
+        // correctly should it ever appear on AArch64 (there is no single
+        // AArch64 addressing-compute instruction, so it expands to
+        // lsl + add [+ add disp]).
+        .lea => |l| {
+            const dest = inst.dest orelse return;
+            const scale_log2: u6 = switch (l.scale) {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                else => unreachable,
+            };
+            const idx = try useInto(code, reg_map, l.index, RegMap.tmp0);
+            if (scale_log2 != 0) {
+                try code.lslImm(RegMap.tmp0, idx, scale_log2);
+            } else if (idx != RegMap.tmp0) {
+                try code.addImm(RegMap.tmp0, idx, 0);
+            }
+            const base = try useInto(code, reg_map, l.base, RegMap.tmp1);
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
+            try code.addRegReg(info.reg, base, RegMap.tmp0);
+            if (l.disp != 0) {
+                try code.movImm64(RegMap.tmp1, @bitCast(@as(i64, l.disp)));
+                try code.addRegReg(info.reg, info.reg, RegMap.tmp1);
+            }
+            try destCommit(code, reg_map, info);
+        },
         .store => |st| try emitStore(code, st, reg_map),
 
         .ret => |maybe_val| {

@@ -146,6 +146,8 @@ fn formatPayload(op: ir.Inst.Op, w: *std.Io.Writer) Error!void {
         .f_ge,
         => |bin| try w.print(" v{d}, v{d}", .{ bin.lhs, bin.rhs }),
 
+        .lea => |l| try w.print(" base=v{d}, index=v{d}, scale={d}, disp={d}", .{ l.base, l.index, l.scale, l.disp }),
+
         // Scalar unary ops (single VReg payload)
         .clz,
         .ctz,

@@ -983,6 +983,11 @@ fn compileInst(
             try stack.push(code, .rax);
         },
 
+        // `.lea` is produced only by the x86-64 `foldCompoundLea` pass,
+        // whose output is lowered by the register-allocating path
+        // (`compileInstRA`). This legacy stack-machine path never sees it.
+        .lea => return error.UnimplementedOp,
+
         // ── Memory store ──────────────────────────────────────────────
         .store => |st| {
             try stack.pop(code, .rcx); // value
@@ -3278,6 +3283,36 @@ fn compileInstRA(
                     .xor => try code.xorRegReg(dr, rhs_reg),
                     else => unreachable,
                 }
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            }
+        },
+
+        // ── Fused address computation (LEA) ───────────────────────────
+        // dest = base + index*scale + disp, emitted as a single flag-free
+        // LEA (#543). Produced only by the `foldCompoundLea` peephole,
+        // which guarantees base/index are live here (they are the op's
+        // operands) and scale ∈ {1,2,4,8}. base→r11, index→r10 are
+        // non-allocatable scratches, so a spilled operand loaded into a
+        // scratch never clobbers the other operand's register.
+        .lea => |l| {
+            const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
+            const base_reg = try useVReg(code, alloc_result, l.base, .r11);
+            const index_reg = try useVReg(code, alloc_result, l.index, .r10);
+            const scale_log2: u2 = switch (l.scale) {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                else => unreachable,
+            };
+            if (inst.type == .i32) {
+                // 32-bit LEA truncates+zero-extends — exactly i32 wrapping,
+                // no trailing zero-extend needed (#393/#543).
+                try code.leaRegBaseIndexScaleDisp32(dr, base_reg, index_reg, scale_log2, l.disp);
+                try writeDef(code, alloc_result, dest, dr);
+            } else {
+                try code.leaRegBaseIndexScaleDisp64(dr, base_reg, index_reg, scale_log2, l.disp);
                 try writeDefTyped(code, alloc_result, dest, dr, inst.type);
             }
         },
@@ -6969,6 +7004,35 @@ test "compileFunctionRA: add of two non-constant values emits LEA" {
     try std.testing.expect(containsBytes(code, &.{0x8D}));
     // ADD reg,reg (opcode 01) must NOT appear — the LEA replaced it.
     // Check no standalone 01 in a REX+01 pattern. Just verify 0x8D is present.
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: .lea op emits a single LEA (0x8D) with disp" {
+    // Directly lower a `.lea` IR op (as produced by foldCompoundLea) and
+    // confirm codegen emits the LEA opcode. base/index come from local_get
+    // so they are real registers.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 3, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .lea = .{ .base = v0, .index = v1, .scale = 4, .disp = 16 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // LEA opcode present, and the disp8 = 16 (0x10) byte appears.
+    try std.testing.expect(containsBytes(code, &.{0x8D}));
+    try std.testing.expect(containsBytes(code, &.{0x10}));
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
 
