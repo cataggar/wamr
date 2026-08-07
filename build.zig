@@ -782,6 +782,36 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // #918 regression: `wamr serve` must shut down cleanly (exit 0) on
+    // SIGINT/SIGTERM rather than dying from the signal (macOS
+    // `Popen(-2)`) or wedging in `accept` until force-killed (Linux). A
+    // small driver (tests/component-http-shutdown/driver.zig) spawns
+    // `wamr serve --addr=127.0.0.1:0 http-service.wasm`, scrapes the
+    // kernel-assigned port from stdout, confirms one `GET / -> 200`
+    // request, then sends SIGINT and requires a *bounded, clean* exit 0.
+    //
+    // Gated on `jit` (the `-Djit=true` CI jobs build the in-process JIT
+    // needed to compile the ~3 MB P3 component in one process) and
+    // `aot_trampoline_pool_target` (its WASI imports need the host-import
+    // trampoline pool, unsupported on Windows / macOS-aarch64, same as
+    // `jit_component_smoke`). Also Linux-only because the driver drives
+    // the child with raw Linux `kill`/socket syscalls.
+    if (jit and aot_trampoline_pool_target and target.result.os.tag == .linux) {
+        const http_shutdown_driver = b.addExecutable(.{
+            .name = "component-http-shutdown-driver",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/component-http-shutdown/driver.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run_http_shutdown = b.addRunArtifact(http_shutdown_driver);
+        run_http_shutdown.addFileArg(exe.getEmittedBin());
+        run_http_shutdown.addFileArg(b.path("tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/http-service.wasm"));
+        run_http_shutdown.expectExitCode(0);
+        test_step.dependOn(&run_http_shutdown.step);
+    }
+
     // #760 regression: AOT `wasi:cli/exit.exit` must terminate the host
     // process with the requested discriminant rather than returning the
     // post-#714 sentinel through the canon-lower(aot) trampoline. Two
