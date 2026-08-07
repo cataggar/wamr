@@ -226,9 +226,11 @@ const RegMap = struct {
         return self.entries.get(vreg);
     }
 
-    /// FP-relative byte offset of a spill slot (scaled by 8 for LDR/STR X).
-    fn spillOffsetScaled(self: *const RegMap, slot_byte_off: u32) u12 {
-        return @intCast((self.spill_base + slot_byte_off) / 8);
+    /// FP-relative *byte* offset of a spill slot. Used by the frame-access
+    /// helpers (#916), which fall back to address materialization when the
+    /// offset overflows the 12-bit scaled LDR/STR immediate.
+    fn spillOffsetBytes(self: *const RegMap, slot_byte_off: u32) u32 {
+        return self.spill_base + slot_byte_off;
     }
 };
 
@@ -2716,6 +2718,20 @@ fn frameLoad(code: *emit.CodeBuffer, dst: emit.Reg, offset: u32) !void {
     }
 }
 
+/// Load `[fp + offset]` into `dst`, using `dst` itself as the scratch for
+/// the out-of-range address computation. Safe wherever `dst` is a
+/// freshly-allocated destination that is about to be overwritten anyway
+/// (e.g. spill reloads), and avoids clobbering the shared `tmp0`. #916.
+fn frameLoadReg(code: *emit.CodeBuffer, dst: emit.Reg, offset: u32) !void {
+    if (offset % 8 == 0 and offset / 8 <= 4095) {
+        try code.ldrImm(dst, .fp, @intCast(offset / 8));
+    } else {
+        try emitMovImm64(code, dst, offset);
+        try code.addRegReg(dst, dst, .fp);
+        try code.ldrImm(dst, dst, 0);
+    }
+}
+
 /// Compute `dst = fp + offset` for offsets that may exceed the 12-bit
 /// ADD-immediate range.
 fn frameAddr(code: *emit.CodeBuffer, dst: emit.Reg, offset: u32) !void {
@@ -2767,11 +2783,31 @@ const nop_word: u32 = 0xd503201f;
 /// before we know which regs the allocator will use.
 fn emitCalleeSaveStore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_saved_regs.len]usize {
     var offs: [callee_saved_regs.len]usize = undefined;
+    // Fast path: the highest slot offset still fits the 12-bit scaled
+    // STR immediate (imm12*8 ≤ 32760). Emit a direct fp-relative STR per
+    // reg so each slot stays a single word (required by the NOP-elision
+    // in `patchUnusedCalleeSaveSlots`).
+    const top_scaled = (callee_save_base + (callee_saved_regs.len - 1) * 8) / 8;
+    if (top_scaled <= 4095) {
+        for (callee_saved_regs, 0..) |r, i| {
+            code.peepholeBarrier();
+            offs[i] = code.len();
+            const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
+            try code.strImm(r, .fp, off_scaled);
+        }
+        code.peepholeBarrier();
+        return offs;
+    }
+    // Large frame (#916): materialize the callee-save base address into a
+    // scratch register once, then STR each reg at a small per-slot scaled
+    // offset (i ∈ [0,9], always in range). The one-time base setup is not
+    // part of `offs`, so NOP-elision still rewrites individual STRs safely.
+    code.peepholeBarrier();
+    try frameAddr(code, RegMap.tmp0, callee_save_base);
     for (callee_saved_regs, 0..) |r, i| {
         code.peepholeBarrier();
         offs[i] = code.len();
-        const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(r, .fp, off_scaled);
+        try code.strImm(r, RegMap.tmp0, @intCast(i));
     }
     code.peepholeBarrier();
     return offs;
@@ -2782,11 +2818,25 @@ fn emitCalleeSaveStore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_s
 /// via `patchUnusedCalleeSaveSlots`.
 fn emitCalleeSaveRestore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_saved_regs.len]usize {
     var offs: [callee_saved_regs.len]usize = undefined;
+    const top_scaled = (callee_save_base + (callee_saved_regs.len - 1) * 8) / 8;
+    if (top_scaled <= 4095) {
+        for (callee_saved_regs, 0..) |r, i| {
+            code.peepholeBarrier();
+            offs[i] = code.len();
+            const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
+            try code.ldrImm(r, .fp, off_scaled);
+        }
+        code.peepholeBarrier();
+        return offs;
+    }
+    // Large frame (#916): mirror `emitCalleeSaveStore`. tmp0 (x16) is dead
+    // at the epilogue — the return value is already staged in x0/x1/v0.
+    code.peepholeBarrier();
+    try frameAddr(code, RegMap.tmp0, callee_save_base);
     for (callee_saved_regs, 0..) |r, i| {
         code.peepholeBarrier();
         offs[i] = code.len();
-        const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(r, .fp, off_scaled);
+        try code.ldrImm(r, RegMap.tmp0, @intCast(i));
     }
     code.peepholeBarrier();
     return offs;
@@ -3378,7 +3428,7 @@ fn destBegin(reg_map: *RegMap, dest: ir.VReg, scratch: emit.Reg) !DestInfo {
 
 fn destCommit(code: *emit.CodeBuffer, reg_map: *const RegMap, info: DestInfo) !void {
     if (info.spill_slot) |off| {
-        try code.strImm(info.reg, .fp, reg_map.spillOffsetScaled(off));
+        try frameStore(code, info.reg, reg_map.spillOffsetBytes(off));
     }
 }
 
@@ -3408,7 +3458,7 @@ fn useInto(
     return switch (loc) {
         .reg => |r| r,
         .stack => |off| blk: {
-            try code.ldrImm(scratch, .fp, reg_map.spillOffsetScaled(off));
+            try frameLoadReg(code, scratch, reg_map.spillOffsetBytes(off));
             break :blk scratch;
         },
     };
@@ -5642,13 +5692,13 @@ fn emitLocMove(
     switch (src) {
         .reg => |src_reg| switch (dst) {
             .reg => |dst_reg| try code.movRegReg(dst_reg, src_reg),
-            .stack => |off| try code.strImm(src_reg, .fp, reg_map.spillOffsetScaled(off)),
+            .stack => |off| try frameStore(code, src_reg, reg_map.spillOffsetBytes(off)),
         },
         .stack => |src_off| switch (dst) {
-            .reg => |dst_reg| try code.ldrImm(dst_reg, .fp, reg_map.spillOffsetScaled(src_off)),
+            .reg => |dst_reg| try frameLoadReg(code, dst_reg, reg_map.spillOffsetBytes(src_off)),
             .stack => |dst_off| {
-                try code.ldrImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(src_off));
-                try code.strImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(dst_off));
+                try frameLoadReg(code, RegMap.tmp0, reg_map.spillOffsetBytes(src_off));
+                try frameStore(code, RegMap.tmp0, reg_map.spillOffsetBytes(dst_off));
             },
         },
     }
@@ -6768,8 +6818,7 @@ fn emitCall(
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask >> @intCast(i)) & 1 != 0) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7153,8 +7202,7 @@ fn emitTableSet(
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7185,8 +7233,7 @@ fn saveCallerSaveForCall(
         if (i >= RegMap.caller_saved_count) continue;
         if ((save_mask >> @intCast(i)) & 1 == 0) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
+        try frameStore(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7290,12 +7337,11 @@ fn stageArgFromSaved(
                 // Source reg was overwritten by earlier arg staging or
                 // by pre-staging fixup; read the saved value from its
                 // fixed call-save slot.
-                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_num * 8) / 8);
-                try code.ldrImm(target, .fp, slot_scaled);
+                try frameLoadReg(code, target, fctx.call_save_base + reg_num * 8);
             }
         },
         .stack => |off| {
-            try code.ldrImm(target, .fp, reg_map.spillOffsetScaled(off));
+            try frameLoadReg(code, target, reg_map.spillOffsetBytes(off));
         },
     }
 }
@@ -7332,8 +7378,7 @@ fn emitTableGrow(
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7402,12 +7447,11 @@ fn emitCallIndirect(
                     if (reg_idx >= 19) {
                         try code.movRegReg(RegMap.tmp2, r);
                     } else {
-                        const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-                        try code.ldrImm(RegMap.tmp2, .fp, slot_scaled);
+                        try frameLoadReg(code, RegMap.tmp2, fctx.call_save_base + reg_idx * 8);
                     }
                 },
                 .stack => |off| {
-                    try code.ldrImm(RegMap.tmp2, .fp, reg_map.spillOffsetScaled(off));
+                    try frameLoadReg(code, RegMap.tmp2, reg_map.spillOffsetBytes(off));
                 },
             }
         }
@@ -7499,8 +7543,7 @@ fn emitCallIndirect(
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask_ci >> @intCast(i)) & 1 != 0) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7585,8 +7628,7 @@ fn emitCallRef(
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask_cr >> @intCast(i)) & 1 != 0) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7702,12 +7744,11 @@ fn emitVmctxHelperCall(
                 if (reg_idx >= 19) {
                     try code.movRegReg(arg_regs[i], r);
                 } else {
-                    const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-                    try code.ldrImm(arg_regs[i], .fp, slot_scaled);
+                    try frameLoadReg(code, arg_regs[i], fctx.call_save_base + reg_idx * 8);
                 }
             },
             .stack => |off| {
-                try code.ldrImm(arg_regs[i], .fp, reg_map.spillOffsetScaled(off));
+                try frameLoadReg(code, arg_regs[i], reg_map.spillOffsetBytes(off));
             },
         }
     }
@@ -7732,8 +7773,7 @@ fn emitVmctxHelperCall(
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7757,12 +7797,11 @@ fn readVregStable(
             if (reg_idx >= 19) {
                 if (r != dest_reg) try code.movRegReg(dest_reg, r);
             } else {
-                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-                try code.ldrImm(dest_reg, .fp, slot_scaled);
+                try frameLoadReg(code, dest_reg, fctx.call_save_base + reg_idx * 8);
             }
         },
         .stack => |off| {
-            try code.ldrImm(dest_reg, .fp, reg_map.spillOffsetScaled(off));
+            try frameLoadReg(code, dest_reg, reg_map.spillOffsetBytes(off));
         },
     }
 }
@@ -7811,8 +7850,7 @@ fn emitTableInit(
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -7837,8 +7875,7 @@ fn emitElemDrop(
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -8306,8 +8343,7 @@ fn emitAtomicNotify(
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -8381,8 +8417,7 @@ fn emitAtomicWait(
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.ldrImm(reg, .fp, slot_scaled);
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }
 }
 
@@ -14872,6 +14907,80 @@ test "compile: binop with spilled operands emits LDR/STR via spill slots" {
         }
     }
     try std.testing.expect(found_ldr_from_fp);
+}
+
+test "compile: large frame beyond 12-bit scaled offset compiles (callee-save + spills) (#916)" {
+    // Regression for #916. On macOS ARM64 (and any aarch64 target) a
+    // function whose frame exceeds the LDR/STR unsigned scaled-immediate
+    // reach (imm12*8 = 32760 bytes for the 64-bit form) used to panic
+    // with "integer does not fit in destination type" while emitting the
+    // prologue callee-save stores (`@intCast` of the slot offset to u12).
+    //
+    // Force a >32 KiB frame by declaring a large local count (each i64
+    // local is an 8-byte frame slot, so ~5000 locals pushes the spill /
+    // call-save / callee-save regions well past the scaled-immediate
+    // limit), and add real register pressure so the allocator spills to
+    // the high spill region too. The whole thing must now compile without
+    // a host-side safety panic.
+    const allocator = std.testing.allocator;
+
+    const local_count = 5000; // 5000 * 8 = 40000 bytes > 32760.
+    var func = ir.IrFunction.init(allocator, 0, 1, local_count);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    // 30 simultaneously-live vregs exceed the allocatable GPRs and force
+    // spills; with the inflated local frame those spill slots land above
+    // the scaled-immediate limit, exercising the frameStore/frameLoadReg
+    // fallback in addition to the callee-save fix.
+    const n = 30;
+    var vregs: [n]ir.VReg = undefined;
+    for (&vregs, 0..) |*v, i| {
+        v.* = func.newVReg();
+        try func.getBlock(bid).append(.{
+            .op = .{ .iconst_64 = @intCast(i + 1) },
+            .dest = v.*,
+            .type = .i64,
+        });
+    }
+    var acc = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .add = .{ .lhs = vregs[0], .rhs = vregs[1] } },
+        .dest = acc,
+        .type = .i64,
+    });
+    for (2..n) |i| {
+        const next = func.newVReg();
+        try func.getBlock(bid).append(.{
+            .op = .{ .add = .{ .lhs = acc, .rhs = vregs[i] } },
+            .dest = next,
+            .type = .i64,
+        });
+        acc = next;
+    }
+    try func.getBlock(bid).append(.{ .op = .{ .ret = acc } });
+
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_scheduler = false, .enable_peephole = false });
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+
+    // The oversized frame must take the #916 large-frame callee-save path:
+    // the base address is materialized into tmp0 (x16) and each callee-save
+    // register is stored via `STR Xt, [x16, #i]` rather than a direct
+    // fp-relative store. Assert at least one STR with base register x16
+    // (rn == 16) is present. STR Xt,[Xn,#imm] top-10 opcode bits == 0x3E4.
+    var found_x16_based_store = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        const top = (w >> 22) & 0x3FF;
+        const rn = (w >> 5) & 0x1F;
+        if (top == 0x3E4 and rn == 16) {
+            found_x16_based_store = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_x16_based_store);
 }
 
 test "compileFunction: enable_xreg_alloc false keeps legacy fallback working" {
