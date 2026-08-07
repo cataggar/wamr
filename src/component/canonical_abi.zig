@@ -929,6 +929,10 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
             const cases = td.variant.cases;
             const disc_sz = discriminantSize(cases.len);
+            // Clear the whole variant region first so discriminant-slot
+            // padding and any unused tail (smaller active arm) are
+            // deterministically zero. See `zeroRange` (#842).
+            zeroRange(memory, ptr, sizeOfType(reg, t));
             switch (disc_sz) {
                 1 => storeU8(memory, ptr, @intCast(val.variant_val.discriminant)),
                 2 => storeU16(memory, ptr, @intCast(val.variant_val.discriminant)),
@@ -954,6 +958,10 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
         .option => {
             const idx = t.option;
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            // Clear the whole option region first (discriminant padding +
+            // unused `none` payload bytes) so consumers reading the slot
+            // as a full word see a clean value. See `zeroRange` (#842).
+            zeroRange(memory, ptr, sizeOfType(reg, t));
             if (val.option_val.is_some) {
                 storeU8(memory, ptr, 1);
                 const inner_align = alignOfType(reg, td.option.inner);
@@ -965,6 +973,11 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
         .result => {
             const idx = t.result;
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
+            // Clear the whole result region first so discriminant-slot
+            // padding and any unused tail (smaller active arm, e.g. the
+            // `ok` bool of `result<bool, error>`) are deterministically
+            // zero. See `zeroRange` (#842).
+            zeroRange(memory, ptr, sizeOfType(reg, t));
             // Per canon ABI: a `result<T, E>`'s payload alignment is the
             // **max** alignment across the ok and err arms (matching the
             // `variant` semantics fixed in PR #560 wave 2). Using the
@@ -1032,6 +1045,8 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
         },
         .variant => |v| {
             const disc_sz = discriminantSize(v.cases.len);
+            // Clear the whole variant region first (#842).
+            zeroRange(memory, ptr, sizeOfTypeDef(reg, td));
             switch (disc_sz) {
                 1 => storeU8(memory, ptr, @intCast(val.variant_val.discriminant)),
                 2 => storeU16(memory, ptr, @intCast(val.variant_val.discriminant)),
@@ -1072,6 +1087,8 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
             }
         },
         .option => |opt| {
+            // Clear the whole option region first (#842).
+            zeroRange(memory, ptr, sizeOfTypeDef(reg, td));
             if (val.option_val.is_some) {
                 storeU8(memory, ptr, 1);
                 const inner_align = alignOfType(reg, opt.inner);
@@ -1095,6 +1112,8 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
             if (res.ok) |ok_t| payload_align = @max(payload_align, alignOfType(reg, ok_t));
             if (res.err) |err_t| payload_align = @max(payload_align, alignOfType(reg, err_t));
             const payload_off = alignUp(ptr + 1, payload_align);
+            // Clear the whole result region first (#842).
+            zeroRange(memory, ptr, sizeOfTypeDef(reg, td));
             if (val.result_val.is_ok) {
                 storeU8(memory, ptr, 0);
                 // The WIT type may be `result<_, E>` (no ok payload).
@@ -1621,6 +1640,24 @@ fn loadU64(mem: []const u8, ptr: u32) u64 {
 fn storeU8(mem: []u8, ptr: u32, val: u8) void {
     const range = checkedRange(mem.len, ptr, 1) orelse return;
     mem[range.start] = val;
+}
+
+/// Zero `byte_len` bytes of `mem` starting at `ptr`, bounded to the
+/// backing slice. Used to clear the discriminant-slot padding and
+/// unused tail bytes of a `variant` / `option` / `result` before the
+/// active arm's data is written, so the lowered region is fully
+/// deterministic. Without this, the padding bytes between a 1-byte
+/// discriminant and its (wider-aligned) payload retain stale memory
+/// from a previous call. Guests that read a discriminant slot as a
+/// full `i32` word (rather than a byte load) then observe garbage —
+/// e.g. the `wasi:keyvalue` guest helper decodes
+/// `result<option<list<u8>>, error>` via `if (w[1] != 1) return null`,
+/// so a stale high byte turns a real `some` into a spurious `none`
+/// (issue #842). Zeroing here also protects `result<bool, error>`
+/// decoders that read the bool slot as a word. (#842)
+fn zeroRange(mem: []u8, ptr: u32, byte_len: u32) void {
+    const range = checkedRange(mem.len, ptr, byte_len) orelse return;
+    @memset(mem[range.start..range.end], 0);
 }
 
 fn storeU16(mem: []u8, ptr: u32, val: u16) void {
@@ -2399,4 +2436,79 @@ test "encode/decodeResourceWireAbi round-trip (#520 wave 2)" {
     // Wire 0 (the "uninitialised" sentinel) decodes to 0, which the
     // adapter-side `lookupSocket(0)` etc. will reject as out-of-range.
     try std.testing.expectEqual(@as(u32, 0), decodeResourceWireAbi(0));
+}
+
+test "storeValReg: option discriminant padding is zeroed for full-word reads (#842)" {
+    // Regression for #842: `wasi:keyvalue` (and other) guests decode an
+    // `option`/`result` discriminant by reading the whole slot as an
+    // i32 word (e.g. `if (w[1] != 1) return null`). The discriminant is
+    // a single byte, so bytes 1..3 are padding before the (4-aligned)
+    // payload. If a prior call left stale bytes there, a real `some`
+    // read as a full word looked like a spurious `none`, so results
+    // decoded as empty. storeValReg must zero the region first.
+    const types = [_]ctypes.TypeDef{
+        .{ .option = .{ .inner = .u32 } },
+    };
+    const reg = TypeRegistry.fromTypes(&types);
+
+    // Pre-dirty the whole buffer so any un-cleared byte is nonzero.
+    var mem = [_]u8{0xFF} ** 16;
+
+    var payload_val = InterfaceValue{ .u32 = 999 };
+    const val = InterfaceValue{ .option_val = .{ .is_some = true, .payload = &payload_val } };
+    try storeValReg(&mem, 0, .{ .option = 0 }, val, reg);
+
+    // The discriminant slot read as a full little-endian word must be
+    // exactly 1 (`some`), not 0x????_??01 with stale high bytes.
+    const disc_word = std.mem.readInt(u32, mem[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1), disc_word);
+    // Payload lands at offset 4.
+    try std.testing.expectEqual(@as(u32, 999), std.mem.readInt(u32, mem[4..8], .little));
+}
+
+test "storeValReg: result<option<list<u8>>, error> ok some clears discriminant padding (#842)" {
+    // This is the exact shape returned by `wasi:keyvalue` bucket `get`:
+    // `result<option<list<u8>>, error>`. The inner `option` has a
+    // 4-aligned `list` payload (ptr,len), so the option discriminant
+    // slot has 3 padding bytes before the payload. The `wasi:keyvalue`
+    // guest decodes the option by reading that slot as a full i32 word
+    // (`if (w[1] != 1) return null`), so stale padding turned a real
+    // `some` into a spurious `none` and every list decoded as empty
+    // (issue #842). Storing into a dirty buffer must leave the option
+    // discriminant word == 1.
+    const err_cases = [_]ctypes.Case{
+        .{ .name = "no-such-store", .type = null, .refines = null },
+    };
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .variant = .{ .cases = &err_cases } }, // 0: error variant
+        .{ .list = .{ .element = .u8 } }, // 1: list<u8>
+        .{ .option = .{ .inner = .{ .list = 1 } } }, // 2: option<list<u8>>
+        .{ .result = .{ .ok = .{ .option = 2 }, .err = .{ .variant = 0 } } }, // 3
+    };
+    const comp_idxspace = [_]?u32{ 0, 1, 2, 3 };
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+    const reg = TypeRegistry.init(&component);
+
+    // Pre-dirty so any un-cleared padding byte is nonzero.
+    var mem = [_]u8{0xFF} ** 32;
+
+    // Build the guest-observed value: ok(some([...])). The list is a
+    // PtrLen reference; contents don't matter for this padding check.
+    var list_val = InterfaceValue{ .list = .{ .ptr = 100, .len = 3 } };
+    var some_val = InterfaceValue{ .option_val = .{ .is_some = true, .payload = &list_val } };
+    const ok_val = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = &some_val } };
+    try storeValReg(&mem, 0, .{ .result = 3 }, ok_val, reg);
+
+    // result discriminant byte 0 == 0 (ok).
+    try std.testing.expectEqual(@as(u8, 0), mem[0]);
+    // The inner option starts at offset 4 (4-aligned). Its discriminant
+    // slot read as a full word must be exactly 1 (`some`), not
+    // 0x????_??01 with stale high bytes — the crux of #842.
+    const opt_disc_word = std.mem.readInt(u32, mem[4..8], .little);
+    try std.testing.expectEqual(@as(u32, 1), opt_disc_word);
+    // list ptr,len land at offsets 8 and 12.
+    try std.testing.expectEqual(@as(u32, 100), std.mem.readInt(u32, mem[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, mem[12..16], .little));
 }
