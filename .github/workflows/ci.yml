@@ -258,6 +258,49 @@ jobs:
       - name: Run unfiltered WASI Preview 3 conformance contract
         run: zig build wasi-p3-testsuite-unfiltered -Doptimize=ReleaseSafe
 
+  wasi-p3-testsuite-arm64:
+    name: Build & Test (wasi-p3-testsuite-arm64)
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 45
+    # The AArch64 counterpart of the `wasi-p3-testsuite` job above, which
+    # runs on x86_64 only. That single-architecture coverage is what let
+    # #929 through: five P3 fixtures stall under AOT on AArch64 while all
+    # 41 pass on x86_64, and nothing in CI observed it.
+    #
+    # Non-blocking until #929 is fixed (same precedent as `jit-parity`
+    # below); `ci-summary` deliberately omits it from needs[]. Flip it into
+    # the gate once AArch64 reaches 41/41.
+    continue-on-error: true
+    env:
+      # Bound the harness so a stalled guest fails one fixture instead of
+      # wedging the suite and burning the whole job timeout (#929).
+      WAMR_TESTSUITE_TIMEOUT: "30"
+      WAMR_TESTSUITE_OP_TIMEOUT: "30"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: true
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./.github/actions/zig-cache
+
+      - name: Install wasi-testsuite runner deps
+        run: |
+          python3 -m pip install --user --break-system-packages \
+            -r tests/wasi-testsuite/test-runner/requirements.txt
+
+      - name: Build wamr (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run unfiltered WASI Preview 3 conformance contract
+        run: zig build wasi-p3-testsuite-unfiltered -Doptimize=ReleaseSafe
+
   jit-parity:
     name: Build & Test (jit-parity)
     runs-on: ubuntu-22.04
