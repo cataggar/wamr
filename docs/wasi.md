@@ -335,6 +335,20 @@ PR [#585](https://github.com/cataggar/wamr/pull/585)).
 $ WAMR_TESTSUITE_TIMEOUT=30 zig build wasi-testsuite
 ```
 
+### `WAMR_COMPILE_TIMEOUT`
+
+`WAMR_TESTSUITE_TIMEOUT` bounds only the guest process wait. Adapter-side
+`wamrc` precompilation runs *before* that process exists, so a codegen hang
+there is otherwise unbounded — it stalls until the CI job timeout cancels the
+job, which skips the `if: always()` artifact upload and destroys the
+diagnostics along with it. `WAMR_COMPILE_TIMEOUT=<seconds>` bounds a single
+`wamrc` invocation and defaults to 600 s
+([#616](https://github.com/cataggar/wamr/issues/616) D3).
+
+```console
+$ WAMR_COMPILE_TIMEOUT=120 zig build wasi-p3-testsuite
+```
+
 ### Outbound HTTPS in unit tests
 
 Off by default so CI stays hermetic:

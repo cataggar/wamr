@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -18,6 +19,9 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 EXPECTED_FIXTURES = 41
+# Never start a sample that cannot plausibly finish; anything
+# shorter is guaranteed to be recorded as a timeout.
+_MIN_SAMPLE_BUDGET_S = 120.0
 ROOT = Path(__file__).resolve().parent.parent
 SUITE = (
     ROOT
@@ -213,11 +217,40 @@ def _sample_is_valid(
     return not errors, errors
 
 
+def _terminate_process_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """Kill the runner and every descendant it spawned.
+
+    A timed-out sample usually means `wamrc` or a guest process is
+    wedged. Killing only the direct child would leave those grandchildren
+    running and contending with the samples that follow, so the child is
+    started in its own session and the whole group is signalled.
+    """
+    if proc.poll() is not None:
+        return
+    if os.name != "nt":
+        for signal_number in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal_number)
+            except (ProcessLookupError, PermissionError, OSError):
+                break
+            try:
+                proc.wait(timeout=10)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+    proc.kill()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run_sample(
     mode: str,
     temperature: str,
     index: int,
     output_dir: Path,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
     run_id = f"{mode}-{temperature}-{index:02d}"
     raw_dir = output_dir / "raw"
@@ -248,16 +281,23 @@ def _run_sample(
     else:
         env.pop("WAMR_JIT_TESTSUITE", None)
 
+    timed_out = False
     started_ns = time.perf_counter_ns()
     with log.open("w", encoding="UTF-8") as output:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, str(UNFILTERED)],
             cwd=ROOT,
             env=env,
             stdout=output,
             stderr=subprocess.STDOUT,
-            check=False,
+            start_new_session=os.name != "nt",
         )
+        try:
+            returncode = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process_tree(proc)
+            returncode = proc.returncode if proc.returncode is not None else -1
     suite_duration_ns = time.perf_counter_ns() - started_ns
 
     counts = (
@@ -266,12 +306,17 @@ def _run_sample(
         else {"fixtures": 0, "executed": 0, "passed": 0, "failed": 0}
     )
     events = parse_jsonl(timing) if timing.is_file() else []
-    valid, errors = _sample_is_valid(
-        mode, temperature, proc.returncode, counts, events
-    )
+    if timed_out:
+        valid = False
+        errors = [f"sample exceeded {timeout_s:g}s and was terminated"]
+    else:
+        valid, errors = _sample_is_valid(
+            mode, temperature, returncode, counts, events
+        )
     print(
         f"{run_id}: valid={valid} passed={counts['passed']}/"
-        f"{EXPECTED_FIXTURES} elapsed={suite_duration_ns / 1e9:.3f}s",
+        f"{EXPECTED_FIXTURES} elapsed={suite_duration_ns / 1e9:.3f}s"
+        f"{' TIMEOUT' if timed_out else ''}",
         flush=True,
     )
     return {
@@ -280,7 +325,8 @@ def _run_sample(
         "index": index,
         "valid": valid,
         "errors": errors,
-        "returncode": proc.returncode,
+        "timed_out": timed_out,
+        "returncode": returncode,
         "suite_duration_ns": suite_duration_ns,
         "counts": counts,
         "events": events,
@@ -293,6 +339,8 @@ def _run_sample(
 def run_collection(args: argparse.Namespace) -> int:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    deadline_s = args.deadline_minutes * 60 if args.deadline_minutes else None
+    started_ns = time.perf_counter_ns()
     document = {
         "schema_version": SCHEMA_VERSION,
         "kind": "wasi-p3-profile-runs",
@@ -301,21 +349,50 @@ def run_collection(args: argparse.Namespace) -> int:
             "cold_samples": args.cold_samples,
             "warm_samples": args.warm_samples,
             "optimize": "ReleaseSafe",
+            "sample_timeout_s": args.sample_timeout,
+            "deadline_minutes": args.deadline_minutes,
         },
+        "planned_samples": args.cold_samples + args.warm_samples,
+        "stopped_early": False,
+        "stop_reason": "",
         "samples": [],
     }
     destination = output_dir / "samples.json"
+
+    def persist() -> None:
+        destination.write_text(json.dumps(document, indent=2) + "\n", encoding="UTF-8")
+
+    persist()
     for temperature, count in (
         ("cold", args.cold_samples),
         ("warm", args.warm_samples),
     ):
         for index in range(1, count + 1):
+            timeout_s = args.sample_timeout
+            if deadline_s is not None:
+                remaining = deadline_s - (time.perf_counter_ns() - started_ns) / 1e9
+                # Stop while there is still time for the caller to upload
+                # what has been collected. A job-level timeout cancels the
+                # workflow run outright, which skips even `if: always()`
+                # upload steps and destroys the evidence. (#616 D3.)
+                if remaining <= _MIN_SAMPLE_BUDGET_S:
+                    document["stopped_early"] = True
+                    document["stop_reason"] = (
+                        f"collection deadline of {args.deadline_minutes}min reached "
+                        f"after {len(document['samples'])} of "
+                        f"{document['planned_samples']} samples"
+                    )
+                    print(f"stopping early: {document['stop_reason']}", flush=True)
+                    persist()
+                    validate_run_document(document)
+                    return 1
+                timeout_s = (
+                    min(timeout_s, remaining) if timeout_s is not None else remaining
+                )
             document["samples"].append(
-                _run_sample(args.mode, temperature, index, output_dir)
+                _run_sample(args.mode, temperature, index, output_dir, timeout_s)
             )
-            destination.write_text(
-                json.dumps(document, indent=2) + "\n", encoding="UTF-8"
-            )
+            persist()
     validate_run_document(document)
     return 0 if all(sample["valid"] for sample in document["samples"]) else 1
 
@@ -386,6 +463,13 @@ def _positive_int(raw: str) -> int:
     return value
 
 
+def _positive_float(raw: str) -> float:
+    value = float(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -396,6 +480,21 @@ def main() -> int:
     collect.add_argument("--output-dir", type=Path, required=True)
     collect.add_argument("--cold-samples", type=_positive_int, default=5)
     collect.add_argument("--warm-samples", type=_positive_int, default=10)
+    collect.add_argument(
+        "--sample-timeout",
+        type=_positive_float,
+        default=1800.0,
+        help="wall-clock bound in seconds for one unfiltered suite sample",
+    )
+    collect.add_argument(
+        "--deadline-minutes",
+        type=_positive_float,
+        default=None,
+        help=(
+            "stop collecting once this much wall clock has elapsed so the "
+            "caller can still upload partial evidence before any job timeout"
+        ),
+    )
     collect.set_defaults(func=run_collection)
 
     profile = subparsers.add_parser("profile", help="capture selected macOS samples")
