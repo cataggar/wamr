@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Tuple
 
 WAMR = shlex.split(os.getenv("WAMR", "wamr"))
 _DEFAULT_TIMEOUT_SECONDS = 5.0
+_DEFAULT_COMPILE_TIMEOUT_SECONDS = 600.0
 
 
 def _resolve_wamrc() -> List[str]:
@@ -133,13 +134,47 @@ def _profile_command(cmd: List[str], fixture: Path, phase: str) -> List[str]:
     ]
 
 
+def get_compile_timeout_seconds() -> float:
+    """Wall-clock bound for a single `wamrc` invocation.
+
+    Precompilation runs before the guest process exists, so it is not
+    covered by `WAMR_TESTSUITE_TIMEOUT` (which only bounds the guest
+    wait). An unbounded compile turns a codegen hang into a silent
+    multi-hour stall that outlives the CI job timeout and destroys the
+    diagnostics with it. Override with `WAMR_COMPILE_TIMEOUT`. (#616 D3.)
+    """
+    raw = os.getenv("WAMR_COMPILE_TIMEOUT")
+    if not raw:
+        return _DEFAULT_COMPILE_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError:
+        timeout = 0
+    if timeout <= 0:
+        print(
+            f"warning: ignoring invalid WAMR_COMPILE_TIMEOUT={raw!r}; "
+            f"falling back to {_DEFAULT_COMPILE_TIMEOUT_SECONDS}s",
+            file=sys.stderr,
+        )
+        return _DEFAULT_COMPILE_TIMEOUT_SECONDS
+    return timeout
+
+
 def _run_compile(cmd: List[str], fixture: Path, phase: str) -> None:
     """Run wamrc, optionally attaching macOS's sampling profiler."""
-    subprocess.run(
-        _profile_command(cmd, fixture, phase),
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    timeout = get_compile_timeout_seconds()
+    try:
+        subprocess.run(
+            _profile_command(cmd, fixture, phase),
+            check=True,
+            stdout=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"wamrc {phase} for {fixture.name} exceeded "
+            f"{timeout:g}s (WAMR_COMPILE_TIMEOUT)"
+        ) from exc
 
 
 def get_name() -> str:

@@ -16,16 +16,25 @@ permissions:
 
 jobs:
   measure:
-    name: Measure (${{ matrix.platform_id }})
+    name: Measure (${{ matrix.platform_id }}, ${{ matrix.mode }})
     strategy:
       fail-fast: false
       matrix:
+        platform_id: [macos-arm64, linux-arm64]
+        mode: [aot, jit]
         include:
           - platform_id: macos-arm64
             runner: macos-14
           - platform_id: linux-arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # AOT and JIT are separate jobs so each mode gets a full budget. Run
+    # 31259495409 was cancelled at this timeout while still inside the AOT
+    # phase on both platforms, leaving the JIT phase unreachable and — because
+    # a job-level timeout cancels the job rather than failing a step — skipping
+    # the `if: always()` upload and destroying every diagnostic. The harness
+    # `--deadline-minutes` below is what actually stops the work, so the upload
+    # and enforcement steps always run. (#616 D3.)
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -51,7 +60,7 @@ jobs:
 
       - name: Record raw host metadata
         env:
-          OUT: wasi-p3-measure-${{ matrix.platform_id }}
+          OUT: wasi-p3-measure-${{ matrix.platform_id }}-${{ matrix.mode }}
         shell: bash
         run: |
           set -euo pipefail
@@ -69,30 +78,47 @@ jobs:
             '^(ImageOS|RUNNER_|ZIG_(GLOBAL|LOCAL)_CACHE_DIR)=' \
             > "$OUT/runner-environment.txt"
 
-      - name: Build ReleaseSafe AOT tools
-        run: zig build -Doptimize=ReleaseSafe
+      - name: Build ReleaseSafe tools
+        run: |
+          if [ '${{ matrix.mode }}' = jit ]; then
+            zig build -Doptimize=ReleaseSafe -Djit=true
+          else
+            zig build -Doptimize=ReleaseSafe
+          fi
 
-      - name: Measure AOT — 5 cold and 10 warm unfiltered suites
-        id: measure-aot
+      - name: Measure ${{ matrix.mode }} — 5 cold and 10 warm unfiltered suites
+        id: measure
         continue-on-error: true
         env:
           WAMR: ${{ github.workspace }}/zig-out/bin/wamr
           WAMRC: ${{ github.workspace }}/zig-out/bin/wamrc
+          # Match `build.zig`'s unfiltered P3 gates. Without this the adapter
+          # falls back to its 5s default, which is far tighter than the gate
+          # these measurements are meant to mirror. JIT recompiles every
+          # fixture in-process with no cross-process cache, so it needs more.
+          WAMR_TESTSUITE_TIMEOUT: ${{ matrix.mode == 'jit' && '120' || '30' }}
+          # Bound adapter-side `wamrc` precompilation, which runs before the
+          # guest process exists and is therefore not covered above.
+          WAMR_COMPILE_TIMEOUT: "600"
         run: |
           python3 scripts/wasi_p3_profile.py run \
-            --mode aot \
+            --mode '${{ matrix.mode }}' \
             --platform-id '${{ matrix.platform_id }}' \
             --cold-samples 5 \
             --warm-samples 10 \
-            --output-dir 'wasi-p3-measure-${{ matrix.platform_id }}/aot'
+            --sample-timeout 900 \
+            --deadline-minutes 300 \
+            --output-dir 'wasi-p3-measure-${{ matrix.platform_id }}-${{ matrix.mode }}/${{ matrix.mode }}'
 
+      # Runs in every job so each uploaded artifact is self-contained and the
+      # aggregate does not depend on artifact ordering to find a report.
       - name: Characterize wasi-microbench without budget enforcement
         id: microbench
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          OUT='wasi-p3-measure-${{ matrix.platform_id }}/microbench'
+          OUT='wasi-p3-measure-${{ matrix.platform_id }}-${{ matrix.mode }}/microbench'
           mkdir -p "$OUT"
           zig build wasi-microbench -Doptimize=ReleaseSafe -- \
             --samples 10 \
@@ -101,47 +127,25 @@ jobs:
             --json "$OUT/report.json" \
             > "$OUT/report.txt" 2>&1
 
-      - name: Build ReleaseSafe JIT tools
-        id: build-jit
-        if: always()
-        run: zig build -Doptimize=ReleaseSafe -Djit=true
-
-      - name: Measure JIT equivalent — 5 cold and 10 warm unfiltered suites
-        id: measure-jit
-        if: always() && steps.build-jit.outcome == 'success'
-        continue-on-error: true
-        env:
-          WAMR: ${{ github.workspace }}/zig-out/bin/wamr
-          WAMRC: ${{ github.workspace }}/zig-out/bin/wamrc
-        run: |
-          python3 scripts/wasi_p3_profile.py run \
-            --mode jit \
-            --platform-id '${{ matrix.platform_id }}' \
-            --cold-samples 5 \
-            --warm-samples 10 \
-            --output-dir 'wasi-p3-measure-${{ matrix.platform_id }}/jit'
-
       - name: Upload raw measurements and conformance reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wasi-p3-measure-${{ matrix.platform_id }}
-          path: wasi-p3-measure-${{ matrix.platform_id }}/
+          name: wasi-p3-measure-${{ matrix.platform_id }}-${{ matrix.mode }}
+          path: wasi-p3-measure-${{ matrix.platform_id }}-${{ matrix.mode }}/
           if-no-files-found: error
           retention-days: 90
 
       - name: Enforce successful measurement phases
         if: always()
         env:
-          AOT: ${{ steps.measure-aot.outcome }}
+          MEASURE: ${{ steps.measure.outcome }}
           MICROBENCH: ${{ steps.microbench.outcome }}
-          BUILD_JIT: ${{ steps.build-jit.outcome }}
-          JIT: ${{ steps.measure-jit.outcome }}
         shell: bash
         run: |
           set -euo pipefail
           failed=0
-          for phase in AOT MICROBENCH BUILD_JIT JIT; do
+          for phase in MEASURE MICROBENCH; do
             outcome="${!phase}"
             printf '%s=%s\n' "$phase" "$outcome"
             if [ "$outcome" != success ]; then failed=1; fi

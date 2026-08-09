@@ -273,5 +273,102 @@ class ProfileTestCase(unittest.TestCase):
         self.assertIn(("jit", "http-fields", "fixture_execution"), keys)
 
 
+    def test_sample_timeout_terminates_runner_and_its_children(self) -> None:
+        """A wedged sample must be bounded and leave nothing behind.
+
+        Before #616 D3 the runner was invoked without a timeout, so a
+        stuck `wamrc` ran until the CI job timeout cancelled the job,
+        which skipped the `if: always()` upload and destroyed the
+        evidence.
+        """
+        marker = self.scratch / "grandchild-started"
+        stub = self.scratch / "hang.py"
+        stub.write_text(
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c',\n"
+            f"    \"import time; open({str(marker)!r}, 'w').close();\"\n"
+            '    "time.sleep(600)"])\n'
+            "time.sleep(600)\n",
+            encoding="UTF-8",
+        )
+        with mock.patch.object(profile, "UNFILTERED", stub):
+            sample = profile._run_sample(
+                "jit", "warm", 1, self.scratch / "out", timeout_s=5
+            )
+
+        self.assertTrue(sample["timed_out"])
+        self.assertFalse(sample["valid"])
+        self.assertLess(sample["suite_duration_ns"], 60_000_000_000)
+        self.assertIn("exceeded", sample["errors"][0])
+        # The document must still satisfy the schema so partial evidence
+        # can be uploaded and inspected.
+        profile.validate_run_document(
+            {
+                "schema_version": profile.SCHEMA_VERSION,
+                "kind": "wasi-p3-profile-runs",
+                "metadata": {
+                    "mode": "jit",
+                    "platform_id": "test",
+                    "commit": "0" * 40,
+                },
+                "samples": [sample],
+            }
+        )
+        self.assertTrue(marker.exists(), "stub never spawned a grandchild")
+        if os.name != "nt":
+            import subprocess as sp
+
+            survivors = sp.run(
+                ["pgrep", "-f", "time.sleep(600)"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.split()
+            self.assertEqual(survivors, [], "descendant processes leaked")
+
+    def test_collection_deadline_stops_early_and_persists_evidence(self) -> None:
+        output_dir = self.scratch / "deadline"
+        args = argparse.Namespace(
+            mode="jit",
+            platform_id="test",
+            output_dir=output_dir,
+            cold_samples=5,
+            warm_samples=10,
+            sample_timeout=900.0,
+            deadline_minutes=0.001,
+        )
+        self.assertEqual(profile.run_collection(args), 1)
+        document = json.loads(
+            (output_dir / "samples.json").read_text(encoding="UTF-8")
+        )
+        self.assertTrue(document["stopped_early"])
+        self.assertIn("deadline", document["stop_reason"])
+        self.assertEqual(document["planned_samples"], 15)
+        self.assertEqual(document["samples"], [])
+
+    def test_compile_timeout_is_bounded_and_configurable(self) -> None:
+        adapter = _load_adapter()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                adapter.get_compile_timeout_seconds(),
+                adapter._DEFAULT_COMPILE_TIMEOUT_SECONDS,
+            )
+        with mock.patch.dict(os.environ, {"WAMR_COMPILE_TIMEOUT": "12"}, clear=True):
+            self.assertEqual(adapter.get_compile_timeout_seconds(), 12.0)
+        with mock.patch.dict(os.environ, {"WAMR_COMPILE_TIMEOUT": "nope"}, clear=True):
+            self.assertEqual(
+                adapter.get_compile_timeout_seconds(),
+                adapter._DEFAULT_COMPILE_TIMEOUT_SECONDS,
+            )
+        with mock.patch.dict(os.environ, {"WAMR_COMPILE_TIMEOUT": "2"}, clear=True):
+            with self.assertRaises(RuntimeError) as caught:
+                adapter._run_compile(
+                    [sys.executable, "-c", "import time; time.sleep(120)"],
+                    Path("fixture.wasm"),
+                    "component_precompile",
+                )
+        self.assertIn("WAMR_COMPILE_TIMEOUT", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
