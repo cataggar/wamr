@@ -1971,21 +1971,50 @@ const HttpFetchRequest = struct {
 /// resource-table entry across adapter/worker lifetimes.
 const HttpFetchOptions = struct {
     connect_timeout_ns: ?u64 = null,
+    first_byte_timeout_ns: ?u64 = null,
+    between_bytes_timeout_ns: ?u64 = null,
 
     fn fromRequestOptions(options: ?*const RequestOptions) HttpFetchOptions {
         const value = options orelse return .{};
-        return .{ .connect_timeout_ns = value.connect_timeout_ns };
+        return .{
+            .connect_timeout_ns = value.connect_timeout_ns,
+            .first_byte_timeout_ns = value.first_byte_timeout_ns,
+            .between_bytes_timeout_ns = value.between_bytes_timeout_ns,
+        };
     }
 
     /// Convert the WIT nanosecond duration without narrowing. Zig's
     /// `Io.Duration.nanoseconds` is i96, so every u64 value is exactly
     /// representable, including `maxInt(u64)`.
-    fn connectTimeout(self: HttpFetchOptions) std.Io.Timeout {
-        const ns = self.connect_timeout_ns orelse return .none;
+    fn timeoutFromNs(ns: ?u64) std.Io.Timeout {
+        const value = ns orelse return .none;
         return .{ .duration = .{
-            .raw = .{ .nanoseconds = @as(i96, ns) },
+            .raw = .{ .nanoseconds = @as(i96, value) },
             .clock = .awake,
         } };
+    }
+
+    /// `request-options.connect-timeout`: budget for acquiring one
+    /// hop's connection, i.e. DNS + TCP + (for `https`) the eager TLS
+    /// handshake `Client.connectTcpOptions` performs inline.
+    fn connectTimeout(self: HttpFetchOptions) std.Io.Timeout {
+        return timeoutFromNs(self.connect_timeout_ns);
+    }
+
+    /// `request-options.first-byte-timeout`: budget for one hop's
+    /// request transmission plus response-head arrival. Applied per
+    /// redirect hop, so a slow chain cannot borrow an earlier hop's
+    /// unused budget.
+    fn firstByteTimeout(self: HttpFetchOptions) std.Io.Timeout {
+        return timeoutFromNs(self.first_byte_timeout_ns);
+    }
+
+    /// `request-options.between-bytes-timeout`: budget for each
+    /// individual body chunk read. A fresh deadline is derived per
+    /// chunk, which is what "reset on progress" means — arriving bytes
+    /// re-arm the window rather than draining a whole-body budget.
+    fn betweenBytesTimeout(self: HttpFetchOptions) std.Io.Timeout {
+        return timeoutFromNs(self.between_bytes_timeout_ns);
     }
 };
 
@@ -3194,6 +3223,11 @@ fn mapHttpFetchError(err: anyerror) HttpErrorCode {
         error.NetworkDown,
         => .destination_unavailable,
         error.Timeout => .connection_timeout,
+        // Response-phase budgets (`first-byte-timeout` /
+        // `between-bytes-timeout`) must not be reported as a
+        // connection timeout: the connection succeeded and it is the
+        // response that was too slow (#616 A1).
+        error.HttpResponseTimeout => .HTTP_response_timeout,
         error.AccessDenied => .destination_IP_prohibited,
 
         // ── TLS (ConnectTcpError remaps `Connection.Tls.create` failures
@@ -3368,10 +3402,22 @@ fn httpClientConnectBeforeDeadline(
 /// behavior rather than silently bypassing an active proxy. TLS still
 /// uses `std.http.Client.Connection.Tls`: the CA bundle initialization
 /// normally performed by `Client.request` must happen before the
-/// explicit TLS connection is acquired. Zig performs the wire TLS
-/// handshake lazily during request I/O, after this connector returns,
-/// so that handshake and any reconnect performed by automatic
-/// redirects are intentionally not claimed as deadline-covered.
+/// explicit TLS connection is acquired, which is why this function
+/// rescans the bundle itself.
+///
+/// The TLS handshake is covered by this deadline. `connectTcpOptions`
+/// builds an `https` connection through `Connection.Tls.create`, which
+/// calls `std.crypto.tls.Client.init` inline; that constructor flushes
+/// the ClientHello and reads server records through `finished`, so the
+/// full handshake completes before `connectTcpOptions` returns and
+/// therefore inside the raced budget. (An earlier revision of this
+/// comment described the handshake as lazily performed during request
+/// I/O; that is not how Zig 0.16 behaves.)
+///
+/// Redirect hops are covered too, because `httpClientLowLevelFetch`
+/// drives redirects itself and routes every hop back through this
+/// function, instead of letting `Request.receiveHead` reconnect via
+/// the untimed `Client.connect`.
 fn httpClientConnectWithTimeout(
     client: *std.http.Client,
     uri: std.Uri,
@@ -3415,6 +3461,118 @@ fn httpClientConnectWithTimeout(
     );
 }
 
+/// Payload type of a raced response-phase operation, i.e. its return
+/// type with any error union stripped.
+fn HttpRacedPayload(comptime op: anytype) type {
+    const Ret = @typeInfo(@TypeOf(op)).@"fn".return_type.?;
+    return switch (@typeInfo(Ret)) {
+        .error_union => |eu| eu.payload,
+        else => Ret,
+    };
+}
+
+fn HttpRaceOutcome(comptime op: anytype) type {
+    return union(enum) {
+        value: @typeInfo(@TypeOf(op)).@"fn".return_type.?,
+        deadline: std.Io.Cancelable!void,
+    };
+}
+
+/// Race a response-phase operation against a *relative* WIT budget.
+///
+/// Unlike `httpClientConnectBeforeDeadlineUsing`, which converts once
+/// to an absolute deadline so DNS + TCP + TLS share a single connect
+/// budget, this helper deliberately takes the relative duration and
+/// starts a fresh timer per call. That is precisely the WIT
+/// "reset on progress" semantic: each redirect hop gets its own
+/// `first-byte-timeout`, and each body chunk that arrives re-arms the
+/// `between-bytes-timeout` rather than drawing down a whole-response
+/// budget.
+///
+/// Callers must not invoke this with `.none`; an unset WIT timeout has
+/// to run the operation directly so no task is spawned and the
+/// zero-configuration path keeps its current cost.
+///
+/// Budget expiry surfaces as `error.HttpResponseTimeout`, which
+/// `mapHttpFetchError` maps to `HTTP_response_timeout` — response-phase
+/// expiry must never be reported as `connection-timeout` (#616 A1).
+/// The losing task is cancelled and joined before returning, so any
+/// stack state it borrowed (`Request`, `Io.Writer`) is quiescent by the
+/// time the caller unwinds.
+fn httpAwaitBeforeDeadline(
+    comptime op: anytype,
+    io: std.Io,
+    budget: std.Io.Timeout,
+    op_args: std.meta.ArgsTuple(@TypeOf(op)),
+) anyerror!HttpRacedPayload(op) {
+    const U = HttpRaceOutcome(op);
+    var outcome_buffer: [2]U = undefined;
+    var select = std.Io.Select(U).init(io, &outcome_buffer);
+
+    try select.concurrent(.deadline, std.Io.Timeout.sleep, .{ budget, io });
+    select.concurrent(.value, op, op_args) catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+
+    const first = select.await() catch |err| {
+        select.cancelDiscard();
+        return err;
+    };
+    return switch (first) {
+        .value => |result| completed: {
+            // Only the void-returning timer can remain; it owns no
+            // resources, so discarding its cancelled result is safe.
+            select.cancelDiscard();
+            break :completed try result;
+        },
+        .deadline => |result| expired: {
+            select.cancelDiscard();
+            try result;
+            break :expired error.HttpResponseTimeout;
+        },
+    };
+}
+
+/// Run `op`, bounding it by `budget` only when the guest actually set
+/// the corresponding `request-options` timeout. `.none` runs inline.
+fn httpRunWithOptionalDeadline(
+    comptime op: anytype,
+    io: std.Io,
+    budget: std.Io.Timeout,
+    op_args: std.meta.ArgsTuple(@TypeOf(op)),
+) anyerror!HttpRacedPayload(op) {
+    return switch (budget) {
+        .none => try @call(.auto, op, op_args),
+        else => try httpAwaitBeforeDeadline(op, io, budget, op_args),
+    };
+}
+
+/// Redirect hops followed for a repeatable (payload-free) outbound
+/// request. Matches the `RedirectBehavior.init(3)` budget the adapter
+/// previously handed to `Request.receiveHead`, so guest-visible
+/// redirect behavior is unchanged; only the timing ownership moved.
+const http_max_redirect_hops: u16 = 3;
+
+/// Scratch space for resolving `Location` headers across a redirect
+/// chain. RFC 9110 recommends supporting at least 8000 bytes of
+/// redirect URI, and `Uri.resolveInPlace` consumes the buffer
+/// monotonically (each hop's resolved URI keeps borrowing its own
+/// region), so the budget covers the whole chain rather than one hop.
+const http_redirect_buffer_bytes: usize = 8 * 1024;
+
+/// Apply the RFC 9110 method rewrite a redirect implies. 303 always
+/// downgrades to GET; 301/302 downgrade only a POST. Mirrors
+/// `std.http.Client.Request.redirect` so guest-visible behavior does
+/// not change now that the adapter owns the redirect loop.
+fn httpRedirectMethod(status: std.http.Status, method: std.http.Method) std.http.Method {
+    return switch (status) {
+        .see_other => .GET,
+        .moved_permanently, .found => if (method == .POST) .GET else method,
+        else => method,
+    };
+}
+
 /// Drive a single outbound HTTP request through the lower-level
 /// `std.http.Client.request` / `Request.receiveHead` /
 /// `Response.readerDecompressing` API and capture the full
@@ -3450,6 +3608,17 @@ fn httpClientConnectWithTimeout(
 /// is handled by the existing `defer req.deinit()` chain — no
 /// explicit close needed. Pass `null` if the caller has no shared
 /// block (e.g. direct unit-test invocations). (#583 B1 follow-up)
+///
+/// Redirects are followed by this function rather than by
+/// `Request.receiveHead` (#616 A1). Automatic redirects reconnect
+/// through the untimed `Client.connect`, which left every hop after
+/// the first outside the guest's `connect-timeout`, and put the whole
+/// chain under a single response budget. Owning the loop lets each hop
+/// re-run `httpClientConnectWithTimeout` and start a fresh
+/// `first-byte-timeout`. The guest-visible policy is unchanged:
+/// payload-free requests follow up to `http_max_redirect_hops` hops
+/// and then fail with `error.TooManyHttpRedirects`, requests carrying a
+/// payload are never redirected and surface the 3xx response as-is.
 fn httpClientLowLevelFetch(
     allocator: Allocator,
     io: std.Io,
@@ -3470,137 +3639,189 @@ fn httpClientLowLevelFetch(
     };
     defer client.deinit();
 
-    const uri = try std.Uri.parse(url);
+    // Redirect scratch. `Uri.resolveInPlace` consumes `aux_buf`
+    // monotonically, so every hop's resolved URI keeps borrowing its
+    // own region and earlier hops stay valid as resolution bases.
+    var redirect_storage: [http_redirect_buffer_bytes]u8 = undefined;
+    var aux_buf: []u8 = &redirect_storage;
 
-    // Leave the unset case on Client.request's original connection
-    // path. When set, acquire the initial connection with the timeout
-    // and transfer it to Request; Request.deinit retains its existing
-    // cancellation, redirect, connection-pool, and TLS cleanup paths.
-    const connection = switch (options.connectTimeout()) {
-        .none => null,
-        else => |timeout| try httpClientConnectWithTimeout(&client, uri, timeout),
-    };
-    var req = client.request(method, uri, .{
-        .extra_headers = extra_headers,
-        .keep_alive = false,
-        .connection = connection,
-        // Mirror `std.http.Client.fetch`: when there is no payload the
-        // request is repeatable so we follow up to 3 redirects; with a
-        // payload we surface the redirect to the caller as
-        // `error.RedirectRequiresResend` so they can act on it.
-        .redirect_behavior = if (payload == null)
-            @as(std.http.Client.Request.RedirectBehavior, @enumFromInt(3))
-        else
-            .unhandled,
-    }) catch |err| {
-        if (connection) |conn| client.connection_pool.release(conn, io);
-        return err;
-    };
-    defer req.deinit();
+    // `receiveHead` never resolves redirects for us now, so it needs no
+    // buffer of its own.
+    const no_redirect_buffer: []u8 = &.{};
 
-    // Pre-send sync point: connect / TLS handshake already done; bail
-    // before pushing the request head + body on the wire if the
-    // guest cancelled.
-    try checkHttpCancel(cancelled);
+    var uri = try std.Uri.parse(url);
+    var hop_method = method;
+    // A request carrying a payload is not repeatable, so it is never
+    // redirected and the 3xx reaches the guest verbatim — the same
+    // outcome the previous `.unhandled` redirect behavior produced.
+    var hops_remaining: u16 = if (payload == null) http_max_redirect_hops else 0;
 
-    if (payload) |p| {
-        req.transfer_encoding = .{ .content_length = p.len };
-        var body_writer = try req.sendBodyUnflushed(&.{});
-        try body_writer.writer.writeAll(p);
-        try body_writer.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
-    }
-
-    // Pre-receive-head sync point: request fully on the wire; bail
-    // before blocking on the response.
-    try checkHttpCancel(cancelled);
-
-    // RFC 9110 recommends ≥ 8000 bytes for the redirect / merged-URI
-    // buffer; the spec ceiling on a header section is `max_http_header_bytes`.
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-
-    // Snapshot headers BEFORE invoking `response.reader(...)` — that
-    // call invalidates `response.head.bytes`, which the iterator
-    // points into.
-    var hdr_list: std.ArrayListUnmanaged(HttpFieldEntry) = .empty;
-    errdefer {
-        for (hdr_list.items) |e| {
-            allocator.free(e.name);
-            allocator.free(e.value);
-        }
-        hdr_list.deinit(allocator);
-    }
-    {
-        var hit = response.head.iterateHeaders();
-        while (hit.next()) |h| {
-            // Trailers are not surfaced through `incoming-response.headers`
-            // per the WIT spec — they have their own `future-trailers`
-            // resource. Stop at the trailer boundary.
-            if (hit.is_trailer) break;
-            if (isTransportManagedHeader(h.name)) continue;
-            const name_copy = try allocator.dupe(u8, h.name);
-            errdefer allocator.free(name_copy);
-            const value_copy = try allocator.dupe(u8, h.value);
-            errdefer allocator.free(value_copy);
-            try hdr_list.append(allocator, .{ .name = name_copy, .value = value_copy });
-        }
-    }
-
-    const status_code: u16 = @intFromEnum(response.head.status);
-
-    // Pre-body-read sync point: response head + headers captured;
-    // bail before draining the body if the guest cancelled. Any
-    // bytes the kernel has already buffered are abandoned by the
-    // deferred `req.deinit()` close.
-    try checkHttpCancel(cancelled);
-
-    // Drain the body. HEAD / 1xx / 204 / 304 responses have no body
-    // per RFC 9110; `Request.receiveHead` leaves the reader in `.ready`
-    // for those and `response.reader(...)` short-circuits to `.ending`.
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-
-    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-        .identity => &.{},
-        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
-        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
-        .compress => return error.UnsupportedCompressionMethod,
-    };
-    defer if (decompress_buffer.len != 0) allocator.free(decompress_buffer);
-
-    var transfer_buffer: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-
-    // Chunked body-read loop with per-chunk cancel polling. Equivalent
-    // to `Reader.streamRemaining` but interleaves a
-    // `cancelled.load(.acquire)` check at each
-    // `http_cancel_body_chunk_bytes` boundary so a `task.cancel`
-    // issued mid-body is observed within one chunk's latency. On
-    // cancel the partial `aw` buffer is freed by its `errdefer`, so
-    // any bytes already streamed are discarded cleanly.
-    const chunk_limit: std.Io.Limit = .limited(http_cancel_body_chunk_bytes);
     while (true) {
+        // Leave the unset case on Client.request's original connection
+        // path. When set, acquire this hop's connection with the
+        // timeout and transfer it to Request; Request.deinit retains
+        // its existing cancellation, connection-pool, and TLS cleanup.
+        const connection = switch (options.connectTimeout()) {
+            .none => null,
+            else => |timeout| try httpClientConnectWithTimeout(&client, uri, timeout),
+        };
+        var req = client.request(hop_method, uri, .{
+            .extra_headers = extra_headers,
+            .keep_alive = false,
+            .connection = connection,
+            // The adapter owns the redirect loop; see the doc comment.
+            .redirect_behavior = .unhandled,
+        }) catch |err| {
+            if (connection) |conn| client.connection_pool.release(conn, io);
+            return err;
+        };
+        defer req.deinit();
+
+        // Pre-send sync point: connect / TLS handshake already done;
+        // bail before pushing the request head + body on the wire if
+        // the guest cancelled.
         try checkHttpCancel(cancelled);
-        _ = body_reader.stream(&aw.writer, chunk_limit) catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => return response.bodyErr().?,
-            else => |e| return e,
+
+        if (payload) |p| {
+            req.transfer_encoding = .{ .content_length = p.len };
+            var body_writer = try req.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(p);
+            try body_writer.end();
+            try req.connection.?.flush();
+        } else {
+            try req.sendBodiless();
+        }
+
+        // Pre-receive-head sync point: request fully on the wire; bail
+        // before blocking on the response.
+        try checkHttpCancel(cancelled);
+
+        // `first-byte-timeout` is armed per hop. The response head is
+        // the observable proxy for "the first byte of the response" —
+        // the same point Wasmtime bounds — and a fresh timer here is
+        // what makes the budget per-hop rather than per-chain.
+        var response = try httpRunWithOptionalDeadline(
+            std.http.Client.Request.receiveHead,
+            io,
+            options.firstByteTimeout(),
+            .{ &req, no_redirect_buffer },
+        );
+
+        if (response.head.status.class() == .redirect and payload == null) {
+            if (hops_remaining == 0) return error.TooManyHttpRedirects;
+
+            const location = response.head.location orelse
+                return error.HttpRedirectLocationMissing;
+            if (location.len > aux_buf.len) return error.HttpRedirectLocationOversize;
+            @memcpy(aux_buf[0..location.len], location);
+            const next_uri = uri.resolveInPlace(location.len, &aux_buf) catch |err| switch (err) {
+                error.NoSpaceLeft => return error.HttpRedirectLocationOversize,
+                else => return error.HttpRedirectLocationInvalid,
+            };
+
+            // Suppress the body drain `Request.deinit` performs for a
+            // half-read response. This hop's connection is never reused
+            // (`keep_alive = false`), and that discard would be an
+            // unbounded read sitting outside every WIT budget.
+            if (req.connection) |conn| conn.closing = true;
+
+            hop_method = httpRedirectMethod(response.head.status, hop_method);
+            uri = next_uri;
+            hops_remaining -= 1;
+            continue;
+        }
+
+        // Snapshot headers BEFORE invoking `response.reader(...)` — that
+        // call invalidates `response.head.bytes`, which the iterator
+        // points into.
+        var hdr_list: std.ArrayListUnmanaged(HttpFieldEntry) = .empty;
+        errdefer {
+            for (hdr_list.items) |e| {
+                allocator.free(e.name);
+                allocator.free(e.value);
+            }
+            hdr_list.deinit(allocator);
+        }
+        {
+            var hit = response.head.iterateHeaders();
+            while (hit.next()) |h| {
+                // Trailers are not surfaced through `incoming-response.headers`
+                // per the WIT spec — they have their own `future-trailers`
+                // resource. Stop at the trailer boundary.
+                if (hit.is_trailer) break;
+                if (isTransportManagedHeader(h.name)) continue;
+                const name_copy = try allocator.dupe(u8, h.name);
+                errdefer allocator.free(name_copy);
+                const value_copy = try allocator.dupe(u8, h.value);
+                errdefer allocator.free(value_copy);
+                try hdr_list.append(allocator, .{ .name = name_copy, .value = value_copy });
+            }
+        }
+
+        const status_code: u16 = @intFromEnum(response.head.status);
+
+        // Pre-body-read sync point: response head + headers captured;
+        // bail before draining the body if the guest cancelled. Any
+        // bytes the kernel has already buffered are abandoned by the
+        // deferred `req.deinit()` close.
+        try checkHttpCancel(cancelled);
+
+        // Drain the body. HEAD / 1xx / 204 / 304 responses have no body
+        // per RFC 9110; `Request.receiveHead` leaves the reader in `.ready`
+        // for those and `response.reader(...)` short-circuits to `.ending`.
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        defer if (decompress_buffer.len != 0) allocator.free(decompress_buffer);
+
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+
+        // Chunked body-read loop with per-chunk cancel polling. Equivalent
+        // to `Reader.streamRemaining` but interleaves a
+        // `cancelled.load(.acquire)` check at each
+        // `http_cancel_body_chunk_bytes` boundary so a `task.cancel`
+        // issued mid-body is observed within one chunk's latency. On
+        // cancel the partial `aw` buffer is freed by its `errdefer`, so
+        // any bytes already streamed are discarded cleanly.
+        //
+        // Each chunk is additionally bounded by `between-bytes-timeout`
+        // with a freshly armed timer, so a chunk that arrives re-arms
+        // the window: the budget is "time without progress", not a
+        // whole-body allowance.
+        const chunk_limit: std.Io.Limit = .limited(http_cancel_body_chunk_bytes);
+        const between_bytes = options.betweenBytesTimeout();
+        while (true) {
+            try checkHttpCancel(cancelled);
+            _ = httpRunWithOptionalDeadline(
+                std.Io.Reader.stream,
+                io,
+                between_bytes,
+                .{ body_reader, &aw.writer, chunk_limit },
+            ) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return response.bodyErr().?,
+                else => |e| return e,
+            };
+        }
+
+        var body_al = aw.toArrayList();
+        const body = try body_al.toOwnedSlice(allocator);
+        errdefer allocator.free(body);
+
+        return .{
+            .status = status_code,
+            .headers = try hdr_list.toOwnedSlice(allocator),
+            .body = body,
         };
     }
-
-    var body_al = aw.toArrayList();
-    const body = try body_al.toOwnedSlice(allocator);
-    errdefer allocator.free(body);
-
-    return .{
-        .status = status_code,
-        .headers = try hdr_list.toOwnedSlice(allocator),
-        .body = body,
-    };
 }
 
 const max_http_header_bytes: usize = 64 * 1024;
@@ -39121,6 +39342,436 @@ test "wasi:http #583 B1 follow-up: httpClientLowLevelFetch observes cancel mid-b
     server.thread.join();
     try testing.expect(done.load(.acquire));
     try testing.expect(was_cancelled.load(.acquire));
+}
+
+/// Synthetic response-phase operation used by the #616 A1 deadline
+/// tests: sleeps for `ns` and then reports the sentinel. Racing this
+/// against a shorter budget exercises exactly the machinery
+/// `receiveHead` and the body-chunk reads go through, without needing
+/// a socket.
+fn testHttpSlowOp(io: std.Io, ns: u64, sentinel: usize) error{Canceled}!usize {
+    const dur: std.Io.Clock.Duration = .{
+        .raw = .{ .nanoseconds = @as(i96, ns) },
+        .clock = .awake,
+    };
+    try dur.sleep(io);
+    return sentinel;
+}
+
+test "wasi:http #616 A1: request-options snapshot carries all three transport timeouts" {
+    const testing = std.testing;
+
+    // An absent `request-options` leaves every budget unset so the
+    // zero-configuration path keeps running operations inline.
+    const unset = HttpFetchOptions.fromRequestOptions(null);
+    try testing.expectEqual(@as(?u64, null), unset.connect_timeout_ns);
+    try testing.expectEqual(@as(?u64, null), unset.first_byte_timeout_ns);
+    try testing.expectEqual(@as(?u64, null), unset.between_bytes_timeout_ns);
+    try testing.expect(unset.connectTimeout() == .none);
+    try testing.expect(unset.firstByteTimeout() == .none);
+    try testing.expect(unset.betweenBytesTimeout() == .none);
+
+    // Before #616 A1 the snapshot dropped `first-byte` and
+    // `between-bytes` on the floor, so the response phase ran
+    // unbounded no matter what the guest configured.
+    const opts: RequestOptions = .{
+        .connect_timeout_ns = 1,
+        .first_byte_timeout_ns = 2,
+        .between_bytes_timeout_ns = 3,
+    };
+    const snapshot = HttpFetchOptions.fromRequestOptions(&opts);
+    try testing.expectEqual(@as(?u64, 1), snapshot.connect_timeout_ns);
+    try testing.expectEqual(@as(?u64, 2), snapshot.first_byte_timeout_ns);
+    try testing.expectEqual(@as(?u64, 3), snapshot.between_bytes_timeout_ns);
+
+    // `Io.Duration.nanoseconds` is i96, so the whole u64 WIT domain
+    // round-trips without narrowing.
+    const max_ns: u64 = std.math.maxInt(u64);
+    const saturated = HttpFetchOptions{
+        .first_byte_timeout_ns = max_ns,
+        .between_bytes_timeout_ns = max_ns,
+    };
+    switch (saturated.firstByteTimeout()) {
+        .duration => |d| try testing.expectEqual(@as(i96, max_ns), d.raw.nanoseconds),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (saturated.betweenBytesTimeout()) {
+        .duration => |d| try testing.expectEqual(@as(i96, max_ns), d.raw.nanoseconds),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "wasi:http #616 A1: response-phase expiry maps to HTTP-response-timeout, not connection-timeout" {
+    const testing = std.testing;
+
+    // `error.Timeout` still means "the connect budget expired", so it
+    // must keep its `connection-timeout` mapping.
+    try testing.expectEqual(HttpErrorCode.connection_timeout, mapHttpFetchError(error.Timeout));
+
+    // A `first-byte` / `between-bytes` expiry happens on a connection
+    // that was established successfully, so reporting it as a
+    // connection timeout would misattribute the failure.
+    try testing.expectEqual(
+        HttpErrorCode.HTTP_response_timeout,
+        mapHttpFetchError(error.HttpResponseTimeout),
+    );
+}
+
+test "wasi:http #616 A1: unset budget runs the operation inline and returns its value" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // `.none` must not spawn a racing timer: an unconfigured guest
+    // keeps the exact cost it had before #616 A1.
+    const got = try httpRunWithOptionalDeadline(
+        testHttpSlowOp,
+        io,
+        .none,
+        .{ io, 0, 0xA1 },
+    );
+    try testing.expectEqual(@as(usize, 0xA1), got);
+}
+
+test "wasi:http #616 A1: an operation finishing inside its budget keeps its result" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Generous budget versus an immediate operation: the raced path
+    // must be transparent when the deadline is not hit, otherwise
+    // every bounded read would corrupt its own result.
+    const got = try httpRunWithOptionalDeadline(
+        testHttpSlowOp,
+        io,
+        .{ .duration = .{ .raw = .{ .nanoseconds = 30 * std.time.ns_per_s }, .clock = .awake } },
+        .{ io, 0, 0xB2 },
+    );
+    try testing.expectEqual(@as(usize, 0xB2), got);
+}
+
+test "wasi:http #616 A1: an operation exceeding its budget fails with HttpResponseTimeout" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // This is the shape of a server that accepts the connection and
+    // then never sends a response head (or stalls mid-body). Before
+    // #616 A1 the adapter waited forever; now the budget wins and the
+    // guest gets `HTTP_response_timeout`.
+    const result = httpRunWithOptionalDeadline(
+        testHttpSlowOp,
+        io,
+        .{ .duration = .{ .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms }, .clock = .awake } },
+        .{ io, 60 * std.time.ns_per_s, 0xC3 },
+    );
+    try testing.expectError(error.HttpResponseTimeout, result);
+    if (result) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expectEqual(HttpErrorCode.HTTP_response_timeout, mapHttpFetchError(err));
+    }
+}
+
+test "wasi:http #616 A1: each raced call re-arms its budget so progress resets the window" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // `between-bytes-timeout` is "time without progress", not a
+    // whole-body allowance. The body loop therefore arms a fresh timer
+    // per chunk; several chunks in a row must all succeed even though
+    // their combined duration exceeds one chunk's budget.
+    const budget: std.Io.Timeout = .{
+        .duration = .{ .raw = .{ .nanoseconds = 5 * std.time.ns_per_s }, .clock = .awake },
+    };
+    var chunk: usize = 0;
+    while (chunk < 4) : (chunk += 1) {
+        const got = try httpRunWithOptionalDeadline(
+            testHttpSlowOp,
+            io,
+            budget,
+            .{ io, 1 * std.time.ns_per_ms, chunk },
+        );
+        try testing.expectEqual(chunk, got);
+    }
+}
+
+test "wasi:http #616 A1: redirect method rewrite matches RFC 9110" {
+    const testing = std.testing;
+
+    // 303 always downgrades to GET.
+    try testing.expectEqual(std.http.Method.GET, httpRedirectMethod(.see_other, .POST));
+    try testing.expectEqual(std.http.Method.GET, httpRedirectMethod(.see_other, .PUT));
+
+    // 301 / 302 downgrade only POST; every other method is preserved.
+    try testing.expectEqual(std.http.Method.GET, httpRedirectMethod(.moved_permanently, .POST));
+    try testing.expectEqual(std.http.Method.GET, httpRedirectMethod(.found, .POST));
+    try testing.expectEqual(std.http.Method.PUT, httpRedirectMethod(.found, .PUT));
+    try testing.expectEqual(std.http.Method.HEAD, httpRedirectMethod(.moved_permanently, .HEAD));
+
+    // 307 / 308 exist precisely to preserve the method.
+    try testing.expectEqual(
+        std.http.Method.POST,
+        httpRedirectMethod(.temporary_redirect, .POST),
+    );
+    try testing.expectEqual(
+        std.http.Method.POST,
+        httpRedirectMethod(.permanent_redirect, .POST),
+    );
+
+    // The adapter's hop budget must stay equal to the
+    // `RedirectBehavior.init(3)` budget it replaced, so guest-visible
+    // redirect behavior did not change when the loop moved in-tree.
+    try testing.expectEqual(@as(u16, 3), http_max_redirect_hops);
+}
+
+/// Loopback server for the #616 A1 redirect tests. Serves
+/// `connections` sequential requests: the first `redirects` of them
+/// answer with a 3xx carrying a `Location` (and a body, so the test
+/// also covers the adapter refusing to drain a redirect body), and any
+/// remaining request answers 200. Each hop's request line is recorded
+/// so the test can assert the loop actually walked the chain.
+const TestHttpRedirectServerCtx = struct {
+    const max_hops = 8;
+    const line_capacity = 128;
+
+    allocator: Allocator,
+    server: std.Io.net.Server,
+    redirects: u32,
+    redirect_status: []const u8,
+    connections: u32,
+    request_lines: [max_hops][line_capacity]u8 = undefined,
+    request_line_lens: [max_hops]usize = @splat(0),
+    served: u32 = 0,
+
+    fn run(self: *TestHttpRedirectServerCtx) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        defer {
+            var srv = self.server;
+            srv.deinit(io);
+        }
+
+        var hop: u32 = 0;
+        while (hop < self.connections) : (hop += 1) {
+            const stream = self.server.accept(io) catch return;
+            defer stream.close(io);
+
+            var req_buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (total < req_buf.len) {
+                var dests = [_][]u8{req_buf[total..]};
+                const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
+            }
+
+            if (hop < max_hops) {
+                const eol = std.mem.indexOf(u8, req_buf[0..total], "\r\n") orelse total;
+                const len = @min(eol, line_capacity);
+                @memcpy(self.request_lines[hop][0..len], req_buf[0..len]);
+                self.request_line_lens[hop] = len;
+            }
+            self.served = hop + 1;
+
+            var head_buf: [256]u8 = undefined;
+            const response = if (hop < self.redirects)
+                std.fmt.bufPrint(
+                    &head_buf,
+                    "HTTP/1.1 {s}\r\nLocation: /hop{d}\r\nContent-Length: 4\r\n" ++
+                        "Connection: close\r\n\r\nskip",
+                    .{ self.redirect_status, hop + 1 },
+                ) catch return
+            else
+                std.fmt.bufPrint(
+                    &head_buf,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfinal",
+                    .{},
+                ) catch return;
+
+            const slices = [_][]const u8{response};
+            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &slices, 1) catch return;
+        }
+    }
+};
+
+const TestHttpRedirectServer = struct {
+    thread: std.Thread,
+    port: u16,
+    ctx: *TestHttpRedirectServerCtx,
+
+    fn serveLoopback(
+        allocator: Allocator,
+        redirects: u32,
+        redirect_status: []const u8,
+        connections: u32,
+    ) !TestHttpRedirectServer {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var any: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+        const server = try std.Io.net.IpAddress.listen(&any, io, .{ .kernel_backlog = 4 });
+        const bound = switch (server.socket.address) {
+            .ip4 => |v4| v4.port,
+            else => {
+                var srv_mut = server;
+                srv_mut.deinit(io);
+                return error.SkipZigTest;
+            },
+        };
+        const ctx = try allocator.create(TestHttpRedirectServerCtx);
+        errdefer allocator.destroy(ctx);
+        ctx.* = .{
+            .allocator = allocator,
+            .server = server,
+            .redirects = redirects,
+            .redirect_status = redirect_status,
+            .connections = connections,
+        };
+        const t = try std.Thread.spawn(.{}, TestHttpRedirectServerCtx.run, .{ctx});
+        return .{ .thread = t, .port = bound, .ctx = ctx };
+    }
+
+    fn requestLine(self: *const TestHttpRedirectServer, hop: usize) []const u8 {
+        return self.ctx.request_lines[hop][0..self.ctx.request_line_lens[hop]];
+    }
+};
+
+test "wasi:http #616 A1: adapter-owned redirect loop walks each hop under its own connect budget" {
+    // The adapter now follows redirects itself so every hop is
+    // acquired through `httpClientConnectWithTimeout`. Previously
+    // `Request.receiveHead` reconnected via the untimed
+    // `Client.connect`, leaving hops 2..n outside `connect-timeout`
+    // entirely. A non-zero connect budget is set here so the test
+    // fails if any hop ever bypasses the timed connector.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var server = TestHttpRedirectServer.serveLoopback(
+        testing.allocator,
+        2,
+        "302 Found",
+        3,
+    ) catch return error.SkipZigTest;
+    defer testing.allocator.destroy(server.ctx);
+    defer server.thread.join();
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/start", .{server.port});
+    defer testing.allocator.free(url);
+
+    // Deadline enforcement needs a backend that can race and cancel
+    // syscalls, which is why the adapter keeps its own
+    // `http_worker_io` instead of the single-threaded global.
+    var worker_io: std.Io.Threaded = .init(testing.allocator, .{});
+    defer worker_io.deinit();
+    const io = worker_io.io();
+
+    const result = try httpClientLowLevelFetch(
+        testing.allocator,
+        io,
+        url,
+        .GET,
+        &.{},
+        null,
+        .{ .connect_timeout_ns = 30 * std.time.ns_per_s },
+        null,
+    );
+    defer testing.allocator.free(result.body);
+    defer freeOwnedHttpHeaders(testing.allocator, result.headers);
+
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try testing.expectEqualStrings("final", result.body);
+
+    // Three connections: the original request plus one per followed
+    // hop, each targeting the resolved relative `Location`.
+    try testing.expectEqual(@as(u32, 3), server.ctx.served);
+    try testing.expectEqualStrings("GET /start HTTP/1.1", server.requestLine(0));
+    try testing.expectEqualStrings("GET /hop1 HTTP/1.1", server.requestLine(1));
+    try testing.expectEqualStrings("GET /hop2 HTTP/1.1", server.requestLine(2));
+}
+
+test "wasi:http #616 A1: redirect hop budget still matches the replaced stdlib behavior" {
+    // `RedirectBehavior.init(3)` followed three hops and failed the
+    // fourth with `error.TooManyHttpRedirects`. Moving the loop in-tree
+    // must not have changed that guest-visible contract.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+
+    // Always redirect; the client is expected to give up after four
+    // connections (initial request + three follows).
+    var server = TestHttpRedirectServer.serveLoopback(
+        testing.allocator,
+        100,
+        "302 Found",
+        4,
+    ) catch return error.SkipZigTest;
+    defer testing.allocator.destroy(server.ctx);
+    defer server.thread.join();
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/start", .{server.port});
+    defer testing.allocator.free(url);
+
+    var worker_io: std.Io.Threaded = .init(testing.allocator, .{});
+    defer worker_io.deinit();
+
+    const result = httpClientLowLevelFetch(
+        testing.allocator,
+        worker_io.io(),
+        url,
+        .GET,
+        &.{},
+        null,
+        .{},
+        null,
+    );
+    try testing.expectError(error.TooManyHttpRedirects, result);
+}
+
+test "wasi:http #616 A1: a stalled response head expires against first-byte-timeout" {
+    // Server accepts the connection and reads the request, then never
+    // sends a response head. Before #616 A1 the adapter blocked here
+    // forever regardless of `request-options`; now the per-hop
+    // `first-byte-timeout` fires and maps to `HTTP_response_timeout`.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var request_received: std.atomic.Value(bool) = .{ .raw = false };
+    var unblock_response: std.atomic.Value(bool) = .{ .raw = false };
+    var server = TestHttpPhaseServer.serveLoopback(
+        testing.allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+        "hello",
+        "",
+        &request_received,
+        &unblock_response,
+        null,
+        null,
+    ) catch return error.SkipZigTest;
+
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/", .{server.port});
+    defer testing.allocator.free(url);
+
+    var worker_io: std.Io.Threaded = .init(testing.allocator, .{});
+    defer worker_io.deinit();
+
+    const result = httpClientLowLevelFetch(
+        testing.allocator,
+        worker_io.io(),
+        url,
+        .GET,
+        &.{},
+        null,
+        .{ .first_byte_timeout_ns = 50 * std.time.ns_per_ms },
+        null,
+    );
+    // Release the server thread now that the client has given up.
+    unblock_response.store(true, .release);
+    server.thread.join();
+
+    try testing.expectError(error.HttpResponseTimeout, result);
 }
 
 test "wasi:clocks/monotonic-clock@0.3 polyfill: subscribe-duration pollable fires via P3 timer (#483)" {
