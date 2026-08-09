@@ -379,6 +379,32 @@ diagnostics along with it. `WAMR_COMPILE_TIMEOUT=<seconds>` bounds a single
 $ WAMR_COMPILE_TIMEOUT=120 zig build wasi-p3-testsuite
 ```
 
+### `WAMR_TESTSUITE_OP_TIMEOUT`
+
+`WAMR_TESTSUITE_TIMEOUT` bounds only `do_wait`'s `Popen.wait`. Fixtures that
+declare an `operations` list (`sockets-echo`, `cli-stdio-roundtrip`, …) also
+perform blocking work on the *harness* side, none of which upstream bounds:
+`do_connect` does an unbounded `readline()` on the guest's stdout to discover
+`host:port`, and `do_read` / `do_send` / `do_recv` block on a pipe or socket
+with no timeout.
+
+A guest that starts but never produces its expected output therefore parks the
+harness forever, so **one wedged fixture hangs the entire suite** instead of
+failing a single test. That is exactly how five AArch64 AOT fixtures consumed
+900 s profiling samples while reporting nothing at all
+([#929](https://github.com/cataggar/wamr/issues/929)).
+
+Each blocking operation now runs under a watchdog that kills the guest process
+when the deadline expires. Killing the guest is what actually unblocks the
+harness: its stdout hits EOF and its sockets are closed by the kernel, so
+upstream's existing error paths turn the stall into an ordinary failure with a
+precise message. `WAMR_TESTSUITE_OP_TIMEOUT=<seconds>` sets the budget;
+unset, it inherits `WAMR_TESTSUITE_TIMEOUT`, falling back to 60 s.
+
+```console
+$ WAMR_TESTSUITE_OP_TIMEOUT=30 zig build wasi-p3-testsuite
+```
+
 ### Outbound HTTPS in unit tests
 
 Off by default so CI stays hermetic:
