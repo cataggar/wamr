@@ -9727,15 +9727,26 @@ pub const WasiCliAdapter = struct {
         return null;
     }
 
-    /// Whether `path` would make Linux `unlinkat(AT_REMOVEDIR)` (or
-    /// the Zig stdlib's `dirDeleteDirPosix`) return `EINVAL` — i.e.
-    /// the path's last component is `.` or `..`. Both the kernel and
-    /// Zig stdlib treat this as a "programmer bug" and panic in debug
-    /// builds; the 0.3 filesystem-mkdir-rmdir fixture explicitly tests
-    /// `rmdir(".")` and expects `Err(ErrorCode::Invalid | Access)`.
-    /// Detect early so the guest gets a clean `.invalid` rather than a
-    /// host trap. Empty path is left to the kernel (NoEntry).
-    fn rmdirPathIsInvalid(path: []const u8) bool {
+    /// Whether `path`'s last component is `.` or `..`, which POSIX
+    /// specifies as `EINVAL` for both `rmdir` and `rename`.
+    ///
+    /// For `rmdir`, Linux `unlinkat(AT_REMOVEDIR)` (and the Zig stdlib's
+    /// `dirDeleteDirPosix`) return `EINVAL`; both the kernel and Zig
+    /// stdlib treat this as a "programmer bug" and panic in debug
+    /// builds, and the 0.3 filesystem-mkdir-rmdir fixture explicitly
+    /// tests `rmdir(".")` expecting `Err(ErrorCode::Invalid | Access)`.
+    ///
+    /// For `rename`, hosts disagree: Linux reports `EBUSY` for
+    /// `rename(".", ...)`, but macOS reports `EINVAL`, which is absent
+    /// from Zig's `RenameError` set and so collapses to
+    /// `error.Unexpected` — surfacing to the guest as a misleading
+    /// `.io`. That is why filesystem-rename passed on Linux but failed
+    /// natively on macOS ARM64 (#616 D3).
+    ///
+    /// Detect early so every host agrees and the guest gets a clean
+    /// `.invalid` rather than a host trap. Empty path is left to the
+    /// kernel (NoEntry).
+    fn pathLastComponentIsDot(path: []const u8) bool {
         if (path.len == 0) return false;
         // Drop trailing slashes — `rmdir("foo/")` should behave like
         // `rmdir("foo")` for the trailing-`.` check below.
@@ -11130,7 +11141,7 @@ pub const WasiCliAdapter = struct {
         // panics on as a "programmer bug". Guard explicitly so the
         // guest sees `Err(ErrorCode::Invalid)` per `filesystem-mkdir-rmdir`
         // (line 73-75 `Err(Invalid | Access)`). (#571.)
-        if (rmdirPathIsInvalid(path_bytes)) {
+        if (pathLastComponentIsDot(path_bytes)) {
             results[0] = try fsResultErr(allocator, .invalid);
             return;
         }
@@ -11228,6 +11239,16 @@ pub const WasiCliAdapter = struct {
         }
         if (checkPathSymlinks(new_dir, new_path_bytes, false)) |code| {
             results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        // POSIX `EINVAL`: renaming to or from a path whose final
+        // component is `.` or `..`. Hosts disagree on the reported
+        // errno, so normalize before hitting the syscall. (#616 D3.)
+        if (pathLastComponentIsDot(old_path_bytes) or
+            pathLastComponentIsDot(new_path_bytes))
+        {
+            results[0] = try fsResultErr(allocator, .invalid);
             return;
         }
 
@@ -29169,6 +29190,95 @@ test "filesystem #476: rename-at within a single preopen" {
     try WasiCliAdapter.fsDescriptorStatAt(&adapter, &ci, &stat_new, &stat_new_r, testing.allocator);
     defer stat_new_r[0].deinit(testing.allocator);
     try testing.expect(stat_new_r[0].result_val.is_ok);
+}
+
+test "filesystem #616: rename-at rejects dot components uniformly across hosts" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "data" });
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 8192);
+    defer ci.disableTestMem();
+
+    // The 0.3 filesystem-rename fixture runs `mv . q.txt` and accepts
+    // `Busy | Invalid | Access`. Linux reports `EBUSY`, but macOS reports
+    // `EINVAL`, which is absent from Zig's `RenameError` and collapsed to
+    // `error.Unexpected` — the guest saw `.io` and the fixture failed only
+    // on native macOS ARM64.
+    for ([_][2][]const u8{
+        .{ ".", "q.txt" },
+        .{ "a.txt", "." },
+        .{ "./", "q.txt" },
+    }) |pair| {
+        const old_path = try testMakeListVal(&ci, testing.allocator, pair[0]);
+        const new_path = try testMakeListVal(&ci, testing.allocator, pair[1]);
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .string = old_path.list },
+            .{ .handle = handle },
+            .{ .string = new_path.list },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorRenameAt(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expectEqual(
+            @intFromEnum(FsErrorCode.invalid),
+            results[0].result_val.payload.?.variant_val.discriminant,
+        );
+    }
+
+    // `..` is rejected earlier by the sandbox check as `not-permitted`,
+    // which the same fixture asserts for `mv a.txt ../q.txt`. Keep that
+    // precedence intact rather than reclassifying it as `.invalid`.
+    for ([_][2][]const u8{
+        .{ "..", "q.txt" },
+        .{ "a.txt", "../q.txt" },
+    }) |pair| {
+        const old_path = try testMakeListVal(&ci, testing.allocator, pair[0]);
+        const new_path = try testMakeListVal(&ci, testing.allocator, pair[1]);
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .string = old_path.list },
+            .{ .handle = handle },
+            .{ .string = new_path.list },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorRenameAt(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expectEqual(
+            @intFromEnum(FsErrorCode.not_permitted),
+            results[0].result_val.payload.?.variant_val.discriminant,
+        );
+    }
+
+    // A rename with no dot component still succeeds.
+    const ok_old = try testMakeListVal(&ci, testing.allocator, "a.txt");
+    const ok_new = try testMakeListVal(&ci, testing.allocator, "b.txt");
+    var ok_args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .string = ok_old.list },
+        .{ .handle = handle },
+        .{ .string = ok_new.list },
+    };
+    var ok_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorRenameAt(&adapter, &ci, &ok_args, &ok_results, testing.allocator);
+    defer ok_results[0].deinit(testing.allocator);
+    try testing.expect(ok_results[0].result_val.is_ok);
 }
 
 test "filesystem #476: rename-at across two distinct descriptor handles" {
