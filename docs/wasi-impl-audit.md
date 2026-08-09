@@ -671,11 +671,11 @@ Pinned WIT: [`types.wit`](https://github.com/WebAssembly/wasi-http/blob/d97efe47
 | `[method]future-trailers.get` | ✅ | :22067 | — |
 | `[resource-drop]future-trailers` | ✅ | :22068 | — |
 | `[constructor]request-options` | ✅ | :22070 | — |
-| `[method]request-options.connect-timeout` | ✅ | :22073 | 0.2-style unprefixed getter name (`get-` prefix only in 0.3). Stored in nanoseconds, copied into worker-owned state, and applied to initial DNS/TCP acquisition by PR #909. This is only the initial portion of #616 A1; Zig's lazy TLS handshake and automatic redirect reconnects are not covered by this deadline. |
+| `[method]request-options.connect-timeout` | ✅ | :22073 | 0.2-style unprefixed getter name (`get-` prefix only in 0.3). Stored in nanoseconds, copied into worker-owned state, and applied to every hop's connection acquisition (#616 A1). Covers DNS, TCP, and the TLS handshake, which `Client.connectTcpOptions` performs inline; the adapter drives redirects itself so hops after the first are covered too. |
 | `[method]request-options.set-connect-timeout` | ✅ | :22074 | Stores `option<duration>` (nanoseconds). Returns `result` ok unconditionally. |
-| `[method]request-options.first-byte-timeout` | ✅ | :22075 | Stored for round-tripping only; enforcing it requires a deadline-aware HTTP/TLS reader and remains #616 A1b/A7 work. |
+| `[method]request-options.first-byte-timeout` | ✅ | :22075 | Enforced per redirect hop around request transmission and response-head arrival; expiry maps to `HTTP-response-timeout` (#616 A1). |
 | `[method]request-options.set-first-byte-timeout` | ✅ | :22076 | Same as above; field `first_byte_timeout_ns`. |
-| `[method]request-options.between-bytes-timeout` | ✅ | :22077 | Stored for round-tripping only; enforcing it requires a deadline-aware HTTP/TLS reader and remains #616 A1b/A7 work. |
+| `[method]request-options.between-bytes-timeout` | ✅ | :22077 | Enforced per response body chunk with a freshly armed timer, so arriving bytes reset the window; expiry maps to `HTTP-response-timeout` (#616 A1). |
 | `[method]request-options.set-between-bytes-timeout` | ✅ | :22078 | Same as above; field `between_bytes_timeout_ns`. |
 | `[resource-drop]request-options` | ✅ | :22079 | — |
 | `[method]response-outparam.send-informational` (`@unstable`) | N/A | — | Unstable feature; intentionally outside the stable denominator. No current follow-up is identified. |
@@ -1000,11 +1000,11 @@ Unified `request` / `response` resource ([PR #487](https://github.com/cataggar/w
 | `[static]request.consume-body` | ✅ | :21945 |
 | `[resource-drop]request` | ✅ | :21946 |
 | `[constructor]request-options` | ✅ | :21948 |
-| `[method]request-options.get-connect-timeout` | ✅ | :21949 | Stored in nanoseconds, snapshotted when the request is constructed, and applied to initial DNS/TCP acquisition by PR #909. This is only the initial portion of #616 A1; the child options resource may be dropped before send. Zig's lazy TLS handshake and automatic redirect reconnects are not deadline-covered. |
+| `[method]request-options.get-connect-timeout` | ✅ | :21949 | Stored in nanoseconds, snapshotted when the request is constructed (so the child options resource may be dropped before send), and applied to every hop's connection acquisition (#616 A1). Covers DNS, TCP, and the inline TLS handshake, plus redirect hops now that the adapter owns the redirect loop. |
 | `[method]request-options.set-connect-timeout` | ✅ | :21950 |
-| `[method]request-options.get-first-byte-timeout` | ✅ | :21951 | Round-trip only; deadline-aware HTTP/TLS reader support remains #616 A1b/A7 work. |
+| `[method]request-options.get-first-byte-timeout` | ✅ | :21951 | Enforced per redirect hop around request transmission and response-head arrival; expiry maps to `HTTP-response-timeout` (#616 A1). |
 | `[method]request-options.set-first-byte-timeout` | ✅ | :21952 |
-| `[method]request-options.get-between-bytes-timeout` | ✅ | :21953 | Round-trip only; deadline-aware HTTP/TLS reader support remains #616 A1b/A7 work. |
+| `[method]request-options.get-between-bytes-timeout` | ✅ | :21953 | Enforced per response body chunk with a freshly armed timer, so arriving bytes reset the window; expiry maps to `HTTP-response-timeout` (#616 A1). |
 | `[method]request-options.set-between-bytes-timeout` | ✅ | :21954 |
 | `[method]request-options.clone` | ✅ | :21955 |
 | `[resource-drop]request-options` | ✅ | :21956 |

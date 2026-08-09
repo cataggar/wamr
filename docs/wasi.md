@@ -197,6 +197,7 @@ either added a new interface family or closed a tracker issue.
 | --------- | -- | -------------- |
 | P3 AOT/JIT/Wasmtime parity, 41 / 41 in each mode | [#908](https://github.com/cataggar/wamr/pull/908) | Parity matrix complete. |
 | Initial DNS/TCP connect deadlines; Linux `splice(2)`; calibrated blocking microbenchmark job; stable host-import audit | [#909](https://github.com/cataggar/wamr/pull/909) | Completes A2, A5, and C1. Only the initial DNS/TCP portion of A1 is complete; TLS handshakes, redirect reconnects, and first-/between-byte deadlines remain open. |
+| Per-hop redirect connect deadlines, `first-byte-timeout`, `between-bytes-timeout` | [#616 A1](https://github.com/cataggar/wamr/issues/616) | Completes A1. All three `request-options` budgets are enforced. |
 
 ## Known limitations
 
@@ -207,10 +208,39 @@ in that tracker.
 
 The current follow-up tracker is
 [#616](https://github.com/cataggar/wamr/issues/616). PR #909 completed
-A2, A5, and C1. Its A1 work applies the configured connect deadline
-only to initial DNS/TCP acquisition; lazy TLS handshakes, redirect
-reconnects, first-byte deadlines, and between-byte deadlines remain
-open.
+A2, A5, and C1.
+
+#### Outbound HTTP `request-options` deadlines (A1)
+
+All three `wasi:http/types.request-options` budgets are enforced on the
+outbound path, for both Preview 2 and Preview 3:
+
+* **`connect-timeout`** bounds acquiring one hop's connection: DNS, TCP,
+  and — for `https` — the TLS handshake. The handshake is included
+  because `std.http.Client.connectTcpOptions` builds the TLS connection
+  through `std.crypto.tls.Client.init`, which completes the wire
+  handshake inline rather than deferring it to the first request write.
+* **`first-byte-timeout`** bounds request transmission plus response-head
+  arrival, armed freshly for *each* redirect hop.
+* **`between-bytes-timeout`** bounds each response body chunk. A fresh
+  timer is armed per chunk, so arriving bytes re-arm the window: the
+  budget measures time without progress, not a whole-body allowance.
+
+Redirects are followed by the adapter rather than by
+`std.http.Client.Request.receiveHead`, because the stdlib path reconnects
+through the untimed `Client.connect` and puts an entire redirect chain
+under a single response budget. The guest-visible policy is unchanged:
+payload-free requests follow up to three hops and then fail with
+`loop-detected`; requests carrying a payload are never redirected and
+receive the 3xx response verbatim.
+
+Expiry of a response-phase budget is reported as `HTTP-response-timeout`.
+Only `connect-timeout` expiry maps to `connection-timeout` — a slow
+response arrives on a connection that was established successfully, so
+attributing it to the connection would be misleading.
+
+An unset budget runs its operation inline, so guests that configure no
+`request-options` pay nothing for this enforcement.
 
 ### Already-shipped 0.3.0 surfaces (section A)
 
