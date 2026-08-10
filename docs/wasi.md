@@ -290,6 +290,40 @@ observed after the worker finished.
 Requests with neither a `request-options` budget nor a cancel flag
 still run inline, so the zero-configuration path is unchanged.
 
+#### Client-disconnect handling on the serve path (A8)
+
+`wamr serve` now distinguishes a client hanging up from a server-side
+I/O fault, and reacts to it.
+
+Previously the TCP and TLS output sinks folded *every* write failure
+into a generic I/O error, so a disconnect mid-response was
+indistinguishable from a real fault. The serve loops swallowed the
+error outright, then looped back to read another request that would
+never arrive, and the guest was never told its response had not
+landed.
+
+Now:
+
+* `ECONNRESET` and `EPIPE`/`ENOTCONN` from the socket write — and the
+  equivalent conditions from the TLS record layer — surface as a
+  *closed* stream rather than an error, which the response writers
+  translate into a distinct disconnect condition.
+* Response bodies are written to the socket in 64 KiB slices, so a
+  disconnect is detected within one chunk instead of after the entire
+  transfer has been handed to the socket layer. This also bounds how
+  much of a single guest response the host can queue at once. The
+  bytes on the wire and their framing are unchanged; only the number
+  of `write` calls differs.
+* On disconnect the connection is torn down instead of being kept
+  alive, and any host operations the guest still owns on that
+  instance — an outbound fetch it never awaited, a timer, a socket
+  read — are cancelled, since their results are no longer observable.
+* For Preview 3, the response's transmission future is closed without
+  a ready payload, which is how the guest learns its response was not
+  delivered. The inbound path previously never wrote to that future at
+  all, so a response abandoned mid-flight looked exactly like one
+  delivered in full.
+
 ### Already-shipped 0.3.0 surfaces (section A)
 
 * **Outbound HTTP response headers not surfaced.** `std.http.Client.FetchResult`
