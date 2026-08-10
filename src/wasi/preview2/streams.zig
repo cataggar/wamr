@@ -140,6 +140,28 @@ pub const InputStream = struct {
 // ── wasi:io/streams — output-stream ─────────────────────────────────────────
 
 /// An output stream resource — a writable byte sink.
+/// True for the errors a socket write produces when the peer has gone
+/// away, as opposed to a genuine I/O fault (#616 A8).
+///
+/// Taken through `anyerror` deliberately: the TLS connection's write
+/// path has an inferred error set that varies with the underlying
+/// stream type, so naming the variants directly there would not
+/// compile. Every name below is a real socket-teardown condition:
+/// `netWrite` maps ECONNRESET to `ConnectionResetByPeer` and both
+/// EPIPE and ENOTCONN to `SocketUnconnected`, while `BrokenPipe` and
+/// `EndOfStream` can surface from file-like and TLS record paths.
+pub fn isPeerDisconnectError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionResetByPeer,
+        error.SocketUnconnected,
+        error.BrokenPipe,
+        error.NotOpenForWriting,
+        error.EndOfStream,
+        => true,
+        else => false,
+    };
+}
+
 pub const OutputStream = struct {
     sink: Sink,
 
@@ -219,15 +241,33 @@ pub const OutputStream = struct {
                 if (data.len == 0) return .{ .ok = 0 };
                 const io = std.Io.Threaded.global_single_threaded.io();
                 const slices = [_][]const u8{data};
-                _ = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch
-                    return .{ .err = .io_error };
+                _ = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch |err| return switch (err) {
+                    // The peer went away. This is not an I/O fault: it
+                    // is the ordinary way a client abandons a request,
+                    // and callers must be able to tell the two apart so
+                    // they can stop writing and drop keep-alive rather
+                    // than reporting a server error (#616 A8).
+                    //
+                    // `netWrite` maps ECONNRESET to `ConnectionResetByPeer`
+                    // and both EPIPE and ENOTCONN to `SocketUnconnected`.
+                    error.ConnectionResetByPeer,
+                    error.SocketUnconnected,
+                    => .{ .closed = {} },
+                    else => .{ .err = .io_error },
+                };
                 return .{ .ok = data.len };
             },
             .tls => |conn| {
-                // `writeAll` encrypts `data` into one or more TLS records and
-                // flushes them to the underlying socket. Any failure (record
-                // overflow, socket error) maps to `.io_error`.
-                conn.writeAll(data) catch return .{ .err = .io_error };
+                // `writeAll` encrypts `data` into one or more TLS records
+                // and flushes them to the underlying socket. A peer that
+                // disappears mid-response surfaces here as the same
+                // socket-level errors as the plain path, so it must reach
+                // callers as `.closed` too (#616 A8); anything else is a
+                // genuine fault (record overflow, encryption failure).
+                conn.writeAll(data) catch |err| return if (isPeerDisconnectError(err))
+                    .{ .closed = {} }
+                else
+                    .{ .err = .io_error };
                 return .{ .ok = data.len };
             },
             .closed => return .{ .closed = {} },

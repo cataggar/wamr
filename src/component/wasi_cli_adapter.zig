@@ -20700,6 +20700,15 @@ pub const WasiCliAdapter = struct {
         };
     }
 
+    /// Largest slice handed to the client socket in one write.
+    ///
+    /// Bounds how far a response can run past a disconnect before the
+    /// host notices, and bounds the kernel-side queueing a single
+    /// guest response can demand (#616 A8). 64 KiB matches the
+    /// outbound body-chunk size and comfortably exceeds a TLS record,
+    /// so it costs no extra syscalls in the common case.
+    const http_response_chunk_bytes: usize = 64 * 1024;
+
     fn writeAllOutputStream(
         self: *WasiCliAdapter,
         out: *streams.OutputStream,
@@ -20707,7 +20716,36 @@ pub const WasiCliAdapter = struct {
     ) !void {
         switch (out.write(bytes, self.allocator)) {
             .ok => |n| if (n != bytes.len) return error.IoError,
-            .closed, .err => return error.IoError,
+            // `.closed` is the peer hanging up, which is a normal
+            // client behaviour rather than a server fault; callers
+            // must distinguish it so they can abandon the response and
+            // drop keep-alive instead of reporting an error (#616 A8).
+            .closed => return error.HttpClientDisconnected,
+            .err => return error.IoError,
+        }
+    }
+
+    /// Write a response body to the client in bounded slices.
+    ///
+    /// A single `writeAll` of a large body hands everything to the
+    /// socket layer at once, so a client that disappears part-way
+    /// through is only noticed after the whole transfer has been
+    /// attempted. Slicing the write means a disconnect surfaces within
+    /// one chunk, and the host never queues an unbounded amount of a
+    /// guest's response at once (#616 A8).
+    ///
+    /// The wire bytes are identical: this only changes how many
+    /// `write` calls carry them.
+    fn writeHttpBodyChunked(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        body: []const u8,
+    ) !void {
+        var offset: usize = 0;
+        while (offset < body.len) {
+            const end = @min(offset + http_response_chunk_bytes, body.len);
+            try self.writeAllOutputStream(out, body[offset..end]);
+            offset = end;
         }
     }
 
@@ -20795,7 +20833,7 @@ pub const WasiCliAdapter = struct {
                 );
                 defer self.allocator.free(trailer);
                 try self.writeAllOutputStream(out, trailer);
-                try self.writeAllOutputStream(out, body);
+                try self.writeHttpBodyChunked(out, body);
             },
         }
     }
@@ -22432,6 +22470,27 @@ pub const WasiCliAdapter = struct {
     /// response (when the body length is unknown pre-write). Trailers
     /// supplied via the guest's `future<option<trailers>>` are lifted
     /// into the chunked trailer block. (#570 / #583 A5)
+    /// Settle a response's transmission future as failed (#616 A8).
+    ///
+    /// In `wasi:http@0.3` the response carries a transmission future
+    /// so the guest can learn whether its response actually reached
+    /// the client. Until now the inbound serve path never wrote to it:
+    /// a response abandoned mid-flight looked identical to one
+    /// delivered in full. Closing it without a ready payload gives the
+    /// guest the failure signal the WIT promises.
+    fn failHttpResponseTransmission(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        response_handle: u32,
+    ) void {
+        const response = self.lookupHttpResponseP3(response_handle) orelse return;
+        const tx = ci.futures.getPtr(response.transmission_future_handle) orelse return;
+        tx.state = .closed;
+        tx.write_closed = true;
+        if (tx.waitable_set) |ws| if (tx.read_waitable_idx) |idx|
+            ws.setReady(idx, self.allocator, executor_root.STATUS_STARTED_CANCELLED);
+    }
+
     pub fn writeHttpResponseP3FromHandle(
         self: *WasiCliAdapter,
         out: *streams.OutputStream,
@@ -22545,7 +22604,7 @@ pub const WasiCliAdapter = struct {
                 const size_line = try std.fmt.allocPrint(self.allocator, "{x}\r\n", .{body.len});
                 defer self.allocator.free(size_line);
                 try self.writeAllOutputStream(out, size_line);
-                try self.writeAllOutputStream(out, body);
+                try self.writeHttpBodyChunked(out, body);
                 try self.writeAllOutputStream(out, "\r\n");
             }
             try self.writeAllOutputStream(out, "0\r\n");
@@ -22571,7 +22630,7 @@ pub const WasiCliAdapter = struct {
             );
             defer self.allocator.free(trailer);
             try self.writeAllOutputStream(out, trailer);
-            try self.writeAllOutputStream(out, body);
+            try self.writeHttpBodyChunked(out, body);
         }
     }
 
@@ -22776,7 +22835,32 @@ pub const WasiCliAdapter = struct {
                 return;
             }
 
-            self.writeHttpResponseP3FromHandle(output, ci, outcome.payload, parsed.keep_alive) catch {};
+            // A client that hangs up mid-response is reported
+            // distinctly from a server-side I/O fault (#616 A8). There
+            // is nothing left to say on this connection and no basis
+            // for keeping it alive, so tear down rather than looping
+            // back to read a request that will never arrive.
+            var disconnected = false;
+            self.writeHttpResponseP3FromHandle(
+                output,
+                ci,
+                outcome.payload,
+                parsed.keep_alive,
+            ) catch |err| {
+                disconnected = err == error.HttpClientDisconnected;
+            };
+            if (disconnected) {
+                self.failHttpResponseTransmission(ci, outcome.payload);
+                // The handler has returned, but it may have left host
+                // operations running on this instance — an outbound
+                // fetch it never awaited, a timer, a socket read. With
+                // the client gone their results are unobservable, so
+                // release them instead of letting them run to
+                // completion.
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+                self.cleanupHttpResourcesAllVersions();
+                return;
+            }
 
             // Per-request resource tables are owned by the handler
             // dispatch — reset them so the next round-trip starts
@@ -26336,7 +26420,14 @@ fn serveOneHttpConnection(
         return;
     };
 
-    adapter.writeHttpResponseFromOutparam(&output, outparam_handle) catch {};
+    // P2 serves one request per connection, so a disconnect has no
+    // keep-alive to suppress — but the guest may still own host
+    // operations whose results can no longer be observed (#616 A8).
+    adapter.writeHttpResponseFromOutparam(&output, outparam_handle) catch |err| {
+        if (err == error.HttpClientDisconnected) {
+            WasiCliAdapter.cancelAllPendingAsyncOps(adapter, inst, null, adapter.allocator);
+        }
+    };
 }
 
 /// P3 (`@0.3.x`) variant of `serveOneHttpConnection`. Dispatches
@@ -42755,6 +42846,145 @@ test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle emits status line + he
     // One non-zero chunk + the terminating 0-chunk with no trailers.
     try testing.expect(std.mem.indexOf(u8, written, "\r\n4\r\nhey\n\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, written, "0\r\n\r\n"));
+}
+
+test "wasi:http #616 A8: a client disconnect is reported distinctly from an I/O fault" {
+    // Before A8 the socket sinks folded every write failure into
+    // `.err = .io_error`, so a client hanging up mid-response was
+    // indistinguishable from a genuine server fault. Callers therefore
+    // could not decide whether to keep the connection alive, and every
+    // disconnect looked like a 500-class problem.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fields_handle = try adapter.pushHttpFields(fields);
+
+    const body_handle = ci.allocAsyncHandle();
+    var body: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+    try body.buffer.appendSlice(testing.allocator, "hey\n");
+    body.write_closed = true;
+    try ci.streams.put(testing.allocator, body_handle, body);
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0,
+        .state = .ready,
+        .write_closed = true,
+    });
+    const tx_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, tx_h, .{
+        .elem_type_idx = 0,
+        .state = .ready,
+        .write_closed = true,
+    });
+
+    const resp = try testing.allocator.create(HttpResponseP3);
+    resp.* = .{
+        .status = 200,
+        .headers_handle = fields_handle,
+        .body_stream_handle = body_handle,
+        .trailers_future_handle = trailers_h,
+        .transmission_future_handle = tx_h,
+    };
+    const resp_handle = try adapter.pushHttpResponseP3(resp);
+
+    // A `.closed` sink is exactly what a departed peer looks like from
+    // the writer's point of view.
+    var out: streams.OutputStream = .{ .sink = .closed };
+    try testing.expectError(
+        error.HttpClientDisconnected,
+        adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle, true),
+    );
+
+    // And the guest learns that its response never landed.
+    adapter.failHttpResponseTransmission(&ci, resp_handle);
+    const tx = ci.futures.getPtr(tx_h).?;
+    try testing.expectEqual(async_mod.Future.State.closed, tx.state);
+    try testing.expect(tx.write_closed);
+}
+
+test "wasi:http #616 A8: the P2 response writer also reports disconnect distinctly" {
+    // Same guarantee on the Preview 2 path, which has its own writer.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fields_handle = try adapter.pushHttpFields(fields);
+
+    const response = try testing.allocator.create(OutgoingResponse);
+    response.* = .{ .status = 200, .headers_handle = fields_handle };
+    const response_handle = try adapter.pushOutgoingResponse(response);
+
+    const outparam = try testing.allocator.create(ResponseOutparam);
+    outparam.* = .{ .state = .{ .response = response_handle } };
+    const outparam_handle = try adapter.pushResponseOutparam(outparam);
+
+    var out: streams.OutputStream = .{ .sink = .closed };
+    try testing.expectError(
+        error.HttpClientDisconnected,
+        adapter.writeHttpResponseFromOutparam(&out, outparam_handle),
+    );
+}
+
+test "wasi:http #616 A8: chunking a large body does not change the bytes on the wire" {
+    // The body is now written in bounded slices so a disconnect is
+    // caught within one chunk instead of after the whole transfer.
+    // That must be purely an issue of how many `write` calls carry the
+    // bytes — the bytes themselves, and the framing around them, are
+    // unchanged. This body is deliberately larger than the chunk size
+    // and not a multiple of it, so it exercises the final short slice.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const size = WasiCliAdapter.http_response_chunk_bytes * 2 + 12345;
+    const payload = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i * 31 + 7);
+
+    var chunked = streams.OutputStream.toBuffer();
+    defer chunked.deinit(testing.allocator);
+    try adapter.writeHttpBodyChunked(&chunked, payload);
+    try testing.expectEqualSlices(u8, payload, chunked.getBufferContents());
+
+    // An empty body must emit nothing at all rather than a stray
+    // zero-length write.
+    var empty = streams.OutputStream.toBuffer();
+    defer empty.deinit(testing.allocator);
+    try adapter.writeHttpBodyChunked(&empty, "");
+    try testing.expectEqual(@as(usize, 0), empty.getBufferContents().len);
+
+    // A departed peer is reported from the very first slice.
+    var closed: streams.OutputStream = .{ .sink = .closed };
+    try testing.expectError(
+        error.HttpClientDisconnected,
+        adapter.writeHttpBodyChunked(&closed, payload),
+    );
+}
+
+test "wasi:http #616 A8: peer-teardown errors classify as disconnect, faults do not" {
+    const testing = std.testing;
+    // The socket sinks route writes through this predicate, so a
+    // misclassification here would either mask real I/O faults as
+    // clean hangups or resurrect the old behaviour of treating every
+    // hangup as a server error.
+    try testing.expect(streams.isPeerDisconnectError(error.ConnectionResetByPeer));
+    try testing.expect(streams.isPeerDisconnectError(error.SocketUnconnected));
+    try testing.expect(streams.isPeerDisconnectError(error.BrokenPipe));
+    try testing.expect(streams.isPeerDisconnectError(error.NotOpenForWriting));
+    try testing.expect(streams.isPeerDisconnectError(error.EndOfStream));
+
+    try testing.expect(!streams.isPeerDisconnectError(error.SystemResources));
+    try testing.expect(!streams.isPeerDisconnectError(error.NetworkDown));
+    try testing.expect(!streams.isPeerDisconnectError(error.AccessDenied));
+    try testing.expect(!streams.isPeerDisconnectError(error.OutOfMemory));
 }
 
 test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle handles 404 + empty body" {
