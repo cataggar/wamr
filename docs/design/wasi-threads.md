@@ -1,7 +1,7 @@
 # `wasi:threads` design — multi-threaded interpreter state isolation
 
-Status: **DRAFT** (shared-memory/parking foundation implemented; opcode
-atomicity and production spawning remain incomplete).
+Status: **DRAFT** (shared-memory/parking foundation and atomic opcode
+semantics implemented; production spawning remains incomplete).
 
 Tracking: [#616 B1.3](https://github.com/cataggar/wamr/issues/616).
 
@@ -83,10 +83,18 @@ memory uses NT reserve/commit. These APIs are intentionally independent of
 opcode lowering so the remaining atomic load/store/RMW audit can use them.
 
 The remaining production work follows the ordered plan below: make all
-shared runtime and host resources safe; complete atomic opcode and fence
-behavior; spawn in both interpreter and AOT modes; isolate cancellation and
-per-thread component/WASI context; and pass the end-to-end correctness,
-conformance, and performance gates.
+shared runtime and host resources safe; spawn in both interpreter and AOT
+modes; isolate cancellation and per-thread component/WASI context; and pass
+the end-to-end correctness, conformance, and performance gates.
+
+Atomic opcode and fence behavior is complete on both execution tiers.
+Interpreted atomic loads, stores, RMW and `cmpxchg` are `seq_cst`, bounds-
+and alignment-checked; `wait`/`notify` use the monotonic parking lot; and
+`atomic.fence` emits a real barrier through `platform.memoryFenceSeqCst`
+rather than the no-op it used to be. That last point matters because the AOT
+backends have always emitted `MFENCE` / `DMB ISH` for the same instruction,
+so a no-op in the interpreter was a tier-dependent memory model — the kind of
+divergence that only surfaces as a rare race once threads actually run.
 
 ## Upstream state
 
@@ -324,11 +332,15 @@ already targets.
   thread's `ModuleInstance.memories[]` slot. All `i32.load` /
   `i32.store` already operate on the shared bytes; `i32.atomic.*` etc.
   add the synchronisation. The core-wasm `threads` proposal
-  (atomic loads/stores/RMW/`wait`/`notify`) is already partly wired in
-  `interp.zig:3349` (`atomic_prefix`) — `atomic.fence` is a no-op
-  ("Fence is a no-op for single-threaded execution.") and most RMW
-  opcodes are implemented as **non-atomic** sequences. **This is the
-  single biggest correctness gap to close before Option B is real.**
+  (atomic loads/stores/RMW/`wait`/`notify`) is wired up in
+  `interp.zig` (`atomic_prefix`): loads, stores, RMW and `cmpxchg` all
+  lower to genuine `seq_cst` Zig atomics, `wait`/`notify` go through
+  the [`parking_lot`](../../src/platform/parking_lot.zig) with
+  monotonic deadlines and cancellation wakeups, and `atomic.fence`
+  issues a real barrier via `platform.memoryFenceSeqCst` (`MFENCE` on
+  x86-64, `DMB ISH` on AArch64) — the same instruction the AOT
+  backends emit for the `atomic_fence` IR op. Bounds and alignment are
+  checked on every atomic access.
 * **Globals:** Cloned per thread via `cloneForThread` (today's
   behaviour). When `shared-everything-threads` lands, `shared` globals
   will need atomic access; for now, the Preview-1 model (mutable

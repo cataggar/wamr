@@ -65,6 +65,7 @@ inline fn wasmNearestF64(x: f64) f64 {
 const Opcode = @import("opcode.zig").Opcode;
 const simd = @import("simd.zig");
 const leb128 = @import("../../shared/utils/leb128.zig");
+const platform = @import("../../platform/platform.zig");
 
 pub const TrapError = error{
     OutOfFuel,
@@ -3354,8 +3355,12 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 switch (sub_op) {
                     0x03 => { // atomic.fence
                         _ = readU32(code, &ip); // reserved byte (must be 0)
-                        // Fence is a no-op for single-threaded execution.
-                        // When multi-threading is implemented, use a proper barrier.
+                        // A sequentially-consistent barrier, matching the
+                        // MFENCE / DMB ISH that the AOT backends emit for the
+                        // `atomic_fence` IR op. The interpreter shares linear
+                        // memory with `wasi:threads` workers, so this must be
+                        // a real barrier and not a no-op.
+                        platform.memoryFenceSeqCst();
                     },
                     // atomic loads
                     0x10 => try atomicLoad(env, code, &ip, u32, u32, 4),   // i32.atomic.load
@@ -4916,8 +4921,14 @@ test "interp: i32.atomic.rmw.cmpxchg success" {
     try testing.expectEqual(@as(i32, 10), result);
 }
 
-test "interp: atomic.fence is a no-op" {
-    // fence then return constant — no memory needed
+test "interp: atomic.fence executes a real barrier and does not disturb the stack" {
+    // The fence has no value-level effect, so what this pins down is that it
+    // decodes its reserved byte correctly and leaves the operand stack alone.
+    // The barrier itself is exercised by the store-buffer litmus test on
+    // `platform.memoryFenceSeqCst`, which is what this opcode now lowers to
+    // (previously it was a no-op, diverging from the MFENCE / DMB ISH that
+    // the AOT backends emit for the same instruction).
+    //
     // 77 in signed LEB128 = 0xCD 0x00 (two bytes, since 77 > 63)
     const result = try runCode(&.{
         0xFE, 0x03, 0x00, // atomic.fence reserved=0
@@ -4925,6 +4936,21 @@ test "interp: atomic.fence is a no-op" {
         0x0B,
     });
     try testing.expectEqual(@as(i32, 77), result);
+}
+
+test "interp: atomic.fence orders surrounding atomic memory accesses" {
+    // Store, fence, load-back through the same address. The fence must not
+    // swallow or reorder the store it separates from the load.
+    const result = try runCodeWithMem(&.{
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 42, // i32.const 42
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0xFE, 0x03, 0x00, // atomic.fence reserved=0
+        0x41, 0x00, // i32.const 0 (addr)
+        0xFE, 0x10, 0x02, 0x00, // i32.atomic.load align=2 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 42), result);
 }
 
 test "interp: i32.load8_s with 0xFF" {
