@@ -2024,6 +2024,8 @@ const HttpConnectResult =
 const HttpConnectDeadlineOutcome = union(enum) {
     connection: HttpConnectResult,
     deadline: std.Io.Cancelable!void,
+    /// #616 A7 cancel lane for the DNS + TCP + TLS-handshake phase.
+    cancel: anyerror!void,
 };
 
 /// Map a `std.Io.net.HostName.LookupError` to the closest
@@ -3228,6 +3230,12 @@ fn mapHttpFetchError(err: anyerror) HttpErrorCode {
         // connection timeout: the connection succeeded and it is the
         // response that was too slow (#616 A1).
         error.HttpResponseTimeout => .HTTP_response_timeout,
+        // Guest-initiated cancellation (#616 A7). The worker's own
+        // cancel arm short-circuits before reaching this table, but the
+        // cancel lane can also surface from paths that map errors
+        // generically, and every one of them must agree with the
+        // drainer's `HTTP_request_denied` disposition.
+        error.HttpFetchCancelled => .HTTP_request_denied,
         error.AccessDenied => .destination_IP_prohibited,
 
         // ── TLS (ConnectTcpError remaps `Connection.Tls.create` failures
@@ -3317,6 +3325,50 @@ fn checkHttpCancel(cancelled: ?*std.atomic.Value(bool)) error{HttpFetchCancelled
     }
 }
 
+/// Poll cadence bounds for the cancel lane (#616 A7).
+///
+/// The lane starts at `initial` and doubles up to `max`, so a cancel
+/// that lands right after an operation blocks is observed in about a
+/// millisecond, while a long-running transfer settles onto a 25 ms
+/// cadence that costs ~40 timer wakeups per second per in-flight
+/// fetch. Both numbers are far below any network round-trip, so the
+/// guest-visible cancel latency is dominated by the wake itself.
+const http_cancel_poll_initial_ns: u64 = 1 * std.time.ns_per_ms;
+const http_cancel_poll_max_ns: u64 = 25 * std.time.ns_per_ms;
+
+fn httpCancelPollTimeout(ns: u64) std.Io.Timeout {
+    return .{ .duration = .{
+        .raw = .{ .nanoseconds = @as(i96, ns) },
+        .clock = .awake,
+    } };
+}
+
+/// Cancel-lane body: returns once `cancelled` has been observed set.
+///
+/// This is the piece that turns the previously *advisory*
+/// `checkHttpCancel` phase-boundary polls into cancellation that can
+/// actually wake a blocked operation (#616 A7). Raced against the real
+/// operation inside a `std.Io.Select`, its completion causes the
+/// select to cancel the losing lane — and because every outbound
+/// operation runs on Zig's Threaded-I/O backend, that cancellation
+/// interrupts the in-flight `getaddrinfo` / `connect` / `read` /
+/// `write` syscall instead of waiting for it to return on its own.
+///
+/// It is implemented as a bounded-backoff sleep rather than a
+/// condition-variable wait for one specific reason: the lane must
+/// itself be cancellable through `std.Io`. When the *operation* wins
+/// the race, the select cancels this lane, and only an `Io`-aware
+/// blocking primitive (`Timeout.sleep`) can be interrupted that way. A
+/// `std.Thread.ResetEvent.wait` would leave the lane parked forever
+/// on every successful request.
+fn httpAwaitCancelSignal(io: std.Io, cancelled: *std.atomic.Value(bool)) anyerror!void {
+    var backoff_ns = http_cancel_poll_initial_ns;
+    while (!cancelled.load(.acquire)) {
+        try std.Io.Timeout.sleep(httpCancelPollTimeout(backoff_ns), io);
+        backoff_ns = @min(backoff_ns * 2, http_cancel_poll_max_ns);
+    }
+}
+
 fn discardHttpConnectDeadlineTasks(
     client: *std.http.Client,
     select: *std.Io.Select(HttpConnectDeadlineOutcome),
@@ -3326,6 +3378,7 @@ fn discardHttpConnectDeadlineTasks(
             client.connection_pool.release(connection, client.io);
         } else |_| {},
         .deadline => |result| result catch {},
+        .cancel => |result| result catch {},
     };
 }
 
@@ -3339,18 +3392,35 @@ fn httpClientConnectBeforeDeadlineUsing(
     client: *std.http.Client,
     connect_options: std.http.Client.ConnectTcpOptions,
     deadline: std.Io.Timeout,
+    cancelled: ?*std.atomic.Value(bool),
     comptime connect: anytype,
 ) anyerror!*std.http.Client.Connection {
-    var outcome_buffer: [2]HttpConnectDeadlineOutcome = undefined;
+    var outcome_buffer: [3]HttpConnectDeadlineOutcome = undefined;
     var select = std.Io.Select(HttpConnectDeadlineOutcome).init(
         client.io,
         &outcome_buffer,
     );
-    try select.concurrent(
-        .deadline,
-        std.Io.Timeout.sleep,
-        .{ deadline, client.io },
-    );
+    if (deadline != .none) {
+        try select.concurrent(
+            .deadline,
+            std.Io.Timeout.sleep,
+            .{ deadline, client.io },
+        );
+    }
+    // #616 A7: without this lane a cancel issued while the worker is
+    // parked in `getaddrinfo` or a TCP/TLS handshake is not observed
+    // until the connect returns on its own — which for an unroutable
+    // host is the full OS SYN-retry period.
+    if (cancelled) |flag| {
+        select.concurrent(
+            .cancel,
+            httpAwaitCancelSignal,
+            .{ client.io, flag },
+        ) catch |err| {
+            discardHttpConnectDeadlineTasks(client, &select);
+            return err;
+        };
+    }
     select.concurrent(
         .connection,
         connect,
@@ -3366,8 +3436,8 @@ fn httpClientConnectBeforeDeadlineUsing(
     };
     return switch (first) {
         .connection => |result| connected: {
-            // Only the void-returning timer remains; it owns no
-            // resources, so discarding its cancelled result is safe.
+            // Only void-returning guard lanes remain; they own no
+            // resources, so discarding their cancelled results is safe.
             select.cancelDiscard();
             break :connected try result;
         },
@@ -3376,6 +3446,11 @@ fn httpClientConnectBeforeDeadlineUsing(
             try result;
             break :timed_out error.Timeout;
         },
+        .cancel => |result| aborted: {
+            discardHttpConnectDeadlineTasks(client, &select);
+            try result;
+            break :aborted error.HttpFetchCancelled;
+        },
     };
 }
 
@@ -3383,11 +3458,13 @@ fn httpClientConnectBeforeDeadline(
     client: *std.http.Client,
     connect_options: std.http.Client.ConnectTcpOptions,
     deadline: std.Io.Timeout,
+    cancelled: ?*std.atomic.Value(bool),
 ) anyerror!*std.http.Client.Connection {
     return httpClientConnectBeforeDeadlineUsing(
         client,
         connect_options,
         deadline,
+        cancelled,
         std.http.Client.connectTcpOptions,
     );
 }
@@ -3422,6 +3499,7 @@ fn httpClientConnectWithTimeout(
     client: *std.http.Client,
     uri: std.Uri,
     timeout: std.Io.Timeout,
+    cancelled: ?*std.atomic.Value(bool),
 ) anyerror!*std.http.Client.Connection {
     // Convert once so name lookup, TCP connection, and synchronous
     // setup consume one budget rather than resetting the duration.
@@ -3458,6 +3536,7 @@ fn httpClientConnectWithTimeout(
             .timeout = deadline,
         },
         deadline,
+        cancelled,
     );
 }
 
@@ -3475,6 +3554,10 @@ fn HttpRaceOutcome(comptime op: anytype) type {
     return union(enum) {
         value: @typeInfo(@TypeOf(op)).@"fn".return_type.?,
         deadline: std.Io.Cancelable!void,
+        /// #616 A7 cancel lane. Wins when the guest cancels (via
+        /// `task.cancel` or by dropping the future/request resource)
+        /// while the operation is still blocked.
+        cancel: anyerror!void,
     };
 }
 
@@ -3503,13 +3586,22 @@ fn httpAwaitBeforeDeadline(
     comptime op: anytype,
     io: std.Io,
     budget: std.Io.Timeout,
+    cancelled: ?*std.atomic.Value(bool),
     op_args: std.meta.ArgsTuple(@TypeOf(op)),
 ) anyerror!HttpRacedPayload(op) {
     const U = HttpRaceOutcome(op);
-    var outcome_buffer: [2]U = undefined;
+    var outcome_buffer: [3]U = undefined;
     var select = std.Io.Select(U).init(io, &outcome_buffer);
 
-    try select.concurrent(.deadline, std.Io.Timeout.sleep, .{ budget, io });
+    if (budget != .none) {
+        try select.concurrent(.deadline, std.Io.Timeout.sleep, .{ budget, io });
+    }
+    if (cancelled) |flag| {
+        select.concurrent(.cancel, httpAwaitCancelSignal, .{ io, flag }) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
+    }
     select.concurrent(.value, op, op_args) catch |err| {
         select.cancelDiscard();
         return err;
@@ -3521,8 +3613,8 @@ fn httpAwaitBeforeDeadline(
     };
     return switch (first) {
         .value => |result| completed: {
-            // Only the void-returning timer can remain; it owns no
-            // resources, so discarding its cancelled result is safe.
+            // Only void-returning guard lanes can remain; they own no
+            // resources, so discarding their cancelled results is safe.
             select.cancelDiscard();
             break :completed try result;
         },
@@ -3531,21 +3623,45 @@ fn httpAwaitBeforeDeadline(
             try result;
             break :expired error.HttpResponseTimeout;
         },
+        .cancel => |result| aborted: {
+            select.cancelDiscard();
+            try result;
+            break :aborted error.HttpFetchCancelled;
+        },
     };
 }
 
-/// Run `op`, bounding it by `budget` only when the guest actually set
-/// the corresponding `request-options` timeout. `.none` runs inline.
+/// Run `op` under the guest's response-phase budget and the cancel
+/// signal, racing only the lanes that are actually armed.
+///
+/// With neither a WIT timeout nor a cancel flag the operation runs
+/// inline, so the zero-configuration path keeps its original cost: no
+/// task is spawned and no timer is armed. Any other combination goes
+/// through `httpAwaitBeforeDeadline`, whose lanes are added
+/// conditionally.
 fn httpRunWithOptionalDeadline(
     comptime op: anytype,
     io: std.Io,
     budget: std.Io.Timeout,
+    cancelled: ?*std.atomic.Value(bool),
     op_args: std.meta.ArgsTuple(@TypeOf(op)),
 ) anyerror!HttpRacedPayload(op) {
-    return switch (budget) {
-        .none => try @call(.auto, op, op_args),
-        else => try httpAwaitBeforeDeadline(op, io, budget, op_args),
-    };
+    if (budget == .none and cancelled == null) {
+        return try @call(.auto, op, op_args);
+    }
+    return try httpAwaitBeforeDeadline(op, io, budget, cancelled, op_args);
+}
+
+/// Run `op` under the cancel signal alone — the request-transmission
+/// phases have no WIT budget of their own, but must still be
+/// interruptible (#616 A7). Runs inline when no cancel flag is armed.
+fn httpRunGuarded(
+    comptime op: anytype,
+    io: std.Io,
+    cancelled: ?*std.atomic.Value(bool),
+    op_args: std.meta.ArgsTuple(@TypeOf(op)),
+) anyerror!HttpRacedPayload(op) {
+    return try httpRunWithOptionalDeadline(op, io, .none, cancelled, op_args);
 }
 
 /// Redirect hops followed for a repeatable (payload-free) outbound
@@ -3657,14 +3773,24 @@ fn httpClientLowLevelFetch(
     var hops_remaining: u16 = if (payload == null) http_max_redirect_hops else 0;
 
     while (true) {
-        // Leave the unset case on Client.request's original connection
-        // path. When set, acquire this hop's connection with the
-        // timeout and transfer it to Request; Request.deinit retains
-        // its existing cancellation, connection-pool, and TLS cleanup.
-        const connection = switch (options.connectTimeout()) {
-            .none => null,
-            else => |timeout| try httpClientConnectWithTimeout(&client, uri, timeout),
-        };
+        // Acquire this hop's connection ourselves whenever there is
+        // anything to enforce — a WIT `connect-timeout`, a cancel
+        // signal, or both — and transfer it to `Request`;
+        // `Request.deinit` retains its existing cancellation,
+        // connection-pool, and TLS cleanup. With neither, fall through
+        // to `Client.request`'s own connection path so the
+        // zero-configuration case is untouched.
+        //
+        // #616 A7 widened this from "connect-timeout set" to "guard
+        // armed": DNS, TCP connect and the eager TLS handshake all
+        // happen inside `connectTcpOptions`, so a cancel that arrives
+        // while the worker is parked there is only observable if this
+        // hop went through the raced helper.
+        const connect_timeout = options.connectTimeout();
+        const connection = if (connect_timeout == .none and cancelled == null)
+            null
+        else
+            try httpClientConnectWithTimeout(&client, uri, connect_timeout, cancelled);
         var req = client.request(hop_method, uri, .{
             .extra_headers = extra_headers,
             .keep_alive = false,
@@ -3682,14 +3808,55 @@ fn httpClientLowLevelFetch(
         // the guest cancelled.
         try checkHttpCancel(cancelled);
 
+        // Request transmission. Every wire-touching step is routed
+        // through the guard so a cancel can interrupt a `write(2)`
+        // that has blocked on a full socket send buffer — which is
+        // exactly what happens when the peer stops reading a large
+        // request body (#616 A7).
+        //
+        // The body is pushed in `http_cancel_body_chunk_bytes` slices
+        // rather than one `writeAll`, so cancellation is polled
+        // between request chunks and not only at the end of the whole
+        // payload. The chunking is invisible on the wire: the writer
+        // buffers and the framing is fixed by `content_length`.
         if (payload) |p| {
             req.transfer_encoding = .{ .content_length = p.len };
-            var body_writer = try req.sendBodyUnflushed(&.{});
-            try body_writer.writer.writeAll(p);
-            try body_writer.end();
-            try req.connection.?.flush();
+            var body_writer = try httpRunGuarded(
+                std.http.Client.Request.sendBodyUnflushed,
+                io,
+                cancelled,
+                .{ &req, &.{} },
+            );
+            var offset: usize = 0;
+            while (offset < p.len) {
+                const end = @min(offset + http_cancel_body_chunk_bytes, p.len);
+                try httpRunGuarded(
+                    std.Io.Writer.writeAll,
+                    io,
+                    cancelled,
+                    .{ &body_writer.writer, p[offset..end] },
+                );
+                offset = end;
+            }
+            try httpRunGuarded(
+                std.http.BodyWriter.end,
+                io,
+                cancelled,
+                .{&body_writer},
+            );
+            try httpRunGuarded(
+                std.http.Client.Connection.flush,
+                io,
+                cancelled,
+                .{req.connection.?},
+            );
         } else {
-            try req.sendBodiless();
+            try httpRunGuarded(
+                std.http.Client.Request.sendBodiless,
+                io,
+                cancelled,
+                .{&req},
+            );
         }
 
         // Pre-receive-head sync point: request fully on the wire; bail
@@ -3704,6 +3871,7 @@ fn httpClientLowLevelFetch(
             std.http.Client.Request.receiveHead,
             io,
             options.firstByteTimeout(),
+            cancelled,
             .{ &req, no_redirect_buffer },
         );
 
@@ -3804,6 +3972,7 @@ fn httpClientLowLevelFetch(
                 std.Io.Reader.stream,
                 io,
                 between_bytes,
+                cancelled,
                 .{ body_reader, &aw.writer, chunk_limit },
             ) catch |err| switch (err) {
                 error.EndOfStream => break,
@@ -8851,6 +9020,35 @@ pub const WasiCliAdapter = struct {
     /// the old symbol (third-party host integrations, tests) keep
     /// working.
     pub const cancelAllPendingTimers = cancelAllPendingAsyncOps;
+
+    /// `ComponentInstance.async_future_drop_driver` hook (#616 A7).
+    ///
+    /// A P3 guest that stops caring about an outbound HTTP response
+    /// does not call `task.cancel` — it simply drops the readable end
+    /// of the future. Without this hook the worker thread stayed
+    /// blocked in `connect` / `receiveHead` / body-read until the
+    /// server or the OS gave up, holding a thread, a socket, and a TLS
+    /// session for a result nobody would ever read.
+    ///
+    /// Raising `shared.cancelled` both settles the advisory
+    /// phase-boundary checks and wakes the cancel lane armed by
+    /// `httpAwaitCancelSignal`, so an already-blocked syscall is
+    /// interrupted rather than merely noticed at the next phase.
+    ///
+    /// Only P3 entries need this: the P2 path flips the same flag from
+    /// its own future-drop handling.
+    pub fn cancelPendingHttpFetchForFuture(
+        ctx: ?*anyopaque,
+        ci: *ComponentInstance,
+        future_handle: u32,
+    ) void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx orelse return));
+        for (self.pending_http_fetches_p3.items) |entry| {
+            if (entry.ci == ci and entry.future_handle == future_handle) {
+                entry.shared.cancelled.store(true, .release);
+            }
+        }
+    }
 
     fn allocStreamHandle(self: *WasiCliAdapter, stream: *streams.OutputStream) !u32 {
         // Linear scan for a free slot before extending; output streams are
@@ -25483,6 +25681,7 @@ pub fn runLoadedComponentP3(
     inst.async_event_driver = &WasiCliAdapter.driveAsyncEvents;
     inst.async_event_driver_ctx = adapter;
     inst.async_cancel_driver = &WasiCliAdapter.cancelAllPendingTimers;
+    inst.async_future_drop_driver = &WasiCliAdapter.cancelPendingHttpFetchForFuture;
     // Synchronous resource-drop hook so guest drops of `tcp-socket` /
     // `udp-socket` release their kernel fd immediately (#575). Without
     // this, the listener fd from `sockets-tcp-bind::test_reuseaddr`
@@ -25909,6 +26108,7 @@ pub fn serveLoadedHttpComponent(
     inst.async_event_driver = &WasiCliAdapter.driveAsyncEvents;
     inst.async_event_driver_ctx = adapter;
     inst.async_cancel_driver = &WasiCliAdapter.cancelAllPendingTimers;
+    inst.async_future_drop_driver = &WasiCliAdapter.cancelPendingHttpFetchForFuture;
 
     // Prefer the P3 (`@0.3.x`) export when present; fall back to the
     // legacy 0.2 dispatch otherwise. The P3 path goes through
@@ -33506,6 +33706,42 @@ test "wasi:http #616 A1: transport connector is interrupted by real deadline" {
                 .protocol = .plain,
             },
             deadline.toDeadline(io),
+            null,
+            TestBlockedHttpConnector.connect,
+        ),
+    );
+}
+
+test "wasi:http #616 A7: transport connector is interrupted by a cancel" {
+    const testing = std.testing;
+    TestBlockedHttpConnector.event = .unset;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client: std.http.Client = .{
+        .allocator = testing.allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    // DNS resolution, the TCP connect and the eager TLS handshake all
+    // run inside the connector, so a guest that cancels during any of
+    // them used to wait out the full OS SYN-retry period. The connector
+    // here parks forever; only a real cancellation of the blocked task
+    // can end this call.
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    const host = try std.Io.net.HostName.init("cancel.test");
+    try testing.expectError(
+        error.HttpFetchCancelled,
+        httpClientConnectBeforeDeadlineUsing(
+            &client,
+            .{
+                .host = host,
+                .port = 80,
+                .protocol = .plain,
+            },
+            .none,
+            &cancelled,
             TestBlockedHttpConnector.connect,
         ),
     );
@@ -38833,6 +39069,113 @@ test "wasi:http #616 A1: P3 HTTP cancellation is scoped to ComponentInstance" {
     );
 }
 
+test "wasi:http #616 A7: dropping the readable end cancels the matching P3 fetch" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci_a = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci_a);
+    var ci_b = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci_b);
+
+    const Fixture = struct {
+        future_handle: u32,
+        shared: *PendingHttpFetchShared,
+
+        fn init(
+            target_adapter: *WasiCliAdapter,
+            target_ci: *ComponentInstance,
+            allocator: Allocator,
+        ) !@This() {
+            const future_handle = target_ci.allocAsyncHandle();
+            try target_ci.futures.put(allocator, future_handle, .{
+                .elem_type_idx = 0,
+                .state = .pending,
+            });
+            const shared = try target_adapter.allocator.create(PendingHttpFetchShared);
+            errdefer target_adapter.allocator.destroy(shared);
+            shared.* = .{};
+            const Worker = struct {
+                fn run(state: *PendingHttpFetchShared) void {
+                    state.outcome = .{ .failure = .internal_error };
+                    state.done.store(true, .release);
+                }
+            };
+            const thread = try std.Thread.spawn(.{}, Worker.run, .{shared});
+            errdefer thread.join();
+            try target_adapter.pending_http_fetches_p3.append(
+                target_adapter.allocator,
+                .{
+                    .future_handle = future_handle,
+                    .ci = target_ci,
+                    .thread = thread,
+                    .shared = shared,
+                },
+            );
+            return .{ .future_handle = future_handle, .shared = shared };
+        }
+    };
+
+    const dropped = try Fixture.init(&adapter, &ci_a, testing.allocator);
+    const kept = try Fixture.init(&adapter, &ci_a, testing.allocator);
+    const other_ci = try Fixture.init(&adapter, &ci_b, testing.allocator);
+
+    // A P3 guest abandoning a response never issues `task.cancel`; it
+    // just drops the readable end. The driver must treat that as a
+    // cancel for exactly that fetch — and only that fetch. Getting the
+    // scoping wrong here would abort unrelated concurrent requests,
+    // including ones owned by a different component instance.
+    WasiCliAdapter.cancelPendingHttpFetchForFuture(
+        &adapter,
+        &ci_a,
+        dropped.future_handle,
+    );
+    try testing.expect(dropped.shared.cancelled.load(.acquire));
+    try testing.expect(!kept.shared.cancelled.load(.acquire));
+    try testing.expect(!other_ci.shared.cancelled.load(.acquire));
+
+    // A handle that matches numerically but belongs to another
+    // instance must not be cancelled either.
+    WasiCliAdapter.cancelPendingHttpFetchForFuture(
+        &adapter,
+        &ci_b,
+        kept.future_handle,
+    );
+    try testing.expect(!kept.shared.cancelled.load(.acquire));
+
+    var attempts: usize = 0;
+    while (attempts < 10_000 and adapter.pending_http_fetches_p3.items.len > 0) : (attempts += 1) {
+        adapter.drainPendingHttpFetchesP3(&ci_a, testing.allocator);
+        adapter.drainPendingHttpFetchesP3(&ci_b, testing.allocator);
+        if (adapter.pending_http_fetches_p3.items.len == 0) break;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const duration: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        duration.sleep(io) catch {};
+    }
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches_p3.items.len);
+
+    // The cancelled fetch settles as denied; its neighbour keeps the
+    // outcome the worker actually produced.
+    const decoded_dropped = decodeP3ClientSendBytes(
+        ci_a.futures.getPtr(dropped.future_handle).?.payload.?,
+    );
+    try testing.expect(!decoded_dropped.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        decoded_dropped.payload,
+    );
+    const decoded_kept = decodeP3ClientSendBytes(
+        ci_a.futures.getPtr(kept.future_handle).?.payload.?,
+    );
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        decoded_kept.payload,
+    );
+}
+
 test "wasi:http #833: in-flight HTTP future exposes a wakeable backend fd (no busy-spin)" {
     // Before #833 the `.http_future_response` pollable had no backend
     // fd, so `waitForBackendEvents` saw zero fds and returned at once →
@@ -39358,6 +39701,118 @@ fn testHttpSlowOp(io: std.Io, ns: u64, sentinel: usize) error{Canceled}!usize {
     return sentinel;
 }
 
+test "wasi:http #616 A7: an in-flight operation is interrupted by the cancel flag" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The heart of A7. Before this change `cancelled` was only read at
+    // phase boundaries, so an operation that had already blocked ran to
+    // completion regardless. Here the operation would take a minute; the
+    // flag is already set, so the cancel lane must win essentially
+    // immediately and the syscall must be torn down rather than waited
+    // out.
+    // The generous 10 s budget is a failure detector, not part of the
+    // behaviour under test: if the cancel lane did not fire, this call
+    // would fail with `HttpResponseTimeout` after ten seconds instead
+    // of hanging on the operation's own minute-long sleep.
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    const result = httpRunWithOptionalDeadline(
+        testHttpSlowOp,
+        io,
+        .{ .duration = .{ .raw = .{ .nanoseconds = 10 * std.time.ns_per_s }, .clock = .awake } },
+        &cancelled,
+        .{ io, 60 * std.time.ns_per_s, 0xD4 },
+    );
+
+    try testing.expectError(error.HttpFetchCancelled, result);
+    // The guest-visible mapping is unchanged: a cancelled fetch is
+    // still reported as a denied request.
+    try testing.expectEqual(
+        HttpErrorCode.HTTP_request_denied,
+        mapHttpFetchError(error.HttpFetchCancelled),
+    );
+}
+
+test "wasi:http #616 A7: a cancel raised while the operation is blocked still wins" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Same as above but the flag is raised *after* the operation has
+    // already parked, which is the real-world ordering: the worker
+    // blocks first, the guest cancels later. This is precisely the case
+    // the old advisory polling could not handle.
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    const Raiser = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            const raiser_io = std.Io.Threaded.global_single_threaded.io();
+            const delay: std.Io.Clock.Duration = .{
+                .raw = .{ .nanoseconds = 20 * std.time.ns_per_ms },
+                .clock = .awake,
+            };
+            delay.sleep(raiser_io) catch {};
+            flag.store(true, .release);
+        }
+    };
+    var raiser = try std.Thread.spawn(.{}, Raiser.run, .{&cancelled});
+    defer raiser.join();
+
+    // As above, the 10 s budget bounds the failure mode: a cancel lane
+    // that never wakes shows up as `HttpResponseTimeout`.
+    const result = httpRunWithOptionalDeadline(
+        testHttpSlowOp,
+        io,
+        .{ .duration = .{ .raw = .{ .nanoseconds = 10 * std.time.ns_per_s }, .clock = .awake } },
+        &cancelled,
+        .{ io, 60 * std.time.ns_per_s, 0xD5 },
+    );
+
+    try testing.expectError(error.HttpFetchCancelled, result);
+}
+
+test "wasi:http #616 A7: an unset cancel flag leaves the operation's result intact" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The cancel lane must be transparent when it does not fire: it is
+    // armed on every guarded call in the request path, so a leaky lane
+    // would corrupt every ordinary request.
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    const got = try httpRunWithOptionalDeadline(
+        testHttpSlowOp,
+        io,
+        .none,
+        &cancelled,
+        .{ io, 1 * std.time.ns_per_ms, 0xD6 },
+    );
+    try testing.expectEqual(@as(usize, 0xD6), got);
+}
+
+test "wasi:http #616 A7: the deadline still wins when it expires before any cancel" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Three-lane race: with both a budget and a cancel flag armed, the
+    // budget must keep its #616 A1 semantics and report a timeout, not
+    // be masked by the newly-added lane.
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    const result = httpRunWithOptionalDeadline(
+        testHttpSlowOp,
+        io,
+        .{ .duration = .{ .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms }, .clock = .awake } },
+        &cancelled,
+        .{ io, 60 * std.time.ns_per_s, 0xD7 },
+    );
+    try testing.expectError(error.HttpResponseTimeout, result);
+}
+
 test "wasi:http #616 A1: request-options snapshot carries all three transport timeouts" {
     const testing = std.testing;
 
@@ -39429,6 +39884,7 @@ test "wasi:http #616 A1: unset budget runs the operation inline and returns its 
         testHttpSlowOp,
         io,
         .none,
+        null,
         .{ io, 0, 0xA1 },
     );
     try testing.expectEqual(@as(usize, 0xA1), got);
@@ -39447,6 +39903,7 @@ test "wasi:http #616 A1: an operation finishing inside its budget keeps its resu
         testHttpSlowOp,
         io,
         .{ .duration = .{ .raw = .{ .nanoseconds = 30 * std.time.ns_per_s }, .clock = .awake } },
+        null,
         .{ io, 0, 0xB2 },
     );
     try testing.expectEqual(@as(usize, 0xB2), got);
@@ -39466,6 +39923,7 @@ test "wasi:http #616 A1: an operation exceeding its budget fails with HttpRespon
         testHttpSlowOp,
         io,
         .{ .duration = .{ .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms }, .clock = .awake } },
+        null,
         .{ io, 60 * std.time.ns_per_s, 0xC3 },
     );
     try testing.expectError(error.HttpResponseTimeout, result);
@@ -39495,6 +39953,7 @@ test "wasi:http #616 A1: each raced call re-arms its budget so progress resets t
             testHttpSlowOp,
             io,
             budget,
+            null,
             .{ io, 1 * std.time.ns_per_ms, chunk },
         );
         try testing.expectEqual(chunk, got);

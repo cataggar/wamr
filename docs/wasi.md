@@ -242,6 +242,54 @@ attributing it to the connection would be misleading.
 An unset budget runs its operation inline, so guests that configure no
 `request-options` pay nothing for this enforcement.
 
+#### Fine-grained outbound HTTP cancellation (A7)
+
+Guest cancellation interrupts an outbound request **while it is
+blocked**, rather than being noticed only when the current operation
+happens to return.
+
+Previously the per-fetch cancel flag was advisory: it was polled at
+phase boundaries (before connect, before send, before the response
+head, before the body, and every 64 KiB of body). A worker already
+parked in `getaddrinfo`, `connect`, `read` or `write` therefore kept
+running to completion — for an unreachable host, that is the full OS
+SYN-retry period — holding a thread, a socket and a TLS session for a
+result no one would read.
+
+Every blocking step on the outbound path now races the operation
+against a cancel lane inside `std.Io.Select`. Because the outbound path
+runs on Zig's threaded I/O backend, the losing lane is cancelled for
+real: the in-flight syscall is interrupted. The lane is armed over:
+
+* connection acquisition (DNS, TCP, and the inline TLS handshake),
+* request transmission — head, body and flush; the body is written in
+  64 KiB slices so cancellation is observed between chunks rather than
+  only after the whole payload,
+* response-head arrival, and
+* each response body chunk.
+
+The lane itself is a bounded-backoff sleep (1 ms, doubling to 25 ms)
+rather than a condition-variable wait, because it must be cancellable
+*through* `std.Io` — otherwise a request that completes normally would
+leave its cancel lane parked forever.
+
+Two things raise the flag:
+
+* **`task.cancel`**, via the existing `async_cancel_driver` hook, and
+* **dropping the readable end of the response future**, via the
+  `async_future_drop_driver` hook added for this work. A Preview 3
+  guest that abandons a response issues no `task.cancel` at all — it
+  simply drops the future — so without this the abandoned request ran
+  to completion. The Preview 2 path already flipped the same flag from
+  its own future-drop handling.
+
+Cancellation is reported to the guest as `HTTP-request-denied`,
+matching the disposition the drainer already used for a cancel
+observed after the worker finished.
+
+Requests with neither a `request-options` budget nor a cancel flag
+still run inline, so the zero-configuration path is unchanged.
+
 ### Already-shipped 0.3.0 surfaces (section A)
 
 * **Outbound HTTP response headers not surfaced.** `std.http.Client.FetchResult`
