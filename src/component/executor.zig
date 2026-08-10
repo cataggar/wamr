@@ -3382,6 +3382,13 @@ fn dispatchAsyncCanon(
         .future_drop_readable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            // #616 A7: the guest abandoning the result is a cancel
+            // request for whatever host operation is still filling it.
+            // Run before the drop bookkeeping below so the driver can
+            // still correlate the handle.
+            if (comp_inst.async_future_drop_driver) |drv| {
+                drv(comp_inst.async_event_driver_ctx, comp_inst, handle);
+            }
             if (comp_inst.futures.getPtr(handle)) |fut| {
                 fut.read_closed = true;
                 // Wake a parked writer so it can observe CANCELLED.

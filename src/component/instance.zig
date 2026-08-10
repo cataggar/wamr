@@ -401,6 +401,27 @@ pub const ComponentInstance = struct {
         allocator: std.mem.Allocator,
     ) void = null,
 
+    /// Companion hook to `async_cancel_driver` invoked when the guest
+    /// drops the readable end of a future (#616 A7).
+    ///
+    /// Dropping the readable end means the guest has abandoned the
+    /// result: nothing will ever observe it. For a host operation
+    /// still in flight — an outbound HTTP fetch, say — that is a
+    /// cancellation request, and the only signal the host gets, since
+    /// no `task.cancel` is issued on this path. The driver looks the
+    /// handle up in its pending-operation tables and, on a match,
+    /// raises that operation's cancel flag so the worker unblocks
+    /// instead of running the request to completion and discarding
+    /// the answer.
+    ///
+    /// Called with the handle still present in `ci.futures`, before
+    /// any drop bookkeeping, so the driver can correlate on it.
+    async_future_drop_driver: ?*const fn (
+        ctx: ?*anyopaque,
+        ci: *ComponentInstance,
+        future_handle: u32,
+    ) void = null,
+
     /// Optional host hook invoked from the `canon resource.drop`
     /// canon-builtin (`dispatchCanonBuiltin.resource_drop`) after the
     /// per-type resource table entry is removed. Host adapters that
