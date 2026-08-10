@@ -468,6 +468,47 @@ fn usleepPosix(us: u64) void {
     _ = std.posix.system.nanosleep(&ts, null);
 }
 
+/// Sequentially-consistent full memory barrier.
+///
+/// This is the host-side counterpart of the WebAssembly `atomic.fence`
+/// instruction. It must order *all* prior loads and stores against *all*
+/// subsequent loads and stores, in both the compiler and the hardware.
+///
+/// The emitted instruction deliberately matches what the AOT backends emit
+/// for the `atomic_fence` IR op (`MFENCE` on x86_64, `DMB ISH` on AArch64),
+/// so interpreted and compiled code observe the same memory model. Anything
+/// weaker here would let the interpreter reorder across a fence that AOT
+/// honours, which is exactly the kind of divergence that only shows up as a
+/// rare data race under load.
+///
+/// `@fence` no longer exists as a builtin, so architectures without an
+/// explicit case fall back to a sequentially-consistent read-modify-write on
+/// a dedicated global. A seq-cst RMW carries full fence semantics and cannot
+/// be elided by the optimiser, which makes it a correct (if slightly heavier)
+/// portable lowering.
+pub fn memoryFenceSeqCst() void {
+    switch (builtin.cpu.arch) {
+        .x86_64, .x86 => asm volatile ("mfence" ::: .{ .memory = true }),
+        .aarch64, .aarch64_be => asm volatile ("dmb ish" ::: .{ .memory = true }),
+        else => {
+            if (builtin.single_threaded) {
+                // No other agent can observe memory, so there is nothing to
+                // order. Single-threaded semantics are preserved by the
+                // compiler regardless of how it schedules the surrounding
+                // accesses. Deliberately avoids inline asm so this branch
+                // also compiles for wasm hosts.
+                return;
+            }
+            _ = @atomicRmw(u32, &portable_fence_slot, .Or, 0, .seq_cst);
+        },
+    }
+}
+
+/// Backing location for the portable `memoryFenceSeqCst` lowering. It is only
+/// ever the target of a no-op `or 0`, so its value is always zero; it exists
+/// solely to give the RMW a real, non-escaping-analysable address.
+var portable_fence_slot: u32 = 0;
+
 // ── 3. Time ─────────────────────────────────────────────────────────────
 
 /// Monotonic time since boot in microseconds.
@@ -823,4 +864,92 @@ test "timeGetBootUs returns increasing values" {
     usleep(1_000); // 1 ms
     const t2 = timeGetBootUs();
     try std.testing.expect(t2 > t1);
+}
+
+test "memoryFenceSeqCst is callable and orders a store-buffer litmus test" {
+    memoryFenceSeqCst();
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    // Classic store-buffer (Dekker) litmus test. Each round, one thread does
+    // `x = 1; fence; read y` while the other does `y = 1; fence; read x`.
+    //
+    // Relaxed atomics are used for the shared accesses precisely because they
+    // forbid *compiler* reordering while still permitting *hardware*
+    // StoreLoad reordering. That isolates the barrier: the only thing that
+    // can stop both threads reading 0 is the fence itself. On x86-64's TSO
+    // model StoreLoad is the single reordering allowed, so a no-op fence
+    // fails this test in practice rather than only in theory.
+    const Shared = struct {
+        x: u32 = 0,
+        y: u32 = 0,
+        r1: u32 = 0,
+        r2: u32 = 0,
+        /// Monotonically increasing arrival counter. Round `k` (0-based)
+        /// releases once it reaches `2 * (k + 1)`. Making it monotonic
+        /// removes any reset race, and — more importantly — lets *both*
+        /// threads spin on the same value so they resume together. An
+        /// asymmetric barrier that releases one side early would mostly
+        /// serialise the two threads and hide the reordering being tested.
+        arrived: u32 = 0,
+        violations: u32 = 0,
+
+        const Self = @This();
+        const rounds: u32 = 20_000;
+
+        /// Wait until both threads have reached round `round`.
+        fn barrier(self: *Self, round: u32) void {
+            _ = @atomicRmw(u32, &self.arrived, .Add, 1, .acq_rel);
+            const release_at = 2 * (round + 1);
+            var spins: u32 = 0;
+            while (@atomicLoad(u32, &self.arrived, .acquire) < release_at) {
+                // Spin first — the whole point is to release both threads
+                // within a few nanoseconds of each other. But an unbounded
+                // spin would livelock on a single-core runner, where the
+                // waiting thread has to be descheduled before the other can
+                // make progress, so fall back to yielding.
+                spins += 1;
+                if (spins < 512) {
+                    std.atomic.spinLoopHint();
+                } else {
+                    std.Thread.yield() catch std.atomic.spinLoopHint();
+                }
+            }
+        }
+
+        fn threadA(self: *Self) void {
+            var round: u32 = 0;
+            while (round < rounds) : (round += 1) {
+                self.barrier(2 * round);
+                @atomicStore(u32, &self.x, 1, .monotonic);
+                memoryFenceSeqCst();
+                self.r1 = @atomicLoad(u32, &self.y, .monotonic);
+                self.barrier(2 * round + 1);
+                // Both threads are past their loads, so this is the only
+                // point at which r1/r2 may be compared, and only one thread
+                // does the comparison and the reset.
+                if (self.r1 == 0 and self.r2 == 0) self.violations += 1;
+                @atomicStore(u32, &self.x, 0, .monotonic);
+                @atomicStore(u32, &self.y, 0, .monotonic);
+            }
+        }
+
+        fn threadB(self: *Self) void {
+            var round: u32 = 0;
+            while (round < rounds) : (round += 1) {
+                self.barrier(2 * round);
+                @atomicStore(u32, &self.y, 1, .monotonic);
+                memoryFenceSeqCst();
+                self.r2 = @atomicLoad(u32, &self.x, .monotonic);
+                self.barrier(2 * round + 1);
+            }
+        }
+    };
+
+    var shared = Shared{};
+    const a = try std.Thread.spawn(.{}, Shared.threadA, .{&shared});
+    const b = try std.Thread.spawn(.{}, Shared.threadB, .{&shared});
+    a.join();
+    b.join();
+
+    try std.testing.expectEqual(@as(u32, 0), shared.violations);
 }
