@@ -54,6 +54,51 @@ def _resolve_wamrc() -> List[str]:
 
 
 WAMRC = _resolve_wamrc()
+
+
+def _compiler_mtime() -> float:
+    """Newest mtime across the `wamrc` invocation's binaries.
+
+    The AOT artifact cache below is keyed on source-vs-artifact mtime.
+    That is not sufficient on its own: the artifacts are *compiler
+    output*, so a rebuilt `wamrc` invalidates every one of them even
+    though no `.wasm` source changed.
+
+    On ephemeral CI runners this never bit us — the workspace starts
+    empty, so every artifact was a cache miss. On a **self-hosted**
+    runner the checkout (and in particular the `tests/wasi-testsuite`
+    submodule working tree) persists across jobs, so stale artifacts
+    built by a *previous commit's* `wamrc` survive and get reused.
+    That silently tests the old compiler: a codegen fix appears to
+    have no effect, and a codegen regression appears clean.
+
+    Returns 0.0 if the binaries can't be stat'd, which degrades to the
+    previous source-mtime-only behaviour rather than erroring.
+    """
+    newest = 0.0
+    for part in WAMRC:
+        try:
+            newest = max(newest, os.stat(part).st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+COMPILER_MTIME = _compiler_mtime()
+
+
+def _artifact_is_fresh(artifact: Path, source: Path) -> bool:
+    """True iff `artifact` can be reused for `source`.
+
+    Requires the artifact to be at least as new as BOTH the wasm source
+    and the `wamrc` that produced it.
+    """
+    if not artifact.exists():
+        return False
+    artifact_mtime = artifact.stat().st_mtime
+    if artifact_mtime < source.stat().st_mtime:
+        return False
+    return artifact_mtime >= COMPILER_MTIME
 _SAMPLE_LAUNCHER = (
     Path(__file__).resolve().parent.parent.parent
     / "scripts"
@@ -263,7 +308,8 @@ def _is_component(path: Path) -> bool:
 
 def _precompile(test_path: str) -> str:
     """Compile `<test_path>` to a sibling AOT artifact, skipping
-    recompile if the artifact exists and is newer than the source.
+    recompile if the artifact exists and is newer than both the source
+    and the `wamrc` binary (see `_artifact_is_fresh`).
     Returns the path `wamr run` should be invoked with — the sibling
     `.cwasm` for core wasm, or the source `.wasm` itself for a
     component (since `wamr run` auto-probes the sibling
@@ -308,7 +354,7 @@ def _precompile(test_path: str) -> str:
     phase = f"{artifact_kind}_precompile"
     if is_component:
         manifest = p.with_suffix(".cwasm.json")
-        if not manifest.exists() or manifest.stat().st_mtime < p.stat().st_mtime:
+        if not _artifact_is_fresh(manifest, p):
             # `wamrc compile-component` already disables the IR
             # verifier internally (compileCoreWasm hard-codes
             # verify_mode=.off), so no extra flag is needed here.
@@ -326,7 +372,7 @@ def _precompile(test_path: str) -> str:
             )
         return test_path
     cwasm = p.with_suffix(".cwasm")
-    if cwasm.exists() and cwasm.stat().st_mtime >= p.stat().st_mtime:
+    if _artifact_is_fresh(cwasm, p):
         _emit_timing(
             p, phase, artifact_kind, time.perf_counter_ns() - started_ns, "hit"
         )

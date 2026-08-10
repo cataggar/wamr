@@ -264,13 +264,12 @@ jobs:
     timeout-minutes: 45
     # The AArch64 counterpart of the `wasi-p3-testsuite` job above, which
     # runs on x86_64 only. That single-architecture coverage is what let
-    # #929 through: five P3 fixtures stall under AOT on AArch64 while all
-    # 41 pass on x86_64, and nothing in CI observed it.
+    # #929 through: five P3 fixtures stalled under AOT on AArch64 while
+    # all 41 passed on x86_64, and nothing in CI observed it.
     #
-    # Non-blocking until #929 is fixed (same precedent as `jit-parity`
-    # below); `ci-summary` deliberately omits it from needs[]. Flip it into
-    # the gate once AArch64 reaches 41/41.
-    continue-on-error: true
+    # Blocking as of the #929 fix (AArch64 is at 41/41): this job is the
+    # only thing standing between an AArch64-specific codegen regression
+    # and main, so it is in `ci-summary`'s needs[].
     env:
       # Bound the harness so a stalled guest fails one fixture instead of
       # wedging the suite and burning the whole job timeout (#929).
@@ -439,12 +438,12 @@ jobs:
   ci-summary:
     name: Build & Test
     runs-on: ubuntu-22.04
-    needs: [build-and-test, wasi-test, wasi-testsuite, component-examples, wasi-p2-testsuite, wasi-p3-testsuite, lazy-jit]
+    needs: [build-and-test, wasi-test, wasi-testsuite, component-examples, wasi-p2-testsuite, wasi-p3-testsuite, wasi-p3-testsuite-arm64, lazy-jit]
     if: always()
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ] || [ "${{ needs.wasi-test.result }}" != "success" ] || [ "${{ needs.wasi-testsuite.result }}" != "success" ] || [ "${{ needs.component-examples.result }}" != "success" ] || [ "${{ needs.wasi-p2-testsuite.result }}" != "success" ] || [ "${{ needs.wasi-p3-testsuite.result }}" != "success" ] || [ "${{ needs.lazy-jit.result }}" != "success" ]; then
+          if [ "${{ needs.build-and-test.result }}" != "success" ] || [ "${{ needs.wasi-test.result }}" != "success" ] || [ "${{ needs.wasi-testsuite.result }}" != "success" ] || [ "${{ needs.component-examples.result }}" != "success" ] || [ "${{ needs.wasi-p2-testsuite.result }}" != "success" ] || [ "${{ needs.wasi-p3-testsuite.result }}" != "success" ] || [ "${{ needs.wasi-p3-testsuite-arm64.result }}" != "success" ] || [ "${{ needs.lazy-jit.result }}" != "success" ]; then
             echo "::error::One or more CI jobs failed"
             exit 1
           fi

@@ -246,6 +246,36 @@ pub fn splitLiveRangesAtLoopBoundariesWithConfig(
             continue;
         };
 
+        // ── Spill-site reachability gate (#929) ──
+        // The split emits `local_set slot, orig` at the end of
+        // `entry_pred` and `alt = local_get slot` at the start of
+        // `exit.succ`. For `alt` to hold `orig`'s value, EVERY execution
+        // that reaches `exit.succ` must first have passed through
+        // `entry_pred` — i.e. `entry_pred` must dominate `exit.succ`.
+        //
+        // The `computePostLoopReachable` dominance filter below is not
+        // enough: it only proves the rewritten uses are dominated by the
+        // reload, not that the reload's slot was ever written. When
+        // `exit.succ` has a second predecessor that bypasses the loop
+        // entirely, e.g.
+        //
+        //     A: br_if -> E, X
+        //     E: local_set slot, orig ; br -> H      (entry_pred)
+        //     H: <loop>  ; exit edge -> S
+        //     X: br -> S                             (bypasses E and H)
+        //     S: alt = local_get slot ; use(alt)     (exit.succ)
+        //
+        // the `A -> X -> S` path reaches the reload without ever
+        // executing the spill, so `alt` observes an uninitialised slot
+        // (reads as zero) instead of `orig`. On the WASI-p3 fixtures
+        // that produced a guest that spun forever on a zeroed loop bound
+        // rather than writing its first byte of stdout.
+        if (!dom.dominates(entry_pred, exit.succ)) {
+            stats.loops_skipped_shape += 1;
+            continue;
+        }
+
+
         // Build the "post-loop reachable AND exit.succ-dominated" block
         // set. Soundness invariant: every use we rewrite from orig → alt
         // must be dominated by the local_get (which lives at the start
@@ -1612,4 +1642,52 @@ test "splitLiveRangesAtLoopBoundaries: N+1 hot-loop synthetic — fresh vreg red
     // fresh vreg's range starts at the post-loop reload, strictly after
     // the originals' last use).
     try std.testing.expect(orig_max_end < fresh_min_start);
+}
+
+test "splitLiveRangesAtLoopBoundaries: #929 skips loops whose exit successor is reachable around the loop" {
+    // Regression for #929. `b_join` (the loop's exit successor) has a
+    // second predecessor `b_skip` that bypasses the loop — and therefore
+    // bypasses `b_pre`, where the split would emit `local_set slot, v0`.
+    // Splitting here would make the `local_get` in `b_join` read an
+    // uninitialised slot on the `b_entry -> b_skip -> b_join` path.
+    //
+    //   b_entry: br_if -> b_pre, b_skip
+    //   b_pre:   br    -> b_hdr            (the loop's single entry pred)
+    //   b_hdr:   br_if -> b_hdr, b_join    (single-block, single-exit loop)
+    //   b_skip:  br    -> b_join           (bypasses b_pre and b_hdr)
+    //   b_join:  ret v0
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b_entry = try func.newBlock();
+    const b_pre = try func.newBlock();
+    const b_hdr = try func.newBlock();
+    const b_skip = try func.newBlock();
+    const b_join = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const c = func.newVReg();
+    const c2 = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br_if = .{ .cond = c, .then_block = b_pre, .else_block = b_skip } }, .type = .void });
+
+    try func.getBlock(b_pre).append(.{ .op = .{ .br = b_hdr }, .type = .void });
+
+    try func.getBlock(b_hdr).append(.{ .op = .{ .iconst_32 = 0 }, .dest = c2, .type = .i32 });
+    try func.getBlock(b_hdr).append(.{ .op = .{ .br_if = .{ .cond = c2, .then_block = b_hdr, .else_block = b_join } }, .type = .void });
+
+    try func.getBlock(b_skip).append(.{ .op = .{ .br = b_join }, .type = .void });
+
+    try func.getBlock(b_join).append(.{ .op = .{ .ret = v0 }, .type = .void });
+
+    var sched = try MockSchedule.fromFunc(&func, allocator);
+    defer sched.deinit();
+
+    const stats = try splitLiveRangesAtLoopBoundariesWithConfig(&func, &sched, allocator, .{ .min_candidates = 0, .min_loop_body_insts = 0, .num_available_phys_regs = 0, .num_callee_saved_regs = 0, .safety_margin = 0 });
+    try std.testing.expect(stats.loops_considered >= 1);
+    try std.testing.expectEqual(@as(u32, 0), stats.splits_applied);
+    try std.testing.expect(stats.loops_skipped_shape >= 1);
 }
