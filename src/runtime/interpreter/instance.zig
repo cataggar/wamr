@@ -392,9 +392,15 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
             continue;
         }
 
-        const min_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
-        const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
-        const initial_size = @as(usize, min_pages) * types.MemoryInstance.page_size;
+        if (mem_type.limits.min > types.MemoryInstance.max_addressable_pages)
+            return error.MemoryAllocationFailed;
+        const min_pages: u32 = @intCast(mem_type.limits.min);
+        const max_pages: u32 = @intCast(@min(
+            mem_type.limits.max orelse 65536,
+            types.MemoryInstance.max_addressable_pages,
+        ));
+        const initial_size = types.MemoryInstance.byteSizeForPages(min_pages) orelse
+            return error.MemoryAllocationFailed;
 
         const data = allocator.alloc(u8, initial_size) catch
             return error.MemoryAllocationFailed;

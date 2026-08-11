@@ -494,6 +494,10 @@ pub const MemoryInstance = struct {
     reserved_size: usize = 0,
 
     pub const page_size: u32 = 65536;
+    pub const max_addressable_pages: u32 = @intCast(@min(
+        @as(u64, 65536),
+        @as(u64, std.math.maxInt(usize) / @as(usize, page_size)),
+    ));
 
     /// Page size of the host platform — used for mmap/mprotect alignment.
     /// Distinct from `page_size` above (the wasm linear-memory page = 64 KiB)
@@ -501,6 +505,11 @@ pub const MemoryInstance = struct {
     /// aarch64. wasm pages are always a multiple of any reasonable host page,
     /// so the OS calls never see sub-page slack.
     pub const page_size_min: u29 = std.heap.page_size_min;
+
+    pub fn byteSizeForPages(pages: u32) ?usize {
+        if (pages > max_addressable_pages) return null;
+        return std.math.mul(usize, @intCast(pages), page_size) catch null;
+    }
 
     /// Allocate a `MemoryInstance` with **stable-address backing** when the
     /// host supports it. The memory's `data.ptr` is pinned to a virtual
@@ -523,11 +532,11 @@ pub const MemoryInstance = struct {
         if (mem_type.is_shared) return null;
         if (!platform.supports_reserved_memory) return null;
         if (cap_pages == 0) return null;
-        const reserved_size: usize = @as(usize, cap_pages) * page_size;
+        const reserved_size = byteSizeForPages(cap_pages) orelse return null;
         const base = platform.reserveAddressSpace(reserved_size) orelse return null;
         errdefer platform.releaseAddressSpace(base, reserved_size);
 
-        const initial_size: usize = @as(usize, initial_pages) * page_size;
+        const initial_size = byteSizeForPages(initial_pages) orelse return null;
         if (initial_size > 0) {
             platform.commitPages(base, initial_size) catch {
                 platform.releaseAddressSpace(base, reserved_size);
@@ -561,7 +570,7 @@ pub const MemoryInstance = struct {
     ) shared_memory.CreateError!*MemoryInstance {
         if (!mem_type.is_shared) return error.InvalidLimits;
         const max_u64 = mem_type.limits.max orelse return error.InvalidLimits;
-        if (mem_type.limits.min > max_u64 or max_u64 > 65536)
+        if (mem_type.limits.min > max_u64 or max_u64 > max_addressable_pages)
             return error.InvalidLimits;
         const initial_pages: u32 = @intCast(mem_type.limits.min);
         const max_pages: u32 = @intCast(max_u64);
@@ -615,8 +624,7 @@ pub const MemoryInstance = struct {
         if (self.memory_type.limits.max) |max| {
             if (new_pages > max) return error.MemoryGrowFailed;
         }
-        if (new_pages > 65536) return error.MemoryGrowFailed;
-        const new_size = @as(usize, new_pages) * page_size;
+        const new_size = byteSizeForPages(new_pages) orelse return error.MemoryGrowFailed;
         const old_size = self.data.len;
         if (old_size < new_size) {
             if (self.reserved_base) |base| {
@@ -1081,6 +1089,15 @@ test "MemoryInstance: createReserved keeps data.ptr stable across grow" {
     // Growing past the cap fails.
     try std.testing.expectError(error.MemoryGrowFailed, mem.grow(1, allocator));
     try std.testing.expectEqual(@as(u32, 8), mem.current_pages);
+}
+
+test "MemoryInstance: page sizing respects host pointer width" {
+    const expected_max: u32 = if (@bitSizeOf(usize) == 32) 65535 else 65536;
+    try std.testing.expectEqual(expected_max, MemoryInstance.max_addressable_pages);
+    try std.testing.expect(MemoryInstance.byteSizeForPages(expected_max) != null);
+    if (expected_max < 65536) {
+        try std.testing.expect(MemoryInstance.byteSizeForPages(expected_max + 1) == null);
+    }
 }
 
 test "MemoryInstance: shared control keeps base stable and lifetime refcounted" {

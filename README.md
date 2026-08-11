@@ -78,7 +78,13 @@ Cross-compilation works out of the box:
 $ zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
 $ zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
 $ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
+$ zig build -Dtarget=wasm32-wasi -Doptimize=ReleaseSafe
 ```
+
+The `wasm32-wasi` target produces an interpreter-only `wamr.wasm` that can
+run core WebAssembly modules inside a WASI runtime such as Wasmtime. Native
+AOT/JIT execution, `wamrc`, Component Model execution, `serve`, shared
+memory, and host threads are intentionally excluded from this target.
 
 ## Running tests
 

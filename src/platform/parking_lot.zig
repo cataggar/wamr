@@ -12,6 +12,7 @@ const platform = @import("platform.zig");
 const is_linux = builtin.os.tag == .linux;
 const is_macos = builtin.os.tag == .macos;
 const is_windows = builtin.os.tag == .windows;
+const parking_supported = !builtin.single_threaded and (is_linux or is_macos or is_windows);
 
 pub const WaitResult = enum(u32) {
     notified = 0,
@@ -88,7 +89,11 @@ pub const ParkingLot = struct {
         expected: u32,
         timeout_ns: i64,
     ) BackendError!WaitResult {
-        return self.waitValue(u32, address, expected, timeout_ns);
+        if (comptime parking_supported) {
+            return self.waitValue(u32, address, expected, timeout_ns);
+        } else {
+            return error.Unsupported;
+        }
     }
 
     pub fn wait64(
@@ -97,7 +102,11 @@ pub const ParkingLot = struct {
         expected: u64,
         timeout_ns: i64,
     ) BackendError!WaitResult {
-        return self.waitValue(u64, address, expected, timeout_ns);
+        if (comptime parking_supported and @bitSizeOf(usize) >= 64) {
+            return self.waitValue(u64, address, expected, timeout_ns);
+        } else {
+            return error.Unsupported;
+        }
     }
 
     fn waitValue(
@@ -206,17 +215,28 @@ pub const ParkingLot = struct {
 
     /// Wake up to `count` waiters at exactly `address`.
     pub fn notify(self: *ParkingLot, address: *const anyopaque, count: u32) BackendError!u32 {
-        if (count == 0) return 0;
-        return self.wakeKey(@intFromPtr(address), count, .notified);
+        if (comptime parking_supported) {
+            if (count == 0) return 0;
+            return self.wakeKey(@intFromPtr(address), count, .notified);
+        } else {
+            return error.Unsupported;
+        }
     }
 
     /// Cancel every waiter at exactly `address`.
     pub fn cancel(self: *ParkingLot, address: *const anyopaque) BackendError!u32 {
-        return self.wakeKey(@intFromPtr(address), std.math.maxInt(u32), .cancelled);
+        if (comptime parking_supported) {
+            return self.wakeKey(@intFromPtr(address), std.math.maxInt(u32), .cancelled);
+        } else {
+            return error.Unsupported;
+        }
     }
 
     /// Cancel all waiters. This is the group-cancellation primitive.
     pub fn cancelAll(self: *ParkingLot) BackendError!u32 {
+        if (comptime !parking_supported) {
+            return error.Unsupported;
+        }
         var total: u32 = 0;
         for (0..bucket_count) |i| {
             const bucket = &self.buckets[i];
@@ -258,6 +278,9 @@ pub const ParkingLot = struct {
     /// Number of currently queued waiters for a key. Intended for
     /// diagnostics and deterministic native tests.
     pub fn waiterCount(self: *ParkingLot, address: *const anyopaque) u32 {
+        if (comptime !parking_supported) {
+            return 0;
+        }
         const key = @intFromPtr(address);
         const bucket = self.bucketFor(key);
         bucket.mutex.lock();
@@ -274,6 +297,9 @@ pub const ParkingLot = struct {
     /// Wake all waiters and wait for their stack-allocated queue nodes to
     /// leave the parking lot.
     pub fn deinit(self: *ParkingLot) void {
+        if (comptime !parking_supported) {
+            return;
+        }
         _ = self.lifecycle.fetchOr(closing_bit, .acq_rel);
         self.closeAll();
 
