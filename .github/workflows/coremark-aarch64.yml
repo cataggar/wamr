@@ -1,6 +1,6 @@
 name: CoreMark (aarch64)
 
-# Per-PR CoreMark comparison on the self-hosted aarch64 runner.
+# Per-PR CoreMark comparison on a hosted aarch64 runner.
 # Runs `scripts/bench_coremark.py` against the PR base, posts a delta table.
 
 on:
@@ -27,8 +27,7 @@ on:
       - .github/workflows/coremark-aarch64.yml
 
 concurrency:
-  # Serialize on the self-hosted runner: parallel CoreMark invocations would
-  # contend on cores and skew results.
+  # Keep one canonical ARM64 comparison active at a time.
   group: coremark-aarch64
   cancel-in-progress: true
 
@@ -38,7 +37,7 @@ permissions:
 
 jobs:
   coremark:
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

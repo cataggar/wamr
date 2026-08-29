@@ -23,6 +23,8 @@ pub fn build(b: *std.Build) void {
     // these arches so cross-compiled release builds for e.g. riscv64 don't
     // try to compile or run the AOT execution path.
     const target_arch = target.result.cpu.arch;
+    const is_wasm_wasi_host = target.result.os.tag == .wasi and
+        (target_arch == .wasm32 or target_arch == .wasm64);
     const aot_executable_target = switch (target_arch) {
         .x86_64, .aarch64 => true,
         else => false,
@@ -56,7 +58,7 @@ pub fn build(b: *std.Build) void {
     const interp = b.option(bool, "interp", "Enable interpreter") orelse true;
     options.addOption(bool, "interp", interp);
 
-    const aot = b.option(bool, "aot", "Enable AOT support") orelse true;
+    const aot = b.option(bool, "aot", "Enable AOT support") orelse !is_wasm_wasi_host;
     options.addOption(bool, "aot", aot);
 
     const fast_interp = b.option(bool, "fast_interp", "Enable fast interpreter") orelse true;
@@ -141,6 +143,19 @@ pub fn build(b: *std.Build) void {
     const component_model = b.option(bool, "component_model", "Enable Component Model") orelse false;
     options.addOption(bool, "component_model", component_model);
 
+    if (is_wasm_wasi_host) {
+        if (!interp)
+            std.debug.panic("wasm32-wasi host builds require the interpreter", .{});
+        if (aot)
+            std.debug.panic("wasm32-wasi host builds do not support the native AOT runtime", .{});
+        if (jit or fast_jit or wamr_compiler)
+            std.debug.panic("wasm32-wasi host builds do not support native code generation", .{});
+        if (component_model)
+            std.debug.panic("wasm32-wasi host builds do not support Component Model execution", .{});
+        if (lib_pthread or lib_wasi_threads or thread_mgr or shared_memory)
+            std.debug.panic("wasm32-wasi host builds do not support host threads or shared memory", .{});
+    }
+
     const threads_inputs = threads_feature.Inputs{
         .enabled = lib_wasi_threads,
         .pointer_bits = target.result.ptrBitWidth(),
@@ -184,6 +199,31 @@ pub fn build(b: *std.Build) void {
     ) orelse true;
 
     const config_module = options.createModule();
+
+    // A WebAssembly host cannot execute the native code produced by WAMR's
+    // AOT backends. Build a deliberately reduced, interpreter-only CLI and
+    // keep native-only dependencies out of the module graph entirely.
+    if (is_wasm_wasi_host) {
+        const wasm_host_module = b.createModule(.{
+            .root_source_file = b.path("src/main_wasm_host.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = if (strip) true else null,
+            .stack_protector = if (stack_protector) true else null,
+            .link_libc = if (link_libc) true else null,
+        });
+        wasm_host_module.addImport("config", config_module);
+
+        const wasm_host_exe = b.addExecutable(.{
+            .name = "wamr-exe",
+            .root_module = wasm_host_module,
+        });
+        const install_wasm_host = b.addInstallArtifact(wasm_host_exe, .{
+            .dest_sub_path = b.fmt("wamr{s}", .{target.result.exeFileExt()}),
+        });
+        b.getInstallStep().dependOn(&install_wasm_host.step);
+        return;
+    }
 
     const stable_resources_test_step = b.step(
         "test-stable-resources",

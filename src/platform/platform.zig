@@ -15,6 +15,8 @@ const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const is_linux = builtin.os.tag == .linux;
 const is_macos = builtin.os.tag == .macos;
+const supports_posix_mmap = !is_windows and builtin.os.tag != .wasi;
+const supports_posix_time = !is_windows and builtin.os.tag != .wasi;
 const page_size = std.heap.page_size_min;
 
 // ── Windows NT API imports ──────────────────────────────────────────────
@@ -57,28 +59,31 @@ pub const MapFlags = packed struct {
 pub fn mmap(hint: ?[*]u8, size: usize, prot: MemProt, flags: MapFlags) ?[*]u8 {
     if (size == 0) return null;
 
-    if (is_windows) {
+    if (comptime is_windows) {
         return mmapWindows(hint, size, prot, flags);
-    } else {
+    } else if (comptime supports_posix_mmap) {
         return mmapPosix(hint, size, prot, flags);
     }
+    return null;
 }
 
 /// Unmap previously mapped memory.
 pub fn munmap(addr: [*]u8, size: usize) void {
-    if (is_windows) {
+    if (comptime is_windows) {
         munmapWindows(addr);
-    } else {
+    } else if (comptime supports_posix_mmap) {
         munmapPosix(addr, size);
     }
 }
 
 /// Change protection on mapped memory.
 pub fn mprotect(addr: [*]u8, size: usize, prot: MemProt) !void {
-    if (is_windows) {
+    if (comptime is_windows) {
         try mprotectWindows(addr, size, prot);
-    } else {
+    } else if (comptime supports_posix_mmap) {
         try mprotectPosix(addr, size, prot);
+    } else {
+        return error.Unsupported;
     }
 }
 
@@ -261,7 +266,7 @@ fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
 /// True on platforms where `reserveAddressSpace` + `commitPages` are
 /// supported. POSIX uses an anonymous `PROT_NONE` mapping followed by
 /// `mprotect`; Windows uses one NT reserve followed by in-place commits.
-pub const supports_reserved_memory: bool = true;
+pub const supports_reserved_memory: bool = is_windows or supports_posix_mmap;
 
 /// Reserve `size` bytes of virtual address space, no physical pages
 /// backed. Returns the base pointer or null on failure. Free with
@@ -445,9 +450,9 @@ fn threadGetStackBoundaryMacos() ?[*]u8 {
 
 /// Sleep for the specified number of microseconds.
 pub fn usleep(us: u64) void {
-    if (is_windows) {
+    if (comptime is_windows) {
         usleepWindows(us);
-    } else {
+    } else if (comptime supports_posix_time) {
         usleepPosix(us);
     }
 }
@@ -513,11 +518,12 @@ var portable_fence_slot: u32 = 0;
 
 /// Monotonic time since boot in microseconds.
 pub fn timeGetBootUs() u64 {
-    if (is_windows) {
+    if (comptime is_windows) {
         return timeGetBootUsWindows();
-    } else {
+    } else if (comptime supports_posix_time) {
         return timeGetBootUsPosix();
     }
+    return 0;
 }
 
 fn timeGetBootUsWindows() u64 {
@@ -549,11 +555,12 @@ fn timeGetBootUsPosix() u64 {
 /// Current thread CPU time in microseconds (best-effort).
 /// Falls back to monotonic time when per-thread CPU time is unavailable.
 pub fn timeThreadCputimeUs() u64 {
-    if (is_windows) {
+    if (comptime is_windows) {
         return timeThreadCputimeWindows();
-    } else {
+    } else if (comptime supports_posix_time) {
         return timeThreadCputimePosix();
     }
+    return 0;
 }
 
 fn timeThreadCputimeWindows() u64 {
