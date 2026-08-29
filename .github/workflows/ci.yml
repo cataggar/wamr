@@ -115,14 +115,13 @@ jobs:
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
 
       - name: Build for wasm32-wasi
-        continue-on-error: true
         run: zig build -Doptimize=ReleaseSafe -Dtarget=wasm32-wasi -Dstrip=true
 
       - name: Run wamr via wasmtime
         run: |
           wasmtime --version
-          # Smoke test: run the wasm binary with --help or similar
-          wasmtime zig-out/bin/wamr.wasm -- --version || echo "wamr.wasm executed (exit code: $?)"
+          test "$(wasmtime zig-out/bin/wamr.wasm -- --version)" = "wamr dev"
+          test "$(wasmtime --dir . zig-out/bin/wamr.wasm -- run tests/coldstart/hello_stdout.wasm)" = "hello from jit"
 
   wasi-testsuite:
     name: Build & Test (wasi-testsuite)
