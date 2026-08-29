@@ -15,10 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: [self-hosted, Linux, X64]
+          - os: ubuntu-22.04
             name: linux-x64
             shell: bash
-          - os: [self-hosted, Linux, ARM64]
+          - os: ubuntu-24.04-arm
             name: linux-arm64
             shell: bash
           - os: windows-latest
@@ -259,7 +259,7 @@ jobs:
 
   wasi-p3-testsuite-arm64:
     name: Build & Test (wasi-p3-testsuite-arm64)
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     # The AArch64 counterpart of the `wasi-p3-testsuite` job above, which
     # runs on x86_64 only. That single-architecture coverage is what let
@@ -372,9 +372,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: [self-hosted, Linux, X64]
+          - os: ubuntu-22.04
             name: linux-x64
-          - os: [self-hosted, Linux, ARM64]
+          - os: ubuntu-24.04-arm
             name: linux-arm64
     # Keep this focused on the unit/regression tests that exercise the
     # lazy-JIT implementation. The full in-process JIT conformance suites
