@@ -1,6 +1,6 @@
 name: Cold-start (aarch64)
 
-# Per-PR cold-start latency comparison on the self-hosted aarch64 runner.
+# Per-PR cold-start latency comparison on a hosted aarch64 runner.
 # Runs `scripts/bench_coldstart.py` against the PR base, posts a sticky
 # delta table, and fails the job if the wamr CLI's median cold-start time
 # regresses by more than --regression-ratio (default 1.5×).
@@ -17,9 +17,8 @@ name: Cold-start (aarch64)
 #   wasmtime `.cwasm`        ~40 ms
 #   wasmtime `.wasm` (JIT)   ~44 ms
 #
-# Pinned to the self-hosted ARM64 runner: GitHub-hosted x86 noise easily
-# exceeds the ~1 ms wamr signal. Hosted runners are unsuitable for this
-# gate.
+# Keep the benchmark on ARM64 and measure both refs in the same hosted job.
+# The 1.5x regression threshold absorbs host variance around the ~1 ms signal.
 
 on:
   workflow_dispatch:
@@ -58,13 +57,8 @@ on:
       - .github/workflows/coldstart-aarch64.yml
 
 concurrency:
-  # Per-ref so successive pushes to the *same* PR cancel earlier runs,
-  # but unrelated PRs queue at the self-hosted runner instead of
-  # silently cancelling each other (a global group key here would make
-  # every new PR discard the previous PR's still-queued run, surfacing
-  # as a `cancelled` ✗ check). The single-slot self-hosted aarch64
-  # runner already serialises cross-PR runs, avoiding the core
-  # contention the author originally guarded against.
+  # Per-ref so successive pushes to the same PR cancel earlier runs while
+  # unrelated hosted-runner comparisons can proceed independently.
   group: coldstart-aarch64-${{ github.ref }}
   cancel-in-progress: true
 
@@ -74,7 +68,7 @@ permissions:
 
 jobs:
   coldstart:
-    runs-on: [self-hosted, Linux, ARM64]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
