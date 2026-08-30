@@ -3623,6 +3623,52 @@ pub fn spillMetricOptionsFromEnv(env: *const std.process.Environ.Map) SpillMetri
     return out;
 }
 
+/// Versioned per-function x86 frame-attribution sidecars. The value of
+/// `WAMR_AOT_FRAME_ATTRIBUTION` is an output prefix; selected functions are
+/// written to `<prefix>.mod<M>.func<F>.json`. Keeping the prefix in the
+/// explicit diagnostic option (rather than deriving it from the AOT output)
+/// also works for component cores, whose final paths are assigned above the
+/// codegen layer.
+pub const FrameAttributionOptions = struct {
+    enabled: bool = false,
+    output_prefix: ?[]const u8 = null,
+    module_filter: ?u32 = null,
+    func_filter: ?u32 = null,
+    /// Filled by the AOT driver, which owns the file-format/build identity.
+    cwasm_aot_version: u32 = 0,
+    compiler_build_id: []const u8 = "",
+
+    pub fn moduleMatches(self: FrameAttributionOptions, module_idx: u32) bool {
+        return self.module_filter == null or self.module_filter.? == module_idx;
+    }
+
+    pub fn shouldEmit(self: FrameAttributionOptions, module_idx: u32, func_idx: u32) bool {
+        if (!self.enabled or self.output_prefix == null or !self.moduleMatches(module_idx)) return false;
+        return self.func_filter == null or self.func_filter.? == func_idx;
+    }
+};
+
+/// Parse the opt-in frame-attribution diagnostic:
+///
+///   - `WAMR_AOT_FRAME_ATTRIBUTION=<output-prefix>`
+///   - `WAMR_AOT_FRAME_ATTRIBUTION_MODULE=<component-core-index>`
+///   - `WAMR_AOT_FRAME_ATTRIBUTION_FUNC=<local-function-index>`
+///
+/// The prefix must be non-empty and must not be one of the normal false-y
+/// gate spellings. The compiler never creates parent directories.
+pub fn frameAttributionOptionsFromEnv(env: *const std.process.Environ.Map) FrameAttributionOptions {
+    const prefix = env.get("WAMR_AOT_FRAME_ATTRIBUTION") orelse return .{};
+    if (!envFlagEnabled(prefix)) return .{};
+
+    var out = FrameAttributionOptions{
+        .enabled = true,
+        .output_prefix = prefix,
+    };
+    if (parseEnvU32(env, "WAMR_AOT_FRAME_ATTRIBUTION_MODULE")) |m| out.module_filter = m;
+    if (parseEnvU32(env, "WAMR_AOT_FRAME_ATTRIBUTION_FUNC")) |f| out.func_filter = f;
+    return out;
+}
+
 fn envFlagEnabled(value: []const u8) bool {
     return value.len != 0 and
         !std.mem.eql(u8, value, "0") and
@@ -16303,6 +16349,37 @@ test "SpillMetricOptions.shouldLog: min-spill threshold without a func filter" {
     // Disabled options never log.
     const off = SpillMetricOptions{ .enabled = false, .min_spilled_vregs = 1 };
     try std.testing.expect(!off.shouldLog(0, 0, 1000));
+}
+
+test "frameAttributionOptionsFromEnv: parses output prefix and exact filters" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("WAMR_AOT_FRAME_ATTRIBUTION", "artifacts/frame");
+    try env.put("WAMR_AOT_FRAME_ATTRIBUTION_MODULE", "4");
+    try env.put("WAMR_AOT_FRAME_ATTRIBUTION_FUNC", "6145");
+
+    const opts = frameAttributionOptionsFromEnv(&env);
+    try std.testing.expect(opts.enabled);
+    try std.testing.expectEqualStrings("artifacts/frame", opts.output_prefix.?);
+    try std.testing.expectEqual(@as(?u32, 4), opts.module_filter);
+    try std.testing.expectEqual(@as(?u32, 6145), opts.func_filter);
+    try std.testing.expect(opts.shouldEmit(4, 6145));
+    try std.testing.expect(!opts.shouldEmit(4, 6146));
+    try std.testing.expect(!opts.shouldEmit(3, 6145));
+}
+
+test "frameAttributionOptionsFromEnv: false-y or missing prefix disables output" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put("WAMR_AOT_FRAME_ATTRIBUTION_FUNC", "7");
+    try std.testing.expect(!frameAttributionOptionsFromEnv(&env).enabled);
+
+    try env.put("WAMR_AOT_FRAME_ATTRIBUTION", "off");
+    try std.testing.expect(!frameAttributionOptionsFromEnv(&env).enabled);
 }
 
 test "tailDuplicateSmallJoins: triple predecessor with br terminator — all three duplicated" {

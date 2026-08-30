@@ -679,11 +679,25 @@ pub fn build(b: *std.Build) void {
         "python3",
         "tests/test_bench_keyvault.py",
     });
+    const frame_attribution_tests = b.addSystemCommand(&.{
+        "python3",
+        "tests/test_aot_jit_attr.py",
+    });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(stable_resources_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
+    test_step.dependOn(&frame_attribution_tests.step);
+    if (target_arch == .x86_64 and target.result.os.tag == .linux) {
+        const frame_attribution_smoke = b.addSystemCommand(&.{
+            "python3",
+            "tests/test_aot_jit_attr.py",
+            "--wamrc",
+        });
+        frame_attribution_smoke.addFileArg(wamrc.getEmittedBin());
+        test_step.dependOn(&frame_attribution_smoke.step);
+    }
 
     const artifact_consumer_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     artifact_consumer_test.setCwd(b.path("tests/artifact-consumer"));
