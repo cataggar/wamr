@@ -35,11 +35,12 @@ def _load_attr_module():
 
 
 class KeyvaultHarnessTest(unittest.TestCase):
-    scratch = ROOT / "zig-out" / "keyvault-harness-unit"
+    scratch_root = ROOT / "zig-out"
 
     def setUp(self) -> None:
+        self.scratch = self.scratch_root / f"keyvault-harness-{self._testMethodName}"
         shutil.rmtree(self.scratch, ignore_errors=True)
-        self.scratch.mkdir(parents=True)
+        self.scratch.mkdir(parents=True, exist_ok=True)
         self.sdk = self.scratch / "sdk"
         self.spec_repo = self.scratch / "spec-repo"
         self.component = self.sdk / "component.wasm"
