@@ -387,6 +387,8 @@ pub fn compileCoreWasmCached(
         .target_arch = opts.target_arch,
         .target_abi = target_abi,
         .import_count = ir_module.import_count,
+        .has_memory64 = ir_module.has_memory64,
+        .has_shared_memory = ir_module.has_shared_memory,
         .global_types = ir_module.global_types,
         .global_offsets = ir_module.global_offsets,
         .global_storage_size = ir_module.global_storage_size,
@@ -801,6 +803,8 @@ pub const LazyCompileDriver = struct {
                 func,
                 self.lazy_out.ir_module.import_count,
                 self.lazy_out.ir_module.global_offsets orelse &.{},
+                self.lazy_out.ir_module.has_memory64,
+                self.lazy_out.ir_module.has_shared_memory,
                 self.allocator,
             ) catch |err| {
                 std.log.err("lazy-JIT spike: compiling deferred aarch64 function {d} failed: {s}", .{ local_idx, @errorName(err) });

@@ -435,6 +435,76 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rt.encoding());
     }
 
+    fn loadStoreRegOffset(self: *CodeBuffer, opcode: u32, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.emit32(opcode | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// LDR Xt, [Xn, Xm] (64-bit load, unshifted register offset).
+    pub fn ldrRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xF8606800, rt, rn, rm);
+    }
+
+    /// STR Xt, [Xn, Xm] (64-bit store, unshifted register offset).
+    pub fn strRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xF8206800, rt, rn, rm);
+    }
+
+    /// LDR Wt, [Xn, Xm] (32-bit load, unshifted register offset).
+    pub fn ldrRegOffset32(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xB8606800, rt, rn, rm);
+    }
+
+    /// STR Wt, [Xn, Xm] (32-bit store, unshifted register offset).
+    pub fn strRegOffset32(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xB8206800, rt, rn, rm);
+    }
+
+    /// LDRB Wt, [Xn, Xm] (zero-extended byte load).
+    pub fn ldrbRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38606800, rt, rn, rm);
+    }
+
+    /// STRB Wt, [Xn, Xm] (byte store).
+    pub fn strbRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38206800, rt, rn, rm);
+    }
+
+    /// LDRH Wt, [Xn, Xm] (zero-extended halfword load).
+    pub fn ldrhRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78606800, rt, rn, rm);
+    }
+
+    /// STRH Wt, [Xn, Xm] (halfword store).
+    pub fn strhRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78206800, rt, rn, rm);
+    }
+
+    /// LDRSB Xt, [Xn, Xm] (sign-extend byte → 64-bit).
+    pub fn ldrsbRegOffset64(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38A06800, rt, rn, rm);
+    }
+
+    /// LDRSB Wt, [Xn, Xm] (sign-extend byte → 32-bit).
+    pub fn ldrsbRegOffset32(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38E06800, rt, rn, rm);
+    }
+
+    /// LDRSH Xt, [Xn, Xm] (sign-extend halfword → 64-bit).
+    pub fn ldrshRegOffset64(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78A06800, rt, rn, rm);
+    }
+
+    /// LDRSH Wt, [Xn, Xm] (sign-extend halfword → 32-bit).
+    pub fn ldrshRegOffset32(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78E06800, rt, rn, rm);
+    }
+
+    /// LDRSW Xt, [Xn, Xm] (sign-extend word → 64-bit).
+    pub fn ldrswRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xB8A06800, rt, rn, rm);
+    }
+
     /// STP Xt1, Xt2, [Xn, #imm7*8]! (store pair, pre-index)
     pub fn stpPre(self: *CodeBuffer, rt1: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
         const imm: u32 = @as(u32, @as(u7, @bitCast(imm7)));
@@ -2624,6 +2694,66 @@ test "emit: LDRSW X0, [X1, #0]" {
     defer code.deinit();
     try code.ldrswImm(.x0, .x1, 0);
     try expectWord(0xB9800020, &code);
+}
+
+test "emit: scalar register-offset load/store encodings" {
+    const Kind = enum {
+        ldrb,
+        strb,
+        ldrh,
+        strh,
+        ldr32,
+        str32,
+        ldr64,
+        str64,
+        ldrsb32,
+        ldrsb64,
+        ldrsh32,
+        ldrsh64,
+        ldrsw,
+    };
+    const cases = [_]struct {
+        kind: Kind,
+        rt: Reg,
+        rn: Reg,
+        rm: Reg,
+        expected: u32,
+    }{
+        .{ .kind = .ldrb, .rt = .x0, .rn = .x1, .rm = .x2, .expected = 0x38626820 },
+        .{ .kind = .strb, .rt = .x3, .rn = .x4, .rm = .x5, .expected = 0x38256883 },
+        .{ .kind = .ldrh, .rt = .x6, .rn = .x7, .rm = .x8, .expected = 0x786868E6 },
+        .{ .kind = .strh, .rt = .x9, .rn = .x10, .rm = .x11, .expected = 0x782B6949 },
+        .{ .kind = .ldr32, .rt = .x12, .rn = .x13, .rm = .x14, .expected = 0xB86E69AC },
+        .{ .kind = .str32, .rt = .x15, .rn = .x16, .rm = .x17, .expected = 0xB8316A0F },
+        .{ .kind = .ldr64, .rt = .x18, .rn = .x19, .rm = .x20, .expected = 0xF8746A72 },
+        .{ .kind = .str64, .rt = .x21, .rn = .x22, .rm = .x23, .expected = 0xF8376AD5 },
+        .{ .kind = .ldrsb32, .rt = .x24, .rn = .x25, .rm = .x26, .expected = 0x38FA6B38 },
+        .{ .kind = .ldrsb64, .rt = .x27, .rn = .x28, .rm = .x0, .expected = 0x38A06B9B },
+        .{ .kind = .ldrsh32, .rt = .x1, .rn = .x2, .rm = .x3, .expected = 0x78E36841 },
+        .{ .kind = .ldrsh64, .rt = .x4, .rn = .x5, .rm = .x6, .expected = 0x78A668A4 },
+        .{ .kind = .ldrsw, .rt = .x7, .rn = .x8, .rm = .x9, .expected = 0xB8A96907 },
+    };
+
+    for (cases) |case| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        switch (case.kind) {
+            .ldrb => try code.ldrbRegOffset(case.rt, case.rn, case.rm),
+            .strb => try code.strbRegOffset(case.rt, case.rn, case.rm),
+            .ldrh => try code.ldrhRegOffset(case.rt, case.rn, case.rm),
+            .strh => try code.strhRegOffset(case.rt, case.rn, case.rm),
+            .ldr32 => try code.ldrRegOffset32(case.rt, case.rn, case.rm),
+            .str32 => try code.strRegOffset32(case.rt, case.rn, case.rm),
+            .ldr64 => try code.ldrRegOffset(case.rt, case.rn, case.rm),
+            .str64 => try code.strRegOffset(case.rt, case.rn, case.rm),
+            .ldrsb32 => try code.ldrsbRegOffset32(case.rt, case.rn, case.rm),
+            .ldrsb64 => try code.ldrsbRegOffset64(case.rt, case.rn, case.rm),
+            .ldrsh32 => try code.ldrshRegOffset32(case.rt, case.rn, case.rm),
+            .ldrsh64 => try code.ldrshRegOffset64(case.rt, case.rn, case.rm),
+            .ldrsw => try code.ldrswRegOffset(case.rt, case.rn, case.rm),
+        }
+        try expectWord(case.expected, &code);
+    }
 }
 
 test "emit: FMIN s0, s1, s2" {
