@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "benchmark_report": {
+    "path": "/absolute/path/to/zig-out/keyvault-798/report.json",
+    "sha256": "<64-character-sha256>"
+  },
+  "core_wasm": {
+    "path": "/absolute/path/to/the-exact-extracted-hot-core.wasm",
+    "sha256": "<core_sha256-from-the-WAMR-component-manifest>"
+  },
+  "function": {
+    "wasm_index": null,
+    "name": "<unique exact name-section value>"
+  },
+  "wamr": {
+    "manifest": "/absolute/path/to/zig-out/keyvault-798/artifacts/keyvault.cwasm.json",
+    "cwasm": "/absolute/path/to/zig-out/keyvault-798/artifacts/keyvault.4.cwasm",
+    "local_func": 6145
+  },
+  "wasmtime": {
+    "profile": null
+  }
+}
