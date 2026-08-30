@@ -8,6 +8,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import platform
 import shutil
 import stat
 import struct
@@ -149,7 +150,7 @@ class KeyvaultHarnessTest(unittest.TestCase):
         config = bench.load_manifest(self.manifest)
         with mock.patch.object(
             bench, "command_version", return_value="pinned-tool-1.0"
-        ):
+        ), mock.patch.object(bench.os, "access", return_value=True):
             report = bench.validate_config(config)
         self.assertEqual(report["inputs"]["component"]["size"], len(self.component.read_bytes()))
         self.assertEqual(len(report["sources"]), 2)
@@ -160,7 +161,7 @@ class KeyvaultHarnessTest(unittest.TestCase):
             bench.HarnessError, "tracked modifications|tree SHA-256 mismatch"
         ), mock.patch.object(
             bench, "command_version", return_value="pinned-tool-1.0"
-        ):
+        ), mock.patch.object(bench.os, "access", return_value=True):
             bench.validate_config(config)
 
     def test_manifest_rejects_placeholders_and_short_revisions(self) -> None:
@@ -324,7 +325,10 @@ class KeyvaultHarnessTest(unittest.TestCase):
         self.assertEqual(report["attributed_samples"], 10)
         self.assertEqual(report["attribution_coverage_pct"], 100)
 
-    @unittest.skipIf(sys.platform == "win32", "controlled runner uses POSIX shell")
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and platform.machine() == "x86_64",
+        "controlled timing cohort requires Linux x86_64",
+    )
     def test_controlled_end_to_end_smoke(self) -> None:
         self.tool.write_text(
             "#!/bin/sh\n"
