@@ -13753,6 +13753,40 @@ test "store: checked memory32 offset zero uses every scalar register-offset form
     }
 }
 
+test "store: spilled value reload preserves the checked register-offset index" {
+    const allocator = std.testing.allocator;
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+    var reg_map = RegMap.init(allocator, 64, 8);
+    defer reg_map.deinit();
+    const base: ir.VReg = 0;
+    const val: ir.VReg = 1;
+    try reg_map.entries.put(base, .{ .reg = .x0 });
+    try reg_map.entries.put(val, .{ .stack = 0 });
+    const fctx = FuncCompileCtx{ .allocator = allocator };
+
+    try emitStore(&code, .{ .base = base, .offset = 0, .size = 4, .val = val }, &reg_map, &fctx);
+
+    const spill_reload = 0xF9400000 |
+        (@as(u32, 8) << 10) |
+        (@as(u32, @intFromEnum(emit.Reg.fp)) << 5) |
+        @as(u32, @intFromEnum(RegMap.tmp1));
+    const reg_store = 0xB8206800 |
+        (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
+        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5) |
+        @as(u32, @intFromEnum(RegMap.tmp1));
+    var reload_pos: ?usize = null;
+    var store_pos: ?usize = null;
+    var i: usize = 0;
+    while (i + 4 <= code.bytes.items.len) : (i += 4) {
+        const word = std.mem.readInt(u32, code.bytes.items[i..][0..4], .little);
+        if (word == spill_reload) reload_pos = i;
+        if (word == reg_store) store_pos = i;
+    }
+    try std.testing.expect(reload_pos.? < store_pos.?);
+    try std.testing.expectEqual(reload_pos.? + 4, store_pos.?);
+}
+
 test "load: register-offset form removes one ADD and keeps zero-extension before the trap edge" {
     const allocator = std.testing.allocator;
     const spec = AddressingLoadTestSpec{ .size = 4 };
