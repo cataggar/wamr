@@ -14,7 +14,7 @@ ASZ="${ASZ:-$HOME/azure-sdk-for-zig}"
 WASM="${WASM:-$ASZ/codegen/cli/zig-out/bin/codegen-cli.composed.wasm}"
 PREOPENS="${PREOPENS:-$ASZ/codegen/tcgc-component/dist/stdlib-preopens.txt}"
 SPEC="${SPEC:-$HOME/azure-rest-api-specs/specification/keyvault/data-plane/Secrets}"
-OUT="${OUT:-/tmp/keyvault-out}"
+OUT="${OUT:?set OUT to a dedicated output directory}"
 MANIFEST="${MANIFEST:-}"   # optional --precompiled-manifest (else sibling auto-probe)
 
 mkdir -p "$OUT"
