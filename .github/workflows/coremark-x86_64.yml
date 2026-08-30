@@ -24,6 +24,7 @@ on:
       - src/runtime/**
       - tests/benchmarks/coremark/**
       - scripts/bench_coremark.py
+      - scripts/test_bench_coremark.py
       - .github/workflows/coremark-x86_64.yml
 
 concurrency:
@@ -55,6 +56,9 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
+      - name: Test CoreMark harness
+        run: python3 -m unittest scripts/test_bench_coremark.py
+
       - name: Resolve refs
         id: refs
         env:
@@ -85,6 +89,7 @@ jobs:
           python3 scripts/bench_coremark.py \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
+            --profile  ci \
             --runs     "$RUNS" \
             --min-delta-pct=-5.0 \
             --out      coremark-table.md \

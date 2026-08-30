@@ -39,6 +39,7 @@ wasm-spec-temp/
 *.aot
 
 # Benchmark artifacts
+.bench-coremark/
 tests/benchmarks/coremark/coremark/
 tests/benchmarks/**/*.wasm
 tests/benchmarks/**/*.aot
