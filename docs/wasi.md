@@ -374,8 +374,10 @@ Now:
   value bytes (e.g. `{"primary":{"alpha":"dmFsdWU="}}`). Reads on
   startup, rewrites synchronously on every mutation (`set` /
   `delete` / successful `swap` / `increment` / batch.{set,delete}-many).
-  The flush is a plain `writeFile` — atomic-rename (`<path>.tmp` →
-  `rename`) is documented as a follow-up hardening. The `cas`
+  The flush is a plain `writeFile`; the metadata-preserving,
+  crash-safe replacement protocol is specified in
+  [`docs/design/metadata-safe-json-persistence.md`](design/metadata-safe-json-persistence.md)
+  for follow-up implementation. The `cas`
   resource is now a real atomic test-and-set (`[static]cas.new` /
   `[method]cas.current` / `swap` / `[resource-drop]cas`); mismatches
   surface `cas-error::cas-failed(cas)` with a re-snapshotted handle
