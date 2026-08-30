@@ -9,11 +9,18 @@ builds and runs CoreMark using Zig's cross-compiler for both native and wasm32-w
    ```
    zig build
    ```
-2. Clone the CoreMark source:
+2. Clone the CoreMark source at the pinned revision used for reproducible
+   source rebuilds:
    ```
    cd tests/benchmarks/coremark
    git clone https://github.com/eembc/coremark.git
+   git -C coremark checkout cfa9ab377835911f23d9b0831c7be302ed1f58de
    ```
+
+The comparison harness does not rebuild from this checkout. It always uses the
+tracked canonical fixture `coremark_wasi.wasm`
+(`sha256:f4b7591296ead10264e0f101f355bdf848865c31329325594e66fbabefec235b`)
+and verifies that checksum before running, eliminating upstream-source drift.
 
 ## Building
 
@@ -30,6 +37,38 @@ zig build run-aot                  # run AOT benchmark via wamr
 zig build run-interp               # run interpreter benchmark via wamr
 zig build bench                    # run all three
 ```
+
+## Reproducible cross-engine comparison
+
+From the repository root:
+
+```
+python3 scripts/bench_coremark.py \
+  --baseline origin/main \
+  --target HEAD \
+  --wasmtime-baseline auto \
+  --wasmtime /path/to/current/wasmtime
+```
+
+The authoritative defaults are two discarded warmups and ten measured runs
+per engine. Reports include architecture, CPU model, optimize mode, exact git
+refs and Wasmtime versions, fixture checksum, every measured sample,
+mean/median/range, and same-host WAMR/Wasmtime ratios. Every sample must contain
+CoreMark's `Correct operation validated.` CRC result; command failures, CRC
+errors, missing results, and ambiguous output fail the run.
+
+`--wasmtime-baseline auto` downloads Wasmtime 44.0.1 (the latest Wasmtime
+release line available before #393's 2026-05-07 reference measurement), the
+pinned historical baseline for future comparisons, and verifies the official
+release archive checksum. Pass
+`--wasmtime /path/to/wasmtime` separately for a caller-selected or current
+binary; the report keeps the two versions in distinct rows. Automatic download
+supports Linux x86_64 and aarch64; other hosts can pass an explicit 44.0.1
+binary.
+
+PR CI deliberately uses `--profile ci` (zero warmups, three measured runs) to
+keep the regression gate affordable. Use the default `--profile authoritative`
+for publishable cross-engine numbers.
 
 ## Options
 
@@ -90,4 +129,3 @@ first 80 lines of `llvm-objdump -d` on the precompiled `.cwasm`. The `perf`
 path requires `kernel.perf_event_paranoid <= 2`; bump it once with
 `sudo sysctl -w kernel.perf_event_paranoid=1`. The wamr `coremark-profile`
 step does **not** depend on `perf_event_paranoid` (it only uses POSIX SIGPROF).
-
