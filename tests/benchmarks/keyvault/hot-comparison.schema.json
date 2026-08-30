@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/wamr/tests/benchmarks/keyvault/hot-comparison.schema.json",
+  "title": "Pinned WAMR/Wasmtime hot-function comparison config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_report",
+    "core_wasm",
+    "function",
+    "wamr",
+    "wasmtime"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "benchmark_report": { "$ref": "#/$defs/file" },
+    "core_wasm": { "$ref": "#/$defs/file" },
+    "function": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wasm_index", "name"],
+      "properties": {
+        "wasm_index": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "name": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "anyOf": [
+        { "properties": { "wasm_index": { "type": "integer" } } },
+        { "properties": { "name": { "type": "string" } } }
+      ]
+    },
+    "wamr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "cwasm", "local_func"],
+      "properties": {
+        "manifest": { "type": "string", "minLength": 1 },
+        "cwasm": { "type": "string", "minLength": 1 },
+        "local_func": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "wasmtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile"],
+      "properties": {
+        "profile": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "sha256"],
+              "properties": {
+                "path": { "type": "string", "minLength": 1 },
+                "sha256": { "$ref": "#/$defs/sha256" }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
