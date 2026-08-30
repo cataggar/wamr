@@ -119,7 +119,8 @@ For Azure Linux setup and interpretation details, see
 
 `scripts/compare_hot_function.py` turns the WAMR profile into a strict,
 archiveable cross-engine code comparison. It does **not** equate WAMR's
-`local_func=N` with Wasmtime's engine-local module/function labels.
+`local_func=N` with Wasmtime's engine-local module/function labels. Native
+capture currently targets the benchmark cohort's Linux x86_64 host.
 
 First run the benchmark with `--profile`. Then extract the raw core modules
 from the exact pinned component without re-encoding them. For example,

@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import struct
 import subprocess
@@ -1165,6 +1166,10 @@ def find_wamr_jump_tables(code: bytes) -> list[dict[str, int]]:
 def disassemble_wamr(
     function: CwasmFunction, work_dir: Path
 ) -> tuple[list[Instruction], list[str], list[dict[str, int]]]:
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        raise ComparisonError(
+            "native hot-function capture currently requires Linux x86_64"
+        )
     objdump = "objdump"
     scratch = work_dir / f".wamr-hot-function-{os.getpid()}.bin"
     jump_tables = find_wamr_jump_tables(function.code)

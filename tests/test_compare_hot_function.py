@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import shutil
 import stat
 import struct
@@ -17,6 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import compare_hot_function as compare  # noqa: E402
+
+
+CAPTURE_SUPPORTED = (
+    sys.platform.startswith("linux")
+    and platform.machine() == "x86_64"
+    and shutil.which("objdump") is not None
+)
 
 
 def leb(value: int) -> bytes:
@@ -527,6 +535,7 @@ class HotFunctionComparisonTest(unittest.TestCase):
             json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="UTF-8"
         )
 
+    @unittest.skipUnless(CAPTURE_SUPPORTED, "capture requires Linux x86_64 objdump")
     def test_controlled_capture_matches_exact_module_and_function(self) -> None:
         capture = compare.capture(self.config, self.scratch / "work")
         self.assertEqual(capture["identity"]["wasm_function_index"], 1)
@@ -617,6 +626,7 @@ class HotFunctionComparisonTest(unittest.TestCase):
         self.assertEqual(metrics["indirect_dispatch"]["value"], 2)
         self.assertEqual(metrics["calls"]["value"], 1)
 
+    @unittest.skipUnless(CAPTURE_SUPPORTED, "capture requires Linux x86_64 objdump")
     def test_wamr_inline_jump_table_bytes_are_not_instructions(self) -> None:
         code = bytes.fromhex(
             "31 c0 "
@@ -753,6 +763,7 @@ class HotFunctionComparisonTest(unittest.TestCase):
         self.assertEqual(example["wamr"]["local_func"], 6145)
         self.assertIsNone(example["wasmtime"]["profile"])
 
+    @unittest.skipUnless(CAPTURE_SUPPORTED, "capture requires Linux x86_64 objdump")
     def test_cli_capture_and_report_smoke(self) -> None:
         capture_path = self.scratch / "capture.json"
         report_path = self.scratch / "report.json"
