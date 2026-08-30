@@ -13,8 +13,11 @@ pub const Handle = u32;
 
 /// Lock ranks increase from outer to inner locks.
 pub const LockRank = struct {
+    pub const resource_registry: u16 = 50;
     pub const resource_directory: u16 = 100;
     pub const resource_node: u16 = 200;
+    pub const core_instance: u16 = 250;
+    pub const core_table: u16 = 300;
 };
 
 const debug_lock_tracking = builtin.mode == .Debug;
@@ -182,6 +185,82 @@ pub fn ConditionalRefCountFor(comptime enabled: bool) type {
 }
 
 pub const ConditionalRefCount = ConditionalRefCountFor(config.lib_wasi_threads);
+
+/// An ownership reference count that is atomic only when sharing is enabled.
+///
+/// Unlike `ConditionalRefCountFor`, the disabled specialization keeps a
+/// plain counter because cross-instance ownership still needs exact lifetime
+/// accounting even in a single-threaded build.
+pub fn ConditionalLifetimeRefCountFor(comptime enabled: bool) type {
+    return if (enabled) struct {
+        const Self = @This();
+
+        value: std.atomic.Value(u32),
+
+        pub fn init(initial: usize) Self {
+            std.debug.assert(initial > 0 and initial <= std.math.maxInt(u32));
+            return .{ .value = std.atomic.Value(u32).init(@intCast(initial)) };
+        }
+
+        pub fn retain(self: *Self) void {
+            var current = self.value.load(.monotonic);
+            while (true) {
+                std.debug.assert(current > 0);
+                std.debug.assert(current < std.math.maxInt(u32));
+                if (self.value.cmpxchgWeak(
+                    current,
+                    current + 1,
+                    .monotonic,
+                    .monotonic,
+                )) |observed| {
+                    current = observed;
+                } else {
+                    return;
+                }
+            }
+        }
+
+        pub fn release(self: *Self) bool {
+            const previous = self.value.fetchSub(1, .release);
+            std.debug.assert(previous > 0);
+            if (previous != 1) return false;
+            _ = self.value.load(.acquire);
+            return true;
+        }
+
+        pub fn count(self: *const Self) usize {
+            return @intCast(self.value.load(.monotonic));
+        }
+    } else struct {
+        const Self = @This();
+
+        value: u32,
+
+        pub fn init(initial: usize) Self {
+            std.debug.assert(initial > 0 and initial <= std.math.maxInt(u32));
+            return .{ .value = @intCast(initial) };
+        }
+
+        pub inline fn retain(self: *Self) void {
+            std.debug.assert(self.value > 0);
+            std.debug.assert(self.value < std.math.maxInt(u32));
+            self.value += 1;
+        }
+
+        pub inline fn release(self: *Self) bool {
+            std.debug.assert(self.value > 0);
+            self.value -= 1;
+            return self.value == 0;
+        }
+
+        pub inline fn count(self: *const Self) usize {
+            return @intCast(self.value);
+        }
+    };
+}
+
+pub const ConditionalLifetimeRefCount =
+    ConditionalLifetimeRefCountFor(config.lib_wasi_threads);
 
 pub const NodeState = enum(u8) {
     published,
@@ -454,6 +533,44 @@ pub fn StableHandleTableFor(
             return .{ .node = node };
         }
 
+        /// Roll back a successful publication without invoking `destroy`.
+        ///
+        /// This succeeds only while the table owns the sole reference, so it
+        /// is intended for callers that have not exposed the handle yet. The
+        /// returned value remains caller-owned.
+        pub fn withdraw(self: *Self, handle: Handle) ?T {
+            const control = self.control.?;
+            control.directory.lock();
+            const slot = findSlot(control, handle) orelse {
+                control.directory.unlock();
+                return null;
+            };
+            const node = switch (slot.*) {
+                .published => |published| published,
+                else => {
+                    control.directory.unlock();
+                    return null;
+                },
+            };
+            if (comptime enabled) {
+                if (node.refs.count() != 1) {
+                    control.directory.unlock();
+                    return null;
+                }
+            }
+
+            node.setState(.destroying);
+            slot.* = .{ .free = control.free_head };
+            control.free_head = node.handle;
+            control.published -= 1;
+            control.live_nodes -= 1;
+            control.directory.unlock();
+
+            const value = node.value;
+            control.allocator.destroy(node);
+            return value;
+        }
+
         /// Unpublishes a handle. Destruction happens after unlocking, and in
         /// enabled builds is deferred until every lease has been released.
         pub fn remove(self: *Self, handle: Handle) bool {
@@ -680,6 +797,23 @@ test "configured aliases follow lib_wasi_threads" {
     try std.testing.expectEqual(expected_ref_size, @sizeOf(ConditionalRefCount));
 }
 
+test "conditional lifetime refcount preserves disabled ownership accounting" {
+    try std.testing.expectEqual(@sizeOf(u32), @sizeOf(ConditionalLifetimeRefCountFor(false)));
+    try std.testing.expectEqual(@sizeOf(u32), @sizeOf(ConditionalLifetimeRefCountFor(true)));
+
+    var disabled = ConditionalLifetimeRefCountFor(false).init(1);
+    disabled.retain();
+    try std.testing.expectEqual(@as(usize, 2), disabled.count());
+    try std.testing.expect(!disabled.release());
+    try std.testing.expect(disabled.release());
+
+    var enabled = ConditionalLifetimeRefCountFor(true).init(1);
+    enabled.retain();
+    try std.testing.expectEqual(@as(usize, 2), enabled.count());
+    try std.testing.expect(!enabled.release());
+    try std.testing.expect(enabled.release());
+}
+
 test "stable table grows without moving a leased node" {
     const Table = TestTable(true, 2);
     var destroyed = std.atomic.Value(usize).init(0);
@@ -813,6 +947,24 @@ test "publish OOM rolls back node and directory growth deterministically" {
     try std.testing.expectEqual(@as(usize, 0), stats.live_nodes);
     try std.testing.expectEqual(@as(usize, 0), stats.chunks);
     try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
+    try table.deinit();
+}
+
+test "withdraw returns unpublished ownership without running the destructor" {
+    const Table = TestTable(true, 2);
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = try Table.init(std.testing.allocator, &destroyed);
+
+    const handle = try table.publish(.{ .value = 123 });
+    const value = table.withdraw(handle).?;
+    try std.testing.expectEqual(@as(usize, 123), value.value);
+    try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
+    try std.testing.expect(table.acquire(handle) == null);
+
+    const reused = try table.publish(.{ .value = 456 });
+    try std.testing.expectEqual(handle, reused);
+    table.shutdown();
+    try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
     try table.deinit();
 }
 

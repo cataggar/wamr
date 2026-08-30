@@ -662,6 +662,23 @@ pub fn build(b: *std.Build) void {
     );
     shared_memory_test_step.dependOn(&run_shared_memory_unit_tests.step);
 
+    const core_resource_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{
+            "FdTable",
+            "WasiCtx",
+            "core resource",
+            "cloneForThread",
+            "shared table",
+        },
+    });
+    const run_core_resource_unit_tests = b.addRunArtifact(core_resource_unit_tests);
+    const core_resource_test_step = b.step(
+        "test-core-resources",
+        "Run Preview-1 descriptor and shared core-resource tests",
+    );
+    core_resource_test_step.dependOn(&run_core_resource_unit_tests.step);
+
     const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

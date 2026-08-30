@@ -1870,8 +1870,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 const elem_idx: u32 = try popTableIdx(env, table);
 
-                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
-                const elem = table.elements[elem_idx];
+                const elem = table.getElement(elem_idx) orelse return error.OutOfBoundsTableAccess;
                 const funcref = elem.asFuncRef() orelse {
                     if (elem.isNull()) return error.UninitializedElement;
                     return error.IndirectCallTypeMismatch;
@@ -1938,8 +1937,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 const elem_idx: u32 = try popTableIdx(env, table);
 
-                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
-                const elem = table.elements[elem_idx];
+                const elem = table.getElement(elem_idx) orelse return error.OutOfBoundsTableAccess;
                 const funcref = elem.asFuncRef() orelse {
                     if (elem.isNull()) return error.UninitializedElement;
                     return error.IndirectCallTypeMismatch;
@@ -2912,8 +2910,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const table_idx = readU32(code, &ip);
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 const elem_idx: u32 = try popTableIdx(env, table);
-                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
-                const elem = table.elements[elem_idx];
+                const elem = table.getElement(elem_idx) orelse return error.OutOfBoundsTableAccess;
                 try env.push(elem.value);
             },
             .table_set => {
@@ -2921,8 +2918,8 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 const ref = try env.pop();
                 const elem_idx: u32 = try popTableIdx(env, table);
-                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
-                table.elements[elem_idx] = types.TableElement.fromValue(ref, env.module_inst);
+                if (!table.setElement(elem_idx, types.TableElement.fromValue(ref, env.module_inst)))
+                    return error.OutOfBoundsTableAccess;
             },
 
             // ── Misc prefix (0xFC) ──
@@ -3026,7 +3023,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         // Check if segment is dropped
-                        if (data_idx < env.module_inst.dropped_data.len and env.module_inst.dropped_data[data_idx]) {
+                        if (env.module_inst.isDataSegmentDropped(data_idx)) {
                             if (n > 0) return error.OutOfBoundsMemoryAccess;
                             continue;
                         }
@@ -3045,9 +3042,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     },
                     9 => { // data.drop
                         const data_idx = readU32(code, &ip);
-                        if (data_idx < env.module_inst.dropped_data.len) {
-                            env.module_inst.dropped_data[data_idx] = true;
-                        }
+                        env.module_inst.dropDataSegment(data_idx);
                     },
                     10 => { // memory.copy
                         const dst_mem_idx = readU32(code, &ip);
@@ -3096,10 +3091,15 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const d: u32 = try popTableIdx(env, table);
                         const module = env.module_inst.module;
                         if (elem_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
+                        env.module_inst.lockState();
+                        defer env.module_inst.unlockState();
                         if (elem_idx < env.module_inst.dropped_elems.len and env.module_inst.dropped_elems[elem_idx]) {
                             if (n > 0) return error.OutOfBoundsTableAccess;
                             continue;
                         }
+
+                        table.lock();
+                        defer table.unlock();
 
                         // Use cached evaluated values (spec requires one-time evaluation)
                         if (elem_idx < env.module_inst.cached_elem_values.len) {
@@ -3126,13 +3126,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     },
                     13 => { // elem.drop
                         const idx = readU32(code, &ip);
-                        if (idx < env.module_inst.dropped_elems.len) {
-                            env.module_inst.dropped_elems[idx] = true;
-                        }
-                        // Also clear cached elem values so GC operations trap
-                        if (idx < env.module_inst.cached_elem_values.len) {
-                            env.module_inst.cached_elem_values[idx] = null;
-                        }
+                        env.module_inst.dropElementSegment(idx);
                     },
                     14 => { // table.copy
                         const dst_table_idx = readU32(code, &ip);
@@ -3143,14 +3137,34 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const n: u32 = if (is_64) blk: { const v: u64 = @bitCast(try env.popI64()); break :blk if (v > std.math.maxInt(u32)) return error.OutOfBoundsTableAccess else @as(u32, @intCast(v)); } else @bitCast(try env.popI32());
                         const s: u32 = try popTableIdx(env, src_table);
                         const d: u32 = try popTableIdx(env, dst_table);
-                        if (@as(u64, s) + n > src_table.elements.len or @as(u64, d) + n > dst_table.elements.len) return error.OutOfBoundsTableAccess;
-                        if (d <= s) {
-                            for (0..n) |i_| dst_table.elements[d + @as(u32, @intCast(i_))] = src_table.elements[s + @as(u32, @intCast(i_))];
+                        if (src_table == dst_table) {
+                            src_table.lock();
+                            defer src_table.unlock();
+                            if (@as(u64, s) + n > src_table.elements.len or @as(u64, d) + n > src_table.elements.len)
+                                return error.OutOfBoundsTableAccess;
+                            if (d <= s) {
+                                std.mem.copyForwards(
+                                    types.TableElement,
+                                    src_table.elements[d..][0..n],
+                                    src_table.elements[s..][0..n],
+                                );
+                            } else {
+                                std.mem.copyBackwards(
+                                    types.TableElement,
+                                    src_table.elements[d..][0..n],
+                                    src_table.elements[s..][0..n],
+                                );
+                            }
                         } else {
-                            var j: u32 = n;
-                            while (j > 0) {
-                                j -= 1;
-                                dst_table.elements[d + j] = src_table.elements[s + j];
+                            if (@as(u64, s) + n > src_table.elementCount() or
+                                @as(u64, d) + n > dst_table.elementCount())
+                                return error.OutOfBoundsTableAccess;
+                            for (0..n) |i_| {
+                                const offset: u32 = @intCast(i_);
+                                const value = src_table.getElement(s + offset) orelse
+                                    return error.OutOfBoundsTableAccess;
+                                if (!dst_table.setElement(d + offset, value))
+                                    return error.OutOfBoundsTableAccess;
                             }
                         }
                     },
@@ -3162,6 +3176,8 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         };
                         const delta: u32 = try popTableIdx(env, table);
                         const init_ref = try env.pop();
+                        table.lock();
+                        defer table.unlock();
                         const old_size: u32 = @intCast(table.elements.len);
                         const new_size = @as(u64, old_size) + delta;
                         if (new_size > std.math.maxInt(u32)) {
@@ -3186,7 +3202,8 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     16 => { // table.size
                         const table_idx = readU32(code, &ip);
                         const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
-                        if (table.table_type.is_table64) try env.pushI64(@intCast(table.elements.len)) else try env.pushI32(@intCast(table.elements.len));
+                        const size = table.elementCount();
+                        if (table.table_type.is_table64) try env.pushI64(@intCast(size)) else try env.pushI32(@intCast(size));
                     },
                     17 => { // table.fill
                         const table_idx = readU32(code, &ip);
@@ -3194,6 +3211,8 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const n: u32 = try popTableIdx(env, table);
                         const val = try env.pop();
                         const offset: u32 = try popTableIdx(env, table);
+                        table.lock();
+                        defer table.unlock();
                         if (@as(u64, offset) + n > table.elements.len) return error.OutOfBoundsTableAccess;
                         const fill_elem = types.TableElement.fromValue(val, env.module_inst);
                         for (table.elements[offset..][0..n]) |*e| e.* = fill_elem;
