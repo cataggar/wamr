@@ -675,10 +675,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
+    const keyvault_harness_tests = b.addSystemCommand(&.{
+        "python3",
+        "tests/test_bench_keyvault.py",
+    });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(stable_resources_test_step);
+    test_step.dependOn(&keyvault_harness_tests.step);
 
     const artifact_consumer_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     artifact_consumer_test.setCwd(b.path("tests/artifact-consumer"));

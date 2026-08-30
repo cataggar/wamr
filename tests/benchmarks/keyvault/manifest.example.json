@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "tools": {
+    "wamr": {
+      "path": "/absolute/path/to/wamr/zig-out/bin/wamr",
+      "sha256": "<64-character-sha256>",
+      "version": "wamr dev"
+    },
+    "wamrc": {
+      "path": "/absolute/path/to/wamr/zig-out/bin/wamrc",
+      "sha256": "<64-character-sha256>",
+      "version": "wamrc dev"
+    },
+    "wasmtime": {
+      "path": "/absolute/path/to/wasmtime",
+      "sha256": "<64-character-sha256>",
+      "version": "wasmtime 46.0.1"
+    }
+  },
+  "sources": [
+    {
+      "name": "wamr",
+      "path": "/absolute/path/to/wamr",
+      "revision": "<full-40-character-commit-sha>"
+    },
+    {
+      "name": "azure-sdk-for-zig",
+      "path": "/absolute/path/to/azure-sdk-for-zig",
+      "revision": "19e06fc47073bcb9a6c461e3a0bf5298dc49cc60"
+    },
+    {
+      "name": "azure-rest-api-specs",
+      "path": "/absolute/path/to/azure-rest-api-specs",
+      "revision": "<full-40-character-commit-sha>"
+    }
+  ],
+  "workload": {
+    "component": {
+      "path": "/absolute/path/to/codegen-cli.composed.wasm",
+      "sha256": "fe08b02fa85209855850ba1ea72bc3ab554cec961fdee005cacb6348d9da8c92"
+    },
+    "preopens_file": {
+      "path": "/absolute/path/to/stdlib-preopens.txt",
+      "sha256": "<64-character-sha256>"
+    },
+    "mounts": [
+      {
+        "path": "/absolute/path/to/azure-rest-api-specs/specification/keyvault/data-plane/Secrets",
+        "guest": "/spec",
+        "sha256_tree": "<64-character-tree-sha256>"
+      },
+      {
+        "path": "/absolute/path/from/stdlib-preopens.txt",
+        "guest": "/the-exact-guest-path-from-stdlib-preopens.txt",
+        "sha256_tree": "<64-character-tree-sha256>"
+      }
+    ],
+    "package_name": "keyvault-secrets",
+    "env": {},
+    "expected_tcgc_response_bytes": 58187
+  },
+  "perf": {
+    "core_index": 4,
+    "hot_func": 6145,
+    "min_samples": 5000,
+    "min_attribution_coverage_pct": 50.0,
+    "base": null
+  }
+}

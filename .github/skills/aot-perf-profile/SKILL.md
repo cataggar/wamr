@@ -33,6 +33,29 @@ Do **not** use this skill for:
 - Compile-time cost — that's `WAMR_AOT_CODEGEN_TIMING` / pass-timing, not
   a runtime `perf record`.
 
+## Pinned keyvault harness (preferred)
+
+For #798 comparisons, use `scripts/bench_keyvault.py` and a completed
+`tests/benchmarks/keyvault/manifest.example.json` rather than assembling
+commands ad hoc. The harness validates full source revisions and SHA-256 values
+for every binary/input/mounted tree, precompiles both runtimes outside measured
+execution, requires at least five measured runs, and rejects response-byte or
+generated-file drift. It also records host/tool/input identity and the
+Wasmtime-time/WAMR-time ratio:
+
+```sh
+python3 scripts/bench_keyvault.py \
+  --manifest /path/to/keyvault.lock.json \
+  --work-dir "$PWD/zig-out/keyvault-798" \
+  --warmups 2 --runs 7
+```
+
+Add `--profile` to capture and attribute a WAMR perf run. In that mode missing
+perf/objdump, inadequate permissions or sample count, and insufficient
+attribution coverage are hard failures; the harness never silently falls back
+to an unprofiled success. See `tests/benchmarks/keyvault/README.md` for the
+lockfile and equivalence contract.
+
 ## Environment
 
 This VM is **Microsoft Azure Linux 3 (`azurelinux`, `azl3`)**, x86_64.
@@ -161,12 +184,17 @@ python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm
 
 # Add --func <N> to classify the hot function's instruction mix:
 python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm --func 6145
+
+# Machine-readable output + a minimum useful sample gate:
+python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm \
+  --func 6145 --min-samples 5000 --json-out attribution.json
 ```
 
 It prints: total samples, % of run in this core, top functions by
 self-samples, and for `--func` the class breakdown (spill reloads /
 frame stores / reg-reg mov / ALU / bounds-check / linear-mem / dispatch /
-call) plus the 20 hottest instructions. Cross-validate: the static
+call) plus the 20 hottest instructions. JSON output also records total and
+attributed samples plus attribution coverage. Cross-validate: the static
 frame-load count for the hot fn should ≈ its `spill_ld` from Step 3.
 
 If size-matching picks the wrong mapping (multiple equal-size cores),
