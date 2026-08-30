@@ -23,8 +23,11 @@ on:
       - src/compiler/**
       - src/runtime/**
       - tests/benchmarks/coremark/**
+      - tests/benchmarks/loop-passes/**
       - scripts/bench_coremark.py
+      - scripts/bench_loop_passes.py
       - scripts/test_bench_coremark.py
+      - scripts/test_bench_loop_passes.py
       - .github/workflows/coremark-x86_64.yml
 
 concurrency:
@@ -56,8 +59,11 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
-      - name: Test CoreMark harness
-        run: python3 -m unittest scripts/test_bench_coremark.py
+      - name: Test benchmark harnesses
+        run: |
+          python3 -m unittest \
+            scripts/test_bench_coremark.py \
+            scripts/test_bench_loop_passes.py
 
       - name: Resolve refs
         id: refs
@@ -95,12 +101,29 @@ jobs:
             --out      coremark-table.md \
             --emit     github
 
+      - name: Run focused loop-pass comparison
+        id: loop_bench
+        continue-on-error: true
+        env:
+          BASELINE: ${{ steps.refs.outputs.baseline }}
+          TARGET: ${{ steps.refs.outputs.target }}
+        run: |
+          python3 scripts/bench_loop_passes.py \
+            --baseline "$BASELINE" \
+            --target   "$TARGET" \
+            --profile  ci \
+            --min-speedup unroll4=20 \
+            --out      loop-passes-table.md \
+            --emit     github
+
       - name: Upload table
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coremark-x86_64-${{ github.sha }}
-          path: coremark-table.md
+          path: |
+            coremark-table.md
+            loop-passes-table.md
           if-no-files-found: ignore
           retention-days: 90
 
@@ -110,11 +133,14 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            if (!fs.existsSync('coremark-table.md')) {
-              core.warning('coremark-table.md was not produced');
+            const reports = ['coremark-table.md', 'loop-passes-table.md']
+              .filter(file => fs.existsSync(file))
+              .map(file => fs.readFileSync(file, 'utf8'));
+            if (reports.length === 0) {
+              core.warning('benchmark reports were not produced');
               return;
             }
-            const body = fs.readFileSync('coremark-table.md', 'utf8');
+            const body = reports.join('\n\n');
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -122,6 +148,6 @@ jobs:
               body,
             });
 
-      - name: Fail on CoreMark regression
-        if: steps.bench.outcome == 'failure'
+      - name: Fail on benchmark regression
+        if: steps.bench.outcome == 'failure' || steps.loop_bench.outcome == 'failure'
         run: exit 1
