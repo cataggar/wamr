@@ -109,10 +109,9 @@ fn expectDiffI32(wasm: []const u8, name: []const u8, expected: i32) !void {
 /// #798 Lever 1: a trap in AOT-compiled code must surface as
 /// `error.WasmTrap` out of `callFuncScalar` (catchable) rather than
 /// aborting the process. Catchable on x86_64 (Windows via the VEH path,
-/// POSIX via the hand-rolled `trap_jmp` setjmp/longjmp); on other arches
-/// AOT traps still abort, so gate the assertion to x86_64.
+/// POSIX via the hand-rolled `trap_jmp` setjmp/longjmp) and POSIX AArch64.
 fn expectAotTrap(wasm: []const u8, name: []const u8) !void {
-    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
     try testing.expectError(error.WasmTrap, runAotI32(testing.allocator, wasm, name));
 }
 

@@ -100,8 +100,9 @@ pub const JitCodeCache = struct {
 // Windows TLS stores only that context pointer; the aligned CONTEXT itself
 // stays in ordinary stack storage.
 const windows_trap_supported = builtin.os.tag == .windows and builtin.cpu.arch == .x86_64;
-/// #798 Lever 1: catch AOT traps as `error.WasmTrap` on POSIX x86_64 too
-/// (Linux / macOS), the analogue of the Windows `RtlCaptureContext` path.
+/// #798 Lever 1: catch AOT traps as `error.WasmTrap` on POSIX x86_64 and
+/// AArch64 (Linux / macOS), the analogue of the Windows x86_64
+/// `RtlCaptureContext` path.
 /// Uses the hand-rolled `trap_jmp` setjmp/longjmp (no libc on Linux). When
 /// false (other targets), AOT traps abort the process as before.
 const posix_trap_supported = !windows_trap_supported and trap_jmp.supported;

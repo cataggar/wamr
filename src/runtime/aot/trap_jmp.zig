@@ -6,9 +6,9 @@
 //! pointer, and return address into a `JmpBuf`, then jump back to the capture
 //! site on `restore`.
 //!
-//! Scope: x86_64 SysV only (Linux / macOS). Other targets keep the
-//! pre-#798 behaviour where AOT traps abort the process; `supported`
-//! reflects that so callers can gate cleanly.
+//! Scope: x86_64 SysV and AArch64 AAPCS64 on Linux / macOS. Other targets
+//! keep the pre-#798 behaviour where AOT traps abort the process;
+//! `supported` reflects that so callers can gate cleanly.
 //!
 //! Safety contract (mirrors C setjmp/longjmp):
 //!   - `capture` must be called such that its caller's frame is still live
