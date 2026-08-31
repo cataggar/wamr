@@ -811,8 +811,14 @@ pub const TableInstance = struct {
     /// AOT VmCtx mirrors that cache this table's native backing pointer and
     /// length. Growth refreshes every subscriber so thread clones and
     /// cross-module importers never retain a freed realloc address.
-    vmctx_subscribers: std.ArrayListUnmanaged(*anyopaque) = .empty,
-    subscriber_mutex: platform.Mutex = .init,
+    vmctx_subscribers: if (config.lib_wasi_threads)
+        std.ArrayListUnmanaged(*anyopaque)
+    else
+        void = if (config.lib_wasi_threads) .empty else {},
+    subscriber_mutex: if (config.lib_wasi_threads)
+        platform.Mutex
+    else
+        void = if (config.lib_wasi_threads) .init else {},
 
     pub fn retain(self: *TableInstance) void {
         self.ref_count.retain();
@@ -820,7 +826,8 @@ pub const TableInstance = struct {
 
     pub fn release(self: *TableInstance, allocator: std.mem.Allocator) void {
         if (!self.ref_count.release()) return;
-        self.vmctx_subscribers.deinit(allocator);
+        if (comptime config.lib_wasi_threads)
+            self.vmctx_subscribers.deinit(allocator);
         if (self.elements.len > 0) allocator.free(self.elements);
         if (self.native_backing.len > 0) allocator.free(self.native_backing);
         if (self.type_backing.len > 0) allocator.free(self.type_backing);
@@ -844,6 +851,7 @@ pub const TableInstance = struct {
         vmctx: *anyopaque,
         allocator: std.mem.Allocator,
     ) !void {
+        if (comptime !config.lib_wasi_threads) return;
         self.subscriber_mutex.lock();
         defer self.subscriber_mutex.unlock();
         for (self.vmctx_subscribers.items) |subscriber| {
@@ -853,6 +861,7 @@ pub const TableInstance = struct {
     }
 
     pub fn unsubscribeVmCtx(self: *TableInstance, vmctx: *anyopaque) void {
+        if (comptime !config.lib_wasi_threads) return;
         self.subscriber_mutex.lock();
         defer self.subscriber_mutex.unlock();
         for (self.vmctx_subscribers.items, 0..) |subscriber, i| {

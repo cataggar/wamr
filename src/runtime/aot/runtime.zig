@@ -1751,7 +1751,8 @@ pub const AotInstance = struct {
     /// Refcounted immutable text mapping shared by thread clones. Every clone
     /// has its own VmCtx and mutable execution state, while native table and
     /// funcref entries can safely keep one stable code address.
-    code_mapping: ?*SharedCodeMapping = null,
+    code_mapping: if (config.lib_wasi_threads) ?*SharedCodeMapping else void =
+        if (config.lib_wasi_threads) null else {},
     /// Resolved AOT host function pointers (one per import).
     host_functions: []const ?*const anyopaque = &.{},
     /// Native function pointer table for call_indirect (one per module function).
@@ -2108,6 +2109,8 @@ pub fn cloneForThread(
     parent: *const AotInstance,
     allocator: std.mem.Allocator,
 ) RuntimeError!*AotInstance {
+    if (comptime !config.lib_wasi_threads)
+        return error.WasiThreadsAotNotImplemented;
     if (comptime config.lazy_jit) return error.WasiThreadsAotNotImplemented;
     if (parent.code_base != null and parent.code_mapping == null)
         return error.CodeMappingFailed;
@@ -2301,7 +2304,12 @@ pub fn cloneForThread(
 /// Destroy an AOT instance, freeing all allocated resources.
 pub fn destroy(inst: *AotInstance) void {
     const allocator = inst.allocator;
-    if (inst.code_mapping) |mapping| mapping.release();
+    if (comptime config.lib_wasi_threads) {
+        if (inst.code_mapping) |mapping| mapping.release();
+    } else if (inst.code_base) |base| {
+        platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
+        JitCodeCache.unregister(inst.code_size);
+    }
     if (comptime config.lazy_jit) {
         inst.lazy_jit.free(allocator);
     }
@@ -2434,6 +2442,7 @@ fn unsubscribeVmCtxFromMemories(inst: *AotInstance) void {
 }
 
 fn subscribeVmCtxToTables(inst: *AotInstance) !void {
+    if (comptime !config.lib_wasi_threads) return;
     const vmctx_opaque: *anyopaque = @ptrCast(&inst.vmctx);
     var subscribed: usize = 0;
     errdefer {
@@ -2447,6 +2456,7 @@ fn subscribeVmCtxToTables(inst: *AotInstance) !void {
 }
 
 fn unsubscribeVmCtxFromTables(inst: *AotInstance) void {
+    if (comptime !config.lib_wasi_threads) return;
     const vmctx_opaque: *anyopaque = @ptrCast(&inst.vmctx);
     for (inst.tables) |table| table.unsubscribeVmCtx(vmctx_opaque);
 }
@@ -2489,6 +2499,7 @@ fn refreshVmCtxTablesForInstance(inst: *AotInstance) void {
 }
 
 fn refreshTableSubscribers(table: *types.TableInstance) void {
+    if (comptime !config.lib_wasi_threads) return;
     table.subscriber_mutex.lock();
     defer table.subscriber_mutex.unlock();
     for (table.vmctx_subscribers.items) |subscriber_opaque| {
@@ -2727,19 +2738,23 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     if (has_text) {
         const text = text_opt.?;
         const mapped = try mapTrackedExecutableCode(text);
-        const mapping = inst.allocator.create(SharedCodeMapping) catch {
-            platform.munmap(@ptrCast(@constCast(mapped.addr)), mapped.size);
-            JitCodeCache.unregister(mapped.size);
-            return error.OutOfMemory;
-        };
-        mapping.* = .{
-            .addr = mapped.addr,
-            .size = mapped.size,
-            .allocator = inst.allocator,
-        };
         inst.code_base = mapped.addr;
         inst.code_size = mapped.size;
-        inst.code_mapping = mapping;
+        if (comptime config.lib_wasi_threads) {
+            const mapping = inst.allocator.create(SharedCodeMapping) catch {
+                platform.munmap(@ptrCast(@constCast(mapped.addr)), mapped.size);
+                JitCodeCache.unregister(mapped.size);
+                inst.code_base = null;
+                inst.code_size = 0;
+                return error.OutOfMemory;
+            };
+            mapping.* = .{
+                .addr = mapped.addr,
+                .size = mapped.size,
+                .allocator = inst.allocator,
+            };
+            inst.code_mapping = mapping;
+        }
     }
 
     // Build function pointer table for call_indirect
@@ -4686,7 +4701,8 @@ test "AOT thread context inherits retained process state without thread-local fl
 }
 
 test "AOT thread clone shares code memory and tables while isolating globals and VmCtx" {
-    if (comptime !can_execute_native) return error.SkipZigTest;
+    if (comptime !config.lib_wasi_threads or !can_execute_native)
+        return error.SkipZigTest;
 
     const Tracker = struct {
         refs: usize = 1,
@@ -4834,7 +4850,8 @@ fn exerciseAotCloneAllocation(
 }
 
 test "AOT thread clone rolls back every partial retain and allocation" {
-    if (comptime !can_execute_native) return error.SkipZigTest;
+    if (comptime !config.lib_wasi_threads or !can_execute_native)
+        return error.SkipZigTest;
 
     const text = switch (builtin.cpu.arch) {
         .x86_64 => &[_]u8{0xC3},
