@@ -1192,6 +1192,9 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
     // keep seeing the growth. Other tables: resize the backing storage
     // in `extra_tables_storage`.
     if (table_idx == 0) {
+        const shared0 = if (inst.tables.len > 0) inst.tables[0] else null;
+        if (shared0) |shared| shared.lock();
+        defer if (shared0) |shared| shared.unlock();
         const old_size: u32 = @intCast(inst.func_table.len);
         const new_size_u64: u64 = @as(u64, old_size) + @as(u64, delta_u);
         const max_cap: u64 = blk: {
@@ -1201,7 +1204,6 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
         };
         if (new_size_u64 > max_cap) return -1;
         const new_size: usize = @intCast(new_size_u64);
-        const shared0 = if (inst.tables.len > 0) inst.tables[0] else null;
         // Realloc the shared backing (owned by TableInstance). Also updates
         // inst.func_table (which aliases it).
         const old_slice: []usize = if (shared0) |s| s.native_backing else inst.func_table;
@@ -1263,6 +1265,8 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
     if (new_size_u64 > max_cap) return -1;
     const new_size: usize = @intCast(new_size_u64);
     const shared_n = if (table_idx < inst.tables.len) inst.tables[table_idx] else null;
+    if (shared_n) |shared| shared.lock();
+    defer if (shared_n) |shared| shared.unlock();
     const old_slice: []usize = if (shared_n) |s| s.native_backing else store.*;
     const new_store = inst.allocator.realloc(old_slice, new_size) catch return -1;
     var i: usize = old_size;
@@ -1345,6 +1349,8 @@ pub fn tableInitHelper(
     const backing: [*]usize = @ptrFromInt(@as(usize, @intCast(ti.ptr)));
     const shared_opt: ?*types.TableInstance =
         if (table_idx < inst.tables.len) inst.tables[table_idx] else null;
+    if (shared_opt) |shared| shared.lock();
+    defer if (shared_opt) |shared| shared.unlock();
     var i: u32 = 0;
     while (i < len) : (i += 1) {
         const fi = seg.func_indices[src + i];
@@ -1410,6 +1416,10 @@ pub fn tableSetHelper(vmctx: *VmCtx, table_idx: u32, elem_idx: u32, value: usize
     if (table_idx >= inst.tables_info.len) aotTrapUnreachable(vmctx);
     const ti = &inst.tables_info[table_idx];
     if (elem_idx >= ti.len) aotTrapUnreachable(vmctx);
+    const shared_opt: ?*types.TableInstance =
+        if (table_idx < inst.tables.len) inst.tables[table_idx] else null;
+    if (shared_opt) |shared| shared.lock();
+    defer if (shared_opt) |shared| shared.unlock();
 
     // Write native pointer into backing store.
     const backing: [*]usize = @ptrFromInt(@as(usize, @intCast(ti.ptr)));
@@ -1442,8 +1452,7 @@ pub fn tableSetHelper(vmctx: *VmCtx, table_idx: u32, elem_idx: u32, value: usize
     }
 
     // Mirror into the shared `TableInstance.elements` for consistency.
-    if (table_idx < inst.tables.len) {
-        const shared = inst.tables[table_idx];
+    if (shared_opt) |shared| {
         if (elem_idx < shared.elements.len) {
             if (value == 0) {
                 shared.elements[elem_idx] = types.TableElement.nullForType(shared.table_type.elem_type);
@@ -2286,6 +2295,8 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     // exporter's compiled call_indirect sees the writes.
     if (inst.tables.len > 0) {
         const tbl = inst.tables[0];
+        tbl.lock();
+        defer tbl.unlock();
         const tbl_size = tbl.elements.len;
         if (tbl_size > 0) {
             var native_table: []usize = undefined;
@@ -2349,6 +2360,7 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         for (extra) |*e| e.* = &.{};
 
         // Slot 0: alias inst.func_table.
+        inst.tables[0].lock();
         info[0] = .{
             .ptr = @intFromPtr(inst.func_table.ptr),
             .len = @intCast(inst.func_table.len),
@@ -2357,49 +2369,54 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
             else
                 0,
         };
+        inst.tables[0].unlock();
 
         // Slots 1..n.
         for (inst.tables[1..], 1..) |tbl_i, idx| {
-            const sz = tbl_i.elements.len;
-            if (sz == 0) continue;
-            var backing: []usize = undefined;
-            if (tbl_i.native_backing.len == sz) {
-                backing = tbl_i.native_backing;
-            } else {
-                backing = inst.allocator.alloc(usize, sz) catch return error.OutOfMemory;
-                @memset(backing, 0);
-                tbl_i.native_backing = backing;
-            }
-            if (tbl_i.type_backing.len != sz) {
-                const tb = inst.allocator.alloc(u32, sz) catch return error.OutOfMemory;
-                @memset(tb, 0);
-                if (tbl_i.type_backing.len > 0) inst.allocator.free(tbl_i.type_backing);
-                tbl_i.type_backing = tb;
-            }
-            for (module.elem_segments) |seg| {
-                if (seg.is_passive) continue;
-                if (seg.table_idx != idx) continue;
-                const seg_end = @as(u64, seg.offset) + @as(u64, seg.func_indices.len);
-                if (seg_end > sz) continue;
-                for (seg.func_indices, 0..) |func_idx, j| {
-                    const dst = seg.offset + @as(u32, @intCast(j));
-                    if (func_idx == std.math.maxInt(u32)) {
-                        backing[dst] = 0;
-                        if (dst < tbl_i.type_backing.len) tbl_i.type_backing[dst] = 0;
-                    } else if (func_idx < n_addrs) {
-                        backing[dst] = func_addrs[func_idx];
-                        if (dst < tbl_i.type_backing.len and func_idx < inst.func_sig_ids.len) {
-                            tbl_i.type_backing[dst] = inst.func_sig_ids[func_idx];
+            {
+                tbl_i.lock();
+                defer tbl_i.unlock();
+                const sz = tbl_i.elements.len;
+                if (sz == 0) continue;
+                var backing: []usize = undefined;
+                if (tbl_i.native_backing.len == sz) {
+                    backing = tbl_i.native_backing;
+                } else {
+                    backing = inst.allocator.alloc(usize, sz) catch return error.OutOfMemory;
+                    @memset(backing, 0);
+                    tbl_i.native_backing = backing;
+                }
+                if (tbl_i.type_backing.len != sz) {
+                    const tb = inst.allocator.alloc(u32, sz) catch return error.OutOfMemory;
+                    @memset(tb, 0);
+                    if (tbl_i.type_backing.len > 0) inst.allocator.free(tbl_i.type_backing);
+                    tbl_i.type_backing = tb;
+                }
+                for (module.elem_segments) |seg| {
+                    if (seg.is_passive) continue;
+                    if (seg.table_idx != idx) continue;
+                    const seg_end = @as(u64, seg.offset) + @as(u64, seg.func_indices.len);
+                    if (seg_end > sz) continue;
+                    for (seg.func_indices, 0..) |func_idx, j| {
+                        const dst = seg.offset + @as(u32, @intCast(j));
+                        if (func_idx == std.math.maxInt(u32)) {
+                            backing[dst] = 0;
+                            if (dst < tbl_i.type_backing.len) tbl_i.type_backing[dst] = 0;
+                        } else if (func_idx < n_addrs) {
+                            backing[dst] = func_addrs[func_idx];
+                            if (dst < tbl_i.type_backing.len and func_idx < inst.func_sig_ids.len) {
+                                tbl_i.type_backing[dst] = inst.func_sig_ids[func_idx];
+                            }
                         }
                     }
                 }
+                extra[idx - 1] = backing;
+                info[idx] = .{
+                    .ptr = @intFromPtr(backing.ptr),
+                    .len = @intCast(sz),
+                    .type_backing_ptr = if (tbl_i.type_backing.len > 0) @intFromPtr(tbl_i.type_backing.ptr) else 0,
+                };
             }
-            extra[idx - 1] = backing;
-            info[idx] = .{
-                .ptr = @intFromPtr(backing.ptr),
-                .len = @intCast(sz),
-                .type_backing_ptr = if (tbl_i.type_backing.len > 0) @intFromPtr(tbl_i.type_backing.ptr) else 0,
-            };
         }
 
         inst.tables_info = info;
@@ -3479,7 +3496,7 @@ fn allocateGlobals(
 
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| if (owned[i]) globals[i].release(allocator);
+        for (globals[0..initialized]) |global| global.release(allocator);
     }
 
     for (imports, 0..) |imp, i| {
@@ -3499,7 +3516,6 @@ fn allocateGlobals(
                 },
                 .value = defaultGlobalZero(imp.val_type),
                 .owned = true,
-                .ref_count = 1,
             };
             globals[i] = g;
             owned[i] = true;
@@ -3577,20 +3593,7 @@ fn freeTables(tables: []*types.TableInstance, owned: []bool, allocator: std.mem.
 
 fn freeGlobals(globals: []*types.GlobalInstance, owned: []bool, allocator: std.mem.Allocator) void {
     std.debug.assert(owned.len == 0 or owned.len == globals.len);
-    for (globals, 0..) |g, i| {
-        if (owned.len == 0) {
-            // Legacy callers pass owned=&.{} when all entries were
-            // unconditionally allocated by this instance (pre-#649-phase-4
-            // shape) — match the previous direct-destroy behaviour.
-            allocator.destroy(g);
-        } else {
-            // New-path: owned slots match the slab we created with
-            // ref_count=1; borrowed slots were retain()'d in allocateGlobals
-            // so they also need a matching release here.
-            _ = i;
-            g.release(allocator);
-        }
-    }
+    for (globals) |global| global.release(allocator);
     if (globals.len > 0) allocator.free(globals);
     if (owned.len > 0) allocator.free(owned);
 }
@@ -3675,6 +3678,40 @@ fn freeTags(tags: []*types.TagInstance, owned: []bool, allocator: std.mem.Alloca
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+test "core resource AOT global rollback releases borrowed override" {
+    const allocator = std.testing.allocator;
+    const shared = try allocator.create(types.GlobalInstance);
+    shared.* = .{
+        .global_type = .{ .val_type = .i32, .mutability = .mutable },
+        .value = .{ .i32 = 9 },
+    };
+    defer shared.release(allocator);
+
+    const imports = [_]aot_loader.ImportedGlobalDesc{.{
+        .module_name = "env",
+        .name = "g",
+        .val_type = .i32,
+        .mutable = true,
+    }};
+    const locals = [_]aot_loader.AotGlobalInit{.{
+        .val_type = @intFromEnum(types.ValType.i32),
+        .mutability = 1,
+        .init_i64 = 1,
+    }};
+    var module = aot_loader.AotModule{
+        .imported_globals = &imports,
+        .global_inits = &locals,
+    };
+    const overrides = [_]?*types.GlobalInstance{shared};
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        allocateGlobals(&module, &overrides, failing.allocator()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), shared.referenceCount());
+}
 
 test "instantiate rejects configured WASI threads before AOT allocation" {
     if (comptime !config.lib_wasi_threads) return error.SkipZigTest;
@@ -3925,17 +3962,17 @@ test "#660 item 4: borrowed memory overrides are retained until importer destroy
 
     const exporter_inst = try instantiate(&exporter_module, std.testing.allocator);
     defer destroy(exporter_inst);
-    try std.testing.expectEqual(@as(u32, 1), exporter_inst.memories[0].ref_count);
+    try std.testing.expectEqual(@as(usize, 1), exporter_inst.memories[0].referenceCount());
     try std.testing.expectEqual(@as(u8, 0xa5), exporter_inst.memories[0].data[7]);
 
     const overrides = [_]?*types.MemoryInstance{exporter_inst.memories[0]};
     const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &.{}, &overrides, &.{}, &.{}, &.{});
     try std.testing.expectEqual(exporter_inst.memories[0], importer_inst.memories[0]);
     try std.testing.expect(!importer_inst.memories_owned[0]);
-    try std.testing.expectEqual(@as(u32, 2), exporter_inst.memories[0].ref_count);
+    try std.testing.expectEqual(@as(usize, 2), exporter_inst.memories[0].referenceCount());
 
     destroy(importer_inst);
-    try std.testing.expectEqual(@as(u32, 1), exporter_inst.memories[0].ref_count);
+    try std.testing.expectEqual(@as(usize, 1), exporter_inst.memories[0].referenceCount());
 
     const vmctx = VmCtx{
         .memory_base = @intFromPtr(exporter_inst.memories[0].data.ptr),
@@ -3958,16 +3995,16 @@ test "#660 item 4: borrowed table overrides are retained until importer destroy"
     const exporter_inst = try instantiate(&exporter_module, std.testing.allocator);
     defer destroy(exporter_inst);
     exporter_inst.tables[0].elements[1] = .{ .value = .{ .funcref = 42 } };
-    try std.testing.expectEqual(@as(u32, 1), exporter_inst.tables[0].ref_count);
+    try std.testing.expectEqual(@as(usize, 1), exporter_inst.tables[0].referenceCount());
 
     const overrides = [_]?*types.TableInstance{exporter_inst.tables[0]};
     const importer_inst = try instantiateWithOverrides(&importer_module, std.testing.allocator, &overrides, &.{}, &.{}, &.{}, &.{});
     try std.testing.expectEqual(exporter_inst.tables[0], importer_inst.tables[0]);
     try std.testing.expect(!importer_inst.tables_owned[0]);
-    try std.testing.expectEqual(@as(u32, 2), exporter_inst.tables[0].ref_count);
+    try std.testing.expectEqual(@as(usize, 2), exporter_inst.tables[0].referenceCount());
 
     destroy(importer_inst);
-    try std.testing.expectEqual(@as(u32, 1), exporter_inst.tables[0].ref_count);
+    try std.testing.expectEqual(@as(usize, 1), exporter_inst.tables[0].referenceCount());
     try std.testing.expectEqual(@as(?u32, 42), exporter_inst.tables[0].elements[1].value.funcref);
 }
 

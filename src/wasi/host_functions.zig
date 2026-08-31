@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const config = @import("config");
 const types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const wasi_core = @import("wasi_core.zig");
@@ -74,7 +75,7 @@ pub fn wasiProcExit(env_opaque: *anyopaque) types.HostFnError!void {
     const code = env.popI32() catch return error.StackUnderflow;
 
     if (getCtx(env)) |ctx| {
-        ctx.exit_code = @bitCast(code);
+        ctx.proc_exit(@bitCast(code));
     }
 
     if (env.module_inst.thread_manager) |tm| {
@@ -1087,7 +1088,7 @@ pub fn writeStringTable(mem: []u8, entries: []const []const u8, argv_ptrs: u32, 
 
 /// fdstat layout (24 bytes): fs_filetype(u8) + 1 pad + fs_flags(u16) +
 /// 4 pad + fs_rights_base(u64) + fs_rights_inheriting(u64).
-fn writeFdstat(mem: []u8, buf_ptr: u32, entry: wasi.FdEntry) i32 {
+fn writeFdstat(mem: []u8, buf_ptr: u32, entry: wasi.FdEntrySnapshot) i32 {
     if (buf_ptr + 24 > mem.len) return wasi_core.WASI_EINVAL;
     @memset(mem[buf_ptr..][0..24], 0);
     mem[buf_ptr] = @intFromEnum(filetypeForEntry(entry));
@@ -1104,7 +1105,7 @@ fn writeFdstat(mem: []u8, buf_ptr: u32, entry: wasi.FdEntry) i32 {
 /// the kind is determined statically by the FdEntry; for an unmapped
 /// stdio fd that isn't a TTY we report `unknown` so guests don't
 /// incorrectly treat a pipe as a TTY.
-fn filetypeForEntry(entry: wasi.FdEntry) wasi.Filetype {
+fn filetypeForEntry(entry: wasi.FdEntrySnapshot) wasi.Filetype {
     return switch (entry.kind) {
         .stdin => stdioFiletype(0),
         .stdout => stdioFiletype(1),
@@ -1139,7 +1140,9 @@ fn stdioFiletype(host_fd: i32) wasi.Filetype {
 pub fn ctxFdFdstatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    var entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    var entry = lease.snapshot();
     // Refresh fdflags from the host fd when applicable so changes that
     // happened outside `fd_fdstat_set_flags` (e.g. inheritance) are
     // reflected. Stdio + regular files honour O_APPEND/O_NONBLOCK; the
@@ -1154,6 +1157,7 @@ pub fn ctxFdFdstatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) 
                 if (o.APPEND) fd_flags |= wasi.FDFLAGS_APPEND;
                 if (o.NONBLOCK) fd_flags |= wasi.FDFLAGS_NONBLOCK;
                 entry.fdflags = fd_flags;
+                lease.setFdFlags(fd_flags);
             }
         }
     }
@@ -1165,7 +1169,7 @@ pub fn ctxFdFdstatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) 
 /// Windows we don't have positional stdio fds (`std.posix.fd_t` is a
 /// HANDLE there), so stdio entries also return null — none of the
 /// host-fd consumers (Linux fcntl/fadvise/etc.) run on Windows anyway.
-fn entryHostFd(entry: wasi.FdEntry) ?std.posix.fd_t {
+fn entryHostFd(entry: wasi.FdEntrySnapshot) ?std.posix.fd_t {
     return switch (entry.kind) {
         .stdin => stdio_in_fd,
         .stdout => stdio_out_fd,
@@ -1182,22 +1186,23 @@ const stdio_err_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else 
 pub fn ctxFdPrestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const name = ctx.preopenName(u_fd) orelse return wasi_core.WASI_EBADF;
+    const name_len = ctx.preopenNameLen(u_fd) orelse return wasi_core.WASI_EBADF;
     // prestat: u8 type (0 = dir) + 3 pad + u32 name_len = 8 bytes.
     if (buf_ptr + 8 > mem.len) return wasi_core.WASI_EINVAL;
     @memset(mem[buf_ptr..][0..8], 0);
     mem[buf_ptr] = 0;
-    if (!wasi_core.memWriteU32(mem, buf_ptr + 4, @intCast(name.len))) return wasi_core.WASI_EINVAL;
+    if (!wasi_core.memWriteU32(mem, buf_ptr + 4, @intCast(name_len))) return wasi_core.WASI_EINVAL;
     return wasi_core.WASI_ESUCCESS;
 }
 
 pub fn ctxFdPrestatDirNameCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, path_ptr: u32, path_len: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const name = ctx.preopenName(u_fd) orelse return wasi_core.WASI_EBADF;
-    if (path_len < name.len) return wasi_core.WASI_EINVAL;
+    const name_len = ctx.preopenNameLen(u_fd) orelse return wasi_core.WASI_EBADF;
+    if (path_len < name_len) return wasi_core.WASI_EINVAL;
     if (path_ptr + path_len > mem.len) return wasi_core.WASI_EINVAL;
-    @memcpy(mem[path_ptr..][0..name.len], name);
+    _ = ctx.copyPreopenName(u_fd, mem[path_ptr..][0..path_len]) orelse
+        return wasi_core.WASI_EBADF;
     return wasi_core.WASI_ESUCCESS;
 }
 
@@ -1218,7 +1223,8 @@ pub fn ctxFdIoCore(
 ) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
 
     var total: u32 = 0;
     var i: u32 = 0;
@@ -1233,12 +1239,12 @@ pub fn ctxFdIoCore(
 
         switch (op) {
             .write => {
-                const n = doWrite(ctx, entry_ptr, slice) catch |e| return errnoToI32(e);
+                const n = doWrite(ctx, &lease, slice) catch |e| return errnoToI32(e);
                 total += @intCast(n);
                 if (n < slice.len) break;
             },
             .read => {
-                const n = doRead(ctx, entry_ptr, slice) catch |e| return errnoToI32(e);
+                const n = doRead(ctx, &lease, slice) catch |e| return errnoToI32(e);
                 total += @intCast(n);
                 if (n < slice.len) break;
             },
@@ -1249,8 +1255,9 @@ pub fn ctxFdIoCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-fn doWrite(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []const u8) !usize {
-    switch (entry_ptr.kind) {
+fn doWrite(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []const u8) !usize {
+    const entry = lease.snapshot();
+    switch (entry.kind) {
         .stdout => {
             const file = std.Io.File.stdout();
             try file.writeStreamingAll(ctx.io, data);
@@ -1262,37 +1269,17 @@ fn doWrite(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []const u8) !usiz
             return data.len;
         },
         .regular_file => {
-            if ((entry_ptr.rights_base & wasi.RIGHTS_FD_WRITE) == 0) return error.BadFd;
-            const host_fd = entry_ptr.host_fd orelse return error.BadFd;
+            if ((entry.rights_base & wasi.RIGHTS_FD_WRITE) == 0) return error.BadFd;
+            const host_fd = entry.host_fd orelse return error.BadFd;
             const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-            const append = (entry_ptr.fdflags & wasi.FDFLAGS_APPEND) != 0;
-            if (append) {
-                // O_APPEND requires streaming write() on the host: std.Io's
-                // positional writer would issue pwrite, which on Linux
-                // still respects O_APPEND but the std side tracks an
-                // independent cursor that drifts from the kernel offset.
-                // Use writeStreamingAll (calls write(2)) so the kernel
-                // append + offset advancement stay in sync, then read the
-                // post-write offset back to update entry.pos.
-                file.writeStreamingAll(ctx.io, data) catch return error.IoError;
-                if (builtin.os.tag == .linux) {
-                    const linux = std.os.linux;
-                    const rc = linux.lseek(host_fd, 0, std.posix.SEEK.CUR);
-                    if (linux.errno(rc) == .SUCCESS) {
-                        entry_ptr.pos = @intCast(rc);
-                    } else {
-                        entry_ptr.pos += data.len;
-                    }
-                } else {
-                    entry_ptr.pos += data.len;
-                }
+            // Use the host open-file-description cursor. The kernel orders
+            // concurrent write(2) operations without a runtime lock held
+            // across blocking I/O.
+            file.writeStreamingAll(ctx.io, data) catch return error.IoError;
+            if (wasi.hostFilePosition(host_fd)) |position| {
+                lease.setPosition(position);
             } else {
-                var buf: [4096]u8 = undefined;
-                var w = file.writer(ctx.io, &buf);
-                w.seekTo(entry_ptr.pos) catch return error.IoError;
-                w.interface.writeAll(data) catch return error.IoError;
-                w.flush() catch return error.IoError;
-                entry_ptr.pos += data.len;
+                lease.advancePosition(data.len);
             }
             return data.len;
         },
@@ -1300,8 +1287,9 @@ fn doWrite(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []const u8) !usiz
     }
 }
 
-fn doRead(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []u8) !usize {
-    switch (entry_ptr.kind) {
+fn doRead(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []u8) !usize {
+    const entry = lease.snapshot();
+    switch (entry.kind) {
         .stdin => {
             const file = std.Io.File.stdin();
             var buf: [4096]u8 = undefined;
@@ -1310,14 +1298,18 @@ fn doRead(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []u8) !usize {
             return n;
         },
         .regular_file => {
-            if ((entry_ptr.rights_base & wasi.RIGHTS_FD_READ) == 0) return error.BadFd;
-            const host_fd = entry_ptr.host_fd orelse return error.BadFd;
+            if ((entry.rights_base & wasi.RIGHTS_FD_READ) == 0) return error.BadFd;
+            const host_fd = entry.host_fd orelse return error.BadFd;
             const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-            var buf: [4096]u8 = undefined;
-            var r = file.reader(ctx.io, &buf);
-            r.seekTo(entry_ptr.pos) catch return error.IoError;
-            const n = r.interface.readSliceShort(data) catch return error.IoError;
-            entry_ptr.pos += n;
+            const n = file.readStreaming(ctx.io, &.{data}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return error.IoError,
+            };
+            if (wasi.hostFilePosition(host_fd)) |position| {
+                lease.setPosition(position);
+            } else {
+                lease.advancePosition(n);
+            }
             return n;
         },
         else => return error.BadFd,
@@ -1343,28 +1335,22 @@ pub fn ctxFdSeekCore(
 ) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
-    switch (entry_ptr.kind) {
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
+    switch (entry.kind) {
         .regular_file => {},
         .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
         .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
     }
-    const host_fd = entry_ptr.host_fd orelse return wasi_core.WASI_EBADF;
+    const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
     const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-
-    const new_pos: i64 = switch (whence) {
-        0 => offset, // SET
-        1 => @as(i64, @intCast(entry_ptr.pos)) + offset, // CUR
-        2 => blk: {
-            const stat = file.stat(ctx.io) catch return wasi_core.WASI_EINVAL;
-            const size: i64 = @intCast(stat.size);
-            break :blk size + offset;
-        },
-        else => return wasi_core.WASI_EINVAL,
-    };
-    if (new_pos < 0) return wasi_core.WASI_EINVAL;
-    entry_ptr.pos = @intCast(new_pos);
-    if (!wasi_core.memWriteU64(mem, newoffset_ptr, entry_ptr.pos)) return wasi_core.WASI_EINVAL;
+    const seek_whence: wasi.Whence = std.enums.fromInt(wasi.Whence, whence) orelse
+        return wasi_core.WASI_EINVAL;
+    const new_position = wasi.seekHostFile(ctx.io, file, offset, seek_whence) catch
+        return wasi_core.WASI_EINVAL;
+    lease.setPosition(new_position);
+    if (!wasi_core.memWriteU64(mem, newoffset_ptr, new_position)) return wasi_core.WASI_EINVAL;
     return wasi_core.WASI_ESUCCESS;
 }
 
@@ -1384,7 +1370,7 @@ fn wasiFiletypeFromDt(dt: u8) wasi.Filetype {
     };
 }
 
-/// Validate `fd` for fd_pread / fd_pwrite, returning the FdEntry pointer
+/// Validate `fd` for fd_pread / fd_pwrite, returning a stable lease
 /// or a WASI errno. The host-fd null check is deliberately deferred so
 /// callers can apply per-flavour rejections (e.g. fd_pwrite refuses
 /// append-mode fds with `notsup`) before bailing out with `EBADF`.
@@ -1393,20 +1379,27 @@ fn pIoLookup(
     fd: i32,
     offset: i64,
 ) union(enum) {
-    ok: *wasi.FdEntry,
+    ok: wasi.FdTable.Lease,
     err: i32,
 } {
     if (fd < 0) return .{ .err = wasi_core.WASI_EBADF };
     if (offset < 0) return .{ .err = wasi_core.WASI_EINVAL };
     const u_fd: u32 = @intCast(fd);
-    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse
+    var lease = ctx.fd_table.acquire(u_fd) orelse
         return .{ .err = wasi_core.WASI_EBADF };
-    switch (entry_ptr.kind) {
-        .stdin, .stdout, .stderr, .socket => return .{ .err = @intCast(@intFromEnum(wasi.Errno.spipe)) },
-        .directory => return .{ .err = @intCast(@intFromEnum(wasi.Errno.isdir)) },
+    const entry = lease.snapshot();
+    switch (entry.kind) {
+        .stdin, .stdout, .stderr, .socket => {
+            lease.release();
+            return .{ .err = @intCast(@intFromEnum(wasi.Errno.spipe)) };
+        },
+        .directory => {
+            lease.release();
+            return .{ .err = @intCast(@intFromEnum(wasi.Errno.isdir)) };
+        },
         .regular_file => {},
     }
-    return .{ .ok = entry_ptr };
+    return .{ .ok = lease };
 }
 
 pub fn ctxFdPreadCore(
@@ -1418,11 +1411,13 @@ pub fn ctxFdPreadCore(
     offset: i64,
     nread_ptr: u32,
 ) i32 {
-    const entry_ptr = switch (pIoLookup(ctx, fd, offset)) {
+    var lease = switch (pIoLookup(ctx, fd, offset)) {
         .err => |e| return e,
-        .ok => |p| p,
+        .ok => |held| held,
     };
-    const host_fd = entry_ptr.host_fd orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
+    const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
     const linux = std.os.linux;
@@ -1461,16 +1456,18 @@ pub fn ctxFdPwriteCore(
     offset: i64,
     nwritten_ptr: u32,
 ) i32 {
-    const entry_ptr = switch (pIoLookup(ctx, fd, offset)) {
+    var lease = switch (pIoLookup(ctx, fd, offset)) {
         .err => |e| return e,
-        .ok => |p| p,
+        .ok => |held| held,
     };
+    defer lease.release();
+    const entry = lease.snapshot();
     // POSIX requires pwrite to ignore the file's append-mode (Linux's
     // implementation in fact respects O_APPEND, contradicting POSIX). We
     // delegate to the host's pwrite — wasi-tests' `pwrite-with-append`
     // explicitly accepts either offset (POSIX or Linux). Crucially we
     // don't update entry.pos here since pwrite doesn't move the cursor.
-    const host_fd = entry_ptr.host_fd orelse return wasi_core.WASI_EBADF;
+    const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
     const linux = std.os.linux;
@@ -1518,24 +1515,29 @@ pub fn ctxFdReaddirCore(
     if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
 
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
     if (entry.kind != .directory) return @intCast(@intFromEnum(wasi.Errno.notdir));
     const dir = entry.host_dir orelse return wasi_core.WASI_EBADF;
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
     const linux = std.os.linux;
+    var operation_dir = dir.openDir(ctx.io, ".", .{ .iterate = true }) catch |err|
+        return mapStdIoErr(err);
+    defer operation_dir.close(ctx.io);
 
-    // Cookie 0 = restart from the top; otherwise it's the kernel d_off
-    // we returned for the previous entry.
+    // Use an operation-local directory cursor so concurrent readdir calls on
+    // the same guest descriptor cannot overwrite each other's cookie seek.
     const seek_off: i64 = @bitCast(cookie);
-    const lrc = linux.lseek(dir.handle, seek_off, linux.SEEK.SET);
+    const lrc = linux.lseek(operation_dir.handle, seek_off, linux.SEEK.SET);
     if (linux.errno(lrc) != .SUCCESS) return mapLinuxErrno(lrc);
 
     var bufused: u32 = 0;
     var staging: [4096]u8 = undefined;
 
     outer: while (true) {
-        const grc = linux.getdents64(dir.handle, &staging, staging.len);
+        const grc = linux.getdents64(operation_dir.handle, &staging, staging.len);
         if (linux.errno(grc) != .SUCCESS) return mapLinuxErrno(grc);
         if (grc == 0) break; // end of directory
 
@@ -1639,13 +1641,13 @@ pub fn ctxPathOpenCore(
     fdflags: u32,
     fd_ptr: u32,
 ) i32 {
-    const dir = switch (pPathLookup(ctx, dirfd)) {
+    var dir_lease = switch (pPathLookup(ctx, dirfd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
-    // Need the dir entry separately for rights enforcement (PATH_FILESTAT_SET_SIZE
-    // gates OFLAGS_TRUNC, etc.). pPathLookup already validated kind+host_dir.
-    const dir_entry: ?wasi.FdEntry = if (dirfd >= 0) ctx.fd_table.get(@intCast(dirfd)) else null;
+    defer dir_lease.release();
+    const dir_entry = dir_lease.snapshot();
+    const dir = dir_entry.host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse
         return wasi_core.WASI_EINVAL;
 
@@ -1678,10 +1680,8 @@ pub fn ctxPathOpenCore(
     // expects NOTCAPABLE when the right was previously dropped via
     // fd_fdstat_set_rights.
     if (want_trunc) {
-        if (dir_entry) |de| {
-            if ((de.rights_base & wasi.RIGHTS_PATH_FILESTAT_SET_SIZE) == 0) {
-                return @intCast(@intFromEnum(wasi.Errno.notcapable));
-            }
+        if ((dir_entry.rights_base & wasi.RIGHTS_PATH_FILESTAT_SET_SIZE) == 0) {
+            return @intCast(@intFromEnum(wasi.Errno.notcapable));
         }
     }
 
@@ -1708,8 +1708,7 @@ pub fn ctxPathOpenCore(
             .iterate = true,
             .follow_symlinks = follow,
         }) catch |err| return mapStdIoErr(err);
-        const new_fd = ctx.fd_table.allocateFd();
-        ctx.fd_table.insert(new_fd, .{
+        const new_fd = ctx.fd_table.create(.{
             .kind = .directory,
             .host_dir = new_dir,
             .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
@@ -1719,7 +1718,10 @@ pub fn ctxPathOpenCore(
             new_dir.close(ctx.io);
             return wasi_core.WASI_EINVAL;
         };
-        if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) return wasi_core.WASI_EINVAL;
+        if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) {
+            std.debug.assert(ctx.fd_table.remove(new_fd));
+            return wasi_core.WASI_EINVAL;
+        }
         return wasi_core.WASI_ESUCCESS;
     }
 
@@ -1748,8 +1750,7 @@ pub fn ctxPathOpenCore(
                     .iterate = true,
                     .follow_symlinks = follow,
                 }) catch |err2| return mapStdIoErr(err2);
-                const new_fd = ctx.fd_table.allocateFd();
-                ctx.fd_table.insert(new_fd, .{
+                const new_fd = ctx.fd_table.create(.{
                     .kind = .directory,
                     .host_dir = nd,
                     .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
@@ -1759,7 +1760,10 @@ pub fn ctxPathOpenCore(
                     nd.close(ctx.io);
                     return wasi_core.WASI_EINVAL;
                 };
-                if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) return wasi_core.WASI_EINVAL;
+                if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) {
+                    std.debug.assert(ctx.fd_table.remove(new_fd));
+                    return wasi_core.WASI_EINVAL;
+                }
                 return wasi_core.WASI_ESUCCESS;
             },
             else => return mapStdIoErr(err),
@@ -1793,8 +1797,7 @@ pub fn ctxPathOpenCore(
         }
     }
 
-    const new_fd = ctx.fd_table.allocateFd();
-    ctx.fd_table.insert(new_fd, .{
+    const new_fd = ctx.fd_table.create(.{
         .kind = .regular_file,
         .host_fd = file.handle,
         .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
@@ -1804,27 +1807,37 @@ pub fn ctxPathOpenCore(
         file.close(ctx.io);
         return wasi_core.WASI_EINVAL;
     };
-    if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) return wasi_core.WASI_EINVAL;
+    if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) {
+        std.debug.assert(ctx.fd_table.remove(new_fd));
+        return wasi_core.WASI_EINVAL;
+    }
     return wasi_core.WASI_ESUCCESS;
 }
 
 // ── path_* core helpers (issue #420 phase 3) ──────────────────────────
 
 /// Validate that `dirfd` resolves to a directory entry with an open
-/// `host_dir`, returning either the std.Io.Dir or an early errno.
+/// `host_dir`, returning a lease that keeps it open across host I/O.
 fn pPathLookup(
     ctx: *wasi.WasiCtx,
     dirfd: i32,
 ) union(enum) {
-    ok: std.Io.Dir,
+    ok: wasi.FdTable.Lease,
     err: i32,
 } {
     if (dirfd < 0) return .{ .err = wasi_core.WASI_EBADF };
     const u_fd: u32 = @intCast(dirfd);
-    const entry = ctx.fd_table.get(u_fd) orelse return .{ .err = wasi_core.WASI_EBADF };
-    if (entry.kind != .directory) return .{ .err = @intCast(@intFromEnum(wasi.Errno.notdir)) };
-    const dir = entry.host_dir orelse return .{ .err = wasi_core.WASI_EBADF };
-    return .{ .ok = dir };
+    var lease = ctx.fd_table.acquire(u_fd) orelse return .{ .err = wasi_core.WASI_EBADF };
+    const entry = lease.snapshot();
+    if (entry.kind != .directory) {
+        lease.release();
+        return .{ .err = @intCast(@intFromEnum(wasi.Errno.notdir)) };
+    }
+    if (entry.host_dir == null) {
+        lease.release();
+        return .{ .err = wasi_core.WASI_EBADF };
+    }
+    return .{ .ok = lease };
 }
 
 /// Bounds-check `(path_ptr, path_len)` against linear memory and reject
@@ -1883,10 +1896,12 @@ pub fn ctxPathFilestatGetCore(
     path_len: u32,
     buf_ptr: u32,
 ) i32 {
-    const dir = switch (pPathLookup(ctx, fd)) {
+    var dir_lease = switch (pPathLookup(ctx, fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer dir_lease.release();
+    const dir = dir_lease.snapshot().host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
     const follow = (lookup_flags & 0x1) != 0;
     const stat = dir.statFile(ctx.io, path, .{ .follow_symlinks = follow }) catch |err|
@@ -1911,10 +1926,12 @@ pub fn ctxPathFilestatSetTimesCore(
     const exclusive_m = wasi.FSTFLAGS_MTIM | wasi.FSTFLAGS_MTIM_NOW;
     if ((fst_flags & exclusive_m) == exclusive_m) return wasi_core.WASI_EINVAL;
 
-    const dir = switch (pPathLookup(ctx, fd)) {
+    var dir_lease = switch (pPathLookup(ctx, fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer dir_lease.release();
+    const dir = dir_lease.snapshot().host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
 
     if (builtin.os.tag != .linux) return @intCast(@intFromEnum(wasi.Errno.notsup));
@@ -1943,10 +1960,12 @@ pub fn ctxPathCreateDirectoryCore(
     path_ptr: u32,
     path_len: u32,
 ) i32 {
-    const dir = switch (pPathLookup(ctx, fd)) {
+    var dir_lease = switch (pPathLookup(ctx, fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer dir_lease.release();
+    const dir = dir_lease.snapshot().host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
     dir.createDir(ctx.io, path, .default_dir) catch |err| return mapStdIoErr(err);
     return wasi_core.WASI_ESUCCESS;
@@ -1959,10 +1978,12 @@ pub fn ctxPathRemoveDirectoryCore(
     path_ptr: u32,
     path_len: u32,
 ) i32 {
-    const dir = switch (pPathLookup(ctx, fd)) {
+    var dir_lease = switch (pPathLookup(ctx, fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer dir_lease.release();
+    const dir = dir_lease.snapshot().host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
     dir.deleteDir(ctx.io, path) catch |err| return mapStdIoErr(err);
     return wasi_core.WASI_ESUCCESS;
@@ -1975,10 +1996,12 @@ pub fn ctxPathUnlinkFileCore(
     path_ptr: u32,
     path_len: u32,
 ) i32 {
-    const dir = switch (pPathLookup(ctx, fd)) {
+    var dir_lease = switch (pPathLookup(ctx, fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer dir_lease.release();
+    const dir = dir_lease.snapshot().host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
     dir.deleteFile(ctx.io, path) catch |err| return mapStdIoErr(err);
     return wasi_core.WASI_ESUCCESS;
@@ -1995,14 +2018,18 @@ pub fn ctxPathLinkCore(
     new_path_ptr: u32,
     new_path_len: u32,
 ) i32 {
-    const old_dir = switch (pPathLookup(ctx, old_fd)) {
+    var old_dir_lease = switch (pPathLookup(ctx, old_fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
-    const new_dir = switch (pPathLookup(ctx, new_fd)) {
+    defer old_dir_lease.release();
+    var new_dir_lease = switch (pPathLookup(ctx, new_fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer new_dir_lease.release();
+    const old_dir = old_dir_lease.snapshot().host_dir.?;
+    const new_dir = new_dir_lease.snapshot().host_dir.?;
     const old_path = readGuestPath(mem, old_path_ptr, old_path_len) orelse
         return wasi_core.WASI_EINVAL;
     const new_path = readGuestPath(mem, new_path_ptr, new_path_len) orelse
@@ -2029,14 +2056,18 @@ pub fn ctxPathRenameCore(
     new_path_ptr: u32,
     new_path_len: u32,
 ) i32 {
-    const old_dir = switch (pPathLookup(ctx, old_fd)) {
+    var old_dir_lease = switch (pPathLookup(ctx, old_fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
-    const new_dir = switch (pPathLookup(ctx, new_fd)) {
+    defer old_dir_lease.release();
+    var new_dir_lease = switch (pPathLookup(ctx, new_fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer new_dir_lease.release();
+    const old_dir = old_dir_lease.snapshot().host_dir.?;
+    const new_dir = new_dir_lease.snapshot().host_dir.?;
     const old_path = readGuestPath(mem, old_path_ptr, old_path_len) orelse
         return wasi_core.WASI_EINVAL;
     const new_path = readGuestPath(mem, new_path_ptr, new_path_len) orelse
@@ -2055,10 +2086,12 @@ pub fn ctxPathSymlinkCore(
     new_path_ptr: u32,
     new_path_len: u32,
 ) i32 {
-    const dir = switch (pPathLookup(ctx, fd)) {
+    var dir_lease = switch (pPathLookup(ctx, fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer dir_lease.release();
+    const dir = dir_lease.snapshot().host_dir.?;
     const old_path = readGuestPath(mem, old_path_ptr, old_path_len) orelse
         return wasi_core.WASI_EINVAL;
     const new_path = readGuestPath(mem, new_path_ptr, new_path_len) orelse
@@ -2085,10 +2118,12 @@ pub fn ctxPathReadlinkCore(
     buf_len: u32,
     bufused_ptr: u32,
 ) i32 {
-    const dir = switch (pPathLookup(ctx, fd)) {
+    var dir_lease = switch (pPathLookup(ctx, fd)) {
         .err => |e| return e,
-        .ok => |d| d,
+        .ok => |lease| lease,
     };
+    defer dir_lease.release();
+    const dir = dir_lease.snapshot().host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
     if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
     if (@as(u64, bufused_ptr) + 4 > mem.len) return wasi_core.WASI_EINVAL;
@@ -2142,7 +2177,9 @@ fn filetypeFromIoKind(kind: std.Io.File.Kind) wasi.Filetype {
 pub fn ctxFdFilestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
 
     if (entry.kind == .directory) {
         if (entry.host_dir) |dir| {
@@ -2182,7 +2219,9 @@ pub fn ctxFdFilestatSetSizeCore(ctx: *wasi.WasiCtx, fd: i32, size: i64) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
 
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
     if (entry.kind == .directory) return @intCast(@intFromEnum(wasi.Errno.isdir));
     if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.inval));
 
@@ -2202,7 +2241,9 @@ pub fn ctxFdFilestatSetTimesCore(ctx: *wasi.WasiCtx, fd: i32, atim: u64, mtim: u
     if ((fst_flags & exclusive_m) == exclusive_m) return wasi_core.WASI_EINVAL;
 
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
     const linux = std.os.linux;
@@ -2228,8 +2269,10 @@ pub fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
     if ((fdflags & ~wasi.FDFLAGS_ALL) != 0) return wasi_core.WASI_EINVAL;
 
     const u_fd: u32 = @intCast(fd);
-    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
-    if (entry_ptr.kind == .directory) return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
+    if (entry.kind == .directory) return wasi_core.WASI_EBADF;
 
     // SYNC/DSYNC/RSYNC can't be toggled via F_SETFL on Linux, and we
     // have no portable way to apply them on macOS/Windows either, so
@@ -2241,7 +2284,7 @@ pub fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
 
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
-        const host_fd = entryHostFd(entry_ptr.*) orelse return wasi_core.WASI_EBADF;
+        const host_fd = entryHostFd(entry) orelse return wasi_core.WASI_EBADF;
         const cur = linux.fcntl(host_fd, linux.F.GETFL, 0);
         if (linux.errno(cur) != .SUCCESS) return mapLinuxErrno(cur);
 
@@ -2254,22 +2297,18 @@ pub fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
         if (linux.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
     }
 
-    entry_ptr.fdflags = fdflags;
+    lease.setFdFlags(fdflags);
     return wasi_core.WASI_ESUCCESS;
 }
 
 pub fn ctxFdFdstatSetRightsCore(ctx: *wasi.WasiCtx, fd: i32, base: u64, inheriting: u64) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
-    if ((base & ~entry_ptr.rights_base) != 0) {
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    if (!lease.narrowRights(base, inheriting)) {
         return @intCast(@intFromEnum(wasi.Errno.notcapable));
     }
-    if ((inheriting & ~entry_ptr.rights_inheriting) != 0) {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
-    }
-    entry_ptr.rights_base = base;
-    entry_ptr.rights_inheriting = inheriting;
     return wasi_core.WASI_ESUCCESS;
 }
 
@@ -2279,7 +2318,9 @@ pub fn ctxFdAdviseCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64, advic
     if (advice > @intFromEnum(wasi.Advice.noreuse)) return wasi_core.WASI_EINVAL;
 
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
     if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.spipe));
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ESUCCESS;
@@ -2303,7 +2344,9 @@ pub fn ctxFdAllocateCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64) i32
     if (offset < 0 or len < 0) return wasi_core.WASI_EINVAL;
 
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
     switch (entry.kind) {
         .regular_file => {},
         .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
@@ -2337,7 +2380,9 @@ pub const SyncMode = enum { data, full };
 pub fn ctxFdSyncCore(ctx: *wasi.WasiCtx, fd: i32, mode: SyncMode) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
 
     if (entry.kind == .directory) {
         if (entry.host_dir) |dir| {
@@ -2377,45 +2422,29 @@ pub fn ctxFdRenumberCore(ctx: *wasi.WasiCtx, from: i32, to: i32) i32 {
     if (from < 0 or to < 0) return wasi_core.WASI_EBADF;
     const u_from: u32 = @intCast(from);
     const u_to: u32 = @intCast(to);
-
-    if (u_from == u_to) {
-        if (ctx.fd_table.get(u_from) == null) return wasi_core.WASI_EBADF;
-        return wasi_core.WASI_ESUCCESS;
-    }
-
-    const from_entry = ctx.fd_table.get(u_from) orelse return wasi_core.WASI_EBADF;
-    const to_entry = ctx.fd_table.get(u_to) orelse return wasi_core.WASI_EBADF;
-
-    switch (to_entry.kind) {
-        .stdin, .stdout, .stderr => return wasi_core.WASI_EBADF,
-        else => {},
-    }
-
-    if (to_entry.host_fd) |host_fd| {
-        const f = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-        f.close(ctx.io);
-    }
-    if (to_entry.host_dir) |dir| {
-        var d = dir;
-        d.close(ctx.io);
-    }
-
-    ctx.fd_table.insert(u_to, from_entry) catch return wasi_core.WASI_EINVAL;
-    ctx.fd_table.remove(u_from);
-
+    ctx.fd_table.renumber(u_from, u_to) catch |err| return switch (err) {
+        error.BadFd, error.TargetIsStdio => wasi_core.WASI_EBADF,
+    };
     return wasi_core.WASI_ESUCCESS;
 }
 
 pub fn ctxFdTellCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, offset_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
     switch (entry.kind) {
         .regular_file => {},
         .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
         .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
     }
-    if (!wasi_core.memWriteU64(mem, offset_ptr, entry.pos)) return wasi_core.WASI_EINVAL;
+    const position = if (entry.host_fd) |host_fd|
+        wasi.hostFilePosition(host_fd) orelse entry.pos
+    else
+        entry.pos;
+    lease.setPosition(position);
+    if (!wasi_core.memWriteU64(mem, offset_ptr, position)) return wasi_core.WASI_EINVAL;
     return wasi_core.WASI_ESUCCESS;
 }
 
@@ -2568,6 +2597,8 @@ const PendingFd = struct {
     /// Real-poll: index into the parallel `pollfds` array. `null`
     /// when the subscription is synthetic-ready / synthetic-error.
     pollfd_index: ?usize,
+    /// Keeps a pollable guest descriptor alive while poll(2) blocks.
+    lease: ?wasi.FdTable.Lease = null,
 };
 
 pub fn ctxPollOneoffCore(
@@ -2599,7 +2630,12 @@ pub fn ctxPollOneoffCore(
     var clocks: std.ArrayListUnmanaged(PendingClock) = .empty;
     defer clocks.deinit(ctx.allocator);
     var fd_subs: std.ArrayListUnmanaged(PendingFd) = .empty;
-    defer fd_subs.deinit(ctx.allocator);
+    defer {
+        for (fd_subs.items) |*sub| {
+            if (sub.lease) |*lease| lease.release();
+        }
+        fd_subs.deinit(ctx.allocator);
+    }
     var pollfds: std.ArrayListUnmanaged(std.posix.pollfd) = .empty;
     defer pollfds.deinit(ctx.allocator);
 
@@ -2662,17 +2698,18 @@ pub fn ctxPollOneoffCore(
                     .pollfd_index = null,
                 };
 
-                const entry_opt = ctx.fd_table.get(fd_raw);
-                if (entry_opt == null) {
+                var lease = ctx.fd_table.acquire(fd_raw) orelse {
                     pending.errno = @intFromEnum(wasi.Errno.badf);
                     any_immediate = true;
                     fd_subs.append(ctx.allocator, pending) catch return wasi_core.WASI_EINVAL;
                     continue;
-                }
-                const entry = entry_opt.?;
+                };
+                const entry = lease.snapshot();
+                var keep_lease = false;
 
                 const need_right: u64 = if (want_write) wasi.RIGHTS_FD_WRITE else wasi.RIGHTS_FD_READ;
                 if ((entry.rights_base & need_right) == 0) {
+                    lease.release();
                     pending.errno = @intFromEnum(wasi.Errno.notcapable);
                     any_immediate = true;
                     fd_subs.append(ctx.allocator, pending) catch return wasi_core.WASI_EINVAL;
@@ -2700,7 +2737,10 @@ pub fn ctxPollOneoffCore(
                                 .fd = 0,
                                 .events = std.posix.POLL.IN,
                                 .revents = 0,
-                            }) catch return wasi_core.WASI_EINVAL;
+                            }) catch {
+                                lease.release();
+                                return wasi_core.WASI_EINVAL;
+                            };
                             pending.pollfd_index = pfd_index;
                         }
                     },
@@ -2723,15 +2763,24 @@ pub fn ctxPollOneoffCore(
                                 .fd = host_fd,
                                 .events = events,
                                 .revents = 0,
-                            }) catch return wasi_core.WASI_EINVAL;
+                            }) catch {
+                                lease.release();
+                                return wasi_core.WASI_EINVAL;
+                            };
                             pending.pollfd_index = pfd_index;
+                            pending.lease = lease;
+                            keep_lease = true;
                         } else {
                             pending.errno = @intFromEnum(wasi.Errno.badf);
                             any_immediate = true;
                         }
                     },
                 }
-                fd_subs.append(ctx.allocator, pending) catch return wasi_core.WASI_EINVAL;
+                if (!keep_lease) lease.release();
+                fd_subs.append(ctx.allocator, pending) catch {
+                    if (pending.lease) |*held| held.release();
+                    return wasi_core.WASI_EINVAL;
+                };
             },
             else => {
                 fd_subs.append(ctx.allocator, .{
@@ -2742,6 +2791,7 @@ pub fn ctxPollOneoffCore(
                     .hangup = false,
                     .errno = @intFromEnum(wasi.Errno.inval),
                     .pollfd_index = null,
+                    .lease = null,
                 }) catch return wasi_core.WASI_EINVAL;
                 any_immediate = true;
             },
@@ -2891,7 +2941,9 @@ pub fn ctxSockShutdownCore(ctx: *wasi.WasiCtx, fd: i32, sdflags: i32) i32 {
 
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
 
     if (entry.kind != .socket) {
         return @intCast(@intFromEnum(wasi.Errno.notsock));
@@ -3003,7 +3055,9 @@ pub fn ctxSockAcceptCore(
 
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
 
     if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
     if ((entry.rights_base & wasi.RIGHTS_SOCK_ACCEPT) == 0) {
@@ -3021,8 +3075,7 @@ pub fn ctxSockAcceptCore(
         if (wasi_err != wasi_core.WASI_ESUCCESS) return wasi_err;
         const new_host_fd: std.posix.fd_t = @intCast(@as(isize, @bitCast(rc)));
 
-        const new_guest_fd = ctx.fd_table.allocateFd();
-        ctx.fd_table.insert(new_guest_fd, .{
+        const new_guest_fd = ctx.fd_table.create(.{
             .kind = .socket,
             .host_fd = new_host_fd,
             .rights_base = wasi.SOCKET_BASE_RIGHTS,
@@ -3065,7 +3118,9 @@ pub fn ctxSockRecvCore(
 
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
 
     if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
     if ((entry.rights_base & wasi.RIGHTS_FD_READ) == 0) {
@@ -3130,7 +3185,9 @@ pub fn ctxSockSendCore(
 
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
-    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
+    defer lease.release();
+    const entry = lease.snapshot();
 
     if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
     if ((entry.rights_base & wasi.RIGHTS_FD_WRITE) == 0) {
@@ -3440,12 +3497,12 @@ test "ctxFdFdstatSetRightsCore: narrow ok, widen rejected" {
         wasi_core.WASI_ESUCCESS,
         ctxFdFdstatSetRightsCore(ctx, 50, 0x0F, 0x0F),
     );
-    const after_narrow = ctx.fd_table.get(50).?;
+    const after_narrow = ctx.fd_table.snapshot(50).?;
     try std.testing.expectEqual(@as(u64, 0x0F), after_narrow.rights_base);
     try std.testing.expectEqual(@as(u64, 0x0F), after_narrow.rights_inheriting);
     const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
     try std.testing.expectEqual(expected, ctxFdFdstatSetRightsCore(ctx, 50, 0xFF, 0x0F));
-    try std.testing.expectEqual(@as(u64, 0x0F), ctx.fd_table.get(50).?.rights_base);
+    try std.testing.expectEqual(@as(u64, 0x0F), ctx.fd_table.snapshot(50).?.rights_base);
 }
 
 test "ctxFdFdstatSetRightsCore: bad fd" {
@@ -3598,13 +3655,13 @@ test "ctxFdPreadCore: reads at offset without moving cached pos" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    const fd = ctx.fd_table.allocateFd();
-    try ctx.fd_table.insert(fd, .{
+    const guest_file = try tmp.dir.openFile(testing_io, "pread.bin", .{});
+    const fd = try ctx.fd_table.create(.{
         .kind = .regular_file,
-        .host_fd = file.handle,
+        .host_fd = guest_file.handle,
         .pos = 5,
     });
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     // mem layout: [0..4] iov0.buf_ptr=12, [4..8] iov0.buf_len=4,
     //             [8..12] nread, [12..16] dst.
@@ -3620,7 +3677,7 @@ test "ctxFdPreadCore: reads at offset without moving cached pos" {
     try std.testing.expectEqual(@as(u32, 4), wasi_core.memReadU32(&mem, 8).?);
 
     // Cached pos must be unchanged — fd_pread is positional.
-    const after = ctx.fd_table.get(fd).?;
+    const after = ctx.fd_table.snapshot(fd).?;
     try std.testing.expectEqual(@as(u64, 5), after.pos);
 }
 
@@ -3638,13 +3695,13 @@ test "ctxFdPwriteCore: writes at offset without moving cached pos" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    const fd = ctx.fd_table.allocateFd();
-    try ctx.fd_table.insert(fd, .{
+    const guest_file = try tmp.dir.openFile(testing_io, "pwrite.bin", .{ .mode = .read_write });
+    const fd = try ctx.fd_table.create(.{
         .kind = .regular_file,
-        .host_fd = file.handle,
+        .host_fd = guest_file.handle,
         .pos = 0,
     });
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     // mem: [0..4] iov.buf_ptr=12, [4..8] iov.buf_len=3, [8..12] nwritten,
     //      [12..16] src "XYZ".
@@ -3658,11 +3715,65 @@ test "ctxFdPwriteCore: writes at offset without moving cached pos" {
         ctxFdPwriteCore(ctx, &mem, @intCast(fd), 0, 1, 4, 8),
     );
     try std.testing.expectEqual(@as(u32, 3), wasi_core.memReadU32(&mem, 8).?);
-    try std.testing.expectEqual(@as(u64, 0), ctx.fd_table.get(fd).?.pos);
+    try std.testing.expectEqual(@as(u64, 0), ctx.fd_table.snapshot(fd).?.pos);
 
     var read_back: [10]u8 = undefined;
     const n = try file.readPositionalAll(testing_io, &read_back, 0);
     try std.testing.expectEqualStrings("....XYZ...", read_back[0..n]);
+}
+
+test "core resource concurrent sequential reads consume distinct bytes" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(testing_io, "shared-cursor.bin", .{ .read = true });
+    try file.writePositionalAll(testing_io, "AB", 0);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try ctx.fd_table.create(.{
+        .kind = .regular_file,
+        .host_fd = file.handle,
+    });
+
+    const Result = struct {
+        mem: [16]u8,
+        rc: i32 = wasi_core.WASI_EINVAL,
+    };
+    var first = Result{ .mem = @splat(0) };
+    var second = Result{ .mem = @splat(0) };
+    for ([_]*Result{ &first, &second }) |result| {
+        _ = wasi_core.memWriteU32(&result.mem, 0, 8);
+        _ = wasi_core.memWriteU32(&result.mem, 4, 1);
+    }
+    var start = std.atomic.Value(bool).init(false);
+
+    const Reader = struct {
+        fn run(
+            target: *wasi.WasiCtx,
+            guest_fd: u32,
+            start_flag: *std.atomic.Value(bool),
+            result: *Result,
+        ) void {
+            while (!start_flag.load(.acquire)) std.atomic.spinLoopHint();
+            result.rc = ctxFdIoCore(target, &result.mem, @intCast(guest_fd), 0, 1, 12, .read);
+        }
+    };
+
+    const first_thread = try std.Thread.spawn(.{}, Reader.run, .{ ctx, fd, &start, &first });
+    const second_thread = try std.Thread.spawn(.{}, Reader.run, .{ ctx, fd, &start, &second });
+    start.store(true, .release);
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, first.rc);
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, second.rc);
+    try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&first.mem, 12).?);
+    try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&second.mem, 12).?);
+    const distinct = (first.mem[8] == 'A' and second.mem[8] == 'B') or
+        (first.mem[8] == 'B' and second.mem[8] == 'A');
+    try std.testing.expect(distinct);
 }
 
 test "ctxFdReaddirCore: encodes preview1 dirents" {
@@ -3680,13 +3791,12 @@ test "ctxFdReaddirCore: encodes preview1 dirents" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    const fd = ctx.fd_table.allocateFd();
-    try ctx.fd_table.insert(fd, .{
+    const owned_dir = try tmp.dir.openDir(testing_io, ".", .{ .iterate = true });
+    const fd = try ctx.fd_table.create(.{
         .kind = .directory,
-        .host_dir = tmp.dir,
+        .host_dir = owned_dir,
     });
-    // Drop the entry before deinit so we don't double-close the dir.
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     // 4 KiB scratch buffer in linear memory.
     var mem: [4096]u8 = @splat(0);
@@ -3736,16 +3846,17 @@ test "ctxFdReaddirCore: encodes preview1 dirents" {
 
 // ── path_* tests (issue #420 phase 3) ──────────────────────────────────
 
-/// Helper: register a tmpDir as a directory fd in `ctx`. The caller must
-/// `defer ctx.fd_table.remove(fd)` to keep `tmp.cleanup()` from
-/// double-closing the dir handle.
+/// Helper: duplicate a tmpDir handle and register the duplicate in `ctx`.
 fn registerTmpDirFd(ctx: *wasi.WasiCtx, dir: std.Io.Dir) !u32 {
-    const fd = ctx.fd_table.allocateFd();
-    try ctx.fd_table.insert(fd, .{
+    const owned_dir = try dir.openDir(ctx.io, ".", .{ .iterate = true });
+    errdefer {
+        var d = owned_dir;
+        d.close(ctx.io);
+    }
+    return try ctx.fd_table.create(.{
         .kind = .directory,
-        .host_dir = dir,
+        .host_dir = owned_dir,
     });
-    return fd;
 }
 
 /// Encode a path string into linear memory at offset 16 and return
@@ -3773,7 +3884,7 @@ test "ctxPathFilestatGetCore: bad fd / not-a-directory dirfd / noent" {
 
     // Register a regular_file fd at 4 → notdir.
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
-    defer ctx.fd_table.remove(4);
+    defer _ = ctx.fd_table.remove(4);
     const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
@@ -3795,7 +3906,7 @@ test "ctxPathFilestatGetCore: happy path on a regular file" {
     defer ctx.deinit();
 
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "stat.bin");
@@ -3822,7 +3933,7 @@ test "ctxPathFilestatSetTimesCore: explicit ns round-trip via stat" {
     defer ctx.deinit();
 
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "times.bin");
@@ -3887,7 +3998,7 @@ test "ctxPathCreateDirectoryCore: happy + exist + bad fd + notdir" {
     defer ctx.deinit();
 
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "newdir");
@@ -3912,7 +4023,7 @@ test "ctxPathCreateDirectoryCore: happy + exist + bad fd + notdir" {
 
     // Not a directory.
     try ctx.fd_table.insert(99, .{ .kind = .regular_file });
-    defer ctx.fd_table.remove(99);
+    defer _ = ctx.fd_table.remove(99);
     const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
@@ -3940,7 +4051,7 @@ test "ctxPathRemoveDirectoryCore: empty ok, populated -> notempty, regular -> no
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [128]u8 = @splat(0);
 
@@ -3982,7 +4093,7 @@ test "ctxPathUnlinkFileCore: happy + noent + isdir-on-directory" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [128]u8 = @splat(0);
 
@@ -4031,9 +4142,9 @@ test "ctxPathLinkCore: cross-dirfd link succeeds and shares ino" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const old_fd = try registerTmpDirFd(ctx, src);
-    defer ctx.fd_table.remove(old_fd);
+    defer _ = ctx.fd_table.remove(old_fd);
     const new_fd = try registerTmpDirFd(ctx, dst);
-    defer ctx.fd_table.remove(new_fd);
+    defer _ = ctx.fd_table.remove(new_fd);
 
     var mem: [256]u8 = @splat(0);
     const op = "orig";
@@ -4074,7 +4185,7 @@ test "ctxPathRenameCore: same-dir rename + bad fd" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [256]u8 = @splat(0);
     const op = "before";
@@ -4135,7 +4246,7 @@ test "ctxPathSymlinkCore: bad fd / notdir / embedded NUL" {
     );
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
-    defer ctx.fd_table.remove(4);
+    defer _ = ctx.fd_table.remove(4);
     const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
@@ -4152,7 +4263,7 @@ test "ctxPathSymlinkCore: happy path creates a symlink" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [256]u8 = @splat(0);
     const target = "target";
@@ -4186,7 +4297,7 @@ test "ctxPathSymlinkCore: target with embedded NUL → inval" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [128]u8 = @splat(0);
     // target = "ab\0c" (embedded NUL) — readGuestPath rejects
@@ -4214,7 +4325,7 @@ test "ctxPathReadlinkCore: bad fd / notdir" {
     );
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
-    defer ctx.fd_table.remove(4);
+    defer _ = ctx.fd_table.remove(4);
     const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
@@ -4232,7 +4343,7 @@ test "ctxPathReadlinkCore: happy path round-trips target" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [256]u8 = @splat(0);
     const link = "link";
@@ -4271,7 +4382,7 @@ test "ctxPathReadlinkCore: not-a-link returns inval" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [256]u8 = @splat(0);
     const p = encodePath(&mem, "regular");
@@ -4292,7 +4403,7 @@ test "ctxPathReadlinkCore: short buffer truncates silently" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [256]u8 = @splat(0);
     const p = encodePath(&mem, "link");
@@ -4327,7 +4438,7 @@ test "ctxPathOpenCore: bad fd / not-a-directory dirfd" {
     );
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
-    defer ctx.fd_table.remove(4);
+    defer _ = ctx.fd_table.remove(4);
     const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
@@ -4344,7 +4455,7 @@ test "ctxPathOpenCore: missing file without CREAT → noent" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(fd);
+    defer _ = ctx.fd_table.remove(fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "missing");
@@ -4365,7 +4476,7 @@ test "ctxPathOpenCore: CREAT creates new file" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "newfile");
@@ -4376,7 +4487,7 @@ test "ctxPathOpenCore: CREAT creates new file" {
     );
     const new_fd = wasi_core.memReadU32(&mem, 64).?;
     try std.testing.expect(new_fd != 0);
-    ctx.fd_table.remove(new_fd);
+    _ = ctx.fd_table.remove(new_fd);
 
     // Confirm the file now exists.
     const f = try tmp.dir.openFile(testing_io, "newfile", .{ .mode = .read_only });
@@ -4394,7 +4505,7 @@ test "ctxPathOpenCore: CREAT|EXCL on existing file → exist" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "victim");
@@ -4418,7 +4529,7 @@ test "ctxPathOpenCore: CREAT|TRUNC zeros existing file" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "data");
@@ -4428,7 +4539,7 @@ test "ctxPathOpenCore: CREAT|TRUNC zeros existing file" {
         ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x1 | 0x8, 0, 0, 0, 64),
     );
     const new_fd = wasi_core.memReadU32(&mem, 64).?;
-    ctx.fd_table.remove(new_fd);
+    _ = ctx.fd_table.remove(new_fd);
 
     const stat_f = try tmp.dir.openFile(testing_io, "data", .{ .mode = .read_only });
     defer stat_f.close(testing_io);
@@ -4447,7 +4558,7 @@ test "ctxPathOpenCore: TRUNC without CREAT zeros existing file" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "data2");
@@ -4457,7 +4568,7 @@ test "ctxPathOpenCore: TRUNC without CREAT zeros existing file" {
         ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x8, 0, 0, 0, 64),
     );
     const new_fd = wasi_core.memReadU32(&mem, 64).?;
-    ctx.fd_table.remove(new_fd);
+    _ = ctx.fd_table.remove(new_fd);
 
     const stat_f = try tmp.dir.openFile(testing_io, "data2", .{ .mode = .read_only });
     defer stat_f.close(testing_io);
@@ -4475,7 +4586,7 @@ test "ctxPathOpenCore: fdflags persists on FdEntry" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "f");
@@ -4497,9 +4608,9 @@ test "ctxPathOpenCore: fdflags persists on FdEntry" {
         ),
     );
     const new_fd = wasi_core.memReadU32(&mem, 64).?;
-    defer ctx.fd_table.remove(new_fd);
+    defer _ = ctx.fd_table.remove(new_fd);
 
-    const entry = ctx.fd_table.get(new_fd).?;
+    const entry = ctx.fd_table.snapshot(new_fd).?;
     try std.testing.expectEqual(
         @as(u16, wasi.FDFLAGS_NONBLOCK | wasi.FDFLAGS_APPEND),
         entry.fdflags,
@@ -4517,7 +4628,7 @@ test "ctxPathOpenCore: rights_base persists; zero is treated as all-ones" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "f");
@@ -4528,8 +4639,8 @@ test "ctxPathOpenCore: rights_base persists; zero is treated as all-ones" {
         ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0, 0, 0, 0, 64),
     );
     const fd_default = wasi_core.memReadU32(&mem, 64).?;
-    try std.testing.expectEqual(@as(u64, ~@as(u64, 0)), ctx.fd_table.get(fd_default).?.rights_base);
-    ctx.fd_table.remove(fd_default);
+    try std.testing.expectEqual(@as(u64, ~@as(u64, 0)), ctx.fd_table.snapshot(fd_default).?.rights_base);
+    _ = ctx.fd_table.remove(fd_default);
 
     // Explicit rights_base = FD_READ → preserved verbatim.
     try std.testing.expectEqual(
@@ -4549,8 +4660,8 @@ test "ctxPathOpenCore: rights_base persists; zero is treated as all-ones" {
         ),
     );
     const fd_ro = wasi_core.memReadU32(&mem, 64).?;
-    defer ctx.fd_table.remove(fd_ro);
-    try std.testing.expectEqual(wasi.RIGHTS_FD_READ, ctx.fd_table.get(fd_ro).?.rights_base);
+    defer _ = ctx.fd_table.remove(fd_ro);
+    try std.testing.expectEqual(wasi.RIGHTS_FD_READ, ctx.fd_table.snapshot(fd_ro).?.rights_base);
 }
 
 test "ctxPathOpenCore: CREAT|DIRECTORY → einval" {
@@ -4562,7 +4673,7 @@ test "ctxPathOpenCore: CREAT|DIRECTORY → einval" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "x");
@@ -4585,7 +4696,7 @@ test "ctxPathOpenCore: SYMLINK_FOLLOW honors dirflags bit" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "link");
@@ -4596,7 +4707,7 @@ test "ctxPathOpenCore: SYMLINK_FOLLOW honors dirflags bit" {
         ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0x1, p.ptr, p.len, 0, 0, 0, 0, 64),
     );
     const fd_followed = wasi_core.memReadU32(&mem, 64).?;
-    ctx.fd_table.remove(fd_followed);
+    _ = ctx.fd_table.remove(fd_followed);
 
     // dirflags=0 (no follow) → preview1 spec: open the symlink itself
     // is still an error path; std.Io maps O_NOFOLLOW on a symlink to
@@ -4617,7 +4728,7 @@ test "ctxPathOpenCore: doRead/doWrite are gated by rights_base" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
-    defer ctx.fd_table.remove(dir_fd);
+    defer _ = ctx.fd_table.remove(dir_fd);
 
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "f");
@@ -4640,9 +4751,10 @@ test "ctxPathOpenCore: doRead/doWrite are gated by rights_base" {
         ),
     );
     const fd_ro = wasi_core.memReadU32(&mem, 64).?;
-    defer ctx.fd_table.remove(fd_ro);
+    defer _ = ctx.fd_table.remove(fd_ro);
 
-    var entry_ro = ctx.fd_table.get(fd_ro).?;
+    var entry_ro = ctx.fd_table.acquire(fd_ro).?;
+    defer entry_ro.release();
     var buf: [8]u8 = undefined;
     const n = try doRead(ctx, &entry_ro, &buf);
     try std.testing.expectEqual(@as(usize, 5), n);
@@ -4660,7 +4772,7 @@ test "ctxFdRenumberCore: bad fds" {
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, -1, -1));
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
-    defer ctx.fd_table.remove(4);
+    defer _ = ctx.fd_table.remove(4);
 
     // from missing.
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 99, 4));
@@ -4673,7 +4785,7 @@ test "ctxFdRenumberCore: stdio in to slot returns BADF; from slot is allowed" {
     defer ctx.deinit();
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
-    defer ctx.fd_table.remove(4);
+    defer _ = ctx.fd_table.remove(4);
 
     // `from` is stdio: this is allowed (wasi-testsuite stdio test renumbers
     // an opened scratch fd into stdout/stderr; the converse direction is also
@@ -4681,7 +4793,7 @@ test "ctxFdRenumberCore: stdio in to slot returns BADF; from slot is allowed" {
     try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 0, 4));
     // After the renumber, fd 0 is closed and fd 4 holds what fd 0 had.
     // Re-prime fd 4 for the next assertion.
-    ctx.fd_table.remove(4);
+    _ = ctx.fd_table.remove(4);
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
 
     // `to` is stdio: rejected to keep stdio slots stable.
@@ -4695,10 +4807,10 @@ test "ctxFdRenumberCore: from == to is no-op success when open" {
     defer ctx.deinit();
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file, .pos = 7 });
-    defer ctx.fd_table.remove(4);
+    defer _ = ctx.fd_table.remove(4);
 
     try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 4, 4));
-    const after = ctx.fd_table.get(4).?;
+    const after = ctx.fd_table.snapshot(4).?;
     try std.testing.expectEqual(wasi.FdEntry.FdKind.regular_file, after.kind);
     try std.testing.expectEqual(@as(u64, 7), after.pos);
 }
@@ -4730,10 +4842,10 @@ test "ctxFdRenumberCore: regular_file over regular_file closes destination host_
     try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 10, 11));
 
     // `from` slot is gone.
-    try std.testing.expect(ctx.fd_table.get(10) == null);
+    try std.testing.expect(ctx.fd_table.snapshot(10) == null);
     // `to` slot now references `from`'s old host_fd. ctx.deinit will close
     // `from_handle` (now at slot 11) — `to_handle` was closed by renumber.
-    try std.testing.expectEqual(@as(?std.posix.fd_t, from_handle), ctx.fd_table.get(11).?.host_fd);
+    try std.testing.expectEqual(@as(?std.posix.fd_t, from_handle), ctx.fd_table.snapshot(11).?.host_fd);
     // The original `to` host_fd has been closed: any operation should fail.
     const rc = std.os.linux.fcntl(to_handle, std.os.linux.F.GETFD, 0);
     try std.testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(rc));
@@ -4766,8 +4878,8 @@ test "ctxFdRenumberCore: directory over directory closes destination host_dir" {
 
     try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 20, 21));
 
-    try std.testing.expect(ctx.fd_table.get(20) == null);
-    const after = ctx.fd_table.get(21).?;
+    try std.testing.expect(ctx.fd_table.snapshot(20) == null);
+    const after = ctx.fd_table.snapshot(21).?;
     try std.testing.expectEqual(wasi.FdEntry.FdKind.directory, after.kind);
     try std.testing.expectEqual(@as(?std.posix.fd_t, from_handle), if (after.host_dir) |d| d.handle else null);
 
@@ -4797,10 +4909,10 @@ test "ctxFdRenumberCore: fdflags and rights transfer from `from` to `to`" {
     });
 
     try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 30, 31));
-    defer ctx.fd_table.remove(31);
+    defer _ = ctx.fd_table.remove(31);
 
-    try std.testing.expect(ctx.fd_table.get(30) == null);
-    const after = ctx.fd_table.get(31).?;
+    try std.testing.expect(ctx.fd_table.snapshot(30) == null);
+    const after = ctx.fd_table.snapshot(31).?;
     try std.testing.expectEqual(wasi.FdEntry.FdKind.regular_file, after.kind);
     try std.testing.expectEqual(wasi.FDFLAGS_APPEND, after.fdflags);
     try std.testing.expectEqual(wasi.RIGHTS_FD_READ, after.rights_base);
@@ -4808,7 +4920,7 @@ test "ctxFdRenumberCore: fdflags and rights transfer from `from` to `to`" {
     try std.testing.expectEqual(@as(u64, 42), after.pos);
 }
 
-test "ctxFdRenumberCore: overwriting a preopen leaves preopens list intact" {
+test "ctxFdRenumberCore: overwriting a preopen preserves its target label" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp_pre = std.testing.tmpDir(.{});
@@ -4829,8 +4941,10 @@ test "ctxFdRenumberCore: overwriting a preopen leaves preopens list intact" {
     defer ctx.deinit();
 
     const pre_fd = try ctx.addPreopen("/pre", .{ .handle = pre_handle });
-    const new_fd = ctx.fd_table.allocateFd();
-    try ctx.fd_table.insert(new_fd, .{ .kind = .directory, .host_dir = .{ .handle = new_handle } });
+    const new_fd = try ctx.fd_table.create(.{
+        .kind = .directory,
+        .host_dir = .{ .handle = new_handle },
+    });
 
     try std.testing.expectEqual(
         wasi_core.WASI_ESUCCESS,
@@ -4838,18 +4952,19 @@ test "ctxFdRenumberCore: overwriting a preopen leaves preopens list intact" {
     );
 
     // `new_fd` is gone, `pre_fd` references the new dir handle.
-    try std.testing.expect(ctx.fd_table.get(new_fd) == null);
-    const after = ctx.fd_table.get(pre_fd).?;
+    try std.testing.expect(ctx.fd_table.snapshot(new_fd) == null);
+    const after = ctx.fd_table.snapshot(pre_fd).?;
     try std.testing.expectEqual(@as(?std.posix.fd_t, new_handle), if (after.host_dir) |d| d.handle else null);
 
     // The original preopen handle was closed by renumber; verify with fcntl.
     const fc = std.os.linux.fcntl(pre_handle, std.os.linux.F.GETFD, 0);
     try std.testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(fc));
 
-    // The preopens list is unchanged: still maps `pre_fd` → "/pre".
-    try std.testing.expectEqual(@as(usize, 1), ctx.preopens.items.len);
-    try std.testing.expectEqual(pre_fd, ctx.preopens.items[0].fd);
-    try std.testing.expectEqualSlices(u8, "/pre", ctx.preopens.items[0].path);
+    // The target numeric fd remains the preopen and still reports "/pre".
+    var name_buf: [8]u8 = undefined;
+    const name_len = ctx.copyPreopenName(pre_fd, &name_buf).?;
+    try std.testing.expectEqualStrings("/pre", name_buf[0..name_len]);
+    try std.testing.expectEqual(@as(usize, 1), ctx.fd_table.preopenCount());
     // ctx.deinit closes `new_handle` via the entry now at slot pre_fd.
 }
 
@@ -5524,10 +5639,10 @@ test "ctxSockAcceptCore: TCP listener accepts a host-side connection" {
     try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, rc);
     const new_guest_fd = std.mem.readInt(u32, mem[0..4], .little);
     try std.testing.expect(new_guest_fd >= 3);
-    const entry = ctx.fd_table.get(new_guest_fd) orelse return error.TestUnexpectedResult;
+    const entry = ctx.fd_table.snapshot(new_guest_fd) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(wasi.FdEntry.FdKind.socket, entry.kind);
-    // listen_fd is owned by the test; rewire its FdEntry to drop ownership
-    // before deinit closes a fd the deferred linux.close also closes.
-    var lis = ctx.fd_table.entries.getPtr(guest_listen_fd).?;
-    lis.host_fd = null;
+    // listen_fd is owned by the test; transfer it back before ctx teardown.
+    var listener_lease = ctx.fd_table.acquire(guest_listen_fd).?;
+    try std.testing.expectEqual(listen_fd, listener_lease.detachHostFd().?);
+    listener_lease.release();
 }
