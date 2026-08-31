@@ -2,10 +2,10 @@
 //!
 //! The configured aliases erase synchronization and atomic reference-count
 //! storage when WASI threads are disabled. Generational tables then use scoped
-//! borrows, while keyed tables retain callback-facing nodes with plain
-//! reference counts so reentrant removal cannot destroy an active callback's
-//! context. Thread-enabled tables retain retired nodes until the final lease
-//! is released. Reused directory slots advance a generation embedded in the
+//! borrows, while keyed tables defer callback-facing node destruction across
+//! reentrant removal without touching an atomic or per-lookup reference count.
+//! Thread-enabled tables retain retired nodes until the final lease is
+//! released. Reused directory slots advance a generation embedded in the
 //! public handle, preventing ABA.
 
 const std = @import("std");
@@ -859,9 +859,10 @@ pub fn StableHandleTableForStart(
 /// A conditionally-stable map from caller-owned public handles to values.
 ///
 /// Enabled builds keep map values in the shared stable-node directory.
-/// Disabled builds use heap-stable plain nodes with a non-atomic scoped
-/// reference count. This keeps callbacks safe across reentrant map growth or
-/// same-handle removal while retaining zero lock/atomic instructions.
+/// Disabled builds use heap-stable plain nodes and a value-specific busy
+/// predicate. Ordinary leases remain scoped borrows; busy nodes defer
+/// same-handle destruction until the callback clears its in-flight marker,
+/// without a per-lookup reference update.
 ///
 /// `publishAt` takes ownership only on success. Removal first unlinks the
 /// public handle, then runs `destroy` outside both directory and value locks.
@@ -871,6 +872,7 @@ pub fn StableKeyedHandleTableFor(
     comptime Context: type,
     comptime destroy: fn (Context, *T) void,
     comptime lock_values: bool,
+    comptime defer_destroy: ?fn (*const T) bool,
 ) type {
     return struct {
         const Self = @This();
@@ -880,8 +882,9 @@ pub fn StableKeyedHandleTableFor(
         const Stored = struct {
             owner: if (enabled) void else *Self = if (enabled) {} else undefined,
             mutex: ValueMutex = .init,
-            refs: if (enabled) void else usize = if (enabled) {} else 1,
             closing: if (enabled) void else bool = if (enabled) {} else false,
+            retired_next: if (enabled) void else ?*Stored =
+                if (enabled) {} else null,
             value: T,
         };
 
@@ -936,11 +939,7 @@ pub fn StableKeyedHandleTableFor(
                 if (comptime enabled) {
                     self.storage.release();
                 } else {
-                    const stored_node = self.storage.?;
                     self.storage = null;
-                    std.debug.assert(stored_node.refs > 0);
-                    stored_node.refs -= 1;
-                    if (stored_node.refs == 0) finalizeDisabled(stored_node);
                 }
             }
 
@@ -961,6 +960,8 @@ pub fn StableKeyedHandleTableFor(
         resources: if (enabled) Resources else void,
         shutting_down: bool = false,
         live_nodes: if (enabled) void else usize = if (enabled) {} else 0,
+        retired_head: if (enabled) void else ?*Stored =
+            if (enabled) {} else null,
 
         pub fn init(allocator: std.mem.Allocator, context: Context) !Self {
             return .{
@@ -1066,7 +1067,6 @@ pub fn StableKeyedHandleTableFor(
                 return null;
             };
             std.debug.assert(!stored.closing);
-            stored.refs += 1;
             self.directory.unlock();
             stored.mutex.lock();
             return .{ .storage = stored };
@@ -1111,9 +1111,8 @@ pub fn StableKeyedHandleTableFor(
             } else {
                 const stored = entry.value;
                 stored.closing = true;
-                std.debug.assert(stored.refs > 0);
-                stored.refs -= 1;
-                if (stored.refs == 0) finalizeDisabled(stored);
+                self.retireDisabled(stored);
+                self.collectRetired();
             }
             return true;
         }
@@ -1162,11 +1161,35 @@ pub fn StableKeyedHandleTableFor(
                 while (values.next()) |stored_ptr| {
                     const stored = stored_ptr.*;
                     stored.closing = true;
-                    std.debug.assert(stored.refs > 0);
-                    stored.refs -= 1;
-                    if (stored.refs == 0) finalizeDisabled(stored);
+                    self.retireDisabled(stored);
                 }
                 detached.deinit(self.allocator);
+                self.collectRetired();
+            }
+        }
+
+        /// Finalize disabled-build nodes whose value-specific busy predicate
+        /// is no longer active. Enabled builds retire through stable leases.
+        pub fn collectRetired(self: *Self) void {
+            if (comptime enabled) return;
+
+            while (true) {
+                self.directory.lock();
+                var link = &self.retired_head;
+                var ready: ?*Stored = null;
+                while (link.*) |stored| {
+                    if (!shouldDeferDestroy(stored)) {
+                        link.* = stored.retired_next;
+                        stored.retired_next = null;
+                        ready = stored;
+                        break;
+                    }
+                    link = &stored.retired_next;
+                }
+                self.directory.unlock();
+
+                const stored = ready orelse return;
+                finalizeDisabled(stored);
             }
         }
 
@@ -1179,8 +1202,9 @@ pub fn StableKeyedHandleTableFor(
             self.shutdown();
             if (comptime enabled) {
                 try self.resources.deinit();
-            } else if (!self.isQuiescent()) {
-                return error.LeasesOutstanding;
+            } else {
+                self.collectRetired();
+                if (!self.isQuiescent()) return error.LeasesOutstanding;
             }
         }
 
@@ -1189,6 +1213,16 @@ pub fn StableKeyedHandleTableFor(
             Destroyer.run(owner.context, stored);
             owner.live_nodes -= 1;
             owner.allocator.destroy(stored);
+        }
+
+        fn retireDisabled(self: *Self, stored: *Stored) void {
+            stored.retired_next = self.retired_head;
+            self.retired_head = stored;
+        }
+
+        fn shouldDeferDestroy(stored: *const Stored) bool {
+            if (defer_destroy) |is_busy| return is_busy(&stored.value);
+            return false;
         }
     };
 }
@@ -1204,12 +1238,17 @@ comptime {
 
 const TestResource = struct {
     value: usize,
+    callback_inflight: bool = false,
 };
 
 const TestDestroyContext = *std.atomic.Value(usize);
 
 fn countTestDestroy(context: TestDestroyContext, _: *TestResource) void {
     _ = context.fetchAdd(1, .monotonic);
+}
+
+fn testCallbackInFlight(resource: *const TestResource) bool {
+    return resource.callback_inflight;
 }
 
 fn TestTable(comptime enabled: bool, comptime capacity: usize) type {
@@ -1229,6 +1268,7 @@ fn TestKeyedTable(comptime enabled: bool) type {
         TestDestroyContext,
         countTestDestroy,
         true,
+        testCallbackInFlight,
     );
 }
 
@@ -1558,7 +1598,7 @@ test "keyed stable table publication failure keeps caller ownership" {
     try table.deinit();
 }
 
-test "disabled keyed table uses non-atomic stable leases" {
+test "disabled keyed table defers destruction across callback reentry" {
     const Table = TestKeyedTable(false);
     var destroyed = std.atomic.Value(usize).init(0);
     var table = try Table.init(std.testing.allocator, &destroyed);
@@ -1566,15 +1606,17 @@ test "disabled keyed table uses non-atomic stable leases" {
     try table.publishAt(5, .{ .value = 8 });
     var lease = table.acquire(5).?;
     try std.testing.expectEqual(@as(usize, 8), lease.value().value);
+    lease.value().callback_inflight = true;
     lease.unlock();
     try std.testing.expect(table.remove(5));
     try std.testing.expect(table.acquire(5) == null);
     try std.testing.expect(lease.isClosing());
-    lease.lock();
-    try std.testing.expectEqual(@as(usize, 8), lease.value().value);
     try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
     try std.testing.expectError(error.LeasesOutstanding, table.deinit());
+    lease.lock();
+    lease.value().callback_inflight = false;
     lease.release();
+    table.collectRetired();
     try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
     try table.deinit();
 }

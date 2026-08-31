@@ -105,9 +105,10 @@ now carry non-wrapping slot generations; Preview-3 futures, streams,
 error-contexts, and waitable sets are reached through conditional stable
 leases; task/waitable mutation is synchronized; and callbacks/destructors run
 after releasing runtime locks. Disabled builds compile out locks and atomics;
-callback-facing keyed nodes use plain scoped reference counts. Execution-local
-task managers, implicit context slots, canon-lower bindings, and realloc state
-remain on `ThreadExecutionContext` as established by the context split.
+callback in-flight markers defer reentrant destruction without per-lookup
+reference updates. Execution-local task managers, implicit context slots,
+canon-lower bindings, and realloc state remain on `ThreadExecutionContext` as
+established by the context split.
 `WasiCliAdapter`'s own resource families remain the final B1.1 follow-up. This
 also does not wire production interpreter/AOT spawning or final group
 cancellation.
@@ -525,7 +526,9 @@ Each wave is a discrete PR with its own conformance gate.
 **Scope.**
 
 * Use the conditional stable-handle/lease primitives for shared resource
-  families, with a direct representation retained in disabled builds.
+  families. Disabled canonical-resource slots retain their compact direct
+  representation; keyed async tables use heap-stable nodes but no locks,
+  atomics, or per-lookup reference updates.
 * `WasiCtx` and `ComponentInstance` are migrated. Every `*_table` field on
   `WasiCliAdapter` remains the separate adapter-resource slice.
 * Gate the mutex acquire behind `comptime config.lib_wasi_threads`:

@@ -2921,9 +2921,9 @@ fn dispatchAsyncCanon(
                             handle,
                             &stream_lease,
                         )) {
-                            if (comptime config.lib_wasi_threads) {
-                                stream_lease.value().host_read_inflight = false;
-                            }
+                            stream_lease.value().host_read_inflight = false;
+                            stream_lease.release();
+                            comp_inst.streams.collectRetired();
                             if (total_bytes > 0) {
                                 env.pushI32(@bitCast(async_canon.packStatus(
                                     .completed,
@@ -2975,9 +2975,9 @@ fn dispatchAsyncCanon(
                                 handle,
                                 &stream_lease,
                             )) {
-                                if (comptime config.lib_wasi_threads) {
-                                    stream_lease.value().host_read_inflight = false;
-                                }
+                                stream_lease.value().host_read_inflight = false;
+                                stream_lease.release();
+                                comp_inst.streams.collectRetired();
                                 env.pushI32(@bitCast(async_canon.packStatus(
                                     .dropped,
                                     0,
@@ -3021,9 +3021,9 @@ fn dispatchAsyncCanon(
                             handle,
                             &stream_lease,
                         )) {
-                            if (comptime config.lib_wasi_threads) {
-                                stream_lease.value().host_read_inflight = false;
-                            }
+                            stream_lease.value().host_read_inflight = false;
+                            stream_lease.release();
+                            comp_inst.streams.collectRetired();
                             env.pushI32(@bitCast(async_canon.packStatus(
                                 .dropped,
                                 0,
@@ -3152,9 +3152,9 @@ fn dispatchAsyncCanon(
                         handle,
                         &stream_lease,
                     )) {
-                        if (comptime config.lib_wasi_threads) {
-                            stream_lease.value().host_write_inflight = false;
-                        }
+                        stream_lease.value().host_write_inflight = false;
+                        stream_lease.release();
+                        comp_inst.streams.collectRetired();
                         env.pushI32(@bitCast(async_canon.packStatus(
                             .dropped,
                             0,
@@ -3233,9 +3233,9 @@ fn dispatchAsyncCanon(
                             handle,
                             &stream_lease,
                         )) {
-                            if (comptime config.lib_wasi_threads) {
-                                stream_lease.value().host_write_inflight = false;
-                            }
+                            stream_lease.value().host_write_inflight = false;
+                            stream_lease.release();
+                            comp_inst.streams.collectRetired();
                             env.pushI32(@bitCast(async_canon.packStatus(
                                 .dropped,
                                 0,
@@ -3323,14 +3323,32 @@ fn dispatchAsyncCanon(
                     null;
                 const waitable = if (transitioned) s.write_waitable else null;
                 const fully_closed = s.read_closed and s.write_closed;
-                stream_lease.unlock();
+                const callback_active = drop_callback != null;
+                if (callback_active) s.host_read_inflight = true;
+                suspendStreamLeaseForCallback(&stream_lease);
                 if (drop_callback) |callback| callback.callback(callback.context);
+                const survived = resumeStreamLeaseAfterCallback(
+                    comp_inst,
+                    handle,
+                    &stream_lease,
+                );
+                if (callback_active) {
+                    stream_lease.value().host_read_inflight = false;
+                }
+                if (!survived) {
+                    stream_lease.release();
+                    comp_inst.streams.collectRetired();
+                } else {
+                    stream_lease.release();
+                }
                 // Wake a parked writer so it can observe CANCELLED.
                 _ = comp_inst.notifyWaitable(
                     waitable,
                     async_canon.packStatus(.dropped, 0),
                 );
-                if (fully_closed) _ = comp_inst.streams.remove(handle);
+                if (survived and fully_closed) {
+                    _ = comp_inst.streams.remove(handle);
+                }
             }
         },
         .stream_drop_writable => |info| {
@@ -3364,30 +3382,50 @@ fn dispatchAsyncCanon(
                     null;
                 const waitable = if (transitioned) s.read_waitable else null;
                 var fully_closed = s.read_closed and s.write_closed;
-                stream_lease.unlock();
+                const callback_active =
+                    driver_drop != null or handler_drop != null;
+                if (callback_active) s.host_write_inflight = true;
+                suspendStreamLeaseForCallback(&stream_lease);
                 if (driver_drop) |callback| callback.callback(callback.context);
                 // Notify any host-attached sink that the guest has
                 // closed its writer end (#537). The host handler is
                 // responsible for settling its companion future.
                 if (handler_drop) |callback| {
                     callback.callback(callback.context);
+                }
+                const survived = resumeStreamLeaseAfterCallback(
+                    comp_inst,
+                    handle,
+                    &stream_lease,
+                );
+                if (callback_active) {
+                    stream_lease.value().host_write_inflight = false;
+                }
+                if (survived) {
+                    const final_stream = stream_lease.value();
                     // A host-attached sink only needs the read end open
                     // long enough to receive synchronous `stream.write`
                     // forwards. After the writer drops, the host is
                     // done — close the read end so the stream entry is
                     // freed (and `on_destroy` reclaims `ctx`).
-                    stream_lease.lock();
-                    const final_stream = stream_lease.value();
-                    final_stream.read_closed = true;
-                    fully_closed = final_stream.write_closed;
-                    stream_lease.unlock();
+                    if (handler_drop != null) {
+                        final_stream.read_closed = true;
+                    }
+                    fully_closed =
+                        final_stream.read_closed and final_stream.write_closed;
+                    stream_lease.release();
+                } else {
+                    stream_lease.release();
+                    comp_inst.streams.collectRetired();
                 }
                 // Wake a parked reader so it can observe CANCELLED.
                 _ = comp_inst.notifyWaitable(
                     waitable,
                     async_canon.packStatus(.dropped, 0),
                 );
-                if (fully_closed) _ = comp_inst.streams.remove(handle);
+                if (survived and fully_closed) {
+                    _ = comp_inst.streams.remove(handle);
+                }
             }
         },
 
@@ -3987,9 +4025,9 @@ pub fn drivePendingHostStreamReads(
                             handle,
                             &stream_lease,
                         )) {
-                            if (comptime config.lib_wasi_threads) {
-                                stream_lease.value().host_read_inflight = false;
-                            }
+                            stream_lease.value().host_read_inflight = false;
+                            stream_lease.release();
+                            comp_inst.streams.collectRetired();
                             continue;
                         }
                         stream = stream_lease.value();
@@ -4044,9 +4082,9 @@ pub fn drivePendingHostStreamReads(
                     handle,
                     &stream_lease,
                 )) {
-                    if (comptime config.lib_wasi_threads) {
-                        stream_lease.value().host_read_inflight = false;
-                    }
+                    stream_lease.value().host_read_inflight = false;
+                    stream_lease.release();
+                    comp_inst.streams.collectRetired();
                     continue;
                 }
                 stream = stream_lease.value();

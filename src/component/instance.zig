@@ -353,6 +353,10 @@ fn destroyStream(allocator: AsyncDestroyContext, stream: *async_mod.AsyncStream)
     stream.deinit(allocator);
 }
 
+fn streamCallbackInFlight(stream: *const async_mod.AsyncStream) bool {
+    return stream.host_read_inflight or stream.host_write_inflight;
+}
+
 fn destroyErrorContext(allocator: AsyncDestroyContext, message: *[]u8) void {
     stable_resource.assertNoLocksHeld();
     allocator.free(message.*);
@@ -370,6 +374,7 @@ pub const FutureTable = stable_resource.StableKeyedHandleTableFor(
     AsyncDestroyContext,
     destroyFuture,
     true,
+    null,
 );
 pub const StreamTable = stable_resource.StableKeyedHandleTableFor(
     config.lib_wasi_threads,
@@ -377,6 +382,7 @@ pub const StreamTable = stable_resource.StableKeyedHandleTableFor(
     AsyncDestroyContext,
     destroyStream,
     true,
+    streamCallbackInFlight,
 );
 pub const ErrorContextTable = stable_resource.StableKeyedHandleTableFor(
     config.lib_wasi_threads,
@@ -384,6 +390,7 @@ pub const ErrorContextTable = stable_resource.StableKeyedHandleTableFor(
     AsyncDestroyContext,
     destroyErrorContext,
     false,
+    null,
 );
 pub const WaitableSetTable = stable_resource.StableKeyedHandleTableFor(
     config.lib_wasi_threads,
@@ -391,6 +398,7 @@ pub const WaitableSetTable = stable_resource.StableKeyedHandleTableFor(
     AsyncDestroyContext,
     destroyWaitableSet,
     false,
+    null,
 );
 
 const ResourceTableRegistry = struct {
