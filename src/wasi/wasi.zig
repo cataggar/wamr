@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config");
 const stable_resource = @import("../shared/stable_resource.zig");
+const execution_context = @import("../runtime/common/execution_context.zig");
 const Io = std.Io;
 const File = Io.File;
 
@@ -1002,8 +1003,13 @@ fn ExitStateFor(comptime enabled: bool) type {
 
 // ── WASI Context ────────────────────────────────────────────────────────
 
-/// WASI execution context — tracks file descriptors, args, env, preopens.
-pub const WasiCtx = struct {
+/// Shared WASI process state.
+///
+/// Descriptors, preopens, arguments, environment, clocks, random source, and
+/// process exit status are shared by every guest thread. Per-thread stack,
+/// TLS, task, cancellation, and trap state lives in
+/// `execution_context.ThreadExecutionContext`.
+pub const WasiProcessState = struct {
     allocator: std.mem.Allocator,
     io: Io,
     refs: stable_resource.ConditionalLifetimeRefCount =
@@ -1013,8 +1019,8 @@ pub const WasiCtx = struct {
     fd_table: FdTable,
     exit_state: ExitStateFor(config.lib_wasi_threads) = .{},
 
-    pub fn init(allocator: std.mem.Allocator, io: Io) !*WasiCtx {
-        const ctx = try allocator.create(WasiCtx);
+    pub fn init(allocator: std.mem.Allocator, io: Io) !*WasiProcessState {
+        const ctx = try allocator.create(WasiProcessState);
         errdefer allocator.destroy(ctx);
         ctx.* = .{
             .allocator = allocator,
@@ -1029,33 +1035,86 @@ pub const WasiCtx = struct {
         return ctx;
     }
 
-    pub fn retain(self: *WasiCtx) void {
+    pub fn retain(self: *WasiProcessState) void {
         self.refs.retain();
     }
 
-    pub fn deinit(self: *WasiCtx) void {
+    pub fn deinit(self: *WasiProcessState) void {
         if (!self.refs.release()) return;
-        self.fd_table.deinit() catch @panic("WasiCtx destroyed with outstanding descriptor leases");
+        self.fd_table.deinit() catch @panic("WasiProcessState destroyed with outstanding descriptor leases");
+        self.freeStringList(self.args);
+        self.freeStringList(self.env_vars);
         self.allocator.destroy(self);
     }
 
-    pub fn setArgs(self: *WasiCtx, args: []const []const u8) void {
-        // Startup-only borrowed configuration; freeze before sharing.
-        std.debug.assert(self.refs.count() == 1);
-        self.args = args;
+    pub fn processStateRef(self: *WasiProcessState) execution_context.ProcessStateRef {
+        return execution_context.ProcessStateRef.init(@ptrCast(self), &process_state_ops);
     }
 
-    pub fn setEnv(self: *WasiCtx, env: []const []const u8) void {
-        // Startup-only borrowed configuration; freeze before sharing.
+    pub fn referenceCount(self: *const WasiProcessState) usize {
+        return self.refs.count();
+    }
+
+    fn retainOpaque(raw: *anyopaque) void {
+        const self: *WasiProcessState = @ptrCast(@alignCast(raw));
+        self.retain();
+    }
+
+    fn releaseOpaque(raw: *anyopaque) void {
+        const self: *WasiProcessState = @ptrCast(@alignCast(raw));
+        self.deinit();
+    }
+
+    const process_state_ops = execution_context.ProcessStateOps{
+        .retain = retainOpaque,
+        .release = releaseOpaque,
+    };
+
+    fn duplicateStringList(
+        self: *WasiProcessState,
+        values: []const []const u8,
+    ) ![]const []const u8 {
+        if (values.len == 0) return &.{};
+        const owned = try self.allocator.alloc([]const u8, values.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |value| self.allocator.free(value);
+            self.allocator.free(owned);
+        }
+        for (values, 0..) |value, i| {
+            owned[i] = try self.allocator.dupe(u8, value);
+            initialized += 1;
+        }
+        return owned;
+    }
+
+    fn freeStringList(self: *WasiProcessState, values: []const []const u8) void {
+        if (values.len == 0) return;
+        for (values) |value| self.allocator.free(value);
+        self.allocator.free(values);
+    }
+
+    pub fn setArgs(self: *WasiProcessState, args: []const []const u8) !void {
+        // Startup-only owned configuration; freeze before sharing.
         std.debug.assert(self.refs.count() == 1);
-        self.env_vars = env;
+        const replacement = try self.duplicateStringList(args);
+        self.freeStringList(self.args);
+        self.args = replacement;
+    }
+
+    pub fn setEnv(self: *WasiProcessState, env: []const []const u8) !void {
+        // Startup-only owned configuration; freeze before sharing.
+        std.debug.assert(self.refs.count() == 1);
+        const replacement = try self.duplicateStringList(env);
+        self.freeStringList(self.env_vars);
+        self.env_vars = replacement;
     }
 
     /// Register an already-opened host directory under `guest_name` as a
     /// preopen. Allocates a fresh fd ≥ 3 and takes ownership of `dir` only
     /// on success (closed on `WasiCtx.deinit`); the caller retains ownership
     /// on error. Returns the assigned fd.
-    pub fn addPreopen(self: *WasiCtx, guest_name: []const u8, dir: std.Io.Dir) !u32 {
+    pub fn addPreopen(self: *WasiProcessState, guest_name: []const u8, dir: std.Io.Dir) !u32 {
         std.debug.assert(self.refs.count() == 1);
         const owned_name = try self.allocator.dupe(u8, guest_name);
         errdefer self.allocator.free(owned_name);
@@ -1074,7 +1133,7 @@ pub const WasiCtx = struct {
 
     /// Open `host_path` on the host and register it as a preopen exposed to
     /// the guest under `guest_name`. Used by the CLI's `--map-dir` flag.
-    pub fn openMappedDir(self: *WasiCtx, host_path: []const u8, guest_name: []const u8) !u32 {
+    pub fn openMappedDir(self: *WasiProcessState, host_path: []const u8, guest_name: []const u8) !u32 {
         const dir = try std.Io.Dir.cwd().openDir(self.io, host_path, .{ .iterate = true });
         errdefer {
             var d = dir;
@@ -1090,7 +1149,7 @@ pub const WasiCtx = struct {
     /// directory preopens; socket preopens are discoverable by convention
     /// (wasi-libc walks fds 3.. and reports `ENOTDIR` for non-dir prestats
     /// to enumerate them). Returns the assigned fd.
-    pub fn addPreopenSocket(self: *WasiCtx, host_fd: std.posix.fd_t) !u32 {
+    pub fn addPreopenSocket(self: *WasiProcessState, host_fd: std.posix.fd_t) !u32 {
         std.debug.assert(self.refs.count() == 1);
         return try self.fd_table.create(.{
             .kind = .socket,
@@ -1100,21 +1159,21 @@ pub const WasiCtx = struct {
         });
     }
 
-    pub fn preopenNameLen(self: *WasiCtx, fd: u32) ?usize {
+    pub fn preopenNameLen(self: *WasiProcessState, fd: u32) ?usize {
         return self.fd_table.preopenNameLen(fd);
     }
 
-    pub fn copyPreopenName(self: *WasiCtx, fd: u32, dest: []u8) ?usize {
+    pub fn copyPreopenName(self: *WasiProcessState, fd: u32, dest: []u8) ?usize {
         return self.fd_table.copyPreopenName(fd, dest);
     }
 
-    pub fn getExitCode(self: *const WasiCtx) ?u32 {
+    pub fn getExitCode(self: *const WasiProcessState) ?u32 {
         return self.exit_state.get();
     }
 
     // ── args ────────────────────────────────────────────────────────
 
-    pub fn args_sizes_get(self: *const WasiCtx) struct { count: u32, buf_size: u32 } {
+    pub fn args_sizes_get(self: *const WasiProcessState) struct { count: u32, buf_size: u32 } {
         var buf_size: u32 = 0;
         for (self.args) |arg| {
             // Each arg is NUL-terminated in the WASI buffer
@@ -1126,7 +1185,7 @@ pub const WasiCtx = struct {
         };
     }
 
-    pub fn args_get(self: *const WasiCtx, argv_buf: []u8) []const u8 {
+    pub fn args_get(self: *const WasiProcessState, argv_buf: []u8) []const u8 {
         var offset: usize = 0;
         for (self.args) |arg| {
             if (offset + arg.len + 1 > argv_buf.len) break;
@@ -1139,7 +1198,7 @@ pub const WasiCtx = struct {
 
     // ── environ ─────────────────────────────────────────────────────
 
-    pub fn environ_sizes_get(self: *const WasiCtx) struct { count: u32, buf_size: u32 } {
+    pub fn environ_sizes_get(self: *const WasiProcessState) struct { count: u32, buf_size: u32 } {
         var buf_size: u32 = 0;
         for (self.env_vars) |env| {
             buf_size += @as(u32, @intCast(env.len)) + 1;
@@ -1152,7 +1211,7 @@ pub const WasiCtx = struct {
 
     // ── clock ───────────────────────────────────────────────────────
 
-    pub fn clock_time_get(self: *const WasiCtx, clock_id: u32, precision: u64) !u64 {
+    pub fn clock_time_get(self: *const WasiProcessState, clock_id: u32, precision: u64) !u64 {
         _ = precision;
         const id = std.enums.fromInt(ClockId, clock_id) orelse return error.InvalidClockId;
         const clock: Io.Clock = switch (id) {
@@ -1169,7 +1228,7 @@ pub const WasiCtx = struct {
 
     // ── fd operations ───────────────────────────────────────────────
 
-    pub fn fd_write(self: *WasiCtx, fd: u32, iovs: []const IoVec) !struct { nwritten: u32 } {
+    pub fn fd_write(self: *WasiProcessState, fd: u32, iovs: []const IoVec) !struct { nwritten: u32 } {
         var lease = self.fd_table.acquire(fd) orelse return error.BadFd;
         defer lease.release();
         const entry = lease.snapshot();
@@ -1216,7 +1275,7 @@ pub const WasiCtx = struct {
         return .{ .nwritten = total_written };
     }
 
-    pub fn fd_read(self: *WasiCtx, fd: u32, iovs: []const IoVec) !struct { nread: u32 } {
+    pub fn fd_read(self: *WasiProcessState, fd: u32, iovs: []const IoVec) !struct { nread: u32 } {
         var lease = self.fd_table.acquire(fd) orelse return error.BadFd;
         defer lease.release();
         const entry = lease.snapshot();
@@ -1260,14 +1319,14 @@ pub const WasiCtx = struct {
         return .{ .nread = total_read };
     }
 
-    pub fn fd_close(self: *WasiCtx, fd: u32) Errno {
+    pub fn fd_close(self: *WasiProcessState, fd: u32) Errno {
         return switch (self.fd_table.closeGuest(fd)) {
             .closed => .success,
             .badf, .protected_stdio => .badf,
         };
     }
 
-    pub fn fd_seek(self: *WasiCtx, fd: u32, offset: i64, whence: u8) !u64 {
+    pub fn fd_seek(self: *WasiProcessState, fd: u32, offset: i64, whence: u8) !u64 {
         var lease = self.fd_table.acquire(fd) orelse return error.BadFd;
         defer lease.release();
         const entry = lease.snapshot();
@@ -1291,22 +1350,95 @@ pub const WasiCtx = struct {
 
     // ── proc ────────────────────────────────────────────────────────
 
-    pub fn proc_exit(self: *WasiCtx, code: u32) void {
+    pub fn proc_exit(self: *WasiProcessState, code: u32) void {
         self.exit_state.set(code);
     }
 
     // ── random ──────────────────────────────────────────────────────
 
-    pub fn random_get(self: *const WasiCtx, buf: []u8) void {
+    pub fn random_get(self: *const WasiProcessState, buf: []u8) void {
         self.io.random(buf);
     }
 };
+
+/// Compatibility name retained for existing embedders.
+pub const WasiCtx = WasiProcessState;
 
 // ════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════
 
 const testing_io = std.testing.io;
+
+test "WasiProcessState shares descriptors preopens args and environment across thread contexts" {
+    const allocator = std.testing.allocator;
+    const process = try WasiProcessState.init(allocator, testing_io);
+    defer process.deinit();
+    var program_buf = [_]u8{ 'p', 'r', 'o', 'g', 'r', 'a', 'm' };
+    var env_buf = [_]u8{ 'K', 'E', 'Y', '=', 'v', 'a', 'l', 'u', 'e' };
+    const args = [_][]const u8{ &program_buf, "child" };
+    const env = [_][]const u8{&env_buf};
+    try process.setArgs(&args);
+    try process.setEnv(&env);
+    program_buf[0] = 'X';
+    env_buf[0] = 'X';
+
+    const owned_name = try allocator.dupe(u8, "/shared");
+    const preopen_fd = try process.fd_table.createPreopen(
+        .{
+            .kind = .directory,
+            .rights_base = DIRECTORY_BASE_RIGHTS,
+            .rights_inheriting = DIRECTORY_INHERITING_RIGHTS,
+        },
+        owned_name,
+    );
+    try process.fd_table.insert(10, .{ .kind = .regular_file });
+
+    var parent = execution_context.ThreadExecutionContext.init(process.processStateRef());
+    defer parent.deinit();
+    var child = execution_context.ThreadExecutionContext.init(parent.process_state);
+    defer child.deinit();
+
+    const parent_process = parent.process(WasiProcessState).?;
+    const child_process = child.process(WasiProcessState).?;
+    try std.testing.expectEqual(parent_process, child_process);
+    try std.testing.expectEqual(@as(usize, 3), process.referenceCount());
+    try std.testing.expectEqual(@as(u32, 2), parent_process.args_sizes_get().count);
+    try std.testing.expectEqual(@as(u32, 1), child_process.environ_sizes_get().count);
+    var args_buf: [32]u8 = undefined;
+    const copied_args = parent_process.args_get(&args_buf);
+    try std.testing.expectEqualStrings("program\x00child\x00", copied_args);
+    try std.testing.expectEqualStrings("KEY=value", child_process.env_vars[0]);
+
+    var name_buf: [32]u8 = undefined;
+    const copied = child_process.copyPreopenName(preopen_fd, &name_buf).?;
+    try std.testing.expectEqualStrings("/shared", name_buf[0..copied]);
+    try std.testing.expectEqual(Errno.success, child_process.fd_close(10));
+    try std.testing.expect(!parent_process.fd_table.contains(10));
+    try std.testing.expectEqual(Errno.success, child_process.fd_close(preopen_fd));
+    try std.testing.expect(parent_process.preopenNameLen(preopen_fd) == null);
+}
+
+test "WasiProcessState survives root and parent release until child completion" {
+    const process = try WasiProcessState.init(std.testing.allocator, testing_io);
+    try process.setArgs(&.{"owned-after-parent"});
+    try process.fd_table.insert(9, .{ .kind = .regular_file, .pos = 77 });
+
+    var parent = execution_context.ThreadExecutionContext.init(process.processStateRef());
+    var child = execution_context.ThreadExecutionContext.init(parent.process_state);
+    try std.testing.expectEqual(@as(usize, 3), process.referenceCount());
+
+    process.deinit();
+    parent.deinit();
+    const child_process = child.process(WasiProcessState).?;
+    try std.testing.expectEqual(@as(usize, 1), child_process.referenceCount());
+    try std.testing.expectEqual(@as(u32, 1), child_process.args_sizes_get().count);
+    var lease = child_process.fd_table.acquire(9).?;
+    try std.testing.expectEqual(@as(u64, 77), lease.snapshot().pos);
+    lease.release();
+
+    child.deinit();
+}
 
 test "FdTable threaded stale lease cannot alias a reused guest fd" {
     const Table = FdTableFor(true);
@@ -1624,7 +1756,7 @@ test "args_sizes_get with known args" {
     defer ctx.deinit();
 
     const args = [_][]const u8{ "hello", "world" };
-    ctx.setArgs(&args);
+    try ctx.setArgs(&args);
 
     const sizes = ctx.args_sizes_get();
     try std.testing.expectEqual(@as(u32, 2), sizes.count);
@@ -1637,7 +1769,7 @@ test "args_get writes NUL-terminated args" {
     defer ctx.deinit();
 
     const args = [_][]const u8{ "ab", "cd" };
-    ctx.setArgs(&args);
+    try ctx.setArgs(&args);
 
     var buf: [6]u8 = undefined;
     const result = ctx.args_get(&buf);
@@ -1650,7 +1782,7 @@ test "environ_sizes_get" {
     defer ctx.deinit();
 
     const env = [_][]const u8{ "FOO=bar", "BAZ=qux" };
-    ctx.setEnv(&env);
+    try ctx.setEnv(&env);
 
     const sizes = ctx.environ_sizes_get();
     try std.testing.expectEqual(@as(u32, 2), sizes.count);

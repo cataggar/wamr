@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+const execution_context = @import("../runtime/common/execution_context.zig");
 const config = @import("config");
 
 /// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
@@ -491,14 +492,21 @@ pub const ThreadManager = struct {
             return err;
         };
         record.tid = tid;
-        env.thread_manager = self;
-        env.tid = tid;
-        env.pushI32(tid) catch {
+        env.setThreadManager(self);
+        env.configureWasiThread(
+            tid,
+            @bitCast(start_arg),
+            if (aux_stack_top) |top|
+                execution_context.AuxiliaryStack.fromTop(top, self.aux_stack_pool.stack_size)
+            else
+                null,
+        );
+        env.pushI32(env.thread_context.tid) catch {
             self.rollbackPublishedLocked(tid);
             self.mutex.unlock();
             return error.ChildInitializationFailed;
         };
-        env.pushI32(start_arg) catch {
+        env.pushI32(@bitCast(env.thread_context.start_arg)) catch {
             self.rollbackPublishedLocked(tid);
             self.mutex.unlock();
             return error.ChildInitializationFailed;
@@ -1306,6 +1314,62 @@ test "thread lifecycle: start_arg contract remains intact" {
     try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(second));
     const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
     try std.testing.expectEqual(@as(u32, 30), counter);
+}
+
+test "thread lifecycle: child record retains process state after parent release" {
+    try requireThreadLifecycle();
+    const Tracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.refs > 0);
+            self.refs -= 1;
+        }
+    };
+    const ops = execution_context.ProcessStateOps{
+        .retain = Tracker.retain,
+        .release = Tracker.release,
+    };
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var tracker = Tracker{};
+    const root_ref = execution_context.ProcessStateRef.init(@ptrCast(&tracker), &ops);
+    ctx.inst.attachProcessState(root_ref);
+
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    try manager.aux_stack_pool.init(1, 32768, allocator);
+
+    const start_arg: u32 = 0xF1234567;
+    const tid = try manager.spawnThread(ctx.inst, @bitCast(start_arg));
+    try waitForCompleted(&manager, 1);
+    try std.testing.expectEqual(@as(usize, 4), tracker.refs);
+
+    const parsed = parseTid(tid).?;
+    const record = manager.slots.items[parsed.slot_index].record.?;
+    try std.testing.expectEqual(
+        @as(*Tracker, @ptrCast(@alignCast(record.env.thread_context.process_state.?.ptr))),
+        &tracker,
+    );
+    try std.testing.expectEqual(tid, record.env.thread_context.tid);
+    try std.testing.expectEqual(start_arg, record.env.thread_context.start_arg);
+    try std.testing.expectEqual(@as(u32, 32768), record.env.thread_context.auxiliary_stack.?.bottom);
+    try std.testing.expectEqual(@as(u32, 40960), record.env.thread_context.auxiliary_stack.?.top);
+    try std.testing.expect(record.env.thread_context.tls_base == null);
+
+    ctx.inst.detachProcessState();
+    root_ref.release();
+    try std.testing.expectEqual(@as(usize, 2), tracker.refs);
+    try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(tid));
+    try std.testing.expectEqual(@as(usize, 0), tracker.refs);
 }
 
 test "thread lifecycle: parent teardown owns and joins all unclaimed records" {

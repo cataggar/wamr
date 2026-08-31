@@ -232,8 +232,8 @@ fn executeCore(
         return 1;
     };
     defer wasi_ctx.deinit();
-    wasi_ctx.setArgs(argv.items);
-    wasi_ctx.setEnv(env_flags);
+    wasi_ctx.setArgs(argv.items) catch return 1;
+    wasi_ctx.setEnv(env_flags) catch return 1;
 
     for (map_dirs) |mapping| {
         _ = wasi_ctx.openMappedDir(mapping.host_path, mapping.guest_name) catch |err| {
@@ -244,7 +244,8 @@ fn executeCore(
             return 1;
         };
     }
-    env.wasi_ctx = @ptrCast(wasi_ctx);
+    module_inst.attachProcessState(wasi_ctx.processStateRef());
+    env.attachProcessState(wasi_ctx.processStateRef());
 
     interp.executeFunction(env, start_func.index) catch |err| {
         if (wasi_ctx.getExitCode()) |code| return @truncate(code);

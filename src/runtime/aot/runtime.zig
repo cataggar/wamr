@@ -14,6 +14,7 @@ const platform = @import("../../platform/platform.zig");
 const sig_registry = @import("../common/sig_registry.zig");
 const trap_jmp = @import("trap_jmp.zig");
 const config = @import("../../config.zig");
+const execution_context = @import("../common/execution_context.zig");
 
 // ─── Windows crash handler (debug only) ─────────────────────────────────────
 const windows = std.os.windows;
@@ -79,29 +80,14 @@ pub const JitCodeCache = struct {
     }
 };
 
-var g_code_base: usize = 0;
-var g_code_size: usize = 0;
-var g_mem_base: usize = 0;
-var g_mem_size: usize = 0;
-/// Wasm `name` custom-section entries for the AOT core whose code is
-/// currently mapped through `g_code_base`. Used by `aotTrapUnreachable`
-/// / `aotTrapOOB` / `aotTrap*` to render `local_func[N]` symbolically
-/// when a guest traps. Set alongside `g_func_offsets` and cleared on
-/// `callFunc` / `callFuncScalar` exit (see `pushTrapDecodeFrame`).
-var g_func_names: []const types.NameSection.FunctionName = &.{};
-/// Number of imported functions in the currently-active core. Needed
-/// to convert a local-func index back to the wasm function index space
-/// (imports first, then locals) for `g_func_names` lookup.
-var g_imported_function_count: u32 = 0;
-
 // ── Trap-as-error plumbing (Windows x86_64 only) ─────────────────────
 //
 // Acts like setjmp/longjmp. `callFuncScalar` calls `RtlCaptureContext`
 // immediately before invoking generated code; if a trap occurs (OOB
 // via `aotTrapOOB`, or any access violation / illegal instruction /
 // divide-by-zero / stack overflow caught by `vehHandler`), we set
-// `g_trap_occurred` and use `RtlRestoreContext` to resume execution
-// at the capture site. The post-capture check of `g_trap_occurred`
+// the active call state's `trap_occurred` flag and use
+// `RtlRestoreContext` to resume execution at the capture site. The check
 // then returns `error.WasmTrap` out of `callFuncScalar`.
 //
 // The VEH body dereferences x86_64-specific `CONTEXT` fields
@@ -109,19 +95,15 @@ var g_imported_function_count: u32 = 0;
 // on aarch64-windows the runtime still works, traps just aren't
 // catchable as errors (they'll abort the process, same as Linux).
 //
-// Not thread-safe — but neither is the rest of this runtime.
-// Not thread-safe (neither is the rest of this runtime). Using a module-level
-// var rather than threadlocal so Windows TLS alignment quirks don't bite us.
+// Per-call trap state lives behind the active `ThreadExecutionContext`.
+// Windows TLS stores only that context pointer; the aligned CONTEXT itself
+// stays in ordinary stack storage.
 const windows_trap_supported = builtin.os.tag == .windows and builtin.cpu.arch == .x86_64;
 /// #798 Lever 1: catch AOT traps as `error.WasmTrap` on POSIX x86_64 too
 /// (Linux / macOS), the analogue of the Windows `RtlCaptureContext` path.
 /// Uses the hand-rolled `trap_jmp` setjmp/longjmp (no libc on Linux). When
 /// false (other targets), AOT traps abort the process as before.
 const posix_trap_supported = !windows_trap_supported and trap_jmp.supported;
-var g_posix_trap_buf: trap_jmp.JmpBuf = undefined;
-var g_saved_ctx: windows.CONTEXT align(16) = undefined;
-var g_trap_catching: bool = false;
-var g_trap_occurred: bool = false;
 /// Forensic dump targets parsed from `WAMR_TRAP_OOB_DUMP`; populated by
 /// `main.zig` at startup. See `aotTrapOobDumpMem` (#719).
 pub var g_trap_oob_dump_env: ?[]const u8 = null;
@@ -318,11 +300,6 @@ fn watchAddrNoteMemory(host_base: usize, wasm_size: usize) void {
     if (wasm_size < cfg.min_mem_bytes) return;
     g_watch_host_base.store(host_base, .release);
 }
-/// Exception code of the last fault vehHandler redirected to trapLongjmp.
-/// Sampled by `callFuncScalar` after trap return to decide whether to
-/// re-arm the thread's stack guard page (see `resetStackGuardPage`).
-var g_last_trap_code: u32 = 0;
-
 extern "kernel32" fn RtlCaptureContext(ContextRecord: *windows.CONTEXT) callconv(.winapi) void;
 extern "kernel32" fn RtlRestoreContext(ContextRecord: *windows.CONTEXT, ExceptionRecord: ?*anyopaque) callconv(.winapi) noreturn;
 
@@ -432,14 +409,15 @@ fn resetStackGuardPage() void {
 }
 
 fn trapLongjmp() noreturn {
-    @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
+    const state = activeAotCallState() orelse std.process.exit(2);
+    state.trap_occurred.store(true, .seq_cst);
     if (comptime windows_trap_supported) {
-        RtlRestoreContext(&g_saved_ctx, null);
+        RtlRestoreContext(&state.saved_ctx, null);
     }
     if (comptime posix_trap_supported) {
         // Resume at the `trap_jmp.capture` site in callFuncScalar, which
         // then returns `error.WasmTrap`.
-        trap_jmp.restore(&g_posix_trap_buf, 1);
+        trap_jmp.restore(&state.posix_trap_buf, 1);
     }
     // No trap-catch support on this target: fall back to exit.
     std.process.exit(2);
@@ -460,25 +438,27 @@ fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
         code == 0xC0000095 or
         code == 0xC000001D or
         code == 0xC00000FD;
+    const state = activeAotCallState();
+    const frame = if (state) |active| active.trap_decode else TrapDecodeFrame{};
     const rip: usize = @intCast(ctx.Rip);
-    const in_code = g_code_base != 0 and g_code_size != 0 and
-        rip >= g_code_base and rip < g_code_base + g_code_size;
+    const in_code = frame.code_base != 0 and frame.code_size != 0 and
+        rip >= frame.code_base and rip < frame.code_base + frame.code_size;
     // If armed, redirect any wasm-like fault to trapLongjmp. We used to
     // only redirect when RIP was inside the generated code, but a null
     // table entry in call_indirect causes RIP=0 at fault time (the
     // `call r11` has already transferred control), so the fault site is
     // outside the code region. The armed check is sufficient to
     // distinguish wasm traps from unrelated process-wide faults.
-    if (is_wasm_fault and @atomicLoad(bool, &g_trap_catching, .seq_cst)) {
+    if (is_wasm_fault and state != null and state.?.trap_catching.load(.seq_cst)) {
         _ = in_code;
-        @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
-        @atomicStore(u32, &g_last_trap_code, code, .seq_cst);
+        state.?.trap_occurred.store(true, .seq_cst);
+        state.?.last_trap_code.store(code, .seq_cst);
         if (code == 0xC00000FD) {
             // Stack overflow: restore the full saved context so we
             // resume at the RtlCaptureContext site on a healthy stack.
             // Using trapLongjmp here is fragile because it would run
             // on the nearly-exhausted overflowed stack.
-            ctx.* = g_saved_ctx;
+            ctx.* = state.?.saved_ctx;
         } else {
             ctx.Rip = @intFromPtr(&trapLongjmp);
         }
@@ -488,25 +468,25 @@ fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
         const fault: usize = @intCast(rec.ExceptionInformation[1]);
         std.debug.print(
             "\n=== VEH CRASH === RIP=0x{x} (code+0x{x}) fault=0x{x}",
-            .{ rip, rip -% g_code_base, fault },
+            .{ rip, rip -% frame.code_base, fault },
         );
-        if (g_mem_base != 0 and fault >= g_mem_base and fault < g_mem_base +% g_mem_size) {
-            std.debug.print(" (wasm mem[0x{x}])", .{fault - g_mem_base});
-        } else if (g_mem_base != 0) {
-            const delta: isize = @as(isize, @bitCast(fault)) - @as(isize, @bitCast(g_mem_base));
-            std.debug.print(" (mem_base+0x{x} delta={d})", .{ fault -% g_mem_base, delta });
+        if (frame.mem_base != 0 and fault >= frame.mem_base and fault < frame.mem_base +% frame.mem_size) {
+            std.debug.print(" (wasm mem[0x{x}])", .{fault - frame.mem_base});
+        } else if (frame.mem_base != 0) {
+            const delta: isize = @as(isize, @bitCast(fault)) - @as(isize, @bitCast(frame.mem_base));
+            std.debug.print(" (mem_base+0x{x} delta={d})", .{ fault -% frame.mem_base, delta });
         }
         std.debug.print("\n", .{});
         std.debug.print("RAX=0x{x} RCX=0x{x} RDX=0x{x} RBX=0x{x}\n", .{ ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx });
         std.debug.print("RSI=0x{x} RDI=0x{x} RBP=0x{x} RSP=0x{x}\n", .{ ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp });
         std.debug.print("R8=0x{x} R9=0x{x} R10=0x{x} R11=0x{x}\n", .{ ctx.R8, ctx.R9, ctx.R10, ctx.R11 });
         std.debug.print("R12=0x{x} R13=0x{x} R14=0x{x} R15=0x{x}\n", .{ ctx.R12, ctx.R13, ctx.R14, ctx.R15 });
-        if (g_code_base != 0 and g_code_size != 0) {
-            const rip_off: usize = rip -% g_code_base;
-            if (rip_off < g_code_size) {
+        if (frame.code_base != 0 and frame.code_size != 0) {
+            const rip_off: usize = rip -% frame.code_base;
+            if (rip_off < frame.code_size) {
                 const start: usize = if (rip_off > 32) rip_off - 32 else 0;
-                const end: usize = @min(rip_off + 16, g_code_size);
-                const p: [*]const u8 = @ptrFromInt(g_code_base + start);
+                const end: usize = @min(rip_off + 16, frame.code_size);
+                const p: [*]const u8 = @ptrFromInt(frame.code_base + start);
                 std.debug.print("code@[0x{x}..0x{x}]:", .{ start, end });
                 var i: usize = 0;
                 while (i < end - start) : (i += 1) {
@@ -697,6 +677,10 @@ pub const VmCtx = extern struct {
     /// Returns the native address of the resolved body (compiling on
     /// demand if still pending), or 0 on failure.
     lazy_compile_fn: usize = 0,
+    /// Pointer to this execution instance's per-thread context. Appended
+    /// after every codegen-addressed field so existing AOT offsets remain
+    /// unchanged.
+    thread_context: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -715,71 +699,91 @@ pub const PtrSigEntry = extern struct {
 /// the trap back through a setjmp/longjmp path so that `callFunc` can
 /// return `error.OutOfBoundsMemoryAccess`, matching interp semantics
 /// for embedded usage. For the current CLI this is sufficient.
-/// Module-level storage populated by callFunc so the trap helper can map
-/// a return address back to a function index (purely diagnostic).
-var g_func_offsets: []const u32 = &.{};
-var g_veh_installed: bool = false;
-
-/// Snapshot of the per-`callFunc`/`callFuncScalar` trap-decode globals so
-/// that nested cross-instance calls (#694) can restore the caller's
-/// view after they return. Without this, the inner call's overwrite of
-/// `g_code_base` / `g_func_offsets` / `g_func_names` /
-/// `g_imported_function_count` / `g_mem_base` / `g_mem_size` leaks past
-/// the return and mis-decodes any later trap in the outer AOT body.
 const TrapDecodeFrame = struct {
-    code_base: usize,
-    code_size: usize,
-    func_offsets: []const u32,
-    func_names: []const types.NameSection.FunctionName,
-    imported_function_count: u32,
-    mem_base: usize,
-    mem_size: usize,
+    code_base: usize = 0,
+    code_size: usize = 0,
+    func_offsets: []const u32 = &.{},
+    func_names: []const types.NameSection.FunctionName = &.{},
+    imported_function_count: u32 = 0,
+    mem_base: usize = 0,
+    mem_size: usize = 0,
 };
 
-fn captureTrapDecodeFrame() TrapDecodeFrame {
-    return .{
-        .code_base = g_code_base,
-        .code_size = g_code_size,
-        .func_offsets = g_func_offsets,
-        .func_names = g_func_names,
-        .imported_function_count = g_imported_function_count,
-        .mem_base = g_mem_base,
-        .mem_size = g_mem_size,
-    };
+/// Per-native-call AOT bookkeeping. A stack-local instance is bound to the
+/// active `ThreadExecutionContext`, so concurrent AOT calls never share trap
+/// decode, jump-buffer, or cancellation/trap state.
+const AotCallState = struct {
+    trap_decode: TrapDecodeFrame = .{},
+    posix_trap_buf: if (posix_trap_supported) trap_jmp.JmpBuf else void =
+        if (posix_trap_supported) undefined else {},
+    saved_ctx: (if (windows_trap_supported) windows.CONTEXT else void) align(16) =
+        if (windows_trap_supported) undefined else {},
+    trap_catching: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    trap_occurred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    last_trap_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
+// 0 = uninitialized, 1 = one thread is installing, 2 = ready.
+var g_veh_install_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+
+fn ensureVehInstalled() void {
+    if (comptime !windows_trap_supported) return;
+    while (true) {
+        switch (g_veh_install_state.load(.acquire)) {
+            0 => {
+                if (g_veh_install_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null)
+                    continue;
+                if (AddVectoredExceptionHandler(1, vehHandler) == null) {
+                    g_veh_install_state.store(0, .release);
+                } else {
+                    g_veh_install_state.store(2, .release);
+                }
+                return;
+            },
+            1 => std.atomic.spinLoopHint(),
+            2 => return,
+            else => unreachable,
+        }
+    }
 }
 
-fn restoreTrapDecodeFrame(frame: TrapDecodeFrame) void {
-    g_code_base = frame.code_base;
-    g_code_size = frame.code_size;
-    g_func_offsets = frame.func_offsets;
-    g_func_names = frame.func_names;
-    g_imported_function_count = frame.imported_function_count;
-    g_mem_base = frame.mem_base;
-    g_mem_size = frame.mem_size;
+fn activeAotCallState() ?*AotCallState {
+    const thread_ctx = execution_context.current() orelse return null;
+    return thread_ctx.backendContext(AotCallState);
+}
+
+fn isTrapCatching() bool {
+    const state = activeAotCallState() orelse return false;
+    return state.trap_catching.load(.seq_cst);
 }
 
 /// Install the calling AOT instance's diagnostic identity. Caller is
-/// expected to pair this with a `defer restoreTrapDecodeFrame(...)`.
+/// expected to have already bound an `AotCallState`.
 fn installTrapDecodeFrameFor(inst: *const AotInstance) void {
+    const state = activeAotCallState() orelse return;
+    const frame = &state.trap_decode;
     if (inst.code_base) |cb| {
-        g_code_base = @intFromPtr(cb);
-        g_code_size = inst.code_size;
-        g_func_offsets = inst.module.func_offsets;
+        frame.code_base = @intFromPtr(cb);
+        frame.code_size = inst.code_size;
+        frame.func_offsets = inst.module.func_offsets;
     }
-    g_func_names = inst.module.function_names;
-    g_imported_function_count = inst.module.import_function_count;
+    frame.func_names = inst.module.function_names;
+    frame.imported_function_count = inst.module.import_function_count;
 }
 
 /// Resolve `local_func[N]` back to the wasm-side symbol when the AOT
 /// artifact preserves a `name` custom section. `local_idx` is the
 /// `func_offsets` index reported by the trap helper's PC decode; the
-/// wasm function index space prefixes imports, so we shift by
-/// `g_imported_function_count` before looking up.
+/// wasm function index space prefixes imports, so we shift by the active
+/// frame's imported-function count before looking up.
 fn lookupLocalFuncName(local_idx: isize) ?[]const u8 {
     if (local_idx < 0) return null;
-    if (g_func_names.len == 0) return null;
-    const wasm_idx: u32 = @intCast(@as(usize, @intCast(local_idx)) + g_imported_function_count);
-    for (g_func_names) |entry| {
+    const frame = &(activeAotCallState() orelse return null).trap_decode;
+    if (frame.func_names.len == 0) return null;
+    const wasm_idx: u32 = @intCast(
+        @as(usize, @intCast(local_idx)) + frame.imported_function_count,
+    );
+    for (frame.func_names) |entry| {
         if (entry.index == wasm_idx) return entry.name;
     }
     return null;
@@ -805,7 +809,7 @@ pub export fn aotProbeDecodePc(pc: usize) callconv(.c) void {
 
 pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     const loc = decodeTrapReturnAddress(@returnAddress());
-    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) {
+    if (isTrapCatching()) {
         // Caller has armed trap-as-error; unwind instead of exiting.
         trapLongjmp();
     }
@@ -903,22 +907,27 @@ const TrapPcLocation = struct {
 };
 
 fn decodeTrapReturnAddress(ret_addr: usize) TrapPcLocation {
-    const code_off_s: isize = @as(isize, @bitCast(ret_addr)) - @as(isize, @bitCast(g_code_base));
+    const frame = if (activeAotCallState()) |state|
+        state.trap_decode
+    else
+        TrapDecodeFrame{};
+    const code_off_s: isize = @as(isize, @bitCast(ret_addr)) -
+        @as(isize, @bitCast(frame.code_base));
     const code_off: usize = if (code_off_s >= 0) @intCast(code_off_s) else 0;
     // PC falls outside the currently-installed code region (e.g. a trap
     // raised from a different AOT instance whose decode frame was just
-    // restored, or a PC corruption). Refuse to scan g_func_offsets so we
+    // restored, or a PC corruption). Refuse to scan the function offsets so we
     // don't report a stale last-index match.
-    if (g_code_size == 0 or code_off >= g_code_size) {
+    if (frame.code_size == 0 or code_off >= frame.code_size) {
         printTrapDecodeForensic(ret_addr, "ret-addr above code blob or no code installed");
         return .{ .code_off = code_off, .func_idx = -1, .rel_off = 0, .name = null };
     }
     if (code_off_s < 0) {
         // #406: ret-addr below the AOT code blob is anomalous — the trap
         // helper expects to be called from inside AOT code, so `@returnAddress()`
-        // should land between `g_code_base` and `g_code_base + g_code_size`.
+        // should land inside the active call's code blob.
         // Falling below indicates either host-stack corruption (the return
-        // slot got overwritten before the trap helper read it) or `g_code_base`
+        // slot got overwritten before the trap helper read it) or the code base
         // being stale. Surface the raw values so the next time this fires we
         // have actionable data instead of the misleading degenerate decode
         // (`local_func[0] "__wasm_call_ctors"+0x0`) below.
@@ -926,7 +935,7 @@ fn decodeTrapReturnAddress(ret_addr: usize) TrapPcLocation {
     }
     var func_idx: isize = -1;
     var func_start: usize = 0;
-    for (g_func_offsets, 0..) |off, idx| {
+    for (frame.func_offsets, 0..) |off, idx| {
         if (off <= code_off) {
             func_idx = @intCast(idx);
             func_start = off;
@@ -947,9 +956,13 @@ fn decodeTrapReturnAddress(ret_addr: usize) TrapPcLocation {
 /// misleading symbolic decode the caller is about to print. Tagged
 /// `[#406]` for grep-ability across CI logs.
 fn printTrapDecodeForensic(ret_addr: usize, why: []const u8) void {
+    const frame = if (activeAotCallState()) |state|
+        state.trap_decode
+    else
+        TrapDecodeFrame{};
     std.debug.print(
-        "[#406] trap decoder fallback: {s} — raw ret=0x{x} g_code_base=0x{x} g_code_size=0x{x}\n",
-        .{ why, ret_addr, g_code_base, g_code_size },
+        "[#406] trap decoder fallback: {s} — raw ret=0x{x} code_base=0x{x} code_size=0x{x}\n",
+        .{ why, ret_addr, frame.code_base, frame.code_size },
     );
 }
 
@@ -970,12 +983,13 @@ fn printTrapWithPc(kind: []const u8, loc: TrapPcLocation) void {
 /// Host helper invoked from AOT-compiled code for `unreachable`,
 /// integer divide-by-zero, INT_MIN/-1 overflow, and invalid float→int
 /// conversion. When the caller has armed trap-as-error
-/// (`g_trap_catching` true), longjmps back to `callFuncScalar` which
+/// (the active call state's `trap_catching` is true), longjmps back to
+/// `callFuncScalar`, which
 /// returns `error.WasmTrap`. Otherwise prints a diagnostic and exits.
 pub fn aotTrapUnreachable(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
     const loc = decodeTrapReturnAddress(@returnAddress());
-    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    if (isTrapCatching()) trapLongjmp();
     printTrapWithPc("unreachable", loc);
     std.process.exit(2);
 }
@@ -983,7 +997,7 @@ pub fn aotTrapUnreachable(vmctx: *VmCtx) callconv(.c) noreturn {
 pub fn aotTrapIntDivZero(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
     const loc = decodeTrapReturnAddress(@returnAddress());
-    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    if (isTrapCatching()) trapLongjmp();
     printTrapWithPc("integer divide by zero", loc);
     std.process.exit(2);
 }
@@ -991,7 +1005,7 @@ pub fn aotTrapIntDivZero(vmctx: *VmCtx) callconv(.c) noreturn {
 pub fn aotTrapIntOverflow(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
     const loc = decodeTrapReturnAddress(@returnAddress());
-    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    if (isTrapCatching()) trapLongjmp();
     printTrapWithPc("integer overflow", loc);
     std.process.exit(2);
 }
@@ -999,7 +1013,7 @@ pub fn aotTrapIntOverflow(vmctx: *VmCtx) callconv(.c) noreturn {
 pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
     const loc = decodeTrapReturnAddress(@returnAddress());
-    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    if (isTrapCatching()) trapLongjmp();
     printTrapWithPc("invalid conversion to integer", loc);
     std.process.exit(2);
 }
@@ -1013,7 +1027,7 @@ pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
 /// scheduled for later commits in PR #674; once they land, this helper
 /// becomes the leaf fallback only.
 pub fn aotThrowUncaught(vmctx: *VmCtx, tag_inst: *types.TagInstance) callconv(.c) noreturn {
-    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    if (isTrapCatching()) trapLongjmp();
     std.debug.print(
         "wasm trap: uncaught exception (tag=0x{x}, payload_words={d})\n",
         .{ @intFromPtr(tag_inst), vmctx.exception_param_count },
@@ -1126,11 +1140,12 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     }
 
     if (comptime windows_trap_supported) {
-        // g_mem_* mirrors the currently executing vmctx for the Windows VEH
-        // diagnostics path; subscriber vmctxs may be inactive or on another
-        // thread, so only the active grow caller updates these globals.
-        g_mem_base = vmctx.memory_base;
-        g_mem_size = vmctx.memory_size;
+        // Subscriber vmctxs may be inactive or on another thread, so only
+        // the active grow caller updates its own VEH diagnostics frame.
+        if (activeAotCallState()) |state| {
+            state.trap_decode.mem_base = vmctx.memory_base;
+            state.trap_decode.mem_size = vmctx.memory_size;
+        }
     }
     return @intCast(old_pages);
 }
@@ -1733,14 +1748,27 @@ pub const AotInstance = struct {
     /// Sorted-by-ptr map from resolved native funcptr → sig_id. Populated in
     /// `mapCodeExecutable` once `funcptrs` hold real addresses.
     ptr_to_sig: []PtrSigEntry = &.{},
-    /// Opaque `*WasiCtx` cast to usize. Set by the CLI (see `wamr run`)
-    /// before invoking exports so AOT WASI adapters in
-    /// `src/runtime/aot/host_bridge.zig` can recover the per-process
-    /// args / env / preopens / fd-table state. `0` means "no WASI ctx";
-    /// the adapters then fall back to the stateless `wasi_core.zig`
-    /// defaults (zero-args, stdout-only). Propagated into the on-stack
-    /// `VmCtx` built in `callFuncScalar` / `callFunc`.
-    wasi_ctx: usize = 0,
+    /// One execution-local context per AOT instance/thread. Only its retained
+    /// process-state reference is shared with sibling instances.
+    thread_context: execution_context.ThreadExecutionContext = .{},
+
+    pub fn attachProcessState(
+        self: *AotInstance,
+        process_state: execution_context.ProcessStateRef,
+    ) void {
+        self.thread_context.replaceProcessState(process_state);
+        refreshVmCtxForInstance(self, null);
+    }
+
+    /// Narrow hook for the future AOT thread-clone path: inherit only the
+    /// process reference, leaving task/cancel/trap/TLS metadata fresh.
+    pub fn inheritProcessStateFrom(
+        self: *AotInstance,
+        parent: *const AotInstance,
+    ) void {
+        self.thread_context.replaceProcessState(parent.thread_context.process_state);
+        refreshVmCtxForInstance(self, null);
+    }
 };
 
 pub const TableInfo = extern struct {
@@ -2014,6 +2042,7 @@ pub fn destroy(inst: *AotInstance) void {
     if (inst.ptr_to_sig.len > 0) allocator.free(inst.ptr_to_sig);
     if (inst.tables_info.len > 0) allocator.free(inst.tables_info);
     if (inst.extra_tables_storage.len > 0) allocator.free(inst.extra_tables_storage);
+    inst.thread_context.deinit();
     allocator.destroy(inst);
 }
 
@@ -2098,8 +2127,12 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
         vmctx.ptr_to_sig_ptr = 0;
         vmctx.ptr_to_sig_len = 0;
     }
-    vmctx.wasi_ctx = inst.wasi_ctx;
+    vmctx.wasi_ctx = if (inst.thread_context.process_state) |state|
+        @intFromPtr(state.ptr)
+    else
+        0;
     vmctx.lazy_compile_fn = if (comptime config.lazy_jit) @intFromPtr(&lazyCompileHelper) else 0;
+    vmctx.thread_context = @intFromPtr(&inst.thread_context);
 }
 
 fn subscribeVmCtxToMemories(inst: *AotInstance) !void {
@@ -2430,6 +2463,9 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 /// Uses comptime to select the correct function pointer type based on `Result`.
 pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
+    const call_thread_context = execution_context.current() orelse &inst.thread_context;
+    var execution_scope = call_thread_context.enter();
+    defer execution_scope.deinit();
 
     // Lazy-JIT: resolve through the per-slot atomic state machine first (see
     // `callFuncScalar`'s matching logic and `LazyJitState.resolveLocalAddr`'s
@@ -2474,29 +2510,28 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
     defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
+    const default_thread_context = vmctx.thread_context;
+    const default_wasi_ctx = vmctx.wasi_ctx;
+    vmctx.thread_context = @intFromPtr(call_thread_context);
+    if (call_thread_context.process_state) |state| {
+        vmctx.wasi_ctx = @intFromPtr(state.ptr);
+    }
+    defer {
+        vmctx.thread_context = default_thread_context;
+        vmctx.wasi_ctx = default_wasi_ctx;
+    }
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
-    // Populate diagnostic globals on every platform — `aotTrapOOB`
-    // uses `g_code_base` / `g_func_offsets` to map the trap PC back
-    // to a wasm function index. The Windows-only block below adds
-    // the VEH path on top (which also needs g_mem_*).
-    //
-    // Snapshot the previous decode frame so a nested cross-instance
-    // call (#694) can restore it on return; without this, a trap that
-    // fires in the outer body after the inner returns mis-decodes the
-    // PC against the *callee's* func_offsets table.
-    const previous_trap_frame = captureTrapDecodeFrame();
-    defer restoreTrapDecodeFrame(previous_trap_frame);
+    var aot_call_state = AotCallState{};
+    var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
+    defer backend_scope.deinit();
     installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
-        g_mem_base = vmctx.memory_base;
-        g_mem_size = vmctx.memory_size;
-        if (!g_veh_installed) {
-            _ = AddVectoredExceptionHandler(1, vehHandler);
-            g_veh_installed = true;
-        }
+        aot_call_state.trap_decode.mem_base = vmctx.memory_base;
+        aot_call_state.trap_decode.mem_size = vmctx.memory_size;
+        ensureVehInstalled();
     }
     const result = func_ptr(vmctx);
 
@@ -2895,6 +2930,9 @@ pub fn callFuncScalar(
     results_out: []ScalarResult,
 ) ScalarCallError![]const ScalarResult {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
+    const call_thread_context = execution_context.current() orelse &inst.thread_context;
+    var execution_scope = call_thread_context.enter();
+    defer execution_scope.deinit();
 
     if (param_types.len != args.len) return error.ArgCountMismatch;
     if (param_types.len > MaxScalarArgs) return error.UnsupportedSignature;
@@ -2959,6 +2997,16 @@ pub fn callFuncScalar(
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
     defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
+    const default_thread_context = vmctx.thread_context;
+    const default_wasi_ctx = vmctx.wasi_ctx;
+    vmctx.thread_context = @intFromPtr(call_thread_context);
+    if (call_thread_context.process_state) |state| {
+        vmctx.wasi_ctx = @intFromPtr(state.ptr);
+    }
+    defer {
+        vmctx.thread_context = default_thread_context;
+        vmctx.wasi_ctx = default_wasi_ctx;
+    }
 
     // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
@@ -2973,34 +3021,26 @@ pub fn callFuncScalar(
         raw[args.len] = @intFromPtr(&hrp_buf);
     }
 
-    // Snapshot the previous decode frame so a nested cross-instance
-    // call (#694) can restore it on return; without this, a trap that
-    // fires in the outer body after the inner returns mis-decodes the
-    // PC against the *callee's* func_offsets table.
-    const previous_trap_frame = captureTrapDecodeFrame();
-    defer restoreTrapDecodeFrame(previous_trap_frame);
+    var aot_call_state = AotCallState{};
+    var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
+    defer backend_scope.deinit();
     installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
-        g_mem_base = vmctx.memory_base;
-        g_mem_size = vmctx.memory_size;
-        if (!g_veh_installed) {
-            _ = AddVectoredExceptionHandler(1, vehHandler);
-            g_veh_installed = true;
-        }
+        aot_call_state.trap_decode.mem_base = vmctx.memory_base;
+        aot_call_state.trap_decode.mem_size = vmctx.memory_size;
+        ensureVehInstalled();
     }
 
-    // Arm the trap-as-error path. Trap helpers (aotTrapOOB, aotTrapUnreachable,
-    // ...) called from generated code check `g_trap_catching` and longjmp
-    // back to the `RtlCaptureContext` site below with `g_trap_occurred = true`
-    // when armed; we then return `error.WasmTrap`.
+    // Arm the trap-as-error path. Trap helpers called from generated code
+    // consult this call-local state and longjmp back to the capture site.
     //
     // We do NOT arm this for the hardware-VEH path (ud2/int3 traps inside
     // generated code); those are still routed via the VEH, which proved
     // unstable for our use case. All wasm traps now go through explicit
     // helper calls, so the VEH is effectively unused.
     if (comptime windows_trap_supported) {
-        @atomicStore(bool, &g_trap_occurred, false, .seq_cst);
-        @atomicStore(u32, &g_last_trap_code, 0, .seq_cst);
+        aot_call_state.trap_occurred.store(false, .seq_cst);
+        aot_call_state.last_trap_code.store(0, .seq_cst);
         // Reserve extra stack headroom so the VEH and trapLongjmp can
         // run safely after a STATUS_STACK_OVERFLOW consumes the guard
         // page. Without this, the OS leaves ~4KB of space below the
@@ -3009,16 +3049,17 @@ pub fn callFuncScalar(
         // may overflow. 16 KB is generous and idempotent across calls.
         var guarantee: u32 = 16 * 1024;
         _ = SetThreadStackGuarantee(&guarantee);
-        @atomicStore(bool, &g_trap_catching, true, .seq_cst);
-        RtlCaptureContext(&g_saved_ctx);
-        if (@atomicLoad(bool, &g_trap_occurred, .seq_cst)) {
-            @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+        aot_call_state.trap_catching.store(true, .seq_cst);
+        RtlCaptureContext(&aot_call_state.saved_ctx);
+        if (aot_call_state.trap_occurred.load(.seq_cst)) {
+            aot_call_state.trap_catching.store(false, .seq_cst);
+            call_thread_context.markTrap();
             // If the trap was a stack overflow, the OS consumed the
             // thread's guard page. Re-arm it here so a subsequent
             // overflow in this process is also catchable rather than
             // silently aborting. Runs on the post-longjmp stack, which
             // is well clear of the former-guard region.
-            if (@atomicLoad(u32, &g_last_trap_code, .seq_cst) == 0xC00000FD) {
+            if (aot_call_state.last_trap_code.load(.seq_cst) == 0xC00000FD) {
                 resetStackGuardPage();
             }
             readGlobalsFromStorage(inst, globals_buf);
@@ -3028,14 +3069,15 @@ pub fn callFuncScalar(
 
     // #798 Lever 1: POSIX x86_64 analogue. The trap helpers (aotTrapOOB,
     // aotTrapUnreachable, ...) longjmp back to the `trap_jmp.capture` site
-    // below when `g_trap_catching` is armed; we then return
+    // below when the call-local trap state is armed; we then return
     // `error.WasmTrap` instead of aborting the process.
     if (comptime posix_trap_supported) {
-        @atomicStore(bool, &g_trap_occurred, false, .seq_cst);
-        @atomicStore(bool, &g_trap_catching, true, .seq_cst);
-        if (trap_jmp.capture(&g_posix_trap_buf) != 0) {
+        aot_call_state.trap_occurred.store(false, .seq_cst);
+        aot_call_state.trap_catching.store(true, .seq_cst);
+        if (trap_jmp.capture(&aot_call_state.posix_trap_buf) != 0) {
             // A trap helper unwound back here.
-            @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+            aot_call_state.trap_catching.store(false, .seq_cst);
+            call_thread_context.markTrap();
             readGlobalsFromStorage(inst, globals_buf);
             return error.WasmTrap;
         }
@@ -3114,10 +3156,10 @@ pub fn callFuncScalar(
     };
 
     if (comptime windows_trap_supported) {
-        @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+        aot_call_state.trap_catching.store(false, .seq_cst);
     }
     if (comptime posix_trap_supported) {
-        @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+        aot_call_state.trap_catching.store(false, .seq_cst);
     }
 
     // Sync globals back.
@@ -4076,6 +4118,130 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 392), @offsetOf(VmCtx, "exception_param_count"));
     try std.testing.expectEqual(@as(usize, 400), @offsetOf(VmCtx, "wasi_ctx"));
     try std.testing.expectEqual(@as(usize, 408), @offsetOf(VmCtx, "lazy_compile_fn"));
+    try std.testing.expectEqual(@as(usize, 416), @offsetOf(VmCtx, "thread_context"));
+    try std.testing.expectEqual(@as(usize, 424), @sizeOf(VmCtx));
+}
+
+test "AOT thread context inherits retained process state without thread-local flags" {
+    const Tracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    const ops = execution_context.ProcessStateOps{
+        .retain = Tracker.retain,
+        .release = Tracker.release,
+    };
+    var tracker = Tracker{};
+    const root_ref = execution_context.ProcessStateRef.init(@ptrCast(&tracker), &ops);
+    var module = aot_loader.AotModule{};
+
+    const parent = try instantiate(&module, std.testing.allocator);
+    parent.attachProcessState(root_ref);
+    parent.thread_context.configureWasiThread(1, 0x1111, null);
+    parent.thread_context.setTlsBase(0x2000);
+    parent.thread_context.requestCancellation();
+    parent.thread_context.markTrap();
+
+    const child = try instantiate(&module, std.testing.allocator);
+    child.inheritProcessStateFrom(parent);
+    child.thread_context.configureWasiThread(2, 0x2222, null);
+    child.thread_context.setTlsBase(0x3000);
+
+    try std.testing.expectEqual(@as(usize, 3), tracker.refs);
+    try std.testing.expectEqual(parent.vmctx.wasi_ctx, child.vmctx.wasi_ctx);
+    try std.testing.expectEqual(
+        @intFromPtr(&parent.thread_context),
+        parent.vmctx.thread_context,
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&child.thread_context),
+        child.vmctx.thread_context,
+    );
+    try std.testing.expect(parent.thread_context.isCancellationRequested());
+    try std.testing.expect(!child.thread_context.isCancellationRequested());
+    try std.testing.expect(parent.thread_context.hasTrapped());
+    try std.testing.expect(!child.thread_context.hasTrapped());
+
+    destroy(parent);
+    root_ref.release();
+    try std.testing.expectEqual(@as(usize, 1), tracker.refs);
+    try std.testing.expectEqual(
+        @as(*Tracker, @ptrCast(@alignCast(child.thread_context.process_state.?.ptr))),
+        &tracker,
+    );
+    destroy(child);
+    try std.testing.expectEqual(@as(usize, 0), tracker.refs);
+}
+
+test "AOT execution context: no-WASI instance keeps process pointer null" {
+    var module = aot_loader.AotModule{};
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    try std.testing.expect(inst.thread_context.process_state == null);
+    try std.testing.expectEqual(@as(usize, 0), inst.vmctx.wasi_ctx);
+    try std.testing.expectEqual(
+        @intFromPtr(&inst.thread_context),
+        inst.vmctx.thread_context,
+    );
+}
+
+test "AOT execution context keeps trap decode bookkeeping per native thread" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Worker = struct {
+        fn run(
+            thread_ctx: *execution_context.ThreadExecutionContext,
+            marker: usize,
+            ready: *std.atomic.Value(u32),
+            go: *std.atomic.Value(bool),
+            observed: *usize,
+        ) void {
+            var active_scope = thread_ctx.enter();
+            defer active_scope.deinit();
+            var call_state = AotCallState{};
+            call_state.trap_decode.code_base = marker;
+            var backend_scope = thread_ctx.bindBackendContext(@ptrCast(&call_state));
+            defer backend_scope.deinit();
+            _ = ready.fetchAdd(1, .acq_rel);
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            observed.* = activeAotCallState().?.trap_decode.code_base;
+        }
+    };
+
+    var first_ctx = execution_context.ThreadExecutionContext{};
+    var second_ctx = execution_context.ThreadExecutionContext{};
+    var ready = std.atomic.Value(u32).init(0);
+    var go = std.atomic.Value(bool).init(false);
+    var first_observed: usize = 0;
+    var second_observed: usize = 0;
+    const first = try std.Thread.spawn(
+        .{},
+        Worker.run,
+        .{ &first_ctx, 0x1111, &ready, &go, &first_observed },
+    );
+    const second = try std.Thread.spawn(
+        .{},
+        Worker.run,
+        .{ &second_ctx, 0x2222, &ready, &go, &second_observed },
+    );
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    first.join();
+    second.join();
+
+    try std.testing.expectEqual(@as(usize, 0x1111), first_observed);
+    try std.testing.expectEqual(@as(usize, 0x2222), second_observed);
+    try std.testing.expect(execution_context.current() == null);
 }
 
 test "getFuncAddr: import indices return null" {
