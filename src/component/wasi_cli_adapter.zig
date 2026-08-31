@@ -1488,8 +1488,6 @@ pub const SocketsP3StreamCtx = struct {
     registry_handle: u32 = std.math.maxInt(u32),
     self_lease: ?SocketsP3StreamCtxTable.Lease = null,
     socket_handle: ?u32 = null,
-    socket_lease: if (build_options.lib_wasi_threads) ?SocketTable.Lease else void =
-        if (build_options.lib_wasi_threads) null else {},
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
     fd: std.posix.fd_t,
     family: IpAddressFamily,
@@ -5207,10 +5205,6 @@ fn destroySocketsP3StreamCtx(
     allocator: Allocator,
     context: **SocketsP3StreamCtx,
 ) void {
-    if (comptime build_options.lib_wasi_threads) {
-        if (context.*.socket_lease) |*lease| lease.release();
-        context.*.socket_lease = null;
-    }
     allocator.destroy(context.*);
 }
 
@@ -18099,20 +18093,10 @@ pub const WasiCliAdapter = struct {
         fd: std.posix.fd_t,
         family: IpAddressFamily,
     ) !*SocketsP3StreamCtx {
-        var socket_lease = if (comptime build_options.lib_wasi_threads)
-            if (socket_handle) |handle|
-                self.socket_table.acquire(handle) orelse return error.InvalidHandle
-            else
-                null
-        else {};
-        errdefer if (comptime build_options.lib_wasi_threads) {
-            if (socket_lease) |*lease| lease.release();
-        };
         const ctx = try self.allocator.create(SocketsP3StreamCtx);
         ctx.* = .{
             .adapter = self,
             .socket_handle = socket_handle,
-            .socket_lease = socket_lease,
             .fd = fd,
             .family = family,
         };
@@ -18197,6 +18181,8 @@ pub const WasiCliAdapter = struct {
         ctx.operation_claim.acquire();
         defer ctx.operation_claim.release();
         if (ctx.cancelled.load(.acquire)) return .err;
+        var parent = lockSocketContext(ctx) orelse return .eof;
+        defer parent.release();
         if (!fdPollReady(ctx.fd, pollInEvents())) return .would_block;
         const io = std.Io.Threaded.global_single_threaded.io();
         var buf: [64 * 1024]u8 = undefined;
@@ -18259,6 +18245,8 @@ pub const WasiCliAdapter = struct {
         defer ctx.operation_claim.release();
         if (ctx.cancelled.load(.acquire)) return .{ .action = .err };
         if (dst.len == 0) return .{ .action = .would_block };
+        var parent = lockSocketContext(ctx) orelse return .{ .action = .eof };
+        defer parent.release();
         if (!fdPollReady(ctx.fd, pollInEvents())) return .{ .action = .would_block };
         const cap = @min(dst.len, 64 * 1024);
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -18276,30 +18264,28 @@ pub const WasiCliAdapter = struct {
         ctx.operation_claim.acquire();
         defer ctx.operation_claim.release();
         const io = std.Io.Threaded.global_single_threaded.io();
-        var stream: std.Io.net.Stream = if (comptime build_options.lib_wasi_threads) blk: {
-            var parent = if (ctx.socket_lease) |*lease| lease else return false;
-            break :blk parent.value().tcp_stream orelse return false;
-        } else blk: {
-            const handle = ctx.socket_handle orelse return false;
-            var parent = ctx.adapter.lookupSocket(handle) orelse return false;
-            defer parent.release();
-            break :blk parent.value().tcp_stream orelse return false;
-        };
-        if (stream.socket.handle != ctx.fd) return false;
+        var parent = lockSocketContext(ctx) orelse return false;
+        defer parent.release();
+        var stream = parent.value().tcp_stream orelse return false;
         stream.shutdown(io, how) catch return false;
         return true;
     }
 
-    fn socketContextServer(ctx: *SocketsP3StreamCtx) ?std.Io.net.Server {
-        if (comptime build_options.lib_wasi_threads) {
-            var parent = if (ctx.socket_lease) |*lease| lease else return null;
-            if (parent.isClosing()) return null;
-            return parent.value().server;
-        }
+    fn lockSocketContext(ctx: *SocketsP3StreamCtx) ?SocketLease {
         const handle = ctx.socket_handle orelse return null;
         var parent = ctx.adapter.lookupSocket(handle) orelse return null;
-        defer parent.release();
-        return parent.value().server;
+        const socket = parent.value();
+        const matches = if (socket.tcp_stream) |stream|
+            stream.socket.handle == ctx.fd
+        else if (socket.server) |server|
+            server.socket.handle == ctx.fd
+        else
+            false;
+        if (!matches) {
+            parent.release();
+            return null;
+        }
+        return parent;
     }
 
     fn tcpReceiveStreamOnDropReadable(opaque_ctx: ?*anyopaque) void {
@@ -18323,6 +18309,8 @@ pub const WasiCliAdapter = struct {
         ctx.operation_claim.acquire();
         defer ctx.operation_claim.release();
         if (src.len == 0) return .progressed;
+        var parent = lockSocketContext(ctx) orelse return .eof;
+        defer parent.release();
         const io = std.Io.Threaded.global_single_threaded.io();
         const slices = [_][]const u8{src};
         _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch {
@@ -18438,9 +18426,16 @@ pub const WasiCliAdapter = struct {
         defer ctx.operation_claim.release();
         if (!fdPollReady(ctx.fd, pollInEvents())) return .would_block;
         const io = std.Io.Threaded.global_single_threaded.io();
-        var server = socketContextServer(ctx) orelse return .eof;
-        if (server.socket.handle != ctx.fd) return .eof;
-        const accepted = server.accept(io) catch return .would_block;
+        var parent = lockSocketContext(ctx) orelse return .eof;
+        var server = parent.value().server orelse {
+            parent.release();
+            return .eof;
+        };
+        const accepted = server.accept(io) catch {
+            parent.release();
+            return .would_block;
+        };
+        parent.release();
         const new_handle = ctx.adapter.pushSocket(.{
             .kind = .tcp,
             .family = ctx.family,
@@ -39095,21 +39090,28 @@ test "sockets #178 UDP: fd-leak verification — rebind same port after drop" {
                 try WasiCliAdapter.socketResourceDrop(adapter, &ci, &drop_args, &drop_results, a);
             }
             // Create a new socket and bind to the same port.
+            var socket_handle: u32 = undefined;
             {
                 const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
                 var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                 try WasiCliAdapter.createUdpSocket(adapter, &ci, &c_args, &c_results, a);
+                socket_handle = c_results[0].result_val.payload.?.handle;
                 c_results[0].deinit(a);
             }
+            var network_handle: u32 = undefined;
             {
                 var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                 try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, a);
+                network_handle = n_results[0].handle;
             }
             {
                 const local = try testMakeIpv4SocketAddress(a, .{ 127, 0, 0, 1 }, port);
                 defer local.deinit(a);
-                // socket=0 (reused slot), network=1 (new)
-                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 1 }, local };
+                const args = [_]InterfaceValue{
+                    .{ .handle = socket_handle },
+                    .{ .handle = network_handle },
+                    local,
+                };
                 var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                 try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, a);
                 defer results[0].deinit(a);
@@ -44447,14 +44449,23 @@ test "http (#562): slot-reuse stays within the 1-based range after a drop" {
     try testing.expectEqual(@as(u32, 2), s2);
     try testing.expectEqual(@as(u32, 3), s3);
 
-    // Free slot 2; a subsequent push must reuse slot 2 (not slot 0).
+    // Free slot 2; disabled builds preserve the numeric handle while enabled
+    // builds reuse the same slot with a larger encoded generation.
     adapter.allocator.destroy(o2);
     _ = adapter.http_outgoing_responses.withdraw(s2);
 
     const o4 = try adapter.allocator.create(OutgoingResponse);
     o4.* = .{ .status = 201, .headers_handle = 0 };
     const s4 = try adapter.pushOutgoingResponse(o4);
-    try testing.expectEqual(@as(u32, 2), s4);
+    if (build_options.lib_wasi_threads) {
+        try testing.expectEqual(@as(u32, 2), stable_resource.handleIndex(s4));
+        try testing.expect(
+            stable_resource.handleGeneration(s4) >
+                stable_resource.handleGeneration(s2),
+        );
+    } else {
+        try testing.expectEqual(@as(u32, 2), s4);
+    }
     try testing.expect(!adapter.http_outgoing_responses.contains(0));
 }
 
