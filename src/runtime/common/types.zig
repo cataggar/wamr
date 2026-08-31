@@ -1,9 +1,11 @@
 //! Core WebAssembly types used throughout the runtime.
 
 const std = @import("std");
+const config = @import("config");
 const platform = @import("../../platform/platform.zig");
 const shared_memory = @import("shared_memory.zig");
 const parking_lot = @import("../../platform/parking_lot.zig");
+const stable_resource = @import("../../shared/stable_resource.zig");
 
 /// WebAssembly value types (§2.3.1)
 pub const ValType = enum(u8) {
@@ -464,9 +466,10 @@ pub const MemoryInstance = struct {
     /// Legacy non-shared page count. Shared readers use `pageCount`.
     current_pages: u32,
     max_pages: u32,
-    /// Legacy non-shared reference count. Shared lifetime is maintained by
-    /// the atomic count in `shared_control`.
-    ref_count: u32 = 1,
+    /// Non-shared ownership count. It compiles out when WASI threads are
+    /// disabled; shared memory keeps using its dedicated control block.
+    ref_count: stable_resource.ConditionalLifetimeRefCount =
+        stable_resource.ConditionalLifetimeRefCount.init(1),
     /// Present exactly for shared memories. Owns the immutable reservation,
     /// atomic size publication, serialized grow, and keyed parking lot.
     shared_control: ?*shared_memory.Control = null,
@@ -652,7 +655,7 @@ pub const MemoryInstance = struct {
             std.debug.assert(control.retain());
             return;
         }
-        self.ref_count += 1;
+        self.ref_count.retain();
     }
 
     pub fn wait32(self: *MemoryInstance, offset: usize, expected: u32, timeout_ns: i64) SharedWaitError!parking_lot.WaitResult {
@@ -703,16 +706,19 @@ pub const MemoryInstance = struct {
             allocator.destroy(self);
             return;
         }
-        self.ref_count -= 1;
-        if (self.ref_count == 0) {
-            self.vmctx_subscribers.deinit(allocator);
-            if (self.reserved_base) |base| {
-                platform.releaseAddressSpace(base, self.reserved_size);
-            } else if (self.data.len > 0) {
-                allocator.free(self.data);
-            }
-            allocator.destroy(self);
+        if (!self.ref_count.release()) return;
+        self.vmctx_subscribers.deinit(allocator);
+        if (self.reserved_base) |base| {
+            platform.releaseAddressSpace(base, self.reserved_size);
+        } else if (self.data.len > 0) {
+            allocator.free(self.data);
         }
+        allocator.destroy(self);
+    }
+
+    pub fn referenceCount(self: *const MemoryInstance) usize {
+        if (self.shared_control) |control| return @intCast(control.referenceCount());
+        return self.ref_count.count();
     }
 };
 
@@ -785,7 +791,9 @@ pub const TableElement = struct {
 pub const TableInstance = struct {
     table_type: TableType,
     elements: []TableElement,
-    ref_count: u32 = 1,
+    ref_count: stable_resource.ConditionalLifetimeRefCount =
+        stable_resource.ConditionalLifetimeRefCount.init(1),
+    mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.core_table) = .init,
     /// AOT-only: native code-pointer backing used by call_indirect / call_ref
     /// / table.init / table.set. Owned by this TableInstance and freed on
     /// final release. When a table is imported by another module the
@@ -801,17 +809,48 @@ pub const TableInstance = struct {
     type_backing: []u32 = &.{},
 
     pub fn retain(self: *TableInstance) void {
-        self.ref_count += 1;
+        self.ref_count.retain();
     }
 
     pub fn release(self: *TableInstance, allocator: std.mem.Allocator) void {
-        self.ref_count -= 1;
-        if (self.ref_count == 0) {
-            if (self.elements.len > 0) allocator.free(self.elements);
-            if (self.native_backing.len > 0) allocator.free(self.native_backing);
-            if (self.type_backing.len > 0) allocator.free(self.type_backing);
-            allocator.destroy(self);
-        }
+        if (!self.ref_count.release()) return;
+        if (self.elements.len > 0) allocator.free(self.elements);
+        if (self.native_backing.len > 0) allocator.free(self.native_backing);
+        if (self.type_backing.len > 0) allocator.free(self.type_backing);
+        allocator.destroy(self);
+    }
+
+    pub fn referenceCount(self: *const TableInstance) usize {
+        return self.ref_count.count();
+    }
+
+    pub inline fn lock(self: *TableInstance) void {
+        self.mutex.lock();
+    }
+
+    pub inline fn unlock(self: *TableInstance) void {
+        self.mutex.unlock();
+    }
+
+    pub inline fn elementCount(self: *TableInstance) usize {
+        self.lock();
+        defer self.unlock();
+        return self.elements.len;
+    }
+
+    pub inline fn getElement(self: *TableInstance, index: usize) ?TableElement {
+        self.lock();
+        defer self.unlock();
+        if (index >= self.elements.len) return null;
+        return self.elements[index];
+    }
+
+    pub inline fn setElement(self: *TableInstance, index: usize, value: TableElement) bool {
+        self.lock();
+        defer self.unlock();
+        if (index >= self.elements.len) return false;
+        self.elements[index] = value;
+        return true;
     }
 };
 
@@ -820,19 +859,21 @@ pub const GlobalInstance = struct {
     global_type: GlobalType,
     value: Value,
     owned: bool = true,
-    ref_count: u32 = 1,
+    ref_count: stable_resource.ConditionalLifetimeRefCount =
+        stable_resource.ConditionalLifetimeRefCount.init(1),
     /// For funcref globals: the module instance that owns the referenced function
     source_module: ?*ModuleInstance = null,
 
     pub fn retain(self: *GlobalInstance) void {
-        self.ref_count += 1;
+        self.ref_count.retain();
     }
 
     pub fn release(self: *GlobalInstance, allocator: std.mem.Allocator) void {
-        self.ref_count -= 1;
-        if (self.ref_count == 0) {
-            allocator.destroy(self);
-        }
+        if (self.ref_count.release()) allocator.destroy(self);
+    }
+
+    pub fn referenceCount(self: *const GlobalInstance) usize {
+        return self.ref_count.count();
     }
 };
 
@@ -900,6 +941,7 @@ pub const ModuleInstance = struct {
     owns_host_func_entries: bool = false,
     tags: []*TagInstance = &.{},
     allocator: std.mem.Allocator,
+    state_mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.core_instance) = .init,
     /// Thread manager (shared across all instances in a thread group).
     thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager = null,
     /// Track dropped elem segments (active segments dropped after instantiation)
@@ -921,12 +963,45 @@ pub const ModuleInstance = struct {
         return null;
     }
 
+    pub inline fn lockState(self: *ModuleInstance) void {
+        self.state_mutex.lock();
+    }
+
+    pub inline fn unlockState(self: *ModuleInstance) void {
+        self.state_mutex.unlock();
+    }
+
+    pub fn isDataSegmentDropped(self: *ModuleInstance, idx: u32) bool {
+        self.lockState();
+        defer self.unlockState();
+        return idx < self.dropped_data.len and self.dropped_data[idx];
+    }
+
+    pub fn dropDataSegment(self: *ModuleInstance, idx: u32) void {
+        self.lockState();
+        defer self.unlockState();
+        if (idx < self.dropped_data.len) self.dropped_data[idx] = true;
+    }
+
+    pub fn dropElementSegment(self: *ModuleInstance, idx: u32) void {
+        var retired_values: ?[]Value = null;
+        self.lockState();
+        if (idx < self.dropped_elems.len) self.dropped_elems[idx] = true;
+        if (idx < self.cached_elem_values.len) {
+            retired_values = self.cached_elem_values[idx];
+            self.cached_elem_values[idx] = null;
+        }
+        self.unlockState();
+        if (retired_values) |values| self.allocator.free(values);
+    }
+
     /// Clone this instance for a new thread (WASI-threads instance-per-thread model).
     /// Shared: memories, tables, import_functions, host_functions, thread_manager.
     /// Cloned: globals (mutable globals are thread-local).
     pub fn cloneForThread(self: *const ModuleInstance, allocator: std.mem.Allocator) !*ModuleInstance {
         const inst = try allocator.create(ModuleInstance);
-        errdefer allocator.destroy(inst);
+        var globals_initialized: usize = 0;
+        var cached_values_initialized: usize = 0;
 
         inst.* = .{
             .module = self.module,
@@ -938,9 +1013,25 @@ pub const ModuleInstance = struct {
             .owns_host_functions = false,
             .host_func_entries = self.host_func_entries, // shared, not owned
             .owns_host_func_entries = false,
+            .tags = self.tags, // immutable identity, parent lifetime owns storage
             .thread_manager = self.thread_manager,
             .allocator = allocator,
         };
+        errdefer {
+            for (inst.memories) |memory| memory.release(allocator);
+            if (inst.memories.len > 0) allocator.free(inst.memories);
+            for (inst.tables) |table| table.release(allocator);
+            if (inst.tables.len > 0) allocator.free(inst.tables);
+            for (inst.globals[0..globals_initialized]) |global| allocator.destroy(global);
+            if (inst.globals.len > 0) allocator.free(inst.globals);
+            if (inst.dropped_elems.len > 0) allocator.free(inst.dropped_elems);
+            if (inst.dropped_data.len > 0) allocator.free(inst.dropped_data);
+            for (inst.cached_elem_values[0..cached_values_initialized]) |maybe_values| {
+                if (maybe_values) |values| allocator.free(values);
+            }
+            if (inst.cached_elem_values.len > 0) allocator.free(inst.cached_elem_values);
+            allocator.destroy(inst);
+        }
 
         // Share memories (retain ref counts)
         if (self.memories.len > 0) {
@@ -971,20 +1062,283 @@ pub const ModuleInstance = struct {
                     .source_module = g.source_module,
                 };
                 inst.globals[i] = clone;
+                globals_initialized += 1;
             }
         }
 
-        // Clone dropped_elems
-        if (self.dropped_elems.len > 0) {
-            inst.dropped_elems = try allocator.alloc(bool, self.dropped_elems.len);
-            @memcpy(inst.dropped_elems, self.dropped_elems);
+        // Segment drop state is execution-local in the Preview-1
+        // instance-per-thread model.
+        if (self.dropped_elems.len > 0 or
+            self.dropped_data.len > 0 or
+            self.cached_elem_values.len > 0)
+        {
+            const mutable_self = @constCast(self);
+            mutable_self.lockState();
+            defer mutable_self.unlockState();
+
+            if (self.dropped_elems.len > 0) {
+                inst.dropped_elems = try allocator.dupe(bool, self.dropped_elems);
+            }
+            if (self.dropped_data.len > 0) {
+                inst.dropped_data = try allocator.dupe(bool, self.dropped_data);
+            }
+
+            // Cached element expressions are evaluated once at instantiation,
+            // then cloned so elem.drop in one thread cannot invalidate another.
+            if (self.cached_elem_values.len > 0) {
+                inst.cached_elem_values = try allocator.alloc(?[]Value, self.cached_elem_values.len);
+                @memset(inst.cached_elem_values, null);
+                for (self.cached_elem_values, 0..) |maybe_values, i| {
+                    if (maybe_values) |values| {
+                        inst.cached_elem_values[i] = try allocator.dupe(Value, values);
+                    }
+                    cached_values_initialized += 1;
+                }
+            }
         }
 
         return inst;
     }
+
+    pub fn destroyThreadClone(self: *ModuleInstance) void {
+        const allocator = self.allocator;
+        for (self.memories) |memory| memory.release(allocator);
+        if (self.memories.len > 0) allocator.free(self.memories);
+        for (self.tables) |table| table.release(allocator);
+        if (self.tables.len > 0) allocator.free(self.tables);
+        for (self.globals) |global| allocator.destroy(global);
+        if (self.globals.len > 0) allocator.free(self.globals);
+        if (self.dropped_elems.len > 0) allocator.free(self.dropped_elems);
+        if (self.dropped_data.len > 0) allocator.free(self.dropped_data);
+        for (self.cached_elem_values) |maybe_values| {
+            if (maybe_values) |values| allocator.free(values);
+        }
+        if (self.cached_elem_values.len > 0) allocator.free(self.cached_elem_values);
+        for (self.gc_objects.items) |object| allocator.free(object.fields);
+        self.gc_objects.deinit(allocator);
+        allocator.destroy(self);
+    }
 };
 
 // ─── Tests for module-level structures ──────────────────────────────────────
+
+test "core resource lifetime references release exactly once concurrently" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const memory = try allocator.create(MemoryInstance);
+    memory.* = .{
+        .memory_type = .{ .limits = .{ .min = 0, .max = 0 } },
+        .data = &.{},
+        .current_pages = 0,
+        .max_pages = 0,
+    };
+    memory.retain();
+
+    const elements = try allocator.alloc(TableElement, 1);
+    elements[0] = TableElement.nullForType(.funcref);
+    const table = try allocator.create(TableInstance);
+    table.* = .{
+        .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = 1 } },
+        .elements = elements,
+    };
+    table.retain();
+
+    const global = try allocator.create(GlobalInstance);
+    global.* = .{
+        .global_type = .{ .val_type = .i32, .mutability = .mutable },
+        .value = .{ .i32 = 0 },
+    };
+    global.retain();
+
+    const Releaser = struct {
+        fn releaseMemory(target: *MemoryInstance, alloc: std.mem.Allocator) void {
+            target.release(alloc);
+        }
+        fn releaseTable(target: *TableInstance, alloc: std.mem.Allocator) void {
+            target.release(alloc);
+        }
+        fn releaseGlobal(target: *GlobalInstance, alloc: std.mem.Allocator) void {
+            target.release(alloc);
+        }
+    };
+
+    const memory_first = try std.Thread.spawn(.{}, Releaser.releaseMemory, .{ memory, allocator });
+    const memory_second = try std.Thread.spawn(.{}, Releaser.releaseMemory, .{ memory, allocator });
+    const table_first = try std.Thread.spawn(.{}, Releaser.releaseTable, .{ table, allocator });
+    const table_second = try std.Thread.spawn(.{}, Releaser.releaseTable, .{ table, allocator });
+    const global_first = try std.Thread.spawn(.{}, Releaser.releaseGlobal, .{ global, allocator });
+    const global_second = try std.Thread.spawn(.{}, Releaser.releaseGlobal, .{ global, allocator });
+    memory_first.join();
+    memory_second.join();
+    table_first.join();
+    table_second.join();
+    global_first.join();
+    global_second.join();
+}
+
+test "shared table accessors serialize concurrent mutation" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const elements = try allocator.alloc(TableElement, 4);
+    for (elements) |*element| element.* = TableElement.nullForType(.funcref);
+    const table = try allocator.create(TableInstance);
+    table.* = .{
+        .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 4, .max = 4 } },
+        .elements = elements,
+    };
+    defer table.release(allocator);
+
+    const Writer = struct {
+        fn run(target: *TableInstance, index: usize, value: u32) void {
+            var i: usize = 0;
+            while (i < 10_000) : (i += 1) {
+                std.debug.assert(target.setElement(index, .{
+                    .value = .{ .funcref = value },
+                }));
+                const observed = target.getElement(index).?;
+                std.debug.assert(observed.value.funcref != null);
+            }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(
+            .{},
+            Writer.run,
+            .{ table, i, @as(u32, @intCast(i + 10)) },
+        );
+    }
+    for (threads) |thread| thread.join();
+    for (0..4) |i| {
+        try std.testing.expectEqual(
+            @as(?u32, @intCast(i + 10)),
+            table.getElement(i).?.value.funcref,
+        );
+    }
+}
+
+test "core resource concurrent elem.drop frees cached values exactly once" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var module = WasmModule{};
+    var dropped = [_]bool{false};
+    const values = try allocator.alloc(Value, 1);
+    values[0] = .{ .i32 = 1 };
+    var cached = [_]?[]Value{values};
+    var instance = ModuleInstance{
+        .module = &module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+        .dropped_elems = &dropped,
+        .cached_elem_values = &cached,
+    };
+
+    const Dropper = struct {
+        fn run(target: *ModuleInstance) void {
+            target.dropElementSegment(0);
+        }
+    };
+    const first = try std.Thread.spawn(.{}, Dropper.run, .{&instance});
+    const second = try std.Thread.spawn(.{}, Dropper.run, .{&instance});
+    first.join();
+    second.join();
+
+    try std.testing.expect(instance.dropped_elems[0]);
+    try std.testing.expect(instance.cached_elem_values[0] == null);
+}
+
+test "cloneForThread rolls back shared resource retains on allocation failure" {
+    const allocator = std.testing.allocator;
+    var module = WasmModule{};
+
+    const memory = try allocator.create(MemoryInstance);
+    memory.* = .{
+        .memory_type = .{ .limits = .{ .min = 0, .max = 0 } },
+        .data = &.{},
+        .current_pages = 0,
+        .max_pages = 0,
+    };
+    defer memory.release(allocator);
+
+    const elements = try allocator.alloc(TableElement, 1);
+    elements[0] = TableElement.nullForType(.funcref);
+    const table = try allocator.create(TableInstance);
+    table.* = .{
+        .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = 1 } },
+        .elements = elements,
+    };
+    defer table.release(allocator);
+
+    const global = try allocator.create(GlobalInstance);
+    global.* = .{
+        .global_type = .{ .val_type = .i32, .mutability = .mutable },
+        .value = .{ .i32 = 7 },
+    };
+    defer global.release(allocator);
+
+    var memories = [_]*MemoryInstance{memory};
+    var tables = [_]*TableInstance{table};
+    var globals = [_]*GlobalInstance{global};
+    var parent = ModuleInstance{
+        .module = &module,
+        .memories = &memories,
+        .tables = &tables,
+        .globals = &globals,
+        .allocator = allocator,
+    };
+
+    var fail_tables = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parent.cloneForThread(fail_tables.allocator()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), memory.referenceCount());
+    try std.testing.expectEqual(@as(usize, 1), table.referenceCount());
+
+    var fail_global = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parent.cloneForThread(fail_global.allocator()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), memory.referenceCount());
+    try std.testing.expectEqual(@as(usize, 1), table.referenceCount());
+}
+
+test "cloneForThread copies mutable segment state" {
+    const allocator = std.testing.allocator;
+    var module = WasmModule{};
+    var dropped_elems = [_]bool{ false, true };
+    var dropped_data = [_]bool{ true, false };
+    var cached_values = [_]Value{.{ .i32 = 7 }};
+    var cached = [_]?[]Value{cached_values[0..]};
+    var parent = ModuleInstance{
+        .module = &module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+        .dropped_elems = &dropped_elems,
+        .dropped_data = &dropped_data,
+        .cached_elem_values = &cached,
+    };
+
+    const clone = try parent.cloneForThread(allocator);
+    defer clone.destroyThreadClone();
+    clone.dropped_elems[0] = true;
+    clone.dropped_data[0] = false;
+    clone.cached_elem_values[0].?[0] = .{ .i32 = 99 };
+
+    try std.testing.expect(!parent.dropped_elems[0]);
+    try std.testing.expect(parent.dropped_data[0]);
+    try std.testing.expectEqual(@as(i32, 7), parent.cached_elem_values[0].?[0].i32);
+    clone.dropElementSegment(0);
+    try std.testing.expect(clone.dropped_elems[0]);
+    try std.testing.expect(clone.cached_elem_values[0] == null);
+}
 
 test "WasmModule: findExport returns null on empty module" {
     const module = WasmModule{};

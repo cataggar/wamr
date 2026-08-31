@@ -87,6 +87,23 @@ shared runtime and host resources safe; spawn in both interpreter and AOT
 modes; isolate cancellation and per-thread component/WASI context; and pass
 the end-to-end correctness, conformance, and performance gates.
 
+The Preview-1/core-resource portion of B1.1 is now established. `WasiCtx`
+uses a conditional descriptor table: thread-enabled builds map guest fds to
+stable lease-retained nodes, while disabled builds keep the direct hash-map
+representation and compile out locks. Directory locking covers only guest-fd
+and preopen-name bookkeeping; host descriptor destruction happens after
+unlock and waits for the final lease. Preopen names are copied while the
+directory lock is held rather than returning container-backed slices.
+`MemoryInstance`, `TableInstance`, and `GlobalInstance` ownership counts are
+atomic only in thread-enabled builds, and shared table access is serialized
+without holding a lock across guest calls. Thread clones also roll back
+partial retains/allocation failures and copy mutable segment state.
+
+This does **not** complete B1.1: `ComponentInstance` and `WasiCliAdapter`
+resource families remain separate follow-ups. It also does not wire spawning,
+change thread-group teardown, or split process-wide `WasiCtx` state from
+per-thread execution state.
+
 Atomic opcode and fence behavior is complete on both execution tiers.
 Interpreted atomic loads, stores, RMW and `cmpxchg` are `seq_cst`, bounds-
 and alignment-checked; `wait`/`notify` use the monotonic parking lot; and

@@ -5,6 +5,9 @@
 //! clocks, secure random) from the Zig standard library.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const config = @import("config");
+const stable_resource = @import("../shared/stable_resource.zig");
 const Io = std.Io;
 const File = Io.File;
 
@@ -366,79 +369,636 @@ pub const IoVec = struct {
     }
 };
 
-// ── Preopen ─────────────────────────────────────────────────────────────
-
-pub const Preopen = struct {
-    fd: u32,
-    path: []const u8,
-};
-
 // ── File Descriptor Table ───────────────────────────────────────────────
 
-pub const FdEntry = struct {
+pub const FdKind = enum {
+    stdin,
+    stdout,
+    stderr,
+    regular_file,
+    directory,
+    socket,
+};
+
+pub const FdEntrySnapshot = struct {
     kind: FdKind,
-    host_fd: ?std.posix.fd_t = null,
-    /// Owned host directory handle for `directory` entries (preopens and the
-    /// results of `path_open` on directories). `null` for non-directory
-    /// entries. WasiCtx owns this and closes it on `fd_close` / `deinit`.
-    host_dir: ?std.Io.Dir = null,
-    /// Tracks the byte offset for `regular_file` entries so `fd_seek` /
-    /// `fd_read` / `fd_write` can advance the position without relying on
-    /// host-side seek (which the std.Io.File reader/writer wraps).
-    pos: u64 = 0,
-    /// Cached preview1 fdflags (APPEND/DSYNC/NONBLOCK/RSYNC/SYNC). Updated
-    /// by `fd_fdstat_set_flags` and surfaced by `fd_fdstat_get`. The
-    /// authoritative state still lives on the host fd via `fcntl` for
-    /// flags that map to host O_*, but we cache here so `fd_fdstat_get`
-    /// reads cheaply and so flags that don't have an O_ analogue (none
-    /// in preview1) are still preserved.
-    fdflags: u16 = 0,
-    /// Preview1 rights cap. Defaults to "all bits set" so existing
-    /// callers see unconstrained rights. `fd_fdstat_set_rights` narrows
-    /// these (widening returns `notcapable`).
-    rights_base: u64 = 0xFFFF_FFFF_FFFF_FFFF,
-    rights_inheriting: u64 = 0xFFFF_FFFF_FFFF_FFFF,
+    host_fd: ?std.posix.fd_t,
+    host_dir: ?std.Io.Dir,
+    pos: u64,
+    fdflags: u16,
+    rights_base: u64,
+    rights_inheriting: u64,
+};
 
-    pub const FdKind = enum {
-        stdin,
-        stdout,
-        stderr,
-        regular_file,
-        directory,
-        socket,
+pub fn FdEntryFor(comptime enabled: bool) type {
+    const EntryMutex = stable_resource.ConditionalMutexFor(
+        enabled,
+        stable_resource.LockRank.resource_node,
+    );
+    const Kind = FdKind;
+
+    return struct {
+        const Self = @This();
+
+        mutex: EntryMutex = .init,
+        kind: Kind,
+        host_fd: ?std.posix.fd_t = null,
+        /// Owned host directory handle for `directory` entries (preopens and
+        /// `path_open` results). The descriptor table closes it exactly once.
+        host_dir: ?std.Io.Dir = null,
+        /// Cached byte offset for regular files.
+        pos: u64 = 0,
+        /// Cached Preview-1 fdflags.
+        fdflags: u16 = 0,
+        /// Preview-1 rights caps. They may only be narrowed after publication.
+        rights_base: u64 = 0xFFFF_FFFF_FFFF_FFFF,
+        rights_inheriting: u64 = 0xFFFF_FFFF_FFFF_FFFF,
+
+        pub const FdKind = Kind;
+
+        inline fn snapshot(self: *Self) FdEntrySnapshot {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return .{
+                .kind = self.kind,
+                .host_fd = self.host_fd,
+                .host_dir = self.host_dir,
+                .pos = self.pos,
+                .fdflags = self.fdflags,
+                .rights_base = self.rights_base,
+                .rights_inheriting = self.rights_inheriting,
+            };
+        }
     };
+}
+
+pub const FdEntry = FdEntryFor(config.lib_wasi_threads);
+
+/// Query the shared host-file cursor without changing it.
+pub fn hostFilePosition(host_fd: std.posix.fd_t) ?u64 {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        var info: windows.FILE.POSITION_INFORMATION = undefined;
+        if (windows.ntdll.NtQueryInformationFile(
+            host_fd,
+            &iosb,
+            &info,
+            @sizeOf(windows.FILE.POSITION_INFORMATION),
+            .Position,
+        ) != .SUCCESS) return null;
+        if (info.CurrentByteOffset < 0) return null;
+        return @intCast(info.CurrentByteOffset);
+    }
+
+    if (comptime std.posix.SEEK == void) return null;
+    const result = std.posix.system.lseek(host_fd, 0, std.posix.SEEK.CUR);
+    if (std.posix.errno(result) != .SUCCESS) return null;
+    return std.math.cast(u64, result);
+}
+
+const WindowsSeek = struct {
+    extern "kernel32" fn SetFilePointerEx(
+        file: std.os.windows.HANDLE,
+        distance: std.os.windows.LARGE_INTEGER,
+        new_position: *std.os.windows.LARGE_INTEGER,
+        move_method: std.os.windows.DWORD,
+    ) callconv(.winapi) std.os.windows.BOOL;
 };
 
-pub const FdTable = struct {
-    entries: std.AutoHashMap(u32, FdEntry),
-    next_fd: u32 = 3,
-
-    pub fn init(allocator: std.mem.Allocator) FdTable {
-        return .{ .entries = std.AutoHashMap(u32, FdEntry).init(allocator) };
+pub fn seekHostFile(io: Io, file: File, offset: i64, whence: Whence) !u64 {
+    if (comptime builtin.os.tag == .windows) {
+        var position: std.os.windows.LARGE_INTEGER = undefined;
+        const move_method: std.os.windows.DWORD = switch (whence) {
+            .set => 0,
+            .cur => 1,
+            .end => 2,
+        };
+        if (!WindowsSeek.SetFilePointerEx(file.handle, offset, &position, move_method).toBool())
+            return error.Unseekable;
+        if (position < 0) return error.InvalidOffset;
+        return @intCast(position);
     }
 
-    pub fn deinit(self: *FdTable) void {
-        self.entries.deinit();
+    if (comptime builtin.os.tag == .linux) {
+        const origin: usize = switch (whence) {
+            .set => 0,
+            .cur => 1,
+            .end => 2,
+        };
+        const result = std.os.linux.lseek(file.handle, offset, origin);
+        if (std.os.linux.errno(result) != .SUCCESS) return error.Unseekable;
+        return @intCast(result);
     }
 
-    pub fn insert(self: *FdTable, fd: u32, entry: FdEntry) !void {
-        try self.entries.put(fd, entry);
+    if (comptime builtin.os.tag != .wasi and std.posix.SEEK != void) {
+        const origin: std.c.whence_t = switch (whence) {
+            .set => 0,
+            .cur => 1,
+            .end => 2,
+        };
+        const result = std.c.lseek(file.handle, @intCast(offset), origin);
+        if (result < 0) return error.Unseekable;
+        return @intCast(result);
     }
 
-    pub fn get(self: *const FdTable, fd: u32) ?FdEntry {
-        return self.entries.get(fd);
+    switch (whence) {
+        .set => {
+            if (offset < 0) return error.InvalidOffset;
+            try io.vtable.fileSeekTo(io.userdata, file, @intCast(offset));
+        },
+        .cur => try io.vtable.fileSeekBy(io.userdata, file, offset),
+        .end => {
+            const stat = try file.stat(io);
+            const position = @as(i64, @intCast(stat.size)) + offset;
+            if (position < 0) return error.InvalidOffset;
+            try io.vtable.fileSeekTo(io.userdata, file, @intCast(position));
+        },
     }
+    return hostFilePosition(file.handle) orelse error.Unseekable;
+}
 
-    pub fn remove(self: *FdTable, fd: u32) void {
-        _ = self.entries.remove(fd);
-    }
+pub fn FdTableFor(comptime enabled: bool) type {
+    const Entry = FdEntryFor(enabled);
+    const DirectoryMutex = stable_resource.ConditionalMutexFor(
+        enabled,
+        stable_resource.LockRank.resource_registry,
+    );
+    const DestroyContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+    };
+    const Destroyer = struct {
+        fn destroy(context: DestroyContext, entry: *Entry) void {
+            stable_resource.assertNoLocksHeldFor(enabled);
+            if (entry.host_dir) |dir| {
+                var owned_dir = dir;
+                owned_dir.close(context.io);
+                entry.host_dir = null;
+            }
+            if (entry.host_fd) |host_fd| {
+                if (entry.kind == .regular_file or entry.kind == .socket) {
+                    const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
+                    file.close(context.io);
+                }
+                entry.host_fd = null;
+            }
+        }
+    };
 
-    pub fn allocateFd(self: *FdTable) u32 {
-        const fd = self.next_fd;
-        self.next_fd += 1;
-        return fd;
-    }
-};
+    const ResourceTable = stable_resource.StableHandleTableFor(
+        enabled,
+        Entry,
+        DestroyContext,
+        Destroyer.destroy,
+        64,
+    );
+    const ThreadedSlot = struct {
+        handle: stable_resource.Handle,
+        kind: FdKind,
+    };
+    const Slot = if (enabled) ThreadedSlot else Entry;
+
+    return struct {
+        const Self = @This();
+
+        pub const Lease = struct {
+            storage: if (enabled) ResourceTable.Lease else ?*Entry,
+
+            inline fn value(self: *Lease) *Entry {
+                if (comptime enabled) return self.storage.value();
+                return self.storage.?;
+            }
+
+            pub inline fn snapshot(self: *Lease) FdEntrySnapshot {
+                return self.value().snapshot();
+            }
+
+            pub fn isClosing(self: *const Lease) bool {
+                if (comptime enabled) return self.storage.isClosing();
+                return false;
+            }
+
+            pub fn setPosition(self: *Lease, position: u64) void {
+                const entry = self.value();
+                entry.mutex.lock();
+                defer entry.mutex.unlock();
+                entry.pos = position;
+            }
+
+            pub fn advancePosition(self: *Lease, amount: usize) void {
+                const entry = self.value();
+                entry.mutex.lock();
+                defer entry.mutex.unlock();
+                entry.pos +|= @as(u64, @intCast(amount));
+            }
+
+            pub fn setFdFlags(self: *Lease, flags: u16) void {
+                const entry = self.value();
+                entry.mutex.lock();
+                defer entry.mutex.unlock();
+                entry.fdflags = flags;
+            }
+
+            pub fn narrowRights(self: *Lease, base: u64, inheriting: u64) bool {
+                const entry = self.value();
+                entry.mutex.lock();
+                defer entry.mutex.unlock();
+                if ((base & ~entry.rights_base) != 0) return false;
+                if ((inheriting & ~entry.rights_inheriting) != 0) return false;
+                entry.rights_base = base;
+                entry.rights_inheriting = inheriting;
+                return true;
+            }
+
+            /// Transfer a raw file handle back to the caller. Intended for
+            /// embedder ownership handoff and tests, not ordinary guest close.
+            pub fn detachHostFd(self: *Lease) ?std.posix.fd_t {
+                const entry = self.value();
+                entry.mutex.lock();
+                defer entry.mutex.unlock();
+                const host_fd = entry.host_fd;
+                entry.host_fd = null;
+                return host_fd;
+            }
+
+            /// Transfer an owned directory handle back to the caller.
+            pub fn detachHostDir(self: *Lease) ?std.Io.Dir {
+                const entry = self.value();
+                entry.mutex.lock();
+                defer entry.mutex.unlock();
+                const host_dir = entry.host_dir;
+                entry.host_dir = null;
+                return host_dir;
+            }
+
+            pub inline fn release(self: *Lease) void {
+                if (comptime enabled) {
+                    self.storage.release();
+                } else {
+                    self.storage = null;
+                }
+            }
+
+            pub fn deinit(self: *Lease) void {
+                self.release();
+            }
+        };
+
+        allocator: std.mem.Allocator,
+        io: Io,
+        entries: std.AutoHashMap(u32, Slot),
+        preopens: std.AutoHashMap(u32, []u8),
+        next_fd: u32 = 3,
+        directory_mutex: DirectoryMutex = .init,
+        resources: if (enabled) ResourceTable else void,
+
+        pub fn init(allocator: std.mem.Allocator, io: Io) !Self {
+            return .{
+                .allocator = allocator,
+                .io = io,
+                .entries = std.AutoHashMap(u32, Slot).init(allocator),
+                .preopens = std.AutoHashMap(u32, []u8).init(allocator),
+                .resources = if (enabled)
+                    try ResourceTable.init(allocator, .{ .allocator = allocator, .io = io })
+                else {},
+            };
+        }
+
+        pub fn deinit(self: *Self) !void {
+            if (comptime enabled) {
+                self.resources.shutdown();
+                if (!self.resources.isQuiescent()) return error.LeasesOutstanding;
+            } else {
+                var entries = self.entries.valueIterator();
+                while (entries.next()) |entry| Destroyer.destroy(
+                    .{ .allocator = self.allocator, .io = self.io },
+                    entry,
+                );
+            }
+
+            var preopens = self.preopens.valueIterator();
+            while (preopens.next()) |path| self.allocator.free(path.*);
+            self.preopens.deinit();
+            self.entries.deinit();
+            if (comptime enabled) try self.resources.deinit();
+        }
+
+        /// Insert at an explicit guest fd, taking ownership only on success.
+        /// Replacing a descriptor preserves any preopen label attached to the
+        /// numeric target fd and destroys the old descriptor after unlocking.
+        pub fn insert(self: *Self, fd: u32, entry: Entry) !void {
+            if (comptime enabled) {
+                const handle = try self.resources.publish(entry);
+                self.directory_mutex.lock();
+                const old = self.entries.get(fd);
+                self.entries.put(fd, .{ .handle = handle, .kind = entry.kind }) catch |err| {
+                    self.directory_mutex.unlock();
+                    std.debug.assert(self.resources.withdraw(handle) != null);
+                    return err;
+                };
+                self.noteExplicitFd(fd);
+                self.directory_mutex.unlock();
+                if (old) |old_entry| std.debug.assert(self.resources.remove(old_entry.handle));
+            } else {
+                self.directory_mutex.lock();
+                const old = self.entries.get(fd);
+                self.entries.put(fd, entry) catch |err| {
+                    self.directory_mutex.unlock();
+                    return err;
+                };
+                self.noteExplicitFd(fd);
+                self.directory_mutex.unlock();
+                if (old) |old_entry| {
+                    var owned = old_entry;
+                    Destroyer.destroy(.{ .allocator = self.allocator, .io = self.io }, &owned);
+                }
+            }
+        }
+
+        /// Allocate and publish a descriptor as one operation.
+        pub fn create(self: *Self, entry: Entry) !u32 {
+            const handle = if (comptime enabled)
+                try self.resources.publish(entry)
+            else {};
+            self.directory_mutex.lock();
+            const fd = self.nextAvailableFdLocked() catch |err| {
+                self.directory_mutex.unlock();
+                if (comptime enabled) std.debug.assert(self.resources.withdraw(handle) != null);
+                return err;
+            };
+
+            if (comptime enabled) {
+                self.entries.put(fd, .{ .handle = handle, .kind = entry.kind }) catch |err| {
+                    self.directory_mutex.unlock();
+                    std.debug.assert(self.resources.withdraw(handle) != null);
+                    return err;
+                };
+            } else {
+                self.entries.put(fd, entry) catch |err| {
+                    self.directory_mutex.unlock();
+                    return err;
+                };
+            }
+            self.advanceNextFd(fd);
+            self.directory_mutex.unlock();
+            return fd;
+        }
+
+        /// Publish a directory descriptor and its owned guest preopen name
+        /// atomically. Both values remain caller-owned on failure.
+        pub fn createPreopen(self: *Self, entry: Entry, owned_name: []u8) !u32 {
+            const handle = if (comptime enabled)
+                try self.resources.publish(entry)
+            else {};
+            self.directory_mutex.lock();
+            const fd = self.nextAvailableFdLocked() catch |err| {
+                self.directory_mutex.unlock();
+                if (comptime enabled) std.debug.assert(self.resources.withdraw(handle) != null);
+                return err;
+            };
+            self.entries.ensureUnusedCapacity(1) catch |err| {
+                self.directory_mutex.unlock();
+                if (comptime enabled) std.debug.assert(self.resources.withdraw(handle) != null);
+                return err;
+            };
+            self.preopens.ensureUnusedCapacity(1) catch |err| {
+                self.directory_mutex.unlock();
+                if (comptime enabled) std.debug.assert(self.resources.withdraw(handle) != null);
+                return err;
+            };
+
+            if (comptime enabled) {
+                self.entries.putAssumeCapacity(fd, .{ .handle = handle, .kind = entry.kind });
+            } else {
+                self.entries.putAssumeCapacity(fd, entry);
+            }
+            self.preopens.putAssumeCapacity(fd, owned_name);
+            self.advanceNextFd(fd);
+            self.directory_mutex.unlock();
+            return fd;
+        }
+
+        pub inline fn acquire(self: *Self, fd: u32) ?Lease {
+            self.directory_mutex.lock();
+            defer self.directory_mutex.unlock();
+            if (comptime enabled) {
+                const slot = self.entries.get(fd) orelse return null;
+                const lease = self.resources.acquire(slot.handle) orelse return null;
+                return .{ .storage = lease };
+            }
+            const entry = self.entries.getPtr(fd) orelse return null;
+            return .{ .storage = entry };
+        }
+
+        pub fn contains(self: *Self, fd: u32) bool {
+            self.directory_mutex.lock();
+            defer self.directory_mutex.unlock();
+            return self.entries.contains(fd);
+        }
+
+        /// Return a metadata snapshot. The snapshot does not keep host
+        /// handles alive; I/O callers must hold an explicit lease instead.
+        pub fn snapshot(self: *Self, fd: u32) ?FdEntrySnapshot {
+            var lease = self.acquire(fd) orelse return null;
+            defer lease.release();
+            return lease.snapshot();
+        }
+
+        /// Remove a descriptor and any preopen label. Destructors and frees
+        /// always run after the directory lock is released.
+        pub fn remove(self: *Self, fd: u32) bool {
+            self.directory_mutex.lock();
+            const removed = self.entries.fetchRemove(fd);
+            const preopen = self.preopens.fetchRemove(fd);
+            self.directory_mutex.unlock();
+
+            if (preopen) |kv| self.allocator.free(kv.value);
+            if (removed) |kv| {
+                if (comptime enabled) {
+                    std.debug.assert(self.resources.remove(kv.value.handle));
+                } else {
+                    var entry = kv.value;
+                    Destroyer.destroy(.{ .allocator = self.allocator, .io = self.io }, &entry);
+                }
+                return true;
+            }
+            return false;
+        }
+
+        pub const CloseResult = enum {
+            closed,
+            badf,
+            protected_stdio,
+        };
+
+        /// Atomically classify and unlink a guest-closeable descriptor so a
+        /// concurrent renumber cannot make the close target a new occupant.
+        pub fn closeGuest(self: *Self, fd: u32) CloseResult {
+            self.directory_mutex.lock();
+            const current = self.entries.get(fd) orelse {
+                self.directory_mutex.unlock();
+                return .badf;
+            };
+            const kind = if (comptime enabled) current.kind else current.kind;
+            switch (kind) {
+                .stdin, .stdout, .stderr => {
+                    self.directory_mutex.unlock();
+                    return .protected_stdio;
+                },
+                else => {},
+            }
+            const removed = self.entries.fetchRemove(fd).?;
+            const preopen = self.preopens.fetchRemove(fd);
+            self.directory_mutex.unlock();
+
+            if (preopen) |kv| self.allocator.free(kv.value);
+            if (comptime enabled) {
+                std.debug.assert(self.resources.remove(removed.value.handle));
+            } else {
+                var entry = removed.value;
+                Destroyer.destroy(.{ .allocator = self.allocator, .io = self.io }, &entry);
+            }
+            return .closed;
+        }
+
+        pub const RenumberError = error{
+            BadFd,
+            TargetIsStdio,
+        };
+
+        /// Move the descriptor at `from` onto the already-open `to` slot.
+        /// Existing leases on either descriptor remain valid. The target's
+        /// numeric preopen label is preserved; a source label is retired.
+        pub fn renumber(self: *Self, from: u32, to: u32) RenumberError!void {
+            self.directory_mutex.lock();
+            if (from == to) {
+                const present = self.entries.contains(from);
+                self.directory_mutex.unlock();
+                if (!present) return error.BadFd;
+                return;
+            }
+
+            const source = self.entries.get(from) orelse {
+                self.directory_mutex.unlock();
+                return error.BadFd;
+            };
+            const target = self.entries.get(to) orelse {
+                self.directory_mutex.unlock();
+                return error.BadFd;
+            };
+            const source_kind = if (comptime enabled) source.kind else source.kind;
+            const target_kind = if (comptime enabled) target.kind else target.kind;
+            switch (target_kind) {
+                .stdin, .stdout, .stderr => {
+                    self.directory_mutex.unlock();
+                    return error.TargetIsStdio;
+                },
+                else => {},
+            }
+
+            if (comptime enabled) {
+                self.entries.putAssumeCapacity(to, source);
+            } else {
+                self.entries.putAssumeCapacity(to, source);
+            }
+            _ = self.entries.remove(from);
+            const source_preopen = self.preopens.fetchRemove(from);
+            const invalid_target_preopen = if (source_kind == .directory)
+                null
+            else
+                self.preopens.fetchRemove(to);
+            self.directory_mutex.unlock();
+
+            if (source_preopen) |kv| self.allocator.free(kv.value);
+            if (invalid_target_preopen) |kv| self.allocator.free(kv.value);
+            if (comptime enabled) {
+                std.debug.assert(self.resources.remove(target.handle));
+            } else {
+                var old_target = target;
+                Destroyer.destroy(.{ .allocator = self.allocator, .io = self.io }, &old_target);
+            }
+        }
+
+        pub fn preopenNameLen(self: *Self, fd: u32) ?usize {
+            self.directory_mutex.lock();
+            defer self.directory_mutex.unlock();
+            if (!self.entries.contains(fd)) return null;
+            const path = self.preopens.get(fd) orelse return null;
+            return path.len;
+        }
+
+        pub fn copyPreopenName(self: *Self, fd: u32, dest: []u8) ?usize {
+            self.directory_mutex.lock();
+            defer self.directory_mutex.unlock();
+            if (!self.entries.contains(fd)) return null;
+            const path = self.preopens.get(fd) orelse return null;
+            if (dest.len < path.len) return null;
+            @memcpy(dest[0..path.len], path);
+            return path.len;
+        }
+
+        pub fn preopenCount(self: *Self) usize {
+            self.directory_mutex.lock();
+            defer self.directory_mutex.unlock();
+            return self.preopens.count();
+        }
+
+        pub fn leakCount(self: *Self) usize {
+            if (comptime enabled) return self.resources.leakCount();
+            return self.entries.count();
+        }
+
+        fn nextAvailableFdLocked(self: *Self) !u32 {
+            var fd = self.next_fd;
+            while (self.entries.contains(fd)) {
+                if (fd == std.math.maxInt(u32)) return error.FdExhausted;
+                fd += 1;
+            }
+            return fd;
+        }
+
+        fn noteExplicitFd(self: *Self, fd: u32) void {
+            if (fd < self.next_fd or fd == std.math.maxInt(u32)) return;
+            self.next_fd = fd + 1;
+        }
+
+        fn advanceNextFd(self: *Self, fd: u32) void {
+            if (fd == std.math.maxInt(u32)) {
+                self.next_fd = fd;
+            } else {
+                self.next_fd = fd + 1;
+            }
+        }
+    };
+}
+
+pub const FdTable = FdTableFor(config.lib_wasi_threads);
+
+fn ExitStateFor(comptime enabled: bool) type {
+    return if (enabled) struct {
+        value: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
+
+        fn set(self: *@This(), code: u32) void {
+            self.value.store(code, .release);
+        }
+
+        fn get(self: *const @This()) ?u32 {
+            const raw = self.value.load(.acquire);
+            return if (raw == std.math.maxInt(u64)) null else @intCast(raw);
+        }
+    } else struct {
+        value: ?u32 = null,
+
+        fn set(self: *@This(), code: u32) void {
+            self.value = code;
+        }
+
+        fn get(self: *const @This()) ?u32 {
+            return self.value;
+        }
+    };
+}
 
 // ── WASI Context ────────────────────────────────────────────────────────
 
@@ -446,19 +1006,22 @@ pub const FdTable = struct {
 pub const WasiCtx = struct {
     allocator: std.mem.Allocator,
     io: Io,
+    refs: stable_resource.ConditionalLifetimeRefCount =
+        stable_resource.ConditionalLifetimeRefCount.init(1),
     args: []const []const u8 = &.{},
     env_vars: []const []const u8 = &.{},
-    preopens: std.ArrayListUnmanaged(Preopen) = .empty,
     fd_table: FdTable,
-    exit_code: ?u32 = null,
+    exit_state: ExitStateFor(config.lib_wasi_threads) = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: Io) !*WasiCtx {
         const ctx = try allocator.create(WasiCtx);
+        errdefer allocator.destroy(ctx);
         ctx.* = .{
             .allocator = allocator,
             .io = io,
-            .fd_table = FdTable.init(allocator),
+            .fd_table = try FdTable.init(allocator, io),
         };
+        errdefer ctx.fd_table.deinit() catch unreachable;
         // Pre-populate stdin(0), stdout(1), stderr(2)
         try ctx.fd_table.insert(0, .{ .kind = .stdin });
         try ctx.fd_table.insert(1, .{ .kind = .stdout });
@@ -466,43 +1029,34 @@ pub const WasiCtx = struct {
         return ctx;
     }
 
+    pub fn retain(self: *WasiCtx) void {
+        self.refs.retain();
+    }
+
     pub fn deinit(self: *WasiCtx) void {
-        // Close any host Dir / file handles owned by the table before tearing
-        // it down so the OS doesn't see a leak in long-lived embedders.
-        var it = self.fd_table.entries.iterator();
-        while (it.next()) |kv| {
-            const entry = kv.value_ptr.*;
-            if (entry.host_dir) |dir| {
-                var d = dir;
-                d.close(self.io);
-            }
-            if (entry.host_fd) |host_fd| {
-                if (entry.kind == .regular_file or entry.kind == .socket) {
-                    const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-                    file.close(self.io);
-                }
-            }
-        }
-        // Free the duplicated guest-name strings stored on each Preopen.
-        for (self.preopens.items) |p| self.allocator.free(p.path);
-        self.preopens.deinit(self.allocator);
-        self.fd_table.deinit();
+        if (!self.refs.release()) return;
+        self.fd_table.deinit() catch @panic("WasiCtx destroyed with outstanding descriptor leases");
         self.allocator.destroy(self);
     }
 
     pub fn setArgs(self: *WasiCtx, args: []const []const u8) void {
+        // Startup-only borrowed configuration; freeze before sharing.
+        std.debug.assert(self.refs.count() == 1);
         self.args = args;
     }
 
     pub fn setEnv(self: *WasiCtx, env: []const []const u8) void {
+        // Startup-only borrowed configuration; freeze before sharing.
+        std.debug.assert(self.refs.count() == 1);
         self.env_vars = env;
     }
 
     /// Register an already-opened host directory under `guest_name` as a
-    /// preopen. Allocates a fresh fd ≥ 3 and takes ownership of `dir`
-    /// (closed on `WasiCtx.deinit`). Returns the assigned fd.
+    /// preopen. Allocates a fresh fd ≥ 3 and takes ownership of `dir` only
+    /// on success (closed on `WasiCtx.deinit`); the caller retains ownership
+    /// on error. Returns the assigned fd.
     pub fn addPreopen(self: *WasiCtx, guest_name: []const u8, dir: std.Io.Dir) !u32 {
-        const fd = self.fd_table.allocateFd();
+        std.debug.assert(self.refs.count() == 1);
         const owned_name = try self.allocator.dupe(u8, guest_name);
         errdefer self.allocator.free(owned_name);
         // Preopens are directories: mask the default all-ones rights down
@@ -510,14 +1064,12 @@ pub const WasiCtx = struct {
         // stays consistent (e.g. `path_open(preopen, OFLAGS_DIRECTORY,
         // base, ...)` doesn't carry FD_WRITE/FD_SEEK that would conflict
         // with the new fd's directory-only nature).
-        try self.fd_table.insert(fd, .{
+        return try self.fd_table.createPreopen(.{
             .kind = .directory,
             .host_dir = dir,
             .rights_base = DIRECTORY_BASE_RIGHTS,
             .rights_inheriting = DIRECTORY_INHERITING_RIGHTS,
-        });
-        try self.preopens.append(self.allocator, .{ .fd = fd, .path = owned_name });
-        return fd;
+        }, owned_name);
     }
 
     /// Open `host_path` on the host and register it as a preopen exposed to
@@ -532,29 +1084,32 @@ pub const WasiCtx = struct {
     }
 
     /// Register an already-listening host TCP socket as a socket preopen.
-    /// Allocates a fresh fd ≥ 3 and takes ownership of `host_fd` (closed
-    /// on `WasiCtx.deinit`). The preopen is *not* recorded in
-    /// `self.preopens` — preview1's `fd_prestat_*` surface only exposes
+    /// Allocates a fresh fd ≥ 3 and takes ownership of `host_fd` on success
+    /// (closed on `WasiCtx.deinit`); the caller retains it on error.
+    /// Preview1's `fd_prestat_*` surface only exposes
     /// directory preopens; socket preopens are discoverable by convention
     /// (wasi-libc walks fds 3.. and reports `ENOTDIR` for non-dir prestats
     /// to enumerate them). Returns the assigned fd.
     pub fn addPreopenSocket(self: *WasiCtx, host_fd: std.posix.fd_t) !u32 {
-        const fd = self.fd_table.allocateFd();
-        try self.fd_table.insert(fd, .{
+        std.debug.assert(self.refs.count() == 1);
+        return try self.fd_table.create(.{
             .kind = .socket,
             .host_fd = host_fd,
             .rights_base = SOCKET_LISTEN_RIGHTS,
             .rights_inheriting = SOCKET_BASE_RIGHTS,
         });
-        return fd;
     }
 
-    /// Look up a preopen by its assigned fd; returns the guest name or null.
-    pub fn preopenName(self: *const WasiCtx, fd: u32) ?[]const u8 {
-        for (self.preopens.items) |p| {
-            if (p.fd == fd) return p.path;
-        }
-        return null;
+    pub fn preopenNameLen(self: *WasiCtx, fd: u32) ?usize {
+        return self.fd_table.preopenNameLen(fd);
+    }
+
+    pub fn copyPreopenName(self: *WasiCtx, fd: u32, dest: []u8) ?usize {
+        return self.fd_table.copyPreopenName(fd, dest);
+    }
+
+    pub fn getExitCode(self: *const WasiCtx) ?u32 {
+        return self.exit_state.get();
     }
 
     // ── args ────────────────────────────────────────────────────────
@@ -615,7 +1170,9 @@ pub const WasiCtx = struct {
     // ── fd operations ───────────────────────────────────────────────
 
     pub fn fd_write(self: *WasiCtx, fd: u32, iovs: []const IoVec) !struct { nwritten: u32 } {
-        const entry = self.fd_table.get(fd) orelse return error.BadFd;
+        var lease = self.fd_table.acquire(fd) orelse return error.BadFd;
+        defer lease.release();
+        const entry = lease.snapshot();
         var total_written: u32 = 0;
 
         switch (entry.kind) {
@@ -640,13 +1197,15 @@ pub const WasiCtx = struct {
             .regular_file => {
                 if (entry.host_fd) |host_fd| {
                     const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-                    var buf: [4096]u8 = undefined;
-                    var w = file.writer(self.io, &buf);
                     for (iovs) |iov| {
-                        w.interface.writeAll(iov.slice()) catch return error.IoError;
+                        file.writeStreamingAll(self.io, iov.slice()) catch return error.IoError;
                         total_written += iov.len;
                     }
-                    w.flush() catch return error.IoError;
+                    if (hostFilePosition(host_fd)) |position| {
+                        lease.setPosition(position);
+                    } else {
+                        lease.advancePosition(total_written);
+                    }
                 } else {
                     return error.BadFd;
                 }
@@ -658,7 +1217,9 @@ pub const WasiCtx = struct {
     }
 
     pub fn fd_read(self: *WasiCtx, fd: u32, iovs: []const IoVec) !struct { nread: u32 } {
-        const entry = self.fd_table.get(fd) orelse return error.BadFd;
+        var lease = self.fd_table.acquire(fd) orelse return error.BadFd;
+        defer lease.release();
+        const entry = lease.snapshot();
         var total_read: u32 = 0;
 
         switch (entry.kind) {
@@ -675,13 +1236,19 @@ pub const WasiCtx = struct {
             .regular_file => {
                 if (entry.host_fd) |host_fd| {
                     const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-                    var buf: [4096]u8 = undefined;
-                    var r = file.reader(self.io, &buf);
                     for (iovs) |iov| {
                         const data = iov.slice();
-                        const n = r.interface.read(data) catch return error.IoError;
+                        const n = file.readStreaming(self.io, &.{data}) catch |err| switch (err) {
+                            error.EndOfStream => 0,
+                            else => return error.IoError,
+                        };
                         total_read += @intCast(n);
                         if (n < data.len) break;
+                    }
+                    if (hostFilePosition(host_fd)) |position| {
+                        lease.setPosition(position);
+                    } else {
+                        lease.advancePosition(total_read);
                     }
                 } else {
                     return error.BadFd;
@@ -694,49 +1261,25 @@ pub const WasiCtx = struct {
     }
 
     pub fn fd_close(self: *WasiCtx, fd: u32) Errno {
-        const entry = self.fd_table.get(fd) orelse return .badf;
-
-        // Don't allow closing stdio
-        switch (entry.kind) {
-            .stdin, .stdout, .stderr => return .badf,
-            else => {},
-        }
-
-        if (entry.host_fd) |host_fd| {
-            const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-            file.close(self.io);
-        }
-
-        self.fd_table.remove(fd);
-        return .success;
+        return switch (self.fd_table.closeGuest(fd)) {
+            .closed => .success,
+            .badf, .protected_stdio => .badf,
+        };
     }
 
     pub fn fd_seek(self: *WasiCtx, fd: u32, offset: i64, whence: u8) !u64 {
-        const entry = self.fd_table.get(fd) orelse return error.BadFd;
+        var lease = self.fd_table.acquire(fd) orelse return error.BadFd;
+        defer lease.release();
+        const entry = lease.snapshot();
 
         switch (entry.kind) {
             .regular_file => {
                 if (entry.host_fd) |host_fd| {
                     const w = std.enums.fromInt(Whence, whence) orelse return error.InvalidWhence;
                     const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-                    var buf: [4096]u8 = undefined;
-                    var reader = file.reader(self.io, &buf);
-                    switch (w) {
-                        .set => {
-                            if (offset < 0) return error.InvalidWhence;
-                            reader.seekTo(@intCast(offset)) catch return error.IoError;
-                        },
-                        .cur => reader.seekBy(offset) catch return error.IoError,
-                        .end => {
-                            const stat = file.stat(self.io) catch return error.IoError;
-                            const size: i64 = @intCast(stat.size);
-                            const new_pos = size + offset;
-                            if (new_pos < 0) return error.InvalidWhence;
-                            reader.seekTo(@intCast(new_pos)) catch return error.IoError;
-                        },
-                    }
-                    // Return current position by seeking by 0
-                    return error.NoSys; // TODO: position tracking
+                    const position = seekHostFile(self.io, file, offset, w) catch return error.IoError;
+                    lease.setPosition(position);
+                    return position;
                 } else {
                     return error.BadFd;
                 }
@@ -749,7 +1292,7 @@ pub const WasiCtx = struct {
     // ── proc ────────────────────────────────────────────────────────
 
     pub fn proc_exit(self: *WasiCtx, code: u32) void {
-        self.exit_code = code;
+        self.exit_state.set(code);
     }
 
     // ── random ──────────────────────────────────────────────────────
@@ -765,37 +1308,283 @@ pub const WasiCtx = struct {
 
 const testing_io = std.testing.io;
 
+test "FdTable threaded stale lease cannot alias a reused guest fd" {
+    const Table = FdTableFor(true);
+    var table = try Table.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
+
+    try table.insert(10, .{ .kind = .regular_file, .pos = 11 });
+    var stale = table.acquire(10).?;
+    try std.testing.expect(table.remove(10));
+    try table.insert(10, .{ .kind = .regular_file, .pos = 22 });
+
+    var current = table.acquire(10).?;
+    defer current.release();
+    try std.testing.expectEqual(@as(u64, 11), stale.snapshot().pos);
+    try std.testing.expect(stale.isClosing());
+    try std.testing.expectEqual(@as(u64, 22), current.snapshot().pos);
+    stale.release();
+}
+
+test "FdTable threaded removal defers descriptor close until final lease" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[1]);
+
+    const Table = FdTableFor(true);
+    var table = try Table.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
+    try table.insert(7, .{ .kind = .regular_file, .host_fd = fds[0] });
+    var lease = table.acquire(7).?;
+
+    const Remover = struct {
+        fn run(target: *Table) void {
+            std.debug.assert(target.remove(7));
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Remover.run, .{&table});
+    thread.join();
+
+    try std.testing.expect(table.acquire(7) == null);
+    try std.testing.expect(lease.isClosing());
+    const before = linux.fcntl(fds[0], linux.F.GETFD, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(before));
+    lease.release();
+    const after = linux.fcntl(fds[0], linux.F.GETFD, 0);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(after));
+}
+
+test "FdTable threaded concurrent lookup and removal are race free" {
+    const Table = FdTableFor(true);
+    var table = try Table.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
+    try table.insert(9, .{ .kind = .regular_file, .pos = 99 });
+
+    var start = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    var acquired = std.atomic.Value(usize).init(0);
+    const Reader = struct {
+        fn run(
+            target: *Table,
+            start_flag: *std.atomic.Value(bool),
+            stop_flag: *std.atomic.Value(bool),
+            count: *std.atomic.Value(usize),
+        ) void {
+            while (!start_flag.load(.acquire)) std.atomic.spinLoopHint();
+            while (!stop_flag.load(.acquire)) {
+                if (target.acquire(9)) |held| {
+                    var lease = held;
+                    std.debug.assert(lease.snapshot().pos == 99);
+                    _ = count.fetchAdd(1, .monotonic);
+                    lease.release();
+                }
+            }
+        }
+    };
+
+    var readers: [4]std.Thread = undefined;
+    for (&readers) |*reader| {
+        reader.* = try std.Thread.spawn(
+            .{},
+            Reader.run,
+            .{ &table, &start, &stop, &acquired },
+        );
+    }
+    start.store(true, .release);
+    while (acquired.load(.acquire) == 0) std.atomic.spinLoopHint();
+    try std.testing.expect(table.remove(9));
+    stop.store(true, .release);
+    for (readers) |reader| reader.join();
+
+    try std.testing.expect(table.acquire(9) == null);
+    try std.testing.expectEqual(@as(usize, 0), table.leakCount());
+}
+
+test "FdTable guest close cannot remove a concurrently renumbered stdio entry" {
+    const Table = FdTableFor(true);
+    const Runner = struct {
+        fn close(target: *Table, start: *std.atomic.Value(bool)) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            _ = target.closeGuest(10);
+        }
+
+        fn renumber(target: *Table, start: *std.atomic.Value(bool)) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            target.renumber(0, 10) catch {};
+        }
+    };
+
+    for (0..100) |_| {
+        var table = try Table.init(std.testing.allocator, testing_io);
+        defer table.deinit() catch unreachable;
+        try table.insert(0, .{ .kind = .stdin });
+        try table.insert(10, .{ .kind = .regular_file });
+        var start = std.atomic.Value(bool).init(false);
+        const closer = try std.Thread.spawn(.{}, Runner.close, .{ &table, &start });
+        const renumberer = try std.Thread.spawn(.{}, Runner.renumber, .{ &table, &start });
+        start.store(true, .release);
+        closer.join();
+        renumberer.join();
+
+        const at_zero = table.snapshot(0);
+        const at_ten = table.snapshot(10);
+        try std.testing.expect((at_zero == null) != (at_ten == null));
+        const survivor = at_zero orelse at_ten.?;
+        try std.testing.expectEqual(FdKind.stdin, survivor.kind);
+    }
+}
+
+test "FdTable preopen label follows the numeric target and closes with it" {
+    const Table = FdTableFor(true);
+    var table = try Table.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
+
+    const name = try std.testing.allocator.dupe(u8, "/shared");
+    const preopen_fd = try table.createPreopen(
+        .{ .kind = .directory },
+        name,
+    );
+    const replacement_fd = try table.create(.{ .kind = .directory });
+    try table.renumber(replacement_fd, preopen_fd);
+
+    try std.testing.expect(!table.contains(replacement_fd));
+    var buf: [16]u8 = undefined;
+    const len = table.copyPreopenName(preopen_fd, &buf).?;
+    try std.testing.expectEqualStrings("/shared", buf[0..len]);
+    try std.testing.expectEqual(@as(usize, 1), table.preopenCount());
+
+    try std.testing.expect(table.remove(preopen_fd));
+    try std.testing.expect(table.copyPreopenName(preopen_fd, &buf) == null);
+    try std.testing.expectEqual(@as(usize, 0), table.preopenCount());
+}
+
+test "FdTable renumber drops a preopen label for a non-directory source" {
+    const Table = FdTableFor(true);
+    var table = try Table.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
+
+    const name = try std.testing.allocator.dupe(u8, "/dir");
+    const preopen_fd = try table.createPreopen(.{ .kind = .directory }, name);
+    const file_fd = try table.create(.{ .kind = .regular_file });
+    try table.renumber(file_fd, preopen_fd);
+
+    try std.testing.expectEqual(FdKind.regular_file, table.snapshot(preopen_fd).?.kind);
+    try std.testing.expectEqual(@as(usize, 0), table.preopenCount());
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(table.copyPreopenName(preopen_fd, &buf) == null);
+}
+
+test "FdTable publication failure returns descriptor ownership to caller" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        // Control, resource node, and first stable chunk succeed. The guest
+        // fd directory allocation then fails after publication.
+        .fail_index = 3,
+    });
+    const Table = FdTableFor(true);
+    var table = try Table.init(failing.allocator(), testing_io);
+    defer table.deinit() catch unreachable;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        table.create(.{ .kind = .regular_file, .host_fd = fds[0] }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), table.leakCount());
+    const still_open = linux.fcntl(fds[0], linux.F.GETFD, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(still_open));
+}
+
+test "FdTable preopen publication rolls back both directories on OOM" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        // Control, resource node/chunk, and descriptor-directory capacity
+        // succeed; preopen-directory capacity fails.
+        .fail_index = 4,
+    });
+    const Table = FdTableFor(true);
+    var table = try Table.init(failing.allocator(), testing_io);
+    defer table.deinit() catch unreachable;
+    const name = try std.testing.allocator.dupe(u8, "/rollback");
+    defer std.testing.allocator.free(name);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        table.createPreopen(.{ .kind = .directory }, name),
+    );
+    try std.testing.expectEqual(@as(usize, 0), table.leakCount());
+    try std.testing.expectEqual(@as(usize, 0), table.preopenCount());
+}
+
+test "FdTable disabled specialization preserves direct behavior" {
+    const Table = FdTableFor(false);
+    const Entry = FdEntryFor(false);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(@TypeOf(@as(Entry, .{
+        .kind = .regular_file,
+    }).mutex)));
+    try std.testing.expectEqual(@sizeOf(FdEntrySnapshot), @sizeOf(Entry));
+
+    var table = try Table.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
+    const fd = try table.create(.{ .kind = .regular_file, .pos = 5 });
+    try std.testing.expectEqual(@as(u64, 5), table.snapshot(fd).?.pos);
+    try std.testing.expect(table.remove(fd));
+    try std.testing.expectEqual(@as(usize, 0), table.leakCount());
+}
+
+test "WasiCtx concurrent final releases destroy exactly once" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
+    ctx.retain();
+
+    const Releaser = struct {
+        fn run(target: *WasiCtx) void {
+            target.deinit();
+        }
+    };
+    const first = try std.Thread.spawn(.{}, Releaser.run, .{ctx});
+    const second = try std.Thread.spawn(.{}, Releaser.run, .{ctx});
+    first.join();
+    second.join();
+}
+
 test "WasiCtx init/deinit lifecycle" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
     // Verify stdio fds are pre-populated
-    try std.testing.expect(ctx.fd_table.get(0) != null);
-    try std.testing.expect(ctx.fd_table.get(1) != null);
-    try std.testing.expect(ctx.fd_table.get(2) != null);
-    try std.testing.expect(ctx.fd_table.get(3) == null);
-    try std.testing.expect(ctx.exit_code == null);
+    try std.testing.expect(ctx.fd_table.contains(0));
+    try std.testing.expect(ctx.fd_table.contains(1));
+    try std.testing.expect(ctx.fd_table.contains(2));
+    try std.testing.expect(!ctx.fd_table.contains(3));
+    try std.testing.expect(ctx.getExitCode() == null);
 }
 
-test "FdTable insert, get, remove" {
-    var table = FdTable.init(std.testing.allocator);
-    defer table.deinit();
+test "FdTable insert, snapshot, remove" {
+    var table = try FdTable.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
 
     try table.insert(10, .{ .kind = .regular_file });
-    const entry = table.get(10);
+    const entry = table.snapshot(10);
     try std.testing.expect(entry != null);
     try std.testing.expectEqual(FdEntry.FdKind.regular_file, entry.?.kind);
 
-    table.remove(10);
-    try std.testing.expect(table.get(10) == null);
+    try std.testing.expect(table.remove(10));
+    try std.testing.expect(table.snapshot(10) == null);
 }
 
-test "FdTable allocateFd" {
-    var table = FdTable.init(std.testing.allocator);
-    defer table.deinit();
+test "FdTable create allocates sequential guest fds" {
+    var table = try FdTable.init(std.testing.allocator, testing_io);
+    defer table.deinit() catch unreachable;
 
-    const fd1 = table.allocateFd();
-    const fd2 = table.allocateFd();
+    const fd1 = try table.create(.{ .kind = .regular_file });
+    const fd2 = try table.create(.{ .kind = .regular_file });
     try std.testing.expectEqual(@as(u32, 3), fd1);
     try std.testing.expectEqual(@as(u32, 4), fd2);
 }
@@ -811,8 +1600,9 @@ test "addPreopen: directory rights default omits fd file-side bits (#476)" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    const fd = try ctx.addPreopen("/pre", tmp.dir);
-    const entry = ctx.fd_table.get(fd) orelse return error.MissingFd;
+    const owned_dir = try tmp.dir.openDir(testing_io, ".", .{ .iterate = true });
+    const fd = try ctx.addPreopen("/pre", owned_dir);
+    const entry = ctx.fd_table.snapshot(fd) orelse return error.MissingFd;
 
     // The four file-side bits must be off on a preopen directory fd.
     try std.testing.expectEqual(@as(u64, 0), entry.rights_base & RIGHTS_FD_READ);
@@ -826,9 +1616,7 @@ test "addPreopen: directory rights default omits fd file-side bits (#476)" {
     try std.testing.expectEqual(DIRECTORY_BASE_RIGHTS, entry.rights_base);
     try std.testing.expectEqual(DIRECTORY_INHERITING_RIGHTS, entry.rights_inheriting);
 
-    // Prevent the test's `tmp.cleanup()` from racing the ctx's deinit on
-    // the same Dir handle — the ctx now owns it.
-    ctx.fd_table.remove(fd);
+    try std.testing.expectEqual(@as(?usize, 4), ctx.preopenNameLen(fd));
 }
 
 test "args_sizes_get with known args" {
@@ -885,8 +1673,7 @@ test "fd_write to a regular file writes all iovs" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    const fd = ctx.fd_table.allocateFd();
-    try ctx.fd_table.insert(fd, .{
+    const fd = try ctx.fd_table.create(.{
         .kind = .regular_file,
         .host_fd = file.handle,
     });
@@ -900,8 +1687,11 @@ test "fd_write to a regular file writes all iovs" {
     const result = try ctx.fd_write(fd, &iovs);
     try std.testing.expectEqual(@as(u32, 11), result.nwritten);
 
-    // Drop the entry so deinit doesn't re-close the host fd we still own.
-    ctx.fd_table.remove(fd);
+    // Transfer the test-owned handle back before removing the guest entry.
+    var lease = ctx.fd_table.acquire(fd).?;
+    try std.testing.expectEqual(file.handle, lease.detachHostFd().?);
+    lease.release();
+    try std.testing.expect(ctx.fd_table.remove(fd));
 
     var buf: [16]u8 = undefined;
     const n = try file.readPositionalAll(testing_io, &buf, 0);
@@ -986,9 +1776,9 @@ test "proc_exit sets exit code" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    try std.testing.expect(ctx.exit_code == null);
+    try std.testing.expect(ctx.getExitCode() == null);
     ctx.proc_exit(42);
-    try std.testing.expectEqual(@as(u32, 42), ctx.exit_code.?);
+    try std.testing.expectEqual(@as(u32, 42), ctx.getExitCode().?);
 }
 
 test "proc_exit with zero" {
@@ -996,7 +1786,7 @@ test "proc_exit with zero" {
     defer ctx.deinit();
 
     ctx.proc_exit(0);
-    try std.testing.expectEqual(@as(u32, 0), ctx.exit_code.?);
+    try std.testing.expectEqual(@as(u32, 0), ctx.getExitCode().?);
 }
 
 test "Errno values match WASI spec" {

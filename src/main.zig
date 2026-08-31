@@ -43,7 +43,7 @@ fn parseSubcommand(s: []const u8) ?Subcommand {
 /// teardown — most importantly the `DebugAllocator` leak hook on
 /// `init.gpa` in Debug builds (#449, #450). Exit-code policy:
 ///   * 0 — successful guest run / `help` / `version`
-///   * `outcome.exit_code` / `ctx.exit_code` — guest-requested
+///   * `outcome.exit_code` / `ctx.getExitCode()` — guest-requested
 ///     (preview1 `proc_exit`, `wasi:cli/exit.exit-with-code`)
 ///   * 1 — runtime failure (trap, load/instantiate fail, host-side OOM
 ///     during guest setup, etc.)
@@ -1417,7 +1417,7 @@ fn runAotReal(
         return 1;
     };
 
-    if (ctx.exit_code) |code| return @intCast(code & 0xFF);
+    if (ctx.getExitCode()) |code| return @intCast(code & 0xFF);
     return 0;
 }
 

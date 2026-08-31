@@ -145,6 +145,7 @@ fn instantiateImpl(
         .globals = &.{},
         .allocator = allocator,
     };
+    errdefer freeGcObjects(inst, allocator);
 
     inst.memories = try allocateMemories(module, allocator, import_ctx);
     errdefer freeMemories(inst.memories, allocator);
@@ -153,7 +154,7 @@ fn instantiateImpl(
     errdefer freeTables(inst.tables, allocator);
 
     inst.globals = try initializeGlobals(module, allocator, import_ctx, inst);
-    errdefer freeGlobals(inst.globals, module.import_global_count, allocator);
+    errdefer freeGlobals(inst.globals, allocator);
 
     // Store imported function references
     if (import_ctx) |ctx| {
@@ -337,7 +338,7 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     const allocator = inst.allocator;
     freeMemories(inst.memories, allocator);
     freeTables(inst.tables, allocator);
-    freeGlobals(inst.globals, inst.module.import_global_count, allocator);
+    freeGlobals(inst.globals, allocator);
     if (inst.import_functions.len > 0) allocator.free(inst.import_functions);
     if (inst.owns_host_functions and inst.host_functions.len > 0)
         allocator.free(inst.host_functions);
@@ -353,6 +354,7 @@ pub fn destroy(inst: *types.ModuleInstance) void {
         if (maybe_vals) |vals| allocator.free(vals);
     }
     if (inst.cached_elem_values.len > 0) allocator.free(inst.cached_elem_values);
+    freeGcObjects(inst, allocator);
     allocator.destroy(inst);
 }
 
@@ -367,8 +369,8 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
         return error.MemoryAllocationFailed;
     errdefer allocator.free(mems);
 
-    var local_init: usize = 0;
-    errdefer for (0..local_init) |i| mems[import_count + i].release(allocator);
+    var initialized: usize = 0;
+    errdefer for (mems[0..initialized]) |memory| memory.release(allocator);
 
     // Imported memories: share pointer and bump refcount
     if (import_count > 0) {
@@ -378,8 +380,13 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
                     const m = ctx.memories[i];
                     @constCast(m).retain();
                     mems[i] = @constCast(m);
+                    initialized += 1;
                 }
+            } else {
+                return error.ImportResolutionFailed;
             }
+        } else {
+            return error.ImportResolutionFailed;
         }
     }
 
@@ -388,7 +395,7 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
         if (mem_type.is_shared) {
             mems[import_count + i] = types.MemoryInstance.createShared(mem_type, allocator) catch
                 return error.MemoryAllocationFailed;
-            local_init += 1;
+            initialized += 1;
             continue;
         }
 
@@ -417,7 +424,7 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
             .max_pages = max_pages,
         };
         mems[import_count + i] = mem;
-        local_init += 1;
+        initialized += 1;
     }
 
     return mems;
@@ -432,8 +439,8 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
         return error.TableAllocationFailed;
     errdefer allocator.free(tables);
 
-    var local_init: usize = 0;
-    errdefer for (0..local_init) |i| tables[import_count + i].release(allocator);
+    var initialized: usize = 0;
+    errdefer for (tables[0..initialized]) |table| table.release(allocator);
 
     // Imported tables: share pointer and bump refcount
     if (import_count > 0) {
@@ -443,8 +450,13 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
                     const t = ctx.tables[i];
                     @constCast(t).retain();
                     tables[i] = @constCast(t);
+                    initialized += 1;
                 }
+            } else {
+                return error.ImportResolutionFailed;
             }
+        } else {
+            return error.ImportResolutionFailed;
         }
     }
 
@@ -461,7 +473,7 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
         };
         tbl.* = .{ .table_type = table_type, .elements = elems };
         tables[import_count + i] = tbl;
-        local_init += 1;
+        initialized += 1;
     }
 
     return tables;
@@ -474,23 +486,33 @@ fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocat
 
     const globals = allocator.alloc(*types.GlobalInstance, total_count) catch
         return error.OutOfMemory;
+    errdefer allocator.free(globals);
 
-    // Copy imported globals
+    var initialized: usize = 0;
+    errdefer for (globals[0..initialized]) |global| global.release(allocator);
+
+    // Retain imported globals for this instance.
     if (import_count > 0) {
         if (import_ctx) |ctx| {
-            const count = @min(import_count, @as(u32, @intCast(ctx.globals.len)));
-            for (0..count) |i| {
-                globals[i] = ctx.globals[i];
+            if (ctx.globals.len < import_count) return error.ImportResolutionFailed;
+            for (0..import_count) |i| {
+                const global = ctx.globals[i];
+                @constCast(global).retain();
+                globals[i] = @constCast(global);
+                initialized += 1;
             }
+        } else {
+            return error.ImportResolutionFailed;
         }
     }
 
     // Initialize local globals (can reference imported globals via global.get)
     for (module.globals, 0..) |global, i| {
+        const value = try evalInitExpr(global.init_expr, globals[0 .. import_count + i], inst);
         const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
         g.* = .{
             .global_type = global.global_type,
-            .value = try evalInitExpr(global.init_expr, globals[0 .. import_count + i], inst),
+            .value = value,
         };
         // For ref_func globals, source_module will be set after inst is fully created
         // For global.get, inherit source_module from the referenced global
@@ -501,6 +523,7 @@ fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocat
             }
         }
         globals[import_count + i] = g;
+        initialized += 1;
     }
 
     return globals;
@@ -852,8 +875,12 @@ fn applyTableInitExprs(module: *const types.WasmModule, tables: []*types.TableIn
         const table = tables[import_count + i];
         const val = evalInitExpr(init_expr, globals, inst) catch continue;
         const elem = types.TableElement.fromValue(val, inst);
-        for (table.elements) |*e| {
-            e.* = elem;
+        {
+            table.lock();
+            defer table.unlock();
+            for (table.elements) |*e| {
+                e.* = elem;
+            }
         }
     }
 }
@@ -870,52 +897,56 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
         const offset = evalInitExprAsU32(offset_expr, globals) catch
             return error.ElemSegmentOutOfBounds;
 
-        const end = @as(u64, offset) + seg.func_indices.len;
-        if (end > table.elements.len) return error.ElemSegmentOutOfBounds;
+        {
+            table.lock();
+            defer table.unlock();
+            const end = @as(u64, offset) + seg.func_indices.len;
+            if (end > table.elements.len) return error.ElemSegmentOutOfBounds;
 
-        for (seg.func_indices, 0..) |mfunc_idx, i| {
-            // Check if this element has a runtime init expression
-            if (seg.elem_exprs.len > i) {
-                if (seg.elem_exprs[i]) |expr| {
-                    switch (expr) {
-                        .ref_func => |fidx| {
-                            table.elements[offset + i] = .{
-                                .value = .{ .nonfuncref = fidx },
-                                .module_inst = inst,
-                            };
-                        },
-                        .global_get => |gidx| {
-                            if (gidx < globals.len) {
-                                const global = globals[gidx];
-                                const gval = global.value;
-                                const src_inst = global.source_module orelse inst;
-                                table.elements[offset + i] = types.TableElement.fromValue(gval, src_inst);
-                            } else {
-                                table.elements[offset + i] = types.TableElement.nullForType(table.table_type.elem_type);
-                            }
-                        },
-                        .bytecode => {
-                            const bc_val = evalInitExpr(expr, globals, inst) catch {
-                                table.elements[offset + i] = types.TableElement.nullForType(table.table_type.elem_type);
-                                continue;
-                            };
-                            table.elements[offset + i] = types.TableElement.fromValue(bc_val, inst);
-                        },
-                        else => {
-                            table.elements[offset + i] = if (mfunc_idx) |func_idx|
-                                .{ .value = .{ .nonfuncref = func_idx }, .module_inst = inst }
-                            else
-                                types.TableElement.nullForType(table.table_type.elem_type);
-                        },
+            for (seg.func_indices, 0..) |mfunc_idx, i| {
+                // Check if this element has a runtime init expression
+                if (seg.elem_exprs.len > i) {
+                    if (seg.elem_exprs[i]) |expr| {
+                        switch (expr) {
+                            .ref_func => |fidx| {
+                                table.elements[offset + i] = .{
+                                    .value = .{ .nonfuncref = fidx },
+                                    .module_inst = inst,
+                                };
+                            },
+                            .global_get => |gidx| {
+                                if (gidx < globals.len) {
+                                    const global = globals[gidx];
+                                    const gval = global.value;
+                                    const src_inst = global.source_module orelse inst;
+                                    table.elements[offset + i] = types.TableElement.fromValue(gval, src_inst);
+                                } else {
+                                    table.elements[offset + i] = types.TableElement.nullForType(table.table_type.elem_type);
+                                }
+                            },
+                            .bytecode => {
+                                const bc_val = evalInitExpr(expr, globals, inst) catch {
+                                    table.elements[offset + i] = types.TableElement.nullForType(table.table_type.elem_type);
+                                    continue;
+                                };
+                                table.elements[offset + i] = types.TableElement.fromValue(bc_val, inst);
+                            },
+                            else => {
+                                table.elements[offset + i] = if (mfunc_idx) |func_idx|
+                                    .{ .value = .{ .nonfuncref = func_idx }, .module_inst = inst }
+                                else
+                                    types.TableElement.nullForType(table.table_type.elem_type);
+                            },
+                        }
+                        continue;
                     }
-                    continue;
                 }
+                // Fallback: use func_indices directly
+                table.elements[offset + i] = if (mfunc_idx) |func_idx|
+                    .{ .value = .{ .nonfuncref = func_idx }, .module_inst = inst }
+                else
+                    types.TableElement.nullForType(table.table_type.elem_type);
             }
-            // Fallback: use func_indices directly
-            table.elements[offset + i] = if (mfunc_idx) |func_idx|
-                .{ .value = .{ .nonfuncref = func_idx }, .module_inst = inst }
-            else
-                types.TableElement.nullForType(table.table_type.elem_type);
         }
     }
 }
@@ -952,17 +983,141 @@ fn freeTables(tables: []*types.TableInstance, allocator: std.mem.Allocator) void
     if (tables.len > 0) allocator.free(tables);
 }
 
-fn freeGlobals(globals: []*types.GlobalInstance, import_count: u32, allocator: std.mem.Allocator) void {
-    // Imported globals use refcounting; locally-created globals are destroyed directly
-    for (globals[0..import_count]) |g| g.release(allocator);
-    for (globals[import_count..]) |g| allocator.destroy(g);
+fn freeGlobals(globals: []*types.GlobalInstance, allocator: std.mem.Allocator) void {
+    for (globals) |g| g.release(allocator);
     if (globals.len > 0) allocator.free(globals);
+}
+
+fn freeGcObjects(inst: *types.ModuleInstance, allocator: std.mem.Allocator) void {
+    for (inst.gc_objects.items) |object| allocator.free(object.fields);
+    inst.gc_objects.deinit(allocator);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const loader = @import("loader.zig");
+
+test "core resource import allocation rollback releases retained owners" {
+    const allocator = testing.allocator;
+
+    const imported_memory = try allocator.create(types.MemoryInstance);
+    imported_memory.* = .{
+        .memory_type = .{ .limits = .{ .min = 0, .max = 0 } },
+        .data = &.{},
+        .current_pages = 0,
+        .max_pages = 0,
+    };
+    defer imported_memory.release(allocator);
+
+    const imported_elements = try allocator.alloc(types.TableElement, 1);
+    imported_elements[0] = types.TableElement.nullForType(.funcref);
+    const imported_table = try allocator.create(types.TableInstance);
+    imported_table.* = .{
+        .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = 1 } },
+        .elements = imported_elements,
+    };
+    defer imported_table.release(allocator);
+
+    const imported_global = try allocator.create(types.GlobalInstance);
+    imported_global.* = .{
+        .global_type = .{ .val_type = .i32, .mutability = .mutable },
+        .value = .{ .i32 = 1 },
+    };
+    defer imported_global.release(allocator);
+
+    const memory_imports = [_]*types.MemoryInstance{imported_memory};
+    const table_imports = [_]*types.TableInstance{imported_table};
+    const global_imports = [_]*types.GlobalInstance{imported_global};
+    const import_ctx = ImportContext{
+        .memories = &memory_imports,
+        .tables = &table_imports,
+        .globals = &global_imports,
+    };
+
+    const local_memories = [_]types.MemoryType{.{
+        .limits = .{ .min = 1, .max = 1 },
+        .is_shared = true,
+    }};
+    var memory_module = types.WasmModule{
+        .import_memory_count = 1,
+        .memories = &local_memories,
+    };
+    var fail_memory = testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try testing.expectError(
+        error.MemoryAllocationFailed,
+        allocateMemories(&memory_module, fail_memory.allocator(), import_ctx),
+    );
+    try testing.expectEqual(@as(usize, 1), imported_memory.referenceCount());
+
+    const local_tables = [_]types.TableType{.{
+        .elem_type = .funcref,
+        .limits = .{ .min = 1, .max = 1 },
+    }};
+    var table_module = types.WasmModule{
+        .import_table_count = 1,
+        .tables = &local_tables,
+    };
+    var fail_table = testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try testing.expectError(
+        error.TableAllocationFailed,
+        allocateTables(&table_module, fail_table.allocator(), import_ctx),
+    );
+    try testing.expectEqual(@as(usize, 1), imported_table.referenceCount());
+
+    const local_globals = [_]types.WasmGlobal{.{
+        .global_type = .{ .val_type = .i32, .mutability = .mutable },
+        .init_expr = .{ .i32_const = 2 },
+    }};
+    var global_module = types.WasmModule{
+        .import_global_count = 1,
+        .globals = &local_globals,
+    };
+    var partial_inst = types.ModuleInstance{
+        .module = &global_module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+    };
+    var fail_global = testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try testing.expectError(
+        error.OutOfMemory,
+        initializeGlobals(&global_module, fail_global.allocator(), import_ctx, &partial_inst),
+    );
+    try testing.expectEqual(@as(usize, 1), imported_global.referenceCount());
+}
+
+test "core resource imported global remains alive until importer destroy" {
+    const allocator = testing.allocator;
+    const imported_global = try allocator.create(types.GlobalInstance);
+    imported_global.* = .{
+        .global_type = .{ .val_type = .i32, .mutability = .mutable },
+        .value = .{ .i32 = 42 },
+    };
+
+    const imports = [_]types.ImportDesc{.{
+        .module_name = "env",
+        .field_name = "g",
+        .kind = .global,
+        .global_type = imported_global.global_type,
+    }};
+    var module = types.WasmModule{
+        .imports = &imports,
+        .import_global_count = 1,
+    };
+    const globals = [_]*types.GlobalInstance{imported_global};
+    const inst = try instantiateWithImports(
+        &module,
+        allocator,
+        .{ .globals = &globals },
+    );
+    try testing.expectEqual(@as(usize, 2), imported_global.referenceCount());
+
+    imported_global.release(allocator);
+    try testing.expectEqual(@as(i32, 42), inst.globals[0].value.i32);
+    destroy(inst);
+}
 
 /// Wasm header: \0asm followed by version 1.
 const wasm_header = [_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 };
@@ -1249,14 +1404,14 @@ test "attachHostFuncEntries: context-carrying host fn receives ctx and takes pri
 test "attachHostFuncEntries: null entry falls through to legacy host_functions" {
     const imports = [_]types.ImportDesc{
         .{
-            .module_name = "wasi",
-            .field_name = "thread-spawn",
+            .module_name = "wasi_snapshot_preview1",
+            .field_name = "sched_yield",
             .kind = .function,
             .func_type_idx = 0,
         },
     };
     const func_types = [_]types.FuncType{
-        .{ .params = &.{.i32}, .results = &.{.i32} },
+        .{ .params = &.{}, .results = &.{.i32} },
     };
     var module = types.WasmModule{
         .imports = &imports,
