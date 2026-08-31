@@ -463,6 +463,12 @@ pub fn StableHandleTableFor(
                 return self.node.?.getState() != .published;
             }
 
+            pub fn retain(self: *const Lease) Lease {
+                const node = self.node.?;
+                if (comptime enabled) node.refs.retain();
+                return .{ .node = node };
+            }
+
             pub fn release(self: *Lease) void {
                 const node = self.node orelse return;
                 self.node = null;

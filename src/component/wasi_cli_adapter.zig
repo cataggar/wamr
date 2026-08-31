@@ -1047,6 +1047,7 @@ pub const FsPreopen = struct {
 /// stream.
 pub const DirEntryStream = struct {
     iter: *std.Io.Dir.Iterator,
+    descriptor_lease: ?FsDescriptorTable.Lease = null,
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
 };
 
@@ -1280,6 +1281,8 @@ pub const Socket = struct {
 /// past this stream's, all operations return `invalid-state`.
 pub const UdpIncomingStream = struct {
     parent_handle: u32,
+    parent_lease: if (build_options.lib_wasi_threads) ?SocketTable.Lease else void =
+        if (build_options.lib_wasi_threads) null else {},
     generation: u32,
     remote: ?std.Io.net.IpAddress,
 };
@@ -1290,6 +1293,8 @@ pub const UdpIncomingStream = struct {
 /// or if `datagrams.len > send_credit`.
 pub const UdpOutgoingStream = struct {
     parent_handle: u32,
+    parent_lease: if (build_options.lib_wasi_threads) ?SocketTable.Lease else void =
+        if (build_options.lib_wasi_threads) null else {},
     generation: u32,
     remote: ?std.Io.net.IpAddress,
     send_credit: ?u64 = null,
@@ -4502,14 +4507,8 @@ const PollBackend = struct {
         input_stream: InputStreamTable.Lease,
         output_stream: OutputStreamTable.Lease,
         socket: SocketLease,
-        udp_incoming: struct {
-            stream: UdpIncomingStreamTable.Lease,
-            socket: SocketLease,
-        },
-        udp_outgoing: struct {
-            stream: UdpOutgoingStreamTable.Lease,
-            socket: SocketLease,
-        },
+        udp_incoming: UdpIncomingStreamTable.Lease,
+        udp_outgoing: UdpOutgoingStreamTable.Lease,
         http_future: struct {
             future: FutureIncomingResponseLease,
             operation: PendingHttpFetchTable.Lease,
@@ -4521,14 +4520,8 @@ const PollBackend = struct {
             .input_stream => |*lease| lease.release(),
             .output_stream => |*lease| lease.release(),
             .socket => |*lease| lease.release(),
-            .udp_incoming => |*guards| {
-                guards.socket.release();
-                guards.stream.release();
-            },
-            .udp_outgoing => |*guards| {
-                guards.socket.release();
-                guards.stream.release();
-            },
+            .udp_incoming => |*lease| lease.release(),
+            .udp_outgoing => |*lease| lease.release(),
             .http_future => |*guards| {
                 guards.operation.release();
                 guards.future.release();
@@ -5059,6 +5052,7 @@ fn destroyFsDescriptor(_: Allocator, descriptor: *FsDescriptor) void {
 
 fn destroyDirEntryStream(allocator: Allocator, stream: *DirEntryStream) void {
     allocator.destroy(stream.iter);
+    if (stream.descriptor_lease) |*lease| lease.release();
 }
 
 fn destroyNetwork(allocator: Allocator, network: *Network) void {
@@ -5070,10 +5064,18 @@ fn destroySocket(allocator: Allocator, socket: *Socket) void {
 }
 
 fn destroyUdpIncomingStream(allocator: Allocator, stream: **UdpIncomingStream) void {
+    if (comptime build_options.lib_wasi_threads) {
+        if (stream.*.parent_lease) |*lease| lease.release();
+        stream.*.parent_lease = null;
+    }
     allocator.destroy(stream.*);
 }
 
 fn destroyUdpOutgoingStream(allocator: Allocator, stream: **UdpOutgoingStream) void {
+    if (comptime build_options.lib_wasi_threads) {
+        if (stream.*.parent_lease) |*lease| lease.release();
+        stream.*.parent_lease = null;
+    }
     allocator.destroy(stream.*);
 }
 
@@ -5272,6 +5274,24 @@ const SocketLease = struct {
     fn release(self: *SocketLease) void {
         self.releaseClaim();
         self.table_lease.release();
+    }
+};
+
+const UdpParentSocketGuard = struct {
+    socket: *Socket,
+    owned_lease: ?SocketLease = null,
+
+    fn value(self: *UdpParentSocketGuard) *Socket {
+        return self.socket;
+    }
+
+    fn release(self: *UdpParentSocketGuard) void {
+        if (self.owned_lease) |*lease| {
+            lease.release();
+            self.owned_lease = null;
+        } else {
+            self.socket.operation_claim.release();
+        }
     }
 };
 const InputStreamTable = adapter_resource.ResourceTable(
@@ -7353,29 +7373,26 @@ pub const WasiCliAdapter = struct {
                     stream_lease.release();
                     return null;
                 }
-                var socket_lease = self.lookupSocket(ref.parent_handle) orelse {
+                var socket_guard = self.lockUdpIncomingParent(stream) orelse {
                     stream_lease.release();
                     return null;
                 };
-                const socket = socket_lease.value();
+                const socket = socket_guard.value();
                 if (socket.stream_generation != ref.generation) {
-                    socket_lease.release();
+                    socket_guard.release();
                     stream_lease.release();
                     return null;
                 }
                 const host_socket = socket.host_socket orelse {
-                    socket_lease.release();
+                    socket_guard.release();
                     stream_lease.release();
                     return null;
                 };
-                socket_lease.releaseClaim();
+                socket_guard.release();
                 return .{
                     .fd = host_socket.handle,
                     .events = pollInEvents(),
-                    .guard = .{ .udp_incoming = .{
-                        .stream = stream_lease,
-                        .socket = socket_lease,
-                    } },
+                    .guard = .{ .udp_incoming = stream_lease },
                 };
             },
             .udp_outgoing_stream => |ref| {
@@ -7385,29 +7402,26 @@ pub const WasiCliAdapter = struct {
                     stream_lease.release();
                     return null;
                 }
-                var socket_lease = self.lookupSocket(ref.parent_handle) orelse {
+                var socket_guard = self.lockUdpOutgoingParent(stream) orelse {
                     stream_lease.release();
                     return null;
                 };
-                const socket = socket_lease.value();
+                const socket = socket_guard.value();
                 if (socket.stream_generation != ref.generation) {
-                    socket_lease.release();
+                    socket_guard.release();
                     stream_lease.release();
                     return null;
                 }
                 const host_socket = socket.host_socket orelse {
-                    socket_lease.release();
+                    socket_guard.release();
                     stream_lease.release();
                     return null;
                 };
-                socket_lease.releaseClaim();
+                socket_guard.release();
                 return .{
                     .fd = host_socket.handle,
                     .events = pollOutEvents(),
-                    .guard = .{ .udp_outgoing = .{
-                        .stream = stream_lease,
-                        .socket = socket_lease,
-                    } },
+                    .guard = .{ .udp_outgoing = stream_lease },
                 };
             },
             .http_future_response => |handle| {
@@ -7513,9 +7527,9 @@ pub const WasiCliAdapter = struct {
                 defer stream_lease.release();
                 const stream = stream_lease.value().*;
                 if (stream.parent_handle != ref.parent_handle or stream.generation != ref.generation) break :blk true;
-                var socket_lease = self.lookupSocket(ref.parent_handle) orelse break :blk true;
-                defer socket_lease.release();
-                const socket = socket_lease.value();
+                var socket_guard = self.lockUdpIncomingParent(stream) orelse break :blk true;
+                defer socket_guard.release();
+                const socket = socket_guard.value();
                 if (socket.stream_generation != ref.generation) break :blk true;
                 const host_socket = socket.host_socket orelse break :blk true;
                 break :blk fdPollReady(host_socket.handle, pollInEvents());
@@ -7525,9 +7539,9 @@ pub const WasiCliAdapter = struct {
                 defer stream_lease.release();
                 const stream = stream_lease.value().*;
                 if (stream.parent_handle != ref.parent_handle or stream.generation != ref.generation) break :blk true;
-                var socket_lease = self.lookupSocket(ref.parent_handle) orelse break :blk true;
-                defer socket_lease.release();
-                const socket = socket_lease.value();
+                var socket_guard = self.lockUdpOutgoingParent(stream) orelse break :blk true;
+                defer socket_guard.release();
+                const socket = socket_guard.value();
                 if (socket.stream_generation != ref.generation) break :blk true;
                 const host_socket = socket.host_socket orelse break :blk true;
                 break :blk fdPollReady(host_socket.handle, pollOutEvents());
@@ -13324,7 +13338,8 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, .bad_descriptor);
             return;
         };
-        defer d_lease.release();
+        var descriptor_active = true;
+        defer if (descriptor_active) d_lease.release();
         const d = d_lease.value();
         const base_dir: std.Io.Dir = d.asDir() orelse {
             results[0] = try fsResultErr(allocator, .not_directory);
@@ -13341,11 +13356,21 @@ pub const WasiCliAdapter = struct {
         };
         iter.* = base_dir.iterate();
 
-        const new_handle = self.dir_entry_stream_table.publish(.{ .iter = iter }) catch {
+        var descriptor_lease: ?FsDescriptorTable.Lease = null;
+        if (comptime build_options.lib_wasi_threads) {
+            descriptor_lease = d_lease;
+            descriptor_active = false;
+        }
+        const new_handle = self.dir_entry_stream_table.publish(.{
+            .iter = iter,
+            .descriptor_lease = descriptor_lease,
+        }) catch {
+            if (descriptor_lease) |*lease| lease.release();
             self.allocator.destroy(iter);
             results[0] = try fsResultErr(allocator, .insufficient_memory);
             return;
         };
+        errdefer _ = self.dir_entry_stream_table.remove(new_handle);
 
         results[0] = try fsResultOk(allocator, .{ .handle = new_handle });
     }
@@ -14653,12 +14678,40 @@ pub const WasiCliAdapter = struct {
         return self.udp_incoming_streams.acquire(h);
     }
 
+    fn lockUdpIncomingParent(
+        self: *WasiCliAdapter,
+        stream: *UdpIncomingStream,
+    ) ?UdpParentSocketGuard {
+        if (comptime build_options.lib_wasi_threads) {
+            var parent = if (stream.parent_lease) |*lease| lease else return null;
+            const socket = parent.value();
+            socket.operation_claim.acquire();
+            return .{ .socket = socket };
+        }
+        const lease = self.lookupSocket(stream.parent_handle) orelse return null;
+        return .{ .socket = lease.socket, .owned_lease = lease };
+    }
+
     fn pushUdpOutgoingStream(self: *WasiCliAdapter, s: *UdpOutgoingStream) !u32 {
         return self.udp_outgoing_streams.publish(s);
     }
 
     fn lookupUdpOutgoingStream(self: *WasiCliAdapter, h: u32) ?UdpOutgoingStreamTable.Lease {
         return self.udp_outgoing_streams.acquire(h);
+    }
+
+    fn lockUdpOutgoingParent(
+        self: *WasiCliAdapter,
+        stream: *UdpOutgoingStream,
+    ) ?UdpParentSocketGuard {
+        if (comptime build_options.lib_wasi_threads) {
+            var parent = if (stream.parent_lease) |*lease| lease else return null;
+            const socket = parent.value();
+            socket.operation_claim.acquire();
+            return .{ .socket = socket };
+        }
+        const lease = self.lookupSocket(stream.parent_handle) orelse return null;
+        return .{ .socket = lease.socket, .owned_lease = lease };
     }
 
     /// Generic `(...) -> result<_, error-code>` access-denied stub. Used as
@@ -16301,6 +16354,7 @@ pub const WasiCliAdapter = struct {
         // Bump generation to invalidate any prior stream pair.
         s.stream_generation += 1;
         s.remote_addr = remote;
+        const stream_generation = s.stream_generation;
 
         // Allocate incoming stream rep.
         const in_rep = self.allocator.create(UdpIncomingStream) catch {
@@ -16309,14 +16363,21 @@ pub const WasiCliAdapter = struct {
         };
         in_rep.* = .{
             .parent_handle = sock_handle,
-            .generation = s.stream_generation,
+            .parent_lease = if (comptime build_options.lib_wasi_threads)
+                s_lease.table_lease.retain()
+            else {},
+            .generation = stream_generation,
             .remote = remote,
         };
         const in_handle = self.pushUdpIncomingStream(in_rep) catch {
+            if (comptime build_options.lib_wasi_threads) {
+                if (in_rep.parent_lease) |*lease| lease.release();
+            }
             self.allocator.destroy(in_rep);
             results[0] = try socketResultErr(allocator, .out_of_memory);
             return;
         };
+        errdefer _ = self.udp_incoming_streams.remove(in_handle);
 
         // Allocate outgoing stream rep.
         const out_rep = self.allocator.create(UdpOutgoingStream) catch {
@@ -16327,15 +16388,22 @@ pub const WasiCliAdapter = struct {
         };
         out_rep.* = .{
             .parent_handle = sock_handle,
-            .generation = s.stream_generation,
+            .parent_lease = if (comptime build_options.lib_wasi_threads)
+                s_lease.table_lease.retain()
+            else {},
+            .generation = stream_generation,
             .remote = remote,
         };
         const out_handle = self.pushUdpOutgoingStream(out_rep) catch {
             std.debug.assert(self.udp_incoming_streams.remove(in_handle));
+            if (comptime build_options.lib_wasi_threads) {
+                if (out_rep.parent_lease) |*lease| lease.release();
+            }
             self.allocator.destroy(out_rep);
             results[0] = try socketResultErr(allocator, .out_of_memory);
             return;
         };
+        errdefer _ = self.udp_outgoing_streams.remove(out_handle);
 
         // Return ok(tuple(in_handle, out_handle)).
         const pair = try allocator.alloc(InterfaceValue, 2);
@@ -16441,12 +16509,12 @@ pub const WasiCliAdapter = struct {
         };
         defer in_stream_lease.release();
         const in_stream = in_stream_lease.value().*;
-        var s_lease = self.lookupSocket(in_stream.parent_handle) orelse {
+        var socket_guard = self.lockUdpIncomingParent(in_stream) orelse {
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
         };
-        defer s_lease.release();
-        const s = s_lease.value();
+        defer socket_guard.release();
+        const s = socket_guard.value();
         // Generation check — stale stream.
         if (in_stream.generation != s.stream_generation) {
             results[0] = try socketResultErr(allocator, .invalid_state);
@@ -16553,15 +16621,14 @@ pub const WasiCliAdapter = struct {
         defer out_stream_lease.release();
         const out_slot = out_stream_lease.lock();
         const out_stream = out_slot.*;
-        const parent_handle = out_stream.parent_handle;
         const generation = out_stream.generation;
         out_stream_lease.unlock();
-        var s_lease = self.lookupSocket(parent_handle) orelse {
+        var socket_guard = self.lockUdpOutgoingParent(out_stream) orelse {
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
         };
-        defer s_lease.release();
-        const s = s_lease.value();
+        defer socket_guard.release();
+        const s = socket_guard.value();
         if (generation != s.stream_generation) {
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
@@ -16613,17 +16680,16 @@ pub const WasiCliAdapter = struct {
             return error.Trap;
         }
         out_stream.send_credit = null;
-        const parent_handle = out_stream.parent_handle;
         const generation = out_stream.generation;
         const remote = out_stream.remote;
         out_stream_lease.unlock();
 
-        var s_lease = self.lookupSocket(parent_handle) orelse {
+        var socket_guard = self.lockUdpOutgoingParent(out_stream) orelse {
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
         };
-        defer s_lease.release();
-        const s = s_lease.value();
+        defer socket_guard.release();
+        const s = socket_guard.value();
         if (generation != s.stream_generation) {
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
@@ -47748,6 +47814,119 @@ test "adapter resource safety: outgoing body owns bytes after stream handle drop
         testing.allocator,
     );
     try testing.expect(!adapter.http_outgoing_bodies.contains(body_handle));
+}
+
+test "adapter resource safety: directory stream retains its descriptor" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "entry.txt", .data = "x" });
+    const child = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    const descriptor_handle = try adapter.pushFsDescriptor(.{ .dir = .{
+        .dir = child,
+        .flags = .{ .read = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    const read_args = [_]InterfaceValue{.{ .handle = descriptor_handle }};
+    var read_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorReadDirectory(
+        &adapter,
+        &ci,
+        &read_args,
+        &read_results,
+        testing.allocator,
+    );
+    defer read_results[0].deinit(testing.allocator);
+    const stream_handle = read_results[0].result_val.payload.?.*.handle;
+
+    const descriptor_drop_args = [_]InterfaceValue{.{ .handle = descriptor_handle }};
+    try WasiCliAdapter.fsDescriptorDrop(
+        &adapter,
+        &ci,
+        &descriptor_drop_args,
+        &.{},
+        testing.allocator,
+    );
+    try testing.expect(!adapter.fs_descriptor_table.contains(descriptor_handle));
+
+    const entry_args = [_]InterfaceValue{.{ .handle = stream_handle }};
+    var entry_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDirectoryEntryStreamReadDirectoryEntry(
+        &adapter,
+        &ci,
+        &entry_args,
+        &entry_results,
+        testing.allocator,
+    );
+    defer entry_results[0].deinit(testing.allocator);
+    try testing.expect(entry_results[0].result_val.is_ok);
+    try testing.expect(entry_results[0].result_val.payload.?.*.option_val.is_some);
+
+    const stream_drop_args = [_]InterfaceValue{.{ .handle = stream_handle }};
+    try WasiCliAdapter.fsDirectoryEntryStreamDrop(
+        &adapter,
+        &ci,
+        &stream_drop_args,
+        &.{},
+        testing.allocator,
+    );
+}
+
+test "adapter resource safety: UDP stream retains its socket" {
+    if (!build_options.lib_wasi_threads or builtin.os.tag != .linux)
+        return error.SkipZigTest;
+    const testing = std.testing;
+    const linux = std.os.linux;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var address: std.Io.net.IpAddress = .{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = 0,
+    } };
+    const host_socket = try std.Io.net.IpAddress.bind(&address, io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    });
+    const socket_handle = try adapter.pushSocket(.{
+        .kind = .udp,
+        .family = .ipv4,
+        .state = .bound,
+        .host_socket = host_socket,
+    });
+    var socket_lease = adapter.lookupSocket(socket_handle).?;
+    const fd = socket_lease.value().host_socket.?.handle;
+    const stream = try adapter.allocator.create(UdpIncomingStream);
+    stream.* = .{
+        .parent_handle = socket_handle,
+        .parent_lease = if (comptime build_options.lib_wasi_threads)
+            socket_lease.table_lease.retain()
+        else {},
+        .generation = socket_lease.value().stream_generation,
+        .remote = null,
+    };
+    const stream_handle = try adapter.pushUdpIncomingStream(stream);
+    socket_lease.release();
+
+    adapter.closeSocketByHandle(socket_handle);
+    try testing.expect(!adapter.socket_table.contains(socket_handle));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+
+    var stream_lease = adapter.lookupUdpIncomingStream(stream_handle).?;
+    var parent = adapter.lockUdpIncomingParent(stream_lease.value().*).?;
+    try testing.expectEqual(fd, parent.value().host_socket.?.handle);
+    parent.release();
+    stream_lease.release();
+
+    try testing.expect(adapter.udp_incoming_streams.remove(stream_handle));
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
 }
 
 test "adapter resource safety: timer completion and cancellation claim exactly once" {

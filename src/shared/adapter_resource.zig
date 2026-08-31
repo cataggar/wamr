@@ -98,6 +98,13 @@ pub fn ResourceTableFor(
                 return false;
             }
 
+            pub fn retain(self: *const Lease) Lease {
+                if (comptime enabled) {
+                    return .{ .storage = self.storage.retain() };
+                }
+                return .{ .storage = self.storage };
+            }
+
             pub fn release(self: *Lease) void {
                 std.debug.assert(!self.locked);
                 if (comptime enabled) {
@@ -129,6 +136,7 @@ pub fn ResourceTableFor(
         stable: if (enabled) ?Stable else void = if (enabled) null else {},
         entries: if (enabled) void else std.ArrayListUnmanaged(?Entry) =
             if (enabled) {} else .empty,
+        published: if (enabled) void else usize = if (enabled) {} else 0,
         shutting_down: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, context: Context) Self {
@@ -164,6 +172,7 @@ pub fn ResourceTableFor(
             for (self.entries.items[start..], start..) |slot, index| {
                 if (slot == null) {
                     self.entries.items[index] = .{ .value = value };
+                    self.published += 1;
                     return @intCast(index);
                 }
             }
@@ -172,6 +181,7 @@ pub fn ResourceTableFor(
             }
             const handle: u32 = @intCast(self.entries.items.len);
             try self.entries.append(self.allocator, .{ .value = value });
+            self.published += 1;
             return handle;
         }
 
@@ -252,6 +262,7 @@ pub fn ResourceTableFor(
             }
             var entry = self.entries.items[handle].?;
             self.entries.items[handle] = null;
+            self.published -= 1;
             self.directory_mutex.unlock();
             Destroyer.run(self.context, &entry);
             return true;
@@ -282,6 +293,7 @@ pub fn ResourceTableFor(
                 return null;
             };
             self.entries.items[handle] = null;
+            self.published -= 1;
             self.directory_mutex.unlock();
             return entry.value;
         }
@@ -319,11 +331,7 @@ pub fn ResourceTableFor(
             } else {
                 self.directory_mutex.lock();
                 defer self.directory_mutex.unlock();
-                var count: usize = 0;
-                for (self.entries.items) |slot| {
-                    if (slot != null) count += 1;
-                }
-                return count;
+                return self.published;
             }
         }
 
@@ -343,10 +351,7 @@ pub fn ResourceTableFor(
             }
 
             self.directory_mutex.lock();
-            var count: usize = 0;
-            for (self.entries.items) |slot| {
-                if (slot != null) count += 1;
-            }
+            const count = self.published;
             self.directory_mutex.unlock();
 
             const handles = try allocator.alloc(u32, count);
@@ -392,6 +397,7 @@ pub fn ResourceTableFor(
                     if (slot.*) |entry| {
                         entry_to_destroy = entry;
                         slot.* = null;
+                        self.published -= 1;
                         break;
                     }
                 }
@@ -414,8 +420,7 @@ pub fn ResourceTableFor(
             } else {
                 self.directory_mutex.lock();
                 defer self.directory_mutex.unlock();
-                for (self.entries.items) |slot| if (slot != null) return false;
-                return true;
+                return self.published == 0;
             }
         }
 
@@ -429,11 +434,7 @@ pub fn ResourceTableFor(
             } else {
                 self.directory_mutex.lock();
                 defer self.directory_mutex.unlock();
-                var count: usize = 0;
-                for (self.entries.items) |slot| if (slot != null) {
-                    count += 1;
-                };
-                return count;
+                return self.published;
             }
         }
 
