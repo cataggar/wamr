@@ -723,14 +723,27 @@ const AotCallState = struct {
     last_trap_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
-var g_veh_installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+// 0 = uninitialized, 1 = one thread is installing, 2 = ready.
+var g_veh_install_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
 
 fn ensureVehInstalled() void {
     if (comptime !windows_trap_supported) return;
-    if (g_veh_installed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-        return;
-    if (AddVectoredExceptionHandler(1, vehHandler) == null) {
-        g_veh_installed.store(false, .release);
+    while (true) {
+        switch (g_veh_install_state.load(.acquire)) {
+            0 => {
+                if (g_veh_install_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null)
+                    continue;
+                if (AddVectoredExceptionHandler(1, vehHandler) == null) {
+                    g_veh_install_state.store(0, .release);
+                } else {
+                    g_veh_install_state.store(2, .release);
+                }
+                return;
+            },
+            1 => std.atomic.spinLoopHint(),
+            2 => return,
+            else => unreachable,
+        }
     }
 }
 
@@ -2450,7 +2463,8 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 /// Uses comptime to select the correct function pointer type based on `Result`.
 pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
-    var execution_scope = inst.thread_context.enter();
+    const call_thread_context = execution_context.current() orelse &inst.thread_context;
+    var execution_scope = call_thread_context.enter();
     defer execution_scope.deinit();
 
     // Lazy-JIT: resolve through the per-slot atomic state machine first (see
@@ -2496,12 +2510,22 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
     defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
+    const default_thread_context = vmctx.thread_context;
+    const default_wasi_ctx = vmctx.wasi_ctx;
+    vmctx.thread_context = @intFromPtr(call_thread_context);
+    if (call_thread_context.process_state) |state| {
+        vmctx.wasi_ctx = @intFromPtr(state.ptr);
+    }
+    defer {
+        vmctx.thread_context = default_thread_context;
+        vmctx.wasi_ctx = default_wasi_ctx;
+    }
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
     var aot_call_state = AotCallState{};
-    var backend_scope = inst.thread_context.bindBackendContext(@ptrCast(&aot_call_state));
+    var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
     installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
@@ -2906,7 +2930,8 @@ pub fn callFuncScalar(
     results_out: []ScalarResult,
 ) ScalarCallError![]const ScalarResult {
     if (comptime !can_execute_native) return error.UnsupportedArchitecture;
-    var execution_scope = inst.thread_context.enter();
+    const call_thread_context = execution_context.current() orelse &inst.thread_context;
+    var execution_scope = call_thread_context.enter();
     defer execution_scope.deinit();
 
     if (param_types.len != args.len) return error.ArgCountMismatch;
@@ -2972,6 +2997,16 @@ pub fn callFuncScalar(
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
     defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
+    const default_thread_context = vmctx.thread_context;
+    const default_wasi_ctx = vmctx.wasi_ctx;
+    vmctx.thread_context = @intFromPtr(call_thread_context);
+    if (call_thread_context.process_state) |state| {
+        vmctx.wasi_ctx = @intFromPtr(state.ptr);
+    }
+    defer {
+        vmctx.thread_context = default_thread_context;
+        vmctx.wasi_ctx = default_wasi_ctx;
+    }
 
     // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
@@ -2987,7 +3022,7 @@ pub fn callFuncScalar(
     }
 
     var aot_call_state = AotCallState{};
-    var backend_scope = inst.thread_context.bindBackendContext(@ptrCast(&aot_call_state));
+    var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
     installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
@@ -3018,7 +3053,7 @@ pub fn callFuncScalar(
         RtlCaptureContext(&aot_call_state.saved_ctx);
         if (aot_call_state.trap_occurred.load(.seq_cst)) {
             aot_call_state.trap_catching.store(false, .seq_cst);
-            inst.thread_context.markTrap();
+            call_thread_context.markTrap();
             // If the trap was a stack overflow, the OS consumed the
             // thread's guard page. Re-arm it here so a subsequent
             // overflow in this process is also catchable rather than
@@ -3042,7 +3077,7 @@ pub fn callFuncScalar(
         if (trap_jmp.capture(&aot_call_state.posix_trap_buf) != 0) {
             // A trap helper unwound back here.
             aot_call_state.trap_catching.store(false, .seq_cst);
-            inst.thread_context.markTrap();
+            call_thread_context.markTrap();
             readGlobalsFromStorage(inst, globals_buf);
             return error.WasmTrap;
         }

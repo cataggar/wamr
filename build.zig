@@ -704,6 +704,7 @@ pub fn build(b: *std.Build) void {
             "process state",
             "WasiProcessState",
             "thread context",
+            "VmCtx layout",
         },
     });
     const run_execution_context_runtime_tests = b.addRunArtifact(execution_context_runtime_tests);

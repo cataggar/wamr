@@ -4991,6 +4991,86 @@ test "execution context: task and cancellation state is isolated per thread" {
     try testing.expect(second_env.host_trap == null);
 }
 
+test "execution context: canon-lower bookkeeping is isolated per native thread" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var first_memory = core_types.MemoryInstance{
+        .memory_type = .{ .limits = .{ .min = 0, .max = 0 } },
+        .data = &.{},
+        .current_pages = 0,
+        .max_pages = 0,
+    };
+    var second_memory = core_types.MemoryInstance{
+        .memory_type = .{ .limits = .{ .min = 0, .max = 0 } },
+        .data = &.{},
+        .current_pages = 0,
+        .max_pages = 0,
+    };
+    var first_ctx = execution_context.ThreadExecutionContext{};
+    var second_ctx = execution_context.ThreadExecutionContext{};
+    var ready = std.atomic.Value(u32).init(0);
+    var go = std.atomic.Value(bool).init(false);
+    var first_observed: ?*core_types.MemoryInstance = null;
+    var second_observed: ?*core_types.MemoryInstance = null;
+
+    const Worker = struct {
+        fn run(
+            component_inst: *ComponentInstance,
+            thread_ctx: *execution_context.ThreadExecutionContext,
+            memory: *core_types.MemoryInstance,
+            ready_flag: *std.atomic.Value(u32),
+            go_flag: *std.atomic.Value(bool),
+            observed: *?*core_types.MemoryInstance,
+        ) void {
+            var active_scope = thread_ctx.enter();
+            defer active_scope.deinit();
+            var binding = ComponentInstance.CanonLowerCallBinding{
+                .owner = component_inst,
+                .call_ctx = .{ .memory = memory },
+            };
+            var call_scope = thread_ctx.bindRuntimeCallContext(@ptrCast(&binding));
+            defer call_scope.deinit();
+            _ = ready_flag.fetchAdd(1, .acq_rel);
+            while (!go_flag.load(.acquire)) std.atomic.spinLoopHint();
+            observed.* = component_inst.activeCanonLowerCallCtx().?.memory;
+        }
+    };
+
+    const first = try std.Thread.spawn(
+        .{},
+        Worker.run,
+        .{ inst, &first_ctx, &first_memory, &ready, &go, &first_observed },
+    );
+    const second = try std.Thread.spawn(
+        .{},
+        Worker.run,
+        .{ inst, &second_ctx, &second_memory, &ready, &go, &second_observed },
+    );
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    first.join();
+    second.join();
+
+    try testing.expectEqual(&first_memory, first_observed.?);
+    try testing.expectEqual(&second_memory, second_observed.?);
+}
+
 test "dispatchCanonBuiltin: task.cancel is idempotent" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
