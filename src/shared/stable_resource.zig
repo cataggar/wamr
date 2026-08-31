@@ -146,6 +146,62 @@ pub fn ConditionalMutex(comptime rank: u16) type {
     return ConditionalMutexFor(config.lib_wasi_threads, rank);
 }
 
+/// Exclusive operation ownership without holding a resource/table mutex.
+///
+/// Enabled callers acquire the claim only after taking a stable lease, wait
+/// without any ranked lock held, and may then perform host callbacks or I/O.
+/// The lease prevents destruction while the claim is owned. Disabled builds
+/// erase the claim entirely.
+pub fn ConditionalOperationClaimFor(comptime enabled: bool) type {
+    return if (enabled) struct {
+        state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+        pub const init: @This() = .{};
+
+        pub fn tryAcquire(self: *@This()) bool {
+            return self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+        }
+
+        pub fn acquire(self: *@This()) void {
+            var spins: usize = 0;
+            while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+                if (spins < 64) {
+                    spins += 1;
+                    std.atomic.spinLoopHint();
+                } else {
+                    std.Thread.yield() catch std.atomic.spinLoopHint();
+                }
+            }
+        }
+
+        pub fn release(self: *@This()) void {
+            if (comptime debug_lock_tracking) {
+                const observed = self.state.cmpxchgStrong(
+                    1,
+                    0,
+                    .release,
+                    .monotonic,
+                );
+                std.debug.assert(observed == null);
+            } else {
+                self.state.store(0, .release);
+            }
+        }
+    } else struct {
+        pub const init: @This() = .{};
+
+        pub inline fn tryAcquire(_: *@This()) bool {
+            return true;
+        }
+
+        pub inline fn acquire(_: *@This()) void {}
+        pub inline fn release(_: *@This()) void {}
+    };
+}
+
+pub const ConditionalOperationClaim =
+    ConditionalOperationClaimFor(config.lib_wasi_threads);
+
 /// An atomic reference count whose disabled specialization has no state.
 ///
 /// `release` always reports the sole reference in the disabled specialization;
@@ -431,6 +487,12 @@ pub fn StableHandleTableForStart(
                 return self.node.?.getState() != .published;
             }
 
+            pub fn retain(self: *const Lease) Lease {
+                const node = self.node.?;
+                if (comptime enabled) node.refs.retain();
+                return .{ .node = node };
+            }
+
             pub fn release(self: *Lease) void {
                 const node = self.node orelse return;
                 self.node = null;
@@ -442,6 +504,11 @@ pub fn StableHandleTableForStart(
             pub fn deinit(self: *Lease) void {
                 self.release();
             }
+        };
+
+        pub const Publication = struct {
+            handle: Handle,
+            lease: Lease,
         };
 
         control: ?*Control,
@@ -462,6 +529,22 @@ pub fn StableHandleTableForStart(
         /// lock. On failure all table allocations are rolled back and the
         /// caller still owns `value`.
         pub fn publish(self: *Self, value: T) !Handle {
+            const node = try self.publishNode(value, false);
+            return node.handle;
+        }
+
+        /// Publish and atomically retain a lease before the handle can be
+        /// retired. Used when initialization continues after publication,
+        /// such as arming a worker-backed pending operation.
+        pub fn publishLeased(self: *Self, value: T) !Publication {
+            const node = try self.publishNode(value, true);
+            return .{
+                .handle = node.handle,
+                .lease = .{ .node = node },
+            };
+        }
+
+        fn publishNode(self: *Self, value: T, comptime retain_lease: bool) !*Node {
             const control = self.control.?;
             assertNoLocksHeldFor(enabled);
 
@@ -470,6 +553,7 @@ pub fn StableHandleTableForStart(
             defer if (!committed) control.allocator.destroy(node);
             node.* = .{
                 .owner = control,
+                .refs = RefCount.init(if (retain_lease) 2 else 1),
                 .value = value,
             };
 
@@ -497,7 +581,7 @@ pub fn StableHandleTableForStart(
                     recordPublish(control);
                     control.directory.unlock();
                     committed = true;
-                    return node.handle;
+                    return node;
                 }
 
                 if (control.tail) |tail| {
@@ -511,7 +595,7 @@ pub fn StableHandleTableForStart(
                         recordPublish(control);
                         control.directory.unlock();
                         committed = true;
-                        return node.handle;
+                        return node;
                     }
                 }
 
@@ -547,7 +631,7 @@ pub fn StableHandleTableForStart(
                     recordPublish(control);
                     control.directory.unlock();
                     committed = true;
-                    return node.handle;
+                    return node;
                 }
 
                 if (control.tail) |tail| {
@@ -1234,6 +1318,9 @@ comptime {
     if (@sizeOf(ConditionalRefCountFor(false)) != 0) {
         @compileError("disabled ConditionalRefCount must have zero size");
     }
+    if (@sizeOf(ConditionalOperationClaimFor(false)) != 0) {
+        @compileError("disabled ConditionalOperationClaim must have zero size");
+    }
 }
 
 const TestResource = struct {
@@ -1278,6 +1365,7 @@ test "disabled conditional synchronization compiles to zero-sized no-ops" {
         @sizeOf(ConditionalMutexFor(false, LockRank.resource_directory)),
     );
     try std.testing.expectEqual(@as(usize, 0), @sizeOf(ConditionalRefCountFor(false)));
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(ConditionalOperationClaimFor(false)));
 
     var mutex: ConditionalMutexFor(false, LockRank.resource_directory) = .init;
     try std.testing.expect(mutex.tryLock());
@@ -1290,6 +1378,22 @@ test "disabled conditional synchronization compiles to zero-sized no-ops" {
     try std.testing.expectEqual(@as(usize, 1), refs.count());
     try std.testing.expect(refs.release());
     try std.testing.expect(debugNoLocksHeldFor(false));
+
+    var claim: ConditionalOperationClaimFor(false) = .init;
+    try std.testing.expect(claim.tryAcquire());
+    claim.release();
+    claim.acquire();
+    claim.release();
+}
+
+test "operation claims serialize ownership without ranked locks" {
+    var claim: ConditionalOperationClaimFor(true) = .init;
+    try std.testing.expect(claim.tryAcquire());
+    try std.testing.expect(!claim.tryAcquire());
+    try std.testing.expect(debugNoLocksHeldFor(true));
+    claim.release();
+    try std.testing.expect(claim.tryAcquire());
+    claim.release();
 }
 
 test "configured aliases follow lib_wasi_threads" {
@@ -1369,6 +1473,21 @@ test "remove racing a lease leaves its node usable and closing" {
     try std.testing.expectEqual(@as(usize, 73), lease.value().value);
     try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
     lease.release();
+    try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
+    try table.deinit();
+}
+
+test "publishLeased establishes ownership before removal can retire a node" {
+    const Table = TestTable(true, 2);
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = try Table.init(std.testing.allocator, &destroyed);
+
+    var published = try table.publishLeased(.{ .value = 91 });
+    try std.testing.expect(table.remove(published.handle));
+    try std.testing.expect(published.lease.isClosing());
+    try std.testing.expectEqual(@as(usize, 91), published.lease.value().value);
+    try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
+    published.lease.release();
     try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
     try table.deinit();
 }

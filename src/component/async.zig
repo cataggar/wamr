@@ -680,6 +680,9 @@ pub const HostStreamDriver = struct {
     /// stream. Socket sinks use this to propagate EOF with a half-close
     /// after all preceding writes have reached the host fd.
     on_drop_writable: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Releases the host-owned context after both stream ends are gone.
+    /// Called exactly once by `AsyncStream.deinit`, outside table locks.
+    on_destroy: ?*const fn (ctx: ?*anyopaque) void = null,
 };
 
 /// A component-level async stream — FIFO byte channel parameterised on
@@ -770,6 +773,10 @@ pub const AsyncStream = struct {
     /// Free any heap-owned state (currently just the FIFO `buffer`).
     /// Safe to call multiple times.
     pub fn deinit(self: *AsyncStream, allocator: std.mem.Allocator) void {
+        if (self.host_driver) |driver| {
+            if (driver.on_destroy) |destroy| destroy(driver.context);
+            self.host_driver = null;
+        }
         self.buffer.deinit(allocator);
     }
 };
