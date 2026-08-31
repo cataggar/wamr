@@ -16,6 +16,11 @@ pub const LockRank = struct {
     pub const resource_registry: u16 = 50;
     pub const resource_directory: u16 = 100;
     pub const resource_node: u16 = 200;
+    pub const adapter_relation: u16 = 210;
+    pub const adapter_input_stream: u16 = 220;
+    pub const adapter_output_stream: u16 = 221;
+    pub const adapter_resource: u16 = 230;
+    pub const adapter_state: u16 = 240;
     pub const core_instance: u16 = 250;
     pub const core_table: u16 = 300;
 };
@@ -120,6 +125,36 @@ pub fn ConditionalMutexFor(comptime enabled: bool, comptime rank: u16) type {
 pub fn ConditionalMutex(comptime rank: u16) type {
     return ConditionalMutexFor(config.lib_wasi_threads, rank);
 }
+
+/// A zero-sized disabled / ordinary blocking mutex enabled specialization
+/// for resource operation gates. Unlike table mutexes, operation gates are
+/// intentionally unranked because they may cover host I/O but must never be
+/// held by table directory code or resource destructors.
+pub fn ConditionalOperationMutexFor(comptime enabled: bool) type {
+    return if (enabled) struct {
+        state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+        pub const init: @This() = .{};
+
+        pub fn lock(self: *@This()) void {
+            while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        pub fn unlock(self: *@This()) void {
+            self.state.store(0, .release);
+        }
+    } else struct {
+        pub const init: @This() = .{};
+
+        pub inline fn lock(_: *@This()) void {}
+        pub inline fn unlock(_: *@This()) void {}
+    };
+}
+
+pub const ConditionalOperationMutex =
+    ConditionalOperationMutexFor(config.lib_wasi_threads);
 
 /// An atomic reference count whose disabled specialization has no state.
 ///
@@ -655,6 +690,44 @@ pub fn StableHandleTableFor(
             };
         }
 
+        /// Return a point-in-time copy of all currently-published handles.
+        /// Allocation and caller work happen outside the directory lock.
+        pub fn snapshotHandles(
+            self: *Self,
+            allocator: std.mem.Allocator,
+        ) ![]Handle {
+            const control = self.control.?;
+            while (true) {
+                control.directory.lock();
+                const capacity = control.published;
+                control.directory.unlock();
+
+                const handles = try allocator.alloc(Handle, capacity);
+                var filled: usize = 0;
+                control.directory.lock();
+                if (control.published > handles.len) {
+                    control.directory.unlock();
+                    allocator.free(handles);
+                    continue;
+                }
+                var chunk = control.head;
+                while (chunk) |current| : (chunk = current.next) {
+                    for (current.slots[0..current.used]) |slot| {
+                        switch (slot) {
+                            .published => |node| {
+                                handles[filled] = node.handle;
+                                filled += 1;
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                control.directory.unlock();
+                if (filled == handles.len) return handles;
+                return try allocator.realloc(handles, filled);
+            }
+        }
+
         /// Shuts down and frees an already-quiescent table. Outstanding
         /// enabled-build leases leave the table intact and return an error.
         pub fn deinit(self: *Self) !void {
@@ -740,6 +813,9 @@ comptime {
     }
     if (@sizeOf(ConditionalRefCountFor(false)) != 0) {
         @compileError("disabled ConditionalRefCount must have zero size");
+    }
+    if (@sizeOf(ConditionalOperationMutexFor(false)) != 0) {
+        @compileError("disabled ConditionalOperationMutex must have zero size");
     }
 }
 

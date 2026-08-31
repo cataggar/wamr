@@ -243,6 +243,24 @@ pub fn build(b: *std.Build) void {
         stable_resources_test_step.dependOn(&run_stable_tests.step);
     }
 
+    const adapter_resources_test_step = b.step(
+        "test-adapter-resources",
+        "Run conditional stable WASI adapter resource tests",
+    );
+    inline for (.{ false, true }) |threads_enabled| {
+        const adapter_resource_options = b.addOptions();
+        adapter_resource_options.addOption(bool, "lib_wasi_threads", threads_enabled);
+        const adapter_resource_test_module = b.createModule(.{
+            .root_source_file = b.path("src/shared/adapter_resource.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        adapter_resource_test_module.addImport("config", adapter_resource_options.createModule());
+        const adapter_resource_tests = b.addTest(.{ .root_module = adapter_resource_test_module });
+        const run_adapter_resource_tests = b.addRunArtifact(adapter_resource_tests);
+        adapter_resources_test_step.dependOn(&run_adapter_resource_tests.step);
+    }
+
     const threads_contract_test_module = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
         .target = target,
