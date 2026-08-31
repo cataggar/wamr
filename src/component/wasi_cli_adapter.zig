@@ -1047,9 +1047,7 @@ pub const FsPreopen = struct {
 /// stream.
 pub const DirEntryStream = struct {
     iter: *std.Io.Dir.Iterator,
-    operation_mutex: stable_resource.ConditionalMutex(
-        stable_resource.LockRank.resource_node,
-    ) = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
 };
 
 /// Close a descriptor's underlying handle. Used by both
@@ -1155,7 +1153,7 @@ const PendingTcpOp = enum { idle, bind_done, listen_done, connect_done };
 /// `std.Io.net.Server` once `start-listen` succeeds (#178 PR A).
 /// UDP holds a `host_socket` after `start-bind` succeeds (#178 PR C).
 pub const Socket = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     kind: SocketKind,
     family: IpAddressFamily,
     /// Monotonic adapter-local identity assigned by `pushSocket`.
@@ -1483,12 +1481,16 @@ pub const SocketsP3StreamCtx = struct {
     adapter: *WasiCliAdapter,
     registry_handle: u32 = std.math.maxInt(u32),
     self_lease: ?SocketsP3StreamCtxTable.Lease = null,
+    socket_handle: ?u32 = null,
+    socket_lease: if (build_options.lib_wasi_threads) ?SocketTable.Lease else void =
+        if (build_options.lib_wasi_threads) null else {},
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     fd: std.posix.fd_t,
     family: IpAddressFamily,
     cancelled: std.atomic.Value(bool) = .{ .raw = false },
     component_instance: ?*ComponentInstance = null,
     completion_future: ?u32 = null,
-    send_failed: bool = false,
+    send_failed: std.atomic.Value(bool) = .{ .raw = false },
 };
 
 /// Lifetime-stable context for a `host_driver` attached to an
@@ -1506,6 +1508,7 @@ pub const FsWriteStreamCtx = struct {
     adapter: *WasiCliAdapter,
     registry_handle: u32 = std.math.maxInt(u32),
     self_lease: ?FsWriteStreamCtxTable.Lease = null,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     /// Guest-visible `descriptor` handle for the target file. We
     /// re-lookup on every callback instead of stashing a `std.Io.File`
     /// by value so a `[resource-drop]descriptor` mid-stream surfaces
@@ -4034,7 +4037,7 @@ pub const HttpFieldEntry = struct {
 };
 
 pub const HttpFields = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     entries: std.ArrayListUnmanaged(HttpFieldEntry) = .empty,
     /// `[static]fields.from-list` returns mutable fields per WIT; the
     /// flag exists so a future implementation of header-immutability
@@ -4327,7 +4330,7 @@ pub fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
 /// which the default-deny adapter accepts as ok no-ops (real header
 /// validation is deferred). String fields are owned host slices.
 pub const OutgoingRequest = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     method_disc: u32 = 0, // .get
     method_other: ?[]u8 = null,
     path_with_query: ?[]u8 = null,
@@ -4350,7 +4353,7 @@ pub const OutgoingRequest = struct {
 /// accepted HTTP/1.1 requests; fields are owned by the adapter and exposed
 /// through the usual resource handles.
 pub const IncomingRequest = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     method_disc: u32 = 0, // .get
     method_other: ?[]u8 = null,
     path_with_query: ?[]u8 = null,
@@ -4376,7 +4379,7 @@ pub const IncomingRequest = struct {
 /// `future-incoming-response.get` happy path once #149 follow-up wires
 /// real outbound HTTP (#176).
 pub const IncomingResponse = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     status: u16 = 0,
     headers_handle: u32 = 0,
     body_consumed: bool = false,
@@ -4391,7 +4394,7 @@ pub const IncomingResponse = struct {
 
 /// `wasi:http/types.outgoing-response`.
 pub const OutgoingResponse = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     status: u16 = 200,
     headers_handle: u32,
     body_consumed: bool = false,
@@ -4401,17 +4404,12 @@ pub const OutgoingResponse = struct {
 /// `wasi:http/types.incoming-body`. Holds readable body data
 /// transferred from `IncomingResponse` on `consume`.
 pub const IncomingBody = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     /// Owned body bytes. Freed on drop.
     data: ?[]u8 = null,
     stream_taken: bool = false,
-    /// Internal lease retained by the body so dropping the guest's stream
-    /// handle cannot invalidate the buffered response before body teardown.
-    stream: ?InputStreamTable.Lease = null,
 
     pub fn deinit(self: *IncomingBody, allocator: Allocator) void {
-        if (self.stream) |*lease| lease.release();
-        self.stream = null;
         if (self.data) |d| allocator.free(d);
         self.data = null;
     }
@@ -4419,17 +4417,17 @@ pub const IncomingBody = struct {
 
 /// `wasi:http/types.outgoing-body`.
 pub const OutgoingBody = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     /// Set by `[method]outgoing-body.write` to ensure a second call
     /// returns err per WIT contract.
     stream_taken: bool = false,
-    /// Internal lease retained by the body so `finish` can read the bytes
+    /// Shared owner retained by the body so `finish` can read the bytes
     /// after the guest drops its own output-stream handle.
-    stream: ?OutputStreamTable.Lease = null,
+    stream_owner: ?*OutputStreamOwner = null,
 
     pub fn deinit(self: *OutgoingBody) void {
-        if (self.stream) |*lease| lease.release();
-        self.stream = null;
+        if (self.stream_owner) |owner| owner.release();
+        self.stream_owner = null;
     }
 };
 
@@ -4452,7 +4450,7 @@ pub const FutureIncomingResponse = struct {
         ready_err: u32, // HttpErrorCode discriminant
     };
 
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     state: State,
 
     /// True on the second `.get()` call — the WIT says a future must
@@ -4464,7 +4462,7 @@ pub const FutureIncomingResponse = struct {
 /// `wasi:http/types.future-trailers`. Default-deny resolves to
 /// `some(ok(ok(none)))` (no trailers).
 pub const FutureTrailers = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     polled: bool = false,
 };
 
@@ -4557,7 +4555,7 @@ pub const TimerFuture = struct {
 /// those phases require a deadline-aware HTTP/TLS reader and remain
 /// #616 A1b / A7 work.
 pub const RequestOptions = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     connect_timeout_ns: ?u64 = null,
     first_byte_timeout_ns: ?u64 = null,
     between_bytes_timeout_ns: ?u64 = null,
@@ -4573,7 +4571,7 @@ pub const ResponseOutparam = struct {
         err: u32,
     };
 
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     state: State = .unset,
 };
 
@@ -4583,7 +4581,7 @@ pub const ResponseOutparam = struct {
 /// and transmission-result live in `ComponentInstance.futures`. Field
 /// strings are owned host slices.
 pub const HttpRequestP3 = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     method_disc: u32 = 0, // .get
     method_other: ?[]u8 = null,
     path_with_query: ?[]u8 = null,
@@ -4617,7 +4615,7 @@ pub const HttpRequestP3 = struct {
 /// `wasi:http/types@0.3.0` unified response resource (#487).
 /// Merges 0.2's `incoming-response` + `outgoing-response`.
 pub const HttpResponseP3 = struct {
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
     status: u16 = 200,
     headers_handle: u32 = 0,
     /// Handle into `ComponentInstance.streams` for body stream<u8>.
@@ -4710,9 +4708,7 @@ pub const WasiLogLevel = enum(u32) {
 pub const KeyvalueBucket = struct {
     identifier: []const u8,
     entries: std.StringHashMapUnmanaged([]const u8) = .empty,
-    operation_mutex: stable_resource.ConditionalMutex(
-        stable_resource.LockRank.adapter_resource,
-    ) = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
 
     pub fn deinit(self: *KeyvalueBucket, allocator: Allocator) void {
         var it = self.entries.iterator();
@@ -4775,9 +4771,7 @@ pub const Cas = struct {
     key: []const u8,
     observed: []const u8,
     is_observed: bool,
-    operation_mutex: stable_resource.ConditionalMutex(
-        stable_resource.LockRank.adapter_relation,
-    ) = .init,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
 
     pub fn deinit(self: *Cas, allocator: Allocator) void {
         allocator.free(self.key);
@@ -4993,24 +4987,45 @@ const InputStreamResource = struct {
     owned_buffer: ?[]u8 = null,
     descriptor_lease: ?FsDescriptorTable.Lease = null,
     socket_lease: ?SocketTable.Lease = null,
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
-    shared_operation_mutex: ?*stable_resource.ConditionalOperationMutex = null,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    shared_operation_claim: ?*stable_resource.ConditionalOperationClaim = null,
 
-    fn mutex(self: *InputStreamResource) *stable_resource.ConditionalOperationMutex {
-        return self.shared_operation_mutex orelse &self.operation_mutex;
+    fn claim(self: *InputStreamResource) *stable_resource.ConditionalOperationClaim {
+        return self.shared_operation_claim orelse &self.operation_claim;
+    }
+};
+
+const OutputStreamOwner = struct {
+    allocator: Allocator,
+    refs: stable_resource.ConditionalLifetimeRefCount =
+        stable_resource.ConditionalLifetimeRefCount.init(1),
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    stream: *streams.OutputStream,
+
+    fn retain(self: *OutputStreamOwner) void {
+        self.refs.retain();
+    }
+
+    fn release(self: *OutputStreamOwner) void {
+        if (!self.refs.release()) return;
+        self.stream.deinit(self.allocator);
+        self.allocator.destroy(self.stream);
+        self.allocator.destroy(self);
     }
 };
 
 const OutputStreamResource = struct {
     stream: *streams.OutputStream,
     owned: bool,
+    owner: ?*OutputStreamOwner = null,
     descriptor_lease: ?FsDescriptorTable.Lease = null,
     socket_lease: ?SocketTable.Lease = null,
-    operation_mutex: stable_resource.ConditionalOperationMutex = .init,
-    shared_operation_mutex: ?*stable_resource.ConditionalOperationMutex = null,
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    shared_operation_claim: ?*stable_resource.ConditionalOperationClaim = null,
 
-    fn mutex(self: *OutputStreamResource) *stable_resource.ConditionalOperationMutex {
-        return self.shared_operation_mutex orelse &self.operation_mutex;
+    fn claim(self: *OutputStreamResource) *stable_resource.ConditionalOperationClaim {
+        if (self.owner) |owner| return &owner.operation_claim;
+        return self.shared_operation_claim orelse &self.operation_claim;
     }
 };
 
@@ -5030,7 +5045,9 @@ fn destroyOutputStreamResource(
 ) void {
     if (resource.descriptor_lease) |*lease| lease.release();
     if (resource.socket_lease) |*lease| lease.release();
-    if (resource.owned) {
+    if (resource.owner) |owner| {
+        owner.release();
+    } else if (resource.owned) {
         resource.stream.deinit(allocator);
         allocator.destroy(resource.stream);
     }
@@ -5187,6 +5204,10 @@ fn destroySocketsP3StreamCtx(
     allocator: Allocator,
     context: **SocketsP3StreamCtx,
 ) void {
+    if (comptime build_options.lib_wasi_threads) {
+        if (context.*.socket_lease) |*lease| lease.release();
+        context.*.socket_lease = null;
+    }
     allocator.destroy(context.*);
 }
 
@@ -5231,8 +5252,10 @@ const SocketTable = adapter_resource.ResourceTable(
 const SocketLease = struct {
     table_lease: SocketTable.Lease,
     socket: *Socket,
+    claimed: bool = true,
 
     fn value(self: *SocketLease) *Socket {
+        std.debug.assert(self.claimed);
         return self.socket;
     }
 
@@ -5240,8 +5263,14 @@ const SocketLease = struct {
         return self.table_lease.isClosing();
     }
 
+    fn releaseClaim(self: *SocketLease) void {
+        if (!self.claimed) return;
+        self.claimed = false;
+        self.socket.operation_claim.release();
+    }
+
     fn release(self: *SocketLease) void {
-        self.socket.operation_mutex.unlock();
+        self.releaseClaim();
         self.table_lease.release();
     }
 };
@@ -5373,17 +5402,21 @@ const PollableTable = adapter_resource.ResourceTable(
     destroyPollable,
     false,
 );
-const PendingHttpFetchTable = adapter_resource.ResourceTable(
+const PendingHttpFetchTable = adapter_resource.ResourceTableFor(
+    true,
     PendingHttpFetch,
     Allocator,
     destroyPendingHttpFetch,
     false,
+    64,
 );
-const PendingHttpFetchP3Table = adapter_resource.ResourceTable(
+const PendingHttpFetchP3Table = adapter_resource.ResourceTableFor(
+    true,
     PendingHttpFetchP3,
     Allocator,
     destroyPendingHttpFetchP3,
     false,
+    64,
 );
 const PendingUdpReceiveTable = adapter_resource.ResourceTable(
     PendingUdpReceive,
@@ -5421,12 +5454,15 @@ fn LockedPointerLease(comptime Table: type, comptime T: type) type {
         table_lease: Table.Lease,
         resource: *T,
         logical_lock: bool = false,
+        claimed: bool = true,
 
         fn value(self: *@This()) **T {
+            std.debug.assert(self.claimed);
             return &self.resource;
         }
 
         fn lock(self: *@This()) **T {
+            std.debug.assert(self.claimed);
             std.debug.assert(!self.logical_lock);
             self.logical_lock = true;
             return &self.resource;
@@ -5441,9 +5477,16 @@ fn LockedPointerLease(comptime Table: type, comptime T: type) type {
             return self.table_lease.isClosing();
         }
 
+        fn releaseClaim(self: *@This()) void {
+            std.debug.assert(!self.logical_lock);
+            if (!self.claimed) return;
+            self.claimed = false;
+            self.resource.operation_claim.release();
+        }
+
         fn release(self: *@This()) void {
             std.debug.assert(!self.logical_lock);
-            self.resource.operation_mutex.unlock();
+            self.releaseClaim();
             self.table_lease.release();
         }
     };
@@ -5456,7 +5499,7 @@ fn lockPointerLease(
 ) LockedPointerLease(Table, T) {
     var table_lease = owned_lease;
     const resource = table_lease.value().*;
-    resource.operation_mutex.lock();
+    resource.operation_claim.acquire();
     return .{ .table_lease = table_lease, .resource = resource };
 }
 
@@ -5487,14 +5530,15 @@ pub const WasiCliAdapter = struct {
     /// `setStdinBytes` before running the component. The slice is
     /// borrowed — keep it alive for as long as the component runs.
     stdin: streams.InputStream = .{ .source = .closed },
-    stdout_operation_mutex: stable_resource.ConditionalOperationMutex = .init,
-    stderr_operation_mutex: stable_resource.ConditionalOperationMutex = .init,
-    stdin_operation_mutex: stable_resource.ConditionalOperationMutex = .init,
+    stdout_operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    stderr_operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    stdin_operation_claim: stable_resource.ConditionalOperationClaim = .init,
 
     /// `wasi:cli/exit.exit` (or `exit-with-code`). The host fn
     /// also returns `error.Trap`; `runLoadedComponent` checks this
     /// field to translate the trap into a normal `RunOutcome`.
     exit_code: ?u32 = null,
+    exit_state_claim: stable_resource.ConditionalOperationClaim = .init,
 
     /// argv passed to the component via `wasi:cli/environment.get-arguments`.
     /// Borrowed — caller keeps slice alive for the run. Default empty.
@@ -5659,9 +5703,7 @@ pub const WasiCliAdapter = struct {
     /// `dir_handle` indexes into `fs_descriptor_table`. The string is owned
     /// by the adapter and freed in `deinit`.
     fs_preopens: std.ArrayListUnmanaged(FsPreopen) = .empty,
-    fs_preopens_mutex: stable_resource.ConditionalMutex(
-        stable_resource.LockRank.adapter_state,
-    ) = .init,
+    fs_preopens_claim: stable_resource.ConditionalOperationClaim = .init,
     /// `wasi:filesystem/types.directory-entry-stream` resource table (#476).
     /// Slot index = guest handle. Each live slot owns a heap-allocated
     /// `std.Io.Dir.Iterator`. Slots are nulled on
@@ -5687,9 +5729,7 @@ pub const WasiCliAdapter = struct {
     ///   * 0.3 DNS (`resolveAddressesP3`) → `name-unresolvable`.
     ///   * Outbound HTTP (0.2 + 0.3) → `HTTP_request_denied`.
     sockets_allow_list_template: []IpCidr = &.{},
-    configuration_mutex: stable_resource.ConditionalMutex(
-        stable_resource.LockRank.adapter_state,
-    ) = .init,
+    configuration_claim: stable_resource.ConditionalOperationClaim = .init,
     /// `wasi:sockets/{tcp,udp}` socket resource table. Slot index = guest
     /// handle (shared across both kinds — `Socket.kind` discriminates).
     /// Slots are nulled on `[resource-drop]tcp-socket` /
@@ -5818,7 +5858,7 @@ pub const WasiCliAdapter = struct {
     /// `deinit` frees it. File format documented in
     /// `setKeyvalueStorePath`.
     keyvalue_store_path: ?[]const u8 = null,
-    keyvalue_state_mutex: stable_resource.ConditionalOperationMutex = .init,
+    keyvalue_state_claim: stable_resource.ConditionalOperationClaim = .init,
     /// `wasi:io/poll.pollable` table. Pollables borrow their source
     /// resources and become ready if that source is dropped/closed, so the
     /// guest can observe the underlying closed/error condition without UAF.
@@ -5847,9 +5887,7 @@ pub const WasiCliAdapter = struct {
     /// `timer_futures` because the `ComponentInstance.futures` handle is
     /// stable until the guest calls `future.drop`.
     timer_future_ready: std.AutoHashMapUnmanaged(u32, bool) = .empty,
-    async_state_mutex: stable_resource.ConditionalMutex(
-        stable_resource.LockRank.adapter_state,
-    ) = .init,
+    async_state_claim: stable_resource.ConditionalOperationClaim = .init,
 
     /// `wasi:io/error.error` handles that originated from a wasi:http
     /// operation, with the specific `wasi:http/types.error-code` variant
@@ -5869,6 +5907,7 @@ pub const WasiCliAdapter = struct {
     /// on first use. Tests can overwrite this before invoking the component
     /// to get deterministic output.
     insecure_prng: ?std.Random.DefaultPrng = null,
+    random_state_claim: stable_resource.ConditionalOperationClaim = .init,
 
     /// Memoised `wasi:random/insecure-seed.{get-,}insecure-seed` value.
     /// Per WASI's spec the function is meant to be called once and any
@@ -6144,10 +6183,10 @@ pub const WasiCliAdapter = struct {
 
         self.network_table.deinit() catch
             @panic("WasiCliAdapter destroyed with outstanding network leases");
-        self.configuration_mutex.lock();
+        self.configuration_claim.acquire();
         const sockets_allow_list_template = self.sockets_allow_list_template;
         self.sockets_allow_list_template = &.{};
-        self.configuration_mutex.unlock();
+        self.configuration_claim.release();
         if (sockets_allow_list_template.len != 0)
             self.allocator.free(sockets_allow_list_template);
         self.socket_table.deinit() catch
@@ -6299,8 +6338,8 @@ pub const WasiCliAdapter = struct {
     /// Set the captured stdin to read from `bytes`. The slice is
     /// borrowed — caller must keep it alive for the run.
     pub fn setStdinBytes(self: *WasiCliAdapter, bytes: []const u8) void {
-        self.stdin_operation_mutex.lock();
-        defer self.stdin_operation_mutex.unlock();
+        self.stdin_operation_claim.acquire();
+        defer self.stdin_operation_claim.release();
         self.stdin = streams.InputStream.fromBuffer(bytes);
     }
 
@@ -6347,10 +6386,10 @@ pub const WasiCliAdapter = struct {
     /// preserved (the partially-filled buffer is freed).
     pub fn setSocketsAllowList(self: *WasiCliAdapter, cidrs: []const []const u8) !void {
         if (cidrs.len == 0) {
-            self.configuration_mutex.lock();
+            self.configuration_claim.acquire();
             const old = self.sockets_allow_list_template;
             self.sockets_allow_list_template = &.{};
-            self.configuration_mutex.unlock();
+            self.configuration_claim.release();
             if (old.len != 0) self.allocator.free(old);
             return;
         }
@@ -6360,16 +6399,16 @@ pub const WasiCliAdapter = struct {
         while (filled < cidrs.len) : (filled += 1) {
             parsed[filled] = try IpCidr.parse(cidrs[filled]);
         }
-        self.configuration_mutex.lock();
+        self.configuration_claim.acquire();
         const old = self.sockets_allow_list_template;
         self.sockets_allow_list_template = parsed;
-        self.configuration_mutex.unlock();
+        self.configuration_claim.release();
         if (old.len != 0) self.allocator.free(old);
     }
 
     fn hasSocketsAllowList(self: *WasiCliAdapter) bool {
-        self.configuration_mutex.lock();
-        defer self.configuration_mutex.unlock();
+        self.configuration_claim.acquire();
+        defer self.configuration_claim.release();
         return self.sockets_allow_list_template.len != 0;
     }
 
@@ -6377,14 +6416,14 @@ pub const WasiCliAdapter = struct {
         self: *WasiCliAdapter,
         address: std.Io.net.IpAddress,
     ) bool {
-        self.configuration_mutex.lock();
-        defer self.configuration_mutex.unlock();
+        self.configuration_claim.acquire();
+        defer self.configuration_claim.release();
         return templateAllows(self.sockets_allow_list_template, address);
     }
 
     fn cloneSocketsAllowList(self: *WasiCliAdapter) ![]IpCidr {
-        self.configuration_mutex.lock();
-        defer self.configuration_mutex.unlock();
+        self.configuration_claim.acquire();
+        defer self.configuration_claim.release();
         if (self.sockets_allow_list_template.len == 0) return &.{};
         return try self.allocator.dupe(IpCidr, self.sockets_allow_list_template);
     }
@@ -7253,18 +7292,18 @@ pub const WasiCliAdapter = struct {
             .input_stream => |handle| {
                 var lease = self.lookupInputStream(handle) orelse return null;
                 const resource = lease.value();
-                const mutex = resource.mutex();
-                mutex.lock();
+                const claim = resource.claim();
+                claim.acquire();
                 const fd = switch (resource.stream.source) {
                     .fd => |value| value,
                     .tcp_stream => |value| value,
                     else => {
-                        mutex.unlock();
+                        claim.release();
                         lease.release();
                         return null;
                     },
                 };
-                mutex.unlock();
+                claim.release();
                 return .{
                     .fd = fd,
                     .events = pollInEvents(),
@@ -7274,18 +7313,18 @@ pub const WasiCliAdapter = struct {
             .output_stream => |handle| {
                 var lease = self.lookupStream(handle) orelse return null;
                 const resource = lease.value();
-                const mutex = resource.mutex();
-                mutex.lock();
+                const claim = resource.claim();
+                claim.acquire();
                 const fd = switch (resource.stream.sink) {
                     .fd => |value| value,
                     .tcp_stream => |value| value,
                     else => {
-                        mutex.unlock();
+                        claim.release();
                         lease.release();
                         return null;
                     },
                 };
-                mutex.unlock();
+                claim.release();
                 return .{
                     .fd = fd,
                     .events = pollOutEvents(),
@@ -7300,6 +7339,7 @@ pub const WasiCliAdapter = struct {
                     return null;
                 };
                 const events = if (socket.state == .connected) pollInEvents() | pollOutEvents() else pollInEvents();
+                socket_lease.releaseClaim();
                 return .{
                     .fd = fd,
                     .events = events,
@@ -7328,6 +7368,7 @@ pub const WasiCliAdapter = struct {
                     stream_lease.release();
                     return null;
                 };
+                socket_lease.releaseClaim();
                 return .{
                     .fd = host_socket.handle,
                     .events = pollInEvents(),
@@ -7359,6 +7400,7 @@ pub const WasiCliAdapter = struct {
                     stream_lease.release();
                     return null;
                 };
+                socket_lease.releaseClaim();
                 return .{
                     .fd = host_socket.handle,
                     .events = pollOutEvents(),
@@ -7383,6 +7425,7 @@ pub const WasiCliAdapter = struct {
                     future_lease.release();
                     return null;
                 }
+                future_lease.releaseClaim();
                 const operation_handles = self.pending_http_fetches.snapshotHandles(
                     self.allocator,
                 ) catch {
@@ -7427,30 +7470,30 @@ pub const WasiCliAdapter = struct {
                 var lease = self.lookupInputStream(handle) orelse break :blk true;
                 defer lease.release();
                 const resource = lease.value();
-                const mutex = resource.mutex();
-                mutex.lock();
+                const claim = resource.claim();
+                claim.acquire();
                 const ready = switch (resource.stream.source) {
                     .buffer, .host_file, .closed => true,
                     .fd => |fd| fdPollReady(fd, pollInEvents()),
                     .tcp_stream => |fd| fdPollReady(fd, pollInEvents()),
                     .tls => true,
                 };
-                mutex.unlock();
+                claim.release();
                 break :blk ready;
             },
             .output_stream => |handle| blk: {
                 var lease = self.lookupStream(handle) orelse break :blk true;
                 defer lease.release();
                 const resource = lease.value();
-                const mutex = resource.mutex();
-                mutex.lock();
+                const claim = resource.claim();
+                claim.acquire();
                 const ready = switch (resource.stream.sink) {
                     .buffer, .host_file, .closed => true,
                     .fd => |fd| fdPollReady(fd, pollOutEvents()),
                     .tcp_stream => |fd| fdPollReady(fd, pollOutEvents()),
                     .tls => true,
                 };
-                mutex.unlock();
+                claim.release();
                 break :blk ready;
             },
             .tcp_socket => |handle| blk: {
@@ -7500,8 +7543,8 @@ pub const WasiCliAdapter = struct {
             },
             .http_future_trailers => true,
             .future_timer => |fut_handle| blk: {
-                self.async_state_mutex.lock();
-                defer self.async_state_mutex.unlock();
+                self.async_state_claim.acquire();
+                defer self.async_state_claim.release();
                 break :blk self.timer_future_ready.get(fut_handle) orelse false;
             },
         };
@@ -8117,7 +8160,9 @@ pub const WasiCliAdapter = struct {
         const capped: usize = @min(want, 64 * 1024);
         const buf = try allocator.alloc(u8, capped);
         defer allocator.free(buf);
+        self.random_state_claim.acquire();
         self.ensureInsecurePrng().bytes(buf);
+        self.random_state_claim.release();
         const guest_ptr = ci.hostAllocAndWrite(buf, 1) orelse return error.IoError;
         results[0] = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(capped) } };
     }
@@ -8132,7 +8177,10 @@ pub const WasiCliAdapter = struct {
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
-        results[0] = .{ .u64 = self.ensureInsecurePrng().int(u64) };
+        self.random_state_claim.acquire();
+        const value = self.ensureInsecurePrng().int(u64);
+        self.random_state_claim.release();
+        results[0] = .{ .u64 = value };
     }
 
     /// `wasi:random/insecure-seed.insecure-seed: () -> tuple<u64, u64>` (#147).
@@ -8149,6 +8197,7 @@ pub const WasiCliAdapter = struct {
     ) anyerror!void {
         if (results.len == 0) return error.InvalidArgs;
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        self.random_state_claim.acquire();
         const pair = self.insecure_seed_cache orelse blk: {
             const p = [_]u64{
                 wasi_p2_core.Random.getRandomU64(),
@@ -8157,6 +8206,7 @@ pub const WasiCliAdapter = struct {
             self.insecure_seed_cache = p;
             break :blk p;
         };
+        self.random_state_claim.release();
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .u64 = pair[0] };
         fields[1] = .{ .u64 = pair[1] };
@@ -8331,8 +8381,8 @@ pub const WasiCliAdapter = struct {
         // gated in ReleaseFast). For `initWithHostStdio` this is the
         // host process's real stderr fd; for `init` it's the captured
         // buffer that tests scan via `getStderrBytes`.
-        self.stderr_operation_mutex.lock();
-        defer self.stderr_operation_mutex.unlock();
+        self.stderr_operation_claim.acquire();
+        defer self.stderr_operation_claim.release();
         switch (self.stderr.write(line, self.allocator)) {
             .ok, .err, .closed => {},
         }
@@ -8596,16 +8646,16 @@ pub const WasiCliAdapter = struct {
         const duration = try u64Arg(args[0]);
         const deadline = self.monotonicNs() +| duration;
         const fut_handle = try self.spawnTimerFuture(ci, deadline);
-        self.async_state_mutex.lock();
+        self.async_state_claim.acquire();
         self.timer_future_ready.put(self.allocator, fut_handle, false) catch |err| {
-            self.async_state_mutex.unlock();
+            self.async_state_claim.release();
             return err;
         };
-        self.async_state_mutex.unlock();
+        self.async_state_claim.release();
         errdefer {
-            self.async_state_mutex.lock();
+            self.async_state_claim.acquire();
             _ = self.timer_future_ready.remove(fut_handle);
-            self.async_state_mutex.unlock();
+            self.async_state_claim.release();
         }
         const ph = try self.pushPollable(.{ .future_timer = fut_handle });
         results[0] = .{ .handle = ph };
@@ -8640,10 +8690,8 @@ pub const WasiCliAdapter = struct {
                 timer_lease.release();
                 continue;
             }
-            if (!self.timer_futures.remove(timer_handle)) {
-                timer_lease.release();
-                continue;
-            }
+            timer_lease.release();
+            if (!self.timer_futures.remove(timer_handle)) continue;
             if (ci.futures.getPtr(tf.handle)) |fut| {
                 fut.pending_read = null;
                 fut.state = .ready;
@@ -8655,10 +8703,9 @@ pub const WasiCliAdapter = struct {
                     ws.setReady(idx, allocator, code);
                 };
             }
-            self.async_state_mutex.lock();
+            self.async_state_claim.acquire();
             if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
-            self.async_state_mutex.unlock();
-            timer_lease.release();
+            self.async_state_claim.release();
             fired = true;
         }
         return fired;
@@ -8691,48 +8738,57 @@ pub const WasiCliAdapter = struct {
             var operation_lease = self.pending_udp_receives.acquire(operation_handle) orelse
                 continue;
             const entry = operation_lease.value();
-            // Future dropped out from under us — discard the entry.
-            const fut = ci.futures.getPtr(entry.future_handle) orelse {
-                _ = self.pending_udp_receives.remove(operation_handle);
-                operation_lease.release();
-                continue;
-            };
-            // (#583 B1) `canon task.cancel` was issued while the
-            // receive was parked. Settle the future with the cancel
-            // disposition and drop the entry — the cancel driver
-            // usually clears the list itself, but defense-in-depth
-            // here handles any cancel observed between drive ticks.
-            if (entry.cancelled.load(.acquire)) {
-                if (!self.pending_udp_receives.remove(operation_handle)) {
+            const future_handle = entry.future_handle;
+            const cancelled_before_poll = entry.cancelled.load(.acquire);
+            const parent_closing = if (comptime build_options.lib_wasi_threads)
+                if (entry.socket_lease) |*parent| parent.isClosing() else true
+            else
+                false;
+            if (ci.futures.getPtr(future_handle) == null or
+                cancelled_before_poll or
+                parent_closing)
+            {
+                if (entry.claimed.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
                     operation_lease.release();
                     continue;
                 }
-                fut.pending_read = null;
-                fut.state = .closed;
-                fut.write_closed = true;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
                 operation_lease.release();
+                if (!self.pending_udp_receives.remove(operation_handle)) continue;
+                const fut = ci.futures.getPtr(future_handle) orelse continue;
+                if (cancelled_before_poll) {
+                    fut.pending_read = null;
+                    fut.state = .closed;
+                    fut.write_closed = true;
+                    if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                        ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+                } else {
+                    self.settlePendingUdpReceiveErr(
+                        ci,
+                        fut,
+                        .invalid_state,
+                        allocator,
+                    ) catch {};
+                }
                 fired = true;
                 continue;
             }
-            if (entry.socket_lease) |*parent| {
-                if (parent.isClosing()) {
-                    if (self.pending_udp_receives.remove(operation_handle)) {
-                        self.settlePendingUdpReceiveErr(ci, fut, .invalid_state, allocator) catch {};
-                        fired = true;
-                    }
+
+            var sock_lease = self.lookupSocket(entry.sock_handle) orelse {
+                if (entry.claimed.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
                     operation_lease.release();
                     continue;
                 }
-            }
-            // Socket torn down — settle err(invalid_state).
-            var sock_lease = self.lookupSocket(entry.sock_handle) orelse {
-                if (self.pending_udp_receives.remove(operation_handle)) {
-                    self.settlePendingUdpReceiveErr(ci, fut, .invalid_state, allocator) catch {};
+                operation_lease.release();
+                if (!self.pending_udp_receives.remove(operation_handle)) continue;
+                if (ci.futures.getPtr(future_handle)) |fut| {
+                    self.settlePendingUdpReceiveErr(
+                        ci,
+                        fut,
+                        .invalid_state,
+                        allocator,
+                    ) catch {};
                     fired = true;
                 }
-                operation_lease.release();
                 continue;
             };
             const sock = sock_lease.value();
@@ -8741,11 +8797,21 @@ pub const WasiCliAdapter = struct {
                 sock.host_socket == null)
             {
                 sock_lease.release();
-                if (self.pending_udp_receives.remove(operation_handle)) {
-                    self.settlePendingUdpReceiveErr(ci, fut, .invalid_state, allocator) catch {};
-                    fired = true;
+                if (entry.claimed.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
+                    operation_lease.release();
+                    continue;
                 }
                 operation_lease.release();
+                if (!self.pending_udp_receives.remove(operation_handle)) continue;
+                if (ci.futures.getPtr(future_handle)) |fut| {
+                    self.settlePendingUdpReceiveErr(
+                        ci,
+                        fut,
+                        .invalid_state,
+                        allocator,
+                    ) catch {};
+                    fired = true;
+                }
                 continue;
             }
             const host_socket = sock.host_socket.?;
@@ -8760,15 +8826,17 @@ pub const WasiCliAdapter = struct {
                 continue;
             }
             if (entry.cancelled.load(.acquire)) {
-                _ = self.pending_udp_receives.remove(operation_handle);
                 sock_lease.release();
-                fut.pending_read = null;
-                fut.state = .closed;
-                fut.write_closed = true;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
                 operation_lease.release();
-                fired = true;
+                if (!self.pending_udp_receives.remove(operation_handle)) continue;
+                if (ci.futures.getPtr(future_handle)) |fut| {
+                    fut.pending_read = null;
+                    fut.state = .closed;
+                    fut.write_closed = true;
+                    if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                        ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+                    fired = true;
+                }
                 continue;
             }
             const io = std.Io.Threaded.global_single_threaded.io();
@@ -8778,18 +8846,22 @@ pub const WasiCliAdapter = struct {
             });
             sock_lease.release();
             if (entry.cancelled.load(.acquire)) {
-                _ = self.pending_udp_receives.remove(operation_handle);
-                fut.pending_read = null;
-                fut.state = .closed;
-                fut.write_closed = true;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
                 operation_lease.release();
-                fired = true;
+                if (!self.pending_udp_receives.remove(operation_handle)) continue;
+                if (ci.futures.getPtr(future_handle)) |fut| {
+                    fut.pending_read = null;
+                    fut.state = .closed;
+                    fut.write_closed = true;
+                    if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                        ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+                    fired = true;
+                }
                 continue;
             }
             if (recv_res) |recv| {
+                operation_lease.release();
                 if (self.pending_udp_receives.remove(operation_handle)) {
+                    const fut = ci.futures.getPtr(future_handle) orelse continue;
                     self.settlePendingUdpReceiveOk(ci, fut, recv.data, recv.from, allocator) catch {
                         self.settlePendingUdpReceiveErr(ci, fut, .unknown, allocator) catch {};
                     };
@@ -8799,8 +8871,32 @@ pub const WasiCliAdapter = struct {
                 // Spurious poll wakeup — release the claim and retry on the
                 // next event-loop tick.
                 entry.claimed.store(false, .release);
+                if (entry.cancelled.load(.acquire) and
+                    entry.claimed.cmpxchgStrong(
+                        false,
+                        true,
+                        .acquire,
+                        .monotonic,
+                    ) == null)
+                {
+                    operation_lease.release();
+                    if (!self.pending_udp_receives.remove(operation_handle)) continue;
+                    if (ci.futures.getPtr(future_handle)) |fut| {
+                        fut.pending_read = null;
+                        fut.state = .closed;
+                        fut.write_closed = true;
+                        if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                            ws.setReady(
+                                idx,
+                                allocator,
+                                executor_root.STATUS_STARTED_CANCELLED,
+                            );
+                        fired = true;
+                    }
+                } else {
+                    operation_lease.release();
+                }
             }
-            operation_lease.release();
         }
         return fired;
     }
@@ -9113,12 +9209,11 @@ pub const WasiCliAdapter = struct {
         entry: *PendingHttpFetch,
         state: FutureIncomingResponse.State,
     ) bool {
-        const lease = if (entry.future_lease) |*future_lease| future_lease else
-            return false;
+        const lease = if (entry.future_lease) |*future_lease| future_lease else return false;
         if (lease.isClosing()) return false;
         const future = lease.value().*;
-        future.operation_mutex.lock();
-        defer future.operation_mutex.unlock();
+        future.operation_claim.acquire();
+        defer future.operation_claim.release();
         if (lease.isClosing()) return false;
         future.state = state;
         return true;
@@ -9247,18 +9342,20 @@ pub const WasiCliAdapter = struct {
         // Publish an unarmed stable operation before spawning. Event
         // drivers skip it until thread/shared ownership is installed, so
         // allocation failure can still roll back without a live worker.
-        const operation_handle = try self.pending_http_fetches.publish(.{
+        const published_operation = try self.pending_http_fetches.publishLeased(.{
             .future_handle = fh,
             .thread = null,
             .shared = null,
             .future_lease = null,
         });
-        errdefer std.debug.assert(self.pending_http_fetches.remove(operation_handle));
+        const operation_handle = published_operation.handle;
+        errdefer _ = self.pending_http_fetches.remove(operation_handle);
+        var operation_lease = published_operation.lease;
+        errdefer operation_lease.release();
 
         const thread = std.Thread.spawn(.{}, httpFetchWorker, .{req}) catch |err| {
             return err;
         };
-        var operation_lease = self.pending_http_fetches.acquire(operation_handle).?;
         const operation = operation_lease.lock();
         operation.thread = thread;
         operation.shared = shared;
@@ -9354,18 +9451,20 @@ pub const WasiCliAdapter = struct {
         });
         errdefer _ = ci.futures.remove(fh);
 
-        const operation_handle = try self.pending_http_fetches_p3.publish(.{
+        const published_operation = try self.pending_http_fetches_p3.publishLeased(.{
             .future_handle = fh,
             .ci = ci,
             .thread = null,
             .shared = null,
         });
-        errdefer std.debug.assert(self.pending_http_fetches_p3.remove(operation_handle));
+        const operation_handle = published_operation.handle;
+        errdefer _ = self.pending_http_fetches_p3.remove(operation_handle);
+        var operation_lease = published_operation.lease;
+        errdefer operation_lease.release();
 
         const thread = std.Thread.spawn(.{}, httpFetchWorker, .{req}) catch |err| {
             return err;
         };
-        var operation_lease = self.pending_http_fetches_p3.acquire(operation_handle).?;
         const operation = operation_lease.lock();
         operation.thread = thread;
         operation.shared = shared;
@@ -9950,11 +10049,9 @@ pub const WasiCliAdapter = struct {
             defer self.allocator.free(handles);
             for (handles) |timer_handle| {
                 var timer_lease = self.timer_futures.acquire(timer_handle) orelse continue;
-                if (!self.timer_futures.remove(timer_handle)) {
-                    timer_lease.release();
-                    continue;
-                }
                 const tf = timer_lease.value().*;
+                timer_lease.release();
+                if (!self.timer_futures.remove(timer_handle)) continue;
                 if (ci.futures.getPtr(tf.handle)) |fut| {
                     fut.pending_read = null;
                     fut.state = .closed;
@@ -9962,10 +10059,9 @@ pub const WasiCliAdapter = struct {
                     if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
                         ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
                 }
-                self.async_state_mutex.lock();
+                self.async_state_claim.acquire();
                 if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
-                self.async_state_mutex.unlock();
-                timer_lease.release();
+                self.async_state_claim.release();
             }
         } else |_| {}
 
@@ -9985,8 +10081,10 @@ pub const WasiCliAdapter = struct {
                 const entry = operation_lease.value();
                 entry.cancelled.store(true, .release);
                 if (entry.claimed.cmpxchgStrong(false, true, .acquire, .monotonic) == null) {
+                    const future_handle = entry.future_handle;
+                    operation_lease.release();
                     if (self.pending_udp_receives.remove(operation_handle)) {
-                        if (ci.futures.getPtr(entry.future_handle)) |fut| {
+                        if (ci.futures.getPtr(future_handle)) |fut| {
                             fut.pending_read = null;
                             fut.state = .closed;
                             fut.write_closed = true;
@@ -9994,8 +10092,9 @@ pub const WasiCliAdapter = struct {
                                 ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
                         }
                     }
+                } else {
+                    operation_lease.release();
                 }
-                operation_lease.release();
             }
         } else |_| {}
 
@@ -10059,7 +10158,10 @@ pub const WasiCliAdapter = struct {
             defer self.allocator.free(handles);
             for (handles) |operation_handle| {
                 var lease = self.pending_http_fetches.acquire(operation_handle) orelse continue;
-                if (lease.value().shared) |shared| shared.cancelled.store(true, .release);
+                const entry = lease.value();
+                if (entry.armed.load(.acquire)) {
+                    if (entry.shared) |shared| shared.cancelled.store(true, .release);
+                }
                 lease.release();
             }
         } else |_| {}
@@ -10068,7 +10170,7 @@ pub const WasiCliAdapter = struct {
             for (handles) |operation_handle| {
                 var lease = self.pending_http_fetches_p3.acquire(operation_handle) orelse continue;
                 const entry = lease.value();
-                if (entry.ci == ci) {
+                if (entry.armed.load(.acquire) and entry.ci == ci) {
                     if (entry.shared) |shared| shared.cancelled.store(true, .release);
                 }
                 lease.release();
@@ -10110,7 +10212,10 @@ pub const WasiCliAdapter = struct {
             for (handles) |operation_handle| {
                 var lease = self.pending_http_fetches_p3.acquire(operation_handle) orelse continue;
                 const entry = lease.value();
-                if (entry.ci == ci and entry.future_handle == future_handle) {
+                if (entry.armed.load(.acquire) and
+                    entry.ci == ci and
+                    entry.future_handle == future_handle)
+                {
                     if (entry.shared) |shared| shared.cancelled.store(true, .release);
                 }
                 lease.release();
@@ -10119,16 +10224,16 @@ pub const WasiCliAdapter = struct {
     }
 
     fn allocStreamHandle(self: *WasiCliAdapter, stream: *streams.OutputStream) !u32 {
-        const shared_mutex = if (stream == &self.stdout)
-            &self.stdout_operation_mutex
+        const shared_claim = if (stream == &self.stdout)
+            &self.stdout_operation_claim
         else if (stream == &self.stderr)
-            &self.stderr_operation_mutex
+            &self.stderr_operation_claim
         else
             null;
         return self.stream_table.publish(.{
             .stream = stream,
             .owned = false,
-            .shared_operation_mutex = shared_mutex,
+            .shared_operation_claim = shared_claim,
         });
     }
 
@@ -10138,9 +10243,16 @@ pub const WasiCliAdapter = struct {
         descriptor_lease: ?FsDescriptorTable.Lease,
         socket_lease: ?SocketTable.Lease,
     ) !u32 {
+        const owner = try self.allocator.create(OutputStreamOwner);
+        errdefer self.allocator.destroy(owner);
+        owner.* = .{
+            .allocator = self.allocator,
+            .stream = stream,
+        };
         return self.stream_table.publish(.{
             .stream = stream,
             .owned = true,
+            .owner = owner,
             .descriptor_lease = descriptor_lease,
             .socket_lease = socket_lease,
         });
@@ -10169,8 +10281,8 @@ pub const WasiCliAdapter = struct {
         };
         const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
             return error.OutOfBoundsMemory;
-        self.stdout_operation_mutex.lock();
-        defer self.stdout_operation_mutex.unlock();
+        self.stdout_operation_claim.acquire();
+        defer self.stdout_operation_claim.release();
         switch (self.stdout.write(bytes, self.allocator)) {
             .ok => {},
             .err, .closed => return error.IoError,
@@ -10223,7 +10335,9 @@ pub const WasiCliAdapter = struct {
             .result_val => |rv| if (rv.is_ok) @as(u32, 0) else 1,
             else => 0,
         } else 0;
+        self.exit_state_claim.acquire();
         self.exit_code = code;
+        self.exit_state_claim.release();
         // #760: pin the code in TLS so the AOT host-import dispatcher
         // can call `std.process.exit(code)` on this `error.WasiExit`
         // rather than writing the post-#714 sentinel into the guest's
@@ -10252,7 +10366,9 @@ pub const WasiCliAdapter = struct {
             .u64 => |v| @truncate(v),
             else => 0,
         } else 0;
+        self.exit_state_claim.acquire();
         self.exit_code = code;
+        self.exit_state_claim.release();
         // #760: see `cliExit` above for the TLS handoff rationale.
         recordPendingWasiExit(code);
         return error.WasiExit;
@@ -10382,9 +10498,9 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
+        const claim = resource.claim();
+        claim.acquire();
+        defer claim.release();
         const stream = resource.stream;
         const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
             return error.OutOfBoundsMemory;
@@ -10424,9 +10540,9 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
+        const claim = resource.claim();
+        claim.acquire();
+        defer claim.release();
         const stream = resource.stream;
         const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
             return error.OutOfBoundsMemory;
@@ -10475,9 +10591,9 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
+        const claim = resource.claim();
+        claim.acquire();
+        defer claim.release();
         const stream = resource.stream;
         switch (stream.flush()) {
             .ok => {},
@@ -10553,8 +10669,8 @@ pub const WasiCliAdapter = struct {
         return self.input_stream_table.publish(.{
             .stream = stream,
             .owned = false,
-            .shared_operation_mutex = if (stream == &self.stdin)
-                &self.stdin_operation_mutex
+            .shared_operation_claim = if (stream == &self.stdin)
+                &self.stdin_operation_claim
             else
                 null,
         });
@@ -10670,9 +10786,9 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupInputStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
+        const claim = resource.claim();
+        claim.acquire();
+        defer claim.release();
         const stream = resource.stream;
 
         const want: usize = @min(want_u64, std.math.maxInt(usize));
@@ -10757,9 +10873,9 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupInputStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
+        const claim = resource.claim();
+        claim.acquire();
+        defer claim.release();
         const stream = resource.stream;
 
         const want: usize = @min(want_u64, std.math.maxInt(usize));
@@ -10812,9 +10928,9 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
+        const claim = resource.claim();
+        claim.acquire();
+        defer claim.release();
         const stream = resource.stream;
 
         const want: usize = @min(want_u64, std.math.maxInt(usize));
@@ -10858,9 +10974,9 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
+        const claim = resource.claim();
+        claim.acquire();
+        defer claim.release();
         const stream = resource.stream;
 
         var remaining: usize = @min(want_u64, std.math.maxInt(usize));
@@ -10942,12 +11058,12 @@ pub const WasiCliAdapter = struct {
         defer src_lease.release();
         const src_resource = src_lease.value();
         const dst_resource = dst_lease.value();
-        const src_mutex = src_resource.mutex();
-        const dst_mutex = dst_resource.mutex();
-        src_mutex.lock();
-        defer src_mutex.unlock();
-        dst_mutex.lock();
-        defer dst_mutex.unlock();
+        const src_claim = src_resource.claim();
+        const dst_claim = dst_resource.claim();
+        src_claim.acquire();
+        defer src_claim.release();
+        dst_claim.acquire();
+        defer dst_claim.release();
         const src = src_resource.stream;
         const dst = dst_resource.stream;
 
@@ -11069,15 +11185,15 @@ pub const WasiCliAdapter = struct {
         errdefer std.debug.assert(self.fs_descriptor_table.remove(slot_idx));
         const dup_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(dup_name);
-        self.fs_preopens_mutex.lock();
+        self.fs_preopens_claim.acquire();
         self.fs_preopens.append(
             self.allocator,
             .{ .name = dup_name, .dir_handle = slot_idx },
         ) catch |err| {
-            self.fs_preopens_mutex.unlock();
+            self.fs_preopens_claim.release();
             return err;
         };
-        self.fs_preopens_mutex.unlock();
+        self.fs_preopens_claim.release();
         return slot_idx;
     }
 
@@ -11390,12 +11506,12 @@ pub const WasiCliAdapter = struct {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
 
-        self.fs_preopens_mutex.lock();
+        self.fs_preopens_claim.acquire();
         const preopens = self.allocator.dupe(FsPreopen, self.fs_preopens.items) catch |err| {
-            self.fs_preopens_mutex.unlock();
+            self.fs_preopens_claim.release();
             return err;
         };
-        self.fs_preopens_mutex.unlock();
+        self.fs_preopens_claim.release();
         defer self.allocator.free(preopens);
 
         const n = preopens.len;
@@ -13270,26 +13386,26 @@ pub const WasiCliAdapter = struct {
         const stream = stream_lease.value();
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        stream.operation_mutex.lock();
+        stream.operation_claim.acquire();
         const maybe_entry = stream.iter.next(io) catch |err| {
-            stream.operation_mutex.unlock();
+            stream.operation_claim.release();
             results[0] = try fsResultErr(allocator, mapFsError(err));
             return;
         };
 
         if (maybe_entry) |entry| {
             if (!std.unicode.utf8ValidateSlice(entry.name)) {
-                stream.operation_mutex.unlock();
+                stream.operation_claim.release();
                 results[0] = try fsResultErr(allocator, .illegal_byte_sequence);
                 return;
             }
             const entry_kind = entry.kind;
             const entry_name = allocator.dupe(u8, entry.name) catch {
-                stream.operation_mutex.unlock();
+                stream.operation_claim.release();
                 results[0] = try fsResultErr(allocator, .insufficient_memory);
                 return;
             };
-            stream.operation_mutex.unlock();
+            stream.operation_claim.release();
             defer allocator.free(entry_name);
 
             const dt: DescType = switch (entry_kind) {
@@ -13330,7 +13446,7 @@ pub const WasiCliAdapter = struct {
             } });
             return;
         }
-        stream.operation_mutex.unlock();
+        stream.operation_claim.release();
 
         // End of iteration → option::none inside Ok arm.
         results[0] = try fsResultOk(allocator, .{ .option_val = .{
@@ -13740,12 +13856,19 @@ pub const WasiCliAdapter = struct {
             .bytes_read = 0,
             .cancelled = .{ .raw = false },
         };
-        const handle = self.fs_read_stream_ctxs.publish(ctx) catch {
-            self.allocator.destroy(ctx);
-            return error.OutOfMemory;
-        };
-        ctx.registry_handle = handle;
-        ctx.self_lease = self.fs_read_stream_ctxs.acquire(handle).?;
+        if (comptime build_options.lib_wasi_threads) {
+            const published = self.fs_read_stream_ctxs.publishLeased(ctx) catch {
+                self.allocator.destroy(ctx);
+                return error.OutOfMemory;
+            };
+            ctx.registry_handle = published.handle;
+            ctx.self_lease = published.lease;
+        } else {
+            ctx.registry_handle = self.fs_read_stream_ctxs.publish(ctx) catch {
+                self.allocator.destroy(ctx);
+                return error.OutOfMemory;
+            };
+        }
         return ctx;
     }
 
@@ -13949,7 +14072,7 @@ pub const WasiCliAdapter = struct {
                     .would_block => {},
                     .eof, .err => {
                         slot.read_closed = true;
-                        _ = self.fs_write_stream_ctxs.remove(ctx.registry_handle);
+                        fsWriteStreamCtxOnDestroy(ctx);
                         break :blk try spawnReadyErrFsFuture(ci, .io);
                     },
                 }
@@ -13995,12 +14118,19 @@ pub const WasiCliAdapter = struct {
             .append = append,
             .cancelled = .{ .raw = false },
         };
-        const handle = self.fs_write_stream_ctxs.publish(ctx) catch {
-            self.allocator.destroy(ctx);
-            return error.OutOfMemory;
-        };
-        ctx.registry_handle = handle;
-        ctx.self_lease = self.fs_write_stream_ctxs.acquire(handle).?;
+        if (comptime build_options.lib_wasi_threads) {
+            const published = self.fs_write_stream_ctxs.publishLeased(ctx) catch {
+                self.allocator.destroy(ctx);
+                return error.OutOfMemory;
+            };
+            ctx.registry_handle = published.handle;
+            ctx.self_lease = published.lease;
+        } else {
+            ctx.registry_handle = self.fs_write_stream_ctxs.publish(ctx) catch {
+                self.allocator.destroy(ctx);
+                return error.OutOfMemory;
+            };
+        }
         return ctx;
     }
 
@@ -14034,6 +14164,8 @@ pub const WasiCliAdapter = struct {
         src: []const u8,
     ) async_mod.HostStreamAction {
         const ctx: *FsWriteStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        ctx.operation_claim.acquire();
+        defer ctx.operation_claim.release();
         // (#583 B1) Pre-entry cancel check: bail before any pwrite(2)
         // if the guest already cancelled. Returning `.err` makes the
         // executor flip `read_closed = true` so the guest's next
@@ -14301,11 +14433,9 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         var lease = self.fs_descriptor_table.acquire(handle) orelse return;
-        defer lease.release();
-        switch (lease.value().*) {
-            .preopen => {}, // persistent — keep the slot live.
-            else => _ = self.fs_descriptor_table.remove(handle),
-        }
+        const is_preopen = lease.value().* == .preopen;
+        lease.release();
+        if (!is_preopen) _ = self.fs_descriptor_table.remove(handle);
     }
 
     // ── wasi:sockets/* (#148) ──────────────────────────────────────────────
@@ -14484,7 +14614,7 @@ pub const WasiCliAdapter = struct {
     fn lookupSocket(self: *WasiCliAdapter, handle: u32) ?SocketLease {
         var table_lease = self.socket_table.acquire(handle) orelse return null;
         const socket = table_lease.value();
-        socket.operation_mutex.lock();
+        socket.operation_claim.acquire();
         return .{ .table_lease = table_lease, .socket = socket };
     }
 
@@ -14596,27 +14726,40 @@ pub const WasiCliAdapter = struct {
     ///     kernel itself would treat `127.0.0.1:N` vs `INADDR_ANY:N`
     ///     as conflicting at the active-bind layer. Cross-family
     ///     mismatches (v4 vs v6) never conflict.
+    const BindConflictCheck = enum {
+        clear,
+        conflict,
+        busy,
+    };
+
     fn bindWouldConflict(
         self: *WasiCliAdapter,
         requested: std.Io.net.IpAddress,
         exclude_handle: u32,
-    ) bool {
+    ) BindConflictCheck {
         const req_port: u16 = switch (requested) {
             .ip4 => |v4| v4.port,
             .ip6 => |v6| v6.port,
         };
-        if (req_port == 0) return false;
+        if (req_port == 0) return .clear;
         const req_is_v4 = switch (requested) {
             .ip4 => true,
             .ip6 => false,
         };
-        const handles = self.socket_table.snapshotHandles(self.allocator) catch return true;
+        const handles = self.socket_table.snapshotHandles(self.allocator) catch return .busy;
         defer self.allocator.free(handles);
         for (handles) |handle| {
             if (handle == exclude_handle) continue;
-            var lease = self.lookupSocket(handle) orelse continue;
-            defer lease.release();
-            const la = lease.value().local_addr orelse continue;
+            var table_lease = self.socket_table.acquire(handle) orelse continue;
+            const socket = table_lease.value();
+            if (!socket.operation_claim.tryAcquire()) {
+                table_lease.release();
+                return .busy;
+            }
+            const maybe_local = socket.local_addr;
+            socket.operation_claim.release();
+            table_lease.release();
+            const la = maybe_local orelse continue;
             const la_port: u16 = switch (la) {
                 .ip4 => |v4| v4.port,
                 .ip6 => |v6| v6.port,
@@ -14627,9 +14770,9 @@ pub const WasiCliAdapter = struct {
                 .ip6 => false,
             };
             if (la_is_v4 != req_is_v4) continue;
-            return true;
+            return .conflict;
         }
-        return false;
+        return .clear;
     }
 
     /// `ComponentInstance.on_resource_drop` hook (#575). Invoked from
@@ -15123,29 +15266,34 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
         };
-        defer s_lease.release();
         const s = s_lease.value();
         if (s.kind != .tcp or s.state != .listening) {
+            s_lease.release();
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
         }
-        const server = &(s.server orelse {
+        var server = s.server orelse {
+            s_lease.release();
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
-        });
+        };
+        const family = s.family;
+        const local_addr = s.local_addr;
         const io = std.Io.Threaded.global_single_threaded.io();
         const accepted = server.accept(io) catch |err| {
+            s_lease.release();
             results[0] = try socketResultErr(allocator, mapConnectError(err));
             return;
         };
+        s_lease.release();
 
         const new_socket_handle = self.pushSocket(.{
             .kind = .tcp,
-            .family = s.family,
+            .family = family,
             .state = .connected,
             .tcp_stream = accepted,
             .remote_addr = accepted.socket.address,
-            .local_addr = s.local_addr,
+            .local_addr = local_addr,
         }) catch {
             var owned = accepted;
             owned.close(io);
@@ -17305,9 +17453,24 @@ pub const WasiCliAdapter = struct {
         // hook (#575), so this check only matches live resources;
         // `sockets-tcp-bind::test_reuseaddr`'s rebind after the
         // server resource drops still succeeds. (#575)
-        if (self.bindWouldConflict(local, sock_handle)) {
-            results[0] = try socketResultErrP3WithDiag(ci, allocator, .address_in_use, "address_in_use");
-            return;
+        switch (self.bindWouldConflict(local, sock_handle)) {
+            .clear => {},
+            .conflict => {
+                results[0] = try socketResultErrP3WithDiag(
+                    ci,
+                    allocator,
+                    .address_in_use,
+                    "address_in_use",
+                );
+                return;
+            },
+            .busy => {
+                results[0] = try socketResultErrP3(
+                    allocator,
+                    .concurrency_conflict,
+                );
+                return;
+            },
         }
         // 0.3 dropped the per-network allow-list at bind: the kernel
         // already enforces what's bindable (returns AddressNotBindable
@@ -17382,9 +17545,24 @@ pub const WasiCliAdapter = struct {
         // the rationale: SO_REUSEADDR on Linux otherwise lets two
         // non-listening bindings coexist, breaking the
         // `sockets-udp-connect::test_explicit_bind_addrinuse` case.
-        if (self.bindWouldConflict(local, sock_handle)) {
-            results[0] = try socketResultErrP3WithDiag(ci, allocator, .address_in_use, "address_in_use");
-            return;
+        switch (self.bindWouldConflict(local, sock_handle)) {
+            .clear => {},
+            .conflict => {
+                results[0] = try socketResultErrP3WithDiag(
+                    ci,
+                    allocator,
+                    .address_in_use,
+                    "address_in_use",
+                );
+                return;
+            },
+            .busy => {
+                results[0] = try socketResultErrP3(
+                    allocator,
+                    .concurrency_conflict,
+                );
+                return;
+            },
         }
         // See `tcpBindP3` (#563, #583 A1): no allow-list at bind in 0.3.
         // SO_REUSEADDR preset so a subsequent UDP bind to a port
@@ -17812,42 +17990,77 @@ pub const WasiCliAdapter = struct {
     /// returned pointer stays valid until adapter `deinit`.
     fn allocSocketsP3StreamCtx(
         self: *WasiCliAdapter,
+        socket_handle: ?u32,
         fd: std.posix.fd_t,
         family: IpAddressFamily,
     ) !*SocketsP3StreamCtx {
-        const ctx = try self.allocator.create(SocketsP3StreamCtx);
-        ctx.* = .{ .adapter = self, .fd = fd, .family = family };
-        const handle = self.sockets_p3_stream_ctxs.publish(ctx) catch {
-            self.allocator.destroy(ctx);
-            return error.OutOfMemory;
+        var socket_lease = if (comptime build_options.lib_wasi_threads)
+            if (socket_handle) |handle|
+                self.socket_table.acquire(handle) orelse return error.InvalidHandle
+            else
+                null
+        else {};
+        errdefer if (comptime build_options.lib_wasi_threads) {
+            if (socket_lease) |*lease| lease.release();
         };
-        ctx.registry_handle = handle;
-        ctx.self_lease = self.sockets_p3_stream_ctxs.acquire(handle).?;
+        const ctx = try self.allocator.create(SocketsP3StreamCtx);
+        ctx.* = .{
+            .adapter = self,
+            .socket_handle = socket_handle,
+            .socket_lease = socket_lease,
+            .fd = fd,
+            .family = family,
+        };
+        if (comptime build_options.lib_wasi_threads) {
+            const published = self.sockets_p3_stream_ctxs.publishLeased(ctx) catch {
+                self.allocator.destroy(ctx);
+                return error.OutOfMemory;
+            };
+            ctx.registry_handle = published.handle;
+            ctx.self_lease = published.lease;
+        } else {
+            ctx.registry_handle = self.sockets_p3_stream_ctxs.publish(ctx) catch {
+                self.allocator.destroy(ctx);
+                return error.OutOfMemory;
+            };
+        }
         return ctx;
     }
 
     fn socketsP3StreamCtxOnDestroy(opaque_ctx: ?*anyopaque) void {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
-        _ = ctx.adapter.sockets_p3_stream_ctxs.remove(ctx.registry_handle);
-        var lease = ctx.self_lease orelse return;
-        ctx.self_lease = null;
-        lease.release();
+        if (comptime build_options.lib_wasi_threads) {
+            var lease = ctx.self_lease orelse return;
+            ctx.self_lease = null;
+            _ = ctx.adapter.sockets_p3_stream_ctxs.remove(ctx.registry_handle);
+            lease.release();
+        } else {
+            _ = ctx.adapter.sockets_p3_stream_ctxs.remove(ctx.registry_handle);
+        }
     }
 
     fn fsWriteStreamCtxOnDestroy(opaque_ctx: ?*anyopaque) void {
         const ctx: *FsWriteStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
-        _ = ctx.adapter.fs_write_stream_ctxs.remove(ctx.registry_handle);
-        var lease = ctx.self_lease orelse return;
-        ctx.self_lease = null;
-        lease.release();
+        if (comptime build_options.lib_wasi_threads) {
+            var lease = ctx.self_lease orelse return;
+            ctx.self_lease = null;
+            _ = ctx.adapter.fs_write_stream_ctxs.remove(ctx.registry_handle);
+            lease.release();
+        } else {
+            _ = ctx.adapter.fs_write_stream_ctxs.remove(ctx.registry_handle);
+        }
     }
 
     fn fsReadStreamCtxOnDestroy(opaque_ctx: ?*anyopaque) void {
         const ctx: *FsReadStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
-        _ = ctx.adapter.fs_read_stream_ctxs.remove(ctx.registry_handle);
-        var lease = ctx.self_lease orelse return;
-        ctx.self_lease = null;
-        lease.release();
+        if (comptime build_options.lib_wasi_threads) {
+            var lease = ctx.self_lease orelse return;
+            ctx.self_lease = null;
+            _ = ctx.adapter.fs_read_stream_ctxs.remove(ctx.registry_handle);
+            lease.release();
+        } else {
+            _ = ctx.adapter.fs_read_stream_ctxs.remove(ctx.registry_handle);
+        }
     }
 
     /// `host_driver.on_read` for a TCP-receive `stream<u8>` slot. Reads
@@ -17876,6 +18089,8 @@ pub const WasiCliAdapter = struct {
         allocator: Allocator,
     ) async_mod.HostStreamAction {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        ctx.operation_claim.acquire();
+        defer ctx.operation_claim.release();
         if (ctx.cancelled.load(.acquire)) return .err;
         if (!fdPollReady(ctx.fd, pollInEvents())) return .would_block;
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -17935,6 +18150,8 @@ pub const WasiCliAdapter = struct {
         dst: []u8,
     ) async_mod.HostStreamReadInto {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        ctx.operation_claim.acquire();
+        defer ctx.operation_claim.release();
         if (ctx.cancelled.load(.acquire)) return .{ .action = .err };
         if (dst.len == 0) return .{ .action = .would_block };
         if (!fdPollReady(ctx.fd, pollInEvents())) return .{ .action = .would_block };
@@ -17951,21 +18168,33 @@ pub const WasiCliAdapter = struct {
         ctx: *SocketsP3StreamCtx,
         how: std.Io.net.ShutdownHow,
     ) bool {
+        ctx.operation_claim.acquire();
+        defer ctx.operation_claim.release();
         const io = std.Io.Threaded.global_single_threaded.io();
-        const handles = ctx.adapter.socket_table.snapshotHandles(ctx.adapter.allocator) catch
-            return false;
-        defer ctx.adapter.allocator.free(handles);
-        for (handles) |handle| {
-            var lease = ctx.adapter.lookupSocket(handle) orelse continue;
-            defer lease.release();
-            if (lease.value().tcp_stream) |*stream| {
-                if (stream.socket.handle == ctx.fd) {
-                    stream.shutdown(io, how) catch return false;
-                    return true;
-                }
-            }
+        var stream: std.Io.net.Stream = if (comptime build_options.lib_wasi_threads) blk: {
+            var parent = if (ctx.socket_lease) |*lease| lease else return false;
+            break :blk parent.value().tcp_stream orelse return false;
+        } else blk: {
+            const handle = ctx.socket_handle orelse return false;
+            var parent = ctx.adapter.lookupSocket(handle) orelse return false;
+            defer parent.release();
+            break :blk parent.value().tcp_stream orelse return false;
+        };
+        if (stream.socket.handle != ctx.fd) return false;
+        stream.shutdown(io, how) catch return false;
+        return true;
+    }
+
+    fn socketContextServer(ctx: *SocketsP3StreamCtx) ?std.Io.net.Server {
+        if (comptime build_options.lib_wasi_threads) {
+            var parent = if (ctx.socket_lease) |*lease| lease else return null;
+            if (parent.isClosing()) return null;
+            return parent.value().server;
         }
-        return false;
+        const handle = ctx.socket_handle orelse return null;
+        var parent = ctx.adapter.lookupSocket(handle) orelse return null;
+        defer parent.release();
+        return parent.value().server;
     }
 
     fn tcpReceiveStreamOnDropReadable(opaque_ctx: ?*anyopaque) void {
@@ -17986,11 +18215,13 @@ pub const WasiCliAdapter = struct {
         src: []const u8,
     ) async_mod.HostStreamAction {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        ctx.operation_claim.acquire();
+        defer ctx.operation_claim.release();
         if (src.len == 0) return .progressed;
         const io = std.Io.Threaded.global_single_threaded.io();
         const slices = [_][]const u8{src};
         _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch {
-            ctx.send_failed = true;
+            ctx.send_failed.store(true, .release);
             return .err;
         };
         return .progressed;
@@ -18026,7 +18257,7 @@ pub const WasiCliAdapter = struct {
             return;
         };
         @memset(payload, 0);
-        if (ctx.send_failed) {
+        if (ctx.send_failed.load(.acquire)) {
             payload[0] = 1;
             payload[4] = @intCast(socketCodeToP3Disc(.unknown));
         }
@@ -18055,7 +18286,7 @@ pub const WasiCliAdapter = struct {
 
     fn tcpSendStreamOnDropWritable(opaque_ctx: ?*anyopaque) void {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
-        if (!shutdownTcpStreamHalf(ctx, .send)) ctx.send_failed = true;
+        if (!shutdownTcpStreamHalf(ctx, .send)) ctx.send_failed.store(true, .release);
         settleTcpSendFuture(ctx);
     }
 
@@ -18070,33 +18301,13 @@ pub const WasiCliAdapter = struct {
         allocator: Allocator,
     ) async_mod.HostStreamAction {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        ctx.operation_claim.acquire();
+        defer ctx.operation_claim.release();
         if (!fdPollReady(ctx.fd, pollInEvents())) return .would_block;
         const io = std.Io.Threaded.global_single_threaded.io();
-        // Look up the server through the fd → socket slot lookup; the
-        // listening socket lives in the adapter's `socket_table`.
-        // We use `Server.accept` on whichever socket is listening on
-        // this fd. To avoid scanning the table on every accept, we
-        // construct a minimal `Server` around the fd by walking the
-        // table once.
-        var server: ?*std.Io.net.Server = null;
-        const handles = ctx.adapter.socket_table.snapshotHandles(ctx.adapter.allocator) catch
-            return .err;
-        defer ctx.adapter.allocator.free(handles);
-        var server_lease: ?SocketLease = null;
-        defer if (server_lease) |*lease| lease.release();
-        for (handles) |handle| {
-            var lease = ctx.adapter.lookupSocket(handle) orelse continue;
-            const s = lease.value();
-            if (s.server) |*srv|
-                if (srv.socket.handle == ctx.fd) {
-                    server = srv;
-                    server_lease = lease;
-                    break;
-                };
-            lease.release();
-        }
-        const srv = server orelse return .eof;
-        const accepted = srv.accept(io) catch return .would_block;
+        var server = socketContextServer(ctx) orelse return .eof;
+        if (server.socket.handle != ctx.fd) return .eof;
+        const accepted = server.accept(io) catch return .would_block;
         const new_handle = ctx.adapter.pushSocket(.{
             .kind = .tcp,
             .family = ctx.family,
@@ -18346,7 +18557,8 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         };
-        defer s_lease.release();
+        var socket_active = true;
+        defer if (socket_active) s_lease.release();
         const s = s_lease.value();
         if (s.kind != .tcp) {
             results[0] = try socketResultErrP3(allocator, .invalid_state);
@@ -18414,12 +18626,18 @@ pub const WasiCliAdapter = struct {
         s.server = server.?;
         s.local_addr = server.?.socket.address;
         s.state = .listening;
+        const family = s.family;
+        const local_addr = s.local_addr;
 
         // Install an accept-loop driver on the stream so each guest
         // `stream.read t` invocation can pop a fresh connection off
         // the backlog (#535). Pre-drain any queued connections so
         // a guest that connect()s before reading still sees them.
-        const driver_ctx = try self.allocSocketsP3StreamCtx(server.?.socket.handle, s.family);
+        const driver_ctx = try self.allocSocketsP3StreamCtx(
+            sock_handle,
+            server.?.socket.handle,
+            family,
+        );
         const stream_h = ci.allocAsyncHandle();
         ci.streams.put(ci.allocator, stream_h, .{
             .elem_type_idx = 0,
@@ -18430,28 +18648,38 @@ pub const WasiCliAdapter = struct {
                 .on_destroy = &socketsP3StreamCtxOnDestroy,
             },
         }) catch |err| {
-            _ = self.sockets_p3_stream_ctxs.remove(driver_ctx.registry_handle);
+            socketsP3StreamCtxOnDestroy(driver_ctx);
             return err;
         };
+        s_lease.release();
+        socket_active = false;
         // Non-blocking accept attempt to pre-fill the stream (the driver
         // path will keep adding as more arrive on subsequent reads).
         if (fdPollReady(server.?.socket.handle, pollInEvents())) {
-            if (s.server.?.accept(io)) |accepted| {
+            var accept_server = server.?;
+            if (accept_server.accept(io)) |accepted| {
                 const new_handle = self.pushSocket(.{
                     .kind = .tcp,
-                    .family = s.family,
+                    .family = family,
                     .state = .connected,
                     .tcp_stream = accepted,
                     .remote_addr = accepted.socket.address,
-                    .local_addr = s.local_addr,
-                }) catch return error.OutOfMemory;
+                    .local_addr = local_addr,
+                }) catch {
+                    var owned = accepted;
+                    owned.close(io);
+                    return error.OutOfMemory;
+                };
                 if (ci.streams.getPtr(stream_h)) |slot| {
                     var handle_bytes: [4]u8 = undefined;
                     // Apply the resource-handle wire offset
                     // (`slot + 1`); see `accept_driver` above. (#520
                     // wave 2)
                     std.mem.writeInt(u32, &handle_bytes, abi.encodeResourceWireAbi(new_handle), .little);
-                    try slot.buffer.appendSlice(ci.allocator, &handle_bytes);
+                    slot.buffer.appendSlice(ci.allocator, &handle_bytes) catch |err| {
+                        _ = self.socket_table.remove(new_handle);
+                        return err;
+                    };
                 }
             } else |_| {}
         }
@@ -18505,7 +18733,6 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
             return;
         };
-        const driver_ctx = try self.allocSocketsP3StreamCtx(stream.socket.handle, s.family);
         {
             // Drain any bytes the guest pre-buffered (e.g. wrote into
             // the stream before calling `send`) straight to the fd.
@@ -18520,11 +18747,19 @@ pub const WasiCliAdapter = struct {
                 };
                 slot.buffer.clearRetainingCapacity();
             }
+            const driver_ctx = try self.allocSocketsP3StreamCtx(
+                sock_handle,
+                stream.socket.handle,
+                s.family,
+            );
             const future_handle = ci.allocAsyncHandle();
-            try ci.futures.put(ci.allocator, future_handle, .{
+            ci.futures.put(ci.allocator, future_handle, .{
                 .elem_type_idx = 0,
                 .state = .pending,
-            });
+            }) catch |err| {
+                socketsP3StreamCtxOnDestroy(driver_ctx);
+                return err;
+            };
             driver_ctx.component_instance = ci;
             driver_ctx.completion_future = future_handle;
             // Attach the driver so subsequent guest writes flow to fd.
@@ -18612,7 +18847,11 @@ pub const WasiCliAdapter = struct {
         // linmem slice; `on_read` remains a fallback when the
         // requested length overflows `u32` or extends past
         // `memory.size`.
-        const driver_ctx = try self.allocSocketsP3StreamCtx(stream.socket.handle, s.family);
+        const driver_ctx = try self.allocSocketsP3StreamCtx(
+            sock_handle,
+            stream.socket.handle,
+            s.family,
+        );
         const stream_h = ci.allocAsyncHandle();
         ci.streams.put(ci.allocator, stream_h, .{
             .elem_type_idx = 0,
@@ -18625,7 +18864,7 @@ pub const WasiCliAdapter = struct {
                 .on_destroy = &socketsP3StreamCtxOnDestroy,
             },
         }) catch |err| {
-            _ = self.sockets_p3_stream_ctxs.remove(driver_ctx.registry_handle);
+            socketsP3StreamCtxOnDestroy(driver_ctx);
             return err;
         };
         // Pre-buffer anything already pending on the fd at call time so
@@ -19230,12 +19469,10 @@ pub const WasiCliAdapter = struct {
         defer body_lease.release();
         const body = body_lease.lock().*;
         defer body_lease.unlock();
-        const stream_lease = if (body.stream) |*lease| lease else return null;
-        const resource = stream_lease.value();
-        const mutex = resource.mutex();
-        mutex.lock();
-        defer mutex.unlock();
-        return try self.allocator.dupe(u8, resource.stream.getBufferContents());
+        const owner = body.stream_owner orelse return null;
+        owner.operation_claim.acquire();
+        defer owner.operation_claim.release();
+        return try self.allocator.dupe(u8, owner.stream.getBufferContents());
     }
 
     fn removeAllResources(self: *WasiCliAdapter, table: anytype) void {
@@ -19246,28 +19483,16 @@ pub const WasiCliAdapter = struct {
     }
 
     fn cleanupHttpResources(self: *WasiCliAdapter) void {
-        const incoming_body_handles = self.http_incoming_bodies.snapshotHandles(self.allocator) catch
-            @panic("failed to snapshot incoming-body handles");
-        defer self.allocator.free(incoming_body_handles);
-        for (incoming_body_handles) |handle| {
-            var lease = self.lookupIncomingBody(handle) orelse continue;
-            const body = lease.lock().*;
-            var stream = body.stream;
-            body.stream = null;
-            lease.unlock();
-            if (stream) |*owned| owned.release();
-            lease.release();
-        }
         const outgoing_body_handles = self.http_outgoing_bodies.snapshotHandles(self.allocator) catch
             @panic("failed to snapshot outgoing-body handles");
         defer self.allocator.free(outgoing_body_handles);
         for (outgoing_body_handles) |handle| {
             var lease = self.lookupOutgoingBody(handle) orelse continue;
             const body = lease.lock().*;
-            var stream = body.stream;
-            body.stream = null;
+            const owner = body.stream_owner;
+            body.stream_owner = null;
             lease.unlock();
-            if (stream) |*owned| owned.release();
+            if (owner) |owned| owned.release();
             lease.release();
         }
 
@@ -20784,14 +21009,7 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        var lease = self.lookupIncomingBody(handle) orelse return;
-        const body = lease.lock().*;
-        var stream = body.stream;
-        body.stream = null;
-        lease.unlock();
-        if (stream) |*owned| owned.release();
-        std.debug.assert(self.http_incoming_bodies.remove(handle));
-        lease.release();
+        _ = self.http_incoming_bodies.remove(handle);
     }
 
     /// `[method]outgoing-body.write(borrow)
@@ -20839,14 +21057,17 @@ pub const WasiCliAdapter = struct {
             body_lease.unlock();
             return err;
         };
-        const retained = self.stream_table.acquire(sh).?;
+        var stream_lease = self.stream_table.acquire(sh).?;
+        const owner = stream_lease.value().owner.?;
+        owner.retain();
+        stream_lease.release();
         const update = body_lease.lock().*;
-        update.stream = retained;
+        update.stream_owner = owner;
         body_lease.unlock();
         errdefer {
             const rollback = body_lease.lock().*;
-            if (rollback.stream) |*lease_to_release| lease_to_release.release();
-            rollback.stream = null;
+            if (rollback.stream_owner) |owned| owned.release();
+            rollback.stream_owner = null;
             rollback.stream_taken = false;
             body_lease.unlock();
             std.debug.assert(self.stream_table.remove(sh));
@@ -20882,12 +21103,12 @@ pub const WasiCliAdapter = struct {
         };
         var lease = self.lookupOutgoingBody(handle) orelse return;
         const body = lease.lock().*;
-        var stream = body.stream;
-        body.stream = null;
+        const owner = body.stream_owner;
+        body.stream_owner = null;
         lease.unlock();
-        if (stream) |*owned| owned.release();
-        std.debug.assert(self.http_outgoing_bodies.remove(handle));
+        if (owner) |owned| owned.release();
         lease.release();
+        _ = self.http_outgoing_bodies.remove(handle);
     }
 
     // --- futures ---
@@ -21035,7 +21256,7 @@ pub const WasiCliAdapter = struct {
             for (handles) |operation_handle| {
                 var lease = self.pending_http_fetches.acquire(operation_handle) orelse continue;
                 const entry = lease.value();
-                if (entry.future_handle == handle) {
+                if (entry.armed.load(.acquire) and entry.future_handle == handle) {
                     if (entry.shared) |shared| shared.cancelled.store(true, .release);
                 }
                 lease.release();
@@ -21312,9 +21533,9 @@ pub const WasiCliAdapter = struct {
             .u32 => |h| h,
             else => return error.InvalidArgs,
         };
-        self.async_state_mutex.lock();
+        self.async_state_claim.acquire();
         const maybe_code = self.http_io_errors.get(handle);
-        self.async_state_mutex.unlock();
+        self.async_state_claim.release();
         const code = maybe_code orelse {
             results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
             return;
@@ -23097,10 +23318,10 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = h };
             return;
         };
-        defer src_lease.release();
         const src = src_lease.lock().*;
         const snapshot = src.*;
         src_lease.unlock();
+        src_lease.release();
         const dst = try self.allocator.create(RequestOptions);
         dst.* = snapshot;
         const h = try self.pushRequestOptionsP3(dst);
@@ -24651,8 +24872,8 @@ pub const WasiCliAdapter = struct {
         // bucket and the persistence layer have independent
         // ownership — `bucket.deinit` frees the bucket side,
         // `keyvalue_persisted.deinit` frees the snapshot side.
-        self.keyvalue_state_mutex.lock();
-        defer self.keyvalue_state_mutex.unlock();
+        self.keyvalue_state_claim.acquire();
+        defer self.keyvalue_state_claim.release();
         if (self.keyvalue_persisted.get(ident_bytes)) |snap| {
             bucket.entries.ensureTotalCapacity(self.allocator, snap.entries.count()) catch {
                 bucket.deinit(self.allocator);
@@ -24712,8 +24933,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
         const key_bytes = if (key_pl.len == 0)
             @as([]const u8, "")
         else
@@ -24766,8 +24987,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
         const key_bytes = if (key_pl.len == 0)
             @as([]const u8, "")
         else
@@ -24853,8 +25074,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
         const key_bytes = if (key_pl.len == 0)
             @as([]const u8, "")
         else
@@ -24890,8 +25111,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
         const key_bytes = if (key_pl.len == 0)
             @as([]const u8, "")
         else
@@ -24931,8 +25152,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
 
         var start_index: usize = 0;
         if (cursor_opt.is_some) {
@@ -25072,8 +25293,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
         const key_bytes = if (key_pl.len == 0)
             @as([]const u8, "")
         else
@@ -25186,18 +25407,22 @@ pub const WasiCliAdapter = struct {
             results[0] = try keyvalueCasErrStoreOther(ci, allocator, "invalid cas handle");
             return;
         };
-        defer cas_lease.release();
+        var cas_active = true;
+        defer if (cas_active) cas_lease.release();
         const cas_rep = cas_lease.value().*;
-        cas_rep.operation_mutex.lock();
-        defer cas_rep.operation_mutex.unlock();
+        cas_rep.operation_claim.acquire();
+        var cas_claimed = true;
+        defer if (cas_claimed) cas_rep.operation_claim.release();
         var bucket_lease = self.lookupKeyvalueBucket(cas_rep.bucket_handle) orelse {
             results[0] = try keyvalueCasErrStoreSimple(allocator, .no_such_store);
             return;
         };
-        defer bucket_lease.release();
+        var bucket_active = true;
+        defer if (bucket_active) bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        var bucket_claimed = true;
+        defer if (bucket_claimed) bucket.operation_claim.release();
         const new_value_bytes = if (value_pl.len == 0)
             @as([]const u8, "")
         else
@@ -25219,7 +25444,15 @@ pub const WasiCliAdapter = struct {
             // snapshot via `bucketStoreEntry`.
             try bucketStoreEntry(self, bucket, cas_rep.key, new_value_bytes);
             // Consume the CAS handle.
-            std.debug.assert(self.cas_table.remove(cas_handle));
+            bucket.operation_claim.release();
+            bucket_claimed = false;
+            bucket_lease.release();
+            bucket_active = false;
+            cas_rep.operation_claim.release();
+            cas_claimed = false;
+            cas_lease.release();
+            cas_active = false;
+            _ = self.cas_table.remove(cas_handle);
             results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
             return;
         }
@@ -25279,8 +25512,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
         const key_bytes = if (key_pl.len == 0)
             @as([]const u8, "")
         else
@@ -25341,8 +25574,8 @@ pub const WasiCliAdapter = struct {
         };
         defer cas_lease.release();
         const cas_rep = cas_lease.value().*;
-        cas_rep.operation_mutex.lock();
-        defer cas_rep.operation_mutex.unlock();
+        cas_rep.operation_claim.acquire();
+        defer cas_rep.operation_claim.release();
         if (!cas_rep.is_observed) {
             results[0] = try keyvalueResultOk(allocator, .{ .option_val = .{
                 .is_some = false,
@@ -25409,8 +25642,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
 
         // Each `string` element is 8 bytes (ptr + len) in linear memory.
         const stride: u32 = 8;
@@ -25504,8 +25737,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
 
         // Each `tuple<string, list<u8>>` is 16 bytes in linear memory.
         const stride: u32 = 16;
@@ -25560,8 +25793,8 @@ pub const WasiCliAdapter = struct {
         };
         defer bucket_lease.release();
         const bucket = bucket_lease.value().*;
-        bucket.operation_mutex.lock();
-        defer bucket.operation_mutex.unlock();
+        bucket.operation_claim.acquire();
+        defer bucket.operation_claim.release();
         const stride: u32 = 8;
         const count = keys_pl.len;
         const keys_bytes: []const u8 = if (count == 0)
@@ -25644,8 +25877,8 @@ pub const WasiCliAdapter = struct {
         key: []const u8,
         value: []const u8,
     ) !void {
-        self.keyvalue_state_mutex.lock();
-        defer self.keyvalue_state_mutex.unlock();
+        self.keyvalue_state_claim.acquire();
+        defer self.keyvalue_state_claim.release();
         if (self.keyvalue_store_path == null) return;
         const bucket = try self.persistedBucketGetOrCreate(identifier);
         const new_value = try self.allocator.dupe(u8, value);
@@ -25673,8 +25906,8 @@ pub const WasiCliAdapter = struct {
         identifier: []const u8,
         key: []const u8,
     ) !void {
-        self.keyvalue_state_mutex.lock();
-        defer self.keyvalue_state_mutex.unlock();
+        self.keyvalue_state_claim.acquire();
+        defer self.keyvalue_state_claim.release();
         if (self.keyvalue_store_path == null) return;
         if (self.keyvalue_persisted.get(identifier)) |bucket| {
             if (bucket.entries.fetchRemove(key)) |entry| {
@@ -25746,8 +25979,8 @@ pub const WasiCliAdapter = struct {
     ///     base64
     ///   - allocator failures bubble up unchanged.
     pub fn setKeyvalueStorePath(self: *WasiCliAdapter, path: []const u8) !void {
-        self.keyvalue_state_mutex.lock();
-        defer self.keyvalue_state_mutex.unlock();
+        self.keyvalue_state_claim.acquire();
+        defer self.keyvalue_state_claim.release();
         const path_dup = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(path_dup);
         if (self.keyvalue_store_path) |old| self.allocator.free(old);
@@ -32558,10 +32791,13 @@ test "sockets P3 #917: dropped udp socket cannot steal a datagram via table-slot
     adapter.closeSocketByHandle(1);
     try testing.expect(!adapter.socket_table.contains(1));
 
-    // A brand-new UDP socket receives another handle while the retired
-    // node is leased, defeating numeric-handle ABA.
+    // Enabled tables keep the retired slot leased; disabled tables retain
+    // the historical direct-array reuse and rely on resource_generation.
     const new_handle = try adapter.pushSocket(.{ .kind = .udp, .family = .ipv4 });
-    try testing.expectEqual(@as(u32, 2), new_handle);
+    try testing.expectEqual(
+        @as(u32, if (build_options.lib_wasi_threads) 2 else 1),
+        new_handle,
+    );
     var any: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     adapter.socket_table.unsafeGetPtrForTest(new_handle).?.host_socket = std.Io.net.IpAddress.bind(&any, io, .{
         .mode = .dgram,
@@ -32602,10 +32838,15 @@ test "sockets P3 #917: dropped udp socket cannot steal a datagram via table-slot
     );
     try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.publishedCount());
 
-    // Releasing the queued receive's final parent lease makes handle 1
-    // reusable again, but only after the stale operation is gone.
+    // Enabled reuse advances the encoded generation; disabled reuse keeps
+    // the historical compact-array numbering.
     const recycled = try adapter.pushSocket(.{ .kind = .udp, .family = .ipv4 });
-    try testing.expectEqual(@as(u32, 1), recycled);
+    if (build_options.lib_wasi_threads) {
+        try testing.expectEqual(@as(u32, 1), stable_resource.handleIndex(recycled));
+        try testing.expect(recycled != 1);
+    } else {
+        try testing.expectEqual(@as(u32, 2), recycled);
+    }
 
     // The datagram survived for its rightful owner: a fresh receive on
     // the reused-slot socket still delivers it with an ok arm.
@@ -33639,9 +33880,9 @@ test "sockets P3 (#583 follow-up): cancelAllPendingAsyncOps flips cancel flag on
     // Allocate two socket-stream ctxs directly (no real fd needed —
     // this test exercises only the cancel-flag wire-up, not the
     // drivers themselves). The bogus fds never get poll'd here.
-    const ctx_a = try adapter.allocSocketsP3StreamCtx(-1, .ipv4);
+    const ctx_a = try adapter.allocSocketsP3StreamCtx(null, -1, .ipv4);
     defer WasiCliAdapter.socketsP3StreamCtxOnDestroy(ctx_a);
-    const ctx_b = try adapter.allocSocketsP3StreamCtx(-1, .ipv6);
+    const ctx_b = try adapter.allocSocketsP3StreamCtx(null, -1, .ipv6);
     defer WasiCliAdapter.socketsP3StreamCtxOnDestroy(ctx_b);
 
     // Pre-cancel: every flag starts false (the struct's default).
@@ -35720,10 +35961,14 @@ test "http: response-outparam.set drives HTTP response writer (#201)" {
         else => return error.TestFailed,
     }
     const body_stream_handle = try adapter.allocOwnedStreamHandle(body_stream, null, null);
+    var body_stream_lease = adapter.stream_table.acquire(body_stream_handle).?;
+    const body_stream_owner = body_stream_lease.value().owner.?;
+    body_stream_owner.retain();
+    body_stream_lease.release();
     const body = try adapter.allocator.create(OutgoingBody);
     body.* = .{
         .stream_taken = true,
-        .stream = adapter.stream_table.acquire(body_stream_handle).?,
+        .stream_owner = body_stream_owner,
     };
     const body_handle = try adapter.pushOutgoingBody(body);
     response.body_handle = body_handle;
@@ -47445,6 +47690,368 @@ test "wasi:sockets/network.network-error-code: returns option::none for opaque i
 
     try testing.expect(results[0] == .option_val);
     try testing.expect(!results[0].option_val.is_some);
+}
+
+test "adapter resource safety: outgoing body owns bytes after stream handle drop" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const body = try adapter.allocator.create(OutgoingBody);
+    body.* = .{};
+    const body_handle = try adapter.pushOutgoingBody(body);
+
+    const write_args = [_]InterfaceValue{.{ .handle = body_handle }};
+    var write_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &write_args,
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+
+    var stream_lease = adapter.lookupStream(stream_handle).?;
+    const resource = stream_lease.value();
+    const claim = resource.claim();
+    claim.acquire();
+    try testing.expectEqual(
+        @as(usize, 7),
+        resource.stream.write("persist", testing.allocator).ok,
+    );
+    claim.release();
+    stream_lease.release();
+
+    const stream_drop_args = [_]InterfaceValue{.{ .handle = stream_handle }};
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &stream_drop_args,
+        &.{},
+        testing.allocator,
+    );
+    try testing.expect(!adapter.stream_table.contains(stream_handle));
+
+    const bytes = (try adapter.copyOutgoingBodyBytes(body_handle)).?;
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("persist", bytes);
+
+    const body_drop_args = [_]InterfaceValue{.{ .handle = body_handle }};
+    try WasiCliAdapter.httpOutgoingBodyDrop(
+        &adapter,
+        &ci,
+        &body_drop_args,
+        &.{},
+        testing.allocator,
+    );
+    try testing.expect(!adapter.http_outgoing_bodies.contains(body_handle));
+}
+
+test "adapter resource safety: timer completion and cancellation claim exactly once" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = makeBareCiForClocksTest();
+    defer freeBareCiForClocksTest(&ci);
+
+    const Runner = struct {
+        fn complete(
+            target: *WasiCliAdapter,
+            component: *ComponentInstance,
+            start: *std.atomic.Value(bool),
+        ) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            _ = target.completeDueTimerFutures(component, testing.allocator);
+        }
+
+        fn cancel(
+            target: *WasiCliAdapter,
+            component: *ComponentInstance,
+            start: *std.atomic.Value(bool),
+        ) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            WasiCliAdapter.cancelAllPendingAsyncOps(
+                target,
+                component,
+                null,
+                testing.allocator,
+            );
+        }
+    };
+
+    for (0..64) |_| {
+        adapter.monotonic_clock_override = 0;
+        const future_handle = try adapter.spawnTimerFuture(&ci, 1);
+        adapter.monotonic_clock_override = 2;
+        var start = std.atomic.Value(bool).init(false);
+        const completing = try std.Thread.spawn(
+            .{},
+            Runner.complete,
+            .{ &adapter, &ci, &start },
+        );
+        const cancelling = try std.Thread.spawn(
+            .{},
+            Runner.cancel,
+            .{ &adapter, &ci, &start },
+        );
+        start.store(true, .release);
+        completing.join();
+        cancelling.join();
+
+        const future = ci.futures.getPtr(future_handle).?;
+        try testing.expect(future.state == .ready or future.state == .closed);
+        try testing.expectEqual(@as(usize, 0), adapter.timer_futures.publishedCount());
+    }
+}
+
+test "adapter resource safety: concurrent socket scans never wait on nested claims" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    _ = try adapter.pushSocket(.{ .kind = .tcp, .family = .ipv4 });
+    _ = try adapter.pushSocket(.{ .kind = .tcp, .family = .ipv4 });
+
+    const Runner = struct {
+        fn run(
+            target: *WasiCliAdapter,
+            handle: u32,
+            ready: *std.atomic.Value(usize),
+            start: *std.atomic.Value(bool),
+            result: *std.atomic.Value(u8),
+        ) void {
+            var lease = target.lookupSocket(handle).?;
+            _ = ready.fetchAdd(1, .release);
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            const address: std.Io.net.IpAddress = .{ .ip4 = .{
+                .bytes = .{ 127, 0, 0, 1 },
+                .port = 31_337,
+            } };
+            result.store(
+                @intFromEnum(target.bindWouldConflict(address, handle)),
+                .release,
+            );
+            lease.release();
+        }
+    };
+
+    var ready = std.atomic.Value(usize).init(0);
+    var start = std.atomic.Value(bool).init(false);
+    var first_result = std.atomic.Value(u8).init(0);
+    var second_result = std.atomic.Value(u8).init(0);
+    const first = try std.Thread.spawn(
+        .{},
+        Runner.run,
+        .{ &adapter, @as(u32, 0), &ready, &start, &first_result },
+    );
+    const second = try std.Thread.spawn(
+        .{},
+        Runner.run,
+        .{ &adapter, @as(u32, 1), &ready, &start, &second_result },
+    );
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    first.join();
+    second.join();
+
+    const busy = @intFromEnum(WasiCliAdapter.BindConflictCheck.busy);
+    const clear = @intFromEnum(WasiCliAdapter.BindConflictCheck.clear);
+    const first_value = first_result.load(.acquire);
+    const second_value = second_result.load(.acquire);
+    try testing.expect(first_value == busy or first_value == clear);
+    try testing.expect(second_value == busy or second_value == clear);
+    try testing.expect(first_value == busy or second_value == busy);
+}
+
+test "adapter resource safety: UDP completion cancel and socket drop quiesce" {
+    if (!build_options.lib_wasi_threads or builtin.os.tag == .windows)
+        return error.SkipZigTest;
+    const testing = std.testing;
+
+    const Runner = struct {
+        fn complete(
+            target: *WasiCliAdapter,
+            component: *ComponentInstance,
+            start: *std.atomic.Value(bool),
+        ) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            _ = target.completeReadyPendingUdpReceives(component, testing.allocator);
+        }
+
+        fn cancel(
+            target: *WasiCliAdapter,
+            component: *ComponentInstance,
+            start: *std.atomic.Value(bool),
+        ) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            WasiCliAdapter.cancelAllPendingAsyncOps(
+                target,
+                component,
+                null,
+                testing.allocator,
+            );
+        }
+
+        fn dropSocket(
+            target: *WasiCliAdapter,
+            handle: u32,
+            start: *std.atomic.Value(bool),
+        ) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            target.closeSocketByHandle(handle);
+        }
+    };
+
+    for (0..24) |_| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci: ComponentInstance = undefined;
+        try ci.enableTestMem(testing.allocator, 4096);
+        defer ci.disableTestMem();
+        p3TestInitAsyncTables(&ci);
+        defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+        const receiver_port = try p3UdpReceiveTestSetup(&adapter, &ci);
+        const recv_args = [_]InterfaceValue{.{ .handle = 1 }};
+        var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpReceiveP3(
+            &adapter,
+            &ci,
+            &recv_args,
+            &recv_results,
+            testing.allocator,
+        );
+        const future = ci.futures.getPtr(recv_results[0].handle).?;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var destination: std.Io.net.IpAddress = .{ .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = receiver_port,
+        } };
+        try adapter.socket_table.unsafeGetPtrForTest(0).?.host_socket.?.send(
+            io,
+            &destination,
+            "race",
+        );
+
+        var start = std.atomic.Value(bool).init(false);
+        const completing = try std.Thread.spawn(
+            .{},
+            Runner.complete,
+            .{ &adapter, &ci, &start },
+        );
+        const cancelling = try std.Thread.spawn(
+            .{},
+            Runner.cancel,
+            .{ &adapter, &ci, &start },
+        );
+        const dropping = try std.Thread.spawn(
+            .{},
+            Runner.dropSocket,
+            .{ &adapter, @as(u32, 1), &start },
+        );
+        start.store(true, .release);
+        completing.join();
+        cancelling.join();
+        dropping.join();
+
+        if (adapter.pending_udp_receives.publishedCount() != 0) {
+            _ = adapter.completeReadyPendingUdpReceives(&ci, testing.allocator);
+        }
+        try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.publishedCount());
+        try testing.expect(future.state == .ready or future.state == .closed);
+    }
+}
+
+test "adapter resource safety: HTTP drain drop and shutdown clean one worker" {
+    const testing = std.testing;
+
+    const Runner = struct {
+        fn worker(shared: *PendingHttpFetchShared, start: *std.atomic.Value(bool)) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            shared.outcome = .{ .failure = .connection_refused };
+            shared.done.store(true, .release);
+        }
+
+        fn drain(target: *WasiCliAdapter, start: *std.atomic.Value(bool)) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            target.drainPendingHttpFetches();
+        }
+
+        fn dropFuture(
+            target: *WasiCliAdapter,
+            future_handle: u32,
+            start: *std.atomic.Value(bool),
+        ) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            var ci: ComponentInstance = undefined;
+            const args = [_]InterfaceValue{.{ .handle = future_handle }};
+            WasiCliAdapter.httpFutureDrop(
+                target,
+                &ci,
+                &args,
+                &.{},
+                testing.allocator,
+            ) catch unreachable;
+        }
+
+        fn shutdown(target: *WasiCliAdapter, start: *std.atomic.Value(bool)) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            target.pending_http_fetches.shutdown();
+        }
+    };
+
+    for (0..24) |_| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+
+        const future = try adapter.allocator.create(FutureIncomingResponse);
+        future.* = .{ .state = .pending };
+        const future_handle = try adapter.pushFutureResponse(future);
+        const future_lease = adapter.http_future_responses.acquire(future_handle).?;
+        const shared = try adapter.allocator.create(PendingHttpFetchShared);
+        shared.* = .{};
+
+        const published = try adapter.pending_http_fetches.publishLeased(.{
+            .future_handle = future_handle,
+            .thread = null,
+            .shared = null,
+            .future_lease = null,
+        });
+        var operation_lease = published.lease;
+        var start = std.atomic.Value(bool).init(false);
+        const worker = try std.Thread.spawn(.{}, Runner.worker, .{ shared, &start });
+        const operation = operation_lease.lock();
+        operation.thread = worker;
+        operation.shared = shared;
+        operation.future_lease = future_lease;
+        operation_lease.unlock();
+        operation.armed.store(true, .release);
+        operation_lease.release();
+
+        const draining = try std.Thread.spawn(.{}, Runner.drain, .{ &adapter, &start });
+        const dropping = try std.Thread.spawn(
+            .{},
+            Runner.dropFuture,
+            .{ &adapter, future_handle, &start },
+        );
+        const shutting_down = try std.Thread.spawn(
+            .{},
+            Runner.shutdown,
+            .{ &adapter, &start },
+        );
+        start.store(true, .release);
+        draining.join();
+        dropping.join();
+        shutting_down.join();
+
+        try testing.expect(adapter.pending_http_fetches.isQuiescent());
+        try testing.expect(!adapter.http_future_responses.contains(future_handle));
+    }
 }
 
 // =========================================================================

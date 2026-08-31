@@ -3,7 +3,8 @@
 //! The configured aliases erase synchronization and reference-count storage
 //! when WASI threads are disabled. In that mode a lease is a scoped borrow:
 //! callers must release it before removing its handle. Thread-enabled tables
-//! retain retired nodes until the final lease is released.
+//! retain retired nodes until the final lease is released. Reused directory
+//! slots advance a generation embedded in the handle, preventing ABA.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,16 +12,32 @@ const config = @import("config");
 
 pub const Handle = u32;
 
+/// Stable handles reserve the high byte for a generation and the low 24 bits
+/// for the directory slot. A slot is retired permanently instead of wrapping
+/// its generation, so an old handle can never alias a later occupant.
+pub const handle_index_bits = 24;
+pub const handle_generation_bits = @bitSizeOf(Handle) - handle_index_bits;
+pub const max_handle_index: Handle = (1 << handle_index_bits) - 1;
+pub const HandleGeneration = std.meta.Int(.unsigned, handle_generation_bits);
+
+pub fn handleIndex(handle: Handle) Handle {
+    return handle & max_handle_index;
+}
+
+pub fn handleGeneration(handle: Handle) HandleGeneration {
+    return @truncate(handle >> handle_index_bits);
+}
+
+pub fn makeHandle(index: Handle, generation: HandleGeneration) Handle {
+    std.debug.assert(index <= max_handle_index);
+    return index | (@as(Handle, generation) << handle_index_bits);
+}
+
 /// Lock ranks increase from outer to inner locks.
 pub const LockRank = struct {
     pub const resource_registry: u16 = 50;
     pub const resource_directory: u16 = 100;
     pub const resource_node: u16 = 200;
-    pub const adapter_relation: u16 = 210;
-    pub const adapter_input_stream: u16 = 220;
-    pub const adapter_output_stream: u16 = 221;
-    pub const adapter_resource: u16 = 230;
-    pub const adapter_state: u16 = 240;
     pub const core_instance: u16 = 250;
     pub const core_table: u16 = 300;
 };
@@ -126,35 +143,61 @@ pub fn ConditionalMutex(comptime rank: u16) type {
     return ConditionalMutexFor(config.lib_wasi_threads, rank);
 }
 
-/// A zero-sized disabled / ordinary blocking mutex enabled specialization
-/// for resource operation gates. Unlike table mutexes, operation gates are
-/// intentionally unranked because they may cover host I/O but must never be
-/// held by table directory code or resource destructors.
-pub fn ConditionalOperationMutexFor(comptime enabled: bool) type {
+/// Exclusive operation ownership without holding a resource/table mutex.
+///
+/// Enabled callers acquire the claim only after taking a stable lease, wait
+/// without any ranked lock held, and may then perform host callbacks or I/O.
+/// The lease prevents destruction while the claim is owned. Disabled builds
+/// erase the claim entirely.
+pub fn ConditionalOperationClaimFor(comptime enabled: bool) type {
     return if (enabled) struct {
         state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
         pub const init: @This() = .{};
 
-        pub fn lock(self: *@This()) void {
+        pub fn tryAcquire(self: *@This()) bool {
+            return self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+        }
+
+        pub fn acquire(self: *@This()) void {
+            var spins: usize = 0;
             while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-                std.atomic.spinLoopHint();
+                if (spins < 64) {
+                    spins += 1;
+                    std.atomic.spinLoopHint();
+                } else {
+                    std.Thread.yield() catch std.atomic.spinLoopHint();
+                }
             }
         }
 
-        pub fn unlock(self: *@This()) void {
-            self.state.store(0, .release);
+        pub fn release(self: *@This()) void {
+            if (comptime debug_lock_tracking) {
+                const observed = self.state.cmpxchgStrong(
+                    1,
+                    0,
+                    .release,
+                    .monotonic,
+                );
+                std.debug.assert(observed == null);
+            } else {
+                self.state.store(0, .release);
+            }
         }
     } else struct {
         pub const init: @This() = .{};
 
-        pub inline fn lock(_: *@This()) void {}
-        pub inline fn unlock(_: *@This()) void {}
+        pub inline fn tryAcquire(_: *@This()) bool {
+            return true;
+        }
+
+        pub inline fn acquire(_: *@This()) void {}
+        pub inline fn release(_: *@This()) void {}
     };
 }
 
-pub const ConditionalOperationMutex =
-    ConditionalOperationMutexFor(config.lib_wasi_threads);
+pub const ConditionalOperationClaim =
+    ConditionalOperationClaimFor(config.lib_wasi_threads);
 
 /// An atomic reference count whose disabled specialization has no state.
 ///
@@ -337,7 +380,7 @@ pub fn StableHandleTableFor(
 ) type {
     comptime {
         if (chunk_capacity == 0) @compileError("chunk_capacity must be non-zero");
-        if (chunk_capacity > std.math.maxInt(Handle)) {
+        if (chunk_capacity > max_handle_index + 1) {
             @compileError("chunk_capacity does not fit in a handle");
         }
     }
@@ -350,6 +393,7 @@ pub fn StableHandleTableFor(
         const Node = struct {
             owner: *Control,
             handle: Handle = 0,
+            slot_index: Handle = 0,
             refs: RefCount = RefCount.init(1),
             state: if (enabled) std.atomic.Value(u8) else NodeState =
                 if (enabled)
@@ -378,7 +422,11 @@ pub fn StableHandleTableFor(
             never,
             published: *Node,
             retired: *Node,
-            free: ?Handle,
+            free: struct {
+                next: ?Handle,
+                generation: HandleGeneration,
+            },
+            exhausted,
         };
 
         const Chunk = struct {
@@ -428,6 +476,11 @@ pub fn StableHandleTableFor(
             }
         };
 
+        pub const Publication = struct {
+            handle: Handle,
+            lease: Lease,
+        };
+
         control: ?*Control,
 
         pub fn init(allocator: std.mem.Allocator, context: Context) !Self {
@@ -446,6 +499,22 @@ pub fn StableHandleTableFor(
         /// lock. On failure all table allocations are rolled back and the
         /// caller still owns `value`.
         pub fn publish(self: *Self, value: T) !Handle {
+            const node = try self.publishNode(value, false);
+            return node.handle;
+        }
+
+        /// Publish and atomically retain a lease before the handle can be
+        /// retired. Used when initialization continues after publication,
+        /// such as arming a worker-backed pending operation.
+        pub fn publishLeased(self: *Self, value: T) !Publication {
+            const node = try self.publishNode(value, true);
+            return .{
+                .handle = node.handle,
+                .lease = .{ .node = node },
+            };
+        }
+
+        fn publishNode(self: *Self, value: T, comptime retain_lease: bool) !*Node {
             const control = self.control.?;
             assertNoLocksHeldFor(enabled);
 
@@ -454,6 +523,7 @@ pub fn StableHandleTableFor(
             defer if (!committed) control.allocator.destroy(node);
             node.* = .{
                 .owner = control,
+                .refs = RefCount.init(if (retain_lease) 2 else 1),
                 .value = value,
             };
 
@@ -467,32 +537,35 @@ pub fn StableHandleTableFor(
                     return error.TableShuttingDown;
                 }
 
-                if (control.free_head) |handle| {
-                    const slot = findSlot(control, handle).?;
+                if (control.free_head) |slot_index| {
+                    const slot = findSlotByIndex(control, slot_index).?;
                     const next = switch (slot.*) {
-                        .free => |free_next| free_next,
+                        .free => |free_slot| free_slot.next,
                         else => unreachable,
                     };
+                    const generation = slot.free.generation;
                     control.free_head = next;
-                    node.handle = handle;
+                    node.slot_index = slot_index;
+                    node.handle = makeHandle(slot_index, generation);
                     slot.* = .{ .published = node };
                     recordPublish(control);
                     control.directory.unlock();
                     committed = true;
-                    return handle;
+                    return node;
                 }
 
                 if (control.tail) |tail| {
                     if (tail.used < chunk_capacity) {
                         const offset = tail.used;
-                        const handle: Handle = tail.base + @as(Handle, @intCast(offset));
+                        const slot_index: Handle = tail.base + @as(Handle, @intCast(offset));
                         tail.used += 1;
                         tail.slots[offset] = .{ .published = node };
-                        node.handle = handle;
+                        node.slot_index = slot_index;
+                        node.handle = makeHandle(slot_index, 0);
                         recordPublish(control);
                         control.directory.unlock();
                         committed = true;
-                        return handle;
+                        return node;
                     }
                 }
 
@@ -508,7 +581,7 @@ pub fn StableHandleTableFor(
                         }
                     else
                         0;
-                    if (base > std.math.maxInt(Handle) - (chunk_capacity - 1)) {
+                    if (base > max_handle_index - (chunk_capacity - 1)) {
                         control.directory.unlock();
                         return error.HandleExhausted;
                     }
@@ -523,11 +596,12 @@ pub fn StableHandleTableFor(
                     control.tail = chunk;
                     control.chunk_count += 1;
                     spare_chunk = null;
-                    node.handle = base;
+                    node.slot_index = base;
+                    node.handle = makeHandle(base, 0);
                     recordPublish(control);
                     control.directory.unlock();
                     committed = true;
-                    return base;
+                    return node;
                 }
 
                 if (control.tail) |tail| {
@@ -539,7 +613,7 @@ pub fn StableHandleTableFor(
                         control.directory.unlock();
                         return error.HandleExhausted;
                     };
-                    if (next_base > std.math.maxInt(Handle) - (chunk_capacity - 1)) {
+                    if (next_base > max_handle_index - (chunk_capacity - 1)) {
                         control.directory.unlock();
                         return error.HandleExhausted;
                     }
@@ -564,6 +638,7 @@ pub fn StableHandleTableFor(
                 .published => |published| published,
                 else => return null,
             };
+            if (node.handle != handle) return null;
             if (comptime enabled) node.refs.retain();
             return .{ .node = node };
         }
@@ -587,16 +662,19 @@ pub fn StableHandleTableFor(
                     return null;
                 },
             };
+            if (node.handle != handle) {
+                control.directory.unlock();
+                return null;
+            }
             if (comptime enabled) {
                 if (node.refs.count() != 1) {
                     control.directory.unlock();
                     return null;
                 }
             }
-
             node.setState(.destroying);
-            slot.* = .{ .free = control.free_head };
-            control.free_head = node.handle;
+            node.setState(.destroying);
+            recycleSlot(control, slot, node);
             control.published -= 1;
             control.live_nodes -= 1;
             control.directory.unlock();
@@ -622,6 +700,10 @@ pub fn StableHandleTableFor(
                     return false;
                 },
             };
+            if (node.handle != handle) {
+                control.directory.unlock();
+                return false;
+            }
             node.setState(.closing);
             slot.* = .{ .retired = node };
             control.published -= 1;
@@ -753,10 +835,14 @@ pub fn StableHandleTableFor(
         }
 
         fn findSlot(control: *Control, handle: Handle) ?*Slot {
+            return findSlotByIndex(control, handleIndex(handle));
+        }
+
+        fn findSlotByIndex(control: *Control, index: Handle) ?*Slot {
             var chunk = control.head;
             while (chunk) |current| : (chunk = current.next) {
-                if (handle < current.base) return null;
-                const offset = handle - current.base;
+                if (index < current.base) return null;
+                const offset = index - current.base;
                 if (offset < current.used) {
                     return &current.slots[@intCast(offset)];
                 }
@@ -791,18 +877,30 @@ pub fn StableHandleTableFor(
             destroy(control.context, &node.value);
 
             control.directory.lock();
-            const slot = findSlot(control, node.handle).?;
+            const slot = findSlotByIndex(control, node.slot_index).?;
             switch (slot.*) {
                 .retired => |retired| std.debug.assert(retired == node),
                 else => unreachable,
             }
-            slot.* = .{ .free = control.free_head };
-            control.free_head = node.handle;
+            recycleSlot(control, slot, node);
             control.retired -= 1;
             control.live_nodes -= 1;
             control.directory.unlock();
 
             allocator.destroy(node);
+        }
+
+        fn recycleSlot(control: *Control, slot: *Slot, node: *Node) void {
+            const generation = handleGeneration(node.handle);
+            if (generation == std.math.maxInt(HandleGeneration)) {
+                slot.* = .exhausted;
+                return;
+            }
+            slot.* = .{ .free = .{
+                .next = control.free_head,
+                .generation = generation + 1,
+            } };
+            control.free_head = node.slot_index;
         }
     };
 }
@@ -814,8 +912,8 @@ comptime {
     if (@sizeOf(ConditionalRefCountFor(false)) != 0) {
         @compileError("disabled ConditionalRefCount must have zero size");
     }
-    if (@sizeOf(ConditionalOperationMutexFor(false)) != 0) {
-        @compileError("disabled ConditionalOperationMutex must have zero size");
+    if (@sizeOf(ConditionalOperationClaimFor(false)) != 0) {
+        @compileError("disabled ConditionalOperationClaim must have zero size");
     }
 }
 
@@ -845,6 +943,7 @@ test "disabled conditional synchronization compiles to zero-sized no-ops" {
         @sizeOf(ConditionalMutexFor(false, LockRank.resource_directory)),
     );
     try std.testing.expectEqual(@as(usize, 0), @sizeOf(ConditionalRefCountFor(false)));
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(ConditionalOperationClaimFor(false)));
 
     var mutex: ConditionalMutexFor(false, LockRank.resource_directory) = .init;
     try std.testing.expect(mutex.tryLock());
@@ -857,6 +956,22 @@ test "disabled conditional synchronization compiles to zero-sized no-ops" {
     try std.testing.expectEqual(@as(usize, 1), refs.count());
     try std.testing.expect(refs.release());
     try std.testing.expect(debugNoLocksHeldFor(false));
+
+    var claim: ConditionalOperationClaimFor(false) = .init;
+    try std.testing.expect(claim.tryAcquire());
+    claim.release();
+    claim.acquire();
+    claim.release();
+}
+
+test "operation claims serialize ownership without ranked locks" {
+    var claim: ConditionalOperationClaimFor(true) = .init;
+    try std.testing.expect(claim.tryAcquire());
+    try std.testing.expect(!claim.tryAcquire());
+    try std.testing.expect(debugNoLocksHeldFor(true));
+    claim.release();
+    try std.testing.expect(claim.tryAcquire());
+    claim.release();
 }
 
 test "configured aliases follow lib_wasi_threads" {
@@ -940,6 +1055,21 @@ test "remove racing a lease leaves its node usable and closing" {
     try table.deinit();
 }
 
+test "publishLeased establishes ownership before removal can retire a node" {
+    const Table = TestTable(true, 2);
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = try Table.init(std.testing.allocator, &destroyed);
+
+    var published = try table.publishLeased(.{ .value = 91 });
+    try std.testing.expect(table.remove(published.handle));
+    try std.testing.expect(published.lease.isClosing());
+    try std.testing.expectEqual(@as(usize, 91), published.lease.value().value);
+    try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
+    published.lease.release();
+    try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
+    try table.deinit();
+}
+
 test "retired handles are reused only after final release" {
     const Table = TestTable(true, 4);
     var destroyed = std.atomic.Value(usize).init(0);
@@ -953,7 +1083,12 @@ test "retired handles are reused only after final release" {
 
     lease.release();
     const reused = try table.publish(.{ .value = 3 });
-    try std.testing.expectEqual(first, reused);
+    try std.testing.expectEqual(handleIndex(first), handleIndex(reused));
+    try std.testing.expect(handleGeneration(reused) > handleGeneration(first));
+    try std.testing.expect(table.acquire(first) == null);
+    var reused_lease = table.acquire(reused).?;
+    try std.testing.expectEqual(@as(usize, 3), reused_lease.value().value);
+    reused_lease.release();
 
     table.shutdown();
     try std.testing.expectEqual(@as(usize, 3), destroyed.load(.monotonic));
@@ -1038,7 +1173,9 @@ test "withdraw returns unpublished ownership without running the destructor" {
     try std.testing.expect(table.acquire(handle) == null);
 
     const reused = try table.publish(.{ .value = 456 });
-    try std.testing.expectEqual(handle, reused);
+    try std.testing.expectEqual(handleIndex(handle), handleIndex(reused));
+    try std.testing.expect(handleGeneration(reused) > handleGeneration(handle));
+    try std.testing.expect(table.acquire(handle) == null);
     table.shutdown();
     try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
     try table.deinit();
@@ -1063,7 +1200,7 @@ test "Debug lock checks reject inversion and track no-lock-held regions" {
     try std.testing.expect(debugNoLocksHeldFor(true));
 }
 
-test "disabled table keeps ordinary scoped operations and handle reuse" {
+test "disabled table keeps ordinary scoped operations and stale generations invalid" {
     const Table = TestTable(false, 2);
     var destroyed = std.atomic.Value(usize).init(0);
     var table = try Table.init(std.testing.allocator, &destroyed);
@@ -1074,9 +1211,42 @@ test "disabled table keeps ordinary scoped operations and handle reuse" {
     lease.release();
     try std.testing.expect(table.remove(first));
     const reused = try table.publish(.{ .value = 8 });
-    try std.testing.expectEqual(first, reused);
+    try std.testing.expectEqual(handleIndex(first), handleIndex(reused));
+    try std.testing.expect(handleGeneration(reused) > handleGeneration(first));
+    try std.testing.expect(table.acquire(first) == null);
 
     table.shutdown();
     try std.testing.expectEqual(@as(usize, 2), destroyed.load(.monotonic));
+    try table.deinit();
+}
+
+test "generation exhaustion retires a slot instead of wrapping ABA" {
+    const Table = TestTable(true, 2);
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = try Table.init(std.testing.allocator, &destroyed);
+
+    const stale = try table.publish(.{ .value = 0 });
+    try std.testing.expect(table.remove(stale));
+    var last = stale;
+    var generation: usize = 1;
+    while (generation <= std.math.maxInt(HandleGeneration)) : (generation += 1) {
+        last = try table.publish(.{ .value = generation });
+        try std.testing.expectEqual(handleIndex(stale), handleIndex(last));
+        try std.testing.expectEqual(
+            @as(HandleGeneration, @intCast(generation)),
+            handleGeneration(last),
+        );
+        try std.testing.expect(table.remove(last));
+    }
+
+    const replacement = try table.publish(.{ .value = 999 });
+    try std.testing.expect(handleIndex(replacement) != handleIndex(stale));
+    try std.testing.expect(table.acquire(stale) == null);
+    try std.testing.expect(table.acquire(last) == null);
+    try std.testing.expect(table.remove(replacement));
+    try std.testing.expectEqual(
+        @as(usize, std.math.maxInt(HandleGeneration)) + 2,
+        destroyed.load(.monotonic),
+    );
     try table.deinit();
 }

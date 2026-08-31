@@ -1,9 +1,10 @@
 //! Conditional stable ownership for adapter-local WASI resource handles.
 //!
 //! The disabled specialization keeps the historical compact array fast path.
-//! Thread-enabled builds publish stable nodes and require callers to hold a
-//! lease while using a resource. Directory locks are never held while user
-//! destructors run.
+//! Its leases are scoped pointers and must not cross mutation of the same
+//! table. Thread-enabled builds publish stable nodes and require callers to
+//! hold a retained lease while using a resource. Directory locks are never
+//! held while user destructors run.
 
 const std = @import("std");
 const config = @import("config");
@@ -68,16 +69,9 @@ pub fn ResourceTableFor(
 
     return struct {
         const Self = @This();
-        const DisabledNode = struct {
-            owner: *Self,
-            handle: u32,
-            refs: usize = 1,
-            closing: bool = false,
-            entry: Entry,
-        };
 
         pub const Lease = struct {
-            storage: if (enabled) Stable.Lease else ?*DisabledNode,
+            storage: if (enabled) Stable.Lease else ?*Entry,
             locked: bool = false,
 
             pub fn value(self: *Lease) *T {
@@ -101,7 +95,7 @@ pub fn ResourceTableFor(
 
             pub fn isClosing(self: *const Lease) bool {
                 if (comptime enabled) return self.storage.isClosing();
-                return self.storage.?.closing;
+                return false;
             }
 
             pub fn release(self: *Lease) void {
@@ -109,11 +103,7 @@ pub fn ResourceTableFor(
                 if (comptime enabled) {
                     self.storage.release();
                 } else {
-                    const node = self.storage orelse return;
                     self.storage = null;
-                    std.debug.assert(node.refs > 0);
-                    node.refs -= 1;
-                    if (node.refs == 0) finalizeDisabledNode(node);
                 }
             }
 
@@ -123,8 +113,13 @@ pub fn ResourceTableFor(
 
             fn entry(self: *Lease) *Entry {
                 if (comptime enabled) return self.storage.value();
-                return &self.storage.?.entry;
+                return self.storage.?;
             }
+        };
+
+        pub const Publication = struct {
+            handle: u32,
+            lease: Lease,
         };
 
         allocator: std.mem.Allocator,
@@ -132,7 +127,7 @@ pub fn ResourceTableFor(
         init_mutex: InitMutex = .init,
         directory_mutex: DirectoryMutex = .init,
         stable: if (enabled) ?Stable else void = if (enabled) null else {},
-        entries: if (enabled) void else std.ArrayListUnmanaged(?*DisabledNode) =
+        entries: if (enabled) void else std.ArrayListUnmanaged(?Entry) =
             if (enabled) {} else .empty,
         shutting_down: bool = false,
 
@@ -149,7 +144,7 @@ pub fn ResourceTableFor(
                 var table = try self.stableTable();
                 const internal = try table.publish(.{ .value = value });
                 if (comptime reserve_zero) {
-                    if (internal == std.math.maxInt(u32)) {
+                    if (internal >= std.math.maxInt(u32) - 1) {
                         std.debug.assert(table.withdraw(internal) != null);
                         return error.HandleExhausted;
                     }
@@ -157,15 +152,6 @@ pub fn ResourceTableFor(
                 }
                 return internal;
             }
-
-            const node = try self.allocator.create(DisabledNode);
-            var committed = false;
-            defer if (!committed) self.allocator.destroy(node);
-            node.* = .{
-                .owner = self,
-                .handle = 0,
-                .entry = .{ .value = value },
-            };
 
             self.directory_mutex.lock();
             defer self.directory_mutex.unlock();
@@ -177,9 +163,7 @@ pub fn ResourceTableFor(
             }
             for (self.entries.items[start..], start..) |slot, index| {
                 if (slot == null) {
-                    node.handle = @intCast(index);
-                    self.entries.items[index] = node;
-                    committed = true;
+                    self.entries.items[index] = .{ .value = value };
                     return @intCast(index);
                 }
             }
@@ -187,10 +171,38 @@ pub fn ResourceTableFor(
                 return error.HandleExhausted;
             }
             const handle: u32 = @intCast(self.entries.items.len);
-            node.handle = handle;
-            try self.entries.append(self.allocator, node);
-            committed = true;
+            try self.entries.append(self.allocator, .{ .value = value });
             return handle;
+        }
+
+        /// Publish and return a retained lease that is established before
+        /// shutdown/removal can retire the new handle.
+        pub fn publishLeased(self: *Self, value: T) !Publication {
+            if (comptime enabled) {
+                var table = try self.stableTable();
+                var published = try table.publishLeased(.{ .value = value });
+                if (comptime reserve_zero) {
+                    if (published.handle >= std.math.maxInt(u32) - 1) {
+                        published.lease.release();
+                        std.debug.assert(table.withdraw(published.handle) != null);
+                        return error.HandleExhausted;
+                    }
+                    return .{
+                        .handle = published.handle + 1,
+                        .lease = .{ .storage = published.lease },
+                    };
+                }
+                return .{
+                    .handle = published.handle,
+                    .lease = .{ .storage = published.lease },
+                };
+            }
+
+            const handle = try self.publish(value);
+            return .{
+                .handle = handle,
+                .lease = self.acquire(handle).?,
+            };
         }
 
         pub fn acquire(self: *Self, handle: u32) ?Lease {
@@ -213,10 +225,10 @@ pub fn ResourceTableFor(
             self.directory_mutex.lock();
             defer self.directory_mutex.unlock();
             if (self.shutting_down or handle >= self.entries.items.len) return null;
-            const node = self.entries.items[handle] orelse return null;
-            if (node.closing) return null;
-            node.refs += 1;
-            return .{ .storage = node };
+            if (self.entries.items[handle]) |*entry| {
+                return .{ .storage = entry };
+            }
+            return null;
         }
 
         /// Remove a published resource. Destruction is deferred until the
@@ -234,24 +246,14 @@ pub fn ResourceTableFor(
             }
 
             self.directory_mutex.lock();
-            if (handle >= self.entries.items.len) {
+            if (handle >= self.entries.items.len or self.entries.items[handle] == null) {
                 self.directory_mutex.unlock();
                 return false;
             }
-            const node = self.entries.items[handle] orelse {
-                self.directory_mutex.unlock();
-                return false;
-            };
-            if (node.closing) {
-                self.directory_mutex.unlock();
-                return false;
-            }
-            node.closing = true;
-            std.debug.assert(node.refs > 0);
-            node.refs -= 1;
-            const finalize = node.refs == 0;
+            var entry = self.entries.items[handle].?;
+            self.entries.items[handle] = null;
             self.directory_mutex.unlock();
-            if (finalize) finalizeDisabledNode(node);
+            Destroyer.run(self.context, &entry);
             return true;
         }
 
@@ -275,19 +277,13 @@ pub fn ResourceTableFor(
                 self.directory_mutex.unlock();
                 return null;
             }
-            const node = self.entries.items[handle] orelse {
+            const entry = self.entries.items[handle] orelse {
                 self.directory_mutex.unlock();
                 return null;
             };
-            if (node.closing or node.refs != 1) {
-                self.directory_mutex.unlock();
-                return null;
-            }
             self.entries.items[handle] = null;
             self.directory_mutex.unlock();
-            const value = node.entry.value;
-            self.allocator.destroy(node);
-            return value;
+            return entry.value;
         }
 
         pub fn contains(self: *Self, handle: u32) bool {
@@ -300,10 +296,17 @@ pub fn ResourceTableFor(
         /// while the handle stays published, but carries no lease and must
         /// never be retained across concurrent removal.
         pub fn unsafeGetPtrForTest(self: *Self, handle: u32) ?*T {
-            var lease = self.acquire(handle) orelse return null;
-            const pointer = lease.value();
-            lease.release();
-            return pointer;
+            if (comptime enabled) {
+                var lease = self.acquire(handle) orelse return null;
+                const pointer = lease.value();
+                lease.release();
+                return pointer;
+            }
+            self.directory_mutex.lock();
+            defer self.directory_mutex.unlock();
+            if (self.shutting_down or handle >= self.entries.items.len) return null;
+            if (self.entries.items[handle]) |*entry| return &entry.value;
+            return null;
         }
 
         pub fn publishedCount(self: *Self) usize {
@@ -317,9 +320,9 @@ pub fn ResourceTableFor(
                 self.directory_mutex.lock();
                 defer self.directory_mutex.unlock();
                 var count: usize = 0;
-                for (self.entries.items) |slot| if (slot) |node| {
-                    if (!node.closing) count += 1;
-                };
+                for (self.entries.items) |slot| {
+                    if (slot != null) count += 1;
+                }
                 return count;
             }
         }
@@ -341,19 +344,19 @@ pub fn ResourceTableFor(
 
             self.directory_mutex.lock();
             var count: usize = 0;
-            for (self.entries.items) |slot| if (slot) |node| {
-                if (!node.closing) count += 1;
-            };
+            for (self.entries.items) |slot| {
+                if (slot != null) count += 1;
+            }
             self.directory_mutex.unlock();
 
             const handles = try allocator.alloc(u32, count);
             self.directory_mutex.lock();
             var filled: usize = 0;
             for (self.entries.items, 0..) |slot, index| {
-                if (slot) |node| if (!node.closing and filled < handles.len) {
+                if (slot != null and filled < handles.len) {
                     handles[filled] = @intCast(index);
                     filled += 1;
-                };
+                }
             }
             self.directory_mutex.unlock();
             if (filled == handles.len) return handles;
@@ -384,19 +387,20 @@ pub fn ResourceTableFor(
 
             while (true) {
                 self.directory_mutex.lock();
-                var node_to_retire: ?*DisabledNode = null;
-                for (self.entries.items) |slot| {
-                    const node = slot orelse continue;
-                    if (node.closing) continue;
-                    node.closing = true;
-                    std.debug.assert(node.refs > 0);
-                    node.refs -= 1;
-                    node_to_retire = node;
-                    break;
+                var entry_to_destroy: ?Entry = null;
+                for (self.entries.items) |*slot| {
+                    if (slot.*) |entry| {
+                        entry_to_destroy = entry;
+                        slot.* = null;
+                        break;
+                    }
                 }
                 self.directory_mutex.unlock();
-                const node = node_to_retire orelse break;
-                if (node.refs == 0) finalizeDisabledNode(node);
+                if (entry_to_destroy) |*entry| {
+                    Destroyer.run(self.context, entry);
+                } else {
+                    break;
+                }
             }
         }
 
@@ -446,20 +450,8 @@ pub fn ResourceTableFor(
                     self.init_mutex.unlock();
                 }
             } else {
-                if (!self.isQuiescent()) return error.LeasesOutstanding;
                 self.entries.deinit(self.allocator);
             }
-        }
-
-        fn finalizeDisabledNode(node: *DisabledNode) void {
-            const owner = node.owner;
-            stable_resource.assertNoLocksHeldFor(false);
-            Destroyer.run(owner.context, &node.entry);
-            owner.directory_mutex.lock();
-            std.debug.assert(owner.entries.items[node.handle] == node);
-            owner.entries.items[node.handle] = null;
-            owner.directory_mutex.unlock();
-            owner.allocator.destroy(node);
         }
 
         fn stableTable(self: *Self) !Stable {
@@ -570,6 +562,53 @@ test "enabled adapter resource removal waits for the final lease" {
     lease.release();
     try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
     try table.deinit();
+}
+
+test "adapter publishLeased survives immediate retirement" {
+    const Table = ResourceTableFor(
+        true,
+        TestResource,
+        *std.atomic.Value(usize),
+        destroyTestResource,
+        true,
+        2,
+    );
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = Table.init(std.testing.allocator, &destroyed);
+    var published = try table.publishLeased(.{ .value = 29 });
+    try std.testing.expectEqual(@as(u32, 1), published.handle);
+    try std.testing.expect(table.remove(published.handle));
+    try std.testing.expect(published.lease.isClosing());
+    try std.testing.expectEqual(@as(usize, 29), published.lease.value().value);
+    published.lease.release();
+    try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
+    try table.deinit();
+}
+
+test "adapter resource handles preserve disabled reuse and reject enabled ABA" {
+    inline for (.{ false, true }) |enabled| {
+        const Table = ResourceTableFor(
+            enabled,
+            TestResource,
+            *std.atomic.Value(usize),
+            destroyTestResource,
+            true,
+            2,
+        );
+        var destroyed = std.atomic.Value(usize).init(0);
+        var table = Table.init(std.testing.allocator, &destroyed);
+        const stale = try table.publish(.{ .value = 1 });
+        try std.testing.expect(table.remove(stale));
+        const replacement = try table.publish(.{ .value = 2 });
+        if (enabled) {
+            try std.testing.expect(stale != replacement);
+            try std.testing.expect(table.acquire(stale) == null);
+        } else {
+            try std.testing.expectEqual(stale, replacement);
+        }
+        try table.deinit();
+        try std.testing.expectEqual(@as(usize, 2), destroyed.load(.monotonic));
+    }
 }
 
 test "adapter resource shutdown reports outstanding enabled leases" {
