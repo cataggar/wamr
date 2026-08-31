@@ -882,6 +882,19 @@ pub fn build(b: *std.Build) void {
     const run_adapter_resource_unit_tests = b.addRunArtifact(adapter_resource_unit_tests);
     adapter_resources_test_step.dependOn(&run_adapter_resource_unit_tests.step);
 
+    const http_streaming_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{"wasi:http #616 A8 live:"},
+    });
+    const run_http_streaming_unit_tests = b.addRunArtifact(
+        http_streaming_unit_tests,
+    );
+    const http_streaming_test_step = b.step(
+        "test-http-streaming",
+        "Run live inbound HTTP response streaming tests",
+    );
+    http_streaming_test_step.dependOn(&run_http_streaming_unit_tests.step);
+
     const component_resource_unit_tests = b.addTest(.{
         .root_module = test_module,
         .filters = &.{"component resource safety"},

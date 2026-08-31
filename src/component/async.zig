@@ -712,14 +712,22 @@ pub const AsyncStream = struct {
     /// FIFO of raw lowered bytes. Element boundaries are recomputed at
     /// op time from `elem_size = sizeOfType(...)`.
     buffer: std.ArrayListUnmanaged(u8) = .empty,
+    /// Optional FIFO high-water mark. When full, `stream.write` parks
+    /// without copying the pending source; a reader wake makes the guest
+    /// re-issue the write against newly available capacity.
+    buffer_limit: ?usize = null,
 
     /// A reader that ran while the buffer was empty. Resolved by the next
     /// `write` (direct memcpy into the parked dst, no buffering).
     pending_read: ?PendingRead = null,
     /// A writer that ran with no parked reader and exhausted the buffer
-    /// cap. The initial implementation has no cap, so this stays `null`;
-    /// kept for the future high-water-mark backpressure PR.
+    /// cap. The source remains in guest memory; after a reader frees space,
+    /// the write waitable wakes with zero completed elements so the guest
+    /// re-issues against the newly available capacity.
     pending_write: ?PendingWrite = null,
+    /// A pending writer was made runnable before it joined a waitable set.
+    /// The next join observes this latched edge and queues completion.
+    write_ready: bool = false,
 
     /// Optional host-side I/O hook for long-lived sockets (#535). When
     /// set, the executor's stream ops invoke the driver before parking
@@ -768,7 +776,11 @@ pub const AsyncStream = struct {
         /// before delivering its waitable event.
         elem_size: u32,
     };
-    pub const PendingWrite = struct { guest_ptr: u32, count: u32 };
+    pub const PendingWrite = struct {
+        guest_ptr: u32,
+        count: u32,
+        elem_size: u32 = 1,
+    };
 
     /// Free any heap-owned state (currently just the FIFO `buffer`).
     /// Safe to call multiple times.

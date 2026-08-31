@@ -1124,8 +1124,33 @@ pub fn callComponentFunc(
     out_results: []InterfaceValue,
     allocator: Allocator,
 ) ExecutionError!void {
+    return callComponentFuncWithHostTaskContext(
+        comp_inst,
+        func_name,
+        args,
+        out_results,
+        null,
+        allocator,
+    );
+}
+
+pub fn callComponentFuncWithHostTaskContext(
+    comp_inst: *const ComponentInstance,
+    func_name: []const u8,
+    args: []const InterfaceValue,
+    out_results: []InterfaceValue,
+    host_task_context: ?*anyopaque,
+    allocator: Allocator,
+) ExecutionError!void {
     const flat = flattenForwardedChain(comp_inst, func_name) orelse return error.FunctionNotFound;
-    return callComponentFuncByLocal(flat.owner, flat.local, args, out_results, allocator);
+    return callComponentFuncByLocalWithHostTaskContext(
+        flat.owner,
+        flat.local,
+        args,
+        out_results,
+        host_task_context,
+        allocator,
+    );
 }
 
 /// Walk an `ExportedFunc.forwarded` chain starting from `(comp_inst,
@@ -1211,6 +1236,24 @@ pub fn callComponentFuncByLocal(
     out_results: []InterfaceValue,
     allocator: Allocator,
 ) ExecutionError!void {
+    return callComponentFuncByLocalWithHostTaskContext(
+        owner_inst,
+        exported,
+        args,
+        out_results,
+        null,
+        allocator,
+    );
+}
+
+fn callComponentFuncByLocalWithHostTaskContext(
+    owner_inst: *const ComponentInstance,
+    exported: ComponentInstance.ExportedFunc.Local,
+    args: []const InterfaceValue,
+    out_results: []InterfaceValue,
+    host_task_context: ?*anyopaque,
+    allocator: Allocator,
+) ExecutionError!void {
     if (exported.core_instance_idx >= owner_inst.core_instances.len)
         return error.CoreInstanceNotAvailable;
     const core_entry = owner_inst.core_instances[exported.core_instance_idx];
@@ -1244,6 +1287,10 @@ pub fn callComponentFuncByLocal(
         }
         frame.deinit();
     }
+    var host_task_scope = frameThreadContext(&frame).bindHostTaskContext(
+        host_task_context,
+    );
+    defer host_task_scope.deinit();
     const is_aot = switch (frame) {
         .aot => true,
         .interp => false,
@@ -1539,6 +1586,26 @@ pub fn callComponentFuncByLocalAsyncLifted(
     task_manager: *async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
+    return callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
+        owner_inst,
+        exported,
+        args,
+        out_status,
+        task_manager,
+        null,
+        allocator,
+    );
+}
+
+fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
+    owner_inst: *const ComponentInstance,
+    exported: ComponentInstance.ExportedFunc.Local,
+    args: []const InterfaceValue,
+    out_status: *u32,
+    task_manager: *async_mod.TaskManager,
+    host_task_context: ?*anyopaque,
+    allocator: Allocator,
+) ExecutionError!void {
     out_status.* = 0;
 
     if (exported.core_instance_idx >= owner_inst.core_instances.len)
@@ -1588,6 +1655,8 @@ pub fn callComponentFuncByLocalAsyncLifted(
     thread_ctx.clearCancellation();
     var task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
     defer task_scope.deinit();
+    var host_task_scope = thread_ctx.bindHostTaskContext(host_task_context);
+    defer host_task_scope.deinit();
 
     const memory_idx = lift_opts.memory_idx orelse 0;
     var memory = frame.memory(memory_idx);
@@ -2826,6 +2895,9 @@ fn dispatchAsyncCanon(
             const handle = comp_inst.allocAsyncHandle();
             comp_inst.streams.put(comp_inst.allocator, handle, .{
                 .elem_type_idx = info.type_idx,
+                .buffer_limit = wasi_cli_adapter.inboundHttpStreamBufferLimit(
+                    thread_context,
+                ),
             }) catch return error.OutOfMemory;
             // Spec packs read+write handles into one i64; in our
             // single-handle prototype we publish the same idx for both
@@ -3073,6 +3145,19 @@ fn dispatchAsyncCanon(
                     s.buffer.items[take_bytes..],
                 );
                 s.buffer.items.len -= take_bytes;
+                const pending_writer = s.pending_write != null;
+                if (pending_writer) {
+                    s.pending_write = null;
+                    s.write_ready = true;
+                }
+                const write_waitable = s.write_waitable;
+                stream_lease.release();
+                if (pending_writer) {
+                    _ = comp_inst.notifyWaitable(
+                        write_waitable,
+                        async_canon.packStatus(.completed, 0),
+                    );
+                }
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, take))) catch
                     return error.StackOverflow;
                 return;
@@ -3111,6 +3196,7 @@ fn dispatchAsyncCanon(
             };
             defer stream_lease.release();
             var s = stream_lease.value();
+            s.write_ready = false;
 
             // Reader end already dropped → writer observes the drop.
             if (s.read_closed) {
@@ -3270,16 +3356,42 @@ fn dispatchAsyncCanon(
                 }
             }
 
-            // No reader yet — append to FIFO.
-            s.buffer.appendSlice(comp_inst.allocator, src) catch
+            // No reader yet — append to the bounded FIFO. A full
+            // response-body stream parks the writer without copying its
+            // guest-memory source; the host drain wakes it to re-issue.
+            const accepted_bytes: usize = if (s.buffer_limit) |limit| blk: {
+                const available = limit -| s.buffer.items.len;
+                const aligned = available - (available % elem_size);
+                if (aligned == 0) {
+                    s.pending_write = .{
+                        .guest_ptr = guest_ptr,
+                        .count = count,
+                        .elem_size = elem_size,
+                    };
+                    env.pushI32(@bitCast(async_canon.BLOCKED_STATUS)) catch
+                        return error.StackOverflow;
+                    return;
+                }
+                break :blk @min(src.len, aligned);
+            } else src.len;
+            s.buffer.appendSlice(
+                comp_inst.allocator,
+                src[0..accepted_bytes],
+            ) catch
                 return error.OutOfMemory;
             const waitable = s.read_waitable;
             stream_lease.release();
             _ = comp_inst.notifyWaitable(
                 waitable,
-                async_canon.packStatus(.completed, count),
+                async_canon.packStatus(
+                    .completed,
+                    @intCast(accepted_bytes / elem_size),
+                ),
             );
-            env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
+            env.pushI32(@bitCast(async_canon.packStatus(
+                .completed,
+                @intCast(accepted_bytes / elem_size),
+            ))) catch
                 return error.StackOverflow;
         },
         .stream_cancel_read => |info| {
@@ -3307,6 +3419,7 @@ fn dispatchAsyncCanon(
             defer stream_lease.release();
             const s = stream_lease.value();
             s.pending_write = null;
+            s.write_ready = false;
             env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
                 return error.StackOverflow;
         },
@@ -3970,6 +4083,8 @@ fn dispatchAsyncCanon(
                     s.write_waitable = registration;
                     if (s.read_closed)
                         break :blk async_canon.packStatus(.dropped, 0);
+                    if (s.write_ready)
+                        break :blk async_canon.packStatus(.completed, 0);
                     break :blk null;
                 };
                 stream_lease.release();
@@ -4200,6 +4315,7 @@ fn executeAsyncLiftCallback(
     callback_idx: CoreFuncIdxComponent,
     event: AsyncLiftCallbackEvent,
     task_manager: *async_mod.TaskManager,
+    host_task_context: ?*anyopaque,
     allocator: Allocator,
 ) ExecutionError!u32 {
     var owned_env: ?*ExecEnv = null;
@@ -4246,6 +4362,10 @@ fn executeAsyncLiftCallback(
     defer frame_context_scope.deinit();
     var task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
     defer task_scope.deinit();
+    var host_task_scope = frameThreadContext(&frame).bindHostTaskContext(
+        host_task_context,
+    );
+    defer host_task_scope.deinit();
 
     frame.pushSlot(.{ .i32 = @bitCast(event.kind) }) catch
         return error.StackOverflow;
@@ -4272,8 +4392,19 @@ fn driveAsyncLiftCallbacks(
     initial_status: u32,
     task_manager: *async_mod.TaskManager,
     task_handle: u32,
+    host_task_context: ?*anyopaque,
     allocator: Allocator,
 ) ExecutionError!void {
+    var event_thread_ctx = execution_context.ThreadExecutionContext{};
+    var task_scope = event_thread_ctx.bindTaskManager(@ptrCast(task_manager));
+    defer task_scope.deinit();
+    var host_task_scope = event_thread_ctx.bindHostTaskContext(
+        host_task_context,
+    );
+    defer host_task_scope.deinit();
+    var active_scope = event_thread_ctx.enter();
+    defer active_scope.deinit();
+
     var status = initial_status;
     while (task_manager.getState(task_handle) == .started) {
         const event: AsyncLiftCallbackEvent = switch (try decodeAsyncLiftCallbackStatus(status)) {
@@ -4321,6 +4452,7 @@ fn driveAsyncLiftCallbacks(
             callback_idx,
             event,
             task_manager,
+            host_task_context,
             allocator,
         );
     }
@@ -4342,6 +4474,26 @@ pub fn callComponentFuncAsync(
     args: []const InterfaceValue,
     task_manager: *async_mod.TaskManager,
     waitable_set: ?*async_mod.WaitableSet,
+    allocator: Allocator,
+) ExecutionError!u32 {
+    return callComponentFuncAsyncWithHostTaskContext(
+        comp_inst,
+        func_name,
+        args,
+        task_manager,
+        waitable_set,
+        null,
+        allocator,
+    );
+}
+
+pub fn callComponentFuncAsyncWithHostTaskContext(
+    comp_inst: *const ComponentInstance,
+    func_name: []const u8,
+    args: []const InterfaceValue,
+    task_manager: *async_mod.TaskManager,
+    waitable_set: ?*async_mod.WaitableSet,
+    host_task_context: ?*anyopaque,
     allocator: Allocator,
 ) ExecutionError!u32 {
     // Create the subtask
@@ -4377,12 +4529,13 @@ pub fn callComponentFuncAsync(
         // Async-lifted ABI: drive the core fn and let `task.return`
         // populate task.return_values on its own.
         var status: u32 = 0;
-        callComponentFuncByLocalAsyncLifted(
+        callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
             owner_for_type,
             exported_local,
             args,
             &status,
             task_manager,
+            host_task_context,
             allocator,
         ) catch |e| {
             task_manager.cancelTask(handle);
@@ -4396,6 +4549,7 @@ pub fn callComponentFuncAsync(
                 status,
                 task_manager,
                 handle,
+                host_task_context,
                 allocator,
             ) catch |e| {
                 task_manager.cancelTask(handle);
@@ -4429,7 +4583,14 @@ pub fn callComponentFuncAsync(
         return error.OutOfMemory;
     };
 
-    callComponentFunc(comp_inst, func_name, args, results, allocator) catch |e| {
+    callComponentFuncWithHostTaskContext(
+        comp_inst,
+        func_name,
+        args,
+        results,
+        host_task_context,
+        allocator,
+    ) catch |e| {
         allocator.free(results);
         task_manager.cancelTask(handle);
         return e;
@@ -6418,6 +6579,99 @@ test "stream.write then stream.read: round-trips 3×u32" {
     try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(handle).?.buffer.items.len);
 }
 
+test "wasi:http #616 A8 live: bounded stream FIFO returns partial progress then parks" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 =
+        @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+    inst.streams.getPtr(handle).?.buffer_limit = 8;
+
+    const src = inst.writableGuestBytes(0, 12).?;
+    std.mem.writeInt(u32, src[0..4], 1, .little);
+    std.mem.writeInt(u32, src[4..8], 2, .little);
+    std.mem.writeInt(u32, src[8..12], 3, .little);
+
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(0);
+    try env.pushI32(3);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{
+            .type_idx = 0,
+            .opts = &.{},
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        async_canon.packStatus(.completed, 2),
+        @as(u32, @bitCast(try env.popI32())),
+    );
+    try testing.expectEqual(
+        @as(usize, 8),
+        inst.streams.getPtr(handle).?.buffer.items.len,
+    );
+
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(8);
+    try env.pushI32(1);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{
+            .type_idx = 0,
+            .opts = &.{},
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        async_canon.BLOCKED_STATUS,
+        @as(u32, @bitCast(try env.popI32())),
+    );
+    try testing.expect(inst.streams.getPtr(handle).?.pending_write != null);
+
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(64);
+    try env.pushI32(1);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{
+            .type_idx = 0,
+            .opts = &.{},
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        async_canon.packStatus(.completed, 1),
+        @as(u32, @bitCast(try env.popI32())),
+    );
+    const stream = inst.streams.getPtr(handle).?;
+    try testing.expectEqual(@as(usize, 4), stream.buffer.items.len);
+    try testing.expect(stream.pending_write == null);
+    try testing.expect(stream.write_ready);
+}
+
 test "stream.read parks; stream.write delivers and wakes waitable" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
@@ -7339,6 +7593,78 @@ test "waitable.join + waitable-set.wait: stream-write event delivered to a parke
     const ev_bytes = inst.writableGuestBytes(out_ptr, 8).?;
     try testing.expectEqual(stream_handle, std.mem.readInt(u32, ev_bytes[0..4], .little));
     try testing.expectEqual(async_canon.packStatus(.dropped, 0), std.mem.readInt(u32, ev_bytes[4..8], .little));
+}
+
+test "wasi:http #616 A8 live: stream backpressure wake is latched before waitable.join" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const stream_handle: u32 =
+        @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_set_new },
+        env,
+        null,
+        testing.allocator,
+    );
+    const ws_handle: u32 = @bitCast(try env.popI32());
+
+    // The host drained the full FIFO before the blocked writer had time
+    // to join its waitable set. The latched edge closes that race.
+    {
+        const stream = inst.streams.getPtr(stream_handle).?;
+        stream.pending_write = null;
+        stream.write_ready = true;
+    }
+    try env.pushI32(@bitCast(stream_handle));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const out_ptr: u32 = 0x100;
+    try env.pushI32(@bitCast(ws_handle));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_wait = .{
+            .cancellable = false,
+            .memory = 0,
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @intFromEnum(async_canon.EventCode.stream_write),
+        @as(u32, @bitCast(try env.popI32())),
+    );
+    const event = inst.writableGuestBytes(out_ptr, 8).?;
+    try testing.expectEqual(
+        async_canon.packStatus(.completed, 0),
+        std.mem.readInt(u32, event[4..8], .little),
+    );
 }
 
 test "waitable-set.poll: settled future surfaces FUTURE_READ event with the right handle/code (#550)" {
