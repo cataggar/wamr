@@ -714,8 +714,10 @@ const TrapDecodeFrame = struct {
 /// decode, jump-buffer, or cancellation/trap state.
 const AotCallState = struct {
     trap_decode: TrapDecodeFrame = .{},
-    posix_trap_buf: trap_jmp.JmpBuf = undefined,
-    saved_ctx: windows.CONTEXT align(16) = undefined,
+    posix_trap_buf: if (posix_trap_supported) trap_jmp.JmpBuf else void =
+        if (posix_trap_supported) undefined else {},
+    saved_ctx: (if (windows_trap_supported) windows.CONTEXT else void) align(16) =
+        if (windows_trap_supported) undefined else {},
     trap_catching: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     trap_occurred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     last_trap_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
