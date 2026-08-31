@@ -40,8 +40,10 @@ wasm-spec-temp/
 
 # Benchmark artifacts
 .bench-coremark/
+.bench-loop-passes/
 tests/benchmarks/coremark/coremark/
 tests/benchmarks/**/*.wasm
+!tests/benchmarks/loop-passes/*.wasm
 tests/benchmarks/**/*.aot
 tests/benchmarks/**/*.exe
 bin/

@@ -5021,13 +5021,20 @@ fn tripCountForLoop(
         .lt_s, .lt_u => |c| c,
         else => return null,
     };
-    const lhs_idx = localGetIdxOf(func, defs, cmp.lhs);
-    if (lhs_idx != ind.local_idx) return null;
+    const lhs_is_iv =
+        localGetIdxOf(func, defs, cmp.lhs) == ind.local_idx or
+        cmp.lhs == ind.update_val;
+    if (!lhs_is_iv) return null;
     const limit = constI32Of(func, defs, cmp.rhs) orelse return null;
-    if (limit <= init) return 0;
-    const distance: u32 = @intCast(limit - init);
-    const step: u32 = @intCast(ind.step);
-    return (distance + step - 1) / step;
+    // The recognized CFG is bottom-tested: the body executes before the
+    // compare. A non-positive distance therefore still executes once, not
+    // zero times, so leave that shape untouched.
+    if (limit <= init) return null;
+    const distance: u64 = @intCast(@as(i64, limit) - @as(i64, init));
+    const step: u64 = @intCast(ind.step);
+    const trips = (distance + step - 1) / step;
+    if (trips > std.math.maxInt(u32)) return null;
+    return @intCast(trips);
 }
 
 const VRegRemap = struct { from: ir.VReg, to: ir.VReg };
@@ -5036,14 +5043,27 @@ fn remapCloneVRegs(inst: *ir.Inst, map: []const VRegRemap) void {
     for (map) |m| replaceInInst(inst, m.from, m.to);
 }
 
+fn remapLoopLiveOuts(
+    func: *ir.IrFunction,
+    loop: *const analysis.Loop,
+    map: []const VRegRemap,
+) void {
+    for (func.blocks.items, 0..) |*block, bid| {
+        if (loop.containsBlock(@intCast(bid))) continue;
+        for (block.instructions.items) |*inst| remapCloneVRegs(inst, map);
+    }
+}
+
 /// Fully unroll very small counted loops.
 ///
 /// The transform is deliberately conservative: it handles dedicated-preheader
-/// natural loops with a single primary `i = i + const_step`, a header
-/// `i < const_limit` condition, trip count ≤ 8, and ≤ 16 IR instructions in
-/// the loop.  It clones the loop instructions into the preheader, substitutes
-/// each `local_get i` with the iteration constant when possible, then redirects
-/// the preheader to the loop exit; the old loop blocks become unreachable.
+/// single-block natural loops with a single primary `i = i + const_step`, a
+/// header `i < const_limit` condition, trip count ≤ 8, and ≤ 16 IR
+/// instructions in the loop. It clones the loop instructions into the
+/// preheader, substitutes each `local_get i` with the iteration constant when
+/// possible, repairs values used after the loop to reference the final clone,
+/// then redirects the preheader to the loop exit; the old loop block becomes
+/// unreachable.
 pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
@@ -5061,6 +5081,9 @@ pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator)
     }
 
     for (lf.loops) |*loop| {
+        // Flattening multiple CFG blocks into the preheader would erase their
+        // internal control flow. Keep the supported class explicit.
+        if (loop.blocks.len != 1) continue;
         if (loopBodySize(func, loop) > 16) continue;
         const ph = dedicatedPreheader(func, loop, &predecessors, &dom) orelse continue;
         var defs = try buildDefSites(func, allocator);
@@ -5102,20 +5125,21 @@ pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator)
         var ph_block = &func.blocks.items[ph];
         const original_term = ph_block.instructions.items.len - 1;
         var insert_at = original_term;
+        var final_map: std.ArrayList(VRegRemap) = .empty;
+        defer final_map.deinit(allocator);
         var iter: u32 = 0;
         while (iter < trips) : (iter += 1) {
             const iter_value = (ind.init orelse 0) + @as(i32, @intCast(iter)) * ind.step;
-            var map: std.ArrayList(VRegRemap) = .empty;
-            defer map.deinit(allocator);
+            final_map.clearRetainingCapacity();
 
             for (templates.items) |tmpl| {
                 var cloned = tmpl;
                 if (cloned.dest) |old_dest| {
                     const new_dest = func.newVReg();
                     cloned.dest = new_dest;
-                    try map.append(allocator, .{ .from = old_dest, .to = new_dest });
+                    try final_map.append(allocator, .{ .from = old_dest, .to = new_dest });
                 }
-                remapCloneVRegs(&cloned, map.items);
+                remapCloneVRegs(&cloned, final_map.items);
                 if (cloned.op == .local_get and cloned.op.local_get == ind.local_idx) {
                     cloned.op = .{ .iconst_32 = iter_value };
                 }
@@ -5124,6 +5148,7 @@ pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator)
             }
         }
 
+        remapLoopLiveOuts(func, loop, final_map.items);
         ph_block.instructions.items[insert_at].op = .{ .br = exit_info.exit };
         return true;
     }
@@ -9104,14 +9129,13 @@ pub const default_passes: []const PassFn = &.{
 
 /// Default optimization pipeline for x86-64.
 ///
-/// Note: `inductionVariableSimplification` and `unrollSmallFixedLoops`
-/// are intentionally omitted here pending a cost-model fix for issue
-/// #385. PR #413's own table reported x86_64 −2.45% on CoreMark (vs
-/// aarch64 −0.24%), confirmed in the #393 audit
-/// (https://github.com/cataggar/wamr/issues/393#issuecomment-4423326059)
-/// as "the cost model is still picking wrong loops". The aarch64
-/// pipeline keeps both passes for now — issue #385 tracks the
-/// cost-model rework that should let x86_64 re-enable them safely.
+/// `inductionVariableSimplification` remains omitted: the #393 follow-up
+/// found that it changes only runtime-cold CoreMark functions on x86-64 and
+/// regresses its focused stride-1 store loop. `unrollSmallFixedLoops` is
+/// enabled for the conservative single-block class after repairing forwarded
+/// exit compares and loop live-outs; `tests/benchmarks/loop-passes` keeps that
+/// class under a focused throughput and correctness gate. Issue #385 is
+/// closed; #393 records the current quantified decision.
 const x86_64_default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
@@ -9130,6 +9154,7 @@ const x86_64_default_passes: []const PassFn = &.{
     &foldWrapOfExtend,
     &globalValueNumbering,
     &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,
     &@import("forward_redundant_loads.zig").forwardRedundantLoads,
     @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
@@ -12626,6 +12651,83 @@ test "unrollSmallFixedLoops: trip count four fully unrolled" {
     try std.testing.expectEqual(@as(usize, 0), lf.loops.len);
 }
 
+test "unrollSmallFixedLoops: forwarded exit compare repairs loop live-out" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_zero = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    const v_seed = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_seed, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i_body = func.newVReg();
+    const v_live_out = func.newVReg();
+    const v_i_up = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_body, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_seed, .rhs = v_i_body } }, .dest = v_live_out, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_up, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i_up, .rhs = v_step } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    // `forwardLocalGet` commonly rewrites the post-update local_get in the
+    // loop condition to the update value itself.
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_next, .rhs = v_limit } }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_live_out } });
+
+    try std.testing.expect(try unrollSmallFixedLoops(&func, allocator));
+
+    const ret = func.getBlock(b2).instructions.items[0];
+    try std.testing.expect(ret.op == .ret);
+    const remapped_live_out = ret.op.ret.?;
+    try std.testing.expect(remapped_live_out != v_live_out);
+
+    var defs = try buildDefSites(&func, allocator);
+    defer defs.deinit();
+    try std.testing.expectEqual(b0, defs.get(remapped_live_out).?.block);
+}
+
+test "unrollSmallFixedLoops: bottom-tested non-positive distance is skipped" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_init } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_step } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_next, .rhs = v_limit } }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    try std.testing.expect(!try unrollSmallFixedLoops(&func, allocator));
+}
+
 test "unrollSmallFixedLoops: trip count too large is skipped" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 1);
@@ -14800,6 +14902,12 @@ fn pipelineContains(pass_list: []const PassFn, needle: PassFn) bool {
 test "default pipeline enables foldBranchOnEqz only for x86_64" {
     try std.testing.expect(pipelineContains(defaultPassesForTarget(.x86_64), &foldBranchOnEqz));
     try std.testing.expect(!pipelineContains(defaultPassesForTarget(.aarch64), &foldBranchOnEqz));
+}
+
+test "x86_64 default pipeline enables bounded unroll but keeps IV simplify off" {
+    const pipeline = defaultPassesForTarget(.x86_64);
+    try std.testing.expect(pipelineContains(pipeline, &unrollSmallFixedLoops));
+    try std.testing.expect(!pipelineContains(pipeline, &inductionVariableSimplification));
 }
 
 test "every default pipeline keeps DCE enabled (#116/#834)" {
