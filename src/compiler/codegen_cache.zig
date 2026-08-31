@@ -21,8 +21,8 @@
 //!   - wamr build id mismatch (different compiler binary)
 //!   - target arch + ABI mismatch (different machine code shape)
 //!   - module epoch mismatch (IrModule-level invariants codegen reads:
-//!     import_count, global_types, global_offsets, global_storage_size,
-//!     func_types, func_type_indices)
+//!     import_count, memory mode, global_types, global_offsets,
+//!     global_storage_size, func_types, func_type_indices)
 //!   - func_count mismatch (functions added/removed)
 //!
 //! Within a valid cache, each per-function entry is reused iff its
@@ -131,6 +131,8 @@ pub const ModuleEpochInputs = struct {
     target_arch: passes.TargetArch,
     target_abi: TargetAbi,
     import_count: u32,
+    has_memory64: bool = false,
+    has_shared_memory: bool = false,
     /// Optional; treated as empty slice when null.
     global_types: ?[]const ir.IrType = null,
     /// Optional; treated as empty slice when null.
@@ -195,6 +197,8 @@ pub fn hashModuleEpoch(inputs: ModuleEpochInputs) [32]u8 {
     w.writeInt(u32, @intFromEnum(inputs.target_arch));
     w.writeInt(u8, @intFromEnum(inputs.target_abi));
     w.writeInt(u32, inputs.import_count);
+    w.writeInt(u8, @intFromBool(inputs.has_memory64));
+    w.writeInt(u8, @intFromBool(inputs.has_shared_memory));
     w.writeOptSliceEnum(ir.IrType, inputs.global_types);
     w.writeOptSliceInt(u32, inputs.global_offsets);
     w.writeInt(u32, inputs.global_storage_size);
@@ -705,6 +709,21 @@ test "hashModuleEpoch: sensitive to import_count" {
     var e2 = e1;
     e2.import_count = 3;
     try testing.expect(!std.mem.eql(u8, &hashModuleEpoch(e1), &hashModuleEpoch(e2)));
+}
+
+test "hashModuleEpoch: sensitive to memory mode" {
+    const e1 = ModuleEpochInputs{
+        .wamr_build_id = "test-build-1",
+        .target_arch = .aarch64,
+        .target_abi = .aarch64_aapcs,
+        .import_count = 0,
+    };
+    var memory64 = e1;
+    memory64.has_memory64 = true;
+    var shared = e1;
+    shared.has_shared_memory = true;
+    try testing.expect(!std.mem.eql(u8, &hashModuleEpoch(e1), &hashModuleEpoch(memory64)));
+    try testing.expect(!std.mem.eql(u8, &hashModuleEpoch(e1), &hashModuleEpoch(shared)));
 }
 
 test "hashModuleEpoch: sensitive to target_abi (sysv vs win64)" {

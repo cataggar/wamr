@@ -50,6 +50,7 @@ pub const PrecompileError = error{
     OutOfMemory,
     OpenDirFailed,
     JsonSerializationFailed,
+    UnsupportedFrameAttributionTarget,
 };
 
 /// Surface the IR verifier's diagnostic detail to stderr when a
@@ -118,6 +119,9 @@ pub const PrecompileOptions = struct {
     /// Optional per-function spill-cost diagnostics (#808 Lever 1),
     /// normally parsed by `wamrc` from `WAMR_AOT_SPILL_METRIC*`.
     spill_metric: passes.SpillMetricOptions = .{},
+    /// Optional versioned x86 frame-origin sidecars, normally parsed by
+    /// `wamrc` from `WAMR_AOT_FRAME_ATTRIBUTION*`.
+    frame_attribution: passes.FrameAttributionOptions = .{},
     /// Tail-duplication compile-time guard/cap options.
     tail_duplication: passes.TailDuplicationOptions = .{},
     /// IR verifier mode for optimized builds. Defaults match the historical
@@ -387,6 +391,8 @@ pub fn compileCoreWasmCached(
         .target_arch = opts.target_arch,
         .target_abi = target_abi,
         .import_count = ir_module.import_count,
+        .has_memory64 = ir_module.has_memory64,
+        .has_shared_memory = ir_module.has_shared_memory,
         .global_types = ir_module.global_types,
         .global_offsets = ir_module.global_offsets,
         .global_storage_size = ir_module.global_storage_size,
@@ -395,6 +401,14 @@ pub fn compileCoreWasmCached(
     };
     const module_epoch = codegen_cache.hashModuleEpoch(epoch_inputs);
 
+    var frame_attribution_opts = opts.frame_attribution;
+    if (frame_attribution_opts.enabled) {
+        frame_attribution_opts.cwasm_aot_version = emit_aot.aot_version;
+        frame_attribution_opts.compiler_build_id = config.version;
+    }
+    if (frame_attribution_opts.enabled and opts.target_arch != .x86_64) {
+        return error.UnsupportedFrameAttributionTarget;
+    }
     const compiled: codegen_cache.CompileResultCached = switch (opts.target_arch) {
         .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
             .codegen_timing = opts.codegen_timing,
@@ -406,6 +420,7 @@ pub fn compileCoreWasmCached(
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
             .codegen_timing = opts.codegen_timing,
             .spill_metric = opts.spill_metric,
+            .frame_attribution = frame_attribution_opts,
             .module_idx = opts.module_idx,
             .lazy_skip = lazy_skip,
             .lazy_entry_stubs = lazy_entry_stubs,
@@ -801,6 +816,8 @@ pub const LazyCompileDriver = struct {
                 func,
                 self.lazy_out.ir_module.import_count,
                 self.lazy_out.ir_module.global_offsets orelse &.{},
+                self.lazy_out.ir_module.has_memory64,
+                self.lazy_out.ir_module.has_shared_memory,
                 self.allocator,
             ) catch |err| {
                 std.log.err("lazy-JIT spike: compiling deferred aarch64 function {d} failed: {s}", .{ local_idx, @errorName(err) });

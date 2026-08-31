@@ -171,6 +171,16 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
     errdefer ir_module.deinit();
 
     ir_module.import_count = wasm_module.import_function_count;
+    for (wasm_module.imports) |imp| {
+        if (imp.kind != .memory) continue;
+        const mt = imp.memory_type orelse continue;
+        ir_module.has_memory64 = ir_module.has_memory64 or mt.is_memory64;
+        ir_module.has_shared_memory = ir_module.has_shared_memory or mt.is_shared;
+    }
+    for (wasm_module.memories) |mt| {
+        ir_module.has_memory64 = ir_module.has_memory64 or mt.is_memory64;
+        ir_module.has_shared_memory = ir_module.has_shared_memory or mt.is_shared;
+    }
 
     for (wasm_module.types) |ft| {
         var params: std.ArrayList(ir.IrType) = .empty;
