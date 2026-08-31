@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const execution_context = @import("execution_context.zig");
 
 /// A stored exception reference (for catch_ref / throw_ref).
 pub const ExceptionRef = struct {
@@ -155,11 +156,10 @@ pub const ExecEnv = struct {
     /// Allocator used for this env's memory.
     allocator: std.mem.Allocator,
 
-    /// Thread manager for cross-thread trap propagation (null for single-threaded).
-    thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager = null,
-
-    /// Thread ID (0 for main thread).
-    tid: i32 = 0,
+    /// Per-thread metadata and dynamic host-call state. Its process reference
+    /// is retained independently of the owning module instance so an
+    /// `ExecEnv` remains valid across parent-instance teardown.
+    thread_context: execution_context.ThreadExecutionContext = .{},
 
     /// Diagnostic info for the most recent host-fn or trampoline trap. Set by
     /// the interpreter dispatch loop and the canon-lower trampoline before
@@ -170,17 +170,6 @@ pub const ExecEnv = struct {
     /// Surfaces in `callComponentFunc` so a `TrapInCoreFunction` is no longer
     /// an opaque "Unreachable" — see issue #308.
     host_trap: ?HostTrapInfo = null,
-
-    /// Optional opaque pointer to a `wasi.WasiCtx` used by the
-    /// `wasi_snapshot_preview1` host functions to look up args, env vars,
-    /// and preopened file descriptors. `null` when no WASI context has been
-    /// attached (unit tests, fuzz harnesses, library-style embedders); host
-    /// functions then fall back to the legacy stub behavior in
-    /// `src/wasi/wasi_core.zig`. Stored as `*anyopaque` to keep this
-    /// runtime-common module from depending on the higher-level WASI module.
-    /// Not owned by ExecEnv: lifetime is managed by the embedder (`runWasm`
-    /// in `src/main.zig`).
-    wasi_ctx: ?*anyopaque = null,
 
     /// Create a new execution environment.
     pub fn create(
@@ -200,22 +189,71 @@ pub const ExecEnv = struct {
         const labels = try allocator.alloc(Label, label_stack_capacity);
         errdefer allocator.free(labels);
 
+        var thread_context = execution_context.ThreadExecutionContext.init(
+            module_inst.process_state,
+        );
+        if (module_inst.thread_manager) |thread_manager| {
+            thread_context.setThreadGroup(@ptrCast(thread_manager));
+        }
         self.* = .{
             .module_inst = module_inst,
             .operand_stack = stack,
             .call_stack = frames,
             .label_stack = labels,
             .allocator = allocator,
+            .thread_context = thread_context,
         };
         return self;
     }
 
     /// Destroy the execution environment and free all memory.
     pub fn destroy(self: *ExecEnv) void {
+        self.thread_context.deinit();
         self.allocator.free(self.operand_stack);
         self.allocator.free(self.call_stack);
         self.allocator.free(self.label_stack);
         self.allocator.destroy(self);
+    }
+
+    /// Attach process state to an already-created environment. Normal
+    /// callers attach it to the module before `create`; this compatibility
+    /// path supports embedders that construct their WASI state later.
+    pub fn attachProcessState(
+        self: *ExecEnv,
+        process_state: execution_context.ProcessStateRef,
+    ) void {
+        self.thread_context.replaceProcessState(process_state);
+    }
+
+    pub fn processState(self: *const ExecEnv, comptime T: type) ?*T {
+        return self.thread_context.process(T);
+    }
+
+    pub fn setThreadManager(
+        self: *ExecEnv,
+        thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager,
+    ) void {
+        self.thread_context.setThreadGroup(if (thread_manager) |manager|
+            @ptrCast(manager)
+        else
+            null);
+    }
+
+    pub fn threadManager(
+        self: *const ExecEnv,
+    ) ?*@import("../../wasi/thread_manager.zig").ThreadManager {
+        return self.thread_context.threadGroup(
+            @import("../../wasi/thread_manager.zig").ThreadManager,
+        );
+    }
+
+    pub fn configureWasiThread(
+        self: *ExecEnv,
+        tid: i32,
+        start_arg: u32,
+        auxiliary_stack: ?execution_context.AuxiliaryStack,
+    ) void {
+        self.thread_context.configureWasiThread(tid, start_arg, auxiliary_stack);
     }
 
     // -- Stack operations --
@@ -589,4 +627,143 @@ test "exception set, has, clear" {
 
     env.clearException();
     try std.testing.expect(!env.hasException());
+}
+
+test "execution context: no-WASI environments keep process state null" {
+    const t = try createTestEnv(16);
+    defer t.deinit();
+
+    try std.testing.expect(t.env.processState(u8) == null);
+    try std.testing.expectEqual(@as(i32, 0), t.env.thread_context.tid);
+    try std.testing.expect(!t.env.thread_context.isCancellationRequested());
+    try std.testing.expect(!t.env.thread_context.hasTrapped());
+}
+
+test "execution context: parent-first and child-first teardown retain process state" {
+    const Tracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.refs > 0);
+            self.refs -= 1;
+        }
+    };
+    const ops = execution_context.ProcessStateOps{
+        .retain = Tracker.retain,
+        .release = Tracker.release,
+    };
+    const allocator = std.testing.allocator;
+
+    inline for (.{ true, false }) |parent_first| {
+        var tracker = Tracker{};
+        const root_ref = execution_context.ProcessStateRef.init(@ptrCast(&tracker), &ops);
+        var module = types.WasmModule{};
+        const parent = try allocator.create(types.ModuleInstance);
+        parent.* = .{
+            .module = &module,
+            .memories = &.{},
+            .tables = &.{},
+            .globals = &.{},
+            .allocator = allocator,
+        };
+        parent.attachProcessState(root_ref);
+        const parent_env = try ExecEnv.create(parent, 16, allocator);
+        const child = try parent.cloneForThread(allocator);
+        const child_env = try ExecEnv.create(child, 16, allocator);
+        try std.testing.expectEqual(@as(usize, 5), tracker.refs);
+
+        if (parent_first) {
+            parent_env.destroy();
+            parent.detachProcessState();
+            allocator.destroy(parent);
+            root_ref.release();
+            try std.testing.expectEqual(@as(usize, 2), tracker.refs);
+            try std.testing.expectEqual(
+                @as(*Tracker, @ptrCast(@alignCast(child_env.thread_context.process_state.?.ptr))),
+                &tracker,
+            );
+            child_env.destroy();
+            child.destroyThreadClone();
+        } else {
+            child_env.destroy();
+            child.destroyThreadClone();
+            try std.testing.expectEqual(@as(usize, 3), tracker.refs);
+            try std.testing.expectEqual(
+                @as(*Tracker, @ptrCast(@alignCast(parent_env.thread_context.process_state.?.ptr))),
+                &tracker,
+            );
+            parent_env.destroy();
+            parent.detachProcessState();
+            allocator.destroy(parent);
+            root_ref.release();
+        }
+        try std.testing.expectEqual(@as(usize, 0), tracker.refs);
+    }
+}
+
+test "execution context: nested thread clones share only process state" {
+    const Tracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    const ops = execution_context.ProcessStateOps{
+        .retain = Tracker.retain,
+        .release = Tracker.release,
+    };
+    const allocator = std.testing.allocator;
+    var tracker = Tracker{};
+    const root_ref = execution_context.ProcessStateRef.init(@ptrCast(&tracker), &ops);
+    var module = types.WasmModule{};
+    const parent = try allocator.create(types.ModuleInstance);
+    parent.* = .{
+        .module = &module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+    };
+    parent.attachProcessState(root_ref);
+    const child = try parent.cloneForThread(allocator);
+    const grandchild = try child.cloneForThread(allocator);
+    const child_env = try ExecEnv.create(child, 16, allocator);
+    const grandchild_env = try ExecEnv.create(grandchild, 16, allocator);
+
+    child_env.configureWasiThread(1, 0x1111, null);
+    grandchild_env.configureWasiThread(2, 0x2222, null);
+    child_env.thread_context.setTlsBase(0x3000);
+    grandchild_env.thread_context.setTlsBase(0x4000);
+    child_env.thread_context.requestCancellation();
+
+    try std.testing.expectEqual(
+        child_env.thread_context.process_state.?.ptr,
+        grandchild_env.thread_context.process_state.?.ptr,
+    );
+    try std.testing.expectEqual(@as(u32, 0x1111), child_env.thread_context.start_arg);
+    try std.testing.expectEqual(@as(u32, 0x2222), grandchild_env.thread_context.start_arg);
+    try std.testing.expect(child_env.thread_context.isCancellationRequested());
+    try std.testing.expect(!grandchild_env.thread_context.isCancellationRequested());
+
+    grandchild_env.destroy();
+    grandchild.destroyThreadClone();
+    child_env.destroy();
+    child.destroyThreadClone();
+    parent.detachProcessState();
+    allocator.destroy(parent);
+    root_ref.release();
+    try std.testing.expectEqual(@as(usize, 0), tracker.refs);
 }

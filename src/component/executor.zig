@@ -17,6 +17,7 @@ const instance_mod = @import("instance.zig");
 const core_types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const HostTrapInfo = @import("../runtime/common/exec_env.zig").HostTrapInfo;
+const execution_context = @import("../runtime/common/execution_context.zig");
 const interp = @import("../runtime/interpreter/interp.zig");
 const indexspace = @import("indexspace.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
@@ -40,6 +41,20 @@ const lifted_result_invariant_violated: [:0]const u8 = "lifted-result-invariant-
 pub const CallFrame = call_frame_mod.CallFrame;
 pub const InterpFrame = call_frame_mod.InterpFrame;
 pub const AotFrame = call_frame_mod.AotFrame;
+
+fn frameThreadContext(frame: *CallFrame) *execution_context.ThreadExecutionContext {
+    return switch (frame.*) {
+        .interp => |*f| &f.env.thread_context,
+        .aot => |*f| &f.ai.thread_context,
+    };
+}
+
+fn taskManagerFor(
+    thread_ctx: ?*execution_context.ThreadExecutionContext,
+) ?*async_mod.TaskManager {
+    const active = thread_ctx orelse return null;
+    return active.taskManager(async_mod.TaskManager);
+}
 
 pub const MAX_FLAT_PARAMS: u32 = 16;
 pub const MAX_FLAT_RESULTS: u32 = 1;
@@ -1517,6 +1532,7 @@ pub fn callComponentFuncByLocalAsyncLifted(
     exported: ComponentInstance.ExportedFunc.Local,
     args: []const InterfaceValue,
     out_status: *u32,
+    task_manager: *async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
     out_status.* = 0;
@@ -1560,6 +1576,10 @@ pub fn callComponentFuncByLocalAsyncLifted(
         }
         frame.deinit();
     }
+    const thread_ctx = frameThreadContext(&frame);
+    thread_ctx.clearCancellation();
+    var task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
+    defer task_scope.deinit();
 
     const memory_idx = lift_opts.memory_idx orelse 0;
     var memory = frame.memory(memory_idx);
@@ -2504,9 +2524,8 @@ pub fn canonResourceRep(
 ///
 /// `task_manager` is the async runtime state for this dispatch (nullable
 /// because synchronous canon-lift paths don't construct one). When null,
-/// `task.yield` is a no-op resume and `context.{get,set}` operate on
-/// `comp_inst.implicit_task_context`, matching Wasmtime's per-instance
-/// fallback for sync calls. (#478 sub-PR 1.)
+/// `task.yield` is a no-op resume and `context.{get,set}` operate on the
+/// active thread's implicit task context.
 /// Resolve the per-element byte size for `stream.{read,write}` /
 /// `future.{read,write}` from the canon's `type_idx` immediate.
 ///
@@ -2551,7 +2570,15 @@ pub fn dispatchCanonBuiltin(
     task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
-    return dispatchCanonBuiltinWithCtx(comp_inst, canon, null, env, task_manager, allocator);
+    return dispatchCanonBuiltinWithCtx(
+        comp_inst,
+        canon,
+        null,
+        env,
+        &env.thread_context,
+        task_manager,
+        allocator,
+    );
 }
 
 /// `dispatchCanonBuiltin` variant that threads the trampoline ctx
@@ -2566,6 +2593,7 @@ pub fn dispatchCanonBuiltinWithCtx(
     canon: ctypes.Canon,
     ctx: ?*const CanonBuiltinTrampolineCtx,
     stack: anytype,
+    thread_context: ?*execution_context.ThreadExecutionContext,
     task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
@@ -2626,7 +2654,9 @@ pub fn dispatchCanonBuiltinWithCtx(
                     }
                 }
                 if (info.slot >= async_mod.N_CONTEXT_SLOTS) return error.StackUnderflow;
-                break :blk comp_inst.implicit_task_context[info.slot];
+                const thread_ctx = thread_context orelse
+                    return error.FunctionNotFound;
+                break :blk thread_ctx.implicit_task_context[info.slot];
             };
             env.pushI32(@bitCast(value)) catch return error.StackOverflow;
         },
@@ -2640,7 +2670,9 @@ pub fn dispatchCanonBuiltinWithCtx(
                 }
             }
             if (info.slot >= async_mod.N_CONTEXT_SLOTS) return error.StackUnderflow;
-            comp_inst.implicit_task_context[info.slot] = value;
+            const thread_ctx = thread_context orelse
+                return error.FunctionNotFound;
+            thread_ctx.implicit_task_context[info.slot] = value;
         },
         .task_return => |info| {
             // `canon task.return rs:<resultlist> opts:<opts>` — Binary.md
@@ -2699,7 +2731,14 @@ pub fn dispatchCanonBuiltinWithCtx(
             }
             async_canon.asyncReturn(tm, handle, flat);
         },
-        .async_canon => |op| try dispatchAsyncCanon(comp_inst, op, env, task_manager, allocator),
+        .async_canon => |op| try dispatchAsyncCanon(
+            comp_inst,
+            op,
+            env,
+            thread_context,
+            task_manager,
+            allocator,
+        ),
         .lift, .lower => {}, // Handled by callComponentFunc
     }
 }
@@ -2716,6 +2755,7 @@ fn dispatchAsyncCanon(
     comp_inst: *ComponentInstance,
     op: ctypes.AsyncCanonOp,
     env: anytype,
+    thread_context: ?*execution_context.ThreadExecutionContext,
     task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
@@ -2744,6 +2784,9 @@ fn dispatchAsyncCanon(
             const tm = task_manager orelse return error.FunctionNotFound;
             const handle = tm.current_task orelse return error.FunctionNotFound;
             tm.cancelTask(handle);
+            if (thread_context) |thread_ctx| {
+                thread_ctx.requestCancellation();
+            }
             // Propagate the cancellation to host-side waitables owned by
             // the cancelled task. Specifically, this aborts any pending
             // `wasi:clocks` `wait-for`/`wait-until` timer future so the
@@ -3834,6 +3877,7 @@ fn executeAsyncLiftCallback(
     fallback_core_entry: ComponentInstance.CoreInstanceEntry,
     callback_idx: CoreFuncIdxComponent,
     event: AsyncLiftCallbackEvent,
+    task_manager: *async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!u32 {
     var owned_env: ?*ExecEnv = null;
@@ -3873,6 +3917,8 @@ fn executeAsyncLiftCallback(
         if (owned_env) |env| env.destroy();
         frame.deinit();
     }
+    var task_scope = frameThreadContext(&frame).bindTaskManager(@ptrCast(task_manager));
+    defer task_scope.deinit();
 
     frame.pushSlot(.{ .i32 = @bitCast(event.kind) }) catch
         return error.StackOverflow;
@@ -3946,6 +3992,7 @@ fn driveAsyncLiftCallbacks(
             fallback_core_entry,
             callback_idx,
             event,
+            task_manager,
             allocator,
         );
     }
@@ -3999,21 +4046,18 @@ pub fn callComponentFuncAsync(
     task_manager.current_task = handle;
     defer task_manager.current_task = saved_current_task;
 
-    // Publish the active TaskManager on the owning instance so the
-    // canon-builtin host trampolines (`canonBuiltinTrampoline`)
-    // installed during instantiation can dispatch into the right task
-    // state. Restored to its prior value on return to support nested
-    // async dispatches. (#520)
-    const owner_for_tm: *ComponentInstance = @constCast(owner_for_type);
-    const saved_tm = owner_for_tm.current_task_manager;
-    owner_for_tm.current_task_manager = task_manager;
-    defer owner_for_tm.current_task_manager = saved_tm;
-
     if (lift_opts.is_async) {
         // Async-lifted ABI: drive the core fn and let `task.return`
         // populate task.return_values on its own.
         var status: u32 = 0;
-        callComponentFuncByLocalAsyncLifted(owner_for_type, exported_local, args, &status, allocator) catch |e| {
+        callComponentFuncByLocalAsyncLifted(
+            owner_for_type,
+            exported_local,
+            args,
+            &status,
+            task_manager,
+            allocator,
+        ) catch |e| {
             task_manager.cancelTask(handle);
             return e;
         };
@@ -4894,6 +4938,59 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
     try testing.expectEqual(@as(u32, 0), env.sp);
 }
 
+test "execution context: task and cancellation state is isolated per thread" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const first_env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer first_env.destroy();
+    const second_env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer second_env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var first_tasks = async_mod.TaskManager{};
+    defer first_tasks.deinit(testing.allocator);
+    const first_task = try first_tasks.createTask(testing.allocator);
+    first_tasks.current_task = first_task;
+    var second_tasks = async_mod.TaskManager{};
+    defer second_tasks.deinit(testing.allocator);
+    const second_task = try second_tasks.createTask(testing.allocator);
+    second_tasks.current_task = second_task;
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .task_cancel },
+        first_env,
+        &first_tasks,
+        testing.allocator,
+    );
+
+    try testing.expectEqual(async_mod.TaskState.cancelled, first_tasks.getState(first_task).?);
+    try testing.expectEqual(async_mod.TaskState.created, second_tasks.getState(second_task).?);
+    try testing.expect(first_env.thread_context.isCancellationRequested());
+    try testing.expect(!second_env.thread_context.isCancellationRequested());
+    try testing.expect(first_env.host_trap == null);
+    try testing.expect(second_env.host_trap == null);
+}
+
 test "dispatchCanonBuiltin: task.cancel is idempotent" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
@@ -5051,7 +5148,7 @@ test "dispatchCanonBuiltin: context set+get round-trip on implicit task" {
         null,
         testing.allocator,
     );
-    try testing.expectEqual(@as(u32, 0x1234), inst.implicit_task_context[0]);
+    try testing.expectEqual(@as(u32, 0x1234), env.thread_context.implicit_task_context[0]);
 
     // `context.get i32 0` → pushes the value back onto the stack.
     try dispatchCanonBuiltin(
@@ -5127,8 +5224,8 @@ test "dispatchCanonBuiltin: context set+yield+get round-trip on async task" {
     );
     try testing.expectEqual(@as(u32, 0xDEAD_BEEF), @as(u32, @bitCast(try env.popI32())));
 
-    // Slot stored on the task, NOT on the instance's implicit context.
-    try testing.expectEqual(@as(u32, 0), inst.implicit_task_context[1]);
+    // Slot stored on the task, NOT on the thread's implicit context.
+    try testing.expectEqual(@as(u32, 0), env.thread_context.implicit_task_context[1]);
     try testing.expectEqual(@as(?u32, 0xDEAD_BEEF), tm.getContextSlot(lift.subtask_handle, 1));
 }
 
@@ -7189,7 +7286,7 @@ pub const LowerOptions = struct {
 
 /// Resolve a canon-lower's `(memory $m)` / `(realloc $f)` opts into a
 /// directly-usable `CanonLowerCallCtx`. Called by the trampoline once
-/// per host import dispatch and stashed on `comp_inst` so
+/// per host import dispatch and bound to the active thread context so
 /// `hostAllocAndWrite` honors the lowerer's pinned memory + realloc
 /// (e.g. wit-component preview1 adapter's `cabi_import_realloc`
 /// routing to per-call `temporary_data`). (#715.)
@@ -7206,6 +7303,19 @@ fn resolveLowerCallCtx(
         cctx.realloc = comp_inst.resolveTopLevelCoreFuncAny(ridx.value());
     }
     return cctx;
+}
+
+fn bindLowerCallContext(
+    comp_inst: *ComponentInstance,
+    call_ctx: ?ComponentInstance.CanonLowerCallCtx,
+    storage: *ComponentInstance.CanonLowerCallBinding,
+) ?execution_context.OpaqueBinding {
+    const thread_ctx = execution_context.current() orelse return null;
+    if (call_ctx) |resolved| {
+        storage.* = .{ .owner = comp_inst, .call_ctx = resolved };
+        return thread_ctx.bindRuntimeCallContext(@ptrCast(storage));
+    }
+    return thread_ctx.bindRuntimeCallContext(null);
 }
 
 /// Per-import-slot context for the canon-lower trampoline. Owned by the
@@ -7299,6 +7409,8 @@ pub const ComponentTrampolineCtx = struct {
 pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const ctx: *ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
+    var context_scope = env.thread_context.enter();
+    defer context_scope.deinit();
     const allocator = ctx.comp_inst.allocator;
     const registry = if (ctx.extended_types.len > 0)
         TypeRegistry.fromExtended(ctx.comp_inst.component, ctx.extended_types, ctx.extended_indexspace)
@@ -7447,9 +7559,13 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     const call = ctx.host_func.call orelse {
         return trampolineTrap(env, ctx, error.HostFuncNotBound, .host_call);
     };
-    const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
-    ctx.comp_inst.current_lower_call_ctx = resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts);
-    defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
+    var lower_binding: ComponentInstance.CanonLowerCallBinding = undefined;
+    const lower_scope = bindLowerCallContext(
+        ctx.comp_inst,
+        resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts),
+        &lower_binding,
+    );
+    defer if (lower_scope) |scope| scope.deinit();
     call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch |err| {
         return trampolineTrap(env, ctx, err, .host_call);
     };
@@ -8102,17 +8218,27 @@ fn dispatchAotCanonBuiltin(
     caller_vmctx: u64,
     regs: [10]u64,
 ) !u64 {
+    const caller_thread_ctx = aotCallerThreadContext(caller_vmctx);
+    const context_scope = if (caller_thread_ctx) |thread_ctx| thread_ctx.enter() else null;
+    defer if (context_scope) |scope| scope.deinit();
+    const dispatch_thread_ctx = caller_thread_ctx orelse execution_context.current();
+
     var frame = try AotCanonBuiltinFrame.init(lowered_sig, regs);
-    const saved_call_ctx = ctx.comp_inst.current_lower_call_ctx;
-    ctx.comp_inst.current_lower_call_ctx = resolveAotCanonBuiltinCallCtx(ctx, caller_vmctx);
-    defer ctx.comp_inst.current_lower_call_ctx = saved_call_ctx;
+    var lower_binding: ComponentInstance.CanonLowerCallBinding = undefined;
+    const lower_scope = bindLowerCallContext(
+        ctx.comp_inst,
+        resolveAotCanonBuiltinCallCtx(ctx, caller_vmctx),
+        &lower_binding,
+    );
+    defer if (lower_scope) |scope| scope.deinit();
 
     try dispatchCanonBuiltinWithCtx(
         ctx.comp_inst,
         ctx.canon,
         ctx,
         &frame,
-        ctx.comp_inst.current_task_manager,
+        dispatch_thread_ctx,
+        taskManagerFor(dispatch_thread_ctx),
         ctx.comp_inst.allocator,
     );
     return frame.finish(lowered_sig, regs);
@@ -8219,6 +8345,20 @@ fn aotCallerMemory(caller_vmctx: ?u64) ?*core_types.MemoryInstance {
     const caller: *const aot_runtime.AotInstance = @ptrFromInt(vmctx.instance_ptr);
     if (caller.memories.len == 0) return null;
     return caller.memories[0];
+}
+
+fn aotCallerThreadContext(
+    caller_vmctx: ?u64,
+) ?*execution_context.ThreadExecutionContext {
+    const raw_vmctx = caller_vmctx orelse return null;
+    if (raw_vmctx == 0 or raw_vmctx % @alignOf(aot_runtime.VmCtx) != 0) return null;
+    const vmctx: *const aot_runtime.VmCtx = @ptrFromInt(@as(usize, @intCast(raw_vmctx)));
+    if (vmctx.thread_context == 0 or
+        vmctx.thread_context % @alignOf(execution_context.ThreadExecutionContext) != 0)
+    {
+        return null;
+    }
+    return @ptrFromInt(vmctx.thread_context);
 }
 
 fn resolveAotLowerCallCtx(
@@ -8340,9 +8480,13 @@ fn dispatchAotAsyncComponentTrampoline(
         results_filled = 1;
     }
 
-    const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
-    ctx.comp_inst.current_lower_call_ctx = resolveAotLowerCallCtx(ctx, caller_vmctx);
-    defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
+    var lower_binding: ComponentInstance.CanonLowerCallBinding = undefined;
+    const lower_scope = bindLowerCallContext(
+        ctx.comp_inst,
+        resolveAotLowerCallCtx(ctx, caller_vmctx),
+        &lower_binding,
+    );
+    defer if (lower_scope) |scope| scope.deinit();
     if (ctx.lift_target) |target| {
         try callComponentFuncByLocal(ctx.comp_inst, target, args, results, allocator);
     } else {
@@ -8383,6 +8527,10 @@ fn dispatchAotComponentTrampoline(
     regs: []const u64,
     caller_vmctx: ?u64,
 ) !u64 {
+    const caller_thread_ctx = aotCallerThreadContext(caller_vmctx);
+    const context_scope = if (caller_thread_ctx) |thread_ctx| thread_ctx.enter() else null;
+    defer if (context_scope) |scope| scope.deinit();
+
     if (ctx.lower_opts.is_async or ctx.is_async_func)
         return dispatchAotAsyncComponentTrampoline(ctx, lowered_sig, regs, caller_vmctx);
     if (lowered_sig.param_types.len + @intFromBool(lowered_sig.has_retptr) > regs.len)
@@ -8449,9 +8597,13 @@ fn dispatchAotComponentTrampoline(
         try callComponentFuncByLocal(ctx.comp_inst, target, args, results, allocator);
     } else {
         const call = ctx.host_func.call orelse return error.HostFuncNotBound;
-        const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
-        ctx.comp_inst.current_lower_call_ctx = resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts);
-        defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
+        var lower_binding: ComponentInstance.CanonLowerCallBinding = undefined;
+        const lower_scope = bindLowerCallContext(
+            ctx.comp_inst,
+            resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts),
+            &lower_binding,
+        );
+        defer if (lower_scope) |scope| scope.deinit();
         try call(ctx.host_func.context, ctx.comp_inst, args, results, allocator);
     }
     results_filled = results.len;
@@ -8707,9 +8859,8 @@ pub const CanonBuiltinTrampolineCtx = struct {
 /// Trampoline entry-point installed on a core wasm import that was
 /// resolved to a canon builtin (context.{get,set}, task.{yield,return},
 /// resource.{new,drop,rep}, async ABI). Routes the call through
-/// `dispatchCanonBuiltin`, passing the instance's current TaskManager
-/// (set up by `callComponentFuncAsync` for the duration of an
-/// async-lifted dispatch; null on the sync-call path).
+/// `dispatchCanonBuiltin`, passing this execution thread's current
+/// TaskManager (bound by `callComponentFuncAsync`; null on sync paths).
 pub fn canonBuiltinTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const ctx: *CanonBuiltinTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
@@ -8718,7 +8869,8 @@ pub fn canonBuiltinTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) c
         ctx.canon,
         ctx,
         env,
-        ctx.comp_inst.current_task_manager,
+        &env.thread_context,
+        taskManagerFor(&env.thread_context),
         ctx.comp_inst.allocator,
     ) catch |err| {
         env.host_trap = .{
@@ -9133,7 +9285,7 @@ test "canonBuiltinTrampoline: context.{set,get} round-trip through implicit fall
     // on every core import that resolves to a canon builtin (context.set,
     // context.get, task.return, etc.). Confirm a context.set followed by
     // context.get round-trips through `dispatchCanonBuiltin`, which falls
-    // back to `comp_inst.implicit_task_context` when no TaskManager is
+    // back to the `ExecEnv`'s implicit task context when no TaskManager is
     // active (sync-call path).
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
@@ -9159,7 +9311,7 @@ test "canonBuiltinTrampoline: context.{set,get} round-trip through implicit fall
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
     defer inst.deinit();
-    try std.testing.expect(inst.current_task_manager == null);
+    try std.testing.expect(env.thread_context.task_manager == null);
 
     var set_ctx = CanonBuiltinTrampolineCtx{
         .comp_inst = inst,
@@ -9172,7 +9324,7 @@ test "canonBuiltinTrampoline: context.{set,get} round-trip through implicit fall
 
     try env.pushI32(@bitCast(@as(u32, 0xCAFE_F00D)));
     try canonBuiltinTrampoline(@ptrCast(env), @ptrCast(&set_ctx));
-    try testing.expectEqual(@as(u32, 0xCAFE_F00D), inst.implicit_task_context[0]);
+    try testing.expectEqual(@as(u32, 0xCAFE_F00D), env.thread_context.implicit_task_context[0]);
 
     try canonBuiltinTrampoline(@ptrCast(env), @ptrCast(&get_ctx));
     try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xCAFE_F00D))), try env.popI32());
@@ -9846,6 +9998,9 @@ test "wamrAotDispatchCanonBuiltin: async context, task, waitable, future, and mu
     defer inst.deinit();
     try inst.enableTestMem(allocator, 256);
     defer inst.disableTestMem();
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var context_scope = thread_ctx.enter();
+    defer context_scope.deinit();
 
     const no_slots = [_]core_types.ValType{};
     const one_i32 = [_]core_types.ValType{.i32};
@@ -9923,8 +10078,8 @@ test "wamrAotDispatchCanonBuiltin: async context, task, waitable, future, and mu
     const task = try task_manager.createTask(allocator);
     task_manager.startTask(task);
     task_manager.current_task = task;
-    inst.current_task_manager = &task_manager;
-    defer inst.current_task_manager = null;
+    var task_scope = thread_ctx.bindTaskManager(@ptrCast(&task_manager));
+    defer task_scope.deinit();
 
     var task_cancel = CanonBuiltinTrampolineCtx{
         .comp_inst = inst,
@@ -9936,6 +10091,7 @@ test "wamrAotDispatchCanonBuiltin: async context, task, waitable, future, and mu
     }, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 });
     try testing.expectEqual(@as(u32, 0), cancel_result.status);
     try testing.expectEqual(async_mod.TaskState.cancelled, task_manager.getState(task).?);
+    try testing.expect(thread_ctx.isCancellationRequested());
 
     const message = "aot async builtin";
     try inst.error_contexts.put(allocator, 77, try allocator.dupe(u8, message));

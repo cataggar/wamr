@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("../runtime/common/types.zig");
+const execution_context = @import("../runtime/common/execution_context.zig");
 const config = @import("config");
 
 /// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
@@ -223,15 +224,12 @@ pub const ThreadManager = struct {
         const func_idx = inst.getExportFunc("wasi_thread_start") orelse return;
 
         // Create execution environment for this thread
-        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
-        var env = ExecEnv.create(inst, 4096, self.allocator) catch return;
+        const env = self.createChildExecEnv(inst, tid, start_arg, aux_stack_top) catch return;
         defer env.destroy();
-        env.thread_manager = self;
-        env.tid = tid;
 
         // Push arguments: tid and start_arg
-        env.pushI32(tid) catch return;
-        env.pushI32(start_arg) catch return;
+        env.pushI32(env.thread_context.tid) catch return;
+        env.pushI32(@bitCast(env.thread_context.start_arg)) catch return;
 
         // Execute
         const interp = @import("../runtime/interpreter/interp.zig");
@@ -239,6 +237,30 @@ pub const ThreadManager = struct {
             // Thread trapped — signal all other threads
             self.signalTrap();
         };
+    }
+
+    /// Construct the execution-local state for a prepared child instance.
+    /// The instance already owns a retained process reference from
+    /// `cloneForThread`; `ExecEnv.create` acquires its own lease.
+    pub fn createChildExecEnv(
+        self: *ThreadManager,
+        inst: *types.ModuleInstance,
+        tid: i32,
+        start_arg: i32,
+        aux_stack_top: ?u32,
+    ) !*@import("../runtime/common/exec_env.zig").ExecEnv {
+        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+        const env = try ExecEnv.create(inst, 4096, self.allocator);
+        env.setThreadManager(self);
+        env.configureWasiThread(
+            tid,
+            @bitCast(start_arg),
+            if (aux_stack_top) |top|
+                execution_context.AuxiliaryStack.fromTop(top, self.aux_stack_pool.stack_size)
+            else
+                null,
+        );
+        return env;
     }
 
     fn destroyClonedInstance(inst: *types.ModuleInstance) void {
@@ -309,6 +331,64 @@ test "ModuleInstance: cloneForThread shares memory" {
     try std.testing.expectEqual(@as(u32, 2), mem_inst.shared_control.?.referenceCount());
 
     allocator.destroy(parent);
+}
+
+test "thread context: child ExecEnv retains inherited process state and ABI metadata" {
+    const Tracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    const ops = execution_context.ProcessStateOps{
+        .retain = Tracker.retain,
+        .release = Tracker.release,
+    };
+    const allocator = std.testing.allocator;
+    var tracker = Tracker{};
+    const root_ref = execution_context.ProcessStateRef.init(@ptrCast(&tracker), &ops);
+    var module = types.WasmModule{};
+    const parent = try allocator.create(types.ModuleInstance);
+    parent.* = .{
+        .module = &module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+    };
+    parent.attachProcessState(root_ref);
+
+    var tm = ThreadManager.init(allocator);
+    defer tm.deinit();
+    parent.thread_manager = &tm;
+    tm.aux_stack_pool.stack_size = 4096;
+
+    const child = try parent.cloneForThread(allocator);
+    const env = try tm.createChildExecEnv(child, 7, @bitCast(@as(u32, 0xF1234567)), 0x8000);
+    try std.testing.expectEqual(@as(usize, 4), tracker.refs);
+    try std.testing.expectEqual(
+        @as(*Tracker, @ptrCast(@alignCast(env.thread_context.process_state.?.ptr))),
+        &tracker,
+    );
+    try std.testing.expectEqual(@as(i32, 7), env.thread_context.tid);
+    try std.testing.expectEqual(@as(u32, 0xF1234567), env.thread_context.start_arg);
+    try std.testing.expectEqual(@as(u32, 0x7000), env.thread_context.auxiliary_stack.?.bottom);
+    try std.testing.expectEqual(@as(u32, 0x8000), env.thread_context.auxiliary_stack.?.top);
+    try std.testing.expect(env.thread_context.tls_base == null);
+
+    env.destroy();
+    child.destroyThreadClone();
+    parent.detachProcessState();
+    allocator.destroy(parent);
+    root_ref.release();
+    try std.testing.expectEqual(@as(usize, 0), tracker.refs);
 }
 
 test "AuxStackPool: allocate and release" {

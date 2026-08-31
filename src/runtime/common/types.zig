@@ -6,6 +6,7 @@ const platform = @import("../../platform/platform.zig");
 const shared_memory = @import("shared_memory.zig");
 const parking_lot = @import("../../platform/parking_lot.zig");
 const stable_resource = @import("../../shared/stable_resource.zig");
+const execution_context = @import("execution_context.zig");
 
 /// WebAssembly value types (§2.3.1)
 pub const ValType = enum(u8) {
@@ -941,6 +942,9 @@ pub const ModuleInstance = struct {
     owns_host_func_entries: bool = false,
     tags: []*TagInstance = &.{},
     allocator: std.mem.Allocator,
+    /// Process-scoped host state retained by this instance. For WASI this is
+    /// a `WasiProcessState`; component and non-WASI instances leave it null.
+    process_state: ?execution_context.ProcessStateRef = null,
     state_mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.core_instance) = .init,
     /// Thread manager (shared across all instances in a thread group).
     thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager = null,
@@ -961,6 +965,22 @@ pub const ModuleInstance = struct {
     pub fn getMemory(self: *const ModuleInstance, idx: u32) ?*MemoryInstance {
         if (idx < self.memories.len) return self.memories[idx];
         return null;
+    }
+
+    /// Retain and attach process-scoped host state. Acquiring before
+    /// releasing the old value makes replacing a state with itself safe.
+    pub fn attachProcessState(
+        self: *ModuleInstance,
+        process_state: execution_context.ProcessStateRef,
+    ) void {
+        const retained = process_state.acquire();
+        if (self.process_state) |old| old.release();
+        self.process_state = retained;
+    }
+
+    pub fn detachProcessState(self: *ModuleInstance) void {
+        if (self.process_state) |state| state.release();
+        self.process_state = null;
     }
 
     pub inline fn lockState(self: *ModuleInstance) void {
@@ -996,7 +1016,8 @@ pub const ModuleInstance = struct {
     }
 
     /// Clone this instance for a new thread (WASI-threads instance-per-thread model).
-    /// Shared: memories, tables, import_functions, host_functions, thread_manager.
+    /// Shared: memories, tables, immutable import bindings, thread manager,
+    /// and retained process state.
     /// Cloned: globals (mutable globals are thread-local).
     pub fn cloneForThread(self: *const ModuleInstance, allocator: std.mem.Allocator) !*ModuleInstance {
         const inst = try allocator.create(ModuleInstance);
@@ -1017,6 +1038,9 @@ pub const ModuleInstance = struct {
             .thread_manager = self.thread_manager,
             .allocator = allocator,
         };
+        if (self.process_state) |state| {
+            inst.process_state = state.acquire();
+        }
         errdefer {
             for (inst.memories) |memory| memory.release(allocator);
             if (inst.memories.len > 0) allocator.free(inst.memories);
@@ -1030,6 +1054,7 @@ pub const ModuleInstance = struct {
                 if (maybe_values) |values| allocator.free(values);
             }
             if (inst.cached_elem_values.len > 0) allocator.free(inst.cached_elem_values);
+            if (inst.process_state) |state| state.release();
             allocator.destroy(inst);
         }
 
@@ -1116,6 +1141,7 @@ pub const ModuleInstance = struct {
         if (self.cached_elem_values.len > 0) allocator.free(self.cached_elem_values);
         for (self.gc_objects.items) |object| allocator.free(object.fields);
         self.gc_objects.deinit(allocator);
+        if (self.process_state) |state| state.release();
         allocator.destroy(self);
     }
 };
@@ -1254,6 +1280,28 @@ test "core resource concurrent elem.drop frees cached values exactly once" {
 test "cloneForThread rolls back shared resource retains on allocation failure" {
     const allocator = std.testing.allocator;
     var module = WasmModule{};
+    const ProcessTracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    const process_ops = execution_context.ProcessStateOps{
+        .retain = ProcessTracker.retain,
+        .release = ProcessTracker.release,
+    };
+    var process_tracker = ProcessTracker{};
+    const process_ref = execution_context.ProcessStateRef.init(
+        @ptrCast(&process_tracker),
+        &process_ops,
+    );
 
     const memory = try allocator.create(MemoryInstance);
     memory.* = .{
@@ -1290,6 +1338,11 @@ test "cloneForThread rolls back shared resource retains on allocation failure" {
         .globals = &globals,
         .allocator = allocator,
     };
+    parent.attachProcessState(process_ref);
+    defer {
+        parent.detachProcessState();
+        process_ref.release();
+    }
 
     var fail_tables = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
     try std.testing.expectError(
@@ -1298,6 +1351,7 @@ test "cloneForThread rolls back shared resource retains on allocation failure" {
     );
     try std.testing.expectEqual(@as(usize, 1), memory.referenceCount());
     try std.testing.expectEqual(@as(usize, 1), table.referenceCount());
+    try std.testing.expectEqual(@as(usize, 2), process_tracker.refs);
 
     var fail_global = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 4 });
     try std.testing.expectError(
@@ -1306,6 +1360,7 @@ test "cloneForThread rolls back shared resource retains on allocation failure" {
     );
     try std.testing.expectEqual(@as(usize, 1), memory.referenceCount());
     try std.testing.expectEqual(@as(usize, 1), table.referenceCount());
+    try std.testing.expectEqual(@as(usize, 2), process_tracker.refs);
 }
 
 test "cloneForThread copies mutable segment state" {

@@ -4,8 +4,10 @@
 //! between component instances and their underlying core module instances.
 
 const std = @import("std");
+const config = @import("../config.zig");
 const ctypes = @import("types.zig");
 const core_types = @import("../runtime/common/types.zig");
+const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const executor_mod = @import("executor.zig");
 const indexspace = @import("indexspace.zig");
 const async_mod = @import("async.zig");
@@ -14,6 +16,7 @@ const aot_loader = @import("../runtime/aot/loader.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const call_frame_mod = @import("call_frame.zig");
+const execution_context = @import("../runtime/common/execution_context.zig");
 const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
 
 const aot_host_bridge = @import("../runtime/aot/host_bridge.zig");
@@ -330,15 +333,6 @@ pub const ComponentInstance = struct {
     /// as `.poisoned` lets `deinit` and external callers reject reuse
     /// without depending on hashmap occupancy. (Issue #355.)
     link_state: LinkState = .unlinked,
-    /// Per-instance context slots for `canon context.{get,set}` invoked
-    /// outside any async task (the synchronous canon-lift call path).
-    /// Mirrors Wasmtime's implicit-task fallback: when no async task is
-    /// on the dispatch stack, context.get/set still works, scoped to
-    /// the instance rather than to any caller task. Initialised to all
-    /// zeros — the spec doesn't define a non-zero initial value.
-    /// (#478 sub-PR 1.)
-    implicit_task_context: [async_mod.N_CONTEXT_SLOTS]u32 = [_]u32{0} ** async_mod.N_CONTEXT_SLOTS,
-
     /// Per-instance async-handle tables for the WASIp3 canonical-ABI
     /// surface (#478 sub-PR 3). Each table maps a u32 handle to the
     /// host-side state allocated by the corresponding `.new` canon op:
@@ -350,18 +344,6 @@ pub const ComponentInstance = struct {
     error_contexts: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     waitable_sets: std.AutoHashMapUnmanaged(u32, async_mod.WaitableSet) = .empty,
     next_async_handle: u32 = 1,
-
-    /// TaskManager driving the currently-active async-lifted call into
-    /// this instance, or null when no async call is on the stack. Set
-    /// by `callComponentFuncAsync` for the duration of an async-lifted
-    /// dispatch, and restored to its prior value on return so nested
-    /// dispatches work. Used by the canon-builtin host trampoline (see
-    /// `executor.canonBuiltinTrampoline`) to route `context.{get,set}`,
-    /// `task.{yield,return}`, and the async ABI canons through
-    /// `dispatchCanonBuiltin` with the right task state. When null,
-    /// canon builtins fall back to the instance-scoped
-    /// `implicit_task_context` (Wasmtime parity, sync-call path). (#520)
-    current_task_manager: ?*async_mod.TaskManager = null,
 
     /// Host-driven async-event driver hook (#551). Installed by
     /// `wasi:cli`-style host adapters that own background timers or other
@@ -453,26 +435,10 @@ pub const ComponentInstance = struct {
     /// the cache aligned with the core module that exposes the
     /// `cabi_realloc` export — re-creating if the realloc owner ever
     /// shifts (e.g. when sub-instances become the realloc target).
-    realloc_env: ?*@import("../runtime/common/exec_env.zig").ExecEnv = null,
-    realloc_env_owner: ?*core_types.ModuleInstance = null,
-
-    /// Canon-lower opts of the in-flight host import call, set by
-    /// `componentTrampoline` / `dispatchAotComponentTrampoline` before
-    /// dispatching into the host method and cleared after. Lets
-    /// `hostAllocAndWrite` honor the lowerer's chosen `(realloc $f)` +
-    /// `(memory $m)` instead of falling back to the canonical
-    /// `cabi_realloc` search.
-    ///
-    /// Critical for wit-component's `wasi_snapshot_preview1` adapter:
-    /// the adapter imports WASIp2 via `canon.lower (realloc
-    /// $cabi_import_realloc)`, where `cabi_import_realloc` routes
-    /// through a per-call `import_alloc` cell that pins string
-    /// allocations to the adapter's own `temporary_data` buffer.
-    /// `fd_readdir` (in the adapter) asserts the returned `name` ptr
-    /// equals `temporary_data` — calling the main module's
-    /// `cabi_realloc` instead returns a ptr in the wrong memory and
-    /// trips that assertion. (#715.)
-    current_lower_call_ctx: ?CanonLowerCallCtx = null,
+    realloc_env: if (config.lib_wasi_threads) void else ?*ExecEnv =
+        if (config.lib_wasi_threads) {} else null,
+    realloc_env_owner: if (config.lib_wasi_threads) void else ?*core_types.ModuleInstance =
+        if (config.lib_wasi_threads) {} else null,
 
     /// Resolved canon-lower opts for an in-flight host import call.
     /// `memory` and `realloc` are pre-resolved from the canon-lower
@@ -483,6 +449,25 @@ pub const ComponentInstance = struct {
         memory: ?*core_types.MemoryInstance = null,
         realloc: ?ReallocTarget = null,
     };
+
+    /// Execution-local binding installed while a canon-lower host call is
+    /// active. Keeping it on `ThreadExecutionContext` prevents concurrent
+    /// calls through one shared component instance from overwriting each
+    /// other's selected memory/realloc pair.
+    pub const CanonLowerCallBinding = struct {
+        owner: *const ComponentInstance,
+        call_ctx: CanonLowerCallCtx,
+    };
+
+    pub fn activeCanonLowerCallCtx(
+        self: *const ComponentInstance,
+    ) ?CanonLowerCallCtx {
+        const thread_ctx = execution_context.current() orelse return null;
+        const binding = thread_ctx.runtimeCallContext(CanonLowerCallBinding) orelse
+            return null;
+        if (binding.owner != self) return null;
+        return binding.call_ctx;
+    }
 
     /// A directly-callable realloc, resolved from a top-level core-func
     /// index in canon-lower opts. Backend-tagged because realloc can
@@ -705,8 +690,8 @@ pub const ComponentInstance = struct {
     /// AOT-aware sibling of `resolveTopLevelCoreFunc`. Returns either an
     /// AOT or interp `ReallocTarget` for the named export of the
     /// aliased core instance. Used by the canon-lower trampoline to
-    /// pre-resolve `(realloc $f)` before stashing the call ctx on
-    /// `current_lower_call_ctx`. (#715.)
+    /// pre-resolve `(realloc $f)` before binding the call ctx to the
+    /// active execution thread. (#715.)
     pub fn resolveTopLevelCoreFuncAny(
         self: *const ComponentInstance,
         idx: u32,
@@ -762,7 +747,7 @@ pub const ComponentInstance = struct {
         // wit-component preview1 adapter's per-page memory) resolve
         // correctly. Falls back to the canonical memory otherwise.
         // (#715.)
-        if (self.current_lower_call_ctx) |cctx| {
+        if (self.activeCanonLowerCallCtx()) |cctx| {
             if (cctx.memory) |mem| {
                 const end = @as(usize, ptr) + @as(usize, len);
                 if (end > mem.byteLen()) return null;
@@ -819,6 +804,33 @@ pub const ComponentInstance = struct {
         return null;
     }
 
+    fn callInterpRealloc(
+        self: *ComponentInstance,
+        owner: *core_types.ModuleInstance,
+        local_idx: CoreFuncIdxLocal,
+        alignment: u32,
+        size: u32,
+    ) ?u32 {
+        const executor = @import("executor.zig");
+        if (comptime config.lib_wasi_threads) {
+            const env = ExecEnv.create(owner, 1024, self.allocator) catch return null;
+            defer env.destroy();
+            var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
+            defer frame.deinit();
+            return executor.callRealloc(&frame, local_idx, 0, 0, alignment, size) catch null;
+        }
+
+        if (self.realloc_env_owner != owner) {
+            if (self.realloc_env) |old| old.destroy();
+            self.realloc_env = ExecEnv.create(owner, 1024, self.allocator) catch null;
+            self.realloc_env_owner = if (self.realloc_env != null) owner else null;
+        }
+        const env = self.realloc_env orelse return null;
+        var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
+        defer frame.deinit();
+        return executor.callRealloc(&frame, local_idx, 0, 0, alignment, size) catch null;
+    }
+
     /// Allocate `size` bytes inside the canonical guest linear memory
     /// (or the test_mem shim, if installed) aligned to `align_`. Returns
     /// the guest-side pointer, or null on failure.
@@ -838,7 +850,7 @@ pub const ComponentInstance = struct {
         // module's `cabi_realloc` here returns a ptr in the wrong
         // memory and trips an assertion inside the adapter's
         // `fd_readdir` handler. (#715.)
-        if (self.current_lower_call_ctx) |cctx| {
+        if (self.activeCanonLowerCallCtx()) |cctx| {
             if (cctx.realloc) |target| {
                 const executor = @import("executor.zig");
                 switch (target) {
@@ -850,16 +862,7 @@ pub const ComponentInstance = struct {
                         return executor.callRealloc(&frame, t.local_idx, 0, 0, a, size) catch null;
                     },
                     .interp => |t| {
-                        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
-                        if (self.realloc_env_owner != t.mi) {
-                            if (self.realloc_env) |old| old.destroy();
-                            self.realloc_env = ExecEnv.create(t.mi, 1024, self.allocator) catch null;
-                            self.realloc_env_owner = if (self.realloc_env != null) t.mi else null;
-                        }
-                        const env = self.realloc_env orelse return null;
-                        var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
-                        defer frame.deinit();
-                        return executor.callRealloc(&frame, t.local_idx, 0, 0, a, size) catch null;
+                        return self.callInterpRealloc(t.mi, t.local_idx, a, size);
                     },
                 }
             }
@@ -882,22 +885,12 @@ pub const ComponentInstance = struct {
         }
         const realloc_owner = self.reallocOwner() orelse return null;
         const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
-        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
-        const executor = @import("executor.zig");
-        // Reuse a cached `ExecEnv` keyed on the realloc owner — the
-        // wasi:http@0.3.0 testsuite fixtures hit `hostAllocGuest`
-        // thousands of times per run and a fresh `ExecEnv.create` is
-        // ~96 KiB of allocator churn each (#538). `realloc_env` is
-        // discarded + re-created if the owner ever shifts.
-        if (self.realloc_env_owner != realloc_owner) {
-            if (self.realloc_env) |old| old.destroy();
-            self.realloc_env = ExecEnv.create(realloc_owner, 1024, self.allocator) catch null;
-            self.realloc_env_owner = if (self.realloc_env != null) realloc_owner else null;
-        }
-        const env = self.realloc_env orelse return null;
-        var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
-        defer frame.deinit();
-        return executor.callRealloc(&frame, CoreFuncIdxLocal.from(realloc_local), 0, 0, a, size) catch null;
+        return self.callInterpRealloc(
+            realloc_owner,
+            CoreFuncIdxLocal.from(realloc_local),
+            a,
+            size,
+        );
     }
 
     /// Return a writable slice into the canonical guest memory (or the
@@ -914,7 +907,7 @@ pub const ComponentInstance = struct {
         // from the lowerer's realloc, which allocates inside the same
         // memory. Mismatching here would write into the wrong module's
         // memory and silently corrupt unrelated guest state. (#715.)
-        if (self.current_lower_call_ctx) |cctx| {
+        if (self.activeCanonLowerCallCtx()) |cctx| {
             if (cctx.memory) |mem| {
                 const end = @as(usize, ptr) + @as(usize, len);
                 if (end > mem.byteLen()) return null;
@@ -1562,7 +1555,6 @@ pub const ComponentInstance = struct {
     /// later runtime error).
     fn runDeferredCoreStarts(self: *ComponentInstance) !void {
         const inst_mod = @import("../runtime/interpreter/instance.zig");
-        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
         const interp = @import("../runtime/interpreter/interp.zig");
         defer self.pending_core_starts.clearRetainingCapacity();
         defer self.pending_aot_starts.clearRetainingCapacity();
@@ -1609,7 +1601,6 @@ pub const ComponentInstance = struct {
                 .lift => |lift| {
                     if (self.core_instances.len > 0) {
                         if (self.core_instances[0].module_inst) |mod_inst| {
-                            const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
                             const interp = @import("../runtime/interpreter/interp.zig");
                             const env = ExecEnv.create(mod_inst, 8192, self.allocator) catch return;
                             defer env.destroy();
@@ -1625,10 +1616,12 @@ pub const ComponentInstance = struct {
     pub fn deinit(self: *ComponentInstance) void {
         // The cached `cabi_realloc` ExecEnv must be freed before the
         // core instances it points at (#538).
-        if (self.realloc_env) |env| {
-            env.destroy();
-            self.realloc_env = null;
-            self.realloc_env_owner = null;
+        if (comptime !config.lib_wasi_threads) {
+            if (self.realloc_env) |env| {
+                env.destroy();
+                self.realloc_env = null;
+                self.realloc_env_owner = null;
+            }
         }
         // Children are allocated independently of `module_arena` so we
         // can give each a deterministic deinit before the parent tears
