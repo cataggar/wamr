@@ -247,11 +247,11 @@ fn executeCore(
     env.wasi_ctx = @ptrCast(wasi_ctx);
 
     interp.executeFunction(env, start_func.index) catch |err| {
-        if (wasi_ctx.exit_code) |code| return @truncate(code);
+        if (wasi_ctx.getExitCode()) |code| return @truncate(code);
         std.debug.print("error: execution trapped: {s}\n", .{@errorName(err)});
         return 1;
     };
-    if (wasi_ctx.exit_code) |code| return @truncate(code);
+    if (wasi_ctx.getExitCode()) |code| return @truncate(code);
     if (is_main and func_type.results.len == 1) {
         const code = env.popI32() catch return 1;
         return @truncate(@as(u32, @bitCast(code)));

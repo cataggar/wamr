@@ -242,17 +242,7 @@ pub const ThreadManager = struct {
     }
 
     fn destroyClonedInstance(inst: *types.ModuleInstance) void {
-        const allocator = inst.allocator;
-        // Release shared memories/tables
-        for (inst.memories) |m| m.release(allocator);
-        if (inst.memories.len > 0) allocator.free(inst.memories);
-        for (inst.tables) |t| t.release(allocator);
-        if (inst.tables.len > 0) allocator.free(inst.tables);
-        // Destroy cloned globals
-        for (inst.globals) |g| allocator.destroy(g);
-        if (inst.globals.len > 0) allocator.free(inst.globals);
-        if (inst.dropped_elems.len > 0) allocator.free(inst.dropped_elems);
-        allocator.destroy(inst);
+        inst.destroyThreadClone();
     }
 };
 
@@ -306,13 +296,7 @@ test "ModuleInstance: cloneForThread shares memory" {
 
     // Clone for a child thread
     const child = try parent.cloneForThread(allocator);
-    defer {
-        // Release shared memory (retain was called in clone)
-        for (child.memories) |m| m.release(allocator);
-        allocator.free(child.memories);
-        for (child.globals) |g| allocator.destroy(g);
-        allocator.destroy(child);
-    }
+    defer child.destroyThreadClone();
 
     // Child should see the same memory
     try std.testing.expectEqual(@as(u8, 42), child.memories[0].data[0]);

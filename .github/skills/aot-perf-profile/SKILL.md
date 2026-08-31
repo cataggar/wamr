@@ -1,6 +1,6 @@
 ---
 name: aot-perf-profile
-description: Profile a precompiled WAMR AOT run (a component like keyvault/#798, or a core module like CoreMark/#393) on an Azure Linux x86_64 VM and attribute cycles per wasm function and per instruction class. Installs `perf` (kernel-tools), records the precompiled load+execute run, then de-anonymizes the `[JIT]` mapping that perf cannot symbolize by mapping sample IPs to `local_func` indices via the `.cwasm` function section, and classifies the hot function's instruction mix (spill reloads / frame stores / reg-reg moves / bounds checks / call_indirect or br_table dispatch / memory). Use for runtime-gap investigations to decide whether spills, zero-extension/move overhead, bounds-checks, or dispatch dominate before committing to codegen levers.
+description: Profile a precompiled WAMR AOT run (a component like keyvault/#798, or a core module like CoreMark/#393) on an Azure Linux x86_64 VM and attribute cycles per wasm function and per instruction class. Installs `perf` (kernel-tools), records the precompiled load+execute run, then de-anonymizes the `[JIT]` mapping that perf cannot symbolize by mapping sample IPs to `local_func` indices via the `.cwasm` function section. With the opt-in compiler sidecar it distinguishes allocator spills from wasm local/phi traffic, explicit frame scratch, fixed runtime/ABI state, and unknown frame accesses. Use for runtime-gap investigations to decide whether allocator spills, local/frame traffic, zero-extension/move overhead, bounds-checks, or dispatch dominate before committing to codegen levers.
 ---
 
 # AOT perf profiling + JIT de-anonymization
@@ -123,6 +123,48 @@ awk '/\[aot-spill-metric\]/{for(i=1;i<=NF;i++){n=index($i,"=");
 Note the per-core `<stem>.<N>.cwasm` files written next to the manifest —
 the biggest one is the hot core's text and you need it in Step 5.
 
+### Emit sound frame-origin metadata for a selected x86 function
+
+After the first profile identifies the runtime-hot core/function, recompile
+that selection with the versioned sidecar enabled (or enable it before a
+fresh perf capture). The diagnostic does not change native code or default
+logging. Its parent directory must already exist:
+
+```sh
+mkdir -p /work/perf/frame
+WAMR_AOT_FRAME_ATTRIBUTION=/work/perf/frame/keyvault \
+WAMR_AOT_FRAME_ATTRIBUTION_MODULE=4 \
+WAMR_AOT_FRAME_ATTRIBUTION_FUNC=6145 \
+WAMR_AOT_SPILL_METRIC=1 \
+WAMR_AOT_SPILL_METRIC_MODULE=4 \
+WAMR_AOT_SPILL_METRIC_FUNC=6145 \
+  ./zig-out/bin/wamrc compile-component \
+  -o /work/perf/comp.cwasm.json <component>.wasm
+```
+
+This writes
+`/work/perf/frame/keyvault.mod4.func6145.json`. Each compiler-emitted
+`rbp`/`rsp` frame access (including fixed prologue/epilogue pushes and pops)
+has a half-open function-relative native byte range, signed displacement,
+width, load/store direction, and one of:
+
+- `allocator_spill`
+- `wasm_local_or_phi` (the lowered IR cannot soundly distinguish the two)
+- `explicit_frame_storage`
+- `fixed_runtime_frame_state`
+- `unknown`
+
+Allocator values additionally carry physical slot/frame offset, vreg,
+defining IR opcode + stable source class, live range, pre-emission IR use/def
+counts, exact emitted reload/store counts, and current rematerialization
+eligibility. If future allocation reuses a slot, an access names a vreg only
+when its emitted native range and owning IR instruction prove the identity;
+otherwise it is explicitly ambiguous. Inline `br_table` data ranges are also
+listed so objdump is restarted after data instead of silently decoding jump
+table bytes as instructions. A selected function bypasses codegen-cache reuse
+for that compile so metadata is regenerated from the exact current IR/emission;
+unselected functions may still reuse their cache entries.
+
 ### Core wasm modules (e.g. CoreMark, #393)
 
 For a **single core module** (not a component) — CoreMark, a microbench,
@@ -187,19 +229,48 @@ python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm --func 6145
 
 # Machine-readable output + a minimum useful sample gate:
 python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm \
-  --func 6145 --min-samples 5000 --json-out attribution.json
+  --func 6145 \
+  --frame-metadata /work/perf/frame/keyvault.mod4.func6145.json \
+  --min-samples 5000 --json-out attribution.json
 ```
 
 It prints: total samples, % of run in this core, top functions by
-self-samples, and for `--func` the class breakdown (spill reloads /
-frame stores / reg-reg mov / ALU / bounds-check / linear-mem / dispatch /
-call) plus the 20 hottest instructions. JSON output also records total and
-attributed samples plus attribution coverage. Cross-validate: the static
-frame-load count for the hot fn should ≈ its `spill_ld` from Step 3.
+self-samples, and for `--func` the class breakdown plus the 20 hottest
+instructions. With `--frame-metadata`, it also ranks allocator contributors by
+slot/vreg/source, reports static and sampled frame-attribution coverage and
+unknowns, and requires exact reconciliation between emitted allocator
+load/store records and the sidecar's `WAMR_AOT_SPILL_METRIC` totals.
+On x86, `spill_ld`/`spill_st` are now emitter-traced totals (so folded
+constant operands and fully suppressed constant defs no longer inflate the
+metric); the allocator-value records retain their IR use/def counts to make
+that difference inspectable. AArch64's standalone spill metric remains the
+pre-emission IR estimate.
 
-If size-matching picks the wrong mapping (multiple equal-size cores),
-pass `--base 0x...` explicitly; get candidate bases from
+The tool fails closed on an incompatible AOT/metadata schema, stale full-core
+text hash or function native-code hash, malformed or overlapping native
+ranges, ambiguous mmap selection, or reconciliation mismatch. The full text
+hash binds identical-looking functions to the correct component core.
+Direct-call rel32 bytes are the only normalized relocations in the function
+hash and are listed explicitly in the sidecar.
+Without metadata, frame moves are reported as **unattributed frame traffic**,
+not guessed to be spills.
+
+Size matching must identify exactly one mapping. For multiple equal-size
+cores, pass `--base 0x...` explicitly; get candidate bases from
 `perf script -i wamr.perf --show-mmap-events | grep '//anon' | grep -E 'r[w-]xp'`.
+
+Static sidecar/cwasm validation (no perf needed) is useful before a long run:
+
+```sh
+python3 $SKILL/aot_jit_attr.py \
+  --cwasm /work/perf/comp.4.cwasm --func 6145 \
+  --frame-metadata /work/perf/frame/keyvault.mod4.func6145.json \
+  --validate-frame-metadata
+```
+
+The tracked `tests/benchmarks/frame_attribution/frame_origins.wasm` fixture is
+the small end-to-end smoke module used by `tests/test_aot_jit_attr.py`; it
+contains both lowered-local frame traffic and allocator spills across a call.
 
 ## Step 6 (optional) — register-supply sensitivity sweep
 
@@ -218,11 +289,14 @@ fn's `spill_ld` only 1.8% → supply is not the constraint.) Revert after.
 |---|---|
 | run | 21.4 s, `[JIT]` = 98.2% of cycles |
 | hot fn | `mod4 local_func=6145` = **75%** of run (SpiderMonkey interp loop) |
-| hot-fn mix | spill reloads 34.6%, frame stores 17.4% → **stack traffic ~52%** |
+| historical hot-fn heuristic | rbp loads 34.6%, rbp stores 17.4% → **frame traffic ~52%** |
 | bounds-check | 2.4% · dispatch ~0.3% · linear-mem 1.5% |
 | compile-time #1 spiller | `local_func=11396` (`spill_ld`=514,965) — **runtime-COLD (0 samples)** |
 
-Lesson: the biggest *compile-time* spiller was never executed; the hot
+These 2026-06 frame percentages predate the origin sidecar and must not be
+read as proof that every frame move was an allocator spill. Re-profile with
+`--frame-metadata` for durable origin attribution. The biggest *compile-time*
+spiller was never executed; the hot
 function was the **#3** spiller. Always confirm the runtime-hot function
 with Step 5 before optimizing the compile-time "monster".
 
@@ -234,7 +308,7 @@ Same tooling on the core module `coremark_wasi.wasm` (`wamr run`, 16.5 s):
 |---|---|
 | `[JIT]` | 99.9% of cycles |
 | hot fns | `local_func` 10 / 3 / 7 ≈ **30% / 28% / 28%** (list / matrix / state) |
-| hot-fn mix | **reg-reg mov 15–18%** each, ALU 5–7%, **spill traffic only 3–4%** |
+| historical hot-fn heuristic | **reg-reg mov 15–18%** each, ALU 5–7%, rbp traffic 3–4% |
 | dominant instrs | wasm i32 zero-extends (`mov esi,esi`, `mov edx,edx`, …) + a `br_table` (`add r10,r11; jmp r10`) |
 
 Lesson: CoreMark is **not** spill-bound (confirms #393/#524 — its hot
@@ -260,10 +334,13 @@ distinguishes the two workload classes directly.
 - Issue #808 / PRs #809, #810 — the `WAMR_AOT_SPILL_METRIC*` diagnostic
   (`src/compiler/codegen/timing.zig:printSpill`,
   `src/compiler/ir/passes.zig:spillMetricOptionsFromEnv`).
+- `src/compiler/codegen/frame_attribution.zig` and x86
+  `compile.zig`/`emit.zig` — schema, slot/source metadata, and exact emitted
+  native ranges behind `WAMR_AOT_FRAME_ATTRIBUTION*`.
 - `src/runtime/aot/loader.zig:parseFunctionSection` — the `.cwasm`
   function section (`type=3`: count then `(offset:u32, type_idx:u32)`)
   that `aot_jit_attr.py` parses for `func_offsets[]`. Text section is
-  `type=2`; magic `\0aot` (`0x746f6100`), version 7.
+  `type=2`; magic `\0aot` (`0x746f6100`), version 8.
 - `src/runtime/aot/runtime.zig` — the `local_func[N]+0x..` trap
   symbolizer that uses the same `func_offsets`; r15 mmap'd RX at
   `runtime.zig` `mprotect`.

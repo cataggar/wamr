@@ -36,10 +36,61 @@ pub const Reg = enum(u4) {
     }
 };
 
+pub const FrameAccessKind = enum {
+    load,
+    store,
+};
+
+/// Raw machine-level frame access captured by the x86 emitter. Semantics are
+/// assigned later by the compiler, which knows the frame layout, allocation,
+/// and owning IR instruction. Offsets are function-relative byte ranges.
+pub const FrameAccess = struct {
+    native_start: u32,
+    native_end: u32,
+    kind: FrameAccessKind,
+    base: Reg,
+    displacement: i32,
+    width: u8,
+};
+
+pub const FrameTrace = struct {
+    accesses: std.ArrayList(FrameAccess) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) FrameTrace {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *FrameTrace) void {
+        self.accesses.deinit(self.allocator);
+    }
+
+    fn record(
+        self: *FrameTrace,
+        native_start: usize,
+        native_end: usize,
+        kind: FrameAccessKind,
+        base: Reg,
+        displacement: i32,
+        width: u8,
+    ) !void {
+        if (base != .rbp and base != .rsp) return;
+        try self.accesses.append(self.allocator, .{
+            .native_start = @intCast(native_start),
+            .native_end = @intCast(native_end),
+            .kind = kind,
+            .base = base,
+            .displacement = displacement,
+            .width = width,
+        });
+    }
+};
+
 /// Machine code buffer with x86-64 instruction encoding helpers.
 pub const CodeBuffer = struct {
     bytes: std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    frame_trace: ?*FrameTrace = null,
 
     pub fn init(allocator: std.mem.Allocator) CodeBuffer {
         return .{ .bytes = .empty, .allocator = allocator };
@@ -62,7 +113,30 @@ pub const CodeBuffer = struct {
     /// with a length greater than current len.
     pub fn truncate(self: *CodeBuffer, new_len: usize) void {
         std.debug.assert(new_len <= self.bytes.items.len);
+        if (self.frame_trace) |trace| {
+            while (trace.accesses.items.len > 0) {
+                const last = trace.accesses.items[trace.accesses.items.len - 1];
+                if (last.native_start < new_len) {
+                    std.debug.assert(last.native_end <= new_len);
+                    break;
+                }
+                _ = trace.accesses.pop();
+            }
+        }
         self.bytes.shrinkRetainingCapacity(new_len);
+    }
+
+    fn recordFrameAccess(
+        self: *CodeBuffer,
+        native_start: usize,
+        kind: FrameAccessKind,
+        base: Reg,
+        displacement: i32,
+        width: u8,
+    ) !void {
+        if (self.frame_trace) |trace| {
+            try trace.record(native_start, self.len(), kind, base, displacement, width);
+        }
     }
 
     // ── Raw byte emission ─────────────────────────────────────────────
@@ -246,14 +320,18 @@ pub const CodeBuffer = struct {
 
     /// PUSH reg (uses REX prefix only for r8–r15).
     pub fn pushReg(self: *CodeBuffer, reg: Reg) !void {
+        const native_start = self.len();
         if (reg.isExtended()) try self.emitByte(0x41);
         try self.emitByte(0x50 | @as(u8, reg.low3()));
+        try self.recordFrameAccess(native_start, .store, .rsp, -8, 8);
     }
 
     /// POP reg (uses REX prefix only for r8–r15).
     pub fn popReg(self: *CodeBuffer, reg: Reg) !void {
+        const native_start = self.len();
         if (reg.isExtended()) try self.emitByte(0x41);
         try self.emitByte(0x58 | @as(u8, reg.low3()));
+        try self.recordFrameAccess(native_start, .load, .rsp, 0, 8);
     }
 
     /// RET (near return).
@@ -344,31 +422,37 @@ pub const CodeBuffer = struct {
 
     /// MOV reg, [base + disp32] (64-bit load from memory).
     pub fn movRegMem(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        const native_start = self.len();
         try self.rexW(dst, base);
         try self.emitByte(0x8B);
         try self.modrm(0b10, dst.low3(), base.low3());
         if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
         try self.emitI32(disp);
+        try self.recordFrameAccess(native_start, .load, base, disp, 8);
     }
 
     /// MOV reg, [base + disp32] (32-bit load; zero-extends to 64). For i32
     /// values the low 32 bits are the value, so this both loads and
     /// zero-extends — no separate `mov eXX,eXX` needed (#393).
     pub fn movRegMem32(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        const native_start = self.len();
         try self.rex(false, dst, base);
         try self.emitByte(0x8B);
         try self.modrm(0b10, dst.low3(), base.low3());
         if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
         try self.emitI32(disp);
+        try self.recordFrameAccess(native_start, .load, base, disp, 4);
     }
 
     /// MOV [base + disp32], reg (64-bit store to memory).
     pub fn movMemReg(self: *CodeBuffer, base: Reg, disp: i32, src: Reg) !void {
+        const native_start = self.len();
         try self.rexW(src, base);
         try self.emitByte(0x89);
         try self.modrm(0b10, src.low3(), base.low3());
         if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
         try self.emitI32(disp);
+        try self.recordFrameAccess(native_start, .store, base, disp, 8);
     }
 
     // ── SETcc / MOVZX / TEST / CQO / DIV / CMOV ──────────────────────
@@ -755,6 +839,7 @@ pub const CodeBuffer = struct {
 
     /// MOV r32, [base + disp32] — 32-bit load (no REX.W, zero-extends to 64).
     pub fn movRegMemNoRex(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        const native_start = self.len();
         if (dst.isExtended() or base.isExtended()) {
             try self.rex(false, dst, base);
         }
@@ -767,10 +852,12 @@ pub const CodeBuffer = struct {
             if (base.low3() == 4) try self.emitByte(0x24);
             try self.emitI32(disp);
         }
+        try self.recordFrameAccess(native_start, .load, base, disp, 4);
     }
 
     /// MOV [base + disp32], r32 — 32-bit store (no REX.W).
     pub fn movMemRegNoRex(self: *CodeBuffer, base: Reg, disp: i32, src: Reg) !void {
+        const native_start = self.len();
         if (src.isExtended() or base.isExtended()) {
             try self.rex(false, src, base);
         }
@@ -783,6 +870,7 @@ pub const CodeBuffer = struct {
             if (base.low3() == 4) try self.emitByte(0x24);
             try self.emitI32(disp);
         }
+        try self.recordFrameAccess(native_start, .store, base, disp, 4);
     }
 
     // ── Atomic / LOCK-prefix instructions ─────────────────────────────
@@ -825,6 +913,7 @@ pub const CodeBuffer = struct {
     /// Size 4 uses 32-bit MOV (implicit zero-extend to 64-bit).
     /// Size 8 uses 64-bit MOV (REX.W).
     pub fn movRegMemSized(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32, size: u8) !void {
+        const native_start = self.len();
         switch (size) {
             1 => {
                 // MOVZX r32, BYTE PTR [base+disp]: [REX] 0F B6 /r
@@ -849,14 +938,17 @@ pub const CodeBuffer = struct {
             else => unreachable,
         }
         try self.emitMemOperand(dst.low3(), base, disp);
+        try self.recordFrameAccess(native_start, .load, base, disp, size);
     }
 
     /// Sized MOV store: store `size` bytes from src into [base + disp].
     pub fn movMemRegSized(self: *CodeBuffer, base: Reg, disp: i32, src: Reg, size: u8) !void {
+        const native_start = self.len();
         const opcode: u8 = if (size == 1) 0x88 else 0x89;
         try self.emitSizedPrefix(src, base, size);
         try self.emitByte(opcode);
         try self.emitMemOperand(src.low3(), base, disp);
+        try self.recordFrameAccess(native_start, .store, base, disp, size);
     }
 
     /// LOCK XADD [base + disp], src — atomic exchange-and-add.
@@ -1884,4 +1976,34 @@ test "movRegReg still emits for distinct regs" {
     try buf.movRegReg(.rax, .rdx);
     // REX.W 89 /r: 48 89 D0 (mov rax, rdx)
     try hexEqual(buf.getCode(), &.{ 0x48, 0x89, 0xD0 });
+}
+
+test "FrameTrace records positive and negative rbp offsets plus rsp accesses" {
+    var trace = FrameTrace.init(std.testing.allocator);
+    defer trace.deinit();
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    buf.frame_trace = &trace;
+
+    try buf.movRegMem(.rax, .rbp, -24);
+    try buf.movMemReg(.rbp, 48, .rdx);
+    try buf.movRegMem32(.r8, .rsp, 32);
+    try buf.pushReg(.r12);
+    try buf.popReg(.r12);
+    try buf.movRegMem(.rax, .rbx, 8); // Non-frame memory is deliberately ignored.
+
+    try std.testing.expectEqual(@as(usize, 5), trace.accesses.items.len);
+    try std.testing.expectEqual(FrameAccessKind.load, trace.accesses.items[0].kind);
+    try std.testing.expectEqual(Reg.rbp, trace.accesses.items[0].base);
+    try std.testing.expectEqual(@as(i32, -24), trace.accesses.items[0].displacement);
+    try std.testing.expectEqual(@as(u8, 8), trace.accesses.items[0].width);
+    try std.testing.expectEqual(FrameAccessKind.store, trace.accesses.items[1].kind);
+    try std.testing.expectEqual(@as(i32, 48), trace.accesses.items[1].displacement);
+    try std.testing.expectEqual(Reg.rsp, trace.accesses.items[2].base);
+    try std.testing.expectEqual(@as(u8, 4), trace.accesses.items[2].width);
+    try std.testing.expectEqual(FrameAccessKind.store, trace.accesses.items[3].kind);
+    try std.testing.expectEqual(@as(i32, -8), trace.accesses.items[3].displacement);
+    try std.testing.expectEqual(FrameAccessKind.load, trace.accesses.items[4].kind);
+    try std.testing.expectEqual(@as(i32, 0), trace.accesses.items[4].displacement);
+    try std.testing.expect(trace.accesses.items[0].native_end <= trace.accesses.items[1].native_start);
 }

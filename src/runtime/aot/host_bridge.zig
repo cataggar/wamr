@@ -464,13 +464,13 @@ pub fn aotProcRaise(vmctx: *VmCtx, sig: i32) callconv(.c) i32 {
 pub fn aotProcExit(vmctx: *VmCtx, code: i32) callconv(.c) void {
     traceAdapter("proc_exit", vmctx, .{code});
     if (getCtx(vmctx)) |ctx| {
-        ctx.exit_code = @bitCast(code);
+        ctx.proc_exit(@bitCast(code));
     }
     // `proc_exit` is unconditional: it must not return to the guest.
     // Since C-calling-convention adapters cannot raise a Zig error,
     // terminate the host process here. This matches the interpreter
     // path (`error.Trap` propagates to the CLI which then calls
-    // `std.process.exit(ctx.exit_code)`).
+    // `std.process.exit(ctx.getExitCode())`).
     const code_u8: u8 = @intCast(@as(u32, @bitCast(code)) & 0xFF);
     std.process.exit(code_u8);
 }

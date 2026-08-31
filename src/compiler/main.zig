@@ -422,10 +422,20 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     const reuse_ptr: ?*const codegen_cache.Cache = if (loaded_cache) |*c| c else null;
 
     const codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map);
+    var frame_attribution = passes.frameAttributionOptionsFromEnv(init.environ_map);
+    if (frame_attribution.enabled) {
+        frame_attribution.cwasm_aot_version = emit_aot.aot_version;
+        frame_attribution.compiler_build_id = wamr.version.string;
+    }
+    if (frame_attribution.enabled and target_arch != .x86_64) {
+        std.debug.print("Error: WAMR_AOT_FRAME_ATTRIBUTION is supported only for x86_64\n", .{});
+        std.process.exit(1);
+    }
     const compiled: codegen_cache.CompileResultCached = switch (target_arch) {
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
             .codegen_timing = codegen_timing,
             .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
+            .frame_attribution = frame_attribution,
         }) catch |err| {
             std.debug.print("Error compiling to x86-64: {}\n", .{err});
             std.process.exit(1);
@@ -947,6 +957,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
         .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
         .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
         .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
+        .frame_attribution = passes.frameAttributionOptionsFromEnv(init.environ_map),
         .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
         .verify_mode = verify_mode,
     }) catch |err| {
@@ -1091,6 +1102,7 @@ fn compileAndSpawn(
                 .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
                 .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
                 .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
+                .frame_attribution = passes.frameAttributionOptionsFromEnv(init.environ_map),
                 .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
                 .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {
@@ -1110,6 +1122,7 @@ fn compileAndSpawn(
                 .analysis_timing = passes.analysisTimingOptionsFromEnv(init.environ_map),
                 .codegen_timing = passes.codegenTimingOptionsFromEnv(init.environ_map),
                 .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
+                .frame_attribution = passes.frameAttributionOptionsFromEnv(init.environ_map),
                 .tail_duplication = passes.tailDuplicationOptionsFromEnv(init.environ_map),
                 .verify_mode = verifyModeFromEnvOrDefault(init.environ_map),
             }) catch |err| {

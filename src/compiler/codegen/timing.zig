@@ -130,10 +130,10 @@ pub const SpillMetricOptions = passes.SpillMetricOptions;
 
 /// Per-function spill-cost diagnostic line (#808 Lever 1). `spill_count`
 /// is the raw `AllocResult.spill_count` (total 8-byte slots); the rest come
-/// from `regalloc.computeSpillMetric`. Printed only when the caller's
-/// `SpillMetricOptions.shouldLog` is satisfied; the backends gate the
-/// (cheap) metric computation on the same predicate so the disabled path
-/// pays nothing.
+/// from `regalloc.computeSpillMetric`. x86 replaces the IR use/def traffic
+/// estimate with exact emitter-traced loads/stores before printing; aarch64
+/// currently reports the pre-emission estimate. Printed only when the
+/// caller's `SpillMetricOptions.shouldLog` is satisfied.
 pub const SpillReport = struct {
     module_idx: u32,
     func_idx: u32,

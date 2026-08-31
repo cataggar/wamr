@@ -12,6 +12,7 @@ const passes = @import("../../ir/passes.zig");
 const emit = @import("emit.zig");
 const codegen_cache = @import("../../codegen_cache.zig");
 const codegen_timing = @import("../timing.zig");
+const frame_attribution = @import("../frame_attribution.zig");
 
 // ── Comptime codegen-trace knobs ────────────────────────────────────────
 //
@@ -1427,6 +1428,7 @@ fn compileInst(
 pub const FuncCompileResult = struct {
     code: []u8,
     call_patches: []CallPatch,
+    frame_attribution: ?PendingFrameAttribution = null,
 };
 
 /// Result of compiling an IR module.
@@ -1625,6 +1627,9 @@ pub const CompileOptions = struct {
     /// #808 Lever 1: per-function spill-cost diagnostics. Off unless
     /// `WAMR_AOT_SPILL_METRIC` is set.
     spill_metric: passes.SpillMetricOptions = .{},
+    /// Versioned machine-readable x86 frame-origin metadata. Off unless
+    /// `WAMR_AOT_FRAME_ATTRIBUTION=<output-prefix>` is set.
+    frame_attribution: passes.FrameAttributionOptions = .{},
     /// Component core/module index, used only to match the
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter. Single-module
     /// `wamrc compile` leaves it at 0.
@@ -1695,8 +1700,23 @@ pub fn compileModuleCachedWithOptions(
     errdefer offsets.deinit(allocator);
     var global_call_patches: std.ArrayList(GlobalCallPatch) = .empty;
     defer global_call_patches.deinit(allocator);
+    var frame_reports: std.ArrayList(PendingFrameAttribution) = .empty;
+    defer {
+        for (frame_reports.items) |*report| report.deinit(allocator);
+        frame_reports.deinit(allocator);
+    }
 
     const func_count: usize = ir_module.functions.items.len;
+    if (options.frame_attribution.enabled and
+        options.frame_attribution.moduleMatches(options.module_idx))
+    {
+        if (options.frame_attribution.func_filter) |f| {
+            if (f >= @as(u32, @intCast(func_count))) return error.FrameAttributionFunctionNotFound;
+            try frame_reports.ensureTotalCapacity(allocator, 1);
+        } else {
+            try frame_reports.ensureTotalCapacity(allocator, func_count);
+        }
+    }
     var cache_funcs = try allocator.alloc(codegen_cache.CachedFunction, func_count);
     var cache_init: usize = 0;
     errdefer {
@@ -1724,11 +1744,16 @@ pub fn compileModuleCachedWithOptions(
     for (ir_module.functions.items, 0..) |func, fi| {
         const func_start: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_start);
+        const frame_attr_live = options.frame_attribution.shouldEmit(
+            options.module_idx,
+            @intCast(fi),
+        );
 
         // #887 lazy-JIT: direct-call targets retain a stable entry stub.
         // Root-only lazy functions emit no text and resolve before their
         // first external call, preserving #862's deferred-code-size benefit.
         if (fi < options.lazy_skip.len and options.lazy_skip[fi]) {
+            if (frame_attr_live) return error.FrameAttributionUnavailableForLazyFunction;
             const stub = if (fi < options.lazy_entry_stubs.len and options.lazy_entry_stubs[fi])
                 try compileLazyEntryStub(@intCast(fi), allocator)
             else
@@ -1766,13 +1791,15 @@ pub fn compileModuleCachedWithOptions(
         var reused = false;
         var hit_code: []const u8 = undefined;
         var hit_patches: []const codegen_cache.FuncCallPatch = undefined;
-        if (reuse) |r| {
-            if (fi < r.functions.len and
-                std.mem.eql(u8, &r.functions[fi].ir_sha256, &ir_sha))
-            {
-                hit_code = r.functions[fi].code;
-                hit_patches = r.functions[fi].call_patches;
-                reused = true;
+        if (!frame_attr_live) {
+            if (reuse) |r| {
+                if (fi < r.functions.len and
+                    std.mem.eql(u8, &r.functions[fi].ir_sha256, &ir_sha))
+                {
+                    hit_code = r.functions[fi].code;
+                    hit_patches = r.functions[fi].call_patches;
+                    reused = true;
+                }
             }
         }
 
@@ -1800,7 +1827,7 @@ pub fn compileModuleCachedWithOptions(
         } else {
             if (ct_live) func_timer = codegen_timing.FuncTimer.start();
             const compile_t0: u64 = if (ct_live) codegen_timing.nowNs() else 0;
-            const result = try compileFunctionRAWithGlobalOffsetsTimed(
+            var result = try compileFunctionRAWithGlobalOffsetsTimed(
                 &func,
                 ir_module.import_count,
                 ir_module.global_offsets orelse &.{},
@@ -1811,8 +1838,21 @@ pub fn compileModuleCachedWithOptions(
                     .module_idx = options.module_idx,
                     .func_idx = @intCast(fi),
                 } else null,
+                if (frame_attr_live) FrameAttributionCtx{
+                    .output_prefix = options.frame_attribution.output_prefix.?,
+                    .module_idx = options.module_idx,
+                    .func_idx = @intCast(fi),
+                    .cwasm_aot_version = options.frame_attribution.cwasm_aot_version,
+                    .compiler_build_id = options.frame_attribution.compiler_build_id,
+                } else null,
                 .{},
             );
+            if (result.frame_attribution) |report_value| {
+                var report = report_value;
+                report.function_offset = func_start;
+                frame_reports.appendAssumeCapacity(report);
+                result.frame_attribution = null;
+            }
             if (ct_live) {
                 compile_ns = codegen_timing.nowNs() -| compile_t0;
                 mod_compile_ns += compile_ns;
@@ -1876,6 +1916,17 @@ pub fn compileModuleCachedWithOptions(
             const target_off = offsets.items[patch.target_func_idx];
             const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
             std.mem.writeInt(i32, all_code.items[patch.patch_offset..][0..4], rel, .little);
+        }
+    }
+    if (frame_reports.items.len > 0) {
+        var module_text_hash: [64]u8 = undefined;
+        sha256Hex(all_code.items, &module_text_hash);
+        for (frame_reports.items) |*report| {
+            try report.write(
+                allocator,
+                @intCast(all_code.items.len),
+                &module_text_hash,
+            );
         }
     }
     if (ct_live) {
@@ -2277,7 +2328,7 @@ fn compileFunctionRAWithGlobalOffsetsEx(
     allocator: std.mem.Allocator,
     options: FunctionCompileOptions,
 ) !FuncCompileResult {
-    return compileFunctionRAWithGlobalOffsetsTimed(func, import_count, global_offsets, allocator, null, null, options);
+    return compileFunctionRAWithGlobalOffsetsTimed(func, import_count, global_offsets, allocator, null, null, null, options);
 }
 
 /// #808 Lever 1 context: identifies the function for the spill-metric line
@@ -2287,6 +2338,637 @@ const SpillMetricCtx = struct {
     module_idx: u32,
     func_idx: u32,
 };
+
+const FrameAttributionCtx = struct {
+    output_prefix: []const u8,
+    module_idx: u32,
+    func_idx: u32,
+    cwasm_aot_version: u32,
+    compiler_build_id: []const u8,
+};
+
+const PendingFrameAttribution = struct {
+    ctx: FrameAttributionCtx,
+    function_name: []const u8,
+    function_offset: u32 = 0,
+    code_size: u32,
+    normalized_code_sha256: [64]u8,
+    direct_call_rel32_offsets: []u32,
+    inline_data_ranges: []frame_attribution.InlineDataRange,
+    frame_layout: frame_attribution.FrameLayout,
+    spill_metric: frame_attribution.SpillMetric,
+    emitted_allocator_loads: u32,
+    emitted_allocator_stores: u32,
+    allocator_values: []frame_attribution.SpillValue,
+    accesses: []frame_attribution.Access,
+
+    fn deinit(self: *PendingFrameAttribution, allocator: std.mem.Allocator) void {
+        allocator.free(self.direct_call_rel32_offsets);
+        allocator.free(self.inline_data_ranges);
+        allocator.free(self.allocator_values);
+        allocator.free(self.accesses);
+    }
+
+    fn write(
+        self: *const PendingFrameAttribution,
+        allocator: std.mem.Allocator,
+        module_text_size: u32,
+        module_text_sha256: []const u8,
+    ) !void {
+        try frame_attribution.writeReport(
+            allocator,
+            self.ctx.output_prefix,
+            self.ctx.module_idx,
+            self.ctx.func_idx,
+            .{
+                .cwasm_aot_version = self.ctx.cwasm_aot_version,
+                .compiler_build_id = self.ctx.compiler_build_id,
+                .abi = if (comptime builtin.os.tag == .windows) "win64" else "sysv",
+                .module = self.ctx.module_idx,
+                .local_func = self.ctx.func_idx,
+                .function_name = self.function_name,
+                .module_text_size = module_text_size,
+                .module_text_sha256 = module_text_sha256,
+                .function_offset = self.function_offset,
+                .code_size = self.code_size,
+                .normalized_code_sha256 = &self.normalized_code_sha256,
+                .direct_call_rel32_offsets = self.direct_call_rel32_offsets,
+                .inline_data_ranges = self.inline_data_ranges,
+                .frame_layout = self.frame_layout,
+                .spill_metric = self.spill_metric,
+                .emitted_allocator_loads = self.emitted_allocator_loads,
+                .emitted_allocator_stores = self.emitted_allocator_stores,
+                .allocator_values = self.allocator_values,
+                .accesses = self.accesses,
+            },
+        );
+    }
+};
+
+const EmittedIrRange = struct {
+    native_start: u32,
+    native_end: u32,
+    ir_position: u32,
+    inst: ir.Inst,
+};
+
+const DefInfo = struct {
+    count: u32 = 0,
+    opcode: ?[]const u8 = null,
+    source_class: ?[]const u8 = null,
+};
+
+fn stableSourceClass(opcode: []const u8) []const u8 {
+    if (std.mem.eql(u8, opcode, "local_get")) return "wasm_local_or_phi";
+    if (std.mem.eql(u8, opcode, "phi") or
+        std.mem.eql(u8, opcode, "parallel_copy"))
+    {
+        return "phi_or_copy";
+    }
+    if (std.mem.startsWith(u8, opcode, "iconst_") or
+        std.mem.startsWith(u8, opcode, "fconst_") or
+        std.mem.eql(u8, opcode, "v128_const"))
+    {
+        return "constant";
+    }
+    if (std.mem.startsWith(u8, opcode, "call")) return "call_result";
+    if (std.mem.indexOf(u8, opcode, "load") != null or
+        std.mem.eql(u8, opcode, "global_get") or
+        std.mem.eql(u8, opcode, "table_get"))
+    {
+        return "memory_or_runtime";
+    }
+    return "computed";
+}
+
+fn rematerializationEligible(opcode: ?[]const u8) bool {
+    const op = opcode orelse return false;
+    return std.mem.eql(u8, op, "iconst_32") or std.mem.eql(u8, op, "iconst_64");
+}
+
+const SpillUseCountCtx = struct {
+    counts: *std.AutoHashMap(ir.VReg, u32),
+
+    fn visit(self: *SpillUseCountCtx, vreg: ir.VReg) anyerror!void {
+        if (self.counts.getPtr(vreg)) |count| count.* += 1;
+    }
+};
+
+fn spillSlotIndex(reg_set: regalloc.RegSet, frame_offset: i32) ?u32 {
+    if (reg_set.spill_stride == 0) return null;
+    const delta = frame_offset - reg_set.spill_base;
+    if (@rem(delta, reg_set.spill_stride) != 0) return null;
+    const idx = @divTrunc(delta, reg_set.spill_stride);
+    if (idx < 0) return null;
+    return @intCast(idx);
+}
+
+fn spillValueCoversSlot(value: frame_attribution.SpillValue, slot: u32) bool {
+    return slot >= value.slot and slot < value.slot + value.slot_count;
+}
+
+fn buildSpillValues(
+    allocator: std.mem.Allocator,
+    func: *const ir.IrFunction,
+    reg_set: regalloc.RegSet,
+    live_ranges: []const analysis.LiveRange,
+    alloc_result: *const regalloc.AllocResult,
+) ![]frame_attribution.SpillValue {
+    var type_ranges = std.AutoHashMap(ir.VReg, analysis.LiveRange).init(allocator);
+    defer type_ranges.deinit();
+    for (live_ranges) |range| try type_ranges.put(range.vreg, range);
+
+    var use_counts = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer use_counts.deinit();
+    var def_infos = std.AutoHashMap(ir.VReg, DefInfo).init(allocator);
+    defer def_infos.deinit();
+
+    {
+        var it = alloc_result.assignments.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .stack) continue;
+            try use_counts.put(entry.key_ptr.*, 0);
+            try def_infos.put(entry.key_ptr.*, .{});
+        }
+    }
+
+    var use_ctx = SpillUseCountCtx{ .counts = &use_counts };
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |dest| {
+                if (def_infos.getPtr(dest)) |info| {
+                    const opcode = @tagName(inst.op);
+                    info.count += 1;
+                    if (info.count == 1) {
+                        info.opcode = opcode;
+                        info.source_class = stableSourceClass(opcode);
+                    } else {
+                        // Multiple defs mean the vreg identity is already
+                        // malformed/non-SSA; do not attach one source label.
+                        info.opcode = null;
+                        info.source_class = null;
+                    }
+                }
+            }
+            try range_split.forEachUseInst(inst, &use_ctx, SpillUseCountCtx.visit);
+        }
+    }
+
+    var values: std.ArrayList(frame_attribution.SpillValue) = .empty;
+    errdefer values.deinit(allocator);
+    {
+        var it = alloc_result.assignments.iterator();
+        while (it.next()) |entry| {
+            const frame_offset = switch (entry.value_ptr.*) {
+                .stack => |off| off,
+                .reg => continue,
+            };
+            const slot = spillSlotIndex(reg_set, frame_offset) orelse
+                return error.InvalidSpillFrameOffset;
+            const range = type_ranges.get(entry.key_ptr.*);
+            const info = def_infos.get(entry.key_ptr.*) orelse DefInfo{};
+            const value_type: ?[]const u8 = if (range) |r| @tagName(r.type) else null;
+            const slot_count: u8 = if (range) |r| r.type.spillSlots64() else 1;
+            try values.append(allocator, .{
+                .vreg = entry.key_ptr.*,
+                .frame_offset = frame_offset,
+                .slot = slot,
+                .slot_count = slot_count,
+                .value_type = value_type,
+                .live_start = if (range) |r| r.start else null,
+                .live_end = if (range) |r| r.end else null,
+                .defining_opcode = info.opcode,
+                .source_class = info.source_class,
+                .ir_use_count = use_counts.get(entry.key_ptr.*) orelse 0,
+                .ir_def_count = info.count,
+                .reload_count = 0,
+                .store_count = 0,
+                .rematerialization_eligible = rematerializationEligible(info.opcode),
+                .reused = false,
+            });
+        }
+    }
+
+    std.mem.sort(frame_attribution.SpillValue, values.items, {}, struct {
+        fn lessThan(_: void, lhs: frame_attribution.SpillValue, rhs: frame_attribution.SpillValue) bool {
+            if (lhs.slot != rhs.slot) return lhs.slot < rhs.slot;
+            return lhs.vreg < rhs.vreg;
+        }
+    }.lessThan);
+
+    // Mark all overlapping allocator homes. The current allocator does not
+    // reuse slots, but the format and classifier stay sound when it does.
+    for (values.items, 0..) |value, i| {
+        const end_slot = value.slot + value.slot_count;
+        var j = i + 1;
+        while (j < values.items.len and values.items[j].slot < end_slot) : (j += 1) {
+            const other_end = values.items[j].slot + values.items[j].slot_count;
+            if (value.slot < other_end) {
+                values.items[i].reused = true;
+                values.items[j].reused = true;
+            }
+        }
+    }
+
+    return values.toOwnedSlice(allocator);
+}
+
+const ResolveSpillUseCtx = struct {
+    values: []const frame_attribution.SpillValue,
+    slot: u32,
+    match: ?usize = null,
+    ambiguous: bool = false,
+
+    fn visit(self: *ResolveSpillUseCtx, vreg: ir.VReg) anyerror!void {
+        for (self.values, 0..) |value, i| {
+            if (value.vreg != vreg or !spillValueCoversSlot(value, self.slot)) continue;
+            if (self.match) |prior| {
+                if (prior != i) self.ambiguous = true;
+            } else {
+                self.match = i;
+            }
+        }
+    }
+};
+
+fn findOwningIrRange(
+    ranges: []const EmittedIrRange,
+    range_cursor: *usize,
+    native_start: u32,
+) ?EmittedIrRange {
+    while (range_cursor.* < ranges.len and
+        ranges[range_cursor.*].native_end <= native_start)
+    {
+        range_cursor.* += 1;
+    }
+    if (range_cursor.* >= ranges.len) return null;
+    const range = ranges[range_cursor.*];
+    if (range.native_start <= native_start and native_start < range.native_end) return range;
+    return null;
+}
+
+fn resolveSpillValue(
+    values: []const frame_attribution.SpillValue,
+    slot: u32,
+    kind: emit.FrameAccessKind,
+    owning_ir: ?EmittedIrRange,
+) !struct { index: ?usize, candidate_count: u32 } {
+    var first: ?usize = null;
+    var candidate_count: u32 = 0;
+    for (values, 0..) |value, i| {
+        if (!spillValueCoversSlot(value, slot)) continue;
+        if (first == null) first = i;
+        candidate_count += 1;
+    }
+    if (candidate_count <= 1) return .{ .index = first, .candidate_count = candidate_count };
+    const range = owning_ir orelse return .{ .index = null, .candidate_count = candidate_count };
+
+    switch (kind) {
+        .store => {
+            const dest = range.inst.dest orelse
+                return .{ .index = null, .candidate_count = candidate_count };
+            var match: ?usize = null;
+            for (values, 0..) |value, i| {
+                if (value.vreg == dest and spillValueCoversSlot(value, slot)) {
+                    if (match != null) return .{ .index = null, .candidate_count = candidate_count };
+                    match = i;
+                }
+            }
+            return .{ .index = match, .candidate_count = candidate_count };
+        },
+        .load => {
+            var ctx = ResolveSpillUseCtx{ .values = values, .slot = slot };
+            try range_split.forEachUseInst(range.inst, &ctx, ResolveSpillUseCtx.visit);
+            return .{
+                .index = if (ctx.ambiguous) null else ctx.match,
+                .candidate_count = candidate_count,
+            };
+        },
+    }
+}
+
+fn buildFrameAccesses(
+    allocator: std.mem.Allocator,
+    func: *const ir.IrFunction,
+    reg_set: regalloc.RegSet,
+    alloc_result: *const regalloc.AllocResult,
+    raw_accesses: []const emit.FrameAccess,
+    ir_ranges: []const EmittedIrRange,
+    spill_values: []const frame_attribution.SpillValue,
+    emitted_loads: *u32,
+    emitted_stores: *u32,
+) ![]frame_attribution.Access {
+    var accesses: std.ArrayList(frame_attribution.Access) = .empty;
+    errdefer accesses.deinit(allocator);
+    try accesses.ensureTotalCapacity(allocator, raw_accesses.len);
+
+    var range_cursor: usize = 0;
+    for (raw_accesses) |raw| {
+        const owning_ir = findOwningIrRange(ir_ranges, &range_cursor, raw.native_start);
+        var access: frame_attribution.Access = .{
+            .native_start = raw.native_start,
+            .native_end = raw.native_end,
+            .kind = switch (raw.kind) {
+                .load => .load,
+                .store => .store,
+            },
+            .base = @tagName(raw.base),
+            .frame_offset = raw.displacement,
+            .width = raw.width,
+            .origin = .unknown,
+            .detail = "unclassified_frame_access",
+            .ir_position = if (owning_ir) |r| r.ir_position else null,
+            .ir_opcode = if (owning_ir) |r| @tagName(r.inst.op) else null,
+        };
+
+        if (raw.base == .rsp) {
+            access.origin = .fixed_runtime_frame_state;
+            access.detail = if (raw.kind == .store and raw.displacement == -8)
+                "prologue_or_callee_save_push"
+            else if (raw.kind == .load and raw.displacement == 0)
+                "epilogue_or_callee_save_pop"
+            else
+                "outgoing_abi_frame";
+        } else {
+            const slot = spillSlotIndex(reg_set, raw.displacement);
+            if (slot != null and slot.? < alloc_result.spill_count) {
+                const resolved = try resolveSpillValue(
+                    spill_values,
+                    slot.?,
+                    raw.kind,
+                    owning_ir,
+                );
+                if (resolved.candidate_count > 0) {
+                    access.origin = .allocator_spill;
+                    access.detail = "allocator_slot";
+                    access.slot = slot;
+                    if (resolved.index) |idx| {
+                        const value = spill_values[idx];
+                        access.vreg = value.vreg;
+                        access.defining_opcode = value.defining_opcode;
+                        access.source_class = value.source_class;
+                        access.rematerialization_eligible = value.rematerialization_eligible;
+                    } else {
+                        access.vreg_ambiguous = resolved.candidate_count > 1;
+                    }
+                    switch (raw.kind) {
+                        .load => emitted_loads.* += 1,
+                        .store => emitted_stores.* += 1,
+                    }
+                } else {
+                    access.detail = "unassigned_spill_or_padding";
+                    access.slot = slot;
+                }
+            } else {
+                const local_first: i32 = -16;
+                const local_last: i32 = -@as(i32, @intCast((func.local_count + 1) * 8));
+                if (func.local_count > 0 and
+                    raw.displacement <= local_first and
+                    raw.displacement >= local_last and
+                    @rem(-raw.displacement, 8) == 0)
+                {
+                    access.origin = .wasm_local_or_phi;
+                    access.detail = "wasm_local_or_lowered_phi";
+                    access.local_index = @intCast(@divTrunc(-raw.displacement, 8) - 2);
+                } else {
+                    const explicit_first = -@as(i32, @intCast((func.local_count + 2) * 8));
+                    const explicit_last = -@as(i32, @intCast((func.local_count + 65) * 8));
+                    if (raw.displacement <= explicit_first and
+                        raw.displacement >= explicit_last and
+                        @rem(-raw.displacement, 8) == 0)
+                    {
+                        access.origin = .explicit_frame_storage;
+                        access.detail = if (raw.displacement == explicit_first)
+                            "hidden_return_pointer_or_explicit_scratch"
+                        else
+                            "explicit_scratch";
+                        access.explicit_slot = @intCast(
+                            @divTrunc(-raw.displacement, 8) -
+                                @as(i32, @intCast(func.local_count + 2)),
+                        );
+                    } else if (raw.displacement == vmctx_offset) {
+                        access.origin = .fixed_runtime_frame_state;
+                        access.detail = "reserved_vmctx";
+                    } else if (raw.displacement >= 0) {
+                        access.origin = .fixed_runtime_frame_state;
+                        access.detail = if (raw.displacement == 0)
+                            "saved_frame_pointer"
+                        else if (raw.displacement == 8)
+                            "return_address"
+                        else
+                            "incoming_abi_argument";
+                    }
+                }
+            }
+        }
+        try accesses.append(allocator, access);
+    }
+    return accesses.toOwnedSlice(allocator);
+}
+
+const EmittedSpillTraffic = struct {
+    loads: u32 = 0,
+    stores: u32 = 0,
+};
+
+fn countEmittedSpillTraffic(
+    allocator: std.mem.Allocator,
+    alloc_result: *const regalloc.AllocResult,
+    raw_accesses: []const emit.FrameAccess,
+) !EmittedSpillTraffic {
+    var spill_offsets = std.AutoHashMap(i32, void).init(allocator);
+    defer spill_offsets.deinit();
+    {
+        var it = alloc_result.assignments.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .stack) {
+                try spill_offsets.put(entry.value_ptr.stack, {});
+            }
+        }
+    }
+
+    var traffic: EmittedSpillTraffic = .{};
+    for (raw_accesses) |access| {
+        if (access.base != .rbp or !spill_offsets.contains(access.displacement)) continue;
+        switch (access.kind) {
+            .load => traffic.loads += 1,
+            .store => traffic.stores += 1,
+        }
+    }
+    return traffic;
+}
+
+fn normalizedCodeSha256(
+    code: []const u8,
+    rel32_offsets: []const u32,
+    hex_out: *[64]u8,
+) !void {
+    var sh = std.crypto.hash.sha2.Sha256.init(.{});
+    var cursor: usize = 0;
+    const zeros = [_]u8{ 0, 0, 0, 0 };
+    for (rel32_offsets) |raw_offset| {
+        const offset: usize = raw_offset;
+        if (offset < cursor or offset + 4 > code.len) return error.InvalidDirectCallPatch;
+        sh.update(code[cursor..offset]);
+        sh.update(&zeros);
+        cursor = offset + 4;
+    }
+    sh.update(code[cursor..]);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    sh.final(&digest);
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |byte, i| {
+        hex_out[i * 2] = hex[byte >> 4];
+        hex_out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+}
+
+fn sha256Hex(data: []const u8, hex_out: *[64]u8) void {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |byte, i| {
+        hex_out[i * 2] = hex[byte >> 4];
+        hex_out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+}
+
+fn buildInlineDataRanges(
+    allocator: std.mem.Allocator,
+    table_patches: []const TablePatch,
+) ![]frame_attribution.InlineDataRange {
+    var ranges: std.ArrayList(frame_attribution.InlineDataRange) = .empty;
+    errdefer ranges.deinit(allocator);
+    var current_base: ?usize = null;
+    var current_end: usize = 0;
+    for (table_patches) |patch| {
+        if (current_base == null or current_base.? != patch.base_offset) {
+            if (current_base) |base| {
+                try ranges.append(allocator, .{
+                    .native_start = @intCast(base),
+                    .native_end = @intCast(current_end),
+                });
+            }
+            current_base = patch.base_offset;
+            current_end = patch.entry_offset + 4;
+        } else {
+            current_end = @max(current_end, patch.entry_offset + 4);
+        }
+    }
+    if (current_base) |base| {
+        try ranges.append(allocator, .{
+            .native_start = @intCast(base),
+            .native_end = @intCast(current_end),
+        });
+    }
+    return ranges.toOwnedSlice(allocator);
+}
+
+fn buildFrameAttribution(
+    allocator: std.mem.Allocator,
+    ctx: FrameAttributionCtx,
+    func: *const ir.IrFunction,
+    reg_set: regalloc.RegSet,
+    live_ranges: []const analysis.LiveRange,
+    alloc_result: *const regalloc.AllocResult,
+    metric: regalloc.SpillMetric,
+    frame_size: u32,
+    code: []const u8,
+    call_patches: []const CallPatch,
+    table_patches: []const TablePatch,
+    raw_accesses: []const emit.FrameAccess,
+    ir_ranges: []const EmittedIrRange,
+) !PendingFrameAttribution {
+    const spill_values = try buildSpillValues(
+        allocator,
+        func,
+        reg_set,
+        live_ranges,
+        alloc_result,
+    );
+    errdefer allocator.free(spill_values);
+
+    var emitted_loads: u32 = 0;
+    var emitted_stores: u32 = 0;
+    const accesses = try buildFrameAccesses(
+        allocator,
+        func,
+        reg_set,
+        alloc_result,
+        raw_accesses,
+        ir_ranges,
+        spill_values,
+        &emitted_loads,
+        &emitted_stores,
+    );
+    errdefer allocator.free(accesses);
+    if (emitted_loads != metric.spill_loads or emitted_stores != metric.spill_stores) {
+        return error.SpillMetricReconciliationFailed;
+    }
+
+    var value_indices = std.AutoHashMap(ir.VReg, usize).init(allocator);
+    defer value_indices.deinit();
+    for (spill_values, 0..) |value, i| try value_indices.put(value.vreg, i);
+    for (accesses) |access| {
+        if (access.origin != .allocator_spill) continue;
+        const vreg = access.vreg orelse continue;
+        const index = value_indices.get(vreg) orelse
+            return error.FrameAttributionUnknownVReg;
+        switch (access.kind) {
+            .load => spill_values[index].reload_count += 1,
+            .store => spill_values[index].store_count += 1,
+        }
+    }
+
+    const rel32_offsets = try allocator.alloc(u32, call_patches.len);
+    errdefer allocator.free(rel32_offsets);
+    for (call_patches, rel32_offsets) |patch, *offset| {
+        offset.* = @intCast(patch.patch_offset);
+    }
+    std.mem.sort(u32, rel32_offsets, {}, std.sort.asc(u32));
+    const inline_data_ranges = try buildInlineDataRanges(allocator, table_patches);
+    errdefer allocator.free(inline_data_ranges);
+
+    var code_hash: [64]u8 = undefined;
+    try normalizedCodeSha256(code, rel32_offsets, &code_hash);
+
+    return .{
+        .ctx = ctx,
+        .function_name = func.name orelse "<anon>",
+        .code_size = @intCast(code.len),
+        .normalized_code_sha256 = code_hash,
+        .direct_call_rel32_offsets = rel32_offsets,
+        .inline_data_ranges = inline_data_ranges,
+        .frame_layout = .{
+            .frame_size = frame_size,
+            .local_count = func.local_count,
+            .param_count = func.param_count,
+            .reserved_vmctx_offset = vmctx_offset,
+            .locals_first_offset = -16,
+            .explicit_storage_first_offset = -@as(i32, @intCast((func.local_count + 2) * 8)),
+            .explicit_storage_slots = 64,
+            .spill_base = reg_set.spill_base,
+            .spill_stride = reg_set.spill_stride,
+            .spill_slots = alloc_result.spill_count,
+        },
+        .spill_metric = .{
+            .slots = alloc_result.spill_count,
+            .spilled_vregs = metric.spilled_vregs,
+            .scalar = metric.spilled_vregs_scalar,
+            .v128 = metric.spilled_vregs_v128,
+            .slots_scalar = metric.slots_scalar,
+            .slots_v128 = metric.slots_v128,
+            .spill_ld = metric.spill_loads,
+            .spill_st = metric.spill_stores,
+            .remat = metric.remat_vregs,
+            .callee_saved = metric.callee_saved_used,
+        },
+        .emitted_allocator_loads = emitted_loads,
+        .emitted_allocator_stores = emitted_stores,
+        .allocator_values = spill_values,
+        .accesses = accesses,
+    };
+}
 
 /// #778: same as `compileFunctionRAWithGlobalOffsets`, but records the
 /// contiguous setup / liveness / regalloc spans into `timer` when codegen
@@ -2300,6 +2982,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     allocator: std.mem.Allocator,
     timer: ?*codegen_timing.FuncTimer,
     spill_ctx: ?SpillMetricCtx,
+    frame_attr_ctx: ?FrameAttributionCtx,
     options: FunctionCompileOptions,
 ) !FuncCompileResult {
     if (functionUsesV128(func)) return error.UnsupportedV128;
@@ -2452,29 +3135,26 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     defer alloc_result.deinit();
     if (timer) |t| t.end(.regalloc);
 
-    // #808 Lever 1: per-function spill-cost diagnostic. The metric walk is
-    // gated on the (already enabled) module filter so the disabled path
-    // pays nothing; `printSpill` is further gated by `shouldLog`.
+    // The aggregate spill metric feeds both the legacy stderr diagnostic and
+    // the versioned frame-attribution sidecar. Compute it once, and only when
+    // one of those explicit diagnostics selected this function.
+    const spill_metric_needed = frame_attr_ctx != null or
+        (spill_ctx != null and spill_ctx.?.opts.moduleMatches(spill_ctx.?.module_idx));
+    var spill_metric_value: ?regalloc.SpillMetric = null;
+    if (spill_metric_needed) {
+        spill_metric_value = try regalloc.computeSpillMetric(
+            allocator,
+            func,
+            x86_64_reg_set(func.local_count),
+            live_ranges,
+            &alloc_result,
+        );
+    }
+    var spill_metric_should_log = false;
     if (spill_ctx) |sc| {
-        if (sc.opts.moduleMatches(sc.module_idx)) {
-            const metric = try regalloc.computeSpillMetric(
-                allocator,
-                func,
-                x86_64_reg_set(func.local_count),
-                live_ranges,
-                &alloc_result,
-            );
-            if (sc.opts.shouldLog(sc.module_idx, sc.func_idx, metric.spilled_vregs)) {
-                codegen_timing.printSpill(.{
-                    .module_idx = sc.module_idx,
-                    .func_idx = sc.func_idx,
-                    .func_name = func.name orelse "<anon>",
-                    .insts = countInstructions(func),
-                    .clobbers = @intCast(clobber_points.items.len),
-                    .spill_count = alloc_result.spill_count,
-                    .metric = metric,
-                });
-            }
+        if (spill_metric_value) |metric| {
+            spill_metric_should_log =
+                sc.opts.shouldLog(sc.module_idx, sc.func_idx, metric.spilled_vregs);
         }
     }
 
@@ -2539,6 +3219,11 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
 
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
+    var frame_trace = emit.FrameTrace.init(allocator);
+    defer frame_trace.deinit();
+    if (frame_attr_ctx != null or spill_metric_should_log) code.frame_trace = &frame_trace;
+    var emitted_ir_ranges: std.ArrayList(EmittedIrRange) = .empty;
+    defer emitted_ir_ranges.deinit(allocator);
 
     // Count callee-saved pushes for stack alignment calculation.
     var callee_save_count: u32 = 0;
@@ -2676,13 +3361,24 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // block_order already computed above — reuse for emission.
 
     var last_was_ret = false;
+    var ir_position: u32 = 0;
     for (block_order, 0..) |block_id, order_idx| {
         const block = func.blocks.items[block_id];
         try block_offsets.put(block_id, code.len());
         const next_block_id: ?ir.BlockId = if (order_idx + 1 < block_order.len) block_order[order_idx + 1] else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
+            const native_start = code.len();
             try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options);
+            if (frame_attr_ctx != null) {
+                try emitted_ir_ranges.append(allocator, .{
+                    .native_start = @intCast(native_start),
+                    .native_end = @intCast(code.len()),
+                    .ir_position = ir_position,
+                    .inst = inst,
+                });
+            }
+            ir_position += 1;
         }
         // C3 fall-through peephole: if the block's terminator emitted a
         // trailing `E9 disp32` (br, or br_if's unconditional else) whose
@@ -2693,6 +3389,9 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
                 const last = branch_patches.items[branch_patches.items.len - 1];
                 if (last.target_block == nb and last.patch_offset + 4 == code.len()) {
                     code.truncate(code.len() - 5);
+                    if (frame_attr_ctx != null and emitted_ir_ranges.items.len > 0) {
+                        emitted_ir_ranges.items[emitted_ir_ranges.items.len - 1].native_end = @intCast(code.len());
+                    }
                     _ = branch_patches.pop();
                 }
             }
@@ -2723,9 +3422,52 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         try code.emitEpilogue();
     }
 
+    if (spill_metric_value) |*metric| {
+        const emitted = try countEmittedSpillTraffic(
+            allocator,
+            &alloc_result,
+            frame_trace.accesses.items,
+        );
+        metric.spill_loads = emitted.loads;
+        metric.spill_stores = emitted.stores;
+    }
+    if (spill_metric_should_log) {
+        const sc = spill_ctx.?;
+        codegen_timing.printSpill(.{
+            .module_idx = sc.module_idx,
+            .func_idx = sc.func_idx,
+            .func_name = func.name orelse "<anon>",
+            .insts = countInstructions(func),
+            .clobbers = @intCast(clobber_points.items.len),
+            .spill_count = alloc_result.spill_count,
+            .metric = spill_metric_value.?,
+        });
+    }
+
+    var pending_frame_attribution: ?PendingFrameAttribution = if (frame_attr_ctx) |fc|
+        try buildFrameAttribution(
+            allocator,
+            fc,
+            func,
+            x86_64_reg_set(func.local_count),
+            live_ranges,
+            &alloc_result,
+            spill_metric_value.?,
+            frame_size,
+            code.getCode(),
+            call_patches.items,
+            table_patches.items,
+            frame_trace.accesses.items,
+            emitted_ir_ranges.items,
+        )
+    else
+        null;
+    errdefer if (pending_frame_attribution) |*report| report.deinit(allocator);
+
     return .{
         .code = try code.bytes.toOwnedSlice(allocator),
         .call_patches = try call_patches.toOwnedSlice(allocator),
+        .frame_attribution = pending_frame_attribution,
     };
 }
 
@@ -7809,4 +8551,149 @@ test "#672 commit 4: throw lowers to mov-arg + call qword [rbx + throw_fn]" {
     try std.testing.expect(containsBytes(result.code, &.{ 0x48, 0x8B, 0x83, 0x00, 0x01, 0x00, 0x00 }));
     // call rax (FF D0)
     try std.testing.expect(containsBytes(result.code, &.{ 0xFF, 0xD0 }));
+}
+
+test "frame attribution spill values expose source, counts, remat eligibility, and reuse" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v0 } }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_64 = 9 }, .dest = v2, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = v0, .start = 0, .end = 1, .type = .i32 },
+        .{ .vreg = v2, .start = 2, .end = 3, .type = .i64 },
+    };
+    const reg_set = x86_64_reg_set(0);
+    var result: regalloc.AllocResult = .{
+        .assignments = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator),
+        .spill_count = 1,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
+    defer result.deinit();
+    try result.assignments.put(v0, .{ .stack = reg_set.spill_base });
+    // Deliberately model future lifetime-based slot reuse.
+    try result.assignments.put(v2, .{ .stack = reg_set.spill_base });
+
+    const values = try buildSpillValues(allocator, &func, reg_set, &ranges, &result);
+    defer allocator.free(values);
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expect(values[0].reused);
+    try std.testing.expect(values[1].reused);
+    try std.testing.expectEqual(@as(u32, 2), values[0].ir_use_count);
+    try std.testing.expectEqual(@as(u32, 1), values[0].ir_def_count);
+    try std.testing.expectEqual(@as(u32, 0), values[0].reload_count);
+    try std.testing.expectEqual(@as(u32, 0), values[0].store_count);
+    try std.testing.expectEqualStrings("iconst_32", values[0].defining_opcode.?);
+    try std.testing.expectEqualStrings("constant", values[0].source_class.?);
+    try std.testing.expect(values[0].rematerialization_eligible);
+}
+
+test "frame attribution classifies mixed origins and does not guess reused vregs" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 2);
+    defer func.deinit();
+    const reg_set = x86_64_reg_set(func.local_count);
+
+    var result: regalloc.AllocResult = .{
+        .assignments = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator),
+        .spill_count = 1,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
+    defer result.deinit();
+
+    const values = [_]frame_attribution.SpillValue{
+        .{
+            .vreg = 10,
+            .frame_offset = reg_set.spill_base,
+            .slot = 0,
+            .slot_count = 1,
+            .value_type = "i64",
+            .live_start = 1,
+            .live_end = 5,
+            .defining_opcode = "load",
+            .source_class = "memory_or_runtime",
+            .ir_use_count = 1,
+            .ir_def_count = 1,
+            .reload_count = 1,
+            .store_count = 1,
+            .rematerialization_eligible = false,
+            .reused = true,
+        },
+        .{
+            .vreg = 11,
+            .frame_offset = reg_set.spill_base,
+            .slot = 0,
+            .slot_count = 1,
+            .value_type = "i64",
+            .live_start = 8,
+            .live_end = 12,
+            .defining_opcode = "add",
+            .source_class = "computed",
+            .ir_use_count = 1,
+            .ir_def_count = 1,
+            .reload_count = 1,
+            .store_count = 1,
+            .rematerialization_eligible = false,
+            .reused = true,
+        },
+    };
+    const ir_ranges = [_]EmittedIrRange{
+        .{
+            .native_start = 100,
+            .native_end = 107,
+            .ir_position = 4,
+            .inst = .{ .op = .{ .add = .{ .lhs = 10, .rhs = 99 } }, .dest = 20 },
+        },
+        .{
+            .native_start = 110,
+            .native_end = 117,
+            .ir_position = 9,
+            .inst = .{ .op = .{ .iconst_64 = 1 }, .dest = 11, .type = .i64 },
+        },
+    };
+    const explicit_first = -@as(i32, @intCast((func.local_count + 2) * 8));
+    const raw = [_]emit.FrameAccess{
+        .{ .native_start = 0, .native_end = 7, .kind = .load, .base = .rbp, .displacement = -16, .width = 8 },
+        .{ .native_start = 8, .native_end = 15, .kind = .store, .base = .rbp, .displacement = explicit_first, .width = 8 },
+        .{ .native_start = 16, .native_end = 23, .kind = .load, .base = .rbp, .displacement = 48, .width = 8 },
+        .{ .native_start = 24, .native_end = 31, .kind = .store, .base = .rsp, .displacement = 32, .width = 8 },
+        .{ .native_start = 32, .native_end = 39, .kind = .load, .base = .rbp, .displacement = -7, .width = 8 },
+        .{ .native_start = 40, .native_end = 47, .kind = .load, .base = .rbp, .displacement = reg_set.spill_base, .width = 8 },
+        .{ .native_start = 100, .native_end = 107, .kind = .load, .base = .rbp, .displacement = reg_set.spill_base, .width = 8 },
+        .{ .native_start = 110, .native_end = 117, .kind = .store, .base = .rbp, .displacement = reg_set.spill_base, .width = 8 },
+    };
+
+    var emitted_loads: u32 = 0;
+    var emitted_stores: u32 = 0;
+    const accesses = try buildFrameAccesses(
+        allocator,
+        &func,
+        reg_set,
+        &result,
+        &raw,
+        &ir_ranges,
+        &values,
+        &emitted_loads,
+        &emitted_stores,
+    );
+    defer allocator.free(accesses);
+
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.wasm_local_or_phi, accesses[0].origin);
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.explicit_frame_storage, accesses[1].origin);
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.fixed_runtime_frame_state, accesses[2].origin);
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.fixed_runtime_frame_state, accesses[3].origin);
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.unknown, accesses[4].origin);
+    try std.testing.expect(accesses[5].vreg == null and accesses[5].vreg_ambiguous);
+    try std.testing.expectEqual(@as(?u32, 10), accesses[6].vreg);
+    try std.testing.expectEqual(@as(?u32, 11), accesses[7].vreg);
+    try std.testing.expectEqual(@as(u32, 2), emitted_loads);
+    try std.testing.expectEqual(@as(u32, 1), emitted_stores);
 }

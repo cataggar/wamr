@@ -512,8 +512,8 @@ pub fn classifyRematCandidates(
 /// codegen traffic, not just slot accounting:
 ///   - distinct spilled vregs (scalar vs v128),
 ///   - 8-byte slots consumed by each class,
-///   - emitted spill *reloads* (one per IR use of a spilled vreg) and
-///     *stores* (one per IR def of a spilled vreg) — the real traffic,
+///   - pre-emission spill *reload/store* estimates (one per IR use/def);
+///     x86 diagnostics refine these to exact emitter-traced traffic,
 ///   - rematerialised vregs (#542), which avoid both slot and traffic,
 ///   - distinct callee-saved registers used (each a prologue push +
 ///     epilogue pop — the only register save/restore traffic in WAMR's
@@ -529,10 +529,14 @@ pub const SpillMetric = struct {
     /// alignment padding is attributed to neither bucket.
     slots_scalar: u32 = 0,
     slots_v128: u32 = 0,
-    /// Emitted spill reloads: one per IR operand reference to a spilled
-    /// vreg (codegen reloads from the slot at each use site).
+    /// Pre-emission spill-reload estimate: one per IR operand reference to a
+    /// spilled vreg. The x86 diagnostic path replaces this with the exact
+    /// emitter-traced count so immediate folding/suppressed constants are not
+    /// mislabeled as reloads; architecture-neutral callers retain the IR
+    /// estimate.
     spill_loads: u32 = 0,
-    /// Emitted spill stores: one per IR def of a spilled vreg.
+    /// Pre-emission store estimate: one per IR def of a spilled vreg. See
+    /// `spill_loads` for the x86 exact-emission refinement.
     spill_stores: u32 = 0,
     /// Vregs rematerialised (#542) instead of spilled — no slot, no
     /// reload (the def is re-emitted at each use instead).
