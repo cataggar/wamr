@@ -81,6 +81,7 @@ jobs:
           fi
 
       - name: Run CoreMark comparison
+        if: github.event_name != 'workflow_dispatch' || inputs.benchmark_memory_size != true
         id: bench
         continue-on-error: true
         env:
