@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
 const alias_class = @import("alias_class.zig");
+const test_interp = @import("interp.zig");
 const deadStoreElimination = @import("dead_store_elimination.zig").deadStoreElimination;
 const verifier = @import("verifier.zig");
 
@@ -5054,6 +5055,11 @@ fn findLoopExit(func: *const ir.IrFunction, loop: *const analysis.Loop) ?struct 
     return .{ .exit = if (then_loop) bi.else_block else bi.then_block, .cond = bi.cond };
 }
 
+fn inductionValueAt(init: i32, step: i32, iter: u32) ?i32 {
+    const value = @as(i64, init) + @as(i64, step) * @as(i64, iter);
+    return std.math.cast(i32, value);
+}
+
 fn tripCountForLoop(
     func: *const ir.IrFunction,
     defs: *const std.AutoHashMap(ir.VReg, DefSite),
@@ -5064,7 +5070,10 @@ fn tripCountForLoop(
     if (ind.step <= 0) return null;
     const cmp_inst = defInst(func, defs, cond) orelse return null;
     const cmp = switch (cmp_inst.op) {
-        .lt_s, .lt_u => |c| c,
+        .lt_s => |c| c,
+        // Unsigned bottom-tested loops require modular wraparound analysis;
+        // signed distance is unsound for negative i32 bit patterns.
+        .lt_u => return null,
         else => return null,
     };
     const lhs_is_iv =
@@ -5080,7 +5089,11 @@ fn tripCountForLoop(
     const step: u64 = @intCast(ind.step);
     const trips = (distance + step - 1) / step;
     if (trips > std.math.maxInt(u32)) return null;
-    return @intCast(trips);
+    const trip_count: u32 = @intCast(trips);
+    // A wrapping signed update can make the loop continue after the
+    // mathematical crossing. Only accept the non-wrapping progression.
+    _ = inductionValueAt(init, ind.step, trip_count) orelse return null;
+    return trip_count;
 }
 
 const VRegRemap = struct { from: ir.VReg, to: ir.VReg };
@@ -5104,7 +5117,7 @@ fn remapLoopLiveOuts(
 ///
 /// The transform is deliberately conservative: it handles dedicated-preheader
 /// single-block natural loops with a single primary `i = i + const_step`, a
-/// header `i < const_limit` condition, trip count ≤ 8, and ≤ 16 IR
+/// signed header `i < const_limit` condition, trip count ≤ 8, and ≤ 16 IR
 /// instructions in the loop. It clones the loop instructions into the
 /// preheader, substitutes each `local_get i` with the iteration constant when
 /// possible, repairs values used after the loop to reference the final clone,
@@ -5138,6 +5151,21 @@ pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator)
         const exit_info = findLoopExit(func, loop) orelse continue;
         const trips = tripCountForLoop(func, &defs, ind, exit_info.cond) orelse continue;
         if (trips > 8) continue;
+
+        var iteration_values: [8]i32 = undefined;
+        var values_representable = true;
+        var value_iter: u32 = 0;
+        while (value_iter < trips) : (value_iter += 1) {
+            iteration_values[@intCast(value_iter)] = inductionValueAt(
+                ind.init orelse 0,
+                ind.step,
+                value_iter,
+            ) orelse {
+                values_representable = false;
+                break;
+            };
+        }
+        if (!values_representable) continue;
 
         var templates: std.ArrayList(ir.Inst) = .empty;
         defer templates.deinit(allocator);
@@ -5175,7 +5203,7 @@ pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator)
         defer final_map.deinit(allocator);
         var iter: u32 = 0;
         while (iter < trips) : (iter += 1) {
-            const iter_value = (ind.init orelse 0) + @as(i32, @intCast(iter)) * ind.step;
+            const iter_value = iteration_values[@intCast(iter)];
             final_map.clearRetainingCapacity();
 
             for (templates.items) |tmpl| {
@@ -12659,6 +12687,85 @@ test "inductionVariableSimplification: non-zero init is skipped" {
     try std.testing.expectEqual(@as(u32, 1), func.local_count);
 }
 
+const UnrollTestCompare = enum { lt_s, lt_u };
+
+const UnrollStoreLoopTest = struct {
+    func: ir.IrFunction,
+    preheader: ir.BlockId,
+    loop: ir.BlockId,
+    exit: ir.BlockId,
+    original_term: usize,
+    template_count: usize,
+};
+
+fn makeUnrollStoreLoopTest(
+    allocator: std.mem.Allocator,
+    init: i32,
+    step: i32,
+    limit: i32,
+    compare: UnrollTestCompare,
+) !UnrollStoreLoopTest {
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    errdefer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    const v_base = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = init }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_init } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = step }, .dest = v_step, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = limit }, .dest = v_limit, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_i } } });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_step } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    const compare_op: ir.Inst.Op = switch (compare) {
+        .lt_s => .{ .lt_s = .{ .lhs = v_next, .rhs = v_limit } },
+        .lt_u => .{ .lt_u = .{ .lhs = v_next, .rhs = v_limit } },
+    };
+    try func.getBlock(b1).append(.{ .op = compare_op, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_i } });
+
+    return .{
+        .func = func,
+        .preheader = b0,
+        .loop = b1,
+        .exit = b2,
+        .original_term = func.getBlock(b0).instructions.items.len - 1,
+        .template_count = func.getBlock(b1).instructions.items.len - 1,
+    };
+}
+
+fn expectUnrollStoreLoopOutcome(outcome: test_interp.Outcome, expected: i32) !void {
+    switch (outcome) {
+        .returned => |returned| {
+            try std.testing.expectEqual(@as(usize, 1), returned.results.len);
+            try std.testing.expectEqual(ir.IrType.i32, returned.results[0].ty);
+            const expected_bits: u32 = @bitCast(expected);
+            try std.testing.expectEqual(@as(u64, expected_bits), returned.results[0].bits);
+            try std.testing.expectEqual(@as(usize, 4), returned.memory.len);
+            const memory_bits =
+                @as(u32, returned.memory[0]) |
+                (@as(u32, returned.memory[1]) << 8) |
+                (@as(u32, returned.memory[2]) << 16) |
+                (@as(u32, returned.memory[3]) << 24);
+            try std.testing.expectEqual(expected_bits, memory_bits);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
 test "unrollSmallFixedLoops: trip count four fully unrolled" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 1);
@@ -12695,6 +12802,106 @@ test "unrollSmallFixedLoops: trip count four fully unrolled" {
     var lf = try analysis.computeLoops(&func, &dom, allocator);
     defer lf.deinit();
     try std.testing.expectEqual(@as(usize, 0), lf.loops.len);
+}
+
+test "unrollSmallFixedLoops: unsigned negative init preserves one-trip memory and live-out" {
+    const allocator = std.testing.allocator;
+    var case = try makeUnrollStoreLoopTest(allocator, -5, 3, 5, .lt_u);
+    defer case.func.deinit();
+    var optimized = try case.func.clone(allocator);
+    defer optimized.deinit();
+    const initial_memory = [_]u8{0} ** 4;
+
+    var expected = try test_interp.run(allocator, &case.func, .{ .memory = &initial_memory });
+    defer expected.deinit(allocator);
+
+    try std.testing.expect(!try unrollSmallFixedLoops(&optimized, allocator));
+    try std.testing.expectEqual(
+        ir.Inst.Op{ .br = case.loop },
+        optimized.getBlock(case.preheader).instructions.items[case.original_term].op,
+    );
+    try analysis.refreshBlockPredecessors(&optimized, allocator);
+    try verifier.verifyFunction(&optimized, 0, .after_each_pass, allocator);
+
+    var observed = try test_interp.run(allocator, &optimized, .{ .memory = &initial_memory });
+    defer observed.deinit(allocator);
+    try expectUnrollStoreLoopOutcome(expected, -5);
+    try expectUnrollStoreLoopOutcome(observed, -5);
+}
+
+test "unrollSmallFixedLoops: widened eight-trip values unroll through i32 max boundary" {
+    const allocator = std.testing.allocator;
+    const init: i32 = -1_852_516_353;
+    const step: i32 = 500_000_000;
+    const limit = std.math.maxInt(i32);
+    const iteration_values = [_]i32{
+        -1_852_516_353,
+        -1_352_516_353,
+        -852_516_353,
+        -352_516_353,
+        147_483_647,
+        647_483_647,
+        1_147_483_647,
+        1_647_483_647,
+    };
+    var case = try makeUnrollStoreLoopTest(allocator, init, step, limit, .lt_s);
+    defer case.func.deinit();
+    var optimized = try case.func.clone(allocator);
+    defer optimized.deinit();
+    const initial_memory = [_]u8{0} ** 4;
+
+    var expected = try test_interp.run(allocator, &case.func, .{ .memory = &initial_memory });
+    defer expected.deinit(allocator);
+
+    try std.testing.expect(try unrollSmallFixedLoops(&optimized, allocator));
+    const preheader = optimized.getBlock(case.preheader);
+    for (iteration_values, 0..) |expected_value, iter| {
+        const inst = preheader.instructions.items[case.original_term + iter * case.template_count];
+        try std.testing.expect(inst.op == .iconst_32);
+        try std.testing.expectEqual(expected_value, inst.op.iconst_32);
+    }
+    try std.testing.expectEqual(
+        ir.Inst.Op{ .br = case.exit },
+        preheader.instructions.items[case.original_term + iteration_values.len * case.template_count].op,
+    );
+    try analysis.refreshBlockPredecessors(&optimized, allocator);
+    try verifier.verifyFunction(&optimized, 0, .after_each_pass, allocator);
+
+    var observed = try test_interp.run(allocator, &optimized, .{ .memory = &initial_memory });
+    defer observed.deinit(allocator);
+    try expectUnrollStoreLoopOutcome(expected, iteration_values[iteration_values.len - 1]);
+    try expectUnrollStoreLoopOutcome(observed, iteration_values[iteration_values.len - 1]);
+}
+
+test "unrollSmallFixedLoops: signed terminating update overflow is skipped" {
+    const allocator = std.testing.allocator;
+    var case = try makeUnrollStoreLoopTest(
+        allocator,
+        1_500_000_000,
+        1_500_000_000,
+        1_600_000_000,
+        .lt_s,
+    );
+    defer case.func.deinit();
+    var optimized = try case.func.clone(allocator);
+    defer optimized.deinit();
+    const initial_memory = [_]u8{0} ** 4;
+
+    var expected = try test_interp.run(allocator, &case.func, .{ .memory = &initial_memory });
+    defer expected.deinit(allocator);
+
+    try std.testing.expect(!try unrollSmallFixedLoops(&optimized, allocator));
+    try std.testing.expectEqual(
+        ir.Inst.Op{ .br = case.loop },
+        optimized.getBlock(case.preheader).instructions.items[case.original_term].op,
+    );
+    try analysis.refreshBlockPredecessors(&optimized, allocator);
+    try verifier.verifyFunction(&optimized, 0, .after_each_pass, allocator);
+
+    var observed = try test_interp.run(allocator, &optimized, .{ .memory = &initial_memory });
+    defer observed.deinit(allocator);
+    try expectUnrollStoreLoopOutcome(expected, 205_032_704);
+    try expectUnrollStoreLoopOutcome(observed, 205_032_704);
 }
 
 test "unrollSmallFixedLoops: forwarded exit compare repairs loop live-out" {
