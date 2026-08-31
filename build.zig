@@ -711,6 +711,10 @@ pub fn build(b: *std.Build) void {
         "python3",
         "tests/test_bench_keyvault.py",
     });
+    const frame_attribution_tests = b.addSystemCommand(&.{
+        "python3",
+        "tests/test_aot_jit_attr.py",
+    });
     const hot_function_comparison_tests = b.addSystemCommand(&.{
         "python3",
         "tests/test_compare_hot_function.py",
@@ -720,6 +724,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(stable_resources_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
+    test_step.dependOn(&frame_attribution_tests.step);
+    if (target_arch == .x86_64 and target.result.os.tag == .linux) {
+        const frame_attribution_smoke = b.addSystemCommand(&.{
+            "python3",
+            "tests/test_aot_jit_attr.py",
+            "--wamrc",
+        });
+        frame_attribution_smoke.addFileArg(wamrc.getEmittedBin());
+        test_step.dependOn(&frame_attribution_smoke.step);
+    }
     test_step.dependOn(&hot_function_comparison_tests.step);
 
     const artifact_consumer_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
