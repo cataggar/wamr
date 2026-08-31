@@ -35,10 +35,18 @@ pub const AuxStackPool = struct {
     free_stacks: std.ArrayListUnmanaged(u32) = .empty,
     /// All allocated stacks (for cleanup).
     all_stacks: std.ArrayListUnmanaged(u32) = .empty,
+    capacity: usize = 0,
+    in_use: usize = 0,
+    next_stack_top: u32 = 0,
+    reserved_end: u32 = 0,
+    memory: ?*types.MemoryInstance = null,
+    allocator: std.mem.Allocator = undefined,
+    configured: bool = false,
     mutex: Mutex = .init,
 
     /// Pre-allocate N auxiliary stacks starting at `base_offset` in linear memory.
     pub fn init(self: *AuxStackPool, count: u32, base_offset: u32, allocator: std.mem.Allocator) !void {
+        std.debug.assert(!self.configured);
         std.debug.assert(self.free_stacks.items.len == 0);
         std.debug.assert(self.all_stacks.items.len == 0);
 
@@ -61,14 +69,63 @@ pub const AuxStackPool = struct {
 
         self.free_stacks = free_stacks;
         self.all_stacks = all_stacks;
+        self.capacity = count;
+        self.next_stack_top = offset;
+        self.reserved_end = offset;
+        self.allocator = allocator;
+        self.configured = true;
+    }
+
+    /// Configure a lazily committed stack region. Unlike `init`, this does not
+    /// materialize every stack up front; the shared memory grows only far
+    /// enough for each newly assigned stack.
+    pub fn initGrowing(
+        self: *AuxStackPool,
+        count: u32,
+        base_offset: u32,
+        memory: *types.MemoryInstance,
+        allocator: std.mem.Allocator,
+    ) !void {
+        std.debug.assert(!self.configured);
+        std.debug.assert(self.free_stacks.items.len == 0);
+        std.debug.assert(self.all_stacks.items.len == 0);
+
+        const region_size = std.math.mul(u32, count, self.stack_size) catch
+            return error.StackAddressOverflow;
+        const reserved_end = std.math.add(u32, base_offset, region_size) catch
+            return error.StackAddressOverflow;
+
+        var free_stacks: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer free_stacks.deinit(allocator);
+        var all_stacks: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer all_stacks.deinit(allocator);
+        try free_stacks.ensureTotalCapacity(allocator, count);
+        try all_stacks.ensureTotalCapacity(allocator, count);
+
+        self.free_stacks = free_stacks;
+        self.all_stacks = all_stacks;
+        self.capacity = count;
+        self.next_stack_top = base_offset;
+        self.reserved_end = reserved_end;
+        self.memory = memory;
+        self.allocator = allocator;
+        self.configured = true;
     }
 
     pub fn deinit(self: *AuxStackPool, allocator: std.mem.Allocator) void {
+        if (!self.configured) return;
+        std.debug.assert(self.in_use == 0);
         std.debug.assert(self.free_stacks.items.len == self.all_stacks.items.len);
         self.free_stacks.deinit(allocator);
         self.all_stacks.deinit(allocator);
         self.free_stacks = .empty;
         self.all_stacks = .empty;
+        self.capacity = 0;
+        self.in_use = 0;
+        self.next_stack_top = 0;
+        self.reserved_end = 0;
+        self.memory = null;
+        self.configured = false;
     }
 
     /// Allocate a stack for a new thread. Returns the top-of-stack offset, or null.
@@ -76,10 +133,33 @@ pub const AuxStackPool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const items = self.free_stacks.items;
-        if (items.len == 0) return null;
-        const val = items[items.len - 1];
-        self.free_stacks.items.len -= 1;
-        return val;
+        if (items.len != 0) {
+            const val = items[items.len - 1];
+            self.free_stacks.items.len -= 1;
+            self.in_use += 1;
+            return val;
+        }
+        if (self.all_stacks.items.len == self.capacity) return null;
+
+        const stack_top = std.math.add(u32, self.next_stack_top, self.stack_size) catch
+            return null;
+        if (stack_top > self.reserved_end) return null;
+        if (self.memory) |memory| {
+            const required_pages_u64 =
+                (@as(u64, stack_top) + types.MemoryInstance.page_size - 1) /
+                types.MemoryInstance.page_size;
+            const required_pages: u32 = @intCast(required_pages_u64);
+            const current_pages = memory.pageCount();
+            if (required_pages > current_pages) {
+                _ = memory.grow(required_pages - current_pages, self.allocator) catch
+                    return null;
+            }
+        }
+
+        self.all_stacks.appendAssumeCapacity(stack_top);
+        self.next_stack_top = stack_top;
+        self.in_use += 1;
+        return stack_top;
     }
 
     /// Return a stack to the pool.
@@ -89,19 +169,27 @@ pub const AuxStackPool = struct {
         std.debug.assert(std.mem.indexOfScalar(u32, self.all_stacks.items, stack_top) != null);
         std.debug.assert(std.mem.indexOfScalar(u32, self.free_stacks.items, stack_top) == null);
         std.debug.assert(self.free_stacks.items.len < self.free_stacks.capacity);
+        std.debug.assert(self.in_use > 0);
         self.free_stacks.appendAssumeCapacity(stack_top);
+        self.in_use -= 1;
     }
 
     pub fn availableCount(self: *AuxStackPool) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.free_stacks.items.len;
+        return self.capacity - self.in_use;
     }
 
     pub fn totalCount(self: *AuxStackPool) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.all_stacks.items.len;
+        return self.capacity;
+    }
+
+    pub fn isConfigured(self: *AuxStackPool) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.configured;
     }
 };
 
@@ -144,6 +232,15 @@ pub const ThreadBackendOps = struct {
     run: *const fn (child: *anyopaque) ThreadOutcome,
     destroy: *const fn (child: *anyopaque) void,
     uses_auxiliary_stack: bool = false,
+};
+
+pub const PrepareError = error{
+    ThreadFeatureDisabled,
+    AlreadyPrepared,
+    SharedMemoryRequired,
+    InvalidHeapBase,
+    AuxStackExhausted,
+    OutOfMemory,
 };
 
 pub const JoinError = error{
@@ -259,6 +356,10 @@ fn createInterpThreadContext(
     const parent: *types.ModuleInstance = @ptrCast(@alignCast(parent_opaque));
     const func_idx = parent.getExportFunc("wasi_thread_start") orelse
         return error.MissingThreadStart;
+    const func_type = parent.module.getFuncType(func_idx) orelse
+        return error.InvalidThreadStartSignature;
+    if (!isWasiThreadStartType(func_type))
+        return error.InvalidThreadStartSignature;
     const child = parent.cloneForThread(allocator) catch return error.OutOfMemory;
     errdefer child.destroyThreadClone();
     const env = ExecEnv.create(child, 4096, allocator) catch return error.OutOfMemory;
@@ -364,6 +465,82 @@ pub const ThreadManager = struct {
             .slots = .empty,
             .allocator = allocator,
         };
+    }
+
+    /// Reserve a guest-memory auxiliary-stack region before any guest entry
+    /// point runs. `__heap_base` is advanced past the reserved address range;
+    /// individual pages are committed lazily by `AuxStackPool.allocate`.
+    pub fn prepareInterpreterInstance(
+        self: *ThreadManager,
+        parent_inst: *types.ModuleInstance,
+    ) PrepareError!void {
+        if (comptime !config.lib_wasi_threads or !config.thread_mgr or builtin.single_threaded)
+            return error.ThreadFeatureDisabled;
+        if (parent_inst.memories.len == 0) return error.SharedMemoryRequired;
+
+        const memory = parent_inst.memories[0];
+        const heap_global: ?*types.GlobalInstance = if (parent_inst.module.findExport(
+            "__heap_base",
+            .global,
+        )) |heap_export| blk: {
+            if (heap_export.index >= parent_inst.globals.len)
+                return error.InvalidHeapBase;
+            break :blk parent_inst.globals[heap_export.index];
+        } else null;
+        return self.prepareSharedMemory(memory, heap_global);
+    }
+
+    /// Configure the auxiliary-stack pool for a backend that exposes the
+    /// group's shared memory and optional `__heap_base` global directly.
+    pub fn prepareSharedMemory(
+        self: *ThreadManager,
+        memory: *types.MemoryInstance,
+        heap_global: ?*types.GlobalInstance,
+    ) PrepareError!void {
+        if (comptime !config.lib_wasi_threads or !config.thread_mgr or builtin.single_threaded)
+            return error.ThreadFeatureDisabled;
+        if (self.aux_stack_pool.isConfigured() or self.slots.items.len != 0)
+            return error.AlreadyPrepared;
+        if (memory.shared_control == null) return error.SharedMemoryRequired;
+        const heap_base: u32 = if (heap_global) |global|
+            switch (global.value) {
+                .i32 => |value| @bitCast(value),
+                else => return error.InvalidHeapBase,
+            }
+        else
+            std.math.cast(u32, memory.byteLen()) orelse
+                return error.InvalidHeapBase;
+
+        const aligned_base_u64 = (@as(u64, heap_base) + 15) & ~@as(u64, 15);
+        const max_memory_bytes = @as(u64, memory.max_pages) * types.MemoryInstance.page_size;
+        const max_address = @min(max_memory_bytes, @as(u64, std.math.maxInt(u32)));
+        if (aligned_base_u64 >= max_address) return error.AuxStackExhausted;
+
+        // Keep at least half of the declared address range available to the
+        // guest allocator. The reserved stack window is address space only;
+        // shared-memory pages are committed lazily as threads are spawned.
+        const available_stacks =
+            ((max_address - aligned_base_u64) / 2) / self.aux_stack_pool.stack_size;
+        const stack_count_u64 = @min(@as(u64, max_thread_slots), available_stacks);
+        if (stack_count_u64 == 0) return error.AuxStackExhausted;
+
+        const stack_count: u32 = @intCast(stack_count_u64);
+        const aligned_base: u32 = @intCast(aligned_base_u64);
+        self.aux_stack_pool.initGrowing(
+            stack_count,
+            aligned_base,
+            memory,
+            self.allocator,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.StackAddressOverflow => return error.InvalidHeapBase,
+        };
+
+        const reserved_end = aligned_base +
+            stack_count * self.aux_stack_pool.stack_size;
+        if (heap_global) |global| {
+            global.value = .{ .i32 = @bitCast(reserved_end) };
+        }
     }
 
     fn initWithTestHooks(allocator: std.mem.Allocator, hooks: *const TestHooks) ThreadManager {
@@ -545,7 +722,7 @@ pub const ThreadManager = struct {
         start_arg: i32,
         backend_ops: *const ThreadBackendOps,
     ) SpawnError!i32 {
-        if (comptime !config.thread_mgr or builtin.single_threaded)
+        if (comptime !config.lib_wasi_threads or !config.thread_mgr or builtin.single_threaded)
             return error.ThreadFeatureDisabled;
         if (!self.beginSpawn()) return error.ThreadGroupShuttingDown;
         defer self.endSpawn();
@@ -560,7 +737,7 @@ pub const ThreadManager = struct {
             null;
         if (backend_ops.uses_auxiliary_stack and
             aux_stack_top == null and
-            self.aux_stack_pool.totalCount() != 0)
+            self.aux_stack_pool.isConfigured())
             return error.AuxStackExhausted;
         var stack_owned_directly = aux_stack_top != null;
         defer if (stack_owned_directly) self.aux_stack_pool.release(aux_stack_top.?);
@@ -779,6 +956,20 @@ pub const ThreadManager = struct {
         if (counter) |value| _ = value.fetchAdd(1, .monotonic);
     }
 };
+
+/// The legacy ABI only specifies that failures are negative. wasi-libc maps
+/// every negative result to `EAGAIN`, and the existing host surface returned
+/// `-1`, so keep that stable for every internal failure class.
+pub fn spawnFailureResult(_: SpawnError) i32 {
+    return -1;
+}
+
+fn isWasiThreadStartType(func_type: types.FuncType) bool {
+    return func_type.params.len == 2 and
+        func_type.params[0] == .i32 and
+        func_type.params[1] == .i32 and
+        func_type.results.len == 0;
+}
 
 fn makeTid(slot_index: usize, generation: u16) i32 {
     std.debug.assert(slot_index < max_thread_slots);
@@ -1067,7 +1258,8 @@ const add_start_arg_thread_code = [_]u8{
 };
 
 fn requireThreadLifecycle() !void {
-    if (builtin.single_threaded or !config.thread_mgr) return error.SkipZigTest;
+    if (builtin.single_threaded or !config.lib_wasi_threads or !config.thread_mgr)
+        return error.SkipZigTest;
 }
 
 fn waitForCompleted(manager: *ThreadManager, expected: usize) !void {
@@ -1085,7 +1277,7 @@ fn atomicCount(value: *const std.atomic.Value(usize)) usize {
 }
 
 test "thread lifecycle: disabled manager rejects spawn without publishing a record" {
-    if (config.thread_mgr) return error.SkipZigTest;
+    if (config.lib_wasi_threads) return error.SkipZigTest;
     var manager = ThreadManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -1174,11 +1366,18 @@ test "thread lifecycle: child traps report an outcome and missing exports fail s
         allocator,
     );
     defer cleanupThreadTest(missing_ctx, allocator);
+    const invalid_signature_ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(invalid_signature_ctx, allocator);
+    @constCast(invalid_signature_ctx.module.types)[0] = .{
+        .params = &.{.i32},
+        .results = &.{},
+    };
 
     var manager = ThreadManager.init(allocator);
     defer manager.deinit();
     trap_ctx.inst.thread_manager = &manager;
     missing_ctx.inst.thread_manager = &manager;
+    invalid_signature_ctx.inst.thread_manager = &manager;
 
     const trap_tid = try manager.spawnThread(trap_ctx.inst, 0);
     try std.testing.expectEqual(ThreadOutcome.trapped, try manager.joinOne(trap_tid));
@@ -1187,7 +1386,29 @@ test "thread lifecycle: child traps report an outcome and missing exports fail s
         error.MissingThreadStart,
         manager.spawnThread(missing_ctx.inst, 0),
     );
+    try std.testing.expectError(
+        error.InvalidThreadStartSignature,
+        manager.spawnThread(invalid_signature_ctx.inst, 0),
+    );
     try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+test "ThreadManager: every spawn failure maps to the stable negative ABI result" {
+    const failures = [_]SpawnError{
+        error.ThreadFeatureDisabled,
+        error.ThreadGroupShuttingDown,
+        error.ThreadIdExhausted,
+        error.MissingThreadStart,
+        error.InvalidThreadStartSignature,
+        error.AuxStackExhausted,
+        error.ChildInitializationFailed,
+        error.ThreadSpawnFailed,
+        error.StartGateFailed,
+        error.OutOfMemory,
+    };
+    for (failures) |failure| {
+        try std.testing.expectEqual(@as(i32, -1), spawnFailureResult(failure));
+    }
 }
 
 test "thread lifecycle: child initialization failure returns stack and clone ownership" {

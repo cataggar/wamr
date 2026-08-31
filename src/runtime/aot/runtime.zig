@@ -2594,6 +2594,15 @@ fn configureAotThreadContext(
     auxiliary_stack: ?execution_context.AuxiliaryStack,
 ) thread_manager.SpawnError!void {
     const child: *AotThreadContext = @ptrCast(@alignCast(child_opaque));
+    if (auxiliary_stack) |stack| {
+        if (child.instance.module.findExport("__stack_pointer", .global)) |exp| {
+            if (exp.index < child.instance.globals.len) {
+                child.instance.globals[exp.index].value = .{
+                    .i32 = @bitCast(stack.top),
+                };
+            }
+        }
+    }
     child.instance.setThreadManager(manager);
     child.instance.thread_context.configureWasiThread(
         tid,
@@ -2634,7 +2643,34 @@ const aot_thread_ops = thread_manager.ThreadBackendOps{
     .configure = configureAotThreadContext,
     .run = runAotThreadContext,
     .destroy = destroyAotThreadContext,
+    .uses_auxiliary_stack = true,
 };
+
+pub fn usesWasiThreads(module: *const aot_loader.AotModule) bool {
+    for (module.imports) |imp| {
+        if (imp.kind == .function and
+            config.threads_feature.isThreadSpawnImport(
+                imp.module_name,
+                imp.field_name,
+            ))
+            return true;
+    }
+    return false;
+}
+
+pub fn prepareWasiThreads(
+    inst: *AotInstance,
+    manager: *thread_manager.ThreadManager,
+) thread_manager.PrepareError!void {
+    if (inst.memories.len == 0) return error.SharedMemoryRequired;
+    const heap_global: ?*types.GlobalInstance =
+        if (inst.module.findExport("__heap_base", .global)) |exp| blk: {
+            if (exp.index >= inst.globals.len) return error.InvalidHeapBase;
+            break :blk inst.globals[exp.index];
+        } else null;
+    try manager.prepareSharedMemory(inst.memories[0], heap_global);
+    inst.setThreadManager(manager);
+}
 
 /// Spawn `wasi_thread_start(tid, start_arg)` on a manager-owned native
 /// thread. The host import maps every lifecycle error to the Preview-1

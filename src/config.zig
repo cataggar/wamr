@@ -183,8 +183,7 @@ pub const shared_memory = opt("shared_memory", lib_wasi_threads);
 /// Enable the thread manager component. Required by WASI threads.
 pub const thread_mgr = opt("thread_mgr", lib_wasi_threads);
 
-/// Enable WebAssembly atomic instructions. This is a configuration
-/// capability, not a claim that the production threads semantics are complete.
+/// Enable WebAssembly atomic instructions.
 pub const wasm_atomics = opt("wasm_atomics", shared_memory);
 
 /// Enable source-level interpreter debugging.
@@ -498,6 +497,11 @@ test "WASI threads build options match the published contract" {
         try std.testing.expect(wasi_threads.configured.shared_memory);
         try std.testing.expect(wasi_threads.configured.thread_manager);
         try std.testing.expect(wasi_threads.configured.wasm_atomics);
+        try std.testing.expect(wasi_threads.implementation.interpreter_thread_spawning);
+        try std.testing.expectEqual(
+            arch == .x86_64 or arch == .aarch64,
+            wasi_threads.implementation.aot_thread_spawning,
+        );
     }
 }
 

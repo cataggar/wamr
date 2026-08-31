@@ -319,6 +319,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "instantiate rejects configured WASI threads",
             "host functions resolved for wasi thread-spawn import",
+            "enabled wasi thread-spawn validates import ABI and shared memory",
+            "disabled feature preserves the negative rejection result",
         },
     });
     const run_threads_runtime_tests = b.addRunArtifact(threads_runtime_tests);
@@ -401,6 +403,158 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
     wabt_module.addImport("build_options", wabt_build_options.createModule());
+
+    const wabt_host_module = b.createModule(.{
+        .root_source_file = wabt_dep.path("src/root.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    wabt_host_module.addImport("build_options", wabt_build_options.createModule());
+    const thread_fixture_generator_module = b.createModule(.{
+        .root_source_file = b.path("tests/wasi-threads/generate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    thread_fixture_generator_module.addImport("wabt", wabt_host_module);
+    const thread_fixture_generator = b.addExecutable(.{
+        .name = "generate-wasi-thread-fixtures",
+        .root_module = thread_fixture_generator_module,
+    });
+    const update_thread_fixtures = b.addRunArtifact(thread_fixture_generator);
+    inline for (.{
+        "pthread-contract",
+        "imported-memory",
+        "shared-descriptors",
+        "parent-teardown",
+        "child-trap",
+        "child-proc-exit",
+        "missing-thread-start",
+        "wrong-thread-start-signature",
+        "disabled-rejection",
+    }) |fixture| {
+        update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wat", .{fixture}));
+        update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}));
+    }
+    const update_thread_fixtures_step = b.step(
+        "update-wasi-thread-fixtures",
+        "Regenerate checked-in Preview-1 WASI thread fixtures",
+    );
+    update_thread_fixtures_step.dependOn(&update_thread_fixtures.step);
+
+    const wasi_threads_test_step = b.step(
+        "test-wasi-threads",
+        "Run Preview-1 WASI thread fixtures",
+    );
+    const aot_thread_spawn_step = b.step(
+        "test-aot-threads",
+        "Run Preview-1 AOT thread-spawn tests",
+    );
+    if (!aot) {
+        if (lib_wasi_threads) {
+            const contract = b.addRunArtifact(exe);
+            contract.addArgs(&.{
+                "run",
+                "tests/wasi-threads/pthread-contract.wasm",
+            });
+            contract.expectExitCode(0);
+            wasi_threads_test_step.dependOn(&contract.step);
+
+            const imported_memory = b.addRunArtifact(exe);
+            imported_memory.addArgs(&.{
+                "run",
+                "tests/wasi-threads/imported-memory.wasm",
+            });
+            imported_memory.expectExitCode(0);
+            wasi_threads_test_step.dependOn(&imported_memory.step);
+
+            const shared_descriptors = b.addRunArtifact(exe);
+            shared_descriptors.addArgs(&.{
+                "run",
+                "--map-dir=tests/wasi-threads/preopen::fixture",
+                "tests/wasi-threads/shared-descriptors.wasm",
+            });
+            shared_descriptors.expectExitCode(0);
+            shared_descriptors.expectStdOutEqual("child-shared-fd\n");
+            wasi_threads_test_step.dependOn(&shared_descriptors.step);
+
+            const parent_teardown = b.addRunArtifact(exe);
+            parent_teardown.addArgs(&.{
+                "run",
+                "tests/wasi-threads/parent-teardown.wasm",
+            });
+            parent_teardown.expectExitCode(0);
+            parent_teardown.expectStdOutEqual("child-after-parent\n");
+            wasi_threads_test_step.dependOn(&parent_teardown.step);
+
+            const child_trap = b.addRunArtifact(exe);
+            child_trap.addArgs(&.{
+                "run",
+                "tests/wasi-threads/child-trap.wasm",
+            });
+            child_trap.expectExitCode(1);
+            wasi_threads_test_step.dependOn(&child_trap.step);
+
+            const child_proc_exit = b.addRunArtifact(exe);
+            child_proc_exit.addArgs(&.{
+                "run",
+                "tests/wasi-threads/child-proc-exit.wasm",
+            });
+            child_proc_exit.expectExitCode(7);
+            wasi_threads_test_step.dependOn(&child_proc_exit.step);
+
+            inline for (.{
+                "missing-thread-start",
+                "wrong-thread-start-signature",
+            }) |fixture| {
+                const run = b.addRunArtifact(exe);
+                run.addArgs(&.{
+                    "run",
+                    b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}),
+                });
+                run.expectExitCode(0);
+                wasi_threads_test_step.dependOn(&run.step);
+            }
+        } else {
+            const disabled = b.addRunArtifact(exe);
+            disabled.addArgs(&.{
+                "run",
+                "tests/wasi-threads/disabled-rejection.wasm",
+            });
+            disabled.expectExitCode(0);
+            wasi_threads_test_step.dependOn(&disabled.step);
+        }
+    }
+    if (aot and aot_executable_target) {
+        if (lib_wasi_threads) {
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "pthread-contract", 0, null, null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "imported-memory", 0, null, null);
+            addAotThreadFixture(
+                b,
+                aot_thread_spawn_step,
+                wamrc,
+                "shared-descriptors",
+                0,
+                "child-shared-fd\n",
+                "tests/wasi-threads/preopen::fixture",
+            );
+            addAotThreadFixture(
+                b,
+                aot_thread_spawn_step,
+                wamrc,
+                "parent-teardown",
+                0,
+                "child-after-parent\n",
+                null,
+            );
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-trap", 1, null, null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-proc-exit", 7, null, null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "missing-thread-start", 0, null, null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "wrong-thread-start-signature", 0, null, null);
+        } else {
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "disabled-rejection", 0, null, null);
+        }
+        wasi_threads_test_step.dependOn(aot_thread_spawn_step);
+    }
 
     const spec_runner_module = b.createModule(.{
         .root_source_file = b.path("src/tests/run_spec_tests.zig"),
@@ -762,6 +916,7 @@ pub fn build(b: *std.Build) void {
             "thread lifecycle:",
             "AOT thread",
             "nested AOT async-lift",
+            "callComponentFuncByLocalAsyncLifted enters",
         },
     });
     const run_thread_lifecycle_unit_tests = b.addRunArtifact(thread_lifecycle_unit_tests);
@@ -770,6 +925,7 @@ pub fn build(b: *std.Build) void {
         "Run WASI thread lifecycle and rollback tests",
     );
     thread_lifecycle_test_step.dependOn(&run_thread_lifecycle_unit_tests.step);
+    aot_thread_spawn_step.dependOn(&run_thread_lifecycle_unit_tests.step);
 
     const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -801,6 +957,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(stable_resources_test_step);
     test_step.dependOn(execution_context_test_step);
+    test_step.dependOn(wasi_threads_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
     test_step.dependOn(&frame_attribution_tests.step);
     if (target_arch == .x86_64 and target.result.os.tag == .linux) {
@@ -1237,23 +1394,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_differential_tests = b.addRunArtifact(differential_tests);
     test_step.dependOn(&run_differential_tests.step);
-
-    const aot_thread_spawn_module = b.createModule(.{
-        .root_source_file = b.path("src/tests/aot_thread_spawn_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    aot_thread_spawn_module.addImport("wamr", lib_module);
-    const aot_thread_spawn_tests = b.addTest(.{
-        .root_module = aot_thread_spawn_module,
-    });
-    const run_aot_thread_spawn_tests = b.addRunArtifact(aot_thread_spawn_tests);
-    const aot_thread_spawn_step = b.step(
-        "test-aot-threads",
-        "Run Preview-1 AOT thread-spawn compile/runtime tests",
-    );
-    aot_thread_spawn_step.dependOn(&run_aot_thread_spawn_tests.step);
-    test_step.dependOn(&run_aot_thread_spawn_tests.step);
 
     // #694: regression test for active elem segments referencing
     // funcidx ≥ 256 (was capped by a fixed 256-entry buffer in
@@ -2020,6 +2160,31 @@ const ComponentRunSteps = struct {
     /// `@unstable` feature gate).
     wasmtime: *std.Build.Step,
 };
+
+fn addAotThreadFixture(
+    b: *std.Build,
+    parent: *std.Build.Step,
+    wamrc: *std.Build.Step.Compile,
+    name: []const u8,
+    expected_exit: u8,
+    expected_stdout: ?[]const u8,
+    map_dir: ?[]const u8,
+) void {
+    const run = b.addRunArtifact(wamrc);
+    run.addArg("run");
+    run.addArg("-o");
+    _ = run.addOutputFileArg(b.fmt("{s}.cwasm", .{name}));
+    run.addFileArg(b.path(b.fmt("tests/wasi-threads/{s}.wasm", .{name})));
+    if (map_dir) |mapping| {
+        run.addArg("--");
+        run.addArg(b.fmt("--map-dir={s}", .{mapping}));
+    }
+    run.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+    run.step.dependOn(b.getInstallStep());
+    run.expectExitCode(expected_exit);
+    if (expected_stdout) |stdout| run.expectStdOutEqual(stdout);
+    parent.dependOn(&run.step);
+}
 
 /// Register one component fixture against both run parents. The wamr
 /// arm spawns the freshly-built `wamrc run` (which compiles the

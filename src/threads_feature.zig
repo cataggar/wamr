@@ -1,5 +1,6 @@
-//! Compile-time contract and backend readiness for the legacy Preview 1
-//! `wasi.thread-spawn` feature.
+//! Compile-time contract for the legacy Preview 1 `wasi.thread-spawn`
+//! feature. Interpreter and supported-architecture AOT backends are
+//! production-ready when the validated capability set is enabled.
 
 const std = @import("std");
 
@@ -13,9 +14,8 @@ pub const TargetSupport = enum {
 pub const BackendSupport = enum {
     disabled,
     target_unsupported,
-    configuration_only,
+    production,
     architecture_abi_not_implemented,
-    supported,
 };
 
 pub const Capabilities = struct {
@@ -116,7 +116,7 @@ pub fn report(inputs: Inputs) Report {
     };
     const implementation = ImplementationStatus{
         .resource_locking = true,
-        .interpreter_thread_spawning = false,
+        .interpreter_thread_spawning = true,
         .wasm_atomics = true,
         .aot_thread_spawning = inputs.aot_architecture_supported,
     };
@@ -145,11 +145,11 @@ pub fn report(inputs: Inputs) Report {
     return .{
         .enabled = true,
         .target = .supported,
-        .interpreter_backend = if (inputs.interp) .configuration_only else .disabled,
+        .interpreter_backend = if (inputs.interp) .production else .disabled,
         .aot_backend = if (!inputs.aot)
             .disabled
         else if (inputs.aot_architecture_supported)
-            .supported
+            .production
         else
             .architecture_abi_not_implemented,
         .required = required,
@@ -221,16 +221,16 @@ test "disabled contract preserves defaults without requiring thread capabilities
     try std.testing.expect(!actual.required.shared_memory);
 }
 
-test "enabled interpreter configuration reports implemented shared foundations" {
+test "enabled configuration reports production interpreter support" {
     const actual = report(validEnabledInputs());
     try std.testing.expectEqual(@as(?ValidationError, null), validationError(validEnabledInputs()));
     try std.testing.expectEqual(TargetSupport.supported, actual.target);
-    try std.testing.expectEqual(BackendSupport.configuration_only, actual.interpreter_backend);
+    try std.testing.expectEqual(BackendSupport.production, actual.interpreter_backend);
     try std.testing.expectEqual(BackendSupport.disabled, actual.aot_backend);
     try std.testing.expect(actual.required.shared_memory);
     try std.testing.expect(actual.configured.shared_memory);
     try std.testing.expect(actual.implementation.resource_locking);
-    try std.testing.expect(!actual.implementation.interpreter_thread_spawning);
+    try std.testing.expect(actual.implementation.interpreter_thread_spawning);
     try std.testing.expect(actual.implementation.wasm_atomics);
     try std.testing.expect(actual.implementation.aot_thread_spawning);
 }
@@ -242,7 +242,7 @@ test "enabled contract reports supported AOT spawning on native architectures" {
     const actual = report(inputs);
     try std.testing.expectEqual(@as(?ValidationError, null), validationError(inputs));
     try std.testing.expectEqual(BackendSupport.disabled, actual.interpreter_backend);
-    try std.testing.expectEqual(BackendSupport.supported, actual.aot_backend);
+    try std.testing.expectEqual(BackendSupport.production, actual.aot_backend);
 }
 
 test "enabled contract rejects unsupported targets, backends, and missing capabilities" {

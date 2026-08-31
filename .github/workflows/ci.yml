@@ -52,6 +52,16 @@ jobs:
       - name: WASI thread lifecycle (enabled AOT)
         run: zig build test-aot-threads -Dlib_wasi_threads=true -Dinterp=false
 
+      - name: WASI thread interpreter fixtures
+        run: |
+          zig build update-wasi-thread-fixtures -Dlib_wasi_threads=true -Daot=false
+          git diff --exit-code -- tests/wasi-threads
+          zig build test-wasi-threads -Daot=false
+          zig build test-wasi-threads -Dlib_wasi_threads=true -Daot=false
+
+      - name: WASI thread AOT fixtures
+        run: zig build test-wasi-threads -Dlib_wasi_threads=true -Dinterp=false
+
       - name: Build (ReleaseSafe)
         continue-on-error: true
         run: zig build -Doptimize=ReleaseSafe

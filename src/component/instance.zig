@@ -2987,8 +2987,6 @@ pub fn instantiateWithOptions(
                             continue;
                         };
                     };
-                    if (comptime config.lib_wasi_threads)
-                        mi.thread_manager = &inst.thread_manager;
                     cis[ci_idx] = .{ .module_inst = mi };
 
                     if (entries.len > 0) inst_mod.attachHostFuncEntries(mi, entries);
@@ -3028,11 +3026,36 @@ pub fn instantiateWithOptions(
             const module_ptr = mod_alloc.create(core_types.WasmModule) catch continue;
             module_ptr.* = module;
             const module_inst = inst_mod.instantiate(module_ptr, allocator) catch continue;
-            if (comptime config.lib_wasi_threads)
-                module_inst.thread_manager = &inst.thread_manager;
             cis[i].module_inst = module_inst;
         }
         inst.core_instances = cis;
+    }
+
+    if (comptime config.lib_wasi_threads) {
+        var threaded_memory: ?*core_types.MemoryInstance = null;
+        for (inst.core_instances) |entry| {
+            const ai = entry.aot_inst orelse continue;
+            if (!aot_runtime.usesWasiThreads(ai.module)) continue;
+            if (threaded_memory) |memory| {
+                if (ai.memories.len == 0 or ai.memories[0] != memory) {
+                    std.log.warn(
+                        "[aot reject] one component thread group cannot span distinct memories",
+                        .{},
+                    );
+                    return error.AotImportUnresolvable;
+                }
+                ai.setThreadManager(&inst.thread_manager);
+                continue;
+            }
+            aot_runtime.prepareWasiThreads(ai, &inst.thread_manager) catch |err| {
+                std.log.warn(
+                    "[aot reject] failed to prepare Preview-1 thread group: {s}",
+                    .{@errorName(err)},
+                );
+                return error.AotImportUnresolvable;
+            };
+            threaded_memory = ai.memories[0];
+        }
     }
 
     // ── Sub-component instantiation (issue #355) ───────────────────────────

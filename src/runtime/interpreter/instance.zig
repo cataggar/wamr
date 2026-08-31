@@ -22,7 +22,8 @@ pub const InstantiationError = error{
     InvalidGlobalIndex,
     UnknownImport,
     StartFunctionFailed,
-    WasiThreadsNotImplemented,
+    InvalidWasiThreadSpawnSignature,
+    WasiThreadsSharedMemoryRequired,
 };
 
 /// Resolved imports passed during instantiation.
@@ -117,12 +118,7 @@ fn instantiateImpl(
     comptime HostImportsT: ?type,
     defer_start: bool,
 ) InstantiationError!*types.ModuleInstance {
-    if (comptime config.lib_wasi_threads and !config.wasi_threads.implementation.interpreter_thread_spawning) {
-        for (module.imports) |imp| {
-            if (imp.kind == .function and config.threads_feature.isThreadSpawnImport(imp.module_name, imp.field_name))
-                return error.WasiThreadsNotImplemented;
-        }
-    }
+    if (comptime config.lib_wasi_threads) try validateWasiThreadModule(module);
 
     const has_non_func_imports =
         module.import_global_count > 0 or
@@ -304,6 +300,47 @@ fn instantiateImpl(
     }
 
     return inst;
+}
+
+fn validateWasiThreadModule(module: *const types.WasmModule) InstantiationError!void {
+    var imports_thread_spawn = false;
+    for (module.imports) |imp| {
+        if (imp.kind != .function or
+            !config.threads_feature.isThreadSpawnImport(imp.module_name, imp.field_name))
+        {
+            continue;
+        }
+        imports_thread_spawn = true;
+        const type_idx = imp.func_type_idx orelse
+            return error.InvalidWasiThreadSpawnSignature;
+        if (type_idx >= module.types.len)
+            return error.InvalidWasiThreadSpawnSignature;
+        const func_type = module.types[type_idx];
+        if (func_type.params.len != 1 or
+            func_type.params[0] != .i32 or
+            func_type.results.len != 1 or
+            func_type.results[0] != .i32)
+        {
+            return error.InvalidWasiThreadSpawnSignature;
+        }
+    }
+    if (!imports_thread_spawn) return;
+
+    var has_memory = false;
+    for (module.imports) |imp| {
+        if (imp.kind != .memory) continue;
+        has_memory = true;
+        const memory_type = imp.memory_type orelse
+            return error.WasiThreadsSharedMemoryRequired;
+        if (!memory_type.is_shared)
+            return error.WasiThreadsSharedMemoryRequired;
+    }
+    for (module.memories) |memory_type| {
+        has_memory = true;
+        if (!memory_type.is_shared)
+            return error.WasiThreadsSharedMemoryRequired;
+    }
+    if (!has_memory) return error.WasiThreadsSharedMemoryRequired;
 }
 
 /// Attach a slice of context-carrying host function entries to an already
@@ -1311,24 +1348,78 @@ test "instantiate: host functions resolved for wasi thread-spawn import" {
     const func_types = [_]types.FuncType{
         .{ .params = &.{.i32}, .results = &.{.i32} },
     };
+    const memories = [_]types.MemoryType{.{
+        .limits = .{ .min = 0, .max = 1 },
+        .is_shared = true,
+    }};
     var module = types.WasmModule{
         .imports = &imports,
         .import_function_count = 1,
         .types = &func_types,
+        .memories = &memories,
     };
-    const inst = instantiate(&module, testing.allocator) catch |err| {
-        if (comptime config.lib_wasi_threads) {
-            try testing.expectEqual(error.WasiThreadsNotImplemented, err);
-            return;
-        }
-        return err;
-    };
+    const inst = try instantiate(&module, testing.allocator);
     defer destroy(inst);
 
     // Host functions should be resolved
     try testing.expectEqual(@as(usize, 1), inst.host_functions.len);
     try testing.expect(inst.host_functions[0] != null);
     try testing.expect(inst.owns_host_functions);
+}
+
+test "instantiate: enabled wasi thread-spawn validates import ABI and shared memory" {
+    if (comptime !config.lib_wasi_threads) return error.SkipZigTest;
+
+    const bad_types = [_]types.FuncType{
+        .{ .params = &.{.i64}, .results = &.{.i32} },
+    };
+    const imports = [_]types.ImportDesc{.{
+        .module_name = "wasi",
+        .field_name = "thread-spawn",
+        .kind = .function,
+        .func_type_idx = 0,
+    }};
+    const shared_memories = [_]types.MemoryType{.{
+        .limits = .{ .min = 0, .max = 1 },
+        .is_shared = true,
+    }};
+    var bad_signature = types.WasmModule{
+        .types = &bad_types,
+        .imports = &imports,
+        .import_function_count = 1,
+        .memories = &shared_memories,
+    };
+    try testing.expectError(
+        error.InvalidWasiThreadSpawnSignature,
+        instantiate(&bad_signature, testing.allocator),
+    );
+
+    const valid_types = [_]types.FuncType{
+        .{ .params = &.{.i32}, .results = &.{.i32} },
+    };
+    var missing_memory = types.WasmModule{
+        .types = &valid_types,
+        .imports = &imports,
+        .import_function_count = 1,
+    };
+    try testing.expectError(
+        error.WasiThreadsSharedMemoryRequired,
+        instantiate(&missing_memory, testing.allocator),
+    );
+
+    const unshared_memories = [_]types.MemoryType{.{
+        .limits = .{ .min = 0, .max = 1 },
+    }};
+    var unshared_memory = types.WasmModule{
+        .types = &valid_types,
+        .imports = &imports,
+        .import_function_count = 1,
+        .memories = &unshared_memories,
+    };
+    try testing.expectError(
+        error.WasiThreadsSharedMemoryRequired,
+        instantiate(&unshared_memory, testing.allocator),
+    );
 }
 
 test "instantiate: non-wasi imports have null host functions" {

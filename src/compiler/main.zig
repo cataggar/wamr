@@ -525,7 +525,29 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
                     .table_max = if (table_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
                 });
             },
-            .memory, .global, .tag => {},
+            .memory => {
+                const memory_type = imp.memory_type orelse continue;
+                try import_entries.append(allocator, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .memory,
+                    .memory_min = @intCast(memory_type.limits.min),
+                    .memory_max = if (memory_type.limits.max) |m| @as(?u32, @intCast(m)) else null,
+                    .memory_is64 = memory_type.is_memory64,
+                    .memory_shared = memory_type.is_shared,
+                });
+            },
+            .global => {
+                const global_type = imp.global_type orelse continue;
+                try import_entries.append(allocator, .{
+                    .module_name = imp.module_name,
+                    .field_name = imp.field_name,
+                    .kind = .global,
+                    .global_val_type = global_type.val_type,
+                    .global_mutable = global_type.mutability == .mutable,
+                });
+            },
+            .tag => {},
         }
     }
 
@@ -537,11 +559,8 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     }
 
     // Surface tag imports too. The outer `for (module.imports)` loop above
-    // intentionally still drops `.memory` / `.global` because the standalone
-    // `wamrc` path doesn't carry imported memory/global descriptors; tags
-    // are different because the component-mode path (`src/component/aot.zig`)
-    // and this path both need the loader to reconstruct `imported_tags` for
-    // cross-instance wiring.
+    // appends tags separately because their type indices use the EH-specific
+    // field on `ImportEntry`.
     for (module.imports) |imp| {
         if (imp.kind != .tag) continue;
         const type_idx = imp.tag_type_idx orelse continue;
