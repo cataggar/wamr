@@ -2473,11 +2473,7 @@ const ResourceTable = instance_mod.ResourceTable;
 const StreamTable = instance_mod.StreamTable;
 
 fn suspendStreamLeaseForCallback(lease: *StreamTable.Lease) void {
-    if (comptime config.lib_wasi_threads) {
-        lease.unlock();
-    } else {
-        lease.release();
-    }
+    lease.unlock();
 }
 
 fn resumeStreamLeaseAfterCallback(
@@ -2485,12 +2481,10 @@ fn resumeStreamLeaseAfterCallback(
     handle: u32,
     lease: *StreamTable.Lease,
 ) bool {
-    if (comptime config.lib_wasi_threads) {
-        lease.lock();
-        return !lease.isClosing();
-    }
-    lease.* = comp_inst.streams.acquire(handle) orelse return false;
-    return true;
+    _ = comp_inst;
+    _ = handle;
+    lease.lock();
+    return !lease.isClosing();
 }
 
 /// Execute `resource.new(rep) → handle`: allocate a new resource handle.
