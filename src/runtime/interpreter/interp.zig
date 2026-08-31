@@ -797,8 +797,13 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
 
 /// Execute a function with caller-supplied limits.
 pub fn executeFunctionWithOptions(env: *ExecEnv, func_idx: u32, options: ExecuteOptions) TrapError!void {
+    var context_scope = env.thread_context.enter();
+    defer context_scope.deinit();
     var fuel = FuelBudget{ .remaining = options.fuel };
-    return executeFunctionWithFuel(env, func_idx, &fuel);
+    return executeFunctionWithFuel(env, func_idx, &fuel) catch |err| {
+        env.thread_context.markTrap();
+        return err;
+    };
 }
 
 /// Record diagnostic info for a host-fn dispatch trap. First-write-wins on
@@ -1539,7 +1544,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
         try fuel.consume();
         // Check for cross-thread trap (every 4096 iterations to minimize overhead)
         if (fuel.remaining % 4096 == 0) {
-            if (env.thread_manager) |tm| {
+            if (env.threadManager()) |tm| {
                 if (tm.hasTrap()) return error.Unreachable;
             }
         }

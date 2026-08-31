@@ -6,9 +6,10 @@
 //! function's arguments in registers, and returns the WASI errno as i32.
 //!
 //! Two execution tiers, mirroring `src/wasi/host_functions.zig`:
-//!   - **ctx-aware**: when `VmCtx.wasi_ctx != 0`, forward to the same
-//!     `ctxXxxCore` helpers used by the interpreter so args / env /
-//!     preopens / fd-table / sockets all behave identically.
+//!   - **ctx-aware**: when `VmCtx.wasi_ctx != 0`, forward to the retained
+//!     `WasiProcessState` through the same `ctxXxxCore` helpers used by the
+//!     interpreter so args / env / preopens / fd-table / sockets all behave
+//!     identically.
 //!   - **legacy stub**: when no `WasiCtx` is attached (CoreMark / unit
 //!     tests) we fall back to the stateless `wasi_core.zig` defaults
 //!     (zero args, stdout-only) so older callers keep working.
@@ -47,8 +48,8 @@ fn getMemoryFromCtx(vmctx: *VmCtx) ?[]u8 {
     return ptr[0..vmctx.memory_size];
 }
 
-/// Resolve `*WasiCtx` from `vmctx.wasi_ctx`. Null when no ctx attached.
-fn getCtx(vmctx: *VmCtx) ?*wasi.WasiCtx {
+/// Resolve the process-scoped WASI state. Null when no state is attached.
+fn getCtx(vmctx: *VmCtx) ?*wasi.WasiProcessState {
     if (vmctx.wasi_ctx == 0) return null;
     return @ptrFromInt(vmctx.wasi_ctx);
 }
