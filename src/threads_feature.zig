@@ -1,6 +1,6 @@
 //! Compile-time contract for the legacy Preview 1 `wasi.thread-spawn`
-//! feature. This describes configuration and readiness; it does not make
-//! the existing thread/atomic prototypes production implementations.
+//! feature. This describes configuration and readiness; the hardened internal
+//! lifecycle does not by itself make the host binding production-ready.
 
 const std = @import("std");
 

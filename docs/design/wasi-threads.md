@@ -1,9 +1,10 @@
 # `wasi:threads` design — multi-threaded interpreter state isolation
 
-Status: **DRAFT** (shared-memory/parking foundation and atomic opcode
-semantics implemented; production spawning remains incomplete).
+Status: **DRAFT** (shared-memory/parking, atomic semantics, and the
+thread-group lifecycle are implemented; production host binding remains
+incomplete).
 
-Tracking: [#616 B1.6](https://github.com/cataggar/wamr/issues/616).
+Tracking: [#616 B1.2-B1.3, B1.6](https://github.com/cataggar/wamr/issues/616).
 
 Author wave: W10-3.
 
@@ -64,10 +65,10 @@ are rejected before allocation while readiness remains false.
 
 ## Current implementation status
 
-The tree contains scaffolding in `ThreadManager`, `cloneForThread`,
-the atomic-opcode dispatcher, and the `wasi.thread-spawn` host import.
-These are prototypes, not production support. No default CLI or
-component path currently offers gated guest-thread execution.
+The tree contains a hardened `ThreadManager` lifecycle plus scaffolding in
+`cloneForThread`, the atomic-opcode dispatcher, and the
+`wasi.thread-spawn` host import. No default CLI or component path currently
+offers gated guest-thread execution.
 
 Shared memories now use a refcounted control block with an immutable base.
 Instantiation reserves the declared maximum up front and fails if that
@@ -100,12 +101,28 @@ without holding a lock across guest calls. Thread clones also roll back
 partial retains/allocation failures and copy mutable segment state.
 
 This does **not** complete B1.1: `ComponentInstance` and `WasiCliAdapter`
-resource families remain separate follow-ups. It also does not wire spawning,
-or change thread-group teardown.
+resource families remain separate follow-ups. It also does not wire the
+production interpreter/AOT host bindings or final group cancellation.
+
+The thread-group lifecycle now publishes a generation-stamped, manager-owned
+record before a native child can enter guest code. The child waits on a start
+gate and crosses the manager lock once after the gate opens, proving that
+publication has completed and the publisher no longer holds the lock. Child
+exit only records an outcome; the native handle, cloned instance, execution
+environment, and auxiliary stack remain owned by the record until an exact
+`joinOne` or batched, unbounded `joinAll` claims them. All joins and destruction
+run outside the manager lock.
+
+The host that owns `ThreadManager` also owns group shutdown. `shutdown` first
+rejects new spawns, drains spawn calls that began before closure, and joins all
+unclaimed records; `deinit` performs the same shutdown before freeing the
+registry and stack pool. Threads are never detached. Shutdown deliberately
+does not add cancellation or preemption semantics: running guest code must
+finish cooperatively or observe the existing group trap flag.
 
 The process/execution split is now explicit:
 
-* `WasiProcessState` owns its argument and environment strings and owns the
+* `WasiProcessState` owns its argument and environment strings and the
   synchronized Preview-1 descriptor/preopen table. `WasiCtx` remains a source
   compatibility alias.
 * `ProcessStateRef` is the type-erased retained handle used by runtime-common
@@ -120,9 +137,8 @@ The process/execution split is now explicit:
   `ComponentInstance`. AOT keeps all existing codegen-addressed `VmCtx`
   offsets stable and appends only a thread-context pointer.
 
-This context work deliberately does **not** make the prototype spawning
-lifecycle production-ready, add AOT spawn bindings, or implement final
-thread-group cancellation.
+This context work deliberately does not add production host bindings, AOT
+thread spawning, or final group cancellation.
 
 ### Process/context lifetime contract
 
@@ -132,11 +148,11 @@ thread-group cancellation.
 | Attach to interpreter/AOT instance | The instance acquires one reference; replacing/detaching releases exactly one. |
 | Create `ExecEnv` | The environment acquires its own reference from the instance. |
 | Clone a thread instance | The child acquires one process reference; allocation rollback releases it with all partially retained core resources. |
-| Parent guest entry returns | Parent execution-local state may be destroyed without affecting a live child. The lifecycle owner must still retain immutable module/link storage until children join. |
-| Child completion | Destroy the child `ExecEnv`, then the child instance; each drops its own reference. |
-| Group shutdown | Join/retire children before dropping the group-owned instances. The final process reference closes descriptors/preopens exactly once. |
+| Parent guest entry returns | Parent execution-local state may be destroyed without affecting a live child; the hardened thread record retains the child instance/env until join. |
+| Child completion | Completion records an outcome only; `joinOne`/`joinAll` destroy the child `ExecEnv`, return its auxiliary stack, and destroy the clone. |
+| Group shutdown | Shutdown drains in-flight spawns and joins all records. The final process reference closes descriptors/preopens exactly once. |
 
-The Preview-1 ABI's `start_arg` is always passed bit-for-bit to
+The Preview-1 ABI's `start_arg` is passed bit-for-bit to
 `wasi_thread_start(tid, start_arg)`. The runtime does not inspect the
 wasi-libc payload: wasi-libc's assembly trampoline reads its stack pointer at
 offset 0 and TLS base at offset 4, then initializes `__stack_pointer` and
@@ -215,7 +231,7 @@ The execution environment is already documented as
 
 | Field                              | Lifetime    | Threading classification                              |
 | ---------------------------------- | ----------- | ----------------------------------------------------- |
-| `module_inst: *ModuleInstance`     | Per-thread  | Borrowed pointer to that thread's instance clone (see (2)). |
+| `module_inst: *ModuleInstance`     | Shared      | Borrowed pointer — the instance is shared across threads (see (2)). |
 | `operand_stack: []Value`           | Per-thread  | Allocated in `ExecEnv.create`; never shared.          |
 | `sp: u32`                          | Per-thread  | —                                                     |
 | `call_stack: []CallFrame`          | Per-thread  | —                                                     |
@@ -223,11 +239,10 @@ The execution environment is already documented as
 | `exception`, `pending_exception_*` | Per-thread  | —                                                     |
 | `exception_refs[8]`, `…_count`     | Per-thread  | —                                                     |
 | `allocator: std.mem.Allocator`     | Per-thread  | Passed in; embedder owns thread-safety.               |
-| `thread_context.thread_group`      | Shared      | Borrowed pointer to the thread manager/group.         |
-| `thread_context.tid/start_arg/TLS` | Per-thread  | Fresh metadata for every execution environment.       |
-| `thread_context.task/cancel/trap`  | Per-thread  | Never copied into a child context.                    |
+| `thread_manager: ?*ThreadManager`  | Shared      | Already a borrowed pointer (today only non-null when `lib_wasi_threads = true`). |
+| `tid: i32`                         | Per-thread  | Already populated by `thread_manager.zig:230`.        |
 | `host_trap: ?HostTrapInfo`         | Per-thread  | Trap diagnostic, not racy by construction.            |
-| `thread_context.process_state`     | Shared      | Independently retained process-state reference.       |
+| `wasi_ctx: ?*anyopaque`            | Shared      | Opaque pointer to embedder's WASI context — see (3).  |
 
 The `ExecEnv` struct itself is already thread-local: one
 `ExecEnv.create` call per spawned thread, no shared mutable fields.
@@ -334,11 +349,13 @@ Counted by `grep -cE "^\s*\w+_table\s*:"` on the adapter: **8** direct
 
 **`TaskManager` ([`src/component/async.zig:157`](../../src/component/async.zig)):**
 
-Each async invocation still owns its `TaskManager`, including
-`current_task`, but the pointer to the active manager is now bound to the
-calling thread's `ThreadExecutionContext`. Canonical built-ins no longer
-read a mutable `ComponentInstance.current_task_manager`, so concurrent
-dispatches cannot overwrite one another's task selection.
+The async task manager is per-component-instance, and within an
+instance it tracks `current_task` for `context.{get,set}` / `task.yield`.
+The single-threaded executor assumes only one task is on the dispatch
+stack at a time; with real threads, **each thread needs its own
+TaskManager** (since each thread has its own "currently active task"),
+or the design must declare that `wasi:threads`-spawned threads never
+run async-lifted entry points.
 
 ## Design options
 
@@ -612,9 +629,10 @@ Each wave is a discrete PR with its own conformance gate.
   resource-table mutex when it observes the cancel — wave-5a must
   pair the cancel-check with a "release every held lock" routine in
   the trap exit path.
-* **5b — Thread joining for embedders.** `ThreadManager.joinAll` is
-  process-wide. Add `tid`-scoped `joinOne(tid: i32)` so embedders that
-  call `runLoadedComponent` repeatedly can serialise.
+* **5b — Thread joining for embedders.** The lifecycle now provides exact
+  `joinOne(tid: i32)` and process-wide batched `joinAll`; wiring those APIs
+  into repeated `runLoadedComponent` ownership remains part of the host-binding
+  work.
 * **5c — Process/per-thread context split.** Implemented: each execution
   environment has private task/cancel/trap/TLS metadata and a retained handle
   to one shared, synchronized WASI process state.
@@ -726,7 +744,7 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
 * [`docs/wasi.md`](../wasi.md) — WASI feature matrix; this design
   doc is linked from the Roadmap section.
 * [`src/wasi/thread_manager.zig`](../../src/wasi/thread_manager.zig)
-  — the existing `wasi:threads@0.1.0` prototype (off by default and
+  — the generation-safe `wasi:threads@0.1.0` lifecycle (off by default and
   not production-wired).
 * [`src/wasi/host_functions.zig`](../../src/wasi/host_functions.zig)
   (`wasiThreadSpawn`, line ~46; registration line ~3209) — the

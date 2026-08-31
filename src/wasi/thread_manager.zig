@@ -4,7 +4,9 @@
 //! spawning/termination for the WASI-threads proposal.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../runtime/common/types.zig");
+const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const execution_context = @import("../runtime/common/execution_context.zig");
 const config = @import("config");
 
@@ -34,28 +36,39 @@ pub const AuxStackPool = struct {
     /// All allocated stacks (for cleanup).
     all_stacks: std.ArrayListUnmanaged(u32) = .empty,
     mutex: Mutex = .init,
-    pool_allocator: std.mem.Allocator = undefined,
 
     /// Pre-allocate N auxiliary stacks starting at `base_offset` in linear memory.
     pub fn init(self: *AuxStackPool, count: u32, base_offset: u32, allocator: std.mem.Allocator) !void {
-        self.pool_allocator = allocator;
-        try self.free_stacks.ensureTotalCapacity(allocator, count);
-        try self.all_stacks.ensureTotalCapacity(allocator, count);
+        std.debug.assert(self.free_stacks.items.len == 0);
+        std.debug.assert(self.all_stacks.items.len == 0);
+
+        var free_stacks: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer free_stacks.deinit(allocator);
+        var all_stacks: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer all_stacks.deinit(allocator);
+        try free_stacks.ensureTotalCapacity(allocator, count);
+        try all_stacks.ensureTotalCapacity(allocator, count);
 
         var offset = base_offset;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            // Stack grows downward; top-of-stack is at offset + stack_size
-            const stack_top = offset + self.stack_size;
-            self.free_stacks.appendAssumeCapacity(stack_top);
-            self.all_stacks.appendAssumeCapacity(stack_top);
-            offset += self.stack_size;
+            const stack_top = std.math.add(u32, offset, self.stack_size) catch
+                return error.StackAddressOverflow;
+            free_stacks.appendAssumeCapacity(stack_top);
+            all_stacks.appendAssumeCapacity(stack_top);
+            offset = stack_top;
         }
+
+        self.free_stacks = free_stacks;
+        self.all_stacks = all_stacks;
     }
 
     pub fn deinit(self: *AuxStackPool, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.free_stacks.items.len == self.all_stacks.items.len);
         self.free_stacks.deinit(allocator);
         self.all_stacks.deinit(allocator);
+        self.free_stacks = .empty;
+        self.all_stacks = .empty;
     }
 
     /// Allocate a stack for a new thread. Returns the top-of-stack offset, or null.
@@ -73,72 +86,203 @@ pub const AuxStackPool = struct {
     pub fn release(self: *AuxStackPool, stack_top: u32) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.free_stacks.append(self.pool_allocator, stack_top) catch {};
+        std.debug.assert(std.mem.indexOfScalar(u32, self.all_stacks.items, stack_top) != null);
+        std.debug.assert(std.mem.indexOfScalar(u32, self.free_stacks.items, stack_top) == null);
+        std.debug.assert(self.free_stacks.items.len < self.free_stacks.capacity);
+        self.free_stacks.appendAssumeCapacity(stack_top);
+    }
+
+    pub fn availableCount(self: *AuxStackPool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.free_stacks.items.len;
+    }
+
+    pub fn totalCount(self: *AuxStackPool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.all_stacks.items.len;
     }
 };
 
-/// Thread handle tracking a spawned thread and its module instance.
-pub const ThreadHandle = struct {
-    tid: i32,
-    thread: std.Thread,
+pub const ThreadOutcome = enum {
+    completed,
+    trapped,
+};
+
+pub const SpawnError = error{
+    ThreadFeatureDisabled,
+    ThreadGroupShuttingDown,
+    ThreadIdExhausted,
+    MissingThreadStart,
+    AuxStackExhausted,
+    ChildInitializationFailed,
+    ThreadSpawnFailed,
+    StartGateFailed,
+    OutOfMemory,
+};
+
+pub const JoinError = error{
+    InvalidThreadId,
+    UnknownThread,
+    StaleThreadId,
+    ThreadAlreadyJoining,
+    ThreadAlreadyJoined,
+    ThreadGroupShuttingDown,
+};
+
+pub const JoinSummary = struct {
+    joined: usize = 0,
+    trapped: usize = 0,
+};
+
+pub const ThreadStats = struct {
+    active: usize,
+    completed: usize,
+    retained: usize,
+    spawning: usize,
+    joining: usize,
+    slots: usize,
+    shutting_down: bool,
+};
+
+/// Deterministic failure and destruction hooks used by lifecycle tests.
+const TestHooks = struct {
+    fail_child_initialization: bool = false,
+    fail_native_spawn: bool = false,
+    fail_start_gate: bool = false,
+    native_threads_started: ?*std.atomic.Value(usize) = null,
+    native_threads_joined: ?*std.atomic.Value(usize) = null,
+    records_destroyed: ?*std.atomic.Value(usize) = null,
+};
+
+const tid_slot_bits = 16;
+const tid_generation_bits = 13;
+// WASI reserves positive TIDs below 2^29. Reuse advances the generation;
+// exhausted generations retire their slot instead of ever repeating an ID.
+const tid_slot_mask: u32 = (1 << tid_slot_bits) - 1;
+const max_thread_slots: usize = tid_slot_mask;
+const max_tid_generation: u16 = (1 << tid_generation_bits) - 1;
+const join_batch_size = 32;
+
+const GateState = enum(u8) {
+    closed,
+    run,
+    abort,
+};
+
+const StartGate = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(GateState.closed)),
+
+    fn open(self: *StartGate) void {
+        std.debug.assert(self.state.load(.monotonic) == @intFromEnum(GateState.closed));
+        self.state.store(@intFromEnum(GateState.run), .release);
+    }
+
+    fn abort(self: *StartGate) void {
+        self.state.store(@intFromEnum(GateState.abort), .release);
+    }
+
+    fn wait(self: *StartGate) bool {
+        var spins: usize = 0;
+        while (true) {
+            switch (@as(GateState, @enumFromInt(self.state.load(.acquire)))) {
+                .closed => {
+                    if (spins < 128) {
+                        spins += 1;
+                        std.atomic.spinLoopHint();
+                    } else {
+                        std.Thread.yield() catch {};
+                    }
+                },
+                .run => return true,
+                .abort => return false,
+            }
+        }
+    }
+};
+
+const ExecutionState = enum(u8) {
+    pending,
+    completed,
+    trapped,
+    start_aborted,
+};
+
+const ThreadRecord = struct {
+    manager: *ThreadManager,
+    tid: i32 = 0,
+    thread: ?std.Thread = null,
     instance: *types.ModuleInstance,
+    env: *ExecEnv,
+    func_idx: u32,
+    aux_stack_top: ?u32,
+    start_gate: StartGate = .{},
+    execution: std.atomic.Value(u8) =
+        std.atomic.Value(u8).init(@intFromEnum(ExecutionState.pending)),
+};
+
+const SlotState = enum {
+    live,
+    joining,
+    free,
+    retired,
+};
+
+const ThreadSlot = struct {
+    generation: u16,
+    state: SlotState,
+    record: ?*ThreadRecord,
+};
+
+const ParsedTid = struct {
+    slot_index: usize,
+    generation: u16,
+};
+
+const JoinClaim = struct {
+    slot_index: usize,
+    generation: u16,
+    record: *ThreadRecord,
 };
 
 /// Thread manager for coordinating WASI threads.
+///
+/// After first use the manager is address-stable. The host owner must keep it
+/// alive until `shutdown`/`deinit` completes. Shutdown closes the group to new
+/// spawns and joins every record; it does not detach or preempt guest code.
 pub const ThreadManager = struct {
-    /// Next TID to allocate (atomic for thread safety).
-    next_tid: std.atomic.Value(i32) = std.atomic.Value(i32).init(1),
-    /// Active threads (protected by mutex).
-    threads: std.ArrayList(ThreadHandle),
+    slots: std.ArrayList(ThreadSlot),
     mutex: Mutex = .init,
-    /// Global trap flag — set when any thread traps.
     trap_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator,
-    /// Per-thread auxiliary stack pool.
     aux_stack_pool: AuxStackPool = .{},
+    shutting_down: bool = false,
+    spawning_count: usize = 0,
+    joining_count: usize = 0,
+    test_hooks: ?*const TestHooks = null,
 
     pub fn init(allocator: std.mem.Allocator) ThreadManager {
         return .{
-            .threads = .empty,
+            .slots = .empty,
             .allocator = allocator,
         };
     }
 
+    fn initWithTestHooks(allocator: std.mem.Allocator, hooks: *const TestHooks) ThreadManager {
+        var manager = init(allocator);
+        manager.test_hooks = hooks;
+        return manager;
+    }
+
     pub fn deinit(self: *ThreadManager) void {
-        // Join all remaining threads
-        self.joinAll();
-        self.threads.deinit(self.allocator);
+        self.shutdown();
+        const current = self.stats();
+        std.debug.assert(current.retained == 0);
+        std.debug.assert(current.spawning == 0);
+        std.debug.assert(current.joining == 0);
+        self.slots.deinit(self.allocator);
         self.aux_stack_pool.deinit(self.allocator);
-    }
-
-    /// Allocate a new thread ID. Range: 1 to 2^29-1.
-    pub fn allocateTid(self: *ThreadManager) i32 {
-        const tid = self.next_tid.fetchAdd(1, .monotonic);
-        // Wrap around if we exceed 2^29-1 (keep bits 30-31 zero per spec)
-        if (tid >= (1 << 29)) {
-            self.next_tid.store(2, .monotonic);
-            return 1;
-        }
-        return tid;
-    }
-
-    /// Register a spawned thread.
-    pub fn registerThread(self: *ThreadManager, handle: ThreadHandle) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.threads.append(self.allocator, handle);
-    }
-
-    /// Remove a thread from the registry (called when thread exits).
-    pub fn unregisterThread(self: *ThreadManager, tid: i32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.threads.items, 0..) |t, i| {
-            if (t.tid == tid) {
-                _ = self.threads.orderedRemove(i);
-                break;
-            }
-        }
     }
 
     /// Signal all threads to stop (trap propagation).
@@ -151,43 +295,161 @@ pub const ThreadManager = struct {
         return self.trap_flag.load(.acquire);
     }
 
-    /// Join all active threads, waiting for them to complete.
+    /// Join every retained record in bounded batches. Completed native handles
+    /// stay owned by their records until this function or `joinOne` claims them.
     pub fn joinAll(self: *ThreadManager) void {
-        self.mutex.lock();
-        const threads = self.threads.items;
-        // Copy handles to join outside the lock
-        var handles: [256]ThreadHandle = undefined;
-        const count = @min(threads.len, handles.len);
-        @memcpy(handles[0..count], threads[0..count]);
-        self.threads.clearRetainingCapacity();
-        self.mutex.unlock();
+        _ = self.joinAllWithSummary();
+    }
 
-        for (handles[0..count]) |h| {
-            h.thread.join();
+    pub fn joinAllWithSummary(self: *ThreadManager) JoinSummary {
+        var summary = JoinSummary{};
+        while (true) {
+            var batch: [join_batch_size]JoinClaim = undefined;
+            var count: usize = 0;
+
+            self.mutex.lock();
+            for (self.slots.items, 0..) |*slot, slot_index| {
+                if (count == batch.len) break;
+                if (slot.state != .live) continue;
+                const record = slot.record.?;
+                slot.state = .joining;
+                self.joining_count += 1;
+                batch[count] = .{
+                    .slot_index = slot_index,
+                    .generation = slot.generation,
+                    .record = record,
+                };
+                count += 1;
+            }
+            const joins_in_flight = self.joining_count;
+            const spawns_in_flight = self.spawning_count;
+            self.mutex.unlock();
+
+            for (batch[0..count]) |claim| {
+                const outcome = self.joinClaimed(claim);
+                summary.joined += 1;
+                if (outcome == .trapped) summary.trapped += 1;
+            }
+            if (count != 0) continue;
+            if (joins_in_flight == 0 and spawns_in_flight == 0) return summary;
+            yieldForLifecycle();
         }
     }
 
-    /// Get the number of active threads.
-    pub fn activeCount(self: *ThreadManager) usize {
+    pub fn joinOne(self: *ThreadManager, tid: i32) JoinError!ThreadOutcome {
+        self.mutex.lock();
+        const claim = self.claimOneLocked(tid) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        return self.joinClaimed(claim);
+    }
+
+    /// Stop accepting new records, then take ownership of joining all existing
+    /// records. Running guest code is allowed to finish cooperatively.
+    pub fn shutdown(self: *ThreadManager) void {
+        _ = self.shutdownWithSummary();
+    }
+
+    pub fn shutdownWithSummary(self: *ThreadManager) JoinSummary {
+        self.mutex.lock();
+        self.shutting_down = true;
+        self.mutex.unlock();
+        self.waitForSpawnsToDrain();
+        return self.joinAllWithSummary();
+    }
+
+    pub fn isShuttingDown(self: *ThreadManager) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.threads.items.len;
+        return self.shutting_down;
+    }
+
+    pub fn activeCount(self: *ThreadManager) usize {
+        return self.stats().active;
+    }
+
+    pub fn retainedCount(self: *ThreadManager) usize {
+        return self.stats().retained;
+    }
+
+    pub fn completedCount(self: *ThreadManager) usize {
+        return self.stats().completed;
+    }
+
+    pub fn stats(self: *ThreadManager) ThreadStats {
+        var active: usize = 0;
+        var completed: usize = 0;
+        var retained: usize = 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |slot| {
+            switch (slot.state) {
+                .live, .joining => {
+                    retained += 1;
+                    const record = slot.record orelse continue;
+                    switch (executionState(record)) {
+                        .pending => active += 1,
+                        .completed, .trapped, .start_aborted => completed += 1,
+                    }
+                },
+                .free, .retired => {},
+            }
+        }
+        return .{
+            .active = active,
+            .completed = completed,
+            .retained = retained,
+            .spawning = self.spawning_count,
+            .joining = self.joining_count,
+            .slots = self.slots.items.len,
+            .shutting_down = self.shutting_down,
+        };
+    }
+
+    pub fn threadOutcome(self: *ThreadManager, tid: i32) JoinError!?ThreadOutcome {
+        const parsed = parseTid(tid) orelse return error.InvalidThreadId;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (parsed.slot_index >= self.slots.items.len) return error.UnknownThread;
+        const slot = &self.slots.items[parsed.slot_index];
+        if (slot.generation != parsed.generation) return error.StaleThreadId;
+        switch (slot.state) {
+            .joining => return error.ThreadAlreadyJoining,
+            .free, .retired => return error.ThreadAlreadyJoined,
+            .live => {
+                return switch (executionState(slot.record.?)) {
+                    .pending => null,
+                    .completed => .completed,
+                    .trapped => .trapped,
+                    .start_aborted => unreachable,
+                };
+            },
+        }
     }
 
     /// Spawn a new thread with a cloned module instance.
     /// The new thread calls the exported `wasi_thread_start(tid, start_arg)` function.
-    /// Returns the TID on success, or a negative errno on failure.
-    pub fn spawnThread(self: *ThreadManager, parent_inst: *types.ModuleInstance, start_arg: i32) !i32 {
-        const tid = self.allocateTid();
+    pub fn spawnThread(self: *ThreadManager, parent_inst: *types.ModuleInstance, start_arg: i32) SpawnError!i32 {
+        if (comptime !config.thread_mgr or builtin.single_threaded)
+            return error.ThreadFeatureDisabled;
+        if (!self.beginSpawn()) return error.ThreadGroupShuttingDown;
+        defer self.endSpawn();
 
-        // Clone the parent instance (shared memory, independent globals)
+        const func_idx = parent_inst.getExportFunc("wasi_thread_start") orelse
+            return error.MissingThreadStart;
         const child_inst = parent_inst.cloneForThread(self.allocator) catch return error.OutOfMemory;
+        var child_owned_directly = true;
+        defer if (child_owned_directly) child_inst.destroyThreadClone();
 
-        // Set up per-thread auxiliary stack if available
-        var aux_stack_top: ?u32 = null;
-        if (self.aux_stack_pool.allocate()) |stack_top| {
-            aux_stack_top = stack_top;
-            // Find and set __stack_pointer global in the cloned instance
+        const aux_stack_top = self.aux_stack_pool.allocate();
+        if (aux_stack_top == null and self.aux_stack_pool.totalCount() != 0)
+            return error.AuxStackExhausted;
+        var stack_owned_directly = aux_stack_top != null;
+        defer if (stack_owned_directly) self.aux_stack_pool.release(aux_stack_top.?);
+        if (aux_stack_top) |stack_top| {
             if (child_inst.module.findExport("__stack_pointer", .global)) |exp| {
                 if (exp.index < child_inst.globals.len) {
                     child_inst.globals[exp.index].value = .{ .i32 = @bitCast(stack_top) };
@@ -195,62 +457,41 @@ pub const ThreadManager = struct {
             }
         }
 
-        // Spawn the native thread
-        const thread = std.Thread.spawn(.{}, threadEntry, .{ self, child_inst, tid, start_arg, aux_stack_top }) catch {
-            // Return aux stack on failure
-            if (aux_stack_top) |st| self.aux_stack_pool.release(st);
-            destroyClonedInstance(child_inst);
-            return error.ThreadSpawnFailed;
-        };
+        const env = ExecEnv.create(child_inst, 4096, self.allocator) catch
+            return error.OutOfMemory;
+        var env_owned_directly = true;
+        defer if (env_owned_directly) env.destroy();
 
-        try self.registerThread(.{
-            .tid = tid,
-            .thread = thread,
-            .instance = child_inst,
-        });
-
-        return tid;
-    }
-
-    fn threadEntry(self: *ThreadManager, inst: *types.ModuleInstance, tid: i32, start_arg: i32, aux_stack_top: ?u32) void {
-        defer {
-            // Return aux stack to pool
-            if (aux_stack_top) |st| self.aux_stack_pool.release(st);
-            self.unregisterThread(tid);
-            destroyClonedInstance(inst);
+        if (self.test_hooks) |hooks| {
+            if (hooks.fail_child_initialization)
+                return error.ChildInitializationFailed;
         }
 
-        // Find the exported wasi_thread_start function
-        const func_idx = inst.getExportFunc("wasi_thread_start") orelse return;
-
-        // Create execution environment for this thread
-        const env = self.createChildExecEnv(inst, tid, start_arg, aux_stack_top) catch return;
-        defer env.destroy();
-
-        // Push arguments: tid and start_arg
-        env.pushI32(env.thread_context.tid) catch return;
-        env.pushI32(@bitCast(env.thread_context.start_arg)) catch return;
-
-        // Execute
-        const interp = @import("../runtime/interpreter/interp.zig");
-        interp.executeFunction(env, func_idx) catch {
-            // Thread trapped — signal all other threads
-            self.signalTrap();
+        const record = self.allocator.create(ThreadRecord) catch return error.OutOfMemory;
+        record.* = .{
+            .manager = self,
+            .instance = child_inst,
+            .env = env,
+            .func_idx = func_idx,
+            .aux_stack_top = aux_stack_top,
         };
-    }
+        child_owned_directly = false;
+        stack_owned_directly = false;
+        env_owned_directly = false;
+        var record_owned_locally = true;
+        defer if (record_owned_locally) self.destroyRecord(record);
 
-    /// Construct the execution-local state for a prepared child instance.
-    /// The instance already owns a retained process reference from
-    /// `cloneForThread`; `ExecEnv.create` acquires its own lease.
-    pub fn createChildExecEnv(
-        self: *ThreadManager,
-        inst: *types.ModuleInstance,
-        tid: i32,
-        start_arg: i32,
-        aux_stack_top: ?u32,
-    ) !*@import("../runtime/common/exec_env.zig").ExecEnv {
-        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
-        const env = try ExecEnv.create(inst, 4096, self.allocator);
+        self.mutex.lock();
+        if (self.shutting_down) {
+            self.mutex.unlock();
+            return error.ThreadGroupShuttingDown;
+        }
+
+        const tid = self.publishRecordLocked(record) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        record.tid = tid;
         env.setThreadManager(self);
         env.configureWasiThread(
             tid,
@@ -260,27 +501,256 @@ pub const ThreadManager = struct {
             else
                 null,
         );
-        return env;
+        env.pushI32(env.thread_context.tid) catch {
+            self.rollbackPublishedLocked(tid);
+            self.mutex.unlock();
+            return error.ChildInitializationFailed;
+        };
+        env.pushI32(@bitCast(env.thread_context.start_arg)) catch {
+            self.rollbackPublishedLocked(tid);
+            self.mutex.unlock();
+            return error.ChildInitializationFailed;
+        };
+
+        const fail_native_spawn = if (self.test_hooks) |hooks|
+            hooks.fail_native_spawn
+        else
+            false;
+        const maybe_thread: ?std.Thread = if (fail_native_spawn)
+            null
+        else
+            std.Thread.spawn(.{}, threadEntry, .{record}) catch null;
+        const thread = maybe_thread orelse {
+            self.rollbackPublishedLocked(tid);
+            self.mutex.unlock();
+            return error.ThreadSpawnFailed;
+        };
+        record.thread = thread;
+
+        const fail_start_gate = if (self.test_hooks) |hooks|
+            hooks.fail_start_gate
+        else
+            false;
+        if (fail_start_gate) {
+            self.rollbackPublishedLocked(tid);
+            record.start_gate.abort();
+            record.thread = null;
+            self.mutex.unlock();
+            thread.join();
+            self.noteNativeJoin();
+            return error.StartGateFailed;
+        }
+
+        record.start_gate.open();
+        self.mutex.unlock();
+        record_owned_locally = false;
+        return tid;
     }
 
-    fn destroyClonedInstance(inst: *types.ModuleInstance) void {
-        inst.destroyThreadClone();
+    fn publishRecordLocked(self: *ThreadManager, record: *ThreadRecord) error{
+        OutOfMemory,
+        ThreadIdExhausted,
+    }!i32 {
+        for (self.slots.items, 0..) |*slot, slot_index| {
+            if (slot.state != .free) continue;
+            if (slot.generation == max_tid_generation) {
+                slot.state = .retired;
+                continue;
+            }
+            slot.generation += 1;
+            slot.state = .live;
+            slot.record = record;
+            return makeTid(slot_index, slot.generation);
+        }
+
+        if (self.slots.items.len == max_thread_slots)
+            return error.ThreadIdExhausted;
+        const slot_index = self.slots.items.len;
+        try self.slots.append(self.allocator, .{
+            .generation = 0,
+            .state = .live,
+            .record = record,
+        });
+        return makeTid(slot_index, 0);
+    }
+
+    fn beginSpawn(self: *ThreadManager) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.shutting_down) return false;
+        self.spawning_count += 1;
+        return true;
+    }
+
+    fn endSpawn(self: *ThreadManager) void {
+        self.mutex.lock();
+        std.debug.assert(self.spawning_count > 0);
+        self.spawning_count -= 1;
+        self.mutex.unlock();
+    }
+
+    fn waitForSpawnsToDrain(self: *ThreadManager) void {
+        while (true) {
+            self.mutex.lock();
+            const spawning = self.spawning_count;
+            self.mutex.unlock();
+            if (spawning == 0) return;
+            yieldForLifecycle();
+        }
+    }
+
+    fn rollbackPublishedLocked(self: *ThreadManager, tid: i32) void {
+        const parsed = parseTid(tid).?;
+        const slot = &self.slots.items[parsed.slot_index];
+        std.debug.assert(slot.generation == parsed.generation);
+        std.debug.assert(slot.state == .live);
+        slot.record = null;
+        slot.state = .free;
+    }
+
+    fn claimOneLocked(self: *ThreadManager, tid: i32) JoinError!JoinClaim {
+        const parsed = parseTid(tid) orelse return error.InvalidThreadId;
+        if (parsed.slot_index >= self.slots.items.len) return error.UnknownThread;
+        const slot = &self.slots.items[parsed.slot_index];
+        if (slot.generation != parsed.generation) return error.StaleThreadId;
+        switch (slot.state) {
+            .joining => return error.ThreadAlreadyJoining,
+            .free, .retired => return error.ThreadAlreadyJoined,
+            .live => {
+                if (self.shutting_down) return error.ThreadGroupShuttingDown;
+                slot.state = .joining;
+                self.joining_count += 1;
+                return .{
+                    .slot_index = parsed.slot_index,
+                    .generation = parsed.generation,
+                    .record = slot.record.?,
+                };
+            },
+        }
+    }
+
+    fn joinClaimed(self: *ThreadManager, claim: JoinClaim) ThreadOutcome {
+        const record = claim.record;
+        const thread = record.thread orelse unreachable;
+        record.thread = null;
+        thread.join();
+        self.noteNativeJoin();
+
+        const outcome: ThreadOutcome = switch (executionState(record)) {
+            .completed => .completed,
+            .trapped => .trapped,
+            .pending, .start_aborted => unreachable,
+        };
+
+        self.mutex.lock();
+        var slot = &self.slots.items[claim.slot_index];
+        std.debug.assert(slot.generation == claim.generation);
+        std.debug.assert(slot.state == .joining);
+        std.debug.assert(slot.record == record);
+        slot.record = null;
+        self.mutex.unlock();
+
+        self.destroyRecord(record);
+
+        self.mutex.lock();
+        slot = &self.slots.items[claim.slot_index];
+        std.debug.assert(slot.generation == claim.generation);
+        std.debug.assert(slot.state == .joining);
+        std.debug.assert(slot.record == null);
+        slot.state = .free;
+        std.debug.assert(self.joining_count > 0);
+        self.joining_count -= 1;
+        self.mutex.unlock();
+        return outcome;
+    }
+
+    fn destroyRecord(self: *ThreadManager, record: *ThreadRecord) void {
+        record.env.destroy();
+        if (record.aux_stack_top) |stack_top| self.aux_stack_pool.release(stack_top);
+        record.instance.destroyThreadClone();
+        self.noteCounter(if (self.test_hooks) |hooks| hooks.records_destroyed else null);
+        self.allocator.destroy(record);
+    }
+
+    fn noteNativeJoin(self: *ThreadManager) void {
+        self.noteCounter(if (self.test_hooks) |hooks| hooks.native_threads_joined else null);
+    }
+
+    fn noteThreadStarted(self: *ThreadManager) void {
+        self.noteCounter(if (self.test_hooks) |hooks| hooks.native_threads_started else null);
+    }
+
+    fn noteCounter(_: *ThreadManager, counter: ?*std.atomic.Value(usize)) void {
+        if (counter) |value| _ = value.fetchAdd(1, .monotonic);
     }
 };
 
+fn makeTid(slot_index: usize, generation: u16) i32 {
+    std.debug.assert(slot_index < max_thread_slots);
+    std.debug.assert(generation <= max_tid_generation);
+    const raw = (@as(u32, generation) << tid_slot_bits) |
+        (@as(u32, @intCast(slot_index)) + 1);
+    std.debug.assert(raw < (1 << 29));
+    return @intCast(raw);
+}
+
+fn parseTid(tid: i32) ?ParsedTid {
+    if (tid <= 0) return null;
+    const raw: u32 = @intCast(tid);
+    if (raw >= (1 << 29)) return null;
+    const encoded_slot = raw & tid_slot_mask;
+    if (encoded_slot == 0) return null;
+    return .{
+        .slot_index = @intCast(encoded_slot - 1),
+        .generation = @intCast(raw >> tid_slot_bits),
+    };
+}
+
+fn executionState(record: *const ThreadRecord) ExecutionState {
+    return @enumFromInt(record.execution.load(.acquire));
+}
+
+fn yieldForLifecycle() void {
+    std.Thread.yield() catch std.atomic.spinLoopHint();
+}
+
+fn threadEntry(record: *ThreadRecord) void {
+    const manager = record.manager;
+    manager.noteThreadStarted();
+    if (!record.start_gate.wait()) {
+        record.execution.store(@intFromEnum(ExecutionState.start_aborted), .release);
+        return;
+    }
+
+    // The gate opens while publication still holds the manager lock. Taking
+    // that lock once guarantees guest code cannot begin until publication ends.
+    manager.mutex.lock();
+    manager.mutex.unlock();
+
+    const interp = @import("../runtime/interpreter/interp.zig");
+    interp.executeFunction(record.env, record.func_idx) catch {
+        manager.signalTrap();
+        record.execution.store(@intFromEnum(ExecutionState.trapped), .release);
+        return;
+    };
+    record.execution.store(@intFromEnum(ExecutionState.completed), .release);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
-test "ThreadManager: allocate TIDs" {
-    var tm = ThreadManager.init(std.testing.allocator);
-    defer tm.deinit();
+test "ThreadManager: TIDs encode slot generations within the spec range" {
+    const first = makeTid(0, 0);
+    const reused = makeTid(0, 1);
+    const last = makeTid(max_thread_slots - 1, max_tid_generation);
 
-    const tid1 = tm.allocateTid();
-    const tid2 = tm.allocateTid();
-    const tid3 = tm.allocateTid();
-
-    try std.testing.expect(tid1 >= 1);
-    try std.testing.expect(tid2 > tid1);
-    try std.testing.expect(tid3 > tid2);
+    try std.testing.expectEqual(@as(i32, 1), first);
+    try std.testing.expect(reused != first);
+    try std.testing.expect(last > 0);
+    try std.testing.expect(last < (1 << 29));
+    try std.testing.expectEqual(@as(usize, 0), parseTid(reused).?.slot_index);
+    try std.testing.expectEqual(@as(u16, 1), parseTid(reused).?.generation);
+    try std.testing.expect(parseTid(0) == null);
+    try std.testing.expect(parseTid(-1) == null);
 }
 
 test "ThreadManager: trap flag" {
@@ -333,64 +803,6 @@ test "ModuleInstance: cloneForThread shares memory" {
     allocator.destroy(parent);
 }
 
-test "thread context: child ExecEnv retains inherited process state and ABI metadata" {
-    const Tracker = struct {
-        refs: usize = 1,
-
-        fn retain(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.refs += 1;
-        }
-
-        fn release(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.refs -= 1;
-        }
-    };
-    const ops = execution_context.ProcessStateOps{
-        .retain = Tracker.retain,
-        .release = Tracker.release,
-    };
-    const allocator = std.testing.allocator;
-    var tracker = Tracker{};
-    const root_ref = execution_context.ProcessStateRef.init(@ptrCast(&tracker), &ops);
-    var module = types.WasmModule{};
-    const parent = try allocator.create(types.ModuleInstance);
-    parent.* = .{
-        .module = &module,
-        .memories = &.{},
-        .tables = &.{},
-        .globals = &.{},
-        .allocator = allocator,
-    };
-    parent.attachProcessState(root_ref);
-
-    var tm = ThreadManager.init(allocator);
-    defer tm.deinit();
-    parent.thread_manager = &tm;
-    tm.aux_stack_pool.stack_size = 4096;
-
-    const child = try parent.cloneForThread(allocator);
-    const env = try tm.createChildExecEnv(child, 7, @bitCast(@as(u32, 0xF1234567)), 0x8000);
-    try std.testing.expectEqual(@as(usize, 4), tracker.refs);
-    try std.testing.expectEqual(
-        @as(*Tracker, @ptrCast(@alignCast(env.thread_context.process_state.?.ptr))),
-        &tracker,
-    );
-    try std.testing.expectEqual(@as(i32, 7), env.thread_context.tid);
-    try std.testing.expectEqual(@as(u32, 0xF1234567), env.thread_context.start_arg);
-    try std.testing.expectEqual(@as(u32, 0x7000), env.thread_context.auxiliary_stack.?.bottom);
-    try std.testing.expectEqual(@as(u32, 0x8000), env.thread_context.auxiliary_stack.?.top);
-    try std.testing.expect(env.thread_context.tls_base == null);
-
-    env.destroy();
-    child.destroyThreadClone();
-    parent.detachProcessState();
-    allocator.destroy(parent);
-    root_ref.release();
-    try std.testing.expectEqual(@as(usize, 0), tracker.refs);
-}
-
 test "AuxStackPool: allocate and release" {
     const allocator = std.testing.allocator;
 
@@ -416,6 +828,11 @@ test "AuxStackPool: allocate and release" {
     const s5 = pool.allocate();
     try std.testing.expect(s5 != null);
     try std.testing.expectEqual(s1.?, s5.?);
+    pool.release(s2.?);
+    pool.release(s3.?);
+    pool.release(s4.?);
+    pool.release(s5.?);
+    try std.testing.expectEqual(@as(usize, 4), pool.availableCount());
 }
 
 test "AuxStackPool: stack addresses are correct" {
@@ -435,6 +852,9 @@ test "AuxStackPool: stack addresses are correct" {
     try std.testing.expect(s1 == 4096 + 3 * 1024);
     try std.testing.expect(s2 == 4096 + 2 * 1024);
     try std.testing.expect(s3 == 4096 + 1 * 1024);
+    pool.release(s1);
+    pool.release(s2);
+    pool.release(s3);
 }
 
 // ── Integration tests ───────────────────────────────────────────────────────
@@ -442,8 +862,6 @@ test "AuxStackPool: stack addresses are correct" {
 // Each builds a WasmModule with an exported wasi_thread_start function,
 // creates a ModuleInstance with shared memory, and spawns real threads.
 // Gated on multi-threaded targets (can't spawn threads on wasm32-wasi).
-
-const builtin = @import("builtin");
 
 const ThreadTestCtx = struct {
     module: *types.WasmModule,
@@ -455,6 +873,14 @@ const ThreadTestCtx = struct {
 /// `code` is the function body bytecode (excluding the end opcode).
 fn buildThreadTestModule(
     func_code: []const u8,
+    allocator: std.mem.Allocator,
+) !ThreadTestCtx {
+    return buildThreadTestModuleWithExport(func_code, "wasi_thread_start", allocator);
+}
+
+fn buildThreadTestModuleWithExport(
+    func_code: []const u8,
+    export_name: []const u8,
     allocator: std.mem.Allocator,
 ) !ThreadTestCtx {
     const module = try allocator.create(types.WasmModule);
@@ -479,7 +905,7 @@ fn buildThreadTestModule(
     };
     const exports = try allocator.alloc(types.ExportDesc, 1);
     exports[0] = .{
-        .name = "wasi_thread_start",
+        .name = export_name,
         .kind = .function,
         .index = 0,
     };
@@ -529,155 +955,520 @@ fn cleanupThreadTest(
     allocator.destroy(ctx.module);
 }
 
-test "integration: spawn threads incrementing atomic counter" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
+const nop_thread_code = [_]u8{0x01};
+const increment_thread_code = [_]u8{
+    0x41, 0x00,
+    0x41, 0x01,
+    0xFE, 0x1E,
+    0x02, 0x00,
+    0x1A,
+};
+const add_start_arg_thread_code = [_]u8{
+    0x41, 0x00,
+    0x20, 0x01,
+    0xFE, 0x1E,
+    0x02, 0x00,
+    0x1A,
+};
 
-    // wasi_thread_start body: i32.const 0; i32.const 1; i32.atomic.rmw.add 2 0; drop
-    const code = [_]u8{
-        0x41, 0x00, // i32.const 0 (address)
-        0x41, 0x01, // i32.const 1 (value to add)
-        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
-        0x1A, // drop
-    };
-    const ctx = try buildThreadTestModule(&code, allocator);
-    defer cleanupThreadTest(ctx, allocator);
-
-    var tm = ThreadManager.init(allocator);
-    defer tm.deinit();
-    ctx.inst.thread_manager = &tm;
-
-    // Spawn 2 threads
-    const tid1 = try tm.spawnThread(ctx.inst, 0);
-    const tid2 = try tm.spawnThread(ctx.inst, 0);
-    try std.testing.expect(tid1 > 0);
-    try std.testing.expect(tid2 > 0);
-    try std.testing.expect(tid1 != tid2);
-
-    // Wait for completion
-    tm.joinAll();
-
-    // Read shared memory — should have been incremented twice
-    const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
-    try std.testing.expectEqual(@as(u32, 2), counter);
+fn requireThreadLifecycle() !void {
+    if (builtin.single_threaded or !config.thread_mgr) return error.SkipZigTest;
 }
 
-test "integration: trap in child signals trap flag" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-
-    // wasi_thread_start body: unreachable
-    const code = [_]u8{0x00}; // unreachable
-    const ctx = try buildThreadTestModule(&code, allocator);
-    defer cleanupThreadTest(ctx, allocator);
-
-    var tm = ThreadManager.init(allocator);
-    defer tm.deinit();
-    ctx.inst.thread_manager = &tm;
-
-    try std.testing.expect(!tm.hasTrap());
-
-    const tid = try tm.spawnThread(ctx.inst, 0);
-    try std.testing.expect(tid > 0);
-
-    // Wait for the thread to finish (it will trap)
-    tm.joinAll();
-
-    // Trap flag should be set
-    try std.testing.expect(tm.hasTrap());
-}
-
-test "integration: stress spawn 4 threads" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-
-    // wasi_thread_start body: i32.const 0; i32.const 1; i32.atomic.rmw.add 2 0; drop
-    const code = [_]u8{
-        0x41, 0x00, // i32.const 0
-        0x41, 0x01, // i32.const 1
-        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
-        0x1A, // drop
-    };
-    const ctx = try buildThreadTestModule(&code, allocator);
-    defer cleanupThreadTest(ctx, allocator);
-
-    var tm = ThreadManager.init(allocator);
-    defer tm.deinit();
-    ctx.inst.thread_manager = &tm;
-
-    // Spawn 4 threads
-    var tids: [4]i32 = undefined;
-    for (&tids) |*tid| {
-        tid.* = try tm.spawnThread(ctx.inst, 0);
-        try std.testing.expect(tid.* > 0);
+fn waitForCompleted(manager: *ThreadManager, expected: usize) !void {
+    var attempts: usize = 0;
+    while (attempts < 1_000_000) : (attempts += 1) {
+        const current = manager.stats();
+        if (current.active == 0 and current.completed == expected) return;
+        yieldForLifecycle();
     }
+    return error.ThreadCompletionTimeout;
+}
 
-    // All TIDs should be unique
-    for (tids, 0..) |a, i| {
-        for (tids[i + 1 ..]) |b| {
-            try std.testing.expect(a != b);
+fn atomicCount(value: *const std.atomic.Value(usize)) usize {
+    return value.load(.acquire);
+}
+
+test "thread lifecycle: disabled manager rejects spawn without publishing a record" {
+    if (config.thread_mgr) return error.SkipZigTest;
+    var manager = ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const unused_parent: *types.ModuleInstance = undefined;
+    try std.testing.expectError(
+        error.ThreadFeatureDisabled,
+        manager.spawnThread(unused_parent, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+test "thread lifecycle: immediate exits retain more than 256 handles until batched joinAll" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const child_count = 300;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var started = std.atomic.Value(usize).init(0);
+    var joined = std.atomic.Value(usize).init(0);
+    var destroyed = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{
+        .native_threads_started = &started,
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+    };
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+
+    for (0..child_count) |_| _ = try manager.spawnThread(ctx.inst, 0);
+    try waitForCompleted(&manager, child_count);
+    const before_join = manager.stats();
+    try std.testing.expectEqual(@as(usize, 0), before_join.active);
+    try std.testing.expectEqual(@as(usize, child_count), before_join.completed);
+    try std.testing.expectEqual(@as(usize, child_count), before_join.retained);
+    try std.testing.expectEqual(@as(usize, 0), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, 0), atomicCount(&destroyed));
+
+    const summary = manager.joinAllWithSummary();
+    try std.testing.expectEqual(@as(usize, child_count), summary.joined);
+    try std.testing.expectEqual(@as(usize, 0), summary.trapped);
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&started));
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&destroyed));
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+test "thread lifecycle: joinOne is exact and reused slots reject stale generations" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+
+    try std.testing.expectError(error.InvalidThreadId, manager.joinOne(-1));
+    try std.testing.expectError(error.UnknownThread, manager.joinOne(makeTid(5, 0)));
+
+    const first_tid = try manager.spawnThread(ctx.inst, 0);
+    try waitForCompleted(&manager, 1);
+    try std.testing.expectEqual(
+        @as(?ThreadOutcome, .completed),
+        try manager.threadOutcome(first_tid),
+    );
+    try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(first_tid));
+    try std.testing.expectError(error.ThreadAlreadyJoined, manager.joinOne(first_tid));
+
+    const second_tid = try manager.spawnThread(ctx.inst, 0);
+    try std.testing.expect(second_tid != first_tid);
+    try std.testing.expectError(error.StaleThreadId, manager.joinOne(first_tid));
+    try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(second_tid));
+}
+
+test "thread lifecycle: child traps report an outcome and missing exports fail synchronously" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const trap_code = [_]u8{0x00};
+    const trap_ctx = try buildThreadTestModule(&trap_code, allocator);
+    defer cleanupThreadTest(trap_ctx, allocator);
+    const missing_ctx = try buildThreadTestModuleWithExport(
+        &nop_thread_code,
+        "not_wasi_thread_start",
+        allocator,
+    );
+    defer cleanupThreadTest(missing_ctx, allocator);
+
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    trap_ctx.inst.thread_manager = &manager;
+    missing_ctx.inst.thread_manager = &manager;
+
+    const trap_tid = try manager.spawnThread(trap_ctx.inst, 0);
+    try std.testing.expectEqual(ThreadOutcome.trapped, try manager.joinOne(trap_tid));
+    try std.testing.expect(manager.hasTrap());
+    try std.testing.expectError(
+        error.MissingThreadStart,
+        manager.spawnThread(missing_ctx.inst, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+test "thread lifecycle: child initialization failure returns stack and clone ownership" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    const hooks = TestHooks{ .fail_child_initialization = true };
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    try manager.aux_stack_pool.init(1, 32768, allocator);
+
+    try std.testing.expectError(
+        error.ChildInitializationFailed,
+        manager.spawnThread(ctx.inst, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 1), manager.aux_stack_pool.availableCount());
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+    try std.testing.expectEqual(@as(usize, 1), ctx.mem_inst.referenceCount());
+}
+
+test "thread lifecycle: auxiliary stack exhaustion is reversible" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    try manager.aux_stack_pool.init(1, 32768, allocator);
+
+    const tid = try manager.spawnThread(ctx.inst, 0);
+    try std.testing.expectError(
+        error.AuxStackExhausted,
+        manager.spawnThread(ctx.inst, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 1), manager.retainedCount());
+    try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(tid));
+    try std.testing.expectEqual(@as(usize, 1), manager.aux_stack_pool.availableCount());
+    try std.testing.expectEqual(@as(usize, 1), ctx.mem_inst.referenceCount());
+}
+
+test "thread lifecycle: injected native spawn failure rolls back the published record" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var started = std.atomic.Value(usize).init(0);
+    var joined = std.atomic.Value(usize).init(0);
+    var destroyed = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{
+        .fail_native_spawn = true,
+        .native_threads_started = &started,
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+    };
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    try manager.aux_stack_pool.init(1, 32768, allocator);
+
+    try std.testing.expectError(
+        error.ThreadSpawnFailed,
+        manager.spawnThread(ctx.inst, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+    try std.testing.expectEqual(@as(usize, 1), manager.aux_stack_pool.availableCount());
+    try std.testing.expectEqual(@as(usize, 0), atomicCount(&started));
+    try std.testing.expectEqual(@as(usize, 0), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, 1), atomicCount(&destroyed));
+    try std.testing.expectEqual(@as(usize, 1), ctx.mem_inst.referenceCount());
+}
+
+test "thread lifecycle: injected start gate failure aborts and joins before cleanup" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var started = std.atomic.Value(usize).init(0);
+    var joined = std.atomic.Value(usize).init(0);
+    var destroyed = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{
+        .fail_start_gate = true,
+        .native_threads_started = &started,
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+    };
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    try manager.aux_stack_pool.init(1, 32768, allocator);
+
+    try std.testing.expectError(
+        error.StartGateFailed,
+        manager.spawnThread(ctx.inst, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+    try std.testing.expectEqual(@as(usize, 1), manager.aux_stack_pool.availableCount());
+    try std.testing.expectEqual(@as(usize, 1), atomicCount(&started));
+    try std.testing.expectEqual(@as(usize, 1), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, 1), atomicCount(&destroyed));
+    try std.testing.expectEqual(@as(usize, 1), ctx.mem_inst.referenceCount());
+}
+
+fn exerciseSpawnAllocationRollback(
+    allocator: std.mem.Allocator,
+    parent: *types.ModuleInstance,
+) !void {
+    const hooks = TestHooks{ .fail_native_spawn = true };
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    parent.thread_manager = &manager;
+    defer parent.thread_manager = null;
+    try manager.aux_stack_pool.init(1, 32768, allocator);
+
+    if (manager.spawnThread(parent, 0)) |_| {
+        return error.ExpectedNativeSpawnFailure;
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ThreadSpawnFailed => {},
+        else => return err,
+    }
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+    try std.testing.expectEqual(@as(usize, 1), manager.aux_stack_pool.availableCount());
+}
+
+test "thread lifecycle: every allocation failure rolls back clone stack env record and slot" {
+    try requireThreadLifecycle();
+    const ctx = try buildThreadTestModule(&nop_thread_code, std.testing.allocator);
+    defer cleanupThreadTest(ctx, std.testing.allocator);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseSpawnAllocationRollback,
+        .{ctx.inst},
+    );
+    try std.testing.expectEqual(@as(usize, 1), ctx.mem_inst.referenceCount());
+}
+
+const ConcurrentLifecycleCtx = struct {
+    manager: *ThreadManager,
+    parent: *types.ModuleInstance,
+    iterations: usize,
+    failed: *std.atomic.Value(bool),
+};
+
+fn concurrentSpawnAndJoin(ctx: *const ConcurrentLifecycleCtx) void {
+    for (0..ctx.iterations) |_| {
+        const tid = ctx.manager.spawnThread(ctx.parent, 0) catch {
+            ctx.failed.store(true, .release);
+            return;
+        };
+        const outcome = ctx.manager.joinOne(tid) catch {
+            ctx.failed.store(true, .release);
+            return;
+        };
+        if (outcome != .completed) {
+            ctx.failed.store(true, .release);
+            return;
         }
     }
-
-    tm.joinAll();
-
-    // Counter should equal 4
-    const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
-    try std.testing.expectEqual(@as(u32, 4), counter);
-    try std.testing.expect(!tm.hasTrap());
 }
 
-test "integration: threads receive start_arg" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+test "thread lifecycle: concurrent spawn and exact joins destroy every resource once" {
+    try requireThreadLifecycle();
     const allocator = std.testing.allocator;
-
-    // wasi_thread_start(tid, start_arg) body:
-    //   i32.const 0 (address); local.get 1 (start_arg); i32.atomic.rmw.add 2 0; drop
-    const code = [_]u8{
-        0x41, 0x00, // i32.const 0 (address)
-        0x20, 0x01, // local.get 1 (start_arg)
-        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
-        0x1A, // drop
-    };
-    const ctx = try buildThreadTestModule(&code, allocator);
+    const worker_count = 4;
+    const iterations = 32;
+    const expected = worker_count * iterations;
+    const ctx = try buildThreadTestModule(&increment_thread_code, allocator);
     defer cleanupThreadTest(ctx, allocator);
+    var started = std.atomic.Value(usize).init(0);
+    var joined = std.atomic.Value(usize).init(0);
+    var destroyed = std.atomic.Value(usize).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+    const hooks = TestHooks{
+        .native_threads_started = &started,
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+    };
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    const worker_ctx = ConcurrentLifecycleCtx{
+        .manager = &manager,
+        .parent = ctx.inst,
+        .iterations = iterations,
+        .failed = &failed,
+    };
 
-    var tm = ThreadManager.init(allocator);
-    defer tm.deinit();
-    ctx.inst.thread_manager = &tm;
+    var workers: [worker_count]std.Thread = undefined;
+    for (&workers) |*worker| {
+        worker.* = try std.Thread.spawn(.{}, concurrentSpawnAndJoin, .{&worker_ctx});
+    }
+    for (workers) |worker| worker.join();
 
-    // Spawn with start_arg=10 and start_arg=20
-    _ = try tm.spawnThread(ctx.inst, 10);
-    _ = try tm.spawnThread(ctx.inst, 20);
-    tm.joinAll();
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+    try std.testing.expectEqual(@as(usize, expected), atomicCount(&started));
+    try std.testing.expectEqual(@as(usize, expected), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, expected), atomicCount(&destroyed));
+    const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
+    try std.testing.expectEqual(@as(u32, expected), counter);
+}
 
-    // Counter should be 10 + 20 = 30
+test "thread lifecycle: start_arg contract remains intact" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&add_start_arg_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+
+    const first = try manager.spawnThread(ctx.inst, 10);
+    const second = try manager.spawnThread(ctx.inst, 20);
+    try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(first));
+    try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(second));
     const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
     try std.testing.expectEqual(@as(u32, 30), counter);
 }
 
-test "integration: aux stack pool allocates distinct stacks" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+test "thread lifecycle: child record retains process state after parent release" {
+    try requireThreadLifecycle();
+    const Tracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.refs > 0);
+            self.refs -= 1;
+        }
+    };
+    const ops = execution_context.ProcessStateOps{
+        .retain = Tracker.retain,
+        .release = Tracker.release,
+    };
     const allocator = std.testing.allocator;
-
-    // Simple nop body — we just verify stacks are allocated/freed
-    const code = [_]u8{0x01}; // nop
-    const ctx = try buildThreadTestModule(&code, allocator);
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
     defer cleanupThreadTest(ctx, allocator);
+    var tracker = Tracker{};
+    const root_ref = execution_context.ProcessStateRef.init(@ptrCast(&tracker), &ops);
+    ctx.inst.attachProcessState(root_ref);
 
-    var tm = ThreadManager.init(allocator);
-    defer tm.deinit();
-    ctx.inst.thread_manager = &tm;
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    try manager.aux_stack_pool.init(1, 32768, allocator);
 
-    // Pre-allocate aux stacks
-    try tm.aux_stack_pool.init(2, 32768, allocator);
+    const start_arg: u32 = 0xF1234567;
+    const tid = try manager.spawnThread(ctx.inst, @bitCast(start_arg));
+    try waitForCompleted(&manager, 1);
+    try std.testing.expectEqual(@as(usize, 4), tracker.refs);
 
-    // Spawn 2 threads — each should get a distinct stack
-    _ = try tm.spawnThread(ctx.inst, 0);
-    _ = try tm.spawnThread(ctx.inst, 0);
-    tm.joinAll();
+    const parsed = parseTid(tid).?;
+    const record = manager.slots.items[parsed.slot_index].record.?;
+    try std.testing.expectEqual(
+        @as(*Tracker, @ptrCast(@alignCast(record.env.thread_context.process_state.?.ptr))),
+        &tracker,
+    );
+    try std.testing.expectEqual(tid, record.env.thread_context.tid);
+    try std.testing.expectEqual(start_arg, record.env.thread_context.start_arg);
+    try std.testing.expectEqual(@as(u32, 32768), record.env.thread_context.auxiliary_stack.?.bottom);
+    try std.testing.expectEqual(@as(u32, 40960), record.env.thread_context.auxiliary_stack.?.top);
+    try std.testing.expect(record.env.thread_context.tls_base == null);
 
-    // Both stacks should be returned to the pool
-    try std.testing.expectEqual(@as(usize, 2), tm.aux_stack_pool.free_stacks.items.len);
-    try std.testing.expect(!tm.hasTrap());
+    ctx.inst.detachProcessState();
+    root_ref.release();
+    try std.testing.expectEqual(@as(usize, 2), tracker.refs);
+    try std.testing.expectEqual(ThreadOutcome.completed, try manager.joinOne(tid));
+    try std.testing.expectEqual(@as(usize, 0), tracker.refs);
+}
+
+test "thread lifecycle: parent teardown owns and joins all unclaimed records" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const child_count = 48;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var started = std.atomic.Value(usize).init(0);
+    var joined = std.atomic.Value(usize).init(0);
+    var destroyed = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{
+        .native_threads_started = &started,
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+    };
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    ctx.inst.thread_manager = &manager;
+
+    for (0..child_count) |_| _ = try manager.spawnThread(ctx.inst, 0);
+    manager.deinit();
+    manager_live = false;
+    ctx.inst.thread_manager = null;
+
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&started));
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&destroyed));
+    try std.testing.expectEqual(@as(usize, 1), ctx.mem_inst.referenceCount());
+}
+
+const ShutdownSpawnCtx = struct {
+    manager: *ThreadManager,
+    parent: *types.ModuleInstance,
+    succeeded: *std.atomic.Value(usize),
+    failed: *std.atomic.Value(bool),
+};
+
+fn spawnUntilShutdown(ctx: *const ShutdownSpawnCtx) void {
+    for (0..128) |_| {
+        _ = ctx.manager.spawnThread(ctx.parent, 0) catch |err| switch (err) {
+            error.ThreadGroupShuttingDown => return,
+            else => {
+                ctx.failed.store(true, .release);
+                return;
+            },
+        };
+        _ = ctx.succeeded.fetchAdd(1, .release);
+    }
+}
+
+test "thread lifecycle: shutdown drains concurrent spawn publication before teardown" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var succeeded = std.atomic.Value(usize).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+    const spawn_ctx = ShutdownSpawnCtx{
+        .manager = &manager,
+        .parent = ctx.inst,
+        .succeeded = &succeeded,
+        .failed = &failed,
+    };
+
+    const spawner = try std.Thread.spawn(.{}, spawnUntilShutdown, .{&spawn_ctx});
+    while (succeeded.load(.acquire) == 0 and !failed.load(.acquire))
+        yieldForLifecycle();
+    const summary = manager.shutdownWithSummary();
+    spawner.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(succeeded.load(.acquire), summary.joined);
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+test "thread lifecycle: shutdown closes group ownership without detaching children" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const child_count = 24;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    ctx.inst.thread_manager = &manager;
+
+    const first_tid = try manager.spawnThread(ctx.inst, 0);
+    for (1..child_count) |_| _ = try manager.spawnThread(ctx.inst, 0);
+    const summary = manager.shutdownWithSummary();
+    try std.testing.expectEqual(@as(usize, child_count), summary.joined);
+    try std.testing.expect(manager.isShuttingDown());
+    try std.testing.expectError(error.ThreadAlreadyJoined, manager.joinOne(first_tid));
+    try std.testing.expectError(
+        error.ThreadGroupShuttingDown,
+        manager.spawnThread(ctx.inst, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
 }

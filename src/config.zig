@@ -153,8 +153,8 @@ pub const lib_pthread = opt("lib_pthread", false);
 /// Enable pthread semaphore support.
 pub const lib_pthread_semaphore = opt("lib_pthread_semaphore", false);
 
-/// Enable the WASI threads configuration contract. Production spawning,
-/// atomics, synchronization, and AOT support remain separately reported.
+/// Enable the WASI threads configuration contract. The internal lifecycle is
+/// hardened; production host binding and AOT support remain separately reported.
 pub const lib_wasi_threads = opt("lib_wasi_threads", false);
 
 /// Allocate auxiliary stacks on the heap (follows lib_wasi_threads).
