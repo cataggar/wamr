@@ -11528,6 +11528,7 @@ test "nested AOT async-lift frames enter their own task-manager context" {
         CoreFuncIdxComponent.from(0),
         .{ .kind = 1, .handle = 2, .code = 3 },
         &frame_manager,
+        null,
         std.testing.allocator,
     );
     try std.testing.expectEqual(@as(u32, 1), status);
