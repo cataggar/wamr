@@ -184,8 +184,17 @@ pub const OutputStream = struct {
         /// The `*tls.Connection` is borrowed — owned by the caller
         /// (`serveOneHttpConnectionP3`); the stream does not close it.
         tls: *tls.Connection,
+        /// Host-owned synchronous sink. The callback owns all
+        /// synchronization and lifetime state; `OutputStream.deinit` does
+        /// not destroy the context.
+        callback: CallbackSink,
         /// Closed.
         closed,
+    };
+
+    pub const CallbackSink = struct {
+        context: ?*anyopaque,
+        write: *const fn (?*anyopaque, []const u8) StreamResult,
     };
 
     pub const HostFile = struct {
@@ -270,6 +279,10 @@ pub const OutputStream = struct {
                     .{ .err = .io_error };
                 return .{ .ok = data.len };
             },
+            .callback => |callback| return callback.write(
+                callback.context,
+                data,
+            ),
             .closed => return .{ .closed = {} },
         }
     }
@@ -310,6 +323,10 @@ pub const OutputStream = struct {
     /// The `*tls.Connection` is borrowed; the stream does not close it.
     pub fn toTlsConn(conn: *tls.Connection) OutputStream {
         return .{ .sink = .{ .tls = conn } };
+    }
+
+    pub fn toCallback(callback: CallbackSink) OutputStream {
+        return .{ .sink = .{ .callback = callback } };
     }
 
     /// Flush any host-side buffering. For host-file sinks with
@@ -606,7 +623,7 @@ pub const Pollable = struct {
                 else => false,
             },
             .output_stream => |s| switch (s.sink) {
-                .buffer => true, // buffer can always accept
+                .buffer, .callback => true,
                 .closed => true,
                 else => false,
             },

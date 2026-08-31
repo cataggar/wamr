@@ -46,6 +46,9 @@ const core_backend = @import("core_backend.zig");
 const debugAotEnabled = core_backend.debugAotEnabled;
 const adapter_resource = @import("../shared/adapter_resource.zig");
 const stable_resource = @import("../shared/stable_resource.zig");
+const execution_context = @import("../runtime/common/execution_context.zig");
+const platform = @import("../platform/platform.zig");
+const parking_lot = @import("../platform/parking_lot.zig");
 
 const tls = @import("tls");
 
@@ -4422,6 +4425,9 @@ pub const IncomingBody = struct {
 /// `wasi:http/types.outgoing-body`.
 pub const OutgoingBody = struct {
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    /// Set for server-side response bodies so a live inbound response
+    /// session can bind the body stream before response-outparam.set.
+    parent_response_handle: ?u32 = null,
     /// Set by `[method]outgoing-body.write` to ensure a second call
     /// returns err per WIT contract.
     stream_taken: bool = false,
@@ -4619,6 +4625,1254 @@ pub const HttpResponseP3 = struct {
 
     pub fn deinit(_: *HttpResponseP3, _: Allocator) void {}
 };
+
+const http_live_response_buffer_bytes: usize = 64 * 1024;
+const http_live_response_wait_ns: i64 = 10 * std.time.ns_per_ms;
+
+const HttpLiveTerminal = enum(u32) {
+    running,
+    succeeded,
+    client_disconnected,
+    io_error,
+    handler_error,
+    response_error,
+    shutdown,
+    fallback,
+};
+
+const HttpConnectionInterrupt = struct {
+    context: ?*anyopaque,
+    callback: *const fn (?*anyopaque) void,
+
+    fn run(self: HttpConnectionInterrupt) void {
+        self.callback(self.context);
+    }
+};
+
+const HttpWireWriter = struct {
+    context: ?*anyopaque,
+    write: *const fn (?*anyopaque, []const u8) streams.StreamResult,
+};
+
+const HttpTrailerSnapshot = struct {
+    complete: bool = false,
+    declaration: ?[]u8 = null,
+    block: ?[]u8 = null,
+    has_entries: bool = false,
+
+    fn deinit(self: *HttpTrailerSnapshot, allocator: Allocator) void {
+        if (self.declaration) |bytes| allocator.free(bytes);
+        if (self.block) |bytes| allocator.free(bytes);
+        self.* = .{};
+    }
+};
+
+/// Per-request bridge between a guest-produced P3 body stream and the client
+/// socket. Guest callbacks copy into a fixed-size ring; a dedicated writer
+/// drains the ring concurrently. The writer never touches component or
+/// adapter resource tables, so both conditional-resource specializations keep
+/// their ownership rules while response memory stays bounded.
+const InboundHttpResponseSession = struct {
+    allocator: Allocator,
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    output: *streams.OutputStream,
+    keep_alive: bool,
+    interrupt: ?HttpConnectionInterrupt,
+    wire_writer: ?HttpWireWriter,
+
+    queue: []u8,
+    queue_head: usize = 0,
+    queue_len: usize = 0,
+    max_buffered: usize = 0,
+    produced_bytes: usize = 0,
+    transmitted_bytes: usize = 0,
+
+    mutex: platform.Mutex = .init,
+    parking: parking_lot.ParkingLot = .init(),
+    data_epoch: std.atomic.Value(u32) = .init(0),
+    space_epoch: std.atomic.Value(u32) = .init(0),
+    terminal_epoch: std.atomic.Value(u32) = .init(0),
+    terminal: std.atomic.Value(u32) =
+        .init(@intFromEnum(HttpLiveTerminal.running)),
+    output_started: std.atomic.Value(bool) = .init(false),
+    tx_settled: std.atomic.Value(bool) = .init(false),
+    guest_cancel_propagated: std.atomic.Value(bool) = .init(false),
+
+    writer_thread: ?std.Thread = null,
+    p2_mode: bool = false,
+    response_handle: ?u32 = null,
+    p2_body_handle: ?u32 = null,
+    body_stream_handle: ?u32 = null,
+    trailers_future_handle: ?u32 = null,
+    transmission_future_handle: ?u32 = null,
+    head_bytes: ?[]u8 = null,
+    trailer_bytes: ?[]u8 = null,
+    head_ready: bool = false,
+    trailers_ready: bool = false,
+    body_closed: bool = false,
+    handler_finished: bool = false,
+    handler_validated: bool = false,
+    use_chunked: bool = false,
+    expected_content_length: ?usize = null,
+
+    fn create(
+        allocator: Allocator,
+        adapter: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        output: *streams.OutputStream,
+        keep_alive: bool,
+        interrupt: ?HttpConnectionInterrupt,
+        wire_writer: ?HttpWireWriter,
+    ) !*InboundHttpResponseSession {
+        const self = try allocator.create(InboundHttpResponseSession);
+        errdefer allocator.destroy(self);
+        const queue = try allocator.alloc(u8, http_live_response_buffer_bytes);
+        self.* = .{
+            .allocator = allocator,
+            .adapter = adapter,
+            .ci = ci,
+            .output = output,
+            .keep_alive = keep_alive,
+            .interrupt = interrupt,
+            .wire_writer = wire_writer,
+            .queue = queue,
+        };
+        return self;
+    }
+
+    fn start(self: *InboundHttpResponseSession) !void {
+        if (comptime builtin.single_threaded) return error.ThreadsUnavailable;
+        self.writer_thread = try std.Thread.spawn(
+            .{},
+            InboundHttpResponseSession.writerMain,
+            .{self},
+        );
+    }
+
+    fn destroy(self: *InboundHttpResponseSession) void {
+        if (self.writer_thread != null) {
+            _ = self.finishTerminal(.shutdown, true);
+            self.waitAndJoin();
+        }
+        self.detachBodyStream();
+        self.parking.deinit();
+        if (self.head_bytes) |bytes| self.allocator.free(bytes);
+        if (self.trailer_bytes) |bytes| self.allocator.free(bytes);
+        self.allocator.free(self.queue);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    fn currentTerminal(self: *const InboundHttpResponseSession) HttpLiveTerminal {
+        return @enumFromInt(self.terminal.load(.acquire));
+    }
+
+    fn hasOutputStarted(self: *const InboundHttpResponseSession) bool {
+        return self.output_started.load(.acquire);
+    }
+
+    fn bufferedHighWater(self: *InboundHttpResponseSession) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.max_buffered;
+    }
+
+    fn responseHeadCommitted(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.response_handle == response_handle and self.head_ready;
+    }
+
+    fn wakeAll(self: *InboundHttpResponseSession) void {
+        _ = self.data_epoch.fetchAdd(1, .acq_rel);
+        _ = self.space_epoch.fetchAdd(1, .acq_rel);
+        _ = self.terminal_epoch.fetchAdd(1, .acq_rel);
+        _ = self.parking.notify(&self.data_epoch.raw, std.math.maxInt(u32)) catch 0;
+        _ = self.parking.notify(&self.space_epoch.raw, std.math.maxInt(u32)) catch 0;
+        _ = self.parking.notify(&self.terminal_epoch.raw, std.math.maxInt(u32)) catch 0;
+    }
+
+    fn waitEpoch(
+        self: *InboundHttpResponseSession,
+        epoch: *std.atomic.Value(u32),
+        observed: u32,
+    ) void {
+        _ = self.parking.wait32(
+            &epoch.raw,
+            observed,
+            http_live_response_wait_ns,
+        ) catch {
+            platform.usleep(100);
+            return;
+        };
+    }
+
+    fn finishTerminal(
+        self: *InboundHttpResponseSession,
+        terminal: HttpLiveTerminal,
+        interrupt: bool,
+    ) bool {
+        if (terminal == .running) return false;
+        if (self.terminal.cmpxchgStrong(
+            @intFromEnum(HttpLiveTerminal.running),
+            @intFromEnum(terminal),
+            .acq_rel,
+            .acquire,
+        ) != null) return false;
+        self.wakeAll();
+        if (interrupt) {
+            if (self.interrupt) |connection| connection.run();
+        }
+        return true;
+    }
+
+    fn cancelForShutdown(self: *InboundHttpResponseSession) void {
+        _ = self.finishTerminal(.shutdown, true);
+    }
+
+    fn enqueueRaw(
+        self: *InboundHttpResponseSession,
+        bytes: []const u8,
+    ) bool {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            if (http_shutdown_requested.load(.acquire)) {
+                self.cancelForShutdown();
+                self.propagateTerminalToGuest();
+                return false;
+            }
+            if (self.currentTerminal() != .running) {
+                self.propagateTerminalToGuest();
+                return false;
+            }
+
+            self.mutex.lock();
+            const available = self.queue.len - self.queue_len;
+            if (available == 0) {
+                const observed = self.space_epoch.load(.acquire);
+                self.mutex.unlock();
+                self.waitEpoch(&self.space_epoch, observed);
+                continue;
+            }
+
+            const take = @min(available, bytes.len - offset);
+            const tail = (self.queue_head + self.queue_len) % self.queue.len;
+            const first = @min(take, self.queue.len - tail);
+            @memcpy(self.queue[tail .. tail + first], bytes[offset .. offset + first]);
+            if (first < take) {
+                @memcpy(
+                    self.queue[0 .. take - first],
+                    bytes[offset + first .. offset + take],
+                );
+            }
+            self.queue_len += take;
+            self.max_buffered = @max(self.max_buffered, self.queue_len);
+            self.mutex.unlock();
+
+            offset += take;
+            _ = self.data_epoch.fetchAdd(1, .acq_rel);
+            _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
+        }
+        return true;
+    }
+
+    fn enqueuePrebuffered(
+        self: *InboundHttpResponseSession,
+        bytes: []const u8,
+    ) bool {
+        if (bytes.len == 0) return true;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (bytes.len > self.queue.len - self.queue_len) return false;
+        const tail = (self.queue_head + self.queue_len) % self.queue.len;
+        const first = @min(bytes.len, self.queue.len - tail);
+        @memcpy(self.queue[tail .. tail + first], bytes[0..first]);
+        if (first < bytes.len) {
+            @memcpy(self.queue[0 .. bytes.len - first], bytes[first..]);
+        }
+        self.queue_len += bytes.len;
+        self.produced_bytes += bytes.len;
+        self.max_buffered = @max(self.max_buffered, self.queue_len);
+        _ = self.data_epoch.fetchAdd(1, .acq_rel);
+        _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
+        return true;
+    }
+
+    fn dequeue(
+        self: *InboundHttpResponseSession,
+        dst: []u8,
+    ) usize {
+        self.mutex.lock();
+        const take = @min(dst.len, self.queue_len);
+        if (take == 0) {
+            self.mutex.unlock();
+            return 0;
+        }
+        const first = @min(take, self.queue.len - self.queue_head);
+        @memcpy(dst[0..first], self.queue[self.queue_head .. self.queue_head + first]);
+        if (first < take) {
+            @memcpy(dst[first..take], self.queue[0 .. take - first]);
+        }
+        self.queue_head = (self.queue_head + take) % self.queue.len;
+        self.queue_len -= take;
+        self.mutex.unlock();
+        _ = self.space_epoch.fetchAdd(1, .acq_rel);
+        _ = self.parking.notify(&self.space_epoch.raw, 1) catch 0;
+        return take;
+    }
+
+    fn appendFmt(
+        self: *InboundHttpResponseSession,
+        list: *std.ArrayListUnmanaged(u8),
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        const rendered = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(rendered);
+        try list.appendSlice(self.allocator, rendered);
+    }
+
+    fn snapshotTrailers(
+        self: *InboundHttpResponseSession,
+        future_handle: u32,
+        force_complete: bool,
+    ) !HttpTrailerSnapshot {
+        var result: HttpTrailerSnapshot = .{};
+        var fields_handle: ?u32 = null;
+
+        var future_lease = self.ci.futures.acquire(future_handle) orelse {
+            result.complete = true;
+            return result;
+        };
+        const future = future_lease.value();
+        const complete = future.state != .pending or future.write_closed;
+        if (!complete and !force_complete) {
+            future_lease.release();
+            return result;
+        }
+        result.complete = true;
+        if (complete) {
+            if (future.payload) |payload| {
+                if (payload.len >= 8 and payload[0] == 1) {
+                    fields_handle = std.mem.readInt(
+                        u32,
+                        payload[4..8],
+                        .little,
+                    );
+                }
+            }
+        }
+        future_lease.release();
+
+        const handle = fields_handle orelse return result;
+        var fields_lease = self.adapter.lookupHttpFields(handle) orelse return result;
+        defer fields_lease.release();
+        const fields = fields_lease.value().*;
+
+        var declaration: std.ArrayListUnmanaged(u8) = .empty;
+        defer declaration.deinit(self.allocator);
+        var block: std.ArrayListUnmanaged(u8) = .empty;
+        defer block.deinit(self.allocator);
+        var first = true;
+        for (fields.entries.items) |entry| {
+            if (WasiCliAdapter.isHopByHopOrFramingHeader(entry.name)) continue;
+            if (!WasiCliAdapter.httpHeaderNameValid(entry.name) or
+                !WasiCliAdapter.httpHeaderValueValid(entry.value))
+            {
+                continue;
+            }
+            if (first) {
+                try declaration.appendSlice(self.allocator, "Trailer: ");
+            } else {
+                try declaration.appendSlice(self.allocator, ", ");
+            }
+            try declaration.appendSlice(self.allocator, entry.name);
+            try self.appendFmt(
+                &block,
+                "{s}: {s}\r\n",
+                .{ entry.name, entry.value },
+            );
+            first = false;
+        }
+        if (first) return result;
+        try declaration.appendSlice(self.allocator, "\r\n");
+        result.declaration = try declaration.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(result.declaration.?);
+        result.block = try block.toOwnedSlice(self.allocator);
+        result.has_entries = true;
+        return result;
+    }
+
+    fn prepareP3Head(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) !void {
+        self.mutex.lock();
+        const already_ready = self.head_ready;
+        self.mutex.unlock();
+        if (already_ready) return;
+
+        var response_lease = self.adapter.lookupHttpResponseP3(response_handle) orelse
+            return error.InvalidHandle;
+        const response = response_lease.value().*;
+        const status: u16 =
+            if (response.status >= 100 and response.status <= 999)
+                response.status
+            else
+                500;
+        const headers_handle = response.headers_handle;
+        const body_stream_handle = response.body_stream_handle;
+        const trailers_future_handle = response.trailers_future_handle;
+        const transmission_future_handle = response.transmission_future_handle;
+        response_lease.release();
+
+        var trailers = try self.snapshotTrailers(
+            trailers_future_handle,
+            false,
+        );
+        defer trailers.deinit(self.allocator);
+
+        var head: std.ArrayListUnmanaged(u8) = .empty;
+        defer head.deinit(self.allocator);
+        try self.appendFmt(
+            &head,
+            "HTTP/1.1 {d} {s}\r\n",
+            .{ status, WasiCliAdapter.httpResponseStatusReason(status) },
+        );
+
+        var content_length: ?usize = null;
+        var fields_lease = self.adapter.lookupHttpFields(headers_handle);
+        defer if (fields_lease) |*lease| lease.release();
+        if (fields_lease) |*lease| {
+            const fields = lease.value().*;
+            for (fields.entries.items) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
+                    const trimmed = std.mem.trim(u8, entry.value, " \t");
+                    const parsed = std.fmt.parseInt(usize, trimmed, 10) catch
+                        return error.InvalidContentLength;
+                    if (content_length) |known| {
+                        if (known != parsed) return error.InvalidContentLength;
+                    } else {
+                        content_length = parsed;
+                    }
+                    continue;
+                }
+                if (WasiCliAdapter.isHopByHopOrFramingHeader(entry.name)) continue;
+                if (!WasiCliAdapter.httpHeaderNameValid(entry.name) or
+                    !WasiCliAdapter.httpHeaderValueValid(entry.value))
+                {
+                    return error.InvalidHeader;
+                }
+                try self.appendFmt(
+                    &head,
+                    "{s}: {s}\r\n",
+                    .{ entry.name, entry.value },
+                );
+            }
+            fields.immutable = true;
+        }
+        if (trailers.declaration) |declaration| {
+            try head.appendSlice(self.allocator, declaration);
+        }
+
+        const has_body = body_stream_handle != null;
+        const use_chunked = trailers.has_entries or
+            (!trailers.complete and has_body) or
+            (has_body and content_length == null);
+        const expected_content_length: ?usize = if (use_chunked)
+            null
+        else if (has_body)
+            content_length orelse 0
+        else
+            0;
+
+        if (use_chunked) {
+            try head.appendSlice(self.allocator, "Transfer-Encoding: chunked\r\n");
+        } else {
+            try self.appendFmt(
+                &head,
+                "Content-Length: {d}\r\n",
+                .{expected_content_length.?},
+            );
+        }
+        try head.appendSlice(
+            self.allocator,
+            if (self.keep_alive)
+                "Connection: keep-alive\r\n\r\n"
+            else
+                "Connection: close\r\n\r\n",
+        );
+
+        const owned_head = try head.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned_head);
+        const owned_trailers = trailers.block;
+        trailers.block = null;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.head_ready) {
+            self.allocator.free(owned_head);
+            if (owned_trailers) |bytes| self.allocator.free(bytes);
+            return;
+        }
+        if (self.currentTerminal() != .running) {
+            self.allocator.free(owned_head);
+            if (owned_trailers) |bytes| self.allocator.free(bytes);
+            return error.ResponseCancelled;
+        }
+        self.response_handle = response_handle;
+        self.body_stream_handle = body_stream_handle;
+        self.trailers_future_handle = trailers_future_handle;
+        self.transmission_future_handle = transmission_future_handle;
+        self.head_bytes = owned_head;
+        self.head_ready = true;
+        self.use_chunked = use_chunked;
+        self.expected_content_length = expected_content_length;
+        if (trailers.complete) {
+            self.trailer_bytes = owned_trailers;
+            self.trailers_ready = true;
+        } else if (owned_trailers) |bytes| {
+            self.allocator.free(bytes);
+        }
+        _ = self.data_epoch.fetchAdd(1, .acq_rel);
+        _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
+    }
+
+    fn prepareP2Head(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) !void {
+        self.mutex.lock();
+        const already_ready = self.head_ready;
+        self.mutex.unlock();
+        if (already_ready) return;
+
+        var response_lease = self.adapter.lookupOutgoingResponse(
+            response_handle,
+        ) orelse return error.InvalidHandle;
+        const response = response_lease.value().*;
+        const status: u16 =
+            if (response.status >= 100 and response.status <= 999)
+                response.status
+            else
+                500;
+        const headers_handle = response.headers_handle;
+        const body_handle = response.body_handle;
+        response_lease.release();
+
+        var head: std.ArrayListUnmanaged(u8) = .empty;
+        defer head.deinit(self.allocator);
+        try self.appendFmt(
+            &head,
+            "HTTP/1.1 {d} {s}\r\n",
+            .{ status, WasiCliAdapter.httpResponseStatusReason(status) },
+        );
+
+        var content_length: ?usize = null;
+        var fields_lease = self.adapter.lookupHttpFields(headers_handle);
+        defer if (fields_lease) |*lease| lease.release();
+        if (fields_lease) |*lease| {
+            const fields = lease.value().*;
+            for (fields.entries.items) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
+                    const trimmed = std.mem.trim(u8, entry.value, " \t");
+                    const parsed = std.fmt.parseInt(
+                        usize,
+                        trimmed,
+                        10,
+                    ) catch return error.InvalidContentLength;
+                    if (content_length) |known| {
+                        if (known != parsed) return error.InvalidContentLength;
+                    } else {
+                        content_length = parsed;
+                    }
+                    continue;
+                }
+                if (WasiCliAdapter.isHopByHopOrFramingHeader(entry.name)) continue;
+                if (!WasiCliAdapter.httpHeaderNameValid(entry.name) or
+                    !WasiCliAdapter.httpHeaderValueValid(entry.value))
+                {
+                    return error.InvalidHeader;
+                }
+                try self.appendFmt(
+                    &head,
+                    "{s}: {s}\r\n",
+                    .{ entry.name, entry.value },
+                );
+            }
+            fields.immutable = true;
+        }
+
+        const has_body = body_handle != null;
+        const use_chunked = has_body and content_length == null;
+        const expected_content_length: ?usize = if (use_chunked)
+            null
+        else if (has_body)
+            content_length orelse 0
+        else
+            0;
+        if (use_chunked) {
+            try head.appendSlice(
+                self.allocator,
+                "Transfer-Encoding: chunked\r\n",
+            );
+        } else {
+            try self.appendFmt(
+                &head,
+                "Content-Length: {d}\r\n",
+                .{expected_content_length.?},
+            );
+        }
+        try head.appendSlice(
+            self.allocator,
+            "Connection: close\r\n\r\n",
+        );
+
+        const owned_head = try head.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned_head);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.head_ready) {
+            self.allocator.free(owned_head);
+            return;
+        }
+        if (self.currentTerminal() != .running) {
+            self.allocator.free(owned_head);
+            return error.ResponseCancelled;
+        }
+        self.p2_mode = true;
+        self.response_handle = response_handle;
+        self.p2_body_handle = body_handle;
+        self.head_bytes = owned_head;
+        self.head_ready = true;
+        self.trailers_ready = true;
+        self.use_chunked = use_chunked;
+        self.expected_content_length = expected_content_length;
+        _ = self.data_epoch.fetchAdd(1, .acq_rel);
+        _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
+    }
+
+    fn refreshTrailers(
+        self: *InboundHttpResponseSession,
+        force_complete: bool,
+    ) void {
+        self.mutex.lock();
+        if (self.trailers_ready) {
+            self.mutex.unlock();
+            return;
+        }
+        const future_handle = self.trailers_future_handle;
+        self.mutex.unlock();
+        const handle = future_handle orelse return;
+
+        var snapshot = self.snapshotTrailers(handle, force_complete) catch {
+            if (force_complete) {
+                self.mutex.lock();
+                self.trailers_ready = true;
+                self.mutex.unlock();
+                self.wakeAll();
+            }
+            return;
+        };
+        defer snapshot.deinit(self.allocator);
+        if (!snapshot.complete) return;
+
+        const block = snapshot.block;
+        snapshot.block = null;
+        self.mutex.lock();
+        if (!self.trailers_ready) {
+            self.trailer_bytes = block;
+            self.trailers_ready = true;
+        } else if (block) |bytes| {
+            self.allocator.free(bytes);
+        }
+        self.mutex.unlock();
+        self.wakeAll();
+    }
+
+    fn attachP3Response(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+        body_stream_handle: ?u32,
+        trailers_future_handle: u32,
+        transmission_future_handle: u32,
+    ) bool {
+        self.mutex.lock();
+        if (self.response_handle) |known| {
+            const matches = known == response_handle;
+            self.mutex.unlock();
+            return matches;
+        }
+        self.response_handle = response_handle;
+        self.body_stream_handle = body_stream_handle;
+        self.trailers_future_handle = trailers_future_handle;
+        self.transmission_future_handle = transmission_future_handle;
+        self.mutex.unlock();
+
+        const stream_handle = body_stream_handle orelse return true;
+        var stream_lease = self.ci.streams.acquire(stream_handle) orelse {
+            self.clearCandidate(response_handle);
+            return false;
+        };
+        const stream = stream_lease.value();
+        if (stream.host_handler != null or
+            stream.host_driver != null or
+            stream.buffer.items.len > self.queue.len)
+        {
+            stream_lease.release();
+            self.clearCandidate(response_handle);
+            return false;
+        }
+
+        const buffered = self.allocator.dupe(
+            u8,
+            stream.buffer.items,
+        ) catch {
+            stream_lease.release();
+            self.clearCandidate(response_handle);
+            return false;
+        };
+        const already_closed = stream.write_closed;
+        const pending_writer = stream.pending_write != null;
+        const write_waitable = stream.write_waitable;
+        stream.pending_write = null;
+        if (pending_writer) stream.write_ready = true;
+        stream.buffer.deinit(self.ci.allocator);
+        stream.buffer = .empty;
+        stream.host_handler = .{
+            .on_write = &InboundHttpResponseSession.onBodyWrite,
+            .on_drop_writable = &InboundHttpResponseSession.onBodyClosed,
+            .ctx = self,
+        };
+        stream_lease.release();
+        if (pending_writer) {
+            _ = self.ci.notifyWaitable(
+                write_waitable,
+                async_canon.packStatus(.completed, 0),
+            );
+        }
+
+        if (!self.enqueuePrebuffered(buffered)) {
+            self.allocator.free(buffered);
+            self.detachBodyStream();
+            self.clearCandidate(response_handle);
+            return false;
+        }
+        self.allocator.free(buffered);
+        if (already_closed) self.markBodyClosed();
+        return true;
+    }
+
+    fn attachP2Response(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+        body_handle: ?u32,
+    ) bool {
+        self.mutex.lock();
+        if (self.response_handle) |known| {
+            const matches = self.p2_mode and known == response_handle and
+                self.p2_body_handle == body_handle;
+            self.mutex.unlock();
+            return matches;
+        }
+        self.p2_mode = true;
+        self.response_handle = response_handle;
+        self.p2_body_handle = body_handle;
+        self.mutex.unlock();
+        return true;
+    }
+
+    fn attachP2Body(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+        body_handle: u32,
+    ) bool {
+        return self.attachP2Response(
+            response_handle,
+            body_handle,
+        );
+    }
+
+    fn closeP2Body(
+        self: *InboundHttpResponseSession,
+        body_handle: u32,
+    ) void {
+        self.mutex.lock();
+        const matches = self.p2_mode and
+            self.p2_body_handle == body_handle;
+        self.mutex.unlock();
+        if (matches) self.markBodyClosed();
+    }
+
+    fn clearCandidate(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.response_handle == response_handle and !self.head_ready) {
+            self.response_handle = null;
+            self.body_stream_handle = null;
+            self.trailers_future_handle = null;
+            self.transmission_future_handle = null;
+        }
+    }
+
+    fn detachBodyStream(self: *InboundHttpResponseSession) void {
+        self.mutex.lock();
+        if (self.p2_mode) {
+            const body_handle = self.p2_body_handle;
+            self.mutex.unlock();
+            const handle = body_handle orelse return;
+            var body_lease = self.adapter.lookupOutgoingBody(handle) orelse return;
+            const owner = body_lease.value().*.stream_owner;
+            if (owner) |retained| retained.retain();
+            body_lease.release();
+            const retained = owner orelse return;
+            defer retained.release();
+            retained.operation_claim.acquire();
+            defer retained.operation_claim.release();
+            switch (retained.stream.sink) {
+                .callback => |callback| {
+                    if (callback.context == @as(?*anyopaque, @ptrCast(self))) {
+                        retained.stream.sink = .closed;
+                    }
+                },
+                else => {},
+            }
+            return;
+        }
+        const body_stream_handle = self.body_stream_handle;
+        self.mutex.unlock();
+        const handle = body_stream_handle orelse return;
+        var stream_lease = self.ci.streams.acquire(handle) orelse return;
+        const stream = stream_lease.value();
+        if (stream.host_handler) |handler| {
+            if (handler.ctx == @as(?*anyopaque, @ptrCast(self))) {
+                stream.host_handler = null;
+            }
+        }
+        stream_lease.release();
+    }
+
+    fn onBodyWrite(ctx: ?*anyopaque, bytes: []const u8) bool {
+        const self: *InboundHttpResponseSession =
+            @ptrCast(@alignCast(ctx.?));
+        const response_handle = self.response_handle orelse return false;
+        const prepare = if (self.p2_mode)
+            self.prepareP2Head(response_handle)
+        else
+            self.prepareP3Head(response_handle);
+        prepare catch {
+            _ = self.finishTerminal(.response_error, false);
+            self.propagateTerminalToGuest();
+            return false;
+        };
+
+        self.mutex.lock();
+        if (self.expected_content_length) |expected| {
+            if (bytes.len > expected -| self.produced_bytes) {
+                self.mutex.unlock();
+                _ = self.finishTerminal(.response_error, true);
+                self.propagateTerminalToGuest();
+                return false;
+            }
+        }
+        self.produced_bytes += bytes.len;
+        self.mutex.unlock();
+
+        if (!self.enqueueRaw(bytes)) return false;
+        return true;
+    }
+
+    fn onBodyClosed(ctx: ?*anyopaque) void {
+        const self: *InboundHttpResponseSession =
+            @ptrCast(@alignCast(ctx.?));
+        self.markBodyClosed();
+    }
+
+    fn markBodyClosed(self: *InboundHttpResponseSession) void {
+        self.refreshTrailers(false);
+        var length_matches = true;
+        self.mutex.lock();
+        self.body_closed = true;
+        if (self.expected_content_length) |expected| {
+            length_matches = self.produced_bytes == expected;
+        }
+        self.handler_validated = length_matches;
+        self.mutex.unlock();
+        if (!length_matches) {
+            _ = self.finishTerminal(.response_error, true);
+            return;
+        }
+        self.wakeAll();
+    }
+
+    fn attachReturnedResponse(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) bool {
+        self.mutex.lock();
+        const candidate = self.response_handle;
+        const has_queued = self.queue_len != 0 or self.produced_bytes != 0;
+        self.mutex.unlock();
+        if (candidate) |known| {
+            if (known == response_handle) return true;
+            if (!self.hasOutputStarted() and !has_queued) {
+                _ = self.finishTerminal(.fallback, false);
+            } else {
+                _ = self.finishTerminal(.response_error, true);
+            }
+            return false;
+        }
+
+        var response_lease = self.adapter.lookupHttpResponseP3(response_handle) orelse {
+            _ = self.finishTerminal(.response_error, false);
+            return false;
+        };
+        const response = response_lease.value().*;
+        const body_handle = response.body_stream_handle;
+        const trailers_handle = response.trailers_future_handle;
+        const transmission_handle = response.transmission_future_handle;
+        response_lease.release();
+        if (!self.attachP3Response(
+            response_handle,
+            body_handle,
+            trailers_handle,
+            transmission_handle,
+        )) {
+            _ = self.finishTerminal(.fallback, false);
+            return false;
+        }
+        return true;
+    }
+
+    fn handlerReturned(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) void {
+        if (!self.attachReturnedResponse(response_handle)) return;
+        self.mutex.lock();
+        self.handler_finished = true;
+        self.body_closed = true;
+        self.mutex.unlock();
+        self.prepareP3Head(response_handle) catch {
+            _ = self.finishTerminal(.response_error, false);
+            return;
+        };
+        self.refreshTrailers(true);
+
+        var length_matches = true;
+        self.mutex.lock();
+        if (self.expected_content_length) |expected| {
+            length_matches = self.produced_bytes == expected;
+        }
+        self.handler_validated = length_matches;
+        self.mutex.unlock();
+        if (!length_matches) {
+            _ = self.finishTerminal(.response_error, true);
+            return;
+        }
+        self.wakeAll();
+    }
+
+    fn handlerReturnedP2(
+        self: *InboundHttpResponseSession,
+        outparam_handle: u32,
+    ) bool {
+        var outparam_lease = self.adapter.lookupResponseOutparam(
+            outparam_handle,
+        ) orelse {
+            _ = self.finishTerminal(.fallback, false);
+            return false;
+        };
+        const outparam = outparam_lease.value().*;
+        const state = outparam.state;
+        outparam_lease.release();
+        const response_handle = switch (state) {
+            .response => |handle| handle,
+            .unset, .err => {
+                _ = self.finishTerminal(.fallback, false);
+                return false;
+            },
+        };
+
+        self.mutex.lock();
+        const known_response = self.response_handle;
+        const known_body = self.p2_body_handle;
+        self.mutex.unlock();
+        const body_handle = if (known_response == response_handle)
+            known_body
+        else blk: {
+            var response_lease = self.adapter.lookupOutgoingResponse(
+                response_handle,
+            ) orelse {
+                _ = self.finishTerminal(.fallback, false);
+                return false;
+            };
+            const response = response_lease.value().*;
+            const handle = response.body_handle;
+            response_lease.release();
+            break :blk handle;
+        };
+        if (!self.attachP2Response(response_handle, body_handle)) {
+            self.mutex.lock();
+            const response_started = self.head_ready or
+                self.produced_bytes != 0 or
+                self.queue_len != 0;
+            self.mutex.unlock();
+            _ = self.finishTerminal(
+                if (response_started) .response_error else .fallback,
+                response_started,
+            );
+            return false;
+        }
+
+        self.mutex.lock();
+        self.handler_finished = true;
+        self.body_closed = true;
+        self.mutex.unlock();
+        self.prepareP2Head(response_handle) catch {
+            _ = self.finishTerminal(.response_error, false);
+            return false;
+        };
+
+        var length_matches = true;
+        self.mutex.lock();
+        if (self.expected_content_length) |expected| {
+            length_matches = self.produced_bytes == expected;
+        }
+        self.handler_validated = length_matches;
+        self.mutex.unlock();
+        if (!length_matches) {
+            _ = self.finishTerminal(.response_error, true);
+            return false;
+        }
+        self.wakeAll();
+        return true;
+    }
+
+    fn handlerFailed(self: *InboundHttpResponseSession) void {
+        self.mutex.lock();
+        self.handler_finished = true;
+        self.body_closed = true;
+        const writer_may_be_in_io = self.head_ready and
+            (self.produced_bytes != 0 or self.queue_len != 0);
+        self.mutex.unlock();
+        _ = self.finishTerminal(.handler_error, writer_may_be_in_io);
+    }
+
+    fn writeWire(
+        self: *InboundHttpResponseSession,
+        bytes: []const u8,
+    ) !void {
+        if (self.wire_writer) |writer| {
+            return switch (writer.write(writer.context, bytes)) {
+                .ok => |n| if (n == bytes.len) {} else error.IoError,
+                .closed => error.HttpClientDisconnected,
+                .err => error.IoError,
+            };
+        }
+        try self.adapter.writeAllOutputStream(self.output, bytes);
+    }
+
+    fn writeBodyChunk(
+        self: *InboundHttpResponseSession,
+        bytes: []const u8,
+    ) !void {
+        if (!self.use_chunked) {
+            try self.writeWire(bytes);
+            return;
+        }
+        var size_buf: [32]u8 = undefined;
+        const size_line = try std.fmt.bufPrint(&size_buf, "{x}\r\n", .{bytes.len});
+        try self.writeWire(size_line);
+        try self.writeWire(bytes);
+        try self.writeWire("\r\n");
+    }
+
+    fn failWrite(
+        self: *InboundHttpResponseSession,
+        err: anyerror,
+    ) void {
+        const terminal: HttpLiveTerminal =
+            if (err == error.HttpClientDisconnected)
+                .client_disconnected
+            else
+                .io_error;
+        _ = self.finishTerminal(terminal, false);
+    }
+
+    fn writerMain(self: *InboundHttpResponseSession) void {
+        var chunk: [http_live_response_buffer_bytes]u8 = undefined;
+        var head_written = false;
+
+        while (self.currentTerminal() == .running) {
+            if (!head_written) {
+                self.mutex.lock();
+                const may_write_head = self.head_ready and
+                    (self.queue_len > 0 or self.handler_finished);
+                const head = if (may_write_head) self.head_bytes else null;
+                const observed = self.data_epoch.load(.acquire);
+                self.mutex.unlock();
+                if (head) |bytes| {
+                    self.writeWire(bytes) catch |err| {
+                        self.failWrite(err);
+                        return;
+                    };
+                    self.output_started.store(true, .release);
+                    head_written = true;
+                    continue;
+                }
+                self.waitEpoch(&self.data_epoch, observed);
+                continue;
+            }
+
+            const count = self.dequeue(&chunk);
+            if (count > 0) {
+                self.writeBodyChunk(chunk[0..count]) catch |err| {
+                    self.failWrite(err);
+                    return;
+                };
+                self.mutex.lock();
+                self.transmitted_bytes += count;
+                self.mutex.unlock();
+                continue;
+            }
+
+            self.mutex.lock();
+            const finished = self.handler_validated and self.body_closed;
+            const trailers_ready = self.trailers_ready;
+            const trailers = self.trailer_bytes;
+            const observed = self.data_epoch.load(.acquire);
+            self.mutex.unlock();
+            if (finished and trailers_ready) {
+                if (self.use_chunked) {
+                    self.writeWire("0\r\n") catch |err| {
+                        self.failWrite(err);
+                        return;
+                    };
+                    if (trailers) |bytes| {
+                        self.writeWire(bytes) catch |err| {
+                            self.failWrite(err);
+                            return;
+                        };
+                    }
+                    self.writeWire("\r\n") catch |err| {
+                        self.failWrite(err);
+                        return;
+                    };
+                }
+                _ = self.finishTerminal(.succeeded, false);
+                return;
+            }
+            self.waitEpoch(&self.data_epoch, observed);
+        }
+    }
+
+    fn waitAndJoin(self: *InboundHttpResponseSession) void {
+        const thread = self.writer_thread orelse return;
+        while (self.currentTerminal() == .running) {
+            if (http_shutdown_requested.load(.acquire)) {
+                self.cancelForShutdown();
+            }
+            const observed = self.terminal_epoch.load(.acquire);
+            if (self.currentTerminal() != .running) break;
+            self.waitEpoch(&self.terminal_epoch, observed);
+        }
+        thread.join();
+        self.writer_thread = null;
+    }
+
+    fn settleTransmission(
+        self: *InboundHttpResponseSession,
+        succeeded: bool,
+    ) bool {
+        if (self.tx_settled.swap(true, .acq_rel)) return false;
+        const handle = self.transmission_future_handle orelse return false;
+        return settleHttpResponseTransmissionFuture(
+            self.ci,
+            handle,
+            succeeded,
+        );
+    }
+
+    fn propagateTerminalToGuest(self: *InboundHttpResponseSession) void {
+        const terminal = self.currentTerminal();
+        if (terminal == .running or terminal == .fallback) return;
+        _ = self.settleTransmission(terminal == .succeeded);
+        if (terminal == .succeeded) return;
+
+        if (execution_context.current()) |thread_ctx| {
+            if (self.guest_cancel_propagated.swap(true, .acq_rel)) return;
+            thread_ctx.requestCancellation();
+            if (thread_ctx.taskManager(async_mod.TaskManager)) |task_manager| {
+                if (task_manager.currentTask()) |task_handle| {
+                    task_manager.cancelTask(task_handle);
+                }
+            }
+        }
+        WasiCliAdapter.cancelAllPendingAsyncOps(
+            self.adapter,
+            self.ci,
+            null,
+            self.allocator,
+        );
+    }
+
+    fn driveGuestEvents(self: *InboundHttpResponseSession) bool {
+        if (http_shutdown_requested.load(.acquire)) {
+            self.cancelForShutdown();
+        }
+        self.refreshTrailers(false);
+        const terminal = self.currentTerminal();
+        if (terminal == .running or terminal == .fallback) return false;
+        const fired = self.settleTransmission(terminal == .succeeded);
+        if (terminal != .succeeded) self.propagateTerminalToGuest();
+        return fired;
+    }
+};
+
+pub fn inboundHttpStreamBufferLimit(
+    thread_ctx: ?*execution_context.ThreadExecutionContext,
+) ?usize {
+    const active = thread_ctx orelse return null;
+    const session = active.hostTaskContext(
+        InboundHttpResponseSession,
+    ) orelse return null;
+    if (session.currentTerminal() != .running) return null;
+    return http_live_response_buffer_bytes;
+}
+
+fn settleHttpResponseTransmissionFuture(
+    ci: *ComponentInstance,
+    future_handle: u32,
+    succeeded: bool,
+) bool {
+    var future_lease = ci.futures.acquire(future_handle) orelse return false;
+    const future = future_lease.value();
+    if (future.read_closed) {
+        future_lease.release();
+        return false;
+    }
+    future.pending_read = null;
+    future.state = if (succeeded) .ready else .closed;
+    future.write_closed = true;
+    const registration = future.read_waitable;
+    future_lease.release();
+    _ = ci.notifyWaitable(
+        registration,
+        if (succeeded)
+            async_canon.packStatus(.completed, 0)
+        else
+            async_canon.packStatus(.dropped, 0),
+    );
+    return true;
+}
 
 /// `(string, string)` pair forwarded to `wasi:cli/environment.get-environment`.
 /// The slices are borrowed by the adapter — the caller is responsible for
@@ -7519,7 +8773,7 @@ pub const WasiCliAdapter = struct {
                 const claim = resource.claim();
                 claim.acquire();
                 const ready = switch (resource.stream.sink) {
-                    .buffer, .host_file, .closed => true,
+                    .buffer, .host_file, .callback, .closed => true,
                     .fd => |fd| fdPollReady(fd, pollOutEvents()),
                     .tcp_stream => |fd| fdPollReady(fd, pollOutEvents()),
                     .tls => true,
@@ -9897,11 +11151,16 @@ pub const WasiCliAdapter = struct {
         allocator: Allocator,
     ) bool {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        const live_response = self.activeInboundHttpResponse(ci);
 
         // Drain anything already due first — the common case for
         // `wait-for(0)` / `wait-until(past)` and for tests that
         // pre-advance `monotonic_clock_override`.
-        var fired = self.completeDueTimerFutures(ci, allocator);
+        var fired = if (live_response) |session|
+            session.driveGuestEvents()
+        else
+            false;
+        if (self.completeDueTimerFutures(ci, allocator)) fired = true;
         if (executor_root.drivePendingHostStreamReads(ci, allocator)) fired = true;
         // Drain any pending UDP `recvfrom`s whose fd is now readable.
         // Runs before the optional sleep so a datagram already in the
@@ -9937,10 +11196,15 @@ pub const WasiCliAdapter = struct {
         const have_http_pending = self.pending_http_fetches.publishedCount() > 0 or
             self.pending_http_fetches_p3.publishedCount() > 0;
         const have_stream_pending = executor_root.hasPendingHostStreamReads(ci);
+        const have_live_response = if (live_response) |session|
+            session.currentTerminal() == .running
+        else
+            false;
         if (self.timer_futures.publishedCount() == 0 and
             !have_udp_pending and
             !have_http_pending and
-            !have_stream_pending)
+            !have_stream_pending and
+            !have_live_response)
         {
             return false;
         }
@@ -9973,6 +11237,7 @@ pub const WasiCliAdapter = struct {
         }
         if (have_udp_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
         if (have_stream_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
+        if (have_live_response) cap_ns = @min(cap_ns, udp_repoll_ns);
 
         // Park in `poll()` on the self-pipe waker fds of in-flight HTTP
         // fetches until a worker publishes its outcome, instead of
@@ -10001,6 +11266,9 @@ pub const WasiCliAdapter = struct {
         // sleep window are observed on this same tick. (#583 A2 / #589)
         self.drainPendingHttpFetches();
         self.drainPendingHttpFetchesP3(ci, allocator);
+        if (live_response) |session| {
+            if (session.driveGuestEvents()) post = true;
+        }
         return post;
     }
 
@@ -20702,7 +21970,7 @@ pub const WasiCliAdapter = struct {
     ///   -> result<_, _>`.
     fn httpOutgoingResponseSetStatusCode(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
@@ -20718,6 +21986,15 @@ pub const WasiCliAdapter = struct {
             .u32 => |v| @intCast(v & 0xFFFF),
             else => 0,
         };
+        if (self.activeInboundHttpResponse(ci)) |session| {
+            if (session.responseHeadCommitted(handle)) {
+                results[0] = .{ .result_val = .{
+                    .is_ok = false,
+                    .payload = null,
+                } };
+                return;
+            }
+        }
         if (self.lookupOutgoingResponse(handle)) |owned_lease| {
             var r_lease = owned_lease;
             const r = r_lease.lock().*;
@@ -20777,7 +22054,7 @@ pub const WasiCliAdapter = struct {
         }
         r.body_consumed = true;
         const body = try self.allocator.create(OutgoingBody);
-        body.* = .{};
+        body.* = .{ .parent_response_handle = handle };
         const bh = try self.pushOutgoingBody(body);
         r.body_handle = bh;
         results[0] = try httpResultOk(allocator, .{ .handle = bh });
@@ -21185,7 +22462,7 @@ pub const WasiCliAdapter = struct {
     /// output stream and stores it on the body for later retrieval.
     fn httpOutgoingBodyWrite(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -21208,6 +22485,7 @@ pub const WasiCliAdapter = struct {
             return;
         }
         body.stream_taken = true;
+        const parent_response_handle = body.parent_response_handle;
         body_lease.unlock();
 
         const s = self.allocator.create(streams.OutputStream) catch |err| {
@@ -21216,7 +22494,34 @@ pub const WasiCliAdapter = struct {
             body_lease.unlock();
             return err;
         };
-        s.* = streams.OutputStream.toBuffer();
+        const live_response = self.activeInboundHttpResponse(ci);
+        const live_attached = if (live_response) |session|
+            if (parent_response_handle) |response_handle|
+                session.attachP2Body(response_handle, handle)
+            else
+                false
+        else
+            false;
+        s.* = if (live_attached)
+            streams.OutputStream.toCallback(.{
+                .context = live_response.?,
+                .write = struct {
+                    fn write(
+                        context: ?*anyopaque,
+                        bytes: []const u8,
+                    ) streams.StreamResult {
+                        return if (InboundHttpResponseSession.onBodyWrite(
+                            context,
+                            bytes,
+                        ))
+                            .{ .ok = bytes.len }
+                        else
+                            .{ .closed = {} };
+                    }
+                }.write,
+            })
+        else
+            streams.OutputStream.toBuffer();
         const sh = self.allocOwnedStreamHandle(s, null, null) catch |err| {
             s.deinit(self.allocator);
             self.allocator.destroy(s);
@@ -21246,19 +22551,31 @@ pub const WasiCliAdapter = struct {
     /// `[static]outgoing-body.finish(own<outgoing-body>,
     ///   option<own<trailers>>) -> result<_, error-code>`.
     fn httpOutgoingBodyFinish(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
-        _: []const InterfaceValue,
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
+        if (args.len > 0) {
+            const handle = switch (args[0]) {
+                .handle => |h| h,
+                else => 0,
+            };
+            if (handle != 0) {
+                if (self.activeInboundHttpResponse(ci)) |session| {
+                    session.closeP2Body(handle);
+                }
+            }
+        }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
     fn httpOutgoingBodyDrop(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         _: []InterfaceValue,
         _: Allocator,
@@ -21269,6 +22586,9 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
+        if (self.activeInboundHttpResponse(ci)) |session| {
+            session.closeP2Body(handle);
+        }
         var lease = self.lookupOutgoingBody(handle) orelse return;
         const body = lease.lock().*;
         const owner = body.stream_owner;
@@ -21711,7 +23031,7 @@ pub const WasiCliAdapter = struct {
     ///   result<own<outgoing-response>, error-code>)`.
     fn httpResponseOutparamSet(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         _: []InterfaceValue,
         _: Allocator,
@@ -21726,34 +23046,66 @@ pub const WasiCliAdapter = struct {
             return error.InvalidHandle;
         defer outparam_lease.release();
         const outparam = outparam_lease.lock().*;
-        defer outparam_lease.unlock();
         switch (outparam.state) {
             .unset => {},
-            else => return error.InvalidState,
+            else => {
+                outparam_lease.unlock();
+                return error.InvalidState;
+            },
         }
 
+        var selected_response: ?u32 = null;
         switch (args[1]) {
             .result_val => |rv| {
-                const payload = rv.payload orelse return error.InvalidArgs;
+                const payload = rv.payload orelse {
+                    outparam_lease.unlock();
+                    return error.InvalidArgs;
+                };
                 if (rv.is_ok) {
-                    outparam.state = .{ .response = switch (payload.*) {
+                    const response_handle = switch (payload.*) {
                         .handle => |h| h,
-                        else => return error.InvalidArgs,
-                    } };
+                        else => {
+                            outparam_lease.unlock();
+                            return error.InvalidArgs;
+                        },
+                    };
+                    outparam.state = .{ .response = response_handle };
+                    selected_response = response_handle;
                 } else {
                     outparam.state = .{ .err = switch (payload.*) {
                         .variant_val => |v| v.discriminant,
                         .enum_val => |d| d,
                         .u32 => |d| d,
-                        else => return error.InvalidArgs,
+                        else => {
+                            outparam_lease.unlock();
+                            return error.InvalidArgs;
+                        },
                     } };
                 }
             },
-            .handle => |h| outparam.state = .{ .response = h },
+            .handle => |h| {
+                outparam.state = .{ .response = h };
+                selected_response = h;
+            },
             .variant_val => |v| outparam.state = .{ .err = v.discriminant },
             .enum_val => |d| outparam.state = .{ .err = d },
             .u32 => |d| outparam.state = .{ .err = d },
-            else => return error.InvalidArgs,
+            else => {
+                outparam_lease.unlock();
+                return error.InvalidArgs;
+            },
+        }
+        outparam_lease.unlock();
+
+        if (selected_response) |response_handle| {
+            if (self.activeInboundHttpResponse(ci)) |session| {
+                var response_lease = self.lookupOutgoingResponse(
+                    response_handle,
+                ) orelse return;
+                const body_handle = response_lease.value().*.body_handle;
+                response_lease.release();
+                _ = session.attachP2Response(response_handle, body_handle);
+            }
         }
     }
 
@@ -22406,7 +23758,7 @@ pub const WasiCliAdapter = struct {
     /// guest response can demand (#616 A8). 64 KiB matches the
     /// outbound body-chunk size and comfortably exceeds a TLS record,
     /// so it costs no extra syscalls in the common case.
-    const http_response_chunk_bytes: usize = 64 * 1024;
+    const http_response_chunk_bytes: usize = http_live_response_buffer_bytes;
 
     fn writeAllOutputStream(
         self: *WasiCliAdapter,
@@ -22580,6 +23932,19 @@ pub const WasiCliAdapter = struct {
         const lease = self.http_responses_p3.acquire(h) orelse return null;
         return lockPointerLease(HttpResponseP3Table, HttpResponseP3, lease);
     }
+
+    fn activeInboundHttpResponse(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+    ) ?*InboundHttpResponseSession {
+        const thread_ctx = execution_context.current() orelse return null;
+        const session = thread_ctx.hostTaskContext(
+            InboundHttpResponseSession,
+        ) orelse return null;
+        if (session.adapter != self or session.ci != ci) return null;
+        return session;
+    }
+
     fn pushRequestOptionsP3(self: *WasiCliAdapter, r: *RequestOptions) !u32 {
         return self.http_request_options_p3.publish(r);
     }
@@ -23541,6 +24906,14 @@ pub const WasiCliAdapter = struct {
             .transmission_future_handle = tx_handle,
         };
         const rh = try self.pushHttpResponseP3(r);
+        if (self.activeInboundHttpResponse(ci)) |session| {
+            _ = session.attachP3Response(
+                rh,
+                body_handle,
+                trailers_handle,
+                tx_handle,
+            );
+        }
 
         const tuple_fields = try allocator.alloc(InterfaceValue, 2);
         tuple_fields[0] = .{ .handle = rh };
@@ -23572,7 +24945,7 @@ pub const WasiCliAdapter = struct {
 
     fn httpResponseSetStatusCodeP3(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
@@ -23583,6 +24956,15 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
+        if (self.activeInboundHttpResponse(ci)) |session| {
+            if (session.responseHeadCommitted(handle)) {
+                results[0] = .{ .result_val = .{
+                    .is_ok = false,
+                    .payload = null,
+                } };
+                return;
+            }
+        }
         var r_lease = self.lookupHttpResponseP3(handle) orelse {
             results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
             return;
@@ -23919,10 +25301,27 @@ pub const WasiCliAdapter = struct {
     /// deposits the lowered flat values on the owning task; this
     /// function reads them back out of `task.return_values`.
     pub fn dispatchHttpHandlerP3(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        export_dotted_name: []const u8,
+        request_handle: u32,
+        allocator: Allocator,
+    ) !HandleP3Outcome {
+        return self.dispatchHttpHandlerP3WithLiveResponse(
+            ci,
+            export_dotted_name,
+            request_handle,
+            null,
+            allocator,
+        );
+    }
+
+    fn dispatchHttpHandlerP3WithLiveResponse(
         _: *WasiCliAdapter,
         ci: *ComponentInstance,
         export_dotted_name: []const u8,
         request_handle: u32,
+        live_response: ?*InboundHttpResponseSession,
         allocator: Allocator,
     ) !HandleP3Outcome {
         // Validate the export resolves to a callable local first so
@@ -23938,12 +25337,13 @@ pub const WasiCliAdapter = struct {
         defer task_mgr.deinit(allocator);
 
         const args: [1]InterfaceValue = .{.{ .handle = request_handle }};
-        const task_handle = executor_root.callComponentFuncAsync(
+        const task_handle = executor_root.callComponentFuncAsyncWithHostTaskContext(
             ci,
             export_dotted_name,
             &args,
             &task_mgr,
             null,
+            if (live_response) |session| @ptrCast(session) else null,
             allocator,
         ) catch |e| return e;
 
@@ -24184,9 +25584,10 @@ pub const WasiCliAdapter = struct {
         }
     }
 
-    /// Serialize an `HttpResponseP3` (handle) as HTTP/1.1 over the
-    /// given output stream. Drains the body `stream<u8>` (if any) into
-    /// a contiguous response body, then emits either a
+    /// Serialize an already-complete `HttpResponseP3` as HTTP/1.1.
+    /// This is the compatibility fallback for responses whose stream
+    /// could not be associated with the live bridge. It drains the body
+    /// `stream<u8>` (if any) into a contiguous response body, then emits a
     /// `Content-Length`-framed response (when the guest set
     /// `Content-Length` in `headers`) or a `Transfer-Encoding: chunked`
     /// response (when the body length is unknown pre-write). Trailers
@@ -24208,17 +25609,25 @@ pub const WasiCliAdapter = struct {
         var response_lease = self.lookupHttpResponseP3(response_handle) orelse return;
         defer response_lease.release();
         const response = response_lease.value().*;
-        var future_lease = ci.futures.acquire(
+        _ = settleHttpResponseTransmissionFuture(
+            ci,
             response.transmission_future_handle,
-        ) orelse return;
-        const tx = future_lease.value();
-        tx.state = .closed;
-        tx.write_closed = true;
-        const registration = tx.read_waitable;
-        future_lease.release();
-        _ = ci.notifyWaitable(
-            registration,
-            executor_root.STATUS_STARTED_CANCELLED,
+            false,
+        );
+    }
+
+    fn succeedHttpResponseTransmission(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        response_handle: u32,
+    ) void {
+        var response_lease = self.lookupHttpResponseP3(response_handle) orelse return;
+        defer response_lease.release();
+        const response = response_lease.value().*;
+        _ = settleHttpResponseTransmissionFuture(
+            ci,
+            response.transmission_future_handle,
+            true,
         );
     }
 
@@ -24539,6 +25948,23 @@ pub const WasiCliAdapter = struct {
         input: *streams.InputStream,
         output: *streams.OutputStream,
     ) void {
+        self.serveOneHttpConnectionP3StreamInterruptible(
+            ci,
+            handler_name,
+            input,
+            output,
+            null,
+        );
+    }
+
+    fn serveOneHttpConnectionP3StreamInterruptible(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        handler_name: []const u8,
+        input: *streams.InputStream,
+        output: *streams.OutputStream,
+        interrupt: ?HttpConnectionInterrupt,
+    ) void {
         var reader: BufferedLineReader = .{ .allocator = self.allocator, .stream = input };
         defer reader.deinit();
 
@@ -24557,10 +25983,53 @@ pub const WasiCliAdapter = struct {
                 return;
             };
 
-            const outcome = self.dispatchHttpHandlerP3(ci, handler_name, parsed.request_handle, self.allocator) catch {
+            const live_response: ?*InboundHttpResponseSession = live: {
+                const session = InboundHttpResponseSession.create(
+                    self.allocator,
+                    self,
+                    ci,
+                    output,
+                    parsed.keep_alive,
+                    interrupt,
+                    null,
+                ) catch break :live null;
+                session.start() catch {
+                    session.destroy();
+                    break :live null;
+                };
+                break :live session;
+            };
+
+            const outcome = self.dispatchHttpHandlerP3WithLiveResponse(
+                ci,
+                handler_name,
+                parsed.request_handle,
+                live_response,
+                self.allocator,
+            ) catch {
                 // Dispatch trapped — graceful 503 instead of
                 // propagating up to the accept loop (#583 A5).
-                self.writeHttpSimpleResponse(output, 503, "service unavailable\n") catch {};
+                var output_started = false;
+                var terminal: HttpLiveTerminal = .handler_error;
+                if (live_response) |session| {
+                    session.handlerFailed();
+                    session.waitAndJoin();
+                    session.propagateTerminalToGuest();
+                    output_started = session.hasOutputStarted();
+                    terminal = session.currentTerminal();
+                    session.destroy();
+                }
+                if (!output_started and terminal != .client_disconnected and
+                    terminal != .shutdown)
+                {
+                    self.writeHttpSimpleResponse(
+                        output,
+                        503,
+                        "service unavailable\n",
+                    ) catch {};
+                }
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+                self.cleanupHttpResourcesAllVersions();
                 return;
             };
 
@@ -24568,32 +26037,74 @@ pub const WasiCliAdapter = struct {
                 const code: u16 = httpStatusFromError(outcome.payload);
                 // Errored responses always close — the error code
                 // semantics imply the connection state is suspect.
-                self.writeHttpSimpleResponse(output, code, "handler returned error\n") catch {};
+                var output_started = false;
+                var terminal: HttpLiveTerminal = .handler_error;
+                if (live_response) |session| {
+                    session.handlerFailed();
+                    session.waitAndJoin();
+                    session.propagateTerminalToGuest();
+                    output_started = session.hasOutputStarted();
+                    terminal = session.currentTerminal();
+                    session.destroy();
+                }
+                if (!output_started and terminal != .client_disconnected and
+                    terminal != .shutdown)
+                {
+                    self.writeHttpSimpleResponse(
+                        output,
+                        code,
+                        "handler returned error\n",
+                    ) catch {};
+                }
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+                self.cleanupHttpResourcesAllVersions();
                 return;
             }
 
-            // A client that hangs up mid-response is reported
-            // distinctly from a server-side I/O fault (#616 A8). There
-            // is nothing left to say on this connection and no basis
-            // for keeping it alive, so tear down rather than looping
-            // back to read a request that will never arrive.
-            var disconnected = false;
-            self.writeHttpResponseP3FromHandle(
-                output,
-                ci,
-                outcome.payload,
-                parsed.keep_alive,
-            ) catch |err| {
-                disconnected = err == error.HttpClientDisconnected;
-            };
-            if (disconnected) {
-                self.failHttpResponseTransmission(ci, outcome.payload);
-                // The handler has returned, but it may have left host
-                // operations running on this instance — an outbound
-                // fetch it never awaited, a timer, a socket read. With
-                // the client gone their results are unobservable, so
-                // release them instead of letting them run to
-                // completion.
+            var live_terminal: HttpLiveTerminal = .fallback;
+            var live_output_started = false;
+            if (live_response) |session| {
+                session.handlerReturned(outcome.payload);
+                session.waitAndJoin();
+                session.propagateTerminalToGuest();
+                live_terminal = session.currentTerminal();
+                live_output_started = session.hasOutputStarted();
+                session.destroy();
+            }
+
+            if (live_terminal == .fallback) {
+                self.writeHttpResponseP3FromHandle(
+                    output,
+                    ci,
+                    outcome.payload,
+                    parsed.keep_alive,
+                ) catch |err| {
+                    self.failHttpResponseTransmission(ci, outcome.payload);
+                    if (err == error.HttpClientDisconnected) {
+                        cancelAllPendingAsyncOps(
+                            self,
+                            ci,
+                            null,
+                            self.allocator,
+                        );
+                    }
+                    self.cleanupHttpResourcesAllVersions();
+                    return;
+                };
+                self.succeedHttpResponseTransmission(ci, outcome.payload);
+                live_terminal = .succeeded;
+            }
+
+            if (live_terminal != .succeeded) {
+                if (live_terminal == .response_error and
+                    !live_output_started)
+                {
+                    self.writeHttpSimpleResponse(
+                        output,
+                        500,
+                        "invalid response\n",
+                    ) catch {};
+                }
                 cancelAllPendingAsyncOps(self, ci, null, self.allocator);
                 self.cleanupHttpResourcesAllVersions();
                 return;
@@ -28173,6 +29684,15 @@ fn serveOneHttpConnection(
 
     var input = streams.InputStream.fromTcpStream(accepted.socket.handle);
     var output = streams.OutputStream.toTcpStream(accepted.socket.handle);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var interrupt_ctx = HttpAcceptedInterruptContext{
+        .stream = accepted,
+        .io = io,
+    };
+    const interrupt = HttpConnectionInterrupt{
+        .context = &interrupt_ctx,
+        .callback = &interruptAcceptedHttpConnection,
+    };
 
     const request_handle = adapter.readIncomingRequestFromStream(&input) catch |err| {
         adapter.writeHttpSimpleResponse(&output, statusForRequestReadError(err), "bad request\n") catch {};
@@ -28195,10 +29715,87 @@ fn serveOneHttpConnection(
         .{ .handle = outparam_handle },
     };
     var results: [0]abi_root.InterfaceValue = .{};
-    executor_root.callComponentFunc(inst, handler_name, &args, &results, adapter.allocator) catch {
-        adapter.writeHttpSimpleResponse(&output, 500, "handler trapped\n") catch {};
+    const live_response: ?*InboundHttpResponseSession = live: {
+        const session = InboundHttpResponseSession.create(
+            adapter.allocator,
+            adapter,
+            inst,
+            &output,
+            false,
+            interrupt,
+            null,
+        ) catch break :live null;
+        session.p2_mode = true;
+        session.start() catch {
+            session.destroy();
+            break :live null;
+        };
+        break :live session;
+    };
+
+    executor_root.callComponentFuncWithHostTaskContext(
+        inst,
+        handler_name,
+        &args,
+        &results,
+        if (live_response) |session| @ptrCast(session) else null,
+        adapter.allocator,
+    ) catch {
+        var output_started = false;
+        var terminal: HttpLiveTerminal = .handler_error;
+        if (live_response) |session| {
+            session.handlerFailed();
+            session.waitAndJoin();
+            session.propagateTerminalToGuest();
+            output_started = session.hasOutputStarted();
+            terminal = session.currentTerminal();
+            session.destroy();
+        }
+        if (!output_started and terminal != .client_disconnected and
+            terminal != .shutdown)
+        {
+            adapter.writeHttpSimpleResponse(
+                &output,
+                500,
+                "handler trapped\n",
+            ) catch {};
+        }
+        WasiCliAdapter.cancelAllPendingAsyncOps(
+            adapter,
+            inst,
+            null,
+            adapter.allocator,
+        );
         return;
     };
+
+    var live_terminal: HttpLiveTerminal = .fallback;
+    var live_output_started = false;
+    if (live_response) |session| {
+        _ = session.handlerReturnedP2(outparam_handle);
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+        live_terminal = session.currentTerminal();
+        live_output_started = session.hasOutputStarted();
+        session.destroy();
+    }
+    if (live_terminal == .succeeded) return;
+    if (live_terminal != .fallback) {
+        if (live_terminal == .response_error and !live_output_started) {
+            adapter.writeHttpSimpleResponse(
+                &output,
+                500,
+                "invalid response\n",
+            ) catch {};
+        }
+        WasiCliAdapter.cancelAllPendingAsyncOps(
+            adapter,
+            inst,
+            null,
+            adapter.allocator,
+        );
+        return;
+    }
 
     // P2 serves one request per connection, so a disconnect has no
     // keep-alive to suppress — but the guest may still own host
@@ -28208,6 +29805,17 @@ fn serveOneHttpConnection(
             WasiCliAdapter.cancelAllPendingAsyncOps(adapter, inst, null, adapter.allocator);
         }
     };
+}
+
+const HttpAcceptedInterruptContext = struct {
+    stream: std.Io.net.Stream,
+    io: std.Io,
+};
+
+fn interruptAcceptedHttpConnection(ctx_opaque: ?*anyopaque) void {
+    const ctx: *HttpAcceptedInterruptContext =
+        @ptrCast(@alignCast(ctx_opaque.?));
+    ctx.stream.shutdown(ctx.io, .both) catch {};
 }
 
 /// P3 (`@0.3.x`) variant of `serveOneHttpConnection`. Dispatches
@@ -28232,6 +29840,15 @@ fn serveOneHttpConnectionP3(
     tls_config: ?*HttpsTlsConfig,
 ) void {
     setKeepAliveIdleTimeout(accepted.socket.handle, http_p3_keep_alive_idle_seconds);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var interrupt_ctx = HttpAcceptedInterruptContext{
+        .stream = accepted,
+        .io = io,
+    };
+    const interrupt = HttpConnectionInterrupt{
+        .context = &interrupt_ctx,
+        .callback = &interruptAcceptedHttpConnection,
+    };
 
     if (tls_config) |cfg| {
         // `TlsServerConn` must be pinned (the TLS connection holds pointers
@@ -28244,13 +29861,25 @@ fn serveOneHttpConnectionP3(
         defer tconn.conn.close() catch {};
         var input = streams.InputStream.fromTlsConn(&tconn.conn);
         var output = streams.OutputStream.toTlsConn(&tconn.conn);
-        adapter.serveOneHttpConnectionP3Stream(inst, handler_name, &input, &output);
+        adapter.serveOneHttpConnectionP3StreamInterruptible(
+            inst,
+            handler_name,
+            &input,
+            &output,
+            interrupt,
+        );
         return;
     }
 
     var input = streams.InputStream.fromTcpStream(accepted.socket.handle);
     var output = streams.OutputStream.toTcpStream(accepted.socket.handle);
-    adapter.serveOneHttpConnectionP3Stream(inst, handler_name, &input, &output);
+    adapter.serveOneHttpConnectionP3StreamInterruptible(
+        inst,
+        handler_name,
+        &input,
+        &output,
+        interrupt,
+    );
 }
 
 /// Set a per-socket `SO_RCVTIMEO` so the keep-alive read between
@@ -44623,6 +46252,806 @@ test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle emits status line + he
     // One non-zero chunk + the terminating 0-chunk with no trailers.
     try testing.expect(std.mem.indexOf(u8, written, "\r\n4\r\nhey\n\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, written, "0\r\n\r\n"));
+}
+
+const LiveHttpTestSink = struct {
+    const Failure = enum { none, closed, io_error };
+
+    mutex: platform.Mutex = .init,
+    bytes: [128 * 1024]u8 = undefined,
+    len: usize = 0,
+    discard: bool = false,
+    block_body: bool = false,
+    failure: Failure = .none,
+    head_seen: std.atomic.Value(bool) = .init(false),
+    blocked: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    first_seen: std.atomic.Value(bool) = .init(false),
+    first_before_handler_return: std.atomic.Value(bool) = .init(false),
+    handler_returned: ?*std.atomic.Value(bool) = null,
+
+    fn write(ctx_opaque: ?*anyopaque, data: []const u8) streams.StreamResult {
+        const self: *LiveHttpTestSink = @ptrCast(@alignCast(ctx_opaque.?));
+        const is_head = std.mem.startsWith(u8, data, "HTTP/1.1 ");
+        if (is_head) self.head_seen.store(true, .release);
+        const is_body = self.head_seen.load(.acquire) and !is_head;
+
+        if (is_body) {
+            switch (self.failure) {
+                .none => {},
+                .closed => return .{ .closed = {} },
+                .io_error => return .{ .err = .io_error },
+            }
+            if (self.block_body) {
+                self.blocked.store(true, .release);
+                while (!self.release.load(.acquire)) platform.usleep(100);
+            }
+            if (std.mem.indexOf(u8, data, "first") != null) {
+                self.first_seen.store(true, .release);
+                const returned = if (self.handler_returned) |flag|
+                    flag.load(.acquire)
+                else
+                    false;
+                if (!returned) {
+                    self.first_before_handler_return.store(true, .release);
+                }
+            }
+        }
+
+        if (!self.discard) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (data.len > self.bytes.len - self.len) {
+                return .{ .err = .io_error };
+            }
+            @memcpy(self.bytes[self.len .. self.len + data.len], data);
+            self.len += data.len;
+        }
+        return .{ .ok = data.len };
+    }
+
+    fn interrupt(ctx_opaque: ?*anyopaque) void {
+        const self: *LiveHttpTestSink = @ptrCast(@alignCast(ctx_opaque.?));
+        self.release.store(true, .release);
+    }
+
+    fn contents(self: *LiveHttpTestSink) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+const LiveHttpProducer = struct {
+    session: *InboundHttpResponseSession,
+    chunks: []const []const u8,
+    pause_after_first: ?*std.atomic.Value(bool) = null,
+    accepted: std.atomic.Value(bool) = .init(true),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *LiveHttpProducer) void {
+        for (self.chunks, 0..) |chunk, i| {
+            if (!InboundHttpResponseSession.onBodyWrite(self.session, chunk)) {
+                self.accepted.store(false, .release);
+                self.done.store(true, .release);
+                return;
+            }
+            if (i == 0) {
+                if (self.pause_after_first) |release| {
+                    while (!release.load(.acquire)) platform.usleep(100);
+                }
+            }
+        }
+        InboundHttpResponseSession.onBodyClosed(self.session);
+        self.done.store(true, .release);
+    }
+};
+
+const LiveHttpResponseFixture = struct {
+    response_handle: u32,
+    body_handle: ?u32,
+    trailers_handle: u32,
+    transmission_handle: u32,
+};
+
+fn makeLiveHttpResponseFixture(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    content_length: ?usize,
+    with_body: bool,
+    trailer: ?struct { name: []const u8, value: []const u8 },
+) !LiveHttpResponseFixture {
+    const fields = try adapter.allocator.create(HttpFields);
+    fields.* = .{};
+    const fields_handle = try adapter.pushHttpFields(fields);
+    if (content_length) |length| {
+        const name = try adapter.allocator.dupe(u8, "content-length");
+        errdefer adapter.allocator.free(name);
+        const value = try std.fmt.allocPrint(adapter.allocator, "{d}", .{length});
+        errdefer adapter.allocator.free(value);
+        try fields.entries.append(adapter.allocator, .{
+            .name = name,
+            .value = value,
+        });
+    }
+
+    const body_handle: ?u32 = if (with_body) blk: {
+        const handle = ci.allocAsyncHandle();
+        try ci.streams.put(ci.allocator, handle, .{ .elem_type_idx = 0 });
+        break :blk handle;
+    } else null;
+
+    var trailers_payload: ?[]u8 = null;
+    if (trailer) |entry| {
+        const trailer_fields = try adapter.allocator.create(HttpFields);
+        trailer_fields.* = .{};
+        const name = try adapter.allocator.dupe(u8, entry.name);
+        errdefer adapter.allocator.free(name);
+        const value = try adapter.allocator.dupe(u8, entry.value);
+        errdefer adapter.allocator.free(value);
+        try trailer_fields.entries.append(adapter.allocator, .{
+            .name = name,
+            .value = value,
+        });
+        const trailer_fields_handle = try adapter.pushHttpFields(trailer_fields);
+        const payload = try ci.allocator.alloc(u8, 8);
+        @memset(payload, 0);
+        payload[0] = 1;
+        std.mem.writeInt(
+            u32,
+            payload[4..8],
+            trailer_fields_handle,
+            .little,
+        );
+        trailers_payload = payload;
+    }
+
+    const trailers_handle = ci.allocAsyncHandle();
+    try ci.futures.put(ci.allocator, trailers_handle, .{
+        .elem_type_idx = 0,
+        .state = .ready,
+        .write_closed = true,
+        .payload = trailers_payload,
+    });
+    const transmission_handle = ci.allocAsyncHandle();
+    try ci.futures.put(ci.allocator, transmission_handle, .{
+        .elem_type_idx = 0,
+        .state = .pending,
+    });
+
+    const response = try adapter.allocator.create(HttpResponseP3);
+    response.* = .{
+        .headers_handle = fields_handle,
+        .body_stream_handle = body_handle,
+        .trailers_future_handle = trailers_handle,
+        .transmission_future_handle = transmission_handle,
+    };
+    const response_handle = try adapter.pushHttpResponseP3(response);
+    return .{
+        .response_handle = response_handle,
+        .body_handle = body_handle,
+        .trailers_handle = trailers_handle,
+        .transmission_handle = transmission_handle,
+    };
+}
+
+fn startLiveHttpTestSession(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    output: *streams.OutputStream,
+    sink: *LiveHttpTestSink,
+    fixture: LiveHttpResponseFixture,
+) !*InboundHttpResponseSession {
+    const session = try InboundHttpResponseSession.create(
+        adapter.allocator,
+        adapter,
+        ci,
+        output,
+        false,
+        .{
+            .context = sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    errdefer session.destroy();
+    try session.start();
+    try std.testing.expect(session.attachP3Response(
+        fixture.response_handle,
+        fixture.body_handle,
+        fixture.trailers_handle,
+        fixture.transmission_handle,
+    ));
+    return session;
+}
+
+fn waitForLiveHttpFlag(flag: *const std.atomic.Value(bool)) !void {
+    var attempts: usize = 0;
+    while (!flag.load(.acquire) and attempts < 50_000) : (attempts += 1) {
+        platform.usleep(100);
+    }
+    try std.testing.expect(flag.load(.acquire));
+}
+
+fn waitForLiveHttpTerminal(
+    session: *InboundHttpResponseSession,
+    terminal: HttpLiveTerminal,
+) !void {
+    var attempts: usize = 0;
+    while (session.currentTerminal() != terminal and
+        attempts < 50_000) : (attempts += 1)
+    {
+        platform.usleep(100);
+    }
+    try std.testing.expectEqual(terminal, session.currentTerminal());
+}
+
+test "wasi:http #616 A8 live: first body chunk reaches the client before handler return" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        11,
+        true,
+        null,
+    );
+    var handler_returned = std.atomic.Value(bool).init(false);
+    var sink = LiveHttpTestSink{ .handler_returned = &handler_returned };
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+
+    var release = std.atomic.Value(bool).init(false);
+    const chunks = [_][]const u8{ "first", "second" };
+    var producer = LiveHttpProducer{
+        .session = session,
+        .chunks = &chunks,
+        .pause_after_first = &release,
+    };
+    const thread = try std.Thread.spawn(.{}, LiveHttpProducer.run, .{&producer});
+    var joined = false;
+    defer {
+        release.store(true, .release);
+        if (!joined) thread.join();
+    }
+
+    try waitForLiveHttpFlag(&sink.first_seen);
+    try testing.expect(sink.first_before_handler_return.load(.acquire));
+    try testing.expect(!handler_returned.load(.acquire));
+
+    release.store(true, .release);
+    thread.join();
+    joined = true;
+    try waitForLiveHttpTerminal(session, .succeeded);
+    try testing.expect(session.driveGuestEvents());
+    const transmission = ci.futures.getPtr(fixture.transmission_handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, transmission.state);
+    try testing.expect(!handler_returned.load(.acquire));
+    handler_returned.store(true, .release);
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expect(std.mem.endsWith(u8, sink.contents(), "firstsecond"));
+}
+
+test "wasi:http #616 A8 live: response streams are bounded before response.new associates them" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+    const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    var sink = LiveHttpTestSink{};
+    const session = try InboundHttpResponseSession.create(
+        testing.allocator,
+        &adapter,
+        &ci,
+        &output,
+        false,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    defer session.destroy();
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(
+        &module,
+        testing.allocator,
+    );
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(
+        core_inst,
+        64,
+        testing.allocator,
+    );
+    defer env.destroy();
+    var host_scope = env.thread_context.bindHostTaskContext(
+        @ptrCast(session),
+    );
+    defer host_scope.deinit();
+
+    try executor_root.dispatchCanonBuiltin(
+        &ci,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const packed_handles: u64 = @bitCast(try env.popI64());
+    const handle: u32 = @truncate(packed_handles >> 32);
+    const stream = ci.streams.getPtr(handle).?;
+    try testing.expectEqual(
+        @as(?usize, http_live_response_buffer_bytes),
+        stream.buffer_limit,
+    );
+}
+
+test "wasi:http #616 A8 live: P2 outgoing-body writes stream before handler return" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const cl_name = try testing.allocator.dupe(u8, "content-length");
+    const cl_value = try testing.allocator.dupe(u8, "11");
+    try fields.entries.append(testing.allocator, .{
+        .name = cl_name,
+        .value = cl_value,
+    });
+    const fields_handle = try adapter.pushHttpFields(fields);
+    const response = try testing.allocator.create(OutgoingResponse);
+    response.* = .{ .headers_handle = fields_handle };
+    const response_handle = try adapter.pushOutgoingResponse(response);
+    const body = try testing.allocator.create(OutgoingBody);
+    body.* = .{ .parent_response_handle = response_handle };
+    const body_handle = try adapter.pushOutgoingBody(body);
+    response.body_handle = body_handle;
+    const outparam = try testing.allocator.create(ResponseOutparam);
+    outparam.* = .{};
+    const outparam_handle = try adapter.pushResponseOutparam(outparam);
+
+    var handler_returned = std.atomic.Value(bool).init(false);
+    var sink = LiveHttpTestSink{ .handler_returned = &handler_returned };
+    const session = try InboundHttpResponseSession.create(
+        testing.allocator,
+        &adapter,
+        &ci,
+        &output,
+        false,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    session.p2_mode = true;
+    defer session.destroy();
+    try session.start();
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    defer owner.release();
+
+    var release = std.atomic.Value(bool).init(false);
+    const P2Producer = struct {
+        stream: *streams.OutputStream,
+        allocator: Allocator,
+        release: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            _ = self.stream.write("first", self.allocator);
+            while (!self.release.load(.acquire)) platform.usleep(100);
+            _ = self.stream.write("second", self.allocator);
+        }
+    };
+    var producer = P2Producer{
+        .stream = owner.stream,
+        .allocator = testing.allocator,
+        .release = &release,
+    };
+    const thread = try std.Thread.spawn(.{}, P2Producer.run, .{&producer});
+    var joined = false;
+    defer {
+        release.store(true, .release);
+        if (!joined) thread.join();
+    }
+
+    try waitForLiveHttpFlag(&sink.first_seen);
+    try testing.expect(sink.first_before_handler_return.load(.acquire));
+    release.store(true, .release);
+    thread.join();
+    joined = true;
+
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    const response_payload = InterfaceValue{ .handle = response_handle };
+    const response_result = InterfaceValue{ .result_val = .{
+        .is_ok = true,
+        .payload = &response_payload,
+    } };
+    try WasiCliAdapter.httpResponseOutparamSet(
+        &adapter,
+        &ci,
+        &.{ .{ .handle = outparam_handle }, response_result },
+        &.{},
+        testing.allocator,
+    );
+    handler_returned.store(true, .release);
+    try testing.expect(session.handlerReturnedP2(outparam_handle));
+    session.waitAndJoin();
+
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expect(std.mem.endsWith(u8, sink.contents(), "firstsecond"));
+}
+
+test "wasi:http #616 A8 live: slow client bounds producer memory and backpressures a large body" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const body_len = http_live_response_buffer_bytes * 8;
+    const payload = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(payload);
+    @memset(payload, 0xa5);
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        body_len,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{
+        .discard = true,
+        .block_body = true,
+    };
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+
+    const chunks = [_][]const u8{payload};
+    var producer = LiveHttpProducer{
+        .session = session,
+        .chunks = &chunks,
+    };
+    const thread = try std.Thread.spawn(.{}, LiveHttpProducer.run, .{&producer});
+    var joined = false;
+    defer {
+        sink.release.store(true, .release);
+        if (!joined) thread.join();
+    }
+
+    try waitForLiveHttpFlag(&sink.blocked);
+    var attempts: usize = 0;
+    while (session.bufferedHighWater() < http_live_response_buffer_bytes and
+        attempts < 50_000) : (attempts += 1)
+    {
+        platform.usleep(100);
+    }
+    try testing.expect(!producer.done.load(.acquire));
+    try testing.expectEqual(
+        http_live_response_buffer_bytes,
+        session.bufferedHighWater(),
+    );
+
+    sink.release.store(true, .release);
+    thread.join();
+    joined = true;
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expectEqual(body_len, session.transmitted_bytes);
+    try testing.expectEqual(
+        http_live_response_buffer_bytes,
+        session.bufferedHighWater(),
+    );
+}
+
+test "wasi:http #616 A8 live: empty body and multi-chunk trailers preserve wire ordering" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const empty_fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        null,
+        false,
+        null,
+    );
+    var empty_sink = LiveHttpTestSink{};
+    const empty_session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &empty_sink,
+        empty_fixture,
+    );
+    empty_session.handlerReturned(empty_fixture.response_handle);
+    empty_session.waitAndJoin();
+    empty_session.propagateTerminalToGuest();
+    try testing.expectEqual(
+        HttpLiveTerminal.succeeded,
+        empty_session.currentTerminal(),
+    );
+    try testing.expect(std.mem.endsWith(
+        u8,
+        empty_sink.contents(),
+        "Content-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
+    empty_session.destroy();
+
+    const chunked_fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        null,
+        true,
+        .{ .name = "x-final", .value = "done" },
+    );
+    var chunked_sink = LiveHttpTestSink{};
+    const chunked_session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &chunked_sink,
+        chunked_fixture,
+    );
+    defer chunked_session.destroy();
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        chunked_session,
+        "abc",
+    ));
+    while (chunked_session.transmitted_bytes < 3) platform.usleep(100);
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        chunked_session,
+        "def",
+    ));
+    InboundHttpResponseSession.onBodyClosed(chunked_session);
+    chunked_session.handlerReturned(chunked_fixture.response_handle);
+    chunked_session.waitAndJoin();
+    chunked_session.propagateTerminalToGuest();
+
+    const wire = chunked_sink.contents();
+    try testing.expect(std.mem.indexOf(
+        u8,
+        wire,
+        "Trailer: x-final\r\n",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        wire,
+        "\r\n3\r\nabc\r\n3\r\ndef\r\n",
+    ) != null);
+    try testing.expect(std.mem.endsWith(
+        u8,
+        wire,
+        "0\r\nx-final: done\r\n\r\n",
+    ));
+}
+
+test "wasi:http #616 A8 live: disconnect and socket fault fail transmission exactly once" {
+    const testing = std.testing;
+    inline for (.{
+        .{ LiveHttpTestSink.Failure.closed, HttpLiveTerminal.client_disconnected },
+        .{ LiveHttpTestSink.Failure.io_error, HttpLiveTerminal.io_error },
+    }) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const body_len = http_live_response_buffer_bytes * 4;
+        const payload = try testing.allocator.alloc(u8, body_len);
+        defer testing.allocator.free(payload);
+        @memset(payload, 0x5a);
+        const fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            body_len,
+            true,
+            null,
+        );
+        var sink = LiveHttpTestSink{
+            .discard = true,
+            .failure = case[0],
+        };
+        const session = try startLiveHttpTestSession(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            fixture,
+        );
+        defer session.destroy();
+
+        const chunks = [_][]const u8{payload};
+        var producer = LiveHttpProducer{
+            .session = session,
+            .chunks = &chunks,
+        };
+        const thread = try std.Thread.spawn(.{}, LiveHttpProducer.run, .{&producer});
+        thread.join();
+        session.handlerFailed();
+        session.waitAndJoin();
+        try testing.expect(!producer.accepted.load(.acquire));
+
+        var task_manager = async_mod.TaskManager{};
+        defer task_manager.deinit(testing.allocator);
+        const task_handle = try task_manager.createTask(testing.allocator);
+        task_manager.startTask(task_handle);
+        var current_task = task_manager.bindCurrent(task_handle);
+        defer current_task.deinit();
+        var thread_ctx = execution_context.ThreadExecutionContext{};
+        var task_binding = thread_ctx.bindTaskManager(@ptrCast(&task_manager));
+        defer task_binding.deinit();
+        var active_scope = thread_ctx.enter();
+        defer active_scope.deinit();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(case[1], session.currentTerminal());
+        try testing.expect(thread_ctx.isCancellationRequested());
+        try testing.expectEqual(
+            async_mod.TaskState.cancelled,
+            task_manager.getState(task_handle).?,
+        );
+        const future = ci.futures.getPtr(fixture.transmission_handle).?;
+        try testing.expectEqual(async_mod.Future.State.closed, future.state);
+        try testing.expect(future.write_closed);
+        try testing.expect(!session.settleTransmission(false));
+    }
+}
+
+test "wasi:http #616 A8 live: handler failure before response emits nothing" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        1,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+
+    session.handlerFailed();
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+    try testing.expectEqual(HttpLiveTerminal.handler_error, session.currentTerminal());
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+}
+
+test "wasi:http #616 A8 live: shutdown releases blocked producer and writer" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const body_len = http_live_response_buffer_bytes * 4;
+    const payload = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(payload);
+    @memset(payload, 0x33);
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        body_len,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{
+        .discard = true,
+        .block_body = true,
+    };
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+
+    const chunks = [_][]const u8{payload};
+    var producer = LiveHttpProducer{
+        .session = session,
+        .chunks = &chunks,
+    };
+    const thread = try std.Thread.spawn(.{}, LiveHttpProducer.run, .{&producer});
+    var joined = false;
+    defer {
+        sink.release.store(true, .release);
+        if (!joined) thread.join();
+    }
+    try waitForLiveHttpFlag(&sink.blocked);
+
+    session.cancelForShutdown();
+    thread.join();
+    joined = true;
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(HttpLiveTerminal.shutdown, session.currentTerminal());
+    try testing.expect(producer.done.load(.acquire));
+    try testing.expect(!producer.accepted.load(.acquire));
 }
 
 test "wasi:http #616 A8: a client disconnect is reported distinctly from an I/O fault" {

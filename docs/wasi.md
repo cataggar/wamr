@@ -324,6 +324,32 @@ Now:
   all, so a response abandoned mid-flight looked exactly like one
   delivered in full.
 
+The remaining live-streaming half is also implemented. Preview 2
+`outgoing-body` writes and Preview 3 `stream<u8>` writes now feed a
+per-request 64 KiB ring while a dedicated network writer drains it to the
+client. The guest producer blocks when the ring is full, so response memory
+does not grow with total body size and a slow client provides real
+backpressure. Preview 3 stream FIFOs created during an inbound handler use
+the same high-water mark even before `response.new` associates the stream
+with the response; a parked producer is woken once association moves the
+buffer into the live ring.
+
+Status and immutable response headers are snapshotted before the first wire
+byte. Explicit `Content-Length` is preserved and verified against the bytes
+produced; unknown-length bodies use HTTP/1.1 chunked framing, with the
+terminating chunk and trailers emitted only after the body closes. Empty
+bodies retain `Content-Length: 0`.
+
+The network writer never accesses component or adapter resource tables.
+Guest-side setup takes stable leases only long enough to snapshot handles
+and metadata, then releases them before queue waits, socket writes, callback
+execution, cancellation, or thread joins. Disconnect, socket failure,
+handler failure, shutdown, and normal completion race through one atomic
+terminal state. That state wakes blocked producers/writers, interrupts the
+accepted socket when cancellation must break a write, settles the Preview 3
+transmission future exactly once, and cancels remaining host async
+operations.
+
 ### Already-shipped 0.3.0 surfaces (section A)
 
 * **Outbound HTTP response headers not surfaced.** `std.http.Client.FetchResult`

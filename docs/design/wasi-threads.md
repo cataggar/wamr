@@ -153,9 +153,10 @@ The process/execution split is now explicit:
   acquire exactly one reference for their own lifetime.
 * `ThreadExecutionContext` owns thread ID, opaque `start_arg`, optional
   auxiliary-stack/TLS metadata, implicit task-context slots, the active
-  `TaskManager`, cancellation/trap flags, and temporary backend/host-call
-  bookkeeping. Sibling contexts begin with fresh execution-local state and
-  inherit only the retained process reference.
+  `TaskManager`, request-scoped host-task coordination, cancellation/trap
+  flags, and temporary backend/host-call bookkeeping. Sibling contexts begin
+  with fresh execution-local state and inherit only the retained process
+  reference.
 * Component canon task and lower-call state no longer lives on the shared
   `ComponentInstance`. AOT keeps all existing codegen-addressed `VmCtx`
   offsets stable and appends only a thread-context pointer.
