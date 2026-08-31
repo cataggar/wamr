@@ -142,6 +142,51 @@ test "differential AOT: out-of-bounds i32.load surfaces as catchable WasmTrap (#
     try expectAotTrap(wasm, "f");
 }
 
+test "differential AOT: memory32 last-byte store/load stays in bounds" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00); // 0 local declarations
+    try body.append(testing.allocator, 0x41); // i32.const address
+    try encodeSLEB128(&body, testing.allocator, 65535);
+    try body.append(testing.allocator, 0x41); // i32.const value
+    try encodeSLEB128(&body, testing.allocator, 90);
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x3A, 0x00, 0x00 }); // i32.store8 align=0 offset=0
+    try body.append(testing.allocator, 0x41); // i32.const address
+    try encodeSLEB128(&body, testing.allocator, 65535);
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x2D, 0x00, 0x00 }); // i32.load8_u align=0 offset=0
+    try body.append(testing.allocator, 0x0B); // end
+    const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 90);
+}
+
+test "differential AOT: memory32 high-bit address traps instead of sign-extending" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00); // 0 local declarations
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x41, 0x7F }); // i32.const -1
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x2D, 0x00, 0x00 }); // i32.load8_u align=0 offset=0
+    try body.append(testing.allocator, 0x0B); // end
+    const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+    defer testing.allocator.free(wasm);
+    try testing.expectError(error.OutOfBoundsMemoryAccess, runInterpI32(testing.allocator, wasm, "f"));
+    try expectAotTrap(wasm, "f");
+}
+
+test "differential AOT: maximum memarg offset traps without u32 wraparound" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00); // 0 local declarations
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x41, 0x00 }); // i32.const 0
+    try body.appendSlice(testing.allocator, &[_]u8{ 0x2D, 0x00 }); // i32.load8_u align=0
+    try encodeULEB128(&body, testing.allocator, std.math.maxInt(u32));
+    try body.append(testing.allocator, 0x0B); // end
+    const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+    defer testing.allocator.free(wasm);
+    try testing.expectError(error.OutOfBoundsMemoryAccess, runInterpI32(testing.allocator, wasm, "f"));
+    try expectAotTrap(wasm, "f");
+}
+
 fn expectSimdDiffI32(wasm: []const u8, name: []const u8, expected: i32) !void {
     const interp_result = try runInterpI32(testing.allocator, wasm, name);
     try testing.expectEqual(expected, interp_result);
