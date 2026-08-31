@@ -3036,16 +3036,12 @@ pub fn instantiateWithOptions(
         for (inst.core_instances) |entry| {
             const ai = entry.aot_inst orelse continue;
             if (!aot_runtime.usesWasiThreads(ai.module)) continue;
-            if (threaded_memory) |memory| {
-                if (ai.memories.len == 0 or ai.memories[0] != memory) {
-                    std.log.warn(
-                        "[aot reject] one component thread group cannot span distinct memories",
-                        .{},
-                    );
-                    return error.AotImportUnresolvable;
-                }
-                ai.setThreadManager(&inst.thread_manager);
-                continue;
+            if (threaded_memory != null) {
+                std.log.warn(
+                    "[aot reject] multiple Preview-1 threaded cores in one component are unsupported",
+                    .{},
+                );
+                return error.AotImportUnresolvable;
             }
             aot_runtime.prepareWasiThreads(ai, &inst.thread_manager) catch |err| {
                 std.log.warn(
