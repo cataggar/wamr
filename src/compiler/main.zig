@@ -443,7 +443,6 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
             .enable_scheduler = enable_aarch64_scheduler,
             .enable_xreg_alloc = enable_aarch64_xreg_alloc,
-            .enable_memory_size_pin = !envFlagEnabled(init.environ_map, "WAMR_AOT_DISABLE_MEMORY_SIZE_PIN"),
             .codegen_timing = codegen_timing,
             .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
         }) catch |err| {
