@@ -15,6 +15,7 @@ const sig_registry = @import("../common/sig_registry.zig");
 const trap_jmp = @import("trap_jmp.zig");
 const config = @import("../../config.zig");
 const execution_context = @import("../common/execution_context.zig");
+const thread_manager = @import("../../wasi/thread_manager.zig");
 
 // ─── Windows crash handler (debug only) ─────────────────────────────────────
 const windows = std.os.windows;
@@ -1018,6 +1019,15 @@ pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
     std.process.exit(2);
 }
 
+/// Unwind a trap raised by a native host adapter. Unlike generated-code trap
+/// helpers, this deliberately skips return-address decoding because the
+/// caller lives in host code rather than the AOT text mapping.
+pub fn aotTrapHost(vmctx: *VmCtx, fallback_exit_code: u8) noreturn {
+    _ = vmctx;
+    if (isTrapCatching()) trapLongjmp();
+    std.process.exit(fallback_exit_code);
+}
+
 /// Host helper invoked from AOT-compiled `throw` when control flow
 /// cannot find a matching catch handler inside the current function
 /// (the only case lowered by commit 3 of #672). Reads the payload
@@ -1262,6 +1272,7 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
                 new_elements[j] = types.TableElement.nullForType(shared.table_type.elem_type);
             }
             shared.elements = new_elements;
+            refreshTableSubscribers(shared);
         }
         return @intCast(old_size);
     }
@@ -1310,6 +1321,7 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
             new_elements[j] = types.TableElement.nullForType(shared.table_type.elem_type);
         }
         shared.elements = new_elements;
+        refreshTableSubscribers(shared);
     }
     return @intCast(old_size);
 }
@@ -1670,6 +1682,30 @@ pub fn lazyCompileHelper(vmctx: *VmCtx, local_idx: u32) callconv(.c) usize {
     return @intFromPtr(addr);
 }
 
+const SharedCodeMapping = struct {
+    addr: [*]const u8,
+    size: usize,
+    allocator: std.mem.Allocator,
+    references: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+
+    fn retain(self: *SharedCodeMapping) void {
+        _ = self.references.fetchAdd(1, .acq_rel);
+    }
+
+    fn release(self: *SharedCodeMapping) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        platform.munmap(@ptrCast(@constCast(self.addr)), self.size);
+        JitCodeCache.unregister(self.size);
+        self.allocator.destroy(self);
+    }
+
+    fn referenceCount(self: *const SharedCodeMapping) usize {
+        return self.references.load(.acquire);
+    }
+};
+
 // ─── Instance ───────────────────────────────────────────────────────────────
 
 pub const AotInstance = struct {
@@ -1711,6 +1747,10 @@ pub const AotInstance = struct {
     code_base: ?[*]const u8 = null,
     /// Size of the mapped executable region (for cleanup).
     code_size: usize = 0,
+    /// Refcounted immutable text mapping shared by thread clones. Every clone
+    /// has its own VmCtx and mutable execution state, while native table and
+    /// funcref entries can safely keep one stable code address.
+    code_mapping: ?*SharedCodeMapping = null,
     /// Resolved AOT host function pointers (one per import).
     host_functions: []const ?*const anyopaque = &.{},
     /// Native function pointer table for call_indirect (one per module function).
@@ -1769,6 +1809,17 @@ pub const AotInstance = struct {
         self.thread_context.replaceProcessState(parent.thread_context.process_state);
         refreshVmCtxForInstance(self, null);
     }
+
+    pub fn setThreadManager(
+        self: *AotInstance,
+        manager: ?*thread_manager.ThreadManager,
+    ) void {
+        self.thread_context.setThreadGroup(if (manager) |value|
+            @ptrCast(value)
+        else
+            null);
+        refreshVmCtxForInstance(self, null);
+    }
 };
 
 pub const TableInfo = extern struct {
@@ -1798,8 +1849,8 @@ pub const RuntimeError = error{
     /// still linked so importers of `src/root.zig` build cleanly on
     /// riscv64 / etc., but invoking it at runtime fails fast.
     UnsupportedArchitecture,
-    /// The feature contract is enabled, but production AOT thread spawning
-    /// and its architecture/ABI contract have not been implemented.
+    /// The selected AOT mode cannot provide an independent thread instance
+    /// (currently lazy-JIT clones).
     WasiThreadsAotNotImplemented,
     /// #857: mapping this instance's code would push total resident
     /// JIT/AOT executable code past `JitCodeCache.budget_bytes`. Only
@@ -2016,17 +2067,244 @@ pub fn instantiateWithOverrides(
     return inst;
 }
 
+/// Clone an executing AOT instance for the Preview-1 instance-per-thread
+/// model.
+///
+/// Shared, retained state: linear memories, tables, immutable native code,
+/// host-function bindings, and process state. Per-thread state: VmCtx,
+/// globals, segment-drop flags, trap/cancel/task bindings, TLS/start_arg, and
+/// transient call bookkeeping.
+/// The parent owns immutable module/link/tag metadata and must outlive the
+/// clone; `ThreadManager` shutdown enforces that for production callers.
+fn snapshotGlobalForThread(
+    parent: *const AotInstance,
+    global: *const types.GlobalInstance,
+    index: usize,
+) types.Value {
+    if (parent.vmctx.globals_ptr == 0) return global.value;
+    const offset = globalOffsetAt(parent, index) orelse return global.value;
+    const storage = @as(
+        [*]const u8,
+        @ptrFromInt(parent.vmctx.globals_ptr),
+    )[0 .. globalStorageWordCount(parent) * @sizeOf(u128)];
+    return switch (global.value) {
+        .v128 => if (offset + 16 <= storage.len)
+            .{ .v128 = std.mem.readInt(u128, storage[offset..][0..16], .little) }
+        else
+            global.value,
+        else => if (offset + 8 <= storage.len)
+            globalValueFromI64(
+                parent,
+                global.value,
+                std.mem.readInt(i64, storage[offset..][0..8], .little),
+            )
+        else
+            global.value,
+    };
+}
+
+pub fn cloneForThread(
+    parent: *const AotInstance,
+    allocator: std.mem.Allocator,
+) RuntimeError!*AotInstance {
+    if (comptime config.lazy_jit) return error.WasiThreadsAotNotImplemented;
+    if (parent.code_base != null and parent.code_mapping == null)
+        return error.CodeMappingFailed;
+
+    const child = allocator.create(AotInstance) catch return error.OutOfMemory;
+    errdefer allocator.destroy(child);
+
+    const memories: []*types.MemoryInstance = if (parent.memories.len > 0)
+        allocator.alloc(*types.MemoryInstance, parent.memories.len) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    var memories_retained: usize = 0;
+    errdefer {
+        for (memories[0..memories_retained]) |memory| memory.release(allocator);
+        if (memories.len > 0) allocator.free(memories);
+    }
+    for (parent.memories, 0..) |memory, i| {
+        memory.retain();
+        memories[i] = memory;
+        memories_retained += 1;
+    }
+    const memories_owned: []bool = if (memories.len > 0)
+        allocator.alloc(bool, memories.len) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (memories_owned.len > 0) allocator.free(memories_owned);
+    @memset(memories_owned, false);
+
+    const tables: []*types.TableInstance = if (parent.tables.len > 0)
+        allocator.alloc(*types.TableInstance, parent.tables.len) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    var tables_retained: usize = 0;
+    errdefer {
+        for (tables[0..tables_retained]) |table| table.release(allocator);
+        if (tables.len > 0) allocator.free(tables);
+    }
+    for (parent.tables, 0..) |table, i| {
+        table.retain();
+        tables[i] = table;
+        tables_retained += 1;
+    }
+    const tables_owned: []bool = if (tables.len > 0)
+        allocator.alloc(bool, tables.len) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (tables_owned.len > 0) allocator.free(tables_owned);
+    @memset(tables_owned, false);
+
+    const globals: []*types.GlobalInstance = if (parent.globals.len > 0)
+        allocator.alloc(*types.GlobalInstance, parent.globals.len) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    var globals_created: usize = 0;
+    errdefer {
+        for (globals[0..globals_created]) |global| global.release(allocator);
+        if (globals.len > 0) allocator.free(globals);
+    }
+    for (parent.globals, 0..) |global, i| {
+        const clone = allocator.create(types.GlobalInstance) catch
+            return error.OutOfMemory;
+        clone.* = .{
+            .global_type = global.global_type,
+            .value = snapshotGlobalForThread(parent, global, i),
+            .owned = global.owned,
+            .source_module = global.source_module,
+        };
+        globals[i] = clone;
+        globals_created += 1;
+    }
+    const globals_owned: []bool = if (globals.len > 0)
+        allocator.alloc(bool, globals.len) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (globals_owned.len > 0) allocator.free(globals_owned);
+    @memset(globals_owned, true);
+
+    const tags: []*types.TagInstance = if (parent.tags.len > 0)
+        allocator.alloc(*types.TagInstance, parent.tags.len) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (tags.len > 0) allocator.free(tags);
+    if (tags.len > 0) @memcpy(tags, parent.tags);
+    const tags_owned: []bool = if (tags.len > 0)
+        allocator.alloc(bool, tags.len) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (tags_owned.len > 0) allocator.free(tags_owned);
+    @memset(tags_owned, false);
+
+    const global_offsets: []u32 = if (parent.global_offsets.len > 0)
+        allocator.dupe(u32, parent.global_offsets) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (global_offsets.len > 0) allocator.free(global_offsets);
+    const host_functions: []const ?*const anyopaque = if (parent.host_functions.len > 0)
+        allocator.dupe(?*const anyopaque, parent.host_functions) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (host_functions.len > 0) allocator.free(host_functions);
+    const funcptrs: []usize = if (parent.funcptrs.len > 0)
+        allocator.dupe(usize, parent.funcptrs) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (funcptrs.len > 0) allocator.free(funcptrs);
+    const elem_segments_dropped: []bool = if (parent.elem_segments_dropped.len > 0)
+        allocator.dupe(bool, parent.elem_segments_dropped) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (elem_segments_dropped.len > 0)
+        allocator.free(elem_segments_dropped);
+    const sig_table: []u32 = if (parent.sig_table.len > 0)
+        allocator.dupe(u32, parent.sig_table) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (sig_table.len > 0) allocator.free(sig_table);
+    const func_sig_ids: []u32 = if (parent.func_sig_ids.len > 0)
+        allocator.dupe(u32, parent.func_sig_ids) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (func_sig_ids.len > 0) allocator.free(func_sig_ids);
+    const ptr_to_sig: []PtrSigEntry = if (parent.ptr_to_sig.len > 0)
+        allocator.dupe(PtrSigEntry, parent.ptr_to_sig) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (ptr_to_sig.len > 0) allocator.free(ptr_to_sig);
+    const tables_info: []TableInfo = if (parent.tables_info.len > 0)
+        allocator.dupe(TableInfo, parent.tables_info) catch return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (tables_info.len > 0) allocator.free(tables_info);
+    const extra_tables_storage: [][]usize = if (parent.extra_tables_storage.len > 0)
+        allocator.dupe([]usize, parent.extra_tables_storage) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (extra_tables_storage.len > 0)
+        allocator.free(extra_tables_storage);
+
+    const code_mapping = parent.code_mapping;
+    if (code_mapping) |mapping| mapping.retain();
+    errdefer if (code_mapping) |mapping| mapping.release();
+
+    var child_thread_context =
+        execution_context.ThreadExecutionContext.init(parent.thread_context.process_state);
+    errdefer child_thread_context.deinit();
+
+    child.* = .{
+        .module = parent.module,
+        .memories = memories,
+        .memories_owned = memories_owned,
+        .tables = tables,
+        .tables_owned = tables_owned,
+        .globals = globals,
+        .globals_owned = globals_owned,
+        .tags = tags,
+        .tags_owned = tags_owned,
+        .global_offsets = global_offsets,
+        .global_storage_size = parent.global_storage_size,
+        .allocator = allocator,
+        .code_base = parent.code_base,
+        .code_size = parent.code_size,
+        .code_mapping = code_mapping,
+        .host_functions = host_functions,
+        .func_table = parent.func_table,
+        .funcptrs = funcptrs,
+        .tables_info = tables_info,
+        .extra_tables_storage = extra_tables_storage,
+        .elem_segments_dropped = elem_segments_dropped,
+        .module_ref = parent.module_ref,
+        .sig_table = sig_table,
+        .func_sig_ids = func_sig_ids,
+        .ptr_to_sig = ptr_to_sig,
+        .thread_context = child_thread_context,
+    };
+    refreshVmCtxForInstance(child, null);
+    subscribeVmCtxToMemories(child) catch return error.OutOfMemory;
+    errdefer unsubscribeVmCtxFromMemories(child);
+    subscribeVmCtxToTables(child) catch return error.OutOfMemory;
+    refreshVmCtxTablesForInstance(child);
+    return child;
+}
+
 /// Destroy an AOT instance, freeing all allocated resources.
 pub fn destroy(inst: *AotInstance) void {
     const allocator = inst.allocator;
-    // Unmap executable code if mapped.
-    if (inst.code_base) |base| {
-        platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
-        JitCodeCache.unregister(inst.code_size);
-    }
+    if (inst.code_mapping) |mapping| mapping.release();
     if (comptime config.lazy_jit) {
         inst.lazy_jit.free(allocator);
     }
+    unsubscribeVmCtxFromTables(inst);
     unsubscribeVmCtxFromMemories(inst);
     freeMemories(inst.memories, inst.memories_owned, allocator);
     freeTables(inst.tables, inst.tables_owned, allocator);
@@ -2154,12 +2432,223 @@ fn unsubscribeVmCtxFromMemories(inst: *AotInstance) void {
     for (inst.memories) |mem| mem.unsubscribeVmCtx(vmctx_opaque);
 }
 
+fn subscribeVmCtxToTables(inst: *AotInstance) !void {
+    const vmctx_opaque: *anyopaque = @ptrCast(&inst.vmctx);
+    var subscribed: usize = 0;
+    errdefer {
+        for (inst.tables[0..subscribed]) |table|
+            table.unsubscribeVmCtx(vmctx_opaque);
+    }
+    for (inst.tables) |table| {
+        try table.subscribeVmCtx(vmctx_opaque, inst.allocator);
+        subscribed += 1;
+    }
+}
+
+fn unsubscribeVmCtxFromTables(inst: *AotInstance) void {
+    const vmctx_opaque: *anyopaque = @ptrCast(&inst.vmctx);
+    for (inst.tables) |table| table.unsubscribeVmCtx(vmctx_opaque);
+}
+
+fn refreshVmCtxTable(
+    inst: *AotInstance,
+    table_idx: usize,
+    table: *types.TableInstance,
+) void {
+    const backing = table.native_backing;
+    const type_backing_ptr = if (table.type_backing.len > 0)
+        @intFromPtr(table.type_backing.ptr)
+    else
+        0;
+    if (table_idx == 0) {
+        inst.func_table = backing;
+        inst.vmctx.func_table_ptr = if (backing.len > 0)
+            @intFromPtr(backing.ptr)
+        else
+            0;
+        inst.vmctx.func_table_len = @intCast(backing.len);
+    } else if (table_idx - 1 < inst.extra_tables_storage.len) {
+        inst.extra_tables_storage[table_idx - 1] = backing;
+    }
+    if (table_idx < inst.tables_info.len) {
+        inst.tables_info[table_idx] = .{
+            .ptr = if (backing.len > 0) @intFromPtr(backing.ptr) else 0,
+            .len = @intCast(backing.len),
+            .type_backing_ptr = type_backing_ptr,
+        };
+    }
+}
+
+fn refreshVmCtxTablesForInstance(inst: *AotInstance) void {
+    for (inst.tables, 0..) |table, table_idx| {
+        table.lock();
+        refreshVmCtxTable(inst, table_idx, table);
+        table.unlock();
+    }
+}
+
+fn refreshTableSubscribers(table: *types.TableInstance) void {
+    table.subscriber_mutex.lock();
+    defer table.subscriber_mutex.unlock();
+    for (table.vmctx_subscribers.items) |subscriber_opaque| {
+        const vmctx: *VmCtx = @ptrCast(@alignCast(subscriber_opaque));
+        if (vmctx.instance_ptr == 0) continue;
+        const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+        for (inst.tables, 0..) |candidate, table_idx| {
+            if (candidate == table) refreshVmCtxTable(inst, table_idx, table);
+        }
+    }
+}
+
 /// Look up an exported function by name, returning its function index.
 pub fn findExportFunc(inst: *const AotInstance, name: []const u8) ?u32 {
     for (inst.module.exports) |exp| {
         if (exp.kind == .function and std.mem.eql(u8, exp.name, name)) return exp.index;
     }
     return null;
+}
+
+fn functionTypeForIndex(
+    module: *const aot_loader.AotModule,
+    func_idx: u32,
+) ?*const aot_loader.AotFuncType {
+    if (func_idx < module.import_function_count) {
+        var imported_idx: u32 = 0;
+        for (module.imports) |*imp| {
+            if (imp.kind != .function) continue;
+            if (imported_idx == func_idx) {
+                if (imp.func_type_idx >= module.func_types.len) return null;
+                return &module.func_types[imp.func_type_idx];
+            }
+            imported_idx += 1;
+        }
+        return null;
+    }
+    const local_idx = func_idx - module.import_function_count;
+    if (local_idx >= module.local_func_type_indices.len) return null;
+    const type_idx = module.local_func_type_indices[local_idx];
+    if (type_idx >= module.func_types.len) return null;
+    return &module.func_types[type_idx];
+}
+
+fn isWasiThreadStartType(func_type: *const aot_loader.AotFuncType) bool {
+    return func_type.params.len == 2 and
+        func_type.params[0] == .i32 and
+        func_type.params[1] == .i32 and
+        func_type.results.len == 0;
+}
+
+const AotThreadContext = struct {
+    instance: *AotInstance,
+    func_idx: u32,
+    allocator: std.mem.Allocator,
+};
+
+fn createAotThreadContext(
+    parent_opaque: *anyopaque,
+    allocator: std.mem.Allocator,
+) thread_manager.SpawnError!*anyopaque {
+    const parent: *AotInstance = @ptrCast(@alignCast(parent_opaque));
+    const func_idx = findExportFunc(parent, "wasi_thread_start") orelse
+        return error.MissingThreadStart;
+    const func_type = functionTypeForIndex(parent.module, func_idx) orelse
+        return error.InvalidThreadStartSignature;
+    if (!isWasiThreadStartType(func_type))
+        return error.InvalidThreadStartSignature;
+
+    const child = cloneForThread(parent, parent.allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ChildInitializationFailed,
+    };
+    errdefer destroy(child);
+    const source_context = execution_context.current() orelse
+        &parent.thread_context;
+    child.thread_context.replaceProcessState(source_context.process_state);
+    const context = allocator.create(AotThreadContext) catch
+        return error.OutOfMemory;
+    context.* = .{
+        .instance = child,
+        .func_idx = func_idx,
+        .allocator = allocator,
+    };
+    return @ptrCast(context);
+}
+
+fn configureAotThreadContext(
+    child_opaque: *anyopaque,
+    manager: *thread_manager.ThreadManager,
+    tid: i32,
+    start_arg: u32,
+    auxiliary_stack: ?execution_context.AuxiliaryStack,
+) thread_manager.SpawnError!void {
+    const child: *AotThreadContext = @ptrCast(@alignCast(child_opaque));
+    child.instance.setThreadManager(manager);
+    child.instance.thread_context.configureWasiThread(
+        tid,
+        start_arg,
+        auxiliary_stack,
+    );
+    refreshVmCtxForInstance(child.instance, null);
+}
+
+fn runAotThreadContext(child_opaque: *anyopaque) thread_manager.ThreadOutcome {
+    const child: *AotThreadContext = @ptrCast(@alignCast(child_opaque));
+    const params = [_]types.ValType{ .i32, .i32 };
+    const args = [_]types.Value{
+        .{ .i32 = child.instance.thread_context.tid },
+        .{ .i32 = @bitCast(child.instance.thread_context.start_arg) },
+    };
+    var results: [0]ScalarResult = .{};
+    _ = callFuncScalar(
+        child.instance,
+        child.func_idx,
+        &params,
+        &.{},
+        &args,
+        &results,
+    ) catch return .trapped;
+    return .completed;
+}
+
+fn destroyAotThreadContext(child_opaque: *anyopaque) void {
+    const child: *AotThreadContext = @ptrCast(@alignCast(child_opaque));
+    const allocator = child.allocator;
+    destroy(child.instance);
+    allocator.destroy(child);
+}
+
+const aot_thread_ops = thread_manager.ThreadBackendOps{
+    .create = createAotThreadContext,
+    .configure = configureAotThreadContext,
+    .run = runAotThreadContext,
+    .destroy = destroyAotThreadContext,
+};
+
+/// Spawn `wasi_thread_start(tid, start_arg)` on a manager-owned native
+/// thread. The host import maps every lifecycle error to the Preview-1
+/// negative-TID failure result.
+pub fn spawnWasiThread(parent: *AotInstance, start_arg: i32) thread_manager.SpawnError!i32 {
+    if (comptime !config.lib_wasi_threads or !can_execute_native)
+        return error.ThreadFeatureDisabled;
+    const source_context = execution_context.current() orelse
+        &parent.thread_context;
+    const manager = source_context.threadGroup(thread_manager.ThreadManager) orelse
+        return error.ThreadFeatureDisabled;
+    return manager.spawnWithBackend(
+        @ptrCast(parent),
+        start_arg,
+        &aot_thread_ops,
+    );
+}
+
+pub fn signalThreadGroupTrap(vmctx: *VmCtx) void {
+    if (vmctx.thread_context == 0) return;
+    const thread_context_ptr: *execution_context.ThreadExecutionContext =
+        @ptrFromInt(vmctx.thread_context);
+    thread_context_ptr.markTrap();
+    if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager| {
+        manager.signalTrap();
+    }
 }
 
 /// Look up an exported memory by name, returning the underlying
@@ -2237,8 +2726,19 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     if (has_text) {
         const text = text_opt.?;
         const mapped = try mapTrackedExecutableCode(text);
+        const mapping = inst.allocator.create(SharedCodeMapping) catch {
+            platform.munmap(@ptrCast(@constCast(mapped.addr)), mapped.size);
+            JitCodeCache.unregister(mapped.size);
+            return error.OutOfMemory;
+        };
+        mapping.* = .{
+            .addr = mapped.addr,
+            .size = mapped.size,
+            .allocator = inst.allocator,
+        };
         inst.code_base = mapped.addr;
         inst.code_size = mapped.size;
+        inst.code_mapping = mapping;
     }
 
     // Build function pointer table for call_indirect
@@ -2455,6 +2955,8 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         inst.tables_info = info;
         inst.extra_tables_storage = extra;
     }
+
+    try subscribeVmCtxToTables(inst);
 }
 
 /// Call an AOT-compiled function by index.
@@ -3755,7 +4257,7 @@ test "core resource AOT global rollback releases borrowed override" {
     try std.testing.expectEqual(@as(usize, 1), shared.referenceCount());
 }
 
-test "instantiate rejects configured WASI threads before AOT allocation" {
+test "instantiate resolves configured AOT thread-spawn imports" {
     if (comptime !config.lib_wasi_threads) return error.SkipZigTest;
 
     const imports = [_]aot_loader.AotImportDesc{.{
@@ -3767,10 +4269,10 @@ test "instantiate rejects configured WASI threads before AOT allocation" {
         .imports = &imports,
         .import_function_count = 1,
     };
-    try std.testing.expectError(
-        error.WasiThreadsAotNotImplemented,
-        instantiate(&module, std.testing.allocator),
-    );
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+    try std.testing.expectEqual(@as(usize, 1), inst.host_functions.len);
+    try std.testing.expect(inst.host_functions[0] != null);
 }
 
 test "instantiate: empty module" {
@@ -4180,6 +4682,215 @@ test "AOT thread context inherits retained process state without thread-local fl
     );
     destroy(child);
     try std.testing.expectEqual(@as(usize, 0), tracker.refs);
+}
+
+test "AOT thread clone shares code memory and tables while isolating globals and VmCtx" {
+    if (comptime !can_execute_native) return error.SkipZigTest;
+
+    const Tracker = struct {
+        refs: usize = 1,
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.refs > 0);
+            self.refs -= 1;
+        }
+    };
+    const process_ops = execution_context.ProcessStateOps{
+        .retain = Tracker.retain,
+        .release = Tracker.release,
+    };
+    const text = switch (builtin.cpu.arch) {
+        .x86_64 => &[_]u8{0xC3},
+        .aarch64 => &[_]u8{ 0xC0, 0x03, 0x5F, 0xD6 },
+        else => unreachable,
+    };
+    const offsets = [_]u32{0};
+    const type_indices = [_]u32{0};
+    const func_types = [_]aot_loader.AotFuncType{.{
+        .params = &.{},
+        .results = &.{},
+    }};
+    const memories = [_]types.MemoryType{.{
+        .limits = .{ .min = 1, .max = 2 },
+        .is_shared = true,
+    }};
+    const tables = [_]types.TableType{.{
+        .elem_type = .funcref,
+        .limits = .{ .min = 1, .max = 2 },
+    }};
+    const globals = [_]aot_loader.AotGlobalInit{.{
+        .val_type = @intFromEnum(types.ValType.i32),
+        .mutability = 1,
+        .init_i64 = 17,
+    }};
+    const tag_types = [_]u32{0};
+    const module = aot_loader.AotModule{
+        .text_section = text,
+        .func_offsets = &offsets,
+        .local_func_type_indices = &type_indices,
+        .func_count = 1,
+        .func_types = &func_types,
+        .memories = &memories,
+        .tables = &tables,
+        .global_inits = &globals,
+        .tag_types = &tag_types,
+    };
+
+    var tracker = Tracker{};
+    const root_ref =
+        execution_context.ProcessStateRef.init(@ptrCast(&tracker), &process_ops);
+    const parent = try instantiate(&module, std.testing.allocator);
+    try mapCodeExecutable(parent);
+    parent.attachProcessState(root_ref);
+    parent.thread_context.configureWasiThread(1, 0x1111, null);
+    parent.thread_context.requestCancellation();
+
+    var active_globals = [_]u128{0};
+    writeGlobalsToStorage(parent, std.mem.sliceAsBytes(&active_globals));
+    std.mem.writeInt(
+        i32,
+        std.mem.sliceAsBytes(&active_globals)[0..4],
+        99,
+        .little,
+    );
+    parent.vmctx.globals_ptr = @intFromPtr(&active_globals);
+    const child = try cloneForThread(parent, std.testing.allocator);
+    parent.vmctx.globals_ptr = 0;
+    child.thread_context.configureWasiThread(2, 0x2222, null);
+
+    try std.testing.expectEqual(parent.memories[0], child.memories[0]);
+    try std.testing.expectEqual(parent.tables[0], child.tables[0]);
+    try std.testing.expectEqual(parent.tags[0], child.tags[0]);
+    try std.testing.expectEqual(@as(usize, 2), parent.memories[0].referenceCount());
+    try std.testing.expectEqual(@as(usize, 2), parent.tables[0].referenceCount());
+    try std.testing.expect(parent.globals[0] != child.globals[0]);
+    try std.testing.expectEqual(@as(i32, 17), parent.globals[0].value.i32);
+    try std.testing.expectEqual(@as(i32, 99), child.globals[0].value.i32);
+    try std.testing.expect(&parent.vmctx != &child.vmctx);
+    try std.testing.expectEqual(parent.vmctx.memory_base, child.vmctx.memory_base);
+    try std.testing.expectEqual(parent.code_base, child.code_base);
+    try std.testing.expectEqual(parent.funcptrs[0], child.funcptrs[0]);
+    try std.testing.expectEqual(@as(usize, 2), parent.code_mapping.?.referenceCount());
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        parent.tables[0].vmctx_subscribers.items.len,
+    );
+    try std.testing.expectEqual(@as(usize, 3), tracker.refs);
+    try std.testing.expect(parent.thread_context.isCancellationRequested());
+    try std.testing.expect(!child.thread_context.isCancellationRequested());
+
+    try std.testing.expectEqual(@as(i32, 1), tableGrowHelper(&parent.vmctx, 0, 1, 0));
+    try std.testing.expectEqual(@as(u32, 2), parent.vmctx.func_table_len);
+    try std.testing.expectEqual(@as(u32, 2), child.vmctx.func_table_len);
+    try std.testing.expectEqual(parent.vmctx.func_table_ptr, child.vmctx.func_table_ptr);
+
+    var no_results: [0]ScalarResult = .{};
+    _ = try callFuncScalar(child, 0, &.{}, &.{}, &.{}, &no_results);
+    destroy(child);
+    try std.testing.expectEqual(@as(usize, 1), parent.memories[0].referenceCount());
+    try std.testing.expectEqual(@as(usize, 1), parent.tables[0].referenceCount());
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        parent.tables[0].vmctx_subscribers.items.len,
+    );
+    try std.testing.expectEqual(@as(usize, 1), parent.code_mapping.?.referenceCount());
+    try std.testing.expectEqual(@as(usize, 2), tracker.refs);
+    destroy(parent);
+    root_ref.release();
+    try std.testing.expectEqual(@as(usize, 0), tracker.refs);
+}
+
+const AotCloneRollbackTracker = struct {
+    refs: usize = 1,
+
+    fn retain(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.refs += 1;
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.refs > 0);
+        self.refs -= 1;
+    }
+};
+
+fn exerciseAotCloneAllocation(
+    failing_allocator: std.mem.Allocator,
+    parent: *AotInstance,
+) !void {
+    const child = cloneForThread(parent, failing_allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return err,
+    };
+    destroy(child);
+}
+
+test "AOT thread clone rolls back every partial retain and allocation" {
+    if (comptime !can_execute_native) return error.SkipZigTest;
+
+    const text = switch (builtin.cpu.arch) {
+        .x86_64 => &[_]u8{0xC3},
+        .aarch64 => &[_]u8{ 0xC0, 0x03, 0x5F, 0xD6 },
+        else => unreachable,
+    };
+    const offsets = [_]u32{0};
+    const type_indices = [_]u32{0};
+    const func_types = [_]aot_loader.AotFuncType{.{
+        .params = &.{},
+        .results = &.{},
+    }};
+    const memories = [_]types.MemoryType{.{
+        .limits = .{ .min = 1, .max = 2 },
+        .is_shared = true,
+    }};
+    const tables = [_]types.TableType{.{
+        .elem_type = .funcref,
+        .limits = .{ .min = 1, .max = 2 },
+    }};
+    const globals = [_]aot_loader.AotGlobalInit{.{
+        .val_type = @intFromEnum(types.ValType.i32),
+        .mutability = 1,
+        .init_i64 = 7,
+    }};
+    const module = aot_loader.AotModule{
+        .text_section = text,
+        .func_offsets = &offsets,
+        .local_func_type_indices = &type_indices,
+        .func_count = 1,
+        .func_types = &func_types,
+        .memories = &memories,
+        .tables = &tables,
+        .global_inits = &globals,
+    };
+    const process_ops = execution_context.ProcessStateOps{
+        .retain = AotCloneRollbackTracker.retain,
+        .release = AotCloneRollbackTracker.release,
+    };
+    var tracker = AotCloneRollbackTracker{};
+    const root_ref =
+        execution_context.ProcessStateRef.init(@ptrCast(&tracker), &process_ops);
+    const parent = try instantiate(&module, std.testing.allocator);
+    defer destroy(parent);
+    try mapCodeExecutable(parent);
+    parent.attachProcessState(root_ref);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseAotCloneAllocation,
+        .{parent},
+    );
+    try std.testing.expectEqual(@as(usize, 1), parent.memories[0].referenceCount());
+    try std.testing.expectEqual(@as(usize, 1), parent.tables[0].referenceCount());
+    try std.testing.expectEqual(@as(usize, 1), parent.code_mapping.?.referenceCount());
+    try std.testing.expectEqual(@as(usize, 2), tracker.refs);
+    root_ref.release();
 }
 
 test "AOT execution context: no-WASI instance keeps process pointer null" {

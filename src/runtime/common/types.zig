@@ -808,6 +808,11 @@ pub const TableInstance = struct {
     /// table.init/copy/fill/grow) so that call_indirect can do a single
     /// 4-byte equality check against the caller's expected sig_id.
     type_backing: []u32 = &.{},
+    /// AOT VmCtx mirrors that cache this table's native backing pointer and
+    /// length. Growth refreshes every subscriber so thread clones and
+    /// cross-module importers never retain a freed realloc address.
+    vmctx_subscribers: std.ArrayListUnmanaged(*anyopaque) = .empty,
+    subscriber_mutex: platform.Mutex = .init,
 
     pub fn retain(self: *TableInstance) void {
         self.ref_count.retain();
@@ -815,6 +820,7 @@ pub const TableInstance = struct {
 
     pub fn release(self: *TableInstance, allocator: std.mem.Allocator) void {
         if (!self.ref_count.release()) return;
+        self.vmctx_subscribers.deinit(allocator);
         if (self.elements.len > 0) allocator.free(self.elements);
         if (self.native_backing.len > 0) allocator.free(self.native_backing);
         if (self.type_backing.len > 0) allocator.free(self.type_backing);
@@ -831,6 +837,30 @@ pub const TableInstance = struct {
 
     pub inline fn unlock(self: *TableInstance) void {
         self.mutex.unlock();
+    }
+
+    pub fn subscribeVmCtx(
+        self: *TableInstance,
+        vmctx: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) !void {
+        self.subscriber_mutex.lock();
+        defer self.subscriber_mutex.unlock();
+        for (self.vmctx_subscribers.items) |subscriber| {
+            if (subscriber == vmctx) return;
+        }
+        try self.vmctx_subscribers.append(allocator, vmctx);
+    }
+
+    pub fn unsubscribeVmCtx(self: *TableInstance, vmctx: *anyopaque) void {
+        self.subscriber_mutex.lock();
+        defer self.subscriber_mutex.unlock();
+        for (self.vmctx_subscribers.items, 0..) |subscriber, i| {
+            if (subscriber == vmctx) {
+                _ = self.vmctx_subscribers.swapRemove(i);
+                return;
+            }
+        }
     }
 
     pub inline fn elementCount(self: *TableInstance) usize {

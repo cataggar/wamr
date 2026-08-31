@@ -1,4 +1,4 @@
-# `wasi:threads` design — multi-threaded interpreter state isolation
+# `wasi:threads` design — native-thread execution isolation
 
 Status: **DRAFT** (shared-memory/parking, atomic semantics, and the
 thread-group lifecycle are implemented; production host binding remains
@@ -55,20 +55,21 @@ operate on the shared linear memory and synchronise across threads.
    `Io`).
 4. **`zig build test` stays green.**
 
-`-Dlib_wasi_threads=true` is currently a configuration contract, not a
-production-support switch. It implies shared memory, the thread manager,
-WebAssembly atomics, and heap auxiliary stacks, requires a 64-bit native
-multithreaded interpreter build, and rejects AOT/JIT configurations. The
+`-Dlib_wasi_threads=true` enables the Preview-1 thread runtime. It implies
+shared memory, the thread manager, WebAssembly atomics, and heap auxiliary
+stacks, and requires a 64-bit native multithreaded host. Production AOT
+thread spawning is supported on x86_64 and AArch64; unsupported AOT targets
+and the in-process JIT/fast-JIT combinations are rejected at build time. The
 public `config.wasi_threads` report keeps target, backend, configured
-capabilities, and implementation readiness separate; thread-spawn imports
-are rejected before allocation while readiness remains false.
+capabilities, and implementation readiness separate.
 
 ## Current implementation status
 
-The tree contains a hardened `ThreadManager` lifecycle plus scaffolding in
-`cloneForThread`, the atomic-opcode dispatcher, and the
-`wasi.thread-spawn` host import. No default CLI or component path currently
-offers gated guest-thread execution.
+The tree contains a hardened `ThreadManager` lifecycle and production AOT
+`wasi.thread-spawn` support. The raw Preview-1 AOT CLI and AOT-backed
+component cores install a parent-owned thread group, publish each child
+before native start, and join every retained child before destroying the
+parent instance. Interpreter production binding remains independently gated.
 
 Shared memories now use a refcounted control block with an immutable base.
 Instantiation reserves the declared maximum up front and fails if that
@@ -156,10 +157,24 @@ The process/execution split is now explicit:
   inherit only the retained process reference.
 * Component canon task and lower-call state no longer lives on the shared
   `ComponentInstance`. AOT keeps all existing codegen-addressed `VmCtx`
-  offsets stable and appends only a thread-context pointer.
+  offsets stable and appends only the thread-context pointer.
 
-This context work deliberately does not add production host bindings, AOT
-thread spawning, or final group cancellation.
+Final group cancellation remains separate work.
+
+The AOT thread clone model is:
+
+* immutable mapped code, shared memories, shared tables, immutable host
+  bindings, exception-tag identity, and retained process state are shared;
+* mutable globals and segment-drop state are snapshotted per thread, including
+  the active globals slab when a nested spawn occurs during an AOT call;
+* each child owns a distinct `VmCtx`, globals slab, `ThreadExecutionContext`,
+  trap jump buffer, start argument, TLS metadata, and task/cancel state;
+* the mapped code has an explicit reference count, core resources use their
+  established retain/release contracts, and every partial clone failure rolls
+  back all acquired ownership;
+* table growth republishes native backing pointers to every subscribed child
+  `VmCtx`, while all pre-existing codegen-addressed fields retain their
+  offsets.
 
 ### Process/context lifetime contract
 
@@ -170,7 +185,7 @@ thread spawning, or final group cancellation.
 | Create `ExecEnv` | The environment acquires its own reference from the instance. |
 | Clone a thread instance | The child acquires one process reference; allocation rollback releases it with all partially retained core resources. |
 | Parent guest entry returns | Parent execution-local state may be destroyed without affecting a live child; the hardened thread record retains the child instance/env until join. |
-| Child completion | Completion records an outcome only; `joinOne`/`joinAll` destroy the child `ExecEnv`, return its auxiliary stack, and destroy the clone. |
+| Child completion | Completion records an outcome only; `joinOne`/`joinAll` destroy the child interpreter `ExecEnv` or AOT instance, return any auxiliary stack, and destroy the clone. |
 | Group shutdown | Shutdown drains in-flight spawns and joins all records. The final process reference closes descriptors/preopens exactly once. |
 
 The Preview-1 ABI's `start_arg` is passed bit-for-bit to
@@ -180,14 +195,21 @@ offset 0 and TLS base at offset 4, then initializes `__stack_pointer` and
 `__tls_base`. Runtime auxiliary-stack metadata therefore remains independent
 of that guest-owned payload.
 
+The focused AOT fixture runs the same compiled module on native x86_64 and
+hosted AArch64. It covers parent-owned join, nested spawn, generation-safe
+TIDs, shared atomic load/store/RMW/cmpxchg, shared Preview-1 descriptors,
+opaque stack/TLS payload words, immediate exit, guest traps, `proc_exit`, and
+missing or malformed `wasi_thread_start` exports.
+
 Atomic opcode and fence behavior is complete on both execution tiers.
 Interpreted atomic loads, stores, RMW and `cmpxchg` are `seq_cst`, bounds-
 and alignment-checked; `wait`/`notify` use the monotonic parking lot; and
 `atomic.fence` emits a real barrier through `platform.memoryFenceSeqCst`
-rather than the no-op it used to be. That last point matters because the AOT
-backends have always emitted `MFENCE` / `DMB ISH` for the same instruction,
-so a no-op in the interpreter was a tier-dependent memory model — the kind of
-divergence that only surfaces as a rare race once threads actually run.
+rather than the no-op it used to be. The production x86_64 register-allocating
+backend now lowers atomic load/store/RMW/cmpxchg instead of falling through its
+generic zero-result placeholder, and validation tracks every `0xFE` stack
+effect. AArch64 uses its existing LSE acquire/release operations; fences lower
+to `MFENCE` / `DMB ISH`.
 
 ## Upstream state
 
@@ -580,6 +602,14 @@ Each wave is a discrete PR with its own conformance gate.
   `thread_manager.zig` into the default test step (currently they
   pass under unit tests but spawning is opt-in).
 
+The AOT half is implemented on x86_64 and AArch64. Its host import calls the
+generation-safe `ThreadManager` through a type-erased backend contract,
+clones the active AOT instance, and invokes the exact
+`wasi_thread_start(i32, i32) -> ()` export through `callFuncScalar`.
+Missing or malformed exports fail synchronously with a negative TID. Child
+traps and `proc_exit` unwind through the call-local trap state, record a
+joined trapped outcome, and never detach or terminate the embedding host.
+
 **Verification.**
 
 * `zig build test -Dlib_wasi_threads=true` green.
@@ -627,13 +657,11 @@ Each wave is a discrete PR with its own conformance gate.
   registered at `:3209`. Productionise it: today it lives behind
   `config.lib_wasi_threads`; flip the default for the WASI Preview-1
   test suite when the suite contains threaded fixtures.
-* Wire `ThreadManager` lifetime to `ComponentInstance` /
-  `WasiCliAdapter` so a `wasi.thread-spawn` from inside a component
-  is observable. The prototype wiring reaches **core-module-only**
-  runs (`runWasm` in `src/main.zig`) but not `runLoadedComponent` and
-  is not a production path. Fix that by retaining a per-`WasiCliAdapter`
-  `ThreadManager` and threading it into every `ExecEnv` the adapter
-  creates.
+* Wire `ThreadManager` lifetime to raw core-module and component ownership so
+  a `wasi.thread-spawn` from an AOT core is joined before its code, trampoline
+  contexts, process state, or component resources are destroyed. The raw CLI
+  owns one manager for the AOT run; each `ComponentInstance` owns one manager
+  shared by its core instances.
 * Document the
   Wasmtime-compat caveat: per spec, "a trap or WASI exit in one
   thread must end execution for all threads." We already have

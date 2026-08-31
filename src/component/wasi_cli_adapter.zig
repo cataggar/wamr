@@ -68,9 +68,9 @@ const tls = @import("tls");
 //
 // Fix: `cliExit` / `cliExitWithCode` pin the code in this thread-local
 // before returning; the AOT dispatcher reads (and clears) it on
-// `error.WasiExit` and calls `std.process.exit` directly — mirroring the
-// existing `aotProcExit` precedent at
-// `src/runtime/aot/host_bridge.zig:464` for raw-WASIp1 `proc_exit`.
+// `error.WasiExit` and calls `std.process.exit` directly. Raw-WASIp1
+// `aotProcExit` instead unwinds through the call-local trap state when one is
+// armed, so its parent-owned thread group can be joined before the CLI exits.
 //
 // Thread-local so multi-instance / multi-thread embeddings stay isolated.
 // Use `recordPendingWasiExit` / `takePendingWasiExitCode` rather than

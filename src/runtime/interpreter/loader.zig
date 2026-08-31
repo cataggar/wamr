@@ -3813,6 +3813,107 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
 
+            // 0xFE prefix (threads/atomics)
+            0xFE => {
+                const sub = readU32Leb(code, &i);
+                const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
+                switch (sub) {
+                    0x00 => { // memory.atomic.notify: [addr i32] -> [i32]
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x01 => { // memory.atomic.wait32: [addr i32 i64] -> [i32]
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x02 => { // memory.atomic.wait64: [addr i64 i64] -> [i32]
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x03 => { // atomic.fence
+                        if (readU32Leb(code, &i) != 0) return error.TypeMismatch;
+                    },
+                    0x10, 0x12, 0x13 => { // i32 atomic loads
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x11, 0x14, 0x15, 0x16 => { // i64 atomic loads
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i64, &stack_tidx);
+                    },
+                    0x17, 0x19, 0x1A => { // i32 atomic stores
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                    },
+                    0x18, 0x1B, 0x1C, 0x1D => { // i64 atomic stores
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                    },
+                    0x1E, 0x20, 0x21,
+                    0x25, 0x27, 0x28,
+                    0x2C, 0x2E, 0x2F,
+                    0x33, 0x35, 0x36,
+                    0x3A, 0x3C, 0x3D,
+                    0x41, 0x43, 0x44,
+                    => { // i32 RMW
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x1F, 0x22, 0x23, 0x24,
+                    0x26, 0x29, 0x2A, 0x2B,
+                    0x2D, 0x30, 0x31, 0x32,
+                    0x34, 0x37, 0x38, 0x39,
+                    0x3B, 0x3E, 0x3F, 0x40,
+                    0x42, 0x45, 0x46, 0x47,
+                    => { // i64 RMW
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i64, &stack_tidx);
+                    },
+                    0x48, 0x4A, 0x4B => { // i32 cmpxchg
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x49, 0x4C, 0x4D, 0x4E => { // i64 cmpxchg
+                        const mem_idx = skipMemImm(code, &i);
+                        const at = getMemAddrType(module, mem_idx);
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, at, cf)) return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i64, &stack_tidx);
+                    },
+                    else => return error.TypeMismatch,
+                }
+            },
+
             // 0xFD prefix (SIMD opcodes)
             0xFD => {
                 const sub = readU32Leb(code, &i);

@@ -1476,6 +1476,23 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
                         });
                     }
                 },
+                .atomic_rmw => |rmw| {
+                    if (rmw.op == .@"and" or rmw.op == .@"or" or
+                        rmw.op == .xor)
+                    {
+                        try clobbers.append(allocator, .{
+                            .pos = cp_pos,
+                            .regs_clobbered = x86_64_reg_clobber_mask(.rdx) |
+                                x86_64_reg_clobber_mask(.r8),
+                        });
+                    }
+                },
+                .atomic_cmpxchg => {
+                    try clobbers.append(allocator, .{
+                        .pos = cp_pos,
+                        .regs_clobbered = x86_64_reg_clobber_mask(.rdx),
+                    });
+                },
                 else => {},
             }
             cp_pos += 1;
@@ -3046,6 +3063,23 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
                                 .regs_clobbered = x86_64_reg_clobber_mask(.rdi),
                             });
                         }
+                    },
+                    .atomic_rmw => |rmw| {
+                        if (rmw.op == .@"and" or rmw.op == .@"or" or
+                            rmw.op == .xor)
+                        {
+                            try clobber_points.append(allocator, .{
+                                .pos = pos,
+                                .regs_clobbered = x86_64_reg_clobber_mask(.rdx) |
+                                    x86_64_reg_clobber_mask(.r8),
+                            });
+                        }
+                    },
+                    .atomic_cmpxchg => {
+                        try clobber_points.append(allocator, .{
+                            .pos = pos,
+                            .regs_clobbered = x86_64_reg_clobber_mask(.rdx),
+                        });
                     },
                     else => {},
                 }
@@ -6072,6 +6106,143 @@ fn compileInstRA(
             try code.movdToXmm(.rax, .rax);
             try code.cvtss2sd(.rax, .rax);
             try code.movqFromXmm(.rax, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+
+        // ── Atomics ────────────────────────────────────────────────
+        .atomic_fence => try code.mfence(),
+        .atomic_load => |ld| {
+            const dest = inst.dest orelse return;
+            const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
+            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.zeroExtend32(.rax);
+            try emitMemBoundsCheck(
+                code,
+                @as(u64, ld.offset) + @as(u64, ld.size),
+            );
+            try code.addRegReg(.rax, .r15);
+            var displacement: i32 = 0;
+            if (ld.offset <= 0x7fff_ffff) {
+                displacement = @intCast(ld.offset);
+            } else {
+                try code.movRegImm64(.r10, ld.offset);
+                try code.addRegReg(.rax, .r10);
+            }
+            const result_reg = destReg(alloc_result, dest);
+            try code.movRegMemSized(result_reg, .rax, displacement, ld.size);
+            try writeDefTyped(code, alloc_result, dest, result_reg, inst.type);
+        },
+        .atomic_store => |st| {
+            const base_reg = try useVReg(code, alloc_result, st.base, .rax);
+            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.zeroExtend32(.rax);
+            try emitMemBoundsCheck(
+                code,
+                @as(u64, st.offset) + @as(u64, st.size),
+            );
+            try code.addRegReg(.rax, .r15);
+            const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
+            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
+            var displacement: i32 = 0;
+            if (st.offset <= 0x7fff_ffff) {
+                displacement = @intCast(st.offset);
+            } else {
+                try code.movRegImm64(.r10, st.offset);
+                try code.addRegReg(.rax, .r10);
+            }
+            try code.movMemRegSized(.rax, displacement, .rcx, st.size);
+            try code.mfence();
+        },
+        .atomic_rmw => |rmw| {
+            const dest = inst.dest orelse return;
+            const base_reg = try useVReg(code, alloc_result, rmw.base, .rax);
+            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.zeroExtend32(.rax);
+            try emitMemBoundsCheck(
+                code,
+                @as(u64, rmw.offset) + @as(u64, rmw.size),
+            );
+            try code.addRegReg(.rax, .r15);
+            if (rmw.offset > 0) {
+                if (rmw.offset <= 0x7fff_ffff) {
+                    try code.addRegImm32(.rax, @intCast(rmw.offset));
+                } else {
+                    try code.movRegImm64(.r10, rmw.offset);
+                    try code.addRegReg(.rax, .r10);
+                }
+            }
+            const val_reg = try useVReg(code, alloc_result, rmw.val, .rcx);
+            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
+            switch (rmw.op) {
+                .add => {
+                    try code.lockXadd(.rax, 0, .rcx, rmw.size);
+                    try code.movRegReg(.rax, .rcx);
+                },
+                .sub => {
+                    try code.negReg(.rcx, rmw.size);
+                    try code.lockXadd(.rax, 0, .rcx, rmw.size);
+                    try code.movRegReg(.rax, .rcx);
+                },
+                .xchg => {
+                    try code.xchgMemReg(.rax, 0, .rcx, rmw.size);
+                    try code.movRegReg(.rax, .rcx);
+                },
+                .@"and", .@"or", .xor => {
+                    try code.movRegReg(.rdx, .rax);
+                    try code.movRegMemSized(.rax, .rdx, 0, rmw.size);
+                    const retry = code.len();
+                    try code.movRegReg(.r8, .rax);
+                    switch (rmw.op) {
+                        .@"and" => try code.andRegReg(.r8, .rcx),
+                        .@"or" => try code.orRegReg(.r8, .rcx),
+                        .xor => try code.xorRegReg(.r8, .rcx),
+                        else => unreachable,
+                    }
+                    try code.lockCmpxchg(.rdx, 0, .r8, rmw.size);
+                    const jne_offset = code.len();
+                    try code.jne(0);
+                    code.patchI32(
+                        jne_offset + 2,
+                        @intCast(
+                            @as(i64, @intCast(retry)) -
+                                @as(i64, @intCast(jne_offset + 6)),
+                        ),
+                    );
+                },
+            }
+            try code.zeroExtendReg(.rax, rmw.size);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+        .atomic_cmpxchg => |cmpxchg| {
+            const dest = inst.dest orelse return;
+            const base_reg =
+                try useVReg(code, alloc_result, cmpxchg.base, .rax);
+            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.zeroExtend32(.rax);
+            try emitMemBoundsCheck(
+                code,
+                @as(u64, cmpxchg.offset) + @as(u64, cmpxchg.size),
+            );
+            try code.addRegReg(.rax, .r15);
+            if (cmpxchg.offset > 0) {
+                if (cmpxchg.offset <= 0x7fff_ffff) {
+                    try code.addRegImm32(.rax, @intCast(cmpxchg.offset));
+                } else {
+                    try code.movRegImm64(.r10, cmpxchg.offset);
+                    try code.addRegReg(.rax, .r10);
+                }
+            }
+            try code.movRegReg(.r11, .rax);
+            const expected_reg =
+                try useVReg(code, alloc_result, cmpxchg.expected, .rax);
+            if (expected_reg != .rax) try code.movRegReg(.rax, expected_reg);
+            const replacement_reg =
+                try useVReg(code, alloc_result, cmpxchg.replacement, .rcx);
+            if (replacement_reg != .rcx)
+                try code.movRegReg(.rcx, replacement_reg);
+            try code.movRegReg(.rdx, .r11);
+            try code.lockCmpxchg(.rdx, 0, .rcx, cmpxchg.size);
+            try code.zeroExtendReg(.rax, cmpxchg.size);
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 

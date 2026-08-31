@@ -49,6 +49,9 @@ jobs:
       - name: WASI thread lifecycle (enabled interpreter)
         run: zig build test-thread-lifecycle -Dlib_wasi_threads=true -Daot=false
 
+      - name: WASI thread lifecycle (enabled AOT)
+        run: zig build test-aot-threads -Dlib_wasi_threads=true -Dinterp=false
+
       - name: Build (ReleaseSafe)
         continue-on-error: true
         run: zig build -Doptimize=ReleaseSafe

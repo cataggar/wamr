@@ -115,11 +115,35 @@ pub const SpawnError = error{
     ThreadGroupShuttingDown,
     ThreadIdExhausted,
     MissingThreadStart,
+    InvalidThreadStartSignature,
     AuxStackExhausted,
     ChildInitializationFailed,
     ThreadSpawnFailed,
     StartGateFailed,
     OutOfMemory,
+};
+
+/// Type-erased backend contract used by the lifecycle manager.
+///
+/// The manager owns the context returned by `create` from that point until
+/// rollback or join. Backends keep their runtime-specific types out of this
+/// module, avoiding an AOT runtime ↔ host bridge ↔ thread manager import
+/// cycle while preserving one publication/join implementation.
+pub const ThreadBackendOps = struct {
+    create: *const fn (
+        parent: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) SpawnError!*anyopaque,
+    configure: *const fn (
+        child: *anyopaque,
+        manager: *ThreadManager,
+        tid: i32,
+        start_arg: u32,
+        auxiliary_stack: ?execution_context.AuxiliaryStack,
+    ) SpawnError!void,
+    run: *const fn (child: *anyopaque) ThreadOutcome,
+    destroy: *const fn (child: *anyopaque) void,
+    uses_auxiliary_stack: bool = false,
 };
 
 pub const JoinError = error{
@@ -213,13 +237,86 @@ const ThreadRecord = struct {
     manager: *ThreadManager,
     tid: i32 = 0,
     thread: ?std.Thread = null,
-    instance: *types.ModuleInstance,
-    env: *ExecEnv,
-    func_idx: u32,
+    backend_context: *anyopaque,
+    backend_ops: *const ThreadBackendOps,
     aux_stack_top: ?u32,
     start_gate: StartGate = .{},
     execution: std.atomic.Value(u8) =
         std.atomic.Value(u8).init(@intFromEnum(ExecutionState.pending)),
+};
+
+const InterpThreadContext = struct {
+    instance: *types.ModuleInstance,
+    env: *ExecEnv,
+    func_idx: u32,
+    allocator: std.mem.Allocator,
+};
+
+fn createInterpThreadContext(
+    parent_opaque: *anyopaque,
+    allocator: std.mem.Allocator,
+) SpawnError!*anyopaque {
+    const parent: *types.ModuleInstance = @ptrCast(@alignCast(parent_opaque));
+    const func_idx = parent.getExportFunc("wasi_thread_start") orelse
+        return error.MissingThreadStart;
+    const child = parent.cloneForThread(allocator) catch return error.OutOfMemory;
+    errdefer child.destroyThreadClone();
+    const env = ExecEnv.create(child, 4096, allocator) catch return error.OutOfMemory;
+    errdefer env.destroy();
+    const context = allocator.create(InterpThreadContext) catch
+        return error.OutOfMemory;
+    context.* = .{
+        .instance = child,
+        .env = env,
+        .func_idx = func_idx,
+        .allocator = allocator,
+    };
+    return @ptrCast(context);
+}
+
+fn configureInterpThreadContext(
+    child_opaque: *anyopaque,
+    manager: *ThreadManager,
+    tid: i32,
+    start_arg: u32,
+    auxiliary_stack: ?execution_context.AuxiliaryStack,
+) SpawnError!void {
+    const child: *InterpThreadContext = @ptrCast(@alignCast(child_opaque));
+    if (auxiliary_stack) |stack| {
+        if (child.instance.module.findExport("__stack_pointer", .global)) |exp| {
+            if (exp.index < child.instance.globals.len) {
+                child.instance.globals[exp.index].value = .{ .i32 = @bitCast(stack.top) };
+            }
+        }
+    }
+    child.env.setThreadManager(manager);
+    child.env.configureWasiThread(tid, start_arg, auxiliary_stack);
+    child.env.pushI32(tid) catch return error.ChildInitializationFailed;
+    child.env.pushI32(@bitCast(start_arg)) catch
+        return error.ChildInitializationFailed;
+}
+
+fn runInterpThreadContext(child_opaque: *anyopaque) ThreadOutcome {
+    const child: *InterpThreadContext = @ptrCast(@alignCast(child_opaque));
+    const interp = @import("../runtime/interpreter/interp.zig");
+    interp.executeFunction(child.env, child.func_idx) catch return .trapped;
+    return .completed;
+}
+
+fn destroyInterpThreadContext(child_opaque: *anyopaque) void {
+    const child: *InterpThreadContext = @ptrCast(@alignCast(child_opaque));
+    const allocator = child.allocator;
+    child.env.destroy();
+    child.instance.destroyThreadClone();
+    allocator.destroy(child);
+}
+
+const interp_thread_ops = ThreadBackendOps{
+    .create = createInterpThreadContext,
+    .configure = configureInterpThreadContext,
+    .run = runInterpThreadContext,
+    .destroy = destroyInterpThreadContext,
+    .uses_auxiliary_stack = true,
 };
 
 const SlotState = enum {
@@ -433,34 +530,40 @@ pub const ThreadManager = struct {
     /// Spawn a new thread with a cloned module instance.
     /// The new thread calls the exported `wasi_thread_start(tid, start_arg)` function.
     pub fn spawnThread(self: *ThreadManager, parent_inst: *types.ModuleInstance, start_arg: i32) SpawnError!i32 {
+        return self.spawnWithBackend(
+            @ptrCast(parent_inst),
+            start_arg,
+            &interp_thread_ops,
+        );
+    }
+
+    /// Spawn a backend-specific guest thread under the same publication,
+    /// rollback, generation-safe TID, join, and shutdown contract.
+    pub fn spawnWithBackend(
+        self: *ThreadManager,
+        parent: *anyopaque,
+        start_arg: i32,
+        backend_ops: *const ThreadBackendOps,
+    ) SpawnError!i32 {
         if (comptime !config.thread_mgr or builtin.single_threaded)
             return error.ThreadFeatureDisabled;
         if (!self.beginSpawn()) return error.ThreadGroupShuttingDown;
         defer self.endSpawn();
 
-        const func_idx = parent_inst.getExportFunc("wasi_thread_start") orelse
-            return error.MissingThreadStart;
-        const child_inst = parent_inst.cloneForThread(self.allocator) catch return error.OutOfMemory;
-        var child_owned_directly = true;
-        defer if (child_owned_directly) child_inst.destroyThreadClone();
+        const backend_context = try backend_ops.create(parent, self.allocator);
+        var backend_owned_directly = true;
+        defer if (backend_owned_directly) backend_ops.destroy(backend_context);
 
-        const aux_stack_top = self.aux_stack_pool.allocate();
-        if (aux_stack_top == null and self.aux_stack_pool.totalCount() != 0)
+        const aux_stack_top = if (backend_ops.uses_auxiliary_stack)
+            self.aux_stack_pool.allocate()
+        else
+            null;
+        if (backend_ops.uses_auxiliary_stack and
+            aux_stack_top == null and
+            self.aux_stack_pool.totalCount() != 0)
             return error.AuxStackExhausted;
         var stack_owned_directly = aux_stack_top != null;
         defer if (stack_owned_directly) self.aux_stack_pool.release(aux_stack_top.?);
-        if (aux_stack_top) |stack_top| {
-            if (child_inst.module.findExport("__stack_pointer", .global)) |exp| {
-                if (exp.index < child_inst.globals.len) {
-                    child_inst.globals[exp.index].value = .{ .i32 = @bitCast(stack_top) };
-                }
-            }
-        }
-
-        const env = ExecEnv.create(child_inst, 4096, self.allocator) catch
-            return error.OutOfMemory;
-        var env_owned_directly = true;
-        defer if (env_owned_directly) env.destroy();
 
         if (self.test_hooks) |hooks| {
             if (hooks.fail_child_initialization)
@@ -470,14 +573,12 @@ pub const ThreadManager = struct {
         const record = self.allocator.create(ThreadRecord) catch return error.OutOfMemory;
         record.* = .{
             .manager = self,
-            .instance = child_inst,
-            .env = env,
-            .func_idx = func_idx,
+            .backend_context = backend_context,
+            .backend_ops = backend_ops,
             .aux_stack_top = aux_stack_top,
         };
-        child_owned_directly = false;
+        backend_owned_directly = false;
         stack_owned_directly = false;
-        env_owned_directly = false;
         var record_owned_locally = true;
         defer if (record_owned_locally) self.destroyRecord(record);
 
@@ -492,24 +593,19 @@ pub const ThreadManager = struct {
             return err;
         };
         record.tid = tid;
-        env.setThreadManager(self);
-        env.configureWasiThread(
+        backend_ops.configure(
+            backend_context,
+            self,
             tid,
             @bitCast(start_arg),
             if (aux_stack_top) |top|
                 execution_context.AuxiliaryStack.fromTop(top, self.aux_stack_pool.stack_size)
             else
                 null,
-        );
-        env.pushI32(env.thread_context.tid) catch {
+        ) catch |err| {
             self.rollbackPublishedLocked(tid);
             self.mutex.unlock();
-            return error.ChildInitializationFailed;
-        };
-        env.pushI32(@bitCast(env.thread_context.start_arg)) catch {
-            self.rollbackPublishedLocked(tid);
-            self.mutex.unlock();
-            return error.ChildInitializationFailed;
+            return err;
         };
 
         const fail_native_spawn = if (self.test_hooks) |hooks|
@@ -665,9 +761,8 @@ pub const ThreadManager = struct {
     }
 
     fn destroyRecord(self: *ThreadManager, record: *ThreadRecord) void {
-        record.env.destroy();
+        record.backend_ops.destroy(record.backend_context);
         if (record.aux_stack_top) |stack_top| self.aux_stack_pool.release(stack_top);
-        record.instance.destroyThreadClone();
         self.noteCounter(if (self.test_hooks) |hooks| hooks.records_destroyed else null);
         self.allocator.destroy(record);
     }
@@ -727,12 +822,12 @@ fn threadEntry(record: *ThreadRecord) void {
     manager.mutex.lock();
     manager.mutex.unlock();
 
-    const interp = @import("../runtime/interpreter/interp.zig");
-    interp.executeFunction(record.env, record.func_idx) catch {
+    const outcome = record.backend_ops.run(record.backend_context);
+    if (outcome == .trapped) {
         manager.signalTrap();
         record.execution.store(@intFromEnum(ExecutionState.trapped), .release);
         return;
-    };
+    }
     record.execution.store(@intFromEnum(ExecutionState.completed), .release);
 }
 
@@ -1355,15 +1450,17 @@ test "thread lifecycle: child record retains process state after parent release"
 
     const parsed = parseTid(tid).?;
     const record = manager.slots.items[parsed.slot_index].record.?;
+    const child: *InterpThreadContext =
+        @ptrCast(@alignCast(record.backend_context));
     try std.testing.expectEqual(
-        @as(*Tracker, @ptrCast(@alignCast(record.env.thread_context.process_state.?.ptr))),
+        @as(*Tracker, @ptrCast(@alignCast(child.env.thread_context.process_state.?.ptr))),
         &tracker,
     );
-    try std.testing.expectEqual(tid, record.env.thread_context.tid);
-    try std.testing.expectEqual(start_arg, record.env.thread_context.start_arg);
-    try std.testing.expectEqual(@as(u32, 32768), record.env.thread_context.auxiliary_stack.?.bottom);
-    try std.testing.expectEqual(@as(u32, 40960), record.env.thread_context.auxiliary_stack.?.top);
-    try std.testing.expect(record.env.thread_context.tls_base == null);
+    try std.testing.expectEqual(tid, child.env.thread_context.tid);
+    try std.testing.expectEqual(start_arg, child.env.thread_context.start_arg);
+    try std.testing.expectEqual(@as(u32, 32768), child.env.thread_context.auxiliary_stack.?.bottom);
+    try std.testing.expectEqual(@as(u32, 40960), child.env.thread_context.auxiliary_stack.?.top);
+    try std.testing.expect(child.env.thread_context.tls_base == null);
 
     ctx.inst.detachProcessState();
     root_ref.release();

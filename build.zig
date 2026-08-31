@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
     const lib_pthread = b.option(bool, "lib_pthread", "Enable pthread library") orelse false;
     options.addOption(bool, "lib_pthread", lib_pthread);
 
-    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable the WASI threads configuration contract (production host binding is not implemented)") orelse false;
+    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable Preview-1 WASI threads") orelse false;
     options.addOption(bool, "lib_wasi_threads", lib_wasi_threads);
 
     const thread_mgr = (b.option(bool, "thread_mgr", "Enable thread manager") orelse false) or lib_wasi_threads;
@@ -166,6 +166,7 @@ pub fn build(b: *std.Build) void {
         .single_threaded = target.result.os.tag == .freestanding,
         .interp = interp,
         .aot = aot,
+        .aot_architecture_supported = target_arch == .x86_64 or target_arch == .aarch64,
         .jit = jit,
         .fast_jit = fast_jit,
         .libc_wasi = libc_wasi,
@@ -759,6 +760,8 @@ pub fn build(b: *std.Build) void {
             "ThreadManager:",
             "AuxStackPool:",
             "thread lifecycle:",
+            "AOT thread",
+            "nested AOT async-lift",
         },
     });
     const run_thread_lifecycle_unit_tests = b.addRunArtifact(thread_lifecycle_unit_tests);
@@ -1234,6 +1237,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_differential_tests = b.addRunArtifact(differential_tests);
     test_step.dependOn(&run_differential_tests.step);
+
+    const aot_thread_spawn_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/aot_thread_spawn_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    aot_thread_spawn_module.addImport("wamr", lib_module);
+    const aot_thread_spawn_tests = b.addTest(.{
+        .root_module = aot_thread_spawn_module,
+    });
+    const run_aot_thread_spawn_tests = b.addRunArtifact(aot_thread_spawn_tests);
+    const aot_thread_spawn_step = b.step(
+        "test-aot-threads",
+        "Run Preview-1 AOT thread-spawn compile/runtime tests",
+    );
+    aot_thread_spawn_step.dependOn(&run_aot_thread_spawn_tests.step);
+    test_step.dependOn(&run_aot_thread_spawn_tests.step);
 
     // #694: regression test for active elem segments referencing
     // funcidx ≥ 256 (was capped by a fixed 256-entry buffer in

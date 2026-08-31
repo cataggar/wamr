@@ -1,6 +1,5 @@
-//! Compile-time contract for the legacy Preview 1 `wasi.thread-spawn`
-//! feature. This describes configuration and readiness; the hardened internal
-//! lifecycle does not by itself make the host binding production-ready.
+//! Compile-time contract and backend readiness for the legacy Preview 1
+//! `wasi.thread-spawn` feature.
 
 const std = @import("std");
 
@@ -16,6 +15,7 @@ pub const BackendSupport = enum {
     target_unsupported,
     configuration_only,
     architecture_abi_not_implemented,
+    supported,
 };
 
 pub const Capabilities = struct {
@@ -38,6 +38,7 @@ pub const Inputs = struct {
     single_threaded: bool,
     interp: bool,
     aot: bool,
+    aot_architecture_supported: bool,
     jit: bool,
     fast_jit: bool,
     libc_wasi: bool,
@@ -89,10 +90,11 @@ pub fn validationError(inputs: Inputs) ?ValidationError {
         .single_threaded_host => return .single_threaded_host,
     }
     if (!inputs.libc_wasi) return .wasi_required;
-    if (!inputs.interp) return .interpreter_required;
-    if (inputs.aot) return .aot_architecture_abi_not_implemented;
     if (inputs.jit) return .jit_backend_not_implemented;
     if (inputs.fast_jit) return .fast_jit_backend_not_implemented;
+    if (!inputs.interp and !inputs.aot) return .interpreter_required;
+    if (inputs.aot and !inputs.aot_architecture_supported)
+        return .aot_architecture_abi_not_implemented;
     if (!inputs.heap_aux_stack_allocation) return .heap_aux_stack_required;
     if (!inputs.shared_memory) return .shared_memory_required;
     if (!inputs.thread_manager) return .thread_manager_required;
@@ -112,6 +114,12 @@ pub fn report(inputs: Inputs) Report {
         .thread_manager = inputs.thread_manager,
         .wasm_atomics = inputs.wasm_atomics,
     };
+    const implementation = ImplementationStatus{
+        .resource_locking = true,
+        .interpreter_thread_spawning = false,
+        .wasm_atomics = true,
+        .aot_thread_spawning = inputs.aot_architecture_supported,
+    };
     if (!inputs.enabled) {
         return .{
             .enabled = false,
@@ -120,6 +128,7 @@ pub fn report(inputs: Inputs) Report {
             .aot_backend = .disabled,
             .required = required,
             .configured = configured,
+            .implementation = implementation,
         };
     }
     if (target != .supported) {
@@ -130,15 +139,22 @@ pub fn report(inputs: Inputs) Report {
             .aot_backend = .target_unsupported,
             .required = required,
             .configured = configured,
+            .implementation = implementation,
         };
     }
     return .{
         .enabled = true,
         .target = .supported,
-        .interpreter_backend = .configuration_only,
-        .aot_backend = .architecture_abi_not_implemented,
+        .interpreter_backend = if (inputs.interp) .configuration_only else .disabled,
+        .aot_backend = if (!inputs.aot)
+            .disabled
+        else if (inputs.aot_architecture_supported)
+            .supported
+        else
+            .architecture_abi_not_implemented,
         .required = required,
         .configured = configured,
+        .implementation = implementation,
     };
 }
 
@@ -148,8 +164,8 @@ pub fn validationMessage(err: ValidationError) []const u8 {
         .unsupported_pointer_width => "lib_wasi_threads requires a 64-bit host target",
         .single_threaded_host => "lib_wasi_threads requires a multithreaded host target",
         .wasi_required => "lib_wasi_threads requires libc_wasi",
-        .interpreter_required => "lib_wasi_threads requires the interpreter backend",
-        .aot_architecture_abi_not_implemented => "lib_wasi_threads AOT architecture/ABI support is not implemented; disable aot",
+        .interpreter_required => "lib_wasi_threads requires the interpreter or AOT backend",
+        .aot_architecture_abi_not_implemented => "lib_wasi_threads AOT thread spawning requires x86_64 or AArch64",
         .jit_backend_not_implemented => "lib_wasi_threads is incompatible with the AOT-based JIT backend",
         .fast_jit_backend_not_implemented => "lib_wasi_threads is incompatible with the fast JIT backend",
         .heap_aux_stack_required => "lib_wasi_threads requires heap auxiliary stack allocation",
@@ -174,6 +190,7 @@ fn validEnabledInputs() Inputs {
         .single_threaded = false,
         .interp = true,
         .aot = false,
+        .aot_architecture_supported = true,
         .jit = false,
         .fast_jit = false,
         .libc_wasi = true,
@@ -204,18 +221,28 @@ test "disabled contract preserves defaults without requiring thread capabilities
     try std.testing.expect(!actual.required.shared_memory);
 }
 
-test "enabled configuration reports requirements without claiming implementation" {
+test "enabled interpreter configuration reports implemented shared foundations" {
     const actual = report(validEnabledInputs());
     try std.testing.expectEqual(@as(?ValidationError, null), validationError(validEnabledInputs()));
     try std.testing.expectEqual(TargetSupport.supported, actual.target);
     try std.testing.expectEqual(BackendSupport.configuration_only, actual.interpreter_backend);
-    try std.testing.expectEqual(BackendSupport.architecture_abi_not_implemented, actual.aot_backend);
+    try std.testing.expectEqual(BackendSupport.disabled, actual.aot_backend);
     try std.testing.expect(actual.required.shared_memory);
     try std.testing.expect(actual.configured.shared_memory);
-    try std.testing.expect(!actual.implementation.resource_locking);
+    try std.testing.expect(actual.implementation.resource_locking);
     try std.testing.expect(!actual.implementation.interpreter_thread_spawning);
-    try std.testing.expect(!actual.implementation.wasm_atomics);
-    try std.testing.expect(!actual.implementation.aot_thread_spawning);
+    try std.testing.expect(actual.implementation.wasm_atomics);
+    try std.testing.expect(actual.implementation.aot_thread_spawning);
+}
+
+test "enabled contract reports supported AOT spawning on native architectures" {
+    var inputs = validEnabledInputs();
+    inputs.interp = false;
+    inputs.aot = true;
+    const actual = report(inputs);
+    try std.testing.expectEqual(@as(?ValidationError, null), validationError(inputs));
+    try std.testing.expectEqual(BackendSupport.disabled, actual.interpreter_backend);
+    try std.testing.expectEqual(BackendSupport.supported, actual.aot_backend);
 }
 
 test "enabled contract rejects unsupported targets, backends, and missing capabilities" {
@@ -226,7 +253,7 @@ test "enabled contract rejects unsupported targets, backends, and missing capabi
             single_threaded,
             wasi,
             interpreter,
-            aot,
+            aot_arch,
             jit,
             fast_jit,
             aux_stack,
@@ -242,7 +269,7 @@ test "enabled contract rejects unsupported targets, backends, and missing capabi
         .{ .mutate = .single_threaded, .expected = .single_threaded_host },
         .{ .mutate = .wasi, .expected = .wasi_required },
         .{ .mutate = .interpreter, .expected = .interpreter_required },
-        .{ .mutate = .aot, .expected = .aot_architecture_abi_not_implemented },
+        .{ .mutate = .aot_arch, .expected = .aot_architecture_abi_not_implemented },
         .{ .mutate = .jit, .expected = .jit_backend_not_implemented },
         .{ .mutate = .fast_jit, .expected = .fast_jit_backend_not_implemented },
         .{ .mutate = .aux_stack, .expected = .heap_aux_stack_required },
@@ -259,7 +286,10 @@ test "enabled contract rejects unsupported targets, backends, and missing capabi
             .single_threaded => inputs.single_threaded = true,
             .wasi => inputs.libc_wasi = false,
             .interpreter => inputs.interp = false,
-            .aot => inputs.aot = true,
+            .aot_arch => {
+                inputs.aot = true;
+                inputs.aot_architecture_supported = false;
+            },
             .jit => inputs.jit = true,
             .fast_jit => inputs.fast_jit = true,
             .aux_stack => inputs.heap_aux_stack_allocation = false,

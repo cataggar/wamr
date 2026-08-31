@@ -2,9 +2,9 @@
 //! (#798 Lever 1). The runtime does not link libc on Linux, so we cannot
 //! use C `setjmp`/`sigsetjmp`. The Windows trap path captures/restores a
 //! full `CONTEXT` via `RtlCaptureContext`/`RtlRestoreContext`; this is the
-//! POSIX x86_64 analogue: save the callee-saved registers, the stack
-//! pointer, and the return address into a `JmpBuf`, then jump back to the
-//! capture site on `restore`.
+//! POSIX native analogue: save the ABI callee-saved registers, stack
+//! pointer, and return address into a `JmpBuf`, then jump back to the capture
+//! site on `restore`.
 //!
 //! Scope: x86_64 SysV only (Linux / macOS). Other targets keep the
 //! pre-#798 behaviour where AOT traps abort the process; `supported`
@@ -14,31 +14,40 @@
 //!   - `capture` must be called such that its caller's frame is still live
 //!     when `restore` runs (i.e. `restore` unwinds *back into* an active
 //!     `capture` caller — exactly how `callFuncScalar` uses it).
-//!   - Only the SysV callee-saved integer registers (rbx, rbp, r12–r15),
-//!     `rsp`, and the return address are preserved. The capture caller must
-//!     therefore treat `capture()` as an ordinary opaque call (the Zig
-//!     compiler does), reloading anything else after it.
+//!   - x86_64 preserves the SysV callee-saved integer registers. AArch64
+//!     preserves x19-x30, sp, and the ABI-preserved halves of d8-d15.
+//!     The capture caller must treat `capture()` as an ordinary opaque call
+//!     (the Zig compiler does), reloading caller-saved state after it.
 
 const builtin = @import("builtin");
 const std = @import("std");
 
-/// True when the hand-rolled jump primitive is available for this target.
-pub const supported: bool =
-    builtin.cpu.arch == .x86_64 and
-    (builtin.os.tag == .linux or builtin.os.tag.isDarwin());
+const supported_os = builtin.os.tag == .linux or builtin.os.tag.isDarwin();
+const x86_64_supported = builtin.cpu.arch == .x86_64 and supported_os;
+const aarch64_supported = builtin.cpu.arch == .aarch64 and supported_os;
 
-/// Saved machine state: [rbx, rbp, r12, r13, r14, r15, rsp, rip].
-pub const JmpBuf = [8]u64;
+/// True when the hand-rolled jump primitive is available for this target.
+pub const supported: bool = x86_64_supported or aarch64_supported;
+
+/// Saved machine state. The x86_64 layout is
+/// [rbx, rbp, r12, r13, r14, r15, rsp, rip]. The AArch64 layout is
+/// [x19..x30, sp, d8..d15].
+pub const JmpBuf = if (aarch64_supported) [21]u64 else [8]u64;
 
 /// Capture the current register/stack context into `buf`. Returns 0 on the
 /// direct call; when a later `restore(buf, val)` jumps back here it appears
 /// to return `val` (or 1 if `val == 0`), just like C `setjmp`.
 pub inline fn capture(buf: *JmpBuf) c_int {
     if (comptime !supported) return 0;
-    // The naked body follows the SysV C ABI (arg in rdi, result in eax, a
-    // normal `ret`), so calling it through a `.c` pointer is correct; the
-    // cast is only needed because Zig forbids direct calls to naked fns.
-    const f: *const fn (*JmpBuf) callconv(.c) c_int = @ptrCast(&wasmTrapSetjmp);
+    // The naked body follows the target C ABI, so calling it through a `.c`
+    // pointer is correct; the cast is needed because Zig forbids direct calls
+    // to naked functions.
+    const f: *const fn (*JmpBuf) callconv(.c) c_int = @ptrCast(
+        if (comptime aarch64_supported)
+            &wasmTrapSetjmpAarch64
+        else
+            &wasmTrapSetjmpX86_64,
+    );
     return f(buf);
 }
 
@@ -49,7 +58,12 @@ pub inline fn restore(buf: *JmpBuf, val: c_int) noreturn {
         @branchHint(.cold);
         unreachable;
     }
-    const f: *const fn (*JmpBuf, c_int) callconv(.c) noreturn = @ptrCast(&wasmTrapLongjmp);
+    const f: *const fn (*JmpBuf, c_int) callconv(.c) noreturn = @ptrCast(
+        if (comptime aarch64_supported)
+            &wasmTrapLongjmpAarch64
+        else
+            &wasmTrapLongjmpX86_64,
+    );
     f(buf, val);
 }
 
@@ -62,7 +76,7 @@ pub inline fn restore(buf: *JmpBuf, val: c_int) noreturn {
 // original return address is no longer on the (restored) stack. SysV arg
 // regs: rdi = `buf`, rsi = `val`.
 
-fn wasmTrapSetjmp() callconv(.naked) void {
+fn wasmTrapSetjmpX86_64() callconv(.naked) void {
     asm volatile (
         \\ movq %%rbx,  0(%%rdi)
         \\ movq %%rbp,  8(%%rdi)
@@ -79,7 +93,7 @@ fn wasmTrapSetjmp() callconv(.naked) void {
     );
 }
 
-fn wasmTrapLongjmp() callconv(.naked) void {
+fn wasmTrapLongjmpX86_64() callconv(.naked) void {
     asm volatile (
         \\ movq  0(%%rdi), %%rbx
         \\ movq  8(%%rdi), %%rbp
@@ -95,6 +109,52 @@ fn wasmTrapLongjmp() callconv(.naked) void {
         \\ incl %%eax
         \\1:
         \\ jmp *%%rdx
+    );
+}
+
+// ── AArch64 AAPCS64 implementation ─────────────────────────────────────
+//
+// x0 = buf, w1 = restore value. AAPCS64 requires x19-x29 and d8-d15 to
+// survive an ordinary call; x30 and sp identify the continuation itself.
+
+fn wasmTrapSetjmpAarch64() callconv(.naked) void {
+    asm volatile (
+        \\ stp x19, x20, [x0, #0]
+        \\ stp x21, x22, [x0, #16]
+        \\ stp x23, x24, [x0, #32]
+        \\ stp x25, x26, [x0, #48]
+        \\ stp x27, x28, [x0, #64]
+        \\ stp x29, x30, [x0, #80]
+        \\ mov x9, sp
+        \\ str x9, [x0, #96]
+        \\ stp d8, d9, [x0, #104]
+        \\ stp d10, d11, [x0, #120]
+        \\ stp d12, d13, [x0, #136]
+        \\ stp d14, d15, [x0, #152]
+        \\ mov w0, wzr
+        \\ ret
+    );
+}
+
+fn wasmTrapLongjmpAarch64() callconv(.naked) void {
+    asm volatile (
+        \\ ldp x19, x20, [x0, #0]
+        \\ ldp x21, x22, [x0, #16]
+        \\ ldp x23, x24, [x0, #32]
+        \\ ldp x25, x26, [x0, #48]
+        \\ ldp x27, x28, [x0, #64]
+        \\ ldp x29, x30, [x0, #80]
+        \\ ldr x9, [x0, #96]
+        \\ ldp d8, d9, [x0, #104]
+        \\ ldp d10, d11, [x0, #120]
+        \\ ldp d12, d13, [x0, #136]
+        \\ ldp d14, d15, [x0, #152]
+        \\ mov sp, x9
+        \\ mov w0, w1
+        \\ cbnz w0, 1f
+        \\ mov w0, #1
+        \\1:
+        \\ br x30
     );
 }
 
