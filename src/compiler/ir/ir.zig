@@ -1182,6 +1182,11 @@ pub const IrModule = struct {
     /// but call instructions use module-level indices where
     /// indices < import_count refer to imports.
     import_count: u32 = 0,
+    /// Conservative module-level memory mode used by target codegen.
+    /// Any memory64 or shared memory disables transforms that are only
+    /// proven for the single pinned memory32 base.
+    has_memory64: bool = false,
+    has_shared_memory: bool = false,
     /// Wasm-flat global types (imported globals first, then local globals).
     /// Populated by the frontend so codegen can use the same byte offsets as
     /// the AOT runtime when globals include 16-byte v128 slots.

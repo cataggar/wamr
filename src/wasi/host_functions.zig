@@ -4,8 +4,8 @@
 //! to an ExecEnv, pops arguments from the operand stack, and pushes results.
 //!
 //! Two dispatch tiers are supported per host fn:
-//!   - **ctx-aware**: when `ExecEnv.wasi_ctx` is non-null we forward to the
-//!     real `wasi.WasiCtx` so args / env / preopens / file I/O all work.
+//!   - **ctx-aware**: when the `ExecEnv` retains a `WasiProcessState`, we
+//!     forward to it so args / env / preopens / file I/O all work.
 //!   - **legacy stub**: when no ctx is attached (unit tests, embedders that
 //!     never call `setWasiCtx`) we fall back to the existing
 //!     `wasi_core.zig` behavior so test fixtures and fuzz harnesses keep
@@ -31,10 +31,9 @@ fn getMemory(env: *ExecEnv) ?[]u8 {
     return inst.memories[0].data;
 }
 
-/// Cast `env.wasi_ctx` to `*wasi.WasiCtx`. Null when no ctx attached.
-fn getCtx(env: *ExecEnv) ?*wasi.WasiCtx {
-    const opaque_ptr = env.wasi_ctx orelse return null;
-    return @ptrCast(@alignCast(opaque_ptr));
+/// Resolve the process-scoped WASI state retained by this thread.
+fn getCtx(env: *ExecEnv) ?*wasi.WasiProcessState {
+    return env.processState(wasi.WasiProcessState);
 }
 
 /// Translate `wasi.Errno` into the i32 errno value placed on the stack.

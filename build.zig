@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
     const lib_pthread = b.option(bool, "lib_pthread", "Enable pthread library") orelse false;
     options.addOption(bool, "lib_pthread", lib_pthread);
 
-    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable the WASI threads configuration contract (production spawning is not implemented)") orelse false;
+    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable the WASI threads configuration contract (production host binding is not implemented)") orelse false;
     options.addOption(bool, "lib_wasi_threads", lib_wasi_threads);
 
     const thread_mgr = (b.option(bool, "thread_mgr", "Enable thread manager") orelse false) or lib_wasi_threads;
@@ -259,6 +259,24 @@ pub fn build(b: *std.Build) void {
         const adapter_resource_tests = b.addTest(.{ .root_module = adapter_resource_test_module });
         const run_adapter_resource_tests = b.addRunArtifact(adapter_resource_tests);
         adapter_resources_test_step.dependOn(&run_adapter_resource_tests.step);
+    }
+
+    const execution_context_test_step = b.step(
+        "test-execution-context",
+        "Run shared-process and per-thread execution-context tests",
+    );
+    inline for (.{ false, true }) |threads_enabled| {
+        const context_options = b.addOptions();
+        context_options.addOption(bool, "lib_wasi_threads", threads_enabled);
+        const context_test_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime/common/execution_context.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        context_test_module.addImport("config", context_options.createModule());
+        const context_tests = b.addTest(.{ .root_module = context_test_module });
+        const run_context_tests = b.addRunArtifact(context_tests);
+        execution_context_test_step.dependOn(&run_context_tests.step);
     }
 
     const threads_contract_test_module = b.createModule(.{
@@ -697,6 +715,34 @@ pub fn build(b: *std.Build) void {
     );
     core_resource_test_step.dependOn(&run_core_resource_unit_tests.step);
 
+    const execution_context_runtime_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{
+            "execution context",
+            "process state",
+            "WasiProcessState",
+            "thread context",
+            "VmCtx layout",
+        },
+    });
+    const run_execution_context_runtime_tests = b.addRunArtifact(execution_context_runtime_tests);
+    execution_context_test_step.dependOn(&run_execution_context_runtime_tests.step);
+
+    const thread_lifecycle_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{
+            "ThreadManager:",
+            "AuxStackPool:",
+            "thread lifecycle:",
+        },
+    });
+    const run_thread_lifecycle_unit_tests = b.addRunArtifact(thread_lifecycle_unit_tests);
+    const thread_lifecycle_test_step = b.step(
+        "test-thread-lifecycle",
+        "Run WASI thread lifecycle and rollback tests",
+    );
+    thread_lifecycle_test_step.dependOn(&run_thread_lifecycle_unit_tests.step);
+
     const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -714,6 +760,10 @@ pub fn build(b: *std.Build) void {
         "python3",
         "tests/test_bench_keyvault.py",
     });
+    const frame_attribution_tests = b.addSystemCommand(&.{
+        "python3",
+        "tests/test_aot_jit_attr.py",
+    });
     const hot_function_comparison_tests = b.addSystemCommand(&.{
         "python3",
         "tests/test_compare_hot_function.py",
@@ -722,7 +772,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(stable_resources_test_step);
+    test_step.dependOn(execution_context_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
+    test_step.dependOn(&frame_attribution_tests.step);
+    if (target_arch == .x86_64 and target.result.os.tag == .linux) {
+        const frame_attribution_smoke = b.addSystemCommand(&.{
+            "python3",
+            "tests/test_aot_jit_attr.py",
+            "--wamrc",
+        });
+        frame_attribution_smoke.addFileArg(wamrc.getEmittedBin());
+        test_step.dependOn(&frame_attribution_smoke.step);
+    }
     test_step.dependOn(&hot_function_comparison_tests.step);
 
     const artifact_consumer_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });

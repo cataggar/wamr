@@ -1,9 +1,10 @@
 # `wasi:threads` design — multi-threaded interpreter state isolation
 
-Status: **DRAFT** (shared-memory/parking foundation and atomic opcode
-semantics implemented; production spawning remains incomplete).
+Status: **DRAFT** (shared-memory/parking, atomic semantics, and the
+thread-group lifecycle are implemented; production host binding remains
+incomplete).
 
-Tracking: [#616 B1.3](https://github.com/cataggar/wamr/issues/616).
+Tracking: [#616 B1.2-B1.3, B1.6](https://github.com/cataggar/wamr/issues/616).
 
 Author wave: W10-3.
 
@@ -64,10 +65,10 @@ are rejected before allocation while readiness remains false.
 
 ## Current implementation status
 
-The tree contains scaffolding in `ThreadManager`, `cloneForThread`,
-the atomic-opcode dispatcher, and the `wasi.thread-spawn` host import.
-These are prototypes, not production support. No default CLI or
-component path currently offers gated guest-thread execution.
+The tree contains a hardened `ThreadManager` lifecycle plus scaffolding in
+`cloneForThread`, the atomic-opcode dispatcher, and the
+`wasi.thread-spawn` host import. No default CLI or component path currently
+offers gated guest-thread execution.
 
 Shared memories now use a refcounted control block with an immutable base.
 Instantiation reserves the declared maximum up front and fails if that
@@ -100,9 +101,63 @@ without holding a lock across guest calls. Thread clones also roll back
 partial retains/allocation failures and copy mutable segment state.
 
 This does **not** complete B1.1: `ComponentInstance` and `WasiCliAdapter`
-resource families remain separate follow-ups. It also does not wire spawning,
-change thread-group teardown, or split process-wide `WasiCtx` state from
-per-thread execution state.
+resource families remain separate follow-ups. It also does not wire the
+production interpreter/AOT host bindings or final group cancellation.
+
+The thread-group lifecycle now publishes a generation-stamped, manager-owned
+record before a native child can enter guest code. The child waits on a start
+gate and crosses the manager lock once after the gate opens, proving that
+publication has completed and the publisher no longer holds the lock. Child
+exit only records an outcome; the native handle, cloned instance, execution
+environment, and auxiliary stack remain owned by the record until an exact
+`joinOne` or batched, unbounded `joinAll` claims them. All joins and destruction
+run outside the manager lock.
+
+The host that owns `ThreadManager` also owns group shutdown. `shutdown` first
+rejects new spawns, drains spawn calls that began before closure, and joins all
+unclaimed records; `deinit` performs the same shutdown before freeing the
+registry and stack pool. Threads are never detached. Shutdown deliberately
+does not add cancellation or preemption semantics: running guest code must
+finish cooperatively or observe the existing group trap flag.
+
+The process/execution split is now explicit:
+
+* `WasiProcessState` owns its argument and environment strings and the
+  synchronized Preview-1 descriptor/preopen table. `WasiCtx` remains a source
+  compatibility alias.
+* `ProcessStateRef` is the type-erased retained handle used by runtime-common
+  code. `ModuleInstance`, thread clones, `ExecEnv`, and `AotInstance` each
+  acquire exactly one reference for their own lifetime.
+* `ThreadExecutionContext` owns thread ID, opaque `start_arg`, optional
+  auxiliary-stack/TLS metadata, implicit task-context slots, the active
+  `TaskManager`, cancellation/trap flags, and temporary backend/host-call
+  bookkeeping. Sibling contexts begin with fresh execution-local state and
+  inherit only the retained process reference.
+* Component canon task and lower-call state no longer lives on the shared
+  `ComponentInstance`. AOT keeps all existing codegen-addressed `VmCtx`
+  offsets stable and appends only a thread-context pointer.
+
+This context work deliberately does not add production host bindings, AOT
+thread spawning, or final group cancellation.
+
+### Process/context lifetime contract
+
+| Event | Ownership rule |
+| --- | --- |
+| CLI creates process state | The CLI owns the initial reference. Args/env are deep-copied before sharing. |
+| Attach to interpreter/AOT instance | The instance acquires one reference; replacing/detaching releases exactly one. |
+| Create `ExecEnv` | The environment acquires its own reference from the instance. |
+| Clone a thread instance | The child acquires one process reference; allocation rollback releases it with all partially retained core resources. |
+| Parent guest entry returns | Parent execution-local state may be destroyed without affecting a live child; the hardened thread record retains the child instance/env until join. |
+| Child completion | Completion records an outcome only; `joinOne`/`joinAll` destroy the child `ExecEnv`, return its auxiliary stack, and destroy the clone. |
+| Group shutdown | Shutdown drains in-flight spawns and joins all records. The final process reference closes descriptors/preopens exactly once. |
+
+The Preview-1 ABI's `start_arg` is passed bit-for-bit to
+`wasi_thread_start(tid, start_arg)`. The runtime does not inspect the
+wasi-libc payload: wasi-libc's assembly trampoline reads its stack pointer at
+offset 0 and TLS base at offset 4, then initializes `__stack_pointer` and
+`__tls_base`. Runtime auxiliary-stack metadata therefore remains independent
+of that guest-owned payload.
 
 Atomic opcode and fence behavior is complete on both execution tiers.
 Interpreted atomic loads, stores, RMW and `cmpxchg` are `seq_cst`, bounds-
@@ -574,13 +629,13 @@ Each wave is a discrete PR with its own conformance gate.
   resource-table mutex when it observes the cancel — wave-5a must
   pair the cancel-check with a "release every held lock" routine in
   the trap exit path.
-* **5b — Thread joining for embedders.** `ThreadManager.joinAll` is
-  process-wide. Add `tid`-scoped `joinOne(tid: i32)` so embedders that
-  call `runLoadedComponent` repeatedly can serialise.
-* **5c — Per-thread WASI context.** Today every thread shares one
-  `ExecEnv.wasi_ctx`. For correctness under threaded `errno` reads,
-  give each `ExecEnv` its own `wasi_ctx` clone (the underlying
-  `WasiCliAdapter` resource tables stay shared via Wave-1 mutexes).
+* **5b — Thread joining for embedders.** The lifecycle now provides exact
+  `joinOne(tid: i32)` and process-wide batched `joinAll`; wiring those APIs
+  into repeated `runLoadedComponent` ownership remains part of the host-binding
+  work.
+* **5c — Process/per-thread context split.** Implemented: each execution
+  environment has private task/cancel/trap/TLS metadata and a retained handle
+  to one shared, synchronized WASI process state.
 * **5d — `shared-everything-threads` canon built-ins.** When upstream
   pins a WIT, add `populateWasiThreads` to `populateWasiProviders`
   and route `thread.spawn` (component-level) to the same
@@ -618,15 +673,11 @@ Each wave is a discrete PR with its own conformance gate.
    linear memory, indexing into the host fd space). One adapter +
    per-table mutexes is the only model that matches the spec.
 4. **Interaction with the async ABI broadening (#488 follow-ups).**
-   Today the executor assumes a single `current_task_manager` per
-   `ComponentInstance`. If thread A is in an async-lifted call and
-   thread B spawns and also enters an async-lifted call, the second
-   `currentTaskManager()` swap clobbers the first. **Decision:**
-   `wasi-threads`-spawned threads MUST NOT enter async-lifted entry
-   points until Wave 5+ moves `current_task_manager` from
-   `ComponentInstance` to `ExecEnv`. The Preview-1 surface only ever
-   re-enters at the exported `wasi_thread_start` core function, so
-   this is naturally enforced today.
+   Resolved for execution-local state: active task managers, implicit context
+   slots, cancellation state, and canon-lower call bindings now live on the
+   active `ThreadExecutionContext`, not `ComponentInstance`. The async
+   resource tables themselves still require the remaining B1.1 migration
+   before component threads can be exposed.
 5. **Memory-grow under concurrent atomics.** Resolved for shared memory:
    reserve the declared maximum, keep the base immutable, serialize commit,
    and release/acquire-publish the visible extent. Non-shared memories keep
@@ -672,10 +723,10 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
   host-level thread"). We use `std.Thread` and inherit OS preemption;
   no userspace scheduler is in scope.
 * **Thread-local storage beyond what the wasm `threads` proposal
-  provides.** TLS in the Preview-1 model is a guest-side
-  trampoline reading the user start function out of `start_arg`.
-  First-class TLS via `shared-everything-threads` thread-local globals
-  is Wave 5e.
+  provides.** The runtime records per-thread TLS metadata but does not
+  reinterpret Preview-1's guest-owned `start_arg`; wasi-libc's trampoline
+  initializes `__tls_base`. First-class TLS via
+  `shared-everything-threads` thread-local globals is Wave 5e.
 * **GPU / accelerator threads.** `wasi-parallel` is a separate
   proposal; we are not targeting it.
 * **`tokio` / async-runtime-style fairness.** No M:N scheduling on the
@@ -693,7 +744,7 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
 * [`docs/wasi.md`](../wasi.md) — WASI feature matrix; this design
   doc is linked from the Roadmap section.
 * [`src/wasi/thread_manager.zig`](../../src/wasi/thread_manager.zig)
-  — the existing `wasi:threads@0.1.0` prototype (off by default and
+  — the generation-safe `wasi:threads@0.1.0` lifecycle (off by default and
   not production-wired).
 * [`src/wasi/host_functions.zig`](../../src/wasi/host_functions.zig)
   (`wasiThreadSpawn`, line ~46; registration line ~3209) — the

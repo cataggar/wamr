@@ -5,6 +5,7 @@
 //! the caller can poll for completion via waitable sets.
 
 const std = @import("std");
+const execution_context = @import("../runtime/common/execution_context.zig");
 
 // ── Task state ──────────────────────────────────────────────────────────────
 
@@ -24,7 +25,7 @@ pub const TaskState = enum(u8) {
 /// (`i32` only, `slot < N_CONTEXT_SLOTS`). Wasmtime currently exposes a
 /// single `i32` slot; pick a small headroom value here so we don't have
 /// to revisit the constant on the first conformance suite that uses 2.
-pub const N_CONTEXT_SLOTS: u32 = 2;
+pub const N_CONTEXT_SLOTS: u32 = execution_context.task_context_slot_count;
 
 /// A task represents an in-flight async component function call.
 pub const Task = struct {
