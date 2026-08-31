@@ -109,6 +109,9 @@ pub const ThreadExecutionContext = struct {
     thread_group: ?*anyopaque = null,
     task_manager: ?*anyopaque = null,
     runtime_call_context: ?*anyopaque = null,
+    /// Request-scoped host coordination state carried through nested
+    /// component calls and async callbacks without storing it globally.
+    host_task_context: ?*anyopaque = null,
     backend_context: ?*anyopaque = null,
     implicit_task_context: [task_context_slot_count]u32 =
         [_]u32{0} ** task_context_slot_count,
@@ -127,6 +130,7 @@ pub const ThreadExecutionContext = struct {
         self.thread_group = null;
         self.task_manager = null;
         self.runtime_call_context = null;
+        self.host_task_context = null;
         self.backend_context = null;
     }
 
@@ -199,6 +203,23 @@ pub const ThreadExecutionContext = struct {
         comptime T: type,
     ) ?*T {
         const ptr = self.runtime_call_context orelse return null;
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    pub fn bindHostTaskContext(
+        self: *ThreadExecutionContext,
+        host_task_context: ?*anyopaque,
+    ) OpaqueBinding {
+        const previous = self.host_task_context;
+        self.host_task_context = host_task_context;
+        return .{ .slot = &self.host_task_context, .previous = previous };
+    }
+
+    pub fn hostTaskContext(
+        self: *const ThreadExecutionContext,
+        comptime T: type,
+    ) ?*T {
+        const ptr = self.host_task_context orelse return null;
         return @ptrCast(@alignCast(ptr));
     }
 
@@ -334,6 +355,8 @@ test "active execution context and opaque bindings restore when nested" {
     var inner = ThreadExecutionContext{};
     var outer_task: u8 = 1;
     var inner_task: u8 = 2;
+    var outer_host: u8 = 3;
+    var inner_host: u8 = 4;
 
     var outer_scope = outer.enter();
     defer outer_scope.deinit();
@@ -341,17 +364,26 @@ test "active execution context and opaque bindings restore when nested" {
 
     var task_binding = outer.bindTaskManager(@ptrCast(&outer_task));
     defer task_binding.deinit();
+    var host_binding = outer.bindHostTaskContext(@ptrCast(&outer_host));
+    defer host_binding.deinit();
     try std.testing.expectEqual(&outer_task, outer.taskManager(u8).?);
+    try std.testing.expectEqual(&outer_host, outer.hostTaskContext(u8).?);
 
     {
         var inner_scope = inner.enter();
         defer inner_scope.deinit();
         var inner_binding = inner.bindTaskManager(@ptrCast(&inner_task));
         defer inner_binding.deinit();
+        var inner_host_binding = inner.bindHostTaskContext(
+            @ptrCast(&inner_host),
+        );
+        defer inner_host_binding.deinit();
         try std.testing.expectEqual(&inner, current().?);
         try std.testing.expectEqual(&inner_task, inner.taskManager(u8).?);
+        try std.testing.expectEqual(&inner_host, inner.hostTaskContext(u8).?);
     }
 
     try std.testing.expectEqual(&outer, current().?);
     try std.testing.expectEqual(&outer_task, outer.taskManager(u8).?);
+    try std.testing.expectEqual(&outer_host, outer.hostTaskContext(u8).?);
 }
