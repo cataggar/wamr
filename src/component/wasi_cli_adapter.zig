@@ -6372,6 +6372,7 @@ pub const WasiCliAdapter = struct {
             stream_entry.deinit(self.allocator);
             return error.OutOfMemory;
         };
+        errdefer _ = ci.streams.remove(stream_handle);
 
         // 2. Allocate a `future<result<_,error-code>>` already settled
         //    to ok. Lowered ABI for `result<_,error-code>` is a single
@@ -6385,6 +6386,7 @@ pub const WasiCliAdapter = struct {
             self.allocator.free(ok_payload);
             return error.OutOfMemory;
         };
+        errdefer _ = ci.futures.remove(future_handle);
 
         // 3. Build tuple<handle, handle>.
         const tuple = try allocator.alloc(InterfaceValue, 2);
@@ -6472,6 +6474,7 @@ pub const WasiCliAdapter = struct {
         const fut_entry = async_mod.Future{ .state = .pending, .payload = null };
         ci.futures.put(self.allocator, future_handle, fut_entry) catch
             return error.OutOfMemory;
+        errdefer _ = ci.futures.remove(future_handle);
 
         const ctx = self.allocator.create(WriteViaStreamCtx) catch
             return error.OutOfMemory;
@@ -6482,18 +6485,24 @@ pub const WasiCliAdapter = struct {
             .future_handle = future_handle,
         };
 
-        if (ci.streams.getPtr(stream_handle)) |s| {
-            // Drain any bytes already buffered (e.g. eagerly written
-            // before the host became attached).
+        var handler_installed = false;
+        var writer_already_closed = false;
+        while (ci.streams.acquire(stream_handle)) |initial_lease| {
+            var stream_lease = initial_lease;
+            const s = stream_lease.value();
             if (s.buffer.items.len > 0) {
-                switch (target.write(s.buffer.items, self.allocator)) {
+                var detached = s.buffer;
+                s.buffer = .empty;
+                stream_lease.release();
+                defer detached.deinit(self.allocator);
+                switch (target.write(detached.items, self.allocator)) {
                     .ok => {},
                     .err, .closed => {
                         self.allocator.destroy(ctx);
                         return error.IoError;
                     },
                 }
-                s.buffer.clearRetainingCapacity();
+                continue;
             }
             // Install host handler — every future `stream.write` from
             // the guest goes synchronously to `target`.
@@ -6503,12 +6512,19 @@ pub const WasiCliAdapter = struct {
                 .on_destroy = &writeViaStreamOnDestroy,
                 .ctx = ctx,
             };
-            // If the writer was already dropped (the synchronous "no
-            // concurrent writer" case), settle the future immediately.
-            if (s.write_closed) writeViaStreamOnDropWritable(ctx);
-        } else {
+            writer_already_closed = s.write_closed;
+            handler_installed = true;
+            stream_lease.release();
+            break;
+        }
+        if (!handler_installed) {
             // Unknown stream handle — settle the future to ok so the
             // guest's await completes without panicking.
+            writeViaStreamOnDropWritable(ctx);
+            self.allocator.destroy(ctx);
+        } else if (writer_already_closed) {
+            // If the writer was already dropped (the synchronous "no
+            // concurrent writer" case), settle the future immediately.
             writeViaStreamOnDropWritable(ctx);
         }
 
@@ -6532,7 +6548,9 @@ pub const WasiCliAdapter = struct {
 
     fn writeViaStreamOnDropWritable(ctx_opaque: ?*anyopaque) void {
         const c: *WriteViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
-        if (c.ci.futures.getPtr(c.future_handle)) |fut| {
+        if (c.ci.futures.acquire(c.future_handle)) |initial_lease| {
+            var future_lease = initial_lease;
+            const fut = future_lease.value();
             // Settle as `Ok(())` (discriminant 0). The companion
             // `future<result<_,error-code>>` lift only inspects the
             // leading 1-byte discriminant: 0 selects the Ok arm and
@@ -6571,8 +6589,12 @@ pub const WasiCliAdapter = struct {
                 fut.state = .ready;
                 fut.write_closed = true;
             }
-            if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                ws.setReady(idx, c.adapter.allocator, async_canon.packStatus(.completed, 0));
+            const registration = fut.read_waitable;
+            future_lease.release();
+            _ = c.ci.notifyWaitable(
+                registration,
+                async_canon.packStatus(.completed, 0),
+            );
         }
         // NB: the ctx is NOT freed here — `stream.drop-readable` /
         // `stream.drop-writable` fire `on_destroy` once the stream
@@ -7873,16 +7895,19 @@ pub const WasiCliAdapter = struct {
                 i += 1;
                 continue;
             }
-            if (ci.futures.getPtr(tf.handle)) |fut| {
+            if (ci.futures.acquire(tf.handle)) |initial_lease| {
+                var future_lease = initial_lease;
+                const fut = future_lease.value();
                 fut.pending_read = null;
                 fut.state = .ready;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx| {
-                    const code: u32 = if (fut.subtask_managed)
-                        executor_root.STATUS_RETURNED
-                    else
-                        async_canon.packStatus(.completed, 0);
-                    ws.setReady(idx, allocator, code);
-                };
+                const registration = fut.read_waitable;
+                const code: u32 = if (fut.subtask_managed)
+                    executor_root.STATUS_RETURNED
+                else
+                    async_canon.packStatus(.completed, 0);
+                future_lease.release();
+                _ = allocator;
+                _ = ci.notifyWaitable(registration, code);
             }
             if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
             _ = self.timer_futures.swapRemove(i);
@@ -7915,7 +7940,7 @@ pub const WasiCliAdapter = struct {
         while (i < self.pending_udp_receives.items.len) {
             const entry = self.pending_udp_receives.items[i];
             // Future dropped out from under us — discard the entry.
-            const fut = ci.futures.getPtr(entry.future_handle) orelse {
+            var future_lease = ci.futures.acquire(entry.future_handle) orelse {
                 _ = self.pending_udp_receives.swapRemove(i);
                 continue;
             };
@@ -7925,15 +7950,21 @@ pub const WasiCliAdapter = struct {
             // usually clears the list itself, but defense-in-depth
             // here handles any cancel observed between drive ticks.
             if (entry.cancelled) {
+                const fut = future_lease.value();
                 fut.pending_read = null;
                 fut.state = .closed;
                 fut.write_closed = true;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+                const registration = fut.read_waitable;
+                future_lease.release();
+                _ = ci.notifyWaitable(
+                    registration,
+                    executor_root.STATUS_STARTED_CANCELLED,
+                );
                 _ = self.pending_udp_receives.swapRemove(i);
                 fired = true;
                 continue;
             }
+            future_lease.release();
             // Socket torn down — settle err(invalid_state).
             const sock = self.lookupSocket(entry.sock_handle);
             if (sock == null or
@@ -7941,7 +7972,12 @@ pub const WasiCliAdapter = struct {
                 sock.?.kind != .udp or
                 sock.?.host_socket == null)
             {
-                self.settlePendingUdpReceiveErr(ci, fut, .invalid_state, allocator) catch {};
+                self.settlePendingUdpReceiveErr(
+                    ci,
+                    entry.future_handle,
+                    .invalid_state,
+                    allocator,
+                ) catch {};
                 _ = self.pending_udp_receives.swapRemove(i);
                 fired = true;
                 continue;
@@ -7957,8 +7993,19 @@ pub const WasiCliAdapter = struct {
                 .duration = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake },
             });
             if (recv_res) |recv| {
-                self.settlePendingUdpReceiveOk(ci, fut, recv.data, recv.from, allocator) catch {
-                    self.settlePendingUdpReceiveErr(ci, fut, .unknown, allocator) catch {};
+                self.settlePendingUdpReceiveOk(
+                    ci,
+                    entry.future_handle,
+                    recv.data,
+                    recv.from,
+                    allocator,
+                ) catch {
+                    self.settlePendingUdpReceiveErr(
+                        ci,
+                        entry.future_handle,
+                        .unknown,
+                        allocator,
+                    ) catch {};
                 };
                 _ = self.pending_udp_receives.swapRemove(i);
                 fired = true;
@@ -7979,7 +8026,7 @@ pub const WasiCliAdapter = struct {
     fn settlePendingUdpReceiveOk(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
-        fut: *async_mod.Future,
+        future_handle: u32,
         data: []const u8,
         remote: std.Io.net.IpAddress,
         allocator: Allocator,
@@ -7996,7 +8043,7 @@ pub const WasiCliAdapter = struct {
         ok_payload.* = ok_tuple;
         const ok_result = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
         const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .udp_receive_err, ok_result);
-        settleFutureDeferred(ci, fut, payload_bytes, allocator);
+        settleFutureDeferred(ci, future_handle, payload_bytes, allocator);
     }
 
     /// Settle a pending `udp-socket.receive` future with an `err`
@@ -8005,7 +8052,7 @@ pub const WasiCliAdapter = struct {
     fn settlePendingUdpReceiveErr(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
-        fut: *async_mod.Future,
+        future_handle: u32,
         code: SocketErrorCode,
         allocator: Allocator,
     ) !void {
@@ -8013,7 +8060,7 @@ pub const WasiCliAdapter = struct {
         const val = try socketsP3BuildUnitErrResultIv(ci.allocator, false, code);
         defer val.deinit(ci.allocator);
         const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .udp_receive_err, val);
-        settleFutureDeferred(ci, fut, payload_bytes, allocator);
+        settleFutureDeferred(ci, future_handle, payload_bytes, allocator);
     }
 
     /// Worker thread body for an outbound HTTP fetch (#583 A2).
@@ -8504,7 +8551,7 @@ pub const WasiCliAdapter = struct {
         allocator: Allocator,
     ) void {
         const ci = entry.ci;
-        const fut = ci.futures.getPtr(entry.future_handle) orelse {
+        var existence_lease = ci.futures.acquire(entry.future_handle) orelse {
             // Future slot already gone (guest dropped). Discard
             // outcome resources and bail.
             switch (entry.shared.outcome) {
@@ -8516,6 +8563,7 @@ pub const WasiCliAdapter = struct {
             }
             return;
         };
+        existence_lease.release();
 
         // task.cancel mid-fetch: settle as HTTP_request_denied, the
         // closest WIT discriminant for "request was not delivered".
@@ -8529,11 +8577,10 @@ pub const WasiCliAdapter = struct {
                 .failure => {},
             }
             const bytes = self.lowerHttpP3ClientSendErr(.HTTP_request_denied) catch {
-                fut.state = .ready;
-                fut.write_closed = true;
+                closeFutureAfterSettleFailure(ci, entry.future_handle);
                 return;
             };
-            settleFutureDeferred(ci, fut, bytes, allocator);
+            settleFutureDeferred(ci, entry.future_handle, bytes, allocator);
             return;
         }
 
@@ -8543,11 +8590,10 @@ pub const WasiCliAdapter = struct {
                     self.allocator.free(s.body);
                     freeOwnedHttpHeaders(self.allocator, s.headers);
                     const bytes = self.lowerHttpP3ClientSendErr(.internal_error) catch {
-                        fut.state = .ready;
-                        fut.write_closed = true;
+                        closeFutureAfterSettleFailure(ci, entry.future_handle);
                         return;
                     };
-                    settleFutureDeferred(ci, fut, bytes, allocator);
+                    settleFutureDeferred(ci, entry.future_handle, bytes, allocator);
                     return;
                 };
                 // Ownership of `s.body` and `s.headers` transferred
@@ -8555,22 +8601,20 @@ pub const WasiCliAdapter = struct {
                 // `buildHttpResponseP3FromBody` — do NOT free here.
                 const bytes = self.lowerHttpP3ClientSendOk(resp_h) catch {
                     const bytes_err = self.lowerHttpP3ClientSendErr(.internal_error) catch {
-                        fut.state = .ready;
-                        fut.write_closed = true;
+                        closeFutureAfterSettleFailure(ci, entry.future_handle);
                         return;
                     };
-                    settleFutureDeferred(ci, fut, bytes_err, allocator);
+                    settleFutureDeferred(ci, entry.future_handle, bytes_err, allocator);
                     return;
                 };
-                settleFutureDeferred(ci, fut, bytes, allocator);
+                settleFutureDeferred(ci, entry.future_handle, bytes, allocator);
             },
             .failure => |code| {
                 const bytes = self.lowerHttpP3ClientSendErr(code) catch {
-                    fut.state = .ready;
-                    fut.write_closed = true;
+                    closeFutureAfterSettleFailure(ci, entry.future_handle);
                     return;
                 };
-                settleFutureDeferred(ci, fut, bytes, allocator);
+                settleFutureDeferred(ci, entry.future_handle, bytes, allocator);
             },
         }
     }
@@ -8594,10 +8638,7 @@ pub const WasiCliAdapter = struct {
         body_stream.buffer = std.ArrayListUnmanaged(u8).fromOwnedSlice(body);
         body_stream.write_closed = true;
         try ci.streams.put(ci.allocator, body_stream_h, body_stream);
-        errdefer {
-            if (ci.streams.getPtr(body_stream_h)) |s| s.deinit(ci.allocator);
-            _ = ci.streams.remove(body_stream_h);
-        }
+        errdefer _ = ci.streams.remove(body_stream_h);
 
         // Trailers future — settled to `ok(none)`; the lower-level
         // outbound path does not surface trailers yet.
@@ -8919,13 +8960,16 @@ pub const WasiCliAdapter = struct {
         allocator: Allocator,
     ) void {
         _ = task_handle;
+        _ = allocator;
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
 
         // ── Timer futures (#551) ──────────────────────────────────
         var i: usize = 0;
         while (i < self.timer_futures.items.len) : (i += 1) {
             const tf = self.timer_futures.items[i];
-            if (ci.futures.getPtr(tf.handle)) |fut| {
+            if (ci.futures.acquire(tf.handle)) |initial_lease| {
+                var future_lease = initial_lease;
+                const fut = future_lease.value();
                 fut.pending_read = null;
                 // Settle the future with the cancel disposition. The
                 // future is `subtask_managed` (timer-future invariant)
@@ -8937,8 +8981,12 @@ pub const WasiCliAdapter = struct {
                 // decoder in wit-bindgen ≥ 0.53.
                 fut.state = .closed;
                 fut.write_closed = true;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+                const registration = fut.read_waitable;
+                future_lease.release();
+                _ = ci.notifyWaitable(
+                    registration,
+                    executor_root.STATUS_STARTED_CANCELLED,
+                );
             }
             if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
         }
@@ -8957,12 +9005,18 @@ pub const WasiCliAdapter = struct {
         while (i < self.pending_udp_receives.items.len) : (i += 1) {
             self.pending_udp_receives.items[i].cancelled = true;
             const fh = self.pending_udp_receives.items[i].future_handle;
-            if (ci.futures.getPtr(fh)) |fut| {
+            if (ci.futures.acquire(fh)) |initial_lease| {
+                var future_lease = initial_lease;
+                const fut = future_lease.value();
                 fut.pending_read = null;
                 fut.state = .closed;
                 fut.write_closed = true;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+                const registration = fut.read_waitable;
+                future_lease.release();
+                _ = ci.notifyWaitable(
+                    registration,
+                    executor_root.STATUS_STARTED_CANCELLED,
+                );
             }
         }
         // Drop the settled entries so `driveAsyncEvents` does not
@@ -12159,12 +12213,15 @@ pub const WasiCliAdapter = struct {
     /// bytes copied to the guest.
     fn spawnReadyFsFuture(ci: *ComponentInstance, payload_bytes: ?[]u8) !u32 {
         const handle = ci.allocAsyncHandle();
-        try ci.futures.put(ci.allocator, handle, .{
+        ci.futures.put(ci.allocator, handle, .{
             .elem_type_idx = 0,
             .payload = payload_bytes,
             .state = .ready,
             .write_closed = true,
-        });
+        }) catch |err| {
+            if (payload_bytes) |bytes| ci.allocator.free(bytes);
+            return err;
+        };
         return handle;
     }
 
@@ -12348,7 +12405,9 @@ pub const WasiCliAdapter = struct {
         code: FsErrorCode,
     ) !InterfaceValue {
         const stream_handle = try spawnEmptyClosedStream(ci);
+        errdefer _ = ci.streams.remove(stream_handle);
         const future_handle = try spawnReadyErrFsFuture(ci, code);
+        errdefer _ = ci.futures.remove(future_handle);
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_handle };
         fields[1] = .{ .handle = future_handle };
@@ -12428,7 +12487,9 @@ pub const WasiCliAdapter = struct {
         // We surface this by closing the stream + spawning an err future.
         if (offset > @as(u64, @bitCast(@as(i64, std.math.maxInt(i64))))) {
             try ci.streams.put(ci.allocator, stream_handle, slot);
+            errdefer _ = ci.streams.remove(stream_handle);
             const err_future = try spawnReadyErrFsFuture(ci, .invalid);
+            errdefer _ = ci.futures.remove(err_future);
             const fields_e = try allocator.alloc(InterfaceValue, 2);
             fields_e[0] = .{ .handle = stream_handle };
             fields_e[1] = .{ .handle = err_future };
@@ -12464,8 +12525,10 @@ pub const WasiCliAdapter = struct {
         };
 
         try ci.streams.put(ci.allocator, stream_handle, slot);
+        errdefer _ = ci.streams.remove(stream_handle);
 
         const future_handle = try spawnReadyOkFsFuture(ci);
+        errdefer _ = ci.futures.remove(future_handle);
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_handle };
         fields[1] = .{ .handle = future_handle };
@@ -12664,55 +12727,52 @@ pub const WasiCliAdapter = struct {
             };
             if (!fs_file.flags.write) break :blk try spawnReadyErrFsFuture(ci, .access);
 
-            const slot = ci.streams.getPtr(stream_handle) orelse {
+            var stream_lease = ci.streams.acquire(stream_handle) orelse {
                 break :blk try spawnReadyErrFsFuture(ci, .bad_descriptor);
             };
 
             const ctx = try self.allocFsWriteStreamCtx(desc_handle, offset, append);
+            while (true) {
+                const slot = stream_lease.value();
+                // Pin byte stride (#571 / PR #573 pattern). `stream<u8>`
+                // resolves to size 1 in the guest's component-local
+                // registry, but cross-instance type-idx resolution can
+                // silently regress; the hint keeps `stream.read t` /
+                // `stream.write t` draining in the right units.
+                slot.elem_size_hint = 1;
 
-            // Pin byte stride (#571 / PR #573 pattern). `stream<u8>`
-            // resolves to size 1 in the guest's component-local
-            // registry, but cross-instance type-idx resolution can
-            // silently regress; the hint keeps `stream.read t` /
-            // `stream.write t` draining in the right units.
-            slot.elem_size_hint = 1;
+                if (slot.buffer.items.len == 0) {
+                    // Install the driver so subsequent guest writes flow
+                    // through the zero-copy pwrite callback.
+                    slot.host_driver = .{
+                        .context = ctx,
+                        .on_write = &fsWriteViaStreamOnWrite,
+                        .on_write_from = &fsWriteViaStreamOnWriteFrom,
+                    };
+                    stream_lease.release();
+                    break;
+                }
 
-            // Drain any bytes the guest pre-buffered (eagerly written
-            // into the stream before invoking `write-via-stream`)
-            // straight through the pwrite path so the install-time
-            // running offset is accurate.
-            if (slot.buffer.items.len > 0) {
-                const action = fsWriteViaStreamOnWrite(
-                    ctx,
-                    slot,
-                    slot.buffer.items,
-                    ci.allocator,
-                );
-                slot.buffer.clearRetainingCapacity();
+                var detached = slot.buffer;
+                slot.buffer = .empty;
+                stream_lease.release();
+                defer detached.deinit(ci.allocator);
+                const action = fsWriteViaStreamOnWriteFrom(ctx, detached.items);
                 switch (action) {
                     .progressed => {},
                     .would_block => {},
                     .eof, .err => {
-                        slot.read_closed = true;
+                        if (ci.streams.acquire(stream_handle)) |failed_lease| {
+                            var final_lease = failed_lease;
+                            final_lease.value().read_closed = true;
+                            final_lease.release();
+                        }
                         break :blk try spawnReadyErrFsFuture(ci, .io);
                     },
                 }
+                stream_lease = ci.streams.acquire(stream_handle) orelse
+                    break :blk try spawnReadyErrFsFuture(ci, .bad_descriptor);
             }
-
-            // Install the driver so subsequent guest `stream.write`s
-            // flow through `fsWriteViaStreamOnWrite` → pwrite(2).
-            //
-            // Both callback shapes are installed: the executor
-            // prefers the thinner `on_write_from` (zero-copy,
-            // #583 B2 follow-up) which drops the unused
-            // `*AsyncStream` / `Allocator` parameters. `on_write`
-            // remains as a delegation shim so unit tests and direct
-            // callers (the pre-buffer drain above) still work.
-            slot.host_driver = .{
-                .context = ctx,
-                .on_write = &fsWriteViaStreamOnWrite,
-                .on_write_from = &fsWriteViaStreamOnWriteFrom,
-            };
 
             break :blk try spawnReadyOkFsFuture(ci);
         };
@@ -12994,11 +13054,13 @@ pub const WasiCliAdapter = struct {
         }
 
         try ci.streams.put(ci.allocator, stream_handle, slot);
+        errdefer _ = ci.streams.remove(stream_handle);
 
         const future_handle: u32 = if (enum_err) |code|
             try spawnReadyErrFsFuture(ci, code)
         else
             try spawnReadyOkFsFuture(ci);
+        errdefer _ = ci.futures.remove(future_handle);
 
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_handle };
@@ -13013,7 +13075,9 @@ pub const WasiCliAdapter = struct {
         code: FsErrorCode,
     ) !InterfaceValue {
         const stream_handle = try spawnEmptyClosedStream(ci);
+        errdefer _ = ci.streams.remove(stream_handle);
         const future_handle = try spawnReadyErrFsFuture(ci, code);
+        errdefer _ = ci.futures.remove(future_handle);
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_handle };
         fields[1] = .{ .handle = future_handle };
@@ -16372,12 +16436,15 @@ pub const WasiCliAdapter = struct {
         defer val.deinit(ci.allocator);
         const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, kind, val);
         const h = ci.allocAsyncHandle();
-        try ci.futures.put(ci.allocator, h, .{
+        ci.futures.put(ci.allocator, h, .{
             .elem_type_idx = 0,
             .payload = payload_bytes,
             .state = .ready,
             .write_closed = true,
-        });
+        }) catch |err| {
+            ci.allocator.free(payload_bytes);
+            return err;
+        };
         return h;
     }
 
@@ -16404,12 +16471,15 @@ pub const WasiCliAdapter = struct {
     /// it after the guest's `future_read` rendezvous. (#535)
     fn spawnReadyFutureBytes(ci: *ComponentInstance, payload_bytes: []u8) !u32 {
         const h = ci.allocAsyncHandle();
-        try ci.futures.put(ci.allocator, h, .{
+        ci.futures.put(ci.allocator, h, .{
             .elem_type_idx = 0,
             .payload = payload_bytes,
             .state = .ready,
             .write_closed = true,
-        });
+        }) catch |err| {
+            ci.allocator.free(payload_bytes);
+            return err;
+        };
         return h;
     }
 
@@ -16424,10 +16494,15 @@ pub const WasiCliAdapter = struct {
     /// for the async-with-result shape. (#576)
     fn settleFutureDeferred(
         ci: *ComponentInstance,
-        fut: *async_mod.Future,
+        future_handle: u32,
         payload_bytes: []u8,
         allocator: Allocator,
     ) void {
+        var future_lease = ci.futures.acquire(future_handle) orelse {
+            ci.allocator.free(payload_bytes);
+            return;
+        };
+        const fut = future_lease.value();
         if (fut.async_lower_retptr) |retptr| {
             if (ci.writableGuestBytes(retptr, @intCast(payload_bytes.len))) |dst| {
                 @memcpy(dst, payload_bytes);
@@ -16437,13 +16512,25 @@ pub const WasiCliAdapter = struct {
         fut.payload = payload_bytes;
         fut.state = .ready;
         fut.write_closed = true;
-        if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx| {
-            const code: u32 = if (fut.subtask_managed)
-                executor_root.STATUS_RETURNED
-            else
-                async_canon.packStatus(.completed, 0);
-            ws.setReady(idx, allocator, code);
-        };
+        const registration = fut.read_waitable;
+        const code: u32 = if (fut.subtask_managed)
+            executor_root.STATUS_RETURNED
+        else
+            async_canon.packStatus(.completed, 0);
+        future_lease.release();
+        _ = allocator;
+        _ = ci.notifyWaitable(registration, code);
+    }
+
+    fn closeFutureAfterSettleFailure(
+        ci: *ComponentInstance,
+        future_handle: u32,
+    ) void {
+        var future_lease = ci.futures.acquire(future_handle) orelse return;
+        const future = future_lease.value();
+        future.state = .ready;
+        future.write_closed = true;
+        future_lease.release();
     }
 
     /// Lower a slice of `std.Io.net.IpAddress` values into a contiguous
@@ -16714,14 +16801,24 @@ pub const WasiCliAdapter = struct {
     fn settleTcpSendFuture(ctx: *SocketsP3StreamCtx) void {
         const ci = ctx.component_instance orelse return;
         const future_handle = ctx.completion_future orelse return;
-        const future = ci.futures.getPtr(future_handle) orelse return;
-        if (future.state != .pending) return;
+        var state_lease = ci.futures.acquire(future_handle) orelse return;
+        if (state_lease.value().state != .pending) {
+            state_lease.release();
+            return;
+        }
+        state_lease.release();
 
         const payload = ci.allocator.alloc(u8, 20) catch {
+            var failed_lease = ci.futures.acquire(future_handle) orelse return;
+            const future = failed_lease.value();
             future.state = .closed;
             future.write_closed = true;
-            if (future.waitable_set) |ws| if (future.read_waitable_idx) |idx|
-                ws.setReady(idx, ci.allocator, async_canon.packStatus(.dropped, 0));
+            const registration = future.read_waitable;
+            failed_lease.release();
+            _ = ci.notifyWaitable(
+                registration,
+                async_canon.packStatus(.dropped, 0),
+            );
             return;
         };
         @memset(payload, 0);
@@ -16730,6 +16827,16 @@ pub const WasiCliAdapter = struct {
             payload[4] = @intCast(socketCodeToP3Disc(.unknown));
         }
 
+        var future_lease = ci.futures.acquire(future_handle) orelse {
+            ci.allocator.free(payload);
+            return;
+        };
+        const future = future_lease.value();
+        if (future.state != .pending) {
+            future_lease.release();
+            ci.allocator.free(payload);
+            return;
+        }
         if (future.pending_read) |pending| {
             if (ci.writableGuestBytes(pending.guest_ptr, @intCast(payload.len))) |dst| {
                 @memcpy(dst, payload);
@@ -16738,8 +16845,12 @@ pub const WasiCliAdapter = struct {
                 ci.allocator.free(payload);
                 future.state = .closed;
                 future.write_closed = true;
-                if (future.waitable_set) |ws| if (future.read_waitable_idx) |idx|
-                    ws.setReady(idx, ci.allocator, async_canon.packStatus(.dropped, 0));
+                const registration = future.read_waitable;
+                future_lease.release();
+                _ = ci.notifyWaitable(
+                    registration,
+                    async_canon.packStatus(.dropped, 0),
+                );
                 return;
             }
             future.pending_read = null;
@@ -16748,8 +16859,12 @@ pub const WasiCliAdapter = struct {
         }
         future.state = .ready;
         future.write_closed = true;
-        if (future.waitable_set) |ws| if (future.read_waitable_idx) |idx|
-            ws.setReady(idx, ci.allocator, async_canon.packStatus(.completed, 0));
+        const registration = future.read_waitable;
+        future_lease.release();
+        _ = ci.notifyWaitable(
+            registration,
+            async_canon.packStatus(.completed, 0),
+        );
     }
 
     fn tcpSendStreamOnDropWritable(opaque_ctx: ?*anyopaque) void {
@@ -17108,6 +17223,7 @@ pub const WasiCliAdapter = struct {
                 .on_read = &tcpAcceptStreamOnRead,
             },
         });
+        errdefer _ = ci.streams.remove(stream_h);
         // Non-blocking accept attempt to pre-fill the stream (the driver
         // path will keep adding as more arrive on subsequent reads).
         if (fdPollReady(server.?.socket.handle, pollInEvents())) {
@@ -17120,7 +17236,10 @@ pub const WasiCliAdapter = struct {
                     .remote_addr = accepted.socket.address,
                     .local_addr = s.local_addr,
                 }) catch return error.OutOfMemory;
-                if (ci.streams.getPtr(stream_h)) |slot| {
+                if (ci.streams.acquire(stream_h)) |initial_lease| {
+                    var stream_lease = initial_lease;
+                    defer stream_lease.release();
+                    const slot = stream_lease.value();
                     var handle_bytes: [4]u8 = undefined;
                     // Apply the resource-handle wire offset
                     // (`slot + 1`); see `accept_driver` above. (#520
@@ -17174,32 +17293,53 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
             return;
         };
-        const slot = ci.streams.getPtr(stream_handle) orelse {
+        var existence_lease = ci.streams.acquire(stream_handle) orelse {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
             return;
         };
+        existence_lease.release();
         const driver_ctx = try self.allocSocketsP3StreamCtx(stream.socket.handle, s.family);
-        {
+        const future_handle = ci.allocAsyncHandle();
+        try ci.futures.put(ci.allocator, future_handle, .{
+            .elem_type_idx = 0,
+            .state = .pending,
+        });
+        errdefer _ = ci.futures.remove(future_handle);
+        driver_ctx.component_instance = ci;
+        driver_ctx.completion_future = future_handle;
+
+        var driver_installed = false;
+        var writer_already_closed = false;
+        while (ci.streams.acquire(stream_handle)) |initial_lease| {
+            var stream_lease = initial_lease;
+            const slot = stream_lease.value();
             // Drain any bytes the guest pre-buffered (e.g. wrote into
             // the stream before calling `send`) straight to the fd.
             if (slot.buffer.items.len > 0) {
+                var detached = slot.buffer;
+                slot.buffer = .empty;
+                stream_lease.release();
+                defer detached.deinit(ci.allocator);
                 const io = std.Io.Threaded.global_single_threaded.io();
-                const slices = [_][]const u8{slot.buffer.items};
+                const slices = [_][]const u8{detached.items};
                 _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &slices, 1) catch |err| {
-                    slot.buffer.clearRetainingCapacity();
-                    slot.read_closed = true;
-                    results[0] = .{ .handle = try socketReadyResultFuture(ci, false, mapSocketSendError(err)) };
+                    if (ci.streams.acquire(stream_handle)) |failed_lease| {
+                        var final_lease = failed_lease;
+                        final_lease.value().read_closed = true;
+                        final_lease.release();
+                    }
+                    _ = ci.futures.remove(future_handle);
+                    results[0] = .{
+                        .handle = try socketReadyResultFuture(
+                            ci,
+                            false,
+                            mapSocketSendError(err),
+                        ),
+                    };
                     return;
                 };
-                slot.buffer.clearRetainingCapacity();
+                continue;
             }
-            const future_handle = ci.allocAsyncHandle();
-            try ci.futures.put(ci.allocator, future_handle, .{
-                .elem_type_idx = 0,
-                .state = .pending,
-            });
-            driver_ctx.component_instance = ci;
-            driver_ctx.completion_future = future_handle;
             // Attach the driver so subsequent guest writes flow to fd.
             // Both callback shapes are installed: the executor prefers
             // the thinner `on_write_from` (zero-copy, #583 B2
@@ -17213,9 +17353,18 @@ pub const WasiCliAdapter = struct {
                 .on_write_from = &tcpSendStreamOnWriteFrom,
                 .on_drop_writable = &tcpSendStreamOnDropWritable,
             };
-            if (slot.write_closed) tcpSendStreamOnDropWritable(driver_ctx);
-            results[0] = .{ .handle = future_handle };
+            writer_already_closed = slot.write_closed;
+            driver_installed = true;
+            stream_lease.release();
+            break;
         }
+        if (!driver_installed) {
+            driver_ctx.send_failed = true;
+            settleTcpSendFuture(driver_ctx);
+        } else if (writer_already_closed) {
+            tcpSendStreamOnDropWritable(driver_ctx);
+        }
+        results[0] = .{ .handle = future_handle };
     }
 
     /// `[method]tcp-socket.receive: func()
@@ -17294,6 +17443,7 @@ pub const WasiCliAdapter = struct {
                 .on_drop_readable = &tcpReceiveStreamOnDropReadable,
             },
         });
+        errdefer _ = ci.streams.remove(stream_h);
         // Pre-buffer anything already pending on the fd at call time so
         // tests that send-then-receive without a yield still see data.
         if (fdPollReady(stream.socket.handle, pollInEvents())) {
@@ -17301,11 +17451,14 @@ pub const WasiCliAdapter = struct {
             var buf: [64 * 1024]u8 = undefined;
             var iovecs = [_][]u8{&buf};
             const n = io.vtable.netRead(io.userdata, stream.socket.handle, &iovecs) catch 0;
-            if (n > 0) if (ci.streams.getPtr(stream_h)) |slot| {
-                try slot.buffer.appendSlice(ci.allocator, buf[0..n]);
+            if (n > 0) if (ci.streams.acquire(stream_h)) |initial_lease| {
+                var stream_lease = initial_lease;
+                defer stream_lease.release();
+                try stream_lease.value().buffer.appendSlice(ci.allocator, buf[0..n]);
             };
         }
         const future_h = try socketReadyResultFuture(ci, true, .unknown);
+        errdefer _ = ci.futures.remove(future_h);
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_h };
         fields[1] = .{ .handle = future_h };
@@ -20965,7 +21118,9 @@ pub const WasiCliAdapter = struct {
         ci: *ComponentInstance,
         handle: u32,
     ) !?[]u8 {
-        const s = ci.streams.getPtr(handle) orelse return null;
+        var stream_lease = ci.streams.acquire(handle) orelse return null;
+        defer stream_lease.release();
+        const s = stream_lease.value();
         if (s.buffer.items.len == 0) return try self.allocator.alloc(u8, 0);
         const out = try self.allocator.dupe(u8, s.buffer.items);
         s.buffer.clearRetainingCapacity();
@@ -22094,9 +22249,12 @@ pub const WasiCliAdapter = struct {
         // we've snapshotted the body for transport. (Mirrors the
         // pre-#589 synchronous behaviour so guests awaiting this
         // future on the request side still resolve.)
-        if (ci.futures.getPtr(r.transmission_future_handle)) |tx| {
+        if (ci.futures.acquire(r.transmission_future_handle)) |initial_lease| {
+            var future_lease = initial_lease;
+            const tx = future_lease.value();
             tx.state = .ready;
             tx.write_closed = true;
+            future_lease.release();
         }
 
         // `request.new` retains only the resource handle. Copy the
@@ -22231,9 +22389,10 @@ pub const WasiCliAdapter = struct {
             allocator,
         ) catch |e| return e;
 
-        if (task_handle >= task_mgr.tasks.items.len) return error.NoHandleExport;
-        const task = &task_mgr.tasks.items[task_handle];
-        return HandleP3Outcome.fromTaskReturnValues(task.return_values);
+        const return_values = try task_mgr.copyReturnValues(task_handle, allocator) orelse
+            return error.NoHandleExport;
+        defer allocator.free(return_values);
+        return HandleP3Outcome.fromTaskReturnValues(return_values);
     }
 
     /// Build a `HttpRequestP3` from a complete HTTP/1.1 request byte
@@ -22401,9 +22560,12 @@ pub const WasiCliAdapter = struct {
             body_stream.deinit(ci.allocator);
             return e;
         };
+        errdefer _ = ci.streams.remove(body_handle);
 
         const trailers_handle = try allocReadyUnitFuture(ci);
+        errdefer _ = ci.futures.remove(trailers_handle);
         const tx_handle = try allocReadyUnitFuture(ci);
+        errdefer _ = ci.futures.remove(tx_handle);
 
         const r = try self.allocator.create(HttpRequestP3);
         r.* = .{
@@ -22420,7 +22582,11 @@ pub const WasiCliAdapter = struct {
         method_other = null;
         path_owned = null;
         authority_copy = null;
-        const handle = try self.pushHttpRequestP3(r);
+        const handle = self.pushHttpRequestP3(r) catch |err| {
+            r.deinit(self.allocator);
+            self.allocator.destroy(r);
+            return err;
+        };
         return .{ .request_handle = handle, .keep_alive = info.keep_alive };
     }
 
@@ -22484,11 +22650,18 @@ pub const WasiCliAdapter = struct {
         response_handle: u32,
     ) void {
         const response = self.lookupHttpResponseP3(response_handle) orelse return;
-        const tx = ci.futures.getPtr(response.transmission_future_handle) orelse return;
+        var future_lease = ci.futures.acquire(
+            response.transmission_future_handle,
+        ) orelse return;
+        const tx = future_lease.value();
         tx.state = .closed;
         tx.write_closed = true;
-        if (tx.waitable_set) |ws| if (tx.read_waitable_idx) |idx|
-            ws.setReady(idx, self.allocator, executor_root.STATUS_STARTED_CANCELLED);
+        const registration = tx.read_waitable;
+        future_lease.release();
+        _ = ci.notifyWaitable(
+            registration,
+            executor_root.STATUS_STARTED_CANCELLED,
+        );
     }
 
     pub fn writeHttpResponseP3FromHandle(
@@ -22666,7 +22839,9 @@ pub const WasiCliAdapter = struct {
         ci: *ComponentInstance,
         future_handle: u32,
     ) ?*HttpFields {
-        const fut = ci.futures.getPtr(future_handle) orelse return null;
+        var future_lease = ci.futures.acquire(future_handle) orelse return null;
+        defer future_lease.release();
+        const fut = future_lease.value();
         const payload = fut.payload orelse return null;
         if (payload.len < 8) return null;
         if (payload[0] != 1) return null; // none
@@ -25801,12 +25976,13 @@ pub fn runLoadedComponentP3(
 
     if (adapter.exit_code) |code| return .{ .is_ok = code == 0, .exit_code = code };
 
-    if (task_handle >= task_mgr.tasks.items.len) return error.Trap;
-    const task = &task_mgr.tasks.items[task_handle];
-    if (task.state != .returned or task.return_values.len == 0) return error.Trap;
+    const return_values = try task_mgr.copyReturnValues(task_handle, allocator) orelse
+        return error.Trap;
+    defer allocator.free(return_values);
+    if (return_values.len == 0) return error.Trap;
     // Lowered `result<_, _>` flat representation: a single i32
     // discriminant (`0 = ok`, `1 = err`).
-    const is_ok = task.return_values[0] == 0;
+    const is_ok = return_values[0] == 0;
     return .{ .is_ok = is_ok };
 }
 
@@ -27873,18 +28049,13 @@ test "populateWasiProviders: binds wasi:filesystem/types + preopens (#145)" {
 /// only call `enableTestMem` get those defaults skipped, so the P3
 /// stream/future tables would otherwise read garbage.
 fn p3TestInitAsyncTables(ci: *ComponentInstance) void {
-    ci.next_async_handle = 1;
-    ci.futures = .empty;
-    ci.streams = .empty;
+    ci.initAsyncTablesForTest(ci.allocator) catch
+        @panic("failed to initialize component async tables");
 }
 
 fn p3TestDeinitAsyncTables(ci: *ComponentInstance, allocator: Allocator) void {
-    var fit = ci.futures.valueIterator();
-    while (fit.next()) |f| f.deinit(allocator);
-    ci.futures.deinit(allocator);
-    var sit = ci.streams.valueIterator();
-    while (sit.next()) |s| s.deinit(allocator);
-    ci.streams.deinit(allocator);
+    _ = allocator;
+    ci.deinitAsyncTablesForTest();
 }
 
 test "wasi:filesystem@0.3.0 read-via-stream: returns stream+future tuple and pre-buffers file bytes (#484)" {
@@ -38376,21 +38547,20 @@ test "sockets #561: pre-bind value flushed to kernel after start-listen" {
 // the futures map via `freeBareCi` after running `Future.deinit` on entries.
 
 fn makeBareCiForClocksTest() ComponentInstance {
-    return .{
-        .component = undefined,
-        .core_instances = &.{},
-        .resource_tables = .empty,
-        .exported_funcs = .empty,
-        .imports = .empty,
-        .module_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-        .allocator = std.testing.allocator,
-    };
+    var ci: ComponentInstance = undefined;
+    ci.component = undefined;
+    ci.core_instances = &.{};
+    ci.exported_funcs = .empty;
+    ci.imports = .empty;
+    ci.module_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    ci.allocator = std.testing.allocator;
+    ci.initAsyncTablesForTest(std.testing.allocator) catch
+        @panic("failed to initialize clock test tables");
+    return ci;
 }
 
 fn freeBareCiForClocksTest(ci: *ComponentInstance) void {
-    var it = ci.futures.valueIterator();
-    while (it.next()) |fut| fut.deinit(ci.allocator);
-    ci.futures.deinit(ci.allocator);
+    ci.deinitAsyncTablesForTest();
     ci.module_arena.deinit();
 }
 
@@ -38551,14 +38721,14 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: UDP receive cancel mid-pending se
     try testing.expectEqual(@as(usize, 1), adapter.pending_udp_receives.items.len);
 
     // Wire up a waitable so we can verify the cancel sentinel reaches it.
-    var ws: async_mod.WaitableSet = .{};
-    defer ws.deinit(testing.allocator);
+    const ws_handle = ci.allocAsyncHandle();
+    try ci.waitable_sets.put(testing.allocator, ws_handle, .{});
+    const ws = ci.waitable_sets.getPtr(ws_handle).?;
     const idx = try ws.register(.{
         .kind = .future_read,
         .handle = fh,
     }, testing.allocator);
-    fut.waitable_set = &ws;
-    fut.read_waitable_idx = idx;
+    fut.read_waitable = .{ .set_handle = ws_handle, .item_index = idx };
 
     // Guest issues `canon task.cancel`. The adapter's cancel driver
     // must reap the pending receive.
@@ -40798,24 +40968,9 @@ test "populateWasiCliP3: stdinReadViaStreamP3 attaches lazy host source (#482, #
     // Minimal ComponentInstance: only the async-handle table fields
     // are touched by `stdinReadViaStreamP3`.
     var ci: ComponentInstance = undefined;
-    ci.streams = .empty;
-    ci.futures = .empty;
-    ci.next_async_handle = 1;
-    defer {
-        var sit = ci.streams.iterator();
-        while (sit.next()) |e| {
-            // Mimic the on_destroy hook the executor fires on a fully
-            // closed stream — frees the heap-allocated host context.
-            if (e.value_ptr.host_handler) |h| if (h.on_destroy) |cb| cb(h.ctx);
-            e.value_ptr.deinit(testing.allocator);
-        }
-        ci.streams.deinit(testing.allocator);
-        var fit = ci.futures.iterator();
-        while (fit.next()) |e| {
-            if (e.value_ptr.payload) |p| testing.allocator.free(p);
-        }
-        ci.futures.deinit(testing.allocator);
-    }
+    ci.allocator = testing.allocator;
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
 
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.stdinReadViaStreamP3(&adapter, &ci, &.{}, &results, testing.allocator);
@@ -40853,24 +41008,9 @@ test "populateWasiCliP3: writeViaStreamImplP3 drains+attaches stream sink (#482,
     defer adapter.deinit();
 
     var ci: ComponentInstance = undefined;
-    ci.streams = .empty;
-    ci.futures = .empty;
-    ci.next_async_handle = 1;
-    defer {
-        var sit = ci.streams.iterator();
-        while (sit.next()) |e| {
-            // Free the heap-allocated host-handler context (mirrors what
-            // `stream.drop-readable`/`drop-writable` does in the executor).
-            if (e.value_ptr.host_handler) |h| if (h.on_destroy) |cb| cb(h.ctx);
-            e.value_ptr.deinit(testing.allocator);
-        }
-        ci.streams.deinit(testing.allocator);
-        var fit = ci.futures.iterator();
-        while (fit.next()) |e| {
-            if (e.value_ptr.payload) |p| testing.allocator.free(p);
-        }
-        ci.futures.deinit(testing.allocator);
-    }
+    ci.allocator = testing.allocator;
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
 
     // Pre-populate a stream with bytes the guest already wrote into,
     // simulating an eager write that landed before `write-via-stream`
@@ -41170,19 +41310,13 @@ test "insecureSeed memoises pair across calls (#520)" {
 fn p3HttpTestCi(allocator: std.mem.Allocator) ComponentInstance {
     var ci: ComponentInstance = undefined;
     ci.allocator = allocator;
-    ci.streams = .empty;
-    ci.futures = .empty;
-    ci.next_async_handle = 1;
+    ci.initAsyncTablesForTest(allocator) catch
+        @panic("failed to initialize HTTP test tables");
     return ci;
 }
 
 fn p3HttpTestCiDeinit(ci: *ComponentInstance) void {
-    var sit = ci.streams.iterator();
-    while (sit.next()) |e| e.value_ptr.deinit(ci.allocator);
-    ci.streams.deinit(ci.allocator);
-    var fit = ci.futures.iterator();
-    while (fit.next()) |e| e.value_ptr.deinit(ci.allocator);
-    ci.futures.deinit(ci.allocator);
+    ci.deinitAsyncTablesForTest();
 }
 
 /// Decode a `result<own<response>, error-code>` canonical-ABI lowered

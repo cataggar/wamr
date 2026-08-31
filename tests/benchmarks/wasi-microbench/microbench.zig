@@ -72,10 +72,10 @@ const Scenario = struct {
 };
 
 const scenarios = [_]Scenario{
-    .{ .name = "http-service-keepalive-100rt", .kind = .rt,    .iters_per_sample = 100, .bytes_per_iter = 256 },
-    .{ .name = "udp-receive-1mb",              .kind = .read,  .iters_per_sample = 128, .bytes_per_iter = 8 * 1024 },
-    .{ .name = "fs-write-via-stream-1mb",      .kind = .write, .iters_per_sample = 16,  .bytes_per_iter = 64 * 1024 },
-    .{ .name = "fs-read-via-stream-1mb",       .kind = .read,  .iters_per_sample = 16,  .bytes_per_iter = 64 * 1024 },
+    .{ .name = "http-service-keepalive-100rt", .kind = .rt, .iters_per_sample = 100, .bytes_per_iter = 256 },
+    .{ .name = "udp-receive-1mb", .kind = .read, .iters_per_sample = 128, .bytes_per_iter = 8 * 1024 },
+    .{ .name = "fs-write-via-stream-1mb", .kind = .write, .iters_per_sample = 16, .bytes_per_iter = 64 * 1024 },
+    .{ .name = "fs-read-via-stream-1mb", .kind = .read, .iters_per_sample = 16, .bytes_per_iter = 64 * 1024 },
 };
 
 // ── Synthetic host drivers ────────────────────────────────────────────
@@ -191,7 +191,9 @@ const StreamFixture = struct {
     }
 
     fn installReadDriver(self: *StreamFixture) void {
-        const s = self.inst.streams.getPtr(self.handle).?;
+        var stream_lease = self.inst.streams.acquire(self.handle).?;
+        defer stream_lease.release();
+        const s = stream_lease.value();
         s.host_driver = .{
             .context = @as(*anyopaque, @ptrCast(&self.src)),
             .on_read_into = &driverReadInto,
@@ -199,7 +201,9 @@ const StreamFixture = struct {
     }
 
     fn installWriteDriver(self: *StreamFixture) void {
-        const s = self.inst.streams.getPtr(self.handle).?;
+        var stream_lease = self.inst.streams.acquire(self.handle).?;
+        defer stream_lease.release();
+        const s = stream_lease.value();
         s.host_driver = .{
             .context = @as(*anyopaque, @ptrCast(&self.sink)),
             .on_write_from = &driverWriteFrom,
@@ -211,10 +215,16 @@ const StreamFixture = struct {
 // retain a reference to it, so a single shared one is safe to reuse.
 var component_shell_types = [_]ctypes.TypeDef{.{ .val = .u8 }};
 var component_shell: ctypes.Component = .{
-    .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-    .components = &.{},   .instances = &.{},      .aliases = &.{},
-    .types = &component_shell_types, .canons = &.{},
-    .imports = &.{},      .exports = &.{},
+    .core_modules = &.{},
+    .core_instances = &.{},
+    .core_types = &.{},
+    .components = &.{},
+    .instances = &.{},
+    .aliases = &.{},
+    .types = &component_shell_types,
+    .canons = &.{},
+    .imports = &.{},
+    .exports = &.{},
 };
 
 fn runReadSample(allocator: std.mem.Allocator, scn: Scenario) !u64 {
