@@ -109,9 +109,21 @@ callback in-flight markers defer reentrant destruction without per-lookup
 reference updates. Execution-local task managers, implicit context slots,
 canon-lower bindings, and realloc state remain on `ThreadExecutionContext` as
 established by the context split.
-`WasiCliAdapter`'s own resource families remain the final B1.1 follow-up. This
-also does not wire production interpreter/AOT spawning or final group
-cancellation.
+
+The `WasiCliAdapter` slice is established as well. Its stream, filesystem,
+socket, HTTP, keyvalue, pollable, callback-context, timer, UDP, and outbound
+HTTP operation tables use the same conditional ownership model: disabled
+builds retain compact direct arrays, while enabled builds use stable retained
+nodes with non-wrapping generations. Child resources retain their exact
+descriptor/socket/stream owners; pending operations claim completion exactly
+once; shutdown cancels and joins producers before retiring their futures and
+parents. Destructors and ComponentInstance callbacks run outside table locks,
+and host I/O/waits hold only stable leases plus zero-sized-when-disabled
+operation claims. Worker-backed HTTP tables remain synchronized in all builds
+because those workers exist independently of `lib_wasi_threads`.
+
+This completes B1.1's resource-lifetime slices. It does not wire production
+interpreter/AOT spawning or final group cancellation.
 
 The thread-group lifecycle now publishes a generation-stamped, manager-owned
 record before a native child can enter guest code. The child waits on a start
@@ -321,14 +333,16 @@ and the Preview-2/3 host adapter ([`src/component/wasi_cli_adapter.zig:3779`](..
   canon-lower call context live on the active `ThreadExecutionContext`, not
   mutable instance-global fields.
 
-**Per-`WasiCliAdapter` (resource tables — every `*_table` field):**
+**Per-`WasiCliAdapter` resource and operation tables:**
 
-Counted by `grep -cE "^\s*\w+_table\s*:"` on the adapter: **8** direct
-`_table` fields, but the full set of guest-handle-indexed
-`ArrayListUnmanaged(?Slot)` collections is wider:
+All guest-visible adapter handles now go through
+`src/shared/adapter_resource.zig`. First-generation handle values retain the
+existing ABI; enabled slot reuse advances an encoded generation, while
+disabled reuse preserves the direct-array numbering.
 
-* `stream_table`, `input_stream_table` — I/O streams (and the owned-lists
-  `owned_input_streams`, `owned_output_streams`).
+* `stream_table`, `input_stream_table` — I/O streams. Owned output streams use
+  a small shared owner so an outgoing HTTP body remains valid after the guest
+  drops its stream handle.
 * `fs_descriptor_table`, `fs_preopens`, `dir_entry_stream_table` — filesystem.
 * `network_table`, `socket_table`, `udp_incoming_streams`,
   `udp_outgoing_streams`, `resolve_streams`.
@@ -341,24 +355,29 @@ Counted by `grep -cE "^\s*\w+_table\s*:"` on the adapter: **8** direct
   `http_incoming_bodies`, `http_outgoing_bodies`,
   `http_future_responses`, `http_future_trailers`,
   `http_requests_p3`, `http_responses_p3`, `http_request_options_p3`.
-* `keyvalue_buckets`.
+* `keyvalue_buckets`, `cas_table`.
 * `pollable_table`.
 * `timer_futures`, `timer_future_ready`.
+
+Directory streams, TCP/UDP stream children, pending UDP receives, and
+socket-backed ComponentInstance stream callbacks retain their exact parent
+node. Poll waits snapshot backend descriptors while holding a lease, release
+operation claims before blocking, and therefore cannot race descriptor close
+or hold a table/value lock across `poll`.
 
 **Adapter-wide singletons / borrowed slices (read-mostly):**
 
 * `argv`, `env`, `config_store` — borrowed slices set at startup;
   read-only during run.
-* `sockets_allow_list_template: []IpCidr` — read-mostly; replaced
-  atomically by `setSocketsAllowList`. Today a single
-  `[]IpCidr` slice, so updates aren't lock-free safe under concurrent
-  reads but no production code path mutates it after startup.
+* `sockets_allow_list_template: []IpCidr` — snapshotted/replaced under a
+  conditional operation claim; old storage is freed after publication.
 * `wall_clock_override`, `monotonic_clock_override`, `log_level` —
   injected once at startup.
 * `stdin`, `stdout`, `stderr` — `streams.OutputStream` / `InputStream`
-  instances; the `OutputStream` write paths funnel through host file
-  descriptors which **the kernel already serialises**.
-* `exit_code: ?u32` — written once when the guest calls `wasi:cli/exit.exit`.
+  instances with shared per-sink operation claims, so aliases serialize
+  without a table lock around host I/O.
+* `exit_code`, insecure PRNG state, preopen metadata, timer-ready flags, and
+  keyvalue persistence state each have conditional operation ownership.
 
 **`TaskManager` ([`src/component/async.zig`](../../src/component/async.zig)):**
 

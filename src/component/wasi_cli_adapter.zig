@@ -1449,8 +1449,9 @@ pub const ResolveAddressStream = struct {
 /// backed `AsyncStream` (#535). The executor invokes the driver
 /// callbacks with this opaque pointer; the callbacks unwrap it,
 /// consult the fd, and (for accept) push new sockets through the
-/// adapter. Owned by `WasiCliAdapter.sockets_p3_stream_ctxs`, lives
-/// until adapter teardown.
+/// adapter. The adapter table publishes a self-lease in enabled builds;
+/// `AsyncStream.deinit` invokes `on_destroy`, which retires that entry
+/// only after the final callback lease is gone.
 ///
 /// ## Cancel observation (#583 follow-up to #607)
 ///
@@ -1507,8 +1508,8 @@ pub const SocketsP3StreamCtx = struct {
 /// `.err`) and `pwrite(2)`s the guest's bytes at
 /// `offset + bytes_written`, tracking the running offset.
 ///
-/// Owned by `WasiCliAdapter.fs_write_stream_ctxs`; freed in adapter
-/// `deinit` after the executor has released all `AsyncStream` slots.
+/// Owned by `WasiCliAdapter.fs_write_stream_ctxs` until the attached
+/// `AsyncStream` invokes its exact-once `on_destroy` callback.
 pub const FsWriteStreamCtx = struct {
     adapter: *WasiCliAdapter,
     registry_handle: u32 = std.math.maxInt(u32),
@@ -6178,9 +6179,9 @@ pub const WasiCliAdapter = struct {
         self.fs_read_stream_ctxs.deinit() catch
             @panic("WasiCliAdapter destroyed with outstanding filesystem read callback leases");
 
-        // Bodies retain internal stream leases. Retire them first, then
-        // retire stream handles, which in turn release descriptor/socket
-        // parent leases before those owning tables shut down.
+        // Outgoing bodies can retain a shared output-stream owner. Retire
+        // bodies first, then stream handles, which in turn release
+        // descriptor/socket parent leases before those owning tables.
         self.http_incoming_bodies.deinit() catch
             @panic("WasiCliAdapter destroyed with outstanding incoming-body leases");
         self.http_outgoing_bodies.deinit() catch
@@ -9084,12 +9085,9 @@ pub const WasiCliAdapter = struct {
     /// transition the P2 `future-incoming-response.get` path consumes,
     /// then joins the worker thread and frees the shared heap struct.
     ///
-    /// Entries whose guest dropped the future-incoming-response while
-    /// the worker was still mid-fetch (the `guest_dropped` flag) get
-    /// their slot nulled here too, after the worker outcome is
-    /// discarded — `httpFutureDrop` left the slot reserved to keep
-    /// `pushFutureResponse` from racing into the same slot before
-    /// the drainer caught up. (#583 A2)
+    /// A pending entry retains the exact future node. Guest drop removes
+    /// the public handle immediately and marks that node closing; the
+    /// drainer then discards the outcome instead of settling a replacement.
     pub fn drainPendingHttpFetches(self: *WasiCliAdapter) void {
         const handles = self.pending_http_fetches.snapshotHandles(self.allocator) catch
             return;
@@ -21415,17 +21413,9 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        // (#583 A2) Drop is the guest's signal that they're no longer
-        // awaiting this future. If a worker thread is still mid-
-        // fetch we cannot null the slot here: `pushFutureResponse`
-        // would happily reuse the slot for an unrelated future, and
-        // `drainPendingHttpFetches` would then settle that wrong
-        // resource on the worker's completion. Instead: mark the
-        // entry cancelled, leave the slot reserved (state stays
-        // pending), and let the drainer null + free the slot once
-        // it has joined the worker. The cancel path inside
-        // `settlePendingHttpFetch` discards the outcome and then
-        // we clean up here in a follow-up sweep.
+        // Drop removes the public handle immediately. The pending operation's
+        // retained lease keeps the exact retired node alive, so later handle
+        // reuse cannot receive this worker's completion.
         if (self.pending_http_fetches.snapshotHandles(self.allocator)) |handles| {
             defer self.allocator.free(handles);
             for (handles) |operation_handle| {
@@ -24428,12 +24418,17 @@ pub const WasiCliAdapter = struct {
         future_handle: u32,
     ) ?HttpFieldsLease {
         var future_lease = ci.futures.acquire(future_handle) orelse return null;
-        defer future_lease.release();
         const fut = future_lease.value();
-        const payload = fut.payload orelse return null;
-        if (payload.len < 8) return null;
-        if (payload[0] != 1) return null; // none
+        const payload = fut.payload orelse {
+            future_lease.release();
+            return null;
+        };
+        if (payload.len < 8 or payload[0] != 1) {
+            future_lease.release();
+            return null;
+        }
         const handle = std.mem.readInt(u32, payload[4..8], .little);
+        future_lease.release();
         return self.lookupHttpFields(handle);
     }
 
