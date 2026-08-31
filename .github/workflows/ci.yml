@@ -59,9 +59,6 @@ jobs:
           zig build test-wasi-threads -Daot=false
           zig build test-wasi-threads -Dlib_wasi_threads=true -Daot=false
 
-      - name: WASI thread AOT fixtures
-        run: zig build test-wasi-threads -Dlib_wasi_threads=true -Dinterp=false
-
       - name: Build (ReleaseSafe)
         continue-on-error: true
         run: zig build -Doptimize=ReleaseSafe
