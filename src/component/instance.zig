@@ -4,6 +4,7 @@
 //! between component instances and their underlying core module instances.
 
 const std = @import("std");
+const config = @import("config");
 const ctypes = @import("types.zig");
 const core_types = @import("../runtime/common/types.zig");
 const executor_mod = @import("executor.zig");
@@ -15,6 +16,7 @@ const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const call_frame_mod = @import("call_frame.zig");
 const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
+const stable_resource = @import("../shared/stable_resource.zig");
 
 const aot_host_bridge = @import("../runtime/aot/host_bridge.zig");
 
@@ -24,81 +26,244 @@ pub const CoreInstanceBackend = core_backend.CoreInstanceBackend;
 
 // ── Resource Table ──────────────────────────────────────────────────────────
 
-/// A resource table maps integer handles to host-side representations.
-/// Each component instance has its own resource table per resource type.
-pub const ResourceTable = struct {
-    /// Slot in the resource table.
-    const Slot = struct {
-        /// The host-side representation value.
-        rep: u32,
-        /// Whether this handle is currently valid.
-        active: bool = true,
-        /// Borrow depth — number of outstanding borrows of this handle.
-        borrow_count: u32 = 0,
-        /// Whether this is an owned handle (vs borrowed).
-        owned: bool = true,
-    };
+/// A resource table maps canonical-ABI handles to host representations.
+///
+/// Enabled builds store each slot in a stable leased node. Disabled builds
+/// keep the original compact ArrayList fast path. Both specializations embed
+/// a generation in reused handles, so a stale drop/rep cannot target a later
+/// occupant of the same slot.
+pub fn ResourceTableFor(comptime enabled: bool) type {
+    const RegistryMutex = stable_resource.ConditionalMutexFor(
+        enabled,
+        stable_resource.LockRank.resource_registry,
+    );
+    const EntryMutex = stable_resource.ConditionalMutexFor(
+        enabled,
+        stable_resource.LockRank.resource_node,
+    );
 
-    slots: std.ArrayListUnmanaged(Slot) = .empty,
-    /// Free list of slot indices for reuse.
-    free_list: std.ArrayListUnmanaged(u32) = .empty,
+    return struct {
+        const Self = @This();
 
-    /// Allocate a new handle for a representation. Returns the handle index.
-    pub fn new(self: *ResourceTable, representation: u32, owned: bool, allocator: std.mem.Allocator) !u32 {
-        if (self.free_list.items.len > 0) {
-            const idx = self.free_list.items[self.free_list.items.len - 1];
-            self.free_list.items.len -= 1;
-            self.slots.items[idx] = .{ .rep = representation, .owned = owned };
-            return idx;
+        const Entry = struct {
+            mutex: EntryMutex = .init,
+            rep: u32,
+            borrow_count: u32 = 0,
+            owned: bool = true,
+            active: bool = true,
+            generation: stable_resource.HandleGeneration = 0,
+            next_free: ?u32 = null,
+        };
+
+        const Destroyer = struct {
+            fn run(_: void, _: *Entry) void {
+                stable_resource.assertNoLocksHeldFor(enabled);
+            }
+        };
+
+        const StableTable = stable_resource.StableHandleTableFor(
+            enabled,
+            Entry,
+            void,
+            Destroyer.run,
+            64,
+        );
+
+        allocator: std.mem.Allocator,
+        registry_mutex: RegistryMutex = .init,
+        storage: if (enabled) StableTable else std.ArrayListUnmanaged(Entry),
+        free_head: if (enabled) void else ?u32 = if (enabled) {} else null,
+
+        pub fn init(allocator: std.mem.Allocator) !Self {
+            return .{
+                .allocator = allocator,
+                .storage = if (enabled)
+                    try StableTable.init(allocator, {})
+                else
+                    .empty,
+            };
         }
-        const idx: u32 = @intCast(self.slots.items.len);
-        try self.slots.append(allocator, .{ .rep = representation, .owned = owned });
-        return idx;
-    }
 
-    /// Get the representation for a handle. Returns null if invalid.
-    pub fn rep(self: *const ResourceTable, handle: u32) ?u32 {
-        if (handle >= self.slots.items.len) return null;
-        const slot = self.slots.items[handle];
-        if (!slot.active) return null;
-        return slot.rep;
-    }
+        /// Allocate a new handle for a representation.
+        pub fn new(
+            self: *Self,
+            representation: u32,
+            owned: bool,
+            allocator: std.mem.Allocator,
+        ) !u32 {
+            _ = allocator;
+            if (comptime enabled) {
+                return self.storage.publish(.{
+                    .rep = representation,
+                    .owned = owned,
+                });
+            }
 
-    /// Drop a handle, marking it inactive. Returns the rep for destructor call.
-    /// Returns null if the handle was already dropped or is a borrow with outstanding refs.
-    pub fn drop(self: *ResourceTable, handle: u32, allocator: std.mem.Allocator) ?u32 {
-        if (handle >= self.slots.items.len) return null;
-        const slot = &self.slots.items[handle];
-        if (!slot.active) return null;
-        if (slot.borrow_count > 0) return null; // can't drop with outstanding borrows
-        const r = slot.rep;
-        slot.active = false;
-        // Add to free list for reuse
-        self.free_list.append(allocator, handle) catch {};
-        return r;
-    }
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.free_head) |index| {
+                const slot = &self.storage.items[index];
+                self.free_head = slot.next_free;
+                slot.rep = representation;
+                slot.borrow_count = 0;
+                slot.owned = owned;
+                slot.active = true;
+                slot.next_free = null;
+                return stable_resource.makeHandle(index, slot.generation);
+            }
 
-    /// Increment borrow count for a handle.
-    pub fn borrow(self: *ResourceTable, handle: u32) bool {
-        if (handle >= self.slots.items.len) return false;
-        const slot = &self.slots.items[handle];
-        if (!slot.active) return false;
-        slot.borrow_count += 1;
-        return true;
-    }
+            if (self.storage.items.len > stable_resource.max_handle_index)
+                return error.HandleExhausted;
+            const index: u32 = @intCast(self.storage.items.len);
+            try self.storage.append(self.allocator, .{
+                .rep = representation,
+                .owned = owned,
+            });
+            return stable_resource.makeHandle(index, 0);
+        }
 
-    /// Decrement borrow count for a handle.
-    pub fn returnBorrow(self: *ResourceTable, handle: u32) void {
-        if (handle >= self.slots.items.len) return;
-        const slot = &self.slots.items[handle];
-        if (slot.borrow_count > 0) slot.borrow_count -= 1;
-    }
+        /// Get the representation for a live handle.
+        pub fn rep(self: *Self, handle: u32) ?u32 {
+            if (comptime enabled) {
+                self.registry_mutex.lock();
+                var lease = self.storage.acquire(handle) orelse {
+                    self.registry_mutex.unlock();
+                    return null;
+                };
+                self.registry_mutex.unlock();
+                defer lease.release();
+                const entry = lease.value();
+                entry.mutex.lock();
+                defer entry.mutex.unlock();
+                return entry.rep;
+            }
 
-    pub fn deinit(self: *ResourceTable, allocator: std.mem.Allocator) void {
-        self.slots.deinit(allocator);
-        self.free_list.deinit(allocator);
-    }
-};
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            const slot = self.directSlot(handle) orelse return null;
+            return slot.rep;
+        }
+
+        /// Unpublish a handle and return its representation. A concurrent
+        /// borrow either wins before this operation or observes the handle
+        /// closed; the two transitions cannot cross.
+        pub fn drop(
+            self: *Self,
+            handle: u32,
+            allocator: std.mem.Allocator,
+        ) ?u32 {
+            _ = allocator;
+            if (comptime enabled) {
+                self.registry_mutex.lock();
+                var lease = self.storage.acquire(handle) orelse {
+                    self.registry_mutex.unlock();
+                    return null;
+                };
+                const entry = lease.value();
+                entry.mutex.lock();
+                if (entry.borrow_count != 0) {
+                    entry.mutex.unlock();
+                    self.registry_mutex.unlock();
+                    lease.release();
+                    return null;
+                }
+                const representation = entry.rep;
+                entry.mutex.unlock();
+                const removed = self.storage.remove(handle);
+                self.registry_mutex.unlock();
+                lease.release();
+                if (!removed) return null;
+                return representation;
+            }
+
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            const slot = self.directSlot(handle) orelse return null;
+            if (slot.borrow_count != 0) return null;
+            const representation = slot.rep;
+            self.recycleDirectSlot(stable_resource.handleIndex(handle), slot);
+            return representation;
+        }
+
+        pub fn borrow(self: *Self, handle: u32) bool {
+            if (comptime enabled) {
+                self.registry_mutex.lock();
+                var lease = self.storage.acquire(handle) orelse {
+                    self.registry_mutex.unlock();
+                    return false;
+                };
+                const entry = lease.value();
+                entry.mutex.lock();
+                const accepted = entry.borrow_count != std.math.maxInt(u32);
+                if (accepted) entry.borrow_count += 1;
+                entry.mutex.unlock();
+                self.registry_mutex.unlock();
+                lease.release();
+                return accepted;
+            }
+
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            const slot = self.directSlot(handle) orelse return false;
+            if (slot.borrow_count == std.math.maxInt(u32)) return false;
+            slot.borrow_count += 1;
+            return true;
+        }
+
+        pub fn returnBorrow(self: *Self, handle: u32) void {
+            if (comptime enabled) {
+                self.registry_mutex.lock();
+                var lease = self.storage.acquire(handle) orelse {
+                    self.registry_mutex.unlock();
+                    return;
+                };
+                const entry = lease.value();
+                entry.mutex.lock();
+                if (entry.borrow_count > 0) entry.borrow_count -= 1;
+                entry.mutex.unlock();
+                self.registry_mutex.unlock();
+                lease.release();
+                return;
+            }
+
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            const slot = self.directSlot(handle) orelse return;
+            if (slot.borrow_count > 0) slot.borrow_count -= 1;
+        }
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            _ = allocator;
+            if (comptime enabled) {
+                self.storage.deinit() catch @panic("Component resource leases outstanding");
+            } else {
+                self.storage.deinit(self.allocator);
+            }
+        }
+
+        fn directSlot(self: *Self, handle: u32) ?*Entry {
+            const index = stable_resource.handleIndex(handle);
+            if (index >= self.storage.items.len) return null;
+            const slot = &self.storage.items[index];
+            if (!slot.active) return null;
+            if (slot.generation != stable_resource.handleGeneration(handle)) return null;
+            return slot;
+        }
+
+        fn recycleDirectSlot(self: *Self, index: u32, slot: *Entry) void {
+            slot.active = false;
+            if (slot.generation == std.math.maxInt(stable_resource.HandleGeneration)) {
+                slot.next_free = null;
+                return;
+            }
+            slot.generation += 1;
+            slot.next_free = self.free_head;
+            self.free_head = index;
+        }
+    };
+}
+
+pub const ResourceTable = ResourceTableFor(config.lib_wasi_threads);
 
 // ── Component Instance ──────────────────────────────────────────────────────
 
@@ -170,6 +335,147 @@ pub const ImportBinding = union(enum) {
     },
 };
 
+const AsyncDestroyContext = std.mem.Allocator;
+
+fn destroyFuture(allocator: AsyncDestroyContext, future: *async_mod.Future) void {
+    stable_resource.assertNoLocksHeld();
+    future.deinit(allocator);
+}
+
+fn destroyStream(allocator: AsyncDestroyContext, stream: *async_mod.AsyncStream) void {
+    stable_resource.assertNoLocksHeld();
+    if (stream.host_handler) |handler| {
+        if (handler.on_destroy) |callback| callback(handler.ctx);
+        stream.host_handler = null;
+    }
+    stream.deinit(allocator);
+}
+
+fn destroyErrorContext(allocator: AsyncDestroyContext, message: *[]u8) void {
+    stable_resource.assertNoLocksHeld();
+    allocator.free(message.*);
+    message.* = &.{};
+}
+
+fn destroyWaitableSet(allocator: AsyncDestroyContext, waitable_set: *async_mod.WaitableSet) void {
+    stable_resource.assertNoLocksHeld();
+    waitable_set.deinit(allocator);
+}
+
+pub const FutureTable = stable_resource.StableKeyedHandleTableFor(
+    config.lib_wasi_threads,
+    async_mod.Future,
+    AsyncDestroyContext,
+    destroyFuture,
+    true,
+);
+pub const StreamTable = stable_resource.StableKeyedHandleTableFor(
+    config.lib_wasi_threads,
+    async_mod.AsyncStream,
+    AsyncDestroyContext,
+    destroyStream,
+    true,
+);
+pub const ErrorContextTable = stable_resource.StableKeyedHandleTableFor(
+    config.lib_wasi_threads,
+    []u8,
+    AsyncDestroyContext,
+    destroyErrorContext,
+    false,
+);
+pub const WaitableSetTable = stable_resource.StableKeyedHandleTableFor(
+    config.lib_wasi_threads,
+    async_mod.WaitableSet,
+    AsyncDestroyContext,
+    destroyWaitableSet,
+    false,
+);
+
+const ResourceTableRegistry = struct {
+    const Mutex = stable_resource.ConditionalMutex(
+        stable_resource.LockRank.resource_registry,
+    );
+
+    allocator: std.mem.Allocator,
+    mutex: Mutex = .init,
+    tables: std.AutoHashMapUnmanaged(u32, *ResourceTable) = .empty,
+    shutting_down: bool = false,
+
+    fn init(allocator: std.mem.Allocator) ResourceTableRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    fn getOrCreate(self: *ResourceTableRegistry, resource_idx: u32) !*ResourceTable {
+        self.mutex.lock();
+        if (self.shutting_down) {
+            self.mutex.unlock();
+            return error.TableShuttingDown;
+        }
+        if (self.tables.get(resource_idx)) |existing| {
+            self.mutex.unlock();
+            return existing;
+        }
+        self.mutex.unlock();
+
+        const candidate = try self.allocator.create(ResourceTable);
+        errdefer self.allocator.destroy(candidate);
+        candidate.* = try ResourceTable.init(self.allocator);
+        errdefer candidate.deinit(self.allocator);
+
+        self.mutex.lock();
+        if (self.shutting_down) {
+            self.mutex.unlock();
+            return error.TableShuttingDown;
+        }
+        if (self.tables.get(resource_idx)) |existing| {
+            self.mutex.unlock();
+            candidate.deinit(self.allocator);
+            self.allocator.destroy(candidate);
+            return existing;
+        }
+        self.tables.put(self.allocator, resource_idx, candidate) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        return candidate;
+    }
+
+    fn deinit(self: *ResourceTableRegistry) void {
+        self.mutex.lock();
+        self.shutting_down = true;
+        var tables = self.tables;
+        self.tables = .empty;
+        self.mutex.unlock();
+
+        var values = tables.valueIterator();
+        while (values.next()) |table| {
+            table.*.deinit(self.allocator);
+            self.allocator.destroy(table.*);
+        }
+        tables.deinit(self.allocator);
+    }
+
+    fn count(self: *ResourceTableRegistry) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.tables.count();
+    }
+};
+
+const TaskManagerBinding = struct {
+    instance: *const ComponentInstance,
+    manager: *async_mod.TaskManager,
+};
+
+const LowerCallBinding = struct {
+    instance: *const ComponentInstance,
+    context: ?ComponentInstance.CanonLowerCallCtx,
+};
+
+threadlocal var task_manager_binding: ?TaskManagerBinding = null;
+threadlocal var lower_call_binding: ?LowerCallBinding = null;
+
 /// Backing buffer used in unit tests that don't have a real core module
 /// instance with a `cabi_realloc` export. Tests opt-in via
 /// `ComponentInstance.enableTestMem`; runtime code never sets this.
@@ -220,7 +526,7 @@ pub const ComponentInstance = struct {
     /// lazily on first access so the dense `[]ResourceTable` layout (which
     /// silently assumed resource indices were dense over locally declared
     /// resources) no longer corrupts on aliased or imported resources.
-    resource_tables: std.AutoHashMapUnmanaged(u32, ResourceTable),
+    resource_tables: ResourceTableRegistry,
     /// Exported functions (component-level func index → core func index + instance).
     exported_funcs: std.StringHashMapUnmanaged(ExportedFunc),
     /// Resolved imports keyed by import name.
@@ -338,6 +644,9 @@ pub const ComponentInstance = struct {
     /// zeros — the spec doesn't define a non-zero initial value.
     /// (#478 sub-PR 1.)
     implicit_task_context: [async_mod.N_CONTEXT_SLOTS]u32 = [_]u32{0} ** async_mod.N_CONTEXT_SLOTS,
+    implicit_task_mutex: stable_resource.ConditionalMutex(
+        stable_resource.LockRank.resource_node,
+    ) = .init,
 
     /// Per-instance async-handle tables for the WASIp3 canonical-ABI
     /// surface (#478 sub-PR 3). Each table maps a u32 handle to the
@@ -345,23 +654,17 @@ pub const ComponentInstance = struct {
     /// futures, streams, error-contexts, and waitable-sets. Handles are
     /// drawn from `next_async_handle` (starting at 1; zero is the spec
     /// sentinel meaning "no value yet").
-    futures: std.AutoHashMapUnmanaged(u32, async_mod.Future) = .empty,
-    streams: std.AutoHashMapUnmanaged(u32, async_mod.AsyncStream) = .empty,
-    error_contexts: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
-    waitable_sets: std.AutoHashMapUnmanaged(u32, async_mod.WaitableSet) = .empty,
-    next_async_handle: u32 = 1,
-
-    /// TaskManager driving the currently-active async-lifted call into
-    /// this instance, or null when no async call is on the stack. Set
-    /// by `callComponentFuncAsync` for the duration of an async-lifted
-    /// dispatch, and restored to its prior value on return so nested
-    /// dispatches work. Used by the canon-builtin host trampoline (see
-    /// `executor.canonBuiltinTrampoline`) to route `context.{get,set}`,
-    /// `task.{yield,return}`, and the async ABI canons through
-    /// `dispatchCanonBuiltin` with the right task state. When null,
-    /// canon builtins fall back to the instance-scoped
-    /// `implicit_task_context` (Wasmtime parity, sync-call path). (#520)
-    current_task_manager: ?*async_mod.TaskManager = null,
+    futures: FutureTable,
+    streams: StreamTable,
+    error_contexts: ErrorContextTable,
+    waitable_sets: WaitableSetTable,
+    next_async_handle: if (config.lib_wasi_threads)
+        std.atomic.Value(u32)
+    else
+        u32 = if (config.lib_wasi_threads)
+        std.atomic.Value(u32).init(1)
+    else
+        1,
 
     /// Host-driven async-event driver hook (#551). Installed by
     /// `wasi:cli`-style host adapters that own background timers or other
@@ -456,9 +759,9 @@ pub const ComponentInstance = struct {
     realloc_env: ?*@import("../runtime/common/exec_env.zig").ExecEnv = null,
     realloc_env_owner: ?*core_types.ModuleInstance = null,
 
-    /// Canon-lower opts of the in-flight host import call, set by
-    /// `componentTrampoline` / `dispatchAotComponentTrampoline` before
-    /// dispatching into the host method and cleared after. Lets
+    /// Canon-lower opts carried by the thread-local `LowerCallScope` while
+    /// `componentTrampoline` / `dispatchAotComponentTrampoline` dispatches
+    /// into a host method. Lets
     /// `hostAllocAndWrite` honor the lowerer's chosen `(realloc $f)` +
     /// `(memory $m)` instead of falling back to the canonical
     /// `cabi_realloc` search.
@@ -472,8 +775,6 @@ pub const ComponentInstance = struct {
     /// equals `temporary_data` — calling the main module's
     /// `cabi_realloc` instead returns a ptr in the wrong memory and
     /// trips that assertion. (#715.)
-    current_lower_call_ctx: ?CanonLowerCallCtx = null,
-
     /// Resolved canon-lower opts for an in-flight host import call.
     /// `memory` and `realloc` are pre-resolved from the canon-lower
     /// opts' top-level indices so `hostAllocAndWrite` does not redo
@@ -498,14 +799,128 @@ pub const ComponentInstance = struct {
         },
     };
 
+    /// Temporary thread-local binding used by canon builtin trampolines.
+    /// B1.6 owns moving this seam into the per-thread execution context;
+    /// keeping it TLS here avoids the former instance-global cross-thread
+    /// overwrite without duplicating that context split.
+    pub const TaskManagerScope = struct {
+        previous: ?TaskManagerBinding,
+        active: bool = true,
+
+        pub fn deinit(self: *TaskManagerScope) void {
+            if (!self.active) return;
+            task_manager_binding = self.previous;
+            self.active = false;
+        }
+    };
+
+    pub const LowerCallScope = struct {
+        previous: ?LowerCallBinding,
+        active: bool = true,
+
+        pub fn deinit(self: *LowerCallScope) void {
+            if (!self.active) return;
+            lower_call_binding = self.previous;
+            self.active = false;
+        }
+    };
+
+    pub fn bindTaskManager(
+        self: *const ComponentInstance,
+        manager: *async_mod.TaskManager,
+    ) TaskManagerScope {
+        const previous = task_manager_binding;
+        task_manager_binding = .{ .instance = self, .manager = manager };
+        return .{ .previous = previous };
+    }
+
+    pub fn currentTaskManager(self: *const ComponentInstance) ?*async_mod.TaskManager {
+        const binding = task_manager_binding orelse return null;
+        if (binding.instance != self) return null;
+        return binding.manager;
+    }
+
+    pub fn bindLowerCallContext(
+        self: *const ComponentInstance,
+        context: ?CanonLowerCallCtx,
+    ) LowerCallScope {
+        const previous = lower_call_binding;
+        lower_call_binding = .{ .instance = self, .context = context };
+        return .{ .previous = previous };
+    }
+
+    pub fn currentLowerCallContext(self: *const ComponentInstance) ?CanonLowerCallCtx {
+        const binding = lower_call_binding orelse return null;
+        if (binding.instance != self) return null;
+        return binding.context orelse null;
+    }
+
+    pub fn getImplicitTaskContext(self: *ComponentInstance, slot: u32) ?u32 {
+        if (slot >= async_mod.N_CONTEXT_SLOTS) return null;
+        self.implicit_task_mutex.lock();
+        defer self.implicit_task_mutex.unlock();
+        return self.implicit_task_context[slot];
+    }
+
+    pub fn setImplicitTaskContext(
+        self: *ComponentInstance,
+        slot: u32,
+        value: u32,
+    ) bool {
+        if (slot >= async_mod.N_CONTEXT_SLOTS) return false;
+        self.implicit_task_mutex.lock();
+        defer self.implicit_task_mutex.unlock();
+        self.implicit_task_context[slot] = value;
+        return true;
+    }
+
     /// Allocate a fresh async-handle (#478 sub-PR 3). Used by every
     /// `.new`-flavoured canon-builtin to mint a unique key into the
     /// per-instance future / stream / error-context / waitable-set
     /// tables.
     pub fn allocAsyncHandle(self: *ComponentInstance) u32 {
-        const h = self.next_async_handle;
+        if (comptime config.lib_wasi_threads) {
+            var current = self.next_async_handle.load(.monotonic);
+            while (current != std.math.maxInt(u32)) {
+                if (self.next_async_handle.cmpxchgWeak(
+                    current,
+                    current + 1,
+                    .monotonic,
+                    .monotonic,
+                )) |observed| {
+                    current = observed;
+                } else {
+                    return current;
+                }
+            }
+            @panic("component async handle space exhausted");
+        }
+
+        if (self.next_async_handle == std.math.maxInt(u32))
+            @panic("component async handle space exhausted");
+        const handle = self.next_async_handle;
         self.next_async_handle += 1;
-        return h;
+        return handle;
+    }
+
+    pub fn notifyWaitable(
+        self: *ComponentInstance,
+        registration: ?async_mod.WaitableRegistration,
+        code: u32,
+    ) bool {
+        const target = registration orelse return false;
+        var lease = self.waitable_sets.acquire(target.set_handle) orelse return false;
+        defer lease.release();
+        return lease.value().trySetReady(target.item_index, self.allocator, code);
+    }
+
+    pub fn unregisterWaitable(
+        self: *ComponentInstance,
+        registration: async_mod.WaitableRegistration,
+    ) void {
+        var lease = self.waitable_sets.acquire(registration.set_handle) orelse return;
+        defer lease.release();
+        lease.value().unregister(registration.item_index);
     }
 
     pub const LinkState = enum { unlinked, linking, linked, poisoned };
@@ -593,9 +1008,7 @@ pub const ComponentInstance = struct {
     /// Get-or-create the resource table for a given component resource type
     /// index. Resource tables are lazily allocated on first use.
     pub fn getOrCreateResourceTable(self: *ComponentInstance, type_idx: u32) !*ResourceTable {
-        const gop = try self.resource_tables.getOrPut(self.allocator, type_idx);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        return gop.value_ptr;
+        return self.resource_tables.getOrCreate(type_idx);
     }
 
     /// Find the first core instance entry with a real `ModuleInstance`.
@@ -705,8 +1118,8 @@ pub const ComponentInstance = struct {
     /// AOT-aware sibling of `resolveTopLevelCoreFunc`. Returns either an
     /// AOT or interp `ReallocTarget` for the named export of the
     /// aliased core instance. Used by the canon-lower trampoline to
-    /// pre-resolve `(realloc $f)` before stashing the call ctx on
-    /// `current_lower_call_ctx`. (#715.)
+    /// pre-resolve `(realloc $f)` before binding the thread-local call
+    /// context. (#715.)
     pub fn resolveTopLevelCoreFuncAny(
         self: *const ComponentInstance,
         idx: u32,
@@ -762,7 +1175,7 @@ pub const ComponentInstance = struct {
         // wit-component preview1 adapter's per-page memory) resolve
         // correctly. Falls back to the canonical memory otherwise.
         // (#715.)
-        if (self.current_lower_call_ctx) |cctx| {
+        if (self.currentLowerCallContext()) |cctx| {
             if (cctx.memory) |mem| {
                 const end = @as(usize, ptr) + @as(usize, len);
                 if (end > mem.byteLen()) return null;
@@ -838,7 +1251,7 @@ pub const ComponentInstance = struct {
         // module's `cabi_realloc` here returns a ptr in the wrong
         // memory and trips an assertion inside the adapter's
         // `fd_readdir` handler. (#715.)
-        if (self.current_lower_call_ctx) |cctx| {
+        if (self.currentLowerCallContext()) |cctx| {
             if (cctx.realloc) |target| {
                 const executor = @import("executor.zig");
                 switch (target) {
@@ -851,6 +1264,13 @@ pub const ComponentInstance = struct {
                     },
                     .interp => |t| {
                         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+                        if (comptime config.lib_wasi_threads) {
+                            const env = ExecEnv.create(t.mi, 1024, self.allocator) catch return null;
+                            defer env.destroy();
+                            var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
+                            defer frame.deinit();
+                            return executor.callRealloc(&frame, t.local_idx, 0, 0, a, size) catch null;
+                        }
                         if (self.realloc_env_owner != t.mi) {
                             if (self.realloc_env) |old| old.destroy();
                             self.realloc_env = ExecEnv.create(t.mi, 1024, self.allocator) catch null;
@@ -884,6 +1304,24 @@ pub const ComponentInstance = struct {
         const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
         const executor = @import("executor.zig");
+        // Reuse a cached `ExecEnv` keyed on the realloc owner when component
+        // state is single-threaded. Thread-enabled calls use a fresh ExecEnv;
+        // B1.6 will move this cache into the per-thread execution context.
+        if (comptime config.lib_wasi_threads) {
+            const env = ExecEnv.create(realloc_owner, 1024, self.allocator) catch return null;
+            defer env.destroy();
+            var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
+            defer frame.deinit();
+            return executor.callRealloc(
+                &frame,
+                CoreFuncIdxLocal.from(realloc_local),
+                0,
+                0,
+                a,
+                size,
+            ) catch null;
+        }
+
         // Reuse a cached `ExecEnv` keyed on the realloc owner — the
         // wasi:http@0.3.0 testsuite fixtures hit `hostAllocGuest`
         // thousands of times per run and a fresh `ExecEnv.create` is
@@ -914,7 +1352,7 @@ pub const ComponentInstance = struct {
         // from the lowerer's realloc, which allocates inside the same
         // memory. Mismatching here would write into the wrong module's
         // memory and silently corrupt unrelated guest state. (#715.)
-        if (self.current_lower_call_ctx) |cctx| {
+        if (self.currentLowerCallContext()) |cctx| {
             if (cctx.memory) |mem| {
                 const end = @as(usize, ptr) + @as(usize, len);
                 if (end > mem.byteLen()) return null;
@@ -965,6 +1403,31 @@ pub const ComponentInstance = struct {
         tm.* = try TestGuestMem.init(allocator, size);
         self.test_mem = tm;
         self.allocator = allocator;
+    }
+
+    pub fn initAsyncTablesForTest(
+        self: *ComponentInstance,
+        allocator: std.mem.Allocator,
+    ) !void {
+        self.futures = try FutureTable.init(allocator, allocator);
+        errdefer self.futures.deinit() catch {};
+        self.streams = try StreamTable.init(allocator, allocator);
+        errdefer self.streams.deinit() catch {};
+        self.error_contexts = try ErrorContextTable.init(allocator, allocator);
+        errdefer self.error_contexts.deinit() catch {};
+        self.waitable_sets = try WaitableSetTable.init(allocator, allocator);
+        self.next_async_handle = if (config.lib_wasi_threads)
+            std.atomic.Value(u32).init(1)
+        else
+            1;
+        self.allocator = allocator;
+    }
+
+    pub fn deinitAsyncTablesForTest(self: *ComponentInstance) void {
+        self.futures.deinit() catch @panic("Future leases outstanding");
+        self.streams.deinit() catch @panic("Stream leases outstanding");
+        self.error_contexts.deinit() catch @panic("Error-context leases outstanding");
+        self.waitable_sets.deinit() catch @panic("Waitable-set leases outstanding");
     }
 
     /// Test-only: tear down a `TestGuestMem` previously installed via
@@ -1652,26 +2115,14 @@ pub const ComponentInstance = struct {
         }
         self.synthetic_host_instances.deinit(self.allocator);
 
-        var rt_it = self.resource_tables.valueIterator();
-        while (rt_it.next()) |rt| rt.deinit(self.allocator);
-        self.resource_tables.deinit(self.allocator);
+        self.resource_tables.deinit();
 
-        // Tear down per-instance async-handle tables (#478 sub-PR 3).
-        // Streams and waitable-sets own heap memory; futures buffer
-        // their lowered payload (#478 sub-PR 3a) and error-contexts
-        // store `[]u8` debug strings which we free below.
-        var fut_it = self.futures.valueIterator();
-        while (fut_it.next()) |f| f.deinit(self.allocator);
-        self.futures.deinit(self.allocator);
-        var stream_it = self.streams.valueIterator();
-        while (stream_it.next()) |s| s.deinit(self.allocator);
-        self.streams.deinit(self.allocator);
-        var ec_it = self.error_contexts.valueIterator();
-        while (ec_it.next()) |msg| self.allocator.free(msg.*);
-        self.error_contexts.deinit(self.allocator);
-        var ws_it = self.waitable_sets.valueIterator();
-        while (ws_it.next()) |ws| ws.deinit(self.allocator);
-        self.waitable_sets.deinit(self.allocator);
+        // Unlink every public async handle first; stable nodes defer their
+        // exact-once destructors until the final in-flight lease releases.
+        self.futures.deinit() catch @panic("Future leases outstanding");
+        self.streams.deinit() catch @panic("Stream leases outstanding");
+        self.error_contexts.deinit() catch @panic("Error-context leases outstanding");
+        self.waitable_sets.deinit() catch @panic("Waitable-set leases outstanding");
         for (self.trampoline_ctxs.items) |ctx| {
             ctx.deinit(self.allocator);
             self.allocator.destroy(ctx);
@@ -1810,12 +2261,43 @@ pub fn instantiateWithOptions(
     options: Options,
 ) InstantiationError!*ComponentInstance {
     const inst = allocator.create(ComponentInstance) catch return error.OutOfMemory;
+    const async_tables = blk: {
+        var futures = FutureTable.init(allocator, allocator) catch {
+            allocator.destroy(inst);
+            return error.OutOfMemory;
+        };
+        errdefer futures.deinit() catch {};
+        var streams = StreamTable.init(allocator, allocator) catch {
+            allocator.destroy(inst);
+            return error.OutOfMemory;
+        };
+        errdefer streams.deinit() catch {};
+        var error_contexts = ErrorContextTable.init(allocator, allocator) catch {
+            allocator.destroy(inst);
+            return error.OutOfMemory;
+        };
+        errdefer error_contexts.deinit() catch {};
+        const waitable_sets = WaitableSetTable.init(allocator, allocator) catch {
+            allocator.destroy(inst);
+            return error.OutOfMemory;
+        };
+        break :blk .{
+            .futures = futures,
+            .streams = streams,
+            .error_contexts = error_contexts,
+            .waitable_sets = waitable_sets,
+        };
+    };
 
     inst.* = .{
         .component = component,
         .module_arena = std.heap.ArenaAllocator.init(allocator),
         .core_instances = &.{},
-        .resource_tables = .empty,
+        .resource_tables = ResourceTableRegistry.init(allocator),
+        .futures = async_tables.futures,
+        .streams = async_tables.streams,
+        .error_contexts = async_tables.error_contexts,
+        .waitable_sets = async_tables.waitable_sets,
         .exported_funcs = .{},
         .imports = .{},
         .options = options,
@@ -4653,7 +5135,7 @@ fn resolveImportedInstance(
 
 test "ResourceTable: new and rep" {
     const allocator = std.testing.allocator;
-    var rt = ResourceTable{};
+    var rt = try ResourceTable.init(allocator);
     defer rt.deinit(allocator);
 
     const h0 = try rt.new(42, true, allocator);
@@ -4667,7 +5149,7 @@ test "ResourceTable: new and rep" {
 
 test "ResourceTable: drop and reuse" {
     const allocator = std.testing.allocator;
-    var rt = ResourceTable{};
+    var rt = try ResourceTable.init(allocator);
     defer rt.deinit(allocator);
 
     const h0 = try rt.new(10, true, allocator);
@@ -4675,15 +5157,20 @@ test "ResourceTable: drop and reuse" {
     try std.testing.expectEqual(@as(?u32, 10), dropped_rep);
     try std.testing.expectEqual(@as(?u32, null), rt.rep(h0));
 
-    // Reuse the slot
+    // Reuse the slot with a fresh generation.
     const h2 = try rt.new(20, true, allocator);
-    try std.testing.expectEqual(h0, h2); // reused slot
+    try std.testing.expectEqual(
+        stable_resource.handleIndex(h0),
+        stable_resource.handleIndex(h2),
+    );
+    try std.testing.expect(h0 != h2);
+    try std.testing.expectEqual(@as(?u32, null), rt.rep(h0));
     try std.testing.expectEqual(@as(?u32, 20), rt.rep(h2));
 }
 
 test "ResourceTable: borrow prevents drop" {
     const allocator = std.testing.allocator;
-    var rt = ResourceTable{};
+    var rt = try ResourceTable.init(allocator);
     defer rt.deinit(allocator);
 
     const h = try rt.new(55, true, allocator);
@@ -4696,7 +5183,7 @@ test "ResourceTable: borrow prevents drop" {
 
 test "ResourceTable: double drop returns null" {
     const allocator = std.testing.allocator;
-    var rt = ResourceTable{};
+    var rt = try ResourceTable.init(allocator);
     defer rt.deinit(allocator);
 
     const h = try rt.new(77, true, allocator);
@@ -5974,3 +6461,274 @@ test "instantiate: dropping component frees shared canon-builtin ctx exactly onc
 // `aot_harness.zig` into the `wamr` lib module and break the
 // `differential.zig` and `run_spec_tests.zig` test runners that also
 // import it.)
+
+test "component resource safety: concurrent allocate lookup remove" {
+    const Table = ResourceTableFor(true);
+    var table = try Table.init(std.testing.allocator);
+    defer table.deinit(std.testing.allocator);
+
+    const thread_count = 6;
+    const iterations = 400;
+    var failed = std.atomic.Value(bool).init(false);
+    const Runner = struct {
+        fn run(
+            target: *Table,
+            did_fail: *std.atomic.Value(bool),
+            thread_index: u32,
+        ) void {
+            var i: u32 = 0;
+            while (i < iterations) : (i += 1) {
+                const representation = thread_index * iterations + i + 1;
+                const handle = target.new(
+                    representation,
+                    true,
+                    std.testing.allocator,
+                ) catch {
+                    did_fail.store(true, .release);
+                    return;
+                };
+                if (target.rep(handle) != representation) {
+                    did_fail.store(true, .release);
+                    return;
+                }
+                if (target.drop(handle, std.testing.allocator) != representation) {
+                    did_fail.store(true, .release);
+                    return;
+                }
+                if (target.rep(handle) != null) {
+                    did_fail.store(true, .release);
+                    return;
+                }
+            }
+        }
+    };
+
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(
+            .{},
+            Runner.run,
+            .{ &table, &failed, @as(u32, @intCast(i)) },
+        );
+    }
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!failed.load(.acquire));
+}
+
+test "component resource safety: stale resource generations never alias" {
+    const Table = ResourceTableFor(true);
+    var table = try Table.init(std.testing.allocator);
+    defer table.deinit(std.testing.allocator);
+
+    const stale = try table.new(11, true, std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(?u32, 11),
+        table.drop(stale, std.testing.allocator),
+    );
+    const replacement = try table.new(22, true, std.testing.allocator);
+    try std.testing.expectEqual(
+        stable_resource.handleIndex(stale),
+        stable_resource.handleIndex(replacement),
+    );
+    try std.testing.expect(stale != replacement);
+    try std.testing.expect(table.rep(stale) == null);
+    try std.testing.expect(table.drop(stale, std.testing.allocator) == null);
+    try std.testing.expectEqual(@as(?u32, 22), table.rep(replacement));
+}
+
+test "component resource safety: async resources destroy exactly once" {
+    var futures = try FutureTable.init(std.testing.allocator, std.testing.allocator);
+    defer futures.deinit() catch unreachable;
+    var streams = try StreamTable.init(std.testing.allocator, std.testing.allocator);
+    defer streams.deinit() catch unreachable;
+    var errors = try ErrorContextTable.init(std.testing.allocator, std.testing.allocator);
+    defer errors.deinit() catch unreachable;
+
+    const future_payload = try std.testing.allocator.dupe(u8, "future");
+    try futures.put(std.testing.allocator, 1, .{ .payload = future_payload });
+    var future_lease = futures.acquire(1).?;
+    if (comptime config.lib_wasi_threads) {
+        future_lease.unlock();
+        try std.testing.expect(futures.remove(1));
+        try std.testing.expect(future_lease.isClosing());
+        future_lease.lock();
+        try std.testing.expectEqualStrings(
+            "future",
+            future_lease.value().payload.?,
+        );
+        future_lease.release();
+    } else {
+        future_lease.release();
+        try std.testing.expect(futures.remove(1));
+    }
+    try std.testing.expect(!futures.remove(1));
+
+    const DestroyState = struct {
+        count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        fn callback(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.count.fetchAdd(1, .monotonic);
+        }
+    };
+    var destroyed = DestroyState{};
+    var stream = async_mod.AsyncStream{};
+    try stream.buffer.appendSlice(std.testing.allocator, "stream");
+    stream.host_handler = .{ .ctx = &destroyed, .on_destroy = &DestroyState.callback };
+    try streams.put(std.testing.allocator, 2, stream);
+    var stream_lease = streams.acquire(2).?;
+    if (comptime config.lib_wasi_threads) {
+        stream_lease.unlock();
+        try std.testing.expect(streams.remove(2));
+        try std.testing.expectEqual(@as(u32, 0), destroyed.count.load(.monotonic));
+        stream_lease.release();
+    } else {
+        stream_lease.release();
+        try std.testing.expect(streams.remove(2));
+    }
+    try std.testing.expectEqual(@as(u32, 1), destroyed.count.load(.monotonic));
+    try std.testing.expect(!streams.remove(2));
+
+    const message = try std.testing.allocator.dupe(u8, "error context");
+    try errors.put(std.testing.allocator, 3, message);
+    try std.testing.expect(errors.remove(3));
+    try std.testing.expect(!errors.remove(3));
+}
+
+test "component resource safety: stream destructor callback can reenter table" {
+    var streams = try StreamTable.init(std.testing.allocator, std.testing.allocator);
+    defer streams.deinit() catch unreachable;
+
+    const Reentry = struct {
+        table: *StreamTable,
+        called: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn callback(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.called.fetchAdd(1, .monotonic);
+            self.table.put(std.testing.allocator, 99, .{}) catch {
+                self.failed.store(true, .release);
+            };
+        }
+    };
+    var reentry = Reentry{ .table = &streams };
+    try streams.put(std.testing.allocator, 1, .{
+        .host_handler = .{
+            .ctx = &reentry,
+            .on_destroy = &Reentry.callback,
+        },
+    });
+
+    try std.testing.expect(streams.remove(1));
+    try std.testing.expectEqual(@as(u32, 1), reentry.called.load(.monotonic));
+    try std.testing.expect(!reentry.failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), streams.count());
+    try std.testing.expect(streams.remove(99));
+}
+
+test "component resource safety: waitable removal races a retained lease" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+
+    var waitable_sets = try WaitableSetTable.init(
+        std.testing.allocator,
+        std.testing.allocator,
+    );
+    defer waitable_sets.deinit() catch unreachable;
+    try waitable_sets.put(std.testing.allocator, 1, .{});
+    var lease = waitable_sets.acquire(1).?;
+    lease.unlock();
+
+    const Runner = struct {
+        fn run(table: *WaitableSetTable) void {
+            std.debug.assert(table.remove(1));
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&waitable_sets});
+    thread.join();
+
+    try std.testing.expect(waitable_sets.acquire(1) == null);
+    try std.testing.expect(lease.isClosing());
+    lease.lock();
+    const idx = try lease.value().register(.{
+        .kind = .future_read,
+        .handle = 7,
+    }, std.testing.allocator);
+    try std.testing.expect(lease.value().trySetReady(
+        idx,
+        std.testing.allocator,
+        42,
+    ));
+    try std.testing.expectEqual(@as(u32, 42), lease.value().popReadyEvent().?.code);
+    lease.release();
+}
+
+test "component resource safety: concurrent registry and async handles" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+
+    const component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const instance = try instantiate(&component, std.testing.allocator);
+    defer instance.deinit();
+
+    const thread_count = 4;
+    const handles_per_thread = 128;
+    var handles: [thread_count][handles_per_thread]u32 = undefined;
+    var tables: [thread_count]*ResourceTable = undefined;
+    const Runner = struct {
+        fn run(
+            target: *ComponentInstance,
+            output: *[handles_per_thread]u32,
+            table_output: **ResourceTable,
+        ) void {
+            table_output.* = target.getOrCreateResourceTable(77) catch unreachable;
+            for (output) |*handle| handle.* = target.allocAsyncHandle();
+        }
+    };
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(
+            .{},
+            Runner.run,
+            .{ instance, &handles[i], &tables[i] },
+        );
+    }
+    for (threads) |thread| thread.join();
+
+    for (tables[1..]) |table| try std.testing.expectEqual(tables[0], table);
+    var flat: [thread_count * handles_per_thread]u32 = undefined;
+    for (handles, 0..) |group, i| {
+        @memcpy(
+            flat[i * handles_per_thread ..][0..handles_per_thread],
+            &group,
+        );
+    }
+    std.mem.sort(u32, &flat, {}, std.sort.asc(u32));
+    for (flat, 1..) |handle, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), handle);
+    }
+}
+
+test "component resource safety: disabled specialization stays direct" {
+    const Table = ResourceTableFor(false);
+    var table = try Table.init(std.testing.allocator);
+    defer table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(@TypeOf(table.registry_mutex)));
+
+    const handle = try table.new(5, true, std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, 5), table.rep(handle));
+    try std.testing.expectEqual(
+        @as(?u32, 5),
+        table.drop(handle, std.testing.allocator),
+    );
+}

@@ -2470,6 +2470,28 @@ fn storeInterfaceValue(
 // ── Canonical built-in functions ─────────────────────────────────────────────
 
 const ResourceTable = instance_mod.ResourceTable;
+const StreamTable = instance_mod.StreamTable;
+
+fn suspendStreamLeaseForCallback(lease: *StreamTable.Lease) void {
+    if (comptime config.lib_wasi_threads) {
+        lease.unlock();
+    } else {
+        lease.release();
+    }
+}
+
+fn resumeStreamLeaseAfterCallback(
+    comp_inst: *ComponentInstance,
+    handle: u32,
+    lease: *StreamTable.Lease,
+) bool {
+    if (comptime config.lib_wasi_threads) {
+        lease.lock();
+        return !lease.isClosing();
+    }
+    lease.* = comp_inst.streams.acquire(handle) orelse return false;
+    return true;
+}
 
 /// Execute `resource.new(rep) → handle`: allocate a new resource handle.
 pub fn canonResourceNew(
@@ -2492,7 +2514,7 @@ pub fn canonResourceDrop(
 
 /// Execute `resource.rep(handle) → rep`: get the representation for a handle.
 pub fn canonResourceRep(
-    resource_table: *const ResourceTable,
+    resource_table: *ResourceTable,
     handle: u32,
 ) ?u32 {
     return resource_table.rep(handle);
@@ -2607,7 +2629,7 @@ pub fn dispatchCanonBuiltinWithCtx(
             // an i32 discriminant: 0 on normal resume, 1 if the task was
             // cancelled while parked (cancellable-only).
             const outcome: u32 = if (task_manager) |tm| blk: {
-                const handle = tm.current_task orelse break :blk 0;
+                const handle = tm.currentTask() orelse break :blk 0;
                 break :blk @intFromEnum(async_canon.taskYield(tm, handle, info.cancellable, allocator));
             } else 0;
             env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
@@ -2619,14 +2641,14 @@ pub fn dispatchCanonBuiltinWithCtx(
             if (info.val_type != .i32) return error.FunctionNotFound;
             const value: u32 = blk: {
                 if (task_manager) |tm| {
-                    if (tm.current_task) |handle| {
+                    if (tm.currentTask()) |handle| {
                         if (tm.getContextSlot(handle, info.slot)) |v| break :blk v;
                         // Slot out of range on a known task → trap.
                         return error.StackUnderflow;
                     }
                 }
-                if (info.slot >= async_mod.N_CONTEXT_SLOTS) return error.StackUnderflow;
-                break :blk comp_inst.implicit_task_context[info.slot];
+                break :blk comp_inst.getImplicitTaskContext(info.slot) orelse
+                    return error.StackUnderflow;
             };
             env.pushI32(@bitCast(value)) catch return error.StackOverflow;
         },
@@ -2634,13 +2656,13 @@ pub fn dispatchCanonBuiltinWithCtx(
             if (info.val_type != .i32) return error.FunctionNotFound;
             const value: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             if (task_manager) |tm| {
-                if (tm.current_task) |handle| {
+                if (tm.currentTask()) |handle| {
                     if (!tm.setContextSlot(handle, info.slot, value)) return error.StackUnderflow;
                     return;
                 }
             }
-            if (info.slot >= async_mod.N_CONTEXT_SLOTS) return error.StackUnderflow;
-            comp_inst.implicit_task_context[info.slot] = value;
+            if (!comp_inst.setImplicitTaskContext(info.slot, value))
+                return error.StackUnderflow;
         },
         .task_return => |info| {
             // `canon task.return rs:<resultlist> opts:<opts>` — Binary.md
@@ -2650,7 +2672,7 @@ pub fn dispatchCanonBuiltinWithCtx(
             // waitable. Caller without a task manager is malformed (a
             // sync lift never emits task.return).
             const tm = task_manager orelse return error.FunctionNotFound;
-            const handle = tm.current_task orelse return error.FunctionNotFound;
+            const handle = tm.currentTask() orelse return error.FunctionNotFound;
             // Prefer the link-time-snapshotted core wasm import flat
             // param count (`ctx.core_flat_param_count`) — this is the
             // authoritative truth of how many typed slots the guest
@@ -2697,7 +2719,7 @@ pub fn dispatchCanonBuiltinWithCtx(
                     return error.StackUnderflow;
                 });
             }
-            async_canon.asyncReturn(tm, handle, flat);
+            tm.returnTaskOwned(handle, flat, allocator);
         },
         .async_canon => |op| try dispatchAsyncCanon(comp_inst, op, env, task_manager, allocator),
         .lift, .lower => {}, // Handled by callComponentFunc
@@ -2742,7 +2764,7 @@ fn dispatchAsyncCanon(
             // issues `task.cancel` from a non-async context is
             // malformed by the spec.
             const tm = task_manager orelse return error.FunctionNotFound;
-            const handle = tm.current_task orelse return error.FunctionNotFound;
+            const handle = tm.currentTask() orelse return error.FunctionNotFound;
             tm.cancelTask(handle);
             // Propagate the cancellation to host-side waitables owned by
             // the cancelled task. Specifically, this aborts any pending
@@ -2764,7 +2786,10 @@ fn dispatchAsyncCanon(
             // single-handle prototype we publish the same idx for both
             // ends to keep the wire format compatible with i64 pops.
             const packed_handles: u64 = (@as(u64, handle) << 32) | @as(u64, handle);
-            env.pushI64(@bitCast(packed_handles)) catch return error.StackOverflow;
+            env.pushI64(@bitCast(packed_handles)) catch {
+                _ = comp_inst.streams.remove(handle);
+                return error.StackOverflow;
+            };
         },
         .stream_read => |info| {
             // Stack: (handle, ptr, max_count) → status. `max_count` is on
@@ -2773,7 +2798,7 @@ fn dispatchAsyncCanon(
             const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
-            const s = comp_inst.streams.getPtr(handle) orelse {
+            var stream_lease = comp_inst.streams.acquire(handle) orelse {
                 // Unknown handle ⇒ treat as "other end gone" so wit-bindgen
                 // surfaces `ReturnCode::Dropped(0)` rather than an unknown
                 // sentinel that would trap.
@@ -2781,6 +2806,8 @@ fn dispatchAsyncCanon(
                     return error.StackOverflow;
                 return;
             };
+            defer stream_lease.release();
+            var s = stream_lease.value();
 
             const registry = TypeRegistry.init(comp_inst.component);
             // Host eager-lowering producers (e.g.
@@ -2803,104 +2830,185 @@ fn dispatchAsyncCanon(
                 return;
             }
 
-            // Host-driven streams (#535) get a chance to top up the FIFO
-            // before we drain. Loop on `progressed` so a chunky reader can
-            // keep filling until `would_block` / `eof`. The loop is bounded
-            // by the driver itself — production drivers do a single
-            // non-blocking syscall per invocation and return `would_block`
-            // on the second pass.
-            //
-            // #583 B2 — when the driver exposes `on_read_into`, we
-            // borrow a slice of guest linmem and let the driver write
-            // bytes directly into it. This skips the
-            // `stream.buffer.appendSlice` allocation + the second
-            // `@memcpy` into guest linmem that the legacy `on_read`
-            // path incurs. `comp_inst.writableGuestBytes` validates
-            // `guest_ptr + max_bytes ≤ memory.size` synchronously
-            // before the host call, and the executor never yields to
-            // a `memory.grow` between that check and the driver
-            // return — the slice stays valid for the call duration.
-            //
-            // Three preconditions for the zero-copy fast path; failing
-            // any one falls back to the legacy `on_read` path below:
-            //   * `elem_size`-aligned `guest_ptr` (the spec's
-            //     "alignment permits" gate);
-            //   * `max_count * elem_size` doesn't overflow `u32`;
-            //   * the resulting byte range is fully inside guest
-            //     `memory.size` (the "length permits" gate).
-            if (s.buffer.items.len == 0 and !s.write_closed) {
-                if (s.host_driver) |drv| zero_copy: {
-                    const cb = drv.on_read_into orelse break :zero_copy;
-                    if (elem_size > 1 and (guest_ptr % elem_size) != 0) break :zero_copy;
-                    const max_bytes_u64: u64 = @as(u64, max_count) * @as(u64, elem_size);
-                    if (max_bytes_u64 > std.math.maxInt(u32)) break :zero_copy;
-                    const max_bytes: u32 = @intCast(max_bytes_u64);
-                    const dst_slice = comp_inst.writableGuestBytes(guest_ptr, max_bytes) orelse
-                        break :zero_copy;
-                    var iters: u8 = 0;
-                    var total_bytes: u32 = 0;
-                    while (iters < 32 and total_bytes < max_bytes) : (iters += 1) {
-                        const r = cb(drv.context, dst_slice[total_bytes..max_bytes]);
-                        switch (r.action) {
-                            .progressed => {
-                                if (r.bytes_written == 0) break;
-                                std.debug.assert(r.bytes_written <= max_bytes - total_bytes);
-                                total_bytes += r.bytes_written;
-                            },
-                            .would_block => break,
-                            .eof, .err => {
-                                s.write_closed = true;
-                                break;
-                            },
-                        }
-                    }
-                    if (total_bytes > 0) {
-                        const got_count = total_bytes / elem_size;
-                        // A sub-element trailing fragment (rare for
-                        // `stream<u8>` where `elem_size == 1`) can't
-                        // be delivered on this op without crossing
-                        // an element boundary in the guest's dst;
-                        // stash it in the FIFO so the next read picks
-                        // it up. The bytes are already in guest
-                        // linmem so we copy them out — alternatively
-                        // we could leak the partial element, but the
-                        // FIFO stash keeps semantics identical to the
-                        // legacy on_read path.
-                        const tail = total_bytes - got_count * elem_size;
-                        if (tail != 0) {
-                            const tail_off = got_count * elem_size;
-                            s.buffer.appendSlice(comp_inst.allocator, dst_slice[tail_off..total_bytes]) catch
-                                return error.OutOfMemory;
-                        }
-                        env.pushI32(@bitCast(async_canon.packStatus(.completed, got_count))) catch
-                            return error.StackOverflow;
-                        return;
-                    }
-                    // Driver returned `would_block` or `eof` with no
-                    // bytes; fall through. If `eof` flipped
-                    // `write_closed`, the post-drain branch surfaces
-                    // `dropped(0)`. If `would_block`, we'll park.
-                }
-                if (s.host_driver) |drv| {
-                    if (drv.on_read) |cb| {
-                        var driver_iters: u8 = 0;
-                        while (driver_iters < 32) : (driver_iters += 1) {
-                            const action = cb(drv.context, s, comp_inst.allocator);
-                            switch (action) {
+            // Reserve a host callback while protected, then invoke it with no
+            // runtime lock held. Enabled builds retain the stable-node lease;
+            // disabled builds reacquire by the never-reused public handle so
+            // callback reentry may grow the direct map safely.
+            if (s.buffer.items.len == 0 and !s.write_closed and !s.host_read_inflight) {
+                if (s.host_driver) |driver| {
+                    s.host_read_inflight = true;
+
+                    var used_zero_copy = false;
+                    if (driver.on_read_into) |callback| zero_copy: {
+                        if (elem_size > 1 and (guest_ptr % elem_size) != 0)
+                            break :zero_copy;
+                        const max_bytes_u64 =
+                            @as(u64, max_count) * @as(u64, elem_size);
+                        if (max_bytes_u64 > std.math.maxInt(u32))
+                            break :zero_copy;
+                        const max_bytes: u32 = @intCast(max_bytes_u64);
+                        const dst_slice = comp_inst.writableGuestBytes(
+                            guest_ptr,
+                            max_bytes,
+                        ) orelse break :zero_copy;
+
+                        used_zero_copy = true;
+                        suspendStreamLeaseForCallback(&stream_lease);
+                        var iterations: u8 = 0;
+                        var total_bytes: u32 = 0;
+                        var closed = false;
+                        while (iterations < 32 and total_bytes < max_bytes) : (iterations += 1) {
+                            const result = callback(
+                                driver.context,
+                                dst_slice[total_bytes..max_bytes],
+                            );
+                            switch (result.action) {
                                 .progressed => {
-                                    if (s.buffer.items.len > 0) break;
-                                    // Driver claimed progress but appended
-                                    // nothing — treat as would_block to
-                                    // avoid spinning.
-                                    break;
+                                    if (result.bytes_written == 0) break;
+                                    if (result.bytes_written > max_bytes - total_bytes) {
+                                        closed = true;
+                                        break;
+                                    }
+                                    total_bytes += result.bytes_written;
                                 },
                                 .would_block => break,
                                 .eof, .err => {
-                                    s.write_closed = true;
+                                    closed = true;
                                     break;
                                 },
                             }
                         }
+
+                        if (!resumeStreamLeaseAfterCallback(
+                            comp_inst,
+                            handle,
+                            &stream_lease,
+                        )) {
+                            if (comptime config.lib_wasi_threads) {
+                                stream_lease.value().host_read_inflight = false;
+                            }
+                            if (total_bytes > 0) {
+                                env.pushI32(@bitCast(async_canon.packStatus(
+                                    .completed,
+                                    total_bytes / elem_size,
+                                ))) catch return error.StackOverflow;
+                            } else {
+                                env.pushI32(@bitCast(async_canon.packStatus(
+                                    .dropped,
+                                    0,
+                                ))) catch return error.StackOverflow;
+                            }
+                            return;
+                        }
+                        s = stream_lease.value();
+                        s.host_read_inflight = false;
+                        if (closed) s.write_closed = true;
+
+                        if (total_bytes > 0) {
+                            const got_count = total_bytes / elem_size;
+                            const tail = total_bytes - got_count * elem_size;
+                            if (tail != 0) {
+                                const tail_offset = got_count * elem_size;
+                                s.buffer.appendSlice(
+                                    comp_inst.allocator,
+                                    dst_slice[tail_offset..total_bytes],
+                                ) catch return error.OutOfMemory;
+                            }
+                            env.pushI32(@bitCast(async_canon.packStatus(
+                                .completed,
+                                got_count,
+                            ))) catch return error.StackOverflow;
+                            return;
+                        }
+                        if (!closed) used_zero_copy = false;
+                    }
+
+                    if (!used_zero_copy) {
+                        if (driver.on_read) |callback| {
+                            var scratch = async_mod.AsyncStream{};
+                            defer scratch.deinit(comp_inst.allocator);
+                            suspendStreamLeaseForCallback(&stream_lease);
+                            const action = callback(
+                                driver.context,
+                                &scratch,
+                                comp_inst.allocator,
+                            );
+                            if (!resumeStreamLeaseAfterCallback(
+                                comp_inst,
+                                handle,
+                                &stream_lease,
+                            )) {
+                                if (comptime config.lib_wasi_threads) {
+                                    stream_lease.value().host_read_inflight = false;
+                                }
+                                env.pushI32(@bitCast(async_canon.packStatus(
+                                    .dropped,
+                                    0,
+                                ))) catch return error.StackOverflow;
+                                return;
+                            }
+                            s = stream_lease.value();
+                            s.host_read_inflight = false;
+                            switch (action) {
+                                .progressed => {
+                                    if (scratch.buffer.items.len > 0) {
+                                        s.buffer.appendSlice(
+                                            comp_inst.allocator,
+                                            scratch.buffer.items,
+                                        ) catch return error.OutOfMemory;
+                                    }
+                                },
+                                .would_block => {},
+                                .eof, .err => s.write_closed = true,
+                            }
+                        } else {
+                            s.host_read_inflight = false;
+                        }
+                    }
+                } else if (s.host_handler) |handler| {
+                    if (handler.on_read) |callback| {
+                        const max_bytes = std.math.mul(
+                            u32,
+                            max_count,
+                            elem_size,
+                        ) catch return error.MemoryNotAvailable;
+                        const dst = comp_inst.writableGuestBytes(
+                            guest_ptr,
+                            max_bytes,
+                        ) orelse return error.MemoryNotAvailable;
+                        s.host_read_inflight = true;
+                        suspendStreamLeaseForCallback(&stream_lease);
+                        const got = callback(handler.ctx, dst);
+                        if (!resumeStreamLeaseAfterCallback(
+                            comp_inst,
+                            handle,
+                            &stream_lease,
+                        )) {
+                            if (comptime config.lib_wasi_threads) {
+                                stream_lease.value().host_read_inflight = false;
+                            }
+                            env.pushI32(@bitCast(async_canon.packStatus(
+                                .dropped,
+                                0,
+                            ))) catch return error.StackOverflow;
+                            return;
+                        }
+                        s = stream_lease.value();
+                        s.host_read_inflight = false;
+                        if (got <= 0) {
+                            if (got == 0) s.write_closed = true;
+                            env.pushI32(@bitCast(async_canon.packStatus(
+                                .dropped,
+                                0,
+                            ))) catch return error.StackOverflow;
+                            return;
+                        }
+                        const got_count: u32 = @as(u32, @intCast(got)) / elem_size;
+                        env.pushI32(@bitCast(async_canon.packStatus(
+                            .completed,
+                            got_count,
+                        ))) catch return error.StackOverflow;
+                        return;
                     }
                 }
             }
@@ -2933,34 +3041,6 @@ fn dispatchAsyncCanon(
                 return;
             }
 
-            // Host-attached source (#537): the host installed a
-            // synchronous producer callback (e.g.
-            // `wasi:cli/stdin.read-via-stream`). Read directly into the
-            // guest's destination buffer instead of parking.
-            if (s.host_handler) |h| if (h.on_read) |reader| {
-                const max_bytes = max_count * elem_size;
-                const dst = comp_inst.writableGuestBytes(guest_ptr, max_bytes) orelse
-                    return error.MemoryNotAvailable;
-                const got = reader(h.ctx, dst);
-                if (got < 0) {
-                    env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
-                        return error.StackOverflow;
-                    return;
-                }
-                if (got == 0) {
-                    // EOF — flag write_closed so subsequent reads
-                    // observe the drop without re-invoking the host.
-                    s.write_closed = true;
-                    env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
-                        return error.StackOverflow;
-                    return;
-                }
-                const got_count: u32 = @as(u32, @intCast(got)) / elem_size;
-                env.pushI32(@bitCast(async_canon.packStatus(.completed, got_count))) catch
-                    return error.StackOverflow;
-                return;
-            };
-
             // No data yet — park; signal BLOCKED (post-#541) so the
             // guest's `WaitableOperation` waits for the completion
             // callback rather than treating us as cancelled.
@@ -2979,11 +3059,13 @@ fn dispatchAsyncCanon(
             const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
-            const s = comp_inst.streams.getPtr(handle) orelse {
+            var stream_lease = comp_inst.streams.acquire(handle) orelse {
                 env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             };
+            defer stream_lease.release();
+            var s = stream_lease.value();
 
             // Reader end already dropped → writer observes the drop.
             if (s.read_closed) {
@@ -3012,7 +3094,8 @@ fn dispatchAsyncCanon(
                 return;
             }
 
-            const byte_len: u32 = elem_size * count;
+            const byte_len = std.math.mul(u32, elem_size, count) catch
+                return error.MemoryNotAvailable;
             const src = comp_inst.readGuestBytes(guest_ptr, byte_len) orelse
                 return error.MemoryNotAvailable;
 
@@ -3022,16 +3105,37 @@ fn dispatchAsyncCanon(
             // what keeps WAMR's single-threaded model in sync with guests
             // that use `futures::join!` to interleave a host I/O await
             // with a writer task.
-            if (s.host_handler) |h| if (h.on_write) |writer| {
-                if (!writer(h.ctx, src)) {
-                    env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
+            if (!s.host_write_inflight) {
+                if (s.host_handler) |handler| if (handler.on_write) |writer| {
+                    s.host_write_inflight = true;
+                    suspendStreamLeaseForCallback(&stream_lease);
+                    const accepted = writer(handler.ctx, src);
+                    if (!resumeStreamLeaseAfterCallback(
+                        comp_inst,
+                        handle,
+                        &stream_lease,
+                    )) {
+                        if (comptime config.lib_wasi_threads) {
+                            stream_lease.value().host_write_inflight = false;
+                        }
+                        env.pushI32(@bitCast(async_canon.packStatus(
+                            .dropped,
+                            0,
+                        ))) catch return error.StackOverflow;
+                        return;
+                    }
+                    s = stream_lease.value();
+                    s.host_write_inflight = false;
+                    if (!accepted) {
+                        env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
+                            return error.StackOverflow;
+                        return;
+                    }
+                    env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
                         return error.StackOverflow;
                     return;
-                }
-                env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
-                    return error.StackOverflow;
-                return;
-            };
+                };
+            }
 
             // Reader parked first: fulfil it directly (no buffering).
             if (s.pending_read) |pr| {
@@ -3049,69 +3153,74 @@ fn dispatchAsyncCanon(
                 }
 
                 s.pending_read = null;
-                if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, transfer_count));
+                const waitable = s.read_waitable;
+                stream_lease.release();
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.completed, transfer_count),
+                );
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, transfer_count))) catch
                     return error.StackOverflow;
                 return;
             }
 
-            // Host-driven sink (#535): the guest writes are forwarded
-            // straight to the host (e.g. a connected TCP fd) instead of
-            // accumulating in the FIFO. We only invoke the driver after
-            // confirming there's no parked reader, since the reader path
-            // is the canonical wakeup mechanism for in-component pairs.
-            //
-            // #583 B2 follow-up — when the driver exposes
-            // `on_write_from`, we prefer it over the legacy `on_write`.
-            // The bounds check has already happened above
-            // (`readGuestBytes(guest_ptr, byte_len)` validated
-            // `ptr + len <= memory.size`), and the executor never
-            // yields to a `memory.grow` between that check and the
-            // driver return — the borrowed slice stays valid for the
-            // call duration. The thinner signature drops the unused
-            // `*AsyncStream` / `Allocator` parameters; semantics are
-            // otherwise identical to `on_write`.
-            if (s.host_driver) |drv| {
-                if (drv.on_write_from) |cb| {
-                    const action = cb(drv.context, src);
-                    switch (action) {
-                        .progressed => {
-                            env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
-                                return error.StackOverflow;
+            // Host-driven sink (#535): invoke the selected callback outside
+            // the stream lock. The legacy callback receives a scratch stream;
+            // in-tree drivers use it only as a compatibility parameter.
+            if (!s.host_write_inflight) {
+                if (s.host_driver) |driver| {
+                    const callback_kind: enum { none, from, legacy } =
+                        if (driver.on_write_from != null)
+                            .from
+                        else if (driver.on_write != null)
+                            .legacy
+                        else
+                            .none;
+                    if (callback_kind != .none) {
+                        s.host_write_inflight = true;
+                        suspendStreamLeaseForCallback(&stream_lease);
+                        var scratch = async_mod.AsyncStream{};
+                        defer scratch.deinit(comp_inst.allocator);
+                        const action = switch (callback_kind) {
+                            .from => driver.on_write_from.?(driver.context, src),
+                            .legacy => driver.on_write.?(
+                                driver.context,
+                                &scratch,
+                                src,
+                                comp_inst.allocator,
+                            ),
+                            .none => unreachable,
+                        };
+                        if (!resumeStreamLeaseAfterCallback(
+                            comp_inst,
+                            handle,
+                            &stream_lease,
+                        )) {
+                            if (comptime config.lib_wasi_threads) {
+                                stream_lease.value().host_write_inflight = false;
+                            }
+                            env.pushI32(@bitCast(async_canon.packStatus(
+                                .dropped,
+                                0,
+                            ))) catch return error.StackOverflow;
                             return;
-                        },
-                        .eof, .err => {
-                            s.read_closed = true;
-                            env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
-                                return error.StackOverflow;
-                            return;
-                        },
-                        .would_block => {
-                            // Fall through to FIFO buffering — a later
-                            // driver invocation (or `cancel_write`) can
-                            // drain it.
-                        },
-                    }
-                } else if (drv.on_write) |cb| {
-                    const action = cb(drv.context, s, src, comp_inst.allocator);
-                    switch (action) {
-                        .progressed => {
-                            env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
-                                return error.StackOverflow;
-                            return;
-                        },
-                        .eof, .err => {
-                            s.read_closed = true;
-                            env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
-                                return error.StackOverflow;
-                            return;
-                        },
-                        .would_block => {
-                            // Fall through to FIFO buffering — a later
-                            // driver invocation (or `cancel_write`) can
-                            // drain it.
-                        },
+                        }
+                        s = stream_lease.value();
+                        s.host_write_inflight = false;
+                        switch (action) {
+                            .progressed => {
+                                env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
+                                    return error.StackOverflow;
+                                return;
+                            },
+                            .eof, .err => {
+                                s.read_closed = true;
+                                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
+                                    return error.StackOverflow;
+                                return;
+                            },
+                            .would_block => {},
+                        }
                     }
                 }
             }
@@ -3119,19 +3228,25 @@ fn dispatchAsyncCanon(
             // No reader yet — append to FIFO.
             s.buffer.appendSlice(comp_inst.allocator, src) catch
                 return error.OutOfMemory;
-            if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
-                ws.setReady(idx, allocator, async_canon.packStatus(.completed, count));
+            const waitable = s.read_waitable;
+            stream_lease.release();
+            _ = comp_inst.notifyWaitable(
+                waitable,
+                async_canon.packStatus(.completed, count),
+            );
             env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
                 return error.StackOverflow;
         },
         .stream_cancel_read => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const s = comp_inst.streams.getPtr(handle) orelse {
+            var stream_lease = comp_inst.streams.acquire(handle) orelse {
                 env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
                     return error.StackOverflow;
                 return;
             };
+            defer stream_lease.release();
+            const s = stream_lease.value();
             s.pending_read = null;
             env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
                 return error.StackOverflow;
@@ -3139,11 +3254,13 @@ fn dispatchAsyncCanon(
         .stream_cancel_write => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const s = comp_inst.streams.getPtr(handle) orelse {
+            var stream_lease = comp_inst.streams.acquire(handle) orelse {
                 env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
                     return error.StackOverflow;
                 return;
             };
+            defer stream_lease.release();
+            const s = stream_lease.value();
             s.pending_write = null;
             env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
                 return error.StackOverflow;
@@ -3151,49 +3268,89 @@ fn dispatchAsyncCanon(
         .stream_drop_readable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            if (comp_inst.streams.getPtr(handle)) |s| {
+            if (comp_inst.streams.acquire(handle)) |initial_lease| {
+                var stream_lease = initial_lease;
+                const s = stream_lease.value();
+                const transitioned = !s.read_closed;
                 s.read_closed = true;
-                if (s.host_driver) |driver| if (driver.on_drop_readable) |cb|
-                    cb(driver.context);
+                const drop_callback = if (transitioned)
+                    if (s.host_driver) |driver|
+                        if (driver.on_drop_readable) |callback|
+                            .{ .callback = callback, .context = driver.context }
+                        else
+                            null
+                    else
+                        null
+                else
+                    null;
+                const waitable = if (transitioned) s.write_waitable else null;
+                const fully_closed = s.read_closed and s.write_closed;
+                stream_lease.release();
+                if (drop_callback) |callback| callback.callback(callback.context);
                 // Wake a parked writer so it can observe CANCELLED.
-                if (s.waitable_set) |ws| if (s.write_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
-                if (s.read_closed and s.write_closed) {
-                    if (s.host_handler) |h| if (h.on_destroy) |cb|
-                        cb(h.ctx);
-                    s.deinit(comp_inst.allocator);
-                    _ = comp_inst.streams.remove(handle);
-                }
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.dropped, 0),
+                );
+                if (fully_closed) _ = comp_inst.streams.remove(handle);
             }
         },
         .stream_drop_writable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            if (comp_inst.streams.getPtr(handle)) |s| {
+            if (comp_inst.streams.acquire(handle)) |initial_lease| {
+                var stream_lease = initial_lease;
+                const s = stream_lease.value();
+                const transitioned = !s.write_closed;
                 s.write_closed = true;
-                if (s.host_driver) |driver| if (driver.on_drop_writable) |cb|
-                    cb(driver.context);
+                const driver_drop = if (transitioned)
+                    if (s.host_driver) |driver|
+                        if (driver.on_drop_writable) |callback|
+                            .{ .callback = callback, .context = driver.context }
+                        else
+                            null
+                    else
+                        null
+                else
+                    null;
+                const handler_drop = if (transitioned)
+                    if (s.host_handler) |handler|
+                        if (handler.on_drop_writable) |callback|
+                            .{ .callback = callback, .context = handler.ctx }
+                        else
+                            null
+                    else
+                        null
+                else
+                    null;
+                const waitable = if (transitioned) s.read_waitable else null;
+                var fully_closed = s.read_closed and s.write_closed;
+                stream_lease.release();
+                if (driver_drop) |callback| callback.callback(callback.context);
                 // Notify any host-attached sink that the guest has
                 // closed its writer end (#537). The host handler is
                 // responsible for settling its companion future.
-                if (s.host_handler) |h| if (h.on_drop_writable) |cb| {
-                    cb(h.ctx);
+                if (handler_drop) |callback| {
+                    callback.callback(callback.context);
                     // A host-attached sink only needs the read end open
                     // long enough to receive synchronous `stream.write`
                     // forwards. After the writer drops, the host is
                     // done — close the read end so the stream entry is
                     // freed (and `on_destroy` reclaims `ctx`).
-                    s.read_closed = true;
-                };
-                // Wake a parked reader so it can observe CANCELLED.
-                if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
-                if (s.read_closed and s.write_closed) {
-                    if (s.host_handler) |h| if (h.on_destroy) |cb|
-                        cb(h.ctx);
-                    s.deinit(comp_inst.allocator);
-                    _ = comp_inst.streams.remove(handle);
+                    if (comp_inst.streams.acquire(handle)) |closing_lease| {
+                        var final_lease = closing_lease;
+                        const final_stream = final_lease.value();
+                        final_stream.read_closed = true;
+                        fully_closed = final_stream.write_closed;
+                        final_lease.release();
+                    }
                 }
+                // Wake a parked reader so it can observe CANCELLED.
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.dropped, 0),
+                );
+                if (fully_closed) _ = comp_inst.streams.remove(handle);
             }
         },
 
@@ -3204,7 +3361,10 @@ fn dispatchAsyncCanon(
                 .elem_type_idx = info.type_idx,
             }) catch return error.OutOfMemory;
             const packed_handles: u64 = (@as(u64, handle) << 32) | @as(u64, handle);
-            env.pushI64(@bitCast(packed_handles)) catch return error.StackOverflow;
+            env.pushI64(@bitCast(packed_handles)) catch {
+                _ = comp_inst.futures.remove(handle);
+                return error.StackOverflow;
+            };
         },
         .future_read => |info| {
             // Stack: (handle, ptr) → status. The destination pointer
@@ -3212,11 +3372,13 @@ fn dispatchAsyncCanon(
             const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
-            const fut = comp_inst.futures.getPtr(handle) orelse {
+            var future_lease = comp_inst.futures.acquire(handle) orelse {
                 env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             };
+            defer future_lease.release();
+            const fut = future_lease.value();
 
             // Unit-type fast-path (#487): when a writer marks the future
             // `.ready` with no payload (e.g. `future<()>` or
@@ -3245,8 +3407,12 @@ fn dispatchAsyncCanon(
             // is false here. `count = 1` reports one unit element.
             if (fut.state == .ready and fut.payload == null and !fut.write_closed) {
                 fut.state = .closed;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+                const waitable = fut.read_waitable;
+                future_lease.release();
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.completed, 0),
+                );
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
@@ -3260,8 +3426,12 @@ fn dispatchAsyncCanon(
                 comp_inst.allocator.free(buf);
                 fut.payload = null;
                 fut.state = .ready;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+                const waitable = fut.read_waitable;
+                future_lease.release();
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.completed, 0),
+                );
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
@@ -3280,11 +3450,13 @@ fn dispatchAsyncCanon(
             const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
-            const fut = comp_inst.futures.getPtr(handle) orelse {
+            var future_lease = comp_inst.futures.acquire(handle) orelse {
                 env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             };
+            defer future_lease.release();
+            const fut = future_lease.value();
 
             // Reader already dropped → writer observes the drop.
             if (fut.read_closed) {
@@ -3317,8 +3489,12 @@ fn dispatchAsyncCanon(
                 @memcpy(dst, src);
                 fut.pending_read = null;
                 fut.state = .ready;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+                const waitable = fut.read_waitable;
+                future_lease.release();
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.completed, 0),
+                );
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
@@ -3331,19 +3507,25 @@ fn dispatchAsyncCanon(
             @memcpy(heap_buf, src);
             fut.payload = heap_buf;
             fut.state = .ready;
-            if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+            const waitable = fut.read_waitable;
+            future_lease.release();
+            _ = comp_inst.notifyWaitable(
+                waitable,
+                async_canon.packStatus(.completed, 0),
+            );
             env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                 return error.StackOverflow;
         },
         .future_cancel_read => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const fut = comp_inst.futures.getPtr(handle) orelse {
+            var future_lease = comp_inst.futures.acquire(handle) orelse {
                 env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
                     return error.StackOverflow;
                 return;
             };
+            defer future_lease.release();
+            const fut = future_lease.value();
             // If a value was already delivered before cancel arrived,
             // surface COMPLETED so the caller still observes the transfer.
             if (fut.state == .ready and fut.payload == null) {
@@ -3358,11 +3540,13 @@ fn dispatchAsyncCanon(
         .future_cancel_write => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const fut = comp_inst.futures.getPtr(handle) orelse {
+            var future_lease = comp_inst.futures.acquire(handle) orelse {
                 env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
                     return error.StackOverflow;
                 return;
             };
+            defer future_lease.release();
+            const fut = future_lease.value();
             // If the reader already consumed the buffered payload, the
             // write completed before cancel; report COMPLETED.
             if (fut.state == .ready and fut.payload == null and fut.pending_read == null) {
@@ -3389,29 +3573,39 @@ fn dispatchAsyncCanon(
             if (comp_inst.async_future_drop_driver) |drv| {
                 drv(comp_inst.async_event_driver_ctx, comp_inst, handle);
             }
-            if (comp_inst.futures.getPtr(handle)) |fut| {
+            if (comp_inst.futures.acquire(handle)) |initial_lease| {
+                var future_lease = initial_lease;
+                const fut = future_lease.value();
+                const transitioned = !fut.read_closed;
                 fut.read_closed = true;
+                const waitable = if (transitioned) fut.write_waitable else null;
+                const fully_closed = fut.read_closed and fut.write_closed;
+                future_lease.release();
                 // Wake a parked writer so it can observe CANCELLED.
-                if (fut.waitable_set) |ws| if (fut.write_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
-                if (fut.read_closed and fut.write_closed) {
-                    fut.deinit(comp_inst.allocator);
-                    _ = comp_inst.futures.remove(handle);
-                }
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.dropped, 0),
+                );
+                if (fully_closed) _ = comp_inst.futures.remove(handle);
             }
         },
         .future_drop_writable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            if (comp_inst.futures.getPtr(handle)) |fut| {
+            if (comp_inst.futures.acquire(handle)) |initial_lease| {
+                var future_lease = initial_lease;
+                const fut = future_lease.value();
+                const transitioned = !fut.write_closed;
                 fut.write_closed = true;
+                const waitable = if (transitioned) fut.read_waitable else null;
+                const fully_closed = fut.read_closed and fut.write_closed;
+                future_lease.release();
                 // Wake a parked reader so it can observe CANCELLED.
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
-                if (fut.read_closed and fut.write_closed) {
-                    fut.deinit(comp_inst.allocator);
-                    _ = comp_inst.futures.remove(handle);
-                }
+                _ = comp_inst.notifyWaitable(
+                    waitable,
+                    async_canon.packStatus(.dropped, 0),
+                );
+                if (fully_closed) _ = comp_inst.futures.remove(handle);
             }
         },
 
@@ -3439,7 +3633,10 @@ fn dispatchAsyncCanon(
                 comp_inst.allocator.free(copy);
                 return error.OutOfMemory;
             };
-            env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
+            env.pushI32(@bitCast(handle)) catch {
+                _ = comp_inst.error_contexts.remove(handle);
+                return error.StackOverflow;
+            };
         },
         .error_context_debug_message => |info| {
             _ = info; // opts.realloc_idx implicit via hostAllocAndWrite
@@ -3449,7 +3646,7 @@ fn dispatchAsyncCanon(
             // memory.
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
-            const stored = comp_inst.error_contexts.get(handle) orelse {
+            var error_lease = comp_inst.error_contexts.acquire(handle) orelse {
                 // Unknown handle (e.g. borrow already dropped on the
                 // other end of a misbehaving guest): return an empty
                 // string rather than trapping.
@@ -3457,38 +3654,43 @@ fn dispatchAsyncCanon(
                 env.pushI32(0) catch return error.StackOverflow;
                 return;
             };
+            defer error_lease.release();
+            const stored = error_lease.value().*;
 
             if (stored.len == 0) {
+                error_lease.release();
                 env.pushI32(0) catch return error.StackOverflow;
                 env.pushI32(0) catch return error.StackOverflow;
                 return;
             }
 
-            const guest_ptr = comp_inst.hostAllocAndWrite(stored, 1) orelse
+            const message = comp_inst.allocator.dupe(u8, stored) catch
+                return error.OutOfMemory;
+            error_lease.release();
+            defer comp_inst.allocator.free(message);
+            const guest_ptr = comp_inst.hostAllocAndWrite(message, 1) orelse
                 return error.OutOfMemory;
             env.pushI32(@bitCast(guest_ptr)) catch return error.StackOverflow;
-            env.pushI32(@bitCast(@as(u32, @intCast(stored.len)))) catch
+            env.pushI32(@bitCast(@as(u32, @intCast(message.len)))) catch
                 return error.StackOverflow;
         },
         .error_context_drop => {
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            if (comp_inst.error_contexts.fetchRemove(handle)) |kv| {
-                comp_inst.allocator.free(kv.value);
-            }
+            _ = comp_inst.error_contexts.remove(handle);
         },
 
         // ── Waitable-set ────────────────────────────────────────────────
         .waitable_set_new => {
             const handle = comp_inst.allocAsyncHandle();
             comp_inst.waitable_sets.put(comp_inst.allocator, handle, .{}) catch return error.OutOfMemory;
-            env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
+            env.pushI32(@bitCast(handle)) catch {
+                _ = comp_inst.waitable_sets.remove(handle);
+                return error.StackOverflow;
+            };
         },
         .waitable_set_drop => {
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            if (comp_inst.waitable_sets.fetchRemove(handle)) |kv| {
-                var ws = kv.value;
-                ws.deinit(comp_inst.allocator);
-            }
+            _ = comp_inst.waitable_sets.remove(handle);
         },
         .waitable_set_wait, .waitable_set_poll => {
             // wait/poll surface the oldest ready item registered in the
@@ -3510,11 +3712,6 @@ fn dispatchAsyncCanon(
             const out_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             const ws_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
-            const ws = comp_inst.waitable_sets.getPtr(ws_handle) orelse {
-                env.pushI32(0) catch return error.StackOverflow;
-                return;
-            };
-
             const is_wait = op == .waitable_set_wait;
             // Bounded drive loop. Each iteration first asks the host
             // async-event driver to advance time / drain host I/O,
@@ -3525,14 +3722,20 @@ fn dispatchAsyncCanon(
             const max_iters: usize = if (is_wait) 256 else 1;
             var iter: usize = 0;
             while (iter < max_iters) : (iter += 1) {
-                if (ws.popReadyEvent()) |item| {
+                var waitable_lease = comp_inst.waitable_sets.acquire(ws_handle) orelse {
+                    env.pushI32(0) catch return error.StackOverflow;
+                    return;
+                };
+                const item = waitable_lease.value().popReadyEvent();
+                waitable_lease.release();
+                if (item) |ready_item| {
                     if (out_ptr != 0) {
                         if (comp_inst.writableGuestBytes(out_ptr, 8)) |bytes| {
-                            std.mem.writeInt(u32, bytes[0..4], item.handle, .little);
-                            std.mem.writeInt(u32, bytes[4..8], item.code, .little);
+                            std.mem.writeInt(u32, bytes[0..4], ready_item.handle, .little);
+                            std.mem.writeInt(u32, bytes[4..8], ready_item.code, .little);
                         }
                     }
-                    env.pushI32(@bitCast(async_canon.eventCodeForKind(item.kind))) catch
+                    env.pushI32(@bitCast(async_canon.eventCodeForKind(ready_item.kind))) catch
                         return error.StackOverflow;
                     return;
                 }
@@ -3566,7 +3769,9 @@ fn dispatchAsyncCanon(
             const waitable_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
             if (ws_handle == 0) return;
-            const ws = comp_inst.waitable_sets.getPtr(ws_handle) orelse return;
+            var waitable_set_lease = comp_inst.waitable_sets.acquire(ws_handle) orelse return;
+            defer waitable_set_lease.release();
+            const ws = waitable_set_lease.value();
 
             // Determine kind by inspecting which end of the
             // future/stream is currently parked. The guest calls
@@ -3578,8 +3783,11 @@ fn dispatchAsyncCanon(
             // `_write` for streams — the common case is a guest
             // awaiting a host-produced future end (see #537
             // `write-via-stream` / `read-via-stream`).
-            if (comp_inst.futures.getPtr(waitable_handle)) |fut| {
-                if (fut.waitable_set != null) return; // already joined
+            if (comp_inst.futures.acquire(waitable_handle)) |initial_lease| {
+                var future_lease = initial_lease;
+                defer future_lease.release();
+                const fut = future_lease.value();
+                if (fut.read_waitable != null or fut.write_waitable != null) return;
                 // #551: a future minted by a canon-lower-of-async-func
                 // host adapter (`wasi:clocks` `wait-for` / `wait-until`)
                 // carries a `subtask_managed` flag — wire it as a
@@ -3592,16 +3800,21 @@ fn dispatchAsyncCanon(
                 if (fut.subtask_managed) {
                     const idx = ws.register(.{ .kind = .subtask, .handle = waitable_handle }, allocator) catch
                         return error.OutOfMemory;
-                    fut.waitable_set = ws;
-                    fut.read_waitable_idx = idx;
+                    const registration = async_mod.WaitableRegistration{
+                        .set_handle = ws_handle,
+                        .item_index = idx,
+                    };
+                    fut.read_waitable = registration;
                     // If the timer already fired before the guest
                     // could join, surface the settled state at join
                     // time so the next `waitable-set.wait` delivers
                     // EVENT_SUBTASK rather than spinning on NONE.
                     if (fut.state == .closed and fut.write_closed) {
-                        ws.setReady(idx, allocator, STATUS_STARTED_CANCELLED);
+                        future_lease.release();
+                        _ = ws.trySetReady(idx, allocator, STATUS_STARTED_CANCELLED);
                     } else if (fut.state == .ready or fut.state == .closed) {
-                        ws.setReady(idx, allocator, STATUS_RETURNED);
+                        future_lease.release();
+                        _ = ws.trySetReady(idx, allocator, STATUS_RETURNED);
                     }
                     return;
                 }
@@ -3617,11 +3830,14 @@ fn dispatchAsyncCanon(
                     if (fut.read_closed) .future_write else .future_read;
                 const idx = ws.register(.{ .kind = kind, .handle = waitable_handle }, allocator) catch
                     return error.OutOfMemory;
-                fut.waitable_set = ws;
+                const registration = async_mod.WaitableRegistration{
+                    .set_handle = ws_handle,
+                    .item_index = idx,
+                };
                 if (kind == .future_read) {
-                    fut.read_waitable_idx = idx;
+                    fut.read_waitable = registration;
                 } else {
-                    fut.write_waitable_idx = idx;
+                    fut.write_waitable = registration;
                 }
                 // If the corresponding end is already settled (the
                 // peer fired its drop / write before the join arrived
@@ -3629,42 +3845,52 @@ fn dispatchAsyncCanon(
                 // synchronously inside the same `futures::join!` arm),
                 // mark the slot ready immediately so the very next
                 // `waitable-set.{wait,poll}` surfaces the event.
-                if (kind == .future_read) {
+                const ready_code: ?u32 = if (kind == .future_read) blk: {
                     if (fut.payload != null or (fut.state == .ready and !fut.write_closed)) {
-                        ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+                        break :blk async_canon.packStatus(.completed, 0);
                     } else if (fut.write_closed and fut.payload == null) {
-                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
+                        break :blk async_canon.packStatus(.dropped, 0);
                     }
-                } else { // future_write
+                    break :blk null;
+                } else blk: { // future_write
                     if (fut.read_closed) {
-                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
+                        break :blk async_canon.packStatus(.dropped, 0);
                     }
-                }
+                    break :blk null;
+                };
+                future_lease.release();
+                if (ready_code) |code| _ = ws.trySetReady(idx, allocator, code);
                 return;
             }
 
-            if (comp_inst.streams.getPtr(waitable_handle)) |s| {
-                if (s.waitable_set != null) return; // already joined
+            if (comp_inst.streams.acquire(waitable_handle)) |initial_lease| {
+                var stream_lease = initial_lease;
+                defer stream_lease.release();
+                const s = stream_lease.value();
+                if (s.read_waitable != null or s.write_waitable != null) return;
                 const kind: async_mod.WaitableSet.WaitableItem.Kind =
                     if (s.pending_read != null) .stream_read else .stream_write;
                 const idx = ws.register(.{ .kind = kind, .handle = waitable_handle }, allocator) catch
                     return error.OutOfMemory;
-                s.waitable_set = ws;
-                if (kind == .stream_read) {
-                    s.read_waitable_idx = idx;
-                    // Buffered bytes available or peer closed →
-                    // surface readiness immediately.
-                    if (s.buffer.items.len > 0) {
-                        ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
-                    } else if (s.write_closed) {
-                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
-                    }
-                } else {
-                    s.write_waitable_idx = idx;
-                    if (s.read_closed) {
-                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
-                    }
-                }
+                const registration = async_mod.WaitableRegistration{
+                    .set_handle = ws_handle,
+                    .item_index = idx,
+                };
+                const ready_code: ?u32 = if (kind == .stream_read) blk: {
+                    s.read_waitable = registration;
+                    if (s.buffer.items.len > 0)
+                        break :blk async_canon.packStatus(.completed, 0);
+                    if (s.write_closed)
+                        break :blk async_canon.packStatus(.dropped, 0);
+                    break :blk null;
+                } else blk: {
+                    s.write_waitable = registration;
+                    if (s.read_closed)
+                        break :blk async_canon.packStatus(.dropped, 0);
+                    break :blk null;
+                };
+                stream_lease.release();
+                if (ready_code) |code| _ = ws.trySetReady(idx, allocator, code);
                 return;
             }
 
@@ -3695,41 +3921,65 @@ pub fn drivePendingHostStreamReads(
     allocator: Allocator,
 ) bool {
     var delivered = false;
-    var streams = comp_inst.streams.iterator();
-    while (streams.next()) |entry| {
-        const stream = entry.value_ptr;
-        const pending = stream.pending_read orelse continue;
-        const ws = stream.waitable_set orelse continue;
-        const waitable_idx = stream.read_waitable_idx orelse continue;
+    const handles = comp_inst.streams.snapshotHandles(allocator) catch return false;
+    defer allocator.free(handles);
+
+    for (handles) |handle| {
+        var stream_lease = comp_inst.streams.acquire(handle) orelse continue;
+        defer stream_lease.release();
+        var stream = stream_lease.value();
+        var pending = stream.pending_read orelse continue;
+        var registration = stream.read_waitable orelse continue;
         const driver = stream.host_driver orelse continue;
 
-        if (stream.buffer.items.len == 0 and !stream.write_closed) {
+        if (stream.buffer.items.len == 0 and
+            !stream.write_closed and
+            !stream.host_read_inflight)
+        {
+            stream.host_read_inflight = true;
             if (driver.on_read_into) |read_into| {
                 const max_bytes_u64 =
                     @as(u64, pending.max_count) * @as(u64, pending.elem_size);
                 if (max_bytes_u64 <= std.math.maxInt(u32)) {
                     const max_bytes: u32 = @intCast(max_bytes_u64);
                     if (comp_inst.writableGuestBytes(pending.guest_ptr, max_bytes)) |dst| {
+                        suspendStreamLeaseForCallback(&stream_lease);
                         const result = read_into(driver.context, dst);
+                        if (!resumeStreamLeaseAfterCallback(
+                            comp_inst,
+                            handle,
+                            &stream_lease,
+                        )) {
+                            if (comptime config.lib_wasi_threads) {
+                                stream_lease.value().host_read_inflight = false;
+                            }
+                            continue;
+                        }
+                        stream = stream_lease.value();
+                        stream.host_read_inflight = false;
                         switch (result.action) {
                             .progressed => {
-                                const bytes_written = @min(result.bytes_written, max_bytes);
+                                const bytes_written = @min(
+                                    result.bytes_written,
+                                    max_bytes,
+                                );
                                 const count = bytes_written / pending.elem_size;
                                 const tail = bytes_written - count * pending.elem_size;
                                 if (tail != 0) {
-                                    const tail_off = count * pending.elem_size;
+                                    const tail_offset = count * pending.elem_size;
                                     stream.buffer.appendSlice(
                                         comp_inst.allocator,
-                                        dst[tail_off..bytes_written],
+                                        dst[tail_offset..bytes_written],
                                     ) catch {
                                         stream.write_closed = true;
                                     };
                                 }
                                 if (count > 0) {
                                     stream.pending_read = null;
-                                    ws.setReady(
-                                        waitable_idx,
-                                        allocator,
+                                    registration = stream.read_waitable orelse continue;
+                                    stream_lease.release();
+                                    _ = comp_inst.notifyWaitable(
+                                        registration,
                                         async_canon.packStatus(.completed, count),
                                     );
                                     delivered = true;
@@ -3740,20 +3990,49 @@ pub fn drivePendingHostStreamReads(
                             .eof, .err => stream.write_closed = true,
                         }
                     } else {
+                        stream.host_read_inflight = false;
                         stream.write_closed = true;
                     }
                 } else {
+                    stream.host_read_inflight = false;
                     stream.write_closed = true;
                 }
             } else if (driver.on_read) |read| {
-                const action = read(driver.context, stream, comp_inst.allocator);
+                var scratch = async_mod.AsyncStream{};
+                defer scratch.deinit(comp_inst.allocator);
+                suspendStreamLeaseForCallback(&stream_lease);
+                const action = read(driver.context, &scratch, comp_inst.allocator);
+                if (!resumeStreamLeaseAfterCallback(
+                    comp_inst,
+                    handle,
+                    &stream_lease,
+                )) {
+                    if (comptime config.lib_wasi_threads) {
+                        stream_lease.value().host_read_inflight = false;
+                    }
+                    continue;
+                }
+                stream = stream_lease.value();
+                stream.host_read_inflight = false;
+                if (scratch.buffer.items.len > 0) {
+                    stream.buffer.appendSlice(
+                        comp_inst.allocator,
+                        scratch.buffer.items,
+                    ) catch {
+                        stream.write_closed = true;
+                    };
+                }
                 switch (action) {
                     .progressed, .would_block => {},
                     .eof, .err => stream.write_closed = true,
                 }
+            } else {
+                stream.host_read_inflight = false;
             }
         }
 
+        pending = stream.pending_read orelse continue;
+        registration = stream.read_waitable orelse continue;
         const buffered_count: u32 =
             @intCast(stream.buffer.items.len / pending.elem_size);
         if (buffered_count > 0) {
@@ -3768,9 +4047,9 @@ pub fn drivePendingHostStreamReads(
                 );
                 stream.buffer.items.len -= byte_count;
                 stream.pending_read = null;
-                ws.setReady(
-                    waitable_idx,
-                    allocator,
+                stream_lease.release();
+                _ = comp_inst.notifyWaitable(
+                    registration,
                     async_canon.packStatus(.completed, count),
                 );
                 delivered = true;
@@ -3781,9 +4060,9 @@ pub fn drivePendingHostStreamReads(
 
         if (stream.write_closed) {
             stream.pending_read = null;
-            ws.setReady(
-                waitable_idx,
-                allocator,
+            stream_lease.release();
+            _ = comp_inst.notifyWaitable(
+                registration,
                 async_canon.packStatus(.dropped, 0),
             );
             delivered = true;
@@ -3794,12 +4073,15 @@ pub fn drivePendingHostStreamReads(
 
 /// Whether the event driver should keep polling for a host-backed stream read.
 pub fn hasPendingHostStreamReads(comp_inst: *ComponentInstance) bool {
-    var streams = comp_inst.streams.iterator();
-    while (streams.next()) |entry| {
-        const stream = entry.value_ptr;
+    const handles = comp_inst.streams.snapshotHandles(comp_inst.allocator) catch
+        return false;
+    defer comp_inst.allocator.free(handles);
+    for (handles) |handle| {
+        var stream_lease = comp_inst.streams.acquire(handle) orelse continue;
+        defer stream_lease.release();
+        const stream = stream_lease.value();
         if (stream.pending_read != null and
-            stream.waitable_set != null and
-            stream.read_waitable_idx != null and
+            stream.read_waitable != null and
             stream.host_driver != null)
         {
             return true;
@@ -3902,9 +4184,7 @@ fn driveAsyncLiftCallbacks(
     allocator: Allocator,
 ) ExecutionError!void {
     var status = initial_status;
-    while (task_handle < task_manager.tasks.items.len and
-        task_manager.tasks.items[task_handle].state == .started)
-    {
+    while (task_manager.getState(task_handle) == .started) {
         const event: AsyncLiftCallbackEvent = switch (try decodeAsyncLiftCallbackStatus(status)) {
             .exit => return,
             .yield => blk: {
@@ -3920,10 +4200,13 @@ fn driveAsyncLiftCallbacks(
             },
             .wait => |waitable_set_handle| blk: {
                 const mutable_inst = @constCast(owner_inst);
-                const ws = mutable_inst.waitable_sets.getPtr(waitable_set_handle) orelse
-                    return error.TrapInCoreFunction;
                 while (true) {
-                    if (ws.popReadyEvent()) |ready| {
+                    var waitable_lease = mutable_inst.waitable_sets.acquire(
+                        waitable_set_handle,
+                    ) orelse return error.TrapInCoreFunction;
+                    const ready_event = waitable_lease.value().popReadyEvent();
+                    waitable_lease.release();
+                    if (ready_event) |ready| {
                         break :blk .{
                             .kind = async_canon.eventCodeForKind(ready.kind),
                             .handle = ready.handle,
@@ -3995,19 +4278,16 @@ pub fn callComponentFuncAsync(
     // Make the just-created subtask discoverable to context.{get,set},
     // task.yield, and task.return invoked from inside the core body.
     // Restored on return regardless of success/failure. (#478 sub-PR 1/2.)
-    const saved_current_task = task_manager.current_task;
-    task_manager.current_task = handle;
-    defer task_manager.current_task = saved_current_task;
+    var current_task_scope = task_manager.bindCurrent(handle);
+    defer current_task_scope.deinit();
 
     // Publish the active TaskManager on the owning instance so the
     // canon-builtin host trampolines (`canonBuiltinTrampoline`)
     // installed during instantiation can dispatch into the right task
     // state. Restored to its prior value on return to support nested
     // async dispatches. (#520)
-    const owner_for_tm: *ComponentInstance = @constCast(owner_for_type);
-    const saved_tm = owner_for_tm.current_task_manager;
-    owner_for_tm.current_task_manager = task_manager;
-    defer owner_for_tm.current_task_manager = saved_tm;
+    var task_manager_scope = owner_for_type.bindTaskManager(task_manager);
+    defer task_manager_scope.deinit();
 
     if (lift_opts.is_async) {
         // Async-lifted ABI: drive the core fn and let `task.return`
@@ -4082,7 +4362,7 @@ pub fn callComponentFuncAsync(
     }
     allocator.free(results);
 
-    async_canon.asyncReturn(task_manager, handle, flat_results);
+    task_manager.returnTaskOwned(handle, flat_results, allocator);
 
     return handle;
 }
@@ -4522,7 +4802,7 @@ test "InterfaceValue.deinit: nested record" {
 
 test "canonResourceNew and canonResourceRep" {
     const allocator = std.testing.allocator;
-    var table = ResourceTable{};
+    var table = try ResourceTable.init(allocator);
     defer table.deinit(allocator);
 
     const handle = try canonResourceNew(&table, 42, allocator);
@@ -4531,7 +4811,7 @@ test "canonResourceNew and canonResourceRep" {
 
 test "canonResourceDrop" {
     const allocator = std.testing.allocator;
-    var table = ResourceTable{};
+    var table = try ResourceTable.init(allocator);
     defer table.deinit(allocator);
 
     const handle = try canonResourceNew(&table, 99, allocator);
@@ -4543,7 +4823,7 @@ test "canonResourceDrop" {
 
 test "canonResourceDrop: double drop returns null" {
     const allocator = std.testing.allocator;
-    var table = ResourceTable{};
+    var table = try ResourceTable.init(allocator);
     defer table.deinit(allocator);
 
     const handle = try canonResourceNew(&table, 7, allocator);
@@ -4745,7 +5025,8 @@ test "dispatchCanonBuiltin: task.yield observes cancellation via TaskManager" {
         .task_manager = &tm,
         .allocator = testing.allocator,
     });
-    tm.current_task = lift.subtask_handle;
+    var current_task_scope = tm.bindCurrent(lift.subtask_handle);
+    defer current_task_scope.deinit();
     async_canon.asyncCancel(&tm, lift.subtask_handle);
 
     // Non-cancellable yield: opaque, always reports resumed=0.
@@ -4879,7 +5160,8 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
     var tm = async_mod.TaskManager{};
     defer tm.deinit(testing.allocator);
     const h = try tm.createTask(testing.allocator);
-    tm.current_task = h;
+    var current_task_scope = tm.bindCurrent(h);
+    defer current_task_scope.deinit();
     try testing.expect(tm.getState(h).? != .cancelled);
 
     try dispatchCanonBuiltin(
@@ -4923,7 +5205,8 @@ test "dispatchCanonBuiltin: task.cancel is idempotent" {
     var tm = async_mod.TaskManager{};
     defer tm.deinit(testing.allocator);
     const h = try tm.createTask(testing.allocator);
-    tm.current_task = h;
+    var current_task_scope = tm.bindCurrent(h);
+    defer current_task_scope.deinit();
 
     try dispatchCanonBuiltin(
         inst,
@@ -4982,7 +5265,8 @@ test "dispatchCanonBuiltin: task.cancel + cancellable task.yield observes cancel
     var tm = async_mod.TaskManager{};
     defer tm.deinit(testing.allocator);
     const h = try tm.createTask(testing.allocator);
-    tm.current_task = h;
+    var current_task_scope = tm.bindCurrent(h);
+    defer current_task_scope.deinit();
 
     // Cancel the currently-executing task via the new dispatch arm.
     try dispatchCanonBuiltin(
@@ -5096,7 +5380,8 @@ test "dispatchCanonBuiltin: context set+yield+get round-trip on async task" {
         .task_manager = &tm,
         .allocator = testing.allocator,
     });
-    tm.current_task = lift.subtask_handle;
+    var current_task_scope = tm.bindCurrent(lift.subtask_handle);
+    defer current_task_scope.deinit();
 
     // `context.set i32 1`(value=0xDEAD_BEEF) → task.yield → `context.get i32 1`
     try env.pushI32(@bitCast(@as(u32, 0xDEAD_BEEF)));
@@ -5201,7 +5486,8 @@ test "dispatchCanonBuiltin: task.return delivers results to the current task (#4
         .task_manager = &tm,
         .allocator = testing.allocator,
     });
-    tm.current_task = lift.subtask_handle;
+    var current_task_scope = tm.bindCurrent(lift.subtask_handle);
+    defer current_task_scope.deinit();
 
     // Push the single i32 result on the env stack, then dispatch task.return.
     try env.pushI32(0x1234_5678);
@@ -5219,7 +5505,6 @@ test "dispatchCanonBuiltin: task.return delivers results to the current task (#4
     // Task should now be in .returned with the value visible to pollers.
     try testing.expectEqual(async_mod.TaskState.returned, tm.getState(lift.subtask_handle).?);
     const ret = async_canon.asyncPollResult(&tm, lift.subtask_handle).?;
-    defer testing.allocator.free(ret);
     try testing.expectEqual(@as(usize, 1), ret.len);
     try testing.expectEqual(@as(u32, 0x1234_5678), ret[0]);
 }
@@ -5537,13 +5822,13 @@ test "future.read parks then future.write wakes a waitable" {
     // Wire a waitable set + register the future's read side. This is
     // the manual plumbing the eventual `waitable.join` arm will set up;
     // the rendezvous logic only checks that the slots are populated.
-    var ws = async_mod.WaitableSet{};
-    defer ws.deinit(testing.allocator);
+    const ws_handle = inst.allocAsyncHandle();
+    try inst.waitable_sets.put(testing.allocator, ws_handle, .{});
+    const ws = inst.waitable_sets.getPtr(ws_handle).?;
     {
         const fut = inst.futures.getPtr(handle).?;
-        fut.waitable_set = &ws;
         const idx = try ws.register(.{ .kind = .future_read, .handle = handle }, testing.allocator);
-        fut.read_waitable_idx = idx;
+        fut.read_waitable = .{ .set_handle = ws_handle, .item_index = idx };
     }
 
     const src_ptr: u32 = 0;
@@ -5934,13 +6219,13 @@ test "stream.read parks; stream.write delivers and wakes waitable" {
 
     // Wire a waitable set + register the read side. This is the manual
     // plumbing the eventual `waitable.join` arm will perform.
-    var ws = async_mod.WaitableSet{};
-    defer ws.deinit(testing.allocator);
+    const ws_handle = inst.allocAsyncHandle();
+    try inst.waitable_sets.put(testing.allocator, ws_handle, .{});
+    const ws = inst.waitable_sets.getPtr(ws_handle).?;
     {
         const s = inst.streams.getPtr(handle).?;
-        s.waitable_set = &ws;
         const idx = try ws.register(.{ .kind = .stream_read, .handle = handle }, testing.allocator);
-        s.read_waitable_idx = idx;
+        s.read_waitable = .{ .set_handle = ws_handle, .item_index = idx };
     }
 
     const src_ptr: u32 = 0;
@@ -6733,7 +7018,10 @@ test "waitable.join + waitable-set.wait: stream-write event delivered to a parke
         async_mod.WaitableSet.WaitableItem.Kind.stream_write,
         inst.waitable_sets.getPtr(ws_handle).?.items.items[0].kind,
     );
-    try testing.expectEqual(@as(u32, 0), inst.streams.getPtr(stream_handle).?.write_waitable_idx.?);
+    try testing.expectEqual(
+        @as(u32, 0),
+        inst.streams.getPtr(stream_handle).?.write_waitable.?.item_index,
+    );
 
     // Drop the readable end — the parked writer must wake with a
     // `dropped` event so the guest can re-issue `stream.write` and
@@ -6838,8 +7126,11 @@ test "waitable-set.poll: settled future surfaces FUTURE_READ event with the righ
         fut.pending_read = null;
         fut.state = .ready;
         fut.write_closed = true;
-        if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-            ws.setReady(idx, testing.allocator, async_canon.packStatus(.completed, 0));
+        const registration = fut.read_waitable;
+        _ = inst.notifyWaitable(
+            registration,
+            async_canon.packStatus(.completed, 0),
+        );
     }
 
     // poll after settlement → FUTURE_READ event with the future handle.
@@ -7447,9 +7738,10 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     const call = ctx.host_func.call orelse {
         return trampolineTrap(env, ctx, error.HostFuncNotBound, .host_call);
     };
-    const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
-    ctx.comp_inst.current_lower_call_ctx = resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts);
-    defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
+    var lower_call_scope = ctx.comp_inst.bindLowerCallContext(
+        resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts),
+    );
+    defer lower_call_scope.deinit();
     call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch |err| {
         return trampolineTrap(env, ctx, err, .host_call);
     };
@@ -7475,7 +7767,10 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         // unconditional for the freshly-minted filesystem/sockets
         // futures from the P3 adapter. (#564.)
         if (handle != 0) {
-            if (ctx.comp_inst.futures.getPtr(handle)) |fut| {
+            if (ctx.comp_inst.futures.acquire(handle)) |initial_lease| {
+                var future_lease = initial_lease;
+                defer future_lease.release();
+                const fut = future_lease.value();
                 if (!fut.subtask_managed) fut.subtask_managed = true;
 
                 // For the with-result async-lower shape, write the
@@ -8103,16 +8398,17 @@ fn dispatchAotCanonBuiltin(
     regs: [10]u64,
 ) !u64 {
     var frame = try AotCanonBuiltinFrame.init(lowered_sig, regs);
-    const saved_call_ctx = ctx.comp_inst.current_lower_call_ctx;
-    ctx.comp_inst.current_lower_call_ctx = resolveAotCanonBuiltinCallCtx(ctx, caller_vmctx);
-    defer ctx.comp_inst.current_lower_call_ctx = saved_call_ctx;
+    var lower_call_scope = ctx.comp_inst.bindLowerCallContext(
+        resolveAotCanonBuiltinCallCtx(ctx, caller_vmctx),
+    );
+    defer lower_call_scope.deinit();
 
     try dispatchCanonBuiltinWithCtx(
         ctx.comp_inst,
         ctx.canon,
         ctx,
         &frame,
-        ctx.comp_inst.current_task_manager,
+        ctx.comp_inst.currentTaskManager(),
         ctx.comp_inst.allocator,
     );
     return frame.finish(lowered_sig, regs);
@@ -8340,9 +8636,10 @@ fn dispatchAotAsyncComponentTrampoline(
         results_filled = 1;
     }
 
-    const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
-    ctx.comp_inst.current_lower_call_ctx = resolveAotLowerCallCtx(ctx, caller_vmctx);
-    defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
+    var lower_call_scope = ctx.comp_inst.bindLowerCallContext(
+        resolveAotLowerCallCtx(ctx, caller_vmctx),
+    );
+    defer lower_call_scope.deinit();
     if (ctx.lift_target) |target| {
         try callComponentFuncByLocal(ctx.comp_inst, target, args, results, allocator);
     } else {
@@ -8357,7 +8654,10 @@ fn dispatchAotAsyncComponentTrampoline(
         else => 0,
     };
     if (handle != 0) {
-        if (ctx.comp_inst.futures.getPtr(handle)) |future| {
+        if (ctx.comp_inst.futures.acquire(handle)) |initial_lease| {
+            var future_lease = initial_lease;
+            defer future_lease.release();
+            const future = future_lease.value();
             future.subtask_managed = true;
             if (async_with_result_retptr) {
                 if (future.state == .ready or future.state == .closed) {
@@ -8449,9 +8749,10 @@ fn dispatchAotComponentTrampoline(
         try callComponentFuncByLocal(ctx.comp_inst, target, args, results, allocator);
     } else {
         const call = ctx.host_func.call orelse return error.HostFuncNotBound;
-        const saved_lower_ctx = ctx.comp_inst.current_lower_call_ctx;
-        ctx.comp_inst.current_lower_call_ctx = resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts);
-        defer ctx.comp_inst.current_lower_call_ctx = saved_lower_ctx;
+        var lower_call_scope = ctx.comp_inst.bindLowerCallContext(
+            resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts),
+        );
+        defer lower_call_scope.deinit();
         try call(ctx.host_func.context, ctx.comp_inst, args, results, allocator);
     }
     results_filled = results.len;
@@ -8639,12 +8940,15 @@ pub const STATUS_RETURNED_CANCELLED: u32 = 4;
 
 pub fn packAsyncLowerStatus(comp_inst: *const ComponentInstance, handle: u32) u32 {
     if (handle == 0) return STATUS_RETURNED;
-    const fut = comp_inst.futures.getPtr(handle) orelse {
+    const mutable_inst: *ComponentInstance = @constCast(comp_inst);
+    var future_lease = mutable_inst.futures.acquire(handle) orelse {
         // No future entry — degenerate "already done" (e.g. host returned
         // an unallocated handle); treat as STATUS_RETURNED with no
         // waitable so the guest skips waitable.join.
         return STATUS_RETURNED;
     };
+    defer future_lease.release();
+    const fut = future_lease.value();
     if (fut.state == .ready or fut.state == .closed) {
         return STATUS_RETURNED;
     }
@@ -8718,7 +9022,7 @@ pub fn canonBuiltinTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) c
         ctx.canon,
         ctx,
         env,
-        ctx.comp_inst.current_task_manager,
+        ctx.comp_inst.currentTaskManager(),
         ctx.comp_inst.allocator,
     ) catch |err| {
         env.host_trap = .{
@@ -9159,7 +9463,7 @@ test "canonBuiltinTrampoline: context.{set,get} round-trip through implicit fall
     };
     const inst = try instance_mod.instantiate(&comp, testing.allocator);
     defer inst.deinit();
-    try std.testing.expect(inst.current_task_manager == null);
+    try std.testing.expect(inst.currentTaskManager() == null);
 
     var set_ctx = CanonBuiltinTrampolineCtx{
         .comp_inst = inst,
@@ -9908,7 +10212,7 @@ test "wamrAotDispatchCanonBuiltin: async context, task, waitable, future, and mu
     };
     const join_result = Invoke.call(&waitable_join, &two_to_none, .{ future_handle, waitable_set_handle, 0, 0, 0, 0, 0, 0, 0 });
     try testing.expectEqual(@as(u32, 0), join_result.status);
-    try testing.expect(inst.futures.getPtr(future_handle).?.waitable_set != null);
+    try testing.expect(inst.futures.getPtr(future_handle).?.read_waitable != null);
 
     var waitable_poll = CanonBuiltinTrampolineCtx{
         .comp_inst = inst,
@@ -9922,9 +10226,10 @@ test "wamrAotDispatchCanonBuiltin: async context, task, waitable, future, and mu
     defer task_manager.deinit(allocator);
     const task = try task_manager.createTask(allocator);
     task_manager.startTask(task);
-    task_manager.current_task = task;
-    inst.current_task_manager = &task_manager;
-    defer inst.current_task_manager = null;
+    var current_task_scope = task_manager.bindCurrent(task);
+    defer current_task_scope.deinit();
+    var task_manager_scope = inst.bindTaskManager(&task_manager);
+    defer task_manager_scope.deinit();
 
     var task_cancel = CanonBuiltinTrampolineCtx{
         .comp_inst = inst,

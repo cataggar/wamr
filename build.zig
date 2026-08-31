@@ -679,6 +679,19 @@ pub fn build(b: *std.Build) void {
     );
     core_resource_test_step.dependOn(&run_core_resource_unit_tests.step);
 
+    const component_resource_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{"component resource safety"},
+    });
+    const run_component_resource_unit_tests = b.addRunArtifact(
+        component_resource_unit_tests,
+    );
+    const component_resource_test_step = b.step(
+        "test-component-resources",
+        "Run ComponentInstance resource lifetime and concurrency tests",
+    );
+    component_resource_test_step.dependOn(&run_component_resource_unit_tests.step);
+
     const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
