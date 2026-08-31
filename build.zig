@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
     const lib_pthread = b.option(bool, "lib_pthread", "Enable pthread library") orelse false;
     options.addOption(bool, "lib_pthread", lib_pthread);
 
-    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable the WASI threads configuration contract (production spawning is not implemented)") orelse false;
+    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable the WASI threads configuration contract (production host binding is not implemented)") orelse false;
     options.addOption(bool, "lib_wasi_threads", lib_wasi_threads);
 
     const thread_mgr = (b.option(bool, "thread_mgr", "Enable thread manager") orelse false) or lib_wasi_threads;
@@ -678,6 +678,21 @@ pub fn build(b: *std.Build) void {
         "Run Preview-1 descriptor and shared core-resource tests",
     );
     core_resource_test_step.dependOn(&run_core_resource_unit_tests.step);
+
+    const thread_lifecycle_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{
+            "ThreadManager:",
+            "AuxStackPool:",
+            "thread lifecycle:",
+        },
+    });
+    const run_thread_lifecycle_unit_tests = b.addRunArtifact(thread_lifecycle_unit_tests);
+    const thread_lifecycle_test_step = b.step(
+        "test-thread-lifecycle",
+        "Run WASI thread lifecycle and rollback tests",
+    );
+    thread_lifecycle_test_step.dependOn(&run_thread_lifecycle_unit_tests.step);
 
     const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

@@ -1,9 +1,10 @@
 # `wasi:threads` design — multi-threaded interpreter state isolation
 
-Status: **DRAFT** (shared-memory/parking foundation and atomic opcode
-semantics implemented; production spawning remains incomplete).
+Status: **DRAFT** (shared-memory/parking, atomic semantics, and the
+thread-group lifecycle are implemented; production host binding remains
+incomplete).
 
-Tracking: [#616 B1.3](https://github.com/cataggar/wamr/issues/616).
+Tracking: [#616 B1.2-B1.3](https://github.com/cataggar/wamr/issues/616).
 
 Author wave: W10-3.
 
@@ -64,10 +65,10 @@ are rejected before allocation while readiness remains false.
 
 ## Current implementation status
 
-The tree contains scaffolding in `ThreadManager`, `cloneForThread`,
-the atomic-opcode dispatcher, and the `wasi.thread-spawn` host import.
-These are prototypes, not production support. No default CLI or
-component path currently offers gated guest-thread execution.
+The tree contains a hardened `ThreadManager` lifecycle plus scaffolding in
+`cloneForThread`, the atomic-opcode dispatcher, and the
+`wasi.thread-spawn` host import. No default CLI or component path currently
+offers gated guest-thread execution.
 
 Shared memories now use a refcounted control block with an immutable base.
 Instantiation reserves the declared maximum up front and fails if that
@@ -101,8 +102,23 @@ partial retains/allocation failures and copy mutable segment state.
 
 This does **not** complete B1.1: `ComponentInstance` and `WasiCliAdapter`
 resource families remain separate follow-ups. It also does not wire spawning,
-change thread-group teardown, or split process-wide `WasiCtx` state from
-per-thread execution state.
+or split process-wide `WasiCtx` state from per-thread execution state.
+
+The thread-group lifecycle now publishes a generation-stamped, manager-owned
+record before a native child can enter guest code. The child waits on a start
+gate and crosses the manager lock once after the gate opens, proving that
+publication has completed and the publisher no longer holds the lock. Child
+exit only records an outcome; the native handle, cloned instance, execution
+environment, and auxiliary stack remain owned by the record until an exact
+`joinOne` or batched, unbounded `joinAll` claims them. All joins and destruction
+run outside the manager lock.
+
+The host that owns `ThreadManager` also owns group shutdown. `shutdown` first
+rejects new spawns, drains spawn calls that began before closure, and joins all
+unclaimed records; `deinit` performs the same shutdown before freeing the
+registry and stack pool. Threads are never detached. Shutdown deliberately
+does not add cancellation or preemption semantics: running guest code must
+finish cooperatively or observe the existing group trap flag.
 
 Atomic opcode and fence behavior is complete on both execution tiers.
 Interpreted atomic loads, stores, RMW and `cmpxchg` are `seq_cst`, bounds-
@@ -574,9 +590,10 @@ Each wave is a discrete PR with its own conformance gate.
   resource-table mutex when it observes the cancel — wave-5a must
   pair the cancel-check with a "release every held lock" routine in
   the trap exit path.
-* **5b — Thread joining for embedders.** `ThreadManager.joinAll` is
-  process-wide. Add `tid`-scoped `joinOne(tid: i32)` so embedders that
-  call `runLoadedComponent` repeatedly can serialise.
+* **5b — Thread joining for embedders.** The lifecycle now provides exact
+  `joinOne(tid: i32)` and process-wide batched `joinAll`; wiring those APIs
+  into repeated `runLoadedComponent` ownership remains part of the host-binding
+  work.
 * **5c — Per-thread WASI context.** Today every thread shares one
   `ExecEnv.wasi_ctx`. For correctness under threaded `errno` reads,
   give each `ExecEnv` its own `wasi_ctx` clone (the underlying
@@ -693,7 +710,7 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
 * [`docs/wasi.md`](../wasi.md) — WASI feature matrix; this design
   doc is linked from the Roadmap section.
 * [`src/wasi/thread_manager.zig`](../../src/wasi/thread_manager.zig)
-  — the existing `wasi:threads@0.1.0` prototype (off by default and
+  — the generation-safe `wasi:threads@0.1.0` lifecycle (off by default and
   not production-wired).
 * [`src/wasi/host_functions.zig`](../../src/wasi/host_functions.zig)
   (`wasiThreadSpawn`, line ~46; registration line ~3209) — the

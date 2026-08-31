@@ -46,6 +46,9 @@ jobs:
       - name: Unit tests
         run: zig build test
 
+      - name: WASI thread lifecycle (enabled interpreter)
+        run: zig build test-thread-lifecycle -Dlib_wasi_threads=true -Daot=false
+
       - name: Build (ReleaseSafe)
         continue-on-error: true
         run: zig build -Doptimize=ReleaseSafe
