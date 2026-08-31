@@ -1346,7 +1346,7 @@ fn runAotReal(
     defer allocator.free(argv_buf);
     argv_buf[0] = "wasm";
     for (wasm_args, 0..) |a, i| argv_buf[1 + i] = a;
-    ctx.setArgs(argv_buf);
+    ctx.setArgs(argv_buf) catch return 1;
 
     var env_buf: std.ArrayListUnmanaged([]const u8) = .empty;
     defer env_buf.deinit(allocator);
@@ -1366,7 +1366,7 @@ fn runAotReal(
     defer if (env_flags.len == 0) {
         for (env_buf.items) |s| allocator.free(s);
     };
-    ctx.setEnv(env_buf.items);
+    ctx.setEnv(env_buf.items) catch return 1;
 
     for (map_dirs) |md| {
         _ = ctx.openMappedDir(md.host_path, md.guest_name) catch |err| {
@@ -1397,9 +1397,8 @@ fn runAotReal(
         return 1;
     };
 
-    // 3. Wire the WasiCtx so the AOT WASI adapters in
-    // `runtime/aot/host_bridge.zig` can resolve it via `vmctx.wasi_ctx`.
-    aot_inst.wasi_ctx = @intFromPtr(ctx);
+    // 3. Retain the process-scoped WASI state on the AOT execution context.
+    aot_inst.attachProcessState(ctx.processStateRef());
 
     const func_idx = aot_runtime.findExportFunc(aot_inst, "_start") orelse
         aot_runtime.findExportFunc(aot_inst, "main") orelse {

@@ -5,8 +5,9 @@
 //! the caller can poll for completion via waitable sets.
 
 const std = @import("std");
-const config = @import("config");
+const config = @import("../config.zig");
 const stable_resource = @import("../shared/stable_resource.zig");
+const execution_context = @import("../runtime/common/execution_context.zig");
 
 // ── Task state ──────────────────────────────────────────────────────────────
 
@@ -26,7 +27,7 @@ pub const TaskState = enum(u8) {
 /// (`i32` only, `slot < N_CONTEXT_SLOTS`). Wasmtime currently exposes a
 /// single `i32` slot; pick a small headroom value here so we don't have
 /// to revisit the constant on the first conformance suite that uses 2.
-pub const N_CONTEXT_SLOTS: u32 = 2;
+pub const N_CONTEXT_SLOTS: u32 = execution_context.task_context_slot_count;
 
 pub const WaitableRegistration = struct {
     set_handle: u32,
@@ -222,10 +223,11 @@ pub const TaskManager = struct {
     pub fn createTask(self: *TaskManager, allocator: std.mem.Allocator) !u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.allocator == null) self.allocator = allocator;
+        const task_allocator = self.allocator orelse allocator;
+        if (self.allocator == null) self.allocator = task_allocator;
         const id = self.next_id;
         const idx: u32 = @intCast(self.tasks.items.len);
-        try self.tasks.append(allocator, .{ .id = id });
+        try self.tasks.append(task_allocator, .{ .id = id });
         self.next_id += 1;
         return idx;
     }
@@ -335,6 +337,7 @@ pub const TaskManager = struct {
     pub fn deinit(self: *TaskManager, allocator: std.mem.Allocator) void {
         self.mutex.lock();
         var tasks = self.tasks;
+        const task_allocator = self.allocator orelse allocator;
         self.tasks = .empty;
         self.allocator = null;
         self.mutex.unlock();
@@ -343,7 +346,7 @@ pub const TaskManager = struct {
                 task.return_values_allocator.?.free(task.return_values);
             }
         }
-        tasks.deinit(allocator);
+        tasks.deinit(task_allocator);
     }
 
     pub fn bindCurrent(self: *TaskManager, handle: u32) CurrentGuard {

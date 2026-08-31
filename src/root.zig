@@ -26,6 +26,9 @@ pub const shared_memory = @import("runtime/common/shared_memory.zig");
 /// Execution environment (operand stack, call frames).
 pub const exec_env = @import("runtime/common/exec_env.zig");
 
+/// Shared-process references and per-thread execution metadata.
+pub const execution_context = @import("runtime/common/execution_context.zig");
+
 /// Process-global canonical FuncType → u32 sig_id registry (for AOT call_indirect).
 pub const sig_registry = @import("runtime/common/sig_registry.zig");
 
@@ -126,6 +129,7 @@ pub const spec_runner = @import("tests/spec_runner.zig");
 /// Note: Uses std.fs.File; tests require IO-aware runner.
 /// Excluded from refAllDecls to avoid test runner hang.
 const _wasi = @import("wasi/wasi.zig");
+pub const WasiProcessState = _wasi.WasiProcessState;
 pub const WasiCtx = _wasi.WasiCtx;
 
 /// Thread manager for WASI-threads.

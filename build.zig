@@ -243,6 +243,24 @@ pub fn build(b: *std.Build) void {
         stable_resources_test_step.dependOn(&run_stable_tests.step);
     }
 
+    const execution_context_test_step = b.step(
+        "test-execution-context",
+        "Run shared-process and per-thread execution-context tests",
+    );
+    inline for (.{ false, true }) |threads_enabled| {
+        const context_options = b.addOptions();
+        context_options.addOption(bool, "lib_wasi_threads", threads_enabled);
+        const context_test_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime/common/execution_context.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        context_test_module.addImport("config", context_options.createModule());
+        const context_tests = b.addTest(.{ .root_module = context_test_module });
+        const run_context_tests = b.addRunArtifact(context_tests);
+        execution_context_test_step.dependOn(&run_context_tests.step);
+    }
+
     const threads_contract_test_module = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
         .target = target,
@@ -692,6 +710,19 @@ pub fn build(b: *std.Build) void {
     );
     component_resource_test_step.dependOn(&run_component_resource_unit_tests.step);
 
+    const execution_context_runtime_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{
+            "execution context",
+            "process state",
+            "WasiProcessState",
+            "thread context",
+            "VmCtx layout",
+        },
+    });
+    const run_execution_context_runtime_tests = b.addRunArtifact(execution_context_runtime_tests);
+    execution_context_test_step.dependOn(&run_execution_context_runtime_tests.step);
+
     const thread_lifecycle_unit_tests = b.addTest(.{
         .root_module = test_module,
         .filters = &.{
@@ -736,6 +767,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(stable_resources_test_step);
+    test_step.dependOn(execution_context_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
     test_step.dependOn(&frame_attribution_tests.step);
     if (target_arch == .x86_64 and target.result.os.tag == .linux) {

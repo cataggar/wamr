@@ -355,6 +355,7 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     }
     if (inst.cached_elem_values.len > 0) allocator.free(inst.cached_elem_values);
     freeGcObjects(inst, allocator);
+    inst.detachProcessState();
     allocator.destroy(inst);
 }
 
