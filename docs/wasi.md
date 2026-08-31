@@ -52,7 +52,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
 | `wasi:config`      | ✅ (rc.1) | — | Layered env (`WAMR_CONFIG_*`) + `--config-store=PATH.json` host adapter (#583 B6). |
 | `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
-| `wasi:threads`     | — | — | Runtime and host-import prototypes exist, but guest threads are not production-wired or gated ([#616 B1](https://github.com/cataggar/wamr/issues/616)). |
+| `wasi:threads`     | — | — | Legacy Preview-1 `wasi.thread-spawn` is production-wired for interpreter-only builds behind `-Dlib_wasi_threads=true -Daot=false`; AOT and Component Model threads remain out of scope ([#616 B1](https://github.com/cataggar/wamr/issues/616)). |
 
 ✅ = shipped + gated by the conformance suite. — = not in scope today.
 
@@ -359,10 +359,10 @@ Now:
   before the host call, and the executor never yields to a
   `memory.grow` between the bounds check and the driver return.
   ([#583 B2](https://github.com/cataggar/wamr/issues/583))
-* **Guest threads** — interpreter/runtime and `wasi.thread-spawn`
-  prototypes exist, but resource safety, correct atomics and
-  wait/notify/fence behavior, interpreter+AOT spawning,
-  cancellation/context isolation, and production gates remain open.
+* **Guest threads** — Preview-1 interpreter spawning, shared resource
+  lifetimes, atomics/wait-notify/fence, per-thread context isolation, and
+  end-to-end gates are implemented behind `-Dlib_wasi_threads=true
+  -Daot=false`. AOT spawning and final cross-thread cancellation remain open.
   ([#616 B1](https://github.com/cataggar/wamr/issues/616))
 * **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped, with
   optional file-backed persistence and real compare-and-swap.
@@ -433,6 +433,9 @@ $ zig build wasi-p2-testsuite                         # Curated components — 5
 $ zig build wasi-p3-testsuite                         # Preview 3 AOT — 41 / 41
 $ zig build wasi-p3-testsuite-jit -Djit=true          # Preview 3 JIT — 41 / 41
 $ zig build wasi-p3-testsuite-wasmtime                # Wasmtime 46.0.1 — 41 / 41
+$ zig build test-wasi-threads -Daot=false             # Feature-disabled ABI
+$ zig build test-wasi-threads -Dlib_wasi_threads=true -Daot=false
+                                                       # Preview-1 interpreter threads
 ```
 
 ### `WAMR_TESTSUITE_TIMEOUT`

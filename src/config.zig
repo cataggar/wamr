@@ -153,8 +153,8 @@ pub const lib_pthread = opt("lib_pthread", false);
 /// Enable pthread semaphore support.
 pub const lib_pthread_semaphore = opt("lib_pthread_semaphore", false);
 
-/// Enable the WASI threads configuration contract. The internal lifecycle is
-/// hardened; production host binding and AOT support remain separately reported.
+/// Enable the production Preview-1 WASI threads interpreter binding. AOT/JIT
+/// support remains separately gated and is not implemented.
 pub const lib_wasi_threads = opt("lib_wasi_threads", false);
 
 /// Allocate auxiliary stacks on the heap (follows lib_wasi_threads).
@@ -184,8 +184,7 @@ pub const shared_memory = opt("shared_memory", lib_wasi_threads);
 /// Enable the thread manager component. Required by WASI threads.
 pub const thread_mgr = opt("thread_mgr", lib_wasi_threads);
 
-/// Enable WebAssembly atomic instructions. This is a configuration
-/// capability, not a claim that the production threads semantics are complete.
+/// Enable WebAssembly atomic instructions.
 pub const wasm_atomics = opt("wasm_atomics", shared_memory);
 
 /// Enable source-level interpreter debugging.
@@ -484,8 +483,8 @@ fn wasiThreadsInputs() threads_feature.Inputs {
 }
 
 /// Deterministic compile-time report for embedders and runtime preflight
-/// gates. `configuration_only` and `architecture_abi_not_implemented` are
-/// intentionally not support claims.
+/// gates. Interpreter production support and the unimplemented AOT ABI are
+/// reported independently.
 pub const wasi_threads = threads_feature.report(wasiThreadsInputs());
 
 test "WASI threads build options match the published contract" {
@@ -500,6 +499,8 @@ test "WASI threads build options match the published contract" {
         try std.testing.expect(wasi_threads.configured.shared_memory);
         try std.testing.expect(wasi_threads.configured.thread_manager);
         try std.testing.expect(wasi_threads.configured.wasm_atomics);
+        try std.testing.expect(wasi_threads.implementation.interpreter_thread_spawning);
+        try std.testing.expect(!wasi_threads.implementation.aot_thread_spawning);
     }
 }
 
