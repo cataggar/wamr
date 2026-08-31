@@ -13,6 +13,7 @@ const range_split = @import("../../ir/range_split.zig");
 const codegen_cache = @import("../../codegen_cache.zig");
 const passes = @import("../../ir/passes.zig");
 const codegen_timing = @import("../timing.zig");
+const pinned_memory_size_reg: emit.Reg = .x28;
 
 /// Compile-time debug flag: when true, print per-function range-split
 /// stats to stderr. Flip via `zig build -Drange-split-debug=true` after
@@ -67,6 +68,8 @@ const RegMap = struct {
     // X21–X28 are AAPCS64 callee-saved and appended after the caller-
     // saved block. They survive calls (no save around BL), trading one
     // extra STR/LDR pair per function per reg that the body allocates.
+    // Memory-heavy single-memory32 functions reserve x28 for a cached
+    // VmCtx.memory_size; other functions keep x28 allocatable.
     pub const caller_saved_count: usize = 15;
     pub const scratch_regs = [_]emit.Reg{
         .x0,  .x1,  .x2,  .x3,  .x4,  .x5,  .x6,  .x7,
@@ -95,14 +98,16 @@ const RegMap = struct {
     spill_base: u32 = 0,
     /// Maximum bytes reserved for spills (beyond which `assign` errors).
     spill_capacity: u32 = 0,
+    /// True when x28 is reserved for VmCtx.memory_size in this function.
+    pin_memory_size: bool = false,
     /// Optional linear-scan allocation result. When non-null, `assign`
     /// consults this for the physical location of every vreg instead of
     /// running the greedy fallback. Set by `compileFunctionImpl` right
     /// after running `regalloc.allocate`.
     alloc_result: ?*const regalloc.AllocResult = null,
 
-    fn init(allocator: std.mem.Allocator, spill_base: u32, spill_capacity: u32) RegMap {
-        return .{
+    fn init(allocator: std.mem.Allocator, spill_base: u32, spill_capacity: u32, pin_memory_size: bool) RegMap {
+        var out = RegMap{
             .entries = std.AutoHashMap(ir.VReg, Location).init(allocator),
             .spill_base = spill_base,
             .spill_capacity = spill_capacity,
@@ -114,7 +119,15 @@ const RegMap = struct {
             // pinned values, so each caller's value is correctly
             // preserved across our frame.
             .used_callee_mask = 0b11,
+            .pin_memory_size = pin_memory_size,
         };
+        if (pin_memory_size) {
+            // x28 is the last scratch_regs entry and bit 9 in
+            // callee_saved_regs (x19..x28).
+            out.reg_used[out.reg_used.len - 1] = true;
+            out.used_callee_mask |= @as(u16, 1) << 9;
+        }
+        return out;
     }
 
     fn deinit(self: *RegMap) void {
@@ -577,6 +590,9 @@ pub const CompileOptions = struct {
     /// Bounds-known, memory64-shaped, non-zero-offset, SIMD, and atomic/shared
     /// paths keep their existing address-materialization fallback.
     enable_mem_reg_offset: bool = true,
+    /// Cache VmCtx.memory_size in x28 for memory-heavy single-memory32
+    /// functions and refresh it after calls/grow alongside memory_base.
+    enable_memory_size_pin: bool = true,
     /// #778: native-codegen timing diagnostics. aarch64 reports per-function
     /// totals + a module summary (no x86_64-style setup/liveness/regalloc
     /// sub-phase breakdown — the #778 bottleneck is the x86_64 host path).
@@ -606,6 +622,7 @@ const FuncCompileCtx = struct {
     import_count: u32 = 0,
     has_memory64: bool = false,
     has_shared_memory: bool = false,
+    pin_memory_size: bool = false,
     call_patches: ?*std.ArrayListUnmanaged(CallPatch) = null,
     /// FP-relative byte offset for each wasm/synthetic local slot.
     local_offsets: []const u32 = &.{},
@@ -1158,6 +1175,8 @@ pub fn compileFunctionImpl(
     if (tmr) |t| t.end(.prepass);
     if (unsupported_v128) return error.UnsupportedV128;
 
+    const pin_memory_size = shouldPinMemorySize(func, &ctx);
+
     // Drive scalar and SIMD virtual registers from linear-scan allocation when
     // enabled. `RegMap.assign` and V128StackMap/V128RegCache consult their
     // AllocResult first; disabling the options keeps legacy greedy/cache paths
@@ -1213,8 +1232,8 @@ pub fn compileFunctionImpl(
             .{
                 // Target-derived pressure thresholds (#524): the aarch64
                 // allocatable integer pool and its callee-saved subset.
-                .num_available_phys_regs = RegMap.scratch_regs.len,
-                .num_callee_saved_regs = RegMap.scratch_regs.len - RegMap.caller_saved_count,
+                .num_available_phys_regs = RegMap.scratch_regs.len - @intFromBool(pin_memory_size),
+                .num_callee_saved_regs = RegMap.scratch_regs.len - RegMap.caller_saved_count - @intFromBool(pin_memory_size),
             },
         );
         if (range_split_debug and rs_stats.loops_considered > 0) {
@@ -1272,6 +1291,8 @@ pub fn compileFunctionImpl(
     // alloc_result.spill_count instead of a conservative next_vreg+16
     // estimate, which shrinks frames and reduces I-cache pressure).
     var fctx = ctx;
+    fctx.pin_memory_size = pin_memory_size;
+    const scalar_reg_set = aarch64RegSetForSpillBaseAndMemorySizePin(spill_base, pin_memory_size);
 
     // Multi-result plumbing. Precompute the caller-side return-area layout for
     // `.call_result` instructions. Scalar-only calls keep the old 8-byte slot
@@ -1658,7 +1679,7 @@ pub fn compileFunctionImpl(
         if (tmr) |t| t.begin();
         alloc_result_storage = try regalloc.allocateFromRangesWithHints(
             allocator,
-            aarch64RegSetForSpillBase(spill_base),
+            scalar_reg_set,
             clobbers.items,
             scalar_live_ranges.items,
             hint_points.items,
@@ -1679,7 +1700,7 @@ pub fn compileFunctionImpl(
             _ = try regalloc.coalesceMoves(
                 allocator,
                 &alloc_result_storage.?,
-                aarch64RegSetForSpillBase(spill_base),
+                scalar_reg_set,
                 clobbers.items,
                 scalar_live_ranges.items,
                 copy_hints.items,
@@ -1722,7 +1743,7 @@ pub fn compileFunctionImpl(
             metric = metric.add(try regalloc.computeSpillMetric(
                 allocator,
                 func,
-                aarch64RegSetForSpillBase(spill_base),
+                scalar_reg_set,
                 scalar_live_ranges.items,
                 ar,
             ));
@@ -1784,7 +1805,7 @@ pub fn compileFunctionImpl(
     const raw_frame = callee_save_base + callee_save_size;
     const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
 
-    var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
+    var reg_map = RegMap.init(allocator, spill_base, spill_capacity, pin_memory_size);
     defer reg_map.deinit();
     if (alloc_result_storage) |*ar| reg_map.alloc_result = ar;
 
@@ -1910,14 +1931,11 @@ pub fn compileFunctionImpl(
     // helper / cross-function call).
     try code.movRegReg(.x19, .x0);
 
-    // Pin VmCtx.memory_base in callee-saved x20 for the whole function
-    // body (issue #466). The preceding callee-save STR preserved the
-    // caller's x20, and `RegMap.init` forces x20's bit in
-    // `used_callee_mask`. Every linear-memory access reads `x20`
-    // directly instead of rematerialising via
-    // `mov tmp, x19; ldr tmp, [tmp]`. `memory.grow` and every wasm
-    // call emit `ldr x20, [x19, #0]` afterward to refresh the base.
-    try code.ldrImm(.x20, .x19, 0);
+    // Pin VmCtx.memory_base in x20 (issue #466). Memory-heavy
+    // single-memory32 functions also pin memory_size in x28; LDP loads
+    // both adjacent VmCtx fields without adding a prologue instruction.
+    // Calls and memory.grow refresh the same pair before execution resumes.
+    try emitRefreshPinnedMemory(&code, fctx.pin_memory_size);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
     if (tmr) |t| t.begin();
@@ -6841,13 +6859,10 @@ fn emitCall(
     }
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
-    // Refresh the pinned memory_base in x20 (issue #466). The callee
-    // may have invoked `memory.grow`, which reallocs the wasm linear
-    // memory and updates `[vmctx + 0]`. The callee's callee-save
-    // discipline restored *our* (pre-call) x20 in its epilogue, so the
-    // value we hold is stale; reload from the now-current
-    // `[vmctx + 0]`.
-    try code.ldrImm(.x20, .x19, 0);
+    // The callee may have grown or replaced the active memory. Its
+    // callee-save discipline restored our pre-call cached values, so
+    // refresh them from the now-current VmCtx before resuming.
+    try emitRefreshPinnedMemory(code, fctx.pin_memory_size);
 
     // Commit result (in x0 or q0) to dest's location BEFORE restoring saved regs,
     // so restoration can't clobber the result holder (dest.reg is always a
@@ -6954,12 +6969,15 @@ fn emitMemIndexImpl(
             try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
         }
 
-        // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1)
-        // directly from the pinned vmctx in x19.
-        try code.ldrImm(RegMap.tmp0, .x19, vmctx_memsize_slot);
+        // Step 3: use the function-wide cached memory_size when enabled,
+        // otherwise load it directly from the pinned vmctx in x19.
+        const memory_size_reg = if (reg_map.pin_memory_size) pinned_memory_size_reg else RegMap.tmp0;
+        if (!reg_map.pin_memory_size) {
+            try code.ldrImm(memory_size_reg, .x19, vmctx_memsize_slot);
+        }
 
         // Step 4: cmp end, mem_size; B.LS over_trap.
-        try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
+        try code.cmpRegReg(RegMap.tmp1, memory_size_reg);
         const over_patch = code.len();
         try code.bCond(.ls, 0); // placeholder
 
@@ -7009,6 +7027,16 @@ const vmctx_tags_ptr_slot: u12 = 30; // byte 240, scale 8
 const vmctx_aot_throw_uncaught_fn_slot: u12 = 32; // byte 256, scale 8
 const vmctx_exception_params_byte_off: u32 = 264; // [16]u64 buffer base
 const vmctx_exception_param_count_slot_w: u12 = 98; // byte 392 (u32), scale 4
+
+fn emitRefreshPinnedMemory(code: *emit.CodeBuffer, pin_memory_size: bool) !void {
+    if (pin_memory_size) {
+        // VmCtx.memory_base and VmCtx.memory_size are adjacent usize
+        // fields at offsets 0 and 8.
+        try code.ldpImm(.x20, pinned_memory_size_reg, .x19, 0);
+    } else {
+        try code.ldrImm(.x20, .x19, 0);
+    }
+}
 
 // Per-table descriptor layout (`TableInfo`, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
@@ -7155,10 +7183,9 @@ fn emitMemoryGrow(
 ) !void {
     const args = [_]ir.VReg{pages_vreg};
     try emitVmctxHelperCall(code, &args, vmctx_mem_grow_fn_slot, reg_map, fctx, inst.dest);
-    // mem_grow_fn may realloc the wasm linear memory and invalidate the
-    // pinned memory_base in x20 (issue #466). Refresh from
-    // [vmctx + 0] now so subsequent memory accesses see the new base.
-    try code.ldrImm(.x20, .x19, 0);
+    // Success can grow/replace memory; failure keeps the same values.
+    // Refresh unconditionally so both result paths share one sequence.
+    try emitRefreshPinnedMemory(code, fctx.pin_memory_size);
 }
 
 fn emitMemoryFill(
@@ -7598,10 +7625,7 @@ fn emitCallIndirect(
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
-    // Refresh pinned memory_base in x20 (issue #466) — the called
-    // function may have invoked `memory.grow`; see emitCall for
-    // rationale.
-    try code.ldrImm(.x20, .x19, 0);
+    try emitRefreshPinnedMemory(code, fctx.pin_memory_size);
 
     try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
@@ -7683,10 +7707,7 @@ fn emitCallRef(
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
-    // Refresh pinned memory_base in x20 (issue #466) — the called
-    // function may have invoked `memory.grow`; see emitCall for
-    // rationale.
-    try code.ldrImm(.x20, .x19, 0);
+    try emitRefreshPinnedMemory(code, fctx.pin_memory_size);
 
     try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
@@ -9085,6 +9106,11 @@ pub const aarch64_alloc_regs = [_]regalloc.PhysReg{
     21, 22, 23, 24, 25, 26, 27, 28,
 };
 
+const aarch64_alloc_regs_memory_size_pinned = [_]regalloc.PhysReg{
+    0,  1,  2,  3,  4,  5,  6,  7, 8, 9, 10, 11, 12, 13, 14,
+    21, 22, 23, 24, 25, 26, 27,
+};
+
 /// Indices into `aarch64_alloc_regs` of AAPCS64 caller-saved registers
 /// (x0..x14). Used as the "prefer when live range doesn't span a call"
 /// pool.
@@ -9099,6 +9125,10 @@ pub const aarch64_caller_saved_indices = [_]u8{
 /// #466).
 pub const aarch64_callee_saved_indices = [_]u8{
     15, 16, 17, 18, 19, 20, 21, 22,
+};
+
+const aarch64_callee_saved_indices_memory_size_pinned = [_]u8{
+    15, 16, 17, 18, 19, 20, 21,
 };
 
 /// Bitmask over `aarch64_alloc_regs` of registers destroyed by any
@@ -9150,9 +9180,13 @@ pub const aarch64_v_call_clobber_mask: u64 = (@as(u64, 1) << aarch64_v_alloc_reg
 /// `[fp+24 .. spill_base)` = locals plus any alignment padding, then spills
 /// grow upward.
 pub fn aarch64RegSetForSpillBase(spill_base: u32) regalloc.RegSet {
+    return aarch64RegSetForSpillBaseAndMemorySizePin(spill_base, false);
+}
+
+fn aarch64RegSetForSpillBaseAndMemorySizePin(spill_base: u32, pin_memory_size: bool) regalloc.RegSet {
     return .{
-        .alloc_regs = &aarch64_alloc_regs,
-        .callee_saved_indices = &aarch64_callee_saved_indices,
+        .alloc_regs = if (pin_memory_size) &aarch64_alloc_regs_memory_size_pinned else &aarch64_alloc_regs,
+        .callee_saved_indices = if (pin_memory_size) &aarch64_callee_saved_indices_memory_size_pinned else &aarch64_callee_saved_indices,
         .caller_saved_indices = &aarch64_caller_saved_indices,
         // Match RegMap's spill_base so translation between AllocResult.stack
         // (absolute FP offset) and RegMap.Location.stack (offset from
@@ -9174,6 +9208,25 @@ pub fn aarch64VRegSetForSpillBase(spill_base: u32) regalloc.RegSet {
 
 pub fn aarch64RegSet(local_count: u32) regalloc.RegSet {
     return aarch64RegSetForSpillBase((local_count + 3) * 8);
+}
+
+fn shouldPinMemorySize(func: *const ir.IrFunction, ctx: *const FuncCompileCtx) bool {
+    if (!ctx.options.enable_memory_size_pin or ctx.has_memory64 or ctx.has_shared_memory) return false;
+
+    var checked_scalar_accesses: u32 = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const checked = switch (inst.op) {
+                .load => |ld| !ld.bounds_known,
+                .store => |st| !st.bounds_known,
+                else => false,
+            };
+            if (!checked) continue;
+            checked_scalar_accesses += 1;
+            if (checked_scalar_accesses >= 4) return true;
+        }
+    }
+    return false;
 }
 
 fn vregClobbersFromScalar(
@@ -9727,7 +9780,7 @@ fn simulateParallelCopy(
         try loc_of.put(e.v, e.loc);
     }
 
-    var reg_map = RegMap.init(allocator, 0, 4096);
+    var reg_map = RegMap.init(allocator, 0, 4096, false);
     defer reg_map.deinit();
     reg_map.alloc_result = &ar;
     // Pre-resolve every vreg into `entries` so `get(src)` succeeds.
@@ -9818,7 +9871,7 @@ test "emitParallelCopyFull: identity move (coalesced) emits nothing" {
     try ar.assignments.put(0, .{ .reg = 5 });
     try ar.assignments.put(1, .{ .reg = 5 }); // src shares dst's register
 
-    var reg_map = RegMap.init(allocator, 0, 4096);
+    var reg_map = RegMap.init(allocator, 0, 4096, false);
     defer reg_map.deinit();
     reg_map.alloc_result = &ar;
     _ = try reg_map.assign(0);
@@ -13757,7 +13810,7 @@ test "store: spilled value reload preserves the checked register-offset index" {
     const allocator = std.testing.allocator;
     var code = emit.CodeBuffer.init(allocator);
     defer code.deinit();
-    var reg_map = RegMap.init(allocator, 64, 8);
+    var reg_map = RegMap.init(allocator, 64, 8, false);
     defer reg_map.deinit();
     const base: ir.VReg = 0;
     const val: ir.VReg = 1;

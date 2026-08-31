@@ -18,6 +18,11 @@ on:
         description: "Runs per ref"
         required: false
         default: "3"
+      benchmark_memory_size:
+        description: "Run the memory-size pin ten-run A/B gate"
+        required: false
+        type: boolean
+        default: false
   pull_request:
     paths:
       - src/compiler/**
@@ -91,6 +96,86 @@ jobs:
             --min-delta-pct=-5.0 \
             --out      coremark-table.md \
             --emit     github
+
+      - name: Benchmark AArch64 memory-size pin
+        if: github.event_name == 'workflow_dispatch' && inputs.benchmark_memory_size
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+        run: |
+          set -euxo pipefail
+          zig build -Doptimize=ReleaseFast
+          mkdir -p memory-size-bench
+          WAMR_AOT_DISABLE_MEMORY_SIZE_PIN=1 \
+            ./zig-out/bin/wamrc compile \
+              tests/benchmarks/coremark/coremark_wasi.wasm \
+              -o memory-size-bench/baseline.cwasm
+          ./zig-out/bin/wamrc compile \
+            tests/benchmarks/coremark/coremark_wasi.wasm \
+            -o memory-size-bench/target.cwasm
+
+          python3 - <<'PY'
+          import json
+          import re
+          import statistics
+          import subprocess
+          from pathlib import Path
+
+          pattern = re.compile(r"Iterations/Sec\s*:\s*([0-9.]+)")
+          validation = "Correct operation validated."
+          commands = {
+              "baseline": ["./zig-out/bin/wamr", "run", "memory-size-bench/baseline.cwasm"],
+              "target": ["./zig-out/bin/wamr", "run", "memory-size-bench/target.cwasm"],
+          }
+          values = {name: [] for name in commands}
+          sequence = ["baseline", "target", "target", "baseline"] * 5
+          for index, name in enumerate(sequence, 1):
+              output = subprocess.run(
+                  commands[name], check=True, text=True, capture_output=True
+              )
+              combined = output.stdout + output.stderr
+              if validation not in combined:
+                  raise SystemExit(f"{name} run {index}: missing CRC validation")
+              matches = pattern.findall(combined)
+              if len(matches) != 1:
+                  raise SystemExit(f"{name} run {index}: expected one score, got {matches}")
+              values[name].append(float(matches[0]))
+
+          baseline = statistics.median(values["baseline"])
+          target = statistics.median(values["target"])
+          delta = (target / baseline - 1.0) * 100.0
+          report = {
+              "baseline": values["baseline"],
+              "target": values["target"],
+              "baseline_median": baseline,
+              "target_median": target,
+              "median_delta_pct": delta,
+          }
+          Path("memory-size-bench/results.json").write_text(
+              json.dumps(report, indent=2) + "\n", encoding="utf-8"
+          )
+          lines = [
+              "# AArch64 memory-size pin benchmark",
+              "",
+              f"- Baseline median: {baseline:.1f} iter/s",
+              f"- Target median: {target:.1f} iter/s",
+              f"- Median delta: {delta:+.2f}%",
+              f"- Baseline samples: {', '.join(f'{x:.1f}' for x in values['baseline'])}",
+              f"- Target samples: {', '.join(f'{x:.1f}' for x in values['target'])}",
+          ]
+          Path("memory-size-bench/results.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+          print("\n".join(lines))
+          PY
+
+      - name: Upload memory-size benchmark
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.benchmark_memory_size
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aarch64-memory-size-benchmark-${{ github.sha }}
+          path: memory-size-bench/
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload table
         if: always()
