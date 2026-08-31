@@ -1,6 +1,6 @@
 //! Compile-time contract for the legacy Preview 1 `wasi.thread-spawn`
-//! feature. This describes configuration and readiness; the hardened internal
-//! lifecycle does not by itself make the host binding production-ready.
+//! feature. Interpreter support is production-ready when the validated
+//! capability set is enabled; AOT support remains explicitly unavailable.
 
 const std = @import("std");
 
@@ -14,7 +14,7 @@ pub const TargetSupport = enum {
 pub const BackendSupport = enum {
     disabled,
     target_unsupported,
-    configuration_only,
+    production,
     architecture_abi_not_implemented,
 };
 
@@ -135,10 +135,16 @@ pub fn report(inputs: Inputs) Report {
     return .{
         .enabled = true,
         .target = .supported,
-        .interpreter_backend = .configuration_only,
+        .interpreter_backend = .production,
         .aot_backend = .architecture_abi_not_implemented,
         .required = required,
         .configured = configured,
+        .implementation = .{
+            .resource_locking = true,
+            .interpreter_thread_spawning = true,
+            .wasm_atomics = true,
+            .aot_thread_spawning = false,
+        },
     };
 }
 
@@ -204,17 +210,17 @@ test "disabled contract preserves defaults without requiring thread capabilities
     try std.testing.expect(!actual.required.shared_memory);
 }
 
-test "enabled configuration reports requirements without claiming implementation" {
+test "enabled configuration reports production interpreter support" {
     const actual = report(validEnabledInputs());
     try std.testing.expectEqual(@as(?ValidationError, null), validationError(validEnabledInputs()));
     try std.testing.expectEqual(TargetSupport.supported, actual.target);
-    try std.testing.expectEqual(BackendSupport.configuration_only, actual.interpreter_backend);
+    try std.testing.expectEqual(BackendSupport.production, actual.interpreter_backend);
     try std.testing.expectEqual(BackendSupport.architecture_abi_not_implemented, actual.aot_backend);
     try std.testing.expect(actual.required.shared_memory);
     try std.testing.expect(actual.configured.shared_memory);
-    try std.testing.expect(!actual.implementation.resource_locking);
-    try std.testing.expect(!actual.implementation.interpreter_thread_spawning);
-    try std.testing.expect(!actual.implementation.wasm_atomics);
+    try std.testing.expect(actual.implementation.resource_locking);
+    try std.testing.expect(actual.implementation.interpreter_thread_spawning);
+    try std.testing.expect(actual.implementation.wasm_atomics);
     try std.testing.expect(!actual.implementation.aot_thread_spawning);
 }
 

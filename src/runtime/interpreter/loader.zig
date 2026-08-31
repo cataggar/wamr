@@ -45,6 +45,7 @@ pub const LoadError = error{
     UndeclaredFuncRef,
     ImmutableArray,
     InvalidArrayElemType,
+    AtomicMemoryNotShared,
 };
 
 /// A streaming reader over the Wasm binary.
@@ -1817,6 +1818,42 @@ fn skipBlockTypeImm(code: []const u8, i: *usize) void {
     }
 }
 
+fn atomicNaturalAlignment(sub: u32) ?u8 {
+    return switch (sub) {
+        0x00, 0x01, 0x10, 0x17, 0x1E, 0x25, 0x2C, 0x33, 0x3A, 0x41, 0x48 => 2,
+        0x02, 0x11, 0x18, 0x1F, 0x26, 0x2D, 0x34, 0x3B, 0x42, 0x49 => 3,
+        0x12, 0x14, 0x19, 0x1B, 0x20, 0x22, 0x27, 0x29, 0x2E, 0x30, 0x35, 0x37, 0x3C, 0x3E, 0x43, 0x45, 0x4A, 0x4C => 0,
+        0x13, 0x15, 0x1A, 0x1C, 0x21, 0x23, 0x28, 0x2A, 0x2F, 0x31, 0x36, 0x38, 0x3D, 0x3F, 0x44, 0x46, 0x4B, 0x4D => 1,
+        0x16, 0x1D, 0x24, 0x2B, 0x32, 0x39, 0x40, 0x47, 0x4E => 2,
+        else => null,
+    };
+}
+
+fn skipAtomicImmediate(code: []const u8, i: *usize) LoadError!u32 {
+    const sub_result = leb128_mod.readUnsigned(u32, code[i.*..]) catch
+        return error.InvalidSectionSize;
+    i.* += sub_result.bytes_read;
+    const sub = sub_result.value;
+    if (sub == 0x03) {
+        const reserved = leb128_mod.readUnsigned(u32, code[i.*..]) catch
+            return error.InvalidSectionSize;
+        i.* += reserved.bytes_read;
+        if (reserved.value != 0) return error.IllegalOpcode;
+        return sub;
+    }
+
+    const natural_alignment = atomicNaturalAlignment(sub) orelse
+        return error.IllegalOpcode;
+    const alignment = leb128_mod.readUnsigned(u32, code[i.*..]) catch
+        return error.InvalidAlignment;
+    i.* += alignment.bytes_read;
+    if (alignment.value != natural_alignment) return error.InvalidAlignment;
+    const offset = leb128_mod.readUnsigned(u32, code[i.*..]) catch
+        return error.InvalidSectionSize;
+    i.* += offset.bytes_read;
+    return sub;
+}
+
 fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void {
     var i: usize = 0;
     while (i < code.len) {
@@ -1896,6 +1933,19 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
                     8, 10, 12, 14 => { const a = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += a.bytes_read; const b = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += b.bytes_read; },
                     9, 11, 13, 15, 16, 17 => { const a = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += a.bytes_read; },
                     else => {},
+                }
+            },
+            0xFE => {
+                const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += sr.bytes_read;
+                if (sr.value == 0x03) {
+                    const reserved = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += reserved.bytes_read;
+                } else if (atomicNaturalAlignment(sr.value) != null) {
+                    const alignment = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += alignment.bytes_read;
+                    const offset = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += offset.bytes_read;
                 }
             },
             else => {},
@@ -2191,10 +2241,11 @@ fn validateFunctionBody(
                     else => {},
                 }
             },
-            // FE prefix (threads/atomics) — skip sub-opcode + memarg
+            // FE prefix (threads/atomics)
             0xFE => {
-                const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
-                i += sr.bytes_read;
+                const sub = try skipAtomicImmediate(code, &i);
+                if (sub != 0x03 and total_memories == 0)
+                    return error.UnknownMemory;
             },
 
             // All valid opcodes with no immediates (numerics, control, etc.)
@@ -2704,6 +2755,22 @@ fn getMemAddrType(module: *const types.WasmModule, idx: u32) VT {
     const local_idx = idx - module.import_memory_count;
     if (local_idx < module.memories.len) return if (module.memories[local_idx].is_memory64) VT.i64 else VT.i32;
     return .i32;
+}
+
+fn getMemoryType(module: *const types.WasmModule, idx: u32) ?types.MemoryType {
+    if (idx < module.import_memory_count) {
+        var mi: u32 = 0;
+        for (module.imports) |imp| {
+            if (imp.kind == .memory) {
+                if (mi == idx) return imp.memory_type;
+                mi += 1;
+            }
+        }
+        return null;
+    }
+    const local_idx = idx - module.import_memory_count;
+    if (local_idx < module.memories.len) return module.memories[local_idx];
+    return null;
 }
 
 fn getTableElemType(module: *const types.WasmModule, idx: u32) ?VT {
@@ -3810,6 +3877,81 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         pushType(&stack_buf, &sp, .anyref, &stack_tidx);
                     },
                     else => {},
+                }
+            },
+
+            // 0xFE prefix (threads/atomics)
+            0xFE => {
+                const sub = try skipAtomicImmediate(code, &i);
+                if (sub != 0x03) {
+                    const memory_type = getMemoryType(module, 0) orelse
+                        return error.UnknownMemory;
+                    if (!memory_type.is_shared)
+                        return error.AtomicMemoryNotShared;
+                }
+                const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
+                const address_type = getMemAddrType(module, 0);
+                switch (sub) {
+                    0x00 => { // memory.atomic.notify: [addr count] -> [i32]
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)
+                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                            return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x01 => { // memory.atomic.wait32: [addr expected timeout] -> [i32]
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)
+                            or !popExpect(&stack_buf, &sp, .i32, cf)
+                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                            return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x02 => { // memory.atomic.wait64: [addr expected timeout] -> [i32]
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)
+                            or !popExpect(&stack_buf, &sp, .i64, cf)
+                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                            return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x03 => {}, // atomic.fence
+                    0x10, 0x12, 0x13 => try doLoad64(&stack_buf, &sp, .i32, address_type, cf, &stack_tidx),
+                    0x11, 0x14, 0x15, 0x16 => try doLoad64(&stack_buf, &sp, .i64, address_type, cf, &stack_tidx),
+                    0x17, 0x19, 0x1A => try doStore64(&stack_buf, &sp, .i32, address_type, cf),
+                    0x18, 0x1B, 0x1C, 0x1D => try doStore64(&stack_buf, &sp, .i64, address_type, cf),
+                    0x1E, 0x20, 0x21,
+                    0x25, 0x27, 0x28,
+                    0x2C, 0x2E, 0x2F,
+                    0x33, 0x35, 0x36,
+                    0x3A, 0x3C, 0x3D,
+                    0x41, 0x43, 0x44,
+                    => {
+                        try doStore64(&stack_buf, &sp, .i32, address_type, cf);
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x1F, 0x22, 0x23, 0x24,
+                    0x26, 0x29, 0x2A, 0x2B,
+                    0x2D, 0x30, 0x31, 0x32,
+                    0x34, 0x37, 0x38, 0x39,
+                    0x3B, 0x3E, 0x3F, 0x40,
+                    0x42, 0x45, 0x46, 0x47,
+                    => {
+                        try doStore64(&stack_buf, &sp, .i64, address_type, cf);
+                        pushType(&stack_buf, &sp, .i64, &stack_tidx);
+                    },
+                    0x48, 0x4A, 0x4B => {
+                        if (!popExpect(&stack_buf, &sp, .i32, cf)
+                            or !popExpect(&stack_buf, &sp, .i32, cf)
+                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                            return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x49, 0x4C, 0x4D, 0x4E => {
+                        if (!popExpect(&stack_buf, &sp, .i64, cf)
+                            or !popExpect(&stack_buf, &sp, .i64, cf)
+                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                            return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i64, &stack_tidx);
+                    },
+                    else => return error.IllegalOpcode,
                 }
             },
 

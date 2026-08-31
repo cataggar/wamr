@@ -21,6 +21,7 @@ const types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const wasi_core = @import("wasi_core.zig");
 const wasi = @import("wasi.zig");
+const thread_manager = @import("thread_manager.zig");
 
 const is_single_threaded = builtin.single_threaded;
 
@@ -47,7 +48,7 @@ fn errnoVal(e: wasi.Errno) i32 {
 pub fn wasiThreadSpawn(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
 
-    if (is_single_threaded) {
+    if (!config.lib_wasi_threads or is_single_threaded) {
         _ = env.popI32() catch return error.StackUnderflow;
         env.pushI32(-1) catch return error.StackOverflow;
         return;
@@ -55,13 +56,13 @@ pub fn wasiThreadSpawn(env_opaque: *anyopaque) types.HostFnError!void {
 
     const start_arg = env.popI32() catch return error.StackUnderflow;
 
-    const tm = env.module_inst.thread_manager orelse {
+    const tm = env.threadManager() orelse {
         env.pushI32(-1) catch return error.StackOverflow;
         return;
     };
 
-    const tid = tm.spawnThread(env.module_inst, start_arg) catch {
-        env.pushI32(-1) catch return error.StackOverflow;
+    const tid = tm.spawnThread(env.module_inst, start_arg) catch |err| {
+        env.pushI32(thread_manager.spawnFailureResult(err)) catch return error.StackOverflow;
         return;
     };
 
@@ -77,7 +78,7 @@ pub fn wasiProcExit(env_opaque: *anyopaque) types.HostFnError!void {
         ctx.proc_exit(@bitCast(code));
     }
 
-    if (env.module_inst.thread_manager) |tm| {
+    if (env.threadManager()) |tm| {
         tm.signalTrap();
     }
 
@@ -3382,6 +3383,28 @@ test "resolveWasiHostFunctions: proc_exit resolved" {
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expect(result[0] != null);
+}
+
+test "wasiThreadSpawn: disabled feature preserves the negative rejection result" {
+    if (comptime config.lib_wasi_threads) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const wasm_module = types.WasmModule{};
+    const inst = try allocator.create(types.ModuleInstance);
+    defer allocator.destroy(inst);
+    inst.* = .{
+        .module = &wasm_module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+    };
+
+    const env = try ExecEnv.create(inst, 16, allocator);
+    defer env.destroy();
+    try env.pushI32(0x1234);
+    try wasiThreadSpawn(@ptrCast(env));
+    try std.testing.expectEqual(@as(i32, -1), try env.popI32());
 }
 
 test "wasiProcExit: signals trap flag" {

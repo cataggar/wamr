@@ -11,6 +11,7 @@ const aot_supported = switch (builtin.cpu.arch) {
     .x86_64, .aarch64 => true,
     else => false,
 };
+const default_interpreter_stack_size: u32 = 64 * 1024;
 
 /// `--map-dir HOST::GUEST` flag value: pre-open `host_path` on the host and
 /// expose it to the guest under `guest_name`. Slices borrow from `args`,
@@ -201,6 +202,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // loopback-bind paths. (#520 wave 2)
     var allow_net: std.ArrayListUnmanaged([]const u8) = .empty;
     defer allow_net.deinit(allocator);
+    var stack_size = default_interpreter_stack_size;
     // `--config-store=<path>` (#583 B6): path to a JSON file whose flat
     // `{ "key": "value", ... }` object becomes the `wasi:config/store`
     // layer-1 backing. Combined with the `WAMR_CONFIG_*` env vars (layer
@@ -232,11 +234,21 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         const arg = run_args[i];
         if (!past_options and arg.len > 0 and arg[0] == '-') {
             if (std.mem.startsWith(u8, arg, "--stack-size=")) {
-                // #644: the interpreter stack-size knob is now a no-op
-                // since the CLI is AOT-only. Accept the flag silently
-                // so existing invocations keep working; warn once on
-                // stderr so out-of-tree callers can adapt.
-                std.debug.print("warning: --stack-size is ignored under the AOT-only CLI (issue #644)\n", .{});
+                if (comptime wamr.config.interp and !wamr.config.aot) {
+                    const value = arg["--stack-size=".len..];
+                    stack_size = std.fmt.parseInt(u32, value, 10) catch {
+                        std.debug.print("error: invalid --stack-size value '{s}'\n", .{value});
+                        return 2;
+                    };
+                    if (stack_size == 0) {
+                        std.debug.print("error: --stack-size must be greater than zero\n", .{});
+                        return 2;
+                    }
+                } else {
+                    // #644: the interpreter stack-size knob remains a no-op
+                    // for AOT/JIT builds.
+                    std.debug.print("warning: --stack-size is ignored under the AOT-only CLI (issue #644)\n", .{});
+                }
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
                 // Reserved for future WASI heap allocation
             } else if (std.mem.eql(u8, arg, "--env") or std.mem.startsWith(u8, arg, "--env=")) {
@@ -461,6 +473,20 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
 
             return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path, component_core_opts);
         }
+    }
+
+    if (comptime wamr.config.interp and !wamr.config.aot) {
+        return runInterpreterCore(
+            init.io,
+            allocator,
+            wasm_data,
+            path,
+            wasm_args.items,
+            env_flags.items,
+            init.environ_map,
+            map_dirs.items,
+            stack_size,
+        );
     }
 
     // Plain core wasm.
@@ -1301,6 +1327,241 @@ fn runHttpComponent(
     return 0;
 }
 
+const InterpreterImportOwner = struct {
+    allocator: std.mem.Allocator,
+    memories: []*wamr.types.MemoryInstance = &.{},
+
+    fn deinit(self: *InterpreterImportOwner) void {
+        for (self.memories) |memory| memory.release(self.allocator);
+        if (self.memories.len != 0) self.allocator.free(self.memories);
+        self.memories = &.{};
+    }
+};
+
+fn importsWasiThreadSpawn(module: *const wamr.types.WasmModule) bool {
+    for (module.imports) |import| {
+        if (import.kind == .function and
+            wamr.config.threads_feature.isThreadSpawnImport(
+                import.module_name,
+                import.field_name,
+            ))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn createInterpreterMemoryImports(
+    module: *const wamr.types.WasmModule,
+    allocator: std.mem.Allocator,
+) !InterpreterImportOwner {
+    var owner = InterpreterImportOwner{ .allocator = allocator };
+    if (module.import_memory_count == 0) return owner;
+
+    owner.memories = try allocator.alloc(
+        *wamr.types.MemoryInstance,
+        module.import_memory_count,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (owner.memories[0..initialized]) |memory| memory.release(allocator);
+        allocator.free(owner.memories);
+    }
+
+    for (module.imports) |import| {
+        if (import.kind != .memory) continue;
+        const memory_type = import.memory_type orelse
+            return error.InvalidMemoryImport;
+        if (!memory_type.is_shared) return error.ThreadMemoryImportMustBeShared;
+        owner.memories[initialized] = try wamr.types.MemoryInstance.createShared(
+            memory_type,
+            allocator,
+        );
+        initialized += 1;
+    }
+    if (initialized != owner.memories.len) return error.InvalidMemoryImport;
+    return owner;
+}
+
+fn runInterpreterCore(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    wasm_data: []const u8,
+    wasm_path: []const u8,
+    wasm_args: []const []const u8,
+    env_flags: []const []const u8,
+    environ_map: *const std.process.Environ.Map,
+    map_dirs: []const MapDir,
+    stack_size: u32,
+) u8 {
+    var module_arena = std.heap.ArenaAllocator.init(allocator);
+    defer module_arena.deinit();
+
+    const module = wamr.loader.load(wasm_data, module_arena.allocator()) catch |err| {
+        std.debug.print("Error: failed to load core module: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    const uses_wasi_threads = importsWasiThreadSpawn(&module);
+
+    var memory_imports = if (uses_wasi_threads)
+        createInterpreterMemoryImports(&module, allocator) catch |err| {
+            std.debug.print(
+                "Error: failed to create WASI thread memory imports: {s}\n",
+                .{@errorName(err)},
+            );
+            return 1;
+        }
+    else
+        InterpreterImportOwner{ .allocator = allocator };
+    defer memory_imports.deinit();
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    argv.append(allocator, wasm_path) catch return 1;
+    for (wasm_args) |arg| argv.append(allocator, arg) catch return 1;
+
+    const wasi_ctx = wamr.WasiProcessState.init(allocator, io) catch |err| {
+        std.debug.print("Error: failed to create WASI process state: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer wasi_ctx.deinit();
+    wasi_ctx.setArgs(argv.items) catch return 1;
+
+    var env_buf: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer env_buf.deinit(allocator);
+    if (env_flags.len > 0) {
+        env_buf.ensureTotalCapacity(allocator, env_flags.len) catch return 1;
+        for (env_flags) |kv| env_buf.appendAssumeCapacity(kv);
+    } else {
+        var it = environ_map.array_hash_map.iterator();
+        while (it.next()) |kv| {
+            const joined = std.fmt.allocPrint(
+                allocator,
+                "{s}={s}",
+                .{ kv.key_ptr.*, kv.value_ptr.* },
+            ) catch return 1;
+            env_buf.append(allocator, joined) catch {
+                allocator.free(joined);
+                return 1;
+            };
+        }
+    }
+    defer if (env_flags.len == 0) {
+        for (env_buf.items) |entry| allocator.free(entry);
+    };
+    wasi_ctx.setEnv(env_buf.items) catch return 1;
+    for (map_dirs) |mapping| {
+        _ = wasi_ctx.openMappedDir(mapping.host_path, mapping.guest_name) catch |err| {
+            std.debug.print(
+                "Error: cannot pre-open '{s}' as '{s}': {s}\n",
+                .{ mapping.host_path, mapping.guest_name, @errorName(err) },
+            );
+            return 1;
+        };
+    }
+
+    const import_ctx: ?wamr.instance.ImportContext =
+        if (memory_imports.memories.len == 0)
+            null
+        else
+            .{ .memories = memory_imports.memories };
+    const module_inst = wamr.instance.instantiateWithOptions(&module, allocator, .{
+        .import_ctx = import_ctx,
+        .defer_start = true,
+    }) catch |err| {
+        std.debug.print("Error: failed to instantiate core module: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer wamr.instance.destroy(module_inst);
+    module_inst.attachProcessState(wasi_ctx.processStateRef());
+
+    var manager = wamr.thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    const manager_enabled = wamr.config.lib_wasi_threads and uses_wasi_threads;
+    if (manager_enabled) {
+        manager.prepareInterpreterInstance(module_inst) catch |err| {
+            std.debug.print(
+                "Error: failed to prepare WASI thread group: {s}\n",
+                .{@errorName(err)},
+            );
+            return 1;
+        };
+        module_inst.thread_manager = &manager;
+    }
+
+    wamr.instance.runStartFunction(module_inst) catch |err| {
+        if (manager_enabled) {
+            manager.signalTrap();
+            _ = manager.shutdownWithSummary();
+        }
+        if (wasi_ctx.getExitCode()) |code| return @truncate(code);
+        std.debug.print("Error: core module start function trapped: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    const wasi_start = module.findExport("_start", .function);
+    const start_func = wasi_start orelse module.findExport("main", .function) orelse {
+        if (manager_enabled) _ = manager.shutdownWithSummary();
+        std.debug.print("Error: no _start or main function exported\n", .{});
+        return 1;
+    };
+    const is_main = wasi_start == null;
+    const func_type = module.getFuncType(start_func.index) orelse {
+        if (manager_enabled) _ = manager.shutdownWithSummary();
+        std.debug.print("Error: entry point has no function type\n", .{});
+        return 1;
+    };
+    if (func_type.params.len != 0) {
+        if (manager_enabled) _ = manager.shutdownWithSummary();
+        std.debug.print("Error: entry point parameters are not supported; use a WASI _start export\n", .{});
+        return 1;
+    }
+    if ((!is_main and func_type.results.len != 0) or
+        (is_main and (func_type.results.len > 1 or
+            (func_type.results.len == 1 and func_type.results[0] != .i32))))
+    {
+        if (manager_enabled) _ = manager.shutdownWithSummary();
+        std.debug.print("Error: unsupported entry point result signature\n", .{});
+        return 1;
+    }
+
+    const env = wamr.exec_env.ExecEnv.create(module_inst, stack_size, allocator) catch |err| {
+        if (manager_enabled) _ = manager.shutdownWithSummary();
+        std.debug.print("Error: failed to create execution environment: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer env.destroy();
+
+    var execution_error: ?anyerror = null;
+    wamr.interp.executeFunction(env, start_func.index) catch |err| {
+        execution_error = err;
+        if (manager_enabled) manager.signalTrap();
+    };
+    const summary = if (manager_enabled)
+        manager.shutdownWithSummary()
+    else
+        wamr.thread_manager.JoinSummary{};
+
+    if (wasi_ctx.getExitCode()) |code| return @truncate(code);
+    if (execution_error) |err| {
+        std.debug.print("Error: execution trapped: {s}\n", .{@errorName(err)});
+        return 1;
+    }
+    if (summary.trapped != 0) {
+        std.debug.print(
+            "Error: {d} WASI child thread{s} trapped\n",
+            .{ summary.trapped, if (summary.trapped == 1) "" else "s" },
+        );
+        return 1;
+    }
+    if (is_main and func_type.results.len == 1) {
+        const code = env.popI32() catch return 1;
+        return @truncate(@as(u32, @bitCast(code)));
+    }
+    return 0;
+}
+
 fn runAot(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1474,7 +1735,8 @@ const top_usage =
 
 const run_usage_options =
     \\Options:
-    \\  --stack-size=<bytes>     (ignored; kept for backward compat)
+    \\  --stack-size=<bytes>     Interpreter operand-stack slots; ignored by
+    \\                           AOT/JIT builds
     \\  --heap-size=<bytes>      Reserved (currently ignored)
     \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
     \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
@@ -1559,7 +1821,24 @@ const run_usage_intro_jit =
     \\
 ;
 
-const run_usage = if (wamr.config.jit) run_usage_intro_jit ++ run_usage_options else run_usage_intro_aot_only ++ run_usage_options;
+const run_usage_intro_interpreter =
+    \\Usage: wamr run [options] <file.wasm> [args...]
+    \\
+    \\This `wamr` binary is an interpreter-only build:
+    \\  * Plain core `.wasm` modules execute directly.
+    \\  * `-Dlib_wasi_threads=true` enables the production Preview-1
+    \\    `wasi.thread-spawn` binding with one shared process/thread group.
+    \\  * AOT thread spawning and Component Model threads remain unavailable.
+    \\
+    \\
+;
+
+const run_usage = if (wamr.config.interp and !wamr.config.aot)
+    run_usage_intro_interpreter ++ run_usage_options
+else if (wamr.config.jit)
+    run_usage_intro_jit ++ run_usage_options
+else
+    run_usage_intro_aot_only ++ run_usage_options;
 
 const serve_usage_options =
     \\Options:

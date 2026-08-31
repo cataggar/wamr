@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
     const lib_pthread = b.option(bool, "lib_pthread", "Enable pthread library") orelse false;
     options.addOption(bool, "lib_pthread", lib_pthread);
 
-    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable the WASI threads configuration contract (production host binding is not implemented)") orelse false;
+    const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable production Preview-1 WASI threads in interpreter-only builds") orelse false;
     options.addOption(bool, "lib_wasi_threads", lib_wasi_threads);
 
     const thread_mgr = (b.option(bool, "thread_mgr", "Enable thread manager") orelse false) or lib_wasi_threads;
@@ -318,6 +318,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "instantiate rejects configured WASI threads",
             "host functions resolved for wasi thread-spawn import",
+            "enabled wasi thread-spawn validates import ABI and shared memory",
+            "disabled feature preserves the negative rejection result",
         },
     });
     const run_threads_runtime_tests = b.addRunArtifact(threads_runtime_tests);
@@ -400,6 +402,123 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
     wabt_module.addImport("build_options", wabt_build_options.createModule());
+
+    const wabt_host_module = b.createModule(.{
+        .root_source_file = wabt_dep.path("src/root.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    wabt_host_module.addImport("build_options", wabt_build_options.createModule());
+    const thread_fixture_generator_module = b.createModule(.{
+        .root_source_file = b.path("tests/wasi-threads/generate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    thread_fixture_generator_module.addImport("wabt", wabt_host_module);
+    const thread_fixture_generator = b.addExecutable(.{
+        .name = "generate-wasi-thread-fixtures",
+        .root_module = thread_fixture_generator_module,
+    });
+    const update_thread_fixtures = b.addRunArtifact(thread_fixture_generator);
+    inline for (.{
+        "pthread-contract",
+        "imported-memory",
+        "shared-descriptors",
+        "parent-teardown",
+        "child-trap",
+        "child-proc-exit",
+        "missing-thread-start",
+        "wrong-thread-start-signature",
+        "disabled-rejection",
+    }) |fixture| {
+        update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wat", .{fixture}));
+        update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}));
+    }
+    const update_thread_fixtures_step = b.step(
+        "update-wasi-thread-fixtures",
+        "Regenerate checked-in Preview-1 WASI thread fixtures",
+    );
+    update_thread_fixtures_step.dependOn(&update_thread_fixtures.step);
+
+    const wasi_threads_test_step = b.step(
+        "test-wasi-threads",
+        "Run Preview-1 WASI thread interpreter fixtures",
+    );
+    if (!aot) {
+        if (lib_wasi_threads) {
+            const contract = b.addRunArtifact(exe);
+            contract.addArgs(&.{
+                "run",
+                "tests/wasi-threads/pthread-contract.wasm",
+            });
+            contract.expectExitCode(0);
+            wasi_threads_test_step.dependOn(&contract.step);
+
+            const imported_memory = b.addRunArtifact(exe);
+            imported_memory.addArgs(&.{
+                "run",
+                "tests/wasi-threads/imported-memory.wasm",
+            });
+            imported_memory.expectExitCode(0);
+            wasi_threads_test_step.dependOn(&imported_memory.step);
+
+            const shared_descriptors = b.addRunArtifact(exe);
+            shared_descriptors.addArgs(&.{
+                "run",
+                "--map-dir=tests/wasi-threads/preopen::fixture",
+                "tests/wasi-threads/shared-descriptors.wasm",
+            });
+            shared_descriptors.expectExitCode(0);
+            shared_descriptors.expectStdOutEqual("child-shared-fd\n");
+            wasi_threads_test_step.dependOn(&shared_descriptors.step);
+
+            const parent_teardown = b.addRunArtifact(exe);
+            parent_teardown.addArgs(&.{
+                "run",
+                "tests/wasi-threads/parent-teardown.wasm",
+            });
+            parent_teardown.expectExitCode(0);
+            parent_teardown.expectStdOutEqual("child-after-parent\n");
+            wasi_threads_test_step.dependOn(&parent_teardown.step);
+
+            const child_trap = b.addRunArtifact(exe);
+            child_trap.addArgs(&.{
+                "run",
+                "tests/wasi-threads/child-trap.wasm",
+            });
+            child_trap.expectExitCode(1);
+            wasi_threads_test_step.dependOn(&child_trap.step);
+
+            const child_proc_exit = b.addRunArtifact(exe);
+            child_proc_exit.addArgs(&.{
+                "run",
+                "tests/wasi-threads/child-proc-exit.wasm",
+            });
+            child_proc_exit.expectExitCode(7);
+            wasi_threads_test_step.dependOn(&child_proc_exit.step);
+
+            inline for (.{
+                "missing-thread-start",
+                "wrong-thread-start-signature",
+            }) |fixture| {
+                const run = b.addRunArtifact(exe);
+                run.addArgs(&.{
+                    "run",
+                    b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}),
+                });
+                run.expectExitCode(0);
+                wasi_threads_test_step.dependOn(&run.step);
+            }
+        } else {
+            const disabled = b.addRunArtifact(exe);
+            disabled.addArgs(&.{
+                "run",
+                "tests/wasi-threads/disabled-rejection.wasm",
+            });
+            disabled.expectExitCode(0);
+            wasi_threads_test_step.dependOn(&disabled.step);
+        }
+    }
 
     const spec_runner_module = b.createModule(.{
         .root_source_file = b.path("src/tests/run_spec_tests.zig"),
@@ -811,6 +930,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(stable_resources_test_step);
     test_step.dependOn(execution_context_test_step);
+    test_step.dependOn(wasi_threads_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
     test_step.dependOn(&frame_attribution_tests.step);
     if (target_arch == .x86_64 and target.result.os.tag == .linux) {
