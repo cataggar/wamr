@@ -5,6 +5,8 @@
 //! the caller can poll for completion via waitable sets.
 
 const std = @import("std");
+const config = @import("../config.zig");
+const stable_resource = @import("../shared/stable_resource.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
 
 // ── Task state ──────────────────────────────────────────────────────────────
@@ -27,14 +29,21 @@ pub const TaskState = enum(u8) {
 /// to revisit the constant on the first conformance suite that uses 2.
 pub const N_CONTEXT_SLOTS: u32 = execution_context.task_context_slot_count;
 
+pub const WaitableRegistration = struct {
+    set_handle: u32,
+    item_index: u32,
+};
+
 /// A task represents an in-flight async component function call.
 pub const Task = struct {
     id: u32,
     state: TaskState = .created,
     /// Return value buffer (set when state transitions to .returned).
     return_values: []u32 = &.{},
+    return_values_allocator: ?std.mem.Allocator = null,
     /// Waiters to notify when state changes.
     waitable_set: ?*WaitableSet = null,
+    waitable_idx: ?u32 = null,
     /// Per-task `context.{get,set} i32` slots. Default-initialised to 0
     /// to match Wasmtime's behaviour for a freshly-started task.
     context_slots: [N_CONTEXT_SLOTS]u32 = [_]u32{0} ** N_CONTEXT_SLOTS,
@@ -46,6 +55,7 @@ pub const Task = struct {
 /// streams, and futures. Callers use wait/poll to discover which
 /// registered items are ready.
 pub const WaitableSet = struct {
+    mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.waitable_set) = .init,
     /// Registered items that can become ready.
     items: std.ArrayListUnmanaged(WaitableItem) = .empty,
     /// FIFO of indices that have become ready since the last
@@ -58,6 +68,7 @@ pub const WaitableSet = struct {
     pub const WaitableItem = struct {
         kind: Kind,
         handle: u32, // task/stream/future handle
+        active: bool = true,
         ready: bool = false,
         /// Packed status word delivered as the event payload2 when this
         /// item is surfaced by `waitable-set.{wait,poll}`. For
@@ -77,9 +88,20 @@ pub const WaitableSet = struct {
     /// stream/future entry so subsequent `setReady` calls can find
     /// the right slot.
     pub fn register(self: *WaitableSet, item: WaitableItem, allocator: std.mem.Allocator) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const idx: u32 = @intCast(self.items.items.len);
         try self.items.append(allocator, item);
         return idx;
+    }
+
+    /// Invalidate a registration without shifting later indices.
+    pub fn unregister(self: *WaitableSet, idx: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (idx >= self.items.items.len) return;
+        self.items.items[idx].active = false;
+        self.items.items[idx].ready = false;
     }
 
     /// Mark an item as ready and enqueue it for the next
@@ -96,13 +118,28 @@ pub const WaitableSet = struct {
         allocator: std.mem.Allocator,
         code: u32,
     ) void {
-        if (idx >= self.items.items.len) return;
+        _ = self.trySetReady(idx, allocator, code);
+    }
+
+    /// `setReady` with explicit OOM reporting. On allocation failure the
+    /// item remains unqueued and can be retried without a stale ready flag.
+    pub fn trySetReady(
+        self: *WaitableSet,
+        idx: u32,
+        allocator: std.mem.Allocator,
+        code: u32,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (idx >= self.items.items.len) return false;
         const item = &self.items.items[idx];
+        if (!item.active) return false;
         item.code = code;
         if (!item.ready) {
+            self.ready_queue.append(allocator, idx) catch return false;
             item.ready = true;
-            self.ready_queue.append(allocator, idx) catch {};
         }
+        return true;
     }
 
     /// Pop the oldest ready item from the queue, clearing its `ready`
@@ -111,11 +148,13 @@ pub const WaitableSet = struct {
     /// event payload without re-indexing. `null` when no ready items
     /// remain — the wait/poll arm signals NONE in that case.
     pub fn popReadyEvent(self: *WaitableSet) ?WaitableItem {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         while (self.ready_queue.items.len > 0) {
             const idx = self.ready_queue.orderedRemove(0);
             if (idx >= self.items.items.len) continue;
             const item = &self.items.items[idx];
-            if (!item.ready) continue;
+            if (!item.active or !item.ready) continue;
             item.ready = false;
             return item.*;
         }
@@ -130,9 +169,11 @@ pub const WaitableSet = struct {
     /// real event delivery goes through `popReadyEvent` so the
     /// guest receives `(kind, handle, code)`.
     pub fn pollReady(self: *WaitableSet, out: []u32) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var count: u32 = 0;
         for (self.items.items, 0..) |*item, i| {
-            if (item.ready) {
+            if (item.active and item.ready) {
                 if (count < out.len) {
                     out[count] = @intCast(i);
                     count += 1;
@@ -147,8 +188,14 @@ pub const WaitableSet = struct {
     }
 
     pub fn deinit(self: *WaitableSet, allocator: std.mem.Allocator) void {
-        self.items.deinit(allocator);
-        self.ready_queue.deinit(allocator);
+        self.mutex.lock();
+        var items = self.items;
+        var ready_queue = self.ready_queue;
+        self.items = .empty;
+        self.ready_queue = .empty;
+        self.mutex.unlock();
+        items.deinit(allocator);
+        ready_queue.deinit(allocator);
     }
 };
 
@@ -158,24 +205,37 @@ pub const WaitableSet = struct {
 pub const TaskManager = struct {
     tasks: std.ArrayListUnmanaged(Task) = .empty,
     next_id: u32 = 1,
-    /// Handle of the task currently executing a core-wasm body, or `null`
-    /// when no async task is on the dispatch stack. `context.{get,set}`
-    /// and `task.yield` consult this to find their target task; when it's
-    /// `null` (synchronous canon-lift call path), callers should fall
-    /// back to `ComponentInstance.implicit_task`.
-    current_task: ?u32 = null,
+    allocator: ?std.mem.Allocator = null,
+    mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.resource_registry) = .init,
+
+    pub const CurrentGuard = struct {
+        previous: ?CurrentTaskBinding,
+        active: bool = true,
+
+        pub fn deinit(self: *CurrentGuard) void {
+            if (!self.active) return;
+            current_task_binding = self.previous;
+            self.active = false;
+        }
+    };
 
     /// Create a new task. Returns the task handle.
     pub fn createTask(self: *TaskManager, allocator: std.mem.Allocator) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const task_allocator = self.allocator orelse allocator;
+        if (self.allocator == null) self.allocator = task_allocator;
         const id = self.next_id;
-        self.next_id += 1;
         const idx: u32 = @intCast(self.tasks.items.len);
-        try self.tasks.append(allocator, .{ .id = id });
+        try self.tasks.append(task_allocator, .{ .id = id });
+        self.next_id += 1;
         return idx;
     }
 
     /// Transition a task to the started state.
     pub fn startTask(self: *TaskManager, handle: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (handle < self.tasks.items.len) {
             self.tasks.items[handle].state = .started;
         }
@@ -183,19 +243,60 @@ pub const TaskManager = struct {
 
     /// Transition a task to the returned state with values.
     pub fn returnTask(self: *TaskManager, handle: u32, values: []u32) void {
+        const allocator = self.allocator orelse std.heap.page_allocator;
+        const owned = allocator.dupe(u32, values) catch {
+            self.cancelTask(handle);
+            return;
+        };
+        self.returnTaskOwned(handle, owned, allocator);
+    }
+
+    /// Transition a task to returned and take ownership of `values`.
+    pub fn returnTaskOwned(
+        self: *TaskManager,
+        handle: u32,
+        values: []u32,
+        values_allocator: std.mem.Allocator,
+    ) void {
+        var waitable_set: ?*WaitableSet = null;
+        var waitable_idx: ?u32 = null;
+        var old_values: []u32 = &.{};
+        var old_values_allocator: ?std.mem.Allocator = null;
+        var accepted = false;
+        self.mutex.lock();
         if (handle < self.tasks.items.len) {
             const task = &self.tasks.items[handle];
+            old_values = task.return_values;
+            old_values_allocator = task.return_values_allocator;
             task.state = .returned;
             task.return_values = values;
-            // Notify waitable set
-            if (task.waitable_set) |ws| {
-                ws.setReady(handle, std.heap.page_allocator, @intFromEnum(TaskState.returned));
-            }
+            task.return_values_allocator = values_allocator;
+            waitable_set = task.waitable_set;
+            waitable_idx = task.waitable_idx;
+            accepted = true;
         }
+        const allocator = self.allocator;
+        self.mutex.unlock();
+
+        const owned_allocator = allocator orelse std.heap.page_allocator;
+        if (!accepted) {
+            values_allocator.free(values);
+            return;
+        }
+        if (old_values.len > 0) old_values_allocator.?.free(old_values);
+        if (waitable_set) |ws| if (waitable_idx) |idx| {
+            ws.setReady(
+                idx,
+                owned_allocator,
+                @intFromEnum(TaskState.returned),
+            );
+        };
     }
 
     /// Cancel a task.
     pub fn cancelTask(self: *TaskManager, handle: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (handle < self.tasks.items.len) {
             self.tasks.items[handle].state = .cancelled;
         }
@@ -203,6 +304,9 @@ pub const TaskManager = struct {
 
     /// Get the state of a task.
     pub fn getState(self: *const TaskManager, handle: u32) ?TaskState {
+        const mutable: *TaskManager = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
         if (handle >= self.tasks.items.len) return null;
         return self.tasks.items[handle].state;
     }
@@ -210,6 +314,9 @@ pub const TaskManager = struct {
     /// Read a per-task `context.get i32 i` slot. Returns `null` if the
     /// task handle is unknown or the slot index is out of range.
     pub fn getContextSlot(self: *const TaskManager, handle: u32, slot: u32) ?u32 {
+        const mutable: *TaskManager = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
         if (handle >= self.tasks.items.len) return null;
         if (slot >= N_CONTEXT_SLOTS) return null;
         return self.tasks.items[handle].context_slots[slot];
@@ -219,6 +326,8 @@ pub const TaskManager = struct {
     /// task handle is unknown or the slot index is out of range; the
     /// caller surfaces this as a component trap.
     pub fn setContextSlot(self: *TaskManager, handle: u32, slot: u32, value: u32) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (handle >= self.tasks.items.len) return false;
         if (slot >= N_CONTEXT_SLOTS) return false;
         self.tasks.items[handle].context_slots[slot] = value;
@@ -226,9 +335,112 @@ pub const TaskManager = struct {
     }
 
     pub fn deinit(self: *TaskManager, allocator: std.mem.Allocator) void {
-        self.tasks.deinit(allocator);
+        self.mutex.lock();
+        var tasks = self.tasks;
+        const task_allocator = self.allocator orelse allocator;
+        self.tasks = .empty;
+        self.allocator = null;
+        self.mutex.unlock();
+        for (tasks.items) |task| {
+            if (task.return_values.len > 0) {
+                task.return_values_allocator.?.free(task.return_values);
+            }
+        }
+        tasks.deinit(task_allocator);
+    }
+
+    pub fn bindCurrent(self: *TaskManager, handle: u32) CurrentGuard {
+        const previous = current_task_binding;
+        current_task_binding = .{ .manager = self, .handle = handle };
+        return .{ .previous = previous };
+    }
+
+    pub fn currentTask(self: *TaskManager) ?u32 {
+        const binding = current_task_binding orelse return null;
+        if (binding.manager != self) return null;
+        return binding.handle;
+    }
+
+    pub fn setWaitable(
+        self: *TaskManager,
+        handle: u32,
+        waitable_set: *WaitableSet,
+        waitable_idx: u32,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (handle >= self.tasks.items.len) return false;
+        self.tasks.items[handle].waitable_set = waitable_set;
+        self.tasks.items[handle].waitable_idx = waitable_idx;
+        return true;
+    }
+
+    pub fn taskCount(self: *const TaskManager) usize {
+        const mutable: *TaskManager = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
+        return self.tasks.items.len;
+    }
+
+    pub fn copyReturnValues(
+        self: *const TaskManager,
+        handle: u32,
+        allocator: std.mem.Allocator,
+    ) !?[]u32 {
+        const mutable: *TaskManager = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
+        if (handle >= self.tasks.items.len) return null;
+        const task = self.tasks.items[handle];
+        if (task.state != .returned) return null;
+        return try allocator.dupe(u32, task.return_values);
+    }
+
+    pub fn returnValuesForTesting(
+        self: *const TaskManager,
+        handle: u32,
+    ) ?[]u32 {
+        if (!@import("builtin").is_test)
+            @compileError("use copyReturnValues() outside tests");
+        const mutable: *TaskManager = @constCast(self);
+        mutable.mutex.lock();
+        defer mutable.mutex.unlock();
+        if (handle >= self.tasks.items.len) return null;
+        const task = self.tasks.items[handle];
+        if (task.state != .returned) return null;
+        return task.return_values;
+    }
+
+    pub fn yieldTask(self: *TaskManager, handle: u32, cancellable: bool) bool {
+        var waitable_set: ?*WaitableSet = null;
+        self.mutex.lock();
+        if (handle >= self.tasks.items.len) {
+            self.mutex.unlock();
+            return false;
+        }
+        const task = &self.tasks.items[handle];
+        if (cancellable and task.state == .cancelled) {
+            self.mutex.unlock();
+            return true;
+        }
+        waitable_set = task.waitable_set;
+        if (task.state == .created) task.state = .started;
+        self.mutex.unlock();
+
+        if (waitable_set) |ws| {
+            var sink: [16]u32 = undefined;
+            _ = ws.pollReady(&sink);
+        }
+        return false;
     }
 };
+
+const CurrentTaskBinding = struct {
+    manager: *TaskManager,
+    handle: u32,
+};
+
+threadlocal var current_task_binding: ?CurrentTaskBinding = null;
 
 // ── Futures ─────────────────────────────────────────────────────────────────
 
@@ -255,10 +467,10 @@ pub const Future = struct {
     /// guest pointer is stashed so that a subsequent `future.write` can
     /// copy straight into the parked reader's memory and complete.
     pending_read: ?PendingRead = null,
-    /// Waitable plumbing for `waitable.join` integration.
-    waitable_set: ?*WaitableSet = null,
-    read_waitable_idx: ?u32 = null,
-    write_waitable_idx: ?u32 = null,
+    /// Stable waitable-set registrations. Handles carry generations, so a
+    /// dropped set can never redirect a later notification to a new set.
+    read_waitable: ?WaitableRegistration = null,
+    write_waitable: ?WaitableRegistration = null,
     state: State = .pending,
     /// Both ends are closed only after both `drop-readable` and
     /// `drop-writable`. Tracked separately so cancellation observes the
@@ -530,10 +742,15 @@ pub const AsyncStream = struct {
     /// targets synchronous-once stdio with future-coupled completion.
     host_handler: ?HostStreamHandler = null,
 
-    /// Waitable plumbing for `waitable.join` integration.
-    waitable_set: ?*WaitableSet = null,
-    read_waitable_idx: ?u32 = null,
-    write_waitable_idx: ?u32 = null,
+    /// Reserve host callbacks under the stream lock, then invoke them after
+    /// unlocking. Reentrant operations observe the reservation and never
+    /// recursively invoke the same callback.
+    host_read_inflight: bool = false,
+    host_write_inflight: bool = false,
+
+    /// Stable waitable-set registrations.
+    read_waitable: ?WaitableRegistration = null,
+    write_waitable: ?WaitableRegistration = null,
 
     state: State = .open,
     /// Both ends are closed only after both `drop-readable` and
@@ -785,4 +1002,117 @@ test "AsyncStream: host_driver field defaults to null and can be installed (#535
     try std.testing.expectEqual(HostStreamAction.progressed, action);
     try std.testing.expectEqual(@as(usize, 2), s.buffer.items.len);
     s.deinit(std.testing.allocator);
+}
+
+test "component resource safety: concurrent task handles and TLS binding" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+
+    const thread_count = 4;
+    const tasks_per_thread = 128;
+    var manager = TaskManager{};
+    defer manager.deinit(std.testing.allocator);
+    var failed = std.atomic.Value(bool).init(false);
+
+    const Runner = struct {
+        fn run(target: *TaskManager, did_fail: *std.atomic.Value(bool), seed: u32) void {
+            var i: u32 = 0;
+            while (i < tasks_per_thread) : (i += 1) {
+                const handle = target.createTask(std.testing.allocator) catch {
+                    did_fail.store(true, .release);
+                    return;
+                };
+                var current = target.bindCurrent(handle);
+                defer current.deinit();
+                if (target.currentTask() != handle) {
+                    did_fail.store(true, .release);
+                    return;
+                }
+                target.startTask(handle);
+                if (!target.setContextSlot(handle, 0, seed + i)) {
+                    did_fail.store(true, .release);
+                    return;
+                }
+                if (target.getContextSlot(handle, 0) != seed + i) {
+                    did_fail.store(true, .release);
+                    return;
+                }
+            }
+        }
+    };
+
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(
+            .{},
+            Runner.run,
+            .{ &manager, &failed, @as(u32, @intCast(i * tasks_per_thread)) },
+        );
+    }
+    for (threads) |thread| thread.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(
+        @as(usize, thread_count * tasks_per_thread),
+        manager.taskCount(),
+    );
+    try std.testing.expect(manager.currentTask() == null);
+}
+
+test "component resource safety: waitable set producer consumer race" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+
+    const producer_count = 4;
+    var waitable_set = WaitableSet{};
+    defer waitable_set.deinit(std.testing.allocator);
+    var indices: [producer_count]u32 = undefined;
+    for (&indices, 0..) |*index, i| {
+        index.* = try waitable_set.register(.{
+            .kind = .future_read,
+            .handle = @intCast(i + 1),
+        }, std.testing.allocator);
+    }
+
+    var completed = std.atomic.Value(usize).init(0);
+    const Producer = struct {
+        fn run(
+            target: *WaitableSet,
+            index: u32,
+            done: *std.atomic.Value(usize),
+        ) void {
+            var i: u32 = 0;
+            while (i < 2000) : (i += 1) {
+                target.setReady(index, std.testing.allocator, i);
+            }
+            _ = done.fetchAdd(1, .release);
+        }
+    };
+
+    var threads: [producer_count]std.Thread = undefined;
+    for (&threads, indices) |*thread, index| {
+        thread.* = try std.Thread.spawn(
+            .{},
+            Producer.run,
+            .{ &waitable_set, index, &completed },
+        );
+    }
+
+    var seen: u8 = 0;
+    while (completed.load(.acquire) != producer_count) {
+        while (waitable_set.popReadyEvent()) |event| {
+            if (event.handle >= 1 and event.handle <= producer_count) {
+                seen |= @as(u8, 1) << @intCast(event.handle - 1);
+            }
+        }
+        std.Thread.yield() catch {};
+    }
+    for (threads) |thread| thread.join();
+    while (waitable_set.popReadyEvent()) |event| {
+        if (event.handle >= 1 and event.handle <= producer_count) {
+            seen |= @as(u8, 1) << @intCast(event.handle - 1);
+        }
+    }
+    try std.testing.expectEqual(
+        @as(u8, (1 << producer_count) - 1),
+        seen,
+    );
 }

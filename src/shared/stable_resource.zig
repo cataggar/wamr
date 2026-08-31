@@ -1,10 +1,12 @@
 //! Conditional synchronization and stable lease-based handle tables.
 //!
-//! The configured aliases erase synchronization and reference-count storage
-//! when WASI threads are disabled. In that mode a lease is a scoped borrow:
-//! callers must release it before removing its handle. Thread-enabled tables
-//! retain retired nodes until the final lease is released. Reused directory
-//! slots advance a generation embedded in the handle, preventing ABA.
+//! The configured aliases erase synchronization and atomic reference-count
+//! storage when WASI threads are disabled. Generational tables then use scoped
+//! borrows, while keyed tables defer callback-facing node destruction across
+//! reentrant removal without touching an atomic or per-lookup reference count.
+//! Thread-enabled tables retain retired nodes until the final lease is
+//! released. Reused directory slots advance a generation embedded in the
+//! public handle, preventing ABA.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,9 +14,9 @@ const config = @import("config");
 
 pub const Handle = u32;
 
-/// Stable handles reserve the high byte for a generation and the low 24 bits
-/// for the directory slot. A slot is retired permanently instead of wrapping
-/// its generation, so an old handle can never alias a later occupant.
+/// Stable handles reserve the high byte for a generation and the low
+/// 24 bits for the directory slot. A slot is retired permanently instead of
+/// wrapping its generation, so an old handle can never alias a later occupant.
 pub const handle_index_bits = 24;
 pub const handle_generation_bits = @bitSizeOf(Handle) - handle_index_bits;
 pub const max_handle_index: Handle = (1 << handle_index_bits) - 1;
@@ -38,6 +40,7 @@ pub const LockRank = struct {
     pub const resource_registry: u16 = 50;
     pub const resource_directory: u16 = 100;
     pub const resource_node: u16 = 200;
+    pub const waitable_set: u16 = 225;
     pub const core_instance: u16 = 250;
     pub const core_table: u16 = 300;
 };
@@ -378,11 +381,32 @@ pub fn StableHandleTableFor(
     comptime destroy: fn (Context, *T) void,
     comptime chunk_capacity: usize,
 ) type {
+    return StableHandleTableForStart(
+        enabled,
+        T,
+        Context,
+        destroy,
+        chunk_capacity,
+        0,
+    );
+}
+
+/// Stable table variant whose first generation-zero slot has `first_index`.
+/// Component async handles use `1` because zero is their ABI sentinel.
+pub fn StableHandleTableForStart(
+    comptime enabled: bool,
+    comptime T: type,
+    comptime Context: type,
+    comptime destroy: fn (Context, *T) void,
+    comptime chunk_capacity: usize,
+    comptime first_index: Handle,
+) type {
     comptime {
         if (chunk_capacity == 0) @compileError("chunk_capacity must be non-zero");
         if (chunk_capacity > max_handle_index + 1) {
             @compileError("chunk_capacity does not fit in a handle");
         }
+        if (first_index > max_handle_index) @compileError("first_index does not fit in a handle");
     }
 
     return struct {
@@ -543,16 +567,16 @@ pub fn StableHandleTableFor(
                     return error.TableShuttingDown;
                 }
 
-                if (control.free_head) |slot_index| {
-                    const slot = findSlotByIndex(control, slot_index).?;
+                if (control.free_head) |handle| {
+                    const slot = findSlotByIndex(control, handle).?;
                     const next = switch (slot.*) {
                         .free => |free_slot| free_slot.next,
                         else => unreachable,
                     };
                     const generation = slot.free.generation;
                     control.free_head = next;
-                    node.slot_index = slot_index;
-                    node.handle = makeHandle(slot_index, generation);
+                    node.slot_index = handle;
+                    node.handle = makeHandle(handle, generation);
                     slot.* = .{ .published = node };
                     recordPublish(control);
                     control.directory.unlock();
@@ -586,7 +610,7 @@ pub fn StableHandleTableFor(
                             return error.HandleExhausted;
                         }
                     else
-                        0;
+                        first_index;
                     if (base > max_handle_index - (chunk_capacity - 1)) {
                         control.directory.unlock();
                         return error.HandleExhausted;
@@ -649,6 +673,23 @@ pub fn StableHandleTableFor(
             return .{ .node = node };
         }
 
+        /// Test-only escape hatch for legacy single-threaded fixtures.
+        /// Production code must use `acquire`; this pointer carries no lease.
+        pub fn unsafeValuePtrForTesting(self: *Self, handle: Handle) ?*T {
+            if (!builtin.is_test) @compileError("use acquire() outside tests");
+            const control = self.control.?;
+            control.directory.lock();
+            defer control.directory.unlock();
+            if (control.shutting_down) return null;
+            const slot = findSlot(control, handle) orelse return null;
+            const node = switch (slot.*) {
+                .published => |published| published,
+                else => return null,
+            };
+            if (node.handle != handle) return null;
+            return &node.value;
+        }
+
         /// Roll back a successful publication without invoking `destroy`.
         ///
         /// This succeeds only while the table owns the sole reference, so it
@@ -678,7 +719,7 @@ pub fn StableHandleTableFor(
                     return null;
                 }
             }
-            node.setState(.destroying);
+
             node.setState(.destroying);
             recycleSlot(control, slot, node);
             control.published -= 1;
@@ -778,42 +819,30 @@ pub fn StableHandleTableFor(
             };
         }
 
-        /// Return a point-in-time copy of all currently-published handles.
-        /// Allocation and caller work happen outside the directory lock.
-        pub fn snapshotHandles(
-            self: *Self,
-            allocator: std.mem.Allocator,
-        ) ![]Handle {
+        /// Return a point-in-time copy of all currently published handles.
+        /// No table-owned pointers escape the directory lock.
+        pub fn snapshotHandles(self: *Self, allocator: std.mem.Allocator) ![]Handle {
             const control = self.control.?;
-            while (true) {
-                control.directory.lock();
-                const capacity = control.published;
-                control.directory.unlock();
+            control.directory.lock();
+            defer control.directory.unlock();
+            if (control.shutting_down) return allocator.alloc(Handle, 0);
 
-                const handles = try allocator.alloc(Handle, capacity);
-                var filled: usize = 0;
-                control.directory.lock();
-                if (control.published > handles.len) {
-                    control.directory.unlock();
-                    allocator.free(handles);
-                    continue;
-                }
-                var chunk = control.head;
-                while (chunk) |current| : (chunk = current.next) {
-                    for (current.slots[0..current.used]) |slot| {
-                        switch (slot) {
-                            .published => |node| {
-                                handles[filled] = node.handle;
-                                filled += 1;
-                            },
-                            else => {},
-                        }
+            const handles = try allocator.alloc(Handle, control.published);
+            var len: usize = 0;
+            var chunk = control.head;
+            while (chunk) |current| : (chunk = current.next) {
+                for (current.slots[0..current.used]) |slot| {
+                    switch (slot) {
+                        .published => |node| {
+                            handles[len] = node.handle;
+                            len += 1;
+                        },
+                        else => {},
                     }
                 }
-                control.directory.unlock();
-                if (filled == handles.len) return handles;
-                return try allocator.realloc(handles, filled);
             }
+            std.debug.assert(len == handles.len);
+            return handles;
         }
 
         /// Shuts down and frees an already-quiescent table. Outstanding
@@ -911,6 +940,377 @@ pub fn StableHandleTableFor(
     };
 }
 
+/// A conditionally-stable map from caller-owned public handles to values.
+///
+/// Enabled builds keep map values in the shared stable-node directory.
+/// Disabled builds use heap-stable plain nodes and a value-specific busy
+/// predicate. Ordinary leases remain scoped borrows; busy nodes defer
+/// same-handle destruction until the callback clears its in-flight marker,
+/// without a per-lookup reference update.
+///
+/// `publishAt` takes ownership only on success. Removal first unlinks the
+/// public handle, then runs `destroy` outside both directory and value locks.
+pub fn StableKeyedHandleTableFor(
+    comptime enabled: bool,
+    comptime T: type,
+    comptime Context: type,
+    comptime destroy: fn (Context, *T) void,
+    comptime lock_values: bool,
+    comptime defer_destroy: ?fn (*const T) bool,
+) type {
+    return struct {
+        const Self = @This();
+        const DirectoryMutex = ConditionalMutexFor(enabled, LockRank.resource_registry);
+        const ValueMutex = ConditionalMutexFor(enabled and lock_values, LockRank.resource_node);
+
+        const Stored = struct {
+            owner: if (enabled) void else *Self = if (enabled) {} else undefined,
+            mutex: ValueMutex = .init,
+            closing: if (enabled) void else bool = if (enabled) {} else false,
+            retired_next: if (enabled) void else ?*Stored =
+                if (enabled) {} else null,
+            value: T,
+        };
+
+        const Destroyer = struct {
+            fn run(context: Context, stored: *Stored) void {
+                assertNoLocksHeldFor(enabled);
+                destroy(context, &stored.value);
+            }
+        };
+
+        const Resources = StableHandleTableFor(
+            enabled,
+            Stored,
+            Context,
+            Destroyer.run,
+            64,
+        );
+        const DirectoryValue = if (enabled) Handle else *Stored;
+
+        pub const Lease = struct {
+            storage: if (enabled) Resources.Lease else ?*Stored,
+            locked: bool = true,
+            active: bool = true,
+
+            pub fn value(self: *Lease) *T {
+                std.debug.assert(self.active and self.locked);
+                return &self.stored().value;
+            }
+
+            pub fn isClosing(self: *const Lease) bool {
+                std.debug.assert(self.active);
+                if (comptime enabled) return self.storage.isClosing();
+                return self.storage.?.closing;
+            }
+
+            pub fn unlock(self: *Lease) void {
+                std.debug.assert(self.active and self.locked);
+                self.stored().mutex.unlock();
+                self.locked = false;
+            }
+
+            pub fn lock(self: *Lease) void {
+                std.debug.assert(self.active and !self.locked);
+                self.stored().mutex.lock();
+                self.locked = true;
+            }
+
+            pub fn release(self: *Lease) void {
+                if (!self.active) return;
+                if (self.locked) self.unlock();
+                self.active = false;
+                if (comptime enabled) {
+                    self.storage.release();
+                } else {
+                    self.storage = null;
+                }
+            }
+
+            pub fn deinit(self: *Lease) void {
+                self.release();
+            }
+
+            fn stored(self: *Lease) *Stored {
+                if (comptime enabled) return self.storage.value();
+                return self.storage.?;
+            }
+        };
+
+        allocator: std.mem.Allocator,
+        context: Context,
+        directory: DirectoryMutex = .init,
+        entries: std.AutoHashMapUnmanaged(Handle, DirectoryValue) = .empty,
+        resources: if (enabled) Resources else void,
+        shutting_down: bool = false,
+        live_nodes: if (enabled) void else usize = if (enabled) {} else 0,
+        retired_head: if (enabled) void else ?*Stored =
+            if (enabled) {} else null,
+
+        pub fn init(allocator: std.mem.Allocator, context: Context) !Self {
+            return .{
+                .allocator = allocator,
+                .context = context,
+                .resources = if (enabled) try Resources.init(allocator, context) else {},
+            };
+        }
+
+        pub fn publishAt(self: *Self, public_handle: Handle, value: T) !void {
+            assertNoLocksHeldFor(enabled);
+            const resource_handle = if (comptime enabled)
+                try self.resources.publish(.{ .value = value })
+            else {};
+            const disabled_node = if (comptime !enabled) blk: {
+                const node = try self.allocator.create(Stored);
+                node.* = .{
+                    .owner = self,
+                    .value = value,
+                };
+                break :blk node;
+            } else {};
+            var disabled_committed = false;
+            defer {
+                if (comptime !enabled) {
+                    if (!disabled_committed) self.allocator.destroy(disabled_node);
+                }
+            }
+
+            self.directory.lock();
+            if (self.shutting_down) {
+                self.directory.unlock();
+                if (comptime enabled) {
+                    std.debug.assert(self.resources.withdraw(resource_handle) != null);
+                }
+                return error.TableShuttingDown;
+            }
+            if (self.entries.contains(public_handle)) {
+                self.directory.unlock();
+                if (comptime enabled) {
+                    std.debug.assert(self.resources.withdraw(resource_handle) != null);
+                }
+                return error.HandleAlreadyExists;
+            }
+
+            if (comptime enabled) {
+                self.entries.put(
+                    self.allocator,
+                    public_handle,
+                    resource_handle,
+                ) catch |err| {
+                    self.directory.unlock();
+                    std.debug.assert(self.resources.withdraw(resource_handle) != null);
+                    return err;
+                };
+            } else {
+                self.entries.put(
+                    self.allocator,
+                    public_handle,
+                    disabled_node,
+                ) catch |err| {
+                    self.directory.unlock();
+                    return err;
+                };
+                self.live_nodes += 1;
+                disabled_committed = true;
+            }
+            self.directory.unlock();
+        }
+
+        pub fn put(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            public_handle: Handle,
+            value: T,
+        ) !void {
+            _ = allocator;
+            return self.publishAt(public_handle, value);
+        }
+
+        pub fn acquire(self: *Self, public_handle: Handle) ?Lease {
+            self.directory.lock();
+            if (self.shutting_down) {
+                self.directory.unlock();
+                return null;
+            }
+            if (comptime enabled) {
+                const resource_handle = self.entries.get(public_handle) orelse {
+                    self.directory.unlock();
+                    return null;
+                };
+                const resource_lease = self.resources.acquire(resource_handle) orelse {
+                    self.directory.unlock();
+                    return null;
+                };
+                self.directory.unlock();
+                var lease = Lease{ .storage = resource_lease };
+                lease.stored().mutex.lock();
+                return lease;
+            }
+            const stored = self.entries.get(public_handle) orelse {
+                self.directory.unlock();
+                return null;
+            };
+            std.debug.assert(!stored.closing);
+            self.directory.unlock();
+            stored.mutex.lock();
+            return .{ .storage = stored };
+        }
+
+        /// Test-only compatibility for old single-threaded fixtures. New
+        /// concurrency coverage must use leases so removal cannot race use.
+        pub fn getPtr(self: *Self, public_handle: Handle) ?*T {
+            if (!builtin.is_test) @compileError("use acquire() outside tests");
+            self.directory.lock();
+            defer self.directory.unlock();
+            if (self.shutting_down) return null;
+            if (comptime enabled) {
+                const resource_handle = self.entries.get(public_handle) orelse
+                    return null;
+                const stored = self.resources.unsafeValuePtrForTesting(
+                    resource_handle,
+                ) orelse return null;
+                return &stored.value;
+            }
+            const stored = self.entries.get(public_handle) orelse return null;
+            return &stored.value;
+        }
+
+        pub fn get(self: *Self, public_handle: Handle) ?T {
+            if (!builtin.is_test) @compileError("use acquire() outside tests");
+            const value = self.getPtr(public_handle) orelse return null;
+            return value.*;
+        }
+
+        pub fn remove(self: *Self, public_handle: Handle) bool {
+            self.directory.lock();
+            const removed = if (self.shutting_down)
+                null
+            else
+                self.entries.fetchRemove(public_handle);
+            self.directory.unlock();
+
+            const entry = removed orelse return false;
+            if (comptime enabled) {
+                std.debug.assert(self.resources.remove(entry.value));
+            } else {
+                const stored = entry.value;
+                stored.closing = true;
+                self.retireDisabled(stored);
+                self.collectRetired();
+            }
+            return true;
+        }
+
+        pub fn count(self: *Self) usize {
+            self.directory.lock();
+            defer self.directory.unlock();
+            return self.entries.count();
+        }
+
+        pub fn snapshotHandles(
+            self: *Self,
+            allocator: std.mem.Allocator,
+        ) ![]Handle {
+            self.directory.lock();
+            defer self.directory.unlock();
+            if (self.shutting_down) return allocator.alloc(Handle, 0);
+
+            const handles = try allocator.alloc(Handle, self.entries.count());
+            var iterator = self.entries.keyIterator();
+            var len: usize = 0;
+            while (iterator.next()) |handle| {
+                handles[len] = handle.*;
+                len += 1;
+            }
+            std.debug.assert(len == handles.len);
+            return handles;
+        }
+
+        pub fn shutdown(self: *Self) void {
+            self.directory.lock();
+            if (self.shutting_down) {
+                self.directory.unlock();
+                return;
+            }
+            self.shutting_down = true;
+            var detached = self.entries;
+            self.entries = .empty;
+            self.directory.unlock();
+
+            if (comptime enabled) {
+                detached.deinit(self.allocator);
+                self.resources.shutdown();
+            } else {
+                var values = detached.valueIterator();
+                while (values.next()) |stored_ptr| {
+                    const stored = stored_ptr.*;
+                    stored.closing = true;
+                    self.retireDisabled(stored);
+                }
+                detached.deinit(self.allocator);
+                self.collectRetired();
+            }
+        }
+
+        /// Finalize disabled-build nodes whose value-specific busy predicate
+        /// is no longer active. Enabled builds retire through stable leases.
+        pub fn collectRetired(self: *Self) void {
+            if (comptime enabled) return;
+
+            while (true) {
+                self.directory.lock();
+                var link = &self.retired_head;
+                var ready: ?*Stored = null;
+                while (link.*) |stored| {
+                    if (!shouldDeferDestroy(stored)) {
+                        link.* = stored.retired_next;
+                        stored.retired_next = null;
+                        ready = stored;
+                        break;
+                    }
+                    link = &stored.retired_next;
+                }
+                self.directory.unlock();
+
+                const stored = ready orelse return;
+                finalizeDisabled(stored);
+            }
+        }
+
+        pub fn isQuiescent(self: *Self) bool {
+            if (comptime enabled) return self.resources.isQuiescent();
+            return self.live_nodes == 0;
+        }
+
+        pub fn deinit(self: *Self) !void {
+            self.shutdown();
+            if (comptime enabled) {
+                try self.resources.deinit();
+            } else {
+                self.collectRetired();
+                if (!self.isQuiescent()) return error.LeasesOutstanding;
+            }
+        }
+
+        fn finalizeDisabled(stored: *Stored) void {
+            const owner = stored.owner;
+            Destroyer.run(owner.context, stored);
+            owner.live_nodes -= 1;
+            owner.allocator.destroy(stored);
+        }
+
+        fn retireDisabled(self: *Self, stored: *Stored) void {
+            stored.retired_next = self.retired_head;
+            self.retired_head = stored;
+        }
+
+        fn shouldDeferDestroy(stored: *const Stored) bool {
+            if (defer_destroy) |is_busy| return is_busy(&stored.value);
+            return false;
+        }
+    };
+}
+
 comptime {
     if (@sizeOf(ConditionalMutexFor(false, LockRank.resource_directory)) != 0) {
         @compileError("disabled ConditionalMutex must have zero size");
@@ -925,12 +1325,17 @@ comptime {
 
 const TestResource = struct {
     value: usize,
+    callback_inflight: bool = false,
 };
 
 const TestDestroyContext = *std.atomic.Value(usize);
 
 fn countTestDestroy(context: TestDestroyContext, _: *TestResource) void {
     _ = context.fetchAdd(1, .monotonic);
+}
+
+fn testCallbackInFlight(resource: *const TestResource) bool {
+    return resource.callback_inflight;
 }
 
 fn TestTable(comptime enabled: bool, comptime capacity: usize) type {
@@ -940,6 +1345,17 @@ fn TestTable(comptime enabled: bool, comptime capacity: usize) type {
         TestDestroyContext,
         countTestDestroy,
         capacity,
+    );
+}
+
+fn TestKeyedTable(comptime enabled: bool) type {
+    return StableKeyedHandleTableFor(
+        enabled,
+        TestResource,
+        TestDestroyContext,
+        countTestDestroy,
+        true,
+        testCallbackInFlight,
     );
 }
 
@@ -1076,7 +1492,7 @@ test "publishLeased establishes ownership before removal can retire a node" {
     try table.deinit();
 }
 
-test "retired handles are reused only after final release" {
+test "retired slots advance generation only after final release" {
     const Table = TestTable(true, 4);
     var destroyed = std.atomic.Value(usize).init(0);
     var table = try Table.init(std.testing.allocator, &destroyed);
@@ -1254,5 +1670,72 @@ test "generation exhaustion retires a slot instead of wrapping ABA" {
         @as(usize, std.math.maxInt(HandleGeneration)) + 2,
         destroyed.load(.monotonic),
     );
+    try table.deinit();
+}
+
+test "keyed stable table unlinks before exact-once out-of-lock destruction" {
+    const Table = TestKeyedTable(true);
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = try Table.init(std.testing.allocator, &destroyed);
+    try table.publishAt(77, .{ .value = 123 });
+    var lease = table.acquire(77).?;
+
+    const Runner = struct {
+        fn run(target: *Table) void {
+            std.debug.assert(target.remove(77));
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&table});
+    thread.join();
+
+    lease.unlock();
+    try std.testing.expect(table.acquire(77) == null);
+    try std.testing.expect(lease.isClosing());
+    lease.lock();
+    try std.testing.expectEqual(@as(usize, 123), lease.value().value);
+    try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
+    try table.deinit();
+}
+
+test "keyed stable table publication failure keeps caller ownership" {
+    const Table = TestKeyedTable(true);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        // Stable control, node, and first chunk succeed; public map growth fails.
+        .fail_index = 3,
+    });
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = try Table.init(failing.allocator(), &destroyed);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        table.publishAt(9, .{ .value = 44 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), table.count());
+    try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
+    try table.deinit();
+}
+
+test "disabled keyed table defers destruction across callback reentry" {
+    const Table = TestKeyedTable(false);
+    var destroyed = std.atomic.Value(usize).init(0);
+    var table = try Table.init(std.testing.allocator, &destroyed);
+
+    try table.publishAt(5, .{ .value = 8 });
+    var lease = table.acquire(5).?;
+    try std.testing.expectEqual(@as(usize, 8), lease.value().value);
+    lease.value().callback_inflight = true;
+    lease.unlock();
+    try std.testing.expect(table.remove(5));
+    try std.testing.expect(table.acquire(5) == null);
+    try std.testing.expect(lease.isClosing());
+    try std.testing.expectEqual(@as(usize, 0), destroyed.load(.monotonic));
+    try std.testing.expectError(error.LeasesOutstanding, table.deinit());
+    lease.lock();
+    lease.value().callback_inflight = false;
+    lease.release();
+    table.collectRetired();
+    try std.testing.expectEqual(@as(usize, 1), destroyed.load(.monotonic));
     try table.deinit();
 }

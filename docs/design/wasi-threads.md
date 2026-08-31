@@ -100,9 +100,18 @@ atomic only in thread-enabled builds, and shared table access is serialized
 without holding a lock across guest calls. Thread clones also roll back
 partial retains/allocation failures and copy mutable segment state.
 
-This does **not** complete B1.1: `ComponentInstance` and `WasiCliAdapter`
-resource families remain separate follow-ups. It also does not wire the
-production interpreter/AOT host bindings or final group cancellation.
+The `ComponentInstance` slice is also established. Canonical resource handles
+now carry non-wrapping slot generations; Preview-3 futures, streams,
+error-contexts, and waitable sets are reached through conditional stable
+leases; task/waitable mutation is synchronized; and callbacks/destructors run
+after releasing runtime locks. Disabled builds compile out locks and atomics;
+callback in-flight markers defer reentrant destruction without per-lookup
+reference updates. Execution-local task managers, implicit context slots,
+canon-lower bindings, and realloc state remain on `ThreadExecutionContext` as
+established by the context split.
+`WasiCliAdapter`'s own resource families remain the final B1.1 follow-up. This
+also does not wire production interpreter/AOT spawning or final group
+cancellation.
 
 The thread-group lifecycle now publishes a generation-stamped, manager-owned
 record before a native child can enter guest code. The child waits on a start
@@ -295,18 +304,22 @@ The Component-Model resource tables live on `ComponentInstance`
 ([`src/component/instance.zig:196`](../../src/component/instance.zig))
 and the Preview-2/3 host adapter ([`src/component/wasi_cli_adapter.zig:3779`](../../src/component/wasi_cli_adapter.zig)).
 
-**Per-`ComponentInstance` (`std.AutoHashMapUnmanaged` / `ArrayList…` —
-all single-threaded today):**
+**Per-`ComponentInstance`:**
 
-* `resource_tables` — keyed by component resource type idx.
+* `resource_tables` — a synchronized registry of heap-stable per-type tables;
+  table slots use stable leases and non-wrapping generations when threads are
+  enabled, and the compact direct-slot path when disabled.
 * `exported_funcs`, `imports` — built once at link time.
 * `trampoline_ctxs`, `canon_builtin_ctxs`, `canon_builtin_ctx_by_canon_idx`,
   `forwarding_ctxs`, `synthetic_host_instances`.
 * `pending_core_starts`, `sub_instances`.
-* `implicit_task_context[N_CONTEXT_SLOTS]`.
-* `futures`, `streams`, `error_contexts`, `waitable_sets`,
-  `next_async_handle` — the Preview-3 async handle tables.
-* `current_task_manager: ?*async_mod.TaskManager`.
+* `futures`, `streams`, `error_contexts`, `waitable_sets` — conditional
+  stable keyed tables. Stream/future entries have short value locking;
+  waitable sets synchronize their own queues.
+* `next_async_handle` — atomic only in thread-enabled builds and never wraps.
+* Implicit task context, the active task manager, cancellation state, and
+  canon-lower call context live on the active `ThreadExecutionContext`, not
+  mutable instance-global fields.
 
 **Per-`WasiCliAdapter` (resource tables — every `*_table` field):**
 
@@ -347,15 +360,13 @@ Counted by `grep -cE "^\s*\w+_table\s*:"` on the adapter: **8** direct
   descriptors which **the kernel already serialises**.
 * `exit_code: ?u32` — written once when the guest calls `wasi:cli/exit.exit`.
 
-**`TaskManager` ([`src/component/async.zig:157`](../../src/component/async.zig)):**
+**`TaskManager` ([`src/component/async.zig`](../../src/component/async.zig)):**
 
-The async task manager is per-component-instance, and within an
-instance it tracks `current_task` for `context.{get,set}` / `task.yield`.
-The single-threaded executor assumes only one task is on the dispatch
-stack at a time; with real threads, **each thread needs its own
-TaskManager** (since each thread has its own "currently active task"),
-or the design must declare that `wasi:threads`-spawned threads never
-run async-lifted entry points.
+Task records and context slots are synchronized and task handles are never
+reused. The current-task selection is TLS, while the active manager pointer is
+bound on `ThreadExecutionContext`; concurrent host threads therefore cannot
+overwrite one another. Interpreter and AOT entry paths supply their execution
+context explicitly, including nested callbacks.
 
 ## Design options
 
@@ -514,13 +525,12 @@ Each wave is a discrete PR with its own conformance gate.
 
 **Scope.**
 
-* Introduce a `ResourceTable(T)` helper in `src/component/instance.zig`
-  that wraps `std.ArrayListUnmanaged(?T)` + a `Mutex` (the same
-  custom-spinlock pattern as `thread_manager.zig:11`, until Zig 0.16
-  reinstates `std.Thread.Mutex` without `Io`).
-* Migrate every `*_table` field on `WasiCliAdapter` and every
-  `…_table` / handle-keyed hashmap on `ComponentInstance` to the new
-  wrapper.
+* Use the conditional stable-handle/lease primitives for shared resource
+  families. Disabled canonical-resource slots retain their compact direct
+  representation; keyed async tables use heap-stable nodes but no locks,
+  atomics, or per-lookup reference updates.
+* `WasiCtx` and `ComponentInstance` are migrated. Every `*_table` field on
+  `WasiCliAdapter` remains the separate adapter-resource slice.
 * Gate the mutex acquire behind `comptime config.lib_wasi_threads`:
   when threads are disabled, the wrapper is a transparent newtype with
   no lock. **No runtime cost when `lib_wasi_threads = false`.**
@@ -675,9 +685,10 @@ Each wave is a discrete PR with its own conformance gate.
 4. **Interaction with the async ABI broadening (#488 follow-ups).**
    Resolved for execution-local state: active task managers, implicit context
    slots, cancellation state, and canon-lower call bindings now live on the
-   active `ThreadExecutionContext`, not `ComponentInstance`. The async
-   resource tables themselves still require the remaining B1.1 migration
-   before component threads can be exposed.
+   active `ThreadExecutionContext`, not `ComponentInstance`. The component
+   async resource tables now use synchronized stable ownership; the
+   `WasiCliAdapter` resource families remain the final B1.1 migration before
+   component threads can be exposed.
 5. **Memory-grow under concurrent atomics.** Resolved for shared memory:
    reserve the declared maximum, keep the base immutable, serialize commit,
    and release/acquire-publish the visible extent. Non-shared memories keep
@@ -732,8 +743,8 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
 * **`tokio` / async-runtime-style fairness.** No M:N scheduling on the
   guest side; threads map 1:1 to `std.Thread`.
 * **Cross-component thread sharing.** A thread spawned by component A
-  cannot enter component B. The `cloneForThread` semantics + the
-  `ComponentInstance`-keyed task manager rule this out by
+  cannot enter component B. The `cloneForThread` semantics, execution-local
+  task-manager binding, and instance-owned resource tables rule this out by
   construction.
 * **Reverse engineering Wasmtime's `wasi-threads` private internals.**
   We follow the spec and our own resource-table model; we don't claim
@@ -765,8 +776,8 @@ A future "Wave 1 lands" PR may declare this design accepted iff:
 * [`src/component/instance.zig`](../../src/component/instance.zig)
   (line ~196) — `ComponentInstance` resource tables.
 * [`src/component/async.zig`](../../src/component/async.zig)
-  (line ~157: `TaskManager`) — the async runtime that Wave 5d has to
-  make thread-aware.
+  (`TaskManager`) — synchronized task records and execution-local current-task
+  binding used by the component async runtime.
 * Upstream proposals:
   * [`wasi-threads`](https://github.com/WebAssembly/wasi-threads) —
     Preview-1 era, legacy. Champion: Alexandru Ene.

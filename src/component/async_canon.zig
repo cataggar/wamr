@@ -36,10 +36,18 @@ pub fn asyncLift(
 
     // Register with waitable set if provided
     if (opts.waitable_set) |ws| {
-        _ = try ws.register(.{
+        const idx = ws.register(.{
             .kind = .subtask,
             .handle = handle,
-        }, opts.allocator);
+        }, opts.allocator) catch |err| {
+            opts.task_manager.cancelTask(handle);
+            return err;
+        };
+        if (!opts.task_manager.setWaitable(handle, ws, idx)) {
+            ws.unregister(idx);
+            opts.task_manager.cancelTask(handle);
+            return error.InvalidTaskHandle;
+        }
     }
 
     return .{ .subtask_handle = handle };
@@ -166,29 +174,10 @@ pub fn taskYield(
 ) YieldOutcome {
     _ = allocator; // reserved for future scheduler hooks (sub-PR 3)
 
-    if (handle >= task_manager.tasks.items.len) return .resumed;
-    const task = &task_manager.tasks.items[handle];
-
-    // Cancellation gets priority: if a cancellation arrived while the task
-    // was on the dispatch stack, surface it before we drain readiness.
-    if (cancellable and task.state == .cancelled) return .cancelled;
-
-    // Drain one round of readiness on the task's waitable set, if any.
-    // The dispatcher consumes the ready_queue via `pollReady` separately;
-    // here we only need to clear the per-task suspend point — the
-    // single-threaded scheduler is implicit (re-entry into wasm resumes
-    // the task immediately on return from this built-in).
-    if (task.waitable_set) |ws| {
-        var sink: [16]u32 = undefined;
-        _ = ws.pollReady(&sink);
-    }
-
-    // Re-arm. If the task was somehow flipped to `.returned` while we
-    // were not looking, leave that alone — only `.created` would be
-    // surprising, but defensively re-mark started just in case.
-    if (task.state == .created) task.state = .started;
-
-    return .resumed;
+    return if (task_manager.yieldTask(handle, cancellable))
+        .cancelled
+    else
+        .resumed;
 }
 
 /// Check if a subtask has completed and retrieve its return values.
@@ -196,12 +185,15 @@ pub fn asyncPollResult(
     task_manager: *const async_mod.TaskManager,
     handle: u32,
 ) ?[]u32 {
-    const state = task_manager.getState(handle) orelse return null;
-    if (state != .returned) return null;
-    if (handle < task_manager.tasks.items.len) {
-        return task_manager.tasks.items[handle].return_values;
-    }
-    return null;
+    return task_manager.returnValuesForTesting(handle);
+}
+
+pub fn asyncPollResultCopy(
+    task_manager: *const async_mod.TaskManager,
+    handle: u32,
+    allocator: std.mem.Allocator,
+) !?[]u32 {
+    return task_manager.copyReturnValues(handle, allocator);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

@@ -727,6 +727,19 @@ pub fn build(b: *std.Build) void {
     const run_adapter_resource_unit_tests = b.addRunArtifact(adapter_resource_unit_tests);
     adapter_resources_test_step.dependOn(&run_adapter_resource_unit_tests.step);
 
+    const component_resource_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{"component resource safety"},
+    });
+    const run_component_resource_unit_tests = b.addRunArtifact(
+        component_resource_unit_tests,
+    );
+    const component_resource_test_step = b.step(
+        "test-component-resources",
+        "Run ComponentInstance resource lifetime and concurrency tests",
+    );
+    component_resource_test_step.dependOn(&run_component_resource_unit_tests.step);
+
     const execution_context_runtime_tests = b.addTest(.{
         .root_module = test_module,
         .filters = &.{

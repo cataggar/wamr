@@ -263,9 +263,15 @@ fn runBench(
     const StreamTypeFixture = struct {
         var types_array = [_]ctypes.TypeDef{.{ .val = .u8 }};
         var comp: ctypes.Component = .{
-            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-            .components = &.{},       .instances = &.{},      .aliases = &.{},
-            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .core_modules = &.{},
+            .core_instances = &.{},
+            .core_types = &.{},
+            .components = &.{},
+            .instances = &.{},
+            .aliases = &.{},
+            .types = &.{},
+            .canons = &.{},
+            .imports = &.{},
             .exports = &.{},
         };
     };
@@ -300,11 +306,13 @@ fn runBench(
     var pi: u32 = 0;
     while (pi < pattern.len) : (pi += 1) pattern[pi] = @truncate(pi);
     var source = SyntheticSource{ .pattern = pattern, .bytes_per_call = bytes_per_call };
-    const s = inst.streams.getPtr(handle).?;
+    var stream_lease = inst.streams.acquire(handle).?;
+    const s = stream_lease.value();
     s.host_driver = if (zero_copy)
         .{ .context = &source, .on_read_into = &zeroCopyOnReadInto }
     else
         .{ .context = &source, .on_read = &baselineOnRead };
+    stream_lease.release();
 
     // Reset the counters AFTER setup so we measure only the per-op cost.
     counter.alloc_count = 0;
@@ -364,9 +372,15 @@ fn runWriteBench(
     const StreamTypeFixture = struct {
         var types_array = [_]ctypes.TypeDef{.{ .val = .u8 }};
         var comp: ctypes.Component = .{
-            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-            .components = &.{},       .instances = &.{},      .aliases = &.{},
-            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .core_modules = &.{},
+            .core_instances = &.{},
+            .core_types = &.{},
+            .components = &.{},
+            .instances = &.{},
+            .aliases = &.{},
+            .types = &.{},
+            .canons = &.{},
+            .imports = &.{},
             .exports = &.{},
         };
     };
@@ -406,11 +420,13 @@ fn runWriteBench(
     }
 
     var sink = SyntheticSink{};
-    const s = inst.streams.getPtr(handle).?;
+    var stream_lease = inst.streams.acquire(handle).?;
+    const s = stream_lease.value();
     s.host_driver = if (zero_copy)
         .{ .context = &sink, .on_write_from = &zeroCopyOnWriteFrom }
     else
         .{ .context = &sink, .on_write = &baselineOnWrite };
+    stream_lease.release();
 
     // Reset counters after setup so we measure only the per-op cost.
     counter.alloc_count = 0;
