@@ -1248,8 +1248,6 @@ pub fn callComponentFuncByLocal(
         .aot => true,
         .interp => false,
     };
-    var frame_context_scope = enterFrameThreadContext(&frame);
-    defer frame_context_scope.deinit();
 
     // Parse canonical options
     const lift_opts = LiftOptions.fromOpts(exported.opts);
