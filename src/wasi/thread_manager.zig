@@ -1041,6 +1041,9 @@ test "thread lifecycle: joinOne is exact and reused slots reject stale generatio
     defer manager.deinit();
     ctx.inst.thread_manager = &manager;
 
+    try std.testing.expectError(error.InvalidThreadId, manager.joinOne(-1));
+    try std.testing.expectError(error.UnknownThread, manager.joinOne(makeTid(5, 0)));
+
     const first_tid = try manager.spawnThread(ctx.inst, 0);
     try waitForCompleted(&manager, 1);
     try std.testing.expectEqual(
