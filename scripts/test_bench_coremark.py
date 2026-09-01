@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_coremark
 
 
+REPO = Path(__file__).resolve().parents[1]
+WORKFLOW = REPO / ".github/workflows/coremark-aarch64.yml"
 VALID_OUTPUT = """\
 Iterations/Sec   : 12345.5
 [0]crcfinal      : 0x33ff
@@ -18,12 +20,11 @@ Correct operation validated. See README.md for run and reporting rules.
 
 class BenchCoremarkTests(unittest.TestCase):
     def test_tracked_fixture_checksum_is_pinned(self):
-        repo = Path(__file__).resolve().parents[1]
         fixture, digest = bench_coremark.resolve_fixture(
-            repo, bench_coremark.DEFAULT_FIXTURE
+            REPO, bench_coremark.DEFAULT_FIXTURE
         )
         self.assertEqual(
-            fixture, (repo / bench_coremark.DEFAULT_FIXTURE).resolve()
+            fixture, (REPO / bench_coremark.DEFAULT_FIXTURE).resolve()
         )
         self.assertEqual(digest, bench_coremark.DEFAULT_FIXTURE_SHA256)
 
@@ -38,6 +39,10 @@ class BenchCoremarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CRC-validated"):
             bench_coremark.parse_coremark_output(
                 "Iterations/Sec : 12345.5\n", "test"
+            )
+        with self.assertRaisesRegex(RuntimeError, "expected exactly 0x33ff"):
+            bench_coremark.parse_coremark_output(
+                VALID_OUTPUT.replace("0x33ff", "0x1234"), "test"
             )
 
     def test_parse_rejects_ambiguous_throughput(self):
@@ -67,8 +72,7 @@ class BenchCoremarkTests(unittest.TestCase):
             "authoritative (overridden)",
         )
 
-    @mock.patch.object(bench_coremark, "host_info", return_value="_Host: test_")
-    def test_report_distinguishes_wasmtime_versions_and_lists_samples(self, _):
+    def test_report_distinguishes_wasmtime_versions_and_lists_samples(self):
         results = [
             bench_coremark.EngineResult(
                 "WAMR", "origin/main (aaaa)", "ReleaseFast", [50.0, 52.0]
@@ -78,13 +82,13 @@ class BenchCoremarkTests(unittest.TestCase):
             ),
             bench_coremark.EngineResult(
                 "Wasmtime historical pin",
-                "44.0.1 (/pinned/wasmtime)",
+                "44.0.1 (sha256:abc; /pinned/wasmtime)",
                 "default JIT",
                 [100.0, 102.0],
             ),
             bench_coremark.EngineResult(
                 "Wasmtime caller-selected",
-                "48.0.1 (/current/wasmtime)",
+                "48.0.1 (sha256:def; /current/wasmtime)",
                 "default JIT",
                 [120.0, 122.0],
             ),
@@ -96,13 +100,43 @@ class BenchCoremarkTests(unittest.TestCase):
             runs=2,
             fixture=Path("coremark.wasm"),
             fixture_sha="abc",
+            host=bench_coremark.HostIdentity(
+                "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
+            ),
         )
         self.assertIn("Median", report)
         self.assertIn("50.0, 52.0", report)
-        self.assertIn("44.0.1 (/pinned/wasmtime)", report)
-        self.assertIn("48.0.1 (/current/wasmtime)", report)
+        self.assertIn("44.0.1 (sha256:abc; /pinned/wasmtime)", report)
+        self.assertIn("48.0.1 (sha256:def; /current/wasmtime)", report)
         self.assertIn("WAMR target / Wasmtime historical pin", report)
         self.assertIn("WAMR target / Wasmtime caller-selected", report)
+        self.assertIn("Median iter/s ratio", report)
+        self.assertIn("0.604×", report)
+        self.assertIn("CRC validation", report)
+        self.assertIn("Neoverse-N2", report)
+        self.assertIn("host fingerprint", report)
+
+    def test_report_rejects_missing_samples(self):
+        results = [
+            bench_coremark.EngineResult(
+                "WAMR", "origin/main (aaaa)", "ReleaseFast", [50.0]
+            ),
+            bench_coremark.EngineResult(
+                "WAMR", "HEAD (bbbb)", "ReleaseFast", [60.0, 62.0]
+            ),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "produced 1 measured samples"):
+            bench_coremark.render_table(
+                results,
+                profile="authoritative",
+                warmups=2,
+                runs=2,
+                fixture=Path("coremark.wasm"),
+                fixture_sha="abc",
+                host=bench_coremark.HostIdentity(
+                    "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
+                ),
+            )
 
     @mock.patch.object(
         bench_coremark, "run", return_value="wasmtime 44.0.1 (abcdef)"
@@ -117,6 +151,80 @@ class BenchCoremarkTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "must be 44.0.1"):
                 bench_coremark.validate_pinned_wasmtime(Path("/bin/wasmtime"))
+
+    @mock.patch.object(bench_coremark, "host_emulation_evidence", return_value="")
+    @mock.patch.dict(
+        bench_coremark.os.environ,
+        {"RUNNER_ARCH": "ARM64"},
+        clear=True,
+    )
+    @mock.patch.object(
+        bench_coremark,
+        "capture_host_identity",
+        return_value=bench_coremark.HostIdentity(
+            "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
+        ),
+    )
+    def test_native_aarch64_host_validation(self, _, __):
+        identity = bench_coremark.validate_native_host("aarch64")
+        self.assertEqual(identity.cpu_model, "Neoverse-N2")
+
+    @mock.patch.object(
+        bench_coremark,
+        "capture_host_identity",
+        return_value=bench_coremark.HostIdentity(
+            "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
+        ),
+    )
+    @mock.patch.object(
+        bench_coremark,
+        "host_emulation_evidence",
+        return_value="Hypervisor vendor: QEMU",
+    )
+    def test_native_host_rejects_emulation(self, _, __):
+        with self.assertRaisesRegex(RuntimeError, "under emulation"):
+            bench_coremark.validate_native_host("aarch64")
+
+    @mock.patch.object(
+        bench_coremark,
+        "capture_host_identity",
+        return_value=bench_coremark.HostIdentity(
+            "aarch64", 8, "Neoverse-N2", "runner", "other-boot"
+        ),
+    )
+    def test_host_consistency_rejects_mixed_host(self, _):
+        with self.assertRaisesRegex(RuntimeError, "host identity changed"):
+            bench_coremark.validate_same_host(
+                bench_coremark.HostIdentity(
+                    "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
+                )
+            )
+
+    def test_aarch64_workflow_contract(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("runs-on: ubuntu-24.04-arm", workflow)
+        dispatch = workflow.split(
+            "- name: Run authoritative same-host CoreMark comparison", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn("github.event_name == 'workflow_dispatch'", dispatch)
+        self.assertIn("--profile  authoritative", dispatch)
+        self.assertIn("--wasmtime-baseline auto", dispatch)
+        self.assertIn("--require-native-arch aarch64", dispatch)
+        self.assertNotIn("--runs", dispatch)
+
+        pr = workflow.split("- name: Run CoreMark PR comparison", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        self.assertIn("github.event_name == 'pull_request'", pr)
+        self.assertIn("--profile  ci", pr)
+        self.assertNotIn("--wasmtime-baseline", pr)
+
+        for line in workflow.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("uses:") or "uses: ./" in stripped:
+                continue
+            action = stripped.split("#", 1)[0].strip()
+            self.assertRegex(action, r"@[0-9a-f]{40}$")
 
 
 if __name__ == "__main__":

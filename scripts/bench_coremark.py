@@ -33,7 +33,9 @@ from pathlib import Path
 from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
 
 ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
+CRC_PATTERN = re.compile(r"(?mi)^\[\d+\]crcfinal\s*:\s*0x([0-9a-f]+)\s*$")
 VALIDATION_TEXT = "Correct operation validated."
+EXPECTED_CRC = "33ff"
 DEFAULT_FIXTURE = Path("tests/benchmarks/coremark/coremark_wasi.wasm")
 DEFAULT_FIXTURE_SHA256 = "f4b7591296ead10264e0f101f355bdf848865c31329325594e66fbabefec235b"
 PINNED_WASMTIME_VERSION = "44.0.1"
@@ -68,6 +70,27 @@ class EngineResult:
     version: str
     optimize: str
     values: list[float]
+
+
+@dataclass(frozen=True)
+class HostIdentity:
+    arch: str
+    cpu_count: int
+    cpu_model: str
+    runner_name: str
+    boot_id: str
+
+    def fingerprint(self) -> str:
+        encoded = "\0".join(
+            (
+                self.arch,
+                str(self.cpu_count),
+                self.cpu_model,
+                self.runner_name,
+                self.boot_id,
+            )
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> str:
@@ -128,6 +151,12 @@ def parse_coremark_output(output: str, engine: str) -> float:
         raise RuntimeError(
             f"{engine} did not produce a CRC-validated CoreMark result:\n{output}"
         )
+    crc_matches = CRC_PATTERN.findall(output)
+    if len(crc_matches) != 1 or crc_matches[0].lower() != EXPECTED_CRC:
+        actual = ", ".join(f"0x{crc}" for crc in crc_matches) or "missing"
+        raise RuntimeError(
+            f"{engine} produced crcfinal {actual}; expected exactly 0x{EXPECTED_CRC}"
+        )
     matches = ITER_PATTERN.findall(output)
     if len(matches) != 1:
         raise RuntimeError(
@@ -137,8 +166,12 @@ def parse_coremark_output(output: str, engine: str) -> float:
     return float(matches[0])
 
 
+def resolve_ref_sha(repo: Path, ref: str) -> str:
+    return run(["git", "rev-parse", ref], cwd=repo).strip()
+
+
 def make_worktree(repo: Path, ref: str, root: Path, label: str) -> tuple[Path, str]:
-    sha = run(["git", "rev-parse", ref], cwd=repo).strip()
+    sha = resolve_ref_sha(repo, ref)
     wt = root / f"{label}-{sha[:12]}"
     run(["git", "worktree", "add", "--detach", str(wt), sha], cwd=repo)
     return wt, sha
@@ -247,16 +280,20 @@ def build_and_run_wamr(
         runs=runs,
         retry_wamr_flake=True,
     )
-    return EngineResult("WAMR", f"{ref} ({sha[:12]})", optimize, values)
+    return EngineResult("WAMR", f"{ref} ({sha})", optimize, values)
 
 
-def normalize_arch() -> str:
-    arch = platform.machine().lower()
+def normalize_arch_name(arch: str) -> str:
+    arch = arch.lower()
     return {
         "amd64": "x86_64",
         "x64": "x86_64",
         "arm64": "aarch64",
     }.get(arch, arch)
+
+
+def normalize_arch() -> str:
+    return normalize_arch_name(platform.machine())
 
 
 def wasmtime_version(path: Path) -> str:
@@ -357,6 +394,7 @@ def measure_wasmtime(
     warmups: int,
     runs: int,
 ) -> EngineResult:
+    binary_sha = sha256_file(path)
     values = measure_command(
         engine=label,
         cmd=[str(path), "run", str(fixture)],
@@ -365,7 +403,12 @@ def measure_wasmtime(
         warmups=warmups,
         runs=runs,
     )
-    return EngineResult(label, f"{version} ({path})", "default JIT", values)
+    return EngineResult(
+        label,
+        f"{version} (sha256:{binary_sha}; {path})",
+        "default JIT",
+        values,
+    )
 
 
 def fmt_stats(values: list[float]) -> tuple[float, float, float, float]:
@@ -406,13 +449,95 @@ def host_cpu_model() -> str:
     return platform.processor() or "unknown CPU"
 
 
-def host_info() -> str:
-    arch = platform.machine() or "unknown-arch"
-    ncpu = os.cpu_count()
-    parts = [f"arch `{arch}`", f"{ncpu or '?'} vCPU", f"`{host_cpu_model()}`"]
-    runner = os.environ.get("RUNNER_NAME")
-    if runner:
-        parts.append(f"runner `{runner}`")
+def read_optional_text(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def capture_host_identity(*, require_boot_id: bool = False) -> HostIdentity:
+    arch = normalize_arch()
+    cpu_count = os.cpu_count() or 0
+    cpu_model = host_cpu_model()
+    runner_name = os.environ.get("RUNNER_NAME", "")
+    boot_id = read_optional_text(Path("/proc/sys/kernel/random/boot_id"))
+    if require_boot_id and not boot_id:
+        raise RuntimeError("cannot establish host identity: Linux boot ID is unavailable")
+    return HostIdentity(arch, cpu_count, cpu_model, runner_name, boot_id)
+
+
+def host_emulation_evidence() -> str:
+    evidence = [
+        platform.platform(),
+        os.environ.get("QEMU_CPU", ""),
+        os.environ.get("QEMU_LD_PREFIX", ""),
+        read_optional_text(Path("/proc/cpuinfo")),
+        read_optional_text(Path("/sys/class/dmi/id/product_name")),
+        read_optional_text(Path("/sys/class/dmi/id/sys_vendor")),
+    ]
+    try:
+        evidence.append(
+            subprocess.run(
+                ["lscpu"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            ).stdout
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "\n".join(evidence)
+
+
+def validate_native_host(expected_arch: str) -> HostIdentity:
+    expected = normalize_arch_name(expected_arch)
+    identity = capture_host_identity(require_boot_id=True)
+    if identity.arch != expected:
+        raise RuntimeError(
+            f"authoritative host architecture must be {expected}; got {identity.arch}"
+        )
+    runner_arch = os.environ.get("RUNNER_ARCH")
+    if runner_arch and normalize_arch_name(runner_arch) != expected:
+        raise RuntimeError(
+            f"RUNNER_ARCH must be {expected}; got {runner_arch}"
+        )
+    if identity.cpu_count <= 0:
+        raise RuntimeError("authoritative host CPU count is unavailable")
+    if not identity.cpu_model or identity.cpu_model == "unknown CPU":
+        raise RuntimeError("authoritative host CPU model is unavailable")
+
+    evidence = host_emulation_evidence()
+    if re.search(r"\b(qemu|tcg|emulat(?:e|ed|ion|or))\b", evidence, re.IGNORECASE):
+        raise RuntimeError("authoritative measurements cannot run under emulation")
+    if expected == "aarch64" and re.search(
+        r"\b(Intel|AMD|Xeon|EPYC)\b", identity.cpu_model, re.IGNORECASE
+    ):
+        raise RuntimeError(
+            "AArch64 process reports an x86 CPU model, indicating user-mode emulation"
+        )
+    return identity
+
+
+def validate_same_host(expected: HostIdentity) -> None:
+    actual = capture_host_identity(require_boot_id=bool(expected.boot_id))
+    if actual != expected:
+        raise RuntimeError(
+            "host identity changed during measurement: "
+            f"started {expected.fingerprint()}, ended {actual.fingerprint()}"
+        )
+
+
+def host_info(identity: HostIdentity) -> str:
+    parts = [
+        f"arch `{identity.arch}`",
+        f"{identity.cpu_count or '?'} vCPU",
+        f"`{identity.cpu_model}`",
+    ]
+    if identity.runner_name:
+        parts.append(f"runner `{identity.runner_name}`")
+    parts.append(f"host fingerprint `{identity.fingerprint()}`")
     return "_Host: " + " · ".join(parts) + "_"
 
 
@@ -428,7 +553,14 @@ def render_table(
     runs: int,
     fixture: Path,
     fixture_sha: str,
+    host: HostIdentity,
 ) -> str:
+    for result in results:
+        if len(result.values) != runs:
+            raise RuntimeError(
+                f"{result.engine} produced {len(result.values)} measured samples; "
+                f"expected {runs}"
+            )
     baseline, target = results[0], results[1]
     delta_pct = compute_delta_pct(baseline.values, target.values)
     sign = "+" if delta_pct >= 0 else ""
@@ -439,6 +571,9 @@ def render_table(
         f"{runs} measured runs per engine)",
         f"- Fixture: `{fixture}` (`sha256:{fixture_sha}`)",
         f"- WAMR optimize mode: `{target.optimize}`; Wasmtime mode: `default JIT`",
+        f"- CRC validation: all {warmups + runs} invocations per measured engine "
+        f"produced `crcfinal 0x{EXPECTED_CRC}` and `{VALIDATION_TEXT}`; "
+        f"warmups were discarded",
         "",
         "| Engine | Version / ref | Optimize mode | Mean iter/s | Median | Range | Samples (iter/s) |",
         "|---|---|---|---:|---:|---:|---|",
@@ -461,15 +596,20 @@ def render_table(
         lines.extend(
             [
                 "",
-                "| Same-host ratio | Mean iter/s ratio |",
-                "|---|---:|",
+                "| Same-host ratio | Median iter/s ratio | Mean iter/s ratio |",
+                "|---|---:|---:|",
             ]
         )
         target_mean = statistics.fmean(target.values)
+        target_median = statistics.median(target.values)
         for result in wasmtime_results:
-            ratio = target_mean / statistics.fmean(result.values)
-            lines.append(f"| WAMR target / {result.engine} `{result.version}` | {ratio:.3f}× |")
-    lines.extend(["", host_info()])
+            median_ratio = target_median / statistics.median(result.values)
+            mean_ratio = target_mean / statistics.fmean(result.values)
+            lines.append(
+                f"| WAMR target / {result.engine} `{result.version}` | "
+                f"{median_ratio:.3f}× | {mean_ratio:.3f}× |"
+            )
+    lines.extend(["", host_info(host)])
     return "\n".join(lines)
 
 
@@ -482,6 +622,7 @@ def render_optimize_table(
     runs: int,
     fixture: Path,
     fixture_sha: str,
+    host: HostIdentity,
 ) -> str:
     lines = [
         "### CoreMark AOT optimize-mode comparison",
@@ -520,7 +661,7 @@ def render_optimize_table(
                 "At least one optimize mode failed before producing complete timings.",
             ]
         )
-    lines.extend(["", host_info()])
+    lines.extend(["", host_info(host)])
     return "\n".join(lines)
 
 
@@ -604,6 +745,12 @@ def main() -> int:
         help="cache for --wasmtime-baseline auto (default: .bench-coremark/tools)",
     )
     p.add_argument(
+        "--require-native-arch",
+        choices=("aarch64", "x86_64"),
+        default=None,
+        help="fail unless the run is on a native, non-emulated host of this architecture",
+    )
+    p.add_argument(
         "--min-delta-pct",
         type=float,
         default=None,
@@ -621,6 +768,11 @@ def main() -> int:
 
     repo = args.repo.resolve()
     fixture, fixture_sha = resolve_fixture(repo, args.fixture)
+    host = (
+        validate_native_host(args.require_native_arch)
+        if args.require_native_arch
+        else capture_host_identity()
+    )
     work_root = repo / ".bench-coremark" / f"run-{uuid.uuid4().hex}"
     work_root.mkdir(parents=True)
     optimize_modes = parse_optimize_modes(args.optimize)
@@ -656,32 +808,62 @@ def main() -> int:
                 runs=runs,
                 fixture=fixture,
                 fixture_sha=fixture_sha,
+                host=host,
             )
             target_vals = mode_results["ReleaseFast"] or []
         else:
             optimize = optimize_modes[0]
-            baseline_wt, baseline_sha = make_worktree(
-                repo, args.baseline, work_root, "baseline"
-            )
-            target_wt, target_sha = make_worktree(repo, args.target, work_root, "target")
-            baseline_result = build_and_run_wamr(
-                baseline_wt,
-                args.baseline,
-                baseline_sha,
-                fixture,
-                optimize,
-                warmups,
-                runs,
-            )
-            target_result = build_and_run_wamr(
-                target_wt,
-                args.target,
-                target_sha,
-                fixture,
-                optimize,
-                warmups,
-                runs,
-            )
+            baseline_sha = resolve_ref_sha(repo, args.baseline)
+            target_sha = resolve_ref_sha(repo, args.target)
+            if baseline_sha == target_sha:
+                target_wt, target_sha = make_worktree(
+                    repo, args.target, work_root, "target"
+                )
+                target_result = build_and_run_wamr(
+                    target_wt,
+                    args.target,
+                    target_sha,
+                    fixture,
+                    optimize,
+                    warmups,
+                    runs,
+                )
+                baseline_result = EngineResult(
+                    "WAMR",
+                    f"{args.baseline} ({baseline_sha})",
+                    optimize,
+                    target_result.values.copy(),
+                )
+                print(
+                    "[harness] WAMR baseline and target resolve to the same commit; "
+                    "reusing the target samples",
+                    file=sys.stderr,
+                )
+            else:
+                baseline_wt, baseline_sha = make_worktree(
+                    repo, args.baseline, work_root, "baseline"
+                )
+                target_wt, target_sha = make_worktree(
+                    repo, args.target, work_root, "target"
+                )
+                baseline_result = build_and_run_wamr(
+                    baseline_wt,
+                    args.baseline,
+                    baseline_sha,
+                    fixture,
+                    optimize,
+                    warmups,
+                    runs,
+                )
+                target_result = build_and_run_wamr(
+                    target_wt,
+                    args.target,
+                    target_sha,
+                    fixture,
+                    optimize,
+                    warmups,
+                    runs,
+                )
             results = [baseline_result, target_result]
             baseline_vals = baseline_result.values
             target_vals = target_result.values
@@ -742,11 +924,13 @@ def main() -> int:
                 runs=runs,
                 fixture=fixture,
                 fixture_sha=fixture_sha,
+                host=host,
             )
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
         run(["git", "worktree", "prune"], cwd=repo)
 
+    validate_same_host(host)
     print(table)
     if args.out:
         args.out.write_text(table + "\n")

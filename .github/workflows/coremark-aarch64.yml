@@ -1,7 +1,7 @@
 name: CoreMark (aarch64)
 
-# Per-PR CoreMark comparison on a hosted aarch64 runner.
-# Runs `scripts/bench_coremark.py` against the PR base, posts a delta table.
+# Per-PR CoreMark comparison plus an authoritative on-demand same-host
+# WAMR/Wasmtime measurement on a hosted native aarch64 runner.
 
 on:
   workflow_dispatch:
@@ -14,10 +14,6 @@ on:
         description: "Target git ref"
         required: false
         default: "HEAD"
-      runs:
-        description: "Runs per ref"
-        required: false
-        default: "3"
   pull_request:
     paths:
       - src/compiler/**
@@ -28,8 +24,9 @@ on:
       - .github/workflows/coremark-aarch64.yml
 
 concurrency:
-  # Keep one canonical ARM64 comparison active at a time.
-  group: coremark-aarch64
+  # Keep PR gates and the authoritative manual measurement from cancelling
+  # each other while still replacing superseded runs of the same kind.
+  group: coremark-aarch64-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -75,20 +72,37 @@ jobs:
             echo "target=${INPUT_TARGET:-HEAD}"            >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run CoreMark comparison
-        id: bench
+      - name: Run CoreMark PR comparison
+        if: github.event_name == 'pull_request'
+        id: bench_pr
         continue-on-error: true
         env:
           BASELINE: ${{ steps.refs.outputs.baseline }}
           TARGET: ${{ steps.refs.outputs.target }}
-          RUNS: ${{ github.event.inputs.runs || '3' }}
         run: |
           python3 scripts/bench_coremark.py \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --profile  ci \
-            --runs     "$RUNS" \
             --min-delta-pct=-5.0 \
+            --out      coremark-table.md \
+            --emit     github
+
+      - name: Run authoritative same-host CoreMark comparison
+        if: github.event_name == 'workflow_dispatch'
+        id: bench_authoritative
+        continue-on-error: true
+        env:
+          BASELINE: ${{ steps.refs.outputs.baseline }}
+          TARGET: ${{ steps.refs.outputs.target }}
+        run: |
+          python3 scripts/bench_coremark.py \
+            --baseline "$BASELINE" \
+            --target   "$TARGET" \
+            --profile  authoritative \
+            --wasmtime-baseline auto \
+            --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
+            --require-native-arch aarch64 \
             --out      coremark-table.md \
             --emit     github
 
@@ -96,9 +110,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coremark-aarch64-${{ github.sha }}
+          name: coremark-aarch64-${{ github.event_name }}-${{ github.sha }}
           path: coremark-table.md
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 90
 
       - name: Comment on PR
@@ -119,6 +133,8 @@ jobs:
               body,
             });
 
-      - name: Fail on CoreMark regression
-        if: steps.bench.outcome == 'failure'
+      - name: Fail on benchmark error
+        if: >-
+          steps.bench_pr.outcome == 'failure' ||
+          steps.bench_authoritative.outcome == 'failure'
         run: exit 1
