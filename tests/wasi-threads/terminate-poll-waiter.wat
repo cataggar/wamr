@@ -31,20 +31,24 @@
     i32.const 1
     i32.const 600
     call $poll_oneoff
-    drop
-    ;; Only reachable when the poll was not interrupted by termination.
-    i32.const 96
-    i32.const 128
-    i32.store
-    i32.const 100
-    i32.const 21
-    i32.store
-    i32.const 1
-    i32.const 96
-    i32.const 1
-    i32.const 104
-    call $fd_write
-    drop)
+    ;; Only a successful poll proves the wait ran to completion instead of
+    ;; being interrupted. Platforms without `poll_oneoff` report ENOSYS here
+    ;; and simply exercise the parent's `proc_exit` path.
+    i32.eqz
+    if
+      i32.const 96
+      i32.const 128
+      i32.store
+      i32.const 100
+      i32.const 21
+      i32.store
+      i32.const 1
+      i32.const 96
+      i32.const 1
+      i32.const 104
+      call $fd_write
+      drop
+    end)
   (func (export "_start")
     (local $i i32)
     i32.const 0
