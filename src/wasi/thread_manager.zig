@@ -8,6 +8,8 @@ const builtin = @import("builtin");
 const types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const execution_context = @import("../runtime/common/execution_context.zig");
+const termination = @import("../runtime/common/termination.zig");
+const platform = @import("../platform/platform.zig");
 const config = @import("config");
 
 /// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
@@ -257,6 +259,23 @@ pub const JoinSummary = struct {
     trapped: usize = 0,
 };
 
+/// Result of a bounded group teardown.
+pub const TerminationSummary = struct {
+    joined: usize = 0,
+    trapped: usize = 0,
+    /// Records still executing guest code when the deadline expired. The
+    /// manager keeps every shared resource alive for them; the embedder
+    /// decides whether to keep waiting or to end the host process.
+    unfinished: usize = 0,
+    timed_out: bool = false,
+};
+
+/// Default bound on sibling teardown. Cooperative siblings unwind as soon as
+/// they observe the terminal outcome (interpreter poll, wait cancellation,
+/// or a blocking-I/O slice boundary); this only bounds the pathological case
+/// of an AOT sibling spinning without any interruptible host call.
+pub const default_termination_timeout_ns: u64 = 2 * std.time.ns_per_s;
+
 pub const ThreadStats = struct {
     active: usize,
     completed: usize,
@@ -459,6 +478,13 @@ pub const ThreadManager = struct {
     spawning_count: usize = 0,
     joining_count: usize = 0,
     test_hooks: ?*const TestHooks = null,
+    /// The group's first-wins terminal outcome, owned by the shared process
+    /// state. Bound by the embedder; when null every termination path stays
+    /// a manager-local interrupt flag exactly as before.
+    termination: ?*termination.State = null,
+    /// Shared linear memory backing guest futexes, recorded by
+    /// `prepareSharedMemory` so termination can cancel every waiter.
+    shared_memory: ?*types.MemoryInstance = null,
 
     pub fn init(allocator: std.mem.Allocator) ThreadManager {
         return .{
@@ -541,6 +567,7 @@ pub const ThreadManager = struct {
         if (heap_global) |global| {
             global.value = .{ .i32 = @bitCast(reserved_end) };
         }
+        self.shared_memory = memory;
     }
 
     fn initWithTestHooks(allocator: std.mem.Allocator, hooks: *const TestHooks) ThreadManager {
@@ -550,6 +577,7 @@ pub const ThreadManager = struct {
     }
 
     pub fn deinit(self: *ThreadManager) void {
+        self.unbindTermination();
         self.shutdown();
         const current = self.stats();
         std.debug.assert(current.retained == 0);
@@ -557,16 +585,68 @@ pub const ThreadManager = struct {
         std.debug.assert(current.joining == 0);
         self.slots.deinit(self.allocator);
         self.aux_stack_pool.deinit(self.allocator);
+        self.shared_memory = null;
+    }
+
+    /// Bind the group to the shared process state's terminal-outcome record.
+    ///
+    /// Termination claimed anywhere — including `proc_exit` reached through
+    /// the process state without ever touching this manager — then wakes
+    /// every sibling through `interrupt`.
+    pub fn bindTermination(self: *ThreadManager, state: *termination.State) void {
+        self.termination = state;
+        state.bindWake(.{ .ctx = @ptrCast(self), .wake = wakeFromTermination });
+    }
+
+    /// Drop the wakeup hook. Required before the manager's storage dies,
+    /// since the process state can outlive it.
+    pub fn unbindTermination(self: *ThreadManager) void {
+        const state = self.termination orelse return;
+        state.unbindWake(@ptrCast(self));
+        self.termination = null;
+    }
+
+    fn wakeFromTermination(raw: *anyopaque) void {
+        const self: *ThreadManager = @ptrCast(@alignCast(raw));
+        self.interrupt();
     }
 
     /// Signal all threads to stop (trap propagation).
+    ///
+    /// The first terminating thread also publishes a trap as the group's
+    /// terminal outcome; a `proc_exit` that already won keeps its status.
     pub fn signalTrap(self: *ThreadManager) void {
+        if (self.termination) |state|
+            _ = state.claimTrap(termination.generic_trap_code);
+        self.interrupt();
+    }
+
+    /// Interrupt every sibling: raise the polled interrupt flag and cancel
+    /// guest futex waits so blocked threads unwind instead of hanging.
+    /// Idempotent, and safe to call from any thread.
+    pub fn interrupt(self: *ThreadManager) void {
         self.trap_flag.store(true, .release);
+        if (self.shared_memory) |memory| _ = memory.cancelWaiters() catch {};
+    }
+
+    /// True once the group's terminal outcome is claimed, or once a trap has
+    /// been signalled locally. Polled by the interpreter loop and checked at
+    /// every interruptible host blocking point.
+    pub fn isTerminating(self: *ThreadManager) bool {
+        if (self.trap_flag.load(.acquire)) return true;
+        const state = self.termination orelse return false;
+        return state.isTerminating();
+    }
+
+    /// Terminal outcome of the group, when one has been claimed.
+    pub fn terminalOutcome(self: *ThreadManager) ?termination.Outcome {
+        const state = self.termination orelse return null;
+        return state.outcome();
     }
 
     /// Check if a trap has been signaled.
     pub fn hasTrap(self: *ThreadManager) bool {
-        return self.trap_flag.load(.acquire);
+        return self.isTerminating();
     }
 
     /// Join every retained record in bounded batches. Completed native handles
@@ -632,6 +712,81 @@ pub const ThreadManager = struct {
         self.mutex.unlock();
         self.waitForSpawnsToDrain();
         return self.joinAllWithSummary();
+    }
+
+    /// Bounded group teardown for a claimed terminal outcome.
+    ///
+    /// Closes the group to new spawns, wakes every sibling, and then joins
+    /// only the records that have already stopped executing guest code, so
+    /// no single join can block. The loop re-arms the interrupt each round —
+    /// that closes the race where a sibling enters a futex wait just after
+    /// the first wake sweep — and gives up after `timeout_ns`, reporting the
+    /// siblings still running. Nothing shared is released while a record is
+    /// unfinished, so there is no use-after-free and no double free.
+    pub fn terminateAndJoin(
+        self: *ThreadManager,
+        timeout_ns: u64,
+    ) TerminationSummary {
+        self.mutex.lock();
+        self.shutting_down = true;
+        self.mutex.unlock();
+
+        var summary = TerminationSummary{};
+        const deadline = monotonicNowNs() +| timeout_ns;
+        while (true) {
+            self.interrupt();
+
+            const drained = self.joinFinishedRecords(&summary);
+            const current = self.stats();
+            if (current.retained == 0 and
+                current.spawning == 0 and
+                current.joining == 0) return summary;
+            if (drained) continue;
+            if (monotonicNowNs() >= deadline) {
+                summary.unfinished = current.retained;
+                summary.timed_out = true;
+                return summary;
+            }
+            platform.usleep(200);
+        }
+    }
+
+    /// Join every record whose guest thread has already stopped. Returns
+    /// true when at least one record was reclaimed.
+    fn joinFinishedRecords(
+        self: *ThreadManager,
+        summary: *TerminationSummary,
+    ) bool {
+        var reclaimed = false;
+        while (true) {
+            var batch: [join_batch_size]JoinClaim = undefined;
+            var count: usize = 0;
+
+            self.mutex.lock();
+            for (self.slots.items, 0..) |*slot, slot_index| {
+                if (count == batch.len) break;
+                if (slot.state != .live) continue;
+                const record = slot.record.?;
+                if (executionState(record) == .pending) continue;
+                slot.state = .joining;
+                self.joining_count += 1;
+                batch[count] = .{
+                    .slot_index = slot_index,
+                    .generation = slot.generation,
+                    .record = record,
+                };
+                count += 1;
+            }
+            self.mutex.unlock();
+
+            if (count == 0) return reclaimed;
+            for (batch[0..count]) |claim| {
+                const outcome = self.joinClaimed(claim);
+                summary.joined += 1;
+                if (outcome == .trapped) summary.trapped += 1;
+            }
+            reclaimed = true;
+        }
     }
 
     pub fn isShuttingDown(self: *ThreadManager) bool {
@@ -1000,6 +1155,11 @@ fn yieldForLifecycle() void {
     std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
+fn monotonicNowNs() u64 {
+    return std.math.mul(u64, platform.timeGetBootUs(), std.time.ns_per_us) catch
+        std.math.maxInt(u64);
+}
+
 fn threadEntry(record: *ThreadRecord) void {
     const manager = record.manager;
     manager.noteThreadStarted();
@@ -1255,6 +1415,32 @@ const add_start_arg_thread_code = [_]u8{
     0xFE, 0x1E,
     0x02, 0x00,
     0x1A,
+};
+
+/// Publish readiness at address 0, then park forever on address 16.
+/// Only group termination can release this thread.
+const futex_wait_thread_code = [_]u8{
+    0x41, 0x00, // i32.const 0
+    0x41, 0x01, // i32.const 1
+    0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add
+    0x1A, // drop
+    0x41, 0x10, // i32.const 16
+    0x41, 0x00, // i32.const 0 (expected)
+    0x42, 0x7F, // i64.const -1 (no timeout)
+    0xFE, 0x01, 0x02, 0x00, // memory.atomic.wait32
+    0x1A, // drop
+};
+
+/// Publish readiness, then spin forever. Only the interpreter's cross-thread
+/// interrupt poll can stop this thread.
+const spin_forever_thread_code = [_]u8{
+    0x41, 0x00, // i32.const 0
+    0x41, 0x01, // i32.const 1
+    0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add
+    0x1A, // drop
+    0x03, 0x40, // loop
+    0x0C, 0x00, // br 0
+    0x0B, // end
 };
 
 fn requireThreadLifecycle() !void {
@@ -1789,4 +1975,272 @@ test "thread lifecycle: shutdown closes group ownership without detaching childr
         manager.spawnThread(ctx.inst, 0),
     );
     try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+// ── First-wins group termination (#616) ─────────────────────────────────
+
+fn readyCount(ctx: ThreadTestCtx) u32 {
+    const cell: *align(4) const u32 = @ptrCast(@alignCast(ctx.mem_inst.data[0..4]));
+    return @atomicLoad(u32, cell, .acquire);
+}
+
+fn waitForReady(ctx: ThreadTestCtx, expected: u32) !void {
+    const deadline = monotonicNowNs() +| (10 * std.time.ns_per_s);
+    while (readyCount(ctx) < expected) {
+        if (monotonicNowNs() >= deadline) return error.ThreadReadinessTimeout;
+        yieldForLifecycle();
+    }
+}
+
+test "group termination: the winning proc_exit is not masked by later terminations" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var state = termination.State{};
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    const child_count = 4;
+    for (0..child_count) |_| _ = try manager.spawnThread(ctx.inst, 0);
+    try waitForReady(ctx, child_count);
+
+    try std.testing.expect(state.claimExit(9));
+    // A racing trap loses; the embedder still observes the exit status.
+    manager.signalTrap();
+    try std.testing.expectEqual(@as(?u32, 9), state.exitCode());
+    try std.testing.expectEqual(
+        termination.Kind.exit,
+        manager.terminalOutcome().?.kind,
+    );
+
+    const summary = manager.terminateAndJoin(default_termination_timeout_ns);
+    try std.testing.expect(!summary.timed_out);
+    try std.testing.expectEqual(@as(usize, 0), summary.unfinished);
+    try std.testing.expectEqual(@as(usize, child_count), summary.joined);
+    try std.testing.expectEqual(@as(usize, child_count), summary.trapped);
+    try std.testing.expectEqual(@as(?u32, 9), state.exitCode());
+}
+
+test "group termination: a winning trap is never overwritten by a later proc_exit" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const trap_code = [_]u8{0x00};
+    const ctx = try buildThreadTestModule(&trap_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var state = termination.State{};
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    ctx.inst.thread_manager = &manager;
+
+    const tid = try manager.spawnThread(ctx.inst, 0);
+    try std.testing.expectEqual(ThreadOutcome.trapped, try manager.joinOne(tid));
+    try std.testing.expectEqual(
+        termination.Kind.trap,
+        state.outcome().?.kind,
+    );
+
+    // `proc_exit(0)` arriving after the trap must not report success.
+    try std.testing.expect(!state.claimExit(0));
+    try std.testing.expect(state.exitCode() == null);
+}
+
+test "group termination: futex waiters wake and join within the teardown bound" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var destroyed = std.atomic.Value(usize).init(0);
+    var joined = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+    };
+    var state = termination.State{};
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    const child_count = 6;
+    for (0..child_count) |_| _ = try manager.spawnThread(ctx.inst, 0);
+    try waitForReady(ctx, child_count);
+    // Every child is parked on the guest futex; nothing will ever notify it.
+    try std.testing.expectEqual(@as(usize, child_count), manager.stats().active);
+
+    const started_ns = monotonicNowNs();
+    _ = state.claimExit(3);
+    const summary = manager.terminateAndJoin(default_termination_timeout_ns);
+    const elapsed_ns = monotonicNowNs() - started_ns;
+
+    try std.testing.expect(!summary.timed_out);
+    try std.testing.expectEqual(@as(usize, child_count), summary.joined);
+    try std.testing.expectEqual(@as(usize, child_count), summary.trapped);
+    try std.testing.expect(elapsed_ns < std.time.ns_per_s);
+    // Each guest stack, clone, and record is reclaimed exactly once.
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, child_count), atomicCount(&destroyed));
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+    try std.testing.expectEqual(
+        manager.aux_stack_pool.totalCount(),
+        manager.aux_stack_pool.availableCount(),
+    );
+    try std.testing.expectEqual(@as(u32, 1), ctx.mem_inst.referenceCount());
+}
+
+test "group termination: a spinning sibling is interrupted by the interpreter poll" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&spin_forever_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var state = termination.State{};
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    ctx.inst.thread_manager = &manager;
+
+    const child_count = 3;
+    for (0..child_count) |_| _ = try manager.spawnThread(ctx.inst, 0);
+    try waitForReady(ctx, child_count);
+
+    const started_ns = monotonicNowNs();
+    _ = state.claimExit(0);
+    const summary = manager.terminateAndJoin(default_termination_timeout_ns);
+    const elapsed_ns = monotonicNowNs() - started_ns;
+
+    try std.testing.expect(!summary.timed_out);
+    try std.testing.expectEqual(@as(usize, child_count), summary.trapped);
+    try std.testing.expect(elapsed_ns < std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+test "group termination: joining a terminated sibling reports its trap" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var state = termination.State{};
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    const tid = try manager.spawnThread(ctx.inst, 0);
+    try waitForReady(ctx, 1);
+    _ = state.claimExit(2);
+
+    // The join is exact and bounded: the sibling was woken by the claim.
+    try std.testing.expectEqual(ThreadOutcome.trapped, try manager.joinOne(tid));
+    try std.testing.expectError(error.ThreadAlreadyJoined, manager.joinOne(tid));
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedCount());
+}
+
+/// Backend that ignores every interrupt for a fixed duration, standing in for
+/// an AOT sibling spinning in guest code with no interruptible host call.
+const StubbornBackend = struct {
+    hold_ns: u64,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn create(parent: *anyopaque, _: std.mem.Allocator) SpawnError!*anyopaque {
+        return parent;
+    }
+
+    fn configure(
+        _: *anyopaque,
+        _: *ThreadManager,
+        _: i32,
+        _: u32,
+        _: ?execution_context.AuxiliaryStack,
+    ) SpawnError!void {}
+
+    fn run(child: *anyopaque) ThreadOutcome {
+        const self: *StubbornBackend = @ptrCast(@alignCast(child));
+        self.running.store(true, .release);
+        const deadline = monotonicNowNs() +| self.hold_ns;
+        while (monotonicNowNs() < deadline) platform.usleep(200);
+        return .completed;
+    }
+
+    fn destroy(_: *anyopaque) void {}
+
+    const ops = ThreadBackendOps{
+        .create = create,
+        .configure = configure,
+        .run = run,
+        .destroy = destroy,
+    };
+};
+
+test "group termination: an uncooperative sibling bounds teardown instead of deadlocking" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+
+    var backend = StubbornBackend{ .hold_ns = 400 * std.time.ns_per_ms };
+    var destroyed = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{ .records_destroyed = &destroyed };
+    var state = termination.State{};
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    var manager_live = true;
+    defer if (manager_live) manager.deinit();
+    manager.bindTermination(&state);
+
+    _ = try manager.spawnWithBackend(
+        @ptrCast(&backend),
+        0,
+        &StubbornBackend.ops,
+    );
+    while (!backend.running.load(.acquire)) yieldForLifecycle();
+
+    const started_ns = monotonicNowNs();
+    _ = state.claimTrap(termination.generic_trap_code);
+    const summary = manager.terminateAndJoin(20 * std.time.ns_per_ms);
+    const elapsed_ns = monotonicNowNs() - started_ns;
+
+    // Teardown returns on its own deadline rather than waiting for the
+    // sibling, and nothing it still owns has been released.
+    try std.testing.expect(summary.timed_out);
+    try std.testing.expectEqual(@as(usize, 1), summary.unfinished);
+    try std.testing.expectEqual(@as(usize, 0), summary.joined);
+    try std.testing.expect(elapsed_ns < 300 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), atomicCount(&destroyed));
+
+    // The record is still owned by the manager, so the ordinary shutdown
+    // path reclaims it exactly once once the sibling finally returns.
+    manager.deinit();
+    manager_live = false;
+    try std.testing.expectEqual(@as(usize, 1), atomicCount(&destroyed));
+}
+
+test "group termination: a late binder still wakes an already terminated group" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var state = termination.State{};
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    _ = try manager.spawnThread(ctx.inst, 0);
+    try waitForReady(ctx, 1);
+    // Claimed before the manager is bound: binding must replay the wakeup.
+    _ = state.claimExit(4);
+    manager.bindTermination(&state);
+
+    const summary = manager.terminateAndJoin(default_termination_timeout_ns);
+    try std.testing.expect(!summary.timed_out);
+    try std.testing.expectEqual(@as(usize, 1), summary.trapped);
 }

@@ -86,9 +86,10 @@ word uses Linux futex, macOS ulock, or Windows WaitOnAddress; Windows linear
 memory uses NT reserve/commit. The binary loader now validates the atomic
 instruction immediates and operand types consumed by the interpreter path.
 
-The remaining production work is final cross-thread cancellation. Both
-execution backends, shared runtime/host resources, and per-thread execution
-contexts are implemented and covered by checked-in end-to-end fixtures.
+First-wins group termination is implemented on both backends (see
+"Group termination" below). Both execution backends, shared runtime/host
+resources, and per-thread execution contexts are implemented and covered by
+checked-in end-to-end fixtures.
 
 The Preview-1/core-resource portion of B1.1 is now established. `WasiCtx`
 uses a conditional descriptor table: thread-enabled builds map guest fds to
@@ -125,7 +126,7 @@ operation claims. Worker-backed HTTP tables remain synchronized in all builds
 because those workers exist independently of `lib_wasi_threads`.
 
 This completes B1.1's resource-lifetime slices. Both Preview-1 execution
-backends use them; final group cancellation remains separate work.
+backends use them.
 
 The thread-group lifecycle now publishes a generation-stamped, manager-owned
 record before a native child can enter guest code. The child waits on a start
@@ -213,6 +214,46 @@ backend now lowers atomic load/store/RMW/cmpxchg instead of falling through its
 generic zero-result placeholder, and validation tracks every `0xFE` stack
 effect. AArch64 uses its existing LSE acquire/release operations; fences lower
 to `MFENCE` / `DMB ISH`.
+
+
+### Group termination (first-wins)
+
+`src/runtime/common/termination.zig` holds the group's single terminal
+outcome. It lives in the shared `WasiProcessState`, so every thread on both
+backends claims into the same record:
+
+* The first `proc_exit(code)` or trap wins a compare-and-swap and publishes
+  `{kind, code}`; every later claim is a no-op. A trap therefore can never be
+  masked by a racing `proc_exit(0)`, and an exit status can never be replaced
+  by a sibling that traps afterwards. `getExitCode()` returns a status only
+  when `proc_exit` won, so the CLI reports exactly the winning outcome.
+* Publication runs the group wakeup hook that `ThreadManager.bindTermination`
+  installs. The hook raises the manager's interrupt flag and calls
+  `MemoryInstance.cancelWaiters`, which cancels every guest `memory.atomic.wait`
+  parked in the shared memory's parking lot.
+
+Siblings leave guest code through four interruption points:
+
+| Blocked in | Interpreter | AOT |
+| --- | --- | --- |
+| Guest code | `hasTrap` poll in the dispatch loop | (not interruptible; bounded by teardown) |
+| `memory.atomic.wait{32,64}` | pre-park guard + `cancelled` → `error.ThreadCancelled` | pre-park guard + `cancelled` → `terminateAotThread` |
+| `poll_oneoff`, blocking stdin reads | bounded 20 ms slices, then `error.Trap` | same slices, then `terminateAotThread` |
+| `sched_yield` | dispatch-loop poll | explicit check in the host bridge |
+
+The pre-park guard matters as much as the cancel sweep: a thread that starts
+waiting after the sweep has already run would otherwise park forever.
+
+`ThreadManager.terminateAndJoin(timeout_ns)` bounds teardown. It closes the
+group to new spawns, re-arms the interrupt each round, and joins only records
+whose guest thread has already stopped, so no individual join can block. It
+returns after `default_termination_timeout_ns` (2 s) with the number of
+siblings still running. Nothing shared is released while a record is
+unfinished — guest stacks, clones, execution environments, and per-thread
+contexts are reclaimed exactly once by the normal join path — so an
+uncooperative sibling can neither deadlock teardown nor be freed underneath.
+The CLI ends the host process with the winning status when the bound expires,
+which is what `proc_exit` means to the guest.
 
 ## Upstream state
 
@@ -675,13 +716,11 @@ joined trapped outcome, and never detach or terminate the embedding host.
 
 **Scope (one mini-wave each).**
 
-* **5a — Cancellation across threads.** Bind `wasi:task.cancel` to set
-  `ThreadManager.trap_flag` so cooperative cancel points in
-  `dispatchLoopWithFuel` (the same `hasTrap` poll) eject other
-  threads. Caveat: only safe if we audit that no thread holds a
-  resource-table mutex when it observes the cancel — wave-5a must
-  pair the cancel-check with a "release every held lock" routine in
-  the trap exit path.
+* **5a — Cancellation across threads.** Implemented for group termination:
+  the first `proc_exit`/trap publishes the terminal outcome, wakes futex
+  waiters and blocking host calls, and teardown is bounded (see "Group
+  termination" above). Binding component-level `wasi:task.cancel` to the same
+  interrupt path remains open.
 * **5b — Thread joining for embedders.** The lifecycle now provides exact
   `joinOne(tid: i32)` and process-wide batched `joinAll`; wiring those APIs
   into repeated `runLoadedComponent` ownership remains part of the host-binding

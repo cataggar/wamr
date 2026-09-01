@@ -1384,6 +1384,47 @@ fn createInterpreterMemoryImports(
     return owner;
 }
 
+/// Outcome of finishing a Preview-1 WASI thread group.
+const ThreadGroupEnd = struct {
+    /// Number of child threads that ended in a trap.
+    trapped: usize = 0,
+};
+
+/// Finish a Preview-1 thread group.
+///
+/// With no terminal outcome claimed this is the pre-existing cooperative
+/// shutdown: close the group and join every child. Once `proc_exit` or a
+/// trap has won the first-wins race, teardown switches to the bounded path
+/// — wake every sibling, join the ones that stopped, and give up after
+/// `default_termination_timeout_ns`. A sibling still running guest code at
+/// that point keeps the shared module, memory, and table state alive, so the
+/// only safe completion is to end the host process with the winning status;
+/// that is precisely `proc_exit` semantics.
+fn endThreadGroup(
+    manager: *wamr.thread_manager.ThreadManager,
+    ctx: *wamr.WasiProcessState,
+) ThreadGroupEnd {
+    const winner = ctx.terminalOutcome() orelse {
+        const summary = manager.shutdownWithSummary();
+        return .{ .trapped = summary.trapped };
+    };
+    const status: u8 = switch (winner.kind) {
+        .exit => @truncate(winner.code),
+        .trap => 1,
+    };
+    const summary = manager.terminateAndJoin(
+        wamr.thread_manager.default_termination_timeout_ns,
+    );
+    if (summary.timed_out) {
+        std.debug.print(
+            "Error: {d} WASI thread(s) did not stop within the termination bound\n",
+            .{summary.unfinished},
+        );
+        std.process.exit(status);
+    }
+    return .{ .trapped = summary.trapped };
+}
+
 fn runInterpreterCore(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1488,12 +1529,13 @@ fn runInterpreterCore(
             return 1;
         };
         module_inst.thread_manager = &manager;
+        manager.bindTermination(&wasi_ctx.termination);
     }
 
     wamr.instance.runStartFunction(module_inst) catch |err| {
         if (manager_enabled) {
             manager.signalTrap();
-            _ = manager.shutdownWithSummary();
+            _ = endThreadGroup(&manager, wasi_ctx);
         }
         if (wasi_ctx.getExitCode()) |code| return @truncate(code);
         std.debug.print("Error: core module start function trapped: {s}\n", .{@errorName(err)});
@@ -1539,11 +1581,25 @@ fn runInterpreterCore(
         if (manager_enabled) manager.signalTrap();
     };
     const summary = if (manager_enabled)
-        manager.shutdownWithSummary()
+        endThreadGroup(&manager, wasi_ctx)
     else
-        wamr.thread_manager.JoinSummary{};
+        ThreadGroupEnd{};
 
-    if (wasi_ctx.getExitCode()) |code| return @truncate(code);
+    // The first thread to exit or trap owns the process result, so a racing
+    // `proc_exit(0)` can never mask a trap and vice versa.
+    if (wasi_ctx.terminalOutcome()) |winner| {
+        switch (winner.kind) {
+            .exit => return @truncate(winner.code),
+            .trap => {
+                if (execution_error) |err| {
+                    std.debug.print("Error: execution trapped: {s}\n", .{@errorName(err)});
+                } else {
+                    std.debug.print("Error: a WASI thread trapped\n", .{});
+                }
+                return 1;
+            },
+        }
+    }
     if (execution_error) |err| {
         std.debug.print("Error: execution trapped: {s}\n", .{@errorName(err)});
         return 1;
@@ -1672,6 +1728,7 @@ fn runAotReal(
             );
             return 1;
         };
+        manager.bindTermination(&ctx.termination);
     }
 
     const func_idx = aot_runtime.findExportFunc(aot_inst, "_start") orelse
@@ -1697,12 +1754,26 @@ fn runAotReal(
         call_error = err;
     };
 
+    if (call_error != null and manager_enabled) manager.signalTrap();
     const thread_summary = if (manager_enabled)
-        manager.shutdownWithSummary()
+        endThreadGroup(&manager, ctx)
     else
-        wamr.thread_manager.JoinSummary{};
+        ThreadGroupEnd{};
 
-    if (ctx.getExitCode()) |code| return @intCast(code & 0xFF);
+    // Same first-wins contract as the interpreter path (#616).
+    if (ctx.terminalOutcome()) |winner| {
+        switch (winner.kind) {
+            .exit => return @intCast(winner.code & 0xFF),
+            .trap => {
+                if (call_error) |err| {
+                    std.debug.print("Error: AOT execution failed: {}\n", .{err});
+                } else {
+                    std.debug.print("Error: an AOT WASI thread trapped\n", .{});
+                }
+                return 1;
+            },
+        }
+    }
     if (call_error) |err| {
         std.debug.print("Error: AOT execution failed: {}\n", .{err});
         return 1;
