@@ -5,6 +5,7 @@ const AtomicMarkers = struct {
     loads: usize,
     stores: usize,
     rmw_adds: usize,
+    cmpxchgs: usize,
     wait32s: usize,
 };
 
@@ -34,6 +35,7 @@ fn rewriteAtomicText(
         .loads = std.mem.count(u8, source, "i32.atomic.load"),
         .stores = std.mem.count(u8, source, "i32.atomic.store"),
         .rmw_adds = std.mem.count(u8, source, "i32.atomic.rmw.add"),
+        .cmpxchgs = std.mem.count(u8, source, "i32.atomic.rmw.cmpxchg"),
         .wait32s = std.mem.count(u8, source, "memory.atomic.wait32"),
     };
     // `memory.atomic.wait32` consumes [addr:i32, expected:i32, timeout:i64]
@@ -47,6 +49,14 @@ fn rewriteAtomicText(
     );
     errdefer allocator.free(rewritten);
     var next = try replaceAll(
+        allocator,
+        rewritten,
+        "i32.atomic.rmw.cmpxchg",
+        "drop drop i32.load",
+    );
+    allocator.free(rewritten);
+    rewritten = next;
+    next = try replaceAll(
         allocator,
         rewritten,
         "i32.atomic.rmw.add",
@@ -77,7 +87,13 @@ fn lowerAtomicMarkers(
     module: *wabt.Module.Module,
     expected: AtomicMarkers,
 ) !void {
-    var actual = AtomicMarkers{ .loads = 0, .stores = 0, .rmw_adds = 0, .wait32s = 0 };
+    var actual = AtomicMarkers{
+        .loads = 0,
+        .stores = 0,
+        .rmw_adds = 0,
+        .cmpxchgs = 0,
+        .wait32s = 0,
+    };
     for (module.funcs.items) |*function| {
         if (function.is_import or function.code_bytes.len == 0) continue;
         var output: std.ArrayListUnmanaged(u8) = .empty;
@@ -94,6 +110,10 @@ fn lowerAtomicMarkers(
                 try output.appendSlice(allocator, &.{ 0xfe, 0x1e, 0x02, 0x00 });
                 i += 3;
                 actual.rmw_adds += 1;
+            } else if (std.mem.startsWith(u8, remaining, &.{ 0x1a, 0x1a, 0x28, 0x02, 0x00 })) {
+                try output.appendSlice(allocator, &.{ 0xfe, 0x48, 0x02, 0x00 });
+                i += 4;
+                actual.cmpxchgs += 1;
             } else if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x36, 0x02 })) {
                 try output.appendSlice(allocator, &.{ 0xfe, 0x17, 0x02 });
                 i += 3;
@@ -113,18 +133,21 @@ fn lowerAtomicMarkers(
     if (actual.loads != expected.loads or
         actual.stores != expected.stores or
         actual.rmw_adds != expected.rmw_adds or
+        actual.cmpxchgs != expected.cmpxchgs or
         actual.wait32s != expected.wait32s)
     {
         std.debug.print(
-            "atomic marker mismatch: expected {d}/{d}/{d}/{d}, found {d}/{d}/{d}/{d}\n",
+            "atomic marker mismatch: expected {d}/{d}/{d}/{d}/{d}, found {d}/{d}/{d}/{d}/{d}\n",
             .{
                 expected.loads,
                 expected.stores,
                 expected.rmw_adds,
+                expected.cmpxchgs,
                 expected.wait32s,
                 actual.loads,
                 actual.stores,
                 actual.rmw_adds,
+                actual.cmpxchgs,
                 actual.wait32s,
             },
         );

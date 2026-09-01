@@ -98,6 +98,7 @@ const vmctx_aot_throw_uncaught_fn_field: i32 = 256; // VmCtx.aot_throw_uncaught_
 const vmctx_exception_params_field: i32 = 264; // VmCtx.exception_params base ([16]u64)
 const vmctx_exception_param_count_field: i32 = 392; // VmCtx.exception_param_count (u32)
 const vmctx_lazy_compile_fn_field: i32 = 408; // VmCtx.lazy_compile_fn offset (usize)
+const vmctx_trap_unaligned_fn_field: i32 = 424; // VmCtx.trap_unaligned_fn offset
 // Per-table descriptor layout (TableInfo, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
 const table_info_ptr_off: i32 = 0;
@@ -150,6 +151,36 @@ fn emitTrapHelperCall(code: *emit.CodeBuffer, field_offset: i32) !void {
     try code.movRegReg(param_regs[0], .rbx);
     try code.movRegMem(.rax, param_regs[0], field_offset);
     try code.callReg(.rax);
+}
+
+fn addAtomicStaticOffset(code: *emit.CodeBuffer, offset: u32) !void {
+    if (offset == 0) return;
+    if (offset <= 0x7fff_ffff) {
+        try code.addRegImm32(.rax, @intCast(offset));
+    } else {
+        try code.movRegImm64(.r10, offset);
+        try code.addRegReg(.rax, .r10);
+    }
+}
+
+fn emitAtomicAlignmentCheck(
+    code: *emit.CodeBuffer,
+    address_reg: emit.Reg,
+    size: u8,
+) !void {
+    if (size == 1) return;
+    std.debug.assert(size == 2 or size == 4 or size == 8);
+    try code.testRegImm32(address_reg, @intCast(size - 1));
+    const aligned_patch = code.len();
+    try code.je(0);
+    try emitTrapHelperCall(code, vmctx_trap_unaligned_fn_field);
+    code.patchI32(
+        aligned_patch + 2,
+        @intCast(
+            @as(i64, @intCast(code.len())) -
+                @as(i64, @intCast(aligned_patch + 6)),
+        ),
+    );
 }
 
 /// #672 commit 4: emit lowering of the IR `throw` op on x86_64.
@@ -6120,16 +6151,11 @@ fn compileInstRA(
                 code,
                 @as(u64, ld.offset) + @as(u64, ld.size),
             );
+            try addAtomicStaticOffset(code, ld.offset);
+            try emitAtomicAlignmentCheck(code, .rax, ld.size);
             try code.addRegReg(.rax, .r15);
-            var displacement: i32 = 0;
-            if (ld.offset <= 0x7fff_ffff) {
-                displacement = @intCast(ld.offset);
-            } else {
-                try code.movRegImm64(.r10, ld.offset);
-                try code.addRegReg(.rax, .r10);
-            }
             const result_reg = destReg(alloc_result, dest);
-            try code.movRegMemSized(result_reg, .rax, displacement, ld.size);
+            try code.movRegMemSized(result_reg, .rax, 0, ld.size);
             try writeDefTyped(code, alloc_result, dest, result_reg, inst.type);
         },
         .atomic_store => |st| {
@@ -6140,17 +6166,12 @@ fn compileInstRA(
                 code,
                 @as(u64, st.offset) + @as(u64, st.size),
             );
+            try addAtomicStaticOffset(code, st.offset);
+            try emitAtomicAlignmentCheck(code, .rax, st.size);
             try code.addRegReg(.rax, .r15);
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            var displacement: i32 = 0;
-            if (st.offset <= 0x7fff_ffff) {
-                displacement = @intCast(st.offset);
-            } else {
-                try code.movRegImm64(.r10, st.offset);
-                try code.addRegReg(.rax, .r10);
-            }
-            try code.movMemRegSized(.rax, displacement, .rcx, st.size);
+            try code.movMemRegSized(.rax, 0, .rcx, st.size);
             try code.mfence();
         },
         .atomic_rmw => |rmw| {
@@ -6162,15 +6183,9 @@ fn compileInstRA(
                 code,
                 @as(u64, rmw.offset) + @as(u64, rmw.size),
             );
+            try addAtomicStaticOffset(code, rmw.offset);
+            try emitAtomicAlignmentCheck(code, .rax, rmw.size);
             try code.addRegReg(.rax, .r15);
-            if (rmw.offset > 0) {
-                if (rmw.offset <= 0x7fff_ffff) {
-                    try code.addRegImm32(.rax, @intCast(rmw.offset));
-                } else {
-                    try code.movRegImm64(.r10, rmw.offset);
-                    try code.addRegReg(.rax, .r10);
-                }
-            }
             const val_reg = try useVReg(code, alloc_result, rmw.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
             switch (rmw.op) {
@@ -6223,15 +6238,9 @@ fn compileInstRA(
                 code,
                 @as(u64, cmpxchg.offset) + @as(u64, cmpxchg.size),
             );
+            try addAtomicStaticOffset(code, cmpxchg.offset);
+            try emitAtomicAlignmentCheck(code, .rax, cmpxchg.size);
             try code.addRegReg(.rax, .r15);
-            if (cmpxchg.offset > 0) {
-                if (cmpxchg.offset <= 0x7fff_ffff) {
-                    try code.addRegImm32(.rax, @intCast(cmpxchg.offset));
-                } else {
-                    try code.movRegImm64(.r10, cmpxchg.offset);
-                    try code.addRegReg(.rax, .r10);
-                }
-            }
             try code.movRegReg(.r11, .rax);
             const expected_reg =
                 try useVReg(code, alloc_result, cmpxchg.expected, .rax);
