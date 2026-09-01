@@ -622,12 +622,12 @@ pub fn build(b: *std.Build) void {
             );
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-trap", 1, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-proc-exit", 7, null, null);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "terminate-futex-waiter", 5, true);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "terminate-poll-waiter", 5, true);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "terminate-spinning-child", 7, true);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "parent-trap-spinning-child", 1, false);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "trap-beats-late-exit", 1, false);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "exit-beats-late-trap", 6, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-futex-waiter", 5, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-poll-waiter", 5, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-spinning-child", 7, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "parent-trap-spinning-child", 1, false);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "trap-beats-late-exit", 1, false);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "exit-beats-late-trap", 6, true);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "missing-thread-start", 0, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "wrong-thread-start-signature", 0, null, null);
             inline for (.{
@@ -2277,6 +2277,7 @@ fn addBoundedAotThreadFixture(
     b: *std.Build,
     parent: *std.Build.Step,
     wamrc: *std.Build.Step.Compile,
+    wamr_exe: *std.Build.Step.Compile,
     bounded_runner: *std.Build.Step.Compile,
     name: []const u8,
     expected_exit: u8,
@@ -2290,10 +2291,11 @@ fn addBoundedAotThreadFixture(
 
     const run = b.addRunArtifact(bounded_runner);
     run.addArg(termination_timeout_seconds);
-    run.addFileArg(b.path("zig-out/bin/wamr"));
+    // Use the built artifact rather than an install path: the executable
+    // suffix and install layout differ per host.
+    run.addFileArg(wamr_exe.getEmittedBin());
     run.addArg("run");
     run.addFileArg(cwasm);
-    run.step.dependOn(b.getInstallStep());
     run.expectExitCode(expected_exit);
     run.expectStdOutEqual("");
     if (quiet_stderr) run.expectStdErrEqual("");
