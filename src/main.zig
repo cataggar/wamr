@@ -1635,6 +1635,32 @@ fn runAot(
     }
 }
 
+fn printAotExecutionError(
+    inst: *wamr.aot_runtime.AotInstance,
+    err: wamr.aot_runtime.ScalarCallError,
+) void {
+    if (err == error.WasmTrap) {
+        switch (wamr.aot_runtime.lastTrapReason(inst)) {
+            .unaligned_atomic => {
+                std.debug.print(
+                    "Error: AOT execution failed: UnalignedAtomicAccess\n",
+                    .{},
+                );
+                return;
+            },
+            .out_of_bounds_memory => {
+                std.debug.print(
+                    "Error: AOT execution failed: OutOfBoundsMemoryAccess\n",
+                    .{},
+                );
+                return;
+            },
+            .unknown => {},
+        }
+    }
+    std.debug.print("Error: AOT execution failed: {}\n", .{err});
+}
+
 fn runAotReal(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1766,7 +1792,7 @@ fn runAotReal(
             .exit => return @intCast(winner.code & 0xFF),
             .trap => {
                 if (call_error) |err| {
-                    std.debug.print("Error: AOT execution failed: {}\n", .{err});
+                    printAotExecutionError(aot_inst, err);
                 } else {
                     std.debug.print("Error: an AOT WASI thread trapped\n", .{});
                 }
@@ -1775,7 +1801,7 @@ fn runAotReal(
         }
     }
     if (call_error) |err| {
-        std.debug.print("Error: AOT execution failed: {}\n", .{err});
+        printAotExecutionError(aot_inst, err);
         return 1;
     }
     if (thread_summary.trapped != 0) {

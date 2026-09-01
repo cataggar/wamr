@@ -6,7 +6,7 @@
   (import "wasi" "thread-spawn" (func $thread_spawn (param i32) (result i32)))
   (import "wasi_snapshot_preview1" "sched_yield" (func $sched_yield (result i32)))
   (memory (export "memory") 1 8)
-  (table (export "__indirect_function_table") 1 2048 funcref)
+  (table (export "__indirect_function_table") 1 funcref)
   (global $__stack_pointer (export "__stack_pointer") (mut i32) (i32.const 4096))
   (global $__heap_base (export "__heap_base") (mut i32) (i32.const 8192))
   (elem (i32.const 0) $callee)
