@@ -4712,6 +4712,30 @@ pub const HttpResponseP3 = struct {
 const http_live_response_buffer_bytes: usize = 64 * 1024;
 const http_live_response_wait_ns: i64 = 10 * std.time.ns_per_ms;
 
+/// Cap on bytes a guest may buffer *before* it selects the response
+/// (`response-outparam.set` / `canon task.return`). Pre-selection bytes
+/// cannot be transmitted — no head has been framed yet — so they cannot
+/// share the transmit ring's blocking back-pressure or the guest would
+/// deadlock itself before it can ever select the response (#962 review).
+/// They spill into a separate staging FIFO that is bounded by this cap;
+/// exceeding it fails the response with `HTTP-response-body-size` rather
+/// than blocking forever.
+pub var http_live_response_prebuffer_bytes: usize = 1024 * 1024;
+
+/// Stall budget for the post-handler completion wait. `waitAndJoin`
+/// only ever runs after the guest handler returned or failed, so any
+/// interval this long without a single observable milestone or byte of
+/// progress means no producer is left to advance the response. The
+/// connection is then settled with `HTTP-response-incomplete` instead of
+/// parking the connection thread forever (#962 review). Progress —
+/// including a writer parked inside a slow client's socket write —
+/// re-arms the budget, so legitimate long-lived streams never expire.
+pub var http_live_response_completion_timeout_ns: u64 = 30 * std.time.ns_per_s;
+
+fn httpLiveMonotonicNs() u64 {
+    return platform.timeGetBootUs() *| std.time.ns_per_us;
+}
+
 const HttpLiveTerminal = enum(u32) {
     running,
     succeeded,
@@ -4780,6 +4804,13 @@ const InboundHttpResponseSession = struct {
     queue: []u8,
     queue_head: usize = 0,
     queue_len: usize = 0,
+    /// Pre-selection / overflow FIFO. Logical body order is the ring
+    /// contents followed by `staging[staging_head..]`; the staging bytes
+    /// migrate into the ring as soon as a head exists and space frees up.
+    staging: std.ArrayListUnmanaged(u8) = .empty,
+    staging_head: usize = 0,
+    prebuffer_limit: usize = 0,
+    completion_timeout_ns: u64 = 0,
     max_buffered: usize = 0,
     produced_bytes: usize = 0,
     transmitted_bytes: usize = 0,
@@ -4795,6 +4826,7 @@ const InboundHttpResponseSession = struct {
     callbacks_accepting: std.atomic.Value(bool) = .init(true),
     callback_refs: std.atomic.Value(u32) = .init(0),
     output_started: std.atomic.Value(bool) = .init(false),
+    writer_in_io: std.atomic.Value(bool) = .init(false),
     tx_settled: std.atomic.Value(bool) = .init(false),
     guest_cancel_propagated: std.atomic.Value(bool) = .init(false),
 
@@ -4840,6 +4872,8 @@ const InboundHttpResponseSession = struct {
             .interrupt = interrupt,
             .wire_writer = wire_writer,
             .queue = queue,
+            .prebuffer_limit = http_live_response_prebuffer_bytes,
+            .completion_timeout_ns = http_live_response_completion_timeout_ns,
         };
         return self;
     }
@@ -4862,6 +4896,7 @@ const InboundHttpResponseSession = struct {
         self.parking.deinit();
         if (self.head_bytes) |bytes| self.allocator.free(bytes);
         if (self.trailer_bytes) |bytes| self.allocator.free(bytes);
+        self.staging.deinit(self.allocator);
         self.allocator.free(self.queue);
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -5034,7 +5069,41 @@ const InboundHttpResponseSession = struct {
             }
 
             self.mutex.lock();
-            const available = self.queue.len - self.queue_len;
+            // The writer can only drain once a head exists. Before that
+            // the ring is a dead end, so blocking on it would deadlock
+            // the very guest thread that still has to select the
+            // response (#962 review regression 1).
+            const drainable = self.head_ready;
+            if (drainable) self.refillFromStagingLocked();
+            if (!drainable) {
+                const pending = bytes.len - offset;
+                const buffered = self.queue_len + self.stagedLenLocked();
+                if (pending > self.prebuffer_limit -| buffered) {
+                    self.mutex.unlock();
+                    self.failResponse(.HTTP_response_body_size, false);
+                    self.propagateTerminalToGuest();
+                    return false;
+                }
+                self.staging.appendSlice(
+                    self.allocator,
+                    bytes[offset..],
+                ) catch {
+                    self.mutex.unlock();
+                    self.failResponse(.internal_error, false);
+                    self.propagateTerminalToGuest();
+                    return false;
+                };
+                self.mutex.unlock();
+                offset = bytes.len;
+                continue;
+            }
+
+            const available = if (self.stagedLenLocked() == 0)
+                self.queue.len - self.queue_len
+            else
+                // Staged bytes precede these in the body; wait for the
+                // ring to drain rather than reordering the stream.
+                0;
             if (available == 0) {
                 const observed = self.space_epoch.load(.acquire);
                 self.mutex.unlock();
@@ -5063,6 +5132,57 @@ const InboundHttpResponseSession = struct {
         return true;
     }
 
+    fn stagedLenLocked(self: *const InboundHttpResponseSession) usize {
+        return self.staging.items.len - self.staging_head;
+    }
+
+    /// Move as many staged bytes as fit into the transmit ring. Caller
+    /// holds `mutex`; only meaningful once `head_ready` lets the writer
+    /// drain the ring.
+    fn refillFromStagingLocked(self: *InboundHttpResponseSession) void {
+        if (!self.head_ready) return;
+        var moved = false;
+        while (self.stagedLenLocked() > 0) {
+            const available = self.queue.len - self.queue_len;
+            if (available == 0) break;
+            const take = @min(available, self.stagedLenLocked());
+            const src = self.staging.items[self.staging_head .. self.staging_head + take];
+            const tail = (self.queue_head + self.queue_len) % self.queue.len;
+            const first = @min(take, self.queue.len - tail);
+            @memcpy(self.queue[tail .. tail + first], src[0..first]);
+            if (first < take) {
+                @memcpy(self.queue[0 .. take - first], src[first..]);
+            }
+            self.queue_len += take;
+            self.staging_head += take;
+            self.max_buffered = @max(self.max_buffered, self.queue_len);
+            moved = true;
+        }
+        if (self.stagedLenLocked() == 0 and self.staging.items.len != 0) {
+            self.staging.clearRetainingCapacity();
+            self.staging_head = 0;
+        }
+        if (moved) {
+            _ = self.data_epoch.fetchAdd(1, .acq_rel);
+            _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
+        }
+    }
+
+    /// Bytes the guest may hand over right now. Post-selection writes
+    /// block against a draining ring and always complete, so the ring
+    /// size is the honest chunk hint. Pre-selection writes cannot drain,
+    /// so the remaining staging budget is reported instead — a
+    /// well-behaved guest observes real back-pressure before it can hit
+    /// the cap (#962 review regression 1).
+    fn writePermit(self: *InboundHttpResponseSession) u64 {
+        if (self.currentTerminal() != .running) return 0;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.head_ready) return @intCast(self.queue.len);
+        const buffered = self.queue_len + self.stagedLenLocked();
+        return @intCast(self.prebuffer_limit -| buffered);
+    }
+
     fn enqueuePrebuffered(
         self: *InboundHttpResponseSession,
         bytes: []const u8,
@@ -5070,16 +5190,11 @@ const InboundHttpResponseSession = struct {
         if (bytes.len == 0) return true;
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (bytes.len > self.queue.len - self.queue_len) return false;
-        const tail = (self.queue_head + self.queue_len) % self.queue.len;
-        const first = @min(bytes.len, self.queue.len - tail);
-        @memcpy(self.queue[tail .. tail + first], bytes[0..first]);
-        if (first < bytes.len) {
-            @memcpy(self.queue[0 .. bytes.len - first], bytes[first..]);
-        }
-        self.queue_len += bytes.len;
+        const buffered = self.queue_len + self.stagedLenLocked();
+        if (bytes.len > self.prebuffer_limit -| buffered) return false;
+        self.staging.appendSlice(self.allocator, bytes) catch return false;
         self.produced_bytes += bytes.len;
-        self.max_buffered = @max(self.max_buffered, self.queue_len);
+        self.refillFromStagingLocked();
         _ = self.data_epoch.fetchAdd(1, .acq_rel);
         _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
         return true;
@@ -5102,6 +5217,7 @@ const InboundHttpResponseSession = struct {
         }
         self.queue_head = (self.queue_head + take) % self.queue.len;
         self.queue_len -= take;
+        self.refillFromStagingLocked();
         self.mutex.unlock();
         _ = self.space_epoch.fetchAdd(1, .acq_rel);
         _ = self.parking.notify(&self.space_epoch.raw, 1) catch 0;
@@ -5331,6 +5447,7 @@ const InboundHttpResponseSession = struct {
         } else if (owned_trailers) |bytes| {
             self.allocator.free(bytes);
         }
+        self.refillFromStagingLocked();
         _ = self.data_epoch.fetchAdd(1, .acq_rel);
         _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
     }
@@ -5445,6 +5562,7 @@ const InboundHttpResponseSession = struct {
         self.trailer_state = .ready;
         self.use_chunked = use_chunked;
         self.expected_content_length = expected_content_length;
+        self.refillFromStagingLocked();
         _ = self.data_epoch.fetchAdd(1, .acq_rel);
         _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
     }
@@ -6074,6 +6192,19 @@ const InboundHttpResponseSession = struct {
             self.failResponse(.HTTP_response_body_size, true);
             return false;
         }
+        if (!body_closed) {
+            // Preview 2 dispatch is a synchronous guest call: it has
+            // already returned, so no producer is left that could
+            // `outgoing-body.finish` or drop the body. Waiting for a
+            // milestone that can never arrive parks the connection
+            // thread forever (#962 review regression 2), so settle the
+            // response as incomplete right here.
+            self.failResponse(
+                .HTTP_response_incomplete,
+                self.writer_in_io.load(.acquire),
+            );
+            return false;
+        }
         self.wakeAll();
         self.tryComplete();
         return true;
@@ -6092,6 +6223,8 @@ const InboundHttpResponseSession = struct {
         self: *InboundHttpResponseSession,
         bytes: []const u8,
     ) !void {
+        self.writer_in_io.store(true, .release);
+        defer self.writer_in_io.store(false, .release);
         if (self.wire_writer) |writer| {
             return switch (writer.write(writer.context, bytes)) {
                 .ok => |n| if (n == bytes.len) {} else error.IoError,
@@ -6169,7 +6302,8 @@ const InboundHttpResponseSession = struct {
             }
 
             self.mutex.lock();
-            const finished = self.body_length_validated and self.body_closed;
+            const finished = self.body_length_validated and self.body_closed and
+                self.stagedLenLocked() == 0;
             const trailers_ready = self.trailer_state == .ready;
             const trailers = self.trailer_bytes;
             const observed = self.data_epoch.load(.acquire);
@@ -6202,8 +6336,49 @@ const InboundHttpResponseSession = struct {
         }
     }
 
+    /// Snapshot of everything that can still move the response forward.
+    /// `waitAndJoin` re-arms its stall budget whenever this changes, so
+    /// an actively streaming producer (or a writer parked inside a slow
+    /// client's socket write) never expires while a response nothing can
+    /// advance is settled within one budget.
+    const CompletionProgress = struct {
+        transmitted: usize,
+        produced: usize,
+        queued: usize,
+        staged: usize,
+        head_ready: bool,
+        body_closed: bool,
+        body_validated: bool,
+        trailer_state: HttpTrailerState,
+        wire_complete: bool,
+        callback_refs: u32,
+        writer_in_io: bool,
+    };
+
+    fn completionProgress(
+        self: *InboundHttpResponseSession,
+    ) CompletionProgress {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{
+            .transmitted = self.transmitted_bytes,
+            .produced = self.produced_bytes,
+            .queued = self.queue_len,
+            .staged = self.stagedLenLocked(),
+            .head_ready = self.head_ready,
+            .body_closed = self.body_closed,
+            .body_validated = self.body_length_validated,
+            .trailer_state = self.trailer_state,
+            .wire_complete = self.wire_complete,
+            .callback_refs = self.callback_refs.load(.acquire),
+            .writer_in_io = self.writer_in_io.load(.acquire),
+        };
+    }
+
     fn waitAndJoin(self: *InboundHttpResponseSession) void {
         const thread = self.writer_thread orelse return;
+        var progress = self.completionProgress();
+        var deadline = httpLiveMonotonicNs() +| self.completion_timeout_ns;
         while (self.currentTerminal() == .running) {
             if (http_shutdown_requested.load(.acquire)) {
                 self.cancelForShutdown();
@@ -6220,6 +6395,25 @@ const InboundHttpResponseSession = struct {
             }
             const observed = self.terminal_epoch.load(.acquire);
             if (self.currentTerminal() != .running) break;
+
+            const now = self.completionProgress();
+            if (now.writer_in_io or now.callback_refs != 0 or
+                !std.meta.eql(now, progress))
+            {
+                progress = now;
+                deadline = httpLiveMonotonicNs() +| self.completion_timeout_ns;
+            } else if (self.completion_timeout_ns != 0 and
+                httpLiveMonotonicNs() >= deadline)
+            {
+                // The handler already returned or failed and nothing has
+                // moved for a whole budget: no producer is left to close
+                // the body, resolve the trailers, or drain the wire.
+                // Settle instead of leaking this thread and its socket
+                // for the lifetime of the process (#962 review
+                // regression 2).
+                self.failResponse(.HTTP_response_incomplete, true);
+                break;
+            }
             self.waitEpoch(&self.terminal_epoch, observed);
         }
         thread.join();
@@ -12373,19 +12567,44 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]output-stream.check-write: (borrow<output-stream>)
-    ///   -> result<u64, stream-error>`. The captured buffer can always
-    /// accept; report a generous chunk so the guest writes in one call.
+    ///   -> result<u64, stream-error>`. Captured buffers can always
+    /// accept, so a generous chunk is reported. A live inbound HTTP
+    /// response body reports its real remaining permit instead: the
+    /// transmit ring once the response is selected, or the remaining
+    /// pre-selection staging budget before that, so a guest buffering
+    /// ahead of `response-outparam.set` sees genuine back-pressure
+    /// rather than an unconditional 64 KiB promise (#962 review).
     fn outputStreamCheckWrite(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
-        _ = ctx_opaque;
         if (args.len == 0 or results.len == 0) return error.InvalidArgs;
+        var permit: u64 = 64 * 1024;
+        if (ctx_opaque) |ctx| {
+            const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx));
+            const handle: ?u32 = switch (args[0]) {
+                .handle => |h| h,
+                else => null,
+            };
+            if (handle) |stream_handle| {
+                const is_http_body = blk: {
+                    var stream_lease = self.lookupStream(stream_handle) orelse
+                        break :blk false;
+                    defer stream_lease.release();
+                    break :blk stream_lease.value().http_outgoing_body_handle != null;
+                };
+                if (is_http_body) {
+                    if (self.activeInboundHttpResponse(ci)) |session| {
+                        permit = session.writePermit();
+                    }
+                }
+            }
+        }
         const payload = try allocator.create(InterfaceValue);
-        payload.* = .{ .u64 = 64 * 1024 };
+        payload.* = .{ .u64 = permit };
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = payload } };
     }
 
@@ -26569,6 +26788,8 @@ pub const WasiCliAdapter = struct {
         ci: *ComponentInstance,
         future_handle: u32,
     ) !?HttpFieldsLease {
+        const deadline = httpLiveMonotonicNs() +|
+            http_live_response_completion_timeout_ns;
         while (true) {
             switch (try decodeHttpTrailerFuture(
                 ci,
@@ -26577,6 +26798,14 @@ pub const WasiCliAdapter = struct {
             )) {
                 .pending => {
                     if (http_shutdown_requested.load(.acquire)) {
+                        return error.HttpTrailersFailed;
+                    }
+                    // A future the guest never resolves would otherwise
+                    // spin this connection thread forever (#962 review
+                    // regression 2).
+                    if (http_live_response_completion_timeout_ns != 0 and
+                        httpLiveMonotonicNs() >= deadline)
+                    {
                         return error.HttpTrailersFailed;
                     }
                     _ = driveAsyncEvents(
@@ -48433,6 +48662,616 @@ test "wasi:http #954 review: pending P3 trailers delay completion and preserve t
         sink.contents(),
         "0\r\nx-late: ready\r\n\r\n",
     ));
+}
+
+/// Hard wall-clock bound for the live-response regression tests. A
+/// regression in the completion path must FAIL the test binary rather
+/// than park CI forever, so a watchdog thread kills the process once the
+/// budget expires (#962 review).
+const LiveHttpWatchdog = struct {
+    label: []const u8,
+    limit_ms: u64,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *LiveHttpWatchdog) !void {
+        self.thread = try std.Thread.spawn(
+            .{},
+            LiveHttpWatchdog.run,
+            .{self},
+        );
+    }
+
+    fn run(self: *LiveHttpWatchdog) void {
+        var waited: u64 = 0;
+        while (waited < self.limit_ms) : (waited += 5) {
+            if (self.done.load(.acquire)) return;
+            platform.usleep(5 * std.time.us_per_ms);
+        }
+        if (self.done.load(.acquire)) return;
+        std.debug.print(
+            "\nwasi:http live response watchdog: '{s}' exceeded {d}ms\n",
+            .{ self.label, self.limit_ms },
+        );
+        std.process.exit(101);
+    }
+
+    fn stop(self: *LiveHttpWatchdog) void {
+        self.done.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+};
+
+const LiveHttpP2Fixture = struct {
+    response_handle: u32,
+    body_handle: u32,
+    outparam_handle: u32,
+};
+
+fn makeLiveHttpP2Fixture(
+    adapter: *WasiCliAdapter,
+    content_length: ?usize,
+) !LiveHttpP2Fixture {
+    const fields = try adapter.allocator.create(HttpFields);
+    fields.* = .{};
+    const fields_handle = try adapter.pushHttpFields(fields);
+    if (content_length) |length| {
+        const name = try adapter.allocator.dupe(u8, "content-length");
+        errdefer adapter.allocator.free(name);
+        const value = try std.fmt.allocPrint(
+            adapter.allocator,
+            "{d}",
+            .{length},
+        );
+        errdefer adapter.allocator.free(value);
+        try fields.entries.append(adapter.allocator, .{
+            .name = name,
+            .value = value,
+        });
+    }
+    const response = try adapter.allocator.create(OutgoingResponse);
+    response.* = .{ .headers_handle = fields_handle };
+    const response_handle = try adapter.pushOutgoingResponse(response);
+    const body = try adapter.allocator.create(OutgoingBody);
+    body.* = .{ .parent_response_handle = response_handle };
+    const body_handle = try adapter.pushOutgoingBody(body);
+    response.body_handle = body_handle;
+    const outparam = try adapter.allocator.create(ResponseOutparam);
+    outparam.* = .{};
+    const outparam_handle = try adapter.pushResponseOutparam(outparam);
+    return .{
+        .response_handle = response_handle,
+        .body_handle = body_handle,
+        .outparam_handle = outparam_handle,
+    };
+}
+
+fn startLiveHttpP2TestSession(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    output: *streams.OutputStream,
+    sink: *LiveHttpTestSink,
+) !*InboundHttpResponseSession {
+    const session = try InboundHttpResponseSession.create(
+        adapter.allocator,
+        adapter,
+        ci,
+        output,
+        false,
+        .{
+            .context = sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    session.p2_mode = true;
+    errdefer session.destroy();
+    try session.start();
+    return session;
+}
+
+fn liveHttpCheckWritePermit(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    stream_handle: u32,
+) !u64 {
+    var results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.outputStreamCheckWrite(
+        adapter,
+        ci,
+        &.{.{ .handle = stream_handle }},
+        &results,
+        adapter.allocator,
+    );
+    defer results[0].deinit(adapter.allocator);
+    return results[0].result_val.payload.?.u64;
+}
+
+fn liveHttpSelectP2Response(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    fixture: LiveHttpP2Fixture,
+) !void {
+    const response_payload = InterfaceValue{ .handle = fixture.response_handle };
+    const response_result = InterfaceValue{ .result_val = .{
+        .is_ok = true,
+        .payload = &response_payload,
+    } };
+    try WasiCliAdapter.httpResponseOutparamSet(
+        adapter,
+        ci,
+        &.{ .{ .handle = fixture.outparam_handle }, response_result },
+        &.{},
+        adapter.allocator,
+    );
+}
+
+const LiveHttpStreamWriter = struct {
+    stream: *streams.OutputStream,
+    allocator: Allocator,
+    payload: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+    accepted: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *LiveHttpStreamWriter) void {
+        const result = self.stream.write(self.payload, self.allocator);
+        self.accepted.store(result == .ok, .release);
+        self.done.store(true, .release);
+    }
+};
+
+test "wasi:http #962 regression: P2 pre-selection writes past the ring never block" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P2 pre-selection writes past the ring never block",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpP2TestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+    );
+    defer session.destroy();
+    session.prebuffer_limit = http_live_response_buffer_bytes * 2;
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    defer owner.release();
+
+    try testing.expectEqual(
+        @as(u64, http_live_response_buffer_bytes * 2),
+        try liveHttpCheckWritePermit(&adapter, &ci, stream_handle),
+    );
+
+    const first = try testing.allocator.alloc(u8, http_live_response_buffer_bytes);
+    defer testing.allocator.free(first);
+    @memset(first, 'a');
+    try testing.expect(owner.stream.write(first, testing.allocator) == .ok);
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+    try testing.expectEqual(
+        @as(u64, http_live_response_buffer_bytes),
+        try liveHttpCheckWritePermit(&adapter, &ci, stream_handle),
+    );
+
+    // The regression: with the ring full and no head framed yet, this
+    // write parked forever inside the host call, so the guest could
+    // never reach `response-outparam.set` to unblock itself.
+    var writer = LiveHttpStreamWriter{
+        .stream = owner.stream,
+        .allocator = testing.allocator,
+        .payload = "Z",
+    };
+    const thread = try std.Thread.spawn(
+        .{},
+        LiveHttpStreamWriter.run,
+        .{&writer},
+    );
+    var attempts: usize = 0;
+    while (!writer.done.load(.acquire) and attempts < 2_000) : (attempts += 1) {
+        platform.usleep(std.time.us_per_ms);
+    }
+    const completed = writer.done.load(.acquire);
+    if (!completed) _ = session.finishTerminal(.shutdown, true);
+    thread.join();
+    try testing.expect(completed);
+    try testing.expect(writer.accepted.load(.acquire));
+    // Still no wire bytes before selection (#962 issue 4 stays fixed).
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+    try testing.expect(!session.hasOutputStarted());
+
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = stream_handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    try testing.expect(session.handlerReturnedP2(fixture.outparam_handle));
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expectEqual(
+        http_live_response_buffer_bytes + 1,
+        session.transmitted_bytes,
+    );
+    const wire = sink.contents();
+    try testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, wire, "Transfer-Encoding: chunked") != null);
+    try testing.expect(std.mem.endsWith(u8, wire, "\r\n1\r\nZ\r\n0\r\n\r\n"));
+}
+
+test "wasi:http #962 regression: pre-selection buffering is capped, not unbounded" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "pre-selection buffering is capped",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpP2TestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+    );
+    defer session.destroy();
+    session.prebuffer_limit = 8 * 1024;
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    defer owner.release();
+
+    const filler = try testing.allocator.alloc(u8, 8 * 1024);
+    defer testing.allocator.free(filler);
+    @memset(filler, 'b');
+    try testing.expect(owner.stream.write(filler, testing.allocator) == .ok);
+    try testing.expectEqual(
+        @as(u64, 0),
+        try liveHttpCheckWritePermit(&adapter, &ci, stream_handle),
+    );
+
+    try testing.expect(owner.stream.write("overflow", testing.allocator) != .ok);
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_body_size),
+        session.response_error_code,
+    );
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+    session.waitAndJoin();
+}
+
+test "wasi:http #962 regression: P2 selected body that never finishes terminates" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P2 selected body that never finishes terminates",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpP2TestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+    );
+    defer session.destroy();
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    defer owner.release();
+
+    try testing.expect(owner.stream.write("hi", testing.allocator) == .ok);
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    try waitForLiveHttpTransmitted(session, 2);
+
+    // The guest neither finished nor dropped the body. Preview 2
+    // dispatch is synchronous, so nothing can ever close it.
+    try testing.expect(!session.handlerReturnedP2(fixture.outparam_handle));
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_incomplete),
+        session.response_error_code,
+    );
+}
+
+test "wasi:http #962 regression: P3 unresolved trailers terminate the connection" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P3 unresolved trailers terminate the connection",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        null,
+        true,
+        null,
+    );
+    try setLiveFuture(&ci, fixture.trailers_handle, .pending, false, null);
+
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+    session.completion_timeout_ns = 300 * std.time.ns_per_ms;
+
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(session, "abc"));
+    InboundHttpResponseSession.onBodyClosed(session);
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_incomplete),
+        session.response_error_code,
+    );
+}
+
+test "wasi:http #962 regression: P3 body stream never closed terminates the connection" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P3 body stream never closed terminates the connection",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        null,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+    session.completion_timeout_ns = 300 * std.time.ns_per_ms;
+
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(session, "abc"));
+    session.handlerReturned(fixture.response_handle);
+    try waitForLiveHttpTransmitted(session, 3);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_incomplete),
+        session.response_error_code,
+    );
+}
+
+const LiveHttpSlowProducer = struct {
+    session: *InboundHttpResponseSession,
+    chunk: []const u8,
+    chunks: usize,
+    gap_us: u64,
+    accepted: std.atomic.Value(bool) = .init(true),
+
+    fn run(self: *LiveHttpSlowProducer) void {
+        var i: usize = 0;
+        while (i < self.chunks) : (i += 1) {
+            platform.usleep(self.gap_us);
+            if (!InboundHttpResponseSession.onBodyWrite(
+                self.session,
+                self.chunk,
+            )) {
+                self.accepted.store(false, .release);
+                return;
+            }
+        }
+        InboundHttpResponseSession.onBodyClosed(self.session);
+    }
+};
+
+test "wasi:http #962 regression: a producer outliving the handler is not truncated" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "a producer outliving the handler is not truncated",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        null,
+        true,
+        .{ .name = "x-final", .value = "done" },
+    );
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+    // Each gap stays well inside one stall budget while the whole
+    // stream spans several of them: progress must re-arm the deadline.
+    session.completion_timeout_ns = 400 * std.time.ns_per_ms;
+
+    var producer = LiveHttpSlowProducer{
+        .session = session,
+        .chunk = "chunk",
+        .chunks = 8,
+        .gap_us = 100 * std.time.us_per_ms,
+    };
+    const thread = try std.Thread.spawn(
+        .{},
+        LiveHttpSlowProducer.run,
+        .{&producer},
+    );
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    thread.join();
+    session.propagateTerminalToGuest();
+
+    try testing.expect(producer.accepted.load(.acquire));
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expectEqual(@as(usize, 40), session.transmitted_bytes);
+    const wire = sink.contents();
+    try testing.expect(std.mem.endsWith(
+        u8,
+        wire,
+        "0\r\nx-final: done\r\n\r\n",
+    ));
+    var seen: usize = 0;
+    var cursor: usize = (std.mem.indexOf(u8, wire, "\r\n\r\n") orelse
+        return error.TestExpectedEqual) + 4;
+    while (std.mem.indexOfPos(u8, wire, cursor, "chunk")) |idx| {
+        seen += 1;
+        cursor = idx + 5;
+    }
+    try testing.expectEqual(@as(usize, 8), seen);
 }
 
 test "wasi:http #954 review: P3 trailer error and dropped writer fail response" {

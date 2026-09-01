@@ -1056,6 +1056,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "wasi:http #616 A8 live:",
             "wasi:http #954 review:",
+            "wasi:http #962 regression:",
         },
     });
     const run_http_streaming_unit_tests = b.addRunArtifact(
