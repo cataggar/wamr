@@ -334,6 +334,29 @@ the same high-water mark even before `response.new` associates the stream
 with the response; a parked producer is woken once association moves the
 buffer into the live ring.
 
+Bytes written *before* the guest selects its response
+(`response-outparam.set` / `canon task.return`) cannot be transmitted yet —
+no head has been framed — so they never share the transmit ring's blocking
+backpressure, which would otherwise deadlock the very guest thread that
+still has to perform the selection. They spill into a separate staging FIFO
+capped at 1 MiB; `output-stream.check-write` reports the remaining
+pre-selection budget so a well-behaved guest observes real backpressure, and
+exceeding the cap fails the response with `HTTP-response-body-size`. No wire
+byte is emitted before selection either way.
+
+The post-handler completion wait is bounded. Once the handler returned or
+failed, the connection thread waits for the outstanding milestones (body
+close, content-length validation, trailer resolution, wire completion) under
+a 30 s stall budget that is re-armed by any observable progress — bytes
+produced or transmitted, a milestone change, an in-flight producer callback,
+or a writer parked inside a slow client's socket write. A response nothing
+can advance (a Preview 2 body that is never finished, a Preview 3 trailer
+future that is never resolved, a body stream whose writable end is never
+closed) therefore settles as `HTTP-response-incomplete` instead of leaking a
+worker thread and socket for the lifetime of the process. Preview 2 dispatch
+is synchronous, so an unfinished body at handler return is failed
+immediately rather than waited on.
+
 Status and immutable response headers are snapshotted before the first wire
 byte. Explicit `Content-Length` is preserved and verified against the bytes
 produced; unknown-length bodies use HTTP/1.1 chunked framing, with the
