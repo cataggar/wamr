@@ -350,6 +350,23 @@ accepted socket when cancellation must break a write, settles the Preview 3
 transmission future exactly once, and cancels remaining host async
 operations.
 
+Response completion keeps four milestones distinct: the handler must return
+the selected response, the actual body writer must close, the
+`result<option<trailers>, error-code>` future must resolve successfully, and
+the network writer must finish. Wire completion may settle the transmission
+future before handler return (so a handler can await it), but it does not mark
+the request successful by itself; a later handler failure still owns the
+request's terminal state.
+
+Preview 2 buffers body bytes until `response-outparam.set` selects the
+response, and never emits an unselected candidate. Its `outgoing-body`
+enforces the WIT parent/child rule: `finish` or body drop traps while the
+child output stream is live, while dropping an unfinished body after the
+child closes marks the selected response `HTTP-response-incomplete`.
+Response-owned stream state survives consumption of the body handle, and
+callback contexts use retained in-flight claims so teardown cannot free a
+session while an unlocked stream callback is running.
+
 ### Already-shipped 0.3.0 surfaces (section A)
 
 * **Outbound HTTP response headers not surfaced.** `std.http.Client.FetchResult`

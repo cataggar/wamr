@@ -747,6 +747,8 @@ fn socketsP3LowerAsyncPayload(
 //    9: variant error-code                            (39 cases; matches 0.3 WIT)
 //   10: result<own<response>, error-code>             — client.send / handler.handle ok arm
 //   11: result<_, error-code>                         — unit-ok arms (future-trailers, transmission)
+//   12: option<own<trailers>>
+//   13: result<option<own<trailers>>, error-code>
 //
 // The 39-case `error-code` variant is shape-equivalent to the 0.2 enum but
 // with payloads on certain arms (DNS-error, TLS-alert-received, the various
@@ -845,11 +847,14 @@ const http_p3_local_types = [_]ctypes.TypeDef{
     // (see `canonical_abi.zig:247,265,824`). Any value works.
     .{ .result = .{ .ok = .{ .own = 0 }, .err = .{ .variant = 9 } } }, // 10: result<own<response>, error-code>
     .{ .result = .{ .ok = null, .err = .{ .variant = 9 } } }, // 11: result<_, error-code>
+    .{ .option = .{ .inner = .{ .own = 0 } } }, // 12: option<own<trailers>>
+    .{ .result = .{ .ok = .{ .type_idx = 12 }, .err = .{ .variant = 9 } } }, // 13: result<option<own<trailers>>, error-code>
 };
 
 const HTTP_P3_ERROR_CODE_VARIANT_IDX: u32 = 9;
 const HTTP_P3_RESULT_CLIENT_SEND_IDX: u32 = 10;
 const HTTP_P3_RESULT_UNIT_ERR_IDX: u32 = 11;
+const HTTP_P3_RESULT_OPTION_TRAILERS_IDX: u32 = 13;
 
 fn httpP3TypeRegistry() abi.TypeRegistry {
     return abi.TypeRegistry.fromTypes(&http_p3_local_types);
@@ -927,6 +932,74 @@ fn httpP3BuildClientSendErrIv(
         .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null },
     };
     return InterfaceValue{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+}
+
+const DecodedHttpTrailers = union(enum) {
+    pending,
+    none,
+    fields: u32,
+    err: u32,
+    dropped,
+};
+
+fn decodeHttpTrailerFuture(
+    ci: *ComponentInstance,
+    future_handle: u32,
+    allocator: Allocator,
+) !DecodedHttpTrailers {
+    var future_lease = ci.futures.acquire(future_handle) orelse
+        return .dropped;
+    const future = future_lease.value();
+    if (future.state == .pending and !future.write_closed) {
+        future_lease.release();
+        return .pending;
+    }
+    const state = future.state;
+    const payload = if (future.payload) |bytes|
+        allocator.dupe(u8, bytes) catch {
+            future_lease.release();
+            return error.OutOfMemory;
+        }
+    else
+        null;
+    future_lease.release();
+    defer if (payload) |bytes| allocator.free(bytes);
+
+    if (payload == null) {
+        return if (state == .ready) .none else .dropped;
+    }
+
+    const reg = httpP3TypeRegistry();
+    var decoded = abi.loadValReg(
+        payload.?,
+        0,
+        .{ .result = HTTP_P3_RESULT_OPTION_TRAILERS_IDX },
+        reg,
+        allocator,
+    ) catch return .dropped;
+    defer decoded.deinit(allocator);
+    if (decoded != .result_val) return .dropped;
+    const result_value = decoded.result_val;
+    if (!result_value.is_ok) {
+        const error_payload = result_value.payload orelse return .dropped;
+        return switch (error_payload.*) {
+            .variant_val => |variant| .{ .err = variant.discriminant },
+            else => .dropped,
+        };
+    }
+    const option_payload = result_value.payload orelse return .none;
+    return switch (option_payload.*) {
+        .option_val => |option_value| if (!option_value.is_some)
+            .none
+        else if (option_value.payload) |handle_payload|
+            switch (handle_payload.*) {
+                .handle => |handle| .{ .fields = handle },
+                else => .dropped,
+            }
+        else
+            .dropped,
+        else => .dropped,
+    };
 }
 
 const streams = @import("../wasi/preview2/streams.zig");
@@ -4406,6 +4479,14 @@ pub const OutgoingResponse = struct {
     headers_handle: u32,
     body_consumed: bool = false,
     body_handle: ?u32 = null,
+    body_owner: ?*OutputStreamOwner = null,
+    body_finished: bool = false,
+    body_incomplete: bool = false,
+
+    pub fn deinit(self: *OutgoingResponse) void {
+        if (self.body_owner) |owner| owner.release();
+        self.body_owner = null;
+    }
 };
 
 /// `wasi:http/types.incoming-body`. Holds readable body data
@@ -4428,6 +4509,8 @@ pub const OutgoingBody = struct {
     /// Set for server-side response bodies so a live inbound response
     /// session can bind the body stream before response-outparam.set.
     parent_response_handle: ?u32 = null,
+    child_stream_handle: ?u32 = null,
+    finished: bool = false,
     /// Set by `[method]outgoing-body.write` to ensure a second call
     /// returns err per WIT contract.
     stream_taken: bool = false,
@@ -4640,6 +4723,18 @@ const HttpLiveTerminal = enum(u32) {
     fallback,
 };
 
+const HttpHandlerOutcome = enum {
+    pending,
+    returned,
+    failed,
+};
+
+const HttpTrailerState = enum {
+    pending,
+    ready,
+    failed,
+};
+
 const HttpConnectionInterrupt = struct {
     context: ?*anyopaque,
     callback: *const fn (?*anyopaque) void,
@@ -4655,7 +4750,8 @@ const HttpWireWriter = struct {
 };
 
 const HttpTrailerSnapshot = struct {
-    complete: bool = false,
+    state: HttpTrailerState = .pending,
+    error_code: ?u32 = null,
     declaration: ?[]u8 = null,
     block: ?[]u8 = null,
     has_entries: bool = false,
@@ -4693,8 +4789,11 @@ const InboundHttpResponseSession = struct {
     data_epoch: std.atomic.Value(u32) = .init(0),
     space_epoch: std.atomic.Value(u32) = .init(0),
     terminal_epoch: std.atomic.Value(u32) = .init(0),
+    callback_epoch: std.atomic.Value(u32) = .init(0),
     terminal: std.atomic.Value(u32) =
         .init(@intFromEnum(HttpLiveTerminal.running)),
+    callbacks_accepting: std.atomic.Value(bool) = .init(true),
+    callback_refs: std.atomic.Value(u32) = .init(0),
     output_started: std.atomic.Value(bool) = .init(false),
     tx_settled: std.atomic.Value(bool) = .init(false),
     guest_cancel_propagated: std.atomic.Value(bool) = .init(false),
@@ -4702,19 +4801,23 @@ const InboundHttpResponseSession = struct {
     writer_thread: ?std.Thread = null,
     p2_mode: bool = false,
     response_handle: ?u32 = null,
+    selected_response_handle: ?u32 = null,
     p2_body_handle: ?u32 = null,
+    p2_body_abandoned: bool = false,
     body_stream_handle: ?u32 = null,
     trailers_future_handle: ?u32 = null,
     transmission_future_handle: ?u32 = null,
     head_bytes: ?[]u8 = null,
     trailer_bytes: ?[]u8 = null,
     head_ready: bool = false,
-    trailers_ready: bool = false,
+    trailer_state: HttpTrailerState = .pending,
     body_closed: bool = false,
-    handler_finished: bool = false,
-    handler_validated: bool = false,
+    body_length_validated: bool = false,
+    handler_outcome: HttpHandlerOutcome = .pending,
+    wire_complete: bool = false,
     use_chunked: bool = false,
     expected_content_length: ?usize = null,
+    response_error_code: ?HttpErrorCode = null,
 
     fn create(
         allocator: Allocator,
@@ -4755,7 +4858,7 @@ const InboundHttpResponseSession = struct {
             _ = self.finishTerminal(.shutdown, true);
             self.waitAndJoin();
         }
-        self.detachBodyStream();
+        self.detachBodyStreamAndWait();
         self.parking.deinit();
         if (self.head_bytes) |bytes| self.allocator.free(bytes);
         if (self.trailer_bytes) |bytes| self.allocator.free(bytes);
@@ -4772,10 +4875,42 @@ const InboundHttpResponseSession = struct {
         return self.output_started.load(.acquire);
     }
 
+    fn retainCallback(ctx: ?*anyopaque) bool {
+        const self: *InboundHttpResponseSession =
+            @ptrCast(@alignCast(ctx.?));
+        if (!self.callbacks_accepting.load(.acquire)) return false;
+        _ = self.callback_refs.fetchAdd(1, .acq_rel);
+        if (!self.callbacks_accepting.load(.acquire)) {
+            self.releaseCallback();
+            return false;
+        }
+        return true;
+    }
+
+    fn releaseCallbackOpaque(ctx: ?*anyopaque) void {
+        const self: *InboundHttpResponseSession =
+            @ptrCast(@alignCast(ctx.?));
+        self.releaseCallback();
+    }
+
+    fn releaseCallback(self: *InboundHttpResponseSession) void {
+        const previous = self.callback_refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        _ = self.callback_epoch.fetchAdd(1, .acq_rel);
+        _ = self.parking.notify(&self.callback_epoch.raw, 1) catch 0;
+    }
+
     fn bufferedHighWater(self: *InboundHttpResponseSession) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.max_buffered;
+    }
+
+    fn responseErrorStatus(self: *InboundHttpResponseSession) u16 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const code = self.response_error_code orelse .internal_error;
+        return WasiCliAdapter.httpStatusFromError(@intFromEnum(code));
     }
 
     fn responseHeadCommitted(
@@ -4785,6 +4920,54 @@ const InboundHttpResponseSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.response_handle == response_handle and self.head_ready;
+    }
+
+    fn p2ResponseSelected(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.selected_response_handle == response_handle;
+    }
+
+    fn validateClosedBody(self: *InboundHttpResponseSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.body_closed or !self.head_ready) return true;
+        const valid = if (self.expected_content_length) |expected|
+            self.produced_bytes == expected
+        else
+            true;
+        self.body_length_validated = valid;
+        return valid;
+    }
+
+    fn tryComplete(self: *InboundHttpResponseSession) void {
+        self.mutex.lock();
+        const complete =
+            self.handler_outcome == .returned and
+            self.selected_response_handle != null and
+            self.selected_response_handle == self.response_handle and
+            self.body_closed and
+            self.body_length_validated and
+            self.trailer_state == .ready and
+            self.wire_complete;
+        self.mutex.unlock();
+        if (complete) _ = self.finishTerminal(.succeeded, false);
+    }
+
+    fn failResponse(
+        self: *InboundHttpResponseSession,
+        code: HttpErrorCode,
+        interrupt: bool,
+    ) void {
+        self.mutex.lock();
+        if (self.response_error_code == null) {
+            self.response_error_code = code;
+        }
+        self.mutex.unlock();
+        _ = self.finishTerminal(.response_error, interrupt);
     }
 
     fn wakeAll(self: *InboundHttpResponseSession) void {
@@ -4939,37 +5122,35 @@ const InboundHttpResponseSession = struct {
     fn snapshotTrailers(
         self: *InboundHttpResponseSession,
         future_handle: u32,
-        force_complete: bool,
     ) !HttpTrailerSnapshot {
         var result: HttpTrailerSnapshot = .{};
-        var fields_handle: ?u32 = null;
-
-        var future_lease = self.ci.futures.acquire(future_handle) orelse {
-            result.complete = true;
+        const decoded = try decodeHttpTrailerFuture(
+            self.ci,
+            future_handle,
+            self.allocator,
+        );
+        const handle = switch (decoded) {
+            .pending => return result,
+            .none => {
+                result.state = .ready;
+                return result;
+            },
+            .err => |code| {
+                result.state = .failed;
+                result.error_code = code;
+                return result;
+            },
+            .dropped => {
+                result.state = .failed;
+                return result;
+            },
+            .fields => |value| value,
+        };
+        result.state = .ready;
+        var fields_lease = self.adapter.lookupHttpFields(handle) orelse {
+            result.state = .failed;
             return result;
         };
-        const future = future_lease.value();
-        const complete = future.state != .pending or future.write_closed;
-        if (!complete and !force_complete) {
-            future_lease.release();
-            return result;
-        }
-        result.complete = true;
-        if (complete) {
-            if (future.payload) |payload| {
-                if (payload.len >= 8 and payload[0] == 1) {
-                    fields_handle = std.mem.readInt(
-                        u32,
-                        payload[4..8],
-                        .little,
-                    );
-                }
-            }
-        }
-        future_lease.release();
-
-        const handle = fields_handle orelse return result;
-        var fields_lease = self.adapter.lookupHttpFields(handle) orelse return result;
         defer fields_lease.release();
         const fields = fields_lease.value().*;
 
@@ -5030,11 +5211,23 @@ const InboundHttpResponseSession = struct {
         const transmission_future_handle = response.transmission_future_handle;
         response_lease.release();
 
-        var trailers = try self.snapshotTrailers(
-            trailers_future_handle,
-            false,
-        );
+        var trailers = try self.snapshotTrailers(trailers_future_handle);
         defer trailers.deinit(self.allocator);
+        switch (trailers.state) {
+            .pending, .ready => {},
+            .failed => {
+                self.mutex.lock();
+                self.response_error_code = if (trailers.error_code) |code|
+                    @enumFromInt(@min(
+                        code,
+                        @intFromEnum(HttpErrorCode.internal_error),
+                    ))
+                else
+                    .HTTP_response_incomplete;
+                self.mutex.unlock();
+                return error.HttpTrailersFailed;
+            },
+        }
 
         var head: std.ArrayListUnmanaged(u8) = .empty;
         defer head.deinit(self.allocator);
@@ -5081,7 +5274,7 @@ const InboundHttpResponseSession = struct {
 
         const has_body = body_stream_handle != null;
         const use_chunked = trailers.has_entries or
-            (!trailers.complete and has_body) or
+            trailers.state == .pending or
             (has_body and content_length == null);
         const expected_content_length: ?usize = if (use_chunked)
             null
@@ -5132,9 +5325,9 @@ const InboundHttpResponseSession = struct {
         self.head_ready = true;
         self.use_chunked = use_chunked;
         self.expected_content_length = expected_content_length;
-        if (trailers.complete) {
+        if (trailers.state == .ready) {
             self.trailer_bytes = owned_trailers;
-            self.trailers_ready = true;
+            self.trailer_state = .ready;
         } else if (owned_trailers) |bytes| {
             self.allocator.free(bytes);
         }
@@ -5249,19 +5442,45 @@ const InboundHttpResponseSession = struct {
         self.p2_body_handle = body_handle;
         self.head_bytes = owned_head;
         self.head_ready = true;
-        self.trailers_ready = true;
+        self.trailer_state = .ready;
         self.use_chunked = use_chunked;
         self.expected_content_length = expected_content_length;
         _ = self.data_epoch.fetchAdd(1, .acq_rel);
         _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
     }
 
-    fn refreshTrailers(
-        self: *InboundHttpResponseSession,
-        force_complete: bool,
-    ) void {
+    fn prepareP3HeadIfReady(self: *InboundHttpResponseSession) void {
         self.mutex.lock();
-        if (self.trailers_ready) {
+        const response_handle = self.response_handle;
+        const selected_response = self.selected_response_handle;
+        const ready = self.head_ready;
+        self.mutex.unlock();
+        if (ready) return;
+        const handle = response_handle orelse return;
+        if (selected_response != handle) return;
+        self.prepareP3Head(handle) catch {
+            self.mutex.lock();
+            self.trailer_state = .failed;
+            self.mutex.unlock();
+            self.failResponse(.internal_error, false);
+        };
+        self.mutex.lock();
+        const head_is_ready = self.head_ready;
+        const body_is_closed = self.body_closed;
+        self.mutex.unlock();
+        if (head_is_ready and body_is_closed) {
+            if (!self.validateClosedBody()) {
+                self.failResponse(.HTTP_response_body_size, true);
+                return;
+            }
+            self.wakeAll();
+            self.tryComplete();
+        }
+    }
+
+    fn pollP3Trailers(self: *InboundHttpResponseSession) void {
+        self.mutex.lock();
+        if (self.p2_mode or self.trailer_state != .pending) {
             self.mutex.unlock();
             return;
         }
@@ -5269,29 +5488,44 @@ const InboundHttpResponseSession = struct {
         self.mutex.unlock();
         const handle = future_handle orelse return;
 
-        var snapshot = self.snapshotTrailers(handle, force_complete) catch {
-            if (force_complete) {
-                self.mutex.lock();
-                self.trailers_ready = true;
-                self.mutex.unlock();
-                self.wakeAll();
-            }
+        var snapshot = self.snapshotTrailers(handle) catch {
+            self.mutex.lock();
+            self.trailer_state = .failed;
+            self.mutex.unlock();
+            self.failResponse(.internal_error, true);
             return;
         };
         defer snapshot.deinit(self.allocator);
-        if (!snapshot.complete) return;
-
-        const block = snapshot.block;
-        snapshot.block = null;
-        self.mutex.lock();
-        if (!self.trailers_ready) {
-            self.trailer_bytes = block;
-            self.trailers_ready = true;
-        } else if (block) |bytes| {
-            self.allocator.free(bytes);
+        switch (snapshot.state) {
+            .pending => return,
+            .failed => {
+                self.mutex.lock();
+                self.trailer_state = .failed;
+                self.response_error_code = if (snapshot.error_code) |code|
+                    @enumFromInt(@min(
+                        code,
+                        @intFromEnum(HttpErrorCode.internal_error),
+                    ))
+                else
+                    .HTTP_response_incomplete;
+                self.mutex.unlock();
+                _ = self.finishTerminal(.response_error, true);
+            },
+            .ready => {
+                const block = snapshot.block;
+                snapshot.block = null;
+                self.mutex.lock();
+                if (self.trailer_state == .pending) {
+                    self.trailer_bytes = block;
+                    self.trailer_state = .ready;
+                } else if (block) |bytes| {
+                    self.allocator.free(bytes);
+                }
+                self.mutex.unlock();
+                self.wakeAll();
+                self.tryComplete();
+            },
         }
-        self.mutex.unlock();
-        self.wakeAll();
     }
 
     fn attachP3Response(
@@ -5313,7 +5547,12 @@ const InboundHttpResponseSession = struct {
         self.transmission_future_handle = transmission_future_handle;
         self.mutex.unlock();
 
-        const stream_handle = body_stream_handle orelse return true;
+        const stream_handle = body_stream_handle orelse {
+            self.mutex.lock();
+            self.body_closed = true;
+            self.mutex.unlock();
+            return true;
+        };
         var stream_lease = self.ci.streams.acquire(stream_handle) orelse {
             self.clearCandidate(response_handle);
             return false;
@@ -5344,6 +5583,8 @@ const InboundHttpResponseSession = struct {
         stream.buffer.deinit(self.ci.allocator);
         stream.buffer = .empty;
         stream.host_handler = .{
+            .retain_context = &InboundHttpResponseSession.retainCallback,
+            .release_context = &InboundHttpResponseSession.releaseCallbackOpaque,
             .on_write = &InboundHttpResponseSession.onBodyWrite,
             .on_drop_writable = &InboundHttpResponseSession.onBodyClosed,
             .ctx = self,
@@ -5358,11 +5599,14 @@ const InboundHttpResponseSession = struct {
 
         if (!self.enqueuePrebuffered(buffered)) {
             self.allocator.free(buffered);
-            self.detachBodyStream();
+            self.detachP3BodyHandler();
             self.clearCandidate(response_handle);
             return false;
         }
         self.allocator.free(buffered);
+        if (buffered.len > 0 or already_closed) {
+            self.prepareP3HeadIfReady();
+        }
         if (already_closed) self.markBodyClosed();
         return true;
     }
@@ -5382,8 +5626,66 @@ const InboundHttpResponseSession = struct {
         self.p2_mode = true;
         self.response_handle = response_handle;
         self.p2_body_handle = body_handle;
+        self.p2_body_abandoned = false;
         self.mutex.unlock();
         return true;
+    }
+
+    fn reserveP2ResponseSelection(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+        body_handle: ?u32,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.p2_mode) return false;
+        if (self.selected_response_handle != null) return false;
+        if (self.response_handle) |candidate| {
+            if (candidate != response_handle or
+                self.p2_body_handle != body_handle or
+                self.p2_body_abandoned)
+            {
+                return false;
+            }
+        } else {
+            self.response_handle = response_handle;
+            self.p2_body_handle = body_handle;
+            self.p2_body_abandoned = false;
+        }
+        self.selected_response_handle = response_handle;
+        return true;
+    }
+
+    fn commitP2ResponseSelection(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+        body_handle: ?u32,
+        body_finished: bool,
+        body_incomplete: bool,
+    ) void {
+        self.mutex.lock();
+        std.debug.assert(self.selected_response_handle == response_handle);
+        std.debug.assert(self.p2_body_handle == body_handle);
+        if (body_handle == null or body_finished) self.body_closed = true;
+        self.mutex.unlock();
+
+        if (body_incomplete) {
+            self.failResponse(.HTTP_response_incomplete, false);
+            return;
+        }
+        self.prepareP2Head(response_handle) catch {
+            self.failResponse(.internal_error, false);
+            return;
+        };
+        self.mutex.lock();
+        const body_closed = self.body_closed;
+        self.mutex.unlock();
+        if (body_closed and !self.validateClosedBody()) {
+            self.failResponse(.HTTP_response_body_size, true);
+            return;
+        }
+        self.wakeAll();
+        self.tryComplete();
     }
 
     fn attachP2Body(
@@ -5408,6 +5710,37 @@ const InboundHttpResponseSession = struct {
         if (matches) self.markBodyClosed();
     }
 
+    fn p2BodyByteCount(
+        self: *InboundHttpResponseSession,
+        body_handle: u32,
+    ) ?usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.p2_mode or self.p2_body_handle != body_handle) return null;
+        return self.produced_bytes;
+    }
+
+    fn abandonP2Body(
+        self: *InboundHttpResponseSession,
+        body_handle: u32,
+    ) void {
+        self.mutex.lock();
+        const matches = self.p2_mode and
+            self.p2_body_handle == body_handle;
+        const selected = self.selected_response_handle ==
+            self.response_handle;
+        const writer_may_be_in_io = self.head_ready and
+            (self.produced_bytes != 0 or self.queue_len != 0);
+        if (matches and !selected) self.p2_body_abandoned = true;
+        self.mutex.unlock();
+        if (matches and selected) {
+            self.failResponse(
+                .HTTP_response_incomplete,
+                writer_may_be_in_io,
+            );
+        }
+    }
+
     fn clearCandidate(
         self: *InboundHttpResponseSession,
         response_handle: u32,
@@ -5422,62 +5755,103 @@ const InboundHttpResponseSession = struct {
         }
     }
 
-    fn detachBodyStream(self: *InboundHttpResponseSession) void {
+    fn detachBodyStreamAndWait(self: *InboundHttpResponseSession) void {
+        self.callbacks_accepting.store(false, .release);
         self.mutex.lock();
         if (self.p2_mode) {
             const body_handle = self.p2_body_handle;
+            const response_handle = self.response_handle;
             self.mutex.unlock();
-            const handle = body_handle orelse return;
-            var body_lease = self.adapter.lookupOutgoingBody(handle) orelse return;
-            const owner = body_lease.value().*.stream_owner;
-            if (owner) |retained| retained.retain();
-            body_lease.release();
-            const retained = owner orelse return;
-            defer retained.release();
-            retained.operation_claim.acquire();
-            defer retained.operation_claim.release();
-            switch (retained.stream.sink) {
-                .callback => |callback| {
-                    if (callback.context == @as(?*anyopaque, @ptrCast(self))) {
-                        retained.stream.sink = .closed;
-                    }
-                },
-                else => {},
+            var retained_owner: ?*OutputStreamOwner = null;
+            if (response_handle) |handle| {
+                if (self.adapter.lookupOutgoingResponse(handle)) |initial_response_lease| {
+                    var response_lease = initial_response_lease;
+                    retained_owner = response_lease.value().*.body_owner;
+                    if (retained_owner) |owner| owner.retain();
+                    response_lease.release();
+                }
             }
-            return;
+            if (retained_owner == null) {
+                if (body_handle) |handle| if (self.adapter.lookupOutgoingBody(handle)) |initial_lease| {
+                    var body_lease = initial_lease;
+                    retained_owner = body_lease.value().*.stream_owner;
+                    if (retained_owner) |owner| owner.retain();
+                    body_lease.release();
+                };
+            }
+            if (retained_owner) |owner| {
+                owner.operation_claim.acquire();
+                switch (owner.stream.sink) {
+                    .callback => |callback| {
+                        if (callback.context == @as(
+                            ?*anyopaque,
+                            @ptrCast(self),
+                        )) {
+                            owner.stream.sink = .closed;
+                        }
+                    },
+                    else => {},
+                }
+                owner.operation_claim.release();
+                owner.release();
+            }
+        } else {
+            self.mutex.unlock();
+            self.detachP3BodyHandler();
         }
+
+        while (self.callback_refs.load(.acquire) != 0) {
+            const observed = self.callback_epoch.load(.acquire);
+            if (self.callback_refs.load(.acquire) == 0) break;
+            self.waitEpoch(&self.callback_epoch, observed);
+        }
+    }
+
+    fn detachP3BodyHandler(self: *InboundHttpResponseSession) void {
+        self.mutex.lock();
         const body_stream_handle = self.body_stream_handle;
         self.mutex.unlock();
         const handle = body_stream_handle orelse return;
-        var stream_lease = self.ci.streams.acquire(handle) orelse return;
-        const stream = stream_lease.value();
-        if (stream.host_handler) |handler| {
-            if (handler.ctx == @as(?*anyopaque, @ptrCast(self))) {
-                stream.host_handler = null;
+        if (self.ci.streams.acquire(handle)) |initial_lease| {
+            var stream_lease = initial_lease;
+            const stream = stream_lease.value();
+            if (stream.host_handler) |handler| {
+                if (handler.ctx == @as(?*anyopaque, @ptrCast(self))) {
+                    stream.host_handler = null;
+                }
             }
+            stream_lease.release();
         }
-        stream_lease.release();
     }
 
     fn onBodyWrite(ctx: ?*anyopaque, bytes: []const u8) bool {
+        stable_resource.assertNoLocksHeld();
         const self: *InboundHttpResponseSession =
             @ptrCast(@alignCast(ctx.?));
         const response_handle = self.response_handle orelse return false;
-        const prepare = if (self.p2_mode)
-            self.prepareP2Head(response_handle)
-        else
-            self.prepareP3Head(response_handle);
-        prepare catch {
-            _ = self.finishTerminal(.response_error, false);
-            self.propagateTerminalToGuest();
-            return false;
-        };
+        self.mutex.lock();
+        const p3_selected = !self.p2_mode and
+            self.selected_response_handle == response_handle;
+        self.mutex.unlock();
+        if (p3_selected or
+            (self.p2_mode and self.p2ResponseSelected(response_handle)))
+        {
+            const prepare = if (self.p2_mode)
+                self.prepareP2Head(response_handle)
+            else
+                self.prepareP3Head(response_handle);
+            prepare catch {
+                self.failResponse(.internal_error, false);
+                self.propagateTerminalToGuest();
+                return false;
+            };
+        }
 
         self.mutex.lock();
         if (self.expected_content_length) |expected| {
             if (bytes.len > expected -| self.produced_bytes) {
                 self.mutex.unlock();
-                _ = self.finishTerminal(.response_error, true);
+                self.failResponse(.HTTP_response_body_size, true);
                 self.propagateTerminalToGuest();
                 return false;
             }
@@ -5490,26 +5864,27 @@ const InboundHttpResponseSession = struct {
     }
 
     fn onBodyClosed(ctx: ?*anyopaque) void {
+        stable_resource.assertNoLocksHeld();
         const self: *InboundHttpResponseSession =
             @ptrCast(@alignCast(ctx.?));
         self.markBodyClosed();
     }
 
     fn markBodyClosed(self: *InboundHttpResponseSession) void {
-        self.refreshTrailers(false);
-        var length_matches = true;
+        if (!self.p2_mode) {
+            self.prepareP3HeadIfReady();
+            self.pollP3Trailers();
+        }
         self.mutex.lock();
         self.body_closed = true;
-        if (self.expected_content_length) |expected| {
-            length_matches = self.produced_bytes == expected;
-        }
-        self.handler_validated = length_matches;
+        const head_ready = self.head_ready;
         self.mutex.unlock();
-        if (!length_matches) {
-            _ = self.finishTerminal(.response_error, true);
+        if (head_ready and !self.validateClosedBody()) {
+            self.failResponse(.HTTP_response_body_size, true);
             return;
         }
         self.wakeAll();
+        self.tryComplete();
     }
 
     fn attachReturnedResponse(
@@ -5525,13 +5900,13 @@ const InboundHttpResponseSession = struct {
             if (!self.hasOutputStarted() and !has_queued) {
                 _ = self.finishTerminal(.fallback, false);
             } else {
-                _ = self.finishTerminal(.response_error, true);
+                self.failResponse(.internal_error, true);
             }
             return false;
         }
 
         var response_lease = self.adapter.lookupHttpResponseP3(response_handle) orelse {
-            _ = self.finishTerminal(.response_error, false);
+            self.failResponse(.internal_error, false);
             return false;
         };
         const response = response_lease.value().*;
@@ -5551,33 +5926,56 @@ const InboundHttpResponseSession = struct {
         return true;
     }
 
+    fn selectP3Response(
+        self: *InboundHttpResponseSession,
+        response_handle: u32,
+    ) bool {
+        if (!self.attachReturnedResponse(response_handle)) return false;
+        self.mutex.lock();
+        if (self.selected_response_handle) |selected| {
+            const matches = selected == response_handle;
+            self.mutex.unlock();
+            return matches;
+        }
+        self.selected_response_handle = response_handle;
+        const no_body = self.body_stream_handle == null;
+        if (no_body) self.body_closed = true;
+        self.mutex.unlock();
+
+        self.prepareP3HeadIfReady();
+        self.pollP3Trailers();
+        self.mutex.lock();
+        const head_ready = self.head_ready;
+        const body_closed = self.body_closed;
+        self.mutex.unlock();
+        if (head_ready and body_closed and !self.validateClosedBody()) {
+            self.failResponse(.HTTP_response_body_size, true);
+            return false;
+        }
+        self.wakeAll();
+        return true;
+    }
+
     fn handlerReturned(
         self: *InboundHttpResponseSession,
         response_handle: u32,
     ) void {
-        if (!self.attachReturnedResponse(response_handle)) return;
+        if (!self.selectP3Response(response_handle)) return;
         self.mutex.lock();
-        self.handler_finished = true;
-        self.body_closed = true;
+        self.handler_outcome = .returned;
         self.mutex.unlock();
-        self.prepareP3Head(response_handle) catch {
-            _ = self.finishTerminal(.response_error, false);
-            return;
-        };
-        self.refreshTrailers(true);
-
-        var length_matches = true;
+        self.prepareP3HeadIfReady();
+        self.pollP3Trailers();
         self.mutex.lock();
-        if (self.expected_content_length) |expected| {
-            length_matches = self.produced_bytes == expected;
-        }
-        self.handler_validated = length_matches;
+        const head_ready = self.head_ready;
+        const body_closed = self.body_closed;
         self.mutex.unlock();
-        if (!length_matches) {
-            _ = self.finishTerminal(.response_error, true);
+        if (head_ready and body_closed and !self.validateClosedBody()) {
+            self.failResponse(.HTTP_response_body_size, true);
             return;
         }
         self.wakeAll();
+        self.tryComplete();
     }
 
     fn handlerReturnedP2(
@@ -5604,10 +6002,20 @@ const InboundHttpResponseSession = struct {
         self.mutex.lock();
         const known_response = self.response_handle;
         const known_body = self.p2_body_handle;
+        const selected_response = self.selected_response_handle;
         self.mutex.unlock();
-        const body_handle = if (known_response == response_handle)
-            known_body
-        else blk: {
+        var body_finished = false;
+        var body_incomplete = false;
+        const body_handle = if (known_response == response_handle) blk: {
+            if (self.adapter.lookupOutgoingResponse(response_handle)) |initial_response_lease| {
+                var response_lease = initial_response_lease;
+                const response = response_lease.value().*;
+                body_finished = response.body_finished;
+                body_incomplete = response.body_incomplete;
+                response_lease.release();
+            }
+            break :blk known_body;
+        } else blk: {
             var response_lease = self.adapter.lookupOutgoingResponse(
                 response_handle,
             ) orelse {
@@ -5616,50 +6024,64 @@ const InboundHttpResponseSession = struct {
             };
             const response = response_lease.value().*;
             const handle = response.body_handle;
+            body_finished = response.body_finished;
+            body_incomplete = response.body_incomplete;
             response_lease.release();
             break :blk handle;
         };
-        if (!self.attachP2Response(response_handle, body_handle)) {
+        if (selected_response == null) {
+            if (!self.reserveP2ResponseSelection(
+                response_handle,
+                body_handle,
+            )) {
+                self.failResponse(.internal_error, false);
+                return false;
+            }
+            self.commitP2ResponseSelection(
+                response_handle,
+                body_handle,
+                body_finished,
+                body_incomplete,
+            );
+            if (self.currentTerminal() != .running) return false;
+        } else if (selected_response != response_handle) {
             self.mutex.lock();
             const response_started = self.head_ready or
                 self.produced_bytes != 0 or
                 self.queue_len != 0;
             self.mutex.unlock();
-            _ = self.finishTerminal(
-                if (response_started) .response_error else .fallback,
-                response_started,
-            );
+            if (response_started) {
+                self.failResponse(.internal_error, true);
+            } else {
+                _ = self.finishTerminal(.fallback, false);
+            }
             return false;
         }
 
         self.mutex.lock();
-        self.handler_finished = true;
-        self.body_closed = true;
+        self.handler_outcome = .returned;
+        if (body_handle == null) self.body_closed = true;
         self.mutex.unlock();
         self.prepareP2Head(response_handle) catch {
-            _ = self.finishTerminal(.response_error, false);
+            self.failResponse(.internal_error, false);
             return false;
         };
 
-        var length_matches = true;
         self.mutex.lock();
-        if (self.expected_content_length) |expected| {
-            length_matches = self.produced_bytes == expected;
-        }
-        self.handler_validated = length_matches;
+        const body_closed = self.body_closed;
         self.mutex.unlock();
-        if (!length_matches) {
-            _ = self.finishTerminal(.response_error, true);
+        if (body_closed and !self.validateClosedBody()) {
+            self.failResponse(.HTTP_response_body_size, true);
             return false;
         }
         self.wakeAll();
+        self.tryComplete();
         return true;
     }
 
     fn handlerFailed(self: *InboundHttpResponseSession) void {
         self.mutex.lock();
-        self.handler_finished = true;
-        self.body_closed = true;
+        self.handler_outcome = .failed;
         const writer_may_be_in_io = self.head_ready and
             (self.produced_bytes != 0 or self.queue_len != 0);
         self.mutex.unlock();
@@ -5715,7 +6137,9 @@ const InboundHttpResponseSession = struct {
             if (!head_written) {
                 self.mutex.lock();
                 const may_write_head = self.head_ready and
-                    (self.queue_len > 0 or self.handler_finished);
+                    (self.queue_len > 0 or
+                        self.body_closed or
+                        self.handler_outcome != .pending);
                 const head = if (may_write_head) self.head_bytes else null;
                 const observed = self.data_epoch.load(.acquire);
                 self.mutex.unlock();
@@ -5745,8 +6169,8 @@ const InboundHttpResponseSession = struct {
             }
 
             self.mutex.lock();
-            const finished = self.handler_validated and self.body_closed;
-            const trailers_ready = self.trailers_ready;
+            const finished = self.body_length_validated and self.body_closed;
+            const trailers_ready = self.trailer_state == .ready;
             const trailers = self.trailer_bytes;
             const observed = self.data_epoch.load(.acquire);
             self.mutex.unlock();
@@ -5767,7 +6191,11 @@ const InboundHttpResponseSession = struct {
                         return;
                     };
                 }
-                _ = self.finishTerminal(.succeeded, false);
+                self.mutex.lock();
+                self.wire_complete = true;
+                self.mutex.unlock();
+                self.wakeAll();
+                self.tryComplete();
                 return;
             }
             self.waitEpoch(&self.data_epoch, observed);
@@ -5779,6 +6207,16 @@ const InboundHttpResponseSession = struct {
         while (self.currentTerminal() == .running) {
             if (http_shutdown_requested.load(.acquire)) {
                 self.cancelForShutdown();
+            }
+            if (!self.p2_mode) {
+                _ = WasiCliAdapter.driveAsyncEvents(
+                    self.adapter,
+                    self.ci,
+                    null,
+                    self.allocator,
+                );
+                self.prepareP3HeadIfReady();
+                self.pollP3Trailers();
             }
             const observed = self.terminal_epoch.load(.acquire);
             if (self.currentTerminal() != .running) break;
@@ -5828,10 +6266,22 @@ const InboundHttpResponseSession = struct {
         if (http_shutdown_requested.load(.acquire)) {
             self.cancelForShutdown();
         }
-        self.refreshTrailers(false);
+        if (!self.p2_mode) {
+            self.prepareP3HeadIfReady();
+            self.pollP3Trailers();
+        }
         const terminal = self.currentTerminal();
-        if (terminal == .running or terminal == .fallback) return false;
-        const fired = self.settleTransmission(terminal == .succeeded);
+        self.mutex.lock();
+        const wire_complete = self.wire_complete;
+        self.mutex.unlock();
+        var fired = if (wire_complete)
+            self.settleTransmission(true)
+        else
+            false;
+        if (terminal == .running or terminal == .fallback) return fired;
+        if (!wire_complete) {
+            if (self.settleTransmission(false)) fired = true;
+        }
         if (terminal != .succeeded) self.propagateTerminalToGuest();
         return fired;
     }
@@ -5846,6 +6296,19 @@ pub fn inboundHttpStreamBufferLimit(
     ) orelse return null;
     if (session.currentTerminal() != .running) return null;
     return http_live_response_buffer_bytes;
+}
+
+pub fn notifyInboundHttpTaskReturn(
+    thread_ctx: ?*execution_context.ThreadExecutionContext,
+    flat_values: []const u32,
+) void {
+    const active = thread_ctx orelse return;
+    const session = active.hostTaskContext(
+        InboundHttpResponseSession,
+    ) orelse return;
+    if (flat_values.len < 2 or flat_values[0] != 0) return;
+    const response_handle = abi.decodeResourceWireAbi(flat_values[1]);
+    _ = session.selectP3Response(response_handle);
 }
 
 fn settleHttpResponseTransmissionFuture(
@@ -6264,6 +6727,7 @@ const OutputStreamResource = struct {
     stream: *streams.OutputStream,
     owned: bool,
     owner: ?*OutputStreamOwner = null,
+    http_outgoing_body_handle: ?u32 = null,
     descriptor_lease: ?FsDescriptorTable.Lease = null,
     socket_lease: ?SocketTable.Lease = null,
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
@@ -6353,6 +6817,7 @@ fn destroyIncomingRequest(allocator: Allocator, request: **IncomingRequest) void
 }
 
 fn destroyOutgoingResponse(allocator: Allocator, response: **OutgoingResponse) void {
+    response.*.deinit();
     allocator.destroy(response.*);
 }
 
@@ -11759,6 +12224,51 @@ pub const WasiCliAdapter = struct {
     /// captured-buffer mode and is omitted from the synthetic fixture's
     /// `result<_, _>` type — this keeps the flat lower path on the
     /// no-payload fast path.)
+    fn writeOwnedHttpBodyStream(
+        self: *WasiCliAdapter,
+        owner: *OutputStreamOwner,
+        bytes: []const u8,
+        flush: bool,
+    ) !void {
+        owner.operation_claim.acquire();
+        const callback = switch (owner.stream.sink) {
+            .callback => |value| value,
+            else => null,
+        };
+        if (callback) |value| {
+            const retained = if (value.retain_context) |retain|
+                retain(value.context)
+            else
+                true;
+            if (!retained) {
+                owner.operation_claim.release();
+                return error.IoError;
+            }
+            owner.operation_claim.release();
+            defer if (value.retain_context != null) {
+                if (value.release_context) |release| {
+                    release(value.context);
+                }
+            };
+            switch (value.write(value.context, bytes)) {
+                .ok => {},
+                .err, .closed => return error.IoError,
+            }
+            return;
+        }
+        defer owner.operation_claim.release();
+        switch (owner.stream.write(bytes, self.allocator)) {
+            .ok => {},
+            .err, .closed => return error.IoError,
+        }
+        if (flush) {
+            switch (owner.stream.flush()) {
+                .ok => {},
+                .err, .closed => return error.IoError,
+            }
+        }
+    }
+
     fn blockingWriteAndFlush(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -11779,6 +12289,20 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
+        if (resource.http_outgoing_body_handle != null) {
+            const owner = resource.owner orelse return error.InvalidHandle;
+            owner.retain();
+            stream_lease.release();
+            defer owner.release();
+            const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
+                return error.OutOfBoundsMemory;
+            try self.writeOwnedHttpBodyStream(owner, bytes, true);
+            results[0] = .{ .result_val = .{
+                .is_ok = true,
+                .payload = null,
+            } };
+            return;
+        }
         const claim = resource.claim();
         claim.acquire();
         defer claim.release();
@@ -11821,6 +12345,20 @@ pub const WasiCliAdapter = struct {
         var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
         defer stream_lease.release();
         const resource = stream_lease.value();
+        if (resource.http_outgoing_body_handle != null) {
+            const owner = resource.owner orelse return error.InvalidHandle;
+            owner.retain();
+            stream_lease.release();
+            defer owner.release();
+            const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
+                return error.OutOfBoundsMemory;
+            try self.writeOwnedHttpBodyStream(owner, bytes, false);
+            results[0] = .{ .result_val = .{
+                .is_ok = true,
+                .payload = null,
+            } };
+            return;
+        }
         const claim = resource.claim();
         claim.acquire();
         defer claim.release();
@@ -11943,6 +12481,23 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
+        var body_handle: ?u32 = null;
+        if (self.stream_table.acquire(handle)) |initial_lease| {
+            var lease = initial_lease;
+            body_handle = lease.value().http_outgoing_body_handle;
+            lease.release();
+        }
+        if (body_handle) |parent_handle| {
+            if (self.lookupOutgoingBody(parent_handle)) |initial_body_lease| {
+                var body_lease = initial_body_lease;
+                const body = body_lease.lock().*;
+                if (body.child_stream_handle == handle) {
+                    body.child_stream_handle = null;
+                }
+                body_lease.unlock();
+                body_lease.release();
+            }
+        }
         _ = self.stream_table.remove(handle);
     }
 
@@ -22495,16 +23050,20 @@ pub const WasiCliAdapter = struct {
             return err;
         };
         const live_response = self.activeInboundHttpResponse(ci);
-        const live_attached = if (live_response) |session|
-            if (parent_response_handle) |response_handle|
-                session.attachP2Body(response_handle, handle)
-            else
-                false
+        const live_candidate = live_response != null and
+            parent_response_handle != null;
+        const live_attached = if (live_candidate)
+            live_response.?.attachP2Body(
+                parent_response_handle.?,
+                handle,
+            )
         else
             false;
         s.* = if (live_attached)
             streams.OutputStream.toCallback(.{
                 .context = live_response.?,
+                .retain_context = &InboundHttpResponseSession.retainCallback,
+                .release_context = &InboundHttpResponseSession.releaseCallbackOpaque,
                 .write = struct {
                     fn write(
                         context: ?*anyopaque,
@@ -22520,6 +23079,8 @@ pub const WasiCliAdapter = struct {
                     }
                 }.write,
             })
+        else if (live_candidate)
+            .{ .sink = .closed }
         else
             streams.OutputStream.toBuffer();
         const sh = self.allocOwnedStreamHandle(s, null, null) catch |err| {
@@ -22531,16 +23092,48 @@ pub const WasiCliAdapter = struct {
             return err;
         };
         var stream_lease = self.stream_table.acquire(sh).?;
-        const owner = stream_lease.value().owner.?;
+        const stream_resource = stream_lease.value();
+        stream_resource.http_outgoing_body_handle = handle;
+        const owner = stream_resource.owner.?;
         owner.retain();
         stream_lease.release();
         const update = body_lease.lock().*;
         update.stream_owner = owner;
+        update.child_stream_handle = sh;
         body_lease.unlock();
+        var response_owner_attached = false;
+        if (parent_response_handle) |response_handle| {
+            if (self.lookupOutgoingResponse(response_handle)) |initial_response_lease| {
+                var response_lease = initial_response_lease;
+                const response = response_lease.lock().*;
+                if (response.body_handle == handle and response.body_owner == null) {
+                    owner.retain();
+                    response.body_owner = owner;
+                    response_owner_attached = true;
+                }
+                response_lease.unlock();
+                response_lease.release();
+            }
+        }
         errdefer {
+            if (response_owner_attached) {
+                if (parent_response_handle) |response_handle| {
+                    if (self.lookupOutgoingResponse(response_handle)) |initial_response_lease| {
+                        var response_lease = initial_response_lease;
+                        const response = response_lease.lock().*;
+                        if (response.body_owner == owner) {
+                            response.body_owner = null;
+                            owner.release();
+                        }
+                        response_lease.unlock();
+                        response_lease.release();
+                    }
+                }
+            }
             const rollback = body_lease.lock().*;
             if (rollback.stream_owner) |owned| owned.release();
             rollback.stream_owner = null;
+            rollback.child_stream_handle = null;
             rollback.stream_taken = false;
             body_lease.unlock();
             std.debug.assert(self.stream_table.remove(sh));
@@ -22555,20 +23148,104 @@ pub const WasiCliAdapter = struct {
         ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
-        _: Allocator,
+        allocator: Allocator,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
-        if (results.len == 0) return error.InvalidArgs;
-        if (args.len > 0) {
-            const handle = switch (args[0]) {
-                .handle => |h| h,
-                else => 0,
-            };
-            if (handle != 0) {
-                if (self.activeInboundHttpResponse(ci)) |session| {
-                    session.closeP2Body(handle);
+        if (args.len == 0 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        var body_lease = self.lookupOutgoingBody(handle) orelse
+            return error.InvalidHandle;
+        const body = body_lease.lock().*;
+        if (body.child_stream_handle != null or body.finished) {
+            body_lease.unlock();
+            body_lease.release();
+            return error.InvalidState;
+        }
+        const parent_response_handle = body.parent_response_handle;
+        const owner = body.stream_owner;
+        if (owner) |retained| retained.retain();
+        body_lease.unlock();
+        body_lease.release();
+
+        var written_len: usize = 0;
+        const live_len = if (self.activeInboundHttpResponse(ci)) |session|
+            session.p2BodyByteCount(handle)
+        else
+            null;
+        if (live_len) |length| {
+            written_len = length;
+        } else if (owner) |retained| {
+            retained.operation_claim.acquire();
+            written_len = retained.stream.getBufferContents().len;
+            retained.operation_claim.release();
+        }
+        if (owner) |retained| retained.release();
+
+        var content_length_matches = true;
+        if (parent_response_handle) |response_handle| {
+            var response_lease = self.lookupOutgoingResponse(
+                response_handle,
+            ) orelse return error.InvalidHandle;
+            const headers_handle = response_lease.value().*.headers_handle;
+            response_lease.release();
+            if (self.lookupHttpFields(headers_handle)) |initial_fields_lease| {
+                var fields_lease = initial_fields_lease;
+                const expected = httpFieldsContentLength(
+                    fields_lease.value().*,
+                ) catch |err| {
+                    fields_lease.release();
+                    return err;
+                };
+                fields_lease.release();
+                if (expected) |length| {
+                    content_length_matches = length == written_len;
                 }
             }
+        }
+
+        body_lease = self.lookupOutgoingBody(handle) orelse
+            return error.InvalidHandle;
+        const final_body = body_lease.lock().*;
+        if (final_body.child_stream_handle != null or final_body.finished) {
+            body_lease.unlock();
+            body_lease.release();
+            return error.InvalidState;
+        }
+        final_body.finished = true;
+        body_lease.unlock();
+        body_lease.release();
+        if (parent_response_handle) |response_handle| {
+            if (self.lookupOutgoingResponse(response_handle)) |initial_response_lease| {
+                var response_lease = initial_response_lease;
+                const response = response_lease.lock().*;
+                response.body_finished = content_length_matches;
+                response.body_incomplete = !content_length_matches;
+                response_lease.unlock();
+                response_lease.release();
+            }
+        }
+
+        if (!content_length_matches) {
+            if (self.activeInboundHttpResponse(ci)) |session| {
+                session.failResponse(.HTTP_response_body_size, true);
+            }
+            results[0] = try httpResultErr(
+                allocator,
+                .HTTP_response_body_size,
+            );
+            if (parent_response_handle != null) {
+                _ = self.http_outgoing_bodies.remove(handle);
+            }
+            return;
+        }
+        if (self.activeInboundHttpResponse(ci)) |session| {
+            session.closeP2Body(handle);
+        }
+        if (parent_response_handle != null) {
+            _ = self.http_outgoing_bodies.remove(handle);
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
@@ -22586,16 +23263,34 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        if (self.activeInboundHttpResponse(ci)) |session| {
-            session.closeP2Body(handle);
-        }
         var lease = self.lookupOutgoingBody(handle) orelse return;
         const body = lease.lock().*;
+        if (body.child_stream_handle != null) {
+            lease.unlock();
+            lease.release();
+            return error.InvalidState;
+        }
+        const finished = body.finished;
+        const parent_response_handle = body.parent_response_handle;
         const owner = body.stream_owner;
         body.stream_owner = null;
         lease.unlock();
         if (owner) |owned| owned.release();
         lease.release();
+        if (!finished) {
+            if (parent_response_handle) |response_handle| {
+                if (self.lookupOutgoingResponse(response_handle)) |initial_response_lease| {
+                    var response_lease = initial_response_lease;
+                    const response = response_lease.lock().*;
+                    response.body_incomplete = true;
+                    response_lease.unlock();
+                    response_lease.release();
+                }
+            }
+            if (self.activeInboundHttpResponse(ci)) |session| {
+                session.abandonP2Body(handle);
+            }
+        }
         _ = self.http_outgoing_bodies.remove(handle);
     }
 
@@ -23042,69 +23737,80 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        var outparam_lease = self.lookupResponseOutparam(handle) orelse
-            return error.InvalidHandle;
-        defer outparam_lease.release();
-        const outparam = outparam_lease.lock().*;
-        switch (outparam.state) {
-            .unset => {},
-            else => {
-                outparam_lease.unlock();
-                return error.InvalidState;
-            },
-        }
-
-        var selected_response: ?u32 = null;
-        switch (args[1]) {
+        const next_state: ResponseOutparam.State = next: switch (args[1]) {
             .result_val => |rv| {
                 const payload = rv.payload orelse {
-                    outparam_lease.unlock();
                     return error.InvalidArgs;
                 };
                 if (rv.is_ok) {
                     const response_handle = switch (payload.*) {
                         .handle => |h| h,
-                        else => {
-                            outparam_lease.unlock();
-                            return error.InvalidArgs;
-                        },
+                        else => return error.InvalidArgs,
                     };
-                    outparam.state = .{ .response = response_handle };
-                    selected_response = response_handle;
+                    break :next .{ .response = response_handle };
                 } else {
-                    outparam.state = .{ .err = switch (payload.*) {
+                    break :next .{ .err = switch (payload.*) {
                         .variant_val => |v| v.discriminant,
                         .enum_val => |d| d,
                         .u32 => |d| d,
-                        else => {
-                            outparam_lease.unlock();
-                            return error.InvalidArgs;
-                        },
+                        else => return error.InvalidArgs,
                     } };
                 }
             },
-            .handle => |h| {
-                outparam.state = .{ .response = h };
-                selected_response = h;
-            },
-            .variant_val => |v| outparam.state = .{ .err = v.discriminant },
-            .enum_val => |d| outparam.state = .{ .err = d },
-            .u32 => |d| outparam.state = .{ .err = d },
-            else => {
-                outparam_lease.unlock();
-                return error.InvalidArgs;
-            },
+            .handle => |h| .{ .response = h },
+            .variant_val => |v| .{ .err = v.discriminant },
+            .enum_val => |d| .{ .err = d },
+            .u32 => |d| .{ .err = d },
+            else => return error.InvalidArgs,
+        };
+
+        var selected_body: ?u32 = null;
+        var selected_body_finished = false;
+        var selected_body_incomplete = false;
+        const live_response = self.activeInboundHttpResponse(ci);
+        if (next_state == .response) {
+            const response_handle = next_state.response;
+            var response_lease = self.lookupOutgoingResponse(
+                response_handle,
+            ) orelse return error.InvalidHandle;
+            const response = response_lease.value().*;
+            selected_body = response.body_handle;
+            selected_body_finished = response.body_finished;
+            selected_body_incomplete = response.body_incomplete;
+            response_lease.release();
         }
+
+        var outparam_lease = self.lookupResponseOutparam(handle) orelse
+            return error.InvalidHandle;
+        defer outparam_lease.release();
+        const outparam = outparam_lease.lock().*;
+        if (outparam.state != .unset) {
+            outparam_lease.unlock();
+            return error.InvalidState;
+        }
+        if (next_state == .response) {
+            if (live_response) |session| {
+                if (!session.reserveP2ResponseSelection(
+                    next_state.response,
+                    selected_body,
+                )) {
+                    outparam_lease.unlock();
+                    return error.InvalidState;
+                }
+            }
+        }
+        outparam.state = next_state;
         outparam_lease.unlock();
 
-        if (selected_response) |response_handle| {
-            if (self.activeInboundHttpResponse(ci)) |session| {
-                var response_lease = self.lookupOutgoingResponse(
+        if (next_state == .response) {
+            const response_handle = next_state.response;
+            if (live_response) |session| {
+                session.commitP2ResponseSelection(
                     response_handle,
-                ) orelse return;
-                const body_handle = response_lease.value().*.body_handle;
-                response_lease.release();
-                _ = session.attachP2Response(response_handle, body_handle);
+                    selected_body,
+                    selected_body_finished,
+                    selected_body_incomplete,
+                );
             }
         }
     }
@@ -23834,18 +24540,44 @@ pub const WasiCliAdapter = struct {
                 var response_lease = self.lookupOutgoingResponse(response_handle) orelse {
                     return self.writeHttpSimpleResponse(out, 500, "invalid response handle\n");
                 };
-                defer response_lease.release();
                 const response = response_lease.value().*;
                 const status: u16 = if (response.status >= 100 and response.status <= 999) response.status else 500;
+                const headers_handle = response.headers_handle;
+                const body_handle = response.body_handle;
+                const body_incomplete = response.body_incomplete;
+                const body_finished = response.body_finished;
+                const body_owner = response.body_owner;
+                if (body_owner) |owner| owner.retain();
+                response_lease.release();
+                defer if (body_owner) |owner| owner.release();
+                if (body_incomplete) {
+                    return self.writeHttpSimpleResponse(
+                        out,
+                        500,
+                        "incomplete response body\n",
+                    );
+                }
                 var body_owned: ?[]u8 = null;
                 defer if (body_owned) |bytes| self.allocator.free(bytes);
-                if (response.body_handle) |body_handle| {
-                    body_owned = try self.copyOutgoingBodyBytes(body_handle) orelse {
+                if (body_owner) |owner| {
+                    owner.operation_claim.acquire();
+                    body_owned = self.allocator.dupe(
+                        u8,
+                        owner.stream.getBufferContents(),
+                    ) catch |err| {
+                        owner.operation_claim.release();
+                        return err;
+                    };
+                    owner.operation_claim.release();
+                } else if (body_finished) {
+                    body_owned = try self.allocator.alloc(u8, 0);
+                } else if (body_handle) |handle| {
+                    body_owned = try self.copyOutgoingBodyBytes(handle) orelse {
                         return self.writeHttpSimpleResponse(out, 500, "invalid body handle\n");
                     };
                 }
                 const body: []const u8 = if (body_owned) |bytes| bytes else "";
-                var response_fields_lease = self.lookupHttpFields(response.headers_handle);
+                var response_fields_lease = self.lookupHttpFields(headers_handle);
                 defer if (response_fields_lease) |*lease| lease.release();
                 if (response_fields_lease) |*lease| {
                     const fields = lease.value().*;
@@ -25685,7 +26417,7 @@ pub const WasiCliAdapter = struct {
         // future from `allocReadyUnitFuture`) is the no-trailers fast
         // path; a `some(<fields_handle>)` payload lifts into the
         // chunked trailer block.
-        var trailer_fields_lease = self.lookupTrailerFieldsFromFuture(
+        var trailer_fields_lease = try self.lookupTrailerFieldsFromFuture(
             ci,
             response.trailers_future_handle,
         );
@@ -25810,30 +26542,56 @@ pub const WasiCliAdapter = struct {
         return false;
     }
 
-    /// Decode the trailers `future<option<own<trailers>>>`'s
-    /// canonical-ABI payload into a borrowed `*HttpFields` pointer
-    /// when the guest wrote `some(<fields_handle>)`. Returns `null`
-    /// for the no-trailers fast path (no payload set, or `none`
-    /// discriminant). Mirrors the canon-ABI layout of `option<T>`:
-    /// 1-byte discriminant + 3 bytes of padding + 4-byte handle.
+    fn httpFieldsContentLength(fields: *const HttpFields) !?usize {
+        var content_length: ?usize = null;
+        for (fields.entries.items) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, "content-length")) continue;
+            const parsed = std.fmt.parseInt(
+                usize,
+                std.mem.trim(u8, entry.value, " \t"),
+                10,
+            ) catch return error.InvalidContentLength;
+            if (content_length) |known| {
+                if (known != parsed) return error.InvalidContentLength;
+            } else {
+                content_length = parsed;
+            }
+        }
+        return content_length;
+    }
+
+    /// Decode the trailers
+    /// `future<result<option<own<trailers>>, error-code>>` and wait for
+    /// a pending producer. A dropped writer or error result fails the
+    /// response rather than being mistaken for `ok(none)`.
     fn lookupTrailerFieldsFromFuture(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
         future_handle: u32,
-    ) ?HttpFieldsLease {
-        var future_lease = ci.futures.acquire(future_handle) orelse return null;
-        const fut = future_lease.value();
-        const payload = fut.payload orelse {
-            future_lease.release();
-            return null;
-        };
-        if (payload.len < 8 or payload[0] != 1) {
-            future_lease.release();
-            return null;
+    ) !?HttpFieldsLease {
+        while (true) {
+            switch (try decodeHttpTrailerFuture(
+                ci,
+                future_handle,
+                self.allocator,
+            )) {
+                .pending => {
+                    if (http_shutdown_requested.load(.acquire)) {
+                        return error.HttpTrailersFailed;
+                    }
+                    _ = driveAsyncEvents(
+                        self,
+                        ci,
+                        10 * std.time.ns_per_ms,
+                        self.allocator,
+                    );
+                },
+                .none => return null,
+                .fields => |handle| return self.lookupHttpFields(handle) orelse
+                    error.HttpTrailersFailed,
+                .err, .dropped => return error.HttpTrailersFailed,
+            }
         }
-        const handle = std.mem.readInt(u32, payload[4..8], .little);
-        future_lease.release();
-        return self.lookupHttpFields(handle);
     }
 
     /// Read a complete HTTP request from `stream`, build an
@@ -26063,12 +26821,14 @@ pub const WasiCliAdapter = struct {
 
             var live_terminal: HttpLiveTerminal = .fallback;
             var live_output_started = false;
+            var live_error_status: u16 = 500;
             if (live_response) |session| {
                 session.handlerReturned(outcome.payload);
                 session.waitAndJoin();
                 session.propagateTerminalToGuest();
                 live_terminal = session.currentTerminal();
                 live_output_started = session.hasOutputStarted();
+                live_error_status = session.responseErrorStatus();
                 session.destroy();
             }
 
@@ -26101,7 +26861,7 @@ pub const WasiCliAdapter = struct {
                 {
                     self.writeHttpSimpleResponse(
                         output,
-                        500,
+                        live_error_status,
                         "invalid response\n",
                     ) catch {};
                 }
@@ -29771,12 +30531,14 @@ fn serveOneHttpConnection(
 
     var live_terminal: HttpLiveTerminal = .fallback;
     var live_output_started = false;
+    var live_error_status: u16 = 500;
     if (live_response) |session| {
         _ = session.handlerReturnedP2(outparam_handle);
         session.waitAndJoin();
         session.propagateTerminalToGuest();
         live_terminal = session.currentTerminal();
         live_output_started = session.hasOutputStarted();
+        live_error_status = session.responseErrorStatus();
         session.destroy();
     }
     if (live_terminal == .succeeded) return;
@@ -29784,7 +30546,7 @@ fn serveOneHttpConnection(
         if (live_terminal == .response_error and !live_output_started) {
             adapter.writeHttpSimpleResponse(
                 &output,
-                500,
+                live_error_status,
                 "invalid response\n",
             ) catch {};
         }
@@ -46352,6 +47114,80 @@ const LiveHttpResponseFixture = struct {
     transmission_handle: u32,
 };
 
+const LiveTrailerResult = union(enum) {
+    none,
+    some: u32,
+    err: HttpErrorCode,
+};
+
+fn encodeLiveTrailerResult(
+    allocator: Allocator,
+    result: LiveTrailerResult,
+) ![]u8 {
+    var handle_value = InterfaceValue{ .handle = 0 };
+    var option_value = InterfaceValue{ .option_val = .{
+        .is_some = false,
+        .payload = null,
+    } };
+    var error_value = InterfaceValue{ .variant_val = .{
+        .discriminant = 0,
+        .payload = null,
+    } };
+    const value = switch (result) {
+        .none => InterfaceValue{ .result_val = .{
+            .is_ok = true,
+            .payload = &option_value,
+        } },
+        .some => |handle| blk: {
+            handle_value = .{ .handle = handle };
+            option_value = .{ .option_val = .{
+                .is_some = true,
+                .payload = &handle_value,
+            } };
+            break :blk InterfaceValue{ .result_val = .{
+                .is_ok = true,
+                .payload = &option_value,
+            } };
+        },
+        .err => |code| blk: {
+            error_value = .{ .variant_val = .{
+                .discriminant = @intFromEnum(code),
+                .payload = null,
+            } };
+            break :blk InterfaceValue{ .result_val = .{
+                .is_ok = false,
+                .payload = &error_value,
+            } };
+        },
+    };
+    const reg = httpP3TypeRegistry();
+    const trailer_type = ctypes.ValType{
+        .result = HTTP_P3_RESULT_OPTION_TRAILERS_IDX,
+    };
+    const payload = try allocator.alloc(u8, abi.sizeOfType(reg, trailer_type));
+    errdefer allocator.free(payload);
+    @memset(payload, 0);
+    try abi.storeValReg(payload, 0, trailer_type, value, reg);
+    return payload;
+}
+
+fn setLiveFuture(
+    ci: *ComponentInstance,
+    handle: u32,
+    state: async_mod.Future.State,
+    write_closed: bool,
+    payload: ?[]u8,
+) !void {
+    var future_lease = ci.futures.acquire(handle) orelse
+        return error.InvalidHandle;
+    const future = future_lease.value();
+    if (future.payload) |old| ci.allocator.free(old);
+    future.payload = payload;
+    future.state = state;
+    future.write_closed = write_closed;
+    future_lease.release();
+}
+
 fn makeLiveHttpResponseFixture(
     adapter: *WasiCliAdapter,
     ci: *ComponentInstance,
@@ -46392,16 +47228,10 @@ fn makeLiveHttpResponseFixture(
             .value = value,
         });
         const trailer_fields_handle = try adapter.pushHttpFields(trailer_fields);
-        const payload = try ci.allocator.alloc(u8, 8);
-        @memset(payload, 0);
-        payload[0] = 1;
-        std.mem.writeInt(
-            u32,
-            payload[4..8],
-            trailer_fields_handle,
-            .little,
+        trailers_payload = try encodeLiveTrailerResult(
+            ci.allocator,
+            .{ .some = trailer_fields_handle },
         );
-        trailers_payload = payload;
     }
 
     const trailers_handle = ci.allocAsyncHandle();
@@ -46463,6 +47293,9 @@ fn startLiveHttpTestSession(
         fixture.trailers_handle,
         fixture.transmission_handle,
     ));
+    try std.testing.expect(session.selectP3Response(
+        fixture.response_handle,
+    ));
     return session;
 }
 
@@ -46485,6 +47318,35 @@ fn waitForLiveHttpTerminal(
         platform.usleep(100);
     }
     try std.testing.expectEqual(terminal, session.currentTerminal());
+}
+
+fn waitForLiveHttpWireComplete(
+    session: *InboundHttpResponseSession,
+) !void {
+    var attempts: usize = 0;
+    while (attempts < 50_000) : (attempts += 1) {
+        session.mutex.lock();
+        const complete = session.wire_complete;
+        session.mutex.unlock();
+        if (complete) return;
+        platform.usleep(100);
+    }
+    return error.TestExpectedEqual;
+}
+
+fn waitForLiveHttpTransmitted(
+    session: *InboundHttpResponseSession,
+    expected: usize,
+) !void {
+    var attempts: usize = 0;
+    while (attempts < 50_000) : (attempts += 1) {
+        session.mutex.lock();
+        const transmitted = session.transmitted_bytes;
+        session.mutex.unlock();
+        if (transmitted >= expected) return;
+        platform.usleep(100);
+    }
+    return error.TestExpectedEqual;
 }
 
 test "wasi:http #616 A8 live: first body chunk reaches the client before handler return" {
@@ -46534,11 +47396,12 @@ test "wasi:http #616 A8 live: first body chunk reaches the client before handler
     release.store(true, .release);
     thread.join();
     joined = true;
-    try waitForLiveHttpTerminal(session, .succeeded);
+    try waitForLiveHttpWireComplete(session);
     try testing.expect(session.driveGuestEvents());
     const transmission = ci.futures.getPtr(fixture.transmission_handle).?;
     try testing.expectEqual(async_mod.Future.State.ready, transmission.state);
     try testing.expect(!handler_returned.load(.acquire));
+    try testing.expectEqual(HttpLiveTerminal.running, session.currentTerminal());
     handler_returned.store(true, .release);
     session.handlerReturned(fixture.response_handle);
     session.waitAndJoin();
@@ -46546,6 +47409,92 @@ test "wasi:http #616 A8 live: first body chunk reaches the client before handler
 
     try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
     try testing.expect(std.mem.endsWith(u8, sink.contents(), "firstsecond"));
+}
+
+test "wasi:http #954 review: handler return does not close an open P3 body" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        11,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        session,
+        "first",
+    ));
+    session.handlerReturned(fixture.response_handle);
+    try waitForLiveHttpFlag(&sink.first_seen);
+    try testing.expectEqual(HttpLiveTerminal.running, session.currentTerminal());
+
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        session,
+        "second",
+    ));
+    InboundHttpResponseSession.onBodyClosed(session);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expect(std.mem.endsWith(u8, sink.contents(), "firstsecond"));
+}
+
+test "wasi:http #954 review: handler failure wins after body wire completion" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        5,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        session,
+        "first",
+    ));
+    InboundHttpResponseSession.onBodyClosed(session);
+    try waitForLiveHttpWireComplete(session);
+    try testing.expectEqual(HttpLiveTerminal.running, session.currentTerminal());
+
+    session.handlerFailed();
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+    try testing.expectEqual(
+        HttpLiveTerminal.handler_error,
+        session.currentTerminal(),
+    );
+    const future = ci.futures.getPtr(fixture.transmission_handle).?;
+    try testing.expectEqual(async_mod.Future.State.closed, future.state);
 }
 
 test "wasi:http #616 A8 live: response streams are bounded before response.new associates them" {
@@ -46608,6 +47557,147 @@ test "wasi:http #616 A8 live: response streams are bounded before response.new a
         @as(?usize, http_live_response_buffer_bytes),
         stream.buffer_limit,
     );
+}
+
+test "wasi:http #954 review: preassociated closed body starts writer before handler return" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        5,
+        true,
+        null,
+    );
+    const body_stream = ci.streams.getPtr(fixture.body_handle.?).?;
+    try body_stream.buffer.appendSlice(testing.allocator, "first");
+    body_stream.write_closed = true;
+
+    var sink = LiveHttpTestSink{};
+    const session = try InboundHttpResponseSession.create(
+        testing.allocator,
+        &adapter,
+        &ci,
+        &output,
+        false,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    defer session.destroy();
+    try session.start();
+    try testing.expect(session.attachP3Response(
+        fixture.response_handle,
+        fixture.body_handle,
+        fixture.trailers_handle,
+        fixture.transmission_handle,
+    ));
+
+    platform.usleep(10 * 1000);
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+    const returned = [_]u32{
+        0,
+        abi.encodeResourceWireAbi(fixture.response_handle),
+    };
+    notifyInboundHttpTaskReturn(&thread_ctx, &returned);
+    try waitForLiveHttpWireComplete(session);
+    try testing.expect(session.driveGuestEvents());
+    try testing.expectEqual(HttpLiveTerminal.running, session.currentTerminal());
+    const transmission = ci.futures.getPtr(fixture.transmission_handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, transmission.state);
+    try testing.expect(std.mem.endsWith(u8, sink.contents(), "first"));
+
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+}
+
+test "wasi:http #954 review: P3 callback lease blocks session destruction" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        1,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{};
+    const session = try InboundHttpResponseSession.create(
+        testing.allocator,
+        &adapter,
+        &ci,
+        &output,
+        false,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    try testing.expect(session.attachP3Response(
+        fixture.response_handle,
+        fixture.body_handle,
+        fixture.trailers_handle,
+        fixture.transmission_handle,
+    ));
+
+    var stream_lease = ci.streams.acquire(fixture.body_handle.?).?;
+    const handler = stream_lease.value().host_handler.?;
+    try testing.expect(handler.retain_context.?(handler.ctx));
+    stream_lease.release();
+
+    const Destroy = struct {
+        fn run(
+            target: *InboundHttpResponseSession,
+            done: *std.atomic.Value(bool),
+        ) void {
+            target.destroy();
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Destroy.run, .{ session, &done });
+    var joined = false;
+    defer {
+        if (!joined) {
+            handler.release_context.?(handler.ctx);
+            thread.join();
+        }
+    }
+
+    var attempts: usize = 0;
+    while (session.callbacks_accepting.load(.acquire) and
+        attempts < 50_000) : (attempts += 1)
+    {
+        platform.usleep(100);
+    }
+    try testing.expect(!session.callbacks_accepting.load(.acquire));
+    try testing.expect(!done.load(.acquire));
+
+    handler.release_context.?(handler.ctx);
+    thread.join();
+    joined = true;
+    try testing.expect(done.load(.acquire));
 }
 
 test "wasi:http #616 A8 live: P2 outgoing-body writes stream before handler return" {
@@ -46705,20 +47795,16 @@ test "wasi:http #616 A8 live: P2 outgoing-body writes stream before handler retu
         if (!joined) thread.join();
     }
 
-    try waitForLiveHttpFlag(&sink.first_seen);
-    try testing.expect(sink.first_before_handler_return.load(.acquire));
-    release.store(true, .release);
-    thread.join();
-    joined = true;
+    var attempts: usize = 0;
+    while (attempts < 50_000) : (attempts += 1) {
+        session.mutex.lock();
+        const produced = session.produced_bytes;
+        session.mutex.unlock();
+        if (produced == 5) break;
+        platform.usleep(100);
+    }
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
 
-    var finish_results: [1]InterfaceValue = undefined;
-    try WasiCliAdapter.httpOutgoingBodyFinish(
-        &adapter,
-        &ci,
-        &.{.{ .handle = body_handle }},
-        &finish_results,
-        testing.allocator,
-    );
     const response_payload = InterfaceValue{ .handle = response_handle };
     const response_result = InterfaceValue{ .result_val = .{
         .is_ok = true,
@@ -46731,12 +47817,386 @@ test "wasi:http #616 A8 live: P2 outgoing-body writes stream before handler retu
         &.{},
         testing.allocator,
     );
+    try waitForLiveHttpFlag(&sink.first_seen);
+    try testing.expect(sink.first_before_handler_return.load(.acquire));
+    release.store(true, .release);
+    thread.join();
+    joined = true;
+
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = stream_handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
     handler_returned.store(true, .release);
     try testing.expect(session.handlerReturnedP2(outparam_handle));
     session.waitAndJoin();
 
     try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
     try testing.expect(std.mem.endsWith(u8, sink.contents(), "firstsecond"));
+}
+
+test "wasi:http #954 review: P2 body finish and drop enforce child ownership" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fields_handle = try adapter.pushHttpFields(fields);
+    const response = try testing.allocator.create(OutgoingResponse);
+    response.* = .{ .headers_handle = fields_handle };
+    const response_handle = try adapter.pushOutgoingResponse(response);
+    const body = try testing.allocator.create(OutgoingBody);
+    body.* = .{ .parent_response_handle = response_handle };
+    const body_handle = try adapter.pushOutgoingBody(body);
+    response.body_handle = body_handle;
+    const outparam = try testing.allocator.create(ResponseOutparam);
+    outparam.* = .{};
+    const outparam_handle = try adapter.pushResponseOutparam(outparam);
+
+    var sink = LiveHttpTestSink{};
+    const session = try InboundHttpResponseSession.create(
+        testing.allocator,
+        &adapter,
+        &ci,
+        &output,
+        false,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    session.p2_mode = true;
+    defer session.destroy();
+    try session.start();
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+
+    var finish_results: [1]InterfaceValue = undefined;
+    try testing.expectError(
+        error.InvalidState,
+        WasiCliAdapter.httpOutgoingBodyFinish(
+            &adapter,
+            &ci,
+            &.{.{ .handle = body_handle }},
+            &finish_results,
+            testing.allocator,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidState,
+        WasiCliAdapter.httpOutgoingBodyDrop(
+            &adapter,
+            &ci,
+            &.{.{ .handle = body_handle }},
+            &.{},
+            testing.allocator,
+        ),
+    );
+    try testing.expect(adapter.http_outgoing_bodies.contains(body_handle));
+
+    const response_payload = InterfaceValue{ .handle = response_handle };
+    const response_result = InterfaceValue{ .result_val = .{
+        .is_ok = true,
+        .payload = &response_payload,
+    } };
+    try WasiCliAdapter.httpResponseOutparamSet(
+        &adapter,
+        &ci,
+        &.{ .{ .handle = outparam_handle }, response_result },
+        &.{},
+        testing.allocator,
+    );
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = stream_handle }},
+        &.{},
+        testing.allocator,
+    );
+    try WasiCliAdapter.httpOutgoingBodyDrop(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &.{},
+        testing.allocator,
+    );
+    try testing.expect(!adapter.http_outgoing_bodies.contains(body_handle));
+    try testing.expect(response.body_incomplete);
+    try testing.expect(response.body_owner != null);
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_incomplete),
+        session.response_error_code,
+    );
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+}
+
+test "wasi:http #954 review: finished P2 body outlives consumed body handle" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const response = try testing.allocator.create(OutgoingResponse);
+    response.* = .{ .headers_handle = try adapter.pushHttpFields(fields) };
+    const response_handle = try adapter.pushOutgoingResponse(response);
+    const body = try testing.allocator.create(OutgoingBody);
+    body.* = .{ .parent_response_handle = response_handle };
+    const body_handle = try adapter.pushOutgoingBody(body);
+    response.body_handle = body_handle;
+    const outparam = try testing.allocator.create(ResponseOutparam);
+    outparam.* = .{ .state = .{ .response = response_handle } };
+    const outparam_handle = try adapter.pushResponseOutparam(outparam);
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    defer owner.release();
+    switch (owner.stream.write("persist", testing.allocator)) {
+        .ok => |count| try testing.expectEqual(@as(usize, 7), count),
+        else => return error.TestFailed,
+    }
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = stream_handle }},
+        &.{},
+        testing.allocator,
+    );
+
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    defer finish_results[0].deinit(testing.allocator);
+    try testing.expect(!adapter.http_outgoing_bodies.contains(body_handle));
+    try testing.expect(response.body_owner != null);
+    try testing.expect(response.body_finished);
+
+    var wire = streams.OutputStream.toBuffer();
+    defer wire.deinit(testing.allocator);
+    try adapter.writeHttpResponseFromOutparam(&wire, outparam_handle);
+    try testing.expect(std.mem.endsWith(
+        u8,
+        wire.getBufferContents(),
+        "\r\n\r\npersist",
+    ));
+}
+
+test "wasi:http #954 review: P2 finish reports content-length mismatch" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    try fields.entries.append(testing.allocator, .{
+        .name = try testing.allocator.dupe(u8, "content-length"),
+        .value = try testing.allocator.dupe(u8, "4"),
+    });
+    const response = try testing.allocator.create(OutgoingResponse);
+    response.* = .{ .headers_handle = try adapter.pushHttpFields(fields) };
+    const response_handle = try adapter.pushOutgoingResponse(response);
+    const body = try testing.allocator.create(OutgoingBody);
+    body.* = .{ .parent_response_handle = response_handle };
+    const body_handle = try adapter.pushOutgoingBody(body);
+    response.body_handle = body_handle;
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    defer owner.release();
+    switch (owner.stream.write("abc", testing.allocator)) {
+        .ok => |count| try testing.expectEqual(@as(usize, 3), count),
+        else => return error.TestFailed,
+    }
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = stream_handle }},
+        &.{},
+        testing.allocator,
+    );
+
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    defer finish_results[0].deinit(testing.allocator);
+    try testing.expect(!finish_results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_response_body_size)),
+        finish_results[0].result_val.payload.?.variant_val.discriminant,
+    );
+    try testing.expect(response.body_incomplete);
+    try testing.expect(!adapter.http_outgoing_bodies.contains(body_handle));
+}
+
+test "wasi:http #954 review: P2 rejects an unselected prebuffered response without writing" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fields_a = try testing.allocator.create(HttpFields);
+    fields_a.* = .{};
+    const fields_a_handle = try adapter.pushHttpFields(fields_a);
+    const response_a = try testing.allocator.create(OutgoingResponse);
+    response_a.* = .{ .headers_handle = fields_a_handle };
+    const response_a_handle = try adapter.pushOutgoingResponse(response_a);
+    const body_a = try testing.allocator.create(OutgoingBody);
+    body_a.* = .{ .parent_response_handle = response_a_handle };
+    const body_a_handle = try adapter.pushOutgoingBody(body_a);
+    response_a.body_handle = body_a_handle;
+
+    const fields_b = try testing.allocator.create(HttpFields);
+    fields_b.* = .{};
+    const fields_b_handle = try adapter.pushHttpFields(fields_b);
+    const response_b = try testing.allocator.create(OutgoingResponse);
+    response_b.* = .{ .headers_handle = fields_b_handle };
+    const response_b_handle = try adapter.pushOutgoingResponse(response_b);
+    const outparam = try testing.allocator.create(ResponseOutparam);
+    outparam.* = .{};
+    const outparam_handle = try adapter.pushResponseOutparam(outparam);
+
+    var sink = LiveHttpTestSink{};
+    const session = try InboundHttpResponseSession.create(
+        testing.allocator,
+        &adapter,
+        &ci,
+        &output,
+        false,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
+    );
+    session.p2_mode = true;
+    defer session.destroy();
+    try session.start();
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        &adapter,
+        &ci,
+        &.{.{ .handle = body_a_handle }},
+        &write_results,
+        testing.allocator,
+    );
+    defer write_results[0].deinit(testing.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    defer owner.release();
+    const write_result = owner.stream.write("unselected", testing.allocator);
+    try testing.expectEqual(@as(usize, 10), write_result.ok);
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+
+    const response_payload = InterfaceValue{ .handle = response_b_handle };
+    const response_result = InterfaceValue{ .result_val = .{
+        .is_ok = true,
+        .payload = &response_payload,
+    } };
+    try testing.expectError(
+        error.InvalidState,
+        WasiCliAdapter.httpResponseOutparamSet(
+            &adapter,
+            &ci,
+            &.{ .{ .handle = outparam_handle }, response_result },
+            &.{},
+            testing.allocator,
+        ),
+    );
+    try testing.expect(outparam.state == .unset);
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+    session.handlerFailed();
+    session.waitAndJoin();
 }
 
 test "wasi:http #616 A8 live: slow client bounds producer memory and backpressures a large body" {
@@ -46826,6 +48286,9 @@ test "wasi:http #616 A8 live: empty body and multi-chunk trailers preserve wire 
         false,
         null,
     );
+    adapter.http_responses_p3.unsafeGetPtrForTest(
+        empty_fixture.response_handle,
+    ).?.*.status = 404;
     var empty_sink = LiveHttpTestSink{};
     const empty_session = try startLiveHttpTestSession(
         &adapter,
@@ -46845,6 +48308,11 @@ test "wasi:http #616 A8 live: empty body and multi-chunk trailers preserve wire 
         u8,
         empty_sink.contents(),
         "Content-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
+    try testing.expect(std.mem.startsWith(
+        u8,
+        empty_sink.contents(),
+        "HTTP/1.1 404 Not Found\r\n",
     ));
     empty_session.destroy();
 
@@ -46894,6 +48362,150 @@ test "wasi:http #616 A8 live: empty body and multi-chunk trailers preserve wire 
         wire,
         "0\r\nx-final: done\r\n\r\n",
     ));
+}
+
+test "wasi:http #954 review: pending P3 trailers delay completion and preserve trailer result" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        null,
+        true,
+        null,
+    );
+    try setLiveFuture(
+        &ci,
+        fixture.trailers_handle,
+        .pending,
+        false,
+        null,
+    );
+
+    const trailer_fields = try testing.allocator.create(HttpFields);
+    trailer_fields.* = .{};
+    try trailer_fields.entries.append(testing.allocator, .{
+        .name = try testing.allocator.dupe(u8, "x-late"),
+        .value = try testing.allocator.dupe(u8, "ready"),
+    });
+    const trailer_fields_handle = try adapter.pushHttpFields(trailer_fields);
+
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSession(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+    );
+    defer session.destroy();
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        session,
+        "abc",
+    ));
+    InboundHttpResponseSession.onBodyClosed(session);
+    session.handlerReturned(fixture.response_handle);
+    try waitForLiveHttpTransmitted(session, 3);
+    try testing.expectEqual(HttpLiveTerminal.running, session.currentTerminal());
+
+    const payload = try encodeLiveTrailerResult(
+        testing.allocator,
+        .{ .some = trailer_fields_handle },
+    );
+    try setLiveFuture(
+        &ci,
+        fixture.trailers_handle,
+        .ready,
+        true,
+        payload,
+    );
+    _ = session.driveGuestEvents();
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expect(std.mem.endsWith(
+        u8,
+        sink.contents(),
+        "0\r\nx-late: ready\r\n\r\n",
+    ));
+}
+
+test "wasi:http #954 review: P3 trailer error and dropped writer fail response" {
+    const testing = std.testing;
+    inline for (.{ false, true }) |is_error_payload| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            null,
+            false,
+            null,
+        );
+        if (is_error_payload) {
+            const payload = try encodeLiveTrailerResult(
+                testing.allocator,
+                .{ .err = .HTTP_protocol_error },
+            );
+            try setLiveFuture(
+                &ci,
+                fixture.trailers_handle,
+                .ready,
+                true,
+                payload,
+            );
+        } else {
+            try setLiveFuture(
+                &ci,
+                fixture.trailers_handle,
+                .closed,
+                true,
+                null,
+            );
+        }
+
+        var sink = LiveHttpTestSink{};
+        const session = try startLiveHttpTestSession(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            fixture,
+        );
+        defer session.destroy();
+        session.handlerReturned(fixture.response_handle);
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.response_error,
+            session.currentTerminal(),
+        );
+        const expected_error: HttpErrorCode = if (is_error_payload)
+            .HTTP_protocol_error
+        else
+            .HTTP_response_incomplete;
+        try testing.expectEqual(
+            @as(?HttpErrorCode, expected_error),
+            session.response_error_code,
+        );
+        try testing.expectEqual(@as(usize, 0), sink.contents().len);
+        const transmission = ci.futures.getPtr(
+            fixture.transmission_handle,
+        ).?;
+        try testing.expectEqual(
+            async_mod.Future.State.closed,
+            transmission.state,
+        );
+    }
 }
 
 test "wasi:http #616 A8 live: disconnect and socket fault fail transmission exactly once" {
@@ -47662,16 +49274,13 @@ test "wasi:http@0.3 (#583 A5): guest trailers ride through the chunked trailer b
     body.write_closed = true;
     try ci.streams.put(testing.allocator, body_handle, body);
 
-    // Simulate what a `future.write` of `some(<handle>)` would have
-    // deposited in the trailers future's `payload` (8 bytes:
-    // 1-byte discriminant `1` for `some`, 3 padding bytes, then
-    // the u32 handle in little-endian).
-    const trailers_payload = try testing.allocator.alloc(u8, 8);
-    trailers_payload[0] = 1;
-    trailers_payload[1] = 0;
-    trailers_payload[2] = 0;
-    trailers_payload[3] = 0;
-    std.mem.writeInt(u32, trailers_payload[4..8], trailer_fields_handle, .little);
+    // `future.write` stores the complete
+    // `result<option<own<trailers>>, error-code>` envelope, including
+    // its outer result discriminant and canonically encoded resource.
+    const trailers_payload = try encodeLiveTrailerResult(
+        testing.allocator,
+        .{ .some = trailer_fields_handle },
+    );
 
     const trailers_h = ci.allocAsyncHandle();
     try ci.futures.put(testing.allocator, trailers_h, .{
