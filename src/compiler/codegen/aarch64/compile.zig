@@ -3255,8 +3255,8 @@ fn compileInst(
         .call_ref => |cr| try emitCallRef(code, inst, cr, reg_map, v128_map, v128_cache, fctx),
 
         // ── Tables & function refs ───────────────────────────────────
-        .table_size => |tidx| try emitTableSize(code, inst, tidx, reg_map),
-        .table_get => |tg| try emitTableGet(code, inst, tg, reg_map),
+        .table_size => |tidx| try emitTableSize(code, inst, tidx, reg_map, fctx.has_shared_memory),
+        .table_get => |tg| try emitTableGet(code, inst, tg, reg_map, fctx.has_shared_memory),
         .table_set => |ts| try emitTableSet(code, ts, reg_map, fctx),
         .table_grow => |tg| try emitTableGrow(code, inst, tg, reg_map, fctx),
         .ref_func => |fidx| try emitRefFunc(code, inst, fidx, reg_map),
@@ -6886,6 +6886,42 @@ fn emitMemAddr(
     try emitMemAddrImpl(code, reg_map, base_vreg, offset, end_offset, false);
 }
 
+fn emitAtomicAlignmentCheck(
+    code: *emit.CodeBuffer,
+    effective_index: emit.Reg,
+    size: u8,
+) !void {
+    if (size == 1) return;
+    std.debug.assert(size == 2 or size == 4 or size == 8);
+    try code.movImm32(RegMap.tmp1, @intCast(size - 1));
+    try code.andRegReg(RegMap.tmp1, effective_index, RegMap.tmp1);
+    const aligned_patch = code.len();
+    try code.cbz64(RegMap.tmp1, 0);
+    try emitTrapHelperCall(code, vmctx_trap_unaligned_fn_slot);
+    patchBCondHere(code, aligned_patch);
+}
+
+fn emitAtomicMemAddr(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    base_vreg: ir.VReg,
+    offset: u32,
+    size: u8,
+) !void {
+    const end_offset: u64 = @as(u64, offset) + @as(u64, size);
+    try emitMemIndexImpl(code, reg_map, base_vreg, end_offset, false);
+    if (offset != 0) {
+        if (offset <= 0xFFF) {
+            try code.addImm(RegMap.tmp2, RegMap.tmp2, @intCast(offset));
+        } else {
+            try code.movImm64(RegMap.tmp1, offset);
+            try code.addRegReg(RegMap.tmp2, RegMap.tmp2, RegMap.tmp1);
+        }
+    }
+    try emitAtomicAlignmentCheck(code, RegMap.tmp2, size);
+    try code.addRegReg(RegMap.tmp0, .x20, RegMap.tmp2);
+}
+
 fn emitMemAddrSkipBounds(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
@@ -7009,6 +7045,7 @@ const vmctx_tags_ptr_slot: u12 = 30; // byte 240, scale 8
 const vmctx_aot_throw_uncaught_fn_slot: u12 = 32; // byte 256, scale 8
 const vmctx_exception_params_byte_off: u32 = 264; // [16]u64 buffer base
 const vmctx_exception_param_count_slot_w: u12 = 98; // byte 392 (u32), scale 4
+const vmctx_trap_unaligned_fn_slot: u12 = 53; // byte 424, scale 8
 
 // Per-table descriptor layout (`TableInfo`, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
@@ -7195,18 +7232,39 @@ fn loadTableInfoAddr(code: *emit.CodeBuffer, dest: emit.Reg, table_idx: u32) !vo
     }
 }
 
+fn loadTableInfoLen(
+    code: *emit.CodeBuffer,
+    dest: emit.Reg,
+    table_info_addr: emit.Reg,
+    thread_shared: bool,
+) !void {
+    // Only shared-memory modules can enter the Preview-1 thread clone path.
+    // Preserve the ordinary-table LDR hot path for all other modules.
+    if (!thread_shared) {
+        try code.ldrImm32(
+            dest,
+            table_info_addr,
+            @intCast(table_info_len_off / 4),
+        );
+        return;
+    }
+    std.debug.assert(dest != table_info_addr);
+    try code.addImm(dest, table_info_addr, @intCast(table_info_len_off));
+    try code.ldarSized(dest, dest, 4);
+}
+
 /// `.table_size` — returns `vmctx.tables_info[table_idx].len`.
 fn emitTableSize(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     table_idx: u32,
     reg_map: *RegMap,
+    thread_shared: bool,
 ) !void {
     const dest = inst.dest orelse return;
     try loadTableInfoAddr(code, RegMap.tmp0, table_idx);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
-    const len_slot_w: u12 = @intCast(table_info_len_off / 4);
-    try code.ldrImm32(info.reg, RegMap.tmp0, len_slot_w);
+    try loadTableInfoLen(code, info.reg, RegMap.tmp0, thread_shared);
     try destCommit(code, reg_map, info);
 }
 
@@ -7218,13 +7276,12 @@ fn emitTableGet(
     inst: ir.Inst,
     tg: @TypeOf(@as(ir.Inst.Op, undefined).table_get),
     reg_map: *RegMap,
+    thread_shared: bool,
 ) !void {
     const dest = inst.dest orelse return;
     const idx_reg = try useInto(code, reg_map, tg.idx, RegMap.tmp2);
-
     try loadTableInfoAddr(code, RegMap.tmp0, tg.table_idx);
-    const len_slot_w: u12 = @intCast(table_info_len_off / 4);
-    try code.ldrImm32(RegMap.tmp1, RegMap.tmp0, len_slot_w);
+    try loadTableInfoLen(code, RegMap.tmp1, RegMap.tmp0, thread_shared);
     try code.cmpRegReg32(idx_reg, RegMap.tmp1);
     const skip_patch = code.len();
     try code.bCond(.lo, 0);
@@ -7528,8 +7585,12 @@ fn emitCallIndirect(
     // tmp0 = &vmctx.tables_info[table_idx]
     try loadTableInfoAddr(code, RegMap.tmp0, ci.table_idx);
     // Bounds check: tmp1 = ti.len; cmp tmp2, tmp1; b.lo ok; trap; ok:
-    const len_slot_w: u12 = @intCast(table_info_len_off / 4);
-    try code.ldrImm32(RegMap.tmp1, RegMap.tmp0, len_slot_w);
+    try loadTableInfoLen(
+        code,
+        RegMap.tmp1,
+        RegMap.tmp0,
+        fctx.has_shared_memory,
+    );
     try code.cmpRegReg32(RegMap.tmp2, RegMap.tmp1);
     const skip_bounds = code.len();
     try code.bCond(.lo, 0);
@@ -8310,8 +8371,7 @@ fn emitAtomicLoad(
         1, 2, 4, 8 => {},
         else => return error.UnimplementedAtomicSize,
     }
-    const end_offset: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
-    try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
+    try emitAtomicMemAddr(code, reg_map, ld.base, ld.offset, ld.size);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     try code.ldarSized(info.reg, RegMap.tmp0, ld.size);
     try destCommit(code, reg_map, info);
@@ -8326,8 +8386,7 @@ fn emitAtomicStore(
         1, 2, 4, 8 => {},
         else => return error.UnimplementedAtomicSize,
     }
-    const end_offset: u64 = @as(u64, st.offset) + @as(u64, st.size);
-    try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
+    try emitAtomicMemAddr(code, reg_map, st.base, st.offset, st.size);
     const val_reg = try useInto(code, reg_map, st.val, RegMap.tmp1);
     try code.stlrSized(val_reg, RegMap.tmp0, st.size);
 }
@@ -8350,10 +8409,9 @@ fn emitAtomicRmw(
         else => return error.UnimplementedAtomicSize,
     }
     const dest = inst.dest orelse return error.AtomicRmwMissingDest;
-    const end_offset: u64 = @as(u64, rmw.offset) + @as(u64, rmw.size);
-    try emitMemAddr(code, reg_map, rmw.base, rmw.offset, end_offset);
+    try emitAtomicMemAddr(code, reg_map, rmw.base, rmw.offset, rmw.size);
 
-    // After emitMemAddr: tmp0 = effective address, tmp1/tmp2 free.
+    // After emitAtomicMemAddr: tmp0 = effective address, tmp1/tmp2 free.
     const val_src = try useInto(code, reg_map, rmw.val, RegMap.tmp1);
 
     // For sub/and we need a mutated copy of val in tmp1.
@@ -8399,8 +8457,7 @@ fn emitAtomicCmpxchg(
         else => return error.UnimplementedAtomicSize,
     }
     const dest = inst.dest orelse return error.AtomicCmpxchgMissingDest;
-    const end_offset: u64 = @as(u64, cx.offset) + @as(u64, cx.size);
-    try emitMemAddr(code, reg_map, cx.base, cx.offset, end_offset);
+    try emitAtomicMemAddr(code, reg_map, cx.base, cx.offset, cx.size);
 
     // info.reg receives `expected`, then CASAL updates it in-place to old.
     const info = try destBegin(reg_map, dest, RegMap.tmp1);

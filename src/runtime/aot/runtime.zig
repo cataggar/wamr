@@ -564,7 +564,8 @@ pub const VmCtx = extern struct {
     /// Returns previous table size on success, -1 on failure.
     table_grow_fn: usize = 0,
     /// Pointer to an array of per-table descriptors, one per declared table:
-    /// `extern struct { ptr: u64, len: u32, _pad: u32 }` (16 bytes).
+    /// `extern struct { ptr: u64, len: u32, _pad: u32,
+    ///                  type_backing_ptr: u64 }` (24 bytes).
     /// Used by table_get/table_set/table_size codegen for multi-table support.
     /// For table 0, `ptr` aliases `func_table_ptr` and `len` aliases
     /// `func_table_len`.
@@ -683,6 +684,10 @@ pub const VmCtx = extern struct {
     /// after every codegen-addressed field so existing AOT offsets remain
     /// unchanged.
     thread_context: usize = 0,
+    /// `fn (*VmCtx) noreturn` — called when an atomic memory instruction's
+    /// effective address is not naturally aligned. Appended so every prior
+    /// codegen-addressed offset remains stable.
+    trap_unaligned_fn: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -1020,6 +1025,14 @@ pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
     std.process.exit(2);
 }
 
+pub fn aotTrapUnaligned(vmctx: *VmCtx) callconv(.c) noreturn {
+    _ = vmctx;
+    const loc = decodeTrapReturnAddress(@returnAddress());
+    if (isTrapCatching()) trapLongjmp();
+    printTrapWithPc("unaligned atomic access", loc);
+    std.process.exit(2);
+}
+
 /// Unwind a trap raised by a native host adapter. Unlike generated-code trap
 /// helpers, this deliberately skips return-address decoding because the
 /// caller lives in host code rather than the AOT text mapping.
@@ -1203,126 +1216,72 @@ pub fn memCopyHelper(vmctx: *VmCtx, dst: u32, src: u32, len: u32) callconv(.c) v
 }
 
 /// AOT host helper for table.grow.
-/// Grows table 0 by `delta` entries (each holding a native function pointer),
-/// initializing new slots with `init_val`. Updates `vmctx.func_table_ptr` and
-/// `vmctx.func_table_len` on success. Returns previous table size, or -1 on
-/// failure (allocation failure or max-size violation).
+/// Grows `table_idx` by `delta` entries, initializing new native slots with
+/// `init_val`. Returns the previous table size, or -1 on allocation failure
+/// or a max-size violation.
 pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32) callconv(.c) i32 {
     if (vmctx.instance_ptr == 0) return -1;
     const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
     if (delta < 0) return -1;
     const delta_u: u32 = @intCast(delta);
     const fill_ptr: usize = @as(usize, @bitCast(@as(i64, init_val)));
+    if (table_idx >= inst.tables.len) return -1;
 
-    // Table 0: resize the shared `func_table` so call_indirect/call_ref
-    // keep seeing the growth. Other tables: resize the backing storage
-    // in `extra_tables_storage`.
-    if (table_idx == 0) {
-        const shared0 = if (inst.tables.len > 0) inst.tables[0] else null;
-        if (shared0) |shared| shared.lock();
-        defer if (shared0) |shared| shared.unlock();
-        const old_size: u32 = @intCast(inst.func_table.len);
-        const new_size_u64: u64 = @as(u64, old_size) + @as(u64, delta_u);
-        const max_cap: u64 = blk: {
-            if (inst.tables.len > 0) {
-                break :blk inst.tables[0].table_type.limits.max orelse 0xFFFF_FFFF;
-            } else break :blk 0xFFFF_FFFF;
-        };
-        if (new_size_u64 > max_cap) return -1;
-        const new_size: usize = @intCast(new_size_u64);
-        // Realloc the shared backing (owned by TableInstance). Also updates
-        // inst.func_table (which aliases it).
-        const old_slice: []usize = if (shared0) |s| s.native_backing else inst.func_table;
-        const new_table = inst.allocator.realloc(old_slice, new_size) catch return -1;
-        var i: usize = old_size;
-        while (i < new_size) : (i += 1) new_table[i] = fill_ptr;
-        inst.func_table = new_table;
-        if (shared0) |s| s.native_backing = new_table;
-        // Keep type_backing sized in lockstep. New tail slots are 0
-        // (null sig_id); call_indirect treats 0 as "uninitialized
-        // element" trap. A follow-up patch will populate new tail
-        // slots with the sig_id of `fill_ptr` when it is non-null.
-        if (shared0) |s| {
-            const old_tb: []u32 = s.type_backing;
-            const new_tb = inst.allocator.realloc(old_tb, new_size) catch return -1;
-            var k: usize = old_size;
-            while (k < new_size) : (k += 1) new_tb[k] = 0;
-            s.type_backing = new_tb;
-        }
-        vmctx.func_table_ptr = @intFromPtr(new_table.ptr);
-        vmctx.func_table_len = @intCast(new_size);
-        if (inst.tables_info.len > 0) {
-            inst.tables_info[0].ptr = @intFromPtr(new_table.ptr);
-            inst.tables_info[0].len = @intCast(new_size);
-            if (shared0) |s| {
-                inst.tables_info[0].type_backing_ptr = @intFromPtr(s.type_backing.ptr);
-            }
-        }
-        // Keep the shared `TableInstance` in sync with the current size.
-        // Future importers that receive this `TableInstance` (via the
-        // ImportRegistry table-swap in the test harness) size their own
-        // `func_table` from `elements.len` in `mapCodeExecutable`; without
-        // reallocating `elements` the importer would see the stale pre-grow
-        // size and return wrong results from `table.size`/`table.grow`.
-        if (inst.tables.len > 0) {
-            const shared = inst.tables[0];
-            shared.table_type.limits.min = @intCast(new_size);
-            const new_elements = inst.allocator.realloc(shared.elements, new_size) catch return -1;
-            var j: usize = old_size;
-            while (j < new_size) : (j += 1) {
-                new_elements[j] = types.TableElement.nullForType(shared.table_type.elem_type);
-            }
-            shared.elements = new_elements;
-            refreshTableSubscribers(shared);
-        }
-        return @intCast(old_size);
-    }
+    const shared = inst.tables[table_idx];
+    shared.lock();
+    defer shared.unlock();
 
-    if (table_idx >= inst.tables_info.len) return -1;
-    if (table_idx - 1 >= inst.extra_tables_storage.len) return -1;
-    const ti = &inst.tables_info[table_idx];
-    const store = &inst.extra_tables_storage[table_idx - 1];
-    const old_size: u32 = ti.len;
-    const new_size_u64: u64 = @as(u64, old_size) + @as(u64, delta_u);
-    const max_cap: u64 = blk: {
-        if (table_idx < inst.tables.len) {
-            break :blk inst.tables[table_idx].table_type.limits.max orelse 0xFFFF_FFFF;
-        } else break :blk 0xFFFF_FFFF;
-    };
-    if (new_size_u64 > max_cap) return -1;
+    const old_size = shared.native_backing.len;
+    if (shared.type_backing.len != old_size or shared.elements.len != old_size)
+        return -1;
+    if (old_size > std.math.maxInt(u32)) return -1;
+    if (delta_u == 0) return @intCast(old_size);
+    const new_size_u64 = @as(u64, old_size) + @as(u64, delta_u);
+    const max_cap = shared.table_type.limits.max orelse
+        @as(u64, std.math.maxInt(u32));
+    if (new_size_u64 > max_cap or new_size_u64 > std.math.maxInt(usize))
+        return -1;
     const new_size: usize = @intCast(new_size_u64);
-    const shared_n = if (table_idx < inst.tables.len) inst.tables[table_idx] else null;
-    if (shared_n) |shared| shared.lock();
-    defer if (shared_n) |shared| shared.unlock();
-    const old_slice: []usize = if (shared_n) |s| s.native_backing else store.*;
-    const new_store = inst.allocator.realloc(old_slice, new_size) catch return -1;
-    var i: usize = old_size;
-    while (i < new_size) : (i += 1) new_store[i] = fill_ptr;
-    store.* = new_store;
-    if (shared_n) |s| s.native_backing = new_store;
-    // Keep type_backing sized in lockstep (same caveat as table 0).
-    if (shared_n) |s| {
-        const old_tb: []u32 = s.type_backing;
-        const new_tb = inst.allocator.realloc(old_tb, new_size) catch return -1;
-        var k: usize = old_size;
-        while (k < new_size) : (k += 1) new_tb[k] = 0;
-        s.type_backing = new_tb;
-    }
-    ti.ptr = @intFromPtr(new_store.ptr);
-    ti.len = @intCast(new_size);
-    if (shared_n) |s| {
-        ti.type_backing_ptr = @intFromPtr(s.type_backing.ptr);
-    }
-    if (table_idx < inst.tables.len) {
-        const shared = inst.tables[table_idx];
-        shared.table_type.limits.min = @intCast(new_size);
-        const new_elements = inst.allocator.realloc(shared.elements, new_size) catch return -1;
-        var j: usize = old_size;
-        while (j < new_size) : (j += 1) {
-            new_elements[j] = types.TableElement.nullForType(shared.table_type.elem_type);
-        }
+
+    if (comptime config.lib_wasi_threads) {
+        // Commit stable native backing first. If the interpreter-only slice
+        // cannot grow, reslice the already-committed reservation back to its
+        // old logical length; no address or allocation needs to be undone.
+        shared.resizeAotBacking(inst.allocator, new_size) catch return -1;
+        const new_elements = inst.allocator.realloc(shared.elements, new_size) catch {
+            shared.resizeAotBacking(inst.allocator, old_size) catch unreachable;
+            return -1;
+        };
         shared.elements = new_elements;
+    } else {
+        // Without shared threads, preserve failure atomicity by preparing a
+        // replacement interpreter slice before moving the native caches.
+        const new_elements = inst.allocator.alloc(types.TableElement, new_size) catch
+            return -1;
+        @memcpy(new_elements[0..old_size], shared.elements[0..old_size]);
+        shared.resizeAotBacking(inst.allocator, new_size) catch {
+            inst.allocator.free(new_elements);
+            return -1;
+        };
+        const old_elements = shared.elements;
+        shared.elements = new_elements;
+        if (old_elements.len > 0) inst.allocator.free(old_elements);
+    }
+    for (shared.elements[old_size..]) |*element|
+        element.* = types.TableElement.nullForType(shared.table_type.elem_type);
+    @memset(shared.native_backing[old_size..], fill_ptr);
+    @memset(shared.type_backing[old_size..], 0);
+
+    shared.table_type.limits.min = @intCast(new_size);
+
+    // Publish the initialized length only after both stable native arrays
+    // and the interpreter view are complete. Threaded subscribers use a
+    // release store so AArch64 call_indirect's acquire load cannot observe
+    // the new length before the initialized tail.
+    if (comptime config.lib_wasi_threads) {
         refreshTableSubscribers(shared);
+    } else {
+        refreshVmCtxTable(inst, table_idx, shared);
     }
     return @intCast(old_size);
 }
@@ -1369,7 +1328,8 @@ pub fn tableInitHelper(
 
     if (table_idx >= inst.tables_info.len) aotTrapUnreachable(vmctx);
     const ti = &inst.tables_info[table_idx];
-    if (@as(u64, dst) + @as(u64, len) > @as(u64, ti.len)) aotTrapUnreachable(vmctx);
+    if (@as(u64, dst) + @as(u64, len) > @as(u64, loadTableInfoLen(ti)))
+        aotTrapUnreachable(vmctx);
 
     if (len == 0) return;
 
@@ -1443,7 +1403,7 @@ pub fn tableSetHelper(vmctx: *VmCtx, table_idx: u32, elem_idx: u32, value: usize
     const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
     if (table_idx >= inst.tables_info.len) aotTrapUnreachable(vmctx);
     const ti = &inst.tables_info[table_idx];
-    if (elem_idx >= ti.len) aotTrapUnreachable(vmctx);
+    if (elem_idx >= loadTableInfoLen(ti)) aotTrapUnreachable(vmctx);
     const shared_opt: ?*types.TableInstance =
         if (table_idx < inst.tables.len) inst.tables[table_idx] else null;
     if (shared_opt) |shared| shared.lock();
@@ -1826,6 +1786,9 @@ pub const AotInstance = struct {
 
 pub const TableInfo = extern struct {
     ptr: u64 = 0,
+    /// Published with release ordering after a successful growth.
+    /// Thread-shared AArch64 code uses LDAR (x86_64 loads are
+    /// acquire-ordered by TSO) before dereferencing either backing pointer.
     len: u32 = 0,
     _pad: u32 = 0,
     /// Pointer to the parallel `u32` sig_id array (TableInstance.type_backing).
@@ -1836,6 +1799,18 @@ pub const TableInfo = extern struct {
     /// bounds check (`len`) rejects all indices first.
     type_backing_ptr: u64 = 0,
 };
+
+inline fn loadTableInfoLen(info: *const TableInfo) u32 {
+    return @atomicLoad(u32, &info.len, .acquire);
+}
+
+inline fn publishTableInfoLen(info: *TableInfo, len: u32) void {
+    @atomicStore(u32, &info.len, len, .release);
+}
+
+inline fn publishFuncTableLen(vmctx: *VmCtx, len: u32) void {
+    @atomicStore(u32, &vmctx.func_table_len, len, .release);
+}
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
@@ -2245,17 +2220,20 @@ pub fn cloneForThread(
         &.{};
     errdefer if (ptr_to_sig.len > 0) allocator.free(ptr_to_sig);
     const tables_info: []TableInfo = if (parent.tables_info.len > 0)
-        allocator.dupe(TableInfo, parent.tables_info) catch return error.OutOfMemory
+        allocator.alloc(TableInfo, parent.tables_info.len) catch
+            return error.OutOfMemory
     else
         &.{};
     errdefer if (tables_info.len > 0) allocator.free(tables_info);
+    @memset(tables_info, .{});
     const extra_tables_storage: [][]usize = if (parent.extra_tables_storage.len > 0)
-        allocator.dupe([]usize, parent.extra_tables_storage) catch
+        allocator.alloc([]usize, parent.extra_tables_storage.len) catch
             return error.OutOfMemory
     else
         &.{};
     errdefer if (extra_tables_storage.len > 0)
         allocator.free(extra_tables_storage);
+    for (extra_tables_storage) |*storage| storage.* = &.{};
 
     const code_mapping = parent.code_mapping;
     if (code_mapping) |mapping| mapping.retain();
@@ -2282,7 +2260,7 @@ pub fn cloneForThread(
         .code_size = parent.code_size,
         .code_mapping = code_mapping,
         .host_functions = host_functions,
-        .func_table = parent.func_table,
+        .func_table = &.{},
         .funcptrs = funcptrs,
         .tables_info = tables_info,
         .extra_tables_storage = extra_tables_storage,
@@ -2374,10 +2352,10 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
     }
     if (inst.func_table.len > 0) {
         vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
-        vmctx.func_table_len = @intCast(inst.func_table.len);
+        publishFuncTableLen(vmctx, @intCast(inst.func_table.len));
     } else {
         vmctx.func_table_ptr = 0;
-        vmctx.func_table_len = 0;
+        publishFuncTableLen(vmctx, 0);
     }
     vmctx.funcptrs_ptr = if (inst.funcptrs.len > 0) @intFromPtr(inst.funcptrs.ptr) else 0;
     vmctx.instance_ptr = @intFromPtr(inst);
@@ -2389,6 +2367,7 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
     vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
     vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
     vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
+    vmctx.trap_unaligned_fn = @intFromPtr(&aotTrapUnaligned);
     vmctx.aot_throw_uncaught_fn = @intFromPtr(&aotThrowUncaught);
     if (inst.tags.len > 0) {
         vmctx.tags_ptr = @intFromPtr(inst.tags.ptr);
@@ -2477,17 +2456,17 @@ fn refreshVmCtxTable(
             @intFromPtr(backing.ptr)
         else
             0;
-        inst.vmctx.func_table_len = @intCast(backing.len);
     } else if (table_idx - 1 < inst.extra_tables_storage.len) {
         inst.extra_tables_storage[table_idx - 1] = backing;
     }
     if (table_idx < inst.tables_info.len) {
-        inst.tables_info[table_idx] = .{
-            .ptr = if (backing.len > 0) @intFromPtr(backing.ptr) else 0,
-            .len = @intCast(backing.len),
-            .type_backing_ptr = type_backing_ptr,
-        };
+        const info = &inst.tables_info[table_idx];
+        info.ptr = if (backing.len > 0) @intFromPtr(backing.ptr) else 0;
+        info.type_backing_ptr = type_backing_ptr;
+        publishTableInfoLen(info, @intCast(backing.len));
     }
+    if (table_idx == 0)
+        publishFuncTableLen(&inst.vmctx, @intCast(backing.len));
 }
 
 fn refreshVmCtxTablesForInstance(inst: *AotInstance) void {
@@ -2883,26 +2862,11 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         tbl.lock();
         defer tbl.unlock();
         const tbl_size = tbl.elements.len;
-        if (tbl_size > 0) {
-            var native_table: []usize = undefined;
-            if (tbl.native_backing.len == tbl_size) {
-                // Exporter already published a backing; alias it.
-                native_table = tbl.native_backing;
-            } else {
-                native_table = inst.allocator.alloc(usize, tbl_size) catch return error.OutOfMemory;
-                @memset(native_table, 0);
-                tbl.native_backing = native_table;
-            }
-            // Size type_backing in lockstep (zero-init = null sig_id).
-            // Filled in by later patches as writer sites start mirroring
-            // sig_ids alongside native pointers.
-            if (tbl.type_backing.len != tbl_size) {
-                const tb = inst.allocator.alloc(u32, tbl_size) catch return error.OutOfMemory;
-                @memset(tb, 0);
-                if (tbl.type_backing.len > 0) inst.allocator.free(tbl.type_backing);
-                tbl.type_backing = tb;
-            }
+        tbl.resizeAotBacking(inst.allocator, tbl_size) catch
+            return error.OutOfMemory;
+        const native_table = tbl.native_backing;
 
+        if (tbl_size > 0) {
             // Apply this module's active element segments (skip passive —
             // only usable by table.init). `0xFFFFFFFF` encodes a null
             // element (emitted by the compiler when the source segment
@@ -2930,9 +2894,8 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
                     }
                 }
             }
-
-            inst.func_table = native_table;
         }
+        inst.func_table = native_table;
     }
 
     // Build per-table native descriptor array for multi-table support.
@@ -2940,14 +2903,19 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     // `TableInstance.native_backing` (allocating on first use).
     if (inst.tables.len > 0) {
         const info = inst.allocator.alloc(TableInfo, inst.tables.len) catch return error.OutOfMemory;
+        errdefer inst.allocator.free(info);
         @memset(info, .{});
         const extra = inst.allocator.alloc([]usize, if (inst.tables.len > 1) inst.tables.len - 1 else 0) catch return error.OutOfMemory;
+        errdefer if (extra.len > 0) inst.allocator.free(extra);
         for (extra) |*e| e.* = &.{};
 
         // Slot 0: alias inst.func_table.
         inst.tables[0].lock();
         info[0] = .{
-            .ptr = @intFromPtr(inst.func_table.ptr),
+            .ptr = if (inst.func_table.len > 0)
+                @intFromPtr(inst.func_table.ptr)
+            else
+                0,
             .len = @intCast(inst.func_table.len),
             .type_backing_ptr = if (inst.tables.len > 0 and inst.tables[0].type_backing.len > 0)
                 @intFromPtr(inst.tables[0].type_backing.ptr)
@@ -2962,42 +2930,32 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
                 tbl_i.lock();
                 defer tbl_i.unlock();
                 const sz = tbl_i.elements.len;
-                if (sz == 0) continue;
-                var backing: []usize = undefined;
-                if (tbl_i.native_backing.len == sz) {
-                    backing = tbl_i.native_backing;
-                } else {
-                    backing = inst.allocator.alloc(usize, sz) catch return error.OutOfMemory;
-                    @memset(backing, 0);
-                    tbl_i.native_backing = backing;
-                }
-                if (tbl_i.type_backing.len != sz) {
-                    const tb = inst.allocator.alloc(u32, sz) catch return error.OutOfMemory;
-                    @memset(tb, 0);
-                    if (tbl_i.type_backing.len > 0) inst.allocator.free(tbl_i.type_backing);
-                    tbl_i.type_backing = tb;
-                }
-                for (module.elem_segments) |seg| {
-                    if (seg.is_passive) continue;
-                    if (seg.table_idx != idx) continue;
-                    const seg_end = @as(u64, seg.offset) + @as(u64, seg.func_indices.len);
-                    if (seg_end > sz) continue;
-                    for (seg.func_indices, 0..) |func_idx, j| {
-                        const dst = seg.offset + @as(u32, @intCast(j));
-                        if (func_idx == std.math.maxInt(u32)) {
-                            backing[dst] = 0;
-                            if (dst < tbl_i.type_backing.len) tbl_i.type_backing[dst] = 0;
-                        } else if (func_idx < n_addrs) {
-                            backing[dst] = func_addrs[func_idx];
-                            if (dst < tbl_i.type_backing.len and func_idx < inst.func_sig_ids.len) {
-                                tbl_i.type_backing[dst] = inst.func_sig_ids[func_idx];
+                tbl_i.resizeAotBacking(inst.allocator, sz) catch
+                    return error.OutOfMemory;
+                const backing = tbl_i.native_backing;
+                if (sz > 0) {
+                    for (module.elem_segments) |seg| {
+                        if (seg.is_passive) continue;
+                        if (seg.table_idx != idx) continue;
+                        const seg_end = @as(u64, seg.offset) + @as(u64, seg.func_indices.len);
+                        if (seg_end > sz) continue;
+                        for (seg.func_indices, 0..) |func_idx, j| {
+                            const dst = seg.offset + @as(u32, @intCast(j));
+                            if (func_idx == std.math.maxInt(u32)) {
+                                backing[dst] = 0;
+                                if (dst < tbl_i.type_backing.len) tbl_i.type_backing[dst] = 0;
+                            } else if (func_idx < n_addrs) {
+                                backing[dst] = func_addrs[func_idx];
+                                if (dst < tbl_i.type_backing.len and func_idx < inst.func_sig_ids.len) {
+                                    tbl_i.type_backing[dst] = inst.func_sig_ids[func_idx];
+                                }
                             }
                         }
                     }
                 }
                 extra[idx - 1] = backing;
                 info[idx] = .{
-                    .ptr = @intFromPtr(backing.ptr),
+                    .ptr = if (backing.len > 0) @intFromPtr(backing.ptr) else 0,
                     .len = @intCast(sz),
                     .type_backing_ptr = if (tbl_i.type_backing.len > 0) @intFromPtr(tbl_i.type_backing.ptr) else 0,
                 };
@@ -4673,7 +4631,8 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 400), @offsetOf(VmCtx, "wasi_ctx"));
     try std.testing.expectEqual(@as(usize, 408), @offsetOf(VmCtx, "lazy_compile_fn"));
     try std.testing.expectEqual(@as(usize, 416), @offsetOf(VmCtx, "thread_context"));
-    try std.testing.expectEqual(@as(usize, 424), @sizeOf(VmCtx));
+    try std.testing.expectEqual(@as(usize, 424), @offsetOf(VmCtx, "trap_unaligned_fn"));
+    try std.testing.expectEqual(@as(usize, 432), @sizeOf(VmCtx));
 }
 
 test "AOT thread context inherits retained process state without thread-local flags" {
@@ -4838,9 +4797,19 @@ test "AOT thread clone shares code memory and tables while isolating globals and
     try std.testing.expect(parent.thread_context.isCancellationRequested());
     try std.testing.expect(!child.thread_context.isCancellationRequested());
 
+    const native_backing_before = parent.vmctx.func_table_ptr;
+    const type_backing_before = parent.tables_info[0].type_backing_ptr;
     try std.testing.expectEqual(@as(i32, 1), tableGrowHelper(&parent.vmctx, 0, 1, 0));
-    try std.testing.expectEqual(@as(u32, 2), parent.vmctx.func_table_len);
-    try std.testing.expectEqual(@as(u32, 2), child.vmctx.func_table_len);
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        @atomicLoad(u32, &parent.vmctx.func_table_len, .acquire),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        @atomicLoad(u32, &child.vmctx.func_table_len, .acquire),
+    );
+    try std.testing.expectEqual(native_backing_before, parent.vmctx.func_table_ptr);
+    try std.testing.expectEqual(type_backing_before, parent.tables_info[0].type_backing_ptr);
     try std.testing.expectEqual(parent.vmctx.func_table_ptr, child.vmctx.func_table_ptr);
 
     var no_results: [0]ScalarResult = .{};

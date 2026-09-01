@@ -788,6 +788,105 @@ pub const TableElement = struct {
     }
 };
 
+const StableAotTableBacking = if (config.lib_wasi_threads) struct {
+    const page_size = std.heap.page_size_min;
+
+    native_base: ?[*]align(page_size) u8 = null,
+    native_reserved_bytes: usize = 0,
+    native_committed_bytes: usize = 0,
+    type_base: ?[*]align(page_size) u8 = null,
+    type_reserved_bytes: usize = 0,
+    type_committed_bytes: usize = 0,
+    capacity: usize = 0,
+
+    fn roundedBytes(element_count: usize, element_size: usize) !usize {
+        const bytes = std.math.mul(usize, element_count, element_size) catch
+            return error.OutOfMemory;
+        if (bytes == 0) return 0;
+        const with_slack = std.math.add(usize, bytes, page_size - 1) catch
+            return error.OutOfMemory;
+        return with_slack & ~(page_size - 1);
+    }
+
+    fn reserve(self: *@This(), capacity: usize) !void {
+        std.debug.assert(self.native_base == null);
+        std.debug.assert(self.type_base == null);
+        if (!platform.supports_reserved_memory) return error.OutOfMemory;
+
+        const native_bytes = try roundedBytes(capacity, @sizeOf(usize));
+        const type_bytes = try roundedBytes(capacity, @sizeOf(u32));
+        if (native_bytes == 0 or type_bytes == 0) {
+            self.capacity = capacity;
+            return;
+        }
+
+        const native_base = platform.reserveAddressSpace(native_bytes) orelse
+            return error.OutOfMemory;
+        errdefer platform.releaseAddressSpace(native_base, native_bytes);
+        const type_base = platform.reserveAddressSpace(type_bytes) orelse
+            return error.OutOfMemory;
+
+        self.native_base = native_base;
+        self.native_reserved_bytes = native_bytes;
+        self.type_base = type_base;
+        self.type_reserved_bytes = type_bytes;
+        self.capacity = capacity;
+    }
+
+    fn commitThrough(self: *@This(), element_count: usize) !void {
+        if (element_count > self.capacity) return error.OutOfMemory;
+        const native_target = try roundedBytes(element_count, @sizeOf(usize));
+        const type_target = try roundedBytes(element_count, @sizeOf(u32));
+
+        if (native_target > self.native_committed_bytes) {
+            const base = self.native_base orelse return error.OutOfMemory;
+            const start: [*]align(page_size) u8 =
+                @alignCast(base + self.native_committed_bytes);
+            platform.commitPages(
+                start,
+                native_target - self.native_committed_bytes,
+            ) catch return error.OutOfMemory;
+            self.native_committed_bytes = native_target;
+        }
+        if (type_target > self.type_committed_bytes) {
+            const base = self.type_base orelse return error.OutOfMemory;
+            const start: [*]align(page_size) u8 =
+                @alignCast(base + self.type_committed_bytes);
+            platform.commitPages(
+                start,
+                type_target - self.type_committed_bytes,
+            ) catch return error.OutOfMemory;
+            self.type_committed_bytes = type_target;
+        }
+    }
+
+    fn nativeSlice(self: *const @This(), len: usize) []usize {
+        if (len == 0) return &.{};
+        const base = self.native_base orelse unreachable;
+        const ptr: [*]usize = @ptrCast(base);
+        return ptr[0..len];
+    }
+
+    fn typeSlice(self: *const @This(), len: usize) []u32 {
+        if (len == 0) return &.{};
+        const base = self.type_base orelse unreachable;
+        const ptr: [*]u32 = @ptrCast(base);
+        return ptr[0..len];
+    }
+
+    fn isReserved(self: *const @This()) bool {
+        return self.native_base != null;
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.native_base) |base|
+            platform.releaseAddressSpace(base, self.native_reserved_bytes);
+        if (self.type_base) |base|
+            platform.releaseAddressSpace(base, self.type_reserved_bytes);
+        self.* = .{};
+    }
+} else void;
+
 /// Runtime table instance (refcounted for cross-module sharing)
 pub const TableInstance = struct {
     table_type: TableType,
@@ -808,9 +907,15 @@ pub const TableInstance = struct {
     /// table.init/copy/fill/grow) so that call_indirect can do a single
     /// 4-byte equality check against the caller's expected sig_id.
     type_backing: []u32 = &.{},
+    /// Threaded AOT keeps the native pointer and signature arrays inside
+    /// reserved virtual-address ranges. `table.grow` commits more pages but
+    /// never relocates either base, so concurrently executing compiled code
+    /// cannot retain a freed backing pointer.
+    stable_aot_backing: StableAotTableBacking =
+        if (config.lib_wasi_threads) .{} else {},
     /// AOT VmCtx mirrors that cache this table's native backing pointer and
-    /// length. Growth refreshes every subscriber so thread clones and
-    /// cross-module importers never retain a freed realloc address.
+    /// length. Growth refreshes every subscriber's length after initializing
+    /// the address-stable backing tail.
     vmctx_subscribers: if (config.lib_wasi_threads)
         std.ArrayListUnmanaged(*anyopaque)
     else
@@ -829,9 +934,93 @@ pub const TableInstance = struct {
         if (comptime config.lib_wasi_threads)
             self.vmctx_subscribers.deinit(allocator);
         if (self.elements.len > 0) allocator.free(self.elements);
+        if (comptime config.lib_wasi_threads) {
+            if (self.stable_aot_backing.isReserved()) {
+                self.stable_aot_backing.deinit();
+            } else {
+                if (self.native_backing.len > 0) allocator.free(self.native_backing);
+                if (self.type_backing.len > 0) allocator.free(self.type_backing);
+            }
+        } else {
+            if (self.native_backing.len > 0) allocator.free(self.native_backing);
+            if (self.type_backing.len > 0) allocator.free(self.type_backing);
+        }
+        allocator.destroy(self);
+    }
+
+    /// Resize the AOT-native table caches. With WASI threads enabled this
+    /// reserves enough virtual address space for the declared table maximum
+    /// and only commits the pages needed by `new_len`; the returned slice
+    /// bases therefore stay fixed across every successful growth.
+    pub fn resizeAotBacking(
+        self: *TableInstance,
+        allocator: std.mem.Allocator,
+        new_len: usize,
+    ) !void {
+        if (comptime config.lib_wasi_threads) {
+            if (!self.stable_aot_backing.isReserved()) {
+                if (new_len == 0) return;
+                const max_u64 = self.table_type.limits.max orelse
+                    @as(u64, std.math.maxInt(u32));
+                const capacity = std.math.cast(usize, max_u64) orelse
+                    return error.OutOfMemory;
+                if (new_len > capacity) return error.OutOfMemory;
+
+                const old_native = self.native_backing;
+                const old_types = self.type_backing;
+                try self.stable_aot_backing.reserve(capacity);
+                errdefer self.stable_aot_backing.deinit();
+                try self.stable_aot_backing.commitThrough(new_len);
+
+                const native = self.stable_aot_backing.nativeSlice(new_len);
+                const types = self.stable_aot_backing.typeSlice(new_len);
+                @memset(native, 0);
+                @memset(types, 0);
+                @memcpy(
+                    native[0..@min(native.len, old_native.len)],
+                    old_native[0..@min(native.len, old_native.len)],
+                );
+                @memcpy(
+                    types[0..@min(types.len, old_types.len)],
+                    old_types[0..@min(types.len, old_types.len)],
+                );
+                self.native_backing = native;
+                self.type_backing = types;
+                if (old_native.len > 0) allocator.free(old_native);
+                if (old_types.len > 0) allocator.free(old_types);
+                return;
+            }
+
+            const old_len = self.native_backing.len;
+            try self.stable_aot_backing.commitThrough(new_len);
+            self.native_backing = self.stable_aot_backing.nativeSlice(new_len);
+            self.type_backing = self.stable_aot_backing.typeSlice(new_len);
+            if (new_len > old_len) {
+                @memset(self.native_backing[old_len..], 0);
+                @memset(self.type_backing[old_len..], 0);
+            }
+            return;
+        }
+
+        if (self.native_backing.len == new_len and
+            self.type_backing.len == new_len) return;
+        const native = try allocator.alloc(usize, new_len);
+        errdefer if (native.len > 0) allocator.free(native);
+        const sig_ids = try allocator.alloc(u32, new_len);
+        @memset(native, 0);
+        @memset(sig_ids, 0);
+        @memcpy(
+            native[0..@min(native.len, self.native_backing.len)],
+            self.native_backing[0..@min(native.len, self.native_backing.len)],
+        );
+        @memcpy(
+            sig_ids[0..@min(sig_ids.len, self.type_backing.len)],
+            self.type_backing[0..@min(sig_ids.len, self.type_backing.len)],
+        );
         if (self.native_backing.len > 0) allocator.free(self.native_backing);
         if (self.type_backing.len > 0) allocator.free(self.type_backing);
-        allocator.destroy(self);
+        self.native_backing = native;
+        self.type_backing = sig_ids;
     }
 
     pub fn referenceCount(self: *const TableInstance) usize {

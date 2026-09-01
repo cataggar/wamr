@@ -431,6 +431,11 @@ pub fn build(b: *std.Build) void {
         "missing-thread-start",
         "wrong-thread-start-signature",
         "disabled-rejection",
+        "unaligned-atomic-load",
+        "unaligned-atomic-store",
+        "unaligned-atomic-rmw",
+        "unaligned-atomic-cmpxchg",
+        "concurrent-table-grow",
     }) |fixture| {
         update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wat", .{fixture}));
         update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}));
@@ -503,6 +508,29 @@ pub fn build(b: *std.Build) void {
             wasi_threads_test_step.dependOn(&child_proc_exit.step);
 
             inline for (.{
+                "unaligned-atomic-load",
+                "unaligned-atomic-store",
+                "unaligned-atomic-rmw",
+                "unaligned-atomic-cmpxchg",
+            }) |fixture| {
+                const run = b.addRunArtifact(exe);
+                run.addArgs(&.{
+                    "run",
+                    b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}),
+                });
+                run.expectExitCode(1);
+                wasi_threads_test_step.dependOn(&run.step);
+            }
+
+            const concurrent_table_grow = b.addRunArtifact(exe);
+            concurrent_table_grow.addArgs(&.{
+                "run",
+                "tests/wasi-threads/concurrent-table-grow.wasm",
+            });
+            concurrent_table_grow.expectExitCode(0);
+            wasi_threads_test_step.dependOn(&concurrent_table_grow.step);
+
+            inline for (.{
                 "missing-thread-start",
                 "wrong-thread-start-signature",
             }) |fixture| {
@@ -550,6 +578,15 @@ pub fn build(b: *std.Build) void {
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-proc-exit", 7, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "missing-thread-start", 0, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "wrong-thread-start-signature", 0, null, null);
+            inline for (.{
+                "unaligned-atomic-load",
+                "unaligned-atomic-store",
+                "unaligned-atomic-rmw",
+                "unaligned-atomic-cmpxchg",
+            }) |fixture| {
+                addAotThreadFixture(b, aot_thread_spawn_step, wamrc, fixture, 1, null, null);
+            }
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "concurrent-table-grow", 0, null, null);
         } else {
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "disabled-rejection", 0, null, null);
         }

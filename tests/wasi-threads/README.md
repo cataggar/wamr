@@ -13,6 +13,11 @@ and AOT bindings enabled by `-Dlib_wasi_threads=true`.
 - `child-trap` / `child-proc-exit`: child terminal outcomes reach the process.
 - `missing-thread-start` / `wrong-thread-start-signature`: spawn fails
   synchronously with a negative ABI result.
+- `unaligned-atomic-*`: load, store, RMW, and compare-exchange all produce the
+  same catchable natural-alignment trap in the interpreter and both AOT
+  backends.
+- `concurrent-table-grow`: a child loops through `call_indirect` while its
+  parent performs 2,047 shared-table growth operations.
 - `disabled-rejection`: the disabled host import continues returning `-1`.
 
 The adjacent `.wasm` files are tracked so tests need no external SDK. Regenerate

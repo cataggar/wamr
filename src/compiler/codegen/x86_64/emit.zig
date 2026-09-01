@@ -500,6 +500,14 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, b.low3(), a.low3());
     }
 
+    /// TEST reg64, imm32.
+    pub fn testRegImm32(self: *CodeBuffer, reg: Reg, imm: i32) !void {
+        try self.rexW(.rax, reg);
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 0, reg.low3());
+        try self.emitI32(imm);
+    }
+
     /// CQO — sign-extend RAX into RDX:RAX (REX.W + 99).
     pub fn cqo(self: *CodeBuffer) !void {
         try self.emitByte(0x48); // REX.W
@@ -1459,6 +1467,13 @@ test "conditional jumps (je, jne)" {
         0x0F, 0x84, 0x10, 0x00, 0x00, 0x00,
         0x0F, 0x85, 0x20, 0x00, 0x00, 0x00,
     });
+}
+
+test "testRegImm32 emits TEST r64, imm32" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.testRegImm32(.rax, 3);
+    try hexEqual(buf.getCode(), &.{ 0x48, 0xF7, 0xC0, 0x03, 0x00, 0x00, 0x00 });
 }
 
 test "patchI32 overwrites previously emitted bytes" {
