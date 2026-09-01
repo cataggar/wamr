@@ -8963,8 +8963,19 @@ test "#616: threaded modules poll VmCtx.cancel_flag at every loop header" {
 
     // cmp dword ptr [rbx + 432], 0 ; je +12
     const poll = [_]u8{ 0x83, 0xBB, 0xB0, 0x01, 0x00, 0x00, 0x00, 0x74, 0x0C };
-    // mov rax, qword ptr [rbx + 440] — the cancel_point_fn load.
-    const helper_load = [_]u8{ 0x48, 0x8B, 0x87, 0xB8, 0x01, 0x00, 0x00 };
+    // mov rax, qword ptr [param0 + 440] — the cancel_point_fn load. The ABI
+    // decides the argument register (rdi on SysV, rcx on Win64), so build the
+    // ModR/M byte instead of hard-coding one ABI's encoding.
+    comptime std.debug.assert(@intFromEnum(param_regs[0]) < 8);
+    const helper_load = [_]u8{
+        0x48,
+        0x8B,
+        0x80 | @as(u8, param_regs[0].low3()),
+        0xB8,
+        0x01,
+        0x00,
+        0x00,
+    };
 
     for ([_]bool{ false, true }) |spawns_threads| {
         var ir_module = ir.IrModule.init(allocator);
