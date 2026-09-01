@@ -231,6 +231,14 @@ backends claims into the same record:
   installs. The hook raises the manager's interrupt flag and calls
   `MemoryInstance.cancelWaiters`, which cancels every guest `memory.atomic.wait`
   parked in the shared memory's parking lot.
+* That cancellation is **level-triggered**: `ParkingLot.cancelAll` latches a
+  sticky flag before sweeping, and any later attempt to park reports
+  `.cancelled` instead of blocking. Waking only the queued waiters would be a
+  check-then-act race — a thread that passes the caller-side guard below and
+  is then descheduled until after the sweep would enqueue behind it. With an
+  infinite guest timeout nothing would ever free it, because the last sweep
+  runs as the final sibling exits and `terminateAndJoin` may never be entered
+  (the embedder thread itself can be the one parking).
 
 Siblings leave guest code through four interruption points:
 
@@ -241,8 +249,9 @@ Siblings leave guest code through four interruption points:
 | `poll_oneoff`, blocking stdin reads | bounded 20 ms slices, then `error.Trap` | same slices, then `terminateAotThread` |
 | `sched_yield` | dispatch-loop poll | explicit check in the host bridge |
 
-The pre-park guard matters as much as the cancel sweep: a thread that starts
-waiting after the sweep has already run would otherwise park forever.
+The pre-park guards are a cheap fast path, not the correctness argument: the
+latch inside the parking lot is what makes a wait entered after the sweep
+safe, since the guard and the enqueue cannot be made atomic from outside.
 
 The AOT loop-header poll is what makes compiled guest code interruptible at
 all — without it a child running `(loop (br 0))` cannot be stopped, and

@@ -71,6 +71,14 @@ const Bucket = struct {
 /// `deinit` first prevents new waits, then wakes every queued waiter and
 /// waits until all active `wait32`/`wait64` calls have returned. The object
 /// may therefore be embedded in another refcounted control block.
+///
+/// Group cancellation (`cancelAll`) is *level*-triggered: it latches a sticky
+/// flag before sweeping the buckets, and every later attempt to park reports
+/// `.cancelled` instead of blocking. Waking only the queued waiters would be
+/// a check-then-act race — a thread that passes its caller-side "is the group
+/// terminating?" guard, then loses the CPU until after the sweep, would
+/// enqueue behind it and (with an infinite timeout) never be woken again,
+/// because nothing sweeps a second time once every sibling has stopped.
 pub const ParkingLot = struct {
     const bucket_count = 64;
     const closing_bit: u32 = 1 << 31;
@@ -78,6 +86,9 @@ pub const ParkingLot = struct {
 
     buckets: [bucket_count]Bucket = @splat(.{}),
     lifecycle: std.atomic.Value(u32) = .init(0),
+    /// Latched by `cancelAll`. Kept out of `lifecycle` so the active-count
+    /// and closing protocol `enter`/`leave`/`deinit` rely on is untouched.
+    cancelled: std.atomic.Value(u32) = .init(0),
 
     pub fn init() ParkingLot {
         return .{};
@@ -135,6 +146,14 @@ pub const ParkingLot = struct {
         if (timeout_ns == 0) {
             bucket.mutex.unlock();
             return .timed_out;
+        }
+        // Checked under the same bucket lock the sweep takes, and only on the
+        // path that would actually block: whichever of the two acquires the
+        // lock first, the waiter is either seen by the sweep or observes the
+        // latch here. Non-blocking outcomes above are unaffected.
+        if (self.cancelled.load(.acquire) != 0) {
+            bucket.mutex.unlock();
+            return .cancelled;
         }
         waiter.next = bucket.head;
         bucket.head = &waiter;
@@ -232,11 +251,19 @@ pub const ParkingLot = struct {
         }
     }
 
-    /// Cancel all waiters. This is the group-cancellation primitive.
+    /// Cancel all waiters and latch the lot as cancelled. This is the
+    /// group-cancellation primitive: after it returns, no thread can park
+    /// here again, so callers need not re-sweep to catch late arrivals.
+    ///
+    /// The latch is published *before* the sweep. A parking thread reads it
+    /// while holding the bucket lock, so it either enqueued before this
+    /// bucket was swept (and is woken below) or observes the latch and
+    /// refuses to park.
     pub fn cancelAll(self: *ParkingLot) BackendError!u32 {
         if (comptime !parking_supported) {
             return error.Unsupported;
         }
+        self.cancelled.store(1, .release);
         var total: u32 = 0;
         for (0..bucket_count) |i| {
             const bucket = &self.buckets[i];
@@ -273,6 +300,11 @@ pub const ParkingLot = struct {
             woken += 1;
         }
         return woken;
+    }
+
+    /// True once `cancelAll` has latched this lot. Diagnostics and tests.
+    pub fn isCancelled(self: *const ParkingLot) bool {
+        return self.cancelled.load(.acquire) != 0;
     }
 
     /// Number of currently queued waiters for a key. Intended for
@@ -570,6 +602,157 @@ fn waitUntilQueued(lot: *ParkingLot, address: *const anyopaque, count: u32) !voi
         platform.usleep(50);
     }
 }
+
+/// Drives one `wait32(-1)` on its own thread and reports when it returned.
+/// The infinite timeout is the point of these tests: only cancellation can
+/// end the wait, so a regression would block forever. `awaitFinished` gives
+/// the harness a bounded escape hatch that turns that into a test failure
+/// instead of a hung CI job.
+const LateWaiterCtx = struct {
+    lot: *ParkingLot,
+    word: *align(4) u32,
+    expected: u32 = 7,
+    /// Set once this thread has read its (still negative) guard.
+    guard_passed: std.atomic.Value(bool) = .init(false),
+    /// Released by the harness once the sweep it must lose to is done.
+    release: *std.atomic.Value(bool),
+    guard_was_clear: bool = false,
+    result: WaitResult = .not_equal,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *LateWaiterCtx) void {
+        // Stand in for the caller-side "is the group terminating?" guard in
+        // the interpreter and AOT `memory.atomic.wait` paths: read here,
+        // before the harness cancels, so this thread commits to parking on
+        // a stale answer.
+        self.guard_was_clear = !self.lot.isCancelled();
+        self.guard_passed.store(true, .release);
+        while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        self.result = self.lot.wait32(self.word, self.expected, -1) catch .closed;
+        self.finished.store(true, .release);
+    }
+
+    fn awaitGuard(self: *LateWaiterCtx) void {
+        while (!self.guard_passed.load(.acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn awaitFinished(self: *LateWaiterCtx, timeout_ns: u64) bool {
+        const deadline = monotonicNowNs() +| timeout_ns;
+        while (!self.finished.load(.acquire)) {
+            if (monotonicNowNs() >= deadline) return false;
+            platform.usleep(200);
+        }
+        return true;
+    }
+};
+
+test "ParkingLot: a wait that loses the race with cancelAll is still cancelled" {
+    if (comptime !parking_supported) return error.SkipZigTest;
+    var lot = ParkingLot.init();
+    defer lot.deinit();
+    var word: u32 align(4) = 7;
+    var release = std.atomic.Value(bool).init(false);
+    var ctx = LateWaiterCtx{ .lot = &lot, .word = &word, .release = &release };
+
+    const thread = try std.Thread.spawn(.{}, LateWaiterCtx.run, .{&ctx});
+    // Force the reported interleaving: the waiter has already passed its
+    // guard, then the last sibling sweeps an empty queue and exits, and only
+    // afterwards does the waiter try to park.
+    ctx.awaitGuard();
+    try std.testing.expectEqual(@as(u32, 0), try lot.cancelAll());
+    release.store(true, .release);
+
+    const finished = ctx.awaitFinished(5 * std.time.ns_per_s);
+    if (!finished) {
+        // Edge-triggered regression: the waiter is queued and only another
+        // sweep can free it. Release it so the test fails instead of hanging.
+        _ = lot.cancelAll() catch {};
+    }
+    thread.join();
+    try std.testing.expect(ctx.guard_was_clear);
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(WaitResult.cancelled, ctx.result);
+}
+
+/// Run one infinite-timeout wait on a helper thread and require it to come
+/// back cancelled. Never blocks the test thread: if the wait parks anyway
+/// (the pre-fix behaviour) the helper is released by a second sweep and the
+/// assertion fails, so a regression cannot hang CI.
+fn expectCancelledWait(lot: *ParkingLot, word: *align(4) u32, expected: u32) !void {
+    var release = std.atomic.Value(bool).init(true);
+    var ctx = LateWaiterCtx{ .lot = lot, .word = word, .release = &release };
+    ctx.expected = expected;
+    const thread = try std.Thread.spawn(.{}, LateWaiterCtx.run, .{&ctx});
+    const finished = ctx.awaitFinished(5 * std.time.ns_per_s);
+    if (!finished) _ = lot.cancelAll() catch {};
+    thread.join();
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(WaitResult.cancelled, ctx.result);
+}
+
+test "ParkingLot: cancellation latches so later waits never park" {
+    if (comptime !parking_supported) return error.SkipZigTest;
+    var lot = ParkingLot.init();
+    defer lot.deinit();
+    var word: u32 align(4) = 7;
+
+    try std.testing.expect(!lot.isCancelled());
+    _ = try lot.cancelAll();
+    try std.testing.expect(lot.isCancelled());
+
+    // Infinite timeout after the sweep: only the level-triggered latch can
+    // end these waits.
+    try expectCancelledWait(&lot, &word, 7);
+    try expectCancelledWait(&lot, &word, 7);
+    try std.testing.expectEqual(@as(u32, 0), lot.waiterCount(&word));
+
+    // Non-blocking results still take precedence: a cancelled lot does not
+    // rewrite a value mismatch or a zero timeout, so neither can block.
+    try std.testing.expectEqual(WaitResult.not_equal, try lot.wait32(&word, 9, -1));
+    try std.testing.expectEqual(WaitResult.timed_out, try lot.wait32(&word, 7, 0));
+}
+
+test "ParkingLot: a 64-bit wait entered after cancellation is cancelled too" {
+    if (comptime !parking_supported or @bitSizeOf(usize) < 64)
+        return error.SkipZigTest;
+    var lot = ParkingLot.init();
+    defer lot.deinit();
+    var word: u64 align(8) = 11;
+
+    _ = try lot.cancelAll();
+
+    var release = std.atomic.Value(bool).init(true);
+    var ctx = Wait64Ctx{ .lot = &lot, .word = &word, .release = &release };
+    const thread = try std.Thread.spawn(.{}, Wait64Ctx.run, .{&ctx});
+    const finished = ctx.awaitFinished(5 * std.time.ns_per_s);
+    if (!finished) _ = lot.cancelAll() catch {};
+    thread.join();
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(WaitResult.cancelled, ctx.result);
+}
+
+const Wait64Ctx = struct {
+    lot: *ParkingLot,
+    word: *align(8) u64,
+    release: *std.atomic.Value(bool),
+    result: WaitResult = .not_equal,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Wait64Ctx) void {
+        while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        self.result = self.lot.wait64(self.word, 11, -1) catch .closed;
+        self.finished.store(true, .release);
+    }
+
+    fn awaitFinished(self: *Wait64Ctx, timeout_ns: u64) bool {
+        const deadline = monotonicNowNs() +| timeout_ns;
+        while (!self.finished.load(.acquire)) {
+            if (monotonicNowNs() >= deadline) return false;
+            platform.usleep(200);
+        }
+        return true;
+    }
+};
 
 test "ParkingLot: wait mismatch does not enqueue" {
     var lot = ParkingLot.init();
