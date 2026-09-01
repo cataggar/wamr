@@ -52,7 +52,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
 | `wasi:config`      | ✅ (rc.1) | — | Layered env (`WAMR_CONFIG_*`) + `--config-store=PATH.json` host adapter (#583 B6). |
 | `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
-| `wasi:threads`     | — | — | Legacy Preview-1 `wasi.thread-spawn` is production-wired for interpreter-only builds behind `-Dlib_wasi_threads=true -Daot=false`; AOT and Component Model threads remain out of scope ([#616 B1](https://github.com/cataggar/wamr/issues/616)). |
+| `wasi:threads`     | ✅ (Preview 1) | — | Legacy Preview-1 `wasi.thread-spawn` is production-wired for interpreter and AOT builds on x86_64/AArch64 behind `-Dlib_wasi_threads=true`; shared-everything Component Model threads remain out of scope ([#616 B1](https://github.com/cataggar/wamr/issues/616)). |
 
 ✅ = shipped + gated by the conformance suite. — = not in scope today.
 
@@ -385,10 +385,10 @@ operations.
   before the host call, and the executor never yields to a
   `memory.grow` between the bounds check and the driver return.
   ([#583 B2](https://github.com/cataggar/wamr/issues/583))
-* **Guest threads** — Preview-1 interpreter spawning, shared resource
+* **Guest threads** — Preview-1 interpreter and AOT spawning, shared resource
   lifetimes, atomics/wait-notify/fence, per-thread context isolation, and
-  end-to-end gates are implemented behind `-Dlib_wasi_threads=true
-  -Daot=false`. AOT spawning and final cross-thread cancellation remain open.
+  end-to-end gates are implemented behind `-Dlib_wasi_threads=true` on
+  x86_64/AArch64. Final cross-thread cancellation remains open.
   ([#616 B1](https://github.com/cataggar/wamr/issues/616))
 * **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped, with
   optional file-backed persistence and real compare-and-swap.
@@ -462,6 +462,8 @@ $ zig build wasi-p3-testsuite-wasmtime                # Wasmtime 46.0.1 — 41 /
 $ zig build test-wasi-threads -Daot=false             # Feature-disabled ABI
 $ zig build test-wasi-threads -Dlib_wasi_threads=true -Daot=false
                                                        # Preview-1 interpreter threads
+$ zig build test-aot-threads -Dlib_wasi_threads=true -Dinterp=false
+                                                       # Preview-1 AOT threads
 ```
 
 ### `WAMR_TESTSUITE_TIMEOUT`
@@ -608,7 +610,7 @@ additions (one PR per interface, gated behind the existing
 
 * **Guest threads** — [#616 B1](https://github.com/cataggar/wamr/issues/616).
   Design doc: [`docs/design/wasi-threads.md`](design/wasi-threads.md)
-  (prototype inventory, multi-threaded interpreter state isolation,
+  (instance-per-thread isolation across interpreter and AOT,
   and production-gating plan).
 * **`wasi:keyvalue@0.2.x`** — [#583 B4](https://github.com/cataggar/wamr/issues/583).
 * ~~**`wasi:logging@0.1.x`**~~ — host adapter shipped (#583 B5); see the

@@ -1660,6 +1660,19 @@ fn runAotReal(
 
     // 3. Retain the process-scoped WASI state on the AOT execution context.
     aot_inst.attachProcessState(ctx.processStateRef());
+    var manager = wamr.thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    const manager_enabled =
+        wamr.config.lib_wasi_threads and aot_runtime.usesWasiThreads(&aot_module);
+    if (manager_enabled) {
+        aot_runtime.prepareWasiThreads(aot_inst, &manager) catch |err| {
+            std.debug.print(
+                "Error: failed to prepare AOT WASI thread group: {s}\n",
+                .{@errorName(err)},
+            );
+            return 1;
+        };
+    }
 
     const func_idx = aot_runtime.findExportFunc(aot_inst, "_start") orelse
         aot_runtime.findExportFunc(aot_inst, "main") orelse {
@@ -1670,14 +1683,37 @@ fn runAotReal(
     // `_start` / `main` take no params and return no values for the
     // wasi-libc CRT shape; route through `callFuncScalar` with empty
     // slices. Any guest call to `proc_exit` short-circuits via
-    // `std.process.exit` inside the host bridge.
+    // the host bridge's trap-as-error path so owned child threads can join.
     var results_buf: [0]wamr.aot_runtime.ScalarResult = .{};
-    _ = aot_runtime.callFuncScalar(aot_inst, func_idx, &.{}, &.{}, &.{}, &results_buf) catch |err| {
-        std.debug.print("Error: AOT execution failed: {}\n", .{err});
-        return 1;
+    var call_error: ?aot_runtime.ScalarCallError = null;
+    _ = aot_runtime.callFuncScalar(
+        aot_inst,
+        func_idx,
+        &.{},
+        &.{},
+        &.{},
+        &results_buf,
+    ) catch |err| {
+        call_error = err;
     };
 
+    const thread_summary = if (manager_enabled)
+        manager.shutdownWithSummary()
+    else
+        wamr.thread_manager.JoinSummary{};
+
     if (ctx.getExitCode()) |code| return @intCast(code & 0xFF);
+    if (call_error) |err| {
+        std.debug.print("Error: AOT execution failed: {}\n", .{err});
+        return 1;
+    }
+    if (thread_summary.trapped != 0) {
+        std.debug.print(
+            "Error: {d} AOT child thread(s) trapped\n",
+            .{thread_summary.trapped},
+        );
+        return 1;
+    }
     return 0;
 }
 

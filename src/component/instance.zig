@@ -19,6 +19,7 @@ const call_frame_mod = @import("call_frame.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
 const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
 const stable_resource = @import("../shared/stable_resource.zig");
+const thread_manager_mod = @import("../wasi/thread_manager.zig");
 
 const aot_host_bridge = @import("../runtime/aot/host_bridge.zig");
 
@@ -597,6 +598,11 @@ pub const ComponentInstance = struct {
     options: Options = .{},
     /// Allocator for instance lifetime.
     allocator: std.mem.Allocator,
+    /// Host-owned Preview-1 thread group. Zero-sized in disabled builds.
+    thread_manager: if (config.lib_wasi_threads)
+        thread_manager_mod.ThreadManager
+    else
+        void,
     /// Child component instances created when the parent component
     /// declares `(instance N (instantiate <subcomp> ...))` expressions.
     /// Indexed by the *local* component-instance idx (i.e. by index into
@@ -1982,6 +1988,7 @@ pub const ComponentInstance = struct {
     }
 
     pub fn deinit(self: *ComponentInstance) void {
+        if (comptime config.lib_wasi_threads) self.thread_manager.deinit();
         // The cached `cabi_realloc` ExecEnv must be freed before the
         // core instances it points at (#538).
         if (comptime !config.lib_wasi_threads) {
@@ -2200,6 +2207,9 @@ pub fn instantiateWithOptions(
         .imports = .{},
         .options = options,
         .allocator = allocator,
+        .thread_manager = if (config.lib_wasi_threads)
+            thread_manager_mod.ThreadManager.init(allocator)
+        else {},
     };
     // From here on, `inst.deinit()` is the single owner of partial-init
     // cleanup. The struct fields above are all in trivially-deinitable
@@ -2471,6 +2481,8 @@ pub fn instantiateWithOptions(
                                 if (aot_only) return error.AotImportUnresolvable;
                                 break :aot_blk;
                             };
+                            if (comptime config.lib_wasi_threads)
+                                aot_inst_ptr.setThreadManager(&inst.thread_manager);
                             aot_runtime.mapCodeExecutable(aot_inst_ptr) catch |err| {
                                 std.log.warn("aot core code-map failed for module {d}: {s}", .{ ie.module_idx, @errorName(err) });
                                 aot_runtime.destroy(aot_inst_ptr);
@@ -3017,6 +3029,29 @@ pub fn instantiateWithOptions(
             cis[i].module_inst = module_inst;
         }
         inst.core_instances = cis;
+    }
+
+    if (comptime config.lib_wasi_threads) {
+        var threaded_memory: ?*core_types.MemoryInstance = null;
+        for (inst.core_instances) |entry| {
+            const ai = entry.aot_inst orelse continue;
+            if (!aot_runtime.usesWasiThreads(ai.module)) continue;
+            if (threaded_memory != null) {
+                std.log.warn(
+                    "[aot reject] multiple Preview-1 threaded cores in one component are unsupported",
+                    .{},
+                );
+                return error.AotImportUnresolvable;
+            }
+            aot_runtime.prepareWasiThreads(ai, &inst.thread_manager) catch |err| {
+                std.log.warn(
+                    "[aot reject] failed to prepare Preview-1 thread group: {s}",
+                    .{@errorName(err)},
+                );
+                return error.AotImportUnresolvable;
+            };
+            threaded_memory = ai.memories[0];
+        }
     }
 
     // ── Sub-component instantiation (issue #355) ───────────────────────────

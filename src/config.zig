@@ -153,8 +153,7 @@ pub const lib_pthread = opt("lib_pthread", false);
 /// Enable pthread semaphore support.
 pub const lib_pthread_semaphore = opt("lib_pthread_semaphore", false);
 
-/// Enable the production Preview-1 WASI threads interpreter binding. AOT/JIT
-/// support remains separately gated and is not implemented.
+/// Enable the Preview-1 WASI threads runtime.
 pub const lib_wasi_threads = opt("lib_wasi_threads", false);
 
 /// Allocate auxiliary stacks on the heap (follows lib_wasi_threads).
@@ -472,6 +471,7 @@ fn wasiThreadsInputs() threads_feature.Inputs {
         .single_threaded = builtin.single_threaded,
         .interp = interp,
         .aot = aot,
+        .aot_architecture_supported = arch == .x86_64 or arch == .aarch64,
         .jit = jit,
         .fast_jit = fast_jit,
         .libc_wasi = libc_wasi,
@@ -482,9 +482,7 @@ fn wasiThreadsInputs() threads_feature.Inputs {
     };
 }
 
-/// Deterministic compile-time report for embedders and runtime preflight
-/// gates. Interpreter production support and the unimplemented AOT ABI are
-/// reported independently.
+/// Deterministic compile-time report for embedders and runtime preflight.
 pub const wasi_threads = threads_feature.report(wasiThreadsInputs());
 
 test "WASI threads build options match the published contract" {
@@ -500,7 +498,10 @@ test "WASI threads build options match the published contract" {
         try std.testing.expect(wasi_threads.configured.thread_manager);
         try std.testing.expect(wasi_threads.configured.wasm_atomics);
         try std.testing.expect(wasi_threads.implementation.interpreter_thread_spawning);
-        try std.testing.expect(!wasi_threads.implementation.aot_thread_spawning);
+        try std.testing.expectEqual(
+            arch == .x86_64 or arch == .aarch64,
+            wasi_threads.implementation.aot_thread_spawning,
+        );
     }
 }
 

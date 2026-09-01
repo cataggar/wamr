@@ -15,7 +15,8 @@
 //!     (zero args, stdout-only) so older callers keep working.
 
 const std = @import("std");
-const VmCtx = @import("runtime.zig").VmCtx;
+const aot_runtime = @import("runtime.zig");
+const VmCtx = aot_runtime.VmCtx;
 const wasi_core = @import("../../wasi/wasi_core.zig");
 const wasi = @import("../../wasi/wasi.zig");
 const host_functions = @import("../../wasi/host_functions.zig");
@@ -467,20 +468,17 @@ pub fn aotProcExit(vmctx: *VmCtx, code: i32) callconv(.c) void {
     if (getCtx(vmctx)) |ctx| {
         ctx.proc_exit(@bitCast(code));
     }
-    // `proc_exit` is unconditional: it must not return to the guest.
-    // Since C-calling-convention adapters cannot raise a Zig error,
-    // terminate the host process here. This matches the interpreter
-    // path (`error.Trap` propagates to the CLI which then calls
-    // `std.process.exit(ctx.getExitCode())`).
-    const code_u8: u8 = @intCast(@as(u32, @bitCast(code)) & 0xFF);
-    std.process.exit(code_u8);
+    aot_runtime.signalThreadGroupTrap(vmctx);
+    aot_runtime.aotTrapHost(
+        vmctx,
+        @intCast(@as(u32, @bitCast(code)) & 0xff),
+    );
 }
 
-pub fn aotThreadSpawn(vmctx: *VmCtx, _: i32) callconv(.c) i32 {
-    _ = vmctx;
-    // AOT path has no thread_manager wiring; report failure per the
-    // wasi-threads spec ("a negative TID indicates spawn failure").
-    return -1;
+pub fn aotThreadSpawn(vmctx: *VmCtx, start_arg: i32) callconv(.c) i32 {
+    if (vmctx.instance_ptr == 0) return -1;
+    const inst: *aot_runtime.AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    return aot_runtime.spawnWasiThread(inst, start_arg) catch -1;
 }
 
 pub fn aotPollOneoff(vmctx: *VmCtx, in_ptr: i32, out_ptr: i32, nsubs: i32, ret_ptr: i32) callconv(.c) i32 {

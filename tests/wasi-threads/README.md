@@ -1,7 +1,7 @@
 # Preview-1 WASI thread fixtures
 
 These deterministic core-Wasm fixtures exercise the production interpreter
-binding enabled by `-Dlib_wasi_threads=true -Daot=false`.
+and AOT bindings enabled by `-Dlib_wasi_threads=true`.
 
 - `pthread-contract`: 300 retained completed threads, generation-safe TIDs,
   guest-side atomic joins, a shared counter, start arguments, guest TLS/global
@@ -20,6 +20,13 @@ them with:
 
 ```sh
 zig build update-wasi-thread-fixtures -Dlib_wasi_threads=true -Daot=false
+```
+
+Run them through either backend with:
+
+```sh
+zig build test-wasi-threads -Dlib_wasi_threads=true -Daot=false
+zig build test-aot-threads -Dlib_wasi_threads=true -Dinterp=false
 ```
 
 The pinned `cataggar/wabt` parses atomic mnemonics but not the WAT `shared`

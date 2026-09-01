@@ -49,6 +49,10 @@ fn frameThreadContext(frame: *CallFrame) *execution_context.ThreadExecutionConte
     };
 }
 
+fn enterFrameThreadContext(frame: *CallFrame) execution_context.ActiveScope {
+    return frameThreadContext(frame).enter();
+}
+
 fn taskManagerFor(
     thread_ctx: ?*execution_context.ThreadExecutionContext,
 ) ?*async_mod.TaskManager {
@@ -1644,6 +1648,10 @@ fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
         frame.deinit();
     }
     const thread_ctx = frameThreadContext(&frame);
+    // Nested lifts must resolve canon task state from this frame, not from an
+    // outer AOT call that happens to be active on the same native thread.
+    var frame_context_scope = enterFrameThreadContext(&frame);
+    defer frame_context_scope.deinit();
     thread_ctx.clearCancellation();
     var task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
     defer task_scope.deinit();
@@ -4347,7 +4355,12 @@ fn executeAsyncLiftCallback(
         if (owned_env) |env| env.destroy();
         frame.deinit();
     }
-    var task_scope = frameThreadContext(&frame).bindTaskManager(@ptrCast(task_manager));
+    const thread_ctx = frameThreadContext(&frame);
+    // The callback can target a different AOT instance than the suspended
+    // lift; install that frame before any canon builtin re-enters the host.
+    var frame_context_scope = enterFrameThreadContext(&frame);
+    defer frame_context_scope.deinit();
+    var task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
     defer task_scope.deinit();
     var host_task_scope = frameThreadContext(&frame).bindHostTaskContext(
         host_task_context,
@@ -11441,4 +11454,187 @@ test "rewriteValueBackToCallerOwnedTyped: list<string> translated callee→calle
         try testing.expectEqual(@as(u32, @intCast(m.len)), nl);
         try testing.expectEqualStrings(m, caller.readGuestBytes(np, nl).?);
     }
+}
+
+test "nested AOT async-lift frames enter their own task-manager context" {
+    const builtin = @import("builtin");
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64)
+        return error.SkipZigTest;
+
+    const aot_loader = @import("../runtime/aot/loader.zig");
+    const Probe = struct {
+        fn run(
+            vmctx: *aot_runtime.VmCtx,
+            event_kind: u64,
+            event_handle: u64,
+            event_code: u64,
+        ) callconv(.c) u64 {
+            const inst: *aot_runtime.AotInstance = @ptrFromInt(vmctx.instance_ptr);
+            const expected = &inst.thread_context;
+            const active = execution_context.current() orelse return 0;
+            if (active != expected) return 0;
+            const expected_manager =
+                expected.taskManager(async_mod.TaskManager) orelse return 0;
+            if (taskManagerFor(active) != expected_manager) return 0;
+            if (event_kind != 1 or event_handle != 2 or event_code != 3)
+                return 0;
+            return 1;
+        }
+    };
+
+    const func_types = [_]aot_loader.AotFuncType{.{
+        .params = &.{ .i32, .i32, .i32 },
+        .results = &.{.i32},
+    }};
+    const type_indices = [_]u32{0};
+    const module = aot_loader.AotModule{
+        .func_count = 1,
+        .func_types = &func_types,
+        .local_func_type_indices = &type_indices,
+    };
+    const inst = try aot_runtime.instantiate(&module, std.testing.allocator);
+    defer aot_runtime.destroy(inst);
+    inst.funcptrs = try std.testing.allocator.alloc(usize, 1);
+    inst.funcptrs[0] = @intFromPtr(&Probe.run);
+
+    var component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const owner = try instance_mod.instantiate(&component, std.testing.allocator);
+    defer owner.deinit();
+
+    var outer_context = execution_context.ThreadExecutionContext{};
+    var outer_manager = async_mod.TaskManager{};
+    defer outer_manager.deinit(std.testing.allocator);
+    var frame_manager = async_mod.TaskManager{};
+    defer frame_manager.deinit(std.testing.allocator);
+    var outer_scope = outer_context.enter();
+    defer outer_scope.deinit();
+    var outer_binding = outer_context.bindTaskManager(@ptrCast(&outer_manager));
+    defer outer_binding.deinit();
+
+    const status = try executeAsyncLiftCallback(
+        owner,
+        .{ .aot_inst = inst },
+        CoreFuncIdxComponent.from(0),
+        .{ .kind = 1, .handle = 2, .code = 3 },
+        &frame_manager,
+        null,
+        std.testing.allocator,
+    );
+    try std.testing.expectEqual(@as(u32, 1), status);
+    try std.testing.expectEqual(&outer_context, execution_context.current().?);
+    try std.testing.expectEqual(
+        &outer_manager,
+        taskManagerFor(execution_context.current()).?,
+    );
+}
+
+test "callComponentFuncByLocalAsyncLifted enters the AOT frame context" {
+    const builtin = @import("builtin");
+    if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64)
+        return error.SkipZigTest;
+
+    const aot_loader = @import("../runtime/aot/loader.zig");
+    const Probe = struct {
+        fn run(vmctx: *aot_runtime.VmCtx) callconv(.c) u64 {
+            const inst: *aot_runtime.AotInstance = @ptrFromInt(vmctx.instance_ptr);
+            const active = execution_context.current() orelse return 0;
+            const expected = &inst.thread_context;
+            const expected_manager =
+                expected.taskManager(async_mod.TaskManager) orelse return 0;
+            if (active != expected or taskManagerFor(active) != expected_manager)
+                return 0;
+            const memory: [*]u8 = @ptrFromInt(vmctx.memory_base);
+            memory[0] = 1;
+            return 0;
+        }
+    };
+
+    const func_types = [_]aot_loader.AotFuncType{.{
+        .params = &.{},
+        .results = &.{},
+    }};
+    const type_indices = [_]u32{0};
+    const memories = [_]core_types.MemoryType{.{
+        .limits = .{ .min = 1, .max = 1 },
+    }};
+    const module = aot_loader.AotModule{
+        .func_count = 1,
+        .func_types = &func_types,
+        .local_func_type_indices = &type_indices,
+        .memories = &memories,
+    };
+    const aot_inst = try aot_runtime.instantiate(&module, std.testing.allocator);
+    aot_inst.funcptrs = try std.testing.allocator.alloc(usize, 1);
+    aot_inst.funcptrs[0] = @intFromPtr(&Probe.run);
+
+    const component_types = [_]ctypes.TypeDef{.{
+        .func = .{
+            .params = &.{},
+            .results = .none,
+            .is_async = true,
+        },
+    }};
+    var component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &component_types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const owner = try instance_mod.instantiate(&component, std.testing.allocator);
+    defer owner.deinit();
+    owner.core_instances = try std.testing.allocator.alloc(
+        ComponentInstance.CoreInstanceEntry,
+        1,
+    );
+    owner.core_instances[0] = .{ .aot_inst = aot_inst };
+
+    var outer_context = execution_context.ThreadExecutionContext{};
+    var outer_manager = async_mod.TaskManager{};
+    defer outer_manager.deinit(std.testing.allocator);
+    var frame_manager = async_mod.TaskManager{};
+    defer frame_manager.deinit(std.testing.allocator);
+    var outer_scope = outer_context.enter();
+    defer outer_scope.deinit();
+    var outer_binding = outer_context.bindTaskManager(@ptrCast(&outer_manager));
+    defer outer_binding.deinit();
+
+    const opts = [_]ctypes.CanonOpt{.async_lift};
+    var status: u32 = 99;
+    try callComponentFuncByLocalAsyncLifted(
+        owner,
+        .{
+            .core_instance_idx = 0,
+            .core_func_idx = 0,
+            .func_type_idx = 0,
+            .opts = &opts,
+        },
+        &.{},
+        &status,
+        &frame_manager,
+        std.testing.allocator,
+    );
+    try std.testing.expectEqual(@as(u32, 0), status);
+    try std.testing.expectEqual(@as(u8, 1), aot_inst.memories[0].data[0]);
+    try std.testing.expectEqual(&outer_context, execution_context.current().?);
+    try std.testing.expectEqual(
+        &outer_manager,
+        taskManagerFor(execution_context.current()).?,
+    );
 }
