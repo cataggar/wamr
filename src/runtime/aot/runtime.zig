@@ -1048,11 +1048,45 @@ pub fn aotThrowUncaught(vmctx: *VmCtx, tag_inst: *types.TagInstance) callconv(.c
 
 // ── Futex helpers for atomic.wait / atomic.notify ────────────────────
 
+/// True once the calling thread's group claimed a terminal outcome.
+///
+/// AOT-compiled code has no interpreter-style poll, so every interruptible
+/// host blocking point consults this before and after it parks.
+pub fn threadGroupTerminating(vmctx: *VmCtx) bool {
+    if (comptime !config.lib_wasi_threads) return false;
+    if (vmctx.thread_context == 0) return false;
+    const thread_context_ptr: *execution_context.ThreadExecutionContext =
+        @ptrFromInt(vmctx.thread_context);
+    const manager = thread_context_ptr.threadGroup(thread_manager.ThreadManager) orelse
+        return false;
+    return manager.isTerminating();
+}
+
+/// Unwind this AOT thread because the group is terminating. Mirrors the
+/// interpreter's `error.ThreadCancelled`: the thread stops running guest
+/// code so bounded teardown can reclaim it. Never returns.
+pub fn terminateAotThread(vmctx: *VmCtx) noreturn {
+    var fallback: u8 = 1;
+    if (comptime config.lib_wasi_threads) {
+        if (vmctx.thread_context != 0) {
+            const thread_context_ptr: *execution_context.ThreadExecutionContext =
+                @ptrFromInt(vmctx.thread_context);
+            if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager| {
+                if (manager.terminalOutcome()) |result| {
+                    if (result.kind == .exit) fallback = @intCast(result.code & 0xff);
+                }
+            }
+        }
+    }
+    aotTrapHost(vmctx, fallback);
+}
+
 /// Host helper for `memory.atomic.wait32`.
 /// Blocks the calling thread if `mem[addr] == expected`.
 /// Returns: 0 = woken by notify, 1 = not-equal, 2 = timed-out.
 pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32, timeout_hi: u32) callconv(.c) i32 {
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
+    if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
     const mem = aotWaitMemory(vmctx, addr, 4) orelse return 1;
     const result = mem.wait32(addr, expected, timeout_ns) catch |err| switch (err) {
         error.NotShared => return 1,
@@ -1066,7 +1100,10 @@ pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32,
     };
     return switch (result) {
         .notified, .not_equal, .timed_out => @intCast(@intFromEnum(result)),
-        .cancelled, .closed => 2,
+        .cancelled, .closed => {
+            if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
+            return 2;
+        },
     };
 }
 
@@ -1074,6 +1111,7 @@ pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32,
 pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeout_lo: u32, timeout_hi: u32) callconv(.c) i32 {
     const expected: u64 = @as(u64, exp_hi) << 32 | @as(u64, exp_lo);
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
+    if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
     const mem = aotWaitMemory(vmctx, addr, 8) orelse return 1;
     const result = mem.wait64(addr, expected, timeout_ns) catch |err| switch (err) {
         error.NotShared => return 1,
@@ -1087,7 +1125,10 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
     };
     return switch (result) {
         .notified, .not_equal, .timed_out => @intCast(@intFromEnum(result)),
-        .cancelled, .closed => 2,
+        .cancelled, .closed => {
+            if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
+            return 2;
+        },
     };
 }
 

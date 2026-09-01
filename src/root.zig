@@ -29,6 +29,9 @@ pub const exec_env = @import("runtime/common/exec_env.zig");
 /// Shared-process references and per-thread execution metadata.
 pub const execution_context = @import("runtime/common/execution_context.zig");
 
+/// First-wins terminal outcome shared by every thread in a group.
+pub const termination = @import("runtime/common/termination.zig");
+
 /// Process-global canonical FuncType → u32 sig_id registry (for AOT call_indirect).
 pub const sig_registry = @import("runtime/common/sig_registry.zig");
 

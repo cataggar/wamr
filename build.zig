@@ -428,6 +428,10 @@ pub fn build(b: *std.Build) void {
         "parent-teardown",
         "child-trap",
         "child-proc-exit",
+        "terminate-futex-waiter",
+        "terminate-poll-waiter",
+        "trap-beats-late-exit",
+        "exit-beats-late-trap",
         "missing-thread-start",
         "wrong-thread-start-signature",
         "disabled-rejection",
@@ -502,6 +506,25 @@ pub fn build(b: *std.Build) void {
             child_proc_exit.expectExitCode(7);
             wasi_threads_test_step.dependOn(&child_proc_exit.step);
 
+            // First-wins group termination (#616). Empty stdout is the
+            // assertion that blocked siblings were woken rather than left to
+            // finish their wait naturally.
+            inline for (.{
+                .{ "terminate-futex-waiter", 5 },
+                .{ "terminate-poll-waiter", 5 },
+                .{ "trap-beats-late-exit", 1 },
+                .{ "exit-beats-late-trap", 6 },
+            }) |termination_case| {
+                const run = b.addRunArtifact(exe);
+                run.addArgs(&.{
+                    "run",
+                    b.fmt("tests/wasi-threads/{s}.wasm", .{termination_case[0]}),
+                });
+                run.expectExitCode(termination_case[1]);
+                run.expectStdOutEqual("");
+                wasi_threads_test_step.dependOn(&run.step);
+            }
+
             inline for (.{
                 "missing-thread-start",
                 "wrong-thread-start-signature",
@@ -548,6 +571,10 @@ pub fn build(b: *std.Build) void {
             );
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-trap", 1, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-proc-exit", 7, null, null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "terminate-futex-waiter", 5, "", null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "terminate-poll-waiter", 5, "", null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "trap-beats-late-exit", 1, "", null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "exit-beats-late-trap", 6, "", null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "missing-thread-start", 0, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "wrong-thread-start-signature", 0, null, null);
         } else {
@@ -927,6 +954,8 @@ pub fn build(b: *std.Build) void {
             "ThreadManager:",
             "AuxStackPool:",
             "thread lifecycle:",
+            "group termination:",
+            "termination:",
             "AOT thread",
             "nested AOT async-lift",
             "callComponentFuncByLocalAsyncLifted enters",

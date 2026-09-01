@@ -5,6 +5,7 @@ const AtomicMarkers = struct {
     loads: usize,
     stores: usize,
     rmw_adds: usize,
+    wait32s: usize,
 };
 
 fn replaceAll(
@@ -33,15 +34,27 @@ fn rewriteAtomicText(
         .loads = std.mem.count(u8, source, "i32.atomic.load"),
         .stores = std.mem.count(u8, source, "i32.atomic.store"),
         .rmw_adds = std.mem.count(u8, source, "i32.atomic.rmw.add"),
+        .wait32s = std.mem.count(u8, source, "memory.atomic.wait32"),
     };
+    // `memory.atomic.wait32` consumes [addr:i32, expected:i32, timeout:i64]
+    // and produces i32; `drop drop` has the same stack effect and leaves a
+    // recognisable byte pattern.
     var rewritten = try replaceAll(
         allocator,
         source,
-        "i32.atomic.rmw.add",
-        "nop nop nop i32.rotr",
+        "memory.atomic.wait32",
+        "nop nop nop drop drop",
     );
     errdefer allocator.free(rewritten);
     var next = try replaceAll(
+        allocator,
+        rewritten,
+        "i32.atomic.rmw.add",
+        "nop nop nop i32.rotr",
+    );
+    allocator.free(rewritten);
+    rewritten = next;
+    next = try replaceAll(
         allocator,
         rewritten,
         "i32.atomic.load",
@@ -64,7 +77,7 @@ fn lowerAtomicMarkers(
     module: *wabt.Module.Module,
     expected: AtomicMarkers,
 ) !void {
-    var actual = AtomicMarkers{ .loads = 0, .stores = 0, .rmw_adds = 0 };
+    var actual = AtomicMarkers{ .loads = 0, .stores = 0, .rmw_adds = 0, .wait32s = 0 };
     for (module.funcs.items) |*function| {
         if (function.is_import or function.code_bytes.len == 0) continue;
         var output: std.ArrayListUnmanaged(u8) = .empty;
@@ -72,7 +85,12 @@ fn lowerAtomicMarkers(
         var i: usize = 0;
         while (i < function.code_bytes.len) : (i += 1) {
             const remaining = function.code_bytes[i..];
-            if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x01, 0x78 })) {
+            if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x01, 0x1A, 0x1A })) {
+                // memory.atomic.wait32 align=2 (4-byte) offset=0
+                try output.appendSlice(allocator, &.{ 0xfe, 0x01, 0x02, 0x00 });
+                i += 4;
+                actual.wait32s += 1;
+            } else if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x01, 0x78 })) {
                 try output.appendSlice(allocator, &.{ 0xfe, 0x1e, 0x02, 0x00 });
                 i += 3;
                 actual.rmw_adds += 1;
@@ -94,17 +112,20 @@ fn lowerAtomicMarkers(
     }
     if (actual.loads != expected.loads or
         actual.stores != expected.stores or
-        actual.rmw_adds != expected.rmw_adds)
+        actual.rmw_adds != expected.rmw_adds or
+        actual.wait32s != expected.wait32s)
     {
         std.debug.print(
-            "atomic marker mismatch: expected {d}/{d}/{d}, found {d}/{d}/{d}\n",
+            "atomic marker mismatch: expected {d}/{d}/{d}/{d}, found {d}/{d}/{d}/{d}\n",
             .{
                 expected.loads,
                 expected.stores,
                 expected.rmw_adds,
+                expected.wait32s,
                 actual.loads,
                 actual.stores,
                 actual.rmw_adds,
+                actual.wait32s,
             },
         );
         return error.AtomicMarkerMismatch;

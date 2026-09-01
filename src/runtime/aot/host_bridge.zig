@@ -77,7 +77,12 @@ pub fn aotFdWrite(vmctx: *VmCtx, fd: i32, iovs_ptr: i32, iovs_len: i32, nwritten
 pub fn aotFdRead(vmctx: *VmCtx, fd: i32, iovs_ptr: i32, iovs_len: i32, nread_ptr: i32) callconv(.c) i32 {
     const mem = getMemoryFromCtx(vmctx) orelse return wasi_core.WASI_EINVAL;
     const ctx = getCtx(vmctx) orelse return wasi_core.WASI_EBADF;
-    return host_functions.ctxFdIoCore(ctx, mem, fd, @bitCast(iovs_ptr), @bitCast(iovs_len), @bitCast(nread_ptr), .read);
+    const result = host_functions.ctxFdIoCore(ctx, mem, fd, @bitCast(iovs_ptr), @bitCast(iovs_len), @bitCast(nread_ptr), .read);
+    // Parity with the interpreter: a read interrupted by the group's
+    // terminal outcome unwinds this thread instead of returning an errno.
+    if (result == host_functions.terminated_result)
+        aot_runtime.terminateAotThread(vmctx);
+    return result;
 }
 
 pub fn aotFdPread(vmctx: *VmCtx, fd: i32, iovs_ptr: i32, iovs_len: i32, offset: i64, nread_ptr: i32) callconv(.c) i32 {
@@ -455,6 +460,10 @@ pub fn aotRandomGet(vmctx: *VmCtx, buf_ptr: i32, buf_len: i32) callconv(.c) i32 
 
 pub fn aotSchedYield(vmctx: *VmCtx) callconv(.c) i32 {
     traceAdapter("sched_yield", vmctx, .{});
+    // Guest spin/yield loops are the one AOT construct that polls the host
+    // often enough to be interrupted without codegen support.
+    if (aot_runtime.threadGroupTerminating(vmctx))
+        aot_runtime.terminateAotThread(vmctx);
     return wasi_core.schedYieldCore();
 }
 
@@ -465,14 +474,20 @@ pub fn aotProcRaise(vmctx: *VmCtx, sig: i32) callconv(.c) i32 {
 
 pub fn aotProcExit(vmctx: *VmCtx, code: i32) callconv(.c) void {
     traceAdapter("proc_exit", vmctx, .{code});
+    var status: u32 = @bitCast(code);
     if (getCtx(vmctx)) |ctx| {
-        ctx.proc_exit(@bitCast(code));
+        ctx.proc_exit(status);
+        // Losing a `proc_exit`/trap race must not change what the embedder
+        // sees: unwind with whatever outcome actually won.
+        if (ctx.terminalOutcome()) |winner| {
+            status = switch (winner.kind) {
+                .exit => winner.code,
+                .trap => 1,
+            };
+        }
     }
     aot_runtime.signalThreadGroupTrap(vmctx);
-    aot_runtime.aotTrapHost(
-        vmctx,
-        @intCast(@as(u32, @bitCast(code)) & 0xff),
-    );
+    aot_runtime.aotTrapHost(vmctx, @intCast(status & 0xff));
 }
 
 pub fn aotThreadSpawn(vmctx: *VmCtx, start_arg: i32) callconv(.c) i32 {
@@ -484,7 +499,10 @@ pub fn aotThreadSpawn(vmctx: *VmCtx, start_arg: i32) callconv(.c) i32 {
 pub fn aotPollOneoff(vmctx: *VmCtx, in_ptr: i32, out_ptr: i32, nsubs: i32, ret_ptr: i32) callconv(.c) i32 {
     const ctx = getCtx(vmctx) orelse return wasi_core.WASI_ENOSYS;
     const mem = getMemoryFromCtx(vmctx) orelse return wasi_core.WASI_EINVAL;
-    return host_functions.ctxPollOneoffCore(ctx, mem, in_ptr, out_ptr, nsubs, ret_ptr);
+    const result = host_functions.ctxPollOneoffCore(ctx, mem, in_ptr, out_ptr, nsubs, ret_ptr);
+    if (result == host_functions.terminated_result)
+        aot_runtime.terminateAotThread(vmctx);
+    return result;
 }
 
 pub fn aotSockShutdown(vmctx: *VmCtx, fd: i32, sdflags: i32) callconv(.c) i32 {
