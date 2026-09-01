@@ -10,6 +10,7 @@ const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const execution_context = @import("../runtime/common/execution_context.zig");
 const termination = @import("../runtime/common/termination.zig");
 const platform = @import("../platform/platform.zig");
+const parking_lot = @import("../platform/parking_lot.zig");
 const config = @import("config");
 
 /// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
@@ -2310,4 +2311,93 @@ test "group termination: the cancel broadcast reaches compiled code on every int
         .broadcast = Probe.broadcast,
     });
     try std.testing.expect(late.calls >= 1);
+}
+
+/// Parks the calling thread on the group's shared memory with an infinite
+/// timeout, on its own thread so the harness keeps a bounded escape hatch.
+const EmbedderParkCtx = struct {
+    memory: *types.MemoryInstance,
+    offset: usize,
+    result: types.MemoryInstance.SharedWaitError!parking_lot.WaitResult = .not_equal,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *EmbedderParkCtx) void {
+        self.result = self.memory.wait32(self.offset, 0, -1);
+        self.finished.store(true, .release);
+    }
+
+    fn awaitFinished(self: *EmbedderParkCtx, timeout_ns: u64) bool {
+        const deadline = monotonicNowNs() +| timeout_ns;
+        while (!self.finished.load(.acquire)) {
+            if (monotonicNowNs() >= deadline) return false;
+            platform.usleep(200);
+        }
+        return true;
+    }
+};
+
+test "group termination: the embedder parking after the last sweep is still cancelled" {
+    // The reported #955 hang: the embedder thread checks `isTerminating()`,
+    // a child claims the terminal outcome and exits (running the last sweep
+    // over an empty queue), and only then does the embedder park with an
+    // infinite timeout. Nothing sweeps again — `terminateAndJoin` is never
+    // even entered — so the wait must be refused rather than woken.
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var state = termination.State{};
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    // A child that completes on its own; its `threadEntry` outcome plus the
+    // claim below produce the only two sweeps in the run.
+    _ = try manager.spawnThread(ctx.inst, 0);
+    try waitForCompleted(&manager, 1);
+    _ = state.claimExit(0);
+    try std.testing.expect(manager.isTerminating());
+
+    var park = EmbedderParkCtx{ .memory = ctx.mem_inst, .offset = 16 };
+    const thread = try std.Thread.spawn(.{}, EmbedderParkCtx.run, .{&park});
+    const finished = park.awaitFinished(5 * std.time.ns_per_s);
+    if (!finished) _ = ctx.mem_inst.cancelWaiters() catch 0;
+    thread.join();
+
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(
+        parking_lot.WaitResult.cancelled,
+        try park.result,
+    );
+    _ = manager.terminateAndJoin(default_termination_timeout_ns);
+}
+
+test "group termination: an interpreter child that parks after termination traps" {
+    // Same shape as the embedder case but through the real interpreter
+    // `memory.atomic.wait32` path with an infinite timeout: the group is
+    // already terminated when the child reaches its wait, so the child must
+    // trap out instead of parking behind the sweep.
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var state = termination.State{};
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    _ = state.claimExit(3);
+    try std.testing.expect(ctx.mem_inst.shared_control.?.parking_lot.isCancelled());
+
+    const tid = try manager.spawnThread(ctx.inst, 0);
+    const started_ns = monotonicNowNs();
+    try std.testing.expectEqual(ThreadOutcome.trapped, try manager.joinOne(tid));
+    try std.testing.expect(monotonicNowNs() - started_ns < std.time.ns_per_s);
+    try std.testing.expectEqual(@as(?u32, 3), state.exitCode());
 }
