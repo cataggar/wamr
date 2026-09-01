@@ -3491,6 +3491,11 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
                         const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
                         if (!memInBounds(effective_addr, 4, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
+                        // Never park after the group's terminal outcome is
+                        // claimed: the wake sweep may already have passed.
+                        if (env.threadManager()) |tm| {
+                            if (tm.isTerminating()) return error.ThreadCancelled;
+                        }
                         const result = mem.wait32(
                             effective_addr,
                             @bitCast(expected),
@@ -3520,6 +3525,9 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         if (effective_addr & 7 != 0) return error.UnalignedAtomicAccess;
                         const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
                         if (!memInBounds(effective_addr, 8, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
+                        if (env.threadManager()) |tm| {
+                            if (tm.isTerminating()) return error.ThreadCancelled;
+                        }
                         const result = mem.wait64(
                             effective_addr,
                             @bitCast(expected),

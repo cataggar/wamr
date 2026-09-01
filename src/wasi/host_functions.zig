@@ -22,8 +22,54 @@ const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const wasi_core = @import("wasi_core.zig");
 const wasi = @import("wasi.zig");
 const thread_manager = @import("thread_manager.zig");
+const platform = @import("../platform/platform.zig");
 
 const is_single_threaded = builtin.single_threaded;
+
+/// Sentinel returned by blocking host cores when the thread group's terminal
+/// outcome was claimed while they were parked. WASI errnos are non-negative,
+/// so a negative value is unambiguous. The backend-specific caller turns it
+/// into a trap so the sibling unwinds instead of finishing its syscall.
+pub const terminated_result: i32 = -1;
+
+/// Longest a blocking host operation parks before re-checking the group's
+/// terminal outcome. This bounds how long a sibling can stay blocked in
+/// host I/O after termination begins.
+pub const blocking_slice_ms: i32 = 20;
+
+const BlockingWait = enum { ready, timed_out, terminated };
+
+/// Wait for readiness on `fds` in bounded slices.
+///
+/// With threads enabled the wait is chopped into `blocking_slice_ms` pieces
+/// and the group's terminal outcome is re-checked between them, so an
+/// otherwise indefinite `poll` or stdin read cannot outlive termination.
+/// `timeout_ms < 0` means "wait indefinitely".
+fn waitForReadiness(
+    ctx: *wasi.WasiCtx,
+    fds: []std.posix.pollfd,
+    timeout_ms: i32,
+) BlockingWait {
+    if (comptime builtin.os.tag == .windows) return .timed_out;
+    if (comptime !config.lib_wasi_threads) {
+        const ready = std.posix.poll(fds, timeout_ms) catch 0;
+        return if (ready > 0) .ready else .timed_out;
+    }
+    var remaining_ms: i64 = timeout_ms;
+    while (true) {
+        if (ctx.isTerminating()) return .terminated;
+        const slice: i32 = if (remaining_ms < 0)
+            blocking_slice_ms
+        else
+            @intCast(@min(remaining_ms, @as(i64, blocking_slice_ms)));
+        const ready = std.posix.poll(fds, slice) catch 0;
+        if (ready > 0) return .ready;
+        if (remaining_ms >= 0) {
+            remaining_ms -= slice;
+            if (remaining_ms <= 0) return .timed_out;
+        }
+    }
+}
 
 /// Get linear memory (memory index 0) from an ExecEnv.
 fn getMemory(env: *ExecEnv) ?[]u8 {
@@ -125,6 +171,7 @@ pub fn wasiFdRead(env_opaque: *anyopaque) types.HostFnError!void {
 
     if (getCtx(env)) |ctx| {
         const result = ctxFdIoCore(ctx, mem, fd, iovs_ptr, iovs_len, nread_ptr, .read);
+        if (result == terminated_result) return error.Trap;
         env.pushI32(result) catch return error.StackOverflow;
         return;
     }
@@ -1244,7 +1291,10 @@ pub fn ctxFdIoCore(
                 if (n < slice.len) break;
             },
             .read => {
-                const n = doRead(ctx, &lease, slice) catch |e| return errnoToI32(e);
+                const n = doRead(ctx, &lease, slice) catch |e| {
+                    if (e == error.Terminated) return terminated_result;
+                    return errnoToI32(e);
+                };
                 total += @intCast(n);
                 if (n < slice.len) break;
             },
@@ -1291,6 +1341,17 @@ fn doRead(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []u8) !usize {
     const entry = lease.snapshot();
     switch (entry.kind) {
         .stdin => {
+            // Park on readiness first so a sibling's terminal outcome can
+            // interrupt what would otherwise be an indefinite blocking read.
+            if (comptime config.lib_wasi_threads and builtin.os.tag != .windows) {
+                var fds = [_]std.posix.pollfd{.{
+                    .fd = std.posix.STDIN_FILENO,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                if (waitForReadiness(ctx, &fds, -1) == .terminated)
+                    return error.Terminated;
+            }
             const file = std.Io.File.stdin();
             var buf: [4096]u8 = undefined;
             var r = file.reader(ctx.io, &buf);
@@ -2517,7 +2578,9 @@ pub fn wasiPollOneoff(env_opaque: *anyopaque) types.HostFnError!void {
         return;
     };
 
-    env.pushI32(ctxPollOneoffCore(ctx, mem, in_ptr, out_ptr, nsubs, ret_ptr)) catch return error.StackOverflow;
+    const poll_result = ctxPollOneoffCore(ctx, mem, in_ptr, out_ptr, nsubs, ret_ptr);
+    if (poll_result == terminated_result) return error.Trap;
+    env.pushI32(poll_result) catch return error.StackOverflow;
 }
 
 /// Return host monotonic clock in nanoseconds since an arbitrary epoch.
@@ -2810,14 +2873,16 @@ pub fn ctxPollOneoffCore(
         }
         if (pollfds.items.len > 0) {
             const timeout_ms: i32 = if (earliest_ns) |dur| nsToTimeoutMs(dur) else -1;
-            _ = std.posix.poll(pollfds.items, timeout_ms) catch 0;
+            if (waitForReadiness(ctx, pollfds.items, timeout_ms) == .terminated)
+                return terminated_result;
             did_poll = true;
         } else if (earliest_ns) |dur| {
             // Only clocks: use poll(2) with an empty fd set as a portable
             // sleep primitive that respects EINTR / cancellation the same
             // way the fd-readiness path does.
             var empty_fds: [0]std.posix.pollfd = .{};
-            _ = std.posix.poll(&empty_fds, nsToTimeoutMs(dur)) catch 0;
+            if (waitForReadiness(ctx, &empty_fds, nsToTimeoutMs(dur)) == .terminated)
+                return terminated_result;
         }
     }
 
@@ -5667,4 +5732,56 @@ test "ctxSockAcceptCore: TCP listener accepts a host-side connection" {
     var listener_lease = ctx.fd_table.acquire(guest_listen_fd).?;
     try std.testing.expectEqual(listen_fd, listener_lease.detachHostFd().?);
     listener_lease.release();
+}
+
+// ── Blocking-host-call interruption (#616 first-wins termination) ────────
+
+const BlockingPollProbe = struct {
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    result: i32 = 0,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *BlockingPollProbe) void {
+        self.result = ctxPollOneoffCore(self.ctx, self.mem, 0, 64, 1, 200);
+        self.finished.store(true, .release);
+    }
+};
+
+test "group termination: a blocking poll_oneoff is interrupted instead of waiting" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!config.lib_wasi_threads or is_single_threaded) return error.SkipZigTest;
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [256]u8 = @splat(0);
+    // A 60-second monotonic sleep: only termination can end this call early.
+    pollTestWriteClockSub(&mem, 0, 7, wasi.CLOCKID_MONOTONIC, 60 * std.time.ns_per_s, 0);
+
+    var probe = BlockingPollProbe{ .ctx = ctx, .mem = &mem };
+    const worker = try std.Thread.spawn(.{}, BlockingPollProbe.run, .{&probe});
+    // Give the worker time to park inside poll(2).
+    platform.usleep(20 * std.time.us_per_ms);
+    try std.testing.expect(!probe.finished.load(.acquire));
+
+    ctx.proc_exit(4);
+    worker.join();
+
+    try std.testing.expectEqual(terminated_result, probe.result);
+    try std.testing.expectEqual(@as(?u32, 4), ctx.getExitCode());
+}
+
+test "group termination: poll_oneoff still honours its own timeout when running" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(&mem, 0, 3, wasi.CLOCKID_MONOTONIC, std.time.ns_per_ms, 0);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCore(ctx, &mem, 0, 64, 1, 200),
+    );
+    try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 200).?);
+    try std.testing.expectEqual(@as(u64, 3), pollTestEventUserdata(&mem, 64, 0));
 }

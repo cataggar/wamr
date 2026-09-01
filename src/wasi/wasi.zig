@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const config = @import("config");
 const stable_resource = @import("../shared/stable_resource.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
+const termination = @import("../runtime/common/termination.zig");
 const Io = std.Io;
 const File = Io.File;
 
@@ -976,38 +977,16 @@ pub fn FdTableFor(comptime enabled: bool) type {
 
 pub const FdTable = FdTableFor(config.lib_wasi_threads);
 
-fn ExitStateFor(comptime enabled: bool) type {
-    return if (enabled) struct {
-        value: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
-
-        fn set(self: *@This(), code: u32) void {
-            self.value.store(code, .release);
-        }
-
-        fn get(self: *const @This()) ?u32 {
-            const raw = self.value.load(.acquire);
-            return if (raw == std.math.maxInt(u64)) null else @intCast(raw);
-        }
-    } else struct {
-        value: ?u32 = null,
-
-        fn set(self: *@This(), code: u32) void {
-            self.value = code;
-        }
-
-        fn get(self: *const @This()) ?u32 {
-            return self.value;
-        }
-    };
-}
+// The Preview-1 process exit status is one facet of the group's first-wins
+// terminal outcome; see `runtime/common/termination.zig`.
 
 // ── WASI Context ────────────────────────────────────────────────────────
 
 /// Shared WASI process state.
 ///
 /// Descriptors, preopens, arguments, environment, clocks, random source, and
-/// process exit status are shared by every guest thread. Per-thread stack,
-/// TLS, task, cancellation, and trap state lives in
+/// the process-wide terminal outcome are shared by every guest thread.
+/// Per-thread stack, TLS, task, cancellation, and trap state lives in
 /// `execution_context.ThreadExecutionContext`.
 pub const WasiProcessState = struct {
     allocator: std.mem.Allocator,
@@ -1017,7 +996,8 @@ pub const WasiProcessState = struct {
     args: []const []const u8 = &.{},
     env_vars: []const []const u8 = &.{},
     fd_table: FdTable,
-    exit_state: ExitStateFor(config.lib_wasi_threads) = .{},
+    /// First-wins terminal result for the whole thread group.
+    termination: termination.State = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: Io) !*WasiProcessState {
         const ctx = try allocator.create(WasiProcessState);
@@ -1168,7 +1148,18 @@ pub const WasiProcessState = struct {
     }
 
     pub fn getExitCode(self: *const WasiProcessState) ?u32 {
-        return self.exit_state.get();
+        return self.termination.exitCode();
+    }
+
+    /// The group's first-wins terminal outcome, or null while it is running.
+    pub fn terminalOutcome(self: *const WasiProcessState) ?termination.Outcome {
+        return self.termination.outcome();
+    }
+
+    /// True once any thread claimed the terminal outcome. Blocking host
+    /// operations poll this to unwind instead of waiting for completion.
+    pub fn isTerminating(self: *const WasiProcessState) bool {
+        return self.termination.isTerminating();
     }
 
     // ── args ────────────────────────────────────────────────────────
@@ -1350,8 +1341,11 @@ pub const WasiProcessState = struct {
 
     // ── proc ────────────────────────────────────────────────────────
 
+    /// Preview-1 `proc_exit`. Only the first terminating thread in the group
+    /// establishes the status; a racing trap or `proc_exit` cannot overwrite
+    /// it. Claiming also wakes siblings blocked in the host.
     pub fn proc_exit(self: *WasiProcessState, code: u32) void {
-        self.exit_state.set(code);
+        _ = self.termination.claimExit(code);
     }
 
     // ── random ──────────────────────────────────────────────────────
