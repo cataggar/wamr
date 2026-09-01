@@ -4712,6 +4712,18 @@ pub const HttpResponseP3 = struct {
 const http_live_response_buffer_bytes: usize = 64 * 1024;
 const http_live_response_wait_ns: i64 = 10 * std.time.ns_per_ms;
 
+/// Granularity at which `writeWire` reports wire progress.
+///
+/// `waitAndJoin`'s stall budget needs a *byte-granular* liveness signal
+/// for the socket. `transmitted_bytes` only advances once a whole
+/// `writeBodyChunk` (up to `http_live_response_buffer_bytes`) has been
+/// accepted, so a client that reads slower than one 64 KiB chunk per
+/// budget would be truncated even though it is making steady progress.
+/// Splitting each wire write into slices this size and counting every
+/// accepted slice lets a legitimately slow reader re-arm the budget
+/// while a client that has genuinely stopped reading still expires.
+const http_live_wire_progress_chunk_bytes: usize = 4 * 1024;
+
 /// Cap on bytes a guest may buffer *before* it selects the response
 /// (`response-outparam.set` / `canon task.return`). Pre-selection bytes
 /// cannot be transmitted — no head has been framed yet — so they cannot
@@ -4827,6 +4839,11 @@ const InboundHttpResponseSession = struct {
     callback_refs: std.atomic.Value(u32) = .init(0),
     output_started: std.atomic.Value(bool) = .init(false),
     writer_in_io: std.atomic.Value(bool) = .init(false),
+    /// Bytes the socket (or test sink) has actually accepted, counted
+    /// per `http_live_wire_progress_chunk_bytes` slice rather than per
+    /// body chunk. Drives the stall budget in `waitAndJoin` (#967
+    /// review issue 1).
+    wire_progress_bytes: std.atomic.Value(u64) = .init(0),
     tx_settled: std.atomic.Value(bool) = .init(false),
     guest_cancel_propagated: std.atomic.Value(bool) = .init(false),
 
@@ -4964,6 +4981,39 @@ const InboundHttpResponseSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.selected_response_handle == response_handle;
+    }
+
+    /// Map a head-framing failure onto the error code the client should
+    /// see. An over-declared `content-length` is a body-size fault, not
+    /// a host fault, and must not be laundered into a 500.
+    fn headPrepareErrorCode(err: anyerror) HttpErrorCode {
+        return switch (err) {
+            error.ResponseBodySize => .HTTP_response_body_size,
+            else => .internal_error,
+        };
+    }
+
+    /// True when the guest already handed over more body bytes than the
+    /// `content-length` it is about to declare.
+    ///
+    /// Pre-selection writes are staged before any head exists, so
+    /// `onBodyWrite`'s per-write check has nothing to compare against
+    /// and every staged byte is unchecked. Framing the head would then
+    /// commit to identity framing, migrate the staged surplus into the
+    /// ring and put it on the wire behind a short `Content-Length` —
+    /// with `Connection: keep-alive` on the P3 path a pipelining client
+    /// or intermediary reads the surplus as the head of the next
+    /// response (HTTP response splitting). Refusing before `head_ready`
+    /// is set means no wire byte has been emitted yet, so the connection
+    /// degrades cleanly to the `!output_started` error page instead.
+    ///
+    /// Caller holds `mutex`.
+    fn overDeclaredLengthLocked(
+        self: *const InboundHttpResponseSession,
+        expected: ?usize,
+    ) bool {
+        const limit = expected orelse return false;
+        return self.produced_bytes > limit;
     }
 
     fn validateClosedBody(self: *InboundHttpResponseSession) bool {
@@ -5428,10 +5478,15 @@ const InboundHttpResponseSession = struct {
             if (owned_trailers) |bytes| self.allocator.free(bytes);
             return;
         }
+        // `owned_head` is released by the `errdefer` above on these
+        // paths; freeing it here as well would double-free it.
         if (self.currentTerminal() != .running) {
-            self.allocator.free(owned_head);
             if (owned_trailers) |bytes| self.allocator.free(bytes);
             return error.ResponseCancelled;
+        }
+        if (self.overDeclaredLengthLocked(expected_content_length)) {
+            if (owned_trailers) |bytes| self.allocator.free(bytes);
+            return error.ResponseBodySize;
         }
         self.response_handle = response_handle;
         self.body_stream_handle = body_stream_handle;
@@ -5550,9 +5605,11 @@ const InboundHttpResponseSession = struct {
             self.allocator.free(owned_head);
             return;
         }
-        if (self.currentTerminal() != .running) {
-            self.allocator.free(owned_head);
-            return error.ResponseCancelled;
+        // `owned_head` is released by the `errdefer` above on these
+        // paths; freeing it here as well would double-free it.
+        if (self.currentTerminal() != .running) return error.ResponseCancelled;
+        if (self.overDeclaredLengthLocked(expected_content_length)) {
+            return error.ResponseBodySize;
         }
         self.p2_mode = true;
         self.response_handle = response_handle;
@@ -5576,11 +5633,11 @@ const InboundHttpResponseSession = struct {
         if (ready) return;
         const handle = response_handle orelse return;
         if (selected_response != handle) return;
-        self.prepareP3Head(handle) catch {
+        self.prepareP3Head(handle) catch |err| {
             self.mutex.lock();
             self.trailer_state = .failed;
             self.mutex.unlock();
-            self.failResponse(.internal_error, false);
+            self.failResponse(headPrepareErrorCode(err), false);
         };
         self.mutex.lock();
         const head_is_ready = self.head_ready;
@@ -5791,8 +5848,8 @@ const InboundHttpResponseSession = struct {
             self.failResponse(.HTTP_response_incomplete, false);
             return;
         }
-        self.prepareP2Head(response_handle) catch {
-            self.failResponse(.internal_error, false);
+        self.prepareP2Head(response_handle) catch |err| {
+            self.failResponse(headPrepareErrorCode(err), false);
             return;
         };
         self.mutex.lock();
@@ -5826,6 +5883,15 @@ const InboundHttpResponseSession = struct {
             self.p2_body_handle == body_handle;
         self.mutex.unlock();
         if (matches) self.markBodyClosed();
+    }
+
+    fn ownsP2Body(
+        self: *InboundHttpResponseSession,
+        body_handle: u32,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.p2_body_handle == body_handle;
     }
 
     fn p2BodyByteCount(
@@ -5958,8 +6024,8 @@ const InboundHttpResponseSession = struct {
                 self.prepareP2Head(response_handle)
             else
                 self.prepareP3Head(response_handle);
-            prepare catch {
-                self.failResponse(.internal_error, false);
+            prepare catch |err| {
+                self.failResponse(headPrepareErrorCode(err), false);
                 self.propagateTerminalToGuest();
                 return false;
             };
@@ -6180,8 +6246,8 @@ const InboundHttpResponseSession = struct {
         self.handler_outcome = .returned;
         if (body_handle == null) self.body_closed = true;
         self.mutex.unlock();
-        self.prepareP2Head(response_handle) catch {
-            self.failResponse(.internal_error, false);
+        self.prepareP2Head(response_handle) catch |err| {
+            self.failResponse(headPrepareErrorCode(err), false);
             return false;
         };
 
@@ -6201,7 +6267,7 @@ const InboundHttpResponseSession = struct {
             // response as incomplete right here.
             self.failResponse(
                 .HTTP_response_incomplete,
-                self.writer_in_io.load(.acquire),
+                self.writerMayBeInIo(),
             );
             return false;
         }
@@ -6219,12 +6285,10 @@ const InboundHttpResponseSession = struct {
         _ = self.finishTerminal(.handler_error, writer_may_be_in_io);
     }
 
-    fn writeWire(
+    fn writeWireSlice(
         self: *InboundHttpResponseSession,
         bytes: []const u8,
     ) !void {
-        self.writer_in_io.store(true, .release);
-        defer self.writer_in_io.store(false, .release);
         if (self.wire_writer) |writer| {
             return switch (writer.write(writer.context, bytes)) {
                 .ok => |n| if (n == bytes.len) {} else error.IoError,
@@ -6233,6 +6297,37 @@ const InboundHttpResponseSession = struct {
             };
         }
         try self.adapter.writeAllOutputStream(self.output, bytes);
+    }
+
+    /// Push `bytes` to the client, reporting progress after every
+    /// accepted slice.
+    ///
+    /// The production socket is a blocking TCP stream, so a client that
+    /// stops reading parks this call inside `write(2)` indefinitely.
+    /// `waitAndJoin` used to treat "the writer is inside a wire write"
+    /// as progress and re-armed its budget forever, which leaked the
+    /// connection thread, the writer thread and the socket to any peer
+    /// that simply stopped reading (#967 review issue 1). Slicing the
+    /// write means a peer that is merely slow keeps bumping
+    /// `wire_progress_bytes` and stays alive, while one that has
+    /// genuinely stalled produces no progress at all and expires.
+    fn writeWire(
+        self: *InboundHttpResponseSession,
+        bytes: []const u8,
+    ) !void {
+        self.writer_in_io.store(true, .release);
+        defer self.writer_in_io.store(false, .release);
+        if (bytes.len == 0) return self.writeWireSlice(bytes);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const take = @min(
+                bytes.len - offset,
+                http_live_wire_progress_chunk_bytes,
+            );
+            try self.writeWireSlice(bytes[offset .. offset + take]);
+            offset += take;
+            _ = self.wire_progress_bytes.fetchAdd(take, .acq_rel);
+        }
     }
 
     fn writeBodyChunk(
@@ -6338,9 +6433,16 @@ const InboundHttpResponseSession = struct {
 
     /// Snapshot of everything that can still move the response forward.
     /// `waitAndJoin` re-arms its stall budget whenever this changes, so
-    /// an actively streaming producer (or a writer parked inside a slow
-    /// client's socket write) never expires while a response nothing can
-    /// advance is settled within one budget.
+    /// an actively streaming producer, or a client that is merely slow
+    /// but still accepting bytes, never expires — while a response that
+    /// nothing can advance is settled within one budget.
+    ///
+    /// Deliberately *not* included: `writer_in_io`. Merely being parked
+    /// inside a blocking wire write is not progress — a peer that stops
+    /// reading holds that flag true forever and used to re-arm the
+    /// budget on every poll, leaking the connection (#967 review issue
+    /// 1). `wire_progress` is the byte-granular replacement: it only
+    /// advances when the peer actually accepts bytes.
     const CompletionProgress = struct {
         transmitted: usize,
         produced: usize,
@@ -6352,7 +6454,7 @@ const InboundHttpResponseSession = struct {
         trailer_state: HttpTrailerState,
         wire_complete: bool,
         callback_refs: u32,
-        writer_in_io: bool,
+        wire_progress: u64,
     };
 
     fn completionProgress(
@@ -6371,8 +6473,25 @@ const InboundHttpResponseSession = struct {
             .trailer_state = self.trailer_state,
             .wire_complete = self.wire_complete,
             .callback_refs = self.callback_refs.load(.acquire),
-            .writer_in_io = self.writer_in_io.load(.acquire),
+            .wire_progress = self.wire_progress_bytes.load(.acquire),
         };
+    }
+
+    /// Conservative "the writer may be parked in a blocking wire write"
+    /// predicate, matching `handlerFailed` and `abandonP2Body`.
+    ///
+    /// `writer_in_io` alone is an instantaneous sample and racy: the
+    /// caller typically reads it microseconds after releasing the
+    /// writer, while the writer is still in `waitEpoch` and has not yet
+    /// entered `writeWire`. Once the sample is lost it is lost
+    /// permanently, so also treat "a head is framed and there are bytes
+    /// for it" as possibly-in-I/O (#967 review issue 3).
+    fn writerMayBeInIo(self: *InboundHttpResponseSession) bool {
+        if (self.writer_in_io.load(.acquire)) return true;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.head_ready and
+            (self.produced_bytes != 0 or self.queue_len != 0);
     }
 
     fn waitAndJoin(self: *InboundHttpResponseSession) void {
@@ -6397,9 +6516,7 @@ const InboundHttpResponseSession = struct {
             if (self.currentTerminal() != .running) break;
 
             const now = self.completionProgress();
-            if (now.writer_in_io or now.callback_refs != 0 or
-                !std.meta.eql(now, progress))
-            {
+            if (now.callback_refs != 0 or !std.meta.eql(now, progress)) {
                 progress = now;
                 deadline = httpLiveMonotonicNs() +| self.completion_timeout_ns;
             } else if (self.completion_timeout_ns != 0 and
@@ -6416,8 +6533,35 @@ const InboundHttpResponseSession = struct {
             }
             self.waitEpoch(&self.terminal_epoch, observed);
         }
+        // The loop above is skipped entirely when a terminal was
+        // already set on entry, and can also exit on a terminal another
+        // thread set without interrupting. Either way the writer may
+        // still be parked in a blocking wire write that only the
+        // connection teardown can unblock, and `join` has no timeout —
+        // so make sure the escape has run before committing to it
+        // (#967 review issue 3).
+        self.ensureWriterUnblocked();
         thread.join();
         self.writer_thread = null;
+    }
+
+    /// Run the connection interrupt (socket shutdown) if the response
+    /// has failed and the writer may still be blocked on the wire.
+    ///
+    /// Teardown is idempotent, but it must not run for `.running` (the
+    /// response is still live), `.succeeded` (the writer has already
+    /// finished and keep-alive may reuse the socket) or `.fallback`
+    /// (the caller still has to write the whole response itself). It is
+    /// also gated on `writerMayBeInIo` so a failure detected before any
+    /// head reached the wire keeps the socket usable for the
+    /// `!output_started` error page.
+    fn ensureWriterUnblocked(self: *InboundHttpResponseSession) void {
+        switch (self.currentTerminal()) {
+            .running, .succeeded, .fallback => return,
+            else => {},
+        }
+        if (!self.writerMayBeInIo()) return;
+        if (self.interrupt) |connection| connection.run();
     }
 
     fn settleTransmission(
@@ -12590,15 +12734,27 @@ pub const WasiCliAdapter = struct {
                 else => null,
             };
             if (handle) |stream_handle| {
-                const is_http_body = blk: {
+                const body_handle: ?u32 = blk: {
                     var stream_lease = self.lookupStream(stream_handle) orelse
-                        break :blk false;
+                        break :blk null;
                     defer stream_lease.release();
-                    break :blk stream_lease.value().http_outgoing_body_handle != null;
+                    break :blk stream_lease.value().http_outgoing_body_handle;
                 };
-                if (is_http_body) {
+                if (body_handle) |body| {
+                    // `http_outgoing_body_handle` is set for *every*
+                    // outgoing body, including outbound
+                    // `outgoing-request` bodies whose sink is an
+                    // in-memory buffer. Reporting the inbound response
+                    // session's permit for those told a proxying guest
+                    // to wait on a buffer that can always accept, and
+                    // returned `ok(0)` — "write nothing, poll" — as
+                    // soon as the *inbound* connection reached a
+                    // terminal (#967 review issue 4). Only substitute
+                    // the permit for the session's own response body.
                     if (self.activeInboundHttpResponse(ci)) |session| {
-                        permit = session.writePermit();
+                        if (session.ownsP2Body(body)) {
+                            permit = session.writePermit();
+                        }
                     }
                 }
             }
@@ -30877,6 +31033,15 @@ fn serveOneHttpConnectionP3(
 /// requests doesn't park forever (#583 A5). Linux/POSIX-only — on
 /// Windows the listener path is gated behind the same builtin
 /// check, and the conformance suite isn't run there.
+///
+/// Deliberately no `SO_SNDTIMEO`: with a send timeout set, `sendmsg`
+/// reports `EAGAIN` once the peer's window is full, and the `std.Io`
+/// socket writer classifies that errno as a programmer bug — panicking
+/// in Debug builds. A peer that stops reading would then abort the host
+/// instead of being bounded. The stall budget in
+/// `InboundHttpResponseSession.waitAndJoin`, re-armed by byte-granular
+/// `wire_progress_bytes` rather than by "the writer is in I/O", is what
+/// bounds that case (#967 review issue 1).
 fn setKeepAliveIdleTimeout(fd: std.posix.fd_t, seconds: i64) void {
     if (builtin.target.os.tag == .windows) return;
     const tv = std.posix.timeval{ .sec = seconds, .usec = 0 };
@@ -47253,6 +47418,9 @@ const LiveHttpTestSink = struct {
     len: usize = 0,
     discard: bool = false,
     block_body: bool = false,
+    /// Per-write delay applied to body writes, modelling a client that
+    /// reads steadily but slowly (#967 review issue 1 positive control).
+    slow_body_us: u64 = 0,
     failure: Failure = .none,
     head_seen: std.atomic.Value(bool) = .init(false),
     blocked: std.atomic.Value(bool) = .init(false),
@@ -47277,6 +47445,7 @@ const LiveHttpTestSink = struct {
                 self.blocked.store(true, .release);
                 while (!self.release.load(.acquire)) platform.usleep(100);
             }
+            if (self.slow_body_us != 0) platform.usleep(self.slow_body_us);
             if (std.mem.indexOf(u8, data, "first") != null) {
                 self.first_seen.store(true, .release);
                 const returned = if (self.handler_returned) |flag|
@@ -49272,6 +49441,541 @@ test "wasi:http #962 regression: a producer outliving the handler is not truncat
         cursor = idx + 5;
     }
     try testing.expectEqual(@as(usize, 8), seen);
+}
+
+/// Runs `waitAndJoin` off the connection thread so a test can assert
+/// that it *settles*, rather than hanging the whole test binary when it
+/// does not (#967 review issues 1 and 3).
+const LiveHttpJoiner = struct {
+    session: *InboundHttpResponseSession,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn run(self: *LiveHttpJoiner) void {
+        self.session.waitAndJoin();
+        self.done.store(true, .release);
+    }
+
+    fn start(self: *LiveHttpJoiner) !void {
+        self.thread = try std.Thread.spawn(.{}, LiveHttpJoiner.run, .{self});
+    }
+
+    fn settled(self: *LiveHttpJoiner, limit_ms: usize) bool {
+        var waited: usize = 0;
+        while (waited < limit_ms) : (waited += 1) {
+            if (self.done.load(.acquire)) return true;
+            platform.usleep(std.time.us_per_ms);
+        }
+        return self.done.load(.acquire);
+    }
+
+    /// Always joins, releasing a stuck sink first so a failing
+    /// assertion reports cleanly instead of deadlocking the runner.
+    fn rescue(self: *LiveHttpJoiner, sink: *LiveHttpTestSink) void {
+        if (self.thread) |thread| {
+            if (!self.done.load(.acquire)) {
+                sink.release.store(true, .release);
+                _ = self.session.finishTerminal(.shutdown, true);
+            }
+            thread.join();
+            self.thread = null;
+        }
+    }
+};
+
+fn liveHttpHeadReady(session: *InboundHttpResponseSession) bool {
+    session.mutex.lock();
+    defer session.mutex.unlock();
+    return session.head_ready;
+}
+
+fn liveHttpTakeBodyStream(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    body_handle: u32,
+) !struct { handle: u32, owner: *OutputStreamOwner } {
+    var write_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyWrite(
+        adapter,
+        ci,
+        &.{.{ .handle = body_handle }},
+        &write_results,
+        adapter.allocator,
+    );
+    defer write_results[0].deinit(adapter.allocator);
+    const stream_handle = write_results[0].result_val.payload.?.handle;
+    var stream_lease = adapter.stream_table.acquire(stream_handle).?;
+    const owner = stream_lease.value().owner.?;
+    owner.retain();
+    stream_lease.release();
+    return .{ .handle = stream_handle, .owner = owner };
+}
+
+test "wasi:http #967 review issue 2: P2 over-declared content-length never reaches the wire" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P2 over-declared content-length never reaches the wire",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    // The guest declares five bytes and then hands over a hundred,
+    // every one of them before `response-outparam.set`.
+    const fixture = try makeLiveHttpP2Fixture(&adapter, 5);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpP2TestSession(&adapter, &ci, &output, &sink);
+    defer session.destroy();
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    const taken = try liveHttpTakeBodyStream(&adapter, &ci, fixture.body_handle);
+    defer taken.owner.release();
+
+    var surplus: [100]u8 = undefined;
+    @memset(&surplus, 'A');
+    try testing.expect(taken.owner.stream.write(&surplus, testing.allocator) == .ok);
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = taken.handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    finish_results[0].deinit(testing.allocator);
+    try testing.expect(!session.handlerReturnedP2(fixture.outparam_handle));
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    // The head must never have been framed: refusing before
+    // `head_ready` is what keeps the surplus off the wire and leaves
+    // the connection usable for the error page.
+    try testing.expect(!liveHttpHeadReady(session));
+    try testing.expect(!session.hasOutputStarted());
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+    try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_body_size),
+        session.response_error_code,
+    );
+}
+
+test "wasi:http #967 review issue 2: P3 over-declared content-length cannot split a keep-alive response" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P3 over-declared content-length cannot split a keep-alive response",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpResponseFixture(&adapter, &ci, 5, true, null);
+    var sink = LiveHttpTestSink{};
+    // `keep-alive` is the response-splitting vector: surplus body bytes
+    // behind a short `Content-Length` are parsed by a pipelining peer
+    // as the start of the next response.
+    const session = try InboundHttpResponseSession.create(
+        adapter.allocator,
+        &adapter,
+        &ci,
+        &output,
+        true,
+        .{ .context = &sink, .callback = &LiveHttpTestSink.interrupt },
+        .{ .context = &sink, .write = &LiveHttpTestSink.write },
+    );
+    defer session.destroy();
+    try session.start();
+    try testing.expect(session.attachP3Response(
+        fixture.response_handle,
+        fixture.body_handle,
+        fixture.trailers_handle,
+        fixture.transmission_handle,
+    ));
+
+    // `response.new` attaches eagerly, so everything written before
+    // `task.return` is pre-selection and used to be unchecked.
+    var surplus: [300]u8 = undefined;
+    @memset(&surplus, 'B');
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(session, &surplus));
+    InboundHttpResponseSession.onBodyClosed(session);
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expect(!liveHttpHeadReady(session));
+    try testing.expect(!session.hasOutputStarted());
+    try testing.expectEqual(@as(usize, 0), sink.contents().len);
+    try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_body_size),
+        session.response_error_code,
+    );
+    // Nothing that a pipelining peer could read as a second response.
+    try testing.expect(std.mem.indexOf(u8, sink.contents(), "keep-alive") == null);
+}
+
+test "wasi:http #967 review issue 1: a client that stops reading is bounded by the stall budget" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "a client that stops reading is bounded by the stall budget",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    // The client completed its request and then simply stopped reading:
+    // the blocking wire write never returns on its own.
+    var sink = LiveHttpTestSink{ .block_body = true };
+    const session = try startLiveHttpP2TestSession(&adapter, &ci, &output, &sink);
+    defer session.destroy();
+    session.completion_timeout_ns = 300 * std.time.ns_per_ms;
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    const taken = try liveHttpTakeBodyStream(&adapter, &ci, fixture.body_handle);
+    defer taken.owner.release();
+    try testing.expect(taken.owner.stream.write("hello", testing.allocator) == .ok);
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = taken.handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    try testing.expect(session.handlerReturnedP2(fixture.outparam_handle));
+    try waitForLiveHttpFlag(&sink.blocked);
+
+    // Every milestone is reached; only the wire is stuck. The writer
+    // sits inside `writeWire` forever, which used to re-arm the budget
+    // on every poll and leak the connection thread, writer thread and
+    // socket to any peer that stopped reading.
+    var joiner = LiveHttpJoiner{ .session = session };
+    try joiner.start();
+    const settled = joiner.settled(15_000);
+    joiner.rescue(&sink);
+    try testing.expect(settled);
+    session.propagateTerminalToGuest();
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_incomplete),
+        session.response_error_code,
+    );
+}
+
+test "wasi:http #967 review issue 1: a slow but progressing client is not truncated" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "a slow but progressing client is not truncated",
+        .limit_ms = 120_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    // 40ms per accepted 4 KiB slice: a whole 64 KiB body chunk takes
+    // ~640ms, well past the stall budget below. Nothing else in the
+    // progress snapshot moves while that chunk is being written, so a
+    // `transmitted_bytes`-only liveness signal truncates this
+    // perfectly healthy client; byte-granular wire progress does not.
+    var sink = LiveHttpTestSink{ .discard = true, .slow_body_us = 40 * std.time.us_per_ms };
+    const session = try startLiveHttpP2TestSession(&adapter, &ci, &output, &sink);
+    defer session.destroy();
+    session.completion_timeout_ns = 400 * std.time.ns_per_ms;
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    const taken = try liveHttpTakeBodyStream(&adapter, &ci, fixture.body_handle);
+    defer taken.owner.release();
+
+    const body_len = http_live_response_buffer_bytes * 2;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    @memset(body, 'c');
+
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    var writer = LiveHttpStreamWriter{
+        .stream = taken.owner.stream,
+        .allocator = testing.allocator,
+        .payload = body,
+    };
+    const thread = try std.Thread.spawn(.{}, LiveHttpStreamWriter.run, .{&writer});
+    thread.join();
+    try testing.expect(writer.accepted.load(.acquire));
+
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = taken.handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    try testing.expect(session.handlerReturnedP2(fixture.outparam_handle));
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(HttpLiveTerminal.succeeded, session.currentTerminal());
+    try testing.expectEqual(body_len, session.transmitted_bytes);
+}
+
+test "wasi:http #967 review issue 3: releasing the writer interrupts conservatively" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "releasing the writer interrupts conservatively",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpP2TestSession(&adapter, &ci, &output, &sink);
+    defer session.destroy();
+    session.completion_timeout_ns = 300 * std.time.ns_per_ms;
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    const taken = try liveHttpTakeBodyStream(&adapter, &ci, fixture.body_handle);
+    defer taken.owner.release();
+    try testing.expect(taken.owner.stream.write("hello", testing.allocator) == .ok);
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    try testing.expect(taken.owner.stream.write("world", testing.allocator) == .ok);
+    try waitForLiveHttpTransmitted(session, 10);
+
+    // Park the writer back in `waitEpoch` so an instantaneous
+    // `writer_in_io` sample reads false — exactly the TOCTOU that made
+    // the hard-fail below skip the connection teardown.
+    var attempts: usize = 0;
+    while (session.writer_in_io.load(.acquire) and attempts < 5_000) : (attempts += 1) {
+        platform.usleep(std.time.us_per_ms);
+    }
+    try testing.expect(!session.writer_in_io.load(.acquire));
+    try testing.expect(!sink.release.load(.acquire));
+
+    // The guest never finished or dropped the body; P2 dispatch is
+    // synchronous, so this is a hard fail that must tear the
+    // connection down rather than trust a lost sample.
+    try testing.expect(!session.handlerReturnedP2(fixture.outparam_handle));
+    try testing.expect(sink.release.load(.acquire));
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+}
+
+test "wasi:http #967 review issue 3: a terminal set before waitAndJoin still bounds the join" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "a terminal set before waitAndJoin still bounds the join",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    var sink = LiveHttpTestSink{ .block_body = true };
+    const session = try startLiveHttpP2TestSession(&adapter, &ci, &output, &sink);
+    defer session.destroy();
+    session.completion_timeout_ns = 300 * std.time.ns_per_ms;
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    const taken = try liveHttpTakeBodyStream(&adapter, &ci, fixture.body_handle);
+    defer taken.owner.release();
+    try testing.expect(taken.owner.stream.write("hello", testing.allocator) == .ok);
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = taken.handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    try testing.expect(session.handlerReturnedP2(fixture.outparam_handle));
+    try waitForLiveHttpFlag(&sink.blocked);
+
+    // A terminal reached without teardown while the writer is already
+    // inside the blocking wire write: `waitAndJoin` skips its budgeted
+    // loop entirely and used to fall into an unbounded `thread.join()`.
+    try testing.expect(session.finishTerminal(.io_error, false));
+    try testing.expect(!sink.release.load(.acquire));
+
+    var joiner = LiveHttpJoiner{ .session = session };
+    try joiner.start();
+    const settled = joiner.settled(15_000);
+    joiner.rescue(&sink);
+    try testing.expect(settled);
+    try testing.expectEqual(HttpLiveTerminal.io_error, session.currentTerminal());
+}
+
+test "wasi:http #967 review issue 4: check-write on an outbound request body reports the buffer permit" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "check-write on an outbound request body reports the buffer permit",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+
+    const fixture = try makeLiveHttpP2Fixture(&adapter, null);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpP2TestSession(&adapter, &ci, &output, &sink);
+    defer session.destroy();
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    // The proxy pattern: while serving the inbound request the handler
+    // also streams to an upstream. An outbound *request* body has no
+    // parent response, and its sink is an in-memory buffer.
+    const outbound = try adapter.allocator.create(OutgoingBody);
+    outbound.* = .{};
+    const outbound_handle = try adapter.pushOutgoingBody(outbound);
+    const outbound_stream = try liveHttpTakeBodyStream(&adapter, &ci, outbound_handle);
+    defer outbound_stream.owner.release();
+
+    // The inbound response body, for contrast: this one *is* the
+    // session's own body and must keep reporting the session permit.
+    const inbound_stream = try liveHttpTakeBodyStream(&adapter, &ci, fixture.body_handle);
+    defer inbound_stream.owner.release();
+
+    try testing.expectEqual(
+        @as(u64, 64 * 1024),
+        try liveHttpCheckWritePermit(&adapter, &ci, outbound_stream.handle),
+    );
+    try testing.expectEqual(
+        @as(u64, http_live_response_prebuffer_bytes),
+        try liveHttpCheckWritePermit(&adapter, &ci, inbound_stream.handle),
+    );
+
+    // The inbound client goes away. That must not stall the upstream
+    // request body, whose buffer can still accept everything.
+    try testing.expect(session.finishTerminal(.client_disconnected, false));
+    try testing.expectEqual(
+        @as(u64, 64 * 1024),
+        try liveHttpCheckWritePermit(&adapter, &ci, outbound_stream.handle),
+    );
+    try testing.expectEqual(
+        @as(u64, 0),
+        try liveHttpCheckWritePermit(&adapter, &ci, inbound_stream.handle),
+    );
+    session.waitAndJoin();
 }
 
 test "wasi:http #954 review: P3 trailer error and dropped writer fail response" {
