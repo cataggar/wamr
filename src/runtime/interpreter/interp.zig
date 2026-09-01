@@ -3614,10 +3614,9 @@ inline fn doAtomicCmpxchg(comptime T: type, ptr: *T, expected: T, replacement: T
 fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32) !struct { ptr: [*]u8, addr: usize } {
     const ma = readMemarg(code, ip);
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (!memInBounds(addr, size, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-    // Alignment check (atomics require natural alignment)
-    if (addr % size != 0) return error.UnalignedAtomicAccess;
     return .{ .ptr = mem.data.ptr + @as(usize, @intCast(addr)), .addr = @intCast(addr) };
 }
 
@@ -3639,9 +3638,9 @@ fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (!memInBounds(addr, size, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     doAtomicStore(T, ptr, val);
 }
@@ -3650,9 +3649,9 @@ fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (!memInBounds(addr, size, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     doAtomicStore(T, ptr, val);
 }
@@ -3661,9 +3660,9 @@ fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comp
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (!memInBounds(addr, size, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const old = doAtomicRmw(T, ptr, op, val);
     try env.pushI32(@bitCast(@as(u32, old)));
@@ -3673,9 +3672,9 @@ fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (!memInBounds(addr, size, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const old = doAtomicRmw(T, ptr, op, val);
     try env.pushI64(@bitCast(@as(u64, old)));
@@ -3686,9 +3685,9 @@ fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     const replacement: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const expected: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (!memInBounds(addr, size, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const result = doAtomicCmpxchg(T, ptr, expected, replacement);
     const old: u32 = if (result) |v| v else expected;
@@ -3700,9 +3699,9 @@ fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type
     const replacement: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const expected: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (!memInBounds(addr, size, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-    if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const result = doAtomicCmpxchg(T, ptr, expected, replacement);
     const old: u64 = if (result) |v| v else expected;

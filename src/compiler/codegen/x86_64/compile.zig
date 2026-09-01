@@ -6225,12 +6225,9 @@ fn compileInstRA(
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax);
-            try emitMemBoundsCheck(
-                code,
-                @as(u64, ld.offset) + @as(u64, ld.size),
-            );
             try addAtomicStaticOffset(code, ld.offset);
             try emitAtomicAlignmentCheck(code, .rax, ld.size);
+            try emitMemBoundsCheck(code, ld.size);
             try code.addRegReg(.rax, .r15);
             const result_reg = destReg(alloc_result, dest);
             try code.movRegMemSized(result_reg, .rax, 0, ld.size);
@@ -6240,12 +6237,9 @@ fn compileInstRA(
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax);
-            try emitMemBoundsCheck(
-                code,
-                @as(u64, st.offset) + @as(u64, st.size),
-            );
             try addAtomicStaticOffset(code, st.offset);
             try emitAtomicAlignmentCheck(code, .rax, st.size);
+            try emitMemBoundsCheck(code, st.size);
             try code.addRegReg(.rax, .r15);
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
@@ -6257,12 +6251,9 @@ fn compileInstRA(
             const base_reg = try useVReg(code, alloc_result, rmw.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax);
-            try emitMemBoundsCheck(
-                code,
-                @as(u64, rmw.offset) + @as(u64, rmw.size),
-            );
             try addAtomicStaticOffset(code, rmw.offset);
             try emitAtomicAlignmentCheck(code, .rax, rmw.size);
+            try emitMemBoundsCheck(code, rmw.size);
             try code.addRegReg(.rax, .r15);
             const val_reg = try useVReg(code, alloc_result, rmw.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
@@ -6312,12 +6303,9 @@ fn compileInstRA(
                 try useVReg(code, alloc_result, cmpxchg.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax);
-            try emitMemBoundsCheck(
-                code,
-                @as(u64, cmpxchg.offset) + @as(u64, cmpxchg.size),
-            );
             try addAtomicStaticOffset(code, cmpxchg.offset);
             try emitAtomicAlignmentCheck(code, .rax, cmpxchg.size);
+            try emitMemBoundsCheck(code, cmpxchg.size);
             try code.addRegReg(.rax, .r15);
             try code.movRegReg(.r11, .rax);
             const expected_reg =
@@ -7057,6 +7045,59 @@ test "compileFunctionRA: iconst_32 + ret" {
 
     try std.testing.expect(code.len > 5);
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: atomic alignment trap precedes bounds trap" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 65535 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = val, .type = .i32 });
+    try block.append(.{
+        .op = .{ .atomic_rmw = .{
+            .base = base,
+            .offset = 0,
+            .size = 4,
+            .val = val,
+            .op = .add,
+        } },
+        .dest = result,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(compile_result.code);
+
+    var unaligned_pattern = emit.CodeBuffer.init(allocator);
+    defer unaligned_pattern.deinit();
+    try unaligned_pattern.movRegMem(
+        .rax,
+        param_regs[0],
+        vmctx_trap_unaligned_fn_field,
+    );
+    var oob_pattern = emit.CodeBuffer.init(allocator);
+    defer oob_pattern.deinit();
+    try oob_pattern.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
+
+    const unaligned_idx = std.mem.indexOf(
+        u8,
+        compile_result.code,
+        unaligned_pattern.getCode(),
+    ) orelse return error.TestExpectedUnalignedTrapLoad;
+    const oob_idx = std.mem.indexOf(
+        u8,
+        compile_result.code,
+        oob_pattern.getCode(),
+    ) orelse return error.TestExpectedOobTrapLoad;
+    try std.testing.expect(unaligned_idx < oob_idx);
 }
 
 test "compileFunctionRA: prologue pins vmctx in rbx (#465) and memory_base in r15 (#466)" {

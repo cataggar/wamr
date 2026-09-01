@@ -29,11 +29,13 @@ which kills the run after 30 s and exits 124, so a regression that hangs fails
 the build instead of stalling CI.
 - `missing-thread-start` / `wrong-thread-start-signature`: spawn fails
   synchronously with a negative ABI result.
-- `unaligned-atomic-*`: load, store, RMW, and compare-exchange all produce the
-  same catchable natural-alignment trap in the interpreter and both AOT
-  backends.
-- `concurrent-table-grow`: a child loops through `call_indirect` while its
-  parent performs 2,047 shared-table growth operations.
+- `unaligned-atomic-*` / `oob-atomic-*`: load, store, RMW, compare-exchange,
+  wait32, wait64, and notify produce catchable alignment/bounds traps in the
+  interpreter and both AOT backends. `unaligned-oob-atomic-rmw` pins alignment
+  as the first trap.
+- `concurrent-table-grow`: a maxless table becomes address-stable only when a
+  child clone is requested, then survives 2,047 parent growth operations while
+  the child loops through `call_indirect`.
 - `disabled-rejection`: the disabled host import continues returning `-1`.
 
 The adjacent `.wasm` files are tracked so tests need no external SDK. Regenerate
@@ -54,5 +56,5 @@ The pinned `cataggar/wabt` parses atomic mnemonics but not the WAT `shared`
 limits keyword yet. `generate.zig` substitutes type-equivalent marker
 instructions, marks memories shared in WABT's IR, validates the ordinary WAT,
 then lowers the markers to atomic opcodes before writing the binaries.
-`memory.atomic.wait32` uses the same trick (`drop drop` has its stack effect)
-and is lowered with `align=4, offset=0`, so waits address memory directly.
+The wait32/wait64/notify markers use equivalent `drop` sequences and are
+lowered with their natural alignment and offset 0.
