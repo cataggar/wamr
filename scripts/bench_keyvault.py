@@ -204,7 +204,7 @@ def load_manifest(path: Path) -> Config:
     hot_func = perf.get("hot_func")
     min_samples = perf.get("min_samples")
     min_coverage_pct = perf.get("min_attribution_coverage_pct")
-    base = perf.get("base")
+    perf_base = perf.get("base")
     if not isinstance(core_index, int) or core_index < 0:
         raise HarnessError("perf.core_index must be a non-negative integer")
     if hot_func is not None and (not isinstance(hot_func, int) or hot_func < 0):
@@ -217,8 +217,9 @@ def load_manifest(path: Path) -> Config:
         raise HarnessError(
             "perf.min_attribution_coverage_pct must be in the range (0, 100]"
         )
-    if base is not None and (
-        not isinstance(base, str) or re.fullmatch(r"0x[0-9a-fA-F]+", base) is None
+    if perf_base is not None and (
+        not isinstance(perf_base, str)
+        or re.fullmatch(r"0x[0-9a-fA-F]+", perf_base) is None
     ):
         raise HarnessError("perf.base must be null or a hexadecimal address")
 
@@ -249,7 +250,7 @@ def load_manifest(path: Path) -> Config:
             "hot_func": hot_func,
             "min_samples": min_samples,
             "min_attribution_coverage_pct": float(min_coverage_pct),
-            "base": base,
+            "base": perf_base,
         },
     )
 

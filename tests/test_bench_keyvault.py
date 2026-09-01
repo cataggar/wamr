@@ -178,6 +178,27 @@ class KeyvaultHarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(bench.HarnessError, "40-character"):
             bench.load_manifest(self.manifest)
 
+    def test_relative_paths_resolve_against_manifest_directory(self) -> None:
+        document = self._manifest_document()
+        manifest_dir = self.manifest.parent.resolve()
+        document["workload"]["component"]["path"] = str(
+            self.component.resolve().relative_to(manifest_dir)
+        )
+        document["workload"]["preopens_file"]["path"] = str(
+            self.preopens.resolve().relative_to(manifest_dir)
+        )
+        document["workload"]["mounts"][0]["path"] = str(
+            self.spec.resolve().relative_to(manifest_dir)
+        )
+        document["perf"]["base"] = "0x400000"
+        self.manifest.write_text(json.dumps(document), encoding="UTF-8")
+
+        config = bench.load_manifest(self.manifest)
+        self.assertEqual(config.component, self.component.resolve())
+        self.assertEqual(config.preopens_file, self.preopens.resolve())
+        self.assertEqual(config.mounts[0].host, self.spec.resolve())
+        self.assertEqual(config.perf["base"], "0x400000")
+
     def test_checked_in_schema_and_example_track_parser_version(self) -> None:
         directory = ROOT / "tests" / "benchmarks" / "keyvault"
         schema = json.loads(
