@@ -52,7 +52,11 @@ fn sleepNs(ns: u64) void {
         };
         _ = std.os.linux.nanosleep(&ts, null);
     } else if (comptime builtin.os.tag == .windows) {
-        std.os.windows.kernel32.Sleep(@intCast(ns / std.time.ns_per_ms));
+        // NtDelayExecution takes 100 ns units, negative for a relative delay
+        // — the same primitive `src/platform/platform.zig` uses.
+        const hundred_ns: u64 = @min(ns / 100, @as(u64, @intCast(std.math.maxInt(i64))));
+        const delay: std.os.windows.LARGE_INTEGER = -@as(i64, @intCast(hundred_ns));
+        _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &delay);
     } else {
         // macOS and other POSIX hosts: busy-yield in coarse steps. The
         // watchdog is idle bookkeeping, so precision does not matter.
