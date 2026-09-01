@@ -439,6 +439,13 @@ pub fn build(b: *std.Build) void {
         "unaligned-atomic-store",
         "unaligned-atomic-rmw",
         "unaligned-atomic-cmpxchg",
+        "unaligned-atomic-wait32",
+        "oob-atomic-wait32",
+        "unaligned-atomic-wait64",
+        "oob-atomic-wait64",
+        "unaligned-atomic-notify",
+        "oob-atomic-notify",
+        "unaligned-oob-atomic-rmw",
         "concurrent-table-grow",
     }) |fixture| {
         update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wat", .{fixture}));
@@ -535,6 +542,13 @@ pub fn build(b: *std.Build) void {
                 "unaligned-atomic-store",
                 "unaligned-atomic-rmw",
                 "unaligned-atomic-cmpxchg",
+                "unaligned-atomic-wait32",
+                "oob-atomic-wait32",
+                "unaligned-atomic-wait64",
+                "oob-atomic-wait64",
+                "unaligned-atomic-notify",
+                "oob-atomic-notify",
+                "unaligned-oob-atomic-rmw",
             }) |fixture| {
                 const run = b.addRunArtifact(exe);
                 run.addArgs(&.{
@@ -542,6 +556,35 @@ pub fn build(b: *std.Build) void {
                     b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}),
                 });
                 run.expectExitCode(1);
+                wasi_threads_test_step.dependOn(&run.step);
+            }
+            const ordering_interp = b.addRunArtifact(exe);
+            ordering_interp.addArgs(&.{
+                "run",
+                "tests/wasi-threads/unaligned-oob-atomic-rmw.wasm",
+            });
+            ordering_interp.expectExitCode(1);
+            ordering_interp.expectStdErrEqual(
+                "Error: execution trapped: UnalignedAtomicAccess\n",
+            );
+            wasi_threads_test_step.dependOn(&ordering_interp.step);
+            inline for (.{
+                .{
+                    "unaligned-atomic-wait32",
+                    "Error: execution trapped: UnalignedAtomicAccess\n",
+                },
+                .{
+                    "oob-atomic-wait32",
+                    "Error: execution trapped: OutOfBoundsMemoryAccess\n",
+                },
+            }) |trap_case| {
+                const run = b.addRunArtifact(exe);
+                run.addArgs(&.{
+                    "run",
+                    b.fmt("tests/wasi-threads/{s}.wasm", .{trap_case[0]}),
+                });
+                run.expectExitCode(1);
+                run.expectStdErrEqual(trap_case[1]);
                 wasi_threads_test_step.dependOn(&run.step);
             }
 
@@ -610,9 +653,46 @@ pub fn build(b: *std.Build) void {
                 "unaligned-atomic-store",
                 "unaligned-atomic-rmw",
                 "unaligned-atomic-cmpxchg",
+                "unaligned-atomic-wait32",
+                "oob-atomic-wait32",
+                "unaligned-atomic-wait64",
+                "oob-atomic-wait64",
+                "unaligned-atomic-notify",
+                "oob-atomic-notify",
+                "unaligned-oob-atomic-rmw",
             }) |fixture| {
                 addAotThreadFixture(b, aot_thread_spawn_step, wamrc, fixture, 1, null, null);
             }
+            addAotThreadFixtureExpected(
+                b,
+                aot_thread_spawn_step,
+                wamrc,
+                "unaligned-oob-atomic-rmw",
+                1,
+                null,
+                "Error: AOT execution failed: UnalignedAtomicAccess\n",
+                null,
+            );
+            addAotThreadFixtureExpected(
+                b,
+                aot_thread_spawn_step,
+                wamrc,
+                "unaligned-atomic-wait32",
+                1,
+                null,
+                "Error: AOT execution failed: UnalignedAtomicAccess\n",
+                null,
+            );
+            addAotThreadFixtureExpected(
+                b,
+                aot_thread_spawn_step,
+                wamrc,
+                "oob-atomic-wait32",
+                1,
+                null,
+                "Error: AOT execution failed: OutOfBoundsMemoryAccess\n",
+                null,
+            );
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "concurrent-table-grow", 0, null, null);
         } else {
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "disabled-rejection", 0, null, null);
@@ -2249,6 +2329,28 @@ fn addAotThreadFixture(
     expected_stdout: ?[]const u8,
     map_dir: ?[]const u8,
 ) void {
+    addAotThreadFixtureExpected(
+        b,
+        parent,
+        wamrc,
+        name,
+        expected_exit,
+        expected_stdout,
+        null,
+        map_dir,
+    );
+}
+
+fn addAotThreadFixtureExpected(
+    b: *std.Build,
+    parent: *std.Build.Step,
+    wamrc: *std.Build.Step.Compile,
+    name: []const u8,
+    expected_exit: u8,
+    expected_stdout: ?[]const u8,
+    expected_stderr: ?[]const u8,
+    map_dir: ?[]const u8,
+) void {
     const run = b.addRunArtifact(wamrc);
     run.addArg("run");
     run.addArg("-o");
@@ -2262,6 +2364,7 @@ fn addAotThreadFixture(
     run.step.dependOn(b.getInstallStep());
     run.expectExitCode(expected_exit);
     if (expected_stdout) |stdout| run.expectStdOutEqual(stdout);
+    if (expected_stderr) |stderr| run.expectStdErrEqual(stderr);
     parent.dependOn(&run.step);
 }
 

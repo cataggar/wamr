@@ -716,6 +716,12 @@ const TrapDecodeFrame = struct {
     mem_size: usize = 0,
 };
 
+pub const TrapReason = enum(u8) {
+    unknown,
+    out_of_bounds_memory,
+    unaligned_atomic,
+};
+
 /// Per-native-call AOT bookkeeping. A stack-local instance is bound to the
 /// active `ThreadExecutionContext`, so concurrent AOT calls never share trap
 /// decode, jump-buffer, or cancellation/trap state.
@@ -728,6 +734,8 @@ const AotCallState = struct {
     trap_catching: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     trap_occurred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     last_trap_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    trap_reason: std.atomic.Value(u8) =
+        std.atomic.Value(u8).init(@intFromEnum(TrapReason.unknown)),
 };
 
 // 0 = uninitialized, 1 = one thread is installing, 2 = ready.
@@ -762,6 +770,11 @@ fn activeAotCallState() ?*AotCallState {
 fn isTrapCatching() bool {
     const state = activeAotCallState() orelse return false;
     return state.trap_catching.load(.seq_cst);
+}
+
+fn noteTrapReason(reason: TrapReason) void {
+    const state = activeAotCallState() orelse return;
+    state.trap_reason.store(@intFromEnum(reason), .release);
 }
 
 /// Install the calling AOT instance's diagnostic identity. Caller is
@@ -815,6 +828,7 @@ pub export fn aotProbeDecodePc(pc: usize) callconv(.c) void {
 }
 
 pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
+    noteTrapReason(.out_of_bounds_memory);
     const loc = decodeTrapReturnAddress(@returnAddress());
     if (isTrapCatching()) {
         // Caller has armed trap-as-error; unwind instead of exiting.
@@ -1027,9 +1041,29 @@ pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
 
 pub fn aotTrapUnaligned(vmctx: *VmCtx) callconv(.c) noreturn {
     _ = vmctx;
+    noteTrapReason(.unaligned_atomic);
     const loc = decodeTrapReturnAddress(@returnAddress());
     if (isTrapCatching()) trapLongjmp();
     printTrapWithPc("unaligned atomic access", loc);
+    std.process.exit(2);
+}
+
+fn aotTrapOOBFromHost(vmctx: *VmCtx) noreturn {
+    noteTrapReason(.out_of_bounds_memory);
+    if (isTrapCatching()) trapLongjmp();
+    std.debug.print(
+        "wasm trap: out of bounds memory access (mem_size=0x{x})\n",
+        .{vmctx.memory_size},
+    );
+    aotTrapOobDumpMem(vmctx);
+    std.process.exit(2);
+}
+
+fn aotTrapUnalignedFromHost(vmctx: *VmCtx) noreturn {
+    _ = vmctx;
+    noteTrapReason(.unaligned_atomic);
+    if (isTrapCatching()) trapLongjmp();
+    std.debug.print("wasm trap: unaligned atomic access\n", .{});
     std.process.exit(2);
 }
 
@@ -1100,11 +1134,11 @@ pub fn terminateAotThread(vmctx: *VmCtx) noreturn {
 pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32, timeout_hi: u32) callconv(.c) i32 {
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
     if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
-    const mem = aotWaitMemory(vmctx, addr, 4) orelse return 1;
+    const mem = aotWaitMemory(vmctx, addr, 4);
     const result = mem.wait32(addr, expected, timeout_ns) catch |err| switch (err) {
         error.NotShared => return 1,
-        error.OutOfBounds,
-        error.Unaligned,
+        error.OutOfBounds => aotTrapOOBFromHost(vmctx),
+        error.Unaligned => aotTrapUnalignedFromHost(vmctx),
         error.InvalidAddress,
         error.InvalidArgument,
         error.Unsupported,
@@ -1125,11 +1159,11 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
     const expected: u64 = @as(u64, exp_hi) << 32 | @as(u64, exp_lo);
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
     if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
-    const mem = aotWaitMemory(vmctx, addr, 8) orelse return 1;
+    const mem = aotWaitMemory(vmctx, addr, 8);
     const result = mem.wait64(addr, expected, timeout_ns) catch |err| switch (err) {
         error.NotShared => return 1,
-        error.OutOfBounds,
-        error.Unaligned,
+        error.OutOfBounds => aotTrapOOBFromHost(vmctx),
+        error.Unaligned => aotTrapUnalignedFromHost(vmctx),
         error.InvalidAddress,
         error.InvalidArgument,
         error.Unsupported,
@@ -1149,11 +1183,11 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
 /// Wakes up to `count` threads waiting on `mem[addr]`.
 /// Returns the number of threads actually woken.
 pub fn aotAtomicNotify(vmctx: *VmCtx, addr: u32, count: u32) callconv(.c) i32 {
-    const mem = aotWaitMemory(vmctx, addr, 4) orelse return 0;
+    const mem = aotWaitMemory(vmctx, addr, 4);
     return @intCast(mem.notify(addr, count) catch |err| switch (err) {
-        error.NotShared,
-        error.OutOfBounds,
-        error.Unaligned,
+        error.NotShared => return 0,
+        error.OutOfBounds => aotTrapOOBFromHost(vmctx),
+        error.Unaligned => aotTrapUnalignedFromHost(vmctx),
         error.InvalidAddress,
         error.InvalidArgument,
         error.Unsupported,
@@ -1162,12 +1196,14 @@ pub fn aotAtomicNotify(vmctx: *VmCtx, addr: u32, count: u32) callconv(.c) i32 {
     });
 }
 
-fn aotWaitMemory(vmctx: *VmCtx, addr: u32, width: u32) ?*types.MemoryInstance {
-    if (vmctx.instance_ptr == 0) return null;
+fn aotWaitMemory(vmctx: *VmCtx, addr: u32, width: u32) *types.MemoryInstance {
+    std.debug.assert(std.math.isPowerOfTwo(width));
+    if (addr & (width - 1) != 0) aotTrapUnalignedFromHost(vmctx);
+    if (vmctx.instance_ptr == 0) aotTrapOOBFromHost(vmctx);
     const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
-    if (inst.memories.len == 0) return null;
+    if (inst.memories.len == 0) aotTrapOOBFromHost(vmctx);
     const mem = inst.memories[0];
-    if (@as(u64, addr) + width > mem.byteLen()) return null;
+    if (@as(u64, addr) + width > mem.byteLen()) aotTrapOOBFromHost(vmctx);
     return mem;
 }
 
@@ -1284,7 +1320,7 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
         return -1;
     const new_size: usize = @intCast(new_size_u64);
 
-    if (comptime config.lib_wasi_threads) {
+    if (shared.hasThreadStableAotBacking()) {
         // Commit stable native backing first. If the interpreter-only slice
         // cannot grow, reslice the already-committed reservation back to its
         // old logical length; no address or allocation needs to be undone.
@@ -1745,6 +1781,11 @@ pub const AotInstance = struct {
     allocator: std.mem.Allocator,
     /// Stable vmctx storage used by AOT calls and MemoryInstance subscriber lists.
     vmctx: VmCtx = .{},
+    /// Reason recorded by the most recent catchable trap in this instance.
+    /// The public call still returns `error.WasmTrap`; embedders and the CLI
+    /// may inspect this for diagnostic parity with the interpreter.
+    last_trap_reason: std.atomic.Value(u8) =
+        std.atomic.Value(u8).init(@intFromEnum(TrapReason.unknown)),
     /// Base address of the mapped executable code (null if not yet mapped).
     code_base: ?[*]const u8 = null,
     /// Size of the mapped executable region (for cleanup).
@@ -2130,6 +2171,23 @@ pub fn cloneForThread(
     if (comptime config.lazy_jit) return error.WasiThreadsAotNotImplemented;
     if (parent.code_base != null and parent.code_mapping == null)
         return error.CodeMappingFailed;
+
+    // A table is moved into its bounded, address-stable reservation only when
+    // a native child is actually requested. The parent is paused in the spawn
+    // host call here, and any pre-existing subscribers are refreshed before
+    // the child can execute. The old heap arrays remain retired until final
+    // table release, so a concurrent cross-module caller cannot dereference
+    // freed storage during this one-time migration.
+    for (parent.tables) |table| {
+        table.lock();
+        const was_stable = table.hasThreadStableAotBacking();
+        table.ensureThreadStableAotBacking(parent.allocator) catch {
+            table.unlock();
+            return error.OutOfMemory;
+        };
+        if (!was_stable) refreshTableSubscribers(table);
+        table.unlock();
+    }
 
     const child = allocator.create(AotInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(child);
@@ -2538,6 +2596,10 @@ pub fn findExportFunc(inst: *const AotInstance, name: []const u8) ?u32 {
         if (exp.kind == .function and std.mem.eql(u8, exp.name, name)) return exp.index;
     }
     return null;
+}
+
+pub fn lastTrapReason(inst: *const AotInstance) TrapReason {
+    return @enumFromInt(inst.last_trap_reason.load(.acquire));
 }
 
 fn functionTypeForIndex(
@@ -3077,6 +3139,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
+    inst.last_trap_reason.store(@intFromEnum(TrapReason.unknown), .release);
     var aot_call_state = AotCallState{};
     var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
@@ -3574,6 +3637,7 @@ pub fn callFuncScalar(
         raw[args.len] = @intFromPtr(&hrp_buf);
     }
 
+    inst.last_trap_reason.store(@intFromEnum(TrapReason.unknown), .release);
     var aot_call_state = AotCallState{};
     var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
@@ -3615,6 +3679,10 @@ pub fn callFuncScalar(
             if (aot_call_state.last_trap_code.load(.seq_cst) == 0xC00000FD) {
                 resetStackGuardPage();
             }
+            inst.last_trap_reason.store(
+                aot_call_state.trap_reason.load(.acquire),
+                .release,
+            );
             readGlobalsFromStorage(inst, globals_buf);
             return error.WasmTrap;
         }
@@ -3631,6 +3699,10 @@ pub fn callFuncScalar(
             // A trap helper unwound back here.
             aot_call_state.trap_catching.store(false, .seq_cst);
             call_thread_context.markTrap();
+            inst.last_trap_reason.store(
+                aot_call_state.trap_reason.load(.acquire),
+                .release,
+            );
             readGlobalsFromStorage(inst, globals_buf);
             return error.WasmTrap;
         }
@@ -4736,7 +4808,7 @@ test "AOT thread context inherits retained process state without thread-local fl
     try std.testing.expectEqual(@as(usize, 0), tracker.refs);
 }
 
-test "AOT thread clone shares code memory and tables while isolating globals and VmCtx" {
+test "AOT thread clone bounds maxless table reservation while sharing resources" {
     if (comptime !config.lib_wasi_threads or !can_execute_native)
         return error.SkipZigTest;
 
@@ -4775,7 +4847,7 @@ test "AOT thread clone shares code memory and tables while isolating globals and
     }};
     const tables = [_]types.TableType{.{
         .elem_type = .funcref,
-        .limits = .{ .min = 1, .max = 2 },
+        .limits = .{ .min = 1 },
     }};
     const globals = [_]aot_loader.AotGlobalInit{.{
         .val_type = @intFromEnum(types.ValType.i32),
@@ -4800,6 +4872,8 @@ test "AOT thread clone shares code memory and tables while isolating globals and
         execution_context.ProcessStateRef.init(@ptrCast(&tracker), &process_ops);
     const parent = try instantiate(&module, std.testing.allocator);
     try mapCodeExecutable(parent);
+    try std.testing.expect(!parent.tables[0].hasThreadStableAotBacking());
+    try std.testing.expectEqual(@as(usize, 0), parent.tables[0].aotBackingReservedBytes());
     parent.attachProcessState(root_ref);
     parent.thread_context.configureWasiThread(1, 0x1111, null);
     parent.thread_context.requestCancellation();
@@ -4816,6 +4890,9 @@ test "AOT thread clone shares code memory and tables while isolating globals and
     const child = try cloneForThread(parent, std.testing.allocator);
     parent.vmctx.globals_ptr = 0;
     child.thread_context.configureWasiThread(2, 0x2222, null);
+    try std.testing.expect(parent.tables[0].hasThreadStableAotBacking());
+    try std.testing.expect(parent.tables[0].aotBackingReservedBytes() > 0);
+    try std.testing.expect(parent.tables[0].aotBackingReservedBytes() <= 16 * 1024 * 1024);
 
     try std.testing.expectEqual(parent.memories[0], child.memories[0]);
     try std.testing.expectEqual(parent.tables[0], child.tables[0]);

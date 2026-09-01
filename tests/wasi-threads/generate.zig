@@ -7,6 +7,8 @@ const AtomicMarkers = struct {
     rmw_adds: usize,
     cmpxchgs: usize,
     wait32s: usize,
+    wait64s: usize,
+    notifies: usize,
 };
 
 fn replaceAll(
@@ -37,6 +39,8 @@ fn rewriteAtomicText(
         .rmw_adds = std.mem.count(u8, source, "i32.atomic.rmw.add"),
         .cmpxchgs = std.mem.count(u8, source, "i32.atomic.rmw.cmpxchg"),
         .wait32s = std.mem.count(u8, source, "memory.atomic.wait32"),
+        .wait64s = std.mem.count(u8, source, "memory.atomic.wait64"),
+        .notifies = std.mem.count(u8, source, "memory.atomic.notify"),
     };
     // `memory.atomic.wait32` consumes [addr:i32, expected:i32, timeout:i64]
     // and produces i32; `drop drop` has the same stack effect and leaves a
@@ -44,11 +48,27 @@ fn rewriteAtomicText(
     var rewritten = try replaceAll(
         allocator,
         source,
-        "memory.atomic.wait32",
-        "nop nop nop drop drop",
+        "memory.atomic.notify",
+        "nop nop nop nop nop drop",
     );
     errdefer allocator.free(rewritten);
     var next = try replaceAll(
+        allocator,
+        rewritten,
+        "memory.atomic.wait64",
+        "nop nop nop nop drop drop",
+    );
+    allocator.free(rewritten);
+    rewritten = next;
+    next = try replaceAll(
+        allocator,
+        rewritten,
+        "memory.atomic.wait32",
+        "nop nop nop drop drop",
+    );
+    allocator.free(rewritten);
+    rewritten = next;
+    next = try replaceAll(
         allocator,
         rewritten,
         "i32.atomic.rmw.cmpxchg",
@@ -93,6 +113,8 @@ fn lowerAtomicMarkers(
         .rmw_adds = 0,
         .cmpxchgs = 0,
         .wait32s = 0,
+        .wait64s = 0,
+        .notifies = 0,
     };
     for (module.funcs.items) |*function| {
         if (function.is_import or function.code_bytes.len == 0) continue;
@@ -101,7 +123,17 @@ fn lowerAtomicMarkers(
         var i: usize = 0;
         while (i < function.code_bytes.len) : (i += 1) {
             const remaining = function.code_bytes[i..];
-            if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x01, 0x1A, 0x1A })) {
+            if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x01, 0x01, 0x01, 0x1A })) {
+                // memory.atomic.notify align=2 (4-byte) offset=0
+                try output.appendSlice(allocator, &.{ 0xfe, 0x00, 0x02, 0x00 });
+                i += 5;
+                actual.notifies += 1;
+            } else if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x01, 0x01, 0x1A, 0x1A })) {
+                // memory.atomic.wait64 align=3 (8-byte) offset=0
+                try output.appendSlice(allocator, &.{ 0xfe, 0x02, 0x03, 0x00 });
+                i += 5;
+                actual.wait64s += 1;
+            } else if (std.mem.startsWith(u8, remaining, &.{ 0x01, 0x01, 0x01, 0x1A, 0x1A })) {
                 // memory.atomic.wait32 align=2 (4-byte) offset=0
                 try output.appendSlice(allocator, &.{ 0xfe, 0x01, 0x02, 0x00 });
                 i += 4;
@@ -134,21 +166,27 @@ fn lowerAtomicMarkers(
         actual.stores != expected.stores or
         actual.rmw_adds != expected.rmw_adds or
         actual.cmpxchgs != expected.cmpxchgs or
-        actual.wait32s != expected.wait32s)
+        actual.wait32s != expected.wait32s or
+        actual.wait64s != expected.wait64s or
+        actual.notifies != expected.notifies)
     {
         std.debug.print(
-            "atomic marker mismatch: expected {d}/{d}/{d}/{d}/{d}, found {d}/{d}/{d}/{d}/{d}\n",
+            "atomic marker mismatch: expected {d}/{d}/{d}/{d}/{d}/{d}/{d}, found {d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
             .{
                 expected.loads,
                 expected.stores,
                 expected.rmw_adds,
                 expected.cmpxchgs,
                 expected.wait32s,
+                expected.wait64s,
+                expected.notifies,
                 actual.loads,
                 actual.stores,
                 actual.rmw_adds,
                 actual.cmpxchgs,
                 actual.wait32s,
+                actual.wait64s,
+                actual.notifies,
             },
         );
         return error.AtomicMarkerMismatch;

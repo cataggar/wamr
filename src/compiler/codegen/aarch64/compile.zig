@@ -6908,8 +6908,7 @@ fn emitAtomicMemAddr(
     offset: u32,
     size: u8,
 ) !void {
-    const end_offset: u64 = @as(u64, offset) + @as(u64, size);
-    try emitMemIndexImpl(code, reg_map, base_vreg, end_offset, false);
+    try emitMemIndex(code, reg_map, base_vreg);
     if (offset != 0) {
         if (offset <= 0xFFF) {
             try code.addImm(RegMap.tmp2, RegMap.tmp2, @intCast(offset));
@@ -6919,6 +6918,7 @@ fn emitAtomicMemAddr(
         }
     }
     try emitAtomicAlignmentCheck(code, RegMap.tmp2, size);
+    try emitMemIndexBoundsCheck(code, RegMap.tmp2, size);
     try code.addRegReg(RegMap.tmp0, .x20, RegMap.tmp2);
 }
 
@@ -6975,47 +6975,56 @@ fn emitMemIndexImpl(
     end_offset: u64,
     skip_bounds: bool,
 ) !void {
-    // Step 1: zero-extend wasm address into tmp2 (kept alive across check).
+    try emitMemIndex(code, reg_map, base_vreg);
+    if (!skip_bounds)
+        try emitMemIndexBoundsCheck(code, RegMap.tmp2, end_offset);
+}
+
+fn emitMemIndex(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    base_vreg: ir.VReg,
+) !void {
     const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
     try code.movRegReg32(RegMap.tmp2, src);
+}
 
-    if (!skip_bounds) {
-        // Step 2: compute end = tmp2 + end_offset in tmp1.
-        if (end_offset == 0) {
-            try code.movRegReg(RegMap.tmp1, RegMap.tmp2);
-        } else if (end_offset <= 0xFFF) {
-            try code.addImm(RegMap.tmp1, RegMap.tmp2, @intCast(end_offset));
-        } else {
-            try code.movImm64(RegMap.tmp1, end_offset);
-            try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
-        }
-
-        // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1)
-        // directly from the pinned vmctx in x19.
-        try code.ldrImm(RegMap.tmp0, .x19, vmctx_memsize_slot);
-
-        // Step 4: cmp end, mem_size; B.LS over_trap.
-        try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
-        const over_patch = code.len();
-        try code.bCond(.ls, 0); // placeholder
-
-        // Trap path.
-        try code.movRegReg(.x0, .x19);
-        try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
-        try code.blr(RegMap.tmp0);
-        try code.brk(0);
-
-        // Patch B.LS to land here.
-        const over_target = code.len();
-        const delta_words: i19 = @intCast(@divExact(
-            @as(i64, @intCast(over_target)) - @as(i64, @intCast(over_patch)),
-            4,
-        ));
-        const existing = std.mem.readInt(u32, code.bytes.items[over_patch..][0..4], .little);
-        const imm19: u19 = @bitCast(delta_words);
-        const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
-        code.patch32(over_patch, new_word);
+fn emitMemIndexBoundsCheck(
+    code: *emit.CodeBuffer,
+    index: emit.Reg,
+    end_offset: u64,
+) !void {
+    // Compute end = index + end_offset in tmp1.
+    if (end_offset == 0) {
+        try code.movRegReg(RegMap.tmp1, index);
+    } else if (end_offset <= 0xFFF) {
+        try code.addImm(RegMap.tmp1, index, @intCast(end_offset));
+    } else {
+        try code.movImm64(RegMap.tmp1, end_offset);
+        try code.addRegReg(RegMap.tmp1, RegMap.tmp1, index);
     }
+
+    // Load VmCtx.memory_size directly from the pinned vmctx in x19.
+    try code.ldrImm(RegMap.tmp0, .x19, vmctx_memsize_slot);
+
+    try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
+    const over_patch = code.len();
+    try code.bCond(.ls, 0);
+
+    try code.movRegReg(.x0, .x19);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
+    try code.blr(RegMap.tmp0);
+    try code.brk(0);
+
+    const over_target = code.len();
+    const delta_words: i19 = @intCast(@divExact(
+        @as(i64, @intCast(over_target)) - @as(i64, @intCast(over_patch)),
+        4,
+    ));
+    const existing = std.mem.readInt(u32, code.bytes.items[over_patch..][0..4], .little);
+    const imm19: u19 = @bitCast(delta_words);
+    const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
+    code.patch32(over_patch, new_word);
 }
 
 /// VmCtx field offsets. Must match `runtime/aot/runtime.zig::VmCtx`.
@@ -15236,6 +15245,55 @@ test "compile: atomic_rmw add emits LDADDAL" {
         if ((w & 0xFFE0FC00) == 0xB8E00000) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "compile: atomic alignment trap precedes bounds trap" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 65535 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = val, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .atomic_rmw = .{
+            .base = addr,
+            .offset = 0,
+            .size = 4,
+            .val = val,
+            .op = .add,
+        } },
+        .dest = result,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var unaligned_pattern = emit.CodeBuffer.init(allocator);
+    defer unaligned_pattern.deinit();
+    try unaligned_pattern.ldrImm(
+        RegMap.tmp0,
+        .x0,
+        vmctx_trap_unaligned_fn_slot,
+    );
+    var oob_pattern = emit.CodeBuffer.init(allocator);
+    defer oob_pattern.deinit();
+    try oob_pattern.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
+
+    const unaligned_idx = std.mem.indexOf(
+        u8,
+        code,
+        unaligned_pattern.getCode(),
+    ) orelse return error.TestExpectedUnalignedTrapLoad;
+    const oob_idx = std.mem.indexOf(
+        u8,
+        code,
+        oob_pattern.getCode(),
+    ) orelse return error.TestExpectedOobTrapLoad;
+    try std.testing.expect(unaligned_idx < oob_idx);
 }
 
 test "compile: atomic_cmpxchg emits CASAL" {
