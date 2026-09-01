@@ -1058,6 +1058,7 @@ pub fn build(b: *std.Build) void {
             "wasi:http #954 review:",
             "wasi:http #962 regression:",
             "wasi:http #967 review",
+            "wasi:http #969 review:",
         },
     });
     const run_http_streaming_unit_tests = b.addRunArtifact(

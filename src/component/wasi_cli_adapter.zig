@@ -5496,7 +5496,11 @@ const InboundHttpResponseSession = struct {
         self.head_ready = true;
         self.use_chunked = use_chunked;
         self.expected_content_length = expected_content_length;
-        if (trailers.state == .ready) {
+        // `pollP3Trailers` may already have snapshotted and stored the same
+        // trailers future (a guest can close the body stream before
+        // `task.return`). Only store when nothing is stored yet, otherwise the
+        // previously stored block would be clobbered and leaked.
+        if (trailers.state == .ready and self.trailer_state == .pending) {
             self.trailer_bytes = owned_trailers;
             self.trailer_state = .ready;
         } else if (owned_trailers) |bytes| {
@@ -49976,6 +49980,100 @@ test "wasi:http #967 review issue 4: check-write on an outbound request body rep
         try liveHttpCheckWritePermit(&adapter, &ci, inbound_stream.handle),
     );
     session.waitAndJoin();
+}
+
+test "wasi:http #969 review: P3 trailers snapshotted twice keep one owned block" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P3 trailers snapshotted twice keep one owned block",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    // The guest may close the body stream before `task.return`. That path
+    // snapshots the trailers future in `pollP3Trailers`, and `task.return`
+    // then snapshots the same future again in `prepareP3Head`. The second
+    // snapshot must not clobber (and leak) the first owned block, and the
+    // trailers must still reach the wire exactly once. Run both orderings
+    // under the testing allocator so a leak fails the test.
+    inline for (.{ true, false }) |close_body_first| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+
+        const fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            null,
+            true,
+            .{ .name = "x-final", .value = "done" },
+        );
+
+        var sink = LiveHttpTestSink{};
+        const session = try InboundHttpResponseSession.create(
+            testing.allocator,
+            &adapter,
+            &ci,
+            &output,
+            false,
+            .{
+                .context = &sink,
+                .callback = &LiveHttpTestSink.interrupt,
+            },
+            .{
+                .context = &sink,
+                .write = &LiveHttpTestSink.write,
+            },
+        );
+        defer session.destroy();
+        try session.start();
+        // Attach without selecting: the head stays unframed until
+        // `handlerReturned`, so the body-close path reaches the trailers
+        // future first.
+        try testing.expect(session.attachP3Response(
+            fixture.response_handle,
+            fixture.body_handle,
+            fixture.trailers_handle,
+            fixture.transmission_handle,
+        ));
+
+        try testing.expect(InboundHttpResponseSession.onBodyWrite(
+            session,
+            "abc",
+        ));
+        if (close_body_first) {
+            InboundHttpResponseSession.onBodyClosed(session);
+            session.handlerReturned(fixture.response_handle);
+        } else {
+            session.handlerReturned(fixture.response_handle);
+            InboundHttpResponseSession.onBodyClosed(session);
+        }
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+        const wire = sink.contents();
+        try testing.expect(std.mem.indexOf(
+            u8,
+            wire,
+            "Trailer: x-final\r\n",
+        ) != null);
+        try testing.expect(std.mem.endsWith(
+            u8,
+            wire,
+            "0\r\nx-final: done\r\n\r\n",
+        ));
+        try testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, wire, "x-final: done\r\n"),
+        );
+    }
 }
 
 test "wasi:http #954 review: P3 trailer error and dropped writer fail response" {
