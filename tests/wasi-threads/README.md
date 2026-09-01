@@ -15,9 +15,18 @@ and AOT bindings enabled by `-Dlib_wasi_threads=true`.
   `memory.atomic.wait32` or in `poll_oneoff` is woken by group termination.
   Both print only if the block outlived termination, so the fixtures' empty
   stdout is the wakeup assertion.
+- `terminate-spinning-child` / `parent-trap-spinning-child`: a child spinning
+  in a bare guest loop with no host calls is stopped by `proc_exit` and by a
+  parent trap. These gate the AOT loop-header cancel poll; without it the run
+  only ends on the teardown deadline, which the fixtures reject by requiring
+  empty stderr.
 - `trap-beats-late-exit` / `exit-beats-late-trap`: first-wins ordering — a
   losing `proc_exit(0)` cannot mask a trap (status 1) and a losing trap cannot
   mask `proc_exit(6)`.
+
+Every group-termination fixture runs under `tests/wasi-threads/run_bounded.zig`,
+which kills the run after 30 s and exits 124, so a regression that hangs fails
+the build instead of stalling CI.
 - `missing-thread-start` / `wrong-thread-start-signature`: spawn fails
   synchronously with a negative ABI result.
 - `unaligned-atomic-*`: load, store, RMW, and compare-exchange all produce the

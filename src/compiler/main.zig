@@ -400,6 +400,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         .import_count = ir_module.import_count,
         .has_memory64 = ir_module.has_memory64,
         .has_shared_memory = ir_module.has_shared_memory,
+        .spawns_threads = ir_module.spawns_threads,
         .global_types = ir_module.global_types,
         .global_offsets = ir_module.global_offsets,
         .global_storage_size = ir_module.global_storage_size,

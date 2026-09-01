@@ -10,6 +10,7 @@ const SimdOpcode = @import("../runtime/interpreter/opcode.zig").SimdOpcode;
 const MiscOpcode = @import("../runtime/interpreter/opcode.zig").MiscOpcode;
 const AtomicOpcode = @import("../runtime/interpreter/opcode.zig").AtomicOpcode;
 const leb128 = @import("../shared/utils/leb128.zig");
+const threads_feature = @import("../threads_feature.zig");
 
 pub const LowerError = error{
     OutOfMemory,
@@ -172,6 +173,10 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
 
     ir_module.import_count = wasm_module.import_function_count;
     for (wasm_module.imports) |imp| {
+        if (imp.kind == .function and threads_feature.isThreadSpawnImport(
+            imp.module_name,
+            imp.field_name,
+        )) ir_module.spawns_threads = true;
         if (imp.kind != .memory) continue;
         const mt = imp.memory_type orelse continue;
         ir_module.has_memory64 = ir_module.has_memory64 or mt.is_memory64;

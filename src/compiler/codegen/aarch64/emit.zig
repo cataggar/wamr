@@ -1913,6 +1913,12 @@ pub const CodeBuffer = struct {
         try self.emit32(0x35000000 | (@as(u32, imm19) << 5) | rt.encoding());
     }
 
+    /// CBZ Wt, #imm19 — branch if 32-bit reg is zero (word offset).
+    pub fn cbz32(self: *CodeBuffer, rt: Reg, offset_words: i19) !void {
+        const imm19: u19 = @bitCast(offset_words);
+        try self.emit32(0x34000000 | (@as(u32, imm19) << 5) | rt.encoding());
+    }
+
     /// CBZ Xt, #imm19 — branch if 64-bit reg is zero (word offset).
     pub fn cbz64(self: *CodeBuffer, rt: Reg, offset_words: i19) !void {
         const imm19: u19 = @bitCast(offset_words);

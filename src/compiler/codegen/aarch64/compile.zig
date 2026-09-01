@@ -532,6 +532,11 @@ pub const CallPatch = struct {
 };
 
 pub const CompileOptions = struct {
+    /// #616: emit a `VmCtx.cancel_flag` poll at every loop header so a guest
+    /// loop that never calls a host function still has an interruption point
+    /// when the thread group terminates. Enabled only for modules that
+    /// import `wasi.thread-spawn`, so other artifacts are byte-identical.
+    cancel_points: bool = false,
     enable_scheduler: bool = true,
     enable_peephole: bool = true,
     /// Use the Stage-A scalar X-register linear-scan allocator.
@@ -787,6 +792,7 @@ pub fn compileFunctionWithGlobalOffsetsPublic(
     global_offsets: []const u32,
     has_memory64: bool,
     has_shared_memory: bool,
+    cancel_points: bool,
     allocator: std.mem.Allocator,
 ) ![]u8 {
     return compileFunctionImpl(func, .{
@@ -794,6 +800,7 @@ pub fn compileFunctionWithGlobalOffsetsPublic(
         .global_offsets = global_offsets,
         .has_memory64 = has_memory64,
         .has_shared_memory = has_shared_memory,
+        .options = .{ .cancel_points = cancel_points },
         .allocator = allocator,
     }, allocator);
 }
@@ -1976,10 +1983,24 @@ pub fn compileFunctionImpl(
     fctx.block_pos = pos_of_block;
     fctx.block_rep = rep;
 
+    const cancel_polls: ?[]bool = if (ctx.options.cancel_points)
+        try markCancelPollBlocks(func, block_order, allocator)
+    else
+        null;
+    defer if (cancel_polls) |p| allocator.free(p);
+
     var last_was_ret = false;
     for (block_order, 0..) |bi, order_idx| {
         block_offsets[bi] = code.len();
         code.peepholeBarrier();
+        // Poll before the header's own instructions so every back-edge and
+        // every loop entry crosses it.
+        if (cancel_polls) |polls| {
+            if (polls[bi]) {
+                try emitCancelPoint(&code);
+                code.peepholeBarrier();
+            }
+        }
         fctx.fallthrough_rep = if (order_idx + 1 < block_order.len) rep[order_idx + 1] else null;
         const block_insts = scheduled.instructions(bi);
         for (block_insts, 0..) |inst, ii| {
@@ -7037,6 +7058,65 @@ const vmctx_sig_table_slot: u12 = 20; // byte 160, scale 8
 const vmctx_table_set_fn_slot: u12 = 24; // byte 192, scale 8
 const vmctx_table_init_fn_slot: u12 = 18; // byte 144, scale 8
 const vmctx_elem_drop_fn_slot: u12 = 19; // byte 152, scale 8
+
+/// Blocks that need a #616 group-cancel poll: every branch target that is not
+/// strictly ahead of its source in emission order, i.e. every loop back-edge
+/// target. Mirrors `markLoopHeaders` in the x86_64 backend.
+fn markCancelPollBlocks(
+    func: *const ir.IrFunction,
+    block_order: []const ir.BlockId,
+    allocator: std.mem.Allocator,
+) ![]bool {
+    const positions = try allocator.alloc(usize, func.blocks.items.len);
+    defer allocator.free(positions);
+    @memset(positions, 0);
+    for (block_order, 0..) |bid, pos| positions[bid] = pos;
+
+    const headers = try allocator.alloc(bool, func.blocks.items.len);
+    @memset(headers, false);
+    for (block_order, 0..) |bid, pos| {
+        for (func.blocks.items[bid].instructions.items) |inst| {
+            switch (inst.op) {
+                .br => |target| {
+                    if (positions[target] <= pos) headers[target] = true;
+                },
+                .br_if => |bi| {
+                    if (positions[bi.then_block] <= pos) headers[bi.then_block] = true;
+                    if (positions[bi.else_block] <= pos) headers[bi.else_block] = true;
+                },
+                .br_table => |bt| {
+                    for (bt.targets) |target| {
+                        if (positions[target] <= pos) headers[target] = true;
+                    }
+                    if (positions[bt.default] <= pos) headers[bt.default] = true;
+                },
+                else => {},
+            }
+        }
+    }
+    return headers;
+}
+
+/// Emit the group-cancel poll. `x19` holds the VmCtx for the whole body and
+/// `tmp0` (x16, the ABI intra-procedure scratch) is never allocated to a
+/// vreg, so the poll disturbs no allocator state.
+///
+///   ldr  w16, [x19, #cancel_flag]      ; 1 instruction
+///   cbz  w16, .Lcont                   ; taken on every normal iteration
+///   mov  x0, x19                       ; ┐ cold, noreturn
+///   ldr  x16, [x19, #cancel_point_fn]  ; │
+///   blr  x16                           ; ┘
+/// .Lcont:
+fn emitCancelPoint(code: *emit.CodeBuffer) !void {
+    try code.ldrImm32(RegMap.tmp0, .x19, vmctx_cancel_flag_slot);
+    try code.cbz32(RegMap.tmp0, 4);
+    try code.movRegReg(.x0, .x19);
+    try code.ldrImm(RegMap.tmp0, .x19, vmctx_cancel_point_fn_slot);
+    try code.blr(RegMap.tmp0);
+}
+
+const vmctx_cancel_flag_slot: u12 = 108; // byte 432, scale 4 (u32 load)
+const vmctx_cancel_point_fn_slot: u12 = 55; // byte 440, scale 8
 const vmctx_futex_wait32_fn_slot: u12 = 25; // byte 200, scale 8
 const vmctx_futex_wait64_fn_slot: u12 = 26; // byte 208, scale 8
 const vmctx_futex_notify_fn_slot: u12 = 27; // byte 216, scale 8
@@ -8812,7 +8892,12 @@ pub fn compileModuleWithOptions(
             .global_offsets = ir_module.global_offsets orelse &.{},
             .func_types = ir_module.func_types.items,
             .func_type_indices = ir_module.func_type_indices.items,
-            .options = options,
+            .options = blk: {
+                var per_func = options;
+                per_func.cancel_points =
+                    per_func.cancel_points or ir_module.spawns_threads;
+                break :blk per_func;
+            },
             .func_idx = @intCast(func_idx),
             .allocator = allocator,
         };
@@ -8996,7 +9081,14 @@ pub fn compileModuleCachedWithOptions(
                 .global_offsets = ir_module.global_offsets orelse &.{},
                 .func_types = ir_module.func_types.items,
                 .func_type_indices = ir_module.func_type_indices.items,
-                .options = options,
+                .options = blk: {
+                    var per_func = options;
+                    // Threaded modules need an interruption point in every
+                    // guest loop; everything else compiles unchanged (#616).
+                    per_func.cancel_points =
+                        per_func.cancel_points or ir_module.spawns_threads;
+                    break :blk per_func;
+                },
                 .codegen_timer = if (func_timer) |*t| t else null,
                 .func_idx = @intCast(fi),
                 .allocator = allocator,

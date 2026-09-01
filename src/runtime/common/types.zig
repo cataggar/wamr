@@ -241,7 +241,7 @@ pub const component_version: u32 = 0x0001_000d;
 pub const aot_magic: u32 = 0x746f6100; // "\0aot"
 
 /// AOT format version
-pub const aot_version: u32 = 8;
+pub const aot_version: u32 = 9;
 
 test "ValType: numeric classification" {
     try std.testing.expect(ValType.i32.isNumeric());

@@ -430,6 +430,8 @@ pub fn build(b: *std.Build) void {
         "child-proc-exit",
         "terminate-futex-waiter",
         "terminate-poll-waiter",
+        "terminate-spinning-child",
+        "parent-trap-spinning-child",
         "trap-beats-late-exit",
         "exit-beats-late-trap",
         "missing-thread-start",
@@ -449,6 +451,18 @@ pub fn build(b: *std.Build) void {
         "Regenerate checked-in Preview-1 WASI thread fixtures",
     );
     update_thread_fixtures_step.dependOn(&update_thread_fixtures.step);
+
+    // Group-termination fixtures assert that the runtime stops; a regression
+    // hangs instead of failing. Every one of them runs under this wrapper so
+    // a hang becomes a deterministic 124 rather than a stuck CI job (#616).
+    const bounded_runner = b.addExecutable(.{
+        .name = "run-bounded",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/wasi-threads/run_bounded.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
 
     const wasi_threads_test_step = b.step(
         "test-wasi-threads",
@@ -514,19 +528,28 @@ pub fn build(b: *std.Build) void {
             // First-wins group termination (#616). Empty stdout is the
             // assertion that blocked siblings were woken rather than left to
             // finish their wait naturally.
+            // `quiet_stderr` cases must also produce no diagnostics: the
+            // bounded-teardown warning is exactly what a missing interruption
+            // point would print, so an empty stderr is the promptness
+            // assertion the exit code alone cannot make (#616).
             inline for (.{
-                .{ "terminate-futex-waiter", 5 },
-                .{ "terminate-poll-waiter", 5 },
-                .{ "trap-beats-late-exit", 1 },
-                .{ "exit-beats-late-trap", 6 },
+                .{ "terminate-futex-waiter", 5, true },
+                .{ "terminate-poll-waiter", 5, true },
+                .{ "terminate-spinning-child", 7, true },
+                .{ "parent-trap-spinning-child", 1, false },
+                .{ "trap-beats-late-exit", 1, false },
+                .{ "exit-beats-late-trap", 6, true },
             }) |termination_case| {
-                const run = b.addRunArtifact(exe);
+                const run = b.addRunArtifact(bounded_runner);
+                run.addArg(termination_timeout_seconds);
+                run.addFileArg(exe.getEmittedBin());
                 run.addArgs(&.{
                     "run",
                     b.fmt("tests/wasi-threads/{s}.wasm", .{termination_case[0]}),
                 });
                 run.expectExitCode(termination_case[1]);
                 run.expectStdOutEqual("");
+                if (termination_case[2]) run.expectStdErrEqual("");
                 wasi_threads_test_step.dependOn(&run.step);
             }
 
@@ -599,10 +622,12 @@ pub fn build(b: *std.Build) void {
             );
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-trap", 1, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-proc-exit", 7, null, null);
-            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "terminate-futex-waiter", 5, "", null);
-            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "terminate-poll-waiter", 5, "", null);
-            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "trap-beats-late-exit", 1, "", null);
-            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "exit-beats-late-trap", 6, "", null);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "terminate-futex-waiter", 5, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "terminate-poll-waiter", 5, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "terminate-spinning-child", 7, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "parent-trap-spinning-child", 1, false);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "trap-beats-late-exit", 1, false);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, bounded_runner, "exit-beats-late-trap", 6, true);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "missing-thread-start", 0, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "wrong-thread-start-signature", 0, null, null);
             inline for (.{
@@ -2239,6 +2264,41 @@ const ComponentRunSteps = struct {
     /// `@unstable` feature gate).
     wasmtime: *std.Build.Step,
 };
+
+/// Wall-clock bound for one group-termination fixture. Generous next to the
+/// ~50 ms these take when the interruption points work, tight enough that a
+/// regression fails the build promptly.
+const termination_timeout_seconds = "30";
+
+/// Same contract as `addAotThreadFixture` (compile with `wamrc`, then run the
+/// artifact) but the run goes through the bounded wrapper and always expects
+/// empty stdout.
+fn addBoundedAotThreadFixture(
+    b: *std.Build,
+    parent: *std.Build.Step,
+    wamrc: *std.Build.Step.Compile,
+    bounded_runner: *std.Build.Step.Compile,
+    name: []const u8,
+    expected_exit: u8,
+    quiet_stderr: bool,
+) void {
+    const compile = b.addRunArtifact(wamrc);
+    compile.addArg("compile");
+    compile.addArg("-o");
+    const cwasm = compile.addOutputFileArg(b.fmt("{s}.cwasm", .{name}));
+    compile.addFileArg(b.path(b.fmt("tests/wasi-threads/{s}.wasm", .{name})));
+
+    const run = b.addRunArtifact(bounded_runner);
+    run.addArg(termination_timeout_seconds);
+    run.addFileArg(b.path("zig-out/bin/wamr"));
+    run.addArg("run");
+    run.addFileArg(cwasm);
+    run.step.dependOn(b.getInstallStep());
+    run.expectExitCode(expected_exit);
+    run.expectStdOutEqual("");
+    if (quiet_stderr) run.expectStdErrEqual("");
+    parent.dependOn(&run.step);
+}
 
 fn addAotThreadFixture(
     b: *std.Build,
