@@ -251,21 +251,32 @@ pub const OutputStream = struct {
                 // HTTP response body, the `404, ""` case).
                 if (data.len == 0) return .{ .ok = 0 };
                 const io = std.Io.Threaded.global_single_threaded.io();
-                const slices = [_][]const u8{data};
-                _ = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch |err| return switch (err) {
-                    // The peer went away. This is not an I/O fault: it
-                    // is the ordinary way a client abandons a request,
-                    // and callers must be able to tell the two apart so
-                    // they can stop writing and drop keep-alive rather
-                    // than reporting a server error (#616 A8).
-                    //
-                    // `netWrite` maps ECONNRESET to `ConnectionResetByPeer`
-                    // and both EPIPE and ENOTCONN to `SocketUnconnected`.
-                    error.ConnectionResetByPeer,
-                    error.SocketUnconnected,
-                    => .{ .closed = {} },
-                    else => .{ .err = .io_error },
-                };
+                // `netWrite` is a single `sendmsg`, which may accept
+                // fewer bytes than offered (a signal landing mid-send on
+                // a blocking socket). Reporting `ok(data.len)` for a
+                // short send silently drops response body bytes and
+                // desynchronises HTTP framing, so loop until the whole
+                // slice has been handed to the kernel.
+                var sent: usize = 0;
+                while (sent < data.len) {
+                    const slices = [_][]const u8{data[sent..]};
+                    const n = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch |err| return switch (err) {
+                        // The peer went away. This is not an I/O fault: it
+                        // is the ordinary way a client abandons a request,
+                        // and callers must be able to tell the two apart so
+                        // they can stop writing and drop keep-alive rather
+                        // than reporting a server error (#616 A8).
+                        //
+                        // `netWrite` maps ECONNRESET to `ConnectionResetByPeer`
+                        // and both EPIPE and ENOTCONN to `SocketUnconnected`.
+                        error.ConnectionResetByPeer,
+                        error.SocketUnconnected,
+                        => .{ .closed = {} },
+                        else => .{ .err = .io_error },
+                    };
+                    if (n == 0) return .{ .err = .io_error };
+                    sent += n;
+                }
                 return .{ .ok = data.len };
             },
             .tls => |conn| {
