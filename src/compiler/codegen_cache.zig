@@ -133,6 +133,9 @@ pub const ModuleEpochInputs = struct {
     import_count: u32,
     has_memory64: bool = false,
     has_shared_memory: bool = false,
+    /// #616: threaded modules get loop-header cancel polls, so their code
+    /// must never be reused for (or from) a non-threaded compile.
+    spawns_threads: bool = false,
     /// Optional; treated as empty slice when null.
     global_types: ?[]const ir.IrType = null,
     /// Optional; treated as empty slice when null.
@@ -199,6 +202,7 @@ pub fn hashModuleEpoch(inputs: ModuleEpochInputs) [32]u8 {
     w.writeInt(u32, inputs.import_count);
     w.writeInt(u8, @intFromBool(inputs.has_memory64));
     w.writeInt(u8, @intFromBool(inputs.has_shared_memory));
+    w.writeInt(u8, @intFromBool(inputs.spawns_threads));
     w.writeOptSliceEnum(ir.IrType, inputs.global_types);
     w.writeOptSliceInt(u32, inputs.global_offsets);
     w.writeInt(u32, inputs.global_storage_size);

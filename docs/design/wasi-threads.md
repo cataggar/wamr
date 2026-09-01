@@ -236,7 +236,7 @@ Siblings leave guest code through four interruption points:
 
 | Blocked in | Interpreter | AOT |
 | --- | --- | --- |
-| Guest code | `hasTrap` poll in the dispatch loop | (not interruptible; bounded by teardown) |
+| Guest code | `hasTrap` poll in the dispatch loop | `VmCtx.cancel_flag` poll at every loop header |
 | `memory.atomic.wait{32,64}` | pre-park guard + `cancelled` → `error.ThreadCancelled` | pre-park guard + `cancelled` → `terminateAotThread` |
 | `poll_oneoff`, blocking stdin reads | bounded 20 ms slices, then `error.Trap` | same slices, then `terminateAotThread` |
 | `sched_yield` | dispatch-loop poll | explicit check in the host bridge |
@@ -244,7 +244,35 @@ Siblings leave guest code through four interruption points:
 The pre-park guard matters as much as the cancel sweep: a thread that starts
 waiting after the sweep has already run would otherwise park forever.
 
-`ThreadManager.terminateAndJoin(timeout_ns)` bounds teardown. It closes the
+The AOT loop-header poll is what makes compiled guest code interruptible at
+all — without it a child running `(loop (br 0))` cannot be stopped, and
+`proc_exit` degrades to waiting out the teardown deadline. `VmCtx` carries a
+`cancel_flag` word and a `cancel_point_fn`, and both backends emit, at the
+head of every block reached by a back-edge:
+
+```
+x86_64                                aarch64
+cmp dword [rbx + cancel_flag], 0      ldr  w16, [x19, #cancel_flag]
+je   .Lcont                           cbz  w16, .Lcont
+mov  rdi, rbx                         mov  x0, x19
+mov  rax, [rbx + cancel_point_fn]     ldr  x16, [x19, #cancel_point_fn]
+call rax                              blr  x16
+.Lcont:                               .Lcont:
+```
+
+The fast path is one load, one compare, and a statically predicted not-taken
+branch, and it clobbers no register the allocator can see (x86_64 compares
+memory against an immediate; aarch64 uses the reserved `x16` scratch). The
+poll is emitted **only** for modules that import `wasi.thread-spawn`
+(`IrModule.spawns_threads`), so CoreMark-class artifacts are byte-identical
+to before; the codegen-cache epoch includes the flag so cached code is never
+reused across the two settings, and `aot_version` is 9 because generated code
+now reads the appended VmCtx fields. `ThreadManager.interrupt` publishes the
+word into every VmCtx subscribed to the group's shared memory — the same
+mechanism memory-grow republication already uses.
+
+`ThreadManager.terminateAndJoin(timeout_ns)` bounds teardown — a backstop
+that now only matters for a sibling wedged outside any interruption point. It closes the
 group to new spawns, re-arms the interrupt each round, and joins only records
 whose guest thread has already stopped, so no individual join can block. It
 returns after `default_termination_timeout_ns` (2 s) with the number of

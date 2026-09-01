@@ -259,6 +259,12 @@ pub const JoinSummary = struct {
     trapped: usize = 0,
 };
 
+/// Backend hook used to publish group cancellation into compiled code.
+pub const CancelBroadcast = struct {
+    ctx: *anyopaque,
+    broadcast: *const fn (*anyopaque) void,
+};
+
 /// Result of a bounded group teardown.
 pub const TerminationSummary = struct {
     joined: usize = 0,
@@ -485,6 +491,11 @@ pub const ThreadManager = struct {
     /// Shared linear memory backing guest futexes, recorded by
     /// `prepareSharedMemory` so termination can cancel every waiter.
     shared_memory: ?*types.MemoryInstance = null,
+    /// Backend hook that publishes the group-cancel word read by compiled
+    /// code. The AOT runtime installs it so a child spinning in guest code
+    /// still reaches an interruption point; the interpreter needs none
+    /// because its dispatch loop polls the manager directly.
+    cancel_broadcast: ?CancelBroadcast = null,
 
     pub fn init(allocator: std.mem.Allocator) ThreadManager {
         return .{
@@ -586,6 +597,7 @@ pub const ThreadManager = struct {
         self.slots.deinit(self.allocator);
         self.aux_stack_pool.deinit(self.allocator);
         self.shared_memory = null;
+        self.cancel_broadcast = null;
     }
 
     /// Bind the group to the shared process state's terminal-outcome record.
@@ -621,11 +633,20 @@ pub const ThreadManager = struct {
         self.interrupt();
     }
 
-    /// Interrupt every sibling: raise the polled interrupt flag and cancel
-    /// guest futex waits so blocked threads unwind instead of hanging.
-    /// Idempotent, and safe to call from any thread.
+    /// Install the backend hook that publishes cancellation into compiled
+    /// code. Replaying it on every `interrupt` keeps threads that were
+    /// spawned mid-teardown from missing the signal.
+    pub fn bindCancelBroadcast(self: *ThreadManager, hook: CancelBroadcast) void {
+        self.cancel_broadcast = hook;
+        if (self.isTerminating()) hook.broadcast(hook.ctx);
+    }
+
+    /// Interrupt every sibling: raise the polled interrupt flag, publish the
+    /// compiled-code cancel word, and cancel guest futex waits so blocked
+    /// threads unwind instead of hanging. Idempotent, safe from any thread.
     pub fn interrupt(self: *ThreadManager) void {
         self.trap_flag.store(true, .release);
+        if (self.cancel_broadcast) |hook| hook.broadcast(hook.ctx);
         if (self.shared_memory) |memory| _ = memory.cancelWaiters() catch {};
     }
 
@@ -2243,4 +2264,50 @@ test "group termination: a late binder still wakes an already terminated group" 
     const summary = manager.terminateAndJoin(default_termination_timeout_ns);
     try std.testing.expect(!summary.timed_out);
     try std.testing.expectEqual(@as(usize, 1), summary.trapped);
+}
+
+test "group termination: the cancel broadcast reaches compiled code on every interrupt" {
+    // The AOT backend publishes cancellation into each thread's VmCtx through
+    // this hook; the manager must replay it for late binders and on every
+    // teardown round so a thread that started after the first sweep still
+    // observes the flag (#616).
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn broadcast(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+
+    var probe = Probe{};
+    var state = termination.State{};
+    var manager = ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    manager.bindTermination(&state);
+    manager.bindCancelBroadcast(.{
+        .ctx = @ptrCast(&probe),
+        .broadcast = Probe.broadcast,
+    });
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+
+    manager.interrupt();
+    try std.testing.expect(probe.calls >= 1);
+
+    const after_interrupt = probe.calls;
+    _ = manager.terminateAndJoin(default_termination_timeout_ns);
+    try std.testing.expect(probe.calls > after_interrupt);
+
+    // Binding after the group already terminated publishes immediately.
+    var late = Probe{};
+    var terminated_state = termination.State{};
+    var late_manager = ThreadManager.init(std.testing.allocator);
+    defer late_manager.deinit();
+    late_manager.bindTermination(&terminated_state);
+    _ = terminated_state.claimExit(1);
+    late_manager.bindCancelBroadcast(.{
+        .ctx = @ptrCast(&late),
+        .broadcast = Probe.broadcast,
+    });
+    try std.testing.expect(late.calls >= 1);
 }

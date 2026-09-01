@@ -688,6 +688,19 @@ pub const VmCtx = extern struct {
     /// effective address is not naturally aligned. Appended so every prior
     /// codegen-addressed offset remains stable.
     trap_unaligned_fn: usize = 0,
+    /// Group-cancel word polled by AOT-compiled loop headers (#616). The
+    /// thread group writes 1 into every member's VmCtx when a terminal
+    /// outcome is claimed, so a guest loop that never calls a host function
+    /// still reaches an interruption point. Zero means "keep running", and
+    /// codegen only emits the poll for modules that import
+    /// `wasi.thread-spawn`, so non-threaded artifacts pay nothing.
+    cancel_flag: u32 = 0,
+    /// Padding so `cancel_point_fn` stays 8-byte aligned.
+    _pad_cancel: u32 = 0,
+    /// `fn (*VmCtx) callconv(.c) noreturn` — invoked when a loop-header poll
+    /// observes `cancel_flag != 0`. Unwinds this thread the same way a trap
+    /// does so bounded teardown can reclaim it.
+    cancel_point_fn: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -2498,6 +2511,36 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
         0;
     vmctx.lazy_compile_fn = if (comptime config.lazy_jit) @intFromPtr(&lazyCompileHelper) else 0;
     vmctx.thread_context = @intFromPtr(&inst.thread_context);
+    vmctx.cancel_point_fn = @intFromPtr(&aotCancelPoint);
+    // A refresh must never resurrect a cancelled thread: inherit whatever the
+    // group has already published.
+    vmctx.cancel_flag = if (comptime config.lib_wasi_threads) blk: {
+        const manager = inst.thread_context.threadGroup(thread_manager.ThreadManager) orelse
+            break :blk vmctx.cancel_flag;
+        break :blk if (manager.isTerminating()) 1 else 0;
+    } else 0;
+}
+
+/// Host helper invoked by an AOT loop-header cancel poll. Never returns:
+/// the thread unwinds through the trap path exactly like the interpreter's
+/// cross-thread interrupt does.
+pub fn aotCancelPoint(vmctx: *VmCtx) callconv(.c) noreturn {
+    terminateAotThread(vmctx);
+}
+
+/// Publish the group cancel word into every VmCtx subscribed to the group's
+/// shared memory. Registered on the `ThreadManager` by `prepareWasiThreads`,
+/// so `ThreadManager.interrupt` reaches AOT children that are executing guest
+/// code without calling any host function.
+fn broadcastCancelToSharedMemory(raw: *anyopaque) void {
+    if (comptime !config.lib_wasi_threads) return;
+    const mem: *types.MemoryInstance = @ptrCast(@alignCast(raw));
+    mem.subscriber_mutex.lock();
+    defer mem.subscriber_mutex.unlock();
+    for (mem.vmctx_subscribers.items) |subscriber_opaque| {
+        const subscriber: *VmCtx = @ptrCast(@alignCast(subscriber_opaque));
+        @atomicStore(u32, &subscriber.cancel_flag, 1, .release);
+    }
 }
 
 fn subscribeVmCtxToMemories(inst: *AotInstance) !void {
@@ -2751,6 +2794,10 @@ pub fn prepareWasiThreads(
             break :blk inst.globals[exp.index];
         } else null;
     try manager.prepareSharedMemory(inst.memories[0], heap_global);
+    manager.bindCancelBroadcast(.{
+        .ctx = @ptrCast(inst.memories[0]),
+        .broadcast = broadcastCancelToSharedMemory,
+    });
     inst.setThreadManager(manager);
 }
 
@@ -4745,7 +4792,9 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 408), @offsetOf(VmCtx, "lazy_compile_fn"));
     try std.testing.expectEqual(@as(usize, 416), @offsetOf(VmCtx, "thread_context"));
     try std.testing.expectEqual(@as(usize, 424), @offsetOf(VmCtx, "trap_unaligned_fn"));
-    try std.testing.expectEqual(@as(usize, 432), @sizeOf(VmCtx));
+    try std.testing.expectEqual(@as(usize, 432), @offsetOf(VmCtx, "cancel_flag"));
+    try std.testing.expectEqual(@as(usize, 440), @offsetOf(VmCtx, "cancel_point_fn"));
+    try std.testing.expectEqual(@as(usize, 448), @sizeOf(VmCtx));
 }
 
 test "AOT thread context inherits retained process state without thread-local flags" {

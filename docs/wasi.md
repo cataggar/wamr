@@ -390,7 +390,8 @@ operations.
   end-to-end gates are implemented behind `-Dlib_wasi_threads=true` on
   x86_64/AArch64. Group termination is first-wins: the first `proc_exit` or
   trap fixes the process result, siblings blocked on guest futexes or blocking
-  WASI I/O are woken, and teardown is bounded.
+  WASI I/O are woken, AOT loop headers poll a group-cancel word so compiled
+  guest loops are interruptible too, and teardown is bounded.
   ([#616 B1](https://github.com/cataggar/wamr/issues/616))
 * **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped, with
   optional file-backed persistence and real compare-and-swap.

@@ -14,7 +14,7 @@ const types = @import("../runtime/common/types.zig");
 pub const aot_magic: u32 = 0x746f6100;
 
 /// AOT format version.
-pub const aot_version: u32 = 8;
+pub const aot_version: u32 = 9;
 
 /// Export kinds (matches WebAssembly spec §2.5 and runtime ExternalKind).
 pub const ExternalKind = enum(u8) {

@@ -393,6 +393,7 @@ pub fn compileCoreWasmCached(
         .import_count = ir_module.import_count,
         .has_memory64 = ir_module.has_memory64,
         .has_shared_memory = ir_module.has_shared_memory,
+        .spawns_threads = ir_module.spawns_threads,
         .global_types = ir_module.global_types,
         .global_offsets = ir_module.global_offsets,
         .global_storage_size = ir_module.global_storage_size,
@@ -791,7 +792,12 @@ pub const LazyCompileDriver = struct {
                     self.lazy_out.ir_module.import_count,
                     self.lazy_out.ir_module.global_offsets orelse &.{},
                     self.allocator,
-                    .{ .local_call_lowering = .via_funcptrs },
+                    .{
+                        .local_call_lowering = .via_funcptrs,
+                        // #616: lazily compiled bodies of a threaded module
+                        // need the same loop-header interruption points.
+                        .cancel_points = self.lazy_out.ir_module.spawns_threads,
+                    },
                 ) catch |err| {
                     std.log.err("lazy-JIT spike: compiling deferred x86_64 function {d} failed: {s}", .{ local_idx, @errorName(err) });
                     return error.CodeMappingFailed;
@@ -818,6 +824,7 @@ pub const LazyCompileDriver = struct {
                 self.lazy_out.ir_module.global_offsets orelse &.{},
                 self.lazy_out.ir_module.has_memory64,
                 self.lazy_out.ir_module.has_shared_memory,
+                self.lazy_out.ir_module.spawns_threads,
                 self.allocator,
             ) catch |err| {
                 std.log.err("lazy-JIT spike: compiling deferred aarch64 function {d} failed: {s}", .{ local_idx, @errorName(err) });

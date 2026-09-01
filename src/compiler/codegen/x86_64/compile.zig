@@ -1611,7 +1611,13 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         try offsets.append(allocator, @intCast(func_start));
 
         // Compile function using register allocator
-        const result = try compileFunctionRAWithGlobalOffsets(&func, ir_module.import_count, ir_module.global_offsets orelse &.{}, allocator);
+        const result = try compileFunctionRAWithGlobalOffsetsEx(
+            &func,
+            ir_module.import_count,
+            ir_module.global_offsets orelse &.{},
+            allocator,
+            .{ .cancel_points = ir_module.spawns_threads },
+        );
         defer allocator.free(result.code);
         defer allocator.free(result.call_patches);
 
@@ -1893,7 +1899,7 @@ pub fn compileModuleCachedWithOptions(
                     .cwasm_aot_version = options.frame_attribution.cwasm_aot_version,
                     .compiler_build_id = options.frame_attribution.compiler_build_id,
                 } else null,
-                .{},
+                .{ .cancel_points = ir_module.spawns_threads },
             );
             if (result.frame_attribution) |report_value| {
                 var report = report_value;
@@ -2343,7 +2349,68 @@ pub const LocalCallLowering = enum {
 
 pub const FunctionCompileOptions = struct {
     local_call_lowering: LocalCallLowering = .direct,
+    /// #616: emit a `VmCtx.cancel_flag` poll at every loop header so a guest
+    /// loop that never calls a host function still has an interruption point
+    /// when the thread group terminates. Enabled only for modules that
+    /// import `wasi.thread-spawn`, so other artifacts are byte-identical.
+    cancel_points: bool = false,
 };
+
+const vmctx_cancel_flag_field: i32 = 432; // VmCtx.cancel_flag offset (u32)
+const vmctx_cancel_point_fn_field: i32 = 440; // VmCtx.cancel_point_fn (usize)
+
+/// Emit the group-cancel poll. `rbx` holds the VmCtx for the whole body.
+///
+///   cmp dword ptr [rbx + cancel_flag], 0   ; 7 bytes, no register clobber
+///   je  .Lcont                             ; 2 bytes, statically predicted
+///   mov param0, rbx                        ; 3 ┐ cold, noreturn
+///   mov rax, [rbx + cancel_point_fn]       ; 7 ├ 12 bytes
+///   call rax                               ; 2 ┘
+/// .Lcont:
+fn emitCancelPoint(code: *emit.CodeBuffer) !void {
+    try code.cmpMem32Imm8(.rbx, vmctx_cancel_flag_field, 0);
+    try code.emitByte(0x74); // JE rel8
+    try code.emitByte(12);
+    try emitTrapHelperCall(code, vmctx_cancel_point_fn_field);
+}
+
+/// Blocks that need a cancel poll: every branch target that is not strictly
+/// ahead of its source in emission order, i.e. every loop back-edge target.
+/// Guarantees each iteration of every guest loop crosses one poll.
+fn markLoopHeaders(
+    func: *const ir.IrFunction,
+    block_order: []const ir.BlockId,
+    allocator: std.mem.Allocator,
+) ![]bool {
+    const positions = try allocator.alloc(usize, func.blocks.items.len);
+    defer allocator.free(positions);
+    @memset(positions, 0);
+    for (block_order, 0..) |bid, pos| positions[bid] = pos;
+
+    const headers = try allocator.alloc(bool, func.blocks.items.len);
+    @memset(headers, false);
+    for (block_order, 0..) |bid, pos| {
+        for (func.blocks.items[bid].instructions.items) |inst| {
+            switch (inst.op) {
+                .br => |target| {
+                    if (positions[target] <= pos) headers[target] = true;
+                },
+                .br_if => |bi| {
+                    if (positions[bi.then_block] <= pos) headers[bi.then_block] = true;
+                    if (positions[bi.else_block] <= pos) headers[bi.else_block] = true;
+                },
+                .br_table => |bt| {
+                    for (bt.targets) |target| {
+                        if (positions[target] <= pos) headers[target] = true;
+                    }
+                    if (positions[bt.default] <= pos) headers[bt.default] = true;
+                },
+                else => {},
+            }
+        }
+    }
+    return headers;
+}
 
 /// Public per-function entry point matching the SAME real regalloc-based
 /// codegen `compileModuleCachedWithOptions` uses (unlike the naive standalone
@@ -3425,11 +3492,22 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
 
     // block_order already computed above — reuse for emission.
 
+    const cancel_headers: ?[]bool = if (options.cancel_points)
+        try markLoopHeaders(func, block_order, allocator)
+    else
+        null;
+    defer if (cancel_headers) |h| allocator.free(h);
+
     var last_was_ret = false;
     var ir_position: u32 = 0;
     for (block_order, 0..) |block_id, order_idx| {
         const block = func.blocks.items[block_id];
         try block_offsets.put(block_id, code.len());
+        // Poll before the header's own instructions so every back-edge and
+        // every loop entry crosses it.
+        if (cancel_headers) |headers| {
+            if (headers[block_id]) try emitCancelPoint(&code);
+        }
         const next_block_id: ?ir.BlockId = if (order_idx + 1 < block_order.len) block_order[order_idx + 1] else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
@@ -8917,4 +8995,78 @@ test "frame attribution classifies mixed origins and does not guess reused vregs
     try std.testing.expectEqual(@as(?u32, 11), accesses[7].vreg);
     try std.testing.expectEqual(@as(u32, 2), emitted_loads);
     try std.testing.expectEqual(@as(u32, 1), emitted_stores);
+}
+
+test "#616: threaded modules poll VmCtx.cancel_flag at every loop header" {
+    // Builds `loop { br loop }` — a bare guest loop with no host calls, the
+    // shape that used to make an AOT child thread uninterruptible.
+    const allocator = std.testing.allocator;
+
+    // cmp dword ptr [rbx + 432], 0 ; je +12
+    const poll = [_]u8{ 0x83, 0xBB, 0xB0, 0x01, 0x00, 0x00, 0x00, 0x74, 0x0C };
+    // mov rax, qword ptr [param0 + 440] — the cancel_point_fn load. The ABI
+    // decides the argument register (rdi on SysV, rcx on Win64), so build the
+    // ModR/M byte instead of hard-coding one ABI's encoding.
+    comptime std.debug.assert(@intFromEnum(param_regs[0]) < 8);
+    const helper_load = [_]u8{
+        0x48,
+        0x8B,
+        0x80 | @as(u8, param_regs[0].low3()),
+        0xB8,
+        0x01,
+        0x00,
+        0x00,
+    };
+
+    for ([_]bool{ false, true }) |spawns_threads| {
+        var ir_module = ir.IrModule.init(allocator);
+        defer ir_module.deinit();
+        ir_module.spawns_threads = spawns_threads;
+
+        var func = ir.IrFunction.init(allocator, 0, 0, 0);
+        _ = try func.newBlock();
+        const loop_block = try func.newBlock();
+        try func.getBlock(0).append(.{ .op = .{ .br = loop_block } });
+        try func.getBlock(loop_block).append(.{ .op = .{ .br = loop_block } });
+        _ = try ir_module.addFunction(func);
+
+        const result = try compileModule(&ir_module, allocator);
+        defer allocator.free(result.code);
+        defer allocator.free(result.offsets);
+
+        try std.testing.expectEqual(spawns_threads, containsBytes(result.code, &poll));
+        try std.testing.expectEqual(
+            spawns_threads,
+            containsBytes(result.code, &helper_load),
+        );
+    }
+}
+
+test "#616: straight-line threaded code stays free of cancel polls" {
+    // Only loop headers get a poll: a function without a back-edge is
+    // byte-identical whether or not the module spawns threads.
+    const allocator = std.testing.allocator;
+
+    var with_threads: []u8 = undefined;
+    var without_threads: []u8 = undefined;
+    for ([_]bool{ false, true }) |spawns_threads| {
+        var ir_module = ir.IrModule.init(allocator);
+        defer ir_module.deinit();
+        ir_module.spawns_threads = spawns_threads;
+
+        var func = ir.IrFunction.init(allocator, 0, 1, 0);
+        _ = try func.newBlock();
+        const v = func.newVReg();
+        try func.getBlock(0).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v, .type = .i32 });
+        try func.getBlock(0).append(.{ .op = .{ .ret = v } });
+        _ = try ir_module.addFunction(func);
+
+        const result = try compileModule(&ir_module, allocator);
+        defer allocator.free(result.offsets);
+        if (spawns_threads) with_threads = result.code else without_threads = result.code;
+    }
+    defer allocator.free(with_threads);
+    defer allocator.free(without_threads);
+
+    try std.testing.expectEqualSlices(u8, without_threads, with_threads);
 }

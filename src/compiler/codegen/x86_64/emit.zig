@@ -431,6 +431,18 @@ pub const CodeBuffer = struct {
         try self.recordFrameAccess(native_start, .load, base, disp, 8);
     }
 
+    /// CMP dword ptr [base + disp32], imm8 (sign-extended). Sets flags
+    /// without touching any register — used by the #616 loop-header
+    /// group-cancel poll, which must not disturb the allocator's state.
+    pub fn cmpMem32Imm8(self: *CodeBuffer, base: Reg, disp: i32, imm: i8) !void {
+        if (@intFromEnum(base) >= 8) try self.emitByte(0x41);
+        try self.emitByte(0x83);
+        try self.modrm(0b10, 7, base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
+        try self.emitI32(disp);
+        try self.emitByte(@bitCast(imm));
+    }
+
     /// MOV reg, [base + disp32] (32-bit load; zero-extends to 64). For i32
     /// values the low 32 bits are the value, so this both loads and
     /// zero-extends — no separate `mov eXX,eXX` needed (#393).
