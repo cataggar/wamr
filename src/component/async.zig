@@ -809,6 +809,11 @@ pub const AsyncStream = struct {
 /// Installed by the corresponding adapter functions in
 /// `wasi_cli_adapter.zig` (#537).
 pub const HostStreamHandler = struct {
+    /// Acquire/release a callback-scoped reference while the stream table
+    /// lock is dropped. `retain_context` runs before unlocking; returning
+    /// false rejects a callback after the host has begun detaching.
+    retain_context: ?*const fn (ctx: ?*anyopaque) bool = null,
+    release_context: ?*const fn (ctx: ?*anyopaque) void = null,
     /// Host-on-read-end: drain guest write directly to a host sink.
     /// Returns `true` on success, `false` if the sink rejected
     /// (closed / errored).

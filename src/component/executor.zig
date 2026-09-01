@@ -2822,6 +2822,10 @@ pub fn dispatchCanonBuiltinWithCtx(
                     return error.StackUnderflow;
                 });
             }
+            wasi_cli_adapter.notifyInboundHttpTaskReturn(
+                thread_context,
+                flat,
+            );
             tm.returnTaskOwned(handle, flat, allocator);
         },
         .async_canon => |op| try dispatchAsyncCanon(
@@ -3093,9 +3097,26 @@ fn dispatchAsyncCanon(
                             guest_ptr,
                             max_bytes,
                         ) orelse return error.MemoryNotAvailable;
+                        const retained = if (handler.retain_context) |retain|
+                            retain(handler.ctx)
+                        else
+                            true;
+                        if (!retained) {
+                            s.write_closed = true;
+                            env.pushI32(@bitCast(async_canon.packStatus(
+                                .dropped,
+                                0,
+                            ))) catch return error.StackOverflow;
+                            return;
+                        }
+                        const release_context = if (handler.retain_context != null)
+                            handler.release_context
+                        else
+                            null;
+                        const callback_context = handler.ctx;
                         s.host_read_inflight = true;
                         suspendStreamLeaseForCallback(&stream_lease);
-                        const got = callback(handler.ctx, dst);
+                        const got = callback(callback_context, dst);
                         if (!resumeStreamLeaseAfterCallback(
                             comp_inst,
                             handle,
@@ -3104,6 +3125,9 @@ fn dispatchAsyncCanon(
                             stream_lease.value().host_read_inflight = false;
                             stream_lease.release();
                             comp_inst.streams.collectRetired();
+                            if (release_context) |release| {
+                                release(callback_context);
+                            }
                             env.pushI32(@bitCast(async_canon.packStatus(
                                 .dropped,
                                 0,
@@ -3114,11 +3138,19 @@ fn dispatchAsyncCanon(
                         s.host_read_inflight = false;
                         if (got <= 0) {
                             if (got == 0) s.write_closed = true;
+                            stream_lease.release();
+                            if (release_context) |release| {
+                                release(callback_context);
+                            }
                             env.pushI32(@bitCast(async_canon.packStatus(
                                 .dropped,
                                 0,
                             ))) catch return error.StackOverflow;
                             return;
+                        }
+                        stream_lease.release();
+                        if (release_context) |release| {
+                            release(callback_context);
                         }
                         const got_count: u32 = @as(u32, @intCast(got)) / elem_size;
                         env.pushI32(@bitCast(async_canon.packStatus(
@@ -3238,9 +3270,26 @@ fn dispatchAsyncCanon(
             // with a writer task.
             if (!s.host_write_inflight) {
                 if (s.host_handler) |handler| if (handler.on_write) |writer| {
+                    const retained = if (handler.retain_context) |retain|
+                        retain(handler.ctx)
+                    else
+                        true;
+                    if (!retained) {
+                        s.read_closed = true;
+                        env.pushI32(@bitCast(async_canon.packStatus(
+                            .dropped,
+                            0,
+                        ))) catch return error.StackOverflow;
+                        return;
+                    }
+                    const release_context = if (handler.retain_context != null)
+                        handler.release_context
+                    else
+                        null;
+                    const callback_context = handler.ctx;
                     s.host_write_inflight = true;
                     suspendStreamLeaseForCallback(&stream_lease);
-                    const accepted = writer(handler.ctx, src);
+                    const accepted = writer(callback_context, src);
                     if (!resumeStreamLeaseAfterCallback(
                         comp_inst,
                         handle,
@@ -3249,6 +3298,9 @@ fn dispatchAsyncCanon(
                         stream_lease.value().host_write_inflight = false;
                         stream_lease.release();
                         comp_inst.streams.collectRetired();
+                        if (release_context) |release| {
+                            release(callback_context);
+                        }
                         env.pushI32(@bitCast(async_canon.packStatus(
                             .dropped,
                             0,
@@ -3257,6 +3309,10 @@ fn dispatchAsyncCanon(
                     }
                     s = stream_lease.value();
                     s.host_write_inflight = false;
+                    stream_lease.release();
+                    if (release_context) |release| {
+                        release(callback_context);
+                    }
                     if (!accepted) {
                         env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                             return error.StackOverflow;
@@ -3491,7 +3547,7 @@ fn dispatchAsyncCanon(
                         null
                 else
                     null;
-                const handler_drop = if (transitioned)
+                var handler_drop = if (transitioned)
                     if (s.host_handler) |handler|
                         if (handler.on_drop_writable) |callback|
                             .{ .callback = callback, .context = handler.ctx }
@@ -3501,6 +3557,21 @@ fn dispatchAsyncCanon(
                         null
                 else
                     null;
+                var handler_release: ?*const fn (?*anyopaque) void = null;
+                if (handler_drop != null) {
+                    const handler = s.host_handler.?;
+                    const retained = if (handler.retain_context) |retain|
+                        retain(handler.ctx)
+                    else
+                        true;
+                    if (retained) {
+                        if (handler.retain_context != null) {
+                            handler_release = handler.release_context;
+                        }
+                    } else {
+                        handler_drop = null;
+                    }
+                }
                 const waitable = if (transitioned) s.read_waitable else null;
                 var fully_closed = s.read_closed and s.write_closed;
                 const callback_active =
@@ -3538,6 +3609,9 @@ fn dispatchAsyncCanon(
                 } else {
                     stream_lease.release();
                     comp_inst.streams.collectRetired();
+                }
+                if (handler_release) |release| {
+                    release(handler_drop.?.context);
                 }
                 // Wake a parked reader so it can observe CANCELLED.
                 _ = comp_inst.notifyWaitable(

@@ -1053,7 +1053,10 @@ pub fn build(b: *std.Build) void {
 
     const http_streaming_unit_tests = b.addTest(.{
         .root_module = test_module,
-        .filters = &.{"wasi:http #616 A8 live:"},
+        .filters = &.{
+            "wasi:http #616 A8 live:",
+            "wasi:http #954 review:",
+        },
     });
     const run_http_streaming_unit_tests = b.addRunArtifact(
         http_streaming_unit_tests,

@@ -195,6 +195,8 @@ pub const OutputStream = struct {
     pub const CallbackSink = struct {
         context: ?*anyopaque,
         write: *const fn (?*anyopaque, []const u8) StreamResult,
+        retain_context: ?*const fn (?*anyopaque) bool = null,
+        release_context: ?*const fn (?*anyopaque) void = null,
     };
 
     pub const HostFile = struct {
@@ -279,10 +281,19 @@ pub const OutputStream = struct {
                     .{ .err = .io_error };
                 return .{ .ok = data.len };
             },
-            .callback => |callback| return callback.write(
-                callback.context,
-                data,
-            ),
+            .callback => |callback| {
+                const retained = if (callback.retain_context) |retain|
+                    retain(callback.context)
+                else
+                    true;
+                if (!retained) return .{ .closed = {} };
+                defer if (callback.retain_context != null) {
+                    if (callback.release_context) |release| {
+                        release(callback.context);
+                    }
+                };
+                return callback.write(callback.context, data);
+            },
             .closed => return .{ .closed = {} },
         }
     }
