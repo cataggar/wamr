@@ -36,6 +36,11 @@ from benchmark_schema import (
     validate_common_report,
 )
 
+CANONICAL_PLATFORMS = {
+    "ubuntu-22.04-x86_64": ("Linux", "x86_64"),
+    "ubuntu-24.04-aarch64": ("Linux", "aarch64"),
+}
+
 
 KIND = "wasi-thread-benchmark"
 PROFILE_COUNTS = {
@@ -1111,11 +1116,13 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         raise HarnessError("budget required_profile must be authoritative")
     if (
         not isinstance(required_platforms, list)
-        or not required_platforms
+        or len(required_platforms) != len(CANONICAL_PLATFORMS)
         or len(set(required_platforms)) != len(required_platforms)
-        or not all(isinstance(item, str) and item for item in required_platforms)
+        or set(required_platforms) != set(CANONICAL_PLATFORMS)
     ):
-        raise HarnessError("budget required_platforms must be unique strings")
+        raise HarnessError(
+            "budget required_platforms must be exactly the canonical hosted platforms"
+        )
     _require_exact_keys(
         cohort,
         {
@@ -1152,6 +1159,8 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
 
     metadata = report["metadata"]
     identity_checks = {
+        "baseline_commit": metadata["commit"],
+        "baseline_build_source_sha256": metadata["build_source_sha256"],
         "fixture_set_sha256": metadata["fixture_set_sha256"],
         "plan_sha256": metadata["plan_sha256"],
         "profile": report["plan"]["profile"],
@@ -1174,6 +1183,9 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         f"platforms.{platform_id}",
     )
     host = metadata["host"]
+    expected_host = CANONICAL_PLATFORMS[platform_id]
+    if (host["system"], host["machine"]) != expected_host:
+        raise HarnessError("report platform ID does not match its canonical host identity")
     if platform_budget["host_system"] != host["system"] or platform_budget["host_machine"] != host["machine"]:
         raise HarnessError("budget/report host platform mismatch")
 

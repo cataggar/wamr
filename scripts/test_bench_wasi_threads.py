@@ -174,6 +174,34 @@ def make_report(
 
 def complete_budget(report: dict) -> dict:
     platform_id = report["metadata"]["platform_id"]
+    other_platform_id = (
+        "ubuntu-24.04-aarch64"
+        if platform_id == "ubuntu-22.04-x86_64"
+        else "ubuntu-22.04-x86_64"
+    )
+    other_system, other_machine = bench.CANONICAL_PLATFORMS[other_platform_id]
+    platform_budget = {
+        "host_system": report["metadata"]["host"]["system"],
+        "host_machine": report["metadata"]["host"]["machine"],
+        "pairs": [
+            {
+                "pair_key": item["pair_key"],
+                "left": item["left"],
+                "right": item["right"],
+                "max_median_elapsed_delta_pct": 100.0,
+            }
+            for item in report["plan"]["pairs"]
+        ],
+        "scenarios": [
+            {
+                "pair_key": item["pair_key"],
+                "condition": item["condition"],
+                "metric_kind": item["metric_kind"],
+                "min_median_ops_per_second": 0.1,
+            }
+            for item in report["summaries"]
+        ],
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "wasi-thread-benchmark-budget",
@@ -181,7 +209,7 @@ def complete_budget(report: dict) -> dict:
         "calibration_requirements": {
             "minimum_reports_per_platform": 20,
             "required_profile": "authoritative",
-            "required_platforms": [platform_id],
+            "required_platforms": list(bench.CANONICAL_PLATFORMS),
         },
         "cohort": {
             "baseline_commit": report["metadata"]["commit"],
@@ -189,31 +217,17 @@ def complete_budget(report: dict) -> dict:
             "fixture_set_sha256": report["metadata"]["fixture_set_sha256"],
             "plan_sha256": report["metadata"]["plan_sha256"],
             "profile": report["plan"]["profile"],
-            "report_count_by_platform": {platform_id: 20},
+            "report_count_by_platform": {
+                item: 20 for item in bench.CANONICAL_PLATFORMS
+            },
         },
         "platforms": {
-            platform_id: {
-                "host_system": report["metadata"]["host"]["system"],
-                "host_machine": report["metadata"]["host"]["machine"],
-                "pairs": [
-                    {
-                        "pair_key": item["pair_key"],
-                        "left": item["left"],
-                        "right": item["right"],
-                        "max_median_elapsed_delta_pct": 100.0,
-                    }
-                    for item in report["plan"]["pairs"]
-                ],
-                "scenarios": [
-                    {
-                        "pair_key": item["pair_key"],
-                        "condition": item["condition"],
-                        "metric_kind": item["metric_kind"],
-                        "min_median_ops_per_second": 0.1,
-                    }
-                    for item in report["summaries"]
-                ],
-            }
+            platform_id: platform_budget,
+            other_platform_id: {
+                **copy.deepcopy(platform_budget),
+                "host_system": other_system,
+                "host_machine": other_machine,
+            },
         },
     }
 
@@ -491,8 +505,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
         report = make_report()
         budget = complete_budget(report)
         mutations = (
-            ("commit", lambda value: value["cohort"].__setitem__("baseline_commit", "bad")),
-            ("source", lambda value: value["cohort"].__setitem__("baseline_build_source_sha256", "bad")),
+            ("commit", lambda value: value["cohort"].__setitem__("baseline_commit", "e" * 40)),
+            ("source", lambda value: value["cohort"].__setitem__("baseline_build_source_sha256", "e" * 64)),
             ("fixture", lambda value: value["cohort"].__setitem__("fixture_set_sha256", "f" * 64)),
             ("plan", lambda value: value["cohort"].__setitem__("plan_sha256", "f" * 64)),
             ("profile", lambda value: value["cohort"].__setitem__("profile", "smoke")),
@@ -512,6 +526,35 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(bench.HarnessError, "duplicate"):
             bench.load_budget(self.write_budget(duplicate_json), report)
+
+    def test_budget_requires_exact_canonical_platform_set_in_either_order(self) -> None:
+        report = make_report()
+        budget = complete_budget(report)
+        reversed_budget = copy.deepcopy(budget)
+        reversed_budget["calibration_requirements"]["required_platforms"].reverse()
+        bench.load_budget(self.write_budget(reversed_budget), report)
+
+        invalid_sets = (
+            ["ubuntu-22.04-x86_64"],
+            ["ubuntu-24.04-aarch64"],
+            ["arbitrary-platform"],
+            [
+                "ubuntu-22.04-x86_64",
+                "ubuntu-24.04-aarch64",
+                "third-platform",
+            ],
+            ["ubuntu-22.04-x86_64", "ubuntu-22.04-x86_64"],
+        )
+        for required_platforms in invalid_sets:
+            corrupt = copy.deepcopy(budget)
+            corrupt["calibration_requirements"][
+                "required_platforms"
+            ] = required_platforms
+            with self.subTest(required_platforms=required_platforms):
+                with self.assertRaisesRegex(
+                    bench.HarnessError, "canonical hosted platforms"
+                ):
+                    bench.load_budget(self.write_budget(corrupt), report)
 
     def test_cohort_rejects_mixed_identity_and_duplicate_run_ids(self) -> None:
         x86 = make_report(run_id="100")
@@ -539,6 +582,69 @@ class ThreadBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(bench.HarnessError, "duplicate"):
             cohort.validate_documents(
                 [(Path("x1"), x86), (Path("x2"), duplicate), (Path("arm"), arm)],
+                cohort.DEFAULT_PLATFORMS,
+                1,
+            )
+
+    def test_cohort_requires_canonical_paired_platform_reports(self) -> None:
+        x86 = make_report(run_id="100")
+        arm = make_report(
+            platform_id="ubuntu-24.04-aarch64",
+            machine="aarch64",
+            run_id="100",
+        )
+        for platforms in (
+            ("ubuntu-22.04-x86_64",),
+            ("ubuntu-24.04-aarch64",),
+            ("arbitrary-platform",),
+            (
+                "ubuntu-22.04-x86_64",
+                "ubuntu-24.04-aarch64",
+                "third-platform",
+            ),
+            ("ubuntu-22.04-x86_64", "ubuntu-22.04-x86_64"),
+        ):
+            with self.subTest(platforms=platforms), self.assertRaisesRegex(
+                bench.HarnessError, "canonical hosted set"
+            ):
+                cohort.validate_documents(
+                    [(Path("x86"), x86), (Path("arm"), arm)],
+                    platforms,
+                    1,
+                )
+
+        masquerading_arm = make_report(
+            platform_id="ubuntu-24.04-aarch64",
+            machine="x86_64",
+            run_id="100",
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "canonical host identity"):
+            cohort.validate_documents(
+                [(Path("x86"), x86), (Path("arm"), masquerading_arm)],
+                cohort.DEFAULT_PLATFORMS,
+                1,
+            )
+
+        other_run_arm = make_report(
+            platform_id="ubuntu-24.04-aarch64",
+            machine="aarch64",
+            run_id="101",
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "same workflow runs"):
+            cohort.validate_documents(
+                [(Path("x86"), x86), (Path("arm"), other_run_arm)],
+                cohort.DEFAULT_PLATFORMS,
+                1,
+            )
+
+        second_x86 = make_report(run_id="101")
+        with self.assertRaisesRegex(bench.HarnessError, "different report counts"):
+            cohort.validate_documents(
+                [
+                    (Path("x86-100"), x86),
+                    (Path("x86-101"), second_x86),
+                    (Path("arm-100"), arm),
+                ],
                 cohort.DEFAULT_PLATFORMS,
                 1,
             )
