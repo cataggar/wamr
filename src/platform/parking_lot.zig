@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
+const config = @import("config");
 
 const is_linux = builtin.os.tag == .linux;
 const is_macos = builtin.os.tag == .macos;
@@ -58,7 +59,8 @@ const Outcome = enum(u32) {
 const Waiter = struct {
     next: ?*Waiter = null,
     key: usize,
-    cancellation: ?CancellationEpoch.Ticket = null,
+    cancellation: if (config.lib_wasi_threads) ?CancellationEpoch.Ticket else void =
+        if (config.lib_wasi_threads) null else {},
     outcome: std.atomic.Value(u32) = .init(@intFromEnum(Outcome.waiting)),
 };
 
@@ -153,7 +155,11 @@ pub const ParkingLot = struct {
         expected: u32,
         timeout_ns: i64,
     ) BackendError!WaitResult {
-        return self.wait32Cancellable(address, expected, timeout_ns, null);
+        if (comptime parking_supported) {
+            return self.waitValue(u32, address, expected, timeout_ns, null);
+        } else {
+            return error.Unsupported;
+        }
     }
 
     pub fn wait32Cancellable(
@@ -163,10 +169,10 @@ pub const ParkingLot = struct {
         timeout_ns: i64,
         cancellation: ?CancellationEpoch.Ticket,
     ) BackendError!WaitResult {
-        if (comptime parking_supported) {
+        if (comptime parking_supported and config.lib_wasi_threads) {
             return self.waitValue(u32, address, expected, timeout_ns, cancellation);
         } else {
-            return error.Unsupported;
+            return self.wait32(address, expected, timeout_ns);
         }
     }
 
@@ -176,7 +182,11 @@ pub const ParkingLot = struct {
         expected: u64,
         timeout_ns: i64,
     ) BackendError!WaitResult {
-        return self.wait64Cancellable(address, expected, timeout_ns, null);
+        if (comptime parking_supported and @bitSizeOf(usize) >= 64) {
+            return self.waitValue(u64, address, expected, timeout_ns, null);
+        } else {
+            return error.Unsupported;
+        }
     }
 
     pub fn wait64Cancellable(
@@ -186,10 +196,13 @@ pub const ParkingLot = struct {
         timeout_ns: i64,
         cancellation: ?CancellationEpoch.Ticket,
     ) BackendError!WaitResult {
-        if (comptime parking_supported and @bitSizeOf(usize) >= 64) {
+        if (comptime parking_supported and
+            @bitSizeOf(usize) >= 64 and
+            config.lib_wasi_threads)
+        {
             return self.waitValue(u64, address, expected, timeout_ns, cancellation);
         } else {
-            return error.Unsupported;
+            return self.wait64(address, expected, timeout_ns);
         }
     }
 
@@ -206,7 +219,10 @@ pub const ParkingLot = struct {
 
         const key = @intFromPtr(address);
         const bucket = self.bucketFor(key);
-        var waiter = Waiter{ .key = key, .cancellation = cancellation };
+        var waiter = if (comptime config.lib_wasi_threads)
+            Waiter{ .key = key, .cancellation = cancellation }
+        else
+            Waiter{ .key = key };
 
         bucket.mutex.lock();
         if (self.lifecycle.load(.acquire) & closing_bit != 0) {
@@ -225,11 +241,15 @@ pub const ParkingLot = struct {
         // path that would actually block: whichever of the two acquires the
         // lock first, the waiter is either seen by the sweep or observes the
         // latch here. Non-blocking outcomes above are unaffected.
-        if (self.cancelled.load(.acquire) != 0 or
-            (cancellation != null and cancellation.?.isCancelled()))
-        {
+        if (self.cancelled.load(.acquire) != 0) {
             bucket.mutex.unlock();
             return .cancelled;
+        }
+        if (comptime config.lib_wasi_threads) {
+            if (cancellation != null and cancellation.?.isCancelled()) {
+                bucket.mutex.unlock();
+                return .cancelled;
+            }
         }
         waiter.next = bucket.head;
         bucket.head = &waiter;
@@ -368,35 +388,36 @@ pub const ParkingLot = struct {
         self: *ParkingLot,
         ticket: CancellationEpoch.Ticket,
     ) BackendError!u32 {
-        if (comptime !parking_supported) {
+        if (comptime !parking_supported or !config.lib_wasi_threads) {
             return error.Unsupported;
-        }
-        _ = CancellationEpoch.publish(ticket);
-        var total: u32 = 0;
-        for (0..bucket_count) |i| {
-            const bucket = &self.buckets[i];
-            bucket.mutex.lock();
-            var link = &bucket.head;
-            while (link.*) |waiter| {
-                const matches = if (waiter.cancellation) |candidate|
-                    CancellationEpoch.Ticket.eql(candidate, ticket)
-                else
-                    false;
-                if (!matches) {
-                    link = &waiter.next;
-                    continue;
+        } else {
+            _ = CancellationEpoch.publish(ticket);
+            var total: u32 = 0;
+            for (0..bucket_count) |i| {
+                const bucket = &self.buckets[i];
+                bucket.mutex.lock();
+                var link = &bucket.head;
+                while (link.*) |waiter| {
+                    const matches = if (waiter.cancellation) |candidate|
+                        CancellationEpoch.Ticket.eql(candidate, ticket)
+                    else
+                        false;
+                    if (!matches) {
+                        link = &waiter.next;
+                        continue;
+                    }
+                    link.* = waiter.next;
+                    waiter.outcome.store(@intFromEnum(Outcome.cancelled), .release);
+                    osWake(&waiter.outcome.raw) catch |err| {
+                        bucket.mutex.unlock();
+                        return err;
+                    };
+                    total +|= 1;
                 }
-                link.* = waiter.next;
-                waiter.outcome.store(@intFromEnum(Outcome.cancelled), .release);
-                osWake(&waiter.outcome.raw) catch |err| {
-                    bucket.mutex.unlock();
-                    return err;
-                };
-                total +|= 1;
+                bucket.mutex.unlock();
             }
-            bucket.mutex.unlock();
+            return total;
         }
-        return total;
     }
 
     fn wakeKey(self: *ParkingLot, key: usize, count: u32, outcome: Outcome) BackendError!u32 {
@@ -886,7 +907,8 @@ const EpochWaiterCtx = struct {
 };
 
 test "ParkingLot: epoch cancellation closes the guard-to-park race" {
-    if (comptime !parking_supported) return error.SkipZigTest;
+    if (comptime !parking_supported or !config.lib_wasi_threads)
+        return error.SkipZigTest;
     var lot = ParkingLot.init();
     defer lot.deinit();
     var epoch = CancellationEpoch{};
@@ -914,7 +936,8 @@ test "ParkingLot: epoch cancellation closes the guard-to-park race" {
 }
 
 test "ParkingLot: a new epoch parks normally after cancellation" {
-    if (comptime !parking_supported) return error.SkipZigTest;
+    if (comptime !parking_supported or !config.lib_wasi_threads)
+        return error.SkipZigTest;
     var lot = ParkingLot.init();
     defer lot.deinit();
     var epoch = CancellationEpoch{};
@@ -942,7 +965,8 @@ test "ParkingLot: a new epoch parks normally after cancellation" {
 }
 
 test "ParkingLot: cancelling one epoch does not poison another group" {
-    if (comptime !parking_supported) return error.SkipZigTest;
+    if (comptime !parking_supported or !config.lib_wasi_threads)
+        return error.SkipZigTest;
     var lot = ParkingLot.init();
     defer lot.deinit();
     var first_epoch = CancellationEpoch{};
