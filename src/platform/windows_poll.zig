@@ -1,10 +1,4 @@
-//! Windows readiness support for WASI Preview-1 polling.
-//!
-//! Console handles are waitable, but anonymous/named pipe handles do not
-//! report byte readiness through `WaitForMultipleObjects`. Pipes are therefore
-//! probed with `PeekNamedPipe` between short waits on the thread group's
-//! manual-reset cancellation event. Disk/character files are always readable
-//! in the same sense as POSIX regular files.
+//! Windows readiness and cancellable stdin I/O for WASI Preview-1.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -62,6 +56,14 @@ const api = if (is_windows) struct {
     ) callconv(.winapi) windows.BOOL;
 
     extern "kernel32" fn GetFileType(hFile: Handle) callconv(.winapi) windows.DWORD;
+
+    extern "kernel32" fn ReadFile(
+        hFile: Handle,
+        lpBuffer: *anyopaque,
+        nNumberOfBytesToRead: windows.DWORD,
+        lpNumberOfBytesRead: ?*windows.DWORD,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(.winapi) windows.BOOL;
 } else struct {};
 
 const wait_object_0: windows.DWORD = 0;
@@ -69,7 +71,7 @@ const wait_timeout: windows.DWORD = 258;
 const wait_failed: windows.DWORD = std.math.maxInt(windows.DWORD);
 const infinite: windows.DWORD = std.math.maxInt(windows.DWORD);
 const max_wait_handles = 64;
-const pipe_probe_slice_ms: windows.DWORD = 10;
+const polling_slice_ms: windows.DWORD = 10;
 
 const file_type_unknown: windows.DWORD = 0;
 const file_type_disk: windows.DWORD = 1;
@@ -109,23 +111,31 @@ comptime {
     std.debug.assert(@sizeOf(InputRecord) == 20);
 }
 
-/// Manual-reset event owned by a WASI thread manager. Once group termination
-/// starts it remains signalled for the rest of that manager's lifetime.
+pub const CancelEventError = error{SystemResources};
+
+/// Lazily-created manual-reset event owned by a WASI thread manager.
 pub const CancelEvent = if (is_windows) struct {
-    handle: Handle,
+    handle: ?Handle = null,
 
     pub fn init() @This() {
-        const handle = api.CreateEventW(null, .TRUE, .FALSE, null) orelse
-            @panic("failed to create WASI thread cancellation event");
-        return .{ .handle = handle };
+        return .{};
+    }
+
+    pub fn ensureInitialized(self: *@This(), fail_for_test: bool) CancelEventError!void {
+        if (self.handle != null) return;
+        if (fail_for_test) return error.SystemResources;
+        self.handle = api.CreateEventW(null, .TRUE, .FALSE, null) orelse
+            return error.SystemResources;
     }
 
     pub fn deinit(self: *@This()) void {
-        windows.CloseHandle(self.handle);
+        if (self.handle) |handle| windows.CloseHandle(handle);
+        self.handle = null;
     }
 
-    pub fn signal(self: *@This()) void {
-        _ = api.SetEvent(self.handle);
+    pub fn signal(self: *@This()) bool {
+        const handle = self.handle orelse return true;
+        return api.SetEvent(handle).toBool();
     }
 
     pub fn opaqueHandle(self: *const @This()) ?*anyopaque {
@@ -136,12 +146,18 @@ pub const CancelEvent = if (is_windows) struct {
         return .{};
     }
 
+    pub fn ensureInitialized(self: *@This(), fail_for_test: bool) CancelEventError!void {
+        _ = self;
+        _ = fail_for_test;
+    }
+
     pub fn deinit(self: *@This()) void {
         _ = self;
     }
 
-    pub fn signal(self: *@This()) void {
+    pub fn signal(self: *@This()) bool {
         _ = self;
+        return true;
     }
 
     pub fn opaqueHandle(self: *const @This()) ?*anyopaque {
@@ -163,6 +179,10 @@ pub const ReadInput = struct {
     status: InputStatus = .pending,
     nbytes: u64 = 0,
     console: bool = false,
+    /// The handle is currently signalled by low-level events, but a blocking
+    /// cooked read would not complete. Poll it in bounded slices rather than
+    /// waiting directly on the perpetually-signalled console handle.
+    poll_only: bool = false,
 };
 
 pub const WaitResult = enum {
@@ -172,37 +192,54 @@ pub const WaitResult = enum {
     failed,
 };
 
-fn consoleReady(handle: Handle, mode: windows.DWORD) InputStatus {
-    var event_count: windows.DWORD = 0;
-    if (!api.GetNumberOfConsoleInputEvents(handle, &event_count).toBool())
-        return .io_error;
-    if (event_count == 0) return .pending;
+const ConsoleStatus = struct {
+    status: InputStatus,
+    poll_only: bool,
+};
 
-    // Keep canonical console reads from being reported ready before Enter is
-    // present. This covers long pasted lines without consuming console events.
-    var records: [256]InputRecord = undefined;
-    var records_read: windows.DWORD = 0;
-    const count: windows.DWORD = @min(event_count, records.len);
-    if (!api.PeekConsoleInputW(handle, &records, count, &records_read).toBool())
-        return .io_error;
-
+fn inspectConsoleRecords(mode: windows.DWORD, records: []const InputRecord) ConsoleStatus {
     const line_mode = (mode & enable_line_input) != 0;
-    for (records[0..records_read]) |record| {
+    for (records) |record| {
         if (record.EventType != key_event) continue;
         const key = record.Event.KeyEvent;
         if (!key.bKeyDown.toBool()) continue;
         const char = key.uChar.UnicodeChar;
         if (char == 0) continue;
-        if (!line_mode or char == '\r' or char == '\n' or char == 0x1a)
-            return .ready;
+        if (!line_mode or char == '\r' or char == '\n')
+            return .{ .status = .ready, .poll_only = false };
     }
-    return .pending;
+    return .{
+        .status = .pending,
+        .poll_only = records.len != 0,
+    };
 }
 
-fn probeInput(input: *ReadInput) void {
+fn consoleReady(
+    allocator: std.mem.Allocator,
+    handle: Handle,
+    mode: windows.DWORD,
+) ConsoleStatus {
+    var event_count: windows.DWORD = 0;
+    if (!api.GetNumberOfConsoleInputEvents(handle, &event_count).toBool())
+        return .{ .status = .io_error, .poll_only = false };
+    if (event_count == 0)
+        return .{ .status = .pending, .poll_only = false };
+
+    const records = allocator.alloc(InputRecord, event_count) catch
+        return .{ .status = .io_error, .poll_only = false };
+    defer allocator.free(records);
+
+    var records_read: windows.DWORD = 0;
+    if (!api.PeekConsoleInputW(handle, records.ptr, event_count, &records_read).toBool())
+        return .{ .status = .io_error, .poll_only = false };
+    return inspectConsoleRecords(mode, records[0..records_read]);
+}
+
+fn probeInput(allocator: std.mem.Allocator, input: *ReadInput) void {
     input.status = .pending;
     input.nbytes = 0;
     input.console = false;
+    input.poll_only = false;
 
     if (input.handle == windows.INVALID_HANDLE_VALUE) {
         input.status = .bad_handle;
@@ -212,7 +249,9 @@ fn probeInput(input: *ReadInput) void {
     var console_mode: windows.DWORD = 0;
     if (api.GetConsoleMode(input.handle, &console_mode).toBool()) {
         input.console = true;
-        input.status = consoleReady(input.handle, console_mode);
+        const result = consoleReady(allocator, input.handle, console_mode);
+        input.status = result.status;
+        input.poll_only = result.poll_only;
         if (input.status == .ready) input.nbytes = 1;
         return;
     }
@@ -222,12 +261,14 @@ fn probeInput(input: *ReadInput) void {
         if (available != 0) {
             input.status = .ready;
             input.nbytes = available;
+        } else {
+            input.poll_only = true;
         }
         return;
     }
 
     switch (windows.GetLastError()) {
-        .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA => {
+        .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA, .HANDLE_EOF => {
             input.status = .hangup;
             return;
         },
@@ -256,22 +297,72 @@ fn appendUniqueHandle(handles: *[max_wait_handles]Handle, count: *usize, handle:
     return true;
 }
 
-fn remainingTimeout(start_ms: u64, timeout_ms: i32) ?windows.DWORD {
+const WaitHooks = struct {
+    ctx: *anyopaque,
+    now_ms: *const fn (*anyopaque) u64,
+    sleep: *const fn (*anyopaque, windows.DWORD) void,
+    wait: *const fn (*anyopaque, []const Handle, windows.DWORD) windows.DWORD,
+    probe: *const fn (*anyopaque, *ReadInput) void,
+};
+
+fn currentMs(hooks: ?WaitHooks) u64 {
+    if (hooks) |installed| return installed.now_ms(installed.ctx);
+    return api.GetTickCount64();
+}
+
+fn sleepMs(hooks: ?WaitHooks, timeout_ms: windows.DWORD) void {
+    if (hooks) |installed| {
+        installed.sleep(installed.ctx, timeout_ms);
+        return;
+    }
+    api.Sleep(timeout_ms);
+}
+
+fn waitHandles(
+    hooks: ?WaitHooks,
+    handles: []const Handle,
+    timeout_ms: windows.DWORD,
+) windows.DWORD {
+    if (hooks) |installed| return installed.wait(installed.ctx, handles, timeout_ms);
+    return api.WaitForMultipleObjects(
+        @intCast(handles.len),
+        handles.ptr,
+        .FALSE,
+        timeout_ms,
+    );
+}
+
+fn remainingTimeout(start_ms: u64, now_ms: u64, timeout_ms: i32) ?windows.DWORD {
     if (timeout_ms < 0) return infinite;
-    const elapsed = api.GetTickCount64() -% start_ms;
+    const elapsed = now_ms -% start_ms;
     const total: u64 = @intCast(timeout_ms);
     if (elapsed >= total) return null;
     return @intCast(total - elapsed);
 }
 
 /// Wait until one input is readable/closed, the timeout expires, or the
-/// manager cancellation event is signalled. The cancellation handle occupies
-/// slot zero whenever present. Pipe readiness and wait sets larger than the
-/// Win32 64-handle limit fall back to bounded cancellation-event waits.
+/// manager cancellation event is signalled.
 pub fn waitForReadiness(
+    allocator: std.mem.Allocator,
     cancel_handle_opaque: ?*anyopaque,
     inputs: []ReadInput,
     timeout_ms: i32,
+) WaitResult {
+    return waitForReadinessWithHooks(
+        allocator,
+        cancel_handle_opaque,
+        inputs,
+        timeout_ms,
+        null,
+    );
+}
+
+fn waitForReadinessWithHooks(
+    allocator: std.mem.Allocator,
+    cancel_handle_opaque: ?*anyopaque,
+    inputs: []ReadInput,
+    timeout_ms: i32,
+    hooks: ?WaitHooks,
 ) WaitResult {
     if (!is_windows) unreachable;
 
@@ -279,12 +370,12 @@ pub fn waitForReadiness(
         @ptrCast(handle)
     else
         null;
-    const start_ms = api.GetTickCount64();
+    const start_ms = currentMs(hooks);
 
     while (true) {
         var handles: [max_wait_handles]Handle = undefined;
         var handle_count: usize = 0;
-        var has_polled_input = false;
+        var needs_bounded_poll = false;
         var overflow = false;
 
         if (cancel_handle) |handle| {
@@ -294,15 +385,18 @@ pub fn waitForReadiness(
 
         var any_ready = false;
         for (inputs) |*input| {
-            probeInput(input);
+            if (hooks) |installed|
+                installed.probe(installed.ctx, input)
+            else
+                probeInput(allocator, input);
             switch (input.status) {
                 .ready, .hangup, .bad_handle, .io_error => any_ready = true,
                 .pending => {
-                    if (input.console) {
+                    if (input.console and !input.poll_only) {
                         if (!appendUniqueHandle(&handles, &handle_count, input.handle))
                             overflow = true;
                     } else {
-                        has_polled_input = true;
+                        needs_bounded_poll = true;
                     }
                 },
             }
@@ -310,30 +404,274 @@ pub fn waitForReadiness(
         if (any_ready) return .ready;
         if (timeout_ms == 0) return .timed_out;
 
-        var wait_ms = remainingTimeout(start_ms, timeout_ms) orelse
+        var wait_ms = remainingTimeout(start_ms, currentMs(hooks), timeout_ms) orelse
             return .timed_out;
-        if (has_polled_input or overflow)
-            wait_ms = @min(wait_ms, pipe_probe_slice_ms);
+        if (needs_bounded_poll or overflow)
+            wait_ms = @min(wait_ms, polling_slice_ms);
 
         if (handle_count == 0) {
-            api.Sleep(wait_ms);
             if (wait_ms == infinite) return .failed;
+            sleepMs(hooks, wait_ms);
             continue;
         }
 
-        const result = api.WaitForMultipleObjects(
-            @intCast(handle_count),
-            &handles,
-            .FALSE,
-            wait_ms,
-        );
+        const result = waitHandles(hooks, handles[0..handle_count], wait_ms);
         if (result == wait_failed) return .failed;
         if (result == wait_timeout) continue;
-        if (result < wait_object_0 or result >= wait_object_0 + handle_count)
-            return .failed;
+        if (result >= wait_object_0 + handle_count) return .failed;
         const index: usize = @intCast(result - wait_object_0);
         if (cancel_handle != null and index == 0) return .cancelled;
-        // A console handle fired. Re-probe to filter non-key events and, in
-        // canonical line mode, incomplete input that would still block ReadFile.
     }
+}
+
+pub const ReadError = error{
+    Cancelled,
+    BadHandle,
+    IoError,
+    ThreadSpawnFailed,
+    WaitFailed,
+};
+
+const ReadOutcome = enum {
+    pending,
+    success,
+    eof,
+    cancelled,
+    bad_handle,
+    io_error,
+};
+
+const ReadJob = struct {
+    handle: Handle,
+    buffer: []u8,
+    outcome: ReadOutcome = .pending,
+    nread: usize = 0,
+
+    fn run(self: *ReadJob) void {
+        var nread: windows.DWORD = 0;
+        if (api.ReadFile(
+            self.handle,
+            self.buffer.ptr,
+            @intCast(self.buffer.len),
+            &nread,
+            null,
+        ).toBool()) {
+            self.outcome = .success;
+            self.nread = nread;
+            return;
+        }
+        self.outcome = switch (windows.GetLastError()) {
+            .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA, .HANDLE_EOF => .eof,
+            .OPERATION_ABORTED => .cancelled,
+            .INVALID_HANDLE => .bad_handle,
+            else => .io_error,
+        };
+    }
+};
+
+fn finishRead(thread: std.Thread, job: *const ReadJob) ReadError!usize {
+    thread.join();
+    return switch (job.outcome) {
+        .success => job.nread,
+        .eof => 0,
+        .cancelled => error.Cancelled,
+        .bad_handle => error.BadHandle,
+        .pending, .io_error => error.IoError,
+    };
+}
+
+fn cancelRead(thread: std.Thread) void {
+    const thread_handle: Handle = thread.getHandle();
+    var wait_handles = [_]Handle{thread_handle};
+    while (true) {
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        _ = windows.ntdll.NtCancelSynchronousIoFile(thread_handle, null, &iosb);
+        const result = api.WaitForMultipleObjects(1, &wait_handles, .FALSE, polling_slice_ms);
+        if (result == wait_object_0 or result == wait_failed) break;
+    }
+    thread.join();
+}
+
+/// Perform the actual synchronous `ReadFile` on a helper thread, then wait on
+/// both that thread and the manager cancellation event. On cancellation the
+/// blocked syscall itself is stopped with `NtCancelSynchronousIoFile`.
+pub fn readCancellable(
+    cancel_handle_opaque: *anyopaque,
+    handle: Handle,
+    buffer: []u8,
+) ReadError!usize {
+    if (!is_windows) unreachable;
+    if (buffer.len == 0) return 0;
+    if (buffer.len > std.math.maxInt(windows.DWORD)) return error.IoError;
+
+    var job = ReadJob{ .handle = handle, .buffer = buffer };
+    var thread = std.Thread.spawn(.{}, ReadJob.run, .{&job}) catch
+        return error.ThreadSpawnFailed;
+    const thread_handle: Handle = thread.getHandle();
+    const cancel_handle: Handle = @ptrCast(cancel_handle_opaque);
+    var handles = [_]Handle{ cancel_handle, thread_handle };
+
+    const result = api.WaitForMultipleObjects(handles.len, &handles, .FALSE, infinite);
+    if (result == wait_object_0 + 1)
+        return finishRead(thread, &job);
+    if (result == wait_object_0) {
+        cancelRead(thread);
+        return error.Cancelled;
+    }
+
+    cancelRead(thread);
+    return error.WaitFailed;
+}
+
+fn testKeyRecord(char: windows.WCHAR) InputRecord {
+    return .{
+        .EventType = key_event,
+        .padding = 0,
+        .Event = .{ .KeyEvent = .{
+            .bKeyDown = .TRUE,
+            .wRepeatCount = 1,
+            .wVirtualKeyCode = 0,
+            .wVirtualScanCode = 0,
+            .uChar = .{ .UnicodeChar = char },
+            .dwControlKeyState = 0,
+        } },
+    };
+}
+
+test "Windows poll review: cooked console requires Enter and scans the complete queue" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var ctrl_z = [_]InputRecord{testKeyRecord(0x1a)};
+    const incomplete = inspectConsoleRecords(enable_line_input, &ctrl_z);
+    try std.testing.expectEqual(InputStatus.pending, incomplete.status);
+    try std.testing.expect(incomplete.poll_only);
+
+    var records: [300]InputRecord = undefined;
+    for (&records) |*record| record.* = testKeyRecord('x');
+    records[299] = testKeyRecord('\r');
+    const complete = inspectConsoleRecords(enable_line_input, &records);
+    try std.testing.expectEqual(InputStatus.ready, complete.status);
+    try std.testing.expect(!complete.poll_only);
+}
+
+test "Windows poll review: non-key records do not spin and raw Unicode is ready" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var non_key = [_]InputRecord{.{
+        .EventType = 0x0002,
+        .padding = 0,
+        .Event = .{ .padding = @splat(0) },
+    }};
+    const ignored = inspectConsoleRecords(enable_line_input, &non_key);
+    try std.testing.expectEqual(InputStatus.pending, ignored.status);
+    try std.testing.expect(ignored.poll_only);
+
+    var unicode = [_]InputRecord{testKeyRecord(0x03bb)};
+    const raw = inspectConsoleRecords(0, &unicode);
+    try std.testing.expectEqual(InputStatus.ready, raw.status);
+}
+
+const FakeWait = struct {
+    now_ms: u64 = 0,
+    probe_count: usize = 0,
+    sleep_count: usize = 0,
+    wait_count: usize = 0,
+    max_wait_handles: usize = 0,
+    max_wait_ms: windows.DWORD = 0,
+    poll_only: bool = true,
+    ready_handle: ?Handle = null,
+    ready_after_probe: usize = std.math.maxInt(usize),
+
+    fn now(raw: *anyopaque) u64 {
+        const self: *FakeWait = @ptrCast(@alignCast(raw));
+        return self.now_ms;
+    }
+
+    fn sleep(raw: *anyopaque, timeout_ms: windows.DWORD) void {
+        const self: *FakeWait = @ptrCast(@alignCast(raw));
+        self.sleep_count += 1;
+        self.max_wait_ms = @max(self.max_wait_ms, timeout_ms);
+        self.now_ms += timeout_ms;
+    }
+
+    fn wait(
+        raw: *anyopaque,
+        handles: []const Handle,
+        timeout_ms: windows.DWORD,
+    ) windows.DWORD {
+        const self: *FakeWait = @ptrCast(@alignCast(raw));
+        self.wait_count += 1;
+        self.max_wait_handles = @max(self.max_wait_handles, handles.len);
+        self.max_wait_ms = @max(self.max_wait_ms, timeout_ms);
+        self.now_ms += timeout_ms;
+        return wait_timeout;
+    }
+
+    fn probe(raw: *anyopaque, input: *ReadInput) void {
+        const self: *FakeWait = @ptrCast(@alignCast(raw));
+        self.probe_count += 1;
+        input.status = if (self.ready_handle == input.handle and
+            self.probe_count >= self.ready_after_probe)
+            .ready
+        else
+            .pending;
+        input.console = true;
+        input.poll_only = self.poll_only;
+        input.nbytes = if (input.status == .ready) 1 else 0;
+    }
+
+    fn hooks(self: *FakeWait) WaitHooks {
+        return .{
+            .ctx = @ptrCast(self),
+            .now_ms = now,
+            .sleep = sleep,
+            .wait = wait,
+            .probe = probe,
+        };
+    }
+};
+
+test "Windows poll review: incomplete cooked input is probed at a bounded rate" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var fake = FakeWait{};
+    var inputs = [_]ReadInput{.{ .handle = @ptrFromInt(1) }};
+    try std.testing.expectEqual(
+        WaitResult.timed_out,
+        waitForReadinessWithHooks(
+            std.testing.allocator,
+            null,
+            &inputs,
+            35,
+            fake.hooks(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 5), fake.probe_count);
+    try std.testing.expectEqual(@as(usize, 4), fake.sleep_count);
+    try std.testing.expectEqual(@as(windows.DWORD, polling_slice_ms), fake.max_wait_ms);
+}
+
+test "Windows poll review: more than 64 console handles stay bounded and complete" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var inputs: [70]ReadInput = undefined;
+    for (&inputs, 0..) |*input, index| {
+        input.* = .{ .handle = @ptrFromInt(index + 1) };
+    }
+    var fake = FakeWait{
+        .poll_only = false,
+        .ready_handle = inputs[69].handle,
+        .ready_after_probe = inputs.len + 1,
+    };
+    try std.testing.expectEqual(
+        WaitResult.ready,
+        waitForReadinessWithHooks(
+            std.testing.allocator,
+            null,
+            &inputs,
+            100,
+            fake.hooks(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, max_wait_handles), fake.max_wait_handles);
+    try std.testing.expectEqual(@as(windows.DWORD, polling_slice_ms), fake.max_wait_ms);
+    try std.testing.expectEqual(InputStatus.ready, inputs[69].status);
 }
