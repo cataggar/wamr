@@ -48,6 +48,8 @@ COMMON=(
   "$DIR/threaded.c" \
   -o "$DIR/threaded.wasm"
 
+chmod 0644 "$DIR/single.wasm" "$DIR/threaded.wasm"
+
 (
   cd "$DIR"
   sha256sum -c fixtures.sha256
