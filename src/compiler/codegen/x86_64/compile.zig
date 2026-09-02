@@ -2358,6 +2358,8 @@ pub const FunctionCompileOptions = struct {
 
 const vmctx_cancel_flag_field: i32 = 432; // VmCtx.cancel_flag offset (u32)
 const vmctx_cancel_point_fn_field: i32 = 440; // VmCtx.cancel_point_fn (usize)
+const vmctx_memory_init_fn_field: i32 = 448; // VmCtx.memory_init_fn (usize)
+const vmctx_data_drop_fn_field: i32 = 456; // VmCtx.data_drop_fn (usize)
 
 /// Emit the group-cancel poll. `rbx` holds the VmCtx for the whole body.
 ///
@@ -5011,16 +5013,46 @@ fn compileInstRA(
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
-        // memory.init and data.drop — currently no-ops in AOT since data
-        // segments are applied at instantiation. For full passive segment
-        // support, these would need runtime calls via VmCtx.
         .memory_init => |mi| {
-            // Consume operands (required for correct vreg tracking)
-            _ = try useVReg(code, alloc_result, mi.dst, .rax);
-            _ = try useVReg(code, alloc_result, mi.src, .rax);
-            _ = try useVReg(code, alloc_result, mi.len, .rax);
+            const arg_len_reg = param_regs[3];
+            const arg_packed_ds_reg = param_regs[2];
+            const arg_packed_sm_reg = param_regs[1];
+
+            const len_reg = try useVReg(code, alloc_result, mi.len, arg_len_reg);
+            if (len_reg != arg_len_reg) try code.movRegReg(arg_len_reg, len_reg);
+            try code.zeroExtend32(arg_len_reg);
+
+            const src_reg = try useVReg(code, alloc_result, mi.src, .r11);
+            if (src_reg != .r11) try code.movRegReg(.r11, src_reg);
+            try code.zeroExtend32(.r11);
+            try code.emitSlice(&.{ 0x49, 0xC1, 0xE3, 0x20 });
+            const dst_reg = try useVReg(code, alloc_result, mi.dst, arg_packed_ds_reg);
+            if (dst_reg != arg_packed_ds_reg)
+                try code.movRegReg(arg_packed_ds_reg, dst_reg);
+            try code.zeroExtend32(arg_packed_ds_reg);
+            try code.orRegReg(arg_packed_ds_reg, .r11);
+
+            const packed_sm: u64 = @as(u64, mi.seg_idx);
+            try code.movRegImm64(arg_packed_sm_reg, packed_sm);
+            try code.movRegReg(param_regs[0], .rbx);
+            try code.movRegMem(.rax, param_regs[0], vmctx_memory_init_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
         },
-        .data_drop => {},
+        .data_drop => |seg_idx| {
+            try code.movRegImm32(param_regs[1], @bitCast(seg_idx));
+            try code.movRegReg(param_regs[0], .rbx);
+            try code.movRegMem(.rax, param_regs[0], vmctx_data_drop_fn_field);
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+        },
 
         .table_init => |ti| {
             // Helper signature (4 args to fit Win64 regs):

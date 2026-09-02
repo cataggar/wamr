@@ -1269,16 +1269,19 @@ fn compileToAot(
         });
     }
 
-    // Data segments: forward active segments whose offset reduces to a
-    // constant u32. See `resolveU32InitExpr` for the supported forms.
+    // Data segments: active offsets must reduce to a constant; passive
+    // segments keep their index/data for memory.init.
     var data_entries: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     for (module.data_segments) |seg| {
-        if (seg.is_passive) continue;
-        const offset_val: u32 = resolveU32InitExpr(seg.offset, tmp_globals.items) orelse continue;
+        const offset_val: u32 = if (seg.is_passive)
+            0
+        else
+            resolveU32InitExpr(seg.offset, tmp_globals.items) orelse continue;
         try data_entries.append(a, .{
             .memory_idx = seg.memory_idx,
             .offset = offset_val,
             .data = seg.data,
+            .is_passive = seg.is_passive,
         });
     }
 

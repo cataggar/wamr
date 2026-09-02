@@ -100,6 +100,12 @@ pub fn build(b: *std.Build) void {
 
     const lib_wasi_threads = b.option(bool, "lib_wasi_threads", "Enable Preview-1 WASI threads") orelse false;
     options.addOption(bool, "lib_wasi_threads", lib_wasi_threads);
+    const benchmark_cancel_point_toggle = b.option(
+        bool,
+        "benchmark-cancel-point-toggle",
+        "Allow the benchmark-only wamrc flag that suppresses AOT cancel points",
+    ) orelse false;
+    options.addOption(bool, "benchmark_cancel_point_toggle", benchmark_cancel_point_toggle);
 
     const thread_mgr = (b.option(bool, "thread_mgr", "Enable thread manager") orelse false) or lib_wasi_threads;
     options.addOption(bool, "thread_mgr", thread_mgr);
@@ -1158,6 +1164,10 @@ pub fn build(b: *std.Build) void {
         "python3",
         "tests/test_bench_keyvault.py",
     });
+    const thread_benchmark_harness_tests = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_bench_wasi_threads.py",
+    });
     const frame_attribution_tests = b.addSystemCommand(&.{
         "python3",
         "tests/test_aot_jit_attr.py",
@@ -1173,6 +1183,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(execution_context_test_step);
     test_step.dependOn(wasi_threads_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
+    test_step.dependOn(&thread_benchmark_harness_tests.step);
     test_step.dependOn(&frame_attribution_tests.step);
     if (target_arch == .x86_64 and target.result.os.tag == .linux) {
         const frame_attribution_smoke = b.addSystemCommand(&.{

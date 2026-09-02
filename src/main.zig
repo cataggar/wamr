@@ -1769,6 +1769,22 @@ fn runAotReal(
         };
     }
 
+    if (aot_module.start_function) |start_idx| {
+        var start_results: [0]aot_runtime.ScalarResult = .{};
+        _ = aot_runtime.callFuncScalar(
+            aot_inst,
+            start_idx,
+            &.{},
+            &.{},
+            &.{},
+            &start_results,
+        ) catch |err| {
+            printAotExecutionError(aot_inst, err);
+            if (manager_enabled) manager.signalTrap();
+            return 1;
+        };
+    }
+
     const func_idx = aot_runtime.findExportFunc(aot_inst, "_start") orelse
         aot_runtime.findExportFunc(aot_inst, "main") orelse {
         std.debug.print("Error: no _start or main function exported in AOT module\n", .{});
