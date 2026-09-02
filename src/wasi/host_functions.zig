@@ -24,6 +24,7 @@ const wasi = @import("wasi.zig");
 const thread_manager = @import("thread_manager.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
 const termination = @import("../runtime/common/termination.zig");
+const task_cancellation = @import("../runtime/common/task_cancellation.zig");
 const platform = @import("../platform/platform.zig");
 const windows_poll = @import("../platform/windows_poll.zig");
 
@@ -3783,6 +3784,40 @@ test "wasiProcExit: signals trap flag" {
     try std.testing.expect(tm.hasTrap());
 }
 
+test "wasiProcExit: task cancellation cannot suppress process exit" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&terminal);
+
+    const wasm_module = types.WasmModule{};
+    const inst = try allocator.create(types.ModuleInstance);
+    defer allocator.destroy(inst);
+    inst.* = .{
+        .module = &wasm_module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+        .thread_manager = &manager,
+    };
+    const env = try ExecEnv.create(inst, 256, allocator);
+    defer env.destroy();
+    const source = try task_cancellation.Source.create(allocator);
+    defer source.release();
+    var group = try manager.bindTaskGroup(&env.thread_context, source);
+    defer group.deinit();
+    source.cancel();
+    try std.testing.expect(manager.isTaskCancelledForContext(&env.thread_context));
+
+    try env.pushI32(37);
+    try std.testing.expectError(error.Trap, wasiProcExit(@ptrCast(env)));
+    try std.testing.expectEqual(@as(?u32, 37), terminal.exitCode());
+    try std.testing.expectEqual(termination.Kind.exit, terminal.outcome().?.kind);
+}
+
 test "resolveWasiFunction: fd_write resolves" {
     const result = resolveWasiFunction("fd_write");
     try std.testing.expect(result != null);
@@ -6711,7 +6746,9 @@ test "group termination: component task cancellation interrupts a blocking poll 
     try manager.bindTermination(&terminal);
     var thread_context = execution_context.ThreadExecutionContext{};
     thread_context.setThreadGroup(@ptrCast(&manager));
-    var group_scope = try manager.bindTaskGroup(&thread_context, 1, false);
+    const source = try task_cancellation.Source.create(std.testing.allocator);
+    defer source.release();
+    var group_scope = try manager.bindTaskGroup(&thread_context, source);
     defer group_scope.deinit();
 
     var probe = TaskBlockingPollProbe{
@@ -6723,7 +6760,7 @@ test "group termination: component task cancellation interrupts a blocking poll 
     platform.usleep(20 * std.time.us_per_ms);
     try std.testing.expect(!probe.finished.load(.acquire));
 
-    try std.testing.expect(manager.cancelTaskForContext(&thread_context));
+    source.cancel();
     const finished = probe.awaitFinished(5 * std.time.ns_per_s);
     if (!finished) ctx.proc_exit(1);
     worker.join();

@@ -247,32 +247,41 @@ permanent record:
 `canon task.cancel` is task-terminal, not process-terminal, so it uses a
 separate resumable state machine:
 
-1. An async frame binds a monotonic `(TaskManager incarnation, task id)` key
-   to a `TaskCancelGroup`. The incarnation prevents address-reuse ABA if the
-   caller destroys a task manager while child records still retain the old
-   group. Nested frames reuse the active group. The frame owns one reference
-   and every spawned `ThreadRecord` inherits and owns another.
-2. The group starts with a `ParkingLot.CancellationEpoch.Ticket` containing
-   `{source, generation}`. Guest waits carry that ticket into the parking lot.
-3. The first cancel advances `source.generation` with an acq_rel CAS **before**
-   signalling the group's Windows cancel event, broadcasting to matching AOT
-   `VmCtx`s, and sweeping matching parking-lot waiters. Repeated cancel does
-   not advance again; it may harmlessly re-arm the targeted wakeups so a
-   transient backend failure cannot strand a waiter.
-4. A waiter checks the generation with acquire ordering while holding the same
+1. Every `TaskManager.Task` owns a refcounted `task_cancellation.Source` with
+   a process-unique 32-bit source id. `task.cancel`, `subtask.cancel`, and all
+   failure paths call the same handle-based `TaskManager.cancelTask`; no
+   cancellation path depends on the currently executing frame.
+2. Each `ComponentInstance.ThreadManager` reached by that task creates one
+   manager-local `TaskCancelGroup` and registers its wake target with the task
+   source. Registration, cancellation, and unregistration serialize under the
+   source lock: cancellation either visits the linked group, or registration
+   sees the latched state and wakes the group before returning. Registrations
+   retain the source, so TaskManager destruction cannot invalidate live child
+   groups.
+3. The manager-local group starts with a
+   `ParkingLot.CancellationEpoch.Ticket` containing `{source, generation}`.
+   Guest waits carry that ticket into the parking lot.
+4. The first group wake advances `source.generation` with an acq_rel CAS
+   **before** signalling the group's Windows cancel event, broadcasting to
+   matching AOT `VmCtx`s, and sweeping matching parking-lot waiters. Repeated
+   cancel does not advance again; it may harmlessly re-arm the targeted
+   wakeups so a transient backend failure cannot strand a waiter.
+5. A waiter checks the generation with acquire ordering while holding the same
    bucket lock used by the sweep. It is therefore either queued before its
    bucket is swept, or it observes the advanced generation and refuses to
    park. This preserves #959's lost-wakeup guarantee without clearing a latch.
-5. Unrelated task groups have different epoch sources. Targeted AOT broadcast
-   and parking-lot sweep compare group/ticket identity, so cancelling one task
-   cannot wake or poison another.
-6. When the last frame/child reference is released, the group is quiescent and
-   moves to a free list. Reuse calls `begin` at the current generation and,
-   on Windows, closes the quiescent event and lazily creates a fresh handle;
-   no shared bit is reset and old tickets remain cancelled forever. A 32-bit
-   generation is never allowed to wrap: after 2^32-1 epochs the quiescent
-   source is discarded and replaced. Reaching that bound is assumed
-   impractical, but aliasing on wrap is prohibited rather than ignored.
+6. Every active manager-local group receives a process-unique, never-reused
+   32-bit token. The AOT call scope release-publishes that value into
+   `VmCtx.cancel_group_token`; targeted broadcast acquire-loads and compares
+   only the value, never a mutable context pointer. Token zero is reserved for
+   process-wide interruption.
+7. When the last frame/child reference is released, the group unregisters
+   from the task source, then moves to a quiescent free list. Reuse calls
+   `begin` at the current parking generation, allocates a new AOT token, and
+   on Windows closes the old event and lazily creates a fresh handle. No shared
+   bit is reset and old tickets remain cancelled forever. Source ids, group
+   tokens, and parking generations never wrap; exhaustion traps or replaces a
+   quiescent object rather than aliasing a stale task.
 
 Spawn and completion races follow those ownership rules. A spawn retains the
 parent's group before allocating a child; if cancellation is already visible
@@ -280,8 +289,20 @@ it fails, and if cancellation wins after the retain the child starts with the
 old ticket and immediately observes cancellation. Return versus cancel is
 first-terminal under the `TaskManager` lock. Join destroys the child backend,
 returns its auxiliary stack, releases the group reference, and frees the
-record exactly once. Instance destruction first unbinds the permanent terminal
-hook, drains thread records, then destroys only quiescent epoch sources.
+record exactly once. A group unregister racing cancellation is safe because
+both operations hold the source lock while the callback target is live.
+Instance destruction first unbinds the permanent terminal hook, drains thread
+records, unregisters groups, then destroys only quiescent epoch objects.
+
+Re-entrant AOT calls use a stack-scoped `VmCtxExecutionScope`. Enter and leave
+first publish neutral token zero, clear the flag, publish the new/restored
+token with release ordering, then acquire-check the corresponding task and
+process state. Thus an outer cancellation missed while an inner token is
+active is reconstructed on unwind; an inner cancellation is cleared before
+the outer token resumes; and process cancellation during the inner call
+remains set. Targeted broadcasters only atomic-load the token and atomic-store
+the flag, eliminating the former data race with plain
+`ThreadExecutionContext.cancellation_group` writes.
 
 Task cancellation never sets `ThreadManager.trap_flag`, calls
 `termination.State.claim*`, or invokes permanent `ParkingLot.cancelAll`.
@@ -289,7 +310,10 @@ Conversely Preview-1 `proc_exit`/trap still uses the first-wins terminal record,
 broadcasts to every `VmCtx`, and leaves the sticky process cancellation latch
 set forever. Its Windows event also signals every active task event, so a
 process terminal outcome still interrupts children currently waiting through a
-task-scoped handle.
+task-scoped handle. The AOT `proc_exit` bridge calls
+`ThreadManager.signalExit` directly with the winning status; task cancellation
+can suppress only an identified cancellation unwind, never an explicit
+process exit.
 
 Siblings leave guest code through four interruption points:
 
