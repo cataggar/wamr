@@ -100,11 +100,14 @@ WAMR `local_func` indices and Wasmtime's full wasm function indices through
 the fixture name section so the same functions are compared explicitly.
 
 Run it from GitHub Actions with **CoreMark (aarch64) → Run workflow → mode:
-profile**. `profile_ref` defaults to the exact merged-main commit measured by
-run 33576430466 (`e32b7b7d2d12007eb66679a66f943b1e4ea6a393`); the workflow
+profile**. `profile_ref` defaults to the corrected authoritative commit from
+run 33631050708 (`19d046a5b23b9c39acf5f7062976f04c5ca8ca75`); the workflow
 builds that ref in an isolated worktree while using the merged profiling
-tooling. It uploads compact JSON/Markdown reports, diagnostics, and compressed
-raw perf/jitdump data when each input is at most 25 MiB.
+tooling. Profiling uses the same fixed arguments and selected CPU as the
+authoritative benchmark, runs ABBA warmups, then records two captures per
+engine in ABBA order before aggregating self samples. It uploads compact
+JSON/Markdown reports, diagnostics, and compressed raw perf/jitdump data when
+each input is at most 25 MiB.
 
 ## Options
 
