@@ -18,6 +18,7 @@ const execution_context = @import("../common/execution_context.zig");
 const thread_manager = @import("../../wasi/thread_manager.zig");
 const parking_lot = @import("../../platform/parking_lot.zig");
 const termination = @import("../common/termination.zig");
+const task_cancellation = @import("../common/task_cancellation.zig");
 
 // ─── Windows crash handler (debug only) ─────────────────────────────────────
 const windows = std.os.windows;
@@ -707,6 +708,11 @@ pub const VmCtx = extern struct {
     memory_init_fn: usize = 0,
     /// `fn (*VmCtx, seg_idx) void`.
     data_drop_fn: usize = 0,
+    /// Immutable manager-local task-group identity for targeted cancellation.
+    /// Published with release ordering by the AOT call scope; broadcasters
+    /// compare it with acquire ordering and never dereference group storage.
+    cancel_group_token: u32 = 0,
+    _pad_cancel_group: u32 = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -752,9 +758,93 @@ const AotCallState = struct {
         if (windows_trap_supported) undefined else {},
     trap_catching: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     trap_occurred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancel_unwind: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     last_trap_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     trap_reason: std.atomic.Value(u8) =
         std.atomic.Value(u8).init(@intFromEnum(TrapReason.unknown)),
+};
+
+fn contextTerminating(
+    inst: *AotInstance,
+    context_ptr: usize,
+) bool {
+    if (comptime !config.lib_wasi_threads) return false;
+    if (context_ptr != 0) {
+        const context: *execution_context.ThreadExecutionContext =
+            @ptrFromInt(context_ptr);
+        if (context.threadGroup(thread_manager.ThreadManager)) |manager|
+            return manager.isTerminatingForContext(context);
+    }
+    if (inst.thread_context.threadGroup(thread_manager.ThreadManager)) |manager|
+        return manager.isProcessTerminating();
+    return false;
+}
+
+fn publishCancellationContext(
+    inst: *AotInstance,
+    vmctx: *VmCtx,
+    context_ptr: usize,
+    token: u32,
+) void {
+    if (comptime !config.lib_wasi_threads) return;
+    // Neutralize identity before clearing the flag. A targeted broadcast that
+    // races either side misses token zero, while the latched group state is
+    // re-read after the new/restored token is release-published. Process-wide
+    // broadcasts ignore the token; a final state check repairs any clear that
+    // raced such a broadcast.
+    @atomicStore(u32, &vmctx.cancel_group_token, 0, .release);
+    @atomicStore(u32, &vmctx.cancel_flag, 0, .release);
+    @atomicStore(u32, &vmctx.cancel_group_token, token, .release);
+    if (contextTerminating(inst, context_ptr))
+        @atomicStore(u32, &vmctx.cancel_flag, 1, .release);
+}
+
+const VmCtxExecutionScope = struct {
+    inst: *AotInstance,
+    vmctx: *VmCtx,
+    previous_thread_context: usize,
+    previous_wasi_ctx: usize,
+    previous_cancel_group_token: u32,
+
+    fn enter(
+        inst: *AotInstance,
+        context: *execution_context.ThreadExecutionContext,
+    ) VmCtxExecutionScope {
+        const vmctx = &inst.vmctx;
+        const scope = VmCtxExecutionScope{
+            .inst = inst,
+            .vmctx = vmctx,
+            .previous_thread_context = vmctx.thread_context,
+            .previous_wasi_ctx = vmctx.wasi_ctx,
+            .previous_cancel_group_token = if (config.lib_wasi_threads)
+                @atomicLoad(u32, &vmctx.cancel_group_token, .acquire)
+            else
+                0,
+        };
+        vmctx.thread_context = @intFromPtr(context);
+        vmctx.wasi_ctx = if (context.process_state) |state|
+            @intFromPtr(state.ptr)
+        else
+            0;
+        publishCancellationContext(
+            inst,
+            vmctx,
+            vmctx.thread_context,
+            context.cancellationGroupToken(),
+        );
+        return scope;
+    }
+
+    fn deinit(self: VmCtxExecutionScope) void {
+        self.vmctx.thread_context = self.previous_thread_context;
+        self.vmctx.wasi_ctx = self.previous_wasi_ctx;
+        publishCancellationContext(
+            self.inst,
+            self.vmctx,
+            self.previous_thread_context,
+            self.previous_cancel_group_token,
+        );
+    }
 };
 
 // 0 = uninitialized, 1 = one thread is installing, 2 = ready.
@@ -1149,6 +1239,8 @@ pub fn terminateAotThread(vmctx: *VmCtx) noreturn {
         if (vmctx.thread_context != 0) {
             const thread_context_ptr: *execution_context.ThreadExecutionContext =
                 @ptrFromInt(vmctx.thread_context);
+            if (thread_context_ptr.backendContext(AotCallState)) |call_state|
+                call_state.cancel_unwind.store(true, .release);
             if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager| {
                 if (manager.terminalOutcome()) |result| {
                     if (result.kind == .exit) fallback = @intCast(result.code & 0xff);
@@ -1926,6 +2018,7 @@ pub const AotInstance = struct {
     ) void {
         self.thread_context.replaceProcessState(process_state);
         refreshVmCtxForInstance(self, null);
+        installDefaultVmCtxExecutionContext(self);
     }
 
     /// Narrow hook for the future AOT thread-clone path: inherit only the
@@ -1936,6 +2029,7 @@ pub const AotInstance = struct {
     ) void {
         self.thread_context.replaceProcessState(parent.thread_context.process_state);
         refreshVmCtxForInstance(self, null);
+        installDefaultVmCtxExecutionContext(self);
     }
 
     pub fn setThreadManager(
@@ -1947,6 +2041,7 @@ pub const AotInstance = struct {
         else
             null);
         refreshVmCtxForInstance(self, null);
+        installDefaultVmCtxExecutionContext(self);
     }
 };
 
@@ -1987,6 +2082,7 @@ pub const RuntimeError = error{
     ExecutionFailed,
     TableAllocationFailed,
     WasmTrap,
+    ThreadCancelled,
     /// AOT execution is unavailable on this build's target architecture
     /// (currently only x86_64 and aarch64 are supported). The symbol is
     /// still linked so importers of `src/root.zig` build cleanly on
@@ -2217,6 +2313,7 @@ pub fn instantiateWithOverrides(
     }
 
     refreshVmCtxForInstance(inst, null);
+    installDefaultVmCtxExecutionContext(inst);
     subscribeVmCtxToMemories(inst) catch return error.OutOfMemory;
 
     return inst;
@@ -2475,6 +2572,7 @@ pub fn cloneForThread(
         .thread_context = child_thread_context,
     };
     refreshVmCtxForInstance(child, null);
+    installDefaultVmCtxExecutionContext(child);
     subscribeVmCtxToMemories(child) catch return error.OutOfMemory;
     errdefer unsubscribeVmCtxFromMemories(child);
     subscribeVmCtxToTables(child) catch return error.OutOfMemory;
@@ -2597,22 +2695,25 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
         vmctx.ptr_to_sig_ptr = 0;
         vmctx.ptr_to_sig_len = 0;
     }
+    vmctx.lazy_compile_fn = if (comptime config.lazy_jit) @intFromPtr(&lazyCompileHelper) else 0;
+    vmctx.cancel_point_fn = @intFromPtr(&aotCancelPoint);
+    vmctx.memory_init_fn = @intFromPtr(&memoryInitHelper);
+    vmctx.data_drop_fn = @intFromPtr(&dataDropHelper);
+}
+
+fn installDefaultVmCtxExecutionContext(inst: *AotInstance) void {
+    const vmctx = &inst.vmctx;
+    vmctx.thread_context = @intFromPtr(&inst.thread_context);
     vmctx.wasi_ctx = if (inst.thread_context.process_state) |state|
         @intFromPtr(state.ptr)
     else
         0;
-    vmctx.lazy_compile_fn = if (comptime config.lazy_jit) @intFromPtr(&lazyCompileHelper) else 0;
-    vmctx.thread_context = @intFromPtr(&inst.thread_context);
-    vmctx.cancel_point_fn = @intFromPtr(&aotCancelPoint);
-    vmctx.memory_init_fn = @intFromPtr(&memoryInitHelper);
-    vmctx.data_drop_fn = @intFromPtr(&dataDropHelper);
-    // A refresh must never resurrect a cancelled thread: inherit whatever the
-    // group has already published.
-    vmctx.cancel_flag = if (comptime config.lib_wasi_threads) blk: {
-        const manager = inst.thread_context.threadGroup(thread_manager.ThreadManager) orelse
-            break :blk vmctx.cancel_flag;
-        break :blk if (manager.isTerminatingForContext(&inst.thread_context)) 1 else 0;
-    } else 0;
+    publishCancellationContext(
+        inst,
+        vmctx,
+        vmctx.thread_context,
+        inst.thread_context.cancellationGroupToken(),
+    );
 }
 
 /// Host helper invoked by an AOT loop-header cancel poll. Never returns:
@@ -2628,7 +2729,7 @@ pub fn aotCancelPoint(vmctx: *VmCtx) callconv(.c) noreturn {
 /// code without calling any host function.
 fn broadcastCancelToSharedMemory(
     raw: *anyopaque,
-    target_group: ?*const anyopaque,
+    target_token: u32,
 ) void {
     if (comptime !config.lib_wasi_threads) return;
     const mem: *types.MemoryInstance = @ptrCast(@alignCast(raw));
@@ -2636,13 +2737,9 @@ fn broadcastCancelToSharedMemory(
     defer mem.subscriber_mutex.unlock();
     for (mem.vmctx_subscribers.items) |subscriber_opaque| {
         const subscriber: *VmCtx = @ptrCast(@alignCast(subscriber_opaque));
-        if (target_group) |target| {
-            if (subscriber.thread_context == 0) continue;
-            const context: *execution_context.ThreadExecutionContext =
-                @ptrFromInt(subscriber.thread_context);
-            const group = context.cancellation_group orelse continue;
-            if (group != target) continue;
-        }
+        if (target_token != 0 and
+            @atomicLoad(u32, &subscriber.cancel_group_token, .acquire) != target_token)
+            continue;
         @atomicStore(u32, &subscriber.cancel_flag, 1, .release);
     }
 }
@@ -2669,35 +2766,328 @@ test "AOT thread task cancellation targets only matching VmCtx subscribers" {
 
     var first_context = execution_context.ThreadExecutionContext{};
     first_context.setThreadGroup(@ptrCast(&manager));
+    const first_source = try task_cancellation.Source.create(allocator);
+    defer first_source.release();
     var first_scope = try manager.bindTaskGroup(
         &first_context,
-        1,
-        false,
+        first_source,
     );
     defer first_scope.deinit();
     var second_context = execution_context.ThreadExecutionContext{};
     second_context.setThreadGroup(@ptrCast(&manager));
+    const second_source = try task_cancellation.Source.create(allocator);
+    defer second_source.release();
     var second_scope = try manager.bindTaskGroup(
         &second_context,
-        2,
-        false,
+        second_source,
     );
     defer second_scope.deinit();
 
     var first_vmctx = VmCtx{};
     first_vmctx.thread_context = @intFromPtr(&first_context);
+    @atomicStore(
+        u32,
+        &first_vmctx.cancel_group_token,
+        first_context.cancellationGroupToken(),
+        .release,
+    );
     var second_vmctx = VmCtx{};
     second_vmctx.thread_context = @intFromPtr(&second_context);
+    @atomicStore(
+        u32,
+        &second_vmctx.cancel_group_token,
+        second_context.cancellationGroupToken(),
+        .release,
+    );
     try mem.subscribeVmCtx(@ptrCast(&first_vmctx), allocator);
     defer mem.unsubscribeVmCtx(@ptrCast(&first_vmctx));
     try mem.subscribeVmCtx(@ptrCast(&second_vmctx), allocator);
     defer mem.unsubscribeVmCtx(@ptrCast(&second_vmctx));
 
-    try std.testing.expect(manager.cancelTaskForContext(&first_context));
-    try std.testing.expectEqual(@as(u32, 1), first_vmctx.cancel_flag);
-    try std.testing.expectEqual(@as(u32, 0), second_vmctx.cancel_flag);
+    first_source.cancel();
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        @atomicLoad(u32, &first_vmctx.cancel_flag, .acquire),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        @atomicLoad(u32, &second_vmctx.cancel_flag, .acquire),
+    );
     try std.testing.expect(!manager.isTaskCancelledForContext(&second_context));
     try std.testing.expect(terminal.outcome() == null);
+}
+
+test "AOT thread cancellation scope restores outer identity and recomputes state" {
+    if (!config.lib_wasi_threads or @import("builtin").single_threaded)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const module = aot_loader.AotModule{};
+    const inst = try instantiate(&module, allocator);
+    defer destroy(inst);
+
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&terminal);
+    inst.setThreadManager(&manager);
+
+    const Probe = struct {
+        fn broadcast(raw: *anyopaque, target_token: u32) void {
+            const vmctx: *VmCtx = @ptrCast(@alignCast(raw));
+            if (target_token == 0 or
+                @atomicLoad(u32, &vmctx.cancel_group_token, .acquire) == target_token)
+                @atomicStore(u32, &vmctx.cancel_flag, 1, .release);
+        }
+    };
+    manager.bindCancelBroadcast(.{
+        .ctx = @ptrCast(&inst.vmctx),
+        .broadcast = Probe.broadcast,
+    });
+
+    const Case = struct {
+        source: *task_cancellation.Source = undefined,
+        context: execution_context.ThreadExecutionContext = .{},
+        scope: thread_manager.ThreadManager.TaskGroupScope = undefined,
+
+        fn init(
+            self: *@This(),
+            tm: *thread_manager.ThreadManager,
+            allocator_: std.mem.Allocator,
+        ) !void {
+            self.source = try task_cancellation.Source.create(allocator_);
+            errdefer self.source.release();
+            self.context.setThreadGroup(@ptrCast(tm));
+            self.scope = try tm.bindTaskGroup(&self.context, self.source);
+        }
+
+        fn deinit(self: *@This()) void {
+            self.scope.deinit();
+            self.source.release();
+        }
+    };
+
+    var cancelled_outer = Case{};
+    try cancelled_outer.init(&manager, allocator);
+    defer cancelled_outer.deinit();
+    var normal_inner = Case{};
+    try normal_inner.init(&manager, allocator);
+    defer normal_inner.deinit();
+    cancelled_outer.source.cancel();
+    const outer_scope = VmCtxExecutionScope.enter(inst, &cancelled_outer.context);
+    try std.testing.expectEqual(
+        cancelled_outer.context.cancellationGroupToken(),
+        @atomicLoad(u32, &inst.vmctx.cancel_group_token, .acquire),
+    );
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    // Both callFunc and callFuncScalar refresh static VmCtx fields before
+    // installing their nested execution scope. That refresh must not erase
+    // the active outer identity/flag.
+    refreshVmCtxForInstance(inst, null);
+    try std.testing.expectEqual(
+        cancelled_outer.context.cancellationGroupToken(),
+        @atomicLoad(u32, &inst.vmctx.cancel_group_token, .acquire),
+    );
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    const inner_scope = VmCtxExecutionScope.enter(inst, &normal_inner.context);
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    inner_scope.deinit();
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    outer_scope.deinit();
+
+    var outer_cancelled_during_inner = Case{};
+    try outer_cancelled_during_inner.init(&manager, allocator);
+    defer outer_cancelled_during_inner.deinit();
+    var second_inner = Case{};
+    try second_inner.init(&manager, allocator);
+    defer second_inner.deinit();
+    const outer_during_scope = VmCtxExecutionScope.enter(
+        inst,
+        &outer_cancelled_during_inner.context,
+    );
+    const second_inner_scope = VmCtxExecutionScope.enter(inst, &second_inner.context);
+    outer_cancelled_during_inner.source.cancel();
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    second_inner_scope.deinit();
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    outer_during_scope.deinit();
+
+    var normal_outer = Case{};
+    try normal_outer.init(&manager, allocator);
+    defer normal_outer.deinit();
+    var cancelled_inner = Case{};
+    try cancelled_inner.init(&manager, allocator);
+    defer cancelled_inner.deinit();
+    const normal_outer_scope = VmCtxExecutionScope.enter(inst, &normal_outer.context);
+    const cancelled_inner_scope = VmCtxExecutionScope.enter(inst, &cancelled_inner.context);
+    cancelled_inner.source.cancel();
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    cancelled_inner_scope.deinit();
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    normal_outer_scope.deinit();
+
+    var process_outer = Case{};
+    try process_outer.init(&manager, allocator);
+    defer process_outer.deinit();
+    var process_inner = Case{};
+    try process_inner.init(&manager, allocator);
+    defer process_inner.deinit();
+    const process_outer_scope = VmCtxExecutionScope.enter(inst, &process_outer.context);
+    const process_inner_scope = VmCtxExecutionScope.enter(inst, &process_inner.context);
+    manager.signalExit(7);
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    process_inner_scope.deinit();
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire));
+    try std.testing.expectEqual(@as(?u32, 7), terminal.exitCode());
+    process_outer_scope.deinit();
+}
+
+test "AOT thread targeted cancellation is race-safe across task scope transitions" {
+    if (!config.lib_wasi_threads or @import("builtin").single_threaded)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const module = aot_loader.AotModule{};
+    const inst = try instantiate(&module, allocator);
+    defer destroy(inst);
+    const mem = try types.MemoryInstance.createShared(.{
+        .limits = .{ .min = 1, .max = 2 },
+        .is_shared = true,
+    }, allocator);
+    defer mem.release(allocator);
+    try mem.subscribeVmCtx(@ptrCast(&inst.vmctx), allocator);
+    defer mem.unsubscribeVmCtx(@ptrCast(&inst.vmctx));
+
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&terminal);
+    manager.bindCancelBroadcast(.{
+        .ctx = @ptrCast(mem),
+        .broadcast = broadcastCancelToSharedMemory,
+    });
+    inst.setThreadManager(&manager);
+
+    const first_source = try task_cancellation.Source.create(allocator);
+    defer first_source.release();
+    var first_context = execution_context.ThreadExecutionContext{};
+    first_context.setThreadGroup(@ptrCast(&manager));
+    var first_group = try manager.bindTaskGroup(&first_context, first_source);
+    defer first_group.deinit();
+    const second_source = try task_cancellation.Source.create(allocator);
+    defer second_source.release();
+    var second_context = execution_context.ThreadExecutionContext{};
+    second_context.setThreadGroup(@ptrCast(&manager));
+    var second_group = try manager.bindTaskGroup(&second_context, second_source);
+    defer second_group.deinit();
+
+    var started = std.atomic.Value(bool).init(false);
+    var cancel_complete = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    var post_cancel = std.atomic.Value(usize).init(0);
+    var missed = std.atomic.Value(usize).init(0);
+    var wrong = std.atomic.Value(usize).init(0);
+    const Racer = struct {
+        inst: *AotInstance,
+        first: *execution_context.ThreadExecutionContext,
+        second: *execution_context.ThreadExecutionContext,
+        started_: *std.atomic.Value(bool),
+        cancel_complete_: *std.atomic.Value(bool),
+        stop_: *std.atomic.Value(bool),
+        post_cancel_: *std.atomic.Value(usize),
+        missed_: *std.atomic.Value(usize),
+        wrong_: *std.atomic.Value(usize),
+
+        fn run(self: *@This()) void {
+            self.started_.store(true, .release);
+            while (!self.stop_.load(.acquire)) {
+                const first_scope_ = VmCtxExecutionScope.enter(self.inst, self.first);
+                if (self.cancel_complete_.load(.acquire) and
+                    @atomicLoad(u32, &self.inst.vmctx.cancel_flag, .acquire) == 0)
+                    _ = self.missed_.fetchAdd(1, .acq_rel);
+                first_scope_.deinit();
+
+                const second_scope_ = VmCtxExecutionScope.enter(self.inst, self.second);
+                if (@atomicLoad(u32, &self.inst.vmctx.cancel_flag, .acquire) != 0)
+                    _ = self.wrong_.fetchAdd(1, .acq_rel);
+                second_scope_.deinit();
+                if (self.cancel_complete_.load(.acquire))
+                    _ = self.post_cancel_.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    var racer = Racer{
+        .inst = inst,
+        .first = &first_context,
+        .second = &second_context,
+        .started_ = &started,
+        .cancel_complete_ = &cancel_complete,
+        .stop_ = &stop,
+        .post_cancel_ = &post_cancel,
+        .missed_ = &missed,
+        .wrong_ = &wrong,
+    };
+    const thread = try std.Thread.spawn(.{}, Racer.run, .{&racer});
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    first_source.cancel();
+    cancel_complete.store(true, .release);
+    const deadline_us = platform.timeGetBootUs() +| 5 * std.time.us_per_s;
+    while (post_cancel.load(.acquire) < 10_000) {
+        if (platform.timeGetBootUs() >= deadline_us) break;
+        std.atomic.spinLoopHint();
+    }
+    stop.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(post_cancel.load(.acquire) >= 10_000);
+    try std.testing.expectEqual(@as(usize, 0), missed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), wrong.load(.acquire));
+    try std.testing.expect(!second_source.isCancelled());
+    try std.testing.expect(terminal.outcome() == null);
+}
+
+test "AOT thread process exit is not suppressed by task cancellation" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&terminal);
+    const source = try task_cancellation.Source.create(allocator);
+    defer source.release();
+    var context = execution_context.ThreadExecutionContext{};
+    context.setThreadGroup(@ptrCast(&manager));
+    var group = try manager.bindTaskGroup(&context, source);
+    defer group.deinit();
+    source.cancel();
+    try std.testing.expect(manager.isTaskCancelledForContext(&context));
+
+    var vmctx = VmCtx{};
+    vmctx.thread_context = @intFromPtr(&context);
+    const winner = signalThreadGroupExit(&vmctx, 23).?;
+    try std.testing.expectEqual(termination.Kind.exit, winner.kind);
+    try std.testing.expectEqual(@as(u32, 23), winner.code);
+    try std.testing.expectEqual(@as(?u32, 23), terminal.exitCode());
+    try std.testing.expect(manager.isProcessTerminating());
+}
+
+test "AOT thread genuine trap after task cancellation remains process-terminal" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&terminal);
+    const source = try task_cancellation.Source.create(allocator);
+    defer source.release();
+    var context = execution_context.ThreadExecutionContext{};
+    context.setThreadGroup(@ptrCast(&manager));
+    var group = try manager.bindTaskGroup(&context, source);
+    defer group.deinit();
+    source.cancel();
+
+    var vmctx = VmCtx{};
+    vmctx.thread_context = @intFromPtr(&context);
+    signalThreadGroupTrap(&vmctx);
+    try std.testing.expectEqual(termination.Kind.trap, terminal.outcome().?.kind);
 }
 
 fn subscribeVmCtxToMemories(inst: *AotInstance) !void {
@@ -2887,14 +3277,17 @@ fn configureAotThreadContext(
         }
     }
     child.instance.setThreadManager(manager);
-    child.instance.thread_context.cancellation_group =
-        if (cancellation_group) |group| @ptrCast(group) else null;
+    child.instance.thread_context.setCancellationGroup(
+        if (cancellation_group) |group| @ptrCast(group) else null,
+        if (cancellation_group) |group| group.token else 0,
+    );
     child.instance.thread_context.configureWasiThread(
         tid,
         start_arg,
         auxiliary_stack,
     );
     refreshVmCtxForInstance(child.instance, null);
+    installDefaultVmCtxExecutionContext(child.instance);
 }
 
 fn runAotThreadContext(child_opaque: *anyopaque) thread_manager.ThreadOutcome {
@@ -2912,13 +3305,8 @@ fn runAotThreadContext(child_opaque: *anyopaque) thread_manager.ThreadOutcome {
         &.{},
         &args,
         &results,
-    ) catch {
-        if (child.instance.thread_context.threadGroup(
-            thread_manager.ThreadManager,
-        )) |manager| {
-            if (manager.isTaskCancelledForContext(&child.instance.thread_context))
-                return .cancelled;
-        }
+    ) catch |err| {
+        if (err == error.ThreadCancelled) return .cancelled;
         return .trapped;
     };
     return .completed;
@@ -2991,10 +3379,25 @@ pub fn signalThreadGroupTrap(vmctx: *VmCtx) void {
     const thread_context_ptr: *execution_context.ThreadExecutionContext =
         @ptrFromInt(vmctx.thread_context);
     thread_context_ptr.markTrap();
-    if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager| {
-        if (manager.isTaskCancelledForContext(thread_context_ptr)) return;
+    if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager|
         manager.signalTrap();
+}
+
+/// Publish an explicit Preview-1 process exit. Unlike cancellation-induced
+/// trap unwind, proc_exit is process-terminal and can never be suppressed by
+/// the current component task's cancellation state.
+pub fn signalThreadGroupExit(
+    vmctx: *VmCtx,
+    code: u32,
+) ?termination.Outcome {
+    if (vmctx.thread_context == 0) return null;
+    const thread_context_ptr: *execution_context.ThreadExecutionContext =
+        @ptrFromInt(vmctx.thread_context);
+    if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager| {
+        manager.signalExit(code);
+        return manager.terminalOutcome();
     }
+    return null;
 }
 
 /// Look up an exported memory by name, returning the underlying
@@ -3341,24 +3744,8 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
     defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
-    const default_thread_context = vmctx.thread_context;
-    const default_wasi_ctx = vmctx.wasi_ctx;
-    vmctx.thread_context = @intFromPtr(call_thread_context);
-    if (call_thread_context.process_state) |state| {
-        vmctx.wasi_ctx = @intFromPtr(state.ptr);
-    }
-    if (comptime config.lib_wasi_threads) {
-        vmctx.cancel_flag = if (call_thread_context.threadGroup(
-            thread_manager.ThreadManager,
-        )) |manager|
-            @intFromBool(manager.isTerminatingForContext(call_thread_context))
-        else
-            0;
-    }
-    defer {
-        vmctx.thread_context = default_thread_context;
-        vmctx.wasi_ctx = default_wasi_ctx;
-    }
+    const vmctx_scope = VmCtxExecutionScope.enter(inst, call_thread_context);
+    defer vmctx_scope.deinit();
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -3837,24 +4224,8 @@ pub fn callFuncScalar(
     refreshVmCtxForInstance(inst, globals_buf);
     const vmctx: *VmCtx = @ptrFromInt(vmctx_storage_addr);
     defer @as(*VmCtx, @ptrFromInt(vmctx_storage_addr)).globals_ptr = previous_globals_ptr;
-    const default_thread_context = vmctx.thread_context;
-    const default_wasi_ctx = vmctx.wasi_ctx;
-    vmctx.thread_context = @intFromPtr(call_thread_context);
-    if (call_thread_context.process_state) |state| {
-        vmctx.wasi_ctx = @intFromPtr(state.ptr);
-    }
-    if (comptime config.lib_wasi_threads) {
-        vmctx.cancel_flag = if (call_thread_context.threadGroup(
-            thread_manager.ThreadManager,
-        )) |manager|
-            @intFromBool(manager.isTerminatingForContext(call_thread_context))
-        else
-            0;
-    }
-    defer {
-        vmctx.thread_context = default_thread_context;
-        vmctx.wasi_ctx = default_wasi_ctx;
-    }
+    const vmctx_scope = VmCtxExecutionScope.enter(inst, call_thread_context);
+    defer vmctx_scope.deinit();
 
     // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
@@ -3902,7 +4273,8 @@ pub fn callFuncScalar(
         RtlCaptureContext(&aot_call_state.saved_ctx);
         if (aot_call_state.trap_occurred.load(.seq_cst)) {
             aot_call_state.trap_catching.store(false, .seq_cst);
-            call_thread_context.markTrap();
+            const cancelled = aot_call_state.cancel_unwind.load(.acquire);
+            if (!cancelled) call_thread_context.markTrap();
             // If the trap was a stack overflow, the OS consumed the
             // thread's guard page. Re-arm it here so a subsequent
             // overflow in this process is also catchable rather than
@@ -3916,7 +4288,7 @@ pub fn callFuncScalar(
                 .release,
             );
             readGlobalsFromStorage(inst, globals_buf);
-            return error.WasmTrap;
+            return if (cancelled) error.ThreadCancelled else error.WasmTrap;
         }
     }
 
@@ -3930,13 +4302,14 @@ pub fn callFuncScalar(
         if (trap_jmp.capture(&aot_call_state.posix_trap_buf) != 0) {
             // A trap helper unwound back here.
             aot_call_state.trap_catching.store(false, .seq_cst);
-            call_thread_context.markTrap();
+            const cancelled = aot_call_state.cancel_unwind.load(.acquire);
+            if (!cancelled) call_thread_context.markTrap();
             inst.last_trap_reason.store(
                 aot_call_state.trap_reason.load(.acquire),
                 .release,
             );
             readGlobalsFromStorage(inst, globals_buf);
-            return error.WasmTrap;
+            return if (cancelled) error.ThreadCancelled else error.WasmTrap;
         }
     }
 
@@ -5008,7 +5381,8 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 440), @offsetOf(VmCtx, "cancel_point_fn"));
     try std.testing.expectEqual(@as(usize, 448), @offsetOf(VmCtx, "memory_init_fn"));
     try std.testing.expectEqual(@as(usize, 456), @offsetOf(VmCtx, "data_drop_fn"));
-    try std.testing.expectEqual(@as(usize, 464), @sizeOf(VmCtx));
+    try std.testing.expectEqual(@as(usize, 464), @offsetOf(VmCtx, "cancel_group_token"));
+    try std.testing.expectEqual(@as(usize, 472), @sizeOf(VmCtx));
 }
 
 test "AOT thread context inherits retained process state without thread-local flags" {

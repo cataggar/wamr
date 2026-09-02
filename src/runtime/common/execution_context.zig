@@ -111,6 +111,12 @@ pub const ThreadExecutionContext = struct {
     /// thread manager; keeping it opaque avoids a runtime-common → WASI
     /// dependency. Child WASI threads inherit this binding explicitly.
     cancellation_group: ?*anyopaque = null,
+    cancellation_group_token: if (config.lib_wasi_threads)
+        std.atomic.Value(u32)
+    else
+        void = if (config.lib_wasi_threads)
+        std.atomic.Value(u32).init(0)
+    else {},
     task_manager: ?*anyopaque = null,
     runtime_call_context: ?*anyopaque = null,
     /// Request-scoped host coordination state carried through nested
@@ -133,6 +139,8 @@ pub const ThreadExecutionContext = struct {
         self.process_state = null;
         self.thread_group = null;
         self.cancellation_group = null;
+        if (comptime config.lib_wasi_threads)
+            self.cancellation_group_token.store(0, .release);
         self.task_manager = null;
         self.runtime_call_context = null;
         self.host_task_context = null;
@@ -180,13 +188,29 @@ pub const ThreadExecutionContext = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    pub fn setCancellationGroup(
+        self: *ThreadExecutionContext,
+        cancellation_group: ?*anyopaque,
+        token: u32,
+    ) void {
+        self.cancellation_group = cancellation_group;
+        if (comptime config.lib_wasi_threads)
+            self.cancellation_group_token.store(token, .release);
+    }
+
     pub fn bindCancellationGroup(
         self: *ThreadExecutionContext,
         cancellation_group: ?*anyopaque,
-    ) OpaqueBinding {
+        token: u32,
+    ) CancellationBinding {
         const previous = self.cancellation_group;
-        self.cancellation_group = cancellation_group;
-        return .{ .slot = &self.cancellation_group, .previous = previous };
+        const previous_token = self.cancellationGroupToken();
+        self.setCancellationGroup(cancellation_group, token);
+        return .{
+            .context = self,
+            .previous = previous,
+            .previous_token = previous_token,
+        };
     }
 
     pub fn cancellationGroup(
@@ -195,6 +219,11 @@ pub const ThreadExecutionContext = struct {
     ) ?*T {
         const ptr = self.cancellation_group orelse return null;
         return @ptrCast(@alignCast(ptr));
+    }
+
+    pub fn cancellationGroupToken(self: *const ThreadExecutionContext) u32 {
+        if (comptime !config.lib_wasi_threads) return 0;
+        return self.cancellation_group_token.load(.acquire);
     }
 
     pub fn bindTaskManager(
@@ -299,6 +328,16 @@ pub const OpaqueBinding = struct {
 
     pub fn deinit(self: OpaqueBinding) void {
         self.slot.* = self.previous;
+    }
+};
+
+pub const CancellationBinding = struct {
+    context: *ThreadExecutionContext,
+    previous: ?*anyopaque,
+    previous_token: u32,
+
+    pub fn deinit(self: CancellationBinding) void {
+        self.context.setCancellationGroup(self.previous, self.previous_token);
     }
 };
 
