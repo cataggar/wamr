@@ -32,9 +32,19 @@
         "required_profile": { "const": "authoritative" },
         "required_platforms": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 2,
+          "maxItems": 2,
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "enum": [
+              "ubuntu-22.04-x86_64",
+              "ubuntu-24.04-aarch64"
+            ]
+          },
+          "allOf": [
+            { "contains": { "const": "ubuntu-22.04-x86_64" } },
+            { "contains": { "const": "ubuntu-24.04-aarch64" } }
+          ]
         }
       }
     },
@@ -63,9 +73,20 @@
             "profile": { "const": "authoritative" },
             "report_count_by_platform": {
               "type": "object",
-              "additionalProperties": {
-                "type": "integer",
-                "minimum": 20
+              "additionalProperties": false,
+              "required": [
+                "ubuntu-22.04-x86_64",
+                "ubuntu-24.04-aarch64"
+              ],
+              "properties": {
+                "ubuntu-22.04-x86_64": {
+                  "type": "integer",
+                  "minimum": 20
+                },
+                "ubuntu-24.04-aarch64": {
+                  "type": "integer",
+                  "minimum": 20
+                }
               }
             }
           }
@@ -74,7 +95,15 @@
     },
     "platforms": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/platform" }
+      "additionalProperties": false,
+      "required": [
+        "ubuntu-22.04-x86_64",
+        "ubuntu-24.04-aarch64"
+      ],
+      "properties": {
+        "ubuntu-22.04-x86_64": { "$ref": "#/$defs/platform" },
+        "ubuntu-24.04-aarch64": { "$ref": "#/$defs/platform" }
+      }
     }
   },
   "$defs": {
