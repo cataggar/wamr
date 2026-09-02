@@ -210,6 +210,20 @@ The current follow-up tracker is
 [#616](https://github.com/cataggar/wamr/issues/616). PR #909 completed
 A2, A5, and C1.
 
+#### Preview-1 `poll_oneoff` on Windows
+
+Windows supports relative and absolute realtime/monotonic clock
+subscriptions plus stdio and regular-file readiness. Console input is treated
+as readable only when a key is available (or a complete line in line-input
+mode); redirected pipes use `PeekNamedPipe` so buffered bytes and writer
+closure/EOF are distinguished. With Preview-1 threads enabled, every blocking
+Windows wait includes a `ThreadManager`-owned manual-reset cancellation event,
+so group termination wakes `poll_oneoff` and blocking stdin reads immediately.
+
+Preview-1 socket subscriptions on Windows currently produce a per-event
+`notsup` error; Windows socket I/O itself remains supported. POSIX
+`poll_oneoff` continues to use `poll(2)` for sockets and descriptors.
+
 #### Outbound HTTP `request-options` deadlines (A1)
 
 All three `wasi:http/types.request-options` budgets are enforced on the
