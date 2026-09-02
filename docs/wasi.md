@@ -644,6 +644,20 @@ dispatch cost (i.e. the WAMR-side surface), so kernel jitter doesn't
 swamp the signal. Real-network coverage stays under the conformance
 gates (`wasi-testsuite`, `wasi-p3-testsuite`).
 
+### Threaded performance evidence
+
+[`scripts/bench_wasi_threads.py`](../scripts/bench_wasi_threads.py) drives the
+checked-in real-wasi-libc pthread fixtures under
+[`tests/benchmarks/wasi-threads/`](../tests/benchmarks/wasi-threads/) through
+the interpreter and AOT. It pairs disabled/enabled runtime builds on one
+identical no-spawn loop, isolates the AOT loop-header cancel poll, and reports
+1/2/4/8-thread hot-loop, atomic-RMW, wait/notify, and spawn/join throughput.
+The path-filtered/manual
+[`wasi-thread-bench` workflow](../.github/workflows/wasi-thread-bench.yml)
+retains raw JSON reports. Its budget remains explicitly uncalibrated until the
+hosted x86_64 and AArch64 cohort described in the benchmark README exists; the
+workflow must continue passing `--no-budget` until then.
+
 ## Roadmap
 
 The post-Preview-3 hardening tracker is
