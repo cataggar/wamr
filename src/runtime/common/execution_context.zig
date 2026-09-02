@@ -107,6 +107,10 @@ pub const ThreadExecutionContext = struct {
     tls_base: ?u32 = null,
     auxiliary_stack: ?AuxiliaryStack = null,
     thread_group: ?*anyopaque = null,
+    /// Task-scoped cancellation group. The concrete type is owned by the
+    /// thread manager; keeping it opaque avoids a runtime-common → WASI
+    /// dependency. Child WASI threads inherit this binding explicitly.
+    cancellation_group: ?*anyopaque = null,
     task_manager: ?*anyopaque = null,
     runtime_call_context: ?*anyopaque = null,
     /// Request-scoped host coordination state carried through nested
@@ -128,6 +132,7 @@ pub const ThreadExecutionContext = struct {
         if (self.process_state) |state| state.release();
         self.process_state = null;
         self.thread_group = null;
+        self.cancellation_group = null;
         self.task_manager = null;
         self.runtime_call_context = null;
         self.host_task_context = null;
@@ -172,6 +177,23 @@ pub const ThreadExecutionContext = struct {
 
     pub fn threadGroup(self: *const ThreadExecutionContext, comptime T: type) ?*T {
         const ptr = self.thread_group orelse return null;
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    pub fn bindCancellationGroup(
+        self: *ThreadExecutionContext,
+        cancellation_group: ?*anyopaque,
+    ) OpaqueBinding {
+        const previous = self.cancellation_group;
+        self.cancellation_group = cancellation_group;
+        return .{ .slot = &self.cancellation_group, .previous = previous };
+    }
+
+    pub fn cancellationGroup(
+        self: *const ThreadExecutionContext,
+        comptime T: type,
+    ) ?*T {
+        const ptr = self.cancellation_group orelse return null;
         return @ptrCast(@alignCast(ptr));
     }
 

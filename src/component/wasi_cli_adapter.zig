@@ -6471,11 +6471,16 @@ const InboundHttpResponseSession = struct {
 
     fn handlerFailed(self: *InboundHttpResponseSession) void {
         self.mutex.lock();
-        self.handler_outcome = .failed;
         const writer_may_be_in_io = self.head_ready and
             (self.produced_bytes != 0 or self.queue_len != 0);
         self.mutex.unlock();
         _ = self.finishTerminal(.handler_error, writer_may_be_in_io);
+        // Publish the terminal state before exposing `.failed` to the writer.
+        // Otherwise it can observe `handler_outcome != .pending` while the
+        // terminal is still `.running` and commit a response head in between.
+        self.mutex.lock();
+        self.handler_outcome = .failed;
+        self.mutex.unlock();
     }
 
     fn writeWireSlice(
@@ -53482,16 +53487,35 @@ test "wasi:http #616 A8 live: handler failure before response emits nothing" {
         null,
     );
     var sink = LiveHttpTestSink{};
-    const session = try startLiveHttpTestSession(
+    const session = try InboundHttpResponseSession.create(
+        adapter.allocator,
         &adapter,
         &ci,
         &output,
-        &sink,
-        fixture,
+        false,
+        .get,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
     );
     defer session.destroy();
+    try testing.expect(session.attachP3Response(
+        fixture.response_handle,
+        fixture.body_handle,
+        fixture.trailers_handle,
+        fixture.transmission_handle,
+    ));
+    try testing.expect(session.selectP3Response(fixture.response_handle));
 
+    // Establish the ordering named by the test: failure is terminal before
+    // the writer can inspect the response head.
     session.handlerFailed();
+    try session.start();
     session.waitAndJoin();
     session.propagateTerminalToGuest();
     try testing.expectEqual(HttpLiveTerminal.handler_error, session.currentTerminal());

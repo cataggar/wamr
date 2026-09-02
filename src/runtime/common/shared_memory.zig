@@ -161,11 +161,26 @@ pub const Control = struct {
         expected: u32,
         timeout_ns: i64,
     ) WaitError!parking.WaitResult {
+        return self.wait32Cancellable(offset, expected, timeout_ns, null);
+    }
+
+    pub fn wait32Cancellable(
+        self: *Control,
+        offset: usize,
+        expected: u32,
+        timeout_ns: i64,
+        cancellation: ?parking.CancellationEpoch.Ticket,
+    ) WaitError!parking.WaitResult {
         if (offset & (@alignOf(u32) - 1) != 0) return error.Unaligned;
         if (!rangeInBounds(offset, @sizeOf(u32), self.byteLen())) return error.OutOfBounds;
         const address: *align(@alignOf(u32)) const u32 =
             @ptrCast(@alignCast(self.base + offset));
-        return self.parking_lot.wait32(address, expected, timeout_ns);
+        return self.parking_lot.wait32Cancellable(
+            address,
+            expected,
+            timeout_ns,
+            cancellation,
+        );
     }
 
     pub fn wait64(
@@ -174,11 +189,26 @@ pub const Control = struct {
         expected: u64,
         timeout_ns: i64,
     ) WaitError!parking.WaitResult {
+        return self.wait64Cancellable(offset, expected, timeout_ns, null);
+    }
+
+    pub fn wait64Cancellable(
+        self: *Control,
+        offset: usize,
+        expected: u64,
+        timeout_ns: i64,
+        cancellation: ?parking.CancellationEpoch.Ticket,
+    ) WaitError!parking.WaitResult {
         if (offset & (@alignOf(u64) - 1) != 0) return error.Unaligned;
         if (!rangeInBounds(offset, @sizeOf(u64), self.byteLen())) return error.OutOfBounds;
         const address: *align(@alignOf(u64)) const u64 =
             @ptrCast(@alignCast(self.base + offset));
-        return self.parking_lot.wait64(address, expected, timeout_ns);
+        return self.parking_lot.wait64Cancellable(
+            address,
+            expected,
+            timeout_ns,
+            cancellation,
+        );
     }
 
     pub fn notify(self: *Control, offset: usize, count: u32) WaitError!u32 {
@@ -194,6 +224,13 @@ pub const Control = struct {
 
     pub fn cancelAll(self: *Control) parking.BackendError!u32 {
         return self.parking_lot.cancelAll();
+    }
+
+    pub fn cancelEpoch(
+        self: *Control,
+        ticket: parking.CancellationEpoch.Ticket,
+    ) parking.BackendError!u32 {
+        return self.parking_lot.cancelEpoch(ticket);
     }
 };
 
