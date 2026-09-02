@@ -427,17 +427,64 @@ class FrameAttributionUnitTests(unittest.TestCase):
             ):
                 aot.parse_cwasm("ambiguous.cwasm")
 
-    def test_equal_size_jit_mappings_require_explicit_base(self):
+    def test_exact_page_rounded_jit_mapping_is_required(self):
+        with mock.patch.object(
+            aot, "jit_exec_mmaps", return_value=[(0x1000, 8192)]
+        ):
+            with self.assertRaisesRegex(
+                aot.AttributionError, "found 0 exact matches"
+            ):
+                aot.select_text_mapping(
+                    "perf.data", 4096, page_size=4096
+                )
+
+        with mock.patch.object(
+            aot, "jit_exec_mmaps", return_value=[(0x2000, 8192)]
+        ):
+            selection = aot.select_text_mapping(
+                "perf.data", 5000, page_size=4096
+            )
+        self.assertEqual(0x2000, selection.base)
+        self.assertEqual(8192, selection.expected_size)
+        self.assertTrue(selection.authoritative)
+
         with mock.patch.object(
             aot, "jit_exec_mmaps", return_value=[(0x1000, 4096), (0x4000, 4096)]
         ):
             with self.assertRaisesRegex(
                 aot.AttributionError, "exactly one"
             ):
-                aot.select_text_base("perf.data", 4096)
-        self.assertEqual(
-            0x4000, aot.select_text_base("perf.data", 4096, "0x4000")
+                aot.select_text_mapping(
+                    "perf.data", 4096, page_size=4096
+                )
+
+    def test_manual_mapping_override_is_non_authoritative(self):
+        with mock.patch.object(
+            aot, "jit_exec_mmaps", return_value=[(0x4000, 8192)]
+        ):
+            selection = aot.select_text_mapping(
+                "perf.data", 4096, "0x4000", page_size=4096
+            )
+        self.assertEqual(0x4000, selection.base)
+        self.assertFalse(selection.authoritative)
+        self.assertEqual("0x4000", selection.override)
+        with mock.patch.object(aot, "jit_exec_mmaps", return_value=[]):
+            with self.assertRaisesRegex(aot.AttributionError, "hexadecimal"):
+                aot.select_text_mapping(
+                    "perf.data", 4096, "not-a-base", page_size=4096
+                )
+
+    def test_attribution_coverage_threshold_fails_closed(self):
+        self.assertGreater(
+            aot.require_attribution_coverage(34398, 34410, 99.0),
+            99.9,
         )
+        self.assertGreater(
+            aot.require_attribution_coverage(34404, 34419, 99.0),
+            99.9,
+        )
+        with self.assertRaisesRegex(aot.AttributionError, "below required"):
+            aot.require_attribution_coverage(980, 1000, 99.0)
 
     @mock.patch.object(aot, "_run_checked", return_value="")
     @mock.patch.dict(aot.os.environ, {"PERF": "/opt/perf"}, clear=False)
