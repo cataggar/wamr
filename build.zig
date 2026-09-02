@@ -1123,9 +1123,12 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "Windows poll_oneoff:",
             "Windows poll review:",
+            "Windows poll rereview:",
             "Windows cancellable read:",
             "poll_oneoff review:",
             "ThreadManager: Windows cancel event",
+            "ThreadManager: Windows interrupt",
+            "ThreadManager: pre-bind interrupt",
             "group termination: a blocking poll_oneoff",
             "group termination: poll_oneoff still honours",
             "group termination: a blocking Windows stdin",

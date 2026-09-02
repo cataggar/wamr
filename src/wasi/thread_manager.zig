@@ -814,6 +814,8 @@ pub const ThreadManager = struct {
         }
         self.termination = state;
         state.bindWindowsCancelHandle(self.windows_cancel.opaqueHandle());
+        if (self.trap_flag.load(.acquire))
+            _ = state.claimTrap(termination.generic_trap_code);
         state.bindWake(.{ .ctx = @ptrCast(self), .wake = wakeFromTermination });
     }
 
@@ -2970,6 +2972,44 @@ test "ThreadManager: Windows task cancel events are scoped and reusable" {
     );
 }
 
+test "ThreadManager: Windows interrupt before bind is replayed" {
+    if (builtin.os.tag != .windows or !config.lib_wasi_threads)
+        return error.SkipZigTest;
+
+    var manager = ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    manager.interrupt();
+
+    var state = termination.State{};
+    try manager.bindTermination(&state);
+    try std.testing.expectEqual(termination.Kind.trap, state.outcome().?.kind);
+
+    var inputs: [0]windows_poll.ReadInput = .{};
+    try std.testing.expectEqual(
+        windows_poll.WaitResult.cancelled,
+        windows_poll.waitForReadiness(
+            std.testing.allocator,
+            state.windowsCancelHandle(),
+            &inputs,
+            1,
+        ),
+    );
+}
+
+test "ThreadManager: pre-bind interrupt preserves an earlier exit outcome" {
+    if (builtin.os.tag != .windows or !config.lib_wasi_threads)
+        return error.SkipZigTest;
+
+    var manager = ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    manager.interrupt();
+
+    var state = termination.State{};
+    try std.testing.expect(state.claimExit(9));
+    try manager.bindTermination(&state);
+    try std.testing.expectEqual(termination.Kind.exit, state.outcome().?.kind);
+    try std.testing.expectEqual(@as(?u32, 9), state.exitCode());
+}
 /// Parks the calling thread on the group's shared memory with an infinite
 /// timeout, on its own thread so the harness keeps a bounded escape hatch.
 const EmbedderParkCtx = struct {

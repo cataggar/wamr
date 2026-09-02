@@ -3206,17 +3206,24 @@ fn ctxPollOneoffCoreWithHooks(
         }
 
         var earliest_ns: ?u64 = null;
+        var recheck_realtime = false;
         for (clocks.items) |clock| {
             if (!clock.valid) continue;
             const remaining_ns = pendingClockRemainingNs(ctx, hooks, clock);
             if (remaining_ns == 0) continue;
+            if (comptime builtin.os.tag == .windows) {
+                if (clock.absolute and clock.clock_id == wasi.CLOCKID_REALTIME)
+                    recheck_realtime = true;
+            }
             if (earliest_ns == null or remaining_ns < earliest_ns.?)
                 earliest_ns = remaining_ns;
         }
-        const timeout_ms: i32 = if (earliest_ns) |remaining_ns|
+        var timeout_ms: i32 = if (earliest_ns) |remaining_ns|
             nsToTimeoutMs(remaining_ns)
         else
             -1;
+        if (recheck_realtime)
+            timeout_ms = @min(timeout_ms, blocking_slice_ms);
 
         const wait_result: BlockingWait = if (pollfds.items.len == 0 and
             windows_inputs.items.len == 0)
@@ -5372,6 +5379,32 @@ const WindowsPollTestApi = if (builtin.os.tag == .windows) struct {
         lpNumberOfBytesWritten: ?*std.os.windows.DWORD,
         lpOverlapped: ?*anyopaque,
     ) callconv(.winapi) std.os.windows.BOOL;
+
+    extern "kernel32" fn CreateNamedPipeW(
+        lpName: std.os.windows.LPCWSTR,
+        dwOpenMode: std.os.windows.DWORD,
+        dwPipeMode: std.os.windows.DWORD,
+        nMaxInstances: std.os.windows.DWORD,
+        nOutBufferSize: std.os.windows.DWORD,
+        nInBufferSize: std.os.windows.DWORD,
+        nDefaultTimeOut: std.os.windows.DWORD,
+        lpSecurityAttributes: ?*std.os.windows.SECURITY_ATTRIBUTES,
+    ) callconv(.winapi) windows_poll.Handle;
+
+    extern "kernel32" fn CreateFileW(
+        lpFileName: std.os.windows.LPCWSTR,
+        dwDesiredAccess: std.os.windows.DWORD,
+        dwShareMode: std.os.windows.DWORD,
+        lpSecurityAttributes: ?*std.os.windows.SECURITY_ATTRIBUTES,
+        dwCreationDisposition: std.os.windows.DWORD,
+        dwFlagsAndAttributes: std.os.windows.DWORD,
+        hTemplateFile: ?windows_poll.Handle,
+    ) callconv(.winapi) windows_poll.Handle;
+
+    extern "kernel32" fn ConnectNamedPipe(
+        hNamedPipe: windows_poll.Handle,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(.winapi) std.os.windows.BOOL;
 } else struct {};
 
 const WindowsPollTestPipe = if (builtin.os.tag == .windows) struct {
@@ -5409,6 +5442,72 @@ const WindowsPollTestPipe = if (builtin.os.tag == .windows) struct {
         const handle = self.write orelse return;
         std.os.windows.CloseHandle(handle);
         self.write = null;
+    }
+} else struct {};
+
+const WindowsMessagePipe = if (builtin.os.tag == .windows) struct {
+    const name = std.unicode.utf8ToUtf16LeStringLiteral(
+        "\\\\.\\pipe\\wamr-978-more-data",
+    );
+    const pipe_access_inbound: u32 = 0x0000_0001;
+    const pipe_type_message: u32 = 0x0000_0004;
+    const pipe_readmode_message: u32 = 0x0000_0002;
+    const generic_write: u32 = 0x4000_0000;
+    const open_existing: u32 = 3;
+    const file_attribute_normal: u32 = 0x0000_0080;
+
+    read: windows_poll.Handle,
+    write: windows_poll.Handle,
+
+    fn init() !@This() {
+        const read = WindowsPollTestApi.CreateNamedPipeW(
+            name,
+            pipe_access_inbound,
+            pipe_type_message | pipe_readmode_message,
+            1,
+            4096,
+            4096,
+            0,
+            null,
+        );
+        if (read == std.os.windows.INVALID_HANDLE_VALUE)
+            return error.TestUnexpectedResult;
+        errdefer std.os.windows.CloseHandle(read);
+
+        const write = WindowsPollTestApi.CreateFileW(
+            name,
+            generic_write,
+            0,
+            null,
+            open_existing,
+            file_attribute_normal,
+            null,
+        );
+        if (write == std.os.windows.INVALID_HANDLE_VALUE)
+            return error.TestUnexpectedResult;
+        errdefer std.os.windows.CloseHandle(write);
+
+        if (!WindowsPollTestApi.ConnectNamedPipe(read, null).toBool() and
+            std.os.windows.GetLastError() != .PIPE_CONNECTED)
+            return error.TestUnexpectedResult;
+        return .{ .read = read, .write = write };
+    }
+
+    fn deinit(self: *@This()) void {
+        std.os.windows.CloseHandle(self.read);
+        std.os.windows.CloseHandle(self.write);
+    }
+
+    fn writeBytes(self: *@This(), bytes: []const u8) !void {
+        var written: std.os.windows.DWORD = 0;
+        if (!WindowsPollTestApi.WriteFile(
+            self.write,
+            bytes.ptr,
+            @intCast(bytes.len),
+            &written,
+            null,
+        ).toBool()) return error.TestUnexpectedResult;
+        if (written != bytes.len) return error.TestUnexpectedResult;
     }
 } else struct {};
 
@@ -5801,6 +5900,10 @@ test "poll_oneoff review: absolute clocks follow selected-clock jumps" {
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), forward.wait_count);
+    try std.testing.expectEqual(
+        @as(i32, if (builtin.os.tag == .windows) blocking_slice_ms else 50),
+        forward.waits[0],
+    );
 
     const backward_steps = [_]FakePollTime.Step{
         .{ .realtime_ns = 40 * std.time.ns_per_ms },
@@ -5832,8 +5935,14 @@ test "poll_oneoff review: absolute clocks follow selected-clock jumps" {
         ),
     );
     try std.testing.expectEqual(@as(usize, 2), backward.wait_count);
-    try std.testing.expectEqual(@as(i32, 50), backward.waits[0]);
-    try std.testing.expectEqual(@as(i32, 60), backward.waits[1]);
+    try std.testing.expectEqual(
+        @as(i32, if (builtin.os.tag == .windows) blocking_slice_ms else 50),
+        backward.waits[0],
+    );
+    try std.testing.expectEqual(
+        @as(i32, if (builtin.os.tag == .windows) blocking_slice_ms else 60),
+        backward.waits[1],
+    );
 }
 
 test "poll_oneoff review: immediate fd does not emit a future absolute clock" {
@@ -6791,4 +6900,30 @@ test "Windows cancellable read: redirected file returns data then EOF" {
     const first_read = try doRead(ctx, &lease, &buffer);
     try std.testing.expectEqualStrings("file", buffer[0..first_read]);
     try std.testing.expectEqual(@as(usize, 0), try doRead(ctx, &lease, &buffer));
+}
+
+test "Windows cancellable read: message pipe preserves ERROR_MORE_DATA prefix" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (!config.lib_wasi_threads or is_single_threaded) return error.SkipZigTest;
+
+    var pipe = try WindowsMessagePipe.init();
+    defer pipe.deinit();
+    try pipe.writeBytes("message");
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(106, .{ .kind = .stdin, .host_fd = pipe.read });
+    var manager = thread_manager.ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&ctx.termination);
+
+    var lease = ctx.fd_table.acquire(106).?;
+    defer lease.release();
+    var first: [3]u8 = undefined;
+    const first_read = try doRead(ctx, &lease, &first);
+    try std.testing.expectEqualStrings("mes", first[0..first_read]);
+
+    var second: [8]u8 = undefined;
+    const second_read = try doRead(ctx, &lease, &second);
+    try std.testing.expectEqualStrings("sage", second[0..second_read]);
 }
