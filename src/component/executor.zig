@@ -80,7 +80,7 @@ fn bindTaskGroupForFrame(
     defer source_ref.deinit();
     return @constCast(owner_inst).thread_manager.bindTaskGroup(
         thread_ctx,
-        source_ref.source,
+        source_ref.sourceForRegistration() catch unreachable,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.WindowsCancelEventUnavailable => return error.ThreadCancellationUnavailable,
@@ -5566,7 +5566,7 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
         env.setThreadManager(&inst.thread_manager);
         group_scope = try inst.thread_manager.bindTaskGroup(
             &env.thread_context,
-            cancellation_ticket.source,
+            cancellation_ticket.sourceForRegistration() catch unreachable,
         );
         task_ticket = inst.thread_manager.cancellationForContext(
             &env.thread_context,
@@ -5582,7 +5582,7 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
         testing.allocator,
     );
     try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(h).?);
-    try testing.expect(cancellation_ticket.isCancelled());
+    try testing.expect(try cancellation_ticket.isCancelled());
     if (task_ticket) |ticket| try testing.expect(ticket.isCancelled());
     if (comptime config.lib_wasi_threads)
         try testing.expect(inst.thread_manager.terminalOutcome() == null);
@@ -5632,25 +5632,28 @@ test "dispatchCanonBuiltin: subtask.cancel fans out across component managers" {
     first_context.setThreadGroup(@ptrCast(&first_inst.thread_manager));
     var first_scope = try first_inst.thread_manager.bindTaskGroup(
         &first_context,
-        target_source.source,
+        target_source.sourceForRegistration() catch unreachable,
     );
     defer first_scope.deinit();
     var second_context = execution_context.ThreadExecutionContext{};
     second_context.setThreadGroup(@ptrCast(&second_inst.thread_manager));
     var second_scope = try second_inst.thread_manager.bindTaskGroup(
         &second_context,
-        target_source.source,
+        target_source.sourceForRegistration() catch unreachable,
     );
     defer second_scope.deinit();
     var unrelated_context = execution_context.ThreadExecutionContext{};
     unrelated_context.setThreadGroup(@ptrCast(&first_inst.thread_manager));
     var unrelated_scope = try first_inst.thread_manager.bindTaskGroup(
         &unrelated_context,
-        unrelated_source.source,
+        unrelated_source.sourceForRegistration() catch unreachable,
     );
     defer unrelated_scope.deinit();
 
-    try testing.expectEqual(@as(usize, 2), target_source.source.registrationCount());
+    try testing.expectEqual(
+        @as(usize, 2),
+        (try target_source.sourceForRegistration()).registrationCount(),
+    );
     try env.pushI32(@bitCast(target));
     try dispatchCanonBuiltin(
         first_inst,
@@ -5726,7 +5729,10 @@ test "dispatchCanonBuiltin: task.cancel fans out beyond current component manage
         &tm,
     )).?;
     defer outer_group.deinit();
-    try testing.expectEqual(@as(usize, 2), source_ref.source.registrationCount());
+    try testing.expectEqual(
+        @as(usize, 2),
+        (try source_ref.sourceForRegistration()).registrationCount(),
+    );
 
     try dispatchCanonBuiltin(
         inner_inst,
