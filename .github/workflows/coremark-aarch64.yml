@@ -127,6 +127,7 @@ jobs:
             --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
             --require-native-arch aarch64 \
             --out      coremark-table.md \
+            --json-out coremark-report.json \
             --emit     github
 
       - name: Install matching perf for profiling
@@ -209,7 +210,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coremark-aarch64-${{ github.event_name }}-${{ github.sha }}
-          path: coremark-table.md
+          path: |
+            coremark-table.md
+            coremark-report.json
           if-no-files-found: error
           retention-days: 90
 
