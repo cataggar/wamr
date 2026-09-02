@@ -50,7 +50,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "created_at": collected_at(),
         "repository": args.repository,
         "workflow": args.workflow,
-        "workflow_ref": target_sha,
+        "workflow_ref": args.workflow_ref,
         "target_sha": target_sha,
         "profile": "authoritative",
         "warmups": 2,
@@ -73,7 +73,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "--repo",
                     args.repository,
                     "--ref",
-                    target_sha,
+                    args.workflow_ref,
                     "-f",
                     f"target_sha={target_sha}",
                     "-f",
@@ -270,6 +270,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     dispatch_parser = sub.add_parser("dispatch")
     dispatch_parser.add_argument("--repository", default="cataggar/wamr")
     dispatch_parser.add_argument("--workflow", default="wasi-thread-bench.yml")
+    dispatch_parser.add_argument("--workflow-ref", default="main")
     dispatch_parser.add_argument("--target-sha", required=True)
     dispatch_parser.add_argument("--runs", type=int, default=20)
     dispatch_parser.add_argument("--max-in-flight", type=int, default=2)

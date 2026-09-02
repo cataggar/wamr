@@ -283,7 +283,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             for scenario in bench.planned_scenarios(args)
             if scenario.workload == "wait-notify"
         }
-        self.assertEqual(wait_iterations, {1: 64_000, 4: 16_000, 8: 8_000})
+        self.assertEqual(wait_iterations, {1: 256_000, 4: 64_000, 8: 32_000})
         with self.assertRaises(SystemExit):
             bench.parse_args(["--thread-counts", "1,3"])
         with self.assertRaises(SystemExit):
@@ -649,8 +649,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
             )
 
-    def test_cohort_dispatch_uses_immutable_sha_as_workflow_ref(self) -> None:
+    def test_cohort_dispatch_uses_ref_pinned_to_immutable_sha(self) -> None:
         target = "a" * 40
+        workflow_ref = "calibration/966-immutable"
         output = self.scratch / "dispatch.json"
         responses = [
             "https://github.com/cataggar/wamr/actions/runs/123\n",
@@ -677,13 +678,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     output=output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
+                    workflow_ref=workflow_ref,
                     poll_seconds=0,
                 )
             )
         dispatch_command = run.call_args_list[0].args[0]
         self.assertEqual(
             dispatch_command[dispatch_command.index("--ref") + 1],
-            target,
+            workflow_ref,
         )
 
         mismatch_output = self.scratch / "dispatch-mismatch.json"
@@ -715,6 +717,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     output=mismatch_output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
+                    workflow_ref=workflow_ref,
                     poll_seconds=0,
                 )
             )
