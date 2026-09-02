@@ -472,8 +472,7 @@ pub fn aotProcRaise(vmctx: *VmCtx, sig: i32) callconv(.c) i32 {
     return wasi_core.procRaiseCore(sig);
 }
 
-pub fn aotProcExit(vmctx: *VmCtx, code: i32) callconv(.c) void {
-    traceAdapter("proc_exit", vmctx, .{code});
+fn publishProcExit(vmctx: *VmCtx, code: i32) u32 {
     var status: u32 = @bitCast(code);
     if (getCtx(vmctx)) |ctx| {
         ctx.proc_exit(status);
@@ -486,7 +485,18 @@ pub fn aotProcExit(vmctx: *VmCtx, code: i32) callconv(.c) void {
             };
         }
     }
-    aot_runtime.signalThreadGroupTrap(vmctx);
+    if (aot_runtime.signalThreadGroupExit(vmctx, status)) |winner| {
+        status = switch (winner.kind) {
+            .exit => winner.code,
+            .trap => 1,
+        };
+    }
+    return status;
+}
+
+pub fn aotProcExit(vmctx: *VmCtx, code: i32) callconv(.c) void {
+    traceAdapter("proc_exit", vmctx, .{code});
+    const status = publishProcExit(vmctx, code);
     aot_runtime.aotTrapHost(vmctx, @intCast(status & 0xff));
 }
 

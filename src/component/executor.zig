@@ -76,11 +76,12 @@ fn bindTaskGroupForFrame(
 ) ExecutionError!?TaskGroupScope {
     if (comptime !config.lib_wasi_threads) return null;
     const handle = task_manager.currentTask() orelse return null;
-    const task_key = task_manager.cancellationKey(handle) orelse return null;
+    var source_ref = task_manager.acquireCancellationSource(handle) orelse
+        return null;
+    defer source_ref.deinit();
     return @constCast(owner_inst).thread_manager.bindTaskGroup(
         thread_ctx,
-        task_key,
-        task_manager.getState(handle) == .cancelled,
+        source_ref.source,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.WindowsCancelEventUnavailable => return error.ThreadCancellationUnavailable,
@@ -1285,6 +1286,7 @@ fn callComponentFuncByLocalWithHostTaskContext(
     if (exported.core_instance_idx >= owner_inst.core_instances.len)
         return error.CoreInstanceNotAvailable;
     const core_entry = owner_inst.core_instances[exported.core_instance_idx];
+    const inherited_task_manager = taskManagerFor(execution_context.current());
 
     // Build a backend-agnostic CallFrame: InterpFrame for the interp
     // core, AotFrame for the AOT core. Both backends are driven through
@@ -1315,7 +1317,22 @@ fn callComponentFuncByLocalWithHostTaskContext(
         }
         frame.deinit();
     }
-    var host_task_scope = frameThreadContext(&frame).bindHostTaskContext(
+    const thread_ctx = frameThreadContext(&frame);
+    var frame_context_scope = enterFrameThreadContext(&frame);
+    defer frame_context_scope.deinit();
+    var inherited_task_scope: ?execution_context.OpaqueBinding = null;
+    defer if (inherited_task_scope) |scope| scope.deinit();
+    var inherited_group_scope: ?TaskGroupScope = null;
+    defer if (inherited_group_scope) |*scope| scope.deinit();
+    if (inherited_task_manager) |task_manager| {
+        inherited_task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
+        inherited_group_scope = try bindTaskGroupForFrame(
+            owner_inst,
+            thread_ctx,
+            task_manager,
+        );
+    }
+    var host_task_scope = thread_ctx.bindHostTaskContext(
         host_task_context,
     );
     defer host_task_scope.deinit();
@@ -2918,12 +2935,6 @@ fn dispatchAsyncCanon(
             if (cancelled) {
                 if (thread_context) |thread_ctx| {
                     thread_ctx.requestCancellation();
-                    if (comptime config.lib_wasi_threads) {
-                        if (thread_ctx.threadGroup(
-                            thread_manager_mod.ThreadManager,
-                        )) |manager|
-                            _ = manager.cancelTaskForContext(thread_ctx);
-                    }
                 }
             }
             // Propagate the cancellation to host-side waitables owned by
@@ -5552,10 +5563,11 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
     if (comptime config.lib_wasi_threads) {
         try testing.expect(inst.thread_manager.hasTerminationBinding());
         env.setThreadManager(&inst.thread_manager);
+        var source_ref = tm.acquireCancellationSource(h).?;
+        defer source_ref.deinit();
         group_scope = try inst.thread_manager.bindTaskGroup(
             &env.thread_context,
-            tm.cancellationKey(h).?,
-            false,
+            source_ref.source,
         );
         task_ticket = inst.thread_manager.cancellationForContext(
             &env.thread_context,
@@ -5576,6 +5588,162 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
         try testing.expect(inst.thread_manager.terminalOutcome() == null);
     // Core signature is `[] -> []`: nothing pushed.
     try testing.expectEqual(@as(u32, 0), env.sp);
+}
+
+test "dispatchCanonBuiltin: subtask.cancel fans out across component managers" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const first_inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer first_inst.deinit();
+    const second_inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer second_inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+    const target = try tm.createTask(testing.allocator);
+    const unrelated = try tm.createTask(testing.allocator);
+    var target_source = tm.acquireCancellationSource(target).?;
+    defer target_source.deinit();
+    var unrelated_source = tm.acquireCancellationSource(unrelated).?;
+    defer unrelated_source.deinit();
+
+    var first_context = execution_context.ThreadExecutionContext{};
+    first_context.setThreadGroup(@ptrCast(&first_inst.thread_manager));
+    var first_scope = try first_inst.thread_manager.bindTaskGroup(
+        &first_context,
+        target_source.source,
+    );
+    defer first_scope.deinit();
+    var second_context = execution_context.ThreadExecutionContext{};
+    second_context.setThreadGroup(@ptrCast(&second_inst.thread_manager));
+    var second_scope = try second_inst.thread_manager.bindTaskGroup(
+        &second_context,
+        target_source.source,
+    );
+    defer second_scope.deinit();
+    var unrelated_context = execution_context.ThreadExecutionContext{};
+    unrelated_context.setThreadGroup(@ptrCast(&first_inst.thread_manager));
+    var unrelated_scope = try first_inst.thread_manager.bindTaskGroup(
+        &unrelated_context,
+        unrelated_source.source,
+    );
+    defer unrelated_scope.deinit();
+
+    try testing.expectEqual(@as(usize, 2), target_source.source.registrationCount());
+    try env.pushI32(@bitCast(target));
+    try dispatchCanonBuiltin(
+        first_inst,
+        .{ .async_canon = .{ .subtask_cancel = .{ .is_async = false } } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+
+    try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(target).?);
+    try testing.expect(first_inst.thread_manager.isTaskCancelledForContext(
+        &first_context,
+    ));
+    try testing.expect(second_inst.thread_manager.isTaskCancelledForContext(
+        &second_context,
+    ));
+    try testing.expect(!first_inst.thread_manager.isTaskCancelledForContext(
+        &unrelated_context,
+    ));
+    try testing.expectEqual(async_mod.TaskState.created, tm.getState(unrelated).?);
+}
+
+test "dispatchCanonBuiltin: task.cancel fans out beyond current component manager" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const outer_inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer outer_inst.deinit();
+    const inner_inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inner_inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+    const handle = try tm.createTask(testing.allocator);
+    tm.startTask(handle);
+    var current = tm.bindCurrent(handle);
+    defer current.deinit();
+    var source_ref = tm.acquireCancellationSource(handle).?;
+    defer source_ref.deinit();
+
+    env.setThreadManager(&inner_inst.thread_manager);
+    var inner_group = (try bindTaskGroupForFrame(
+        inner_inst,
+        &env.thread_context,
+        &tm,
+    )).?;
+    defer inner_group.deinit();
+    var outer_context = execution_context.ThreadExecutionContext{};
+    outer_context.setThreadGroup(@ptrCast(&outer_inst.thread_manager));
+    var outer_group = (try bindTaskGroupForFrame(
+        outer_inst,
+        &outer_context,
+        &tm,
+    )).?;
+    defer outer_group.deinit();
+    try testing.expectEqual(@as(usize, 2), source_ref.source.registrationCount());
+
+    try dispatchCanonBuiltin(
+        inner_inst,
+        .{ .async_canon = .task_cancel },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(handle).?);
+    try testing.expect(inner_inst.thread_manager.isTaskCancelledForContext(
+        &env.thread_context,
+    ));
+    try testing.expect(outer_inst.thread_manager.isTaskCancelledForContext(
+        &outer_context,
+    ));
+    try testing.expect(outer_inst.thread_manager.terminalOutcome() == null);
+    try testing.expect(inner_inst.thread_manager.terminalOutcome() == null);
 }
 
 test "execution context: task and cancellation state is isolated per thread" {
