@@ -267,10 +267,60 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("WAMR target / Wasmtime historical pin", report)
         self.assertIn("WAMR target / Wasmtime caller-selected", report)
         self.assertIn("Median iter/s ratio", report)
-        self.assertIn("0.604×", report)
+        self.assertIn("0.603960×", report)
         self.assertIn("CRC validation", report)
         self.assertIn("Neoverse-N2", report)
         self.assertIn("host fingerprint", report)
+
+    def test_published_ratio_uses_full_precision_raw_statistics(self):
+        wamr = [11702.9216445]
+        wasmtime = [24350.89644]
+        raw_ratio = 0.48059510553690316
+        rounded_display_ratio = 11702.9 / 24350.9
+        median_ratio, _ = bench_coremark.compute_ratio_stats(wamr, wasmtime)
+        self.assertAlmostEqual(raw_ratio, median_ratio, places=15)
+        self.assertNotEqual(round(raw_ratio, 9), round(rounded_display_ratio, 9))
+
+        results = [
+            bench_coremark.EngineResult(
+                "WAMR", "main", "ReleaseFast", wamr
+            ),
+            bench_coremark.EngineResult(
+                "WAMR", "main", "ReleaseFast", wamr
+            ),
+            bench_coremark.EngineResult(
+                "Wasmtime historical pin",
+                "44.0.1",
+                "default JIT",
+                wasmtime,
+            ),
+        ]
+        report = bench_coremark.render_table(
+            results,
+            profile="authoritative",
+            warmups=0,
+            runs=1,
+            fixture=Path("coremark.wasm"),
+            fixture_sha="abc",
+            host=bench_coremark.HostIdentity(
+                "aarch64", 4, "Neoverse-N2", "runner", "boot"
+            ),
+        )
+        self.assertIn("0.480595×", report)
+        payload = bench_coremark.build_json_report(
+            results,
+            profile="authoritative",
+            warmups=0,
+            runs=1,
+            fixture=Path("coremark.wasm"),
+            fixture_sha="abc",
+            host=bench_coremark.HostIdentity(
+                "aarch64", 4, "Neoverse-N2", "runner", "boot"
+            ),
+            schedule_records=[],
+            affinity=None,
+        )
+        self.assertEqual(raw_ratio, payload["ratios"][0]["median_ratio"])
 
     def test_report_rejects_missing_samples(self):
         results = [
@@ -417,6 +467,14 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("select_cpu_affinity()", profile_script)
         self.assertIn("coremark_guest_args(", profile_script)
         self.assertIn("PROFILE_CAPTURES_PER_ENGINE = 2", profile_script)
+        self.assertIn("MIN_ATTRIBUTION_COVERAGE_PCT = 99.0", profile_script)
+        self.assertIn('"--authoritative"', profile_script)
+        self.assertIn('"--min-attribution-pct"', profile_script)
+        self.assertIn("all_alu", profile_script)
+        self.assertIn(
+            "the all-ALU differential is not address/check headroom",
+            profile_script,
+        )
 
         for line in workflow.splitlines():
             stripped = line.strip()

@@ -747,6 +747,17 @@ def compute_delta_pct(baseline_vals: list[float], target_vals: list[float]) -> f
     return (statistics.fmean(target_vals) / statistics.fmean(baseline_vals) - 1.0) * 100.0
 
 
+def compute_ratio_stats(
+    numerator_vals: list[float], denominator_vals: list[float]
+) -> tuple[float, float]:
+    return (
+        statistics.median(numerator_vals)
+        / statistics.median(denominator_vals),
+        statistics.fmean(numerator_vals)
+        / statistics.fmean(denominator_vals),
+    )
+
+
 def host_cpu_model() -> str:
     try:
         out = subprocess.run(
@@ -946,14 +957,13 @@ def render_table(
                 "|---|---:|---:|",
             ]
         )
-        target_mean = statistics.fmean(target.values)
-        target_median = statistics.median(target.values)
         for result in wasmtime_results:
-            median_ratio = target_median / statistics.median(result.values)
-            mean_ratio = target_mean / statistics.fmean(result.values)
+            median_ratio, mean_ratio = compute_ratio_stats(
+                target.values, result.values
+            )
             lines.append(
                 f"| WAMR target / {result.engine} `{result.version}` | "
-                f"{median_ratio:.3f}× | {mean_ratio:.3f}× |"
+                f"{median_ratio:.6f}× | {mean_ratio:.6f}× |"
             )
     if affinity is not None:
         lines.extend(
@@ -1017,18 +1027,15 @@ def build_json_report(
     ratios = []
     target = results[1]
     for result in results[2:]:
+        median_ratio, mean_ratio = compute_ratio_stats(
+            target.values, result.values
+        )
         ratios.append(
             {
                 "numerator": target.engine,
                 "denominator": result.engine,
-                "median_ratio": (
-                    statistics.median(target.values)
-                    / statistics.median(result.values)
-                ),
-                "mean_ratio": (
-                    statistics.fmean(target.values)
-                    / statistics.fmean(result.values)
-                ),
+                "median_ratio": median_ratio,
+                "mean_ratio": mean_ratio,
             }
         )
     return {

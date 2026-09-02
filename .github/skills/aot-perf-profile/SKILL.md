@@ -215,8 +215,8 @@ unwind it** (the generated code has no CFI), so `perf script` callchains
 are mostly empty — do **not** rely on them. Use the per-address **self**
 sample counts from `perf report` instead. The helper script does all of
 this: it parses `func_offsets[]` from the `.cwasm` function section,
-finds the text mmap base in the perf data (by matching the core's text
-size), buckets IPs per `local_func`, and classifies one function's
+finds the text mmap base in the perf data (by matching the exact
+host-page-rounded core text size), buckets IPs per `local_func`, and classifies one function's
 instruction mix.
 
 ```sh
@@ -255,8 +255,17 @@ hash and are listed explicitly in the sidecar.
 Without metadata, frame moves are reported as **unattributed frame traffic**,
 not guessed to be spills.
 
-Size matching must identify exactly one mapping. For multiple equal-size
-cores, pass `--base 0x...` explicitly; get candidate bases from
+Authoritative size matching computes
+`ceil(cwasm_text_size / host_page_size) * host_page_size` because Linux
+records the page-rounded VMA created by `mapExecutableCode`, then requires
+exactly one anonymous executable mmap of that size. Approximate matches are
+rejected and every candidate is retained in JSON. CoreMark additionally uses
+`--authoritative --min-attribution-pct 99.0`: the 99% threshold allows the
+small measured host/transition share while making a success-shaped unrelated
+mapping impossible (the accepted captures are about 99.96%).
+
+For manual diagnostics only, pass `--base 0x...`; the JSON marks that mapping
+non-authoritative and `--authoritative` rejects the override. Get candidates from
 `perf script -i wamr.perf --show-mmap-events | grep '//anon' | grep -E 'r[w-]xp'`.
 
 Static sidecar/cwasm validation (no perf needed) is useful before a long run:
