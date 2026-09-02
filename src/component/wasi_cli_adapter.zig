@@ -6412,11 +6412,16 @@ const InboundHttpResponseSession = struct {
 
     fn handlerFailed(self: *InboundHttpResponseSession) void {
         self.mutex.lock();
-        self.handler_outcome = .failed;
         const writer_may_be_in_io = self.head_ready and
             (self.produced_bytes != 0 or self.queue_len != 0);
         self.mutex.unlock();
         _ = self.finishTerminal(.handler_error, writer_may_be_in_io);
+        // Publish the terminal state before exposing `.failed` to the writer.
+        // Otherwise it can observe `handler_outcome != .pending` while the
+        // terminal is still `.running` and commit a response head in between.
+        self.mutex.lock();
+        self.handler_outcome = .failed;
+        self.mutex.unlock();
     }
 
     fn writeWireSlice(
