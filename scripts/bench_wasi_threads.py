@@ -61,7 +61,7 @@ FIXTURES = {
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "6843f2a5967bf2626cdedfd65fdbaaa675465ee996433921262e606cfd5affb5",
+        "sha256": "cb9bf0c19e23bb4389994447d579886534281ece1405f700007d123226dd3cdc",
     },
 }
 MASK64 = (1 << 64) - 1
@@ -230,7 +230,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--single-iterations", type=int, default=64_000_000)
     parser.add_argument("--hot-iterations", type=int, default=64_000_000)
     parser.add_argument("--atomic-iterations", type=int, default=20_000_000)
-    parser.add_argument("--wait-iterations", type=int, default=10_000)
+    parser.add_argument("--wait-iterations", type=int, default=30_000)
     parser.add_argument("--spawn-iterations", type=int, default=600)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument(
