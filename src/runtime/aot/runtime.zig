@@ -1986,6 +1986,7 @@ pub const RuntimeError = error{
     FunctionNotFound,
     ExecutionFailed,
     TableAllocationFailed,
+    DataSegmentOutOfBounds,
     WasmTrap,
     /// AOT execution is unavailable on this build's target architecture
     /// (currently only x86_64 and aarch64 are supported). The symbol is
@@ -2095,29 +2096,27 @@ pub fn instantiateWithOverrides(
     inst.memories_owned = mem_alloc.owned;
     errdefer freeMemories(inst.memories, inst.memories_owned, allocator);
 
-    // Apply data segments to locally-allocated linear memory only.
-    // Writing into a *borrowed* memory would scribble the exporter's bytes
-    // during the importer's instantiation, since both VmCtx's see the same
-    // backing buffer.
     for (module.data_segments) |seg| {
         if (seg.isPassive()) continue;
         const memory_idx = seg.memory_idx;
-        if (memory_idx >= inst.memories.len) continue;
-        if (memory_idx < inst.memories_owned.len and !inst.memories_owned[memory_idx]) continue;
+        if (memory_idx >= inst.memories.len)
+            return error.DataSegmentOutOfBounds;
         const mem = inst.memories[memory_idx];
         const offset: u32 = switch (seg.offset_kind) {
             .i32_const => seg.offset,
             .global_get => blk: {
-                if (seg.offset >= inst.globals.len) continue;
+                if (seg.offset >= inst.globals.len)
+                    return error.DataSegmentOutOfBounds;
                 break :blk switch (inst.globals[seg.offset].value) {
                     .i32 => |value| @bitCast(value),
-                    else => continue,
+                    else => return error.DataSegmentOutOfBounds,
                 };
             },
             .passive => unreachable,
         };
-        const end = std.math.add(usize, @as(usize, offset), seg.data.len) catch continue;
-        if (end > mem.byteLen()) continue;
+        const end = std.math.add(usize, @as(usize, offset), seg.data.len) catch
+            return error.DataSegmentOutOfBounds;
+        if (end > mem.byteLen()) return error.DataSegmentOutOfBounds;
         @memcpy(mem.data[offset..][0..seg.data.len], seg.data);
     }
 
@@ -4874,7 +4873,19 @@ test "#660 item 4: borrowed memory overrides are retained until importer destroy
     const imported = [_]aot_loader.ImportedMemoryDesc{
         .{ .module_name = "env", .name = "mem", .min = 1, .max = 4 },
     };
-    const importer_module = aot_loader.AotModule{ .imported_memories = &imported };
+    const importer_data = [_]u8{0x5a};
+    const importer_segments = [_]aot_loader.AotDataSegment{
+        .{
+            .memory_idx = 0,
+            .offset_kind = .i32_const,
+            .offset = 8,
+            .data = &importer_data,
+        },
+    };
+    const importer_module = aot_loader.AotModule{
+        .imported_memories = &imported,
+        .data_segments = &importer_segments,
+    };
 
     const exporter_inst = try instantiate(&exporter_module, std.testing.allocator);
     defer destroy(exporter_inst);
@@ -4886,6 +4897,7 @@ test "#660 item 4: borrowed memory overrides are retained until importer destroy
     try std.testing.expectEqual(exporter_inst.memories[0], importer_inst.memories[0]);
     try std.testing.expect(!importer_inst.memories_owned[0]);
     try std.testing.expectEqual(@as(usize, 2), exporter_inst.memories[0].referenceCount());
+    try std.testing.expectEqual(@as(u8, 0x5a), exporter_inst.memories[0].data[8]);
 
     destroy(importer_inst);
     try std.testing.expectEqual(@as(usize, 1), exporter_inst.memories[0].referenceCount());
@@ -5007,6 +5019,55 @@ test "active data global.get offset preserves source segment indices" {
     try std.testing.expectEqual(@as(u8, 0xa5), inst.memories[0].data[7]);
     try std.testing.expect(inst.data_segments_dropped[0]);
     try std.testing.expect(!inst.data_segments_dropped[1]);
+}
+
+test "active data global.get out of bounds fails instantiation" {
+    const allocator = std.testing.allocator;
+    const memories = [_]types.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    const imports = [_]aot_loader.ImportedGlobalDesc{
+        .{
+            .module_name = "env",
+            .name = "base",
+            .val_type = .i32,
+            .mutable = false,
+        },
+    };
+    const payload = [_]u8{0xa5};
+    const segments = [_]aot_loader.AotDataSegment{
+        .{
+            .memory_idx = 0,
+            .offset_kind = .global_get,
+            .offset = 0,
+            .data = &payload,
+        },
+    };
+    const module = aot_loader.AotModule{
+        .memories = &memories,
+        .imported_globals = &imports,
+        .data_segments = &segments,
+    };
+    const imported = try allocator.create(types.GlobalInstance);
+    imported.* = .{
+        .global_type = .{ .val_type = .i32, .mutability = .immutable },
+        .value = .{ .i32 = types.MemoryInstance.page_size },
+    };
+    defer imported.release(allocator);
+    const overrides = [_]?*types.GlobalInstance{imported};
+
+    try std.testing.expectError(
+        error.DataSegmentOutOfBounds,
+        instantiateWithOverrides(
+            &module,
+            allocator,
+            &.{},
+            &.{},
+            &overrides,
+            &.{},
+            &.{},
+        ),
+    );
 }
 
 test "getFuncAddr: returns null without text section" {
