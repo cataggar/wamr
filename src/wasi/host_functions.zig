@@ -81,6 +81,7 @@ fn waitForWindowsReadiness(
     if (comptime builtin.os.tag != .windows) unreachable;
     if (ctx.isTerminating()) return .terminated;
     return switch (windows_poll.waitForReadiness(
+        ctx.allocator,
         ctx.termination.windowsCancelHandle(),
         inputs,
         timeout_ms,
@@ -1362,24 +1363,24 @@ fn doRead(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []u8) !usize {
     const entry = lease.snapshot();
     switch (entry.kind) {
         .stdin => {
-            // Park on readiness first so a sibling's terminal outcome can
-            // interrupt what would otherwise be an indefinite blocking read.
-            if (comptime config.lib_wasi_threads) {
-                if (comptime builtin.os.tag == .windows) {
-                    var inputs = [_]windows_poll.ReadInput{.{
-                        .handle = entry.host_fd orelse std.Io.File.stdin().handle,
-                    }};
-                    switch (waitForWindowsReadiness(ctx, &inputs, -1)) {
-                        .terminated => return error.Terminated,
-                        .failed => return error.IoError,
-                        .ready => switch (inputs[0].status) {
-                            .ready, .hangup => {},
-                            .bad_handle, .io_error => return error.IoError,
-                            .pending => unreachable,
-                        },
-                        .timed_out => unreachable,
-                    }
-                } else {
+            const file = if (entry.host_fd) |host_fd|
+                std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } }
+            else
+                std.Io.File.stdin();
+            if (comptime builtin.os.tag == .windows and config.lib_wasi_threads) {
+                if (ctx.termination.windowsCancelHandle()) |cancel_handle| {
+                    return windows_poll.readCancellable(
+                        cancel_handle,
+                        file.handle,
+                        data,
+                    ) catch |err| switch (err) {
+                        error.Cancelled => error.Terminated,
+                        error.BadHandle => error.BadFd,
+                        else => error.IoError,
+                    };
+                }
+            } else if (comptime config.lib_wasi_threads) {
+                {
                     var fds = [_]std.posix.pollfd{.{
                         .fd = entry.host_fd orelse std.posix.STDIN_FILENO,
                         .events = std.posix.POLL.IN,
@@ -1389,10 +1390,6 @@ fn doRead(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []u8) !usize {
                         return error.Terminated;
                 }
             }
-            const file = if (entry.host_fd) |host_fd|
-                std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } }
-            else
-                std.Io.File.stdin();
             var buf: [4096]u8 = undefined;
             var r = file.reader(ctx.io, &buf);
             const n = r.interface.readSliceShort(data) catch return error.IoError;
@@ -2653,9 +2650,31 @@ fn hostRealtimeNs(ctx: *const wasi.WasiCtx) u64 {
 /// saturating at i32 max. `0` ns stays `0` (poll returns immediately).
 fn nsToTimeoutMs(ns: u64) i32 {
     if (ns == 0) return 0;
-    const ms_u: u64 = (ns + 999_999) / 1_000_000;
+    const ms_u = (ns - 1) / std.time.ns_per_ms + 1;
     if (ms_u > @as(u64, @intCast(std.math.maxInt(i32)))) return std.math.maxInt(i32);
     return @intCast(ms_u);
+}
+
+const PollOneoffHooks = struct {
+    ctx: *anyopaque,
+    clock_now: ?*const fn (*anyopaque, u32) u64 = null,
+    clock_wait: ?*const fn (*anyopaque, i32) BlockingWait = null,
+    windows_wait: ?*const fn (*anyopaque, []windows_poll.ReadInput, i32) BlockingWait = null,
+};
+
+fn pollClockNow(
+    ctx: *const wasi.WasiCtx,
+    hooks: ?PollOneoffHooks,
+    clock_id: u32,
+) u64 {
+    if (hooks) |installed| {
+        if (installed.clock_now) |clock_now|
+            return clock_now(installed.ctx, clock_id);
+    }
+    return if (clock_id == wasi.CLOCKID_REALTIME)
+        hostRealtimeNs(ctx)
+    else
+        hostMonotonicNs(ctx);
 }
 
 /// Write a 32-byte preview1 `event` record at `off` in linear memory.
@@ -2680,14 +2699,30 @@ fn writeEvent(
 
 const PendingClock = struct {
     userdata: u64,
-    /// duration in nanoseconds from the start of the call until this
-    /// clock fires; `0` means "already expired at classification time".
-    duration_ns: u64,
+    clock_id: u32,
+    timeout_ns: u64,
+    relative_start_ns: u64,
+    absolute: bool,
     /// `false` if the subscription was malformed (unknown clock id);
     /// in that case `errno` is emitted as a synthetic event.
     valid: bool,
     errno: u16,
 };
+
+fn pendingClockRemainingNs(
+    ctx: *const wasi.WasiCtx,
+    hooks: ?PollOneoffHooks,
+    clock: PendingClock,
+) u64 {
+    const now = pollClockNow(ctx, hooks, clock.clock_id);
+    if (clock.absolute)
+        return if (now >= clock.timeout_ns) 0 else clock.timeout_ns - now;
+    const elapsed = if (now >= clock.relative_start_ns)
+        now - clock.relative_start_ns
+    else
+        0;
+    return if (elapsed >= clock.timeout_ns) 0 else clock.timeout_ns - elapsed;
+}
 
 const PendingFd = struct {
     userdata: u64,
@@ -2708,6 +2743,59 @@ const PendingFd = struct {
     lease: ?wasi.FdTable.Lease = null,
 };
 
+fn applyWindowsInputResults(
+    fd_subs: []PendingFd,
+    windows_inputs: []const windows_poll.ReadInput,
+) void {
+    for (fd_subs) |*sub| {
+        const input_index = sub.windows_input_index orelse continue;
+        const input = windows_inputs[input_index];
+        switch (input.status) {
+            .pending => {},
+            .ready => {
+                sub.ready = true;
+                sub.nbytes = input.nbytes;
+            },
+            .hangup => {
+                sub.ready = true;
+                sub.hangup = true;
+            },
+            .bad_handle => sub.errno = @intFromEnum(wasi.Errno.badf),
+            .io_error => sub.errno = @intFromEnum(wasi.Errno.io),
+        }
+    }
+}
+
+fn runWindowsPollWait(
+    ctx: *wasi.WasiCtx,
+    hooks: ?PollOneoffHooks,
+    inputs: []windows_poll.ReadInput,
+    timeout_ms: i32,
+) BlockingWait {
+    if (hooks) |installed| {
+        if (installed.windows_wait) |wait|
+            return wait(installed.ctx, inputs, timeout_ms);
+    }
+    return waitForWindowsReadiness(ctx, inputs, timeout_ms);
+}
+
+fn runClockOnlyWait(
+    ctx: *wasi.WasiCtx,
+    hooks: ?PollOneoffHooks,
+    timeout_ms: i32,
+) BlockingWait {
+    if (hooks) |installed| {
+        if (installed.clock_wait) |wait|
+            return wait(installed.ctx, timeout_ms);
+    }
+    if (comptime builtin.os.tag == .windows) {
+        var inputs: [0]windows_poll.ReadInput = .{};
+        return waitForWindowsReadiness(ctx, &inputs, timeout_ms);
+    }
+    var pollfds: [0]PosixPollFd = .{};
+    return waitForReadiness(ctx, &pollfds, timeout_ms);
+}
+
 pub fn ctxPollOneoffCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
@@ -2715,6 +2803,26 @@ pub fn ctxPollOneoffCore(
     out_ptr: i32,
     nsubs: i32,
     ret_ptr: i32,
+) i32 {
+    return ctxPollOneoffCoreWithHooks(
+        ctx,
+        mem,
+        in_ptr,
+        out_ptr,
+        nsubs,
+        ret_ptr,
+        null,
+    );
+}
+
+fn ctxPollOneoffCoreWithHooks(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    in_ptr: i32,
+    out_ptr: i32,
+    nsubs: i32,
+    ret_ptr: i32,
+    hooks: ?PollOneoffHooks,
 ) i32 {
     if (nsubs <= 0) return wasi_core.WASI_EINVAL;
     if (in_ptr < 0 or out_ptr < 0 or ret_ptr < 0) return wasi_core.WASI_EINVAL;
@@ -2730,8 +2838,6 @@ pub fn ctxPollOneoffCore(
     if (@as(u64, u_out) + evts_bytes > mem.len) return wasi_core.WASI_EINVAL;
     if (@as(u64, u_ret) + 4 > mem.len) return wasi_core.WASI_EINVAL;
 
-    const start = hostMonotonicNs(ctx);
-
     var clocks: std.ArrayListUnmanaged(PendingClock) = .empty;
     defer clocks.deinit(ctx.allocator);
     var fd_subs: std.ArrayListUnmanaged(PendingFd) = .empty;
@@ -2745,8 +2851,6 @@ pub fn ctxPollOneoffCore(
     defer pollfds.deinit(ctx.allocator);
     var windows_inputs: std.ArrayListUnmanaged(windows_poll.ReadInput) = .empty;
     defer windows_inputs.deinit(ctx.allocator);
-
-    var any_immediate: bool = false;
 
     // ── Pass 1: classify each subscription ─────────────────────────
     var i: usize = 0;
@@ -2765,40 +2869,39 @@ pub fn ctxPollOneoffCore(
                 if (clock_id > wasi.CLOCKID_THREAD_CPUTIME_ID) {
                     clocks.append(ctx.allocator, .{
                         .userdata = userdata,
-                        .duration_ns = 0,
+                        .clock_id = clock_id,
+                        .timeout_ns = timeout_ns,
+                        .relative_start_ns = 0,
+                        .absolute = abstime,
                         .valid = false,
                         .errno = @intFromEnum(wasi.Errno.inval),
                     }) catch return wasi_core.WASI_EINVAL;
-                    any_immediate = true;
                     continue;
                 }
                 if (comptime builtin.os.tag == .windows) {
                     if (clock_id > wasi.CLOCKID_MONOTONIC) {
                         clocks.append(ctx.allocator, .{
                             .userdata = userdata,
-                            .duration_ns = 0,
+                            .clock_id = clock_id,
+                            .timeout_ns = timeout_ns,
+                            .relative_start_ns = 0,
+                            .absolute = abstime,
                             .valid = false,
                             .errno = @intFromEnum(wasi.Errno.notsup),
                         }) catch return wasi_core.WASI_EINVAL;
-                        any_immediate = true;
                         continue;
                     }
                 }
 
-                const duration_ns: u64 = blk: {
-                    if (!abstime) break :blk timeout_ns;
-                    const now_clock_ns: u64 = if (clock_id == wasi.CLOCKID_REALTIME)
-                        hostRealtimeNs(ctx)
-                    else
-                        hostMonotonicNs(ctx);
-                    if (timeout_ns <= now_clock_ns) break :blk 0;
-                    break :blk timeout_ns - now_clock_ns;
-                };
-
-                if (duration_ns == 0) any_immediate = true;
                 clocks.append(ctx.allocator, .{
                     .userdata = userdata,
-                    .duration_ns = duration_ns,
+                    .clock_id = clock_id,
+                    .timeout_ns = timeout_ns,
+                    .relative_start_ns = if (abstime)
+                        0
+                    else
+                        pollClockNow(ctx, hooks, clock_id),
+                    .absolute = abstime,
                     .valid = true,
                     .errno = 0,
                 }) catch return wasi_core.WASI_EINVAL;
@@ -2820,7 +2923,6 @@ pub fn ctxPollOneoffCore(
 
                 var lease = ctx.fd_table.acquire(fd_raw) orelse {
                     pending.errno = @intFromEnum(wasi.Errno.badf);
-                    any_immediate = true;
                     fd_subs.append(ctx.allocator, pending) catch return wasi_core.WASI_EINVAL;
                     continue;
                 };
@@ -2831,7 +2933,6 @@ pub fn ctxPollOneoffCore(
                 if ((entry.rights_base & need_right) == 0) {
                     lease.release();
                     pending.errno = @intFromEnum(wasi.Errno.notcapable);
-                    any_immediate = true;
                     fd_subs.append(ctx.allocator, pending) catch return wasi_core.WASI_EINVAL;
                     continue;
                 }
@@ -2840,17 +2941,14 @@ pub fn ctxPollOneoffCore(
                     .stdout, .stderr => {
                         if (want_write) {
                             pending.ready = true;
-                            any_immediate = true;
                         } else {
                             // Reading from stdout/stderr: Linux returns EBADF.
                             pending.errno = @intFromEnum(wasi.Errno.badf);
-                            any_immediate = true;
                         }
                     },
                     .stdin => {
                         if (want_write) {
                             pending.errno = @intFromEnum(wasi.Errno.badf);
-                            any_immediate = true;
                         } else if (comptime builtin.os.tag == .windows) {
                             const input_index = windows_inputs.items.len;
                             windows_inputs.append(ctx.allocator, .{
@@ -2880,16 +2978,13 @@ pub fn ctxPollOneoffCore(
                         // We emit ready immediately to avoid the syscall and
                         // to stay platform-uniform.
                         pending.ready = true;
-                        any_immediate = true;
                     },
                     .directory => {
                         pending.errno = @intFromEnum(wasi.Errno.badf);
-                        any_immediate = true;
                     },
                     .socket => {
                         if (comptime builtin.os.tag == .windows) {
                             pending.errno = @intFromEnum(wasi.Errno.notsup);
-                            any_immediate = true;
                         } else if (entry.host_fd) |host_fd| {
                             const events: i16 = if (want_write) std.posix.POLL.OUT else std.posix.POLL.IN;
                             const pfd_index = pollfds.items.len;
@@ -2906,7 +3001,6 @@ pub fn ctxPollOneoffCore(
                             keep_lease = true;
                         } else {
                             pending.errno = @intFromEnum(wasi.Errno.badf);
-                            any_immediate = true;
                         }
                     },
                 }
@@ -2928,169 +3022,164 @@ pub fn ctxPollOneoffCore(
                     .windows_input_index = null,
                     .lease = null,
                 }) catch return wasi_core.WASI_EINVAL;
-                any_immediate = true;
             },
         }
     }
 
-    // ── Pass 2: optionally run poll(2) or sleep ─────────────────────
-    var did_poll = false;
-    if (!any_immediate) {
-        var earliest_ns: ?u64 = null;
-        for (clocks.items) |c| {
-            if (!c.valid) continue;
-            if (earliest_ns == null or c.duration_ns < earliest_ns.?) {
-                earliest_ns = c.duration_ns;
-            }
-        }
-        if (comptime builtin.os.tag == .windows) {
-            const timeout_ms: i32 = if (earliest_ns) |dur| nsToTimeoutMs(dur) else -1;
-            switch (waitForWindowsReadiness(ctx, windows_inputs.items, timeout_ms)) {
-                .terminated => return terminated_result,
-                .failed => return @intCast(@intFromEnum(wasi.Errno.io)),
-                .ready, .timed_out => {},
-            }
-            did_poll = true;
-            for (fd_subs.items) |*sub| {
-                const input_index = sub.windows_input_index orelse continue;
-                const input = windows_inputs.items[input_index];
-                switch (input.status) {
-                    .pending => {},
-                    .ready => {
-                        sub.ready = true;
-                        sub.nbytes = input.nbytes;
-                    },
-                    .hangup => {
-                        sub.ready = true;
-                        sub.hangup = true;
-                    },
-                    .bad_handle => sub.errno = @intFromEnum(wasi.Errno.badf),
-                    .io_error => sub.errno = @intFromEnum(wasi.Errno.io),
+    // ── Pass 2/3: probe complete readiness sets, wait, then emit ─────
+    var probe_inputs = true;
+    while (true) {
+        if (probe_inputs) {
+            if (comptime builtin.os.tag == .windows) {
+                if (windows_inputs.items.len != 0) {
+                    switch (runWindowsPollWait(ctx, hooks, windows_inputs.items, 0)) {
+                        .terminated => return terminated_result,
+                        .failed => return @intCast(@intFromEnum(wasi.Errno.io)),
+                        .ready, .timed_out => {},
+                    }
+                    applyWindowsInputResults(fd_subs.items, windows_inputs.items);
+                }
+            } else if (pollfds.items.len != 0) {
+                switch (waitForReadiness(ctx, pollfds.items, 0)) {
+                    .terminated => return terminated_result,
+                    .ready, .timed_out => {},
+                    .failed => unreachable,
                 }
             }
-        } else if (pollfds.items.len > 0) {
-            const timeout_ms: i32 = if (earliest_ns) |dur| nsToTimeoutMs(dur) else -1;
-            switch (waitForReadiness(ctx, pollfds.items, timeout_ms)) {
-                .terminated => return terminated_result,
-                .ready, .timed_out => {},
-                .failed => unreachable,
-            }
-            did_poll = true;
-        } else if (earliest_ns) |dur| {
-            // Only clocks: use poll(2) with an empty fd set as a portable
-            // sleep primitive that respects EINTR / cancellation the same
-            // way the fd-readiness path does.
-            var empty_fds: [0]PosixPollFd = .{};
-            switch (waitForReadiness(ctx, &empty_fds, nsToTimeoutMs(dur))) {
-                .terminated => return terminated_result,
-                .ready, .timed_out => {},
-                .failed => unreachable,
+        }
+        probe_inputs = true;
+
+        var has_ready = false;
+        for (clocks.items) |clock| {
+            if (!clock.valid or pendingClockRemainingNs(ctx, hooks, clock) == 0) {
+                has_ready = true;
+                break;
             }
         }
-    }
-
-    // ── Pass 3: emit events ─────────────────────────────────────────
-    const elapsed_ns: u64 = blk: {
-        const now = hostMonotonicNs(ctx);
-        if (now <= start) break :blk 0;
-        break :blk now - start;
-    };
-
-    var event_count: u32 = 0;
-
-    for (clocks.items) |c| {
-        if (!c.valid) {
-            writeEvent(
-                mem,
-                u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
-                c.userdata,
-                c.errno,
-                wasi.EVENTTYPE_CLOCK,
-                0,
-                0,
-            );
-            event_count += 1;
-            continue;
+        if (!has_ready) {
+            for (fd_subs.items) |sub| {
+                if (sub.errno != 0 or sub.ready) {
+                    has_ready = true;
+                    break;
+                }
+                if (sub.pollfd_index) |pollfd_index| {
+                    if (comptime builtin.os.tag == .windows) unreachable;
+                    const revents = pollfds.items[pollfd_index].revents;
+                    const wanted: i16 = if (sub.type_ == wasi.EVENTTYPE_FD_WRITE)
+                        std.posix.POLL.OUT
+                    else
+                        std.posix.POLL.IN;
+                    if ((revents & (wanted | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
+                        has_ready = true;
+                        break;
+                    }
+                }
+            }
         }
-        const fired = c.duration_ns == 0 or elapsed_ns >= c.duration_ns;
-        if (fired) {
-            writeEvent(
-                mem,
-                u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
-                c.userdata,
-                0,
-                wasi.EVENTTYPE_CLOCK,
-                0,
-                0,
-            );
-            event_count += 1;
-        }
-    }
 
-    for (fd_subs.items) |s| {
-        if (s.errno != 0) {
-            writeEvent(
-                mem,
-                u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
-                s.userdata,
-                s.errno,
-                s.type_,
-                0,
-                0,
-            );
-            event_count += 1;
-        } else if (s.ready) {
-            const flags: u16 = if (s.hangup) wasi.EVENT_FD_READWRITE_HANGUP else 0;
-            writeEvent(
-                mem,
-                u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
-                s.userdata,
-                0,
-                s.type_,
-                s.nbytes,
-                flags,
-            );
-            event_count += 1;
-        } else if (s.pollfd_index) |pi| {
-            if (comptime builtin.os.tag == .windows) unreachable;
-            if (!did_poll) continue;
-            const r = pollfds.items[pi].revents;
-            const ready_for: i16 = if (s.type_ == wasi.EVENTTYPE_FD_WRITE)
-                std.posix.POLL.OUT
-            else
-                std.posix.POLL.IN;
-            const hangup = (r & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
-            if ((r & ready_for) != 0 or hangup) {
-                const flags: u16 = if (hangup) wasi.EVENT_FD_READWRITE_HANGUP else 0;
+        if (has_ready) {
+            var event_count: u32 = 0;
+            for (clocks.items) |clock| {
+                if (clock.valid and pendingClockRemainingNs(ctx, hooks, clock) != 0)
+                    continue;
                 writeEvent(
                     mem,
                     u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
-                    s.userdata,
+                    clock.userdata,
+                    if (clock.valid) 0 else clock.errno,
+                    wasi.EVENTTYPE_CLOCK,
                     0,
-                    s.type_,
                     0,
-                    flags,
                 );
                 event_count += 1;
             }
-        }
-    }
 
-    // Safety net: callers (e.g. the wasi-testsuite poll_oneoff_stdio
-    // test) panic if zero events come back. If the poll timed out
-    // without any fd readiness AND no clock fired, treat the earliest
-    // valid clock as fired.
-    if (event_count == 0) {
-        for (clocks.items) |c| {
-            if (!c.valid) continue;
-            writeEvent(mem, u_out, c.userdata, 0, wasi.EVENTTYPE_CLOCK, 0, 0);
-            event_count = 1;
-            break;
-        }
-    }
+            for (fd_subs.items) |sub| {
+                if (sub.errno != 0) {
+                    writeEvent(
+                        mem,
+                        u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
+                        sub.userdata,
+                        sub.errno,
+                        sub.type_,
+                        0,
+                        0,
+                    );
+                    event_count += 1;
+                } else if (sub.ready) {
+                    writeEvent(
+                        mem,
+                        u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
+                        sub.userdata,
+                        0,
+                        sub.type_,
+                        sub.nbytes,
+                        if (sub.hangup) wasi.EVENT_FD_READWRITE_HANGUP else 0,
+                    );
+                    event_count += 1;
+                } else if (sub.pollfd_index) |pollfd_index| {
+                    if (comptime builtin.os.tag == .windows) unreachable;
+                    const revents = pollfds.items[pollfd_index].revents;
+                    const wanted: i16 = if (sub.type_ == wasi.EVENTTYPE_FD_WRITE)
+                        std.posix.POLL.OUT
+                    else
+                        std.posix.POLL.IN;
+                    const hangup =
+                        (revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
+                    if ((revents & wanted) == 0 and !hangup) continue;
+                    writeEvent(
+                        mem,
+                        u_out + event_count * @as(u32, @intCast(wasi.EVENT_SIZE)),
+                        sub.userdata,
+                        0,
+                        sub.type_,
+                        0,
+                        if (hangup) wasi.EVENT_FD_READWRITE_HANGUP else 0,
+                    );
+                    event_count += 1;
+                }
+            }
 
-    if (!wasi_core.memWriteU32(mem, u_ret, event_count)) return wasi_core.WASI_EINVAL;
-    return wasi_core.WASI_ESUCCESS;
+            // A realtime clock can move backwards between the readiness check
+            // and emission. Re-enter the wait loop rather than returning an
+            // empty event set or fabricating an early clock event.
+            if (event_count != 0) {
+                if (!wasi_core.memWriteU32(mem, u_ret, event_count))
+                    return wasi_core.WASI_EINVAL;
+                return wasi_core.WASI_ESUCCESS;
+            }
+        }
+
+        var earliest_ns: ?u64 = null;
+        for (clocks.items) |clock| {
+            if (!clock.valid) continue;
+            const remaining_ns = pendingClockRemainingNs(ctx, hooks, clock);
+            if (remaining_ns == 0) continue;
+            if (earliest_ns == null or remaining_ns < earliest_ns.?)
+                earliest_ns = remaining_ns;
+        }
+        const timeout_ms: i32 = if (earliest_ns) |remaining_ns|
+            nsToTimeoutMs(remaining_ns)
+        else
+            -1;
+
+        const wait_result: BlockingWait = if (pollfds.items.len == 0 and
+            windows_inputs.items.len == 0)
+            runClockOnlyWait(ctx, hooks, timeout_ms)
+        else if (comptime builtin.os.tag == .windows)
+            runWindowsPollWait(ctx, hooks, windows_inputs.items, timeout_ms)
+        else
+            waitForReadiness(ctx, pollfds.items, timeout_ms);
+
+        switch (wait_result) {
+            .terminated => return terminated_result,
+            .failed => return @intCast(@intFromEnum(wasi.Errno.io)),
+            .ready => probe_inputs = false,
+            .timed_out => {},
+        }
+        if (comptime builtin.os.tag == .windows)
+            applyWindowsInputResults(fd_subs.items, windows_inputs.items);
+    }
 }
 
 // ── sock_shutdown (#420 phase 8) ───────────────────────────────────────
@@ -5268,6 +5357,71 @@ const WindowsPollTestPipe = if (builtin.os.tag == .windows) struct {
     }
 } else struct {};
 
+const FakePollTime = struct {
+    const Step = struct {
+        realtime_ns: ?u64 = null,
+        monotonic_ns: ?u64 = null,
+    };
+
+    realtime_ns: u64 = 0,
+    monotonic_ns: u64 = 0,
+    steps: []const Step = &.{},
+    advance_by_timeout: bool = false,
+    waits: [16]i32 = @splat(0),
+    wait_count: usize = 0,
+
+    fn now(raw: *anyopaque, clock_id: u32) u64 {
+        const self: *FakePollTime = @ptrCast(@alignCast(raw));
+        return if (clock_id == wasi.CLOCKID_REALTIME)
+            self.realtime_ns
+        else
+            self.monotonic_ns;
+    }
+
+    fn wait(raw: *anyopaque, timeout_ms: i32) BlockingWait {
+        const self: *FakePollTime = @ptrCast(@alignCast(raw));
+        if (self.wait_count < self.waits.len)
+            self.waits[self.wait_count] = timeout_ms;
+        if (self.wait_count < self.steps.len) {
+            const step = self.steps[self.wait_count];
+            if (step.realtime_ns) |value| self.realtime_ns = value;
+            if (step.monotonic_ns) |value| self.monotonic_ns = value;
+        } else if (self.advance_by_timeout and timeout_ms >= 0) {
+            const advance = @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms;
+            self.realtime_ns +|= advance;
+            self.monotonic_ns +|= advance;
+        }
+        self.wait_count += 1;
+        return .timed_out;
+    }
+
+    fn windowsReady(
+        raw: *anyopaque,
+        inputs: []windows_poll.ReadInput,
+        timeout_ms: i32,
+    ) BlockingWait {
+        const self: *FakePollTime = @ptrCast(@alignCast(raw));
+        if (self.wait_count < self.waits.len)
+            self.waits[self.wait_count] = timeout_ms;
+        self.wait_count += 1;
+        for (inputs) |*input| {
+            input.status = .ready;
+            input.nbytes = 1;
+            input.console = true;
+            input.poll_only = false;
+        }
+        return .ready;
+    }
+
+    fn hooks(self: *FakePollTime) PollOneoffHooks {
+        return .{
+            .ctx = @ptrCast(self),
+            .clock_now = now,
+            .clock_wait = wait,
+        };
+    }
+};
+
 test "ctxPollOneoffCore: nsubs <= 0 → einval" {
     if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
@@ -5510,6 +5664,189 @@ test "ctxPollOneoffCore: rights deficit → notcapable event" {
     );
 }
 
+test "poll_oneoff review: timeout conversion is overflow-free and rounds up" {
+    try std.testing.expectEqual(@as(i32, 0), nsToTimeoutMs(0));
+    try std.testing.expectEqual(@as(i32, 1), nsToTimeoutMs(1));
+    try std.testing.expectEqual(@as(i32, 1), nsToTimeoutMs(std.time.ns_per_ms - 1));
+    try std.testing.expectEqual(@as(i32, 1), nsToTimeoutMs(std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(i32, 2), nsToTimeoutMs(std.time.ns_per_ms + 1));
+    try std.testing.expectEqual(std.math.maxInt(i32), nsToTimeoutMs(std.math.maxInt(u64)));
+}
+
+test "poll_oneoff review: a 30-day clock uses repeated bounded wait chunks" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var fake = FakePollTime{ .advance_by_timeout = true };
+    var mem: [256]u8 = @splat(0);
+    const thirty_days_ns: u64 = 30 * std.time.ns_per_day;
+    pollTestWriteClockSub(&mem, 0, 30, wasi.CLOCKID_MONOTONIC, thirty_days_ns, 0);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(ctx, &mem, 0, 64, 1, 200, fake.hooks()),
+    );
+    try std.testing.expectEqual(@as(usize, 2), fake.wait_count);
+    try std.testing.expectEqual(std.math.maxInt(i32), fake.waits[0]);
+    try std.testing.expectEqual(@as(i32, 444_516_353), fake.waits[1]);
+    try std.testing.expectEqual(@as(u64, 30), pollTestEventUserdata(&mem, 64, 0));
+}
+
+test "poll_oneoff review: max u64 timeout neither overflows nor expires after one chunk" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const steps = [_]FakePollTime.Step{.{ .monotonic_ns = std.math.maxInt(u64) }};
+    var fake = FakePollTime{ .steps = &steps };
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(
+        &mem,
+        0,
+        64,
+        wasi.CLOCKID_MONOTONIC,
+        std.math.maxInt(u64),
+        0,
+    );
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(ctx, &mem, 0, 64, 1, 200, fake.hooks()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.wait_count);
+    try std.testing.expectEqual(std.math.maxInt(i32), fake.waits[0]);
+    try std.testing.expectEqual(@as(u64, 64), pollTestEventUserdata(&mem, 64, 0));
+}
+
+test "poll_oneoff review: absolute clocks follow selected-clock jumps" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const forward_steps = [_]FakePollTime.Step{.{ .realtime_ns = 120 * std.time.ns_per_ms }};
+    var forward = FakePollTime{
+        .realtime_ns = 50 * std.time.ns_per_ms,
+        .steps = &forward_steps,
+    };
+    var forward_mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(
+        &forward_mem,
+        0,
+        1,
+        wasi.CLOCKID_REALTIME,
+        100 * std.time.ns_per_ms,
+        wasi.SUBSCRIPTION_CLOCK_ABSTIME,
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(
+            ctx,
+            &forward_mem,
+            0,
+            64,
+            1,
+            200,
+            forward.hooks(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), forward.wait_count);
+
+    const backward_steps = [_]FakePollTime.Step{
+        .{ .realtime_ns = 40 * std.time.ns_per_ms },
+        .{ .realtime_ns = 110 * std.time.ns_per_ms },
+    };
+    var backward = FakePollTime{
+        .realtime_ns = 50 * std.time.ns_per_ms,
+        .steps = &backward_steps,
+    };
+    var backward_mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(
+        &backward_mem,
+        0,
+        2,
+        wasi.CLOCKID_REALTIME,
+        100 * std.time.ns_per_ms,
+        wasi.SUBSCRIPTION_CLOCK_ABSTIME,
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(
+            ctx,
+            &backward_mem,
+            0,
+            64,
+            1,
+            200,
+            backward.hooks(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), backward.wait_count);
+    try std.testing.expectEqual(@as(i32, 50), backward.waits[0]);
+    try std.testing.expectEqual(@as(i32, 60), backward.waits[1]);
+}
+
+test "poll_oneoff review: immediate fd does not emit a future absolute clock" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var fake = FakePollTime{ .monotonic_ns = 100 };
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(
+        &mem,
+        0,
+        1,
+        wasi.CLOCKID_MONOTONIC,
+        1_000,
+        wasi.SUBSCRIPTION_CLOCK_ABSTIME,
+    );
+    pollTestWriteFdSub(&mem, 1, 2, wasi.EVENTTYPE_FD_WRITE, 1);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(ctx, &mem, 0, 128, 2, 248, fake.hooks()),
+    );
+    try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 248).?);
+    try std.testing.expectEqual(@as(u64, 2), pollTestEventUserdata(&mem, 128, 0));
+    try std.testing.expectEqual(@as(usize, 0), fake.wait_count);
+}
+
+test "poll_oneoff review: multiple clocks emit the earliest complete ready set" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const steps = [_]FakePollTime.Step{.{ .monotonic_ns = 100 * std.time.ns_per_ms }};
+    var fake = FakePollTime{ .steps = &steps };
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(
+        &mem,
+        0,
+        1,
+        wasi.CLOCKID_MONOTONIC,
+        100 * std.time.ns_per_ms,
+        wasi.SUBSCRIPTION_CLOCK_ABSTIME,
+    );
+    pollTestWriteClockSub(
+        &mem,
+        1,
+        2,
+        wasi.CLOCKID_MONOTONIC,
+        200 * std.time.ns_per_ms,
+        wasi.SUBSCRIPTION_CLOCK_ABSTIME,
+    );
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(ctx, &mem, 0, 128, 2, 248, fake.hooks()),
+    );
+    try std.testing.expectEqual(@as(i32, 100), fake.waits[0]);
+    try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 248).?);
+    try std.testing.expectEqual(@as(u64, 1), pollTestEventUserdata(&mem, 128, 0));
+
+    fake.monotonic_ns = 250 * std.time.ns_per_ms;
+    fake.wait_count = 0;
+    @memset(mem[128..], 0);
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(ctx, &mem, 0, 128, 2, 248, fake.hooks()),
+    );
+    try std.testing.expectEqual(@as(u32, 2), wasi_core.memReadU32(&mem, 248).?);
+    try std.testing.expectEqual(@as(usize, 0), fake.wait_count);
+}
+
 test "Windows poll_oneoff: relative and absolute clocks have bounded deadlines" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
@@ -5626,6 +5963,84 @@ test "Windows poll_oneoff: redirected stdin pipe EOF reports hangup" {
         wasi.EVENT_FD_READWRITE_HANGUP,
         pollTestEventFlags(&mem, 128, 0),
     );
+}
+
+test "Windows poll review: ready pipe and unsupported socket both emit" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var pipe = try WindowsPollTestPipe.init();
+    defer pipe.deinit();
+    try pipe.writeBytes("x");
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(110, .{ .kind = .stdin, .host_fd = pipe.read });
+    try ctx.fd_table.insert(111, .{ .kind = .socket });
+
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteFdSub(&mem, 0, 10, wasi.EVENTTYPE_FD_READ, 110);
+    pollTestWriteFdSub(&mem, 1, 11, wasi.EVENTTYPE_FD_READ, 111);
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCore(ctx, &mem, 0, 128, 2, 248),
+    );
+
+    try std.testing.expectEqual(@as(u32, 2), wasi_core.memReadU32(&mem, 248).?);
+    try std.testing.expectEqual(@as(u64, 10), pollTestEventUserdata(&mem, 128, 0));
+    try std.testing.expectEqual(@as(u16, 0), pollTestEventErrno(&mem, 128, 0));
+    try std.testing.expectEqual(@as(u64, 11), pollTestEventUserdata(&mem, 128, 1));
+    try std.testing.expectEqual(
+        @intFromEnum(wasi.Errno.notsup),
+        pollTestEventErrno(&mem, 128, 1),
+    );
+}
+
+test "Windows poll review: ready console and expired clock both emit" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var pipe = try WindowsPollTestPipe.init();
+    defer pipe.deinit();
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(112, .{ .kind = .stdin, .host_fd = pipe.read });
+
+    var fake = FakePollTime{};
+    var hooks = fake.hooks();
+    hooks.windows_wait = FakePollTime.windowsReady;
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(&mem, 0, 12, wasi.CLOCKID_MONOTONIC, 0, 0);
+    pollTestWriteFdSub(&mem, 1, 13, wasi.EVENTTYPE_FD_READ, 112);
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCoreWithHooks(ctx, &mem, 0, 128, 2, 248, hooks),
+    );
+
+    try std.testing.expectEqual(@as(u32, 2), wasi_core.memReadU32(&mem, 248).?);
+    try std.testing.expectEqual(@as(u64, 12), pollTestEventUserdata(&mem, 128, 0));
+    try std.testing.expectEqual(@as(u64, 13), pollTestEventUserdata(&mem, 128, 1));
+}
+
+test "poll_oneoff review: POSIX immediate and pipe readiness both emit" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.write(fds[1], "x", 1)));
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(113, .{ .kind = .stdin, .host_fd = fds[0] });
+
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteFdSub(&mem, 0, 14, wasi.EVENTTYPE_FD_WRITE, 1);
+    pollTestWriteFdSub(&mem, 1, 15, wasi.EVENTTYPE_FD_READ, 113);
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCore(ctx, &mem, 0, 128, 2, 248),
+    );
+    try std.testing.expectEqual(@as(u32, 2), wasi_core.memReadU32(&mem, 248).?);
+    try std.testing.expectEqual(@as(u64, 14), pollTestEventUserdata(&mem, 128, 0));
+    try std.testing.expectEqual(@as(u64, 15), pollTestEventUserdata(&mem, 128, 1));
 }
 
 // ── sock_shutdown tests (#420 phase 8) ──────────────────────────────
@@ -6041,7 +6456,7 @@ test "group termination: a blocking poll_oneoff is interrupted instead of waitin
     defer ctx.deinit();
     var manager = thread_manager.ThreadManager.init(std.testing.allocator);
     defer manager.deinit();
-    manager.bindTermination(&ctx.termination);
+    try manager.bindTermination(&ctx.termination);
 
     var mem: [256]u8 = @splat(0);
     // A two-second sleep is the hard test backstop; group cancellation must
@@ -6085,6 +6500,8 @@ const BlockingReadProbe = struct {
     ctx: *wasi.WasiCtx,
     fd: u32,
     outcome: Outcome = .pending,
+    nread: usize = 0,
+    byte: u8 = 0,
     finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn run(self: *BlockingReadProbe) void {
@@ -6095,11 +6512,13 @@ const BlockingReadProbe = struct {
         };
         defer lease.release();
         var byte: [1]u8 = undefined;
-        _ = doRead(self.ctx, &lease, &byte) catch |err| {
+        const nread = doRead(self.ctx, &lease, &byte) catch |err| {
             self.outcome = if (err == error.Terminated) .terminated else .failed;
             self.finished.store(true, .release);
             return;
         };
+        self.nread = nread;
+        if (nread != 0) self.byte = byte[0];
         self.outcome = .read;
         self.finished.store(true, .release);
     }
@@ -6121,7 +6540,7 @@ test "group termination: a blocking Windows stdin pipe read is interrupted" {
 
     var manager = thread_manager.ThreadManager.init(std.testing.allocator);
     defer manager.deinit();
-    manager.bindTermination(&ctx.termination);
+    try manager.bindTermination(&ctx.termination);
 
     const FallbackWriter = struct {
         fn run(target: *WindowsPollTestPipe) void {
@@ -6145,4 +6564,108 @@ test "group termination: a blocking Windows stdin pipe read is interrupted" {
     try std.testing.expectEqual(BlockingReadProbe.Outcome.terminated, probe.outcome);
     try std.testing.expect(interrupt_elapsed < 500 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(?u32, 5), ctx.getExitCode());
+}
+
+test "Windows cancellable read: two readers sharing one byte leave the loser interruptible" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (!config.lib_wasi_threads or is_single_threaded) return error.SkipZigTest;
+
+    var pipe = try WindowsPollTestPipe.init();
+    defer pipe.deinit();
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const guest_fd: u32 = 103;
+    try ctx.fd_table.insert(guest_fd, .{ .kind = .stdin, .host_fd = pipe.read });
+
+    var manager = thread_manager.ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&ctx.termination);
+
+    const FallbackWriter = struct {
+        fn run(target: *WindowsPollTestPipe) void {
+            platform.usleep(std.time.us_per_s);
+            target.writeBytes("b") catch {};
+        }
+    };
+    const fallback = try std.Thread.spawn(.{}, FallbackWriter.run, .{&pipe});
+
+    var first = BlockingReadProbe{ .ctx = ctx, .fd = guest_fd };
+    var second = BlockingReadProbe{ .ctx = ctx, .fd = guest_fd };
+    const first_thread = try std.Thread.spawn(.{}, BlockingReadProbe.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, BlockingReadProbe.run, .{&second});
+    platform.usleep(20 * std.time.us_per_ms);
+    try pipe.writeBytes("a");
+
+    const ready_deadline = hostMonotonicNs(ctx) + 500 * std.time.ns_per_ms;
+    while (!first.finished.load(.acquire) and
+        !second.finished.load(.acquire) and
+        hostMonotonicNs(ctx) < ready_deadline)
+    {
+        platform.usleep(std.time.us_per_ms);
+    }
+    const finished_before_cancel =
+        @as(usize, @intFromBool(first.finished.load(.acquire))) +
+        @as(usize, @intFromBool(second.finished.load(.acquire)));
+
+    const interrupted_at = hostMonotonicNs(ctx);
+    ctx.proc_exit(7);
+    first_thread.join();
+    second_thread.join();
+    const interrupt_elapsed = hostMonotonicNs(ctx) - interrupted_at;
+    fallback.join();
+
+    const first_read = first.outcome == .read and first.nread == 1 and first.byte == 'a';
+    const second_read = second.outcome == .read and second.nread == 1 and second.byte == 'a';
+    try std.testing.expectEqual(@as(usize, 1), finished_before_cancel);
+    try std.testing.expect(first_read != second_read);
+    try std.testing.expect(
+        first.outcome == .terminated or second.outcome == .terminated,
+    );
+    try std.testing.expect(interrupt_elapsed < 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(?u32, 7), ctx.getExitCode());
+}
+
+test "Windows cancellable read: redirected pipe EOF returns zero" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (!config.lib_wasi_threads or is_single_threaded) return error.SkipZigTest;
+
+    var pipe = try WindowsPollTestPipe.init();
+    defer pipe.deinit();
+    pipe.closeWrite();
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(104, .{ .kind = .stdin, .host_fd = pipe.read });
+    var manager = thread_manager.ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&ctx.termination);
+
+    var lease = ctx.fd_table.acquire(104).?;
+    defer lease.release();
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try doRead(ctx, &lease, &byte));
+}
+
+test "Windows cancellable read: redirected file returns data then EOF" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (!config.lib_wasi_threads or is_single_threaded) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(testing_io, "redirected-stdin.txt", .{ .read = true });
+    defer file.close(testing_io);
+    try file.writePositionalAll(testing_io, "file", 0);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(105, .{ .kind = .stdin, .host_fd = file.handle });
+    var manager = thread_manager.ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&ctx.termination);
+
+    var lease = ctx.fd_table.acquire(105).?;
+    defer lease.release();
+    var buffer: [8]u8 = undefined;
+    const first_read = try doRead(ctx, &lease, &buffer);
+    try std.testing.expectEqualStrings("file", buffer[0..first_read]);
+    try std.testing.expectEqual(@as(usize, 0), try doRead(ctx, &lease, &buffer));
 }

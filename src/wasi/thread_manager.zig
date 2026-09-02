@@ -247,6 +247,10 @@ pub const PrepareError = error{
     OutOfMemory,
 };
 
+pub const BindError = error{
+    WindowsCancelEventUnavailable,
+};
+
 pub const JoinError = error{
     InvalidThreadId,
     UnknownThread,
@@ -299,6 +303,7 @@ const TestHooks = struct {
     fail_child_initialization: bool = false,
     fail_native_spawn: bool = false,
     fail_start_gate: bool = false,
+    fail_windows_cancel_event: bool = false,
     native_threads_started: ?*std.atomic.Value(usize) = null,
     native_threads_joined: ?*std.atomic.Value(usize) = null,
     records_destroyed: ?*std.atomic.Value(usize) = null,
@@ -498,8 +503,8 @@ pub const ThreadManager = struct {
     /// still reaches an interruption point; the interpreter needs none
     /// because its dispatch loop polls the manager directly.
     cancel_broadcast: ?CancelBroadcast = null,
-    /// Manual-reset event included in every Windows host wait set. The event
-    /// stays signalled after the first group interruption.
+    /// Lazily-created manual-reset event included in every Windows host wait
+    /// set. It stays signalled after the first group interruption.
     windows_cancel: windows_poll.CancelEvent,
 
     pub fn init(allocator: std.mem.Allocator) ThreadManager {
@@ -612,7 +617,15 @@ pub const ThreadManager = struct {
     /// Termination claimed anywhere — including `proc_exit` reached through
     /// the process state without ever touching this manager — then wakes
     /// every sibling through `interrupt`.
-    pub fn bindTermination(self: *ThreadManager, state: *termination.State) void {
+    pub fn bindTermination(self: *ThreadManager, state: *termination.State) BindError!void {
+        if (comptime config.lib_wasi_threads) {
+            const fail_for_test = if (self.test_hooks) |hooks|
+                hooks.fail_windows_cancel_event
+            else
+                false;
+            self.windows_cancel.ensureInitialized(fail_for_test) catch
+                return error.WindowsCancelEventUnavailable;
+        }
         self.termination = state;
         state.bindWindowsCancelHandle(self.windows_cancel.opaqueHandle());
         state.bindWake(.{ .ctx = @ptrCast(self), .wake = wakeFromTermination });
@@ -655,7 +668,7 @@ pub const ThreadManager = struct {
     /// threads unwind instead of hanging. Idempotent, safe from any thread.
     pub fn interrupt(self: *ThreadManager) void {
         self.trap_flag.store(true, .release);
-        self.windows_cancel.signal();
+        _ = self.windows_cancel.signal();
         if (self.cancel_broadcast) |hook| hook.broadcast(hook.ctx);
         if (self.shared_memory) |memory| _ = memory.cancelWaiters() catch {};
     }
@@ -2032,7 +2045,7 @@ test "group termination: the winning proc_exit is not masked by later terminatio
     var state = termination.State{};
     var manager = ThreadManager.init(allocator);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     try manager.prepareSharedMemory(ctx.mem_inst, null);
     ctx.inst.thread_manager = &manager;
 
@@ -2067,7 +2080,7 @@ test "group termination: a winning trap is never overwritten by a later proc_exi
     var state = termination.State{};
     var manager = ThreadManager.init(allocator);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     ctx.inst.thread_manager = &manager;
 
     const tid = try manager.spawnThread(ctx.inst, 0);
@@ -2097,7 +2110,7 @@ test "group termination: futex waiters wake and join within the teardown bound" 
     var state = termination.State{};
     var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     try manager.prepareSharedMemory(ctx.mem_inst, null);
     ctx.inst.thread_manager = &manager;
 
@@ -2136,7 +2149,7 @@ test "group termination: a spinning sibling is interrupted by the interpreter po
     var state = termination.State{};
     var manager = ThreadManager.init(allocator);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     ctx.inst.thread_manager = &manager;
 
     const child_count = 3;
@@ -2163,7 +2176,7 @@ test "group termination: joining a terminated sibling reports its trap" {
     var state = termination.State{};
     var manager = ThreadManager.init(allocator);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     try manager.prepareSharedMemory(ctx.mem_inst, null);
     ctx.inst.thread_manager = &manager;
 
@@ -2224,7 +2237,7 @@ test "group termination: an uncooperative sibling bounds teardown instead of dea
     var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
     var manager_live = true;
     defer if (manager_live) manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
 
     _ = try manager.spawnWithBackend(
         @ptrCast(&backend),
@@ -2269,7 +2282,7 @@ test "group termination: a late binder still wakes an already terminated group" 
     try waitForReady(ctx, 1);
     // Claimed before the manager is bound: binding must replay the wakeup.
     _ = state.claimExit(4);
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
 
     const summary = manager.terminateAndJoin(default_termination_timeout_ns);
     try std.testing.expect(!summary.timed_out);
@@ -2294,7 +2307,7 @@ test "group termination: the cancel broadcast reaches compiled code on every int
     var state = termination.State{};
     var manager = ThreadManager.init(std.testing.allocator);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     manager.bindCancelBroadcast(.{
         .ctx = @ptrCast(&probe),
         .broadcast = Probe.broadcast,
@@ -2313,13 +2326,37 @@ test "group termination: the cancel broadcast reaches compiled code on every int
     var terminated_state = termination.State{};
     var late_manager = ThreadManager.init(std.testing.allocator);
     defer late_manager.deinit();
-    late_manager.bindTermination(&terminated_state);
+    try late_manager.bindTermination(&terminated_state);
     _ = terminated_state.claimExit(1);
     late_manager.bindCancelBroadcast(.{
         .ctx = @ptrCast(&late),
         .broadcast = Probe.broadcast,
     });
     try std.testing.expect(late.calls >= 1);
+}
+
+test "ThreadManager: Windows cancel event is lazy for unused managers" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const hooks = TestHooks{ .fail_windows_cancel_event = true };
+    var manager = ThreadManager.initWithTestHooks(std.testing.allocator, &hooks);
+    defer manager.deinit();
+    try std.testing.expect(manager.windows_cancel.opaqueHandle() == null);
+}
+
+test "ThreadManager: Windows cancel event creation failure is explicit" {
+    if (builtin.os.tag != .windows or !config.lib_wasi_threads)
+        return error.SkipZigTest;
+
+    const hooks = TestHooks{ .fail_windows_cancel_event = true };
+    var manager = ThreadManager.initWithTestHooks(std.testing.allocator, &hooks);
+    defer manager.deinit();
+    var state = termination.State{};
+    try std.testing.expectError(
+        error.WindowsCancelEventUnavailable,
+        manager.bindTermination(&state),
+    );
+    try std.testing.expect(manager.termination == null);
+    try std.testing.expect(state.windowsCancelHandle() == null);
 }
 
 /// Parks the calling thread on the group's shared memory with an infinite
@@ -2359,7 +2396,7 @@ test "group termination: the embedder parking after the last sweep is still canc
     var state = termination.State{};
     var manager = ThreadManager.init(allocator);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     try manager.prepareSharedMemory(ctx.mem_inst, null);
     ctx.inst.thread_manager = &manager;
 
@@ -2397,7 +2434,7 @@ test "group termination: an interpreter child that parks after termination traps
     var state = termination.State{};
     var manager = ThreadManager.init(allocator);
     defer manager.deinit();
-    manager.bindTermination(&state);
+    try manager.bindTermination(&state);
     try manager.prepareSharedMemory(ctx.mem_inst, null);
     ctx.inst.thread_manager = &manager;
 
