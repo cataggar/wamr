@@ -105,7 +105,12 @@ run 33631050708 (`19d046a5b23b9c39acf5f7062976f04c5ca8ca75`); the workflow
 builds that ref in an isolated worktree while using the merged profiling
 tooling. Profiling uses the same fixed arguments and selected CPU as the
 authoritative benchmark, runs ABBA warmups, then records two captures per
-engine in ABBA order before aggregating self samples. It uploads compact
+engine in ABBA order before aggregating self samples. Each WAMR capture must
+independently find exactly one anonymous executable mmap with the precise
+host-page-rounded cwasm text size and attribute at least 99% of all self
+samples; both Wasmtime captures must independently clear the same coverage
+gate. Manual mapping overrides are diagnostic-only and non-authoritative.
+It uploads compact
 JSON/Markdown reports, diagnostics, and compressed raw perf/jitdump data when
 each input is at most 25 MiB.
 

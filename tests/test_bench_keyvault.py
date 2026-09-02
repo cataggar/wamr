@@ -337,7 +337,11 @@ class KeyvaultHarnessTest(unittest.TestCase):
             "--require-size-match",
         ]
         with mock.patch.object(attr, "addr_counts", return_value=({base: 10}, 10)), (
-            mock.patch.object(attr, "jit_exec_mmaps", return_value=[(base, 8)])
+            mock.patch.object(
+                attr, "jit_exec_mmaps", return_value=[(base, 4096)]
+            )
+        ), mock.patch.object(
+            attr, "system_page_size", return_value=4096
         ), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(
             io.StringIO()
         ):
@@ -346,6 +350,8 @@ class KeyvaultHarnessTest(unittest.TestCase):
         self.assertEqual(report["total_samples"], 10)
         self.assertEqual(report["attributed_samples"], 10)
         self.assertEqual(report["attribution_coverage_pct"], 100)
+        self.assertEqual(report["mapping"]["expected_size"], 4096)
+        self.assertTrue(report["mapping"]["authoritative"])
 
     @unittest.skipUnless(
         sys.platform.startswith("linux") and platform.machine() == "x86_64",
