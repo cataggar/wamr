@@ -22,6 +22,22 @@ pub const TaskState = enum(u8) {
     cancelled = 3,
 };
 
+var next_task_manager_identity: std.atomic.Value(u32) = .init(1);
+
+fn allocateTaskManagerIdentity() u32 {
+    var current = next_task_manager_identity.load(.acquire);
+    while (true) {
+        if (current == std.math.maxInt(u32))
+            @panic("task-manager cancellation identity exhausted");
+        current = next_task_manager_identity.cmpxchgWeak(
+            current,
+            current + 1,
+            .acq_rel,
+            .acquire,
+        ) orelse return current;
+    }
+}
+
 /// Per-task `context.{get,set} i32 i` slots. The spec allows arbitrary
 /// `valtype` and arbitrary index range; sub-PR 1 of #478 caps both
 /// (`i32` only, `slot < N_CONTEXT_SLOTS`). Wasmtime currently exposes a
@@ -205,6 +221,8 @@ pub const WaitableSet = struct {
 pub const TaskManager = struct {
     tasks: std.ArrayListUnmanaged(Task) = .empty,
     next_id: u32 = 1,
+    cancellation_identity: if (config.lib_wasi_threads) u32 else void =
+        if (config.lib_wasi_threads) 0 else {},
     allocator: ?std.mem.Allocator = null,
     mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.resource_registry) = .init,
 
@@ -225,6 +243,10 @@ pub const TaskManager = struct {
         defer self.mutex.unlock();
         const task_allocator = self.allocator orelse allocator;
         if (self.allocator == null) self.allocator = task_allocator;
+        if (comptime config.lib_wasi_threads) {
+            if (self.cancellation_identity == 0)
+                self.cancellation_identity = allocateTaskManagerIdentity();
+        }
         const id = self.next_id;
         const idx: u32 = @intCast(self.tasks.items.len);
         try self.tasks.append(task_allocator, .{ .id = id });
@@ -237,7 +259,8 @@ pub const TaskManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (handle < self.tasks.items.len) {
-            self.tasks.items[handle].state = .started;
+            if (self.tasks.items[handle].state == .created)
+                self.tasks.items[handle].state = .started;
         }
     }
 
@@ -266,14 +289,16 @@ pub const TaskManager = struct {
         self.mutex.lock();
         if (handle < self.tasks.items.len) {
             const task = &self.tasks.items[handle];
-            old_values = task.return_values;
-            old_values_allocator = task.return_values_allocator;
-            task.state = .returned;
-            task.return_values = values;
-            task.return_values_allocator = values_allocator;
-            waitable_set = task.waitable_set;
-            waitable_idx = task.waitable_idx;
-            accepted = true;
+            if (task.state == .created or task.state == .started) {
+                old_values = task.return_values;
+                old_values_allocator = task.return_values_allocator;
+                task.state = .returned;
+                task.return_values = values;
+                task.return_values_allocator = values_allocator;
+                waitable_set = task.waitable_set;
+                waitable_idx = task.waitable_idx;
+                accepted = true;
+            }
         }
         const allocator = self.allocator;
         self.mutex.unlock();
@@ -295,11 +320,25 @@ pub const TaskManager = struct {
 
     /// Cancel a task.
     pub fn cancelTask(self: *TaskManager, handle: u32) void {
+        _ = self.tryCancelTask(handle);
+    }
+
+    /// Cancel a task unless it already returned. Returns true when the task is
+    /// cancelled after the call (including an idempotent repeated cancel).
+    /// Return and cancellation are first-terminal under the manager lock.
+    pub fn tryCancelTask(self: *TaskManager, handle: u32) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (handle < self.tasks.items.len) {
-            self.tasks.items[handle].state = .cancelled;
-        }
+        if (handle >= self.tasks.items.len) return false;
+        const task = &self.tasks.items[handle];
+        return switch (task.state) {
+            .created, .started => blk: {
+                task.state = .cancelled;
+                break :blk true;
+            },
+            .cancelled => true,
+            .returned => false,
+        };
     }
 
     /// Get the state of a task.
@@ -359,6 +398,19 @@ pub const TaskManager = struct {
         const binding = current_task_binding orelse return null;
         if (binding.manager != self) return null;
         return binding.handle;
+    }
+
+    /// Stable cancellation key for a task. The high word is a monotonic
+    /// TaskManager incarnation, preventing address-reuse ABA after a manager
+    /// is destroyed while child thread records still retain the old group.
+    pub fn cancellationKey(self: *TaskManager, handle: u32) ?u64 {
+        if (comptime !config.lib_wasi_threads) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (handle >= self.tasks.items.len) return null;
+        std.debug.assert(self.cancellation_identity != 0);
+        return (@as(u64, self.cancellation_identity) << 32) |
+            self.tasks.items[handle].id;
     }
 
     pub fn setWaitable(
@@ -863,6 +915,80 @@ test "TaskManager: cancel" {
     const h = try tm.createTask(allocator);
     tm.cancelTask(h);
     try std.testing.expectEqual(TaskState.cancelled, tm.getState(h).?);
+}
+
+test "TaskManager: cancellation keys distinguish manager incarnations" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var first = TaskManager{};
+    defer first.deinit(allocator);
+    var second = TaskManager{};
+    defer second.deinit(allocator);
+    const first_handle = try first.createTask(allocator);
+    const second_handle = try second.createTask(allocator);
+    try std.testing.expect(first.cancellationKey(first_handle).? !=
+        second.cancellationKey(second_handle).?);
+}
+
+test "TaskManager: return and cancel are first-terminal under races" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tm = TaskManager{};
+    defer tm.deinit(allocator);
+
+    const Racer = struct {
+        manager: *TaskManager,
+        handle: u32,
+        values: []u32,
+        gate: *std.atomic.Value(bool),
+
+        fn cancel(self: *@This()) void {
+            while (!self.gate.load(.acquire)) std.atomic.spinLoopHint();
+            _ = self.manager.tryCancelTask(self.handle);
+        }
+
+        fn complete(self: *@This()) void {
+            while (!self.gate.load(.acquire)) std.atomic.spinLoopHint();
+            self.manager.returnTaskOwned(
+                self.handle,
+                self.values,
+                std.testing.allocator,
+            );
+        }
+    };
+
+    var round: usize = 0;
+    while (round < 64) : (round += 1) {
+        const handle = try tm.createTask(allocator);
+        tm.startTask(handle);
+        const values = try allocator.dupe(u32, &.{@intCast(round)});
+        var gate = std.atomic.Value(bool).init(false);
+        var racer = Racer{
+            .manager = &tm,
+            .handle = handle,
+            .values = values,
+            .gate = &gate,
+        };
+        const cancel_thread = try std.Thread.spawn(.{}, Racer.cancel, .{&racer});
+        const return_thread = try std.Thread.spawn(.{}, Racer.complete, .{&racer});
+        gate.store(true, .release);
+        cancel_thread.join();
+        return_thread.join();
+
+        switch (tm.getState(handle).?) {
+            .cancelled => {
+                try std.testing.expect(tm.tryCancelTask(handle));
+                tm.startTask(handle);
+                try std.testing.expectEqual(TaskState.cancelled, tm.getState(handle).?);
+            },
+            .returned => {
+                try std.testing.expect(!tm.tryCancelTask(handle));
+                tm.startTask(handle);
+                try std.testing.expectEqual(TaskState.returned, tm.getState(handle).?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "TaskManager: context slot get/set round-trip" {
