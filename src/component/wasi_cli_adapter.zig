@@ -4705,6 +4705,7 @@ pub const HttpResponseP3 = struct {
     trailers_future_handle: u32 = 0,
     /// Handle into `ComponentInstance.futures` for transmission future.
     transmission_future_handle: u32 = 0,
+    transmission_settled: bool = false,
 
     pub fn deinit(_: *HttpResponseP3, _: Allocator) void {}
 };
@@ -6568,7 +6569,7 @@ const InboundHttpResponseSession = struct {
                 const may_write_head = self.head_ready and body_ready and
                     (self.queue_len > 0 or
                         self.body_closed or
-                        self.handler_outcome != .pending);
+                        self.handler_outcome == .returned);
                 const head = if (may_write_head) self.head_bytes else null;
                 const observed = self.data_epoch.load(.acquire);
                 self.mutex.unlock();
@@ -25489,9 +25490,124 @@ pub const WasiCliAdapter = struct {
         return h;
     }
 
-    /// Drain a `stream<u8>` handle into a host byte slice (caller-owned).
-    /// Returns null + 0-len if the handle is unknown. The stream's
-    /// internal buffer is moved into the returned slice.
+    fn retireP3FallbackBodyStream(
+        ci: *ComponentInstance,
+        handle: u32,
+        cancelled: bool,
+    ) void {
+        var write_waitable: ?async_mod.WaitableRegistration = null;
+        var read_waitable: ?async_mod.WaitableRegistration = null;
+        var wake_writer = false;
+        var wake_reader = false;
+        if (ci.streams.acquire(handle)) |initial_lease| {
+            var stream_lease = initial_lease;
+            const stream = stream_lease.value();
+            stream.buffer.clearRetainingCapacity();
+            wake_writer = stream.pending_write != null;
+            wake_reader = stream.pending_read != null;
+            stream.pending_write = null;
+            stream.pending_read = null;
+            stream.write_ready = false;
+            stream.read_closed = true;
+            if (cancelled) stream.write_closed = true;
+            write_waitable = stream.write_waitable;
+            read_waitable = stream.read_waitable;
+            stream_lease.release();
+        }
+        if (wake_writer) {
+            _ = ci.notifyWaitable(
+                write_waitable,
+                async_canon.packStatus(.dropped, 0),
+            );
+        }
+        if (wake_reader) {
+            _ = ci.notifyWaitable(
+                read_waitable,
+                async_canon.packStatus(.dropped, 0),
+            );
+        }
+        _ = ci.streams.remove(handle);
+        ci.streams.collectRetired();
+    }
+
+    /// Drain a fallback response stream through writer closure. Content
+    /// responses are collected with a hard size bound; bodyless responses
+    /// discard incrementally. Either path releases FIFO capacity and wakes a
+    /// parked writer before waiting for the next producer milestone.
+    fn settleP3FallbackBodyStream(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        handle: u32,
+        collect: bool,
+        timeout_ns: u64,
+    ) ![]u8 {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer body.deinit(self.allocator);
+        var deadline = httpLiveMonotonicNs() +| timeout_ns;
+
+        while (true) {
+            var stream_lease = ci.streams.acquire(handle) orelse
+                return error.InvalidHandle;
+            const stream = stream_lease.value();
+            if (stream.host_handler != null or stream.host_driver != null) {
+                stream_lease.release();
+                retireP3FallbackBodyStream(ci, handle, true);
+                return error.InvalidHandle;
+            }
+
+            const drained = stream.buffer.items.len;
+            if (collect and drained != 0) {
+                if (drained > max_http_p3_body_bytes -| body.items.len) {
+                    stream_lease.release();
+                    retireP3FallbackBodyStream(ci, handle, true);
+                    return error.ResponseBodySize;
+                }
+                body.appendSlice(
+                    self.allocator,
+                    stream.buffer.items,
+                ) catch |err| {
+                    stream_lease.release();
+                    retireP3FallbackBodyStream(ci, handle, true);
+                    return err;
+                };
+            }
+            stream.buffer.clearRetainingCapacity();
+            stream.buffer_limit = http_live_response_buffer_bytes;
+            const writer_was_parked = stream.pending_write != null;
+            if (writer_was_parked) {
+                stream.pending_write = null;
+                stream.write_ready = true;
+            }
+            const write_waitable = stream.write_waitable;
+            const write_closed = stream.write_closed;
+            stream_lease.release();
+
+            if (writer_was_parked) {
+                _ = ci.notifyWaitable(
+                    write_waitable,
+                    async_canon.packStatus(.completed, 0),
+                );
+            }
+            if (write_closed) {
+                retireP3FallbackBodyStream(ci, handle, false);
+                return body.toOwnedSlice(self.allocator);
+            }
+            if (drained != 0 or writer_was_parked) {
+                deadline = httpLiveMonotonicNs() +| timeout_ns;
+            } else if (timeout_ns != 0 and
+                httpLiveMonotonicNs() >= deadline)
+            {
+                retireP3FallbackBodyStream(ci, handle, true);
+                return error.HttpResponseIncomplete;
+            }
+
+            _ = driveAsyncEvents(self, ci, null, self.allocator);
+            platform.usleep(100);
+        }
+    }
+
+    /// Snapshot a stream whose producer is already known complete.
+    /// Inbound fallback responses use `settleP3FallbackBodyStream` instead.
     fn drainByteStream(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
@@ -25499,10 +25615,12 @@ pub const WasiCliAdapter = struct {
     ) !?[]u8 {
         var stream_lease = ci.streams.acquire(handle) orelse return null;
         defer stream_lease.release();
-        const s = stream_lease.value();
-        if (s.buffer.items.len == 0) return try self.allocator.alloc(u8, 0);
-        const out = try self.allocator.dupe(u8, s.buffer.items);
-        s.buffer.clearRetainingCapacity();
+        const stream = stream_lease.value();
+        if (stream.buffer.items.len == 0) {
+            return try self.allocator.alloc(u8, 0);
+        }
+        const out = try self.allocator.dupe(u8, stream.buffer.items);
+        stream.buffer.clearRetainingCapacity();
         return out;
     }
 
@@ -26388,6 +26506,16 @@ pub const WasiCliAdapter = struct {
             else => try allocReadyUnitFuture(ci),
         };
         const tx_handle = try allocPendingUnitFuture(ci);
+        if (body_handle) |handle| {
+            if (ci.streams.acquire(handle)) |initial_stream_lease| {
+                var stream_lease = initial_stream_lease;
+                const stream = stream_lease.value();
+                if (stream.buffer_limit == null) {
+                    stream.buffer_limit = http_live_response_buffer_bytes;
+                }
+                stream_lease.release();
+            }
+        }
 
         // Per WIT, headers given to `response.new` (and accessed
         // later via `get-headers`) become an immutable view (#538).
@@ -27108,11 +27236,18 @@ pub const WasiCliAdapter = struct {
         response_handle: u32,
     ) void {
         var response_lease = self.lookupHttpResponseP3(response_handle) orelse return;
-        defer response_lease.release();
         const response = response_lease.value().*;
+        if (response.transmission_settled) {
+            response_lease.release();
+            return;
+        }
+        response.transmission_settled = true;
+        const transmission_future_handle =
+            response.transmission_future_handle;
+        response_lease.release();
         _ = settleHttpResponseTransmissionFuture(
             ci,
-            response.transmission_future_handle,
+            transmission_future_handle,
             false,
         );
     }
@@ -27123,11 +27258,18 @@ pub const WasiCliAdapter = struct {
         response_handle: u32,
     ) void {
         var response_lease = self.lookupHttpResponseP3(response_handle) orelse return;
-        defer response_lease.release();
         const response = response_lease.value().*;
+        if (response.transmission_settled) {
+            response_lease.release();
+            return;
+        }
+        response.transmission_settled = true;
+        const transmission_future_handle =
+            response.transmission_future_handle;
+        response_lease.release();
         _ = settleHttpResponseTransmissionFuture(
             ci,
-            response.transmission_future_handle,
+            transmission_future_handle,
             true,
         );
     }
@@ -27156,6 +27298,25 @@ pub const WasiCliAdapter = struct {
         keep_alive: bool,
         request_method: HttpRequestMethod,
     ) !bool {
+        return self.writeHttpResponseP3FromHandleForMethodWithTimeout(
+            out,
+            ci,
+            response_handle,
+            keep_alive,
+            request_method,
+            http_live_response_completion_timeout_ns,
+        );
+    }
+
+    fn writeHttpResponseP3FromHandleForMethodWithTimeout(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        ci: *ComponentInstance,
+        response_handle: u32,
+        keep_alive: bool,
+        request_method: HttpRequestMethod,
+        completion_timeout_ns: u64,
+    ) !bool {
         var response_lease = self.lookupHttpResponseP3(response_handle) orelse {
             try self.writeHttpSimpleResponseForMethod(
                 out,
@@ -27174,15 +27335,16 @@ pub const WasiCliAdapter = struct {
             status,
         );
 
-        // Drain the body stream<u8> if present. Empty streams (no
-        // contents pushed by the guest) yield a zero-length body
-        // without a Content-Length error.
-        var body_owned: ?[]u8 = null;
-        defer if (body_owned) |b| self.allocator.free(b);
-        if (response.body_stream_handle) |sh| {
-            body_owned = self.drainByteStream(ci, sh) catch null;
-        }
-        const body: []const u8 = if (body_owned) |b| b else "";
+        const body = if (response.body_stream_handle) |stream_handle|
+            try self.settleP3FallbackBodyStream(
+                ci,
+                stream_handle,
+                semantics.wire_body_allowed,
+                completion_timeout_ns,
+            )
+        else
+            try self.allocator.alloc(u8, 0);
+        defer self.allocator.free(body);
 
         // Validate response header name/value bytes before emitting.
         // Skip transport-managed headers (we set Content-Length /
@@ -27209,6 +27371,11 @@ pub const WasiCliAdapter = struct {
                 }
             }
         }
+        if (semantics.content_length == .framing) {
+            if (content_length) |expected| {
+                if (body.len != expected) return error.ResponseBodySize;
+            }
+        }
 
         // Extract optional guest-supplied trailer fields out of the
         // trailers future payload. `payload == null` (the ready-unit
@@ -27226,11 +27393,6 @@ pub const WasiCliAdapter = struct {
             null;
         const has_trailer_entries = if (trailer_fields) |tf| tf.entries.items.len > 0 else false;
         const has_body_stream = response.body_stream_handle != null;
-        if (semantics.wire_body_allowed and has_body_stream) {
-            if (content_length) |expected| {
-                if (body.len != expected) return error.ResponseBodySize;
-            }
-        }
 
         // Frame selection: prefer identity framing when the guest's
         // headers carry a Content-Length, or when there is no body
@@ -27717,16 +27879,14 @@ pub const WasiCliAdapter = struct {
                         outcome.payload,
                         parsed.keep_alive,
                         parsed.request_method,
-                    ) catch |err| {
+                    ) catch {
                         self.failHttpResponseTransmission(ci, outcome.payload);
-                        if (err == error.HttpClientDisconnected) {
-                            cancelAllPendingAsyncOps(
-                                self,
-                                ci,
-                                null,
-                                self.allocator,
-                            );
-                        }
+                        cancelAllPendingAsyncOps(
+                            self,
+                            ci,
+                            null,
+                            self.allocator,
+                        );
                         self.cleanupHttpResourcesAllVersions();
                         return;
                     };
@@ -48031,6 +48191,63 @@ const LiveHttpProducer = struct {
     }
 };
 
+const P3FallbackTestProducer = struct {
+    ci: *ComponentInstance,
+    handle: u32,
+    payload: []const u8,
+    delay_us: u64 = 0,
+    wait_for_parked_wake: bool = false,
+    close_after_write: bool = true,
+    woke: std.atomic.Value(bool) = .init(false),
+    cancelled: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *P3FallbackTestProducer) void {
+        if (self.delay_us != 0) platform.usleep(self.delay_us);
+        while (true) {
+            var stream_lease = self.ci.streams.acquire(self.handle) orelse {
+                self.cancelled.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            };
+            const stream = stream_lease.value();
+            if (stream.read_closed) {
+                stream_lease.release();
+                self.cancelled.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            }
+            if (self.wait_for_parked_wake and stream.pending_write != null) {
+                stream_lease.release();
+                platform.usleep(100);
+                continue;
+            }
+            if (self.wait_for_parked_wake) {
+                self.woke.store(stream.write_ready, .release);
+            }
+            stream.buffer.appendSlice(
+                self.ci.allocator,
+                self.payload,
+            ) catch {
+                stream_lease.release();
+                self.cancelled.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            };
+            if (self.close_after_write) stream.write_closed = true;
+            stream_lease.release();
+            self.done.store(true, .release);
+            return;
+        }
+    }
+};
+
+fn p3FallbackStreamExists(ci: *ComponentInstance, handle: u32) bool {
+    var stream_lease = ci.streams.acquire(handle) orelse return false;
+    stream_lease.release();
+    return true;
+}
+
 const LiveHttpResponseFixture = struct {
     response_handle: u32,
     body_handle: ?u32,
@@ -51039,6 +51256,532 @@ test "wasi:http #970 review: simple responses share CONNECT and 205 policy" {
             output.getBufferContents(),
         );
     }
+}
+
+test "wasi:http #970 review: P3 fallback validates absent body length before wire" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P3 fallback validates absent body length before wire",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const invalid = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        5,
+        false,
+        null,
+    );
+    var invalid_wire = streams.OutputStream.toBuffer();
+    defer invalid_wire.deinit(testing.allocator);
+    try testing.expectError(
+        error.ResponseBodySize,
+        adapter.writeHttpResponseP3FromHandleForMethod(
+            &invalid_wire,
+            &ci,
+            invalid.response_handle,
+            true,
+            .get,
+        ),
+    );
+    try testing.expectEqual(
+        @as(usize, 0),
+        invalid_wire.getBufferContents().len,
+    );
+    adapter.failHttpResponseTransmission(&ci, invalid.response_handle);
+    try testing.expectEqual(
+        async_mod.Future.State.closed,
+        ci.futures.getPtr(invalid.transmission_handle).?.state,
+    );
+
+    var pipeline_wire = streams.OutputStream.toBuffer();
+    defer pipeline_wire.deinit(testing.allocator);
+    const empty = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        0,
+        false,
+        null,
+    );
+    try testing.expect(try adapter.writeHttpResponseP3FromHandleForMethod(
+        &pipeline_wire,
+        &ci,
+        empty.response_handle,
+        true,
+        .get,
+    ));
+    adapter.succeedHttpResponseTransmission(&ci, empty.response_handle);
+
+    const second = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        2,
+        true,
+        null,
+    );
+    const second_body = ci.streams.getPtr(second.body_handle.?).?;
+    try second_body.buffer.appendSlice(testing.allocator, "ok");
+    second_body.write_closed = true;
+    try testing.expect(!(try adapter.writeHttpResponseP3FromHandleForMethod(
+        &pipeline_wire,
+        &ci,
+        second.response_handle,
+        false,
+        .get,
+    )));
+    adapter.succeedHttpResponseTransmission(&ci, second.response_handle);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Connection: keep-alive\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 2\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "ok",
+        pipeline_wire.getBufferContents(),
+    );
+
+    const implicit_empty = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        null,
+        false,
+        null,
+    );
+    var implicit_wire = streams.OutputStream.toBuffer();
+    defer implicit_wire.deinit(testing.allocator);
+    try testing.expect(try adapter.writeHttpResponseP3FromHandleForMethod(
+        &implicit_wire,
+        &ci,
+        implicit_empty.response_handle,
+        true,
+        .get,
+    ));
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Connection: keep-alive\r\n\r\n",
+        implicit_wire.getBufferContents(),
+    );
+}
+
+test "wasi:http #970 review: absent HEAD and 304 bodies retain length metadata" {
+    const testing = std.testing;
+    const cases = [_]struct {
+        method: HttpRequestMethod,
+        status: u16,
+        expected_status: []const u8,
+    }{
+        .{ .method = .head, .status = 200, .expected_status = "200 OK" },
+        .{ .method = .get, .status = 304, .expected_status = "304 Not Modified" },
+    };
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        const fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            5,
+            false,
+            null,
+        );
+        try setLiveHttpResponseStatus(
+            &adapter,
+            fixture.response_handle,
+            case.status,
+        );
+        var wire = streams.OutputStream.toBuffer();
+        defer wire.deinit(testing.allocator);
+        try testing.expect(try adapter.writeHttpResponseP3FromHandleForMethod(
+            &wire,
+            &ci,
+            fixture.response_handle,
+            true,
+            case.method,
+        ));
+        const expected = try std.fmt.allocPrint(
+            testing.allocator,
+            "HTTP/1.1 {s}\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .{case.expected_status},
+        );
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, wire.getBufferContents());
+    }
+}
+
+test "wasi:http #970 review: response.new bounds a fallback body stream" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fields_handle = try adapter.pushHttpFields(fields);
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, stream_handle, .{
+        .elem_type_idx = 0,
+    });
+    const trailers_handle = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_handle, .{
+        .elem_type_idx = 0,
+        .state = .ready,
+        .write_closed = true,
+    });
+    var body_value = InterfaceValue{ .handle = stream_handle };
+    const args = [_]InterfaceValue{
+        .{ .handle = fields_handle },
+        .{ .option_val = .{
+            .is_some = true,
+            .payload = &body_value,
+        } },
+        .{ .handle = trailers_handle },
+    };
+    var results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpResponseNewP3(
+        &adapter,
+        &ci,
+        &args,
+        &results,
+        testing.allocator,
+    );
+    defer results[0].deinit(testing.allocator);
+
+    var stream_lease = ci.streams.acquire(stream_handle) orelse
+        return error.InvalidHandle;
+    const limit = stream_lease.value().buffer_limit;
+    stream_lease.release();
+    try testing.expectEqual(
+        @as(?usize, http_live_response_buffer_bytes),
+        limit,
+    );
+}
+
+test "wasi:http #970 review: bodyless fallback settles late producers" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "bodyless fallback settles late producers",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    const Case = struct {
+        method: HttpRequestMethod,
+        status: u16,
+        expected: []const u8,
+        reusable: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .method = .head,
+            .status = 200,
+            .expected = "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: 100\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .reusable = true,
+        },
+        .{
+            .method = .get,
+            .status = 304,
+            .expected = "HTTP/1.1 304 Not Modified\r\n" ++
+                "Content-Length: 100\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .reusable = true,
+        },
+        .{
+            .method = .get,
+            .status = 205,
+            .expected = "HTTP/1.1 205 Reset Content\r\n" ++
+                "Content-Length: 0\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .reusable = true,
+        },
+        .{
+            .method = .connect,
+            .status = 200,
+            .expected = "HTTP/1.1 200 OK\r\n" ++
+                "Connection: close\r\n\r\n",
+            .reusable = false,
+        },
+    };
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        const fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            100,
+            true,
+            null,
+        );
+        try setLiveHttpResponseStatus(
+            &adapter,
+            fixture.response_handle,
+            case.status,
+        );
+        const stream_handle = fixture.body_handle.?;
+        const stream = ci.streams.getPtr(stream_handle).?;
+        try stream.buffer.appendSlice(testing.allocator, "first");
+        var producer = P3FallbackTestProducer{
+            .ci = &ci,
+            .handle = stream_handle,
+            .payload = "later",
+            .delay_us = 10 * std.time.us_per_ms,
+        };
+        const thread = try std.Thread.spawn(
+            .{},
+            P3FallbackTestProducer.run,
+            .{&producer},
+        );
+        var joined = false;
+        defer if (!joined) thread.join();
+
+        var wire = streams.OutputStream.toBuffer();
+        defer wire.deinit(testing.allocator);
+        const reusable =
+            try adapter.writeHttpResponseP3FromHandleForMethodWithTimeout(
+                &wire,
+                &ci,
+                fixture.response_handle,
+                true,
+                case.method,
+                std.time.ns_per_s,
+            );
+        thread.join();
+        joined = true;
+        adapter.succeedHttpResponseTransmission(
+            &ci,
+            fixture.response_handle,
+        );
+
+        try testing.expectEqual(case.reusable, reusable);
+        try testing.expectEqualStrings(case.expected, wire.getBufferContents());
+        try testing.expect(producer.done.load(.acquire));
+        try testing.expect(!producer.cancelled.load(.acquire));
+        try testing.expect(!p3FallbackStreamExists(&ci, stream_handle));
+        try testing.expectEqual(
+            async_mod.Future.State.ready,
+            ci.futures.getPtr(fixture.transmission_handle).?.state,
+        );
+    }
+}
+
+test "wasi:http #970 review: fallback drain wakes a parked producer" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "fallback drain wakes a parked producer",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        100,
+        true,
+        null,
+    );
+    try setLiveHttpResponseStatus(&adapter, fixture.response_handle, 205);
+    const stream_handle = fixture.body_handle.?;
+    const stream = ci.streams.getPtr(stream_handle).?;
+    stream.buffer_limit = 5;
+    try stream.buffer.appendSlice(testing.allocator, "first");
+    stream.pending_write = .{
+        .guest_ptr = 0,
+        .count = 5,
+        .elem_size = 1,
+    };
+    var producer = P3FallbackTestProducer{
+        .ci = &ci,
+        .handle = stream_handle,
+        .payload = "later",
+        .wait_for_parked_wake = true,
+    };
+    const thread = try std.Thread.spawn(
+        .{},
+        P3FallbackTestProducer.run,
+        .{&producer},
+    );
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var wire = streams.OutputStream.toBuffer();
+    defer wire.deinit(testing.allocator);
+    try testing.expect(
+        try adapter.writeHttpResponseP3FromHandleForMethodWithTimeout(
+            &wire,
+            &ci,
+            fixture.response_handle,
+            true,
+            .get,
+            std.time.ns_per_s,
+        ),
+    );
+    thread.join();
+    joined = true;
+
+    try testing.expect(producer.woke.load(.acquire));
+    try testing.expect(!producer.cancelled.load(.acquire));
+    try testing.expect(!p3FallbackStreamExists(&ci, stream_handle));
+    try testing.expectEqualStrings(
+        "HTTP/1.1 205 Reset Content\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Connection: keep-alive\r\n\r\n",
+        wire.getBufferContents(),
+    );
+}
+
+test "wasi:http #970 review: fallback producer timeout cancels and retires" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "fallback producer timeout cancels and retires",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        100,
+        true,
+        null,
+    );
+    const stream_handle = fixture.body_handle.?;
+    var producer = P3FallbackTestProducer{
+        .ci = &ci,
+        .handle = stream_handle,
+        .payload = "too late",
+        .delay_us = 100 * std.time.us_per_ms,
+    };
+    const thread = try std.Thread.spawn(
+        .{},
+        P3FallbackTestProducer.run,
+        .{&producer},
+    );
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var wire = streams.OutputStream.toBuffer();
+    defer wire.deinit(testing.allocator);
+    try testing.expectError(
+        error.HttpResponseIncomplete,
+        adapter.writeHttpResponseP3FromHandleForMethodWithTimeout(
+            &wire,
+            &ci,
+            fixture.response_handle,
+            true,
+            .head,
+            20 * std.time.ns_per_ms,
+        ),
+    );
+    adapter.failHttpResponseTransmission(&ci, fixture.response_handle);
+    thread.join();
+    joined = true;
+
+    try testing.expectEqual(@as(usize, 0), wire.getBufferContents().len);
+    try testing.expect(producer.cancelled.load(.acquire));
+    try testing.expect(producer.done.load(.acquire));
+    try testing.expect(!p3FallbackStreamExists(&ci, stream_handle));
+    try testing.expect(!ci.streams.remove(stream_handle));
+    try testing.expectEqual(
+        async_mod.Future.State.closed,
+        ci.futures.getPtr(fixture.transmission_handle).?.state,
+    );
+    adapter.failHttpResponseTransmission(&ci, fixture.response_handle);
+    var response_lease = adapter.lookupHttpResponseP3(
+        fixture.response_handle,
+    ) orelse return error.InvalidHandle;
+    const settled = response_lease.value().*.transmission_settled;
+    response_lease.release();
+    try testing.expect(settled);
+}
+
+test "wasi:http #970 review: ordinary fallback GET collects late body bytes" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "ordinary fallback GET collects late body bytes",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        10,
+        true,
+        null,
+    );
+    const stream_handle = fixture.body_handle.?;
+    const stream = ci.streams.getPtr(stream_handle).?;
+    try stream.buffer.appendSlice(testing.allocator, "first");
+    var producer = P3FallbackTestProducer{
+        .ci = &ci,
+        .handle = stream_handle,
+        .payload = "later",
+        .delay_us = 10 * std.time.us_per_ms,
+    };
+    const thread = try std.Thread.spawn(
+        .{},
+        P3FallbackTestProducer.run,
+        .{&producer},
+    );
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var wire = streams.OutputStream.toBuffer();
+    defer wire.deinit(testing.allocator);
+    try testing.expect(
+        try adapter.writeHttpResponseP3FromHandleForMethodWithTimeout(
+            &wire,
+            &ci,
+            fixture.response_handle,
+            true,
+            .get,
+            std.time.ns_per_s,
+        ),
+    );
+    thread.join();
+    joined = true;
+
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 10\r\n" ++
+            "Connection: keep-alive\r\n\r\n" ++
+            "firstlater",
+        wire.getBufferContents(),
+    );
+    try testing.expect(!producer.cancelled.load(.acquire));
+    try testing.expect(!p3FallbackStreamExists(&ci, stream_handle));
 }
 
 const LiveHttpStreamWriter = struct {
