@@ -438,6 +438,21 @@ class FrameAttributionUnitTests(unittest.TestCase):
         aot.jit_exec_mmaps("perf.data")
         self.assertEqual("/opt/perf", run.call_args.args[0][0])
 
+    def test_address_counts_fall_back_to_perf_script_self_ips(self):
+        report = "no parseable per-address rows\n"
+        script = """\
+0xffff00001000 ([JIT])
+0xffff00001000 ([JIT])
+0xaaaa00002000 /usr/bin/wamr
+"""
+        with mock.patch.object(
+            aot, "_run_checked", side_effect=[report, script]
+        ):
+            counts, total = aot.addr_counts("perf.data")
+        self.assertEqual(3, total)
+        self.assertEqual(2, counts[0xFFFF00001000])
+        self.assertEqual(1, counts[0xAAAA00002000])
+
     def test_current_aot_version_matches_emitter(self):
         source = (ROOT / "src/compiler/emit_aot.zig").read_text()
         match = re.search(r"pub const aot_version: u32 = (\d+);", source)

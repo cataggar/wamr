@@ -240,6 +240,33 @@ def addr_counts(perf):
         if symbol:
             ip = int(symbol.group(1), 16)
             counts[ip] = counts.get(ip, 0) + count
+    if counts and total:
+        return counts, total
+
+    # Newer perf releases can omit unresolved per-address rows from
+    # `perf report` even with `--percent-limit 0`. `perf script` still emits
+    # one self IP per sample, and the caller filters those IPs against the
+    # exact anonymous text mapping selected from mmap events.
+    script = _run_checked(
+        [
+            perf_binary(),
+            "script",
+            "-i",
+            perf,
+            "-F",
+            "ip,dso",
+        ],
+        "perf script self samples",
+    )
+    counts, total = {}, 0
+    row = re.compile(r"^\s*(?:0x)?([0-9a-fA-F]+)\s+")
+    for line in script.splitlines():
+        match = row.match(line)
+        if not match:
+            continue
+        total += 1
+        ip = int(match.group(1), 16)
+        counts[ip] = counts.get(ip, 0) + 1
     return counts, total
 
 

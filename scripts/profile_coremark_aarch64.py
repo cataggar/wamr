@@ -1021,11 +1021,19 @@ def main() -> int:
     try:
         report = run_profile(args)
     except Exception as exc:
+        retained = []
+        for pattern in ("*.perf.data", "jit-*.dump"):
+            for path in args.out_dir.glob(pattern):
+                try:
+                    retained.append(gzip_if_small(path, args.max_perf_bytes))
+                except OSError:
+                    pass
         failure = {
             "schema_version": REPORT_SCHEMA_VERSION,
             "kind": REPORT_KIND,
             "status": "failed",
             "error": str(exc),
+            "retained_perf_artifacts": retained,
         }
         (args.out_dir / "failure.json").write_text(
             json.dumps(failure, indent=2, sort_keys=True) + "\n",
