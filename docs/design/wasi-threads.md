@@ -257,12 +257,26 @@ separate resumable state machine:
    targets remain compiled behind `lib_wasi_threads`.
 2. `TaskManager.acquireCancellationTicket(handle)` captures an owning
    `Source.Ticket` or returns `error.InvalidTaskHandle`. Capture while the
-   task handle is valid, move or `clone` it into the HTTP body/trailer
-   settlement owner, query `isCancelled`, and call `deinit` exactly once per
-   ticket. A ticket retains only the immutable source identity/generation and
-   may outlive its frame, task owner, and `TaskManager`; it never retains a raw
-   task pointer. Monotonic task handles prevent a stale handle from capturing
-   a later task's source after manager teardown.
+   task handle is valid, transfer it with `ticket.take()` into the HTTP
+   response/session settlement owner, query `isCancelled`, and call `deinit`
+   exactly once on that owner. Prefer one shared settlement owner for body and
+   trailers; call `clone()` only when they truly require independent
+   lifetimes. Ordinary Zig assignment is **not** a move or clone and is
+   unsupported because it does not retain the source. `take()` makes the
+   source variable inert before returning its one reference; repeated
+   `take()` and `deinit()` are harmless, while queries/clones on an inert
+   ticket return `error.InactiveTicket`. A ticket retains only the immutable
+   source identity/generation and may outlive its frame, task owner, and
+   `TaskManager`; it never retains a raw task pointer. Monotonic task handles
+   prevent a stale handle from capturing a later task's source after manager
+   teardown.
+
+   ```zig
+   var captured = try task_manager.acquireCancellationTicket(task_handle);
+   errdefer captured.deinit();
+   response_owner.cancellation = captured.take();
+   // response_owner.deinit() calls cancellation.deinit() exactly once.
+   ```
 3. Each `ComponentInstance.ThreadManager` reached by that task creates one
    manager-local `TaskCancelGroup` and registers its wake target with the task
    source. Registration, cancellation, and unregistration serialize under the
