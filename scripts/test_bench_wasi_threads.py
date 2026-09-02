@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
@@ -514,6 +515,43 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 cohort.DEFAULT_PLATFORMS,
                 1,
             )
+
+    def test_cohort_dispatch_uses_immutable_sha_as_workflow_ref(self) -> None:
+        target = "a" * 40
+        output = self.scratch / "dispatch.json"
+        responses = [
+            "https://github.com/cataggar/wamr/actions/runs/123\n",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": target,
+                    "url": "https://github.com/cataggar/wamr/actions/runs/123",
+                }
+            ),
+            json.dumps({"artifacts": []}),
+        ]
+        with mock.patch.object(
+            cohort.subprocess,
+            "check_output",
+            side_effect=responses,
+        ) as run, mock.patch.object(cohort.time, "sleep"):
+            cohort.dispatch(
+                Namespace(
+                    target_sha=target,
+                    runs=1,
+                    max_in_flight=1,
+                    output=output,
+                    repository="cataggar/wamr",
+                    workflow="wasi-thread-bench.yml",
+                    poll_seconds=0,
+                )
+            )
+        dispatch_command = run.call_args_list[0].args[0]
+        self.assertEqual(
+            dispatch_command[dispatch_command.index("--ref") + 1],
+            target,
+        )
 
     def test_fixture_hashes_and_schema_are_pinned(self) -> None:
         fixtures = bench.resolve_fixtures(ROOT)
