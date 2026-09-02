@@ -58,12 +58,65 @@ const Outcome = enum(u32) {
 const Waiter = struct {
     next: ?*Waiter = null,
     key: usize,
+    cancellation: ?CancellationEpoch.Ticket = null,
     outcome: std.atomic.Value(u32) = .init(@intFromEnum(Outcome.waiting)),
 };
 
 const Bucket = struct {
     mutex: SpinMutex = .{},
     head: ?*Waiter = null,
+};
+
+/// A reusable, monotonically advancing cancellation source.
+///
+/// A caller takes a `Ticket` when a task/thread group starts. Cancelling that
+/// ticket advances `generation` before the parking-lot sweep. Waiters compare
+/// the generation they entered with against the acquire-loaded current value,
+/// so a waiter that passed an external guard but reaches the bucket after the
+/// sweep still returns `.cancelled`.
+///
+/// There is deliberately no clear/reset operation. A later task starts from
+/// the newly published generation via `begin`. The owner must not reuse the
+/// source until every holder of the previous ticket is quiescent. Generation
+/// wrap is not permitted: owners discard an exhausted source rather than
+/// aliasing a live/stale ticket after 2^32 epochs.
+pub const CancellationEpoch = struct {
+    generation: std.atomic.Value(u32) = .init(0),
+
+    pub const Ticket = struct {
+        source: *CancellationEpoch,
+        generation: u32,
+
+        pub fn isCancelled(self: Ticket) bool {
+            return self.source.generation.load(.acquire) != self.generation;
+        }
+
+        fn eql(a: Ticket, b: Ticket) bool {
+            return a.source == b.source and a.generation == b.generation;
+        }
+    };
+
+    /// Start an epoch. `null` means this source has exhausted its 32-bit
+    /// generation space and must be replaced after quiescence.
+    pub fn begin(self: *CancellationEpoch) ?Ticket {
+        const generation = self.generation.load(.acquire);
+        if (generation == std.math.maxInt(u32)) return null;
+        return .{ .source = self, .generation = generation };
+    }
+
+    /// Publish cancellation for exactly `ticket`. Returns true only for the
+    /// first caller that advances this epoch; repeated cancellation is a
+    /// no-op. The acq_rel CAS is the release edge observed by waiters'
+    /// acquire loads under their bucket lock.
+    pub fn publish(ticket: Ticket) bool {
+        if (ticket.generation == std.math.maxInt(u32)) return false;
+        return ticket.source.generation.cmpxchgStrong(
+            ticket.generation,
+            ticket.generation + 1,
+            .acq_rel,
+            .acquire,
+        ) == null;
+    }
 };
 
 /// A keyed parking lot with explicit cancellation and quiescent shutdown.
@@ -100,8 +153,18 @@ pub const ParkingLot = struct {
         expected: u32,
         timeout_ns: i64,
     ) BackendError!WaitResult {
+        return self.wait32Cancellable(address, expected, timeout_ns, null);
+    }
+
+    pub fn wait32Cancellable(
+        self: *ParkingLot,
+        address: *align(@alignOf(u32)) const u32,
+        expected: u32,
+        timeout_ns: i64,
+        cancellation: ?CancellationEpoch.Ticket,
+    ) BackendError!WaitResult {
         if (comptime parking_supported) {
-            return self.waitValue(u32, address, expected, timeout_ns);
+            return self.waitValue(u32, address, expected, timeout_ns, cancellation);
         } else {
             return error.Unsupported;
         }
@@ -113,8 +176,18 @@ pub const ParkingLot = struct {
         expected: u64,
         timeout_ns: i64,
     ) BackendError!WaitResult {
+        return self.wait64Cancellable(address, expected, timeout_ns, null);
+    }
+
+    pub fn wait64Cancellable(
+        self: *ParkingLot,
+        address: *align(@alignOf(u64)) const u64,
+        expected: u64,
+        timeout_ns: i64,
+        cancellation: ?CancellationEpoch.Ticket,
+    ) BackendError!WaitResult {
         if (comptime parking_supported and @bitSizeOf(usize) >= 64) {
-            return self.waitValue(u64, address, expected, timeout_ns);
+            return self.waitValue(u64, address, expected, timeout_ns, cancellation);
         } else {
             return error.Unsupported;
         }
@@ -126,13 +199,14 @@ pub const ParkingLot = struct {
         address: *align(@alignOf(T)) const T,
         expected: T,
         timeout_ns: i64,
+        cancellation: ?CancellationEpoch.Ticket,
     ) BackendError!WaitResult {
         if (!self.enter()) return .closed;
         defer self.leave();
 
         const key = @intFromPtr(address);
         const bucket = self.bucketFor(key);
-        var waiter = Waiter{ .key = key };
+        var waiter = Waiter{ .key = key, .cancellation = cancellation };
 
         bucket.mutex.lock();
         if (self.lifecycle.load(.acquire) & closing_bit != 0) {
@@ -151,7 +225,9 @@ pub const ParkingLot = struct {
         // path that would actually block: whichever of the two acquires the
         // lock first, the waiter is either seen by the sweep or observes the
         // latch here. Non-blocking outcomes above are unaffected.
-        if (self.cancelled.load(.acquire) != 0) {
+        if (self.cancelled.load(.acquire) != 0 or
+            (cancellation != null and cancellation.?.isCancelled()))
+        {
             bucket.mutex.unlock();
             return .cancelled;
         }
@@ -272,6 +348,47 @@ pub const ParkingLot = struct {
                 bucket.head = w.next;
                 w.outcome.store(@intFromEnum(Outcome.cancelled), .release);
                 osWake(&w.outcome.raw) catch |err| {
+                    bucket.mutex.unlock();
+                    return err;
+                };
+                total +|= 1;
+            }
+            bucket.mutex.unlock();
+        }
+        return total;
+    }
+
+    /// Cancel waiters that entered under exactly `ticket`.
+    ///
+    /// Publication precedes the sweep. Under each bucket lock a waiter either
+    /// queued before that bucket was swept and is removed below, or queued
+    /// later and observes the advanced generation in `waitValue`. Waiters
+    /// belonging to other task groups are left untouched.
+    pub fn cancelEpoch(
+        self: *ParkingLot,
+        ticket: CancellationEpoch.Ticket,
+    ) BackendError!u32 {
+        if (comptime !parking_supported) {
+            return error.Unsupported;
+        }
+        _ = CancellationEpoch.publish(ticket);
+        var total: u32 = 0;
+        for (0..bucket_count) |i| {
+            const bucket = &self.buckets[i];
+            bucket.mutex.lock();
+            var link = &bucket.head;
+            while (link.*) |waiter| {
+                const matches = if (waiter.cancellation) |candidate|
+                    CancellationEpoch.Ticket.eql(candidate, ticket)
+                else
+                    false;
+                if (!matches) {
+                    link = &waiter.next;
+                    continue;
+                }
+                link.* = waiter.next;
+                waiter.outcome.store(@intFromEnum(Outcome.cancelled), .release);
+                osWake(&waiter.outcome.raw) catch |err| {
                     bucket.mutex.unlock();
                     return err;
                 };
@@ -729,6 +846,140 @@ test "ParkingLot: a 64-bit wait entered after cancellation is cancelled too" {
     thread.join();
     try std.testing.expect(finished);
     try std.testing.expectEqual(WaitResult.cancelled, ctx.result);
+}
+
+const EpochWaiterCtx = struct {
+    lot: *ParkingLot,
+    word: *align(4) u32,
+    ticket: CancellationEpoch.Ticket,
+    release: *std.atomic.Value(bool),
+    guard_passed: std.atomic.Value(bool) = .init(false),
+    guard_was_clear: bool = false,
+    result: WaitResult = .not_equal,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *EpochWaiterCtx) void {
+        self.guard_was_clear = !self.ticket.isCancelled();
+        self.guard_passed.store(true, .release);
+        while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        self.result = self.lot.wait32Cancellable(
+            self.word,
+            self.word.*,
+            -1,
+            self.ticket,
+        ) catch .closed;
+        self.finished.store(true, .release);
+    }
+
+    fn awaitGuard(self: *EpochWaiterCtx) void {
+        while (!self.guard_passed.load(.acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn awaitFinished(self: *EpochWaiterCtx, timeout_ns: u64) bool {
+        const deadline = monotonicNowNs() +| timeout_ns;
+        while (!self.finished.load(.acquire)) {
+            if (monotonicNowNs() >= deadline) return false;
+            platform.usleep(200);
+        }
+        return true;
+    }
+};
+
+test "ParkingLot: epoch cancellation closes the guard-to-park race" {
+    if (comptime !parking_supported) return error.SkipZigTest;
+    var lot = ParkingLot.init();
+    defer lot.deinit();
+    var epoch = CancellationEpoch{};
+    const ticket = epoch.begin().?;
+    var word: u32 align(4) = 7;
+    var release = std.atomic.Value(bool).init(false);
+    var ctx = EpochWaiterCtx{
+        .lot = &lot,
+        .word = &word,
+        .ticket = ticket,
+        .release = &release,
+    };
+
+    const thread = try std.Thread.spawn(.{}, EpochWaiterCtx.run, .{&ctx});
+    ctx.awaitGuard();
+    try std.testing.expectEqual(@as(u32, 0), try lot.cancelEpoch(ticket));
+    release.store(true, .release);
+
+    const finished = ctx.awaitFinished(5 * std.time.ns_per_s);
+    if (!finished) _ = lot.cancelAll() catch {};
+    thread.join();
+    try std.testing.expect(ctx.guard_was_clear);
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(WaitResult.cancelled, ctx.result);
+}
+
+test "ParkingLot: a new epoch parks normally after cancellation" {
+    if (comptime !parking_supported) return error.SkipZigTest;
+    var lot = ParkingLot.init();
+    defer lot.deinit();
+    var epoch = CancellationEpoch{};
+    const cancelled_ticket = epoch.begin().?;
+    _ = try lot.cancelEpoch(cancelled_ticket);
+    const next_ticket = epoch.begin().?;
+    try std.testing.expect(!next_ticket.isCancelled());
+
+    var word: u32 align(4) = 7;
+    var release = std.atomic.Value(bool).init(true);
+    var ctx = EpochWaiterCtx{
+        .lot = &lot,
+        .word = &word,
+        .ticket = next_ticket,
+        .release = &release,
+    };
+    const thread = try std.Thread.spawn(.{}, EpochWaiterCtx.run, .{&ctx});
+    try waitUntilQueued(&lot, &word, 1);
+    try std.testing.expectEqual(@as(u32, 1), try lot.notify(&word, 1));
+    const finished = ctx.awaitFinished(5 * std.time.ns_per_s);
+    if (!finished) _ = lot.cancelAll() catch {};
+    thread.join();
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(WaitResult.notified, ctx.result);
+}
+
+test "ParkingLot: cancelling one epoch does not poison another group" {
+    if (comptime !parking_supported) return error.SkipZigTest;
+    var lot = ParkingLot.init();
+    defer lot.deinit();
+    var first_epoch = CancellationEpoch{};
+    var second_epoch = CancellationEpoch{};
+    const first_ticket = first_epoch.begin().?;
+    const second_ticket = second_epoch.begin().?;
+    var word: u32 align(4) = 7;
+    var release = std.atomic.Value(bool).init(true);
+    var first = EpochWaiterCtx{
+        .lot = &lot,
+        .word = &word,
+        .ticket = first_ticket,
+        .release = &release,
+    };
+    var second = EpochWaiterCtx{
+        .lot = &lot,
+        .word = &word,
+        .ticket = second_ticket,
+        .release = &release,
+    };
+    const first_thread = try std.Thread.spawn(.{}, EpochWaiterCtx.run, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, EpochWaiterCtx.run, .{&second});
+    try waitUntilQueued(&lot, &word, 2);
+
+    try std.testing.expectEqual(@as(u32, 1), try lot.cancelEpoch(first_ticket));
+    try std.testing.expect(first.awaitFinished(5 * std.time.ns_per_s));
+    try std.testing.expect(!second.awaitFinished(20 * std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(u32, 1), lot.waiterCount(&word));
+    try std.testing.expectEqual(@as(u32, 1), try lot.notify(&word, 1));
+
+    const second_finished = second.awaitFinished(5 * std.time.ns_per_s);
+    if (!second_finished) _ = lot.cancelAll() catch {};
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expectEqual(WaitResult.cancelled, first.result);
+    try std.testing.expect(second_finished);
+    try std.testing.expectEqual(WaitResult.notified, second.result);
 }
 
 const Wait64Ctx = struct {

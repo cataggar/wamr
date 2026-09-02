@@ -16,6 +16,8 @@ const trap_jmp = @import("trap_jmp.zig");
 const config = @import("../../config.zig");
 const execution_context = @import("../common/execution_context.zig");
 const thread_manager = @import("../../wasi/thread_manager.zig");
+const parking_lot = @import("../../platform/parking_lot.zig");
+const termination = @import("../common/termination.zig");
 
 // ─── Windows crash handler (debug only) ─────────────────────────────────────
 const windows = std.os.windows;
@@ -1119,7 +1121,19 @@ pub fn threadGroupTerminating(vmctx: *VmCtx) bool {
         @ptrFromInt(vmctx.thread_context);
     const manager = thread_context_ptr.threadGroup(thread_manager.ThreadManager) orelse
         return false;
-    return manager.isTerminating();
+    return manager.isTerminatingForContext(thread_context_ptr);
+}
+
+fn threadCancellation(
+    vmctx: *VmCtx,
+) ?parking_lot.CancellationEpoch.Ticket {
+    if (comptime !config.lib_wasi_threads) return null;
+    if (vmctx.thread_context == 0) return null;
+    const thread_context_ptr: *execution_context.ThreadExecutionContext =
+        @ptrFromInt(vmctx.thread_context);
+    const manager = thread_context_ptr.threadGroup(thread_manager.ThreadManager) orelse
+        return null;
+    return manager.cancellationForContext(thread_context_ptr);
 }
 
 /// Unwind this AOT thread because the group is terminating. Mirrors the
@@ -1148,7 +1162,12 @@ pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32,
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
     if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
     const mem = aotWaitMemory(vmctx, addr, 4);
-    const result = mem.wait32(addr, expected, timeout_ns) catch |err| switch (err) {
+    const result = mem.wait32Cancellable(
+        addr,
+        expected,
+        timeout_ns,
+        threadCancellation(vmctx),
+    ) catch |err| switch (err) {
         error.NotShared => return 1,
         error.OutOfBounds => aotTrapOOBFromHost(vmctx),
         error.Unaligned => aotTrapUnalignedFromHost(vmctx),
@@ -1173,7 +1192,12 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
     const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
     if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
     const mem = aotWaitMemory(vmctx, addr, 8);
-    const result = mem.wait64(addr, expected, timeout_ns) catch |err| switch (err) {
+    const result = mem.wait64Cancellable(
+        addr,
+        expected,
+        timeout_ns,
+        threadCancellation(vmctx),
+    ) catch |err| switch (err) {
         error.NotShared => return 1,
         error.OutOfBounds => aotTrapOOBFromHost(vmctx),
         error.Unaligned => aotTrapUnalignedFromHost(vmctx),
@@ -2517,7 +2541,7 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
     vmctx.cancel_flag = if (comptime config.lib_wasi_threads) blk: {
         const manager = inst.thread_context.threadGroup(thread_manager.ThreadManager) orelse
             break :blk vmctx.cancel_flag;
-        break :blk if (manager.isTerminating()) 1 else 0;
+        break :blk if (manager.isTerminatingForContext(&inst.thread_context)) 1 else 0;
     } else 0;
 }
 
@@ -2532,15 +2556,78 @@ pub fn aotCancelPoint(vmctx: *VmCtx) callconv(.c) noreturn {
 /// shared memory. Registered on the `ThreadManager` by `prepareWasiThreads`,
 /// so `ThreadManager.interrupt` reaches AOT children that are executing guest
 /// code without calling any host function.
-fn broadcastCancelToSharedMemory(raw: *anyopaque) void {
+fn broadcastCancelToSharedMemory(
+    raw: *anyopaque,
+    target_group: ?*const anyopaque,
+) void {
     if (comptime !config.lib_wasi_threads) return;
     const mem: *types.MemoryInstance = @ptrCast(@alignCast(raw));
     mem.subscriber_mutex.lock();
     defer mem.subscriber_mutex.unlock();
     for (mem.vmctx_subscribers.items) |subscriber_opaque| {
         const subscriber: *VmCtx = @ptrCast(@alignCast(subscriber_opaque));
+        if (target_group) |target| {
+            if (subscriber.thread_context == 0) continue;
+            const context: *execution_context.ThreadExecutionContext =
+                @ptrFromInt(subscriber.thread_context);
+            const group = context.cancellation_group orelse continue;
+            if (group != target) continue;
+        }
         @atomicStore(u32, &subscriber.cancel_flag, 1, .release);
     }
+}
+
+test "AOT thread task cancellation targets only matching VmCtx subscribers" {
+    if (!config.lib_wasi_threads or @import("builtin").single_threaded)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mem = try types.MemoryInstance.createShared(.{
+        .limits = .{ .min = 1, .max = 4 },
+        .is_shared = true,
+    }, allocator);
+    defer mem.release(allocator);
+
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    manager.bindTermination(&terminal);
+    try manager.prepareSharedMemory(mem, null);
+    manager.bindCancelBroadcast(.{
+        .ctx = @ptrCast(mem),
+        .broadcast = broadcastCancelToSharedMemory,
+    });
+
+    var first_context = execution_context.ThreadExecutionContext{};
+    first_context.setThreadGroup(@ptrCast(&manager));
+    var first_scope = try manager.bindTaskGroup(
+        &first_context,
+        1,
+        false,
+    );
+    defer first_scope.deinit();
+    var second_context = execution_context.ThreadExecutionContext{};
+    second_context.setThreadGroup(@ptrCast(&manager));
+    var second_scope = try manager.bindTaskGroup(
+        &second_context,
+        2,
+        false,
+    );
+    defer second_scope.deinit();
+
+    var first_vmctx = VmCtx{};
+    first_vmctx.thread_context = @intFromPtr(&first_context);
+    var second_vmctx = VmCtx{};
+    second_vmctx.thread_context = @intFromPtr(&second_context);
+    try mem.subscribeVmCtx(@ptrCast(&first_vmctx), allocator);
+    defer mem.unsubscribeVmCtx(@ptrCast(&first_vmctx));
+    try mem.subscribeVmCtx(@ptrCast(&second_vmctx), allocator);
+    defer mem.unsubscribeVmCtx(@ptrCast(&second_vmctx));
+
+    try std.testing.expect(manager.cancelTaskForContext(&first_context));
+    try std.testing.expectEqual(@as(u32, 1), first_vmctx.cancel_flag);
+    try std.testing.expectEqual(@as(u32, 0), second_vmctx.cancel_flag);
+    try std.testing.expect(!manager.isTaskCancelledForContext(&second_context));
+    try std.testing.expect(terminal.outcome() == null);
 }
 
 fn subscribeVmCtxToMemories(inst: *AotInstance) !void {
@@ -2714,6 +2801,7 @@ fn createAotThreadContext(
 fn configureAotThreadContext(
     child_opaque: *anyopaque,
     manager: *thread_manager.ThreadManager,
+    cancellation_group: ?*thread_manager.TaskCancelGroup,
     tid: i32,
     start_arg: u32,
     auxiliary_stack: ?execution_context.AuxiliaryStack,
@@ -2729,6 +2817,8 @@ fn configureAotThreadContext(
         }
     }
     child.instance.setThreadManager(manager);
+    child.instance.thread_context.cancellation_group =
+        if (cancellation_group) |group| @ptrCast(group) else null;
     child.instance.thread_context.configureWasiThread(
         tid,
         start_arg,
@@ -2752,7 +2842,15 @@ fn runAotThreadContext(child_opaque: *anyopaque) thread_manager.ThreadOutcome {
         &.{},
         &args,
         &results,
-    ) catch return .trapped;
+    ) catch {
+        if (child.instance.thread_context.threadGroup(
+            thread_manager.ThreadManager,
+        )) |manager| {
+            if (manager.isTaskCancelledForContext(&child.instance.thread_context))
+                return .cancelled;
+        }
+        return .trapped;
+    };
     return .completed;
 }
 
@@ -2824,6 +2922,7 @@ pub fn signalThreadGroupTrap(vmctx: *VmCtx) void {
         @ptrFromInt(vmctx.thread_context);
     thread_context_ptr.markTrap();
     if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager| {
+        if (manager.isTaskCancelledForContext(thread_context_ptr)) return;
         manager.signalTrap();
     }
 }
@@ -3177,6 +3276,14 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     vmctx.thread_context = @intFromPtr(call_thread_context);
     if (call_thread_context.process_state) |state| {
         vmctx.wasi_ctx = @intFromPtr(state.ptr);
+    }
+    if (comptime config.lib_wasi_threads) {
+        vmctx.cancel_flag = if (call_thread_context.threadGroup(
+            thread_manager.ThreadManager,
+        )) |manager|
+            @intFromBool(manager.isTerminatingForContext(call_thread_context))
+        else
+            0;
     }
     defer {
         vmctx.thread_context = default_thread_context;
@@ -3665,6 +3772,14 @@ pub fn callFuncScalar(
     vmctx.thread_context = @intFromPtr(call_thread_context);
     if (call_thread_context.process_state) |state| {
         vmctx.wasi_ctx = @intFromPtr(state.ptr);
+    }
+    if (comptime config.lib_wasi_threads) {
+        vmctx.cancel_flag = if (call_thread_context.threadGroup(
+            thread_manager.ThreadManager,
+        )) |manager|
+            @intFromBool(manager.isTerminatingForContext(call_thread_context))
+        else
+            0;
     }
     defer {
         vmctx.thread_context = default_thread_context;

@@ -24,6 +24,8 @@ const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const core_backend = @import("core_backend.zig");
 const call_frame_mod = @import("call_frame.zig");
+const thread_manager_mod = @import("../wasi/thread_manager.zig");
+const parking_lot = @import("../platform/parking_lot.zig");
 // `wasi_cli_adapter` is imported solely for the
 // `takePendingWasiExitCode` handoff used by the AOT host-import
 // dispatchers below (#760). The two modules are otherwise mutually
@@ -58,6 +60,28 @@ fn taskManagerFor(
 ) ?*async_mod.TaskManager {
     const active = thread_ctx orelse return null;
     return active.taskManager(async_mod.TaskManager);
+}
+
+const TaskGroupScope = if (config.lib_wasi_threads)
+    thread_manager_mod.ThreadManager.TaskGroupScope
+else
+    struct {
+        pub fn deinit(_: *@This()) void {}
+    };
+
+fn bindTaskGroupForFrame(
+    owner_inst: *const ComponentInstance,
+    thread_ctx: *execution_context.ThreadExecutionContext,
+    task_manager: *async_mod.TaskManager,
+) ExecutionError!?TaskGroupScope {
+    if (comptime !config.lib_wasi_threads) return null;
+    const handle = task_manager.currentTask() orelse return null;
+    const task_key = task_manager.cancellationKey(handle) orelse return null;
+    return @constCast(owner_inst).thread_manager.bindTaskGroup(
+        thread_ctx,
+        task_key,
+        task_manager.getState(handle) == .cancelled,
+    ) catch return error.OutOfMemory;
 }
 
 pub const MAX_FLAT_PARAMS: u32 = 16;
@@ -1655,6 +1679,12 @@ fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
     thread_ctx.clearCancellation();
     var task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
     defer task_scope.deinit();
+    var task_group_scope = try bindTaskGroupForFrame(
+        owner_inst,
+        thread_ctx,
+        task_manager,
+    );
+    defer if (task_group_scope) |*scope| scope.deinit();
     var host_task_scope = thread_ctx.bindHostTaskContext(host_task_context);
     defer host_task_scope.deinit();
 
@@ -2880,18 +2910,26 @@ fn dispatchAsyncCanon(
             // malformed by the spec.
             const tm = task_manager orelse return error.FunctionNotFound;
             const handle = tm.currentTask() orelse return error.FunctionNotFound;
-            tm.cancelTask(handle);
-            if (thread_context) |thread_ctx| {
-                thread_ctx.requestCancellation();
+            const cancelled = tm.tryCancelTask(handle);
+            if (cancelled) {
+                if (thread_context) |thread_ctx| {
+                    thread_ctx.requestCancellation();
+                    if (comptime config.lib_wasi_threads) {
+                        if (thread_ctx.threadGroup(
+                            thread_manager_mod.ThreadManager,
+                        )) |manager|
+                            _ = manager.cancelTaskForContext(thread_ctx);
+                    }
+                }
             }
             // Propagate the cancellation to host-side waitables owned by
             // the cancelled task. Specifically, this aborts any pending
             // `wasi:clocks` `wait-for`/`wait-until` timer future so the
             // wait settles with the cancel disposition the next time the
             // guest issues `waitable-set.{wait,poll}`. (#551 / multi-clock-wait.)
-            if (comp_inst.async_cancel_driver) |drv| {
+            if (cancelled) if (comp_inst.async_cancel_driver) |drv| {
                 drv(comp_inst.async_event_driver_ctx, comp_inst, handle, allocator);
-            }
+            };
         },
 
         // ── Stream handles ──────────────────────────────────────────────
@@ -4436,6 +4474,12 @@ fn executeAsyncLiftCallback(
     defer frame_context_scope.deinit();
     var task_scope = thread_ctx.bindTaskManager(@ptrCast(task_manager));
     defer task_scope.deinit();
+    var task_group_scope = try bindTaskGroupForFrame(
+        owner_inst,
+        thread_ctx,
+        task_manager,
+    );
+    defer if (task_group_scope) |*scope| scope.deinit();
     var host_task_scope = frameThreadContext(&frame).bindHostTaskContext(
         host_task_context,
     );
@@ -5489,6 +5533,21 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
     var current_task_scope = tm.bindCurrent(h);
     defer current_task_scope.deinit();
     try testing.expect(tm.getState(h).? != .cancelled);
+    var group_scope: ?TaskGroupScope = null;
+    var task_ticket: ?parking_lot.CancellationEpoch.Ticket = null;
+    if (comptime config.lib_wasi_threads) {
+        try testing.expect(inst.thread_manager.hasTerminationBinding());
+        env.setThreadManager(&inst.thread_manager);
+        group_scope = try inst.thread_manager.bindTaskGroup(
+            &env.thread_context,
+            tm.cancellationKey(h).?,
+            false,
+        );
+        task_ticket = inst.thread_manager.cancellationForContext(
+            &env.thread_context,
+        );
+    }
+    defer if (group_scope) |*scope| scope.deinit();
 
     try dispatchCanonBuiltin(
         inst,
@@ -5498,6 +5557,9 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
         testing.allocator,
     );
     try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(h).?);
+    if (task_ticket) |ticket| try testing.expect(ticket.isCancelled());
+    if (comptime config.lib_wasi_threads)
+        try testing.expect(inst.thread_manager.terminalOutcome() == null);
     // Core signature is `[] -> []`: nothing pushed.
     try testing.expectEqual(@as(u32, 0), env.sp);
 }

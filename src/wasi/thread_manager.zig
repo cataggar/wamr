@@ -199,6 +199,7 @@ pub const AuxStackPool = struct {
 pub const ThreadOutcome = enum {
     completed,
     trapped,
+    cancelled,
 };
 
 pub const SpawnError = error{
@@ -228,6 +229,7 @@ pub const ThreadBackendOps = struct {
     configure: *const fn (
         child: *anyopaque,
         manager: *ThreadManager,
+        cancellation_group: ?*TaskCancelGroup,
         tid: i32,
         start_arg: u32,
         auxiliary_stack: ?execution_context.AuxiliaryStack,
@@ -263,7 +265,21 @@ pub const JoinSummary = struct {
 /// Backend hook used to publish group cancellation into compiled code.
 pub const CancelBroadcast = struct {
     ctx: *anyopaque,
-    broadcast: *const fn (*anyopaque) void,
+    /// `null` targets the permanent process group; a non-null pointer targets
+    /// only VmCtxs carrying that task cancellation group.
+    broadcast: *const fn (*anyopaque, ?*const anyopaque) void,
+};
+
+pub const TaskCancelGroup = struct {
+    task_key: u64,
+    refs: usize = 0,
+    epoch: parking_lot.CancellationEpoch = .{},
+    ticket: parking_lot.CancellationEpoch.Ticket = undefined,
+    next: ?*TaskCancelGroup = null,
+
+    fn isCancelled(self: *const TaskCancelGroup) bool {
+        return self.ticket.isCancelled();
+    }
 };
 
 /// Result of a bounded group teardown.
@@ -293,6 +309,11 @@ pub const ThreadStats = struct {
     shutting_down: bool,
 };
 
+pub const TaskGroupStats = struct {
+    active: usize,
+    free: usize,
+};
+
 /// Deterministic failure and destruction hooks used by lifecycle tests.
 const TestHooks = struct {
     fail_child_initialization: bool = false,
@@ -301,6 +322,8 @@ const TestHooks = struct {
     native_threads_started: ?*std.atomic.Value(usize) = null,
     native_threads_joined: ?*std.atomic.Value(usize) = null,
     records_destroyed: ?*std.atomic.Value(usize) = null,
+    spawn_group_captured: ?*std.atomic.Value(bool) = null,
+    resume_spawn: ?*std.atomic.Value(bool) = null,
 };
 
 const tid_slot_bits = 16;
@@ -353,6 +376,7 @@ const ExecutionState = enum(u8) {
     pending,
     completed,
     trapped,
+    cancelled,
     start_aborted,
 };
 
@@ -363,6 +387,7 @@ const ThreadRecord = struct {
     backend_context: *anyopaque,
     backend_ops: *const ThreadBackendOps,
     aux_stack_top: ?u32,
+    cancellation_group: ?*TaskCancelGroup,
     start_gate: StartGate = .{},
     execution: std.atomic.Value(u8) =
         std.atomic.Value(u8).init(@intFromEnum(ExecutionState.pending)),
@@ -404,6 +429,7 @@ fn createInterpThreadContext(
 fn configureInterpThreadContext(
     child_opaque: *anyopaque,
     manager: *ThreadManager,
+    cancellation_group: ?*TaskCancelGroup,
     tid: i32,
     start_arg: u32,
     auxiliary_stack: ?execution_context.AuxiliaryStack,
@@ -417,6 +443,10 @@ fn configureInterpThreadContext(
         }
     }
     child.env.setThreadManager(manager);
+    child.env.thread_context.cancellation_group = if (cancellation_group) |group|
+        @ptrCast(group)
+    else
+        null;
     child.env.configureWasiThread(tid, start_arg, auxiliary_stack);
     child.env.pushI32(tid) catch return error.ChildInitializationFailed;
     child.env.pushI32(@bitCast(start_arg)) catch
@@ -426,7 +456,16 @@ fn configureInterpThreadContext(
 fn runInterpThreadContext(child_opaque: *anyopaque) ThreadOutcome {
     const child: *InterpThreadContext = @ptrCast(@alignCast(child_opaque));
     const interp = @import("../runtime/interpreter/interp.zig");
-    interp.executeFunction(child.env, child.func_idx) catch return .trapped;
+    interp.executeFunction(child.env, child.func_idx) catch |err| {
+        if (err == error.ThreadCancelled) {
+            if (child.env.threadManager()) |manager| {
+                if (manager.isTaskCancelledForContext(&child.env.thread_context))
+                    return .cancelled;
+            }
+        }
+        if (child.env.threadManager()) |manager| manager.signalTrap();
+        return .trapped;
+    };
     return .completed;
 }
 
@@ -497,6 +536,25 @@ pub const ThreadManager = struct {
     /// still reaches an interruption point; the interpreter needs none
     /// because its dispatch loop polls the manager directly.
     cancel_broadcast: ?CancelBroadcast = null,
+    /// Intrusive lists of task-scoped cancellation groups. Active groups are
+    /// keyed by the TaskManager's monotonic task key; quiescent groups are
+    /// recycled by starting from their monotonically advanced epoch.
+    task_groups: ?*TaskCancelGroup = null,
+    free_task_groups: ?*TaskCancelGroup = null,
+
+    pub const TaskGroupScope = struct {
+        manager: *ThreadManager,
+        group: *TaskCancelGroup,
+        binding: execution_context.OpaqueBinding,
+        active: bool = true,
+
+        pub fn deinit(self: *TaskGroupScope) void {
+            if (!self.active) return;
+            self.binding.deinit();
+            self.manager.releaseTaskGroup(self.group);
+            self.active = false;
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) ThreadManager {
         return .{
@@ -599,6 +657,124 @@ pub const ThreadManager = struct {
         self.aux_stack_pool.deinit(self.allocator);
         self.shared_memory = null;
         self.cancel_broadcast = null;
+        self.mutex.lock();
+        std.debug.assert(self.task_groups == null);
+        var free_groups = self.free_task_groups;
+        self.free_task_groups = null;
+        self.mutex.unlock();
+        while (free_groups) |group| {
+            free_groups = group.next;
+            self.allocator.destroy(group);
+        }
+    }
+
+    /// Bind one component task to a task-scoped cancellation epoch.
+    ///
+    /// Nested frames for the same task key share the active group;
+    /// child WASI threads retain it in their `ThreadRecord`. The last frame
+    /// or child release moves the group to the quiescent free list, where a
+    /// later task can begin at the current (never-cleared) generation.
+    pub fn bindTaskGroup(
+        self: *ThreadManager,
+        context: *execution_context.ThreadExecutionContext,
+        task_key: u64,
+        already_cancelled: bool,
+    ) error{OutOfMemory}!TaskGroupScope {
+        const group = try self.acquireTaskGroup(task_key);
+        const binding = context.bindCancellationGroup(@ptrCast(group));
+        if (already_cancelled) _ = self.cancelTaskGroup(group);
+        return .{
+            .manager = self,
+            .group = group,
+            .binding = binding,
+        };
+    }
+
+    fn acquireTaskGroup(
+        self: *ThreadManager,
+        task_key: u64,
+    ) error{OutOfMemory}!*TaskCancelGroup {
+        while (true) {
+            self.mutex.lock();
+            var current = self.task_groups;
+            while (current) |group| : (current = group.next) {
+                if (group.task_key == task_key) {
+                    group.refs += 1;
+                    self.mutex.unlock();
+                    return group;
+                }
+            }
+            if (self.free_task_groups) |group| {
+                self.free_task_groups = group.next;
+                if (group.epoch.begin()) |ticket| {
+                    group.task_key = task_key;
+                    group.refs = 1;
+                    group.ticket = ticket;
+                    group.next = self.task_groups;
+                    self.task_groups = group;
+                    self.mutex.unlock();
+                    return group;
+                }
+                self.mutex.unlock();
+                self.allocator.destroy(group);
+                continue;
+            }
+            self.mutex.unlock();
+
+            const candidate = self.allocator.create(TaskCancelGroup) catch
+                return error.OutOfMemory;
+            candidate.* = .{
+                .task_key = task_key,
+            };
+            candidate.ticket = candidate.epoch.begin().?;
+
+            self.mutex.lock();
+            current = self.task_groups;
+            while (current) |group| : (current = group.next) {
+                if (group.task_key == task_key) {
+                    group.refs += 1;
+                    self.mutex.unlock();
+                    self.allocator.destroy(candidate);
+                    return group;
+                }
+            }
+            candidate.next = self.task_groups;
+            candidate.refs = 1;
+            self.task_groups = candidate;
+            self.mutex.unlock();
+            return candidate;
+        }
+    }
+
+    fn retainTaskGroup(self: *ThreadManager, group: *TaskCancelGroup) void {
+        self.mutex.lock();
+        std.debug.assert(group.refs > 0);
+        group.refs += 1;
+        self.mutex.unlock();
+    }
+
+    fn releaseTaskGroup(self: *ThreadManager, group: *TaskCancelGroup) void {
+        self.mutex.lock();
+        std.debug.assert(group.refs > 0);
+        group.refs -= 1;
+        if (group.refs != 0) {
+            self.mutex.unlock();
+            return;
+        }
+
+        var link = &self.task_groups;
+        while (link.*) |candidate| {
+            if (candidate == group) {
+                link.* = candidate.next;
+                group.next = self.free_task_groups;
+                self.free_task_groups = group;
+                self.mutex.unlock();
+                return;
+            }
+            link = &candidate.next;
+        }
+        self.mutex.unlock();
+        unreachable;
     }
 
     /// Bind the group to the shared process state's terminal-outcome record.
@@ -634,12 +810,21 @@ pub const ThreadManager = struct {
         self.interrupt();
     }
 
+    /// Publish Preview-1 `proc_exit(code)` into the permanent process record.
+    /// Raw-core paths normally claim the same record through `WasiProcessState`
+    /// first; component-owned managers use this direct path.
+    pub fn signalExit(self: *ThreadManager, code: u32) void {
+        if (self.termination) |state|
+            _ = state.claimExit(code);
+        self.interrupt();
+    }
+
     /// Install the backend hook that publishes cancellation into compiled
     /// code. Replaying it on every `interrupt` keeps threads that were
     /// spawned mid-teardown from missing the signal.
     pub fn bindCancelBroadcast(self: *ThreadManager, hook: CancelBroadcast) void {
         self.cancel_broadcast = hook;
-        if (self.isTerminating()) hook.broadcast(hook.ctx);
+        if (self.isProcessTerminating()) hook.broadcast(hook.ctx, null);
     }
 
     /// Interrupt every sibling: raise the polled interrupt flag, publish the
@@ -647,23 +832,90 @@ pub const ThreadManager = struct {
     /// threads unwind instead of hanging. Idempotent, safe from any thread.
     pub fn interrupt(self: *ThreadManager) void {
         self.trap_flag.store(true, .release);
-        if (self.cancel_broadcast) |hook| hook.broadcast(hook.ctx);
+        if (self.cancel_broadcast) |hook| hook.broadcast(hook.ctx, null);
         if (self.shared_memory) |memory| _ = memory.cancelWaiters() catch {};
     }
 
-    /// True once the group's terminal outcome is claimed, or once a trap has
-    /// been signalled locally. Polled by the interpreter loop and checked at
-    /// every interruptible host blocking point.
-    pub fn isTerminating(self: *ThreadManager) bool {
+    /// Cancel only the task group bound to `context`. Publication advances the
+    /// group's epoch before targeted AOT/futex wakeups, so repeated calls are
+    /// idempotent and unrelated groups sharing the memory remain runnable.
+    pub fn cancelTaskForContext(
+        self: *ThreadManager,
+        context: *const execution_context.ThreadExecutionContext,
+    ) bool {
+        const group = context.cancellationGroup(TaskCancelGroup) orelse
+            return false;
+        return self.cancelTaskGroup(group);
+    }
+
+    fn cancelTaskGroup(self: *ThreadManager, group: *TaskCancelGroup) bool {
+        const first = parking_lot.CancellationEpoch.publish(group.ticket);
+        if (self.cancel_broadcast) |hook|
+            hook.broadcast(hook.ctx, @ptrCast(group));
+        if (self.shared_memory) |memory|
+            _ = memory.cancelWaitersForEpoch(group.ticket) catch {};
+        return first;
+    }
+
+    pub fn cancellationForContext(
+        self: *ThreadManager,
+        context: *const execution_context.ThreadExecutionContext,
+    ) ?parking_lot.CancellationEpoch.Ticket {
+        _ = self;
+        const group = context.cancellationGroup(TaskCancelGroup) orelse
+            return null;
+        return group.ticket;
+    }
+
+    pub fn currentCancellation(
+        self: *ThreadManager,
+    ) ?parking_lot.CancellationEpoch.Ticket {
+        const context = execution_context.current() orelse return null;
+        return self.cancellationForContext(context);
+    }
+
+    pub fn isTaskCancelledForContext(
+        self: *ThreadManager,
+        context: *const execution_context.ThreadExecutionContext,
+    ) bool {
+        _ = self;
+        const group = context.cancellationGroup(TaskCancelGroup) orelse
+            return false;
+        return group.isCancelled();
+    }
+
+    /// True once the permanent process outcome is claimed, or once a trap has
+    /// been signalled locally. Task cancellation never changes this state.
+    pub fn isProcessTerminating(self: *ThreadManager) bool {
         if (self.trap_flag.load(.acquire)) return true;
         const state = self.termination orelse return false;
         return state.isTerminating();
+    }
+
+    pub fn isTerminatingForContext(
+        self: *ThreadManager,
+        context: *const execution_context.ThreadExecutionContext,
+    ) bool {
+        return self.isProcessTerminating() or
+            self.isTaskCancelledForContext(context);
+    }
+
+    /// True when the permanent process is terminating or the active execution
+    /// context belongs to a cancelled component task.
+    pub fn isTerminating(self: *ThreadManager) bool {
+        if (self.isProcessTerminating()) return true;
+        const context = execution_context.current() orelse return false;
+        return self.isTerminatingForContext(context);
     }
 
     /// Terminal outcome of the group, when one has been claimed.
     pub fn terminalOutcome(self: *ThreadManager) ?termination.Outcome {
         const state = self.termination orelse return null;
         return state.outcome();
+    }
+
+    pub fn hasTerminationBinding(self: *const ThreadManager) bool {
+        return self.termination != null;
     }
 
     /// Check if a trap has been signaled.
@@ -843,7 +1095,7 @@ pub const ThreadManager = struct {
                     const record = slot.record orelse continue;
                     switch (executionState(record)) {
                         .pending => active += 1,
-                        .completed, .trapped, .start_aborted => completed += 1,
+                        .completed, .trapped, .cancelled, .start_aborted => completed += 1,
                     }
                 },
                 .free, .retired => {},
@@ -858,6 +1110,18 @@ pub const ThreadManager = struct {
             .slots = self.slots.items.len,
             .shutting_down = self.shutting_down,
         };
+    }
+
+    pub fn taskGroupStats(self: *ThreadManager) TaskGroupStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var active: usize = 0;
+        var group = self.task_groups;
+        while (group) |current| : (group = current.next) active += 1;
+        var free: usize = 0;
+        group = self.free_task_groups;
+        while (group) |current| : (group = current.next) free += 1;
+        return .{ .active = active, .free = free };
     }
 
     pub fn threadOutcome(self: *ThreadManager, tid: i32) JoinError!?ThreadOutcome {
@@ -875,6 +1139,7 @@ pub const ThreadManager = struct {
                     .pending => null,
                     .completed => .completed,
                     .trapped => .trapped,
+                    .cancelled => .cancelled,
                     .start_aborted => unreachable,
                 };
             },
@@ -904,6 +1169,30 @@ pub const ThreadManager = struct {
         if (!self.beginSpawn()) return error.ThreadGroupShuttingDown;
         defer self.endSpawn();
 
+        const source_context = execution_context.current();
+        const cancellation_group: ?*TaskCancelGroup = if (source_context) |context| blk: {
+            if (context.threadGroup(ThreadManager) != self) break :blk null;
+            break :blk context.cancellationGroup(TaskCancelGroup);
+        } else null;
+        if (cancellation_group) |group| {
+            self.retainTaskGroup(group);
+            if (group.isCancelled()) {
+                self.releaseTaskGroup(group);
+                return error.ThreadGroupShuttingDown;
+            }
+        }
+        var group_owned_directly = cancellation_group != null;
+        defer if (group_owned_directly)
+            self.releaseTaskGroup(cancellation_group.?);
+        if (self.test_hooks) |hooks| {
+            if (hooks.spawn_group_captured) |captured| {
+                captured.store(true, .release);
+                if (hooks.resume_spawn) |resume_flag| {
+                    while (!resume_flag.load(.acquire)) std.atomic.spinLoopHint();
+                }
+            }
+        }
+
         const backend_context = try backend_ops.create(parent, self.allocator);
         var backend_owned_directly = true;
         defer if (backend_owned_directly) backend_ops.destroy(backend_context);
@@ -930,9 +1219,11 @@ pub const ThreadManager = struct {
             .backend_context = backend_context,
             .backend_ops = backend_ops,
             .aux_stack_top = aux_stack_top,
+            .cancellation_group = cancellation_group,
         };
         backend_owned_directly = false;
         stack_owned_directly = false;
+        group_owned_directly = false;
         var record_owned_locally = true;
         defer if (record_owned_locally) self.destroyRecord(record);
 
@@ -950,6 +1241,7 @@ pub const ThreadManager = struct {
         backend_ops.configure(
             backend_context,
             self,
+            cancellation_group,
             tid,
             @bitCast(start_arg),
             if (aux_stack_top) |top|
@@ -1089,6 +1381,7 @@ pub const ThreadManager = struct {
         const outcome: ThreadOutcome = switch (executionState(record)) {
             .completed => .completed,
             .trapped => .trapped,
+            .cancelled => .cancelled,
             .pending, .start_aborted => unreachable,
         };
 
@@ -1117,6 +1410,7 @@ pub const ThreadManager = struct {
     fn destroyRecord(self: *ThreadManager, record: *ThreadRecord) void {
         record.backend_ops.destroy(record.backend_context);
         if (record.aux_stack_top) |stack_top| self.aux_stack_pool.release(stack_top);
+        if (record.cancellation_group) |group| self.releaseTaskGroup(group);
         self.noteCounter(if (self.test_hooks) |hooks| hooks.records_destroyed else null);
         self.allocator.destroy(record);
     }
@@ -1201,7 +1495,13 @@ fn threadEntry(record: *ThreadRecord) void {
         record.execution.store(@intFromEnum(ExecutionState.trapped), .release);
         return;
     }
-    record.execution.store(@intFromEnum(ExecutionState.completed), .release);
+    record.execution.store(
+        @intFromEnum(if (outcome == .cancelled)
+            ExecutionState.cancelled
+        else
+            ExecutionState.completed),
+        .release,
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1478,6 +1778,33 @@ fn waitForCompleted(manager: *ThreadManager, expected: usize) !void {
         yieldForLifecycle();
     }
     return error.ThreadCompletionTimeout;
+}
+
+fn waitForMemoryWaiters(
+    memory: *types.MemoryInstance,
+    offset: usize,
+    expected: u32,
+) !void {
+    const lot = &memory.shared_control.?.parking_lot;
+    const address = memory.data.ptr + offset;
+    const deadline = monotonicNowNs() +| 5 * std.time.ns_per_s;
+    while (lot.waiterCount(address) != expected) {
+        if (monotonicNowNs() >= deadline) return error.ThreadCompletionTimeout;
+        platform.usleep(200);
+    }
+}
+
+fn awaitThreadOutcome(
+    manager: *ThreadManager,
+    tid: i32,
+    timeout_ns: u64,
+) !bool {
+    const deadline = monotonicNowNs() +| timeout_ns;
+    while (try manager.threadOutcome(tid) == null) {
+        if (monotonicNowNs() >= deadline) return false;
+        platform.usleep(200);
+    }
+    return true;
 }
 
 fn atomicCount(value: *const std.atomic.Value(usize)) usize {
@@ -2181,6 +2508,7 @@ const StubbornBackend = struct {
     fn configure(
         _: *anyopaque,
         _: *ThreadManager,
+        _: ?*TaskCancelGroup,
         _: i32,
         _: u32,
         _: ?execution_context.AuxiliaryStack,
@@ -2275,7 +2603,7 @@ test "group termination: the cancel broadcast reaches compiled code on every int
     const Probe = struct {
         calls: usize = 0,
 
-        fn broadcast(raw: *anyopaque) void {
+        fn broadcast(raw: *anyopaque, _: ?*const anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
         }
@@ -2311,6 +2639,222 @@ test "group termination: the cancel broadcast reaches compiled code on every int
         .broadcast = Probe.broadcast,
     });
     try std.testing.expect(late.calls >= 1);
+}
+
+test "component task epochs cancel only owned threads and remain reusable" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var joined = std.atomic.Value(usize).init(0);
+    var destroyed = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+    };
+    var process_terminal = termination.State{};
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    manager.bindTermination(&process_terminal);
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    var first_context = execution_context.ThreadExecutionContext{};
+    first_context.setThreadGroup(@ptrCast(&manager));
+    var first_scope = try manager.bindTaskGroup(
+        &first_context,
+        1,
+        false,
+    );
+    const first_ticket = manager.cancellationForContext(&first_context).?;
+
+    var second_context = execution_context.ThreadExecutionContext{};
+    second_context.setThreadGroup(@ptrCast(&manager));
+    var second_scope = try manager.bindTaskGroup(
+        &second_context,
+        2,
+        false,
+    );
+
+    const first_tid = blk: {
+        var active = first_context.enter();
+        defer active.deinit();
+        break :blk try manager.spawnThread(ctx.inst, 0);
+    };
+    const second_tid = blk: {
+        var active = second_context.enter();
+        defer active.deinit();
+        break :blk try manager.spawnThread(ctx.inst, 0);
+    };
+    try waitForReady(ctx, 2);
+    try waitForMemoryWaiters(ctx.mem_inst, 16, 2);
+
+    const started_ns = monotonicNowNs();
+    try std.testing.expect(manager.cancelTaskForContext(&first_context));
+    try std.testing.expect(!manager.cancelTaskForContext(&first_context));
+    const first_finished = try awaitThreadOutcome(
+        &manager,
+        first_tid,
+        5 * std.time.ns_per_s,
+    );
+    if (!first_finished) manager.interrupt();
+    try std.testing.expectEqual(
+        ThreadOutcome.cancelled,
+        try manager.joinOne(first_tid),
+    );
+    try std.testing.expect(first_finished);
+    try std.testing.expect(monotonicNowNs() - started_ns < std.time.ns_per_s);
+    try std.testing.expect(process_terminal.outcome() == null);
+    try std.testing.expectEqual(@as(u32, 1), ctx.mem_inst.shared_control.?.parking_lot.waiterCount(
+        ctx.mem_inst.data.ptr + 16,
+    ));
+
+    try std.testing.expectEqual(@as(u32, 1), try ctx.mem_inst.notify(16, 1));
+    const second_finished = try awaitThreadOutcome(
+        &manager,
+        second_tid,
+        5 * std.time.ns_per_s,
+    );
+    if (!second_finished) manager.interrupt();
+    try std.testing.expectEqual(
+        ThreadOutcome.completed,
+        try manager.joinOne(second_tid),
+    );
+    try std.testing.expect(second_finished);
+    try std.testing.expect(!manager.isTaskCancelledForContext(&second_context));
+    try std.testing.expect(process_terminal.outcome() == null);
+
+    second_scope.deinit();
+    first_scope.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.taskGroupStats().active);
+    try std.testing.expectEqual(@as(usize, 2), manager.taskGroupStats().free);
+
+    // A later task reuses one quiescent group by beginning at the advanced
+    // generation. No cancelled bit is cleared, and the old ticket stays
+    // cancelled forever.
+    var third_context = execution_context.ThreadExecutionContext{};
+    third_context.setThreadGroup(@ptrCast(&manager));
+    var third_scope = try manager.bindTaskGroup(
+        &third_context,
+        3,
+        false,
+    );
+    defer third_scope.deinit();
+    const third_ticket = manager.cancellationForContext(&third_context).?;
+    try std.testing.expect(first_ticket.isCancelled());
+    try std.testing.expectEqual(first_ticket.source, third_ticket.source);
+    try std.testing.expectEqual(first_ticket.generation + 1, third_ticket.generation);
+
+    const ready_word: *align(4) u32 = @ptrCast(@alignCast(ctx.mem_inst.data.ptr));
+    @atomicStore(u32, ready_word, 0, .seq_cst);
+    const third_tid = blk: {
+        var active = third_context.enter();
+        defer active.deinit();
+        break :blk try manager.spawnThread(ctx.inst, 0);
+    };
+    try waitForReady(ctx, 1);
+    try waitForMemoryWaiters(ctx.mem_inst, 16, 1);
+    try std.testing.expectEqual(@as(u32, 1), try ctx.mem_inst.notify(16, 1));
+    const third_finished = try awaitThreadOutcome(
+        &manager,
+        third_tid,
+        5 * std.time.ns_per_s,
+    );
+    if (!third_finished) manager.interrupt();
+    try std.testing.expectEqual(
+        ThreadOutcome.completed,
+        try manager.joinOne(third_tid),
+    );
+    try std.testing.expect(third_finished);
+
+    try std.testing.expectEqual(@as(usize, 3), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, 3), atomicCount(&destroyed));
+}
+
+test "component task cancellation racing spawn is inherited safely" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var captured = std.atomic.Value(bool).init(false);
+    var resume_flag = std.atomic.Value(bool).init(false);
+    var joined = std.atomic.Value(usize).init(0);
+    var destroyed = std.atomic.Value(usize).init(0);
+    const hooks = TestHooks{
+        .native_threads_joined = &joined,
+        .records_destroyed = &destroyed,
+        .spawn_group_captured = &captured,
+        .resume_spawn = &resume_flag,
+    };
+    var process_terminal = termination.State{};
+    var manager = ThreadManager.initWithTestHooks(allocator, &hooks);
+    defer manager.deinit();
+    manager.bindTermination(&process_terminal);
+    try manager.prepareSharedMemory(ctx.mem_inst, null);
+    ctx.inst.thread_manager = &manager;
+
+    var parent_context = execution_context.ThreadExecutionContext{};
+    parent_context.setThreadGroup(@ptrCast(&manager));
+    var group_scope = try manager.bindTaskGroup(
+        &parent_context,
+        1,
+        false,
+    );
+    defer group_scope.deinit();
+
+    const SpawnRace = struct {
+        manager: *ThreadManager,
+        parent: *types.ModuleInstance,
+        context: *execution_context.ThreadExecutionContext,
+        tid: i32 = -1,
+        err: ?SpawnError = null,
+
+        fn run(self: *@This()) void {
+            var active = self.context.enter();
+            defer active.deinit();
+            self.tid = self.manager.spawnThread(self.parent, 0) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var race = SpawnRace{
+        .manager = &manager,
+        .parent = ctx.inst,
+        .context = &parent_context,
+    };
+    const spawn_thread = try std.Thread.spawn(.{}, SpawnRace.run, .{&race});
+    const deadline = monotonicNowNs() +| 5 * std.time.ns_per_s;
+    while (!captured.load(.acquire)) {
+        if (monotonicNowNs() >= deadline) {
+            resume_flag.store(true, .release);
+            spawn_thread.join();
+            return error.ThreadCompletionTimeout;
+        }
+        platform.usleep(200);
+    }
+
+    try std.testing.expect(manager.cancelTaskForContext(&parent_context));
+    resume_flag.store(true, .release);
+    spawn_thread.join();
+    try std.testing.expect(race.err == null);
+    try std.testing.expect(race.tid > 0);
+    const child_finished = try awaitThreadOutcome(
+        &manager,
+        race.tid,
+        5 * std.time.ns_per_s,
+    );
+    if (!child_finished) manager.interrupt();
+    try std.testing.expectEqual(
+        ThreadOutcome.cancelled,
+        try manager.joinOne(race.tid),
+    );
+    try std.testing.expect(child_finished);
+    try std.testing.expect(process_terminal.outcome() == null);
+    try std.testing.expectEqual(@as(usize, 1), atomicCount(&joined));
+    try std.testing.expectEqual(@as(usize, 1), atomicCount(&destroyed));
 }
 
 /// Parks the calling thread on the group's shared memory with an infinite
