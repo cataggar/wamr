@@ -1269,20 +1269,11 @@ fn compileToAot(
         });
     }
 
-    // Data segments: active offsets must reduce to a constant; passive
-    // segments keep their index/data for memory.init.
+    // Keep every data segment in source order so memory.init/data.drop
+    // indices stay in the original wasm index space.
     var data_entries: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     for (module.data_segments) |seg| {
-        const offset_val: u32 = if (seg.is_passive)
-            0
-        else
-            resolveU32InitExpr(seg.offset, tmp_globals.items) orelse continue;
-        try data_entries.append(a, .{
-            .memory_idx = seg.memory_idx,
-            .offset = offset_val,
-            .data = seg.data,
-            .is_passive = seg.is_passive,
-        });
+        try data_entries.append(a, try emit_aot.dataSegmentEntry(seg));
     }
 
     var arch_name = std.mem.zeroes([16]u8);

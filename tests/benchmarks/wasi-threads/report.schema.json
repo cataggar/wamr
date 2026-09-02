@@ -15,7 +15,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -24,6 +24,9 @@
         "tracked_diff_sha256",
         "build_source_sha256",
         "collected_at",
+        "platform_id",
+        "fixture_set_sha256",
+        "plan_sha256",
         "host",
         "execution",
         "tools",
@@ -41,6 +44,8 @@
         "thread_counts",
         "iterations",
         "timeout_seconds",
+        "minimum_timed_interval_ns",
+        "pairs",
         "optimize"
       ]
     },
@@ -56,6 +61,8 @@
           "phase",
           "order",
           "condition",
+          "pair_left",
+          "pair_right",
           "mode",
           "threads_enabled",
           "cancel_points",
@@ -64,6 +71,15 @@
           "iterations",
           "command",
           "elapsed_ns",
+          "guest_elapsed_ns",
+          "raw_guest_elapsed_ns",
+          "timing_overhead_ns",
+          "timing_overhead_ppm",
+          "host_wall_elapsed_ns",
+          "host_wall_over_guest",
+          "metric_kind",
+          "cancel_polls_per_operation",
+          "static_cancel_poll_sites",
           "operations",
           "throughput_ops_per_second",
           "per_thread_ops_per_second",

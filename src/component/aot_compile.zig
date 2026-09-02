@@ -51,6 +51,7 @@ pub const PrecompileError = error{
     OpenDirFailed,
     JsonSerializationFailed,
     UnsupportedFrameAttributionTarget,
+    UnsupportedDataSegmentOffset,
 };
 
 /// Surface the IR verifier's diagnostic detail to stderr when a
@@ -554,16 +555,9 @@ pub fn compileCoreWasmCached(
 
     var data_segs: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     for (module.data_segments) |seg| {
-        const offset: u32 = if (seg.is_passive) 0 else switch (seg.offset) {
-            .i32_const => |v| @bitCast(v),
-            else => continue,
-        };
-        data_segs.append(ea, .{
-            .memory_idx = seg.memory_idx,
-            .offset = offset,
-            .data = seg.data,
-            .is_passive = seg.is_passive,
-        }) catch return error.OutOfMemory;
+        const entry = emit_aot.dataSegmentEntry(seg) catch
+            return error.UnsupportedDataSegmentOffset;
+        data_segs.append(ea, entry) catch return error.OutOfMemory;
     }
 
     var func_type_entries: std.ArrayList(emit_aot.FuncTypeEntry) = .empty;

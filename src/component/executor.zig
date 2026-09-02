@@ -76,8 +76,7 @@ fn bindTaskGroupForFrame(
 ) ExecutionError!?TaskGroupScope {
     if (comptime !config.lib_wasi_threads) return null;
     const handle = task_manager.currentTask() orelse return null;
-    var source_ref = task_manager.acquireCancellationSource(handle) orelse
-        return null;
+    var source_ref = task_manager.acquireCancellationTicket(handle) catch return null;
     defer source_ref.deinit();
     return @constCast(owner_inst).thread_manager.bindTaskGroup(
         thread_ctx,
@@ -5555,6 +5554,8 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
     var tm = async_mod.TaskManager{};
     defer tm.deinit(testing.allocator);
     const h = try tm.createTask(testing.allocator);
+    var cancellation_ticket = try tm.acquireCancellationTicket(h);
+    defer cancellation_ticket.deinit();
     var current_task_scope = tm.bindCurrent(h);
     defer current_task_scope.deinit();
     try testing.expect(tm.getState(h).? != .cancelled);
@@ -5563,11 +5564,9 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
     if (comptime config.lib_wasi_threads) {
         try testing.expect(inst.thread_manager.hasTerminationBinding());
         env.setThreadManager(&inst.thread_manager);
-        var source_ref = tm.acquireCancellationSource(h).?;
-        defer source_ref.deinit();
         group_scope = try inst.thread_manager.bindTaskGroup(
             &env.thread_context,
-            source_ref.source,
+            cancellation_ticket.source,
         );
         task_ticket = inst.thread_manager.cancellationForContext(
             &env.thread_context,
@@ -5583,6 +5582,7 @@ test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
         testing.allocator,
     );
     try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(h).?);
+    try testing.expect(cancellation_ticket.isCancelled());
     if (task_ticket) |ticket| try testing.expect(ticket.isCancelled());
     if (comptime config.lib_wasi_threads)
         try testing.expect(inst.thread_manager.terminalOutcome() == null);
@@ -5623,9 +5623,9 @@ test "dispatchCanonBuiltin: subtask.cancel fans out across component managers" {
     defer tm.deinit(testing.allocator);
     const target = try tm.createTask(testing.allocator);
     const unrelated = try tm.createTask(testing.allocator);
-    var target_source = tm.acquireCancellationSource(target).?;
+    var target_source = try tm.acquireCancellationTicket(target);
     defer target_source.deinit();
-    var unrelated_source = tm.acquireCancellationSource(unrelated).?;
+    var unrelated_source = try tm.acquireCancellationTicket(unrelated);
     defer unrelated_source.deinit();
 
     var first_context = execution_context.ThreadExecutionContext{};
@@ -5708,7 +5708,7 @@ test "dispatchCanonBuiltin: task.cancel fans out beyond current component manage
     tm.startTask(handle);
     var current = tm.bindCurrent(handle);
     defer current.deinit();
-    var source_ref = tm.acquireCancellationSource(handle).?;
+    var source_ref = try tm.acquireCancellationTicket(handle);
     defer source_ref.deinit();
 
     env.setThreadManager(&inner_inst.thread_manager);

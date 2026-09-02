@@ -51,18 +51,19 @@ pub const TargetInfo = struct {
 
 /// A data segment parsed from the AOT data section.
 pub const AotDataSegment = struct {
+    pub const OffsetKind = enum(u8) {
+        i32_const = 0,
+        global_get = 1,
+        passive = 2,
+    };
+
     memory_idx: u32,
+    offset_kind: OffsetKind,
     offset: u32,
     data: []const u8,
 
-    pub const passive_flag: u32 = 1 << 31;
-
     pub fn isPassive(self: AotDataSegment) bool {
-        return self.memory_idx & passive_flag != 0;
-    }
-
-    pub fn memoryIndex(self: AotDataSegment) u32 {
-        return self.memory_idx & ~passive_flag;
+        return self.offset_kind == .passive;
     }
 };
 
@@ -574,6 +575,13 @@ fn parseDataSection(reader: *BinaryReader, section_size: u32, module: *AotModule
     }
 
     for (0..count) |i| {
+        const offset_kind_raw = try reader.readByte();
+        const offset_kind: AotDataSegment.OffsetKind = switch (offset_kind_raw) {
+            0 => .i32_const,
+            1 => .global_get,
+            2 => .passive,
+            else => return error.InvalidSection,
+        };
         const memory_idx = try reader.readU32Le();
         const offset = try reader.readU32Le();
         const data_len = try reader.readU32Le();
@@ -583,6 +591,7 @@ fn parseDataSection(reader: *BinaryReader, section_size: u32, module: *AotModule
 
         segments[i] = .{
             .memory_idx = memory_idx,
+            .offset_kind = offset_kind,
             .offset = offset,
             .data = data_copy,
         };
@@ -956,16 +965,17 @@ test "AotModule: findExport" {
 }
 
 test "load: passive data segment preserves index and bytes" {
-    var data = [_]u8{0} ** 33;
+    var data = [_]u8{0} ** 34;
     writeU32Le(&data, 0, types.aot_magic);
     writeU32Le(&data, 4, types.aot_version);
     writeU32Le(&data, 8, 5); // data section
-    writeU32Le(&data, 12, 17);
+    writeU32Le(&data, 12, 18);
     writeU32Le(&data, 16, 1);
-    writeU32Le(&data, 20, AotDataSegment.passive_flag);
-    writeU32Le(&data, 24, 0);
-    writeU32Le(&data, 28, 1);
-    data[32] = 0xa5;
+    data[20] = @intFromEnum(AotDataSegment.OffsetKind.passive);
+    writeU32Le(&data, 21, 0);
+    writeU32Le(&data, 25, 0);
+    writeU32Le(&data, 29, 1);
+    data[33] = 0xa5;
 
     const allocator = std.testing.allocator;
     const module = try load(&data, allocator);
@@ -974,6 +984,6 @@ test "load: passive data segment preserves index and bytes" {
     try std.testing.expectEqual(@as(usize, 1), module.data_segments.len);
     const segment = module.data_segments[0];
     try std.testing.expect(segment.isPassive());
-    try std.testing.expectEqual(@as(u32, 0), segment.memoryIndex());
+    try std.testing.expectEqual(@as(u32, 0), segment.memory_idx);
     try std.testing.expectEqualSlices(u8, &.{0xa5}, segment.data);
 }

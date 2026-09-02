@@ -19,7 +19,30 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    uint64_t warmup_iterations = iterations / 64;
+    if (warmup_iterations < 1024) warmup_iterations = 1024;
+    (void)bench_hot_kernel(bench_seed(0), warmup_iterations);
+
+    uint64_t overhead = 0;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    struct bench_timing timing;
+    if (bench_clock_overhead(&overhead) != 0 ||
+        bench_now_ns(&start) != 0) {
+        return 1;
+    }
     uint64_t checksum = bench_hot_kernel(bench_seed(0), iterations);
+    if (bench_now_ns(&end) != 0 ||
+        bench_finish_timing(start, end, overhead, &timing) != 0) {
+        return 1;
+    }
     return bench_write_result(
-        "single-hot", 1, iterations, iterations, checksum);
+        "single-hot",
+        1,
+        iterations,
+        iterations,
+        checksum,
+        "steady-state-kernel",
+        iterations,
+        &timing);
 }
