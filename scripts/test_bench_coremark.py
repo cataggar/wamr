@@ -370,7 +370,7 @@ class BenchCoremarkTests(unittest.TestCase):
         )
         self.assertIn("- profile", workflow)
         self.assertIn(
-            'default: "e32b7b7d2d12007eb66679a66f943b1e4ea6a393"',
+            'default: "19d046a5b23b9c39acf5f7062976f04c5ca8ca75"',
             workflow,
         )
         dispatch = workflow.split(
@@ -413,6 +413,10 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("WAMR_AOT_SPILL_METRIC", profile_script)
         self.assertIn("WAMR_AOT_CODEGEN_TIMING", profile_script)
         self.assertIn('"cycles:u"', profile_script)
+        self.assertIn("AUTHORITATIVE_BASELINE_RUN = 33631050708", profile_script)
+        self.assertIn("select_cpu_affinity()", profile_script)
+        self.assertIn("coremark_guest_args(", profile_script)
+        self.assertIn("PROFILE_CAPTURES_PER_ENGINE = 2", profile_script)
 
         for line in workflow.splitlines():
             stripped = line.strip()
