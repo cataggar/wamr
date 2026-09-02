@@ -215,9 +215,12 @@ A2, A5, and C1.
 Windows supports relative and absolute realtime/monotonic clock
 subscriptions plus stdio and regular-file readiness. Console input is treated
 as readable only when a key is available (or a complete line in line-input
-mode); redirected pipes use `PeekNamedPipe` so buffered bytes and writer
-closure/EOF are distinguished. Absolute deadlines are re-evaluated against
-their selected clock after every wake, including realtime clock adjustments.
+mode). Redirected-pipe readiness runs `PeekNamedPipe` on a cancellable helper
+thread so a synchronous pipe probe cannot trap the guest thread inside an
+uncancellable kernel wait; buffered bytes and writer closure/EOF remain
+distinct. Message-pipe `ERROR_MORE_DATA` reads return the consumed prefix.
+Absolute deadlines are re-evaluated against their selected clock after every
+wake, and Windows bounds absolute-realtime waits to observe wall-clock jumps.
 
 With Preview-1 threads enabled, binding the group lazily creates a
 `ThreadManager`-owned manual-reset cancellation event; allocation failure is
