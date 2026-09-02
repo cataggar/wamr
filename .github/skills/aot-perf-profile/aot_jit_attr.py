@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""De-anonymize WAMR AOT perf data and attribute x86 frame traffic.
+"""De-anonymize WAMR AOT perf data and classify generated instructions.
 
 The optional compiler sidecar is deliberately authoritative: it identifies
 each emitted frame-access instruction by a function-relative native byte
 range and binds allocator traffic to a physical slot and, only when sound, a
-vreg/source. Without a sidecar, frame moves remain "unattributed" rather than
-being mislabeled as spills.
+vreg/source on x86_64. Without a sidecar, x86_64 and AArch64 frame moves remain
+"unattributed" rather than being mislabeled as spills.
 """
 
 import argparse
@@ -13,6 +13,7 @@ import bisect
 import hashlib
 import json
 import os
+import platform
 import re
 import struct
 import subprocess
@@ -35,6 +36,7 @@ FRAME_ORIGINS = {
     "fixed_runtime_frame_state",
     "unknown",
 }
+SUPPORTED_ARCHITECTURES = {"x86_64", "aarch64"}
 
 
 class AttributionError(RuntimeError):
@@ -82,6 +84,25 @@ def _run_checked(argv, what):
         detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
         raise AttributionError(f"{what} failed: {detail}")
     return proc.stdout
+
+
+def perf_binary():
+    return os.environ.get("PERF", "perf")
+
+
+def normalize_architecture(value=None):
+    arch = (value or platform.machine()).lower()
+    arch = {
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "arm64": "aarch64",
+    }.get(arch, arch)
+    if arch not in SUPPORTED_ARCHITECTURES:
+        raise AttributionError(
+            f"unsupported disassembly architecture {arch!r}; expected "
+            "x86_64 or aarch64"
+        )
+    return arch
 
 
 def parse_cwasm(path):
@@ -172,7 +193,7 @@ def function_bounds(info, func_index):
 def jit_exec_mmaps(perf):
     """Return unique anonymous executable mappings, largest first."""
     output = _run_checked(
-        ["perf", "script", "-i", perf, "--show-mmap-events"],
+        [perf_binary(), "script", "-i", perf, "--show-mmap-events"],
         "perf script --show-mmap-events",
     )
     maps = []
@@ -190,7 +211,7 @@ def addr_counts(perf):
     """Return ({ip: self_samples}, total_self_samples)."""
     output = _run_checked(
         [
-            "perf",
+            perf_binary(),
             "report",
             "-i",
             perf,
@@ -238,10 +259,21 @@ def select_text_base(perf, text_size, explicit_base=None):
 
 
 def disassemble_blob(
-    blob, virtual_address, scratch_dir, label, function_offset_base=0
+    blob,
+    virtual_address,
+    scratch_dir,
+    label,
+    function_offset_base=0,
+    architecture=None,
 ):
+    architecture = normalize_architecture(architecture)
     scratch_dir = Path(scratch_dir)
     scratch = scratch_dir / f".aot-jit-attr-{os.getpid()}-{label}.bin"
+    machine_args = (
+        ["-m", "i386:x86-64", "-M", "intel"]
+        if architecture == "x86_64"
+        else ["-m", "aarch64"]
+    )
     try:
         scratch.write_bytes(blob)
         output = _run_checked(
@@ -250,10 +282,7 @@ def disassemble_blob(
                 "-D",
                 "-b",
                 "binary",
-                "-m",
-                "i386:x86-64",
-                "-M",
-                "intel",
+                *machine_args,
                 f"--adjust-vma=0x{virtual_address:x}",
                 str(scratch),
             ],
@@ -263,7 +292,8 @@ def disassemble_blob(
         scratch.unlink(missing_ok=True)
 
     pattern = re.compile(
-        r"^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s+)+)\s*(.*)$"
+        r"^\s*([0-9a-fA-F]+):\s+"
+        r"((?:(?:[0-9a-fA-F]{2}|[0-9a-fA-F]{8})\s+)+)\s*(.*)$"
     )
     instructions = []
     for line in output.splitlines():
@@ -276,7 +306,7 @@ def disassemble_blob(
             Instruction(
                 address=address,
                 offset=function_offset_base + address - virtual_address,
-                size=len(encoded),
+                size=sum(len(token) // 2 for token in encoded),
                 text=match.group(3).strip(),
             )
         )
@@ -291,6 +321,7 @@ def disassemble_function(
     scratch_dir,
     label,
     inline_data_ranges,
+    architecture=None,
 ):
     instructions = []
     cursor = 0
@@ -305,6 +336,7 @@ def disassemble_function(
                     scratch_dir,
                     f"{label}-segment-{index}",
                     cursor,
+                    architecture,
                 )
             )
         cursor = end
@@ -316,6 +348,7 @@ def disassemble_function(
                 scratch_dir,
                 f"{label}-segment-tail",
                 cursor,
+                architecture,
             )
         )
     return instructions
@@ -356,19 +389,21 @@ def parse_frame_operand(text):
         if not bracket:
             continue
         expression = re.sub(r"\s+", "", bracket.group(1).lower())
-        base_match = re.search(r"(?<![a-z0-9_])(rbp|rsp)(?![a-z0-9_])", expression)
+        base_match = re.search(
+            r"(?<![a-z0-9_])(rbp|rsp)(?![a-z0-9_])", expression
+        )
         if not base_match:
             continue
         base = base_match.group(1)
-        simple = re.fullmatch(r"(rbp|rsp)(?:([+-])(0x[0-9a-f]+|\d+))?", expression)
+        simple = re.fullmatch(
+            r"(rbp|rsp)(?:([+-])(0x[0-9a-f]+|\d+))?", expression
+        )
         offset = None
         complex_address = True
         if simple:
             magnitude = int(simple.group(3), 0) if simple.group(3) else 0
             offset = -magnitude if simple.group(2) == "-" else magnitude
             complex_address = False
-        # For MOV-family instructions the first memory operand is the
-        # destination. Other explicit frame operands are conservatively reads.
         kind = (
             "store"
             if mnemonic.startswith("mov") and operand_index == 0
@@ -376,6 +411,70 @@ def parse_frame_operand(text):
         )
         return FrameOperand(kind, base, offset, complex_address)
     return None
+
+
+def parse_aarch64_frame_operand(text):
+    """Identify AArch64 x29/sp frame loads and stores."""
+    mnemonic, operands = _split_operands(text)
+    load_mnemonics = {
+        "ldr",
+        "ldrb",
+        "ldrh",
+        "ldrsb",
+        "ldrsh",
+        "ldrsw",
+        "ldur",
+        "ldurb",
+        "ldurh",
+        "ldursb",
+        "ldursh",
+        "ldursw",
+        "ldp",
+        "ldpsw",
+    }
+    store_mnemonics = {
+        "str",
+        "strb",
+        "strh",
+        "stur",
+        "sturb",
+        "sturh",
+        "stp",
+    }
+    if mnemonic not in load_mnemonics | store_mnemonics:
+        return None
+    for operand in operands:
+        bracket = re.search(
+            r"\[\s*(x29|fp|sp)\s*(?:,\s*#?(-?(?:0x[0-9a-f]+|\d+)))?",
+            operand.lower(),
+        )
+        if not bracket:
+            continue
+        base = "x29" if bracket.group(1) in {"x29", "fp"} else "sp"
+        offset = int(bracket.group(2), 0) if bracket.group(2) else 0
+        complex_address = bool(
+            re.search(
+                r"\[\s*(?:x29|fp|sp)\s*,\s*"
+                r"(?!#?-?(?:0x[0-9a-f]+|\d+))",
+                operand.lower(),
+            )
+        )
+        return FrameOperand(
+            "load" if mnemonic in load_mnemonics else "store",
+            base,
+            None if complex_address else offset,
+            complex_address,
+        )
+    return None
+
+
+def instruction_frame_operand(text, architecture=None):
+    architecture = normalize_architecture(architecture)
+    return (
+        parse_frame_operand(text)
+        if architecture == "x86_64"
+        else parse_aarch64_frame_operand(text)
+    )
 
 
 def normalized_code_sha256(code, rel32_offsets):
@@ -742,7 +841,7 @@ def validate_metadata_disassembly(metadata, instructions):
             )
 
 
-def classify_basic(text):
+def classify_x86_64_basic(text):
     mnemonic = text.split()[0].lower() if text else ""
     frame = parse_frame_operand(text)
     if frame:
@@ -815,15 +914,143 @@ def classify_basic(text):
     return "other"
 
 
-def classify_instruction(instruction, metadata=None):
+def _is_aarch64_register(value):
+    return bool(
+        re.fullmatch(
+            r"(?:[xw](?:[0-9]|[12][0-9]|30)|sp|xzr|wzr|"
+            r"[bhsdqv](?:[0-9]|[12][0-9]|3[01]))",
+            value.strip().lower(),
+        )
+    )
+
+
+def classify_aarch64_basic(text):
+    mnemonic, operands = _split_operands(text)
+    frame = parse_aarch64_frame_operand(text)
+    if frame:
+        return f"frame_{frame.kind}_unattributed"
+    if mnemonic in {"bl", "blr"}:
+        return "call"
+    if mnemonic == "br":
+        return "indirect_dispatch"
+    if mnemonic == "b":
+        return "direct_branch"
+    if (
+        mnemonic.startswith("b.")
+        or mnemonic in {"cbz", "cbnz", "tbz", "tbnz"}
+    ):
+        return "cond_branch"
+    load_store = mnemonic.startswith(("ldr", "ldur", "str", "stur", "ldp", "stp"))
+    if load_store and any("[" in operand for operand in operands):
+        if re.search(r"\[\s*x20(?:\s*,|\s*\])", text, re.IGNORECASE):
+            return "linear_memory"
+        return "mem_access"
+    if (
+        mnemonic == "mov"
+        and len(operands) == 2
+        and _is_aarch64_register(operands[0])
+        and _is_aarch64_register(operands[1])
+    ):
+        return "regmov"
+    if mnemonic in {
+        "add",
+        "adds",
+        "sub",
+        "subs",
+        "adc",
+        "adcs",
+        "sbc",
+        "sbcs",
+        "and",
+        "ands",
+        "orr",
+        "eor",
+        "bic",
+        "bics",
+        "madd",
+        "msub",
+        "mul",
+        "mneg",
+        "udiv",
+        "sdiv",
+        "lsl",
+        "lsr",
+        "asr",
+        "ror",
+        "extr",
+        "ubfm",
+        "sbfm",
+        "bfm",
+        "uxtb",
+        "uxth",
+        "sxtb",
+        "sxth",
+        "sxtw",
+        "cmp",
+        "cmn",
+        "tst",
+        "csel",
+        "csinc",
+        "csinv",
+        "csneg",
+        "adr",
+        "adrp",
+    }:
+        return "alu"
+    return "other"
+
+
+def classify_basic(text, architecture=None):
+    architecture = normalize_architecture(architecture)
+    return (
+        classify_x86_64_basic(text)
+        if architecture == "x86_64"
+        else classify_aarch64_basic(text)
+    )
+
+
+def classify_instruction(instruction, metadata=None, architecture=None):
+    architecture = normalize_architecture(architecture)
     if metadata:
         access = metadata.access_by_start.get(instruction.offset)
         if access:
             return f"{access['origin']}_{access['kind']}"
-        frame = parse_frame_operand(instruction.text)
+        frame = instruction_frame_operand(instruction.text, architecture)
         if frame:
             return f"unknown_frame_{frame.kind}"
-    return classify_basic(instruction.text)
+    return classify_basic(instruction.text, architecture)
+
+
+def classify_instruction_stream(instructions, metadata=None, architecture=None):
+    architecture = normalize_architecture(architecture)
+    classes = [
+        classify_instruction(instruction, metadata, architecture)
+        for instruction in instructions
+    ]
+    if architecture != "aarch64":
+        return classes
+
+    for index in range(len(instructions) - 1):
+        mnemonic, _ = _split_operands(instructions[index].text)
+        next_mnemonic, _ = _split_operands(instructions[index + 1].text)
+        if mnemonic not in {"cmp", "cmn"} or next_mnemonic not in {
+            "b.hi",
+            "b.hs",
+            "b.lo",
+            "b.ls",
+        }:
+            continue
+        window = " ".join(
+            item.text for item in instructions[max(0, index - 3) : index]
+        )
+        if re.search(
+            r"\[\s*x19\s*,\s*#?(?:0x)?0*8\s*\]",
+            window,
+            re.IGNORECASE,
+        ):
+            classes[index] = "bounds_cmp"
+            classes[index + 1] = "bounds_branch"
+    return classes
 
 
 def _percent(numerator, denominator):
@@ -1054,6 +1281,12 @@ def main():
     parser.add_argument("--func", type=int, help="selected local_func")
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--base", help="explicit text mmap base (hex)")
+    parser.add_argument(
+        "--arch",
+        choices=sorted(SUPPORTED_ARCHITECTURES),
+        default=normalize_architecture(),
+        help="generated-code architecture (default: current host)",
+    )
     parser.add_argument("--json-out", help="write machine-readable attribution summary")
     parser.add_argument("--min-samples", type=int, default=0)
     parser.add_argument(
@@ -1079,6 +1312,8 @@ def main():
         parser.error("--validate-frame-metadata requires --func and --frame-metadata")
     if args.frame_metadata and args.func is None:
         parser.error("--frame-metadata requires --func")
+    if args.frame_metadata and args.arch != "x86_64":
+        parser.error("--frame-metadata is currently supported only for x86_64")
 
     info = parse_cwasm(args.cwasm)
     counts, total = ({}, 0)
@@ -1136,6 +1371,7 @@ def main():
 
     report = {
         "schema_version": 2,
+        "architecture": args.arch,
         "perf": str(Path(args.perf).resolve()) if args.perf else None,
         "cwasm": str(Path(args.cwasm).resolve()),
         "text_base": base,
@@ -1181,12 +1417,17 @@ def main():
             scratch_dir,
             f"func-{args.func}",
             metadata.inline_data_ranges,
+            args.arch,
         )
         validate_metadata_disassembly(metadata, instructions)
         frame_summary = build_frame_summary(instructions, counts, metadata)
     else:
         instructions = disassemble_blob(
-            function_code, function_base, scratch_dir, f"func-{args.func}"
+            function_code,
+            function_base,
+            scratch_dir,
+            f"func-{args.func}",
+            architecture=args.arch,
         )
 
     function_counts = {
@@ -1196,12 +1437,17 @@ def main():
     }
     function_samples = sum(function_counts.values())
     by_class = Counter()
+    static_by_class = Counter()
     hot = []
     instruction_addresses = set()
-    for instruction in instructions:
+    instruction_classes = classify_instruction_stream(
+        instructions, metadata, args.arch
+    )
+    for instruction, class_name in zip(instructions, instruction_classes):
         instruction_addresses.add(instruction.address)
         samples = counts.get(instruction.address, 0)
-        by_class[classify_instruction(instruction, metadata)] += samples
+        static_by_class[class_name] += 1
+        by_class[class_name] += samples
         if samples:
             hot.append((samples, instruction.address, instruction.text))
     for address, samples in function_counts.items():
@@ -1233,7 +1479,9 @@ def main():
         )
     if metadata is None:
         frame_count = sum(
-            1 for instruction in instructions if parse_frame_operand(instruction.text)
+            1
+            for instruction in instructions
+            if instruction_frame_operand(instruction.text, args.arch)
         )
         if frame_count:
             print(
@@ -1255,12 +1503,16 @@ def main():
         "local_func": args.func,
         "samples": function_samples,
         "percent_of_run": _percent(function_samples, total),
+        "instruction_count": sum(static_by_class.values()),
         "classes": {
             class_name: {
-                "samples": samples,
-                "percent_of_run": _percent(samples, total),
+                "samples": by_class.get(class_name, 0),
+                "percent_of_run": _percent(
+                    by_class.get(class_name, 0), total
+                ),
+                "static_instructions": static_by_class.get(class_name, 0),
             }
-            for class_name, samples in sorted(by_class.items())
+            for class_name in sorted(set(static_by_class) | set(by_class))
         },
         "hottest_instructions": [
             {

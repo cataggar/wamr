@@ -282,7 +282,10 @@ class FrameAttributionUnitTests(unittest.TestCase):
     def test_inline_br_table_ranges_split_disassembly(self):
         calls = []
 
-        def fake_disassemble(blob, address, scratch, label, offset_base=0):
+        def fake_disassemble(
+            blob, address, scratch, label, offset_base=0, architecture=None
+        ):
+            self.assertEqual("x86_64", architecture)
             calls.append((bytes(blob), address, offset_base))
             return [
                 aot.Instruction(
@@ -297,6 +300,7 @@ class FrameAttributionUnitTests(unittest.TestCase):
                 ROOT,
                 "table",
                 [{"native_start": 3, "native_end": 7, "kind": "br_table"}],
+                "x86_64",
             )
         self.assertEqual(
             [(b"abc", 0x1000, 0), (b"hijkl", 0x1007, 7)], calls
@@ -427,6 +431,90 @@ class FrameAttributionUnitTests(unittest.TestCase):
         self.assertEqual(
             0x4000, aot.select_text_base("perf.data", 4096, "0x4000")
         )
+
+    @mock.patch.object(aot, "_run_checked", return_value="")
+    @mock.patch.dict(aot.os.environ, {"PERF": "/opt/perf"}, clear=False)
+    def test_perf_binary_override_is_honored(self, run):
+        aot.jit_exec_mmaps("perf.data")
+        self.assertEqual("/opt/perf", run.call_args.args[0][0])
+
+    def test_current_aot_version_matches_emitter(self):
+        source = (ROOT / "src/compiler/emit_aot.zig").read_text()
+        match = re.search(r"pub const aot_version: u32 = (\d+);", source)
+        self.assertIsNotNone(match)
+        self.assertEqual(aot.AOT_VERSION, int(match.group(1)))
+
+    def test_aarch64_instruction_classes(self):
+        text = [
+            "add x17, x15, #1",
+            "ldr x16, [x19, #8]",
+            "cmp x17, x16",
+            "b.ls 0x1020",
+            "ldr w8, [x20, x15]",
+            "ldr x9, [x29, #-16]",
+            "str x10, [sp, #32]",
+            "mov w11, w8",
+            "add w12, w11, w10",
+            "bl 0x2000",
+            "br x13",
+            "b 0x3000",
+            "cbnz w8, 0x4000",
+        ]
+        instructions = [
+            aot.Instruction(0x1000 + index * 4, index * 4, 4, item)
+            for index, item in enumerate(text)
+        ]
+        self.assertEqual(
+            [
+                "alu",
+                "mem_access",
+                "bounds_cmp",
+                "bounds_branch",
+                "linear_memory",
+                "frame_load_unattributed",
+                "frame_store_unattributed",
+                "regmov",
+                "alu",
+                "call",
+                "indirect_dispatch",
+                "direct_branch",
+                "cond_branch",
+            ],
+            aot.classify_instruction_stream(
+                instructions, architecture="aarch64"
+            ),
+        )
+
+    def test_x86_classification_remains_compatible(self):
+        self.assertEqual(
+            "regmov",
+            aot.classify_basic("mov eax,edx", architecture="x86_64"),
+        )
+        self.assertEqual(
+            "dispatch_jmp",
+            aot.classify_basic("jmp r10", architecture="x86_64"),
+        )
+        self.assertEqual(
+            "frame_load_unattributed",
+            aot.classify_basic(
+                "mov rax,QWORD PTR [rbp-0x20]", architecture="x86_64"
+            ),
+        )
+
+    def test_aarch64_objdump_selection_and_parsing(self):
+        output = "   1000:  8b010000  add x0, x0, x1\n"
+        with mock.patch.object(aot, "_run_checked", return_value=output) as run:
+            instructions = aot.disassemble_blob(
+                b"\x00\x00\x01\x8b",
+                0x1000,
+                ROOT,
+                "aarch64-test",
+                architecture="aarch64",
+            )
+        argv = run.call_args.args[0]
+        self.assertIn("aarch64", argv)
+        self.assertNotIn("intel", argv)
+        self.assertEqual("add x0, x0, x1", instructions[0].text)
 
     def test_direct_call_rel32_is_the_only_normalized_function_region(self):
         first = b"\x90\xe8\x01\x02\x03\x04\xc3"

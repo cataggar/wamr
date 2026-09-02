@@ -6,6 +6,14 @@ name: CoreMark (aarch64)
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "On-demand operation"
+        required: true
+        type: choice
+        default: "benchmark"
+        options:
+          - benchmark
+          - profile
       baseline:
         description: "Baseline git ref"
         required: false
@@ -14,13 +22,22 @@ on:
         description: "Target git ref"
         required: false
         default: "HEAD"
+      profile_ref:
+        description: "Exact WAMR commit/ref to profile"
+        required: false
+        default: "e32b7b7d2d12007eb66679a66f943b1e4ea6a393"
   pull_request:
     paths:
       - src/compiler/**
       - src/runtime/**
       - tests/benchmarks/coremark/**
       - scripts/bench_coremark.py
+      - scripts/profile_coremark_aarch64.py
       - scripts/test_bench_coremark.py
+      - scripts/test_profile_coremark_aarch64.py
+      - scripts/compare_hot_function.py
+      - .github/skills/aot-perf-profile/aot_jit_attr.py
+      - tests/test_aot_jit_attr.py
       - .github/workflows/coremark-aarch64.yml
 
 concurrency:
@@ -36,7 +53,7 @@ permissions:
 jobs:
   coremark:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -53,7 +70,11 @@ jobs:
         uses: ./.github/actions/zig-cache
 
       - name: Test CoreMark harness
-        run: python3 -m unittest scripts/test_bench_coremark.py
+        run: |
+          python3 -m unittest \
+            scripts/test_bench_coremark.py \
+            scripts/test_profile_coremark_aarch64.py \
+            tests/test_aot_jit_attr.py
 
       - name: Resolve refs
         id: refs
@@ -89,7 +110,9 @@ jobs:
             --emit     github
 
       - name: Run authoritative same-host CoreMark comparison
-        if: github.event_name == 'workflow_dispatch'
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mode != 'profile'
         id: bench_authoritative
         continue-on-error: true
         env:
@@ -106,12 +129,109 @@ jobs:
             --out      coremark-table.md \
             --emit     github
 
-      - name: Upload table
-        if: always()
+      - name: Install matching perf for profiling
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mode == 'profile'
+        id: perf_setup
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p coremark-profile
+          exec > >(tee coremark-profile/perf-setup.log) 2>&1
+
+          uname -a
+          lscpu
+          kernel="$(uname -r)"
+          package="linux-tools-${kernel}"
+          echo "Installing Ubuntu package ${package}"
+          sudo apt-get update -qq
+          apt-cache show "$package" >/dev/null
+          sudo apt-get install -y -qq --no-install-recommends \
+            linux-tools-common "$package"
+
+          command -v perf
+          perf_binary="/usr/lib/linux-tools/${kernel}/perf"
+          test -x "$perf_binary"
+          "$perf_binary" --version
+          package_version="$(dpkg-query -W -f='${Version}' "$package")"
+          initial_paranoid="$(cat /proc/sys/kernel/perf_event_paranoid)"
+          echo "perf_event_paranoid initial=${initial_paranoid}"
+          if [ "$initial_paranoid" -gt 2 ]; then
+            sudo sysctl kernel.perf_event_paranoid=1
+          fi
+          effective_paranoid="$(cat /proc/sys/kernel/perf_event_paranoid)"
+          echo "perf_event_paranoid effective=${effective_paranoid}"
+
+          echo "COREMARK_PERF_PACKAGE=${package}" >> "$GITHUB_ENV"
+          echo "COREMARK_PERF_PACKAGE_VERSION=${package_version}" >> "$GITHUB_ENV"
+          echo "COREMARK_PERF_PARANOID_INITIAL=${initial_paranoid}" >> "$GITHUB_ENV"
+          echo "PERF=${perf_binary}" >> "$GITHUB_ENV"
+
+          "$perf_binary" record -e cycles:u -F 99 \
+            -o coremark-profile/perf-probe.data -- \
+            python3 -c 'import time
+          end = time.monotonic() + 0.5
+          value = 1
+          while time.monotonic() < end:
+              value = (value * 1664525 + 1013904223) & 0xffffffff
+          print(value)'
+          "$perf_binary" report -i coremark-profile/perf-probe.data \
+            --stdio -g none -n >/dev/null
+          rm coremark-profile/perf-probe.data
+          echo "native cycles:u sampling permitted"
+
+      - name: Capture matched-host CoreMark profiles
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mode == 'profile' &&
+          steps.perf_setup.outcome == 'success'
+        id: profile
+        continue-on-error: true
+        env:
+          PROFILE_REF: ${{ github.event.inputs.profile_ref }}
+        run: |
+          python3 scripts/profile_coremark_aarch64.py \
+            --out-dir coremark-profile \
+            --wamr-ref "$PROFILE_REF" \
+            --work-root "$RUNNER_TEMP/coremark-profile-wamr-source" \
+            --frequency 999 \
+            --min-samples 1000 \
+            --top 10 \
+            --classify 3
+
+      - name: Upload benchmark table
+        if: >-
+          always() &&
+          (github.event_name == 'pull_request' ||
+          github.event.inputs.mode != 'profile')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coremark-aarch64-${{ github.event_name }}-${{ github.sha }}
           path: coremark-table.md
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload profiling reports and diagnostics
+        if: >-
+          always() &&
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mode == 'profile'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coremark-aarch64-profile-${{ github.sha }}
+          path: |
+            coremark-profile/profile.json
+            coremark-profile/profile.md
+            coremark-profile/failure.json
+            coremark-profile/*.log
+            coremark-profile/wamr-attribution.json
+            coremark-profile/wamr-func-*.json
+            coremark-profile/wasmtime-samples.txt
+            coremark-profile/wasmtime-objdump.txt
+            coremark-profile/*.data.gz
+            coremark-profile/*.dump.gz
           if-no-files-found: error
           retention-days: 90
 
@@ -137,5 +257,7 @@ jobs:
         if: >-
           always() &&
           (steps.bench_pr.outcome == 'failure' ||
-          steps.bench_authoritative.outcome == 'failure')
+          steps.bench_authoritative.outcome == 'failure' ||
+          steps.perf_setup.outcome == 'failure' ||
+          steps.profile.outcome == 'failure')
         run: exit 1
