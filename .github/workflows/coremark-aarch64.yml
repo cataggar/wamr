@@ -135,6 +135,7 @@ jobs:
 
       - name: Fail on benchmark error
         if: >-
-          steps.bench_pr.outcome == 'failure' ||
-          steps.bench_authoritative.outcome == 'failure'
+          always() &&
+          (steps.bench_pr.outcome == 'failure' ||
+          steps.bench_authoritative.outcome == 'failure')
         run: exit 1

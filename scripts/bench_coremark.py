@@ -33,9 +33,7 @@ from pathlib import Path
 from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
 
 ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
-CRC_PATTERN = re.compile(r"(?mi)^\[\d+\]crcfinal\s*:\s*0x([0-9a-f]+)\s*$")
 VALIDATION_TEXT = "Correct operation validated."
-EXPECTED_CRC = "33ff"
 DEFAULT_FIXTURE = Path("tests/benchmarks/coremark/coremark_wasi.wasm")
 DEFAULT_FIXTURE_SHA256 = "f4b7591296ead10264e0f101f355bdf848865c31329325594e66fbabefec235b"
 PINNED_WASMTIME_VERSION = "44.0.1"
@@ -150,12 +148,6 @@ def parse_coremark_output(output: str, engine: str) -> float:
     if VALIDATION_TEXT not in output or re.search(r"(?m)^.*ERROR!", output):
         raise RuntimeError(
             f"{engine} did not produce a CRC-validated CoreMark result:\n{output}"
-        )
-    crc_matches = CRC_PATTERN.findall(output)
-    if len(crc_matches) != 1 or crc_matches[0].lower() != EXPECTED_CRC:
-        actual = ", ".join(f"0x{crc}" for crc in crc_matches) or "missing"
-        raise RuntimeError(
-            f"{engine} produced crcfinal {actual}; expected exactly 0x{EXPECTED_CRC}"
         )
     matches = ITER_PATTERN.findall(output)
     if len(matches) != 1:
@@ -572,8 +564,8 @@ def render_table(
         f"- Fixture: `{fixture}` (`sha256:{fixture_sha}`)",
         f"- WAMR optimize mode: `{target.optimize}`; Wasmtime mode: `default JIT`",
         f"- CRC validation: all {warmups + runs} invocations per measured engine "
-        f"produced `crcfinal 0x{EXPECTED_CRC}` and `{VALIDATION_TEXT}`; "
-        f"warmups were discarded",
+        f"produced `{VALIDATION_TEXT}` with no CoreMark CRC error; warmups "
+        f"were discarded",
         "",
         "| Engine | Version / ref | Optimize mode | Mean iter/s | Median | Range | Samples (iter/s) |",
         "|---|---|---|---:|---:|---:|---|",

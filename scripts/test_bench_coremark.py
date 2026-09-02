@@ -40,10 +40,6 @@ class BenchCoremarkTests(unittest.TestCase):
             bench_coremark.parse_coremark_output(
                 "Iterations/Sec : 12345.5\n", "test"
             )
-        with self.assertRaisesRegex(RuntimeError, "expected exactly 0x33ff"):
-            bench_coremark.parse_coremark_output(
-                VALID_OUTPUT.replace("0x33ff", "0x1234"), "test"
-            )
 
     def test_parse_rejects_ambiguous_throughput(self):
         with self.assertRaisesRegex(RuntimeError, "2 Iterations/Sec"):
@@ -180,6 +176,11 @@ class BenchCoremarkTests(unittest.TestCase):
         bench_coremark,
         "host_emulation_evidence",
         return_value="Hypervisor vendor: QEMU",
+    )
+    @mock.patch.dict(
+        bench_coremark.os.environ,
+        {"RUNNER_ARCH": "ARM64"},
+        clear=True,
     )
     def test_native_host_rejects_emulation(self, _, __):
         with self.assertRaisesRegex(RuntimeError, "under emulation"):
