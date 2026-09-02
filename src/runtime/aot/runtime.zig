@@ -703,6 +703,10 @@ pub const VmCtx = extern struct {
     /// observes `cancel_flag != 0`. Unwinds this thread the same way a trap
     /// does so bounded teardown can reclaim it.
     cancel_point_fn: usize = 0,
+    /// `fn (*VmCtx, packed_seg_memory, packed_dst_src, len) void`.
+    memory_init_fn: usize = 0,
+    /// `fn (*VmCtx, seg_idx) void`.
+    data_drop_fn: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -1505,6 +1509,46 @@ pub fn elemDropHelper(vmctx: *VmCtx, seg_idx: u32) callconv(.c) void {
     }
 }
 
+pub fn memoryInitHelper(
+    vmctx: *VmCtx,
+    packed_seg_memory: u64,
+    packed_dst_src: u64,
+    len: u32,
+) callconv(.c) void {
+    if (vmctx.instance_ptr == 0) aotTrapOOBFromHost(vmctx);
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    const module = inst.module_ref orelse inst.module;
+    const seg_idx: u32 = @truncate(packed_seg_memory);
+    const memory_idx: u32 = @truncate(packed_seg_memory >> 32);
+    const dst: u32 = @truncate(packed_dst_src);
+    const src: u32 = @truncate(packed_dst_src >> 32);
+
+    if (seg_idx >= module.data_segments.len or memory_idx >= inst.memories.len)
+        aotTrapOOBFromHost(vmctx);
+    const dropped =
+        inst.data_segments_dropped.len > seg_idx and
+        inst.data_segments_dropped[seg_idx];
+    const seg = module.data_segments[seg_idx];
+    const seg_len: u64 = if (dropped) 0 else @intCast(seg.data.len);
+    if (@as(u64, src) + len > seg_len) aotTrapOOBFromHost(vmctx);
+
+    const mem = inst.memories[memory_idx];
+    if (@as(u64, dst) + len > mem.byteLen()) aotTrapOOBFromHost(vmctx);
+    if (len == 0) return;
+    const len_usize: usize = len;
+    @memcpy(
+        mem.data[@as(usize, dst)..][0..len_usize],
+        seg.data[@as(usize, src)..][0..len_usize],
+    );
+}
+
+pub fn dataDropHelper(vmctx: *VmCtx, seg_idx: u32) callconv(.c) void {
+    if (vmctx.instance_ptr == 0) return;
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    if (seg_idx < inst.data_segments_dropped.len)
+        inst.data_segments_dropped[seg_idx] = true;
+}
+
 /// Host helper invoked from AOT-compiled `table.set` sites.
 /// Writes the funcptr into `tables_info[table_idx].ptr[elem_idx]`
 /// (native_backing) and derives + writes the matching sig_id into
@@ -1856,6 +1900,9 @@ pub const AotInstance = struct {
     /// passive segments). A dropped segment behaves as length-0 — `table.init`
     /// with `src>0` or `len>0` traps.
     elem_segments_dropped: []bool = &.{},
+    /// Per data-segment drop flag. Active segments start dropped; passive
+    /// segments become dropped after `data.drop`.
+    data_segments_dropped: []bool = &.{},
     /// The underlying module — kept on the instance so host helpers invoked
     /// from AOT code (e.g. `tableInitHelper`) can recover the passive
     /// segment data via `vmctx.instance_ptr`.
@@ -2028,6 +2075,16 @@ pub fn instantiateWithOverrides(
     }
     errdefer if (inst.elem_segments_dropped.len > 0) allocator.free(inst.elem_segments_dropped);
 
+    if (module.data_segments.len > 0) {
+        const dropped = allocator.alloc(bool, module.data_segments.len) catch
+            return error.OutOfMemory;
+        for (module.data_segments, 0..) |seg, i|
+            dropped[i] = !seg.isPassive();
+        inst.data_segments_dropped = dropped;
+    }
+    errdefer if (inst.data_segments_dropped.len > 0)
+        allocator.free(inst.data_segments_dropped);
+
     const mem_alloc = try allocateMemories(module, allocator, imported_memory_overrides);
     inst.memories = mem_alloc.memories;
     inst.memories_owned = mem_alloc.owned;
@@ -2038,9 +2095,11 @@ pub fn instantiateWithOverrides(
     // during the importer's instantiation, since both VmCtx's see the same
     // backing buffer.
     for (module.data_segments) |seg| {
-        if (seg.memory_idx >= inst.memories.len) continue;
-        if (seg.memory_idx < inst.memories_owned.len and !inst.memories_owned[seg.memory_idx]) continue;
-        const mem = inst.memories[seg.memory_idx];
+        if (seg.isPassive()) continue;
+        const memory_idx = seg.memoryIndex();
+        if (memory_idx >= inst.memories.len) continue;
+        if (memory_idx < inst.memories_owned.len and !inst.memories_owned[memory_idx]) continue;
+        const mem = inst.memories[memory_idx];
         const end = @as(usize, seg.offset) + seg.data.len;
         if (end > mem.byteLen()) continue;
         @memcpy(mem.data[seg.offset..][0..seg.data.len], seg.data);
@@ -2339,6 +2398,13 @@ pub fn cloneForThread(
         &.{};
     errdefer if (elem_segments_dropped.len > 0)
         allocator.free(elem_segments_dropped);
+    const data_segments_dropped: []bool = if (parent.data_segments_dropped.len > 0)
+        allocator.dupe(bool, parent.data_segments_dropped) catch
+            return error.OutOfMemory
+    else
+        &.{};
+    errdefer if (data_segments_dropped.len > 0)
+        allocator.free(data_segments_dropped);
     const sig_table: []u32 = if (parent.sig_table.len > 0)
         allocator.dupe(u32, parent.sig_table) catch return error.OutOfMemory
     else
@@ -2401,6 +2467,7 @@ pub fn cloneForThread(
         .tables_info = tables_info,
         .extra_tables_storage = extra_tables_storage,
         .elem_segments_dropped = elem_segments_dropped,
+        .data_segments_dropped = data_segments_dropped,
         .module_ref = parent.module_ref,
         .sig_table = sig_table,
         .func_sig_ids = func_sig_ids,
@@ -2438,6 +2505,7 @@ pub fn destroy(inst: *AotInstance) void {
     // inst.func_table aliases tables[0].native_backing (freed by TableInstance.release).
     if (inst.funcptrs.len > 0) allocator.free(inst.funcptrs);
     if (inst.elem_segments_dropped.len > 0) allocator.free(inst.elem_segments_dropped);
+    if (inst.data_segments_dropped.len > 0) allocator.free(inst.data_segments_dropped);
     if (inst.sig_table.len > 0) allocator.free(inst.sig_table);
     if (inst.func_sig_ids.len > 0) allocator.free(inst.func_sig_ids);
     if (inst.ptr_to_sig.len > 0) allocator.free(inst.ptr_to_sig);
@@ -2536,6 +2604,8 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
     vmctx.lazy_compile_fn = if (comptime config.lazy_jit) @intFromPtr(&lazyCompileHelper) else 0;
     vmctx.thread_context = @intFromPtr(&inst.thread_context);
     vmctx.cancel_point_fn = @intFromPtr(&aotCancelPoint);
+    vmctx.memory_init_fn = @intFromPtr(&memoryInitHelper);
+    vmctx.data_drop_fn = @intFromPtr(&dataDropHelper);
     // A refresh must never resurrect a cancelled thread: inherit whatever the
     // group has already published.
     vmctx.cancel_flag = if (comptime config.lib_wasi_threads) blk: {
@@ -4837,6 +4907,33 @@ test "#660 item 4: borrowed table overrides are retained until importer destroy"
     try std.testing.expectEqual(@as(?u32, 42), exporter_inst.tables[0].elements[1].value.funcref);
 }
 
+test "passive data memory.init copies bytes and data.drop records state" {
+    const memories = [_]types.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    const payload = [_]u8{ 0xa5, 0x5a };
+    const segments = [_]aot_loader.AotDataSegment{
+        .{
+            .memory_idx = aot_loader.AotDataSegment.passive_flag,
+            .offset = 0,
+            .data = &payload,
+        },
+    };
+    const module = aot_loader.AotModule{
+        .memories = &memories,
+        .data_segments = &segments,
+    };
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    try std.testing.expectEqual(@as(u8, 0), inst.memories[0].data[8]);
+    memoryInitHelper(&inst.vmctx, 0, 8, @intCast(payload.len));
+    try std.testing.expectEqualSlices(u8, &payload, inst.memories[0].data[8..10]);
+    dataDropHelper(&inst.vmctx, 0);
+    try std.testing.expect(inst.data_segments_dropped[0]);
+    memoryInitHelper(&inst.vmctx, 0, 0, 0);
+}
+
 test "getFuncAddr: returns null without text section" {
     const module = aot_loader.AotModule{};
     const inst = try instantiate(&module, std.testing.allocator);
@@ -4909,7 +5006,9 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 424), @offsetOf(VmCtx, "trap_unaligned_fn"));
     try std.testing.expectEqual(@as(usize, 432), @offsetOf(VmCtx, "cancel_flag"));
     try std.testing.expectEqual(@as(usize, 440), @offsetOf(VmCtx, "cancel_point_fn"));
-    try std.testing.expectEqual(@as(usize, 448), @sizeOf(VmCtx));
+    try std.testing.expectEqual(@as(usize, 448), @offsetOf(VmCtx, "memory_init_fn"));
+    try std.testing.expectEqual(@as(usize, 456), @offsetOf(VmCtx, "data_drop_fn"));
+    try std.testing.expectEqual(@as(usize, 464), @sizeOf(VmCtx));
 }
 
 test "AOT thread context inherits retained process state without thread-local flags" {

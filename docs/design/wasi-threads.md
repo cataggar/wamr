@@ -326,10 +326,12 @@ memory against an immediate; aarch64 uses the reserved `x16` scratch). The
 poll is emitted **only** for modules that import `wasi.thread-spawn`
 (`IrModule.spawns_threads`), so CoreMark-class artifacts are byte-identical
 to before; the codegen-cache epoch includes the flag so cached code is never
-reused across the two settings, and `aot_version` is 9 because generated code
-now reads the appended VmCtx fields. `ThreadManager.interrupt` publishes the word into every `VmCtx` subscribed to
-the process group's shared memory. Component task cancellation uses the same
-subscriber list but filters by the inherited task-group pointer.
+reused across the two settings, and `aot_version` is 10 because generated code
+now reads the appended cancel-point and passive-data helper fields.
+`ThreadManager.interrupt` publishes the word into every `VmCtx` subscribed to
+the process group's shared memory — the same mechanism memory-grow
+republication already uses. Component task cancellation uses the subscriber
+list too, but filters by the inherited task-group pointer.
 
 `ThreadManager.terminateAndJoin(timeout_ns)` bounds teardown — a backstop
 that now only matters for a sibling wedged outside any interruption point. It closes the

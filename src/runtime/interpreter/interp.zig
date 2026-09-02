@@ -1153,6 +1153,17 @@ fn skipCatchClauses(code: []const u8, pos: usize) usize {
     return p;
 }
 
+fn skipAtomicInstruction(code: []const u8, pos_in: usize) usize {
+    var pos = pos_in;
+    const sub_op = readU32Static(code, &pos);
+    if (sub_op == 0x03) return skipLeb128(code, pos);
+    if (sub_op <= 0x02 or (sub_op >= 0x10 and sub_op <= 0x4E)) {
+        pos = skipLeb128(code, pos);
+        pos = skipLeb128(code, pos);
+    }
+    return pos;
+}
+
 /// Starting at `start` (which must be right after a block/loop/if opcode
 /// and its block-type byte), scan forward to find the position just AFTER
 /// the matching `end` opcode.
@@ -1232,6 +1243,7 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                     else => {},
                 }
             },
+            .atomic_prefix => pos = skipAtomicInstruction(code, pos),
             .simd_prefix => {
                 const sub_op = readU32Static(code, &pos);
                 switch (sub_op) {
@@ -1365,6 +1377,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
                     else => {},
                 }
             },
+            .atomic_prefix => pos = skipAtomicInstruction(code, pos),
             .simd_prefix => {
                 const sub_op = readU32Static(code, &pos);
                 switch (sub_op) {
@@ -1884,8 +1897,12 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 };
 
                 const module = env.module_inst.module;
+                const source_inst = if (env.module_inst.sharesThreadFamily(funcref.module_inst))
+                    env.module_inst
+                else
+                    funcref.module_inst;
 
-                if (funcref.module_inst == env.module_inst) {
+                if (source_inst == env.module_inst) {
                     const raw_actual = funcref.module_inst.module.getRawFuncTypeIdx(funcref.func_idx) orelse return error.UnknownFunction;
                     if (raw_actual != type_idx) {
                         const canon_actual = if (raw_actual < module.canonical_type_map.len) module.canonical_type_map[raw_actual] else raw_actual;
@@ -1908,9 +1925,9 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 frame.ip = @intCast(ip);
 
                 // Dispatch to the funcref's source module
-                if (funcref.module_inst != env.module_inst) {
+                if (source_inst != env.module_inst) {
                     const saved = env.module_inst;
-                    env.module_inst = funcref.module_inst;
+                    env.module_inst = source_inst;
                     env.label_top = label_base + label_sp;
                     executeFunctionWithFuel(env, funcref.func_idx, fuel) catch |err| {
                         env.module_inst = saved;
@@ -1951,10 +1968,14 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 };
 
                 const module = env.module_inst.module;
+                const source_inst = if (env.module_inst.sharesThreadFamily(funcref.module_inst))
+                    env.module_inst
+                else
+                    funcref.module_inst;
                 const expected_canonical = if (type_idx < module.canonical_type_map.len) module.canonical_type_map[type_idx] else type_idx;
                 const actual_tidx = funcref.module_inst.module.getFuncTypeIdx(funcref.func_idx) orelse return error.UnknownFunction;
 
-                if (funcref.module_inst == env.module_inst) {
+                if (source_inst == env.module_inst) {
                     if (actual_tidx != expected_canonical) return error.IndirectCallTypeMismatch;
                 } else {
                     if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
@@ -1963,8 +1984,8 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
                 }
 
-                if (funcref.module_inst != env.module_inst) {
-                    env.module_inst = funcref.module_inst;
+                if (source_inst != env.module_inst) {
+                    env.module_inst = source_inst;
                 }
                 try prepareTailCall(env, funcref.func_idx);
                 tail_call_target.* = funcref.func_idx;
@@ -4276,6 +4297,11 @@ test "interp: br_table dispatch" {
                 0x0E, //       br_table
                 0x02, //         count=2
                 0x00, 0x01, 0x02, // labels: 0, 1, default=2
+                // Unreachable after br_table, but block scanners still must
+                // skip the atomic subopcode and memarg.
+                0x41, 0x00, 0x41, 0x00, 0x41, 0x01,
+                0xFE, 0x48, 0x02, 0x00, // i32.atomic.rmw.cmpxchg
+                0x1A, // drop
                 0x0B, //     end L0
                 0x41, 10, //   i32.const 10
                 0x21, 0x00, // local.set 0

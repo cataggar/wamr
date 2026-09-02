@@ -14,7 +14,9 @@ const types = @import("../runtime/common/types.zig");
 pub const aot_magic: u32 = 0x746f6100;
 
 /// AOT format version.
-pub const aot_version: u32 = 9;
+pub const aot_version: u32 = 10;
+
+pub const passive_data_segment_flag: u32 = 1 << 31;
 
 /// Export kinds (matches WebAssembly spec §2.5 and runtime ExternalKind).
 pub const ExternalKind = enum(u8) {
@@ -44,6 +46,7 @@ pub const DataSegmentEntry = struct {
     memory_idx: u32,
     offset: u32,
     data: []const u8,
+    is_passive: bool = false,
 };
 
 pub const ImportEntry = struct {
@@ -207,7 +210,9 @@ pub fn emit(
             defer tmp.deinit(allocator);
             try appendU32Le(&tmp, allocator, @intCast(segments.len));
             for (segments) |seg| {
-                try appendU32Le(&tmp, allocator, seg.memory_idx);
+                const encoded_memory_idx = seg.memory_idx |
+                    if (seg.is_passive) passive_data_segment_flag else 0;
+                try appendU32Le(&tmp, allocator, encoded_memory_idx);
                 try appendU32Le(&tmp, allocator, seg.offset);
                 try appendU32Le(&tmp, allocator, @intCast(seg.data.len));
                 try tmp.appendSlice(allocator, seg.data);

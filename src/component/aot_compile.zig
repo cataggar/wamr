@@ -554,8 +554,7 @@ pub fn compileCoreWasmCached(
 
     var data_segs: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     for (module.data_segments) |seg| {
-        if (seg.is_passive) continue;
-        const offset: u32 = switch (seg.offset) {
+        const offset: u32 = if (seg.is_passive) 0 else switch (seg.offset) {
             .i32_const => |v| @bitCast(v),
             else => continue,
         };
@@ -563,6 +562,7 @@ pub fn compileCoreWasmCached(
             .memory_idx = seg.memory_idx,
             .offset = offset,
             .data = seg.data,
+            .is_passive = seg.is_passive,
         }) catch return error.OutOfMemory;
     }
 

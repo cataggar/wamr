@@ -1,0 +1,135 @@
+name: WASI thread benchmark
+
+on:
+  pull_request:
+    paths:
+      - build.zig
+      - src/compiler/**
+      - src/runtime/**
+      - src/wasi/**
+      - scripts/benchmark_schema.py
+      - scripts/bench_wasi_threads.py
+      - scripts/test_bench_wasi_threads.py
+      - tests/benchmarks/wasi-threads/**
+      - .github/workflows/wasi-thread-bench.yml
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Measurement profile"
+        type: choice
+        options: [authoritative, smoke]
+        default: authoritative
+      warmups:
+        description: "Discarded paired warmups"
+        default: "2"
+      samples:
+        description: "Measured paired samples"
+        default: "10"
+
+concurrency:
+  group: wasi-thread-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  benchmark:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04-x86_64
+            runner: ubuntu-22.04
+          - platform: ubuntu-24.04-aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./.github/actions/zig-cache
+
+      - name: Test benchmark harness
+        if: matrix.platform == 'ubuntu-22.04-x86_64'
+        run: python3 -m unittest scripts/test_bench_wasi_threads.py
+
+      - name: Verify pinned wasi-libc fixtures
+        if: matrix.platform == 'ubuntu-22.04-x86_64'
+        env:
+          SDK_URL: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+          SDK_SHA256: 52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c
+        run: |
+          set -euo pipefail
+          SDK_ROOT="$RUNNER_TEMP/wasi-sdk-25"
+          ARCHIVE="$RUNNER_TEMP/wasi-sdk-25.tar.gz"
+          mkdir -p "$SDK_ROOT" "$RUNNER_TEMP/wasi-thread-fixture-tmp"
+          curl --fail --location --retry 3 "$SDK_URL" -o "$ARCHIVE"
+          echo "$SDK_SHA256  $ARCHIVE" | sha256sum -c -
+          tar -xzf "$ARCHIVE" -C "$SDK_ROOT" --strip-components=1
+          WASI_SDK_PATH="$SDK_ROOT" \
+          TMPDIR="$RUNNER_TEMP/wasi-thread-fixture-tmp" \
+            tests/benchmarks/wasi-threads/build-fixtures.sh
+          git diff --exit-code -- tests/benchmarks/wasi-threads
+
+      - name: Run paired benchmark
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_PROFILE: ${{ github.event.inputs.profile }}
+          INPUT_WARMUPS: ${{ github.event.inputs.warmups }}
+          INPUT_SAMPLES: ${{ github.event.inputs.samples }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            PROFILE="${INPUT_PROFILE:-authoritative}"
+            WARMUPS="${INPUT_WARMUPS:-2}"
+            SAMPLES="${INPUT_SAMPLES:-10}"
+          else
+            PROFILE=smoke
+            WARMUPS=1
+            SAMPLES=3
+          fi
+          python3 scripts/bench_wasi_threads.py \
+            --profile "$PROFILE" \
+            --warmups "$WARMUPS" \
+            --samples "$SAMPLES" \
+            --output-dir "$PWD/wasi-thread-bench-out" \
+            --no-budget
+          cat wasi-thread-bench-out/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload retained report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-bench-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            wasi-thread-bench-out/report.json
+            wasi-thread-bench-out/report.md
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Comment on pull request
+        if: always() && github.event_name == 'pull_request' && matrix.platform == 'ubuntu-22.04-x86_64'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'wasi-thread-bench-out/report.md';
+            if (!fs.existsSync(path)) {
+              core.warning('thread benchmark report was not produced');
+              return;
+            }
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: fs.readFileSync(path, 'utf8'),
+            });

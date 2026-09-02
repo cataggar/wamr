@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "kind": "wasi-thread-benchmark-budget",
+  "calibrated": false,
+  "calibration": {
+    "required_platforms": ["ubuntu-22.04-x86_64", "ubuntu-24.04-aarch64"],
+    "minimum_reports_per_platform": 20,
+    "minimum_workflow_runs_per_platform": 10,
+    "profile": "authoritative",
+    "workflow": ".github/workflows/wasi-thread-bench.yml",
+    "note": "Do not add thresholds until the retained hosted cohort exists."
+  },
+  "paired_elapsed_delta_pct": {},
+  "min_median_ops_per_second": {}
+}
