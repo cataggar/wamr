@@ -237,7 +237,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--thread-counts", type=parse_thread_counts, default=(1, 2, 4, 8))
     parser.add_argument("--single-iterations", type=int, default=128_000_000)
     parser.add_argument("--hot-iterations", type=int, default=128_000_000)
-    parser.add_argument("--atomic-iterations", type=int, default=40_000_000)
+    parser.add_argument("--atomic-iterations", type=int, default=64_000_000)
     parser.add_argument("--wait-iterations", type=int, default=30_000)
     parser.add_argument("--spawn-iterations", type=int, default=1_200)
     parser.add_argument("--timeout", type=float, default=60.0)
