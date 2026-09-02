@@ -6564,7 +6564,7 @@ const InboundHttpResponseSession = struct {
                 const may_write_head = self.head_ready and body_ready and
                     (self.queue_len > 0 or
                         self.body_closed or
-                        self.handler_outcome != .pending);
+                        self.handler_outcome == .returned);
                 const head = if (may_write_head) self.head_bytes else null;
                 const observed = self.data_epoch.load(.acquire);
                 self.mutex.unlock();
