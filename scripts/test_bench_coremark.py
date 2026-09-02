@@ -11,6 +11,7 @@ import bench_coremark
 
 REPO = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO / ".github/workflows/coremark-aarch64.yml"
+PROFILE_SCRIPT = REPO / "scripts/profile_coremark_aarch64.py"
 VALID_OUTPUT = """\
 Iterations/Sec   : 12345.5
 [0]crcfinal      : 0x33ff
@@ -204,6 +205,15 @@ class BenchCoremarkTests(unittest.TestCase):
     def test_aarch64_workflow_contract(self):
         workflow = WORKFLOW.read_text()
         self.assertIn("runs-on: ubuntu-24.04-arm", workflow)
+        self.assertIn(
+            "group: coremark-aarch64-${{ github.event_name }}-${{ github.ref }}",
+            workflow,
+        )
+        self.assertIn("- profile", workflow)
+        self.assertIn(
+            'default: "e32b7b7d2d12007eb66679a66f943b1e4ea6a393"',
+            workflow,
+        )
         dispatch = workflow.split(
             "- name: Run authoritative same-host CoreMark comparison", 1
         )[1].split("\n      - name:", 1)[0]
@@ -219,6 +229,30 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("github.event_name == 'pull_request'", pr)
         self.assertIn("--profile  ci", pr)
         self.assertNotIn("--wasmtime-baseline", pr)
+
+        perf_setup = workflow.split(
+            "- name: Install matching perf for profiling", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn("github.event.inputs.mode == 'profile'", perf_setup)
+        self.assertIn('package="linux-tools-${kernel}"', perf_setup)
+        self.assertIn('"$perf_binary" record -e cycles:u', perf_setup)
+        self.assertIn("native cycles:u sampling permitted", perf_setup)
+        self.assertNotIn("qemu", perf_setup.lower())
+
+        profile_step = workflow.split(
+            "- name: Capture matched-host CoreMark profiles", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn("github.event_name == 'workflow_dispatch'", profile_step)
+        self.assertIn("github.event.inputs.mode == 'profile'", profile_step)
+        self.assertIn("profile_coremark_aarch64.py", profile_step)
+        self.assertIn('--wamr-ref "$PROFILE_REF"', profile_step)
+        self.assertIn("--min-samples 1000", profile_step)
+
+        profile_script = PROFILE_SCRIPT.read_text()
+        self.assertIn("--profile=jitdump", profile_script)
+        self.assertIn("WAMR_AOT_SPILL_METRIC", profile_script)
+        self.assertIn("WAMR_AOT_CODEGEN_TIMING", profile_script)
+        self.assertIn('"cycles:u"', profile_script)
 
         for line in workflow.splitlines():
             stripped = line.strip()
