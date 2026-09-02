@@ -50,10 +50,16 @@ pub fn build(b: *std.Build) void {
         (stack_protector or target.result.os.tag == .wasi);
     const version_string = b.option([]const u8, "version", "Version string") orelse "dev";
     const ir_property_iterations = b.option(u32, "ir-property-iters", "IR optimizer property-test iterations per shape/pass") orelse 8;
+    const benchmark_interp_fuel = b.option(
+        u32,
+        "benchmark-interp-fuel",
+        "Interpreter fuel for long-running benchmark builds",
+    ) orelse 100_000_000;
 
     // ── Feature flags ──────────────────────────────────────────────────
     const options = b.addOptions();
     options.addOption([]const u8, "version", version_string);
+    options.addOption(u32, "benchmark_interp_fuel", benchmark_interp_fuel);
 
     const interp = b.option(bool, "interp", "Enable interpreter") orelse true;
     options.addOption(bool, "interp", interp);
@@ -455,6 +461,9 @@ pub fn build(b: *std.Build) void {
         "oob-atomic-notify",
         "unaligned-oob-atomic-rmw",
         "concurrent-table-grow",
+        "passive-clobber",
+        "passive-clobber-v128",
+        "mixed-active-passive",
     }) |fixture| {
         update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wat", .{fixture}));
         update_thread_fixtures.addArg(b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}));
@@ -625,6 +634,16 @@ pub fn build(b: *std.Build) void {
             concurrent_table_grow.expectExitCode(0);
             wasi_threads_test_step.dependOn(&concurrent_table_grow.step);
 
+            inline for (.{"passive-clobber"}) |fixture| {
+                const run = b.addRunArtifact(exe);
+                run.addArgs(&.{
+                    "run",
+                    b.fmt("tests/wasi-threads/{s}.wasm", .{fixture}),
+                });
+                run.expectExitCode(0);
+                wasi_threads_test_step.dependOn(&run.step);
+            }
+
             inline for (.{
                 "missing-thread-start",
                 "wrong-thread-start-signature",
@@ -725,6 +744,11 @@ pub fn build(b: *std.Build) void {
                 null,
             );
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "concurrent-table-grow", 0, null, null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "passive-clobber", 0, null, null);
+            addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "mixed-active-passive", 0, null, null);
+            if (target_arch == .aarch64) {
+                addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "passive-clobber-v128", 0, null, null);
+            }
         } else {
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "disabled-rejection", 0, null, null);
         }

@@ -1480,20 +1480,12 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     var cp_pos: u32 = 0;
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
-            switch (ci.op) {
-                .call,
-                .call_indirect,
-                .call_ref,
-                .memory_grow,
-                .table_grow,
-                .table_set,
-                .table_init,
-                .elem_drop,
-                .atomic_notify,
-                .atomic_wait,
-                => {
-                    try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = x86_64_call_clobber_mask });
-                },
+            if (isFullCallClobber(ci.op)) {
+                try clobbers.append(allocator, .{
+                    .pos = cp_pos,
+                    .regs_clobbered = x86_64_call_clobber_mask,
+                });
+            } else switch (ci.op) {
                 .memory_copy => |mc| {
                     if (smallFixedBulkMemLen(&const_vals, mc.len) == null) {
                         try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = x86_64_call_clobber_mask });
@@ -2056,6 +2048,25 @@ const x86_64_call_clobber_mask: u64 = blk: {
     for (x86_64_caller_saved_indices) |i| m |= @as(u64, 1) << i;
     break :blk m;
 };
+
+fn isFullCallClobber(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .call,
+        .call_indirect,
+        .call_ref,
+        .memory_grow,
+        .table_grow,
+        .table_set,
+        .table_init,
+        .elem_drop,
+        .memory_init,
+        .data_drop,
+        .atomic_notify,
+        .atomic_wait,
+        => true,
+        else => false,
+    };
+}
 
 /// Map an `emit.Reg` to its index in `x86_64_alloc_regs`, or null if the
 /// register is not allocatable. Used to build register-allocator hints
@@ -3129,23 +3140,15 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         var pos: u32 = 0;
         for (block_order) |block_id| {
             for (func.blocks.items[block_id].instructions.items) |ci| {
-                switch (ci.op) {
-                    .call,
-                    .call_indirect,
-                    .call_ref,
-                    .memory_grow,
-                    .table_grow,
-                    .table_set,
-                    .table_init,
-                    .elem_drop,
-                    .atomic_notify,
-                    .atomic_wait,
-                    => {
-                        // Calls clobber caller-saved allocatable regs.
-                        // Runtime helpers are compiled as host calls
-                        // (same ABI), so they clobber caller-saved registers.
-                        try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = x86_64_call_clobber_mask });
-                    },
+                if (isFullCallClobber(ci.op)) {
+                    // Calls clobber caller-saved allocatable regs.
+                    // Runtime helpers are compiled as host calls
+                    // (same ABI), so they clobber caller-saved registers.
+                    try clobber_points.append(allocator, .{
+                        .pos = pos,
+                        .regs_clobbered = x86_64_call_clobber_mask,
+                    });
+                } else switch (ci.op) {
                     .memory_copy => |mc| {
                         if (smallFixedBulkMemLen(&const_vals, mc.len) == null) {
                             // Variable/large memory.copy is compiled as a host call.
@@ -7526,6 +7529,17 @@ test "x86_64 clobber mask for REP STOSB tracks rdi alloc index" {
     const rdi_idx = x86_64_alloc_idx(.rdi) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(regalloc.PhysReg, @intFromEnum(emit.Reg.rdi)), x86_64_alloc_regs[rdi_idx]);
     try std.testing.expectEqual(@as(u64, 1) << @as(u6, @intCast(rdi_idx)), x86_64_reg_clobber_mask(.rdi));
+}
+
+test "x86_64 full call clobbers include passive-data helpers" {
+    try std.testing.expect(isFullCallClobber(.{ .memory_init = .{
+        .seg_idx = 0,
+        .dst = 0,
+        .src = 1,
+        .len = 2,
+    } }));
+    try std.testing.expect(isFullCallClobber(.{ .data_drop = 0 }));
+    try std.testing.expect(!isFullCallClobber(.{ .atomic_fence = {} }));
 }
 
 test "compileFunctionRA: small fixed memory_fill emits unrolled stores" {

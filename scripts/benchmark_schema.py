@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class BenchmarkDataError(ValueError):
@@ -83,6 +83,9 @@ def host_metadata() -> dict[str, Any]:
         "runner_image": os.getenv("ImageOS", ""),
         "runner_os": os.getenv("RUNNER_OS", ""),
         "runner_arch": os.getenv("RUNNER_ARCH", ""),
+        "github_run_id": os.getenv("GITHUB_RUN_ID", ""),
+        "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
+        "github_workflow": os.getenv("GITHUB_WORKFLOW", ""),
     }
 
 
@@ -130,11 +133,12 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
             os.fsync(output.fileno())
         os.chmod(temporary, existing_mode)
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if os.name != "nt":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
 

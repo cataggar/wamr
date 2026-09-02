@@ -507,17 +507,15 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     // Build data segment entries from the parsed wasm module
     var data_segs: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     defer data_segs.deinit(allocator);
-    for (module.data_segments) |seg| {
-        const offset: u32 = if (seg.is_passive) 0 else switch (seg.offset) {
-            .i32_const => |v| @bitCast(v),
-            else => continue,
+    for (module.data_segments, 0..) |seg, seg_idx| {
+        const entry = emit_aot.dataSegmentEntry(seg) catch {
+            std.debug.print(
+                "Error: data segment {d} has an unsupported active offset expression\n",
+                .{seg_idx},
+            );
+            std.process.exit(1);
         };
-        try data_segs.append(allocator, .{
-            .memory_idx = seg.memory_idx,
-            .offset = offset,
-            .data = seg.data,
-            .is_passive = seg.is_passive,
-        });
+        try data_segs.append(allocator, entry);
     }
 
     // Build import entries from the parsed wasm module

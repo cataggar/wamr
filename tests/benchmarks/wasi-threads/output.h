@@ -1,51 +1,53 @@
 #ifndef WAMR_WASI_THREAD_BENCH_OUTPUT_H
 #define WAMR_WASI_THREAD_BENCH_OUTPUT_H
 
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
+#include <stdio.h>
 #include <unistd.h>
 
-static inline void bench_append_text(
-    char *buffer, size_t *length, const char *text) {
-    size_t text_length = strlen(text);
-    memcpy(buffer + *length, text, text_length);
-    *length += text_length;
-}
-
-static inline void bench_append_u64(
-    char *buffer, size_t *length, uint64_t value) {
-    char reversed[20];
-    size_t digits = 0;
-    do {
-        reversed[digits++] = (char)('0' + value % 10);
-        value /= 10;
-    } while (value != 0);
-    while (digits > 0) buffer[(*length)++] = reversed[--digits];
-}
+#include "timing.h"
 
 static inline int bench_write_result(
     const char *workload,
     uint32_t threads,
     uint64_t iterations,
     uint64_t operations,
-    uint64_t checksum) {
-    char buffer[256];
-    size_t length = 0;
-    bench_append_text(
+    uint64_t checksum,
+    const char *metric_kind,
+    uint64_t timed_loop_backedges,
+    const struct bench_timing *timing) {
+    char buffer[512];
+    if (timing->raw_elapsed_ns == 0) return 1;
+    uint64_t timing_overhead_ppm =
+        (uint64_t)(((unsigned __int128)timing->timing_overhead_ns *
+                       UINT64_C(1000000)) /
+                   timing->raw_elapsed_ns);
+    int written = snprintf(
         buffer,
-        &length,
-        "{\"kind\":\"wasi-thread-benchmark-result\",\"workload\":\"");
-    bench_append_text(buffer, &length, workload);
-    bench_append_text(buffer, &length, "\",\"threads\":");
-    bench_append_u64(buffer, &length, threads);
-    bench_append_text(buffer, &length, ",\"iterations\":");
-    bench_append_u64(buffer, &length, iterations);
-    bench_append_text(buffer, &length, ",\"operations\":");
-    bench_append_u64(buffer, &length, operations);
-    bench_append_text(buffer, &length, ",\"checksum\":");
-    bench_append_u64(buffer, &length, checksum);
-    bench_append_text(buffer, &length, "}\n");
+        sizeof(buffer),
+        "{\"kind\":\"wasi-thread-benchmark-result\",\"workload\":\"%s\","
+        "\"threads\":%" PRIu32 ",\"iterations\":%" PRIu64
+        ",\"operations\":%" PRIu64 ",\"checksum\":%" PRIu64
+        ",\"clock_id\":\"wasi-monotonic\",\"metric_kind\":\"%s\","
+        "\"raw_elapsed_ns\":%" PRIu64 ",\"timing_overhead_ns\":%" PRIu64
+        ",\"elapsed_ns\":%" PRIu64 ",\"timing_overhead_ppm\":%" PRIu64
+        ",\"timed_loop_backedges\":%" PRIu64
+        ",\"clock_calls_in_timed_loop\":0}\n",
+        workload,
+        threads,
+        iterations,
+        operations,
+        checksum,
+        metric_kind,
+        timing->raw_elapsed_ns,
+        timing->timing_overhead_ns,
+        timing->elapsed_ns,
+        timing_overhead_ppm,
+        timed_loop_backedges);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) return 1;
+    size_t length = (size_t)written;
     return write(STDOUT_FILENO, buffer, length) == (ssize_t)length ? 0 : 1;
 }
 

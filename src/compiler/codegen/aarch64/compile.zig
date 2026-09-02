@@ -3069,8 +3069,6 @@ fn instRequiresV128Flush(inst: ir.Inst) bool {
         .atomic_cmpxchg,
         .atomic_fence,
         .parallel_copy,
-        .memory_init,
-        .data_drop,
         => false,
         else => true,
     };
@@ -9414,7 +9412,8 @@ fn vregClobbersFromScalar(
 ///     reference calls, all go through `bl`/`blr`.
 ///   - `.memory_grow`, `.memory_copy`, `.memory_fill`, `.memory_init` —
 ///     compiled as vmctx helper calls (see `emitVmctxHelperCall`).
-///   - `.table_set`, `.table_grow`, `.table_init` — likewise.
+///   - `.data_drop`, `.table_set`, `.table_grow`, `.table_init`,
+///     `.elem_drop` — likewise.
 ///   - `.atomic_wait`, `.atomic_notify` — vmctx helper calls.
 /// All use a `bl` to a C ABI helper and therefore clobber the full
 /// caller-saved set.
@@ -9454,6 +9453,7 @@ pub fn collectClobberPoints(
                 .memory_copy,
                 .memory_fill,
                 .memory_init,
+                .data_drop,
                 .table_set,
                 .table_grow,
                 .table_init,
@@ -15890,17 +15890,31 @@ test "collectClobberPoints: one ClobberPoint per call, correct mask" {
     try block.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v1 }); // pos 1
     try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = func.newVReg(), .type = .i32 }); // pos 2
     try block.append(.{ .op = .{ .memory_fill = .{ .dst = v0, .val = v0, .len = v0 } } }); // pos 3
-    try block.append(.{ .op = .{ .ret = v1 } }); // pos 4
+    try block.append(.{ .op = .{ .memory_init = .{ .seg_idx = 0, .dst = v0, .src = v0, .len = v0 } } }); // pos 4
+    try block.append(.{ .op = .{ .data_drop = 0 } }); // pos 5
+    try block.append(.{ .op = .{ .ret = v1 } }); // pos 6
 
     var cps = try collectClobberPoints(&func, null, null, allocator);
     defer cps.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), cps.items.len);
+    try std.testing.expectEqual(@as(usize, 4), cps.items.len);
     try std.testing.expectEqual(@as(u32, 1), cps.items[0].pos);
     try std.testing.expectEqual(@as(u32, 3), cps.items[1].pos);
+    try std.testing.expectEqual(@as(u32, 4), cps.items[2].pos);
+    try std.testing.expectEqual(@as(u32, 5), cps.items[3].pos);
     // Full caller-saved set (x0..x14 = indices 0..14): (1<<15) - 1 = 0x7FFF.
     try std.testing.expectEqual(@as(u64, 0x7FFF), cps.items[0].regs_clobbered);
     try std.testing.expectEqual(@as(u64, 0x7FFF), cps.items[1].regs_clobbered);
+    try std.testing.expectEqual(@as(u64, 0x7FFF), cps.items[2].regs_clobbered);
+    try std.testing.expectEqual(@as(u64, 0x7FFF), cps.items[3].regs_clobbered);
+}
+
+test "passive-data helpers flush live v128 cache state" {
+    try std.testing.expect(instRequiresV128Flush(.{
+        .op = .{ .memory_init = .{ .seg_idx = 0, .dst = 0, .src = 1, .len = 2 } },
+    }));
+    try std.testing.expect(instRequiresV128Flush(.{ .op = .{ .data_drop = 0 } }));
+    try std.testing.expect(!instRequiresV128Flush(.{ .op = .{ .atomic_fence = {} } }));
 }
 
 test "collectClobberPoints: positions are monotonic across blocks" {

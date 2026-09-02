@@ -161,6 +161,11 @@ pub const lib_wasi_threads = opt("lib_wasi_threads", false);
 pub const benchmark_cancel_point_toggle =
     opt("benchmark_cancel_point_toggle", false);
 
+/// Interpreter fuel ceiling. Benchmark builds raise this explicitly so a
+/// long, valid timing interval does not trip the normal runaway-work limit.
+pub const benchmark_interp_fuel =
+    optInt(u32, "benchmark_interp_fuel", 100_000_000);
+
 /// Allocate auxiliary stacks on the heap (follows lib_wasi_threads).
 pub const heap_aux_stack_allocation = opt("heap_aux_stack_allocation", lib_wasi_threads);
 

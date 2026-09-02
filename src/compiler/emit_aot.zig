@@ -14,9 +14,13 @@ const types = @import("../runtime/common/types.zig");
 pub const aot_magic: u32 = 0x746f6100;
 
 /// AOT format version.
-pub const aot_version: u32 = 10;
+pub const aot_version: u32 = 11;
 
-pub const passive_data_segment_flag: u32 = 1 << 31;
+pub const DataSegmentOffsetKind = enum(u8) {
+    i32_const = 0,
+    global_get = 1,
+    passive = 2,
+};
 
 /// Export kinds (matches WebAssembly spec §2.5 and runtime ExternalKind).
 pub const ExternalKind = enum(u8) {
@@ -44,10 +48,40 @@ pub const ExportEntry = struct {
 
 pub const DataSegmentEntry = struct {
     memory_idx: u32,
+    offset_kind: DataSegmentOffsetKind,
     offset: u32,
     data: []const u8,
-    is_passive: bool = false,
 };
+
+pub const DataSegmentError = error{UnsupportedDataSegmentOffset};
+
+pub fn dataSegmentEntry(
+    segment: types.DataSegment,
+) DataSegmentError!DataSegmentEntry {
+    if (segment.is_passive) {
+        return .{
+            .memory_idx = segment.memory_idx,
+            .offset_kind = .passive,
+            .offset = 0,
+            .data = segment.data,
+        };
+    }
+    return switch (segment.offset) {
+        .i32_const => |value| .{
+            .memory_idx = segment.memory_idx,
+            .offset_kind = .i32_const,
+            .offset = @bitCast(value),
+            .data = segment.data,
+        },
+        .global_get => |index| .{
+            .memory_idx = segment.memory_idx,
+            .offset_kind = .global_get,
+            .offset = index,
+            .data = segment.data,
+        },
+        else => error.UnsupportedDataSegmentOffset,
+    };
+}
 
 pub const ImportEntry = struct {
     module_name: []const u8,
@@ -210,9 +244,8 @@ pub fn emit(
             defer tmp.deinit(allocator);
             try appendU32Le(&tmp, allocator, @intCast(segments.len));
             for (segments) |seg| {
-                const encoded_memory_idx = seg.memory_idx |
-                    if (seg.is_passive) passive_data_segment_flag else 0;
-                try appendU32Le(&tmp, allocator, encoded_memory_idx);
+                try tmp.append(allocator, @intFromEnum(seg.offset_kind));
+                try appendU32Le(&tmp, allocator, seg.memory_idx);
                 try appendU32Le(&tmp, allocator, seg.offset);
                 try appendU32Le(&tmp, allocator, @intCast(seg.data.len));
                 try tmp.appendSlice(allocator, seg.data);
@@ -470,9 +503,38 @@ test "emit: one function offset produces valid function section" {
             try std.testing.expectEqual(@as(u32, 0), off);
             found_func_section = true;
         }
+
         pos += sec_size;
     }
     try std.testing.expect(found_func_section);
+}
+
+test "dataSegmentEntry preserves global.get and rejects unsupported offsets" {
+    const bytes = "x";
+    const global = try dataSegmentEntry(.{
+        .memory_idx = 0,
+        .offset = .{ .global_get = 3 },
+        .data = bytes,
+    });
+    try std.testing.expectEqual(DataSegmentOffsetKind.global_get, global.offset_kind);
+    try std.testing.expectEqual(@as(u32, 3), global.offset);
+
+    const passive = try dataSegmentEntry(.{
+        .memory_idx = 0,
+        .offset = .{ .i32_const = 99 },
+        .data = bytes,
+        .is_passive = true,
+    });
+    try std.testing.expectEqual(DataSegmentOffsetKind.passive, passive.offset_kind);
+
+    try std.testing.expectError(
+        error.UnsupportedDataSegmentOffset,
+        dataSegmentEntry(.{
+            .memory_idx = 0,
+            .offset = .{ .bytecode = &.{ 0x41, 0x00 } },
+            .data = bytes,
+        }),
+    );
 }
 
 test "emit: export section encodes name, kind, and index" {
