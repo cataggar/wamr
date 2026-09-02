@@ -692,6 +692,49 @@ pub fn allocateFromRangesWithHintsRemat(
     hints: []const Hint,
     remat_candidates: ?*const std.AutoHashMap(ir.VReg, RematDef),
 ) !AllocResult {
+    return allocateFromRangesWithHintsRematPolicy(
+        allocator,
+        reg_set,
+        clobbers,
+        ranges,
+        hints,
+        remat_candidates,
+        false,
+    );
+}
+
+/// AArch64-oriented rematerialisation policy: when pressure exhausts the
+/// register file, prefer dropping an active cheap def over spilling an
+/// incoming non-rematerialisable value at the same loop depth. Existing
+/// architecture-neutral callers retain the original spill-only policy.
+pub fn allocateFromRangesWithHintsPreferRemat(
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    hints: []const Hint,
+    remat_candidates: *const std.AutoHashMap(ir.VReg, RematDef),
+) !AllocResult {
+    return allocateFromRangesWithHintsRematPolicy(
+        allocator,
+        reg_set,
+        clobbers,
+        ranges,
+        hints,
+        remat_candidates,
+        true,
+    );
+}
+
+fn allocateFromRangesWithHintsRematPolicy(
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    hints: []const Hint,
+    remat_candidates: ?*const std.AutoHashMap(ir.VReg, RematDef),
+    prefer_active_remat: bool,
+) !AllocResult {
     std.debug.assert(reg_set.alloc_regs.len <= max_alloc_regs);
 
     var assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator);
@@ -738,6 +781,44 @@ pub fn allocateFromRangesWithHintsRemat(
                 .max_loop_depth = range.max_loop_depth,
             });
         } else {
+            // Some backends have enough registers for ordinary straight-line
+            // code but can still pin many cheap constants across a large
+            // branch/loop region. When requested, discard one such active
+            // constant before considering a real spill of the incoming value.
+            // Never trade a hotter remat range for a colder newcomer.
+            if (prefer_active_remat and
+                (remat_candidates == null or !remat_candidates.?.contains(range.vreg)))
+            {
+                var best_remat: ?usize = null;
+                if (remat_candidates) |rc| {
+                    for (active.items, 0..) |ai, idx| {
+                        if (ai.max_loop_depth > range.max_loop_depth) continue;
+                        if (!regSafeForRange(ai.reg_idx, range.start, range.end, clobbers)) continue;
+                        if (!rc.contains(ai.vreg)) continue;
+                        if (best_remat) |best_idx| {
+                            if (ai.end > active.items[best_idx].end) best_remat = idx;
+                        } else {
+                            best_remat = idx;
+                        }
+                    }
+                    if (best_remat) |remat_idx| {
+                        const evicted = active.orderedRemove(remat_idx);
+                        const remat_def = rc.get(evicted.vreg).?;
+                        _ = assignments.remove(evicted.vreg);
+                        try remat.put(evicted.vreg, remat_def);
+                        try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[evicted.reg_idx] });
+                        try insertActive(&active, allocator, .{
+                            .vreg = range.vreg,
+                            .end = range.end,
+                            .reg_idx = evicted.reg_idx,
+                            .type = range.type,
+                            .max_loop_depth = range.max_loop_depth,
+                        });
+                        continue;
+                    }
+                }
+            }
+
             // No safe free register — try to evict an active interval
             // whose register IS safe for this range. Eviction strategy
             // depends on whether the new range is itself inside a
@@ -1775,7 +1856,6 @@ test "allocateFromRangesWithHints: empty hint list behaves like allocateFromRang
     try std.testing.expectEqual(result_a.get(1).?, result_b.get(1).?);
 }
 
-
 // ── Loop-depth-weighted eviction (issue #382) ───────────────────────────
 
 test "allocateFromRanges: cold vreg evicted over hot vreg under pressure" {
@@ -2169,6 +2249,106 @@ test "remat: spilled iconst becomes remat (not stack)" {
     while (it.next()) |entry| {
         try std.testing.expect(result.get(entry.key_ptr.*) == null);
     }
+}
+
+test "prefer active remat keeps equal-end nonconstant ranges in registers" {
+    const allocator = std.testing.allocator;
+    const tiny: RegSet = .{
+        .alloc_regs = &.{ 0, 1 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 8, .type = .i32, .max_loop_depth = 1 },
+        .{ .vreg = 1, .start = 1, .end = 8, .type = .i32, .max_loop_depth = 1 },
+        .{ .vreg = 2, .start = 2, .end = 8, .type = .i32, .max_loop_depth = 1 },
+    };
+    var candidates = std.AutoHashMap(ir.VReg, RematDef).init(allocator);
+    defer candidates.deinit();
+    try candidates.put(0, .{ .iconst_32 = 7 });
+
+    var result = try allocateFromRangesWithHintsPreferRemat(
+        allocator,
+        tiny,
+        &.{},
+        &ranges,
+        &.{},
+        &candidates,
+    );
+    defer result.deinit();
+
+    try std.testing.expect(result.isRemat(0));
+    try std.testing.expect(result.get(0) == null);
+    try std.testing.expect(result.get(1).? == .reg);
+    try std.testing.expect(result.get(2).? == .reg);
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
+}
+
+test "prefer active remat preserves hotter ranges" {
+    const allocator = std.testing.allocator;
+    const one_reg: RegSet = .{
+        .alloc_regs = &.{0},
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{0},
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    var candidates = std.AutoHashMap(ir.VReg, RematDef).init(allocator);
+    defer candidates.deinit();
+    try candidates.put(0, .{ .iconst_32 = 7 });
+
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 8, .type = .i32, .max_loop_depth = 2 },
+        .{ .vreg = 1, .start = 1, .end = 8, .type = .i32, .max_loop_depth = 1 },
+    };
+    var result = try allocateFromRangesWithHintsPreferRemat(
+        allocator,
+        one_reg,
+        &.{},
+        &ranges,
+        &.{},
+        &candidates,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(false, result.isRemat(0));
+    try std.testing.expectEqual(Allocation{ .reg = 0 }, result.get(0).?);
+    try std.testing.expectEqual(Allocation{ .stack = 64 }, result.get(1).?);
+}
+
+test "prefer active remat preserves call clobber safety" {
+    const allocator = std.testing.allocator;
+    const one_reg: RegSet = .{
+        .alloc_regs = &.{0},
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{0},
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    var candidates = std.AutoHashMap(ir.VReg, RematDef).init(allocator);
+    defer candidates.deinit();
+    try candidates.put(0, .{ .iconst_32 = 7 });
+
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 3, .type = .i32, .max_loop_depth = 1 },
+        .{ .vreg = 1, .start = 1, .end = 8, .type = .i32, .max_loop_depth = 1 },
+    };
+    const clobbers = [_]ClobberPoint{
+        .{ .pos = 4, .regs_clobbered = 0b1 },
+    };
+    var result = try allocateFromRangesWithHintsPreferRemat(
+        allocator,
+        one_reg,
+        &clobbers,
+        &ranges,
+        &.{},
+        &candidates,
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(false, result.isRemat(0));
+    try std.testing.expectEqual(Allocation{ .reg = 0 }, result.get(0).?);
+    try std.testing.expectEqual(Allocation{ .stack = 64 }, result.get(1).?);
 }
 
 test "remat: tiny functions skip classification (coldstart guard)" {

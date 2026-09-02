@@ -1663,13 +1663,26 @@ pub fn compileFunctionImpl(
     defer if (alloc_result_storage) |*ar| ar.deinit();
     if (ctx.options.enable_xreg_alloc) {
         if (tmr) |t| t.begin();
-        alloc_result_storage = try regalloc.allocateFromRangesWithHints(
-            allocator,
-            aarch64RegSetForSpillBase(spill_base),
-            clobbers.items,
-            scalar_live_ranges.items,
-            hint_points.items,
-        );
+        if (func.next_vreg > RegMap.scratch_regs.len) {
+            var remat_candidates = try regalloc.classifyRematCandidates(allocator, func);
+            defer remat_candidates.deinit();
+            alloc_result_storage = try regalloc.allocateFromRangesWithHintsPreferRemat(
+                allocator,
+                aarch64RegSetForSpillBase(spill_base),
+                clobbers.items,
+                scalar_live_ranges.items,
+                hint_points.items,
+                &remat_candidates,
+            );
+        } else {
+            alloc_result_storage = try regalloc.allocateFromRangesWithHints(
+                allocator,
+                aarch64RegSetForSpillBase(spill_base),
+                clobbers.items,
+                scalar_live_ranges.items,
+                hint_points.items,
+            );
+        }
         if (tmr) |t| t.end(.regalloc);
 
         // Post-allocation move coalescing (issue #386). Retarget the
@@ -3094,6 +3107,11 @@ fn compileInst(
         // ── Constants ────────────────────────────────────────────────
         .iconst_32 => |val| {
             const dest = inst.dest orelse return;
+            // Rematerialised defs have no register or spill-slot assignment.
+            // Their consumers recreate the constant at the use site.
+            if (reg_map.alloc_result) |ar| {
+                if (ar.isRemat(dest)) return;
+            }
             if (fctx.suppress_iconst_emit) |s| {
                 if (s.contains(dest)) {
                     // All uses fold as immediates (#523). Skip the
@@ -3105,29 +3123,20 @@ fn compileInst(
                     return;
                 }
             }
-            // #542: rematerialisable — re-emitted at each use site
-            // by `useInto` (and the call-arg staging helpers). The
-            // canonical def emits nothing AND skips `reg_map.assign`
-            // entirely because the allocator chose not to assign it
-            // (no spill slot, no register).
-            if (reg_map.alloc_result) |ar| {
-                if (ar.isRemat(dest)) return;
-            }
             const info = try destBegin(reg_map, dest, RegMap.tmp0);
             try code.movImm32(info.reg, val);
             try destCommit(code, reg_map, info);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
+            if (reg_map.alloc_result) |ar| {
+                if (ar.isRemat(dest)) return;
+            }
             if (fctx.suppress_iconst_emit) |s| {
                 if (s.contains(dest)) {
                     _ = try reg_map.assign(dest);
                     return;
                 }
-            }
-            // #542: rematerialisable — see above.
-            if (reg_map.alloc_result) |ar| {
-                if (ar.isRemat(dest)) return;
             }
             const info = try destBegin(reg_map, dest, RegMap.tmp0);
             try code.movImm64(info.reg, @bitCast(val));
@@ -5781,10 +5790,16 @@ fn emitParallelCopyFull(
 
     var resolved = try allocator.alloc(Resolved, pairs.len);
     defer allocator.free(resolved);
+    var remat_sources = try allocator.alloc(?regalloc.RematDef, pairs.len);
+    defer allocator.free(remat_sources);
 
     for (pairs, 0..) |p, i| {
         const dst_loc = try reg_map.assign(p.dst);
-        const src_loc = reg_map.get(p.src) orelse return error.UnboundVReg;
+        remat_sources[i] = if (reg_map.alloc_result) |ar| ar.getRemat(p.src) else null;
+        const src_loc = if (remat_sources[i] == null)
+            reg_map.get(p.src) orelse return error.UnboundVReg
+        else
+            dst_loc;
         resolved[i] = .{ .dst = dst_loc, .src = src_loc };
     }
 
@@ -5802,7 +5817,7 @@ fn emitParallelCopyFull(
     // uses for the reg-only subset, generalised via `emitLocMove`.
     var done = try allocator.alloc(bool, pairs.len);
     defer allocator.free(done);
-    @memset(done, false);
+    for (remat_sources, 0..) |source, i| done[i] = source != null;
 
     const n = resolved.len;
     while (true) {
@@ -5844,7 +5859,7 @@ fn emitParallelCopyFull(
                 break;
             }
         }
-        if (head == null) return;
+        if (head == null) break;
 
         const start = head.?;
         const scratch = Loc{ .reg = RegMap.tmp2 };
@@ -5887,6 +5902,26 @@ fn emitParallelCopyFull(
         // Close the cycle: write the saved head source into head's dst.
         try emitLocMove(code, reg_map, resolved[start].dst, scratch);
         done[start] = true;
+    }
+
+    // Constants have no source location to protect. Materialise them only
+    // after every location-backed copy has consumed its old source value,
+    // preserving parallel-copy semantics even when a remat destination is
+    // also another pair's source.
+    for (remat_sources, resolved) |source, copy| {
+        const remat = source orelse continue;
+        const target = switch (copy.dst) {
+            .reg => |reg| reg,
+            .stack => RegMap.tmp0,
+        };
+        switch (remat) {
+            .iconst_32 => |value| try code.movImm32(target, value),
+            .iconst_64 => |value| try code.movImm64(target, @bitCast(value)),
+        }
+        switch (copy.dst) {
+            .reg => {},
+            .stack => |offset| try frameStore(code, target, reg_map.spillOffsetBytes(offset)),
+        }
     }
 }
 
@@ -10040,6 +10075,82 @@ test "emitParallelCopyFull: identity move (coalesced) emits nothing" {
     const pairs = [_]ir.Inst.ParallelCopy{.{ .dst = 0, .src = 1, .ty = .i32 }};
     try emitParallelCopyFull(&code, &pairs, &reg_map, allocator);
     try std.testing.expectEqual(@as(usize, 0), code.bytes.items.len);
+}
+
+test "emitParallelCopyFull: remat writes after location-backed sources are consumed" {
+    const allocator = std.testing.allocator;
+    var ar = regalloc.AllocResult{
+        .assignments = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator),
+        .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
+    defer ar.deinit();
+    try ar.assignments.put(0, .{ .reg = 5 });
+    try ar.remat.put(1, .{ .iconst_32 = 42 });
+    try ar.assignments.put(2, .{ .reg = 6 });
+
+    var reg_map = RegMap.init(allocator, 0, 0);
+    defer reg_map.deinit();
+    reg_map.alloc_result = &ar;
+
+    const pairs = [_]ir.Inst.ParallelCopy{
+        .{ .dst = 0, .src = 1, .ty = .i32 }, // x5 <- remat(42)
+        .{ .dst = 2, .src = 0, .ty = .i32 }, // x6 <- old x5
+    };
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+    try emitParallelCopyFull(&code, &pairs, &reg_map, allocator);
+
+    try std.testing.expectEqual(@as(usize, 8), code.bytes.items.len);
+    const consume_old_x5 = std.mem.readInt(u32, code.bytes.items[0..4], .little);
+    const write_remat_x5 = std.mem.readInt(u32, code.bytes.items[4..8], .little);
+    try std.testing.expectEqual(testMovRegRegWord(.x6, .x5), consume_old_x5);
+    try std.testing.expectEqual(
+        @as(u32, 0xD2800000) |
+            (@as(u32, 42) << 5) |
+            @as(u32, @intFromEnum(emit.Reg.x5)),
+        write_remat_x5,
+    );
+}
+
+test "emitParallelCopyFull: remat stores into a spill destination" {
+    const allocator = std.testing.allocator;
+    var ar = regalloc.AllocResult{
+        .assignments = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator),
+        .spill_count = 1,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
+    defer ar.deinit();
+    try ar.assignments.put(0, .{ .stack = 64 });
+    try ar.remat.put(1, .{ .iconst_64 = 7 });
+
+    var reg_map = RegMap.init(allocator, 64, 8);
+    defer reg_map.deinit();
+    reg_map.alloc_result = &ar;
+
+    const pairs = [_]ir.Inst.ParallelCopy{
+        .{ .dst = 0, .src = 1, .ty = .i64 },
+    };
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+    try emitParallelCopyFull(&code, &pairs, &reg_map, allocator);
+
+    try std.testing.expectEqual(@as(usize, 8), code.bytes.items.len);
+    const movz_tmp0_7 = std.mem.readInt(u32, code.bytes.items[0..4], .little);
+    const store_tmp0 = std.mem.readInt(u32, code.bytes.items[4..8], .little);
+    try std.testing.expectEqual(
+        @as(u32, 0xD2800000) |
+            (@as(u32, 7) << 5) |
+            @as(u32, @intFromEnum(RegMap.tmp0)),
+        movz_tmp0_7,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0xF9000000 |
+            ((64 / 8) << 10) |
+            (@as(u32, @intFromEnum(emit.Reg.fp)) << 5) |
+            @as(u32, @intFromEnum(RegMap.tmp0))),
+        store_tmp0,
+    );
 }
 
 test "emitParallelCopyFull: spill slot is both source and destination" {
@@ -16093,11 +16204,10 @@ test "remat (#542): high-pressure iconst function compiles successfully" {
 }
 
 test "remat (#542): iconst used after a call recompiles cleanly" {
-    // f0 returns 7. f1 builds an iconst, calls f0, then adds the
-    // iconst to f0's result. Call clobbers all caller-save physregs;
-    // if the allocator assigned the iconst to a caller-save it would
-    // have to spill across the call — remat skips that and re-emits
-    // the const at the post-call use.
+    // f0 returns 7. f1 keeps more constants live across the call than
+    // the callee-saved register bank can hold, forcing rematerialisation.
+    // Every remat use must be emitted after the BL that clobbers caller-save
+    // registers, never at the canonical pre-call def.
     const allocator = std.testing.allocator;
     var module = ir.IrModule.init(allocator);
     defer module.deinit();
@@ -16115,18 +16225,31 @@ test "remat (#542): iconst used after a call recompiles cleanly" {
     {
         const b = try f1.newBlock();
         const blk = f1.getBlock(b);
-        const k = f1.newVReg();
-        // Out-of-imm12 to defeat #523 fold-on-use and force a real
-        // remat use point.
-        try blk.append(.{ .op = .{ .iconst_32 = 0x10003 }, .dest = k, .type = .i32 });
+        var constants: [24]ir.VReg = undefined;
+        for (&constants, 0..) |*constant, i| {
+            constant.* = f1.newVReg();
+            try blk.append(.{
+                .op = .{ .iconst_32 = 0x10003 + @as(i32, @intCast(i)) },
+                .dest = constant.*,
+                .type = .i32,
+            });
+        }
         const call_res = f1.newVReg();
         try blk.append(.{
             .op = .{ .call = .{ .func_idx = 0, .args = &.{} } },
             .dest = call_res,
             .type = .i32,
         });
-        const sum = f1.newVReg();
-        try blk.append(.{ .op = .{ .add = .{ .lhs = call_res, .rhs = k } }, .dest = sum, .type = .i32 });
+        var sum = call_res;
+        for (constants) |constant| {
+            const next = f1.newVReg();
+            try blk.append(.{
+                .op = .{ .add = .{ .lhs = sum, .rhs = constant } },
+                .dest = next,
+                .type = .i32,
+            });
+            sum = next;
+        }
         try blk.append(.{ .op = .{ .ret = sum } });
     }
     _ = try module.addFunction(f1);
@@ -16135,6 +16258,72 @@ test "remat (#542): iconst used after a call recompiles cleanly" {
     defer allocator.free(result.code);
     defer allocator.free(result.offsets);
     try std.testing.expect(result.code.len > 0);
+
+    const caller = result.code[result.offsets[1]..];
+    var bl_end: ?usize = null;
+    var i: usize = 0;
+    while (i + 4 <= caller.len) : (i += 4) {
+        const word = std.mem.readInt(u32, caller[i..][0..4], .little);
+        if ((word & 0xFC000000) == 0x94000000) {
+            bl_end = i + 4;
+            break;
+        }
+    }
+    try std.testing.expect(bl_end != null);
+    try std.testing.expect(countMovzImm(caller[bl_end.?..]) > 0);
+}
+
+test "remat: checked load traps before post-load constant materialisation" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    const b = try func.newBlock();
+    const block = func.getBlock(b);
+    const address = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = address, .type = .i32 });
+
+    var constants: [24]ir.VReg = undefined;
+    for (&constants, 0..) |*constant, i| {
+        constant.* = func.newVReg();
+        try block.append(.{
+            .op = .{ .iconst_32 = 0x10003 + @as(i32, @intCast(i)) },
+            .dest = constant.*,
+            .type = .i32,
+        });
+    }
+    const loaded = func.newVReg();
+    try block.append(.{
+        .op = .{ .load = .{ .base = address, .offset = 0, .size = 4 } },
+        .dest = loaded,
+        .type = .i32,
+    });
+    var sum = loaded;
+    for (constants) |constant| {
+        const next = func.newVReg();
+        try block.append(.{
+            .op = .{ .add = .{ .lhs = sum, .rhs = constant } },
+            .dest = next,
+            .type = .i32,
+        });
+        sum = next;
+    }
+    try block.append(.{ .op = .{ .ret = sum } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var brk_end: ?usize = null;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const word = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((word & 0xFFE0001F) == 0xD4200000) {
+            brk_end = i + 4;
+            break;
+        }
+    }
+    try std.testing.expect(brk_end != null);
+    try std.testing.expect(countMovzImm(code[brk_end.?..]) > 0);
 }
 
 test "remat (#542): iconst with mixed imm12 + out-of-imm12 uses composes with #523 fold" {
