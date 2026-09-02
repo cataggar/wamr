@@ -57,6 +57,26 @@ mean/median/range, and same-host WAMR/Wasmtime ratios. Every sample must contain
 CoreMark's `Correct operation validated.` CRC result; command failures, CRC
 errors, missing results, and ambiguous output fail the run.
 
+Every authoritative invocation receives the fixed guest arguments
+`0 0 0 400000 0`: the three zero seeds select CoreMark's canonical 2K
+performance parameters, `400000` fixes the timed iteration count, and the zero
+execution mask selects all algorithms. The affordable PR profile uses the same
+explicit seed/mask contract with 200,000 fixed iterations. The harness requires
+exactly one `2K performance run parameters for coremark.` marker, the selected
+fixed `Iterations` value, and one CRC-success marker, so independent
+self-calibration cannot silently produce unequal workloads.
+
+Authoritative mode also reads the runner's allowed CPU set, selects one CPU,
+verifies `taskset` can restrict a child to that CPU, and pins every engine
+invocation to it. Engines are fully built/installed before timing and warmups
+and measured samples use a counterbalanced forward/reverse order (ABBA for two
+engines). The Markdown and JSON reports retain the exact order, per-sample UTC
+start/end timestamps, CPU selection, iterations, and raw throughput.
+
+Run 33576430466 predates these controls and is explicitly non-authoritative:
+it allowed each engine to self-calibrate a different iteration count and
+measured the engines in separate unpinned blocks.
+
 `--wasmtime-baseline auto` downloads Wasmtime 44.0.1 (the latest Wasmtime
 release line available before #393's 2026-05-07 reference measurement), the
 pinned historical baseline for future comparisons, and verifies the official
