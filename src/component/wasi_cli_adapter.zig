@@ -25543,7 +25543,11 @@ pub const WasiCliAdapter = struct {
     fn p3FallbackSettlementCancelled() bool {
         if (http_shutdown_requested.load(.acquire)) return true;
         const thread_context = execution_context.current() orelse return false;
-        return thread_context.isCancellationRequested();
+        if (thread_context.isCancellationRequested()) return true;
+        const ThreadManager = @import("../wasi/thread_manager.zig").ThreadManager;
+        const manager = thread_context.threadGroup(ThreadManager) orelse
+            return false;
+        return manager.isTaskCancelledForContext(thread_context);
     }
 
     /// Drain a fallback response stream through writer closure. Content
