@@ -69,6 +69,18 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
         with self.assertRaisesRegex(profile.ProfileError, "name mismatch"):
             profile.validate_wasmtime_mapping(bad, identity)
 
+        plain = profile.parse_wasmtime_samples(
+            "ffff core_bench_list+0x14 (/work/jitted-99-3.so)\n",
+            identity,
+        )
+        self.assertEqual(1, plain["functions"][15]["samples"])
+        self.assertEqual(Counter({0x14: 1}), plain["functions"][15]["offsets"])
+        with self.assertRaisesRegex(profile.ProfileError, "implies local function"):
+            profile.parse_wasmtime_samples(
+                "ffff core_bench_list+0x14 (/work/jitted-99-4.so)\n",
+                identity,
+            )
+
     def test_ambiguous_wasmtime_sample_mapping_fails(self):
         with self.assertRaisesRegex(profile.ProfileError, "ambiguous"):
             profile.parse_wasmtime_samples(

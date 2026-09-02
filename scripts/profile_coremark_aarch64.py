@@ -36,6 +36,12 @@ WASMTIME_SYMBOL_RE = re.compile(
     r"wasm\[(?P<module>\d+)\]::function\[(?P<function>\d+)\]"
     r"(?:::(?P<name>[^+\s(]+))?"
 )
+WASMTIME_JITTED_SYMBOL_RE = re.compile(
+    r"^\s*(?:0x)?[0-9a-fA-F]+\s+"
+    r"(?P<name>[^+\s(]+)"
+    r"(?:\+0x(?P<offset>[0-9a-fA-F]+))?\s+"
+    r"\((?P<dso>[^)]+/jitted-\d+-(?P<local>\d+)\.so)\)"
+)
 CLASS_GROUPS = {
     "frame_traffic": {
         "frame_load_unattributed",
@@ -181,9 +187,16 @@ def parse_spill_metrics(text: str) -> dict[int, dict[str, Any]]:
     return metrics
 
 
-def parse_wasmtime_samples(text: str) -> dict[str, Any]:
+def parse_wasmtime_samples(
+    text: str,
+    identity: compare_hot_function.WasmModuleIdentity | None = None,
+) -> dict[str, Any]:
     total = 0
     functions: dict[int, dict[str, Any]] = {}
+    names_to_indices: dict[str, list[int]] = {}
+    if identity is not None:
+        for index, name in identity.function_names.items():
+            names_to_indices.setdefault(name, []).append(index)
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -192,26 +205,61 @@ def parse_wasmtime_samples(text: str) -> dict[str, Any]:
         matches = list(WASMTIME_SYMBOL_RE.finditer(stripped))
         if len(matches) > 1:
             raise ProfileError(f"ambiguous Wasmtime sample mapping: {line}")
-        if not matches:
-            continue
-        match = matches[0]
-        if int(match.group("module")) != 0:
-            continue
-        wasm_index = int(match.group("function"))
-        name = match.group("name")
-        offset_match = re.search(
-            r"(?:^|\s|\+)(?:0x)([0-9a-fA-F]+)(?=\s|$|\()",
-            stripped[match.end() :],
-        )
+        if matches:
+            match = matches[0]
+            if int(match.group("module")) != 0:
+                continue
+            wasm_index = int(match.group("function"))
+            name = match.group("name")
+            offset_match = re.search(
+                r"(?:^|\s|\+)(?:0x)([0-9a-fA-F]+)(?=\s|$|\()",
+                stripped[match.end() :],
+            )
+            offset = int(offset_match.group(1), 16) if offset_match else None
+            mapping = "full_wasm_symbol"
+        else:
+            plain = WASMTIME_JITTED_SYMBOL_RE.match(stripped)
+            if plain is None or identity is None:
+                continue
+            name = plain.group("name")
+            name_matches = names_to_indices.get(name, [])
+            if len(name_matches) != 1:
+                if name_matches:
+                    raise ProfileError(
+                        f"Wasmtime JIT symbol {name!r} is ambiguous at wasm "
+                        f"indices {name_matches}"
+                    )
+                continue
+            wasm_index = name_matches[0]
+            expected_local = wasm_index - identity.imported_function_count
+            dso_local = int(plain.group("local"))
+            if expected_local != dso_local:
+                raise ProfileError(
+                    f"Wasmtime JIT DSO {plain.group('dso')} implies local "
+                    f"function {dso_local}, but name-section mapping for "
+                    f"{name!r} implies {expected_local}"
+                )
+            offset = (
+                int(plain.group("offset"), 16)
+                if plain.group("offset") is not None
+                else None
+            )
+            mapping = "name_section_and_jitted_dso_local_index"
         entry = functions.setdefault(
             wasm_index,
-            {"samples": 0, "names": set(), "offsets": Counter()},
+            {
+                "samples": 0,
+                "names": set(),
+                "offsets": Counter(),
+                "mapping_methods": set(),
+            },
         )
         entry["samples"] += 1
+        entry["mapping_methods"].add(mapping)
         if name:
             entry["names"].add(name)
-        if offset_match is not None:
-            entry["offsets"][int(offset_match.group(1), 16)] += 1
+        if offset is not None:
+            entry["offsets"][offset] += 1
     if total == 0:
         raise ProfileError("perf script produced no Wasmtime samples")
     return {"total_samples": total, "functions": functions}
@@ -753,7 +801,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     (out_dir / "wasmtime-samples.txt").write_text(
         perf_script, encoding="utf-8"
     )
-    parsed_wasmtime = parse_wasmtime_samples(perf_script)
+    parsed_wasmtime = parse_wasmtime_samples(perf_script, wasm_identity)
     validate_wasmtime_mapping(parsed_wasmtime, wasm_identity)
     if parsed_wasmtime["total_samples"] < args.min_samples:
         raise ProfileError(
@@ -915,6 +963,12 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "version": wasmtime_version,
             "sha256": wasmtime_sha,
             "profile_strategy": "jitdump",
+            "function_mapping": (
+                "Wasmtime v44 perf inject emitted name-only symbols in "
+                "jitted-<pid>-<defined-func-index>.so. Each symbol name was "
+                "resolved uniquely through the wasm name section and the DSO "
+                "suffix was required to equal wasm_index - import_count."
+            ),
             "cwasm_sha256": sha256_file(wasmtime_cwasm),
         },
         "engines": {
