@@ -673,13 +673,18 @@ gates (`wasi-testsuite`, `wasi-p3-testsuite`).
 checked-in real-wasi-libc pthread fixtures under
 [`tests/benchmarks/wasi-threads/`](../tests/benchmarks/wasi-threads/) through
 the interpreter and AOT. It pairs disabled/enabled runtime builds on one
-identical no-spawn loop, isolates the AOT loop-header cancel poll, and reports
-1/2/4/8-thread hot-loop, atomic-RMW, wait/notify, and spawn/join throughput.
+identical no-spawn loop and reports 1/2/4/8-thread hot-loop, atomic-RMW,
+wait/notify, and spawn/join results. Post-#979 schema-v2 reports use
+guest-monotonic, barrier-corrected kernel intervals; host process wall time is
+diagnostic only, and spawn/join is a separately labelled lifecycle metric.
+The original #979 whole-process measurements are not valid throughput or
+cancel-poll evidence.
 The path-filtered/manual
 [`wasi-thread-bench` workflow](../.github/workflows/wasi-thread-bench.yml)
 retains raw JSON reports. Its budget remains explicitly uncalibrated until the
-hosted x86_64 and AArch64 cohort described in the benchmark README exists; the
-workflow must continue passing `--no-budget` until then.
+corrected harness passes independent review and the immutable hosted x86_64 and
+AArch64 cohort described in the benchmark README exists; the workflow must
+continue passing `--no-budget` until then.
 
 ## Roadmap
 

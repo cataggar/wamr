@@ -10,10 +10,14 @@ on:
       - scripts/benchmark_schema.py
       - scripts/bench_wasi_threads.py
       - scripts/test_bench_wasi_threads.py
+      - scripts/wasi_thread_cohort.py
       - tests/benchmarks/wasi-threads/**
       - .github/workflows/wasi-thread-bench.yml
   workflow_dispatch:
     inputs:
+      target_sha:
+        description: "Immutable 40-character commit SHA to benchmark"
+        required: true
       profile:
         description: "Measurement profile"
         type: choice
@@ -27,8 +31,8 @@ on:
         default: "10"
 
 concurrency:
-  group: wasi-thread-bench-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'workflow_dispatch' && format('wasi-thread-calibration-{0}', github.run_id) || format('wasi-thread-bench-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
   contents: read
@@ -48,6 +52,25 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_sha || github.sha }}
+
+      - name: Resolve benchmark revision
+        id: revision
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET_SHA: ${{ github.event.inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "target_sha must be 40 lowercase hexadecimal characters" >&2
+              exit 2
+            }
+            test "$ACTUAL" = "$TARGET_SHA"
+          fi
+          echo "sha=$ACTUAL" >> "$GITHUB_OUTPUT"
 
       - name: Install Zig 0.16.0
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -101,6 +124,7 @@ jobs:
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
+            --platform-id '${{ matrix.platform }}' \
             --output-dir "$PWD/wasi-thread-bench-out" \
             --no-budget
           cat wasi-thread-bench-out/report.md >> "$GITHUB_STEP_SUMMARY"
@@ -109,7 +133,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wasi-thread-bench-${{ matrix.platform }}-${{ github.sha }}
+          name: wasi-thread-bench-${{ matrix.platform }}-${{ steps.revision.outputs.sha }}
           path: |
             wasi-thread-bench-out/report.json
             wasi-thread-bench-out/report.md
