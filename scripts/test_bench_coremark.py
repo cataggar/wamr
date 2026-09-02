@@ -13,7 +13,9 @@ REPO = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO / ".github/workflows/coremark-aarch64.yml"
 PROFILE_SCRIPT = REPO / "scripts/profile_coremark_aarch64.py"
 VALID_OUTPUT = """\
+2K performance run parameters for coremark.
 Iterations/Sec   : 12345.5
+Iterations       : 400000
 [0]crcfinal      : 0x33ff
 Correct operation validated. See README.md for run and reporting rules.
 """
@@ -30,9 +32,9 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertEqual(digest, bench_coremark.DEFAULT_FIXTURE_SHA256)
 
     def test_parse_requires_crc_validation(self):
-        self.assertEqual(
-            bench_coremark.parse_coremark_output(VALID_OUTPUT, "test"), 12345.5
-        )
+        parsed = bench_coremark.parse_coremark_output(VALID_OUTPUT, "test")
+        self.assertEqual(parsed.throughput, 12345.5)
+        self.assertEqual(parsed.iterations, 400000)
         with self.assertRaisesRegex(RuntimeError, "CRC-validated"):
             bench_coremark.parse_coremark_output(
                 "Iterations/Sec : 12345.5\nERROR! bad crc\n", "test"
@@ -47,6 +49,163 @@ class BenchCoremarkTests(unittest.TestCase):
             bench_coremark.parse_coremark_output(
                 VALID_OUTPUT + "Iterations/Sec : 1\n", "test"
             )
+
+    def test_parse_rejects_invalid_fixed_workload(self):
+        with self.assertRaisesRegex(RuntimeError, "0 Iterations fields"):
+            bench_coremark.parse_coremark_output(
+                VALID_OUTPUT.replace("Iterations       : 400000\n", ""),
+                "test",
+            )
+        with self.assertRaisesRegex(RuntimeError, "2 Iterations fields"):
+            bench_coremark.parse_coremark_output(
+                VALID_OUTPUT + "Iterations : 400000\n", "test"
+            )
+        with self.assertRaisesRegex(RuntimeError, "malformed Iterations"):
+            bench_coremark.parse_coremark_output(
+                VALID_OUTPUT.replace("Iterations       : 400000", "Iterations : auto"),
+                "test",
+            )
+        with self.assertRaisesRegex(RuntimeError, "self-calibration is forbidden"):
+            bench_coremark.parse_coremark_output(
+                VALID_OUTPUT.replace("400000", "300000"), "test"
+            )
+        with self.assertRaisesRegex(RuntimeError, "2K performance"):
+            bench_coremark.parse_coremark_output(
+                VALID_OUTPUT.replace(
+                    "2K performance run parameters for coremark.\n", ""
+                ),
+                "test",
+            )
+        with self.assertRaisesRegex(RuntimeError, "CRC-validated"):
+            bench_coremark.parse_coremark_output(
+                VALID_OUTPUT + "Correct operation validated.\n", "test"
+            )
+
+    def test_fixed_guest_args_are_applied_to_both_engines(self):
+        self.assertEqual(
+            ("0", "0", "0", "200000", "0"),
+            bench_coremark.coremark_guest_args(
+                bench_coremark.PROFILE_ITERATIONS["ci"]
+            ),
+        )
+        with (
+            mock.patch.object(bench_coremark, "run", return_value=""),
+            mock.patch.object(bench_coremark, "worktree_env", return_value={}),
+            mock.patch.object(bench_coremark, "sha256_file", return_value="abc"),
+        ):
+            wamr = bench_coremark.prepare_wamr(
+                Path("/worktree"),
+                "HEAD",
+                "a" * 40,
+                Path("/fixture.wasm"),
+                "ReleaseFast",
+            )
+            wasmtime = bench_coremark.prepare_wasmtime(
+                Path("/wasmtime"),
+                "Wasmtime",
+                "44.0.1",
+                Path("/fixture.wasm"),
+            )
+        self.assertEqual(
+            list(bench_coremark.COREMARK_GUEST_ARGS),
+            wamr.cmd[-5:],
+        )
+        self.assertEqual(
+            list(bench_coremark.COREMARK_GUEST_ARGS),
+            wasmtime.cmd[-5:],
+        )
+
+    def test_authoritative_affinity_is_selected_and_verified(self):
+        with (
+            mock.patch.object(
+                bench_coremark.os,
+                "sched_getaffinity",
+                return_value={4, 7},
+            ),
+            mock.patch.object(
+                bench_coremark.shutil,
+                "which",
+                return_value="/usr/bin/taskset",
+            ),
+            mock.patch.object(bench_coremark, "run", return_value="4\n") as run,
+        ):
+            affinity = bench_coremark.select_cpu_affinity()
+        self.assertEqual((4, 7), affinity.allowed_cpus)
+        self.assertEqual(4, affinity.selected_cpu)
+        self.assertEqual("/usr/bin/taskset", run.call_args.args[0][0])
+        self.assertEqual(
+            ["/usr/bin/taskset", "--cpu-list", "4", "engine"],
+            bench_coremark.apply_affinity(["engine"], affinity),
+        )
+
+    def test_counterbalanced_order_is_abba(self):
+        self.assertEqual(
+            ["A", "B", "B", "A"],
+            bench_coremark.counterbalanced_order(["A", "B"], 2),
+        )
+        order = bench_coremark.counterbalanced_order(["A", "B"], 10)
+        self.assertEqual(10, order.count("A"))
+        self.assertEqual(10, order.count("B"))
+        self.assertEqual(["A", "B", "B", "A"], order[:4])
+
+    def test_schedule_groups_samples_and_recomputes_ratio(self):
+        def output(value):
+            return VALID_OUTPUT.replace("12345.5", str(value))
+
+        engines = [
+            bench_coremark.PreparedEngine(
+                "A",
+                "WAMR",
+                "commit",
+                "ReleaseFast",
+                ["wamr"],
+                Path("."),
+                {},
+                400000,
+            ),
+            bench_coremark.PreparedEngine(
+                "B",
+                "Wasmtime",
+                "44.0.1",
+                "default JIT",
+                ["wasmtime"],
+                Path("."),
+                {},
+                400000,
+            ),
+        ]
+        with mock.patch.object(
+            bench_coremark,
+            "run",
+            side_effect=[output(10), output(20), output(22), output(12)],
+        ):
+            results, records = bench_coremark.measure_prepared_engines(
+                engines,
+                warmups=0,
+                runs=2,
+                affinity=None,
+            )
+        self.assertEqual([10.0, 12.0], results["A"].values)
+        self.assertEqual([20.0, 22.0], results["B"].values)
+        self.assertEqual(["A", "B", "B", "A"], [r.engine_key for r in records])
+        report = bench_coremark.build_json_report(
+            [
+                results["A"],
+                results["A"],
+                results["B"],
+            ],
+            profile="authoritative",
+            warmups=0,
+            runs=2,
+            fixture=Path("fixture.wasm"),
+            fixture_sha="abc",
+            host=bench_coremark.HostIdentity(
+                "aarch64", 4, "Neoverse-N2", "runner", "boot"
+            ),
+            schedule_records=records,
+            affinity=None,
+        )
+        self.assertAlmostEqual(11 / 21, report["ratios"][0]["median_ratio"])
 
     def test_profile_defaults_and_overrides(self):
         self.assertEqual(
@@ -221,6 +380,7 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("--profile  authoritative", dispatch)
         self.assertIn("--wasmtime-baseline auto", dispatch)
         self.assertIn("--require-native-arch aarch64", dispatch)
+        self.assertIn("--json-out coremark-report.json", dispatch)
         self.assertNotIn("--runs", dispatch)
 
         pr = workflow.split("- name: Run CoreMark PR comparison", 1)[1].split(
