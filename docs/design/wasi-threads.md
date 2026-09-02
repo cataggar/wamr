@@ -255,10 +255,10 @@ separate resumable state machine:
 2. The group starts with a `ParkingLot.CancellationEpoch.Ticket` containing
    `{source, generation}`. Guest waits carry that ticket into the parking lot.
 3. The first cancel advances `source.generation` with an acq_rel CAS **before**
-   broadcasting to matching AOT `VmCtx`s and sweeping matching parking-lot
-   waiters. Repeated cancel does not advance again; it may harmlessly re-arm
-   the targeted broadcast/sweep so a transient backend wake failure cannot
-   strand a waiter.
+   signalling the group's Windows cancel event, broadcasting to matching AOT
+   `VmCtx`s, and sweeping matching parking-lot waiters. Repeated cancel does
+   not advance again; it may harmlessly re-arm the targeted wakeups so a
+   transient backend failure cannot strand a waiter.
 4. A waiter checks the generation with acquire ordering while holding the same
    bucket lock used by the sweep. It is therefore either queued before its
    bucket is swept, or it observes the advanced generation and refuses to
@@ -267,11 +267,12 @@ separate resumable state machine:
    and parking-lot sweep compare group/ticket identity, so cancelling one task
    cannot wake or poison another.
 6. When the last frame/child reference is released, the group is quiescent and
-   moves to a free list. Reuse calls `begin` at the current generation; no bit
-   is reset and old tickets remain cancelled forever. A 32-bit generation is
-   never allowed to wrap: after 2^32-1 epochs the quiescent source is discarded
-   and replaced. Reaching that bound is assumed impractical, but aliasing on
-   wrap is prohibited rather than ignored.
+   moves to a free list. Reuse calls `begin` at the current generation and,
+   on Windows, closes the quiescent event and lazily creates a fresh handle;
+   no shared bit is reset and old tickets remain cancelled forever. A 32-bit
+   generation is never allowed to wrap: after 2^32-1 epochs the quiescent
+   source is discarded and replaced. Reaching that bound is assumed
+   impractical, but aliasing on wrap is prohibited rather than ignored.
 
 Spawn and completion races follow those ownership rules. A spawn retains the
 parent's group before allocating a child; if cancellation is already visible
@@ -286,7 +287,9 @@ Task cancellation never sets `ThreadManager.trap_flag`, calls
 `termination.State.claim*`, or invokes permanent `ParkingLot.cancelAll`.
 Conversely Preview-1 `proc_exit`/trap still uses the first-wins terminal record,
 broadcasts to every `VmCtx`, and leaves the sticky process cancellation latch
-set forever.
+set forever. Its Windows event also signals every active task event, so a
+process terminal outcome still interrupts children currently waiting through a
+task-scoped handle.
 
 Siblings leave guest code through four interruption points:
 

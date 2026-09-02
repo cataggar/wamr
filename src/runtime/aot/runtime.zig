@@ -2590,7 +2590,7 @@ test "AOT thread task cancellation targets only matching VmCtx subscribers" {
     var terminal = termination.State{};
     var manager = thread_manager.ThreadManager.init(allocator);
     defer manager.deinit();
-    manager.bindTermination(&terminal);
+    try manager.bindTermination(&terminal);
     try manager.prepareSharedMemory(mem, null);
     manager.bindCancelBroadcast(.{
         .ctx = @ptrCast(mem),

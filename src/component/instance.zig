@@ -2133,6 +2133,9 @@ pub const InstantiationError = error{
     /// during AOT instantiation (#889), but the sidecar was missing or
     /// otherwise could not be attached.
     LazyJitAttachFailed,
+    /// The platform could not create the interruption primitive required by
+    /// the component's Preview-1 thread manager.
+    ThreadCancellationUnavailable,
 };
 
 /// Instantiate a parsed component, producing a runnable ComponentInstance.
@@ -2233,13 +2236,14 @@ pub fn instantiateWithOptions(
             termination.State{}
         else {},
     };
-    if (comptime config.lib_wasi_threads)
-        inst.thread_manager.bindTermination(&inst.thread_termination);
     // From here on, `inst.deinit()` is the single owner of partial-init
     // cleanup. The struct fields above are all in trivially-deinitable
     // states (empty maps, freshly-init arena, &.{} slices) so deinit on
     // partial state is safe before any further work.
     errdefer inst.deinit();
+    if (comptime config.lib_wasi_threads)
+        inst.thread_manager.bindTermination(&inst.thread_termination) catch
+            return error.ThreadCancellationUnavailable;
 
     const loader = @import("../runtime/interpreter/loader.zig");
     const inst_mod = @import("../runtime/interpreter/instance.zig");

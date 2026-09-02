@@ -81,7 +81,10 @@ fn bindTaskGroupForFrame(
         thread_ctx,
         task_key,
         task_manager.getState(handle) == .cancelled,
-    ) catch return error.OutOfMemory;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.WindowsCancelEventUnavailable => return error.ThreadCancellationUnavailable,
+    };
 }
 
 pub const MAX_FLAT_PARAMS: u32 = 16;
@@ -162,6 +165,7 @@ pub const ExecutionError = error{
     PostReturnFailed,
     LiftError,
     LowerError,
+    ThreadCancellationUnavailable,
     /// AOT-backed core hit a canon-ABI shape this PR doesn't yet
     /// support — only scalar primitive params and a single scalar
     /// result land on the fast path; compound types, memory-spilled
