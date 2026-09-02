@@ -322,35 +322,75 @@ fn probeInput(allocator: std.mem.Allocator, input: *ReadInput) void {
     }
 }
 
+const PipeProbeSlot = struct {
+    input_index: usize,
+    handle: Handle,
+    status: InputStatus = .pending,
+    nbytes: u64 = 0,
+};
+
 const PipeProbeWorker = struct {
-    inputs: []ReadInput,
+    allocator: std.mem.Allocator,
+    slots: []PipeProbeSlot,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+
+    fn create(allocator: std.mem.Allocator, inputs: []const ReadInput) !*PipeProbeWorker {
+        var count: usize = 0;
+        for (inputs) |input| {
+            if (input.pipe) count += 1;
+        }
+        const self = try allocator.create(PipeProbeWorker);
+        errdefer allocator.destroy(self);
+        const slots = try allocator.alloc(PipeProbeSlot, count);
+        var slot_index: usize = 0;
+        for (inputs, 0..) |input, input_index| {
+            if (!input.pipe) continue;
+            slots[slot_index] = .{
+                .input_index = input_index,
+                .handle = input.handle,
+            };
+            slot_index += 1;
+        }
+        self.* = .{ .allocator = allocator, .slots = slots };
+        return self;
+    }
+
+    fn retain(self: *PipeProbeWorker) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *PipeProbeWorker) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        allocator.free(self.slots);
+        allocator.destroy(self);
+    }
 
     fn run(self: *PipeProbeWorker) void {
+        defer self.release();
         while (!self.stop.load(.acquire)) {
             var any_ready = false;
-            for (self.inputs) |*input| {
-                if (!input.pipe) continue;
-                input.status = .pending;
-                input.nbytes = 0;
-                input.poll_only = true;
-                switch (probePipe(input.handle)) {
+            for (self.slots) |*slot| {
+                slot.status = .pending;
+                slot.nbytes = 0;
+                switch (probePipe(slot.handle)) {
                     .pending => {},
                     .ready => |nbytes| {
-                        input.status = .ready;
-                        input.nbytes = nbytes;
+                        slot.status = .ready;
+                        slot.nbytes = nbytes;
                         any_ready = true;
                     },
                     .hangup => {
-                        input.status = .hangup;
+                        slot.status = .hangup;
                         any_ready = true;
                     },
                     .bad_handle => {
-                        input.status = .bad_handle;
+                        slot.status = .bad_handle;
                         any_ready = true;
                     },
                     .io_error => {
-                        input.status = .io_error;
+                        slot.status = .io_error;
                         any_ready = true;
                     },
                 }
@@ -358,6 +398,15 @@ const PipeProbeWorker = struct {
             }
             if (any_ready) return;
             api.Sleep(polling_slice_ms);
+        }
+    }
+
+    fn copyResults(self: *const PipeProbeWorker, inputs: []ReadInput) void {
+        for (self.slots) |slot| {
+            const input = &inputs[slot.input_index];
+            input.status = slot.status;
+            input.nbytes = slot.nbytes;
+            input.poll_only = slot.status == .pending;
         }
     }
 };
@@ -382,16 +431,38 @@ fn pipeWorkerFinished(thread: std.Thread) bool {
     return api.WaitForMultipleObjects(1, &handles, .FALSE, 0) == wait_object_0;
 }
 
-fn joinPipeWorker(thread: *?std.Thread) void {
-    const worker = thread.* orelse return;
-    worker.join();
+fn joinPipeWorker(
+    probe_worker: *const PipeProbeWorker,
+    thread: *?std.Thread,
+    inputs: []ReadInput,
+) void {
+    const running = thread.* orelse return;
+    running.join();
     thread.* = null;
+    probe_worker.copyResults(inputs);
 }
 
 fn stopPipeWorker(worker: *PipeProbeWorker, thread: *?std.Thread) void {
     const running = thread.* orelse return;
     worker.stop.store(true, .release);
-    cancelSynchronousWorker(running);
+    const started = api.GetTickCount64();
+    var handles = [_]Handle{running.getHandle()};
+    while (true) {
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        _ = windows.ntdll.NtCancelSynchronousIoFile(running.getHandle(), null, &iosb);
+        _ = windows.ntdll.NtAlertThread(running.getHandle());
+        const result = api.WaitForMultipleObjects(1, &handles, .FALSE, polling_slice_ms);
+        if (result == wait_object_0) {
+            running.join();
+            break;
+        }
+        if (result == wait_failed or
+            api.GetTickCount64() - started >= 2 * polling_slice_ms)
+        {
+            running.detach();
+            break;
+        }
+    }
     thread.* = null;
 }
 
@@ -480,24 +551,36 @@ fn waitForReadinessWithHooks(
         null;
     const start_ms = currentMs(hooks);
 
-    var pipe_worker = PipeProbeWorker{ .inputs = inputs };
+    var pipe_worker: ?*PipeProbeWorker = null;
     var pipe_thread: ?std.Thread = null;
     if (hooks == null and classifyPipeInputs(inputs)) {
-        pipe_thread = std.Thread.spawn(.{}, PipeProbeWorker.run, .{&pipe_worker}) catch
+        const worker = PipeProbeWorker.create(allocator, inputs) catch return .failed;
+        worker.retain();
+        pipe_thread = std.Thread.spawn(.{}, PipeProbeWorker.run, .{worker}) catch {
+            worker.release();
+            worker.release();
             return .failed;
+        };
+        pipe_worker = worker;
     }
-    defer stopPipeWorker(&pipe_worker, &pipe_thread);
+    defer {
+        if (pipe_worker) |worker| {
+            stopPipeWorker(worker, &pipe_thread);
+            worker.release();
+        }
+    }
 
     while (true) {
         if (pipe_thread) |thread| {
-            if (pipeWorkerFinished(thread)) joinPipeWorker(&pipe_thread);
+            if (pipeWorkerFinished(thread))
+                joinPipeWorker(pipe_worker.?, &pipe_thread, inputs);
         }
 
         if (cancel_handle) |cancel| {
             var cancel_only = [_]Handle{cancel};
             const cancel_result = waitHandles(hooks, &cancel_only, 0);
             if (cancel_result == wait_object_0) {
-                stopPipeWorker(&pipe_worker, &pipe_thread);
+                if (pipe_worker) |worker| stopPipeWorker(worker, &pipe_thread);
                 return .cancelled;
             }
             if (cancel_result == wait_failed) return .failed;
@@ -557,11 +640,11 @@ fn waitForReadinessWithHooks(
                     polling_slice_ms,
                 );
                 if (cancel_handle != null and grace_result == wait_object_0) {
-                    stopPipeWorker(&pipe_worker, &pipe_thread);
+                    stopPipeWorker(pipe_worker.?, &pipe_thread);
                     return .cancelled;
                 }
                 if (grace_result == wait_object_0 + worker_index) {
-                    joinPipeWorker(&pipe_thread);
+                    joinPipeWorker(pipe_worker.?, &pipe_thread, inputs);
                     for (inputs) |input| {
                         if (!input.pipe) continue;
                         switch (input.status) {
@@ -570,7 +653,7 @@ fn waitForReadinessWithHooks(
                         }
                     }
                 } else {
-                    stopPipeWorker(&pipe_worker, &pipe_thread);
+                    stopPipeWorker(pipe_worker.?, &pipe_thread);
                     if (grace_result == wait_failed) return .failed;
                 }
             }
@@ -594,11 +677,12 @@ fn waitForReadinessWithHooks(
         if (result >= wait_object_0 + handle_count) return .failed;
         const index: usize = @intCast(result - wait_object_0);
         if (cancel_handle != null and index == 0) {
-            stopPipeWorker(&pipe_worker, &pipe_thread);
+            if (pipe_worker) |worker| stopPipeWorker(worker, &pipe_thread);
             return .cancelled;
         }
         if (pipe_thread_index) |worker_index| {
-            if (worker_index == index) joinPipeWorker(&pipe_thread);
+            if (worker_index == index)
+                joinPipeWorker(pipe_worker.?, &pipe_thread, inputs);
         }
     }
 }
@@ -915,7 +999,7 @@ test "Windows poll rereview: blocked pipe metadata worker respects the caller ti
     const started = api.GetTickCount64();
     var inputs = [_]ReadInput{.{ .handle = read }};
     const result = waitForReadiness(
-        std.testing.allocator,
+        std.heap.page_allocator,
         null,
         &inputs,
         50,
