@@ -6654,6 +6654,7 @@ test "Windows cancellable read: redirected file returns data then EOF" {
     const file = try tmp.dir.createFile(testing_io, "redirected-stdin.txt", .{ .read = true });
     defer file.close(testing_io);
     try file.writePositionalAll(testing_io, "file", 0);
+    _ = try wasi.seekHostFile(testing_io, file, 0, .set);
 
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
