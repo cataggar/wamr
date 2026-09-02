@@ -1559,7 +1559,9 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
         // Check for cross-thread trap (every 4096 iterations to minimize overhead)
         if (fuel.remaining % 4096 == 0) {
             if (env.threadManager()) |tm| {
-                if (tm.hasTrap()) return error.Unreachable;
+                if (tm.isTaskCancelledForContext(&env.thread_context))
+                    return error.ThreadCancelled;
+                if (tm.isProcessTerminating()) return error.Unreachable;
             }
         }
         const byte = code[ip];
@@ -3518,10 +3520,14 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         if (env.threadManager()) |tm| {
                             if (tm.isTerminating()) return error.ThreadCancelled;
                         }
-                        const result = mem.wait32(
+                        const result = mem.wait32Cancellable(
                             effective_addr,
                             @bitCast(expected),
                             timeout,
+                            if (env.threadManager()) |tm|
+                                tm.cancellationForContext(&env.thread_context)
+                            else
+                                null,
                         ) catch |err| switch (err) {
                             error.NotShared => .not_equal,
                             error.OutOfBounds => return error.OutOfBoundsMemoryAccess,
@@ -3550,10 +3556,14 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         if (env.threadManager()) |tm| {
                             if (tm.isTerminating()) return error.ThreadCancelled;
                         }
-                        const result = mem.wait64(
+                        const result = mem.wait64Cancellable(
                             effective_addr,
                             @bitCast(expected),
                             timeout,
+                            if (env.threadManager()) |tm|
+                                tm.cancellationForContext(&env.thread_context)
+                            else
+                                null,
                         ) catch |err| switch (err) {
                             error.NotShared => .not_equal,
                             error.OutOfBounds => return error.OutOfBoundsMemoryAccess,

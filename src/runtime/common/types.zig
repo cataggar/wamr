@@ -664,9 +664,31 @@ pub const MemoryInstance = struct {
         return control.wait32(offset, expected, timeout_ns);
     }
 
+    pub fn wait32Cancellable(
+        self: *MemoryInstance,
+        offset: usize,
+        expected: u32,
+        timeout_ns: i64,
+        cancellation: ?parking_lot.CancellationEpoch.Ticket,
+    ) SharedWaitError!parking_lot.WaitResult {
+        const control = self.shared_control orelse return error.NotShared;
+        return control.wait32Cancellable(offset, expected, timeout_ns, cancellation);
+    }
+
     pub fn wait64(self: *MemoryInstance, offset: usize, expected: u64, timeout_ns: i64) SharedWaitError!parking_lot.WaitResult {
         const control = self.shared_control orelse return error.NotShared;
         return control.wait64(offset, expected, timeout_ns);
+    }
+
+    pub fn wait64Cancellable(
+        self: *MemoryInstance,
+        offset: usize,
+        expected: u64,
+        timeout_ns: i64,
+        cancellation: ?parking_lot.CancellationEpoch.Ticket,
+    ) SharedWaitError!parking_lot.WaitResult {
+        const control = self.shared_control orelse return error.NotShared;
+        return control.wait64Cancellable(offset, expected, timeout_ns, cancellation);
     }
 
     pub fn notify(self: *MemoryInstance, offset: usize, count: u32) SharedWaitError!u32 {
@@ -677,6 +699,14 @@ pub const MemoryInstance = struct {
     pub fn cancelWaiters(self: *MemoryInstance) parking_lot.BackendError!u32 {
         const control = self.shared_control orelse return 0;
         return control.cancelAll();
+    }
+
+    pub fn cancelWaitersForEpoch(
+        self: *MemoryInstance,
+        ticket: parking_lot.CancellationEpoch.Ticket,
+    ) parking_lot.BackendError!u32 {
+        const control = self.shared_control orelse return 0;
+        return control.cancelEpoch(ticket);
     }
 
     pub fn subscribeVmCtx(self: *MemoryInstance, vmctx: *anyopaque, allocator: std.mem.Allocator) !void {
@@ -1176,6 +1206,7 @@ pub const HostFnEntry = struct {
 
 pub const HostFnError = error{
     Trap,
+    ThreadCancelled,
     StackOverflow,
     StackUnderflow,
     OutOfBoundsMemoryAccess,
