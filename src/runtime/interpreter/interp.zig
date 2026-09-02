@@ -66,6 +66,7 @@ const Opcode = @import("opcode.zig").Opcode;
 const simd = @import("simd.zig");
 const leb128 = @import("../../shared/utils/leb128.zig");
 const platform = @import("../../platform/platform.zig");
+const config = @import("../../config.zig");
 
 pub const TrapError = error{
     OutOfFuel,
@@ -88,7 +89,7 @@ pub const TrapError = error{
     UncaughtException,
 };
 
-pub const default_fuel: u32 = 100_000_000;
+pub const default_fuel: u32 = config.benchmark_interp_fuel;
 
 pub const ExecuteOptions = struct {
     fuel: u32 = default_fuel,

@@ -275,8 +275,9 @@ memory against an immediate; aarch64 uses the reserved `x16` scratch). The
 poll is emitted **only** for modules that import `wasi.thread-spawn`
 (`IrModule.spawns_threads`), so CoreMark-class artifacts are byte-identical
 to before; the codegen-cache epoch includes the flag so cached code is never
-reused across the two settings, and `aot_version` is 10 because generated code
-now reads the appended cancel-point and passive-data helper fields.
+reused across the two settings, and `aot_version` is 11 because generated code
+uses the passive-data helper fields and the data section now preserves active
+`global.get` offsets without compacting original segment indices.
 `ThreadManager.interrupt` publishes the
 word into every VmCtx subscribed to the group's shared memory — the same
 mechanism memory-grow republication already uses.

@@ -2061,6 +2061,11 @@ pub fn instantiateWithOverrides(
     errdefer if (inst.data_segments_dropped.len > 0)
         allocator.free(inst.data_segments_dropped);
 
+    const global_alloc = try allocateGlobals(module, imported_global_overrides, allocator);
+    inst.globals = global_alloc.globals;
+    inst.globals_owned = global_alloc.owned;
+    errdefer freeGlobals(inst.globals, inst.globals_owned, allocator);
+
     const mem_alloc = try allocateMemories(module, allocator, imported_memory_overrides);
     inst.memories = mem_alloc.memories;
     inst.memories_owned = mem_alloc.owned;
@@ -2072,13 +2077,24 @@ pub fn instantiateWithOverrides(
     // backing buffer.
     for (module.data_segments) |seg| {
         if (seg.isPassive()) continue;
-        const memory_idx = seg.memoryIndex();
+        const memory_idx = seg.memory_idx;
         if (memory_idx >= inst.memories.len) continue;
         if (memory_idx < inst.memories_owned.len and !inst.memories_owned[memory_idx]) continue;
         const mem = inst.memories[memory_idx];
-        const end = @as(usize, seg.offset) + seg.data.len;
+        const offset: u32 = switch (seg.offset_kind) {
+            .i32_const => seg.offset,
+            .global_get => blk: {
+                if (seg.offset >= inst.globals.len) continue;
+                break :blk switch (inst.globals[seg.offset].value) {
+                    .i32 => |value| @bitCast(value),
+                    else => continue,
+                };
+            },
+            .passive => unreachable,
+        };
+        const end = @as(usize, offset) + seg.data.len;
         if (end > mem.byteLen()) continue;
-        @memcpy(mem.data[seg.offset..][0..seg.data.len], seg.data);
+        @memcpy(mem.data[offset..][0..seg.data.len], seg.data);
     }
 
     const table_alloc = try allocateTables(module, allocator, imported_table_overrides);
@@ -2118,10 +2134,6 @@ pub fn instantiateWithOverrides(
         }
     }
 
-    const global_alloc = try allocateGlobals(module, imported_global_overrides, allocator);
-    inst.globals = global_alloc.globals;
-    inst.globals_owned = global_alloc.owned;
-    errdefer freeGlobals(inst.globals, inst.globals_owned, allocator);
     const global_layout = try computeGlobalLayout(module.importedGlobals(), module.global_inits, allocator);
     inst.global_offsets = global_layout.offsets;
     inst.global_storage_size = global_layout.size;
@@ -4733,7 +4745,12 @@ test "#660 item 4: borrowed memory overrides are retained until importer destroy
     };
     const data = [_]u8{0xa5};
     const data_segments = [_]aot_loader.AotDataSegment{
-        .{ .memory_idx = 0, .offset = 7, .data = &data },
+        .{
+            .memory_idx = 0,
+            .offset_kind = .i32_const,
+            .offset = 7,
+            .data = &data,
+        },
     };
     const exporter_module = aot_loader.AotModule{
         .memories = &mem_types,
@@ -4799,7 +4816,8 @@ test "passive data memory.init copies bytes and data.drop records state" {
     const payload = [_]u8{ 0xa5, 0x5a };
     const segments = [_]aot_loader.AotDataSegment{
         .{
-            .memory_idx = aot_loader.AotDataSegment.passive_flag,
+            .memory_idx = 0,
+            .offset_kind = .passive,
             .offset = 0,
             .data = &payload,
         },
@@ -4817,6 +4835,63 @@ test "passive data memory.init copies bytes and data.drop records state" {
     dataDropHelper(&inst.vmctx, 0);
     try std.testing.expect(inst.data_segments_dropped[0]);
     memoryInitHelper(&inst.vmctx, 0, 0, 0);
+}
+
+test "active data global.get offset preserves source segment indices" {
+    const allocator = std.testing.allocator;
+    const memories = [_]types.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    const imports = [_]aot_loader.ImportedGlobalDesc{
+        .{
+            .module_name = "env",
+            .name = "base",
+            .val_type = .i32,
+            .mutable = false,
+        },
+    };
+    const active = [_]u8{0xa5};
+    const passive = [_]u8{0x5a};
+    const segments = [_]aot_loader.AotDataSegment{
+        .{
+            .memory_idx = 0,
+            .offset_kind = .global_get,
+            .offset = 0,
+            .data = &active,
+        },
+        .{
+            .memory_idx = 0,
+            .offset_kind = .passive,
+            .offset = 0,
+            .data = &passive,
+        },
+    };
+    const module = aot_loader.AotModule{
+        .memories = &memories,
+        .imported_globals = &imports,
+        .data_segments = &segments,
+    };
+    const imported = try allocator.create(types.GlobalInstance);
+    imported.* = .{
+        .global_type = .{ .val_type = .i32, .mutability = .immutable },
+        .value = .{ .i32 = 7 },
+    };
+    defer imported.release(allocator);
+    const overrides = [_]?*types.GlobalInstance{imported};
+
+    const inst = try instantiateWithOverrides(
+        &module,
+        allocator,
+        &.{},
+        &.{},
+        &overrides,
+        &.{},
+        &.{},
+    );
+    defer destroy(inst);
+    try std.testing.expectEqual(@as(u8, 0xa5), inst.memories[0].data[7]);
+    try std.testing.expect(inst.data_segments_dropped[0]);
+    try std.testing.expect(!inst.data_segments_dropped[1]);
 }
 
 test "getFuncAddr: returns null without text section" {

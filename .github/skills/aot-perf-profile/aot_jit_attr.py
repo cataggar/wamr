@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 AOT_MAGIC = 0x746F6100  # "\0aot"
-AOT_VERSION = 10
+AOT_VERSION = 11
 SEC_TEXT = 2
 SEC_FUNCTION = 3
 FRAME_SCHEMA = "wamr-aot-frame-attribution"

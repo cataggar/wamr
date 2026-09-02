@@ -141,6 +141,39 @@ test "#625 phase 2: precompile + loadManifest + instantiate round-trip" {
     try std.testing.expectEqual(@as(i32, 142), results[0].i32);
 }
 
+test "#979 component AOT core compile preserves mixed data segment indices" {
+    const allocator = std.testing.allocator;
+    const wasm = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tests/wasi-threads/mixed-active-passive.wasm",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(wasm);
+
+    for ([_]wamr.passes.TargetArch{ .x86_64, .aarch64 }) |target_arch| {
+        const cwasm = try component_aot_compile.compileCoreWasm(
+            allocator,
+            wasm,
+            .{ .target_arch = target_arch },
+        );
+        defer allocator.free(cwasm);
+        const module = try aot_loader_mod.load(cwasm, allocator);
+        defer aot_loader_mod.unload(&module, allocator);
+
+        try std.testing.expectEqual(@as(usize, 2), module.data_segments.len);
+        try std.testing.expectEqual(
+            aot_loader_mod.AotDataSegment.OffsetKind.global_get,
+            module.data_segments[0].offset_kind,
+        );
+        try std.testing.expectEqual(@as(u32, 0), module.data_segments[0].offset);
+        try std.testing.expectEqual(
+            aot_loader_mod.AotDataSegment.OffsetKind.passive,
+            module.data_segments[1].offset_kind,
+        );
+    }
+}
+
 test "#889: precompileComponentInMemory lazy-JIT attaches for a single-core component" {
     if (comptime !config.lazy_jit) return error.SkipZigTest;
     if (comptime !aot_harness.can_exec_aot) return error.SkipZigTest;
