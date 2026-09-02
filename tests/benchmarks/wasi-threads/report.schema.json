@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/wamr/tests/benchmarks/wasi-threads/report.schema.json",
+  "title": "WAMR WASI thread benchmark report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "metadata",
+    "plan",
+    "records",
+    "summaries",
+    "paired_summaries",
+    "budget"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "wasi-thread-benchmark" },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "commit",
+        "tracked_diff_sha256",
+        "build_source_sha256",
+        "collected_at",
+        "host",
+        "execution",
+        "tools",
+        "fixture_toolchain",
+        "fixtures"
+      ]
+    },
+    "plan": {
+      "type": "object",
+      "required": [
+        "profile",
+        "warmups",
+        "samples",
+        "modes",
+        "thread_counts",
+        "iterations",
+        "timeout_seconds",
+        "optimize"
+      ]
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "pair_kind",
+          "pair_key",
+          "pair_index",
+          "phase",
+          "order",
+          "condition",
+          "mode",
+          "threads_enabled",
+          "cancel_points",
+          "workload",
+          "threads",
+          "iterations",
+          "command",
+          "elapsed_ns",
+          "operations",
+          "throughput_ops_per_second",
+          "per_thread_ops_per_second",
+          "guest",
+          "correct",
+          "correctness",
+          "stdout",
+          "stderr"
+        ]
+      }
+    },
+    "summaries": { "type": "array", "minItems": 1 },
+    "paired_summaries": { "type": "array", "minItems": 1 },
+    "budget": {
+      "type": "object",
+      "required": ["status", "path", "failures"]
+    }
+  }
+}

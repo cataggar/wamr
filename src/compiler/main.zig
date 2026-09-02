@@ -106,6 +106,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     var optimize = true;
     var enable_aarch64_scheduler = true;
     var enable_aarch64_xreg_alloc = true;
+    var benchmark_disable_cancel_points = false;
     var target_arch: TargetArch = switch (builtin.cpu.arch) {
         .aarch64 => .aarch64,
         else => .x86_64,
@@ -166,6 +167,8 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             enable_aarch64_scheduler = false;
         } else if (std.mem.eql(u8, a, "--aarch64-no-xreg-alloc")) {
             enable_aarch64_xreg_alloc = false;
+        } else if (std.mem.eql(u8, a, "--benchmark-disable-cancel-points")) {
+            benchmark_disable_cancel_points = true;
         } else if (std.mem.startsWith(u8, a, "--dump-ir-after=")) {
             try dump_pass_names.append(dump_alloc, a["--dump-ir-after=".len..]);
         } else if (std.mem.startsWith(u8, a, "--dump-ir-functions=")) {
@@ -247,6 +250,19 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         std.process.exit(1);
     };
     defer ir_module.deinit();
+    ir_module.spawns_threads = resolveCancelPoints(
+        ir_module.spawns_threads,
+        benchmark_disable_cancel_points,
+        wamr.config.benchmark_cancel_point_toggle,
+    ) catch |err| {
+        std.debug.print("error: {s}\n", .{switch (err) {
+            error.BenchmarkToggleUnavailable => "--benchmark-disable-cancel-points requires " ++
+                "-Dbenchmark-cancel-point-toggle=true",
+            error.NotThreadedModule => "--benchmark-disable-cancel-points requires a module " ++
+                "that imports wasi.thread-spawn",
+        }});
+        std.process.exit(1);
+    };
 
     std.debug.print("Lowered {d} functions to IR\n", .{ir_module.functions.items.len});
 
@@ -492,8 +508,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     var data_segs: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     defer data_segs.deinit(allocator);
     for (module.data_segments) |seg| {
-        if (seg.is_passive) continue;
-        const offset: u32 = switch (seg.offset) {
+        const offset: u32 = if (seg.is_passive) 0 else switch (seg.offset) {
             .i32_const => |v| @bitCast(v),
             else => continue,
         };
@@ -501,6 +516,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             .memory_idx = seg.memory_idx,
             .offset = offset,
             .data = seg.data,
+            .is_passive = seg.is_passive,
         });
     }
 
@@ -1634,6 +1650,10 @@ const compile_usage =
     \\  -O0                           Disable IR optimizations
     \\  --aarch64-no-scheduler        Disable AArch64 instruction scheduler
     \\  --aarch64-no-xreg-alloc       Disable AArch64 X-register allocator
+    \\  --benchmark-disable-cancel-points
+    \\                                 Suppress loop-header cancel polls only
+    \\                                 in a wamrc built with
+    \\                                 -Dbenchmark-cancel-point-toggle=true.
     \\
     \\IR diagnostics (post-frontend IR snapshots; one snapshot per
     \\matching function-pass pair, last-write-wins on repeated runs):
@@ -1690,6 +1710,22 @@ const compile_usage =
     \\                                 codegen invariants, func count).
     \\
 ;
+
+const CancelPointToggleError = error{
+    BenchmarkToggleUnavailable,
+    NotThreadedModule,
+};
+
+fn resolveCancelPoints(
+    spawns_threads: bool,
+    disable_requested: bool,
+    toggle_available: bool,
+) CancelPointToggleError!bool {
+    if (!disable_requested) return spawns_threads;
+    if (!toggle_available) return error.BenchmarkToggleUnavailable;
+    if (!spawns_threads) return error.NotThreadedModule;
+    return false;
+}
 
 const compile_component_usage =
     \\Usage: wamrc compile-component [options] <component.wasm> [-o <manifest.json>]
@@ -2093,4 +2129,17 @@ test "sanitizeFilename: empty name yields placeholder" {
     const s = try sanitizeFilename(a, "");
     defer a.free(s);
     try std.testing.expectEqualStrings("_", s);
+}
+
+test "benchmark cancel-point override is explicit and fail-closed" {
+    try std.testing.expect(try resolveCancelPoints(true, false, false));
+    try std.testing.expect(!try resolveCancelPoints(true, true, true));
+    try std.testing.expectError(
+        error.BenchmarkToggleUnavailable,
+        resolveCancelPoints(true, true, false),
+    );
+    try std.testing.expectError(
+        error.NotThreadedModule,
+        resolveCancelPoints(false, true, true),
+    );
 }

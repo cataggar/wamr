@@ -3415,11 +3415,8 @@ fn compileInst(
         .atomic_wait => |aw| try emitAtomicWait(code, inst, aw, reg_map, fctx),
 
         // ── Passive segments ─────────────────────────────────────────
-        // memory.init / data.drop are AOT no-ops: active segments are
-        // applied at instantiation; passive memory segments aren't
-        // tracked separately by this runtime. Mirrors x86_64 behavior.
-        .memory_init => {},
-        .data_drop => {},
+        .memory_init => |mi| try emitMemoryInit(code, mi, reg_map, fctx),
+        .data_drop => |seg_idx| try emitDataDrop(code, seg_idx, reg_map, fctx),
         .table_init => |ti| try emitTableInit(code, ti, reg_map, fctx),
         .elem_drop => |seg_idx| try emitElemDrop(code, seg_idx, reg_map, fctx),
         // Phi must be lowered before codegen.
@@ -7126,6 +7123,8 @@ fn emitCancelPoint(code: *emit.CodeBuffer) !void {
 
 const vmctx_cancel_flag_slot: u12 = 108; // byte 432, scale 4 (u32 load)
 const vmctx_cancel_point_fn_slot: u12 = 55; // byte 440, scale 8
+const vmctx_memory_init_fn_slot: u12 = 56; // byte 448, scale 8
+const vmctx_data_drop_fn_slot: u12 = 57; // byte 456, scale 8
 const vmctx_futex_wait32_fn_slot: u12 = 25; // byte 200, scale 8
 const vmctx_futex_wait64_fn_slot: u12 = 26; // byte 208, scale 8
 const vmctx_futex_notify_fn_slot: u12 = 27; // byte 216, scale 8
@@ -8040,22 +8039,22 @@ fn emitTableInit(
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
     try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ ti.src, ti.dst, ti.len });
 
-    // x3 = dst | (src << 32). Build in x3 via tmp0 scratch.
-    try readVregStable(code, reg_map, fctx, ti.src, .x3);
-    try code.movRegReg32(.x3, .x3); // zero-extend 32→64
-    try code.lslImm(.x3, .x3, 32);
+    // x2 = dst | (src << 32). Build in x2 via tmp0 scratch.
+    try readVregStable(code, reg_map, fctx, ti.src, .x2);
+    try code.movRegReg32(.x2, .x2); // zero-extend 32→64
+    try code.lslImm(.x2, .x2, 32);
     try readVregStable(code, reg_map, fctx, ti.dst, RegMap.tmp0);
     try code.movRegReg32(RegMap.tmp0, RegMap.tmp0);
-    try code.orrRegReg(.x3, .x3, RegMap.tmp0);
+    try code.orrRegReg(.x2, .x2, RegMap.tmp0);
 
-    // x4 = zero-extended len.
-    try readVregStable(code, reg_map, fctx, ti.len, .x4);
-    try code.movRegReg32(.x4, .x4);
+    // x3 = zero-extended len.
+    try readVregStable(code, reg_map, fctx, ti.len, .x3);
+    try code.movRegReg32(.x3, .x3);
 
-    // x2 = packed_seg_table (compile-time constant).
+    // x1 = packed_seg_table (compile-time constant).
     const packed_st: u64 =
         @as(u64, ti.seg_idx) | (@as(u64, ti.table_idx) << 32);
-    try code.movImm64(.x2, packed_st);
+    try code.movImm64(.x1, packed_st);
 
     // x0 = vmctx; tmp0 = vmctx.table_init_fn; BLR tmp0.
     try code.movRegReg(.x0, .x19);
@@ -8067,6 +8066,60 @@ fn emitTableInit(
         if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
+    }
+}
+
+fn emitMemoryInit(
+    code: *emit.CodeBuffer,
+    mi: @TypeOf(@as(ir.Inst.Op, undefined).memory_init),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ mi.src, mi.dst, mi.len });
+
+    try readVregStable(code, reg_map, fctx, mi.src, .x2);
+    try code.movRegReg32(.x2, .x2);
+    try code.lslImm(.x2, .x2, 32);
+    try readVregStable(code, reg_map, fctx, mi.dst, RegMap.tmp0);
+    try code.movRegReg32(RegMap.tmp0, RegMap.tmp0);
+    try code.orrRegReg(.x2, .x2, RegMap.tmp0);
+    try readVregStable(code, reg_map, fctx, mi.len, .x3);
+    try code.movRegReg32(.x3, .x3);
+
+    const packed_sm: u64 = @as(u64, mi.seg_idx);
+    try code.movImm64(.x1, packed_sm);
+    try code.movRegReg(.x0, .x19);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_memory_init_fn_slot);
+    try code.blr(RegMap.tmp0);
+
+    for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
+        if (!used or i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
+    }
+}
+
+fn emitDataDrop(
+    code: *emit.CodeBuffer,
+    seg_idx: u32,
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{});
+    try code.movImm32(.x1, @bitCast(seg_idx));
+    try code.movRegReg(.x0, .x19);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_data_drop_fn_slot);
+    try code.blr(RegMap.tmp0);
+    for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
+        if (!used or i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
         try frameLoadReg(code, reg, fctx.call_save_base + @as(u32, @intCast(i)) * 8);
     }

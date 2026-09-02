@@ -156,6 +156,11 @@ pub const lib_pthread_semaphore = opt("lib_pthread_semaphore", false);
 /// Enable the Preview-1 WASI threads runtime.
 pub const lib_wasi_threads = opt("lib_wasi_threads", false);
 
+/// Enables a wamrc-only benchmark flag for measuring cancel-point cost.
+/// Production builds leave this false, so they cannot suppress cancellation.
+pub const benchmark_cancel_point_toggle =
+    opt("benchmark_cancel_point_toggle", false);
+
 /// Allocate auxiliary stacks on the heap (follows lib_wasi_threads).
 pub const heap_aux_stack_allocation = opt("heap_aux_stack_allocation", lib_wasi_threads);
 
