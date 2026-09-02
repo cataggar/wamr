@@ -52296,16 +52296,35 @@ test "wasi:http #616 A8 live: handler failure before response emits nothing" {
         null,
     );
     var sink = LiveHttpTestSink{};
-    const session = try startLiveHttpTestSession(
+    const session = try InboundHttpResponseSession.create(
+        adapter.allocator,
         &adapter,
         &ci,
         &output,
-        &sink,
-        fixture,
+        false,
+        .get,
+        .{
+            .context = &sink,
+            .callback = &LiveHttpTestSink.interrupt,
+        },
+        .{
+            .context = &sink,
+            .write = &LiveHttpTestSink.write,
+        },
     );
     defer session.destroy();
+    try testing.expect(session.attachP3Response(
+        fixture.response_handle,
+        fixture.body_handle,
+        fixture.trailers_handle,
+        fixture.transmission_handle,
+    ));
+    try testing.expect(session.selectP3Response(fixture.response_handle));
 
+    // Establish the ordering named by the test: failure is terminal before
+    // the writer can inspect the response head.
     session.handlerFailed();
+    try session.start();
     session.waitAndJoin();
     session.propagateTerminalToGuest();
     try testing.expectEqual(HttpLiveTerminal.handler_error, session.currentTerminal());
