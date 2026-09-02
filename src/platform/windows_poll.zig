@@ -46,6 +46,15 @@ const api = if (is_windows) struct {
         lpNumberOfEventsRead: *windows.DWORD,
     ) callconv(.winapi) windows.BOOL;
 
+    extern "kernel32" fn PeekNamedPipe(
+        hNamedPipe: Handle,
+        lpBuffer: ?*anyopaque,
+        nBufferSize: windows.DWORD,
+        lpBytesRead: ?*windows.DWORD,
+        lpTotalBytesAvail: ?*windows.DWORD,
+        lpBytesLeftThisMessage: ?*windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
+
     extern "kernel32" fn GetFileType(hFile: Handle) callconv(.winapi) windows.DWORD;
 
     extern "kernel32" fn ReadFile(
@@ -263,23 +272,14 @@ fn cancelSynchronousWorker(thread: std.Thread) void {
 }
 
 fn probePipe(handle: Handle) PipeProbeResult {
-    var iosb: windows.IO_STATUS_BLOCK = undefined;
-    var info: windows.FILE.PIPE.LOCAL_INFORMATION = undefined;
-    return switch (windows.ntdll.NtQueryInformationFile(
-        handle,
-        &iosb,
-        &info,
-        @sizeOf(windows.FILE.PIPE.LOCAL_INFORMATION),
-        .PipeLocal,
-    )) {
-        .SUCCESS => if (info.ReadDataAvailable != 0)
-            .{ .ready = info.ReadDataAvailable }
-        else switch (info.NamedPipeState) {
-            .DISCONNECTED, .CLOSING => .hangup,
-            .LISTENING, .CONNECTED => .pending,
-        },
-        .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE => .hangup,
+    var available: windows.DWORD = 0;
+    if (api.PeekNamedPipe(handle, null, 0, null, &available, null).toBool())
+        return if (available == 0) .pending else .{ .ready = available };
+    return switch (windows.GetLastError()) {
+        .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .HANDLE_EOF => .hangup,
+        .NO_DATA => .pending,
         .INVALID_HANDLE => .bad_handle,
+        .OPERATION_ABORTED => .pending,
         else => .io_error,
     };
 }
@@ -927,7 +927,7 @@ test "Windows poll rereview: blocked pipe metadata worker respects the caller ti
     try std.testing.expect(elapsed < 250);
 }
 
-test "Windows poll rereview: repeated idle pipe probes create no worker churn" {
+test "Windows poll rereview: idle pipe wait uses one persistent worker" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var read = windows.INVALID_HANDLE_VALUE;
@@ -937,9 +937,12 @@ test "Windows poll rereview: repeated idle pipe probes create no worker churn" {
     defer windows.CloseHandle(read);
     defer windows.CloseHandle(write);
 
+    var inputs = [_]ReadInput{.{ .handle = read }};
     const started = api.GetTickCount64();
-    for (0..512) |_|
-        try std.testing.expect(probePipe(read) == .pending);
+    try std.testing.expectEqual(
+        WaitResult.timed_out,
+        waitForReadiness(std.testing.allocator, null, &inputs, 50),
+    );
     const elapsed = api.GetTickCount64() - started;
     try std.testing.expect(elapsed < 250);
 }

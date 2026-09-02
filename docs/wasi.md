@@ -215,10 +215,10 @@ A2, A5, and C1.
 Windows supports relative and absolute realtime/monotonic clock
 subscriptions plus stdio and regular-file readiness. Console input is treated
 as readable only when a key is available (or a complete line in line-input
-mode). Redirected-pipe readiness queries `FilePipeLocalInformation`
-(`ReadDataAvailable` plus connection state) on one persistent, cancellable
-worker per wait. This avoids `PeekNamedPipe`'s documented blocking,
-per-subscription latency, and repeated idle worker creation. Message-pipe
+mode). Redirected-pipe readiness runs `PeekNamedPipe` on one persistent,
+cancellable worker per wait. This contains its documented synchronous
+blocking without per-subscription latency or repeated idle worker creation.
+Message-pipe
 `ERROR_MORE_DATA` reads return the consumed prefix; `PIPE_NOWAIT`
 `ERROR_NO_DATA` waits for readiness instead of fabricating EOF.
 Absolute deadlines are re-evaluated against their selected clock after every
