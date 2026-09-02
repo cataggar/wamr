@@ -205,6 +205,10 @@ class BenchCoremarkTests(unittest.TestCase):
     def test_aarch64_workflow_contract(self):
         workflow = WORKFLOW.read_text()
         self.assertIn("runs-on: ubuntu-24.04-arm", workflow)
+        self.assertIn(
+            "group: coremark-aarch64-${{ github.event_name }}-${{ github.ref }}",
+            workflow,
+        )
         self.assertIn("- profile", workflow)
         self.assertIn(
             'default: "e32b7b7d2d12007eb66679a66f943b1e4ea6a393"',

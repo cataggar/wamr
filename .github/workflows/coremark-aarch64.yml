@@ -41,9 +41,9 @@ on:
       - .github/workflows/coremark-aarch64.yml
 
 concurrency:
-  # Keep PR gates and the authoritative manual measurement from cancelling
-  # each other while still replacing superseded runs of the same kind.
-  group: coremark-aarch64-${{ github.event_name }}
+  # Isolate each PR and manual ref so unrelated branches cannot cancel a
+  # required native ARM measurement while replacing superseded runs in place.
+  group: coremark-aarch64-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
