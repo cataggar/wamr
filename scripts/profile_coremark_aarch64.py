@@ -448,6 +448,23 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "#### Hottest sampled instructions",
+            "",
+            "| Function | Engine | Run share | Instruction |",
+            "|---|---|---:|---|",
+        ]
+    )
+    for item in report["matched_functions"]:
+        for engine in ("wamr", "wasmtime"):
+            for hot in item[engine]["hottest_instructions"][:3]:
+                lines.append(
+                    f"| `{item['name']}` | {engine.upper()} | "
+                    f"{hot['percent_of_run']:.2f}% | "
+                    f"`{hot['instruction']}` |"
+                )
+    lines.extend(
+        [
+            "",
             "#### Same-function instruction-class differences",
             "",
             "| Function | Class | WAMR run share | Wasmtime run share | Delta |",
