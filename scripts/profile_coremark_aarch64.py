@@ -641,8 +641,8 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         compile_result.stdout + compile_result.stderr
     )
     cwasm_info = aot.parse_cwasm(cwasm)
-    if cwasm_info.version != aot.AOT_VERSION:
-        raise ProfileError("WAMR cwasm version changed during profiling")
+    if cwasm_info.version not in aot.SUPPORTED_AOT_VERSIONS:
+        raise ProfileError("WAMR cwasm version is unsupported by attribution")
 
     wamr_perf = out_dir / "wamr.perf.data"
     wamr_run = recorder.run(

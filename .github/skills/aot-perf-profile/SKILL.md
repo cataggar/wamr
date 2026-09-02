@@ -340,7 +340,9 @@ distinguishes the two workload classes directly.
 - `src/runtime/aot/loader.zig:parseFunctionSection` — the `.cwasm`
   function section (`type=3`: count then `(offset:u32, type_idx:u32)`)
   that `aot_jit_attr.py` parses for `func_offsets[]`. Text section is
-  `type=2`; magic `\0aot` (`0x746f6100`), version 9.
+  `type=2`; magic `\0aot` (`0x746f6100`), current version 10. The helper
+  also accepts version 9 so profiles can be attributed to the exact #973
+  benchmark commit measured before #979 advanced the format.
 - `src/runtime/aot/runtime.zig` — the `local_func[N]+0x..` trap
   symbolizer that uses the same `func_offsets`; r15 mmap'd RX at
   `runtime.zig` `mprotect`.

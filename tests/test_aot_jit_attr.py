@@ -394,8 +394,15 @@ class FrameAttributionUnitTests(unittest.TestCase):
             info = aot.parse_cwasm("ok.cwasm")
         self.assertEqual([0], info.func_offsets)
 
+        previous = bytearray(good)
+        struct.pack_into("<I", previous, 4, aot.AOT_VERSION - 1)
+        with mock.patch.object(
+            aot.Path, "read_bytes", return_value=bytes(previous)
+        ):
+            self.assertEqual(aot.AOT_VERSION - 1, aot.parse_cwasm("prior.cwasm").version)
+
         bad_version = bytearray(good)
-        struct.pack_into("<I", bad_version, 4, aot.AOT_VERSION - 1)
+        struct.pack_into("<I", bad_version, 4, min(aot.SUPPORTED_AOT_VERSIONS) - 1)
         with mock.patch.object(
             aot.Path, "read_bytes", return_value=bytes(bad_version)
         ):

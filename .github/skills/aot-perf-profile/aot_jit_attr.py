@@ -25,6 +25,7 @@ from pathlib import Path
 
 AOT_MAGIC = 0x746F6100  # "\0aot"
 AOT_VERSION = 10
+SUPPORTED_AOT_VERSIONS = {9, AOT_VERSION}
 SEC_TEXT = 2
 SEC_FUNCTION = 3
 FRAME_SCHEMA = "wamr-aot-frame-attribution"
@@ -116,9 +117,10 @@ def parse_cwasm(path):
     magic, version = struct.unpack_from("<II", data, 0)
     if magic != AOT_MAGIC:
         raise AttributionError(f"{path}: bad magic {magic:#x} (not a .cwasm)")
-    if version != AOT_VERSION:
+    if version not in SUPPORTED_AOT_VERSIONS:
         raise AttributionError(
-            f"{path}: incompatible aot_version={version}; tool requires {AOT_VERSION}"
+            f"{path}: incompatible aot_version={version}; tool supports "
+            f"{sorted(SUPPORTED_AOT_VERSIONS)}"
         )
 
     pos = 8
