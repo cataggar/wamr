@@ -218,9 +218,11 @@ to `MFENCE` / `DMB ISH`.
 
 ### Group termination (first-wins)
 
-`src/runtime/common/termination.zig` holds the group's single terminal
-outcome. It lives in the shared `WasiProcessState`, so every thread on both
-backends claims into the same record:
+`src/runtime/common/termination.zig` holds the process group's single terminal
+outcome. Raw-core runs keep it in the shared `WasiProcessState`;
+`ComponentInstance` embeds and binds an equivalent record before any core can
+run. Every Preview-1 thread on both backends therefore claims into one
+permanent record:
 
 * The first `proc_exit(code)` or trap wins a compare-and-swap and publishes
   `{kind, code}`; every later claim is a no-op. A trap therefore can never be
@@ -239,6 +241,55 @@ backends claims into the same record:
   infinite guest timeout nothing would ever free it, because the last sweep
   runs as the final sibling exits and `terminateAndJoin` may never be entered
   (the embedder thread itself can be the one parking).
+
+### Component task cancellation epochs
+
+`canon task.cancel` is task-terminal, not process-terminal, so it uses a
+separate resumable state machine:
+
+1. An async frame binds a monotonic `(TaskManager incarnation, task id)` key
+   to a `TaskCancelGroup`. The incarnation prevents address-reuse ABA if the
+   caller destroys a task manager while child records still retain the old
+   group. Nested frames reuse the active group. The frame owns one reference
+   and every spawned `ThreadRecord` inherits and owns another.
+2. The group starts with a `ParkingLot.CancellationEpoch.Ticket` containing
+   `{source, generation}`. Guest waits carry that ticket into the parking lot.
+3. The first cancel advances `source.generation` with an acq_rel CAS **before**
+   signalling the group's Windows cancel event, broadcasting to matching AOT
+   `VmCtx`s, and sweeping matching parking-lot waiters. Repeated cancel does
+   not advance again; it may harmlessly re-arm the targeted wakeups so a
+   transient backend failure cannot strand a waiter.
+4. A waiter checks the generation with acquire ordering while holding the same
+   bucket lock used by the sweep. It is therefore either queued before its
+   bucket is swept, or it observes the advanced generation and refuses to
+   park. This preserves #959's lost-wakeup guarantee without clearing a latch.
+5. Unrelated task groups have different epoch sources. Targeted AOT broadcast
+   and parking-lot sweep compare group/ticket identity, so cancelling one task
+   cannot wake or poison another.
+6. When the last frame/child reference is released, the group is quiescent and
+   moves to a free list. Reuse calls `begin` at the current generation and,
+   on Windows, closes the quiescent event and lazily creates a fresh handle;
+   no shared bit is reset and old tickets remain cancelled forever. A 32-bit
+   generation is never allowed to wrap: after 2^32-1 epochs the quiescent
+   source is discarded and replaced. Reaching that bound is assumed
+   impractical, but aliasing on wrap is prohibited rather than ignored.
+
+Spawn and completion races follow those ownership rules. A spawn retains the
+parent's group before allocating a child; if cancellation is already visible
+it fails, and if cancellation wins after the retain the child starts with the
+old ticket and immediately observes cancellation. Return versus cancel is
+first-terminal under the `TaskManager` lock. Join destroys the child backend,
+returns its auxiliary stack, releases the group reference, and frees the
+record exactly once. Instance destruction first unbinds the permanent terminal
+hook, drains thread records, then destroys only quiescent epoch sources.
+
+Task cancellation never sets `ThreadManager.trap_flag`, calls
+`termination.State.claim*`, or invokes permanent `ParkingLot.cancelAll`.
+Conversely Preview-1 `proc_exit`/trap still uses the first-wins terminal record,
+broadcasts to every `VmCtx`, and leaves the sticky process cancellation latch
+set forever. Its Windows event also signals every active task event, so a
+process terminal outcome still interrupts children currently waiting through a
+task-scoped handle.
 
 Siblings leave guest code through four interruption points:
 
@@ -277,9 +328,10 @@ poll is emitted **only** for modules that import `wasi.thread-spawn`
 to before; the codegen-cache epoch includes the flag so cached code is never
 reused across the two settings, and `aot_version` is 10 because generated code
 now reads the appended cancel-point and passive-data helper fields.
-`ThreadManager.interrupt` publishes the
-word into every VmCtx subscribed to the group's shared memory — the same
-mechanism memory-grow republication already uses.
+`ThreadManager.interrupt` publishes the word into every `VmCtx` subscribed to
+the process group's shared memory — the same mechanism memory-grow
+republication already uses. Component task cancellation uses the subscriber
+list too, but filters by the inherited task-group pointer.
 
 `ThreadManager.terminateAndJoin(timeout_ns)` bounds teardown — a backstop
 that now only matters for a sibling wedged outside any interruption point. It closes the

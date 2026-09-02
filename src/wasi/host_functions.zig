@@ -22,6 +22,8 @@ const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const wasi_core = @import("wasi_core.zig");
 const wasi = @import("wasi.zig");
 const thread_manager = @import("thread_manager.zig");
+const execution_context = @import("../runtime/common/execution_context.zig");
+const termination = @import("../runtime/common/termination.zig");
 const platform = @import("../platform/platform.zig");
 const windows_poll = @import("../platform/windows_poll.zig");
 
@@ -41,6 +43,26 @@ pub const blocking_slice_ms: i32 = 20;
 const BlockingWait = enum { ready, timed_out, terminated, failed };
 const PosixPollFd = if (builtin.os.tag == .windows) struct {} else std.posix.pollfd;
 
+fn activeExecutionTerminating(ctx: *wasi.WasiCtx) bool {
+    if (ctx.isTerminating()) return true;
+    if (execution_context.current()) |thread_ctx| {
+        if (thread_ctx.threadGroup(thread_manager.ThreadManager)) |manager| {
+            return manager.isTerminatingForContext(thread_ctx);
+        }
+    }
+    return false;
+}
+
+fn activeWindowsCancelHandle(ctx: *wasi.WasiCtx) ?*anyopaque {
+    if (execution_context.current()) |thread_ctx| {
+        if (thread_ctx.threadGroup(thread_manager.ThreadManager)) |manager| {
+            if (manager.windowsCancelHandleForContext(thread_ctx)) |handle|
+                return handle;
+        }
+    }
+    return ctx.termination.windowsCancelHandle();
+}
+
 /// Wait for readiness on `fds` in bounded slices.
 ///
 /// With threads enabled the wait is chopped into `blocking_slice_ms` pieces
@@ -59,7 +81,7 @@ fn waitForReadiness(
     }
     var remaining_ms: i64 = timeout_ms;
     while (true) {
-        if (ctx.isTerminating()) return .terminated;
+        if (activeExecutionTerminating(ctx)) return .terminated;
         const slice: i32 = if (remaining_ms < 0)
             blocking_slice_ms
         else
@@ -79,18 +101,42 @@ fn waitForWindowsReadiness(
     timeout_ms: i32,
 ) BlockingWait {
     if (comptime builtin.os.tag != .windows) unreachable;
-    if (ctx.isTerminating()) return .terminated;
-    return switch (windows_poll.waitForReadiness(
-        ctx.allocator,
-        ctx.termination.windowsCancelHandle(),
-        inputs,
-        timeout_ms,
-    )) {
-        .ready => .ready,
-        .timed_out => .timed_out,
-        .cancelled => .terminated,
-        .failed => .failed,
-    };
+    if (comptime !config.lib_wasi_threads) {
+        return switch (windows_poll.waitForReadiness(
+            ctx.allocator,
+            activeWindowsCancelHandle(ctx),
+            inputs,
+            timeout_ms,
+        )) {
+            .ready => .ready,
+            .timed_out => .timed_out,
+            .cancelled => .terminated,
+            .failed => .failed,
+        };
+    }
+    var remaining_ms: i64 = timeout_ms;
+    while (true) {
+        if (activeExecutionTerminating(ctx)) return .terminated;
+        const slice: i32 = if (remaining_ms < 0)
+            blocking_slice_ms
+        else
+            @intCast(@min(remaining_ms, @as(i64, blocking_slice_ms)));
+        switch (windows_poll.waitForReadiness(
+            ctx.allocator,
+            activeWindowsCancelHandle(ctx),
+            inputs,
+            slice,
+        )) {
+            .ready => return .ready,
+            .cancelled => return .terminated,
+            .failed => return .failed,
+            .timed_out => {},
+        }
+        if (remaining_ms >= 0) {
+            remaining_ms -= slice;
+            if (remaining_ms <= 0) return .timed_out;
+        }
+    }
 }
 
 /// Get linear memory (memory index 0) from an ExecEnv.
@@ -103,6 +149,14 @@ fn getMemory(env: *ExecEnv) ?[]u8 {
 /// Resolve the process-scoped WASI state retained by this thread.
 fn getCtx(env: *ExecEnv) ?*wasi.WasiProcessState {
     return env.processState(wasi.WasiProcessState);
+}
+
+fn interruptedHostError(env: *ExecEnv) types.HostFnError {
+    if (env.threadManager()) |manager| {
+        if (manager.isTaskCancelledForContext(&env.thread_context))
+            return error.ThreadCancelled;
+    }
+    return error.Trap;
 }
 
 /// Translate `wasi.Errno` into the i32 errno value placed on the stack.
@@ -147,7 +201,7 @@ pub fn wasiProcExit(env_opaque: *anyopaque) types.HostFnError!void {
     }
 
     if (env.threadManager()) |tm| {
-        tm.signalTrap();
+        tm.signalExit(@bitCast(code));
     }
 
     return error.Trap;
@@ -193,7 +247,7 @@ pub fn wasiFdRead(env_opaque: *anyopaque) types.HostFnError!void {
 
     if (getCtx(env)) |ctx| {
         const result = ctxFdIoCore(ctx, mem, fd, iovs_ptr, iovs_len, nread_ptr, .read);
-        if (result == terminated_result) return error.Trap;
+        if (result == terminated_result) return interruptedHostError(env);
         env.pushI32(result) catch return error.StackOverflow;
         return;
     }
@@ -1368,7 +1422,8 @@ fn doRead(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []u8) !usize {
             else
                 std.Io.File.stdin();
             if (comptime builtin.os.tag == .windows and config.lib_wasi_threads) {
-                if (ctx.termination.windowsCancelHandle()) |cancel_handle| {
+                if (activeExecutionTerminating(ctx)) return error.Terminated;
+                if (activeWindowsCancelHandle(ctx)) |cancel_handle| {
                     return windows_poll.readCancellable(
                         cancel_handle,
                         file.handle,
@@ -2616,7 +2671,7 @@ pub fn wasiPollOneoff(env_opaque: *anyopaque) types.HostFnError!void {
     };
 
     const poll_result = ctxPollOneoffCore(ctx, mem, in_ptr, out_ptr, nsubs, ret_ptr);
-    if (poll_result == terminated_result) return error.Trap;
+    if (poll_result == terminated_result) return interruptedHostError(env);
     env.pushI32(poll_result) catch return error.StackOverflow;
 }
 
@@ -6556,6 +6611,73 @@ const BlockingPollProbe = struct {
         self.finished.store(true, .release);
     }
 };
+
+const TaskBlockingPollProbe = struct {
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    thread_context: *execution_context.ThreadExecutionContext,
+    result: i32 = 0,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *TaskBlockingPollProbe) void {
+        var active = self.thread_context.enter();
+        defer active.deinit();
+        self.result = ctxPollOneoffCore(self.ctx, self.mem, 0, 64, 1, 200);
+        self.finished.store(true, .release);
+    }
+
+    fn awaitFinished(self: *TaskBlockingPollProbe, timeout_ns: u64) bool {
+        const started = std.math.mul(u64, platform.timeGetBootUs(), std.time.ns_per_us) catch
+            std.math.maxInt(u64);
+        const deadline = started +| timeout_ns;
+        while (!self.finished.load(.acquire)) {
+            const now = std.math.mul(u64, platform.timeGetBootUs(), std.time.ns_per_us) catch
+                std.math.maxInt(u64);
+            if (now >= deadline) return false;
+            platform.usleep(200);
+        }
+        return true;
+    }
+};
+
+test "group termination: component task cancellation interrupts a blocking poll without process termination" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows)
+        return error.SkipZigTest;
+    if (!config.lib_wasi_threads or is_single_threaded) return error.SkipZigTest;
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [256]u8 = @splat(0);
+    pollTestWriteClockSub(&mem, 0, 7, wasi.CLOCKID_MONOTONIC, 60 * std.time.ns_per_s, 0);
+
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&terminal);
+    var thread_context = execution_context.ThreadExecutionContext{};
+    thread_context.setThreadGroup(@ptrCast(&manager));
+    var group_scope = try manager.bindTaskGroup(&thread_context, 1, false);
+    defer group_scope.deinit();
+
+    var probe = TaskBlockingPollProbe{
+        .ctx = ctx,
+        .mem = &mem,
+        .thread_context = &thread_context,
+    };
+    const worker = try std.Thread.spawn(.{}, TaskBlockingPollProbe.run, .{&probe});
+    platform.usleep(20 * std.time.us_per_ms);
+    try std.testing.expect(!probe.finished.load(.acquire));
+
+    try std.testing.expect(manager.cancelTaskForContext(&thread_context));
+    const finished = probe.awaitFinished(5 * std.time.ns_per_s);
+    if (!finished) ctx.proc_exit(1);
+    worker.join();
+
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(terminated_result, probe.result);
+    try std.testing.expect(ctx.terminalOutcome() == null);
+    try std.testing.expect(terminal.outcome() == null);
+}
 
 test "group termination: a blocking poll_oneoff is interrupted instead of waiting" {
     if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
