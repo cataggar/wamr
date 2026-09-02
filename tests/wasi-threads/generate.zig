@@ -237,10 +237,11 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         wabt.Validator.validate(&module, .{}) catch |err| {
-            const has_passive_data_ops =
-                std.mem.indexOf(u8, source, "memory.init") != null or
-                std.mem.indexOf(u8, source, "data.drop") != null;
-            if (!has_passive_data_ops) {
+            const passive_data_validator_gap =
+                std.mem.eql(u8, args[i], "tests/wasi-threads/passive-clobber.wat") or
+                std.mem.eql(u8, args[i], "tests/wasi-threads/passive-clobber-v128.wat") or
+                std.mem.eql(u8, args[i], "tests/wasi-threads/mixed-active-passive.wat");
+            if (!passive_data_validator_gap) {
                 std.debug.print(
                     "{s}: placeholder validation failed: {s}\n",
                     .{ args[i], @errorName(err) },
