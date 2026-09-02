@@ -4799,6 +4799,51 @@ const HttpTrailerSnapshot = struct {
     }
 };
 
+const HttpResponseContentLength = enum {
+    framing,
+    representation,
+    forbidden,
+};
+
+const HttpResponseBodySemantics = struct {
+    wire_body_allowed: bool,
+    content_length: HttpResponseContentLength,
+    connection_reusable: bool,
+
+    /// RFC 9110 permits representation metadata on HEAD and 304, but
+    /// forbids both content and Content-Length on 1xx and 204. A lone
+    /// guest-produced 1xx cannot complete the request, so it also ends
+    /// the HTTP connection instead of consuming the next response.
+    fn classify(request_is_head: bool, status: u16) HttpResponseBodySemantics {
+        if (status >= 100 and status < 200) {
+            return .{
+                .wire_body_allowed = false,
+                .content_length = .forbidden,
+                .connection_reusable = false,
+            };
+        }
+        if (status == 204) {
+            return .{
+                .wire_body_allowed = false,
+                .content_length = .forbidden,
+                .connection_reusable = true,
+            };
+        }
+        if (status == 304 or request_is_head) {
+            return .{
+                .wire_body_allowed = false,
+                .content_length = .representation,
+                .connection_reusable = true,
+            };
+        }
+        return .{
+            .wire_body_allowed = true,
+            .content_length = .framing,
+            .connection_reusable = true,
+        };
+    }
+};
+
 /// Per-request bridge between a guest-produced P3 body stream and the client
 /// socket. Guest callbacks copy into a fixed-size ring; a dedicated writer
 /// drains the ring concurrently. The writer never touches component or
@@ -4810,6 +4855,7 @@ const InboundHttpResponseSession = struct {
     ci: *ComponentInstance,
     output: *streams.OutputStream,
     keep_alive: bool,
+    request_is_head: bool,
     interrupt: ?HttpConnectionInterrupt,
     wire_writer: ?HttpWireWriter,
 
@@ -4865,6 +4911,8 @@ const InboundHttpResponseSession = struct {
     handler_outcome: HttpHandlerOutcome = .pending,
     wire_complete: bool = false,
     use_chunked: bool = false,
+    suppress_body: bool = false,
+    response_connection_reusable: bool = true,
     expected_content_length: ?usize = null,
     response_error_code: ?HttpErrorCode = null,
 
@@ -4874,6 +4922,7 @@ const InboundHttpResponseSession = struct {
         ci: *ComponentInstance,
         output: *streams.OutputStream,
         keep_alive: bool,
+        request_is_head: bool,
         interrupt: ?HttpConnectionInterrupt,
         wire_writer: ?HttpWireWriter,
     ) !*InboundHttpResponseSession {
@@ -4886,6 +4935,8 @@ const InboundHttpResponseSession = struct {
             .ci = ci,
             .output = output,
             .keep_alive = keep_alive,
+            .request_is_head = request_is_head,
+            .suppress_body = request_is_head,
             .interrupt = interrupt,
             .wire_writer = wire_writer,
             .queue = queue,
@@ -4963,6 +5014,12 @@ const InboundHttpResponseSession = struct {
         defer self.mutex.unlock();
         const code = self.response_error_code orelse .internal_error;
         return WasiCliAdapter.httpStatusFromError(@intFromEnum(code));
+    }
+
+    fn canReuseConnection(self: *InboundHttpResponseSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.keep_alive and self.response_connection_reusable;
     }
 
     fn responseHeadCommitted(
@@ -5119,6 +5176,11 @@ const InboundHttpResponseSession = struct {
             }
 
             self.mutex.lock();
+            if (self.suppress_body) {
+                self.mutex.unlock();
+                self.wakeAll();
+                return true;
+            }
             // The writer can only drain once a head exists. Before that
             // the ring is a dead end, so blocking on it would deadlock
             // the very guest thread that still has to select the
@@ -5186,11 +5248,27 @@ const InboundHttpResponseSession = struct {
         return self.staging.items.len - self.staging_head;
     }
 
+    fn discardBufferedBodyLocked(self: *InboundHttpResponseSession) void {
+        self.queue_head = 0;
+        self.queue_len = 0;
+        self.staging.clearRetainingCapacity();
+        self.staging_head = 0;
+        _ = self.space_epoch.fetchAdd(1, .acq_rel);
+        _ = self.parking.notify(
+            &self.space_epoch.raw,
+            std.math.maxInt(u32),
+        ) catch 0;
+    }
+
     /// Move as many staged bytes as fit into the transmit ring. Caller
     /// holds `mutex`; only meaningful once `head_ready` lets the writer
     /// drain the ring.
     fn refillFromStagingLocked(self: *InboundHttpResponseSession) void {
         if (!self.head_ready) return;
+        if (self.suppress_body) {
+            self.discardBufferedBodyLocked();
+            return;
+        }
         var moved = false;
         while (self.stagedLenLocked() > 0) {
             const available = self.queue.len - self.queue_len;
@@ -5434,33 +5512,52 @@ const InboundHttpResponseSession = struct {
             }
             fields.immutable = true;
         }
+        const semantics = HttpResponseBodySemantics.classify(
+            self.request_is_head,
+            status,
+        );
         if (trailers.declaration) |declaration| {
-            try head.appendSlice(self.allocator, declaration);
+            if (semantics.wire_body_allowed) {
+                try head.appendSlice(self.allocator, declaration);
+            }
         }
 
         const has_body = body_stream_handle != null;
-        const use_chunked = trailers.has_entries or
-            trailers.state == .pending or
-            (has_body and content_length == null);
-        const expected_content_length: ?usize = if (use_chunked)
-            null
-        else if (has_body)
-            content_length orelse 0
-        else
-            0;
+        const use_chunked = semantics.wire_body_allowed and
+            (trailers.has_entries or
+                trailers.state == .pending or
+                (has_body and content_length == null));
+        const expected_content_length: ?usize = switch (semantics.content_length) {
+            .framing => if (use_chunked)
+                null
+            else if (has_body)
+                content_length orelse 0
+            else
+                0,
+            .representation => if (has_body) content_length else null,
+            .forbidden => null,
+        };
+        const wire_content_length: ?usize = switch (semantics.content_length) {
+            .framing => if (use_chunked)
+                null
+            else
+                expected_content_length,
+            .representation => content_length,
+            .forbidden => null,
+        };
 
         if (use_chunked) {
             try head.appendSlice(self.allocator, "Transfer-Encoding: chunked\r\n");
-        } else {
+        } else if (wire_content_length) |length| {
             try self.appendFmt(
                 &head,
                 "Content-Length: {d}\r\n",
-                .{expected_content_length.?},
+                .{length},
             );
         }
         try head.appendSlice(
             self.allocator,
-            if (self.keep_alive)
+            if (self.keep_alive and semantics.connection_reusable)
                 "Connection: keep-alive\r\n\r\n"
             else
                 "Connection: close\r\n\r\n",
@@ -5495,6 +5592,8 @@ const InboundHttpResponseSession = struct {
         self.head_bytes = owned_head;
         self.head_ready = true;
         self.use_chunked = use_chunked;
+        self.suppress_body = !semantics.wire_body_allowed;
+        self.response_connection_reusable = semantics.connection_reusable;
         self.expected_content_length = expected_content_length;
         // `pollP3Trailers` may already have snapshotted and stored the same
         // trailers future (a guest can close the body stream before
@@ -5506,7 +5605,11 @@ const InboundHttpResponseSession = struct {
         } else if (owned_trailers) |bytes| {
             self.allocator.free(bytes);
         }
-        self.refillFromStagingLocked();
+        if (self.suppress_body) {
+            self.discardBufferedBodyLocked();
+        } else {
+            self.refillFromStagingLocked();
+        }
         _ = self.data_epoch.fetchAdd(1, .acq_rel);
         _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
     }
@@ -5576,24 +5679,41 @@ const InboundHttpResponseSession = struct {
             fields.immutable = true;
         }
 
+        const semantics = HttpResponseBodySemantics.classify(
+            self.request_is_head,
+            status,
+        );
         const has_body = body_handle != null;
-        const use_chunked = has_body and content_length == null;
-        const expected_content_length: ?usize = if (use_chunked)
-            null
-        else if (has_body)
-            content_length orelse 0
-        else
-            0;
+        const use_chunked = semantics.wire_body_allowed and
+            has_body and content_length == null;
+        const expected_content_length: ?usize = switch (semantics.content_length) {
+            .framing => if (use_chunked)
+                null
+            else if (has_body)
+                content_length orelse 0
+            else
+                0,
+            .representation => if (has_body) content_length else null,
+            .forbidden => null,
+        };
+        const wire_content_length: ?usize = switch (semantics.content_length) {
+            .framing => if (use_chunked)
+                null
+            else
+                expected_content_length,
+            .representation => content_length,
+            .forbidden => null,
+        };
         if (use_chunked) {
             try head.appendSlice(
                 self.allocator,
                 "Transfer-Encoding: chunked\r\n",
             );
-        } else {
+        } else if (wire_content_length) |length| {
             try self.appendFmt(
                 &head,
                 "Content-Length: {d}\r\n",
-                .{expected_content_length.?},
+                .{length},
             );
         }
         try head.appendSlice(
@@ -5622,8 +5742,13 @@ const InboundHttpResponseSession = struct {
         self.head_ready = true;
         self.trailer_state = .ready;
         self.use_chunked = use_chunked;
+        self.suppress_body = !semantics.wire_body_allowed;
         self.expected_content_length = expected_content_length;
-        self.refillFromStagingLocked();
+        if (self.suppress_body) {
+            self.discardBufferedBodyLocked();
+        } else {
+            self.refillFromStagingLocked();
+        }
         _ = self.data_epoch.fetchAdd(1, .acq_rel);
         _ = self.parking.notify(&self.data_epoch.raw, 1) catch 0;
     }
@@ -6045,8 +6170,13 @@ const InboundHttpResponseSession = struct {
             }
         }
         self.produced_bytes += bytes.len;
+        const suppress_body = self.suppress_body;
         self.mutex.unlock();
 
+        if (suppress_body) {
+            self.wakeAll();
+            return true;
+        }
         if (!self.enqueueRaw(bytes)) return false;
         return true;
     }
@@ -6368,7 +6498,11 @@ const InboundHttpResponseSession = struct {
         while (self.currentTerminal() == .running) {
             if (!head_written) {
                 self.mutex.lock();
-                const may_write_head = self.head_ready and
+                // Settle and validate a suppressed producer before
+                // committing representation metadata to the wire.
+                const body_ready = !self.suppress_body or
+                    self.body_length_validated;
+                const may_write_head = self.head_ready and body_ready and
                     (self.queue_len > 0 or
                         self.body_closed or
                         self.handler_outcome != .pending);
@@ -24779,10 +24913,14 @@ pub const WasiCliAdapter = struct {
 
     fn httpResponseStatusReason(status: u16) []const u8 {
         return switch (status) {
+            100 => "Continue",
+            101 => "Switching Protocols",
+            103 => "Early Hints",
             200 => "OK",
             201 => "Created",
             202 => "Accepted",
             204 => "No Content",
+            304 => "Not Modified",
             400 => "Bad Request",
             404 => "Not Found",
             405 => "Method Not Allowed",
@@ -24891,14 +25029,53 @@ pub const WasiCliAdapter = struct {
         status: u16,
         body: []const u8,
     ) !void {
+        return self.writeHttpSimpleResponseForRequest(
+            out,
+            status,
+            body,
+            false,
+        );
+    }
+
+    fn writeHttpSimpleResponseForRequest(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        status: u16,
+        body: []const u8,
+        request_is_head: bool,
+    ) !void {
+        const semantics = HttpResponseBodySemantics.classify(
+            request_is_head,
+            status,
+        );
         const status_line = try std.fmt.allocPrint(
             self.allocator,
-            "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{ status, httpResponseStatusReason(status), body.len },
+            "HTTP/1.1 {d} {s}\r\n",
+            .{ status, httpResponseStatusReason(status) },
         );
         defer self.allocator.free(status_line);
         try self.writeAllOutputStream(out, status_line);
-        try self.writeAllOutputStream(out, body);
+        const content_length: ?usize = switch (semantics.content_length) {
+            .framing => body.len,
+            .representation => if (request_is_head and status != 304)
+                body.len
+            else
+                null,
+            .forbidden => null,
+        };
+        if (content_length) |length| {
+            const line = try std.fmt.allocPrint(
+                self.allocator,
+                "Content-Length: {d}\r\n",
+                .{length},
+            );
+            defer self.allocator.free(line);
+            try self.writeAllOutputStream(out, line);
+        }
+        try self.writeAllOutputStream(out, "Connection: close\r\n\r\n");
+        if (semantics.wire_body_allowed) {
+            try self.writeAllOutputStream(out, body);
+        }
     }
 
     /// Serialize a `response-outparam` result as an HTTP/1.1 response.
@@ -24907,17 +25084,50 @@ pub const WasiCliAdapter = struct {
         out: *streams.OutputStream,
         outparam_handle: u32,
     ) !void {
+        return self.writeHttpResponseFromOutparamForRequest(
+            out,
+            outparam_handle,
+            false,
+        );
+    }
+
+    fn writeHttpResponseFromOutparamForRequest(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        outparam_handle: u32,
+        request_is_head: bool,
+    ) !void {
         var outparam_lease = self.lookupResponseOutparam(outparam_handle) orelse {
-            return self.writeHttpSimpleResponse(out, 500, "missing response outparam\n");
+            return self.writeHttpSimpleResponseForRequest(
+                out,
+                500,
+                "missing response outparam\n",
+                request_is_head,
+            );
         };
         defer outparam_lease.release();
         const outparam = outparam_lease.value().*;
         switch (outparam.state) {
-            .unset => return self.writeHttpSimpleResponse(out, 500, "handler did not set response\n"),
-            .err => |code| return self.writeHttpSimpleResponse(out, httpStatusFromError(code), "handler returned error\n"),
+            .unset => return self.writeHttpSimpleResponseForRequest(
+                out,
+                500,
+                "handler did not set response\n",
+                request_is_head,
+            ),
+            .err => |code| return self.writeHttpSimpleResponseForRequest(
+                out,
+                httpStatusFromError(code),
+                "handler returned error\n",
+                request_is_head,
+            ),
             .response => |response_handle| {
                 var response_lease = self.lookupOutgoingResponse(response_handle) orelse {
-                    return self.writeHttpSimpleResponse(out, 500, "invalid response handle\n");
+                    return self.writeHttpSimpleResponseForRequest(
+                        out,
+                        500,
+                        "invalid response handle\n",
+                        request_is_head,
+                    );
                 };
                 const response = response_lease.value().*;
                 const status: u16 = if (response.status >= 100 and response.status <= 999) response.status else 500;
@@ -24930,10 +25140,11 @@ pub const WasiCliAdapter = struct {
                 response_lease.release();
                 defer if (body_owner) |owner| owner.release();
                 if (body_incomplete) {
-                    return self.writeHttpSimpleResponse(
+                    return self.writeHttpSimpleResponseForRequest(
                         out,
                         500,
                         "incomplete response body\n",
+                        request_is_head,
                     );
                 }
                 var body_owned: ?[]u8 = null;
@@ -24952,23 +25163,43 @@ pub const WasiCliAdapter = struct {
                     body_owned = try self.allocator.alloc(u8, 0);
                 } else if (body_handle) |handle| {
                     body_owned = try self.copyOutgoingBodyBytes(handle) orelse {
-                        return self.writeHttpSimpleResponse(out, 500, "invalid body handle\n");
+                        return self.writeHttpSimpleResponseForRequest(
+                            out,
+                            500,
+                            "invalid body handle\n",
+                            request_is_head,
+                        );
                     };
                 }
                 const body: []const u8 = if (body_owned) |bytes| bytes else "";
+                const semantics = HttpResponseBodySemantics.classify(
+                    request_is_head,
+                    status,
+                );
                 var response_fields_lease = self.lookupHttpFields(headers_handle);
                 defer if (response_fields_lease) |*lease| lease.release();
+                var content_length: ?usize = null;
                 if (response_fields_lease) |*lease| {
                     const fields = lease.value().*;
+                    content_length = try httpFieldsContentLength(fields);
                     for (fields.entries.items) |entry| {
-                        if (std.ascii.eqlIgnoreCase(entry.name, "content-length") or
-                            std.ascii.eqlIgnoreCase(entry.name, "connection"))
-                        {
-                            continue;
-                        }
+                        if (isHopByHopOrFramingHeader(entry.name)) continue;
                         if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
-                            return self.writeHttpSimpleResponse(out, 500, "invalid response header\n");
+                            return self.writeHttpSimpleResponseForRequest(
+                                out,
+                                500,
+                                "invalid response header\n",
+                                request_is_head,
+                            );
                         }
+                    }
+                }
+                const has_body_producer = body_owner != null or body_handle != null;
+                if (semantics.content_length == .representation and
+                    has_body_producer)
+                {
+                    if (content_length) |expected| {
+                        if (body.len != expected) return error.ResponseBodySize;
                     }
                 }
 
@@ -24983,11 +25214,7 @@ pub const WasiCliAdapter = struct {
                 if (response_fields_lease) |*lease| {
                     const fields = lease.value().*;
                     for (fields.entries.items) |entry| {
-                        if (std.ascii.eqlIgnoreCase(entry.name, "content-length") or
-                            std.ascii.eqlIgnoreCase(entry.name, "connection"))
-                        {
-                            continue;
-                        }
+                        if (isHopByHopOrFramingHeader(entry.name)) continue;
                         const line = try std.fmt.allocPrint(
                             self.allocator,
                             "{s}: {s}\r\n",
@@ -24998,14 +25225,33 @@ pub const WasiCliAdapter = struct {
                     }
                 }
 
-                const trailer = try std.fmt.allocPrint(
-                    self.allocator,
-                    "Content-Length: {d}\r\nConnection: close\r\n\r\n",
-                    .{body.len},
+                const wire_content_length: ?usize = switch (semantics.content_length) {
+                    .framing => body.len,
+                    .representation => if (status == 304)
+                        content_length
+                    else
+                        content_length orelse if (has_body_producer)
+                            body.len
+                        else
+                            null,
+                    .forbidden => null,
+                };
+                if (wire_content_length) |length| {
+                    const line = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Content-Length: {d}\r\n",
+                        .{length},
+                    );
+                    defer self.allocator.free(line);
+                    try self.writeAllOutputStream(out, line);
+                }
+                try self.writeAllOutputStream(
+                    out,
+                    "Connection: close\r\n\r\n",
                 );
-                defer self.allocator.free(trailer);
-                try self.writeAllOutputStream(out, trailer);
-                try self.writeHttpBodyChunked(out, body);
+                if (semantics.wire_body_allowed) {
+                    try self.writeHttpBodyChunked(out, body);
+                }
             },
         }
     }
@@ -26514,6 +26760,9 @@ pub const WasiCliAdapter = struct {
     pub const HttpRequestP3Read = struct {
         request_handle: u32,
         keep_alive: bool,
+        /// Carried separately because the guest-owned request resource
+        /// can be dropped before the host frames its response.
+        request_is_head: bool,
     };
 
     /// Build a P3 incoming-request from already-separated header /
@@ -26654,7 +26903,11 @@ pub const WasiCliAdapter = struct {
             self.allocator.destroy(r);
             return err;
         };
-        return .{ .request_handle = handle, .keep_alive = info.keep_alive };
+        return .{
+            .request_handle = handle,
+            .keep_alive = info.keep_alive,
+            .request_is_head = method_disc == 1,
+        };
     }
 
     /// Stream-decode a `Transfer-Encoding: chunked` body off
@@ -26749,13 +27002,40 @@ pub const WasiCliAdapter = struct {
         response_handle: u32,
         keep_alive: bool,
     ) !void {
+        _ = try self.writeHttpResponseP3FromHandleForRequest(
+            out,
+            ci,
+            response_handle,
+            keep_alive,
+            false,
+        );
+    }
+
+    fn writeHttpResponseP3FromHandleForRequest(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        ci: *ComponentInstance,
+        response_handle: u32,
+        keep_alive: bool,
+        request_is_head: bool,
+    ) !bool {
         var response_lease = self.lookupHttpResponseP3(response_handle) orelse {
-            return self.writeHttpSimpleResponse(out, 500, "invalid response handle\n");
+            try self.writeHttpSimpleResponseForRequest(
+                out,
+                500,
+                "invalid response handle\n",
+                request_is_head,
+            );
+            return false;
         };
         defer response_lease.release();
         const response = response_lease.value().*;
 
         const status: u16 = if (response.status >= 100 and response.status <= 999) response.status else 500;
+        const semantics = HttpResponseBodySemantics.classify(
+            request_is_head,
+            status,
+        );
 
         // Drain the body stream<u8> if present. Empty streams (no
         // contents pushed by the guest) yield a zero-length body
@@ -26770,23 +27050,25 @@ pub const WasiCliAdapter = struct {
         // Validate response header name/value bytes before emitting.
         // Skip transport-managed headers (we set Content-Length /
         // Transfer-Encoding / Connection / Trailer ourselves).
-        var guest_set_content_length = false;
         var response_fields_lease = self.lookupHttpFields(response.headers_handle);
         defer if (response_fields_lease) |*lease| lease.release();
         const response_fields: ?*HttpFields = if (response_fields_lease) |*lease|
             lease.value().*
         else
             null;
+        var content_length: ?usize = null;
         if (response_fields) |fields| {
+            content_length = try httpFieldsContentLength(fields);
             for (fields.entries.items) |entry| {
-                if (isHopByHopOrFramingHeader(entry.name)) {
-                    if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
-                        guest_set_content_length = true;
-                    }
-                    continue;
-                }
+                if (isHopByHopOrFramingHeader(entry.name)) continue;
                 if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
-                    return self.writeHttpSimpleResponse(out, 500, "invalid response header\n");
+                    try self.writeHttpSimpleResponseForRequest(
+                        out,
+                        500,
+                        "invalid response header\n",
+                        request_is_head,
+                    );
+                    return false;
                 }
             }
         }
@@ -26807,6 +27089,11 @@ pub const WasiCliAdapter = struct {
             null;
         const has_trailer_entries = if (trailer_fields) |tf| tf.entries.items.len > 0 else false;
         const has_body_stream = response.body_stream_handle != null;
+        if (semantics.content_length != .forbidden and has_body_stream) {
+            if (content_length) |expected| {
+                if (body.len != expected) return error.ResponseBodySize;
+            }
+        }
 
         // Frame selection: prefer identity framing when the guest's
         // headers carry a Content-Length, or when there is no body
@@ -26815,7 +27102,9 @@ pub const WasiCliAdapter = struct {
         // when guest-supplied trailers need to be carried in the
         // trailer block (RFC 7230 §4.1.2 forbids trailers on
         // identity-framed responses). (#583 A5)
-        const use_chunked = has_trailer_entries or (has_body_stream and !guest_set_content_length);
+        const use_chunked = semantics.wire_body_allowed and
+            (has_trailer_entries or
+                (has_body_stream and content_length == null));
 
         const status_line = try std.fmt.allocPrint(
             self.allocator,
@@ -26842,28 +27131,37 @@ pub const WasiCliAdapter = struct {
         // names that will appear after the body. Generate one
         // listing every trailer key so downstream caches can decide
         // whether they need to keep them.
-        if (trailer_fields) |tf| {
-            if (tf.entries.items.len > 0) {
-                var trailer_decl: std.ArrayListUnmanaged(u8) = .empty;
-                defer trailer_decl.deinit(self.allocator);
-                try trailer_decl.appendSlice(self.allocator, "Trailer: ");
-                var first = true;
-                for (tf.entries.items) |entry| {
-                    if (isHopByHopOrFramingHeader(entry.name)) continue;
-                    if (!first) try trailer_decl.appendSlice(self.allocator, ", ");
-                    try trailer_decl.appendSlice(self.allocator, entry.name);
-                    first = false;
+        if (semantics.wire_body_allowed) {
+            if (trailer_fields) |tf| {
+                if (tf.entries.items.len > 0) {
+                    var trailer_decl: std.ArrayListUnmanaged(u8) = .empty;
+                    defer trailer_decl.deinit(self.allocator);
+                    try trailer_decl.appendSlice(self.allocator, "Trailer: ");
+                    var first = true;
+                    for (tf.entries.items) |entry| {
+                        if (isHopByHopOrFramingHeader(entry.name)) continue;
+                        if (!first) try trailer_decl.appendSlice(self.allocator, ", ");
+                        try trailer_decl.appendSlice(self.allocator, entry.name);
+                        first = false;
+                    }
+                    try trailer_decl.appendSlice(self.allocator, "\r\n");
+                    if (!first) try self.writeAllOutputStream(out, trailer_decl.items);
                 }
-                try trailer_decl.appendSlice(self.allocator, "\r\n");
-                if (!first) try self.writeAllOutputStream(out, trailer_decl.items);
             }
         }
 
-        const framing = if (use_chunked) "Transfer-Encoding: chunked\r\n" else "";
-        const connection_header = if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n";
+        const connection_reusable = keep_alive and
+            semantics.connection_reusable;
+        const connection_header = if (connection_reusable)
+            "Connection: keep-alive\r\n"
+        else
+            "Connection: close\r\n";
 
         if (use_chunked) {
-            try self.writeAllOutputStream(out, framing);
+            try self.writeAllOutputStream(
+                out,
+                "Transfer-Encoding: chunked\r\n",
+            );
             try self.writeAllOutputStream(out, connection_header);
             try self.writeAllOutputStream(out, "\r\n");
             if (body.len > 0) {
@@ -26889,15 +27187,33 @@ pub const WasiCliAdapter = struct {
             }
             try self.writeAllOutputStream(out, "\r\n");
         } else {
-            const trailer = try std.fmt.allocPrint(
-                self.allocator,
-                "Content-Length: {d}\r\n{s}\r\n",
-                .{ body.len, connection_header },
-            );
-            defer self.allocator.free(trailer);
-            try self.writeAllOutputStream(out, trailer);
-            try self.writeHttpBodyChunked(out, body);
+            const wire_content_length: ?usize = switch (semantics.content_length) {
+                .framing => content_length orelse body.len,
+                .representation => if (status == 304)
+                    content_length
+                else
+                    content_length orelse if (has_body_stream)
+                        body.len
+                    else
+                        null,
+                .forbidden => null,
+            };
+            if (wire_content_length) |length| {
+                const line = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Content-Length: {d}\r\n",
+                    .{length},
+                );
+                defer self.allocator.free(line);
+                try self.writeAllOutputStream(out, line);
+            }
+            try self.writeAllOutputStream(out, connection_header);
+            try self.writeAllOutputStream(out, "\r\n");
+            if (semantics.wire_body_allowed) {
+                try self.writeHttpBodyChunked(out, body);
+            }
         }
+        return connection_reusable;
     }
 
     /// Names that the HTTP/1.1 transport layer manages itself —
@@ -27137,6 +27453,7 @@ pub const WasiCliAdapter = struct {
                     ci,
                     output,
                     parsed.keep_alive,
+                    parsed.request_is_head,
                     interrupt,
                     null,
                 ) catch break :live null;
@@ -27169,10 +27486,11 @@ pub const WasiCliAdapter = struct {
                 if (!output_started and terminal != .client_disconnected and
                     terminal != .shutdown)
                 {
-                    self.writeHttpSimpleResponse(
+                    self.writeHttpSimpleResponseForRequest(
                         output,
                         503,
                         "service unavailable\n",
+                        parsed.request_is_head,
                     ) catch {};
                 }
                 cancelAllPendingAsyncOps(self, ci, null, self.allocator);
@@ -27197,10 +27515,11 @@ pub const WasiCliAdapter = struct {
                 if (!output_started and terminal != .client_disconnected and
                     terminal != .shutdown)
                 {
-                    self.writeHttpSimpleResponse(
+                    self.writeHttpSimpleResponseForRequest(
                         output,
                         code,
                         "handler returned error\n",
+                        parsed.request_is_head,
                     ) catch {};
                 }
                 cancelAllPendingAsyncOps(self, ci, null, self.allocator);
@@ -27211,6 +27530,7 @@ pub const WasiCliAdapter = struct {
             var live_terminal: HttpLiveTerminal = .fallback;
             var live_output_started = false;
             var live_error_status: u16 = 500;
+            var connection_reusable = parsed.keep_alive;
             if (live_response) |session| {
                 session.handlerReturned(outcome.payload);
                 session.waitAndJoin();
@@ -27218,28 +27538,31 @@ pub const WasiCliAdapter = struct {
                 live_terminal = session.currentTerminal();
                 live_output_started = session.hasOutputStarted();
                 live_error_status = session.responseErrorStatus();
+                connection_reusable = session.canReuseConnection();
                 session.destroy();
             }
 
             if (live_terminal == .fallback) {
-                self.writeHttpResponseP3FromHandle(
-                    output,
-                    ci,
-                    outcome.payload,
-                    parsed.keep_alive,
-                ) catch |err| {
-                    self.failHttpResponseTransmission(ci, outcome.payload);
-                    if (err == error.HttpClientDisconnected) {
-                        cancelAllPendingAsyncOps(
-                            self,
-                            ci,
-                            null,
-                            self.allocator,
-                        );
-                    }
-                    self.cleanupHttpResourcesAllVersions();
-                    return;
-                };
+                connection_reusable =
+                    self.writeHttpResponseP3FromHandleForRequest(
+                        output,
+                        ci,
+                        outcome.payload,
+                        parsed.keep_alive,
+                        parsed.request_is_head,
+                    ) catch |err| {
+                        self.failHttpResponseTransmission(ci, outcome.payload);
+                        if (err == error.HttpClientDisconnected) {
+                            cancelAllPendingAsyncOps(
+                                self,
+                                ci,
+                                null,
+                                self.allocator,
+                            );
+                        }
+                        self.cleanupHttpResourcesAllVersions();
+                        return;
+                    };
                 self.succeedHttpResponseTransmission(ci, outcome.payload);
                 live_terminal = .succeeded;
             }
@@ -27248,10 +27571,11 @@ pub const WasiCliAdapter = struct {
                 if (live_terminal == .response_error and
                     !live_output_started)
                 {
-                    self.writeHttpSimpleResponse(
+                    self.writeHttpSimpleResponseForRequest(
                         output,
                         live_error_status,
                         "invalid response\n",
+                        parsed.request_is_head,
                     ) catch {};
                 }
                 cancelAllPendingAsyncOps(self, ci, null, self.allocator);
@@ -27265,7 +27589,7 @@ pub const WasiCliAdapter = struct {
             // on the component instance persist for the connection;
             // each request allocates fresh ones.
             self.cleanupHttpResourcesAllVersions();
-            if (!parsed.keep_alive) return;
+            if (!connection_reusable) return;
             reader.compact();
         }
     }
@@ -30847,15 +31171,31 @@ fn serveOneHttpConnection(
         adapter.writeHttpSimpleResponse(&output, statusForRequestReadError(err), "bad request\n") catch {};
         return;
     };
+    const request_is_head = head: {
+        var request_lease = adapter.lookupIncomingRequest(request_handle) orelse
+            break :head false;
+        defer request_lease.release();
+        break :head request_lease.value().*.method_disc == 1;
+    };
 
     const outparam = adapter.allocator.create(ResponseOutparam) catch {
-        adapter.writeHttpSimpleResponse(&output, 500, "out of memory\n") catch {};
+        adapter.writeHttpSimpleResponseForRequest(
+            &output,
+            500,
+            "out of memory\n",
+            request_is_head,
+        ) catch {};
         return;
     };
     outparam.* = .{};
     const outparam_handle = adapter.pushResponseOutparam(outparam) catch {
         adapter.allocator.destroy(outparam);
-        adapter.writeHttpSimpleResponse(&output, 500, "out of memory\n") catch {};
+        adapter.writeHttpSimpleResponseForRequest(
+            &output,
+            500,
+            "out of memory\n",
+            request_is_head,
+        ) catch {};
         return;
     };
 
@@ -30871,6 +31211,7 @@ fn serveOneHttpConnection(
             inst,
             &output,
             false,
+            request_is_head,
             interrupt,
             null,
         ) catch break :live null;
@@ -30903,10 +31244,11 @@ fn serveOneHttpConnection(
         if (!output_started and terminal != .client_disconnected and
             terminal != .shutdown)
         {
-            adapter.writeHttpSimpleResponse(
+            adapter.writeHttpSimpleResponseForRequest(
                 &output,
                 500,
                 "handler trapped\n",
+                request_is_head,
             ) catch {};
         }
         WasiCliAdapter.cancelAllPendingAsyncOps(
@@ -30933,10 +31275,11 @@ fn serveOneHttpConnection(
     if (live_terminal == .succeeded) return;
     if (live_terminal != .fallback) {
         if (live_terminal == .response_error and !live_output_started) {
-            adapter.writeHttpSimpleResponse(
+            adapter.writeHttpSimpleResponseForRequest(
                 &output,
                 live_error_status,
                 "invalid response\n",
+                request_is_head,
             ) catch {};
         }
         WasiCliAdapter.cancelAllPendingAsyncOps(
@@ -30951,7 +31294,11 @@ fn serveOneHttpConnection(
     // P2 serves one request per connection, so a disconnect has no
     // keep-alive to suppress — but the guest may still own host
     // operations whose results can no longer be observed (#616 A8).
-    adapter.writeHttpResponseFromOutparam(&output, outparam_handle) catch |err| {
+    adapter.writeHttpResponseFromOutparamForRequest(
+        &output,
+        outparam_handle,
+        request_is_head,
+    ) catch |err| {
         if (err == error.HttpClientDisconnected) {
             WasiCliAdapter.cancelAllPendingAsyncOps(adapter, inst, null, adapter.allocator);
         }
@@ -47672,12 +48019,33 @@ fn startLiveHttpTestSession(
     sink: *LiveHttpTestSink,
     fixture: LiveHttpResponseFixture,
 ) !*InboundHttpResponseSession {
+    return startLiveHttpTestSessionForRequest(
+        adapter,
+        ci,
+        output,
+        sink,
+        fixture,
+        false,
+        false,
+    );
+}
+
+fn startLiveHttpTestSessionForRequest(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    output: *streams.OutputStream,
+    sink: *LiveHttpTestSink,
+    fixture: LiveHttpResponseFixture,
+    keep_alive: bool,
+    request_is_head: bool,
+) !*InboundHttpResponseSession {
     const session = try InboundHttpResponseSession.create(
         adapter.allocator,
         adapter,
         ci,
         output,
-        false,
+        keep_alive,
+        request_is_head,
         .{
             .context = sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -47736,6 +48104,17 @@ fn waitForLiveHttpWireComplete(
     return error.TestExpectedEqual;
 }
 
+fn setLiveHttpResponseStatus(
+    adapter: *WasiCliAdapter,
+    response_handle: u32,
+    status: u16,
+) !void {
+    var response_lease = adapter.lookupHttpResponseP3(response_handle) orelse
+        return error.InvalidHandle;
+    defer response_lease.release();
+    response_lease.value().*.status = status;
+}
+
 fn waitForLiveHttpTransmitted(
     session: *InboundHttpResponseSession,
     expected: usize,
@@ -47749,6 +48128,328 @@ fn waitForLiveHttpTransmitted(
         platform.usleep(100);
     }
     return error.TestExpectedEqual;
+}
+
+test "wasi:http #970: P3 HEAD drains its body and preserves pipelined framing" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P3 HEAD drains its body and preserves pipelined framing",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    var sink = LiveHttpTestSink{};
+
+    const head_fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        5,
+        true,
+        null,
+    );
+    {
+        const session = try startLiveHttpTestSessionForRequest(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            head_fixture,
+            true,
+            true,
+        );
+        defer session.destroy();
+
+        try testing.expect(InboundHttpResponseSession.onBodyWrite(
+            session,
+            "hello",
+        ));
+        session.handlerReturned(head_fixture.response_handle);
+        try testing.expect(!session.hasOutputStarted());
+        try testing.expectEqual(@as(usize, 0), sink.contents().len);
+        try testing.expectEqual(
+            async_mod.Future.State.pending,
+            ci.futures.getPtr(head_fixture.transmission_handle).?.state,
+        );
+
+        InboundHttpResponseSession.onBodyClosed(session);
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+        try testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            sink.contents(),
+        );
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+        try testing.expectEqual(@as(usize, 5), session.produced_bytes);
+        try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+        try testing.expectEqual(
+            async_mod.Future.State.ready,
+            ci.futures.getPtr(head_fixture.transmission_handle).?.state,
+        );
+    }
+
+    const first_response_len = sink.contents().len;
+    const get_fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        2,
+        true,
+        null,
+    );
+    {
+        const session = try startLiveHttpTestSessionForRequest(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            get_fixture,
+            false,
+            false,
+        );
+        defer session.destroy();
+        try testing.expect(InboundHttpResponseSession.onBodyWrite(
+            session,
+            "ok",
+        ));
+        InboundHttpResponseSession.onBodyClosed(session);
+        session.handlerReturned(get_fixture.response_handle);
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+    }
+
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 2\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "ok",
+        sink.contents()[first_response_len..],
+    );
+}
+
+test "wasi:http #970: P3 body-forbidden statuses omit body framing" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P3 body-forbidden statuses omit body framing",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    const Case = struct {
+        status: u16,
+        reason: []const u8,
+        content_length: ?usize,
+        expect_content_length: bool,
+        connection_reusable: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .status = 103,
+            .reason = "Early Hints",
+            .content_length = 5,
+            .expect_content_length = false,
+            .connection_reusable = false,
+        },
+        .{
+            .status = 204,
+            .reason = "No Content",
+            .content_length = 5,
+            .expect_content_length = false,
+            .connection_reusable = true,
+        },
+        .{
+            .status = 304,
+            .reason = "Not Modified",
+            .content_length = 5,
+            .expect_content_length = true,
+            .connection_reusable = true,
+        },
+        .{
+            .status = 304,
+            .reason = "Not Modified",
+            .content_length = null,
+            .expect_content_length = false,
+            .connection_reusable = true,
+        },
+    };
+
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            case.content_length,
+            true,
+            .{ .name = "x-final", .value = "done" },
+        );
+        try setLiveHttpResponseStatus(
+            &adapter,
+            fixture.response_handle,
+            case.status,
+        );
+        var sink = LiveHttpTestSink{};
+        const session = try startLiveHttpTestSessionForRequest(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            fixture,
+            true,
+            false,
+        );
+        defer session.destroy();
+
+        try testing.expect(InboundHttpResponseSession.onBodyWrite(
+            session,
+            "hello",
+        ));
+        InboundHttpResponseSession.onBodyClosed(session);
+        session.handlerReturned(fixture.response_handle);
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+        const status_line = try std.fmt.allocPrint(
+            testing.allocator,
+            "HTTP/1.1 {d} {s}\r\n",
+            .{ case.status, case.reason },
+        );
+        defer testing.allocator.free(status_line);
+        const wire = sink.contents();
+        try testing.expect(std.mem.startsWith(u8, wire, status_line));
+        try testing.expect(std.mem.endsWith(
+            u8,
+            wire,
+            if (case.connection_reusable)
+                "Connection: keep-alive\r\n\r\n"
+            else
+                "Connection: close\r\n\r\n",
+        ));
+        try testing.expectEqual(
+            case.connection_reusable,
+            session.canReuseConnection(),
+        );
+        try testing.expectEqual(
+            case.expect_content_length,
+            std.mem.indexOf(
+                u8,
+                wire,
+                "Content-Length: 5\r\n",
+            ) != null,
+        );
+        try testing.expect(
+            std.mem.indexOf(u8, wire, "Transfer-Encoding:") == null,
+        );
+        try testing.expect(std.mem.indexOf(u8, wire, "Trailer:") == null);
+        try testing.expect(std.mem.indexOf(u8, wire, "hello") == null);
+        try testing.expect(std.mem.indexOf(u8, wire, "0\r\n") == null);
+        try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+        try testing.expectEqual(
+            async_mod.Future.State.ready,
+            ci.futures.getPtr(fixture.transmission_handle).?.state,
+        );
+    }
+}
+
+test "wasi:http #970: representation length mismatches forbid connection reuse" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "representation length mismatches forbid connection reuse",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    const Case = struct {
+        body: []const u8,
+        status: u16,
+        request_is_head: bool,
+    };
+    const cases = [_]Case{
+        .{ .body = "four", .status = 200, .request_is_head = true },
+        .{ .body = "sixsix", .status = 200, .request_is_head = true },
+        .{ .body = "four", .status = 304, .request_is_head = false },
+    };
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            5,
+            true,
+            null,
+        );
+        try setLiveHttpResponseStatus(
+            &adapter,
+            fixture.response_handle,
+            case.status,
+        );
+        var sink = LiveHttpTestSink{};
+        const session = try startLiveHttpTestSessionForRequest(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            fixture,
+            true,
+            case.request_is_head,
+        );
+        defer session.destroy();
+
+        const accepted = InboundHttpResponseSession.onBodyWrite(
+            session,
+            case.body,
+        );
+        if (case.body.len < 5) {
+            try testing.expect(accepted);
+            InboundHttpResponseSession.onBodyClosed(session);
+        } else {
+            try testing.expect(!accepted);
+        }
+        session.handlerReturned(fixture.response_handle);
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.response_error,
+            session.currentTerminal(),
+        );
+        try testing.expectEqual(
+            @as(?HttpErrorCode, .HTTP_response_body_size),
+            session.response_error_code,
+        );
+        try testing.expect(!session.hasOutputStarted());
+        try testing.expectEqual(@as(usize, 0), sink.contents().len);
+        try testing.expectEqual(
+            async_mod.Future.State.closed,
+            ci.futures.getPtr(fixture.transmission_handle).?.state,
+        );
+    }
 }
 
 test "wasi:http #616 A8 live: first body chunk reaches the client before handler return" {
@@ -47917,6 +48618,7 @@ test "wasi:http #616 A8 live: response streams are bounded before response.new a
         &ci,
         &output,
         false,
+        false,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -47986,6 +48688,7 @@ test "wasi:http #954 review: preassociated closed body starts writer before hand
         &ci,
         &output,
         false,
+        false,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -48046,6 +48749,7 @@ test "wasi:http #954 review: P3 callback lease blocks session destruction" {
         &adapter,
         &ci,
         &output,
+        false,
         false,
         .{
             .context = &sink,
@@ -48137,6 +48841,7 @@ test "wasi:http #616 A8 live: P2 outgoing-body writes stream before handler retu
         &adapter,
         &ci,
         &output,
+        false,
         false,
         .{
             .context = &sink,
@@ -48276,6 +48981,7 @@ test "wasi:http #954 review: P2 body finish and drop enforce child ownership" {
         &adapter,
         &ci,
         &output,
+        false,
         false,
         .{
             .context = &sink,
@@ -48541,6 +49247,7 @@ test "wasi:http #954 review: P2 rejects an unselected prebuffered response witho
         &adapter,
         &ci,
         &output,
+        false,
         false,
         .{
             .context = &sink,
@@ -48926,12 +49633,29 @@ fn startLiveHttpP2TestSession(
     output: *streams.OutputStream,
     sink: *LiveHttpTestSink,
 ) !*InboundHttpResponseSession {
+    return startLiveHttpP2TestSessionForRequest(
+        adapter,
+        ci,
+        output,
+        sink,
+        false,
+    );
+}
+
+fn startLiveHttpP2TestSessionForRequest(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    output: *streams.OutputStream,
+    sink: *LiveHttpTestSink,
+    request_is_head: bool,
+) !*InboundHttpResponseSession {
     const session = try InboundHttpResponseSession.create(
         adapter.allocator,
         adapter,
         ci,
         output,
         false,
+        request_is_head,
         .{
             .context = sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -48980,6 +49704,287 @@ fn liveHttpSelectP2Response(
         &.{ .{ .handle = fixture.outparam_handle }, response_result },
         &.{},
         adapter.allocator,
+    );
+}
+
+test "wasi:http #970: P2 HEAD drains its body but emits headers only" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P2 HEAD drains its body but emits headers only",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpP2Fixture(&adapter, 5);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpP2TestSessionForRequest(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        true,
+    );
+    defer session.destroy();
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var active_scope = thread_ctx.enter();
+    defer active_scope.deinit();
+    var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+    defer host_scope.deinit();
+
+    const taken = try liveHttpTakeBodyStream(
+        &adapter,
+        &ci,
+        fixture.body_handle,
+    );
+    defer taken.owner.release();
+    try testing.expect(
+        taken.owner.stream.write("hello", testing.allocator) == .ok,
+    );
+    try liveHttpSelectP2Response(&adapter, &ci, fixture);
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = taken.handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    defer finish_results[0].deinit(testing.allocator);
+    try testing.expect(finish_results[0].result_val.is_ok);
+    try testing.expect(session.handlerReturnedP2(fixture.outparam_handle));
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(
+        HttpLiveTerminal.succeeded,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(@as(usize, 5), session.produced_bytes);
+    try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Connection: close\r\n\r\n",
+        sink.contents(),
+    );
+}
+
+test "wasi:http #970: P2 body-forbidden statuses omit body framing" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P2 body-forbidden statuses omit body framing",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    const Case = struct {
+        status: u16,
+        reason: []const u8,
+        expect_content_length: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .status = 103,
+            .reason = "Early Hints",
+            .expect_content_length = false,
+        },
+        .{
+            .status = 204,
+            .reason = "No Content",
+            .expect_content_length = false,
+        },
+        .{
+            .status = 304,
+            .reason = "Not Modified",
+            .expect_content_length = true,
+        },
+    };
+
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const fixture = try makeLiveHttpP2Fixture(&adapter, 5);
+        var response_lease = adapter.lookupOutgoingResponse(
+            fixture.response_handle,
+        ) orelse return error.InvalidHandle;
+        response_lease.value().*.status = case.status;
+        response_lease.release();
+
+        var sink = LiveHttpTestSink{};
+        const session = try startLiveHttpP2TestSessionForRequest(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            false,
+        );
+        defer session.destroy();
+
+        var thread_ctx = execution_context.ThreadExecutionContext{};
+        var active_scope = thread_ctx.enter();
+        defer active_scope.deinit();
+        var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+        defer host_scope.deinit();
+
+        const taken = try liveHttpTakeBodyStream(
+            &adapter,
+            &ci,
+            fixture.body_handle,
+        );
+        defer taken.owner.release();
+        try testing.expect(
+            taken.owner.stream.write("hello", testing.allocator) == .ok,
+        );
+        try liveHttpSelectP2Response(&adapter, &ci, fixture);
+        try WasiCliAdapter.dropOutputStream(
+            &adapter,
+            &ci,
+            &.{.{ .handle = taken.handle }},
+            &.{},
+            testing.allocator,
+        );
+        var finish_results: [1]InterfaceValue = undefined;
+        try WasiCliAdapter.httpOutgoingBodyFinish(
+            &adapter,
+            &ci,
+            &.{.{ .handle = fixture.body_handle }},
+            &finish_results,
+            testing.allocator,
+        );
+        defer finish_results[0].deinit(testing.allocator);
+        try testing.expect(finish_results[0].result_val.is_ok);
+        try testing.expect(session.handlerReturnedP2(
+            fixture.outparam_handle,
+        ));
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+        const status_line = try std.fmt.allocPrint(
+            testing.allocator,
+            "HTTP/1.1 {d} {s}\r\n",
+            .{ case.status, case.reason },
+        );
+        defer testing.allocator.free(status_line);
+        const wire = sink.contents();
+        try testing.expect(std.mem.startsWith(u8, wire, status_line));
+        try testing.expect(std.mem.endsWith(
+            u8,
+            wire,
+            "Connection: close\r\n\r\n",
+        ));
+        try testing.expectEqual(
+            case.expect_content_length,
+            std.mem.indexOf(
+                u8,
+                wire,
+                "Content-Length: 5\r\n",
+            ) != null,
+        );
+        try testing.expect(
+            std.mem.indexOf(u8, wire, "Transfer-Encoding:") == null,
+        );
+        try testing.expect(std.mem.indexOf(u8, wire, "hello") == null);
+        try testing.expect(std.mem.indexOf(u8, wire, "0\r\n") == null);
+        try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+    }
+}
+
+test "wasi:http #970: non-live P2 and P3 HEAD fallbacks suppress bodies" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const p3_fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        5,
+        true,
+        null,
+    );
+    const p3_body = ci.streams.getPtr(p3_fixture.body_handle.?).?;
+    try p3_body.buffer.appendSlice(testing.allocator, "hello");
+    p3_body.write_closed = true;
+    var p3_wire = streams.OutputStream.toBuffer();
+    defer p3_wire.deinit(testing.allocator);
+    _ = try adapter.writeHttpResponseP3FromHandleForRequest(
+        &p3_wire,
+        &ci,
+        p3_fixture.response_handle,
+        true,
+        true,
+    );
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Connection: keep-alive\r\n\r\n",
+        p3_wire.getBufferContents(),
+    );
+
+    const p2_fixture = try makeLiveHttpP2Fixture(&adapter, 5);
+    const taken = try liveHttpTakeBodyStream(
+        &adapter,
+        &ci,
+        p2_fixture.body_handle,
+    );
+    defer taken.owner.release();
+    try testing.expect(
+        taken.owner.stream.write("hello", testing.allocator) == .ok,
+    );
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = taken.handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = p2_fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    defer finish_results[0].deinit(testing.allocator);
+    try testing.expect(finish_results[0].result_val.is_ok);
+    try liveHttpSelectP2Response(&adapter, &ci, p2_fixture);
+
+    var p2_wire = streams.OutputStream.toBuffer();
+    defer p2_wire.deinit(testing.allocator);
+    try adapter.writeHttpResponseFromOutparamForRequest(
+        &p2_wire,
+        p2_fixture.outparam_handle,
+        true,
+    );
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Connection: close\r\n\r\n",
+        p2_wire.getBufferContents(),
     );
 }
 
@@ -49615,6 +50620,7 @@ test "wasi:http #967 review issue 2: P3 over-declared content-length cannot spli
         &ci,
         &output,
         true,
+        false,
         .{ .context = &sink, .callback = &LiveHttpTestSink.interrupt },
         .{ .context = &sink, .write = &LiveHttpTestSink.write },
     );
@@ -50018,6 +51024,7 @@ test "wasi:http #969 review: P3 trailers snapshotted twice keep one owned block"
             &adapter,
             &ci,
             &output,
+            false,
             false,
             .{
                 .context = &sink,
