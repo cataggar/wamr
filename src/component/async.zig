@@ -1082,7 +1082,7 @@ test "TaskManager: invalid and stale handles cannot acquire another task ticket"
 }
 
 test "TaskManager: return and cancel are first-terminal under races" {
-    if (@import("builtin").single_threaded)
+    if (@import("builtin").single_threaded or !config.lib_wasi_threads)
         return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tm = TaskManager{};
