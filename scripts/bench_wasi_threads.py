@@ -43,6 +43,13 @@ PROFILE_COUNTS = {
     "smoke": (1, 3),
 }
 MIN_TIMED_INTERVAL_MS = 100.0
+# Stable fast-path signatures emitted by emitCancelPoint in each backend.
+# Counting these signatures avoids treating instruction-sequence byte sizes as
+# an ABI; text growth per site is derived from each on/off artifact pair.
+CANCEL_POLL_SIGNATURES = {
+    "x86_64": bytes.fromhex("83bbb001000000740c"),
+    "aarch64": struct.pack("<II", 0xB941B270, 0x34000090),
+}
 WASI_SDK = {
     "version": "25.0",
     "clang": "clang version 19.1.5-wasi-sdk",
@@ -501,7 +508,7 @@ def compile_aot_fixtures(
     return {name: Path(command[-1]) for name, command in commands.items()}
 
 
-def aot_text_size(path: Path) -> int:
+def aot_text_section(path: Path) -> bytes:
     data = path.read_bytes()
     if len(data) < 8 or data[:4] != b"\x00aot":
         raise HarnessError(f"not a WAMR AOT file: {path}")
@@ -512,7 +519,7 @@ def aot_text_size(path: Path) -> int:
         if position + section_size > len(data):
             raise HarnessError(f"truncated AOT section: {path}")
         if section_type == 2:
-            return section_size
+            return data[position : position + section_size]
         position += section_size
     raise HarnessError(f"AOT text section missing: {path}")
 
@@ -521,30 +528,48 @@ def aot_artifact_report(
     artifacts: dict[str, Path],
     arch: str,
 ) -> dict[str, Any]:
+    text_sections = {
+        name: aot_text_section(path) for name, path in artifacts.items()
+    }
     report = {
         name: {
             "path": str(path),
             "sha256": sha256_file(path),
             "file_bytes": path.stat().st_size,
-            "text_bytes": aot_text_size(path),
+            "text_bytes": len(text_sections[name]),
         }
         for name, path in sorted(artifacts.items())
     }
+    try:
+        signature = CANCEL_POLL_SIGNATURES[arch]
+    except KeyError as exc:
+        raise HarnessError(f"unsupported cancel-poll architecture: {arch}") from exc
+    on_text = text_sections["threaded-polls-on"]
+    off_text = text_sections["threaded-polls-off"]
+    sites_enabled = on_text.count(signature)
+    sites_disabled = off_text.count(signature)
     on_bytes = report["threaded-polls-on"]["text_bytes"]
     off_bytes = report["threaded-polls-off"]["text_bytes"]
-    poll_bytes = 20 if arch == "aarch64" else 21
     delta = on_bytes - off_bytes
-    if delta <= 0 or delta % poll_bytes != 0:
+    if sites_enabled <= 0 or sites_disabled != 0:
         raise HarnessError(
-            f"cancel-poll text delta {delta} is not a positive multiple "
-            f"of {poll_bytes} bytes for {arch}"
+            f"cancel-poll signature count is invalid for {arch}: "
+            f"enabled={sites_enabled}, disabled={sites_disabled}"
         )
+    if delta <= 0 or delta % sites_enabled != 0:
+        raise HarnessError(
+            f"cancel-poll text delta {delta} cannot be attributed to "
+            f"{sites_enabled} detected sites for {arch}"
+        )
+    poll_bytes = delta // sites_enabled
     report["cancel_poll_static"] = {
         "architecture": arch,
+        "detection": "machine-code-signature",
+        "signature_hex": signature.hex(),
         "bytes_per_site": poll_bytes,
         "text_delta_bytes": delta,
-        "sites_enabled": delta // poll_bytes,
-        "sites_disabled": 0,
+        "sites_enabled": sites_enabled,
+        "sites_disabled": sites_disabled,
     }
     return report
 

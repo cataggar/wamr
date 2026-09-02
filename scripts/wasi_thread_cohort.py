@@ -13,7 +13,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from benchmark_schema import SCHEMA_VERSION, atomic_write_json, collected_at
+from benchmark_schema import (
+    BenchmarkDataError,
+    SCHEMA_VERSION,
+    atomic_write_json,
+    collected_at,
+)
 from bench_wasi_threads import HarnessError, validate_report
 
 
@@ -123,6 +128,12 @@ def dispatch(args: argparse.Namespace) -> int:
                     "url": run["url"],
                 }
             )
+            if str(run["headSha"]).lower() != target_sha:
+                atomic_write_json(args.output, state)
+                raise HarnessError(
+                    f"workflow run {run_id} head SHA {run['headSha']!r} "
+                    f"does not match target {target_sha}"
+                )
             if run["status"] == "completed":
                 artifacts = gh_json(
                     [
@@ -270,7 +281,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         return dispatch(args) if args.command == "dispatch" else validate_cohort(args)
-    except (HarnessError, OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+    except (
+        BenchmarkDataError,
+        HarnessError,
+        OSError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

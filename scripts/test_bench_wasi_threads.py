@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import shutil
+import struct
 import sys
 import unittest
 from argparse import Namespace
@@ -563,6 +564,87 @@ class ThreadBenchmarkTests(unittest.TestCase):
             dispatch_command[dispatch_command.index("--ref") + 1],
             target,
         )
+
+        mismatch_output = self.scratch / "dispatch-mismatch.json"
+        mismatch_responses = [
+            "https://github.com/cataggar/wamr/actions/runs/124\n",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": "b" * 40,
+                    "url": "https://github.com/cataggar/wamr/actions/runs/124",
+                }
+            ),
+        ]
+        with (
+            mock.patch.object(
+                cohort.subprocess,
+                "check_output",
+                side_effect=mismatch_responses,
+            ),
+            mock.patch.object(cohort.time, "sleep"),
+            self.assertRaisesRegex(bench.HarnessError, "does not match target"),
+        ):
+            cohort.dispatch(
+                Namespace(
+                    target_sha=target,
+                    runs=1,
+                    max_in_flight=1,
+                    output=mismatch_output,
+                    repository="cataggar/wamr",
+                    workflow="wasi-thread-bench.yml",
+                    poll_seconds=0,
+                )
+            )
+
+    def test_cohort_main_handles_report_schema_errors(self) -> None:
+        with mock.patch.object(
+            cohort,
+            "validate_cohort",
+            side_effect=BenchmarkDataError("bad report"),
+        ):
+            self.assertEqual(
+                cohort.main(
+                    [
+                        "validate",
+                        "--input-dir",
+                        str(self.scratch),
+                    ]
+                ),
+                2,
+            )
+
+    def test_cancel_poll_sites_use_machine_code_signatures(self) -> None:
+        for arch, bytes_per_site in (("x86_64", 21), ("aarch64", 20)):
+            signature = bench.CANCEL_POLL_SIGNATURES[arch]
+            off_text = bytes(32)
+            on_text = (
+                signature
+                + bytes(7)
+                + signature
+                + bytes(len(off_text) + 2 * bytes_per_site - 2 * len(signature) - 7)
+            )
+            artifacts = {}
+            for name, text in (
+                ("single", bytes(8)),
+                ("threaded-polls-on", on_text),
+                ("threaded-polls-off", off_text),
+            ):
+                path = self.scratch / f"{arch}-{name}.cwasm"
+                path.write_bytes(
+                    b"\x00aot"
+                    + struct.pack("<I", 11)
+                    + struct.pack("<II", 2, len(text))
+                    + text
+                )
+                artifacts[name] = path
+            report = bench.aot_artifact_report(artifacts, arch)
+            detected = report["cancel_poll_static"]
+            self.assertEqual(detected["detection"], "machine-code-signature")
+            self.assertEqual(detected["sites_enabled"], 2)
+            self.assertEqual(detected["sites_disabled"], 0)
+            self.assertEqual(detected["bytes_per_site"], bytes_per_site)
 
     def test_fixture_hashes_and_schema_are_pinned(self) -> None:
         fixtures = bench.resolve_fixtures(ROOT)
