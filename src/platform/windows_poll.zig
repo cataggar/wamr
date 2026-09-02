@@ -265,6 +265,7 @@ fn cancelSynchronousWorker(thread: std.Thread) void {
     while (true) {
         var iosb: windows.IO_STATUS_BLOCK = undefined;
         _ = windows.ntdll.NtCancelSynchronousIoFile(thread_handle, null, &iosb);
+        _ = windows.ntdll.NtAlertThread(thread_handle);
         const result = api.WaitForMultipleObjects(1, &wait_handles, .FALSE, polling_slice_ms);
         if (result == wait_object_0 or result == wait_failed) break;
     }
