@@ -646,6 +646,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
             self.assertEqual(detected["sites_disabled"], 0)
             self.assertEqual(detected["bytes_per_site"], bytes_per_site)
 
+        unsupported = self.scratch / "unsupported-version.cwasm"
+        unsupported.write_bytes(
+            b"\x00aot"
+            + struct.pack("<I", bench.AOT_VERSION - 1)
+            + struct.pack("<II", 2, 0)
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "unsupported WAMR AOT version"):
+            bench.aot_text_section(unsupported)
+
     def test_fixture_hashes_and_schema_are_pinned(self) -> None:
         fixtures = bench.resolve_fixtures(ROOT)
         self.assertEqual(fixtures["single"]["sha256"], bench.FIXTURES["single"]["sha256"])

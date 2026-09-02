@@ -43,6 +43,7 @@ PROFILE_COUNTS = {
     "smoke": (1, 3),
 }
 MIN_TIMED_INTERVAL_MS = 100.0
+AOT_VERSION = 11
 # Stable fast-path signatures emitted by emitCancelPoint in each backend.
 # Counting these signatures avoids treating instruction-sequence byte sizes as
 # an ABI; text growth per site is derived from each on/off artifact pair.
@@ -68,7 +69,7 @@ FIXTURES = {
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "cb9bf0c19e23bb4389994447d579886534281ece1405f700007d123226dd3cdc",
+        "sha256": "3905e4d35da45fd7b60abde10388dc23b276439eb6f4c67e844fff05d76c5474",
     },
 }
 MASK64 = (1 << 64) - 1
@@ -512,6 +513,12 @@ def aot_text_section(path: Path) -> bytes:
     data = path.read_bytes()
     if len(data) < 8 or data[:4] != b"\x00aot":
         raise HarnessError(f"not a WAMR AOT file: {path}")
+    version = struct.unpack_from("<I", data, 4)[0]
+    if version != AOT_VERSION:
+        raise HarnessError(
+            f"unsupported WAMR AOT version {version} in {path}; "
+            f"expected {AOT_VERSION}"
+        )
     position = 8
     while position + 8 <= len(data):
         section_type, section_size = struct.unpack_from("<II", data, position)

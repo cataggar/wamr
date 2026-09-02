@@ -237,10 +237,14 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         wabt.Validator.validate(&module, .{}) catch |err| {
+            const basename = std.fs.path.basename(args[i]);
             const passive_data_validator_gap =
-                std.mem.eql(u8, std.fs.path.basename(args[i]), "passive-clobber.wat") or
-                std.mem.eql(u8, std.fs.path.basename(args[i]), "passive-clobber-v128.wat") or
-                std.mem.eql(u8, std.fs.path.basename(args[i]), "mixed-active-passive.wat");
+                (std.mem.eql(u8, basename, "passive-clobber.wat") and
+                    err == error.InvalidDataIndex) or
+                (std.mem.eql(u8, basename, "passive-clobber-v128.wat") and
+                    err == error.TypeMismatch) or
+                (std.mem.eql(u8, basename, "mixed-active-passive.wat") and
+                    err == error.InvalidDataIndex);
             if (!passive_data_validator_gap) {
                 std.debug.print(
                     "{s}: placeholder validation failed: {s}\n",

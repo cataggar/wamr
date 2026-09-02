@@ -31,13 +31,13 @@ struct worker_arg {
 };
 
 static _Atomic uint64_t shared_counter;
-static int32_t ready_count;
-static int32_t completed_count;
-static int32_t phase;
-static int32_t gates[MAX_THREADS];
-static int32_t acknowledgements[MAX_THREADS];
-static int32_t abort_requested;
-static int32_t worker_failed;
+static _Atomic int32_t ready_count;
+static _Atomic int32_t completed_count;
+static _Atomic int32_t phase;
+static _Atomic int32_t gates[MAX_THREADS];
+static _Atomic int32_t acknowledgements[MAX_THREADS];
+static _Atomic int32_t abort_requested;
+static _Atomic int32_t worker_failed;
 static alignas(16) unsigned char
     worker_stacks[MAX_THREADS][THREAD_STACK_BYTES];
 
@@ -62,22 +62,29 @@ static int parse_u64(const char *text, uint64_t *out) {
     return 0;
 }
 
-static int32_t load_i32(const int32_t *address) {
-    return __atomic_load_n(address, __ATOMIC_SEQ_CST);
+static int32_t load_i32(const _Atomic int32_t *address) {
+    return atomic_load_explicit(address, memory_order_seq_cst);
 }
 
-static void store_i32(int32_t *address, int32_t value) {
-    __atomic_store_n(address, value, __ATOMIC_SEQ_CST);
+static void store_i32(_Atomic int32_t *address, int32_t value) {
+    atomic_store_explicit(address, value, memory_order_seq_cst);
 }
 
-static int wait_while_equal(int32_t *address, int32_t expected) {
+static int32_t *wait_address(_Atomic int32_t *address) {
+    // Clang's wasm wait/notify builtins take the non-atomic value pointer even
+    // though the emitted operations are atomic. All C accesses remain atomic.
+    return (int32_t *)(void *)address;
+}
+
+static int wait_while_equal(
+    _Atomic int32_t *address, int32_t expected) {
     while (load_i32(address) == expected) {
         if (load_i32(&abort_requested) != 0 ||
             load_i32(&worker_failed) != 0) {
             return -1;
         }
         int result = __builtin_wasm_memory_atomic_wait32(
-            address, expected, INT64_C(-1));
+            wait_address(address), expected, INT64_C(-1));
         if (result != 0 && result != 1) return -1;
     }
     if (load_i32(&abort_requested) != 0 ||
@@ -87,23 +94,25 @@ static int wait_while_equal(int32_t *address, int32_t expected) {
     return 0;
 }
 
-static void notify_all(int32_t *address) {
-    (void)__builtin_wasm_memory_atomic_notify(address, INT32_MAX);
+static void notify_all(_Atomic int32_t *address) {
+    (void)__builtin_wasm_memory_atomic_notify(
+        wait_address(address), INT32_MAX);
 }
 
-static int wait_for_count(int32_t *address, int32_t expected) {
+static int wait_for_count(
+    _Atomic int32_t *address, int32_t expected) {
     while (1) {
         if (load_i32(&worker_failed) != 0) return -1;
         int32_t current = load_i32(address);
         if (current >= expected) return 0;
         int result = __builtin_wasm_memory_atomic_wait32(
-            address, current, INT64_C(-1));
+            wait_address(address), current, INT64_C(-1));
         if (result != 0 && result != 1) return -1;
     }
 }
 
-static void signal_count(int32_t *address) {
-    __atomic_fetch_add(address, 1, __ATOMIC_SEQ_CST);
+static void signal_count(_Atomic int32_t *address) {
+    atomic_fetch_add_explicit(address, 1, memory_order_seq_cst);
     notify_all(address);
 }
 
@@ -179,8 +188,8 @@ static void *wait_notify_worker(void *opaque) {
         worker_complete(arg);
         return NULL;
     }
-    int32_t *gate = &gates[arg->index];
-    int32_t *ack = &acknowledgements[arg->index];
+    _Atomic int32_t *gate = &gates[arg->index];
+    _Atomic int32_t *ack = &acknowledgements[arg->index];
     for (int32_t epoch = 1; epoch <= (int32_t)arg->iterations; ++epoch) {
         if (wait_while_equal(gate, epoch - 1) != 0 ||
             load_i32(&abort_requested) != 0 ||
@@ -280,10 +289,13 @@ static void reset_timed_state(void) {
 static void abort_workers(uint32_t threads) {
     store_i32(&abort_requested, 1);
     store_i32(&phase, INT32_MAX);
+    notify_all(&ready_count);
+    notify_all(&completed_count);
     notify_all(&phase);
     for (uint32_t i = 0; i < threads; ++i) {
         store_i32(&gates[i], INT32_MAX);
         notify_all(&gates[i]);
+        notify_all(&acknowledgements[i]);
     }
 }
 
