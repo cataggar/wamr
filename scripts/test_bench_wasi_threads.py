@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bench_wasi_threads as bench  # noqa: E402
+import benchmark_schema as schema  # noqa: E402
 import wasi_thread_cohort as cohort  # noqa: E402
 from benchmark_schema import (  # noqa: E402
     BenchmarkDataError,
@@ -233,6 +234,16 @@ class ThreadBenchmarkTests(unittest.TestCase):
             encoding="UTF-8",
         )
         return path
+
+    def test_atomic_json_write_skips_windows_directory_fsync(self) -> None:
+        output = self.scratch / "report.json"
+        with (
+            mock.patch.object(schema.os, "name", "nt"),
+            mock.patch.object(schema.os, "open") as open_mock,
+        ):
+            schema.atomic_write_json(output, {"ok": True})
+        open_mock.assert_not_called()
+        self.assertEqual(json.loads(output.read_text(encoding="UTF-8")), {"ok": True})
 
     def test_cli_parsing_and_profiles(self) -> None:
         args = bench.parse_args(
