@@ -58,9 +58,11 @@ The corrected schema-v2 metric is guest-reported WASI monotonic time:
 The report retains raw guest time, corrected guest time, overhead and overhead
 ppm, plus host wall time as a watchdog/lifecycle diagnostic. Throughput uses
 only corrected guest time. Default inputs target at least hundreds of
-milliseconds per sample: 64 million hot-loop iterations per worker, 20 million
-atomic RMWs per worker, 10,000 wait/notify hand-offs per worker, and 600
-spawn/join rounds.
+milliseconds per sample: 128 million hot-loop iterations per worker, 64
+million atomic RMWs per worker, 64,000 total wait/notify hand-offs divided
+evenly across the selected workers, and 3,000 spawn/join rounds. Keeping the
+wait/notify operation total fixed avoids turning its intentionally serialized
+controller/worker protocol into a multi-minute sample at higher thread counts.
 
 ## Rebuild the fixtures
 

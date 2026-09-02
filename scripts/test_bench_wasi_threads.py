@@ -264,8 +264,23 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.thread_counts, (1, 4, 8))
         self.assertEqual(args.modes, "aot")
         self.assertEqual(args.min_interval_ms, 100)
+        wait_iterations = {
+            scenario.threads: scenario.iterations
+            for scenario in bench.planned_scenarios(args)
+            if scenario.workload == "wait-notify"
+        }
+        self.assertEqual(wait_iterations, {1: 64_000, 4: 16_000, 8: 8_000})
         with self.assertRaises(SystemExit):
             bench.parse_args(["--thread-counts", "1,3"])
+        with self.assertRaises(SystemExit):
+            bench.parse_args(
+                [
+                    "--thread-counts",
+                    "1,8",
+                    "--wait-iterations",
+                    "10",
+                ]
+            )
 
     def test_pair_direction_never_depends_on_condition_sorting(self) -> None:
         records = []

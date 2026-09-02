@@ -105,7 +105,13 @@ class Scenario:
 
 def planned_scenarios(args: argparse.Namespace) -> list[Scenario]:
     return [
-        Scenario(workload, threads, iterations)
+        Scenario(
+            workload,
+            threads,
+            iterations // threads
+            if workload == "wait-notify"
+            else iterations,
+        )
         for workload, iterations in (
             ("hot", args.hot_iterations),
             ("atomic", args.atomic_iterations),
@@ -284,6 +290,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be > 0")
+    if any(
+        args.wait_iterations % threads != 0
+        for threads in args.thread_counts
+    ):
+        parser.error(
+            "--wait-iterations must be divisible by every selected thread count"
+        )
     if args.timeout <= 0:
         parser.error("--timeout must be > 0")
     if args.min_interval_ms <= 0:
