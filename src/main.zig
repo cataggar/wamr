@@ -1529,7 +1529,13 @@ fn runInterpreterCore(
             return 1;
         };
         module_inst.thread_manager = &manager;
-        manager.bindTermination(&wasi_ctx.termination);
+        manager.bindTermination(&wasi_ctx.termination) catch |err| {
+            std.debug.print(
+                "Error: failed to initialize WASI thread cancellation: {s}\n",
+                .{@errorName(err)},
+            );
+            return 1;
+        };
     }
 
     wamr.instance.runStartFunction(module_inst) catch |err| {
@@ -1754,7 +1760,13 @@ fn runAotReal(
             );
             return 1;
         };
-        manager.bindTermination(&ctx.termination);
+        manager.bindTermination(&ctx.termination) catch |err| {
+            std.debug.print(
+                "Error: failed to initialize AOT WASI thread cancellation: {s}\n",
+                .{@errorName(err)},
+            );
+            return 1;
+        };
     }
 
     if (aot_module.start_function) |start_idx| {

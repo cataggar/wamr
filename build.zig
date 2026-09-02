@@ -1128,6 +1128,10 @@ pub fn build(b: *std.Build) void {
         .root_module = test_module,
         .filters = &.{
             "Windows poll_oneoff:",
+            "Windows poll review:",
+            "Windows cancellable read:",
+            "poll_oneoff review:",
+            "ThreadManager: Windows cancel event",
             "group termination: a blocking poll_oneoff",
             "group termination: poll_oneoff still honours",
             "group termination: a blocking Windows stdin",

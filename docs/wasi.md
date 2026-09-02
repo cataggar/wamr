@@ -216,9 +216,15 @@ Windows supports relative and absolute realtime/monotonic clock
 subscriptions plus stdio and regular-file readiness. Console input is treated
 as readable only when a key is available (or a complete line in line-input
 mode); redirected pipes use `PeekNamedPipe` so buffered bytes and writer
-closure/EOF are distinguished. With Preview-1 threads enabled, every blocking
-Windows wait includes a `ThreadManager`-owned manual-reset cancellation event,
-so group termination wakes `poll_oneoff` and blocking stdin reads immediately.
+closure/EOF are distinguished. Absolute deadlines are re-evaluated against
+their selected clock after every wake, including realtime clock adjustments.
+
+With Preview-1 threads enabled, binding the group lazily creates a
+`ThreadManager`-owned manual-reset cancellation event; allocation failure is
+reported as a setup error rather than panicking. Readiness waits include that
+event directly. Blocking stdin `ReadFile` calls run on a bounded helper thread:
+group cancellation waits for and cancels the actual syscall with
+`NtCancelSynchronousIoFile`, rather than relying on an earlier readiness probe.
 
 Preview-1 socket subscriptions on Windows currently produce a per-event
 `notsup` error; Windows socket I/O itself remains supported. POSIX
