@@ -19,14 +19,11 @@ from benchmark_schema import (
     atomic_write_json,
     collected_at,
 )
-from bench_wasi_threads import HarnessError, validate_report
+from bench_wasi_threads import CANONICAL_PLATFORMS, HarnessError, validate_report
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-DEFAULT_PLATFORMS = (
-    "ubuntu-22.04-x86_64",
-    "ubuntu-24.04-aarch64",
-)
+DEFAULT_PLATFORMS = tuple(CANONICAL_PLATFORMS)
 
 
 def require_sha(value: str) -> str:
@@ -168,6 +165,12 @@ def validate_documents(
 ) -> dict[str, Any]:
     if minimum_reports < 1:
         raise HarnessError("minimum report count must be positive")
+    if (
+        len(required_platforms) != len(DEFAULT_PLATFORMS)
+        or len(set(required_platforms)) != len(required_platforms)
+        or set(required_platforms) != set(DEFAULT_PLATFORMS)
+    ):
+        raise HarnessError("cohort platforms must be exactly the canonical hosted set")
     grouped: dict[str, list[tuple[Path, dict[str, Any]]]] = defaultdict(list)
     identities: set[tuple[str, str, str, str, str]] = set()
     for path, document in documents:
@@ -176,6 +179,12 @@ def validate_documents(
         platform_id = metadata["platform_id"]
         if platform_id not in required_platforms:
             raise HarnessError(f"{path}: unknown platform {platform_id!r}")
+        expected_host = CANONICAL_PLATFORMS[platform_id]
+        host = metadata["host"]
+        if (host["system"], host["machine"]) != expected_host:
+            raise HarnessError(
+                f"{path}: platform ID does not match canonical host identity"
+            )
         if document["plan"]["profile"] != "authoritative":
             raise HarnessError(f"{path}: cohort report is not authoritative")
         identities.add(
@@ -192,6 +201,7 @@ def validate_documents(
         raise HarnessError("cohort reports have mixed commit/source/fixture/plan identity")
     if set(grouped) != set(required_platforms):
         raise HarnessError("cohort platform set is incomplete")
+    run_ids_by_platform: dict[str, set[str]] = {}
     for platform_id in required_platforms:
         selected = grouped[platform_id]
         if len(selected) < minimum_reports:
@@ -204,6 +214,11 @@ def validate_documents(
         ]
         if any(not run_id for run_id in run_ids) or len(set(run_ids)) != len(run_ids):
             raise HarnessError(f"{platform_id}: workflow run IDs are missing or duplicate")
+        run_ids_by_platform[platform_id] = set(run_ids)
+    if len({len(items) for items in grouped.values()}) != 1:
+        raise HarnessError("cohort platforms have different report counts")
+    if len({frozenset(items) for items in run_ids_by_platform.values()}) != 1:
+        raise HarnessError("cohort platforms do not contain the same workflow runs")
     identity = next(iter(identities))
     return {
         "schema_version": SCHEMA_VERSION,
@@ -238,7 +253,7 @@ def validate_cohort(args: argparse.Namespace) -> int:
         raise HarnessError(f"no report.json files under {args.input_dir}")
     result = validate_documents(
         documents,
-        tuple(args.platform or DEFAULT_PLATFORMS),
+        DEFAULT_PLATFORMS,
         args.minimum_reports,
     )
     atomic_write_json(args.output, result)
@@ -266,11 +281,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--input-dir", type=Path, required=True)
     validate_parser.add_argument("--minimum-reports", type=int, default=20)
-    validate_parser.add_argument(
-        "--platform",
-        action="append",
-        default=None,
-    )
     validate_parser.add_argument(
         "--output", type=Path, default=Path("wasi-thread-cohort.json")
     )
