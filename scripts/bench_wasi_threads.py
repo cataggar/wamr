@@ -57,11 +57,11 @@ WASI_SDK = {
 FIXTURES = {
     "single": {
         "path": Path("tests/benchmarks/wasi-threads/single.wasm"),
-        "sha256": "85ef78d9497bd0c46956ae7df272856ccba183ce1c8c02bf5afeea7cd9ca871f",
+        "sha256": "ca254623aecd94750391e683ac97927a179fe48724d26ea3f400205ff93226ed",
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "bd90a4a9ea209411809155dcd23210636d4dbaff1df46cdeaeb07fd8f161c24b",
+        "sha256": "c1f830ae5e41432f1123904154fa21227f4eecee0af019dee1e14a9d7bc4504e",
     },
 }
 MASK64 = (1 << 64) - 1

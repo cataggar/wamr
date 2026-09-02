@@ -211,8 +211,12 @@ static int join_workers(
     struct worker_arg args[MAX_THREADS]) {
     for (uint32_t i = 0; i < threads; ++i) {
         int rc = pthread_join(tids[i], NULL);
-        if (rc != 0 || args[i].error != 0) {
+        if (rc != 0) {
             fprintf(stderr, "pthread_join[%u] failed: %d\n", i, rc);
+            return -1;
+        }
+        if (args[i].error != 0) {
+            fprintf(stderr, "worker[%u] failed: %d\n", i, args[i].error);
             return -1;
         }
     }

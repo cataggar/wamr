@@ -2092,7 +2092,7 @@ pub fn instantiateWithOverrides(
             },
             .passive => unreachable,
         };
-        const end = @as(usize, offset) + seg.data.len;
+        const end = std.math.add(usize, @as(usize, offset), seg.data.len) catch continue;
         if (end > mem.byteLen()) continue;
         @memcpy(mem.data[offset..][0..seg.data.len], seg.data);
     }
