@@ -46,15 +46,6 @@ const api = if (is_windows) struct {
         lpNumberOfEventsRead: *windows.DWORD,
     ) callconv(.winapi) windows.BOOL;
 
-    extern "kernel32" fn PeekNamedPipe(
-        hNamedPipe: Handle,
-        lpBuffer: ?*anyopaque,
-        nBufferSize: windows.DWORD,
-        lpBytesRead: ?*windows.DWORD,
-        lpTotalBytesAvail: ?*windows.DWORD,
-        lpBytesLeftThisMessage: ?*windows.DWORD,
-    ) callconv(.winapi) windows.BOOL;
-
     extern "kernel32" fn GetFileType(hFile: Handle) callconv(.winapi) windows.DWORD;
 
     extern "kernel32" fn ReadFile(
@@ -256,51 +247,6 @@ const PipeProbeResult = union(enum) {
     hangup,
     bad_handle,
     io_error,
-    cancelled,
-};
-
-const PipeProbeOperation = enum {
-    peek,
-    blocking_read_for_test,
-};
-
-const PipeProbeJob = struct {
-    handle: Handle,
-    operation: PipeProbeOperation,
-    result: PipeProbeResult = .pending,
-
-    fn run(self: *PipeProbeJob) void {
-        if (self.operation == .blocking_read_for_test) {
-            var byte: [1]u8 = undefined;
-            var nread: windows.DWORD = 0;
-            if (api.ReadFile(self.handle, &byte, 1, &nread, null).toBool()) {
-                self.result = if (nread == 0) .hangup else .{ .ready = nread };
-                return;
-            }
-            self.result = switch (windows.GetLastError()) {
-                .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA, .HANDLE_EOF => .hangup,
-                .INVALID_HANDLE => .bad_handle,
-                .OPERATION_ABORTED => .cancelled,
-                else => .io_error,
-            };
-            return;
-        }
-
-        var available: windows.DWORD = 0;
-        if (api.PeekNamedPipe(self.handle, null, 0, null, &available, null).toBool()) {
-            self.result = if (available == 0)
-                .pending
-            else
-                .{ .ready = available };
-            return;
-        }
-        self.result = switch (windows.GetLastError()) {
-            .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA, .HANDLE_EOF => .hangup,
-            .INVALID_HANDLE => .bad_handle,
-            .OPERATION_ABORTED => .cancelled,
-            else => .io_error,
-        };
-    }
 };
 
 fn cancelSynchronousWorker(thread: std.Thread) void {
@@ -315,52 +261,29 @@ fn cancelSynchronousWorker(thread: std.Thread) void {
     thread.join();
 }
 
-fn probePipeOperation(
-    cancel_handle: ?Handle,
-    handle: Handle,
-    operation: PipeProbeOperation,
-) PipeProbeResult {
-    var job = PipeProbeJob{ .handle = handle, .operation = operation };
-    var thread = std.Thread.spawn(.{}, PipeProbeJob.run, .{&job}) catch
-        return .io_error;
-    const thread_handle: Handle = thread.getHandle();
-    var handles: [2]Handle = undefined;
-    var handle_count: usize = 0;
-    if (cancel_handle) |cancel| {
-        handles[0] = cancel;
-        handle_count = 1;
-    }
-    handles[handle_count] = thread_handle;
-    handle_count += 1;
-
-    const result = api.WaitForMultipleObjects(
-        @intCast(handle_count),
-        &handles,
-        .FALSE,
-        polling_slice_ms,
-    );
-    if (cancel_handle != null and result == wait_object_0) {
-        cancelSynchronousWorker(thread);
-        return .cancelled;
-    }
-    const thread_index: windows.DWORD = if (cancel_handle == null) 0 else 1;
-    if (result == wait_object_0 + thread_index) {
-        thread.join();
-        return job.result;
-    }
-    cancelSynchronousWorker(thread);
-    return if (result == wait_timeout) .pending else .io_error;
+fn probePipe(handle: Handle) PipeProbeResult {
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    var info: windows.FILE.PIPE.LOCAL_INFORMATION = undefined;
+    return switch (windows.ntdll.NtQueryInformationFile(
+        handle,
+        &iosb,
+        &info,
+        @sizeOf(windows.FILE.PIPE.LOCAL_INFORMATION),
+        .PipeLocal,
+    )) {
+        .SUCCESS => if (info.ReadDataAvailable != 0)
+            .{ .ready = info.ReadDataAvailable }
+        else switch (info.NamedPipeState) {
+            .DISCONNECTED, .CLOSING => .hangup,
+            .LISTENING, .CONNECTED => .pending,
+        },
+        .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE => .hangup,
+        .INVALID_HANDLE => .bad_handle,
+        else => .io_error,
+    };
 }
 
-fn probePipe(cancel_handle: ?Handle, handle: Handle) PipeProbeResult {
-    return probePipeOperation(cancel_handle, handle, .peek);
-}
-
-fn probeInput(
-    allocator: std.mem.Allocator,
-    cancel_handle: ?Handle,
-    input: *ReadInput,
-) bool {
+fn probeInput(allocator: std.mem.Allocator, input: *ReadInput) void {
     input.status = .pending;
     input.nbytes = 0;
     input.console = false;
@@ -368,7 +291,7 @@ fn probeInput(
 
     if (input.handle == windows.INVALID_HANDLE_VALUE) {
         input.status = .bad_handle;
-        return false;
+        return;
     }
 
     var console_mode: windows.DWORD = 0;
@@ -378,12 +301,12 @@ fn probeInput(
         input.status = result.status;
         input.poll_only = result.poll_only;
         if (input.status == .ready) input.nbytes = 1;
-        return false;
+        return;
     }
 
     switch (api.GetFileType(input.handle)) {
         file_type_disk, file_type_char => input.status = .ready,
-        file_type_pipe => switch (probePipe(cancel_handle, input.handle)) {
+        file_type_pipe => switch (probePipe(input.handle)) {
             .pending => input.poll_only = true,
             .ready => |nbytes| {
                 input.status = .ready;
@@ -392,12 +315,10 @@ fn probeInput(
             .hangup => input.status = .hangup,
             .bad_handle => input.status = .bad_handle,
             .io_error => input.status = .io_error,
-            .cancelled => return true,
         },
         file_type_unknown => input.status = .bad_handle,
         else => input.status = .ready,
     }
-    return false;
 }
 
 fn appendUniqueHandle(handles: *[max_wait_handles]Handle, count: *usize, handle: Handle) bool {
@@ -507,8 +428,8 @@ fn waitForReadinessWithHooks(
         for (inputs) |*input| {
             if (hooks) |installed|
                 installed.probe(installed.ctx, input)
-            else if (probeInput(allocator, cancel_handle, input))
-                return .cancelled;
+            else
+                probeInput(allocator, input);
             switch (input.status) {
                 .ready, .hangup, .bad_handle, .io_error => any_ready = true,
                 .pending => {
@@ -550,12 +471,14 @@ pub const ReadError = error{
     IoError,
     ThreadSpawnFailed,
     WaitFailed,
+    WouldBlock,
 };
 
 const ReadOutcome = enum {
     pending,
     success,
     eof,
+    would_block,
     cancelled,
     bad_handle,
     io_error,
@@ -587,7 +510,8 @@ const ReadJob = struct {
             return;
         }
         self.outcome = switch (err) {
-            .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA, .HANDLE_EOF => .eof,
+            .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .HANDLE_EOF => .eof,
+            .NO_DATA => .would_block,
             .OPERATION_ABORTED => .cancelled,
             .INVALID_HANDLE => .bad_handle,
             else => .io_error,
@@ -600,6 +524,7 @@ fn finishRead(thread: std.Thread, job: *const ReadJob) ReadError!usize {
     return switch (job.outcome) {
         .success => job.nread,
         .eof => 0,
+        .would_block => error.WouldBlock,
         .cancelled => error.Cancelled,
         .bad_handle => error.BadHandle,
         .pending, .io_error => error.IoError,
@@ -610,6 +535,7 @@ fn finishRead(thread: std.Thread, job: *const ReadJob) ReadError!usize {
 /// both that thread and the manager cancellation event. On cancellation the
 /// blocked syscall itself is stopped with `NtCancelSynchronousIoFile`.
 pub fn readCancellable(
+    allocator: std.mem.Allocator,
     cancel_handle_opaque: *anyopaque,
     handle: Handle,
     buffer: []u8,
@@ -618,23 +544,52 @@ pub fn readCancellable(
     if (buffer.len == 0) return 0;
     if (buffer.len > std.math.maxInt(windows.DWORD)) return error.IoError;
 
-    var job = ReadJob{ .handle = handle, .buffer = buffer };
-    var thread = std.Thread.spawn(.{}, ReadJob.run, .{&job}) catch
-        return error.ThreadSpawnFailed;
-    const thread_handle: Handle = thread.getHandle();
     const cancel_handle: Handle = @ptrCast(cancel_handle_opaque);
-    var handles = [_]Handle{ cancel_handle, thread_handle };
+    const is_pipe = api.GetFileType(handle) == file_type_pipe;
 
-    const result = api.WaitForMultipleObjects(handles.len, &handles, .FALSE, infinite);
-    if (result == wait_object_0 + 1)
-        return finishRead(thread, &job);
-    if (result == wait_object_0) {
+    while (true) {
+        if (is_pipe) {
+            var inputs = [_]ReadInput{.{ .handle = handle }};
+            switch (waitForReadiness(
+                allocator,
+                cancel_handle_opaque,
+                &inputs,
+                -1,
+            )) {
+                .cancelled => return error.Cancelled,
+                .failed, .timed_out => return error.WaitFailed,
+                .ready => switch (inputs[0].status) {
+                    .ready => {},
+                    .hangup => return 0,
+                    .bad_handle => return error.BadHandle,
+                    .io_error => return error.IoError,
+                    .pending => continue,
+                },
+            }
+        }
+
+        var job = ReadJob{ .handle = handle, .buffer = buffer };
+        var thread = std.Thread.spawn(.{}, ReadJob.run, .{&job}) catch
+            return error.ThreadSpawnFailed;
+        const thread_handle: Handle = thread.getHandle();
+        var handles = [_]Handle{ cancel_handle, thread_handle };
+
+        const result = api.WaitForMultipleObjects(handles.len, &handles, .FALSE, infinite);
+        if (result == wait_object_0 + 1) {
+            const nread = finishRead(thread, &job) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            return nread;
+        }
+        if (result == wait_object_0) {
+            cancelSynchronousWorker(thread);
+            return error.Cancelled;
+        }
+
         cancelSynchronousWorker(thread);
-        return error.Cancelled;
+        return error.WaitFailed;
     }
-
-    cancelSynchronousWorker(thread);
-    return error.WaitFailed;
 }
 
 fn testKeyRecord(char: windows.WCHAR) InputRecord {
@@ -790,7 +745,7 @@ test "Windows poll review: more than 64 console handles stay bounded and complet
     try std.testing.expectEqual(InputStatus.ready, inputs[69].status);
 }
 
-test "Windows poll rereview: a blocked pipe probe is cancelled on its worker" {
+test "Windows poll rereview: pipe metadata query does not serialize behind a blocking read" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     var read = windows.INVALID_HANDLE_VALUE;
@@ -800,12 +755,14 @@ test "Windows poll rereview: a blocked pipe probe is cancelled on its worker" {
     defer windows.CloseHandle(read);
     defer windows.CloseHandle(write);
 
-    var cancel = CancelEvent.init();
-    defer cancel.deinit();
-    try cancel.ensureInitialized(false);
-    _ = cancel.signal();
-
-    const Fallback = struct {
+    const Reader = struct {
+        fn run(handle: Handle) void {
+            var byte: [1]u8 = undefined;
+            var nread: windows.DWORD = 0;
+            _ = api.ReadFile(handle, &byte, 1, &nread, null);
+        }
+    };
+    const FallbackWriter = struct {
         fn run(handle: Handle) void {
             api.Sleep(1000);
             var written: windows.DWORD = 0;
@@ -813,17 +770,33 @@ test "Windows poll rereview: a blocked pipe probe is cancelled on its worker" {
             _ = api.WriteFile(handle, byte.ptr, 1, &written, null);
         }
     };
-    const fallback = try std.Thread.spawn(.{}, Fallback.run, .{write});
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{read});
+    const fallback = try std.Thread.spawn(.{}, FallbackWriter.run, .{write});
+    api.Sleep(20);
 
     const started = api.GetTickCount64();
-    const result = probePipeOperation(
-        cancel.handle,
-        read,
-        .blocking_read_for_test,
-    );
+    const result = probePipe(read);
     const elapsed = api.GetTickCount64() - started;
     fallback.join();
+    reader.join();
 
-    try std.testing.expectEqual(PipeProbeResult.cancelled, result);
-    try std.testing.expect(elapsed < 500);
+    try std.testing.expect(result == .pending);
+    try std.testing.expect(elapsed < 250);
+}
+
+test "Windows poll rereview: repeated idle pipe probes create no worker churn" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var read = windows.INVALID_HANDLE_VALUE;
+    var write = windows.INVALID_HANDLE_VALUE;
+    if (!api.CreatePipe(&read, &write, null, 0).toBool())
+        return error.TestUnexpectedResult;
+    defer windows.CloseHandle(read);
+    defer windows.CloseHandle(write);
+
+    const started = api.GetTickCount64();
+    for (0..512) |_|
+        try std.testing.expect(probePipe(read) == .pending);
+    const elapsed = api.GetTickCount64() - started;
+    try std.testing.expect(elapsed < 250);
 }
