@@ -17,6 +17,7 @@ const aot_runtime = @import("../runtime/aot/runtime.zig");
 const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const call_frame_mod = @import("call_frame.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
+const termination = @import("../runtime/common/termination.zig");
 const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
 const stable_resource = @import("../shared/stable_resource.zig");
 const thread_manager_mod = @import("../wasi/thread_manager.zig");
@@ -601,6 +602,12 @@ pub const ComponentInstance = struct {
     /// Host-owned Preview-1 thread group. Zero-sized in disabled builds.
     thread_manager: if (config.lib_wasi_threads)
         thread_manager_mod.ThreadManager
+    else
+        void,
+    /// Permanent Preview-1 process terminal record. Component task
+    /// cancellation is carried separately by resumable task-group epochs.
+    thread_termination: if (config.lib_wasi_threads)
+        termination.State
     else
         void,
     /// Child component instances created when the parent component
@@ -2126,6 +2133,9 @@ pub const InstantiationError = error{
     /// during AOT instantiation (#889), but the sidecar was missing or
     /// otherwise could not be attached.
     LazyJitAttachFailed,
+    /// The platform could not create the interruption primitive required by
+    /// the component's Preview-1 thread manager.
+    ThreadCancellationUnavailable,
 };
 
 /// Instantiate a parsed component, producing a runnable ComponentInstance.
@@ -2148,6 +2158,18 @@ pub fn instantiate(
     allocator: std.mem.Allocator,
 ) InstantiationError!*ComponentInstance {
     return instantiateWithOptions(component, allocator, .{});
+}
+
+fn interpreterUsesWasiThreads(module: *const core_types.WasmModule) bool {
+    for (module.imports) |imp| {
+        if (imp.kind == .function and
+            config.threads_feature.isThreadSpawnImport(
+                imp.module_name,
+                imp.field_name,
+            ))
+            return true;
+    }
+    return false;
 }
 
 /// `instantiate` variant that accepts caller-supplied options (#625).
@@ -2210,12 +2232,18 @@ pub fn instantiateWithOptions(
         .thread_manager = if (config.lib_wasi_threads)
             thread_manager_mod.ThreadManager.init(allocator)
         else {},
+        .thread_termination = if (config.lib_wasi_threads)
+            termination.State{}
+        else {},
     };
     // From here on, `inst.deinit()` is the single owner of partial-init
     // cleanup. The struct fields above are all in trivially-deinitable
     // states (empty maps, freshly-init arena, &.{} slices) so deinit on
     // partial state is safe before any further work.
     errdefer inst.deinit();
+    if (comptime config.lib_wasi_threads)
+        inst.thread_manager.bindTermination(&inst.thread_termination) catch
+            return error.ThreadCancellationUnavailable;
 
     const loader = @import("../runtime/interpreter/loader.zig");
     const inst_mod = @import("../runtime/interpreter/instance.zig");
@@ -3034,23 +3062,45 @@ pub fn instantiateWithOptions(
     if (comptime config.lib_wasi_threads) {
         var threaded_memory: ?*core_types.MemoryInstance = null;
         for (inst.core_instances) |entry| {
-            const ai = entry.aot_inst orelse continue;
-            if (!aot_runtime.usesWasiThreads(ai.module)) continue;
+            const memory: *core_types.MemoryInstance = blk: {
+                if (entry.aot_inst) |ai| {
+                    if (!aot_runtime.usesWasiThreads(ai.module)) continue;
+                    if (ai.memories.len == 0) return error.AotImportUnresolvable;
+                    break :blk ai.memories[0];
+                }
+                if (entry.module_inst) |mi| {
+                    if (!interpreterUsesWasiThreads(mi.module)) continue;
+                    if (mi.memories.len == 0) return error.AotImportUnresolvable;
+                    break :blk mi.memories[0];
+                }
+                continue;
+            };
             if (threaded_memory != null) {
                 std.log.warn(
-                    "[aot reject] multiple Preview-1 threaded cores in one component are unsupported",
+                    "multiple Preview-1 threaded cores in one component are unsupported",
                     .{},
                 );
                 return error.AotImportUnresolvable;
             }
-            aot_runtime.prepareWasiThreads(ai, &inst.thread_manager) catch |err| {
-                std.log.warn(
-                    "[aot reject] failed to prepare Preview-1 thread group: {s}",
-                    .{@errorName(err)},
-                );
-                return error.AotImportUnresolvable;
-            };
-            threaded_memory = ai.memories[0];
+            if (entry.aot_inst) |ai| {
+                aot_runtime.prepareWasiThreads(ai, &inst.thread_manager) catch |err| {
+                    std.log.warn(
+                        "[aot reject] failed to prepare Preview-1 thread group: {s}",
+                        .{@errorName(err)},
+                    );
+                    return error.AotImportUnresolvable;
+                };
+            } else if (entry.module_inst) |mi| {
+                inst.thread_manager.prepareInterpreterInstance(mi) catch |err| {
+                    std.log.warn(
+                        "failed to prepare Preview-1 thread group: {s}",
+                        .{@errorName(err)},
+                    );
+                    return error.AotImportUnresolvable;
+                };
+                mi.thread_manager = &inst.thread_manager;
+            }
+            threaded_memory = memory;
         }
     }
 
