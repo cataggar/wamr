@@ -9,6 +9,7 @@ const types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const execution_context = @import("../runtime/common/execution_context.zig");
 const termination = @import("../runtime/common/termination.zig");
+const task_cancellation = @import("../runtime/common/task_cancellation.zig");
 const platform = @import("../platform/platform.zig");
 const parking_lot = @import("../platform/parking_lot.zig");
 const windows_poll = @import("../platform/windows_poll.zig");
@@ -270,16 +271,19 @@ pub const JoinSummary = struct {
 /// Backend hook used to publish group cancellation into compiled code.
 pub const CancelBroadcast = struct {
     ctx: *anyopaque,
-    /// `null` targets the permanent process group; a non-null pointer targets
-    /// only VmCtxs carrying that task cancellation group.
-    broadcast: *const fn (*anyopaque, ?*const anyopaque) void,
+    /// Token zero targets the permanent process group. Non-zero tokens are
+    /// immutable for one active manager-local task group.
+    broadcast: *const fn (*anyopaque, u32) void,
 };
 
 pub const TaskCancelGroup = struct {
-    task_key: u64,
+    manager: *ThreadManager,
+    source_id: u32,
+    token: u32,
     refs: usize = 0,
     epoch: parking_lot.CancellationEpoch = .{},
     ticket: parking_lot.CancellationEpoch.Ticket = undefined,
+    registration: task_cancellation.Registration = .{},
     windows_cancel: windows_poll.CancelEvent = windows_poll.CancelEvent.init(),
     next: ?*TaskCancelGroup = null,
 
@@ -287,6 +291,22 @@ pub const TaskCancelGroup = struct {
         return self.ticket.isCancelled();
     }
 };
+
+var next_task_group_token: std.atomic.Value(u32) = .init(1);
+
+fn allocateTaskGroupToken() u32 {
+    var current = next_task_group_token.load(.acquire);
+    while (true) {
+        if (current == std.math.maxInt(u32))
+            @panic("task cancellation group token exhausted");
+        current = next_task_group_token.cmpxchgWeak(
+            current,
+            current + 1,
+            .acq_rel,
+            .acquire,
+        ) orelse return current;
+    }
+}
 
 /// Result of a bounded group teardown.
 pub const TerminationSummary = struct {
@@ -450,10 +470,10 @@ fn configureInterpThreadContext(
         }
     }
     child.env.setThreadManager(manager);
-    child.env.thread_context.cancellation_group = if (cancellation_group) |group|
-        @ptrCast(group)
-    else
-        null;
+    child.env.thread_context.setCancellationGroup(
+        if (cancellation_group) |group| @ptrCast(group) else null,
+        if (cancellation_group) |group| group.token else 0,
+    );
     child.env.configureWasiThread(tid, start_arg, auxiliary_stack);
     child.env.pushI32(tid) catch return error.ChildInitializationFailed;
     child.env.pushI32(@bitCast(start_arg)) catch
@@ -555,7 +575,7 @@ pub const ThreadManager = struct {
     pub const TaskGroupScope = struct {
         manager: *ThreadManager,
         group: *TaskCancelGroup,
-        binding: execution_context.OpaqueBinding,
+        binding: execution_context.CancellationBinding,
         active: bool = true,
 
         pub fn deinit(self: *TaskGroupScope) void {
@@ -675,6 +695,7 @@ pub const ThreadManager = struct {
         self.mutex.unlock();
         while (free_groups) |group| {
             free_groups = group.next;
+            std.debug.assert(group.registration.source == null);
             group.windows_cancel.deinit();
             self.allocator.destroy(group);
         }
@@ -683,23 +704,25 @@ pub const ThreadManager = struct {
 
     /// Bind one component task to a task-scoped cancellation epoch.
     ///
-    /// Nested frames for the same task key share the active group;
+    /// Nested frames for the same task source share the active group;
     /// child WASI threads retain it in their `ThreadRecord`. The last frame
     /// or child release moves the group to the quiescent free list, where a
     /// later task can begin at the current (never-cleared) generation.
     pub fn bindTaskGroup(
         self: *ThreadManager,
         context: *execution_context.ThreadExecutionContext,
-        task_key: u64,
-        already_cancelled: bool,
+        source: *task_cancellation.Source,
     ) (error{OutOfMemory} || BindError)!TaskGroupScope {
-        const group = try self.acquireTaskGroup(task_key);
+        const group = try self.acquireTaskGroup(source);
         group.windows_cancel.ensureInitialized(false) catch {
             self.releaseTaskGroup(group);
             return error.WindowsCancelEventUnavailable;
         };
-        const binding = context.bindCancellationGroup(@ptrCast(group));
-        if (already_cancelled) _ = self.cancelTaskGroup(group);
+        if (source.isCancelled()) _ = self.cancelTaskGroup(group);
+        const binding = context.bindCancellationGroup(
+            @ptrCast(group),
+            group.token,
+        );
         return .{
             .manager = self,
             .group = group,
@@ -709,13 +732,13 @@ pub const ThreadManager = struct {
 
     fn acquireTaskGroup(
         self: *ThreadManager,
-        task_key: u64,
+        source: *task_cancellation.Source,
     ) error{OutOfMemory}!*TaskCancelGroup {
         while (true) {
             self.mutex.lock();
             var current = self.task_groups;
             while (current) |group| : (current = group.next) {
-                if (group.task_key == task_key) {
+                if (group.source_id == source.id) {
                     group.refs += 1;
                     self.mutex.unlock();
                     return group;
@@ -723,12 +746,22 @@ pub const ThreadManager = struct {
             }
             if (self.free_task_groups) |group| {
                 self.free_task_groups = group.next;
+                std.debug.assert(group.registration.source == null);
                 if (group.epoch.begin()) |ticket| {
-                    group.task_key = task_key;
+                    group.manager = self;
+                    group.source_id = source.id;
+                    group.token = allocateTaskGroupToken();
                     group.refs = 1;
                     group.ticket = ticket;
                     group.next = self.task_groups;
                     self.task_groups = group;
+                    _ = source.register(
+                        &group.registration,
+                        .{
+                            .ctx = @ptrCast(group),
+                            .wake = wakeFromTaskCancellation,
+                        },
+                    );
                     self.mutex.unlock();
                     return group;
                 }
@@ -742,14 +775,16 @@ pub const ThreadManager = struct {
             const candidate = self.allocator.create(TaskCancelGroup) catch
                 return error.OutOfMemory;
             candidate.* = .{
-                .task_key = task_key,
+                .manager = self,
+                .source_id = source.id,
+                .token = allocateTaskGroupToken(),
             };
             candidate.ticket = candidate.epoch.begin().?;
 
             self.mutex.lock();
             current = self.task_groups;
             while (current) |group| : (current = group.next) {
-                if (group.task_key == task_key) {
+                if (group.source_id == source.id) {
                     group.refs += 1;
                     self.mutex.unlock();
                     candidate.windows_cancel.deinit();
@@ -760,9 +795,21 @@ pub const ThreadManager = struct {
             candidate.next = self.task_groups;
             candidate.refs = 1;
             self.task_groups = candidate;
+            _ = source.register(
+                &candidate.registration,
+                .{
+                    .ctx = @ptrCast(candidate),
+                    .wake = wakeFromTaskCancellation,
+                },
+            );
             self.mutex.unlock();
             return candidate;
         }
+    }
+
+    fn wakeFromTaskCancellation(raw: *anyopaque) void {
+        const group: *TaskCancelGroup = @ptrCast(@alignCast(raw));
+        _ = group.manager.cancelTaskGroup(group);
     }
 
     fn retainTaskGroup(self: *ThreadManager, group: *TaskCancelGroup) void {
@@ -785,8 +832,11 @@ pub const ThreadManager = struct {
         while (link.*) |candidate| {
             if (candidate == group) {
                 link.* = candidate.next;
+                self.mutex.unlock();
+                group.registration.unregister();
                 group.windows_cancel.deinit();
                 group.windows_cancel = windows_poll.CancelEvent.init();
+                self.mutex.lock();
                 group.next = self.free_task_groups;
                 self.free_task_groups = group;
                 self.mutex.unlock();
@@ -857,7 +907,7 @@ pub const ThreadManager = struct {
     /// spawned mid-teardown from missing the signal.
     pub fn bindCancelBroadcast(self: *ThreadManager, hook: CancelBroadcast) void {
         self.cancel_broadcast = hook;
-        if (self.isProcessTerminating()) hook.broadcast(hook.ctx, null);
+        if (self.isProcessTerminating()) hook.broadcast(hook.ctx, 0);
     }
 
     /// Interrupt every sibling: raise the polled interrupt flag, publish the
@@ -871,27 +921,15 @@ pub const ThreadManager = struct {
         while (group) |current| : (group = current.next)
             _ = current.windows_cancel.signal();
         self.mutex.unlock();
-        if (self.cancel_broadcast) |hook| hook.broadcast(hook.ctx, null);
+        if (self.cancel_broadcast) |hook| hook.broadcast(hook.ctx, 0);
         if (self.shared_memory) |memory| _ = memory.cancelWaiters() catch {};
-    }
-
-    /// Cancel only the task group bound to `context`. Publication advances the
-    /// group's epoch before targeted AOT/futex wakeups, so repeated calls are
-    /// idempotent and unrelated groups sharing the memory remain runnable.
-    pub fn cancelTaskForContext(
-        self: *ThreadManager,
-        context: *const execution_context.ThreadExecutionContext,
-    ) bool {
-        const group = context.cancellationGroup(TaskCancelGroup) orelse
-            return false;
-        return self.cancelTaskGroup(group);
     }
 
     fn cancelTaskGroup(self: *ThreadManager, group: *TaskCancelGroup) bool {
         const first = parking_lot.CancellationEpoch.publish(group.ticket);
         _ = group.windows_cancel.signal();
         if (self.cancel_broadcast) |hook|
-            hook.broadcast(hook.ctx, @ptrCast(group));
+            hook.broadcast(hook.ctx, group.token);
         if (self.shared_memory) |memory|
             _ = memory.cancelWaitersForEpoch(group.ticket) catch {};
         return first;
@@ -905,6 +943,16 @@ pub const ThreadManager = struct {
         const group = context.cancellationGroup(TaskCancelGroup) orelse
             return null;
         return group.ticket;
+    }
+
+    pub fn cancellationTokenForContext(
+        self: *ThreadManager,
+        context: *const execution_context.ThreadExecutionContext,
+    ) u32 {
+        _ = self;
+        const group = context.cancellationGroup(TaskCancelGroup) orelse
+            return 0;
+        return group.token;
     }
 
     pub fn windowsCancelHandleForContext(
@@ -2652,7 +2700,7 @@ test "group termination: the cancel broadcast reaches compiled code on every int
     const Probe = struct {
         calls: usize = 0,
 
-        fn broadcast(raw: *anyopaque, _: ?*const anyopaque) void {
+        fn broadcast(raw: *anyopaque, _: u32) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
         }
@@ -2690,7 +2738,7 @@ test "group termination: the cancel broadcast reaches compiled code on every int
     try std.testing.expect(late.calls >= 1);
 }
 
-test "component task epochs cancel only owned threads and remain reusable" {
+test "thread lifecycle: component task epochs cancel only owned threads and remain reusable" {
     try requireThreadLifecycle();
     const allocator = std.testing.allocator;
     const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
@@ -2711,20 +2759,16 @@ test "component task epochs cancel only owned threads and remain reusable" {
 
     var first_context = execution_context.ThreadExecutionContext{};
     first_context.setThreadGroup(@ptrCast(&manager));
-    var first_scope = try manager.bindTaskGroup(
-        &first_context,
-        1,
-        false,
-    );
+    const first_source = try task_cancellation.Source.create(allocator);
+    defer first_source.release();
+    var first_scope = try manager.bindTaskGroup(&first_context, first_source);
     const first_ticket = manager.cancellationForContext(&first_context).?;
 
     var second_context = execution_context.ThreadExecutionContext{};
     second_context.setThreadGroup(@ptrCast(&manager));
-    var second_scope = try manager.bindTaskGroup(
-        &second_context,
-        2,
-        false,
-    );
+    const second_source = try task_cancellation.Source.create(allocator);
+    defer second_source.release();
+    var second_scope = try manager.bindTaskGroup(&second_context, second_source);
 
     const first_tid = blk: {
         var active = first_context.enter();
@@ -2740,8 +2784,8 @@ test "component task epochs cancel only owned threads and remain reusable" {
     try waitForMemoryWaiters(ctx.mem_inst, 16, 2);
 
     const started_ns = monotonicNowNs();
-    try std.testing.expect(manager.cancelTaskForContext(&first_context));
-    try std.testing.expect(!manager.cancelTaskForContext(&first_context));
+    first_source.cancel();
+    first_source.cancel();
     const first_finished = try awaitThreadOutcome(
         &manager,
         first_tid,
@@ -2784,11 +2828,9 @@ test "component task epochs cancel only owned threads and remain reusable" {
     // cancelled forever.
     var third_context = execution_context.ThreadExecutionContext{};
     third_context.setThreadGroup(@ptrCast(&manager));
-    var third_scope = try manager.bindTaskGroup(
-        &third_context,
-        3,
-        false,
-    );
+    const third_source = try task_cancellation.Source.create(allocator);
+    defer third_source.release();
+    var third_scope = try manager.bindTaskGroup(&third_context, third_source);
     defer third_scope.deinit();
     const third_ticket = manager.cancellationForContext(&third_context).?;
     try std.testing.expect(first_ticket.isCancelled());
@@ -2821,7 +2863,214 @@ test "component task epochs cancel only owned threads and remain reusable" {
     try std.testing.expectEqual(@as(usize, 3), atomicCount(&destroyed));
 }
 
-test "component task cancellation racing spawn is inherited safely" {
+test "thread lifecycle: component task source fans cancellation across manager-local groups" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    const first_module = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(first_module, allocator);
+    const second_module = try buildThreadTestModule(&futex_wait_thread_code, allocator);
+    defer cleanupThreadTest(second_module, allocator);
+
+    var first_terminal = termination.State{};
+    var first_manager = ThreadManager.init(allocator);
+    defer first_manager.deinit();
+    try first_manager.bindTermination(&first_terminal);
+    try first_manager.prepareSharedMemory(first_module.mem_inst, null);
+    first_module.inst.thread_manager = &first_manager;
+
+    var second_terminal = termination.State{};
+    var second_manager = ThreadManager.init(allocator);
+    defer second_manager.deinit();
+    try second_manager.bindTermination(&second_terminal);
+    try second_manager.prepareSharedMemory(second_module.mem_inst, null);
+    second_module.inst.thread_manager = &second_manager;
+
+    const task_source = try task_cancellation.Source.create(allocator);
+    defer task_source.release();
+    var first_context = execution_context.ThreadExecutionContext{};
+    first_context.setThreadGroup(@ptrCast(&first_manager));
+    var first_scope = try first_manager.bindTaskGroup(&first_context, task_source);
+    defer first_scope.deinit();
+    var second_context = execution_context.ThreadExecutionContext{};
+    second_context.setThreadGroup(@ptrCast(&second_manager));
+    var second_scope = try second_manager.bindTaskGroup(&second_context, task_source);
+    defer second_scope.deinit();
+
+    const unrelated_source = try task_cancellation.Source.create(allocator);
+    defer unrelated_source.release();
+    var unrelated_context = execution_context.ThreadExecutionContext{};
+    unrelated_context.setThreadGroup(@ptrCast(&first_manager));
+    var unrelated_scope = try first_manager.bindTaskGroup(
+        &unrelated_context,
+        unrelated_source,
+    );
+    defer unrelated_scope.deinit();
+
+    const first_tid = blk: {
+        var active = first_context.enter();
+        defer active.deinit();
+        break :blk try first_manager.spawnThread(first_module.inst, 0);
+    };
+    const second_tid = blk: {
+        var active = second_context.enter();
+        defer active.deinit();
+        break :blk try second_manager.spawnThread(second_module.inst, 0);
+    };
+    const unrelated_tid = blk: {
+        var active = unrelated_context.enter();
+        defer active.deinit();
+        break :blk try first_manager.spawnThread(first_module.inst, 0);
+    };
+    try waitForReady(first_module, 2);
+    try waitForReady(second_module, 1);
+    try waitForMemoryWaiters(first_module.mem_inst, 16, 2);
+    try waitForMemoryWaiters(second_module.mem_inst, 16, 1);
+
+    const started_ns = monotonicNowNs();
+    task_source.cancel();
+    const first_finished = try awaitThreadOutcome(
+        &first_manager,
+        first_tid,
+        5 * std.time.ns_per_s,
+    );
+    const second_finished = try awaitThreadOutcome(
+        &second_manager,
+        second_tid,
+        5 * std.time.ns_per_s,
+    );
+    if (!first_finished) first_manager.interrupt();
+    if (!second_finished) second_manager.interrupt();
+    try std.testing.expectEqual(
+        ThreadOutcome.cancelled,
+        try first_manager.joinOne(first_tid),
+    );
+    try std.testing.expectEqual(
+        ThreadOutcome.cancelled,
+        try second_manager.joinOne(second_tid),
+    );
+    try std.testing.expect(first_finished);
+    try std.testing.expect(second_finished);
+    try std.testing.expect(monotonicNowNs() - started_ns < std.time.ns_per_s);
+    try std.testing.expect(first_terminal.outcome() == null);
+    try std.testing.expect(second_terminal.outcome() == null);
+
+    try std.testing.expect(!unrelated_source.isCancelled());
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        first_module.mem_inst.shared_control.?.parking_lot.waiterCount(
+            first_module.mem_inst.data.ptr + 16,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        try first_module.mem_inst.notify(16, 1),
+    );
+    const unrelated_finished = try awaitThreadOutcome(
+        &first_manager,
+        unrelated_tid,
+        5 * std.time.ns_per_s,
+    );
+    if (!unrelated_finished) first_manager.interrupt();
+    try std.testing.expectEqual(
+        ThreadOutcome.completed,
+        try first_manager.joinOne(unrelated_tid),
+    );
+    try std.testing.expect(unrelated_finished);
+}
+
+test "thread lifecycle: component task group registered after cancellation starts cancelled" {
+    try requireThreadLifecycle();
+    const allocator = std.testing.allocator;
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+    const source = try task_cancellation.Source.create(allocator);
+    defer source.release();
+    source.cancel();
+
+    var context = execution_context.ThreadExecutionContext{};
+    context.setThreadGroup(@ptrCast(&manager));
+    var scope = try manager.bindTaskGroup(&context, source);
+    defer scope.deinit();
+    try std.testing.expect(manager.isTaskCancelledForContext(&context));
+    try std.testing.expectEqual(@as(usize, 0), source.registrationCount());
+
+    const unused_parent: *types.ModuleInstance = undefined;
+    var active = context.enter();
+    defer active.deinit();
+    try std.testing.expectError(
+        error.ThreadGroupShuttingDown,
+        manager.spawnThread(unused_parent, 0),
+    );
+}
+
+test "thread lifecycle: component task cancel racing process exit and trap never replaces winner" {
+    try requireThreadLifecycle();
+    const Racer = struct {
+        manager: *ThreadManager,
+        source: *task_cancellation.Source,
+        gate: *std.atomic.Value(bool),
+        kind: enum { task_cancel, process_exit, process_trap },
+
+        fn run(self: @This()) void {
+            while (!self.gate.load(.acquire)) std.atomic.spinLoopHint();
+            switch (self.kind) {
+                .task_cancel => self.source.cancel(),
+                .process_exit => self.manager.signalExit(7),
+                .process_trap => self.manager.signalTrap(),
+            }
+        }
+    };
+
+    var round: usize = 0;
+    while (round < 64) : (round += 1) {
+        var terminal = termination.State{};
+        var manager = ThreadManager.init(std.testing.allocator);
+        defer manager.deinit();
+        try manager.bindTermination(&terminal);
+        const source = try task_cancellation.Source.create(std.testing.allocator);
+        defer source.release();
+        var context = execution_context.ThreadExecutionContext{};
+        context.setThreadGroup(@ptrCast(&manager));
+        var group = try manager.bindTaskGroup(&context, source);
+        defer group.deinit();
+
+        var gate = std.atomic.Value(bool).init(false);
+        const task_thread = try std.Thread.spawn(.{}, Racer.run, .{Racer{
+            .manager = &manager,
+            .source = source,
+            .gate = &gate,
+            .kind = .task_cancel,
+        }});
+        const exit_thread = try std.Thread.spawn(.{}, Racer.run, .{Racer{
+            .manager = &manager,
+            .source = source,
+            .gate = &gate,
+            .kind = .process_exit,
+        }});
+        const trap_thread = try std.Thread.spawn(.{}, Racer.run, .{Racer{
+            .manager = &manager,
+            .source = source,
+            .gate = &gate,
+            .kind = .process_trap,
+        }});
+        gate.store(true, .release);
+        task_thread.join();
+        exit_thread.join();
+        trap_thread.join();
+
+        try std.testing.expect(source.isCancelled());
+        const outcome = terminal.outcome().?;
+        switch (outcome.kind) {
+            .exit => try std.testing.expectEqual(@as(u32, 7), outcome.code),
+            .trap => try std.testing.expectEqual(
+                termination.generic_trap_code,
+                outcome.code,
+            ),
+        }
+    }
+}
+
+test "thread lifecycle: component task cancellation racing spawn is inherited safely" {
     try requireThreadLifecycle();
     const allocator = std.testing.allocator;
     const ctx = try buildThreadTestModule(&futex_wait_thread_code, allocator);
@@ -2846,11 +3095,9 @@ test "component task cancellation racing spawn is inherited safely" {
 
     var parent_context = execution_context.ThreadExecutionContext{};
     parent_context.setThreadGroup(@ptrCast(&manager));
-    var group_scope = try manager.bindTaskGroup(
-        &parent_context,
-        1,
-        false,
-    );
+    const source = try task_cancellation.Source.create(allocator);
+    defer source.release();
+    var group_scope = try manager.bindTaskGroup(&parent_context, source);
     defer group_scope.deinit();
 
     const SpawnRace = struct {
@@ -2885,7 +3132,7 @@ test "component task cancellation racing spawn is inherited safely" {
         platform.usleep(200);
     }
 
-    try std.testing.expect(manager.cancelTaskForContext(&parent_context));
+    source.cancel();
     resume_flag.store(true, .release);
     spawn_thread.join();
     try std.testing.expect(race.err == null);
@@ -2941,14 +3188,16 @@ test "ThreadManager: Windows task cancel events are scoped and reusable" {
 
     var first_context = execution_context.ThreadExecutionContext{};
     first_context.setThreadGroup(@ptrCast(&manager));
-    var first_scope = try manager.bindTaskGroup(&first_context, 1, false);
+    const first_source = try task_cancellation.Source.create(allocator);
+    defer first_source.release();
+    var first_scope = try manager.bindTaskGroup(&first_context, first_source);
     const first_handle = manager.windowsCancelHandleForContext(&first_context).?;
     var no_inputs: [0]windows_poll.ReadInput = .{};
     try std.testing.expectEqual(
         windows_poll.WaitResult.timed_out,
         windows_poll.waitForReadiness(allocator, first_handle, &no_inputs, 0),
     );
-    try std.testing.expect(manager.cancelTaskForContext(&first_context));
+    first_source.cancel();
     try std.testing.expectEqual(
         windows_poll.WaitResult.cancelled,
         windows_poll.waitForReadiness(allocator, first_handle, &no_inputs, 1000),
@@ -2957,7 +3206,9 @@ test "ThreadManager: Windows task cancel events are scoped and reusable" {
 
     var second_context = execution_context.ThreadExecutionContext{};
     second_context.setThreadGroup(@ptrCast(&manager));
-    var second_scope = try manager.bindTaskGroup(&second_context, 2, false);
+    const second_source = try task_cancellation.Source.create(allocator);
+    defer second_source.release();
+    var second_scope = try manager.bindTaskGroup(&second_context, second_source);
     defer second_scope.deinit();
     const second_handle = manager.windowsCancelHandleForContext(&second_context).?;
     try std.testing.expectEqual(
