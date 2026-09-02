@@ -29,6 +29,11 @@ on:
       - src/runtime/**
       - tests/benchmarks/coremark/**
       - scripts/bench_coremark.py
+      - scripts/profile_coremark_aarch64.py
+      - scripts/test_profile_coremark_aarch64.py
+      - scripts/compare_hot_function.py
+      - .github/skills/aot-perf-profile/aot_jit_attr.py
+      - tests/test_aot_jit_attr.py
       - .github/workflows/coremark-x86_64.yml
       - .github/workflows/coremark-aarch64.yml
 
