@@ -4192,7 +4192,12 @@ fn dispatchAsyncCanon(
                 const s = stream_lease.value();
                 if (s.read_waitable != null or s.write_waitable != null) return;
                 const kind: async_mod.WaitableSet.WaitableItem.Kind =
-                    if (s.pending_read != null) .stream_read else .stream_write;
+                    if (s.terminal_write_dropped)
+                        .stream_write
+                    else if (s.pending_read != null)
+                        .stream_read
+                    else
+                        .stream_write;
                 const idx = ws.register(.{ .kind = kind, .handle = waitable_handle }, allocator) catch
                     return error.OutOfMemory;
                 const registration = async_mod.WaitableRegistration{
@@ -4208,14 +4213,19 @@ fn dispatchAsyncCanon(
                     break :blk null;
                 } else blk: {
                     s.write_waitable = registration;
-                    if (s.read_closed)
+                    if (s.terminal_write_dropped or s.read_closed)
                         break :blk async_canon.packStatus(.dropped, 0);
                     if (s.write_ready)
                         break :blk async_canon.packStatus(.completed, 0);
                     break :blk null;
                 };
+                const retire_after_join = s.terminal_write_dropped;
                 stream_lease.release();
                 if (ready_code) |code| _ = ws.trySetReady(idx, allocator, code);
+                if (retire_after_join) {
+                    _ = comp_inst.streams.remove(waitable_handle);
+                    comp_inst.streams.collectRetired();
+                }
                 return;
             }
 
@@ -7973,6 +7983,133 @@ test "wasi:http #616 A8 live: stream backpressure wake is latched before waitabl
         async_canon.packStatus(.completed, 0),
         std.mem.readInt(u32, event[4..8], .little),
     );
+}
+
+test "wasi:http #970 review: retired blocked writer joins a terminal tombstone" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const stream_handle: u32 =
+        @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_set_new },
+        env,
+        null,
+        testing.allocator,
+    );
+    const ws_handle: u32 = @bitCast(try env.popI32());
+
+    // The write returned BLOCKED, then cancellation retired the stream
+    // before waitable.join could register. Keep only the terminal latch.
+    {
+        const stream = inst.streams.getPtr(stream_handle).?;
+        stream.pending_write = null;
+        stream.write_ready = false;
+        stream.read_closed = true;
+        stream.write_closed = true;
+        stream.terminal_write_dropped = true;
+    }
+    try env.pushI32(@bitCast(stream_handle));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expect(inst.streams.getPtr(stream_handle) == null);
+
+    const out_ptr: u32 = 0x100;
+    try env.pushI32(@bitCast(ws_handle));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_wait = .{
+            .cancellable = false,
+            .memory = 0,
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @intFromEnum(async_canon.EventCode.stream_write),
+        @as(u32, @bitCast(try env.popI32())),
+    );
+    const event = inst.writableGuestBytes(out_ptr, 8).?;
+    try testing.expectEqual(
+        stream_handle,
+        std.mem.readInt(u32, event[0..4], .little),
+    );
+    try testing.expectEqual(
+        async_canon.packStatus(.dropped, 0),
+        std.mem.readInt(u32, event[4..8], .little),
+    );
+
+    // A later stream receives a fresh handle. Joining the retired handle
+    // again on a fresh set remains inert and cannot consume the new stream.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const replacement_handle: u32 =
+        @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+    try testing.expect(replacement_handle != stream_handle);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_set_new },
+        env,
+        null,
+        testing.allocator,
+    );
+    const fresh_ws: u32 = @bitCast(try env.popI32());
+    try env.pushI32(@bitCast(stream_handle));
+    try env.pushI32(@bitCast(fresh_ws));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+    try env.pushI32(@bitCast(fresh_ws));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_poll = .{
+            .cancellable = false,
+            .memory = 0,
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @intFromEnum(async_canon.EventCode.none),
+        @as(u32, @bitCast(try env.popI32())),
+    );
+    try testing.expect(inst.streams.getPtr(replacement_handle) != null);
 }
 
 test "waitable-set.poll: settled future surfaces FUTURE_READ event with the right handle/code (#550)" {

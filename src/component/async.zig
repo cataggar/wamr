@@ -787,6 +787,11 @@ pub const AsyncStream = struct {
     /// A pending writer was made runnable before it joined a waitable set.
     /// The next join observes this latched edge and queues completion.
     write_ready: bool = false,
+    /// Cancellation retired the reader after a writer returned BLOCKED but
+    /// before its waitable joined. The stream remains as a zero-buffer
+    /// tombstone until that join observes DROPPED, then the executor removes
+    /// it. Arbitrary unknown handles still remain inert.
+    terminal_write_dropped: bool = false,
 
     /// Optional host-side I/O hook for long-lived sockets (#535). When
     /// set, the executor's stream ops invoke the driver before parking
