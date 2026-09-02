@@ -36,6 +36,11 @@ DEFAULT_CLASSIFY_FUNCTIONS = 3
 DEFAULT_MAX_PERF_BYTES = 25 * 1024 * 1024
 AUTHORITATIVE_BASELINE_RUN = 33631050708
 PROFILE_CAPTURES_PER_ENGINE = 2
+MIN_ATTRIBUTION_COVERAGE_PCT = 99.0
+ALL_ALU_WORDING = (
+    "all ALU-class instructions: add/sub, logical operations, mul/div, "
+    "shifts, compares, csel, and address-generation instructions"
+)
 WASMTIME_SYMBOL_RE = re.compile(
     r"wasm\[(?P<module>\d+)\]::function\[(?P<function>\d+)\]"
     r"(?:::(?P<name>[^+\s(]+))?"
@@ -54,7 +59,7 @@ CLASS_GROUPS = {
         "unknown_frame_store",
     },
     "reg_moves": {"regmov"},
-    "alu": {"alu"},
+    "all_alu": {"alu"},
     "bounds_checks": {"bounds_cmp", "bounds_branch"},
     "linear_memory": {"linear_memory", "mem_access"},
     "calls": {"call"},
@@ -194,6 +199,73 @@ def aggregate_wamr_rankings(reports: list[dict[str, Any]]) -> dict[str, Any]:
         "text_size": text_size,
         "function_count": function_count,
         "top_functions": top,
+    }
+
+
+def validate_wamr_capture(
+    report: dict[str, Any],
+    *,
+    minimum_samples: int,
+    minimum_coverage_pct: float = MIN_ATTRIBUTION_COVERAGE_PCT,
+) -> dict[str, Any]:
+    total = report.get("total_samples")
+    attributed = report.get("attributed_samples")
+    mapping = report.get("mapping")
+    if not isinstance(total, int) or total < minimum_samples:
+        raise ProfileError(
+            f"WAMR capture has {total!r} total samples; requires "
+            f"at least {minimum_samples}"
+        )
+    if not isinstance(attributed, int) or not 0 < attributed <= total:
+        raise ProfileError("WAMR capture has invalid attributed sample count")
+    coverage = 100.0 * attributed / total
+    if coverage < minimum_coverage_pct:
+        raise ProfileError(
+            f"WAMR capture attribution coverage {coverage:.4f}% is below "
+            f"{minimum_coverage_pct:.4f}%"
+        )
+    if (
+        not isinstance(mapping, dict)
+        or mapping.get("authoritative") is not True
+        or mapping.get("override") is not None
+        or mapping.get("size") != mapping.get("expected_size")
+    ):
+        raise ProfileError(
+            "WAMR capture did not use automatic exact-size mmap attribution"
+        )
+    return {
+        "total_samples": total,
+        "attributed_samples": attributed,
+        "coverage_pct": coverage,
+        "mapping": mapping,
+    }
+
+
+def validate_wasmtime_capture(
+    capture: dict[str, Any],
+    *,
+    minimum_samples: int,
+    minimum_coverage_pct: float = MIN_ATTRIBUTION_COVERAGE_PCT,
+) -> dict[str, Any]:
+    total = capture["total_samples"]
+    attributed = sum(
+        entry["samples"] for entry in capture["functions"].values()
+    )
+    if total < minimum_samples:
+        raise ProfileError(
+            f"Wasmtime capture has {total} samples; requires "
+            f"at least {minimum_samples}"
+        )
+    coverage = 100.0 * attributed / total
+    if coverage < minimum_coverage_pct:
+        raise ProfileError(
+            f"Wasmtime capture attribution coverage {coverage:.4f}% is below "
+            f"{minimum_coverage_pct:.4f}%"
+        )
+    return {
+        "total_samples": total,
+        "attributed_samples": attributed,
+        "coverage_pct": coverage,
     }
 
 
@@ -513,6 +585,8 @@ def validate_report(report: dict[str, Any]) -> None:
         raise ProfileError("profile report guest args are not authoritative")
     if report.get("expected_iterations") != bench_coremark.EXPECTED_ITERATIONS:
         raise ProfileError("profile report iteration count is not authoritative")
+    if report.get("classifier_wording", {}).get("all_alu") != ALL_ALU_WORDING:
+        raise ProfileError("profile report has ambiguous ALU classifier wording")
     affinity = report.get("affinity")
     if not isinstance(affinity, dict) or affinity.get("verified") is not True:
         raise ProfileError("profile report lacks verified CPU affinity")
@@ -525,6 +599,26 @@ def validate_report(report: dict[str, Any]) -> None:
         raise ProfileError("profile report execution order is not ABBA/ABBA")
     if phases != ["warmup"] * 4 + ["profile"] * 4:
         raise ProfileError("profile report phases are not balanced")
+    if report.get("minimum_attribution_coverage_pct") != MIN_ATTRIBUTION_COVERAGE_PCT:
+        raise ProfileError("profile report has the wrong coverage threshold")
+    wamr_captures = report.get("wamr_captures")
+    wasmtime_captures = report.get("wasmtime_captures")
+    if (
+        not isinstance(wamr_captures, list)
+        or len(wamr_captures) != PROFILE_CAPTURES_PER_ENGINE
+        or not isinstance(wasmtime_captures, list)
+        or len(wasmtime_captures) != PROFILE_CAPTURES_PER_ENGINE
+    ):
+        raise ProfileError("profile report must validate two captures per engine")
+    for capture in wamr_captures:
+        if (
+            capture.get("coverage_pct", 0) < MIN_ATTRIBUTION_COVERAGE_PCT
+            or capture.get("mapping", {}).get("authoritative") is not True
+        ):
+            raise ProfileError("WAMR capture failed authoritative attribution")
+    for capture in wasmtime_captures:
+        if capture.get("coverage_pct", 0) < MIN_ATTRIBUTION_COVERAGE_PCT:
+            raise ProfileError("Wasmtime capture failed attribution coverage")
     engines = report.get("engines")
     if not isinstance(engines, dict) or set(engines) != {"wamr", "wasmtime"}:
         raise ProfileError("profile report must contain WAMR and Wasmtime engines")
@@ -558,6 +652,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         "A" if item["engine"] == "wamr" else "B"
         for item in report["profile_schedule"]
     )
+    wamr_capture_coverage = ", ".join(
+        f"{item['coverage_pct']:.4f}%" for item in report["wamr_captures"]
+    )
+    wasmtime_capture_coverage = ", ".join(
+        f"{item['coverage_pct']:.4f}%"
+        for item in report["wasmtime_captures"]
+    )
     lines = [
         "### Matched-host AArch64 CoreMark profiles",
         "",
@@ -576,6 +677,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"`{report['affinity']['taskset']}`",
         f"- Counterbalanced execution order: `{order}` "
         f"(A=WAMR, B=Wasmtime; warmups then profile captures)",
+        f"- Per-capture attribution gate: "
+        f"`≥{report['minimum_attribution_coverage_pct']:.2f}%`; WAMR "
+        f"`{wamr_capture_coverage}`, Wasmtime "
+        f"`{wasmtime_capture_coverage}`",
         f"- Host: `{host['architecture']}` · {host['cpu_count']} vCPU · "
         f"`{host['cpu_model']}` · kernel `{host['kernel']}` · "
         f"fingerprint `{host['fingerprint']}`",
@@ -676,7 +781,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             "Caveats: perf self samples only; no DWARF unwinding through WAMR "
             "generated code. AArch64 spill metrics are pre-emission estimates, "
             "so static frame traffic is a conservative cross-check, not a claim "
-            "that every frame access is an allocator spill.",
+            "that every frame access is an allocator spill. `all_alu` means "
+            f"{report['classifier_wording']['all_alu']}; its cross-engine "
+            "difference is not address/check headroom. Narrower attribution "
+            "requires matched semantic value/path tracing in both engines.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -1006,6 +1114,11 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             wasmtime_captures.append(
                 parse_wasmtime_samples(perf_script, wasm_identity)
             )
+            validate_wasmtime_mapping(wasmtime_captures[-1], wasm_identity)
+            validate_wasmtime_capture(
+                wasmtime_captures[-1],
+                minimum_samples=args.min_samples,
+            )
         completed_at = datetime.now(timezone.utc).isoformat()
         profile_schedule.append(
             {
@@ -1023,6 +1136,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
 
     helper = repo / ".github/skills/aot-perf-profile/aot_jit_attr.py"
     ranking_reports = []
+    wamr_capture_validations = []
     for ordinal, wamr_perf in enumerate(wamr_perfs, 1):
         ranking_json = out_dir / f"wamr-attribution-{ordinal}.json"
         recorder.run(
@@ -1039,15 +1153,23 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 str(len(cwasm_info.func_offsets)),
                 "--min-samples",
                 str(args.min_samples),
+                "--min-attribution-pct",
+                str(MIN_ATTRIBUTION_COVERAGE_PCT),
+                "--authoritative",
                 "--json-out",
                 str(ranking_json),
             ],
             f"wamr-attribution-{ordinal}.log",
             cwd=repo,
         )
-        ranking_reports.append(
-            json.loads(ranking_json.read_text(encoding="utf-8"))
+        ranking_report = json.loads(ranking_json.read_text(encoding="utf-8"))
+        wamr_capture_validations.append(
+            validate_wamr_capture(
+                ranking_report,
+                minimum_samples=args.min_samples,
+            )
         )
+        ranking_reports.append(ranking_report)
     wamr_attribution = aggregate_wamr_rankings(ranking_reports)
     top_functions = wamr_attribution["top_functions"][: args.classify]
     if len(top_functions) != args.classify:
@@ -1076,6 +1198,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     str(args.top),
                     "--min-samples",
                     str(args.min_samples),
+                    "--min-attribution-pct",
+                    str(MIN_ATTRIBUTION_COVERAGE_PCT),
+                    "--authoritative",
                     "--json-out",
                     str(path),
                 ],
@@ -1222,6 +1347,16 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "verified": True,
         },
         "profile_schedule": profile_schedule,
+        "classifier_wording": {"all_alu": ALL_ALU_WORDING},
+        "minimum_attribution_coverage_pct": MIN_ATTRIBUTION_COVERAGE_PCT,
+        "wamr_captures": wamr_capture_validations,
+        "wasmtime_captures": [
+            validate_wasmtime_capture(
+                capture,
+                minimum_samples=args.min_samples,
+            )
+            for capture in wasmtime_captures
+        ],
         "fixture": {"path": str(fixture), "sha256": fixture_sha},
         "wasm": {
             "imported_function_count": wasm_identity.imported_function_count,
@@ -1332,6 +1467,10 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "AArch64 spill metrics are pre-emission estimates.",
             "Wasmtime wasm symbols use full function indices including imports.",
             "Two captures per engine were collected in ABBA order after ABBA warmups.",
+            ALL_ALU_WORDING
+            + "; the all-ALU differential is not address/check headroom.",
+            "Narrower address/check attribution requires matched semantic "
+            "value/path tracing in both engines.",
         ],
     }
     bench_coremark.validate_same_host(host_identity)

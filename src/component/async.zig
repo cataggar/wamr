@@ -322,7 +322,7 @@ pub const TaskManager = struct {
     /// cancelled after the call (including an idempotent repeated cancel).
     /// Return and cancellation are first-terminal under the manager lock.
     pub fn tryCancelTask(self: *TaskManager, handle: u32) bool {
-        var source_ref: ?task_cancellation.Source.Ref = null;
+        var source_ref: ?task_cancellation.Source.Ticket = null;
         self.mutex.lock();
         const index = self.taskIndexLocked(handle) orelse {
             self.mutex.unlock();
@@ -342,7 +342,8 @@ pub const TaskManager = struct {
         self.mutex.unlock();
 
         if (source_ref) |*source| {
-            source.source.cancel();
+            const source_ptr = source.sourceForRegistration() catch unreachable;
+            source_ptr.cancel();
             source.deinit();
         }
         return cancelled;
@@ -412,11 +413,12 @@ pub const TaskManager = struct {
 
     /// Capture a durable cancellation ticket while the task handle is valid.
     ///
-    /// The caller owns the returned ticket and must call `deinit` exactly
-    /// once. It can be cloned, moved into an HTTP body/trailer settlement
-    /// owner, and queried after the frame, task owner, or TaskManager is
-    /// destroyed. The ticket retains only the immutable task source
-    /// generation, never a Task or TaskManager pointer.
+    /// The caller owns the returned ticket. Transfer that owner with `take`,
+    /// create an additional owner only with `clone`, and call `deinit` once
+    /// per owner. Ordinary assignment is not a move. A transferred ticket can
+    /// be queried after the frame, task owner, or TaskManager is destroyed; it
+    /// retains only the immutable task source generation, never a Task or
+    /// TaskManager pointer.
     pub fn acquireCancellationTicket(
         self: *TaskManager,
         handle: u32,
@@ -961,14 +963,14 @@ test "TaskManager: handle cancellation fans out every registered target" {
     defer second_registration.unregister();
     try std.testing.expectEqual(
         task_cancellation.RegisterResult.registered,
-        source_ref.source.register(&first_registration, .{
+        (try source_ref.sourceForRegistration()).register(&first_registration, .{
             .ctx = @ptrCast(&first),
             .wake = Counter.wake,
         }),
     );
     try std.testing.expectEqual(
         task_cancellation.RegisterResult.registered,
-        source_ref.source.register(&second_registration, .{
+        (try source_ref.sourceForRegistration()).register(&second_registration, .{
             .ctx = @ptrCast(&second),
             .wake = Counter.wake,
         }),
@@ -1003,7 +1005,7 @@ test "TaskManager: registered cancellation source outlives manager teardown" {
     if (comptime config.lib_wasi_threads) {
         try std.testing.expectEqual(
             task_cancellation.RegisterResult.registered,
-            source_ref.source.register(&registration, .{
+            (try source_ref.sourceForRegistration()).register(&registration, .{
                 .ctx = @ptrCast(&counter),
                 .wake = Counter.wake,
             }),
@@ -1011,7 +1013,7 @@ test "TaskManager: registered cancellation source outlives manager teardown" {
     }
 
     tm.deinit(allocator);
-    source_ref.source.cancel();
+    (try source_ref.sourceForRegistration()).cancel();
     try std.testing.expectEqual(@as(usize, 1), counter.hits);
 }
 
@@ -1028,23 +1030,28 @@ test "TaskManager: cancellation sources distinguish task generations" {
     const second_handle = try tm.createTask(allocator);
     var second_source = try tm.acquireCancellationTicket(second_handle);
     defer second_source.deinit();
-    try std.testing.expect(first_source.source.id != second_source.source.id);
+    try std.testing.expect(
+        try first_source.identity() != try second_source.identity(),
+    );
 }
 
 test "TaskManager: durable cancellation ticket survives owner teardown" {
     const allocator = std.testing.allocator;
     var tm = TaskManager{};
     const handle = try tm.createTask(allocator);
-    var ticket = try tm.acquireCancellationTicket(handle);
-    var clone = ticket.clone();
+    var captured = try tm.acquireCancellationTicket(handle);
+    var owner = captured.take();
+    var clone = try owner.clone();
 
     tm.cancelTask(handle);
     tm.deinit(allocator);
 
-    try std.testing.expect(ticket.isCancelled());
-    try std.testing.expect(clone.isCancelled());
-    try std.testing.expectEqual(ticket.identity(), clone.identity());
-    ticket.deinit();
+    try std.testing.expect(!captured.isActive());
+    try std.testing.expect(try owner.isCancelled());
+    try std.testing.expect(try clone.isCancelled());
+    try std.testing.expectEqual(try owner.identity(), try clone.identity());
+    captured.deinit();
+    owner.deinit();
     clone.deinit();
 }
 
@@ -1056,7 +1063,7 @@ test "TaskManager: ticket acquired after cancellation observes terminal flag" {
     tm.cancelTask(handle);
     var ticket = try tm.acquireCancellationTicket(handle);
     defer ticket.deinit();
-    try std.testing.expect(ticket.isCancelled());
+    try std.testing.expect(try ticket.isCancelled());
 }
 
 test "TaskManager: invalid and stale handles cannot acquire another task ticket" {
@@ -1078,7 +1085,20 @@ test "TaskManager: invalid and stale handles cannot acquire another task ticket"
     );
     var ticket = try tm.acquireCancellationTicket(current);
     defer ticket.deinit();
-    try std.testing.expect(!ticket.isCancelled());
+    try std.testing.expect(!try ticket.isCancelled());
+}
+
+test "TaskManager: task source allocation failure leaves no owner" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var tm = TaskManager{};
+    defer tm.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        tm.createTask(failing.allocator()),
+    );
+    try std.testing.expectEqual(@as(usize, 0), tm.taskCount());
 }
 
 test "TaskManager: return and cancel are first-terminal under races" {
@@ -1129,7 +1149,7 @@ test "TaskManager: return and cancel are first-terminal under races" {
         if (comptime config.lib_wasi_threads) {
             try std.testing.expectEqual(
                 task_cancellation.RegisterResult.registered,
-                source_ref.source.register(&registration, .{
+                (try source_ref.sourceForRegistration()).register(&registration, .{
                     .ctx = @ptrCast(&counter),
                     .wake = Counter.wake,
                 }),
@@ -1154,7 +1174,7 @@ test "TaskManager: return and cancel are first-terminal under races" {
                 try std.testing.expect(tm.tryCancelTask(handle));
                 tm.startTask(handle);
                 try std.testing.expectEqual(TaskState.cancelled, tm.getState(handle).?);
-                try std.testing.expect(source_ref.isCancelled());
+                try std.testing.expect(try source_ref.isCancelled());
                 if (comptime config.lib_wasi_threads)
                     try std.testing.expect(counter.hits.load(.acquire) >= 1);
             },
@@ -1162,7 +1182,7 @@ test "TaskManager: return and cancel are first-terminal under races" {
                 try std.testing.expect(!tm.tryCancelTask(handle));
                 tm.startTask(handle);
                 try std.testing.expectEqual(TaskState.returned, tm.getState(handle).?);
-                try std.testing.expect(!source_ref.isCancelled());
+                try std.testing.expect(!try source_ref.isCancelled());
                 try std.testing.expectEqual(@as(usize, 0), counter.hits.load(.acquire));
             },
             else => return error.TestUnexpectedResult,

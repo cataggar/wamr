@@ -142,8 +142,26 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             "authoritative_baseline_run": profile.AUTHORITATIVE_BASELINE_RUN,
             "guest_args": list(profile.bench_coremark.COREMARK_GUEST_ARGS),
             "expected_iterations": profile.bench_coremark.EXPECTED_ITERATIONS,
+            "classifier_wording": {"all_alu": profile.ALL_ALU_WORDING},
             "affinity": {"verified": True},
             "profile_schedule": schedule,
+            "minimum_attribution_coverage_pct": (
+                profile.MIN_ATTRIBUTION_COVERAGE_PCT
+            ),
+            "wamr_captures": [
+                {
+                    "coverage_pct": 99.96,
+                    "mapping": {"authoritative": True},
+                },
+                {
+                    "coverage_pct": 99.95,
+                    "mapping": {"authoritative": True},
+                },
+            ],
+            "wasmtime_captures": [
+                {"coverage_pct": 99.9},
+                {"coverage_pct": 99.9},
+            ],
             "wasm": {"imported_function_count": 12},
             "engines": {
                 "wamr": {"total_samples": 100, "attributed_samples": 99},
@@ -162,6 +180,78 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
         report["matched_functions"][0]["wasm_function_index"] = 14
         with self.assertRaisesRegex(profile.ProfileError, "inconsistent"):
             profile.validate_report(report)
+
+    def test_each_wamr_capture_must_pass_exact_mapping_and_coverage(self):
+        base = {
+            "total_samples": 34410,
+            "attributed_samples": 34398,
+            "mapping": {
+                "authoritative": True,
+                "override": None,
+                "size": 122880,
+                "expected_size": 122880,
+            },
+        }
+        first = profile.validate_wamr_capture(
+            base, minimum_samples=1000
+        )
+        self.assertGreater(first["coverage_pct"], 99.9)
+        second = profile.validate_wamr_capture(
+            {
+                **base,
+                "total_samples": 34419,
+                "attributed_samples": 34404,
+            },
+            minimum_samples=1000,
+        )
+        self.assertGreater(second["coverage_pct"], 99.9)
+
+        with self.assertRaisesRegex(profile.ProfileError, "below"):
+            profile.validate_wamr_capture(
+                {
+                    **base,
+                    "total_samples": 1000,
+                    "attributed_samples": 980,
+                },
+                minimum_samples=1000,
+            )
+        with self.assertRaisesRegex(profile.ProfileError, "requires at least"):
+            profile.validate_wamr_capture(
+                {
+                    **base,
+                    "total_samples": 999,
+                    "attributed_samples": 998,
+                },
+                minimum_samples=1000,
+            )
+        with self.assertRaisesRegex(profile.ProfileError, "exact-size"):
+            profile.validate_wamr_capture(
+                {
+                    **base,
+                    "mapping": {
+                        **base["mapping"],
+                        "authoritative": False,
+                        "override": "0x1000",
+                    },
+                },
+                minimum_samples=1000,
+            )
+
+        with self.assertRaisesRegex(profile.ProfileError, "below"):
+            profile.validate_wasmtime_capture(
+                {
+                    "total_samples": 1000,
+                    "functions": {15: {"samples": 980}},
+                },
+                minimum_samples=1000,
+            )
+
+    def test_classifier_names_all_alu_without_address_claim(self):
+        self.assertIn("all_alu", profile.CLASS_GROUPS)
+        self.assertNotIn("alu", profile.CLASS_GROUPS)
+        self.assertIn("address-generation", profile.ALL_ALU_WORDING)
+        delta = 13627 / 68829 * 100 - 3880 / 33113 * 100
+        self.assertAlmostEqual(8.0808884555, delta, places=10)
 
     def test_profile_aggregates_preserve_balanced_samples(self):
         rankings = [

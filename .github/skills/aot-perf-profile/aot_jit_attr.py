@@ -62,6 +62,18 @@ class Instruction:
 
 
 @dataclass(frozen=True)
+class TextMappingSelection:
+    base: int
+    size: int
+    text_size: int
+    page_size: int
+    expected_size: int
+    candidates: list[tuple[int, int]]
+    authoritative: bool
+    override: str | None
+
+
+@dataclass(frozen=True)
 class FrameOperand:
     kind: str
     base: str
@@ -272,19 +284,80 @@ def addr_counts(perf):
     return counts, total
 
 
-def select_text_base(perf, text_size, explicit_base=None):
-    if explicit_base is not None:
-        return int(explicit_base, 16)
+def system_page_size():
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        page_size = 0
+    if not isinstance(page_size, int) or page_size <= 0:
+        raise AttributionError("cannot determine the host page size")
+    return page_size
+
+
+def expected_text_mapping_size(text_size, page_size):
+    if text_size <= 0:
+        raise AttributionError("cwasm text size must be positive")
+    if page_size <= 0 or page_size & (page_size - 1):
+        raise AttributionError(f"invalid host page size {page_size}")
+    return (text_size + page_size - 1) & -page_size
+
+
+def _render_mappings(maps):
+    return ", ".join(f"{base:#x}/{size:#x}" for base, size in maps) or "none"
+
+
+def select_text_mapping(perf, text_size, explicit_base=None, page_size=None):
+    page_size = page_size or system_page_size()
+    expected_size = expected_text_mapping_size(text_size, page_size)
     maps = jit_exec_mmaps(perf)
-    matches = [(base, size) for base, size in maps if abs(size - text_size) <= 0x2000]
-    if len(matches) != 1:
-        rendered = ", ".join(f"{base:#x}/{size:#x}" for base, size in matches)
-        raise AttributionError(
-            f"expected exactly one anonymous executable mmap matching "
-            f"text_size={text_size}, found {len(matches)}"
-            f"{': ' + rendered if rendered else ''}; pass --base explicitly"
+    if explicit_base is not None:
+        try:
+            base = int(explicit_base, 16)
+        except ValueError as exc:
+            raise AttributionError(
+                f"manual --base must be hexadecimal, got {explicit_base!r}"
+            ) from exc
+        matches = [(candidate, size) for candidate, size in maps if candidate == base]
+        if len(matches) != 1:
+            raise AttributionError(
+                f"manual --base {base:#x} must identify exactly one anonymous "
+                f"executable mmap; candidates: {_render_mappings(maps)}"
+            )
+        return TextMappingSelection(
+            base=matches[0][0],
+            size=matches[0][1],
+            text_size=text_size,
+            page_size=page_size,
+            expected_size=expected_size,
+            candidates=maps,
+            authoritative=False,
+            override=explicit_base,
         )
-    return matches[0][0]
+
+    matches = [(base, size) for base, size in maps if size == expected_size]
+    if len(matches) != 1:
+        raise AttributionError(
+            f"expected exactly one anonymous executable mmap of page-rounded "
+            f"size {expected_size:#x} for text_size={text_size:#x} and "
+            f"page_size={page_size:#x}; found {len(matches)} exact matches "
+            f"among candidates: {_render_mappings(maps)}"
+        )
+    return TextMappingSelection(
+        base=matches[0][0],
+        size=matches[0][1],
+        text_size=text_size,
+        page_size=page_size,
+        expected_size=expected_size,
+        candidates=maps,
+        authoritative=True,
+        override=None,
+    )
+
+
+def select_text_base(perf, text_size, explicit_base=None, page_size=None):
+    return select_text_mapping(
+        perf, text_size, explicit_base, page_size
+    ).base
 
 
 def disassemble_blob(
@@ -1086,6 +1159,16 @@ def _percent(numerator, denominator):
     return 100.0 * numerator / denominator if denominator else 0.0
 
 
+def require_attribution_coverage(attributed, total, minimum_pct):
+    coverage = _percent(attributed, total)
+    if coverage < minimum_pct:
+        raise AttributionError(
+            f"cwasm attribution coverage {coverage:.4f}% "
+            f"({attributed}/{total}) is below required {minimum_pct:.4f}%"
+        )
+    return coverage
+
+
 def build_frame_summary(instructions, counts, metadata):
     origin_static = Counter()
     origin_samples = Counter()
@@ -1319,6 +1402,17 @@ def main():
     parser.add_argument("--json-out", help="write machine-readable attribution summary")
     parser.add_argument("--min-samples", type=int, default=0)
     parser.add_argument(
+        "--min-attribution-pct",
+        type=float,
+        default=0.0,
+        help="fail if fewer than this percentage of self samples map to cwasm text",
+    )
+    parser.add_argument(
+        "--authoritative",
+        action="store_true",
+        help="require automatic exact-size mmap selection; disallow --base",
+    )
+    parser.add_argument(
         "--require-size-match",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1343,10 +1437,15 @@ def main():
         parser.error("--frame-metadata requires --func")
     if args.frame_metadata and args.arch != "x86_64":
         parser.error("--frame-metadata is currently supported only for x86_64")
+    if not 0.0 <= args.min_attribution_pct <= 100.0:
+        parser.error("--min-attribution-pct must be between 0 and 100")
+    if args.authoritative and args.base:
+        parser.error("--base is a non-authoritative diagnostic override")
 
     info = parse_cwasm(args.cwasm)
     counts, total = ({}, 0)
     base = None
+    mapping = None
     if args.perf:
         counts, total = addr_counts(args.perf)
         if total == 0:
@@ -1356,7 +1455,8 @@ def main():
                 f"perf data has only {total} self samples; "
                 f"--min-samples requires at least {args.min_samples}"
             )
-        base = select_text_base(args.perf, info.text_size, args.base)
+        mapping = select_text_mapping(args.perf, info.text_size, args.base)
+        base = mapping.base
 
     per_function, in_core = {}, 0
     top_functions = []
@@ -1378,6 +1478,9 @@ def main():
         print(
             f"samples in this core: {in_core} "
             f"({_percent(in_core, total):.1f}% of run)\n"
+        )
+        require_attribution_coverage(
+            in_core, total, args.min_attribution_pct
         )
         print(f"=== top {args.top} functions by self samples ===")
         for local_func, count in sorted(
@@ -1401,6 +1504,9 @@ def main():
     report = {
         "schema_version": 2,
         "architecture": args.arch,
+        "authoritative": bool(
+            args.authoritative and mapping is not None and mapping.authoritative
+        ),
         "perf": str(Path(args.perf).resolve()) if args.perf else None,
         "cwasm": str(Path(args.cwasm).resolve()),
         "text_base": base,
@@ -1409,6 +1515,24 @@ def main():
         "total_samples": total,
         "attributed_samples": in_core,
         "attribution_coverage_pct": _percent(in_core, total),
+        "minimum_attribution_coverage_pct": args.min_attribution_pct,
+        "mapping": (
+            {
+                "base": mapping.base,
+                "size": mapping.size,
+                "text_size": mapping.text_size,
+                "page_size": mapping.page_size,
+                "expected_size": mapping.expected_size,
+                "candidates": [
+                    {"base": candidate, "size": size}
+                    for candidate, size in mapping.candidates
+                ],
+                "authoritative": mapping.authoritative,
+                "override": mapping.override,
+            }
+            if mapping is not None
+            else None
+        ),
         "top_functions": top_functions,
     }
     if args.func is None:

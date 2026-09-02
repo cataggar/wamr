@@ -80,36 +80,56 @@ pub const Source = struct {
     /// Durable observation handle for one task cancellation generation.
     ///
     /// A ticket owns one source reference, may outlive the task, frame, and
-    /// TaskManager that created it, and never retains a raw Task pointer.
-    /// Clone with `clone`, query with `isCancelled`, and release exactly once
-    /// with `deinit`.
+    /// TaskManager that created it, and never retains a raw Task pointer. It
+    /// is a linear owner despite Zig permitting bitwise copies: ordinary
+    /// assignment is unsupported. Transfer ownership with `take`, create an
+    /// additional owner with `clone`, and release each owner with `deinit`.
     pub const Ticket = struct {
-        source: *Source,
-        active: bool = true,
+        source: ?*Source = null,
 
-        pub fn clone(self: *const Ticket) Ticket {
-            std.debug.assert(self.active);
-            return self.source.acquire();
+        pub const Error = error{InactiveTicket};
+
+        /// Transfer this ticket's one owned reference to the result. Repeated
+        /// calls return an inert ticket and never touch the source.
+        pub fn take(self: *Ticket) Ticket {
+            const source = self.source orelse return .{};
+            self.source = null;
+            return .{ .source = source };
         }
 
-        pub fn isCancelled(self: *const Ticket) bool {
-            std.debug.assert(self.active);
-            return self.source.isCancelled();
+        /// Create an independent owner. This is the only supported operation
+        /// that adds a ticket owner/reference.
+        pub fn clone(self: *const Ticket) Error!Ticket {
+            const source = self.source orelse return error.InactiveTicket;
+            return source.acquire();
         }
 
-        pub fn identity(self: *const Ticket) u32 {
-            std.debug.assert(self.active);
-            return self.source.id;
+        pub fn isCancelled(self: *const Ticket) Error!bool {
+            const source = self.source orelse return error.InactiveTicket;
+            return source.isCancelled();
+        }
+
+        pub fn identity(self: *const Ticket) Error!u32 {
+            const source = self.source orelse return error.InactiveTicket;
+            return source.id;
+        }
+
+        pub fn isActive(self: *const Ticket) bool {
+            return self.source != null;
+        }
+
+        /// Internal bridge for thread wake registration. Callers must not
+        /// retain the returned pointer beyond this ticket's lifetime.
+        pub fn sourceForRegistration(self: *const Ticket) Error!*Source {
+            return self.source orelse error.InactiveTicket;
         }
 
         pub fn deinit(self: *Ticket) void {
-            if (!self.active) return;
-            self.source.release();
-            self.active = false;
+            const source = self.source orelse return;
+            self.source = null;
+            source.release();
         }
     };
-
-    pub const Ref = Ticket;
 
     pub fn create(allocator: std.mem.Allocator) !*Source {
         const self = try allocator.create(Source);
@@ -230,6 +250,68 @@ const RegisterTestHook = struct {
     reached: std.atomic.Value(bool) = .init(false),
     resume_flag: std.atomic.Value(bool) = .init(false),
 };
+
+test "task cancellation ticket: take transfers one owner and leaves source inert" {
+    const source = try Source.create(std.testing.allocator);
+    var ticket = source.acquire();
+    var transferred = ticket.take();
+    var repeated = ticket.take();
+
+    try std.testing.expect(!ticket.isActive());
+    try std.testing.expect(!repeated.isActive());
+    try std.testing.expectError(error.InactiveTicket, ticket.clone());
+    try std.testing.expectError(error.InactiveTicket, ticket.isCancelled());
+    try std.testing.expectError(error.InactiveTicket, ticket.identity());
+    try std.testing.expectError(
+        error.InactiveTicket,
+        ticket.sourceForRegistration(),
+    );
+
+    source.cancel();
+    try std.testing.expect(try transferred.isCancelled());
+    source.release();
+    ticket.deinit();
+    ticket.deinit();
+    repeated.deinit();
+    transferred.deinit();
+}
+
+test "task cancellation ticket: cancellation before take remains observable" {
+    const source = try Source.create(std.testing.allocator);
+    var ticket = source.acquire();
+    source.cancel();
+    var transferred = ticket.take();
+    source.release();
+
+    try std.testing.expect(try transferred.isCancelled());
+    transferred.deinit();
+}
+
+test "task cancellation ticket: clone creates an independent reference" {
+    const source = try Source.create(std.testing.allocator);
+    var ticket = source.acquire();
+    var clone = try ticket.clone();
+    try std.testing.expectEqual(@as(u32, 3), source.refs.load(.acquire));
+
+    source.release();
+    ticket.deinit();
+    try std.testing.expect(clone.isActive());
+    clone.deinit();
+}
+
+test "task cancellation ticket: raw value copy is not a retained owner" {
+    const source = try Source.create(std.testing.allocator);
+    defer source.release();
+    var ticket = source.acquire();
+    defer ticket.deinit();
+    var unsupported_copy = ticket;
+    try std.testing.expectEqual(@as(u32, 2), source.refs.load(.acquire));
+
+    // Direct copies are intentionally unsupported: disarm this test-only
+    // copy rather than releasing the same reference twice.
+    unsupported_copy.source = null;
+    unsupported_copy.deinit();
+}
 
 test "task cancellation: register racing a latched cancel wakes immediately" {
     if (comptime !config.lib_wasi_threads) return error.SkipZigTest;
