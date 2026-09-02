@@ -101,10 +101,11 @@ fn waitForWindowsReadiness(
     timeout_ms: i32,
 ) BlockingWait {
     if (comptime builtin.os.tag != .windows) unreachable;
+    const cancel_handle = activeWindowsCancelHandle(ctx);
     if (comptime !config.lib_wasi_threads) {
         return switch (windows_poll.waitForReadiness(
             ctx.allocator,
-            activeWindowsCancelHandle(ctx),
+            cancel_handle,
             inputs,
             timeout_ms,
         )) {
@@ -114,6 +115,24 @@ fn waitForWindowsReadiness(
             .failed => .failed,
         };
     }
+    if (activeExecutionTerminating(ctx)) return .terminated;
+    if (cancel_handle != null) {
+        return switch (windows_poll.waitForReadiness(
+            ctx.allocator,
+            cancel_handle,
+            inputs,
+            timeout_ms,
+        )) {
+            .ready => .ready,
+            .timed_out => .timed_out,
+            .cancelled => .terminated,
+            .failed => .failed,
+        };
+    }
+
+    // Thread-enabled embedders that provide no manager event retain the
+    // bounded state-polling fallback. Real thread groups bind either the
+    // permanent process event or a task-epoch event and take the path above.
     var remaining_ms: i64 = timeout_ms;
     while (true) {
         if (activeExecutionTerminating(ctx)) return .terminated;
@@ -1425,6 +1444,7 @@ fn doRead(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []u8) !usize {
                 if (activeExecutionTerminating(ctx)) return error.Terminated;
                 if (activeWindowsCancelHandle(ctx)) |cancel_handle| {
                     return windows_poll.readCancellable(
+                        ctx.allocator,
                         cancel_handle,
                         file.handle,
                         data,
@@ -5452,6 +5472,7 @@ const WindowsMessagePipe = if (builtin.os.tag == .windows) struct {
     const pipe_access_inbound: u32 = 0x0000_0001;
     const pipe_type_message: u32 = 0x0000_0004;
     const pipe_readmode_message: u32 = 0x0000_0002;
+    const pipe_nowait: u32 = 0x0000_0001;
     const generic_write: u32 = 0x4000_0000;
     const open_existing: u32 = 3;
     const file_attribute_normal: u32 = 0x0000_0080;
@@ -5460,10 +5481,19 @@ const WindowsMessagePipe = if (builtin.os.tag == .windows) struct {
     write: windows_poll.Handle,
 
     fn init() !@This() {
+        return initWithMode(false);
+    }
+
+    fn initNowait() !@This() {
+        return initWithMode(true);
+    }
+
+    fn initWithMode(nowait: bool) !@This() {
         const read = WindowsPollTestApi.CreateNamedPipeW(
             name,
             pipe_access_inbound,
-            pipe_type_message | pipe_readmode_message,
+            pipe_type_message | pipe_readmode_message |
+                (if (nowait) pipe_nowait else 0),
             1,
             4096,
             4096,
@@ -6180,6 +6210,31 @@ test "Windows poll review: ready console and expired clock both emit" {
     try std.testing.expectEqual(@as(u32, 2), wasi_core.memReadU32(&mem, 248).?);
     try std.testing.expectEqual(@as(u64, 12), pollTestEventUserdata(&mem, 128, 0));
     try std.testing.expectEqual(@as(u64, 13), pollTestEventUserdata(&mem, 128, 1));
+}
+
+test "Windows poll rereview: expired clock is not delayed by many idle pipes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var pipe = try WindowsPollTestPipe.init();
+    defer pipe.deinit();
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(114, .{ .kind = .stdin, .host_fd = pipe.read });
+
+    var mem: [8192]u8 = @splat(0);
+    pollTestWriteClockSub(&mem, 0, 1, wasi.CLOCKID_MONOTONIC, 0, 0);
+    for (1..65) |index|
+        pollTestWriteFdSub(&mem, index, index + 1, wasi.EVENTTYPE_FD_READ, 114);
+
+    const started = hostMonotonicNs(ctx);
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPollOneoffCore(ctx, &mem, 0, 4096, 65, 7000),
+    );
+    const elapsed = hostMonotonicNs(ctx) - started;
+
+    try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 7000).?);
+    try std.testing.expectEqual(@as(u64, 1), pollTestEventUserdata(&mem, 4096, 0));
+    try std.testing.expect(elapsed < 250 * std.time.ns_per_ms);
 }
 
 test "poll_oneoff review: POSIX immediate and pipe readiness both emit" {
@@ -6926,4 +6981,39 @@ test "Windows cancellable read: message pipe preserves ERROR_MORE_DATA prefix" {
     var second: [8]u8 = undefined;
     const second_read = try doRead(ctx, &lease, &second);
     try std.testing.expectEqualStrings("sage", second[0..second_read]);
+}
+
+test "Windows cancellable read: PIPE_NOWAIT empty is not EOF" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (!config.lib_wasi_threads or is_single_threaded) return error.SkipZigTest;
+
+    var pipe = try WindowsMessagePipe.initNowait();
+    defer pipe.deinit();
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(107, .{ .kind = .stdin, .host_fd = pipe.read });
+    var manager = thread_manager.ThreadManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&ctx.termination);
+
+    const DelayedWriter = struct {
+        fn run(target: *WindowsMessagePipe) void {
+            platform.usleep(50 * std.time.us_per_ms);
+            target.writeBytes("z") catch {};
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, DelayedWriter.run, .{&pipe});
+
+    var lease = ctx.fd_table.acquire(107).?;
+    defer lease.release();
+    var byte: [1]u8 = undefined;
+    const started = hostMonotonicNs(ctx);
+    const nread = try doRead(ctx, &lease, &byte);
+    const elapsed = hostMonotonicNs(ctx) - started;
+    writer.join();
+
+    try std.testing.expectEqual(@as(usize, 1), nread);
+    try std.testing.expectEqual(@as(u8, 'z'), byte[0]);
+    try std.testing.expect(elapsed >= 20 * std.time.ns_per_ms);
+    try std.testing.expect(elapsed < 500 * std.time.ns_per_ms);
 }
