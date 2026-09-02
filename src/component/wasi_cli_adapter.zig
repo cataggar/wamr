@@ -4802,7 +4802,52 @@ const HttpTrailerSnapshot = struct {
 const HttpResponseContentLength = enum {
     framing,
     representation,
+    zero,
     forbidden,
+};
+
+const HttpRequestMethod = enum {
+    get,
+    head,
+    post,
+    put,
+    delete,
+    connect,
+    options,
+    trace,
+    patch,
+    other,
+
+    fn fromDiscriminant(discriminant: u32) HttpRequestMethod {
+        return switch (discriminant) {
+            0 => .get,
+            1 => .head,
+            2 => .post,
+            3 => .put,
+            4 => .delete,
+            5 => .connect,
+            6 => .options,
+            7 => .trace,
+            8 => .patch,
+            else => .other,
+        };
+    }
+};
+
+threadlocal var active_inbound_http_request_method: ?HttpRequestMethod = null;
+
+const InboundHttpRequestMethodScope = struct {
+    previous: ?HttpRequestMethod,
+
+    fn bind(method: HttpRequestMethod) InboundHttpRequestMethodScope {
+        const previous = active_inbound_http_request_method;
+        active_inbound_http_request_method = method;
+        return .{ .previous = previous };
+    }
+
+    fn deinit(self: *InboundHttpRequestMethodScope) void {
+        active_inbound_http_request_method = self.previous;
+    }
 };
 
 const HttpResponseBodySemantics = struct {
@@ -4810,11 +4855,21 @@ const HttpResponseBodySemantics = struct {
     content_length: HttpResponseContentLength,
     connection_reusable: bool,
 
-    /// RFC 9110 permits representation metadata on HEAD and 304, but
-    /// forbids both content and Content-Length on 1xx and 204. A lone
-    /// guest-produced 1xx cannot complete the request, so it also ends
-    /// the HTTP connection instead of consuming the next response.
-    fn classify(request_is_head: bool, status: u16) HttpResponseBodySemantics {
+    /// RFC 9110 permits representation metadata on HEAD and 304, forbids
+    /// Content-Length on 1xx/204, and permits an explicit zero length on
+    /// 205. Successful CONNECT is bodyless and non-reusable because this
+    /// server has no tunnel handoff; a lone 1xx is likewise not final.
+    fn classify(
+        request_method: HttpRequestMethod,
+        status: u16,
+    ) HttpResponseBodySemantics {
+        if (request_method == .connect and status >= 200 and status < 300) {
+            return .{
+                .wire_body_allowed = false,
+                .content_length = .forbidden,
+                .connection_reusable = false,
+            };
+        }
         if (status >= 100 and status < 200) {
             return .{
                 .wire_body_allowed = false,
@@ -4829,7 +4884,14 @@ const HttpResponseBodySemantics = struct {
                 .connection_reusable = true,
             };
         }
-        if (status == 304 or request_is_head) {
+        if (status == 205) {
+            return .{
+                .wire_body_allowed = false,
+                .content_length = .zero,
+                .connection_reusable = true,
+            };
+        }
+        if (status == 304 or request_method == .head) {
             return .{
                 .wire_body_allowed = false,
                 .content_length = .representation,
@@ -4855,7 +4917,7 @@ const InboundHttpResponseSession = struct {
     ci: *ComponentInstance,
     output: *streams.OutputStream,
     keep_alive: bool,
-    request_is_head: bool,
+    request_method: HttpRequestMethod,
     interrupt: ?HttpConnectionInterrupt,
     wire_writer: ?HttpWireWriter,
 
@@ -4922,7 +4984,7 @@ const InboundHttpResponseSession = struct {
         ci: *ComponentInstance,
         output: *streams.OutputStream,
         keep_alive: bool,
-        request_is_head: bool,
+        request_method: HttpRequestMethod,
         interrupt: ?HttpConnectionInterrupt,
         wire_writer: ?HttpWireWriter,
     ) !*InboundHttpResponseSession {
@@ -4935,8 +4997,8 @@ const InboundHttpResponseSession = struct {
             .ci = ci,
             .output = output,
             .keep_alive = keep_alive,
-            .request_is_head = request_is_head,
-            .suppress_body = request_is_head,
+            .request_method = request_method,
+            .suppress_body = request_method == .head,
             .interrupt = interrupt,
             .wire_writer = wire_writer,
             .queue = queue,
@@ -5513,7 +5575,7 @@ const InboundHttpResponseSession = struct {
             fields.immutable = true;
         }
         const semantics = HttpResponseBodySemantics.classify(
-            self.request_is_head,
+            self.request_method,
             status,
         );
         if (trailers.declaration) |declaration| {
@@ -5527,22 +5589,20 @@ const InboundHttpResponseSession = struct {
             (trailers.has_entries or
                 trailers.state == .pending or
                 (has_body and content_length == null));
-        const expected_content_length: ?usize = switch (semantics.content_length) {
-            .framing => if (use_chunked)
+        const expected_content_length: ?usize =
+            if (!semantics.wire_body_allowed or use_chunked)
                 null
             else if (has_body)
                 content_length orelse 0
             else
-                0,
-            .representation => if (has_body) content_length else null,
-            .forbidden => null,
-        };
+                0;
         const wire_content_length: ?usize = switch (semantics.content_length) {
             .framing => if (use_chunked)
                 null
             else
                 expected_content_length,
             .representation => content_length,
+            .zero => 0,
             .forbidden => null,
         };
 
@@ -5680,28 +5740,26 @@ const InboundHttpResponseSession = struct {
         }
 
         const semantics = HttpResponseBodySemantics.classify(
-            self.request_is_head,
+            self.request_method,
             status,
         );
         const has_body = body_handle != null;
         const use_chunked = semantics.wire_body_allowed and
             has_body and content_length == null;
-        const expected_content_length: ?usize = switch (semantics.content_length) {
-            .framing => if (use_chunked)
+        const expected_content_length: ?usize =
+            if (!semantics.wire_body_allowed or use_chunked)
                 null
             else if (has_body)
                 content_length orelse 0
             else
-                0,
-            .representation => if (has_body) content_length else null,
-            .forbidden => null,
-        };
+                0;
         const wire_content_length: ?usize = switch (semantics.content_length) {
             .framing => if (use_chunked)
                 null
             else
                 expected_content_length,
             .representation => content_length,
+            .zero => 0,
             .forbidden => null,
         };
         if (use_chunked) {
@@ -23684,7 +23742,8 @@ pub const WasiCliAdapter = struct {
         body_lease.release();
 
         var written_len: usize = 0;
-        const live_len = if (self.activeInboundHttpResponse(ci)) |session|
+        const live_response = self.activeInboundHttpResponse(ci);
+        const live_len = if (live_response) |session|
             session.p2BodyByteCount(handle)
         else
             null;
@@ -23702,19 +23761,34 @@ pub const WasiCliAdapter = struct {
             var response_lease = self.lookupOutgoingResponse(
                 response_handle,
             ) orelse return error.InvalidHandle;
-            const headers_handle = response_lease.value().*.headers_handle;
+            const response = response_lease.value().*;
+            const headers_handle = response.headers_handle;
+            const status = response.status;
             response_lease.release();
-            if (self.lookupHttpFields(headers_handle)) |initial_fields_lease| {
-                var fields_lease = initial_fields_lease;
-                const expected = httpFieldsContentLength(
-                    fields_lease.value().*,
-                ) catch |err| {
+            const request_method = if (live_response) |session|
+                session.request_method
+            else
+                active_inbound_http_request_method;
+            const validate_content_length = if (request_method) |method|
+                HttpResponseBodySemantics.classify(
+                    method,
+                    status,
+                ).wire_body_allowed
+            else
+                true;
+            if (validate_content_length) {
+                if (self.lookupHttpFields(headers_handle)) |initial_fields_lease| {
+                    var fields_lease = initial_fields_lease;
+                    const expected = httpFieldsContentLength(
+                        fields_lease.value().*,
+                    ) catch |err| {
+                        fields_lease.release();
+                        return err;
+                    };
                     fields_lease.release();
-                    return err;
-                };
-                fields_lease.release();
-                if (expected) |length| {
-                    content_length_matches = length == written_len;
+                    if (expected) |length| {
+                        content_length_matches = length == written_len;
+                    }
                 }
             }
         }
@@ -24526,6 +24600,50 @@ pub const WasiCliAdapter = struct {
         return 9;
     }
 
+    const ParsedHttpRequestLine = struct {
+        method: []const u8,
+        target: []const u8,
+        version: []const u8,
+        method_disc: u32,
+    };
+
+    fn parseHttpRequestLineSyntax(
+        request_line: []const u8,
+        allow_http_10: bool,
+    ) !ParsedHttpRequestLine {
+        var tokens = std.mem.tokenizeScalar(u8, request_line, ' ');
+        const method = tokens.next() orelse return error.HttpBadRequest;
+        const target = tokens.next() orelse return error.HttpBadRequest;
+        const version = tokens.next() orelse return error.HttpBadRequest;
+        if (tokens.next() != null) return error.HttpBadRequest;
+        if (method.len == 0 or target.len == 0) return error.HttpBadRequest;
+        if (!std.mem.eql(u8, version, "HTTP/1.1") and
+            !(allow_http_10 and std.mem.eql(u8, version, "HTTP/1.0")))
+        {
+            return error.HttpBadRequest;
+        }
+        return .{
+            .method = method,
+            .target = target,
+            .version = version,
+            .method_disc = httpMethodDiscriminant(method),
+        };
+    }
+
+    fn parseHttpRequestLine(
+        request_line: []const u8,
+        allow_http_10: bool,
+    ) !ParsedHttpRequestLine {
+        const parsed = try parseHttpRequestLineSyntax(
+            request_line,
+            allow_http_10,
+        );
+        if (parsed.target.len > max_http_target_bytes) {
+            return error.HttpRequestUriTooLong;
+        }
+        return parsed;
+    }
+
     fn splitHttpTarget(target: []const u8) HttpTargetParts {
         const Prefix = struct { text: []const u8, scheme: u32 };
         const prefixes = [_]Prefix{
@@ -24769,6 +24887,18 @@ pub const WasiCliAdapter = struct {
         self: *WasiCliAdapter,
         stream: *streams.InputStream,
     ) !u32 {
+        var ignored_method: ?HttpRequestMethod = null;
+        return self.readIncomingRequestFromStreamWithMethod(
+            stream,
+            &ignored_method,
+        );
+    }
+
+    fn readIncomingRequestFromStreamWithMethod(
+        self: *WasiCliAdapter,
+        stream: *streams.InputStream,
+        request_method: *?HttpRequestMethod,
+    ) !u32 {
         var bytes: std.ArrayListUnmanaged(u8) = .empty;
         defer bytes.deinit(self.allocator);
 
@@ -24781,6 +24911,18 @@ pub const WasiCliAdapter = struct {
                 .err => return error.IoError,
             };
             try bytes.appendSlice(self.allocator, tmp[0..n]);
+            if (request_method.* == null) {
+                if (std.mem.indexOf(u8, bytes.items, "\r\n")) |line_end| {
+                    if (parseHttpRequestLineSyntax(
+                        bytes.items[0..line_end],
+                        false,
+                    )) |parsed| {
+                        request_method.* = HttpRequestMethod.fromDiscriminant(
+                            parsed.method_disc,
+                        );
+                    } else |_| {}
+                }
+            }
             if (bytes.items.len > max_http_header_bytes) return error.HttpRequestHeaderTooLarge;
             header_end = httpHeaderEnd(bytes.items);
         }
@@ -24818,14 +24960,9 @@ pub const WasiCliAdapter = struct {
 
         var lines = std.mem.splitSequence(u8, header_block[0 .. header_end - 4], "\r\n");
         const request_line = lines.next() orelse return error.HttpBadRequest;
-        var tokens = std.mem.tokenizeScalar(u8, request_line, ' ');
-        const method = tokens.next() orelse return error.HttpBadRequest;
-        const target = tokens.next() orelse return error.HttpBadRequest;
-        const version = tokens.next() orelse return error.HttpBadRequest;
-        if (tokens.next() != null) return error.HttpBadRequest;
-        if (method.len == 0 or target.len == 0) return error.HttpBadRequest;
-        if (target.len > max_http_target_bytes) return error.HttpRequestUriTooLong;
-        if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.HttpBadRequest;
+        const parsed_line = try parseHttpRequestLine(request_line, false);
+        const method = parsed_line.method;
+        const target = parsed_line.target;
 
         const target_parts = splitHttpTarget(target);
         var host_header: ?[]const u8 = null;
@@ -24862,7 +24999,7 @@ pub const WasiCliAdapter = struct {
 
         var method_other: ?[]u8 = null;
         errdefer if (method_other) |s| self.allocator.free(s);
-        const method_disc = httpMethodDiscriminant(method);
+        const method_disc = parsed_line.method_disc;
         if (method_disc == 9) method_other = try self.allocator.dupe(u8, method);
 
         var path_copy: ?[]u8 = try self.allocator.dupe(u8, target_parts.path_with_query);
@@ -24920,8 +25057,10 @@ pub const WasiCliAdapter = struct {
             201 => "Created",
             202 => "Accepted",
             204 => "No Content",
+            205 => "Reset Content",
             304 => "Not Modified",
             400 => "Bad Request",
+            403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
             413 => "Payload Too Large",
@@ -25029,23 +25168,23 @@ pub const WasiCliAdapter = struct {
         status: u16,
         body: []const u8,
     ) !void {
-        return self.writeHttpSimpleResponseForRequest(
+        return self.writeHttpSimpleResponseForMethod(
             out,
             status,
             body,
-            false,
+            .get,
         );
     }
 
-    fn writeHttpSimpleResponseForRequest(
+    fn writeHttpSimpleResponseForMethod(
         self: *WasiCliAdapter,
         out: *streams.OutputStream,
         status: u16,
         body: []const u8,
-        request_is_head: bool,
+        request_method: HttpRequestMethod,
     ) !void {
         const semantics = HttpResponseBodySemantics.classify(
-            request_is_head,
+            request_method,
             status,
         );
         const status_line = try std.fmt.allocPrint(
@@ -25057,10 +25196,11 @@ pub const WasiCliAdapter = struct {
         try self.writeAllOutputStream(out, status_line);
         const content_length: ?usize = switch (semantics.content_length) {
             .framing => body.len,
-            .representation => if (request_is_head and status != 304)
+            .representation => if (request_method == .head and status != 304)
                 body.len
             else
                 null,
+            .zero => 0,
             .forbidden => null,
         };
         if (content_length) |length| {
@@ -25084,49 +25224,49 @@ pub const WasiCliAdapter = struct {
         out: *streams.OutputStream,
         outparam_handle: u32,
     ) !void {
-        return self.writeHttpResponseFromOutparamForRequest(
+        return self.writeHttpResponseFromOutparamForMethod(
             out,
             outparam_handle,
-            false,
+            .get,
         );
     }
 
-    fn writeHttpResponseFromOutparamForRequest(
+    fn writeHttpResponseFromOutparamForMethod(
         self: *WasiCliAdapter,
         out: *streams.OutputStream,
         outparam_handle: u32,
-        request_is_head: bool,
+        request_method: HttpRequestMethod,
     ) !void {
         var outparam_lease = self.lookupResponseOutparam(outparam_handle) orelse {
-            return self.writeHttpSimpleResponseForRequest(
+            return self.writeHttpSimpleResponseForMethod(
                 out,
                 500,
                 "missing response outparam\n",
-                request_is_head,
+                request_method,
             );
         };
         defer outparam_lease.release();
         const outparam = outparam_lease.value().*;
         switch (outparam.state) {
-            .unset => return self.writeHttpSimpleResponseForRequest(
+            .unset => return self.writeHttpSimpleResponseForMethod(
                 out,
                 500,
                 "handler did not set response\n",
-                request_is_head,
+                request_method,
             ),
-            .err => |code| return self.writeHttpSimpleResponseForRequest(
+            .err => |code| return self.writeHttpSimpleResponseForMethod(
                 out,
                 httpStatusFromError(code),
                 "handler returned error\n",
-                request_is_head,
+                request_method,
             ),
             .response => |response_handle| {
                 var response_lease = self.lookupOutgoingResponse(response_handle) orelse {
-                    return self.writeHttpSimpleResponseForRequest(
+                    return self.writeHttpSimpleResponseForMethod(
                         out,
                         500,
                         "invalid response handle\n",
-                        request_is_head,
+                        request_method,
                     );
                 };
                 const response = response_lease.value().*;
@@ -25140,11 +25280,11 @@ pub const WasiCliAdapter = struct {
                 response_lease.release();
                 defer if (body_owner) |owner| owner.release();
                 if (body_incomplete) {
-                    return self.writeHttpSimpleResponseForRequest(
+                    return self.writeHttpSimpleResponseForMethod(
                         out,
                         500,
                         "incomplete response body\n",
-                        request_is_head,
+                        request_method,
                     );
                 }
                 var body_owned: ?[]u8 = null;
@@ -25163,17 +25303,17 @@ pub const WasiCliAdapter = struct {
                     body_owned = try self.allocator.alloc(u8, 0);
                 } else if (body_handle) |handle| {
                     body_owned = try self.copyOutgoingBodyBytes(handle) orelse {
-                        return self.writeHttpSimpleResponseForRequest(
+                        return self.writeHttpSimpleResponseForMethod(
                             out,
                             500,
                             "invalid body handle\n",
-                            request_is_head,
+                            request_method,
                         );
                     };
                 }
                 const body: []const u8 = if (body_owned) |bytes| bytes else "";
                 const semantics = HttpResponseBodySemantics.classify(
-                    request_is_head,
+                    request_method,
                     status,
                 );
                 var response_fields_lease = self.lookupHttpFields(headers_handle);
@@ -25185,19 +25325,17 @@ pub const WasiCliAdapter = struct {
                     for (fields.entries.items) |entry| {
                         if (isHopByHopOrFramingHeader(entry.name)) continue;
                         if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
-                            return self.writeHttpSimpleResponseForRequest(
+                            return self.writeHttpSimpleResponseForMethod(
                                 out,
                                 500,
                                 "invalid response header\n",
-                                request_is_head,
+                                request_method,
                             );
                         }
                     }
                 }
                 const has_body_producer = body_owner != null or body_handle != null;
-                if (semantics.content_length == .representation and
-                    has_body_producer)
-                {
+                if (semantics.wire_body_allowed and has_body_producer) {
                     if (content_length) |expected| {
                         if (body.len != expected) return error.ResponseBodySize;
                     }
@@ -25234,6 +25372,7 @@ pub const WasiCliAdapter = struct {
                             body.len
                         else
                             null,
+                    .zero => 0,
                     .forbidden => null,
                 };
                 if (wire_content_length) |length| {
@@ -26760,9 +26899,9 @@ pub const WasiCliAdapter = struct {
     pub const HttpRequestP3Read = struct {
         request_handle: u32,
         keep_alive: bool,
-        /// Carried separately because the guest-owned request resource
-        /// can be dropped before the host frames its response.
-        request_is_head: bool,
+        /// Carried separately because the guest-owned request resource can
+        /// be dropped before the host frames method-specific responses.
+        request_method: HttpRequestMethod,
     };
 
     /// Build a P3 incoming-request from already-separated header /
@@ -26787,16 +26926,9 @@ pub const WasiCliAdapter = struct {
         // sentinel entry. Mirrors `createIncomingRequestFromHttpBytes`.
         var lines = std.mem.splitSequence(u8, header_block[0 .. header_block.len - 4], "\r\n");
         const request_line = lines.next() orelse return error.HttpBadRequest;
-        var tokens = std.mem.tokenizeScalar(u8, request_line, ' ');
-        const method = tokens.next() orelse return error.HttpBadRequest;
-        const target = tokens.next() orelse return error.HttpBadRequest;
-        const version = tokens.next() orelse return error.HttpBadRequest;
-        if (tokens.next() != null) return error.HttpBadRequest;
-        if (method.len == 0 or target.len == 0) return error.HttpBadRequest;
-        if (target.len > max_http_target_bytes) return error.HttpRequestUriTooLong;
-        if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) {
-            return error.HttpBadRequest;
-        }
+        const parsed_line = try parseHttpRequestLine(request_line, true);
+        const method = parsed_line.method;
+        const target = parsed_line.target;
 
         const target_parts = splitHttpTarget(target);
         var host_header: ?[]const u8 = null;
@@ -26837,7 +26969,7 @@ pub const WasiCliAdapter = struct {
 
         var method_other: ?[]u8 = null;
         errdefer if (method_other) |s| self.allocator.free(s);
-        const method_disc = httpMethodDiscriminant(method);
+        const method_disc = parsed_line.method_disc;
         if (method_disc == 9) method_other = try self.allocator.dupe(u8, method);
 
         const path_copy = try self.allocator.dupe(u8, target_parts.path_with_query);
@@ -26906,7 +27038,7 @@ pub const WasiCliAdapter = struct {
         return .{
             .request_handle = handle,
             .keep_alive = info.keep_alive,
-            .request_is_head = method_disc == 1,
+            .request_method = HttpRequestMethod.fromDiscriminant(method_disc),
         };
     }
 
@@ -27002,29 +27134,29 @@ pub const WasiCliAdapter = struct {
         response_handle: u32,
         keep_alive: bool,
     ) !void {
-        _ = try self.writeHttpResponseP3FromHandleForRequest(
+        _ = try self.writeHttpResponseP3FromHandleForMethod(
             out,
             ci,
             response_handle,
             keep_alive,
-            false,
+            .get,
         );
     }
 
-    fn writeHttpResponseP3FromHandleForRequest(
+    fn writeHttpResponseP3FromHandleForMethod(
         self: *WasiCliAdapter,
         out: *streams.OutputStream,
         ci: *ComponentInstance,
         response_handle: u32,
         keep_alive: bool,
-        request_is_head: bool,
+        request_method: HttpRequestMethod,
     ) !bool {
         var response_lease = self.lookupHttpResponseP3(response_handle) orelse {
-            try self.writeHttpSimpleResponseForRequest(
+            try self.writeHttpSimpleResponseForMethod(
                 out,
                 500,
                 "invalid response handle\n",
-                request_is_head,
+                request_method,
             );
             return false;
         };
@@ -27033,7 +27165,7 @@ pub const WasiCliAdapter = struct {
 
         const status: u16 = if (response.status >= 100 and response.status <= 999) response.status else 500;
         const semantics = HttpResponseBodySemantics.classify(
-            request_is_head,
+            request_method,
             status,
         );
 
@@ -27062,11 +27194,11 @@ pub const WasiCliAdapter = struct {
             for (fields.entries.items) |entry| {
                 if (isHopByHopOrFramingHeader(entry.name)) continue;
                 if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
-                    try self.writeHttpSimpleResponseForRequest(
+                    try self.writeHttpSimpleResponseForMethod(
                         out,
                         500,
                         "invalid response header\n",
-                        request_is_head,
+                        request_method,
                     );
                     return false;
                 }
@@ -27089,7 +27221,7 @@ pub const WasiCliAdapter = struct {
             null;
         const has_trailer_entries = if (trailer_fields) |tf| tf.entries.items.len > 0 else false;
         const has_body_stream = response.body_stream_handle != null;
-        if (semantics.content_length != .forbidden and has_body_stream) {
+        if (semantics.wire_body_allowed and has_body_stream) {
             if (content_length) |expected| {
                 if (body.len != expected) return error.ResponseBodySize;
             }
@@ -27196,6 +27328,7 @@ pub const WasiCliAdapter = struct {
                         body.len
                     else
                         null,
+                .zero => 0,
                 .forbidden => null,
             };
             if (wire_content_length) |length| {
@@ -27317,7 +27450,12 @@ pub const WasiCliAdapter = struct {
     ) !HttpRequestP3Read {
         var reader: BufferedLineReader = .{ .allocator = self.allocator, .stream = stream };
         defer reader.deinit();
-        return self.readIncomingRequestP3FromBufferedReader(ci, &reader);
+        var ignored_method: ?HttpRequestMethod = null;
+        return self.readIncomingRequestP3FromBufferedReaderWithMethod(
+            ci,
+            &reader,
+            &ignored_method,
+        );
     }
 
     /// Sibling of `readIncomingRequestP3FromStream` that reuses a
@@ -27329,6 +27467,20 @@ pub const WasiCliAdapter = struct {
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
         reader: *BufferedLineReader,
+    ) !HttpRequestP3Read {
+        var ignored_method: ?HttpRequestMethod = null;
+        return self.readIncomingRequestP3FromBufferedReaderWithMethod(
+            ci,
+            reader,
+            &ignored_method,
+        );
+    }
+
+    fn readIncomingRequestP3FromBufferedReaderWithMethod(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        reader: *BufferedLineReader,
+        request_method: *?HttpRequestMethod,
     ) !HttpRequestP3Read {
         // Reset the per-request "have we consumed any bytes yet"
         // flag so the very-first `readLine` can surface a clean
@@ -27345,6 +27497,10 @@ pub const WasiCliAdapter = struct {
         // First line — surface idle-close cleanly so the keep-alive
         // loop can exit without writing a response.
         const first_line = try reader.readLine(max_http_p3_header_section_bytes);
+        const parsed_line = try parseHttpRequestLineSyntax(first_line, true);
+        request_method.* = HttpRequestMethod.fromDiscriminant(
+            parsed_line.method_disc,
+        );
         try hdr_bytes.appendSlice(self.allocator, first_line);
         try hdr_bytes.appendSlice(self.allocator, "\r\n");
 
@@ -27432,16 +27588,22 @@ pub const WasiCliAdapter = struct {
         defer reader.deinit();
 
         while (true) {
-            const parsed = self.readIncomingRequestP3FromBufferedReader(ci, &reader) catch |err| {
+            var request_method: ?HttpRequestMethod = null;
+            const parsed = self.readIncomingRequestP3FromBufferedReaderWithMethod(
+                ci,
+                &reader,
+                &request_method,
+            ) catch |err| {
                 if (err == error.HttpConnectionIdleClose) {
                     // Client closed cleanly between requests — no
                     // response, just exit.
                     return;
                 }
-                self.writeHttpSimpleResponse(
+                self.writeHttpSimpleResponseForMethod(
                     output,
                     statusForRequestReadError(err),
                     "bad request\n",
+                    request_method orelse .other,
                 ) catch {};
                 return;
             };
@@ -27453,7 +27615,7 @@ pub const WasiCliAdapter = struct {
                     ci,
                     output,
                     parsed.keep_alive,
-                    parsed.request_is_head,
+                    parsed.request_method,
                     interrupt,
                     null,
                 ) catch break :live null;
@@ -27486,11 +27648,11 @@ pub const WasiCliAdapter = struct {
                 if (!output_started and terminal != .client_disconnected and
                     terminal != .shutdown)
                 {
-                    self.writeHttpSimpleResponseForRequest(
+                    self.writeHttpSimpleResponseForMethod(
                         output,
                         503,
                         "service unavailable\n",
-                        parsed.request_is_head,
+                        parsed.request_method,
                     ) catch {};
                 }
                 cancelAllPendingAsyncOps(self, ci, null, self.allocator);
@@ -27515,11 +27677,11 @@ pub const WasiCliAdapter = struct {
                 if (!output_started and terminal != .client_disconnected and
                     terminal != .shutdown)
                 {
-                    self.writeHttpSimpleResponseForRequest(
+                    self.writeHttpSimpleResponseForMethod(
                         output,
                         code,
                         "handler returned error\n",
-                        parsed.request_is_head,
+                        parsed.request_method,
                     ) catch {};
                 }
                 cancelAllPendingAsyncOps(self, ci, null, self.allocator);
@@ -27544,12 +27706,12 @@ pub const WasiCliAdapter = struct {
 
             if (live_terminal == .fallback) {
                 connection_reusable =
-                    self.writeHttpResponseP3FromHandleForRequest(
+                    self.writeHttpResponseP3FromHandleForMethod(
                         output,
                         ci,
                         outcome.payload,
                         parsed.keep_alive,
-                        parsed.request_is_head,
+                        parsed.request_method,
                     ) catch |err| {
                         self.failHttpResponseTransmission(ci, outcome.payload);
                         if (err == error.HttpClientDisconnected) {
@@ -27571,11 +27733,11 @@ pub const WasiCliAdapter = struct {
                 if (live_terminal == .response_error and
                     !live_output_started)
                 {
-                    self.writeHttpSimpleResponseForRequest(
+                    self.writeHttpSimpleResponseForMethod(
                         output,
                         live_error_status,
                         "invalid response\n",
-                        parsed.request_is_head,
+                        parsed.request_method,
                     ) catch {};
                 }
                 cancelAllPendingAsyncOps(self, ci, null, self.allocator);
@@ -31167,34 +31329,42 @@ fn serveOneHttpConnection(
         .callback = &interruptAcceptedHttpConnection,
     };
 
-    const request_handle = adapter.readIncomingRequestFromStream(&input) catch |err| {
-        adapter.writeHttpSimpleResponse(&output, statusForRequestReadError(err), "bad request\n") catch {};
+    var parsed_method: ?HttpRequestMethod = null;
+    const request_handle = adapter.readIncomingRequestFromStreamWithMethod(
+        &input,
+        &parsed_method,
+    ) catch |err| {
+        adapter.writeHttpSimpleResponseForMethod(
+            &output,
+            statusForRequestReadError(err),
+            "bad request\n",
+            parsed_method orelse .other,
+        ) catch {};
         return;
     };
-    const request_is_head = head: {
-        var request_lease = adapter.lookupIncomingRequest(request_handle) orelse
-            break :head false;
-        defer request_lease.release();
-        break :head request_lease.value().*.method_disc == 1;
-    };
+    const request_method = parsed_method orelse .other;
+    var request_method_scope = InboundHttpRequestMethodScope.bind(
+        request_method,
+    );
+    defer request_method_scope.deinit();
 
     const outparam = adapter.allocator.create(ResponseOutparam) catch {
-        adapter.writeHttpSimpleResponseForRequest(
+        adapter.writeHttpSimpleResponseForMethod(
             &output,
             500,
             "out of memory\n",
-            request_is_head,
+            request_method,
         ) catch {};
         return;
     };
     outparam.* = .{};
     const outparam_handle = adapter.pushResponseOutparam(outparam) catch {
         adapter.allocator.destroy(outparam);
-        adapter.writeHttpSimpleResponseForRequest(
+        adapter.writeHttpSimpleResponseForMethod(
             &output,
             500,
             "out of memory\n",
-            request_is_head,
+            request_method,
         ) catch {};
         return;
     };
@@ -31211,7 +31381,7 @@ fn serveOneHttpConnection(
             inst,
             &output,
             false,
-            request_is_head,
+            request_method,
             interrupt,
             null,
         ) catch break :live null;
@@ -31244,11 +31414,11 @@ fn serveOneHttpConnection(
         if (!output_started and terminal != .client_disconnected and
             terminal != .shutdown)
         {
-            adapter.writeHttpSimpleResponseForRequest(
+            adapter.writeHttpSimpleResponseForMethod(
                 &output,
                 500,
                 "handler trapped\n",
-                request_is_head,
+                request_method,
             ) catch {};
         }
         WasiCliAdapter.cancelAllPendingAsyncOps(
@@ -31275,11 +31445,11 @@ fn serveOneHttpConnection(
     if (live_terminal == .succeeded) return;
     if (live_terminal != .fallback) {
         if (live_terminal == .response_error and !live_output_started) {
-            adapter.writeHttpSimpleResponseForRequest(
+            adapter.writeHttpSimpleResponseForMethod(
                 &output,
                 live_error_status,
                 "invalid response\n",
-                request_is_head,
+                request_method,
             ) catch {};
         }
         WasiCliAdapter.cancelAllPendingAsyncOps(
@@ -31294,10 +31464,10 @@ fn serveOneHttpConnection(
     // P2 serves one request per connection, so a disconnect has no
     // keep-alive to suppress — but the guest may still own host
     // operations whose results can no longer be observed (#616 A8).
-    adapter.writeHttpResponseFromOutparamForRequest(
+    adapter.writeHttpResponseFromOutparamForMethod(
         &output,
         outparam_handle,
-        request_is_head,
+        request_method,
     ) catch |err| {
         if (err == error.HttpClientDisconnected) {
             WasiCliAdapter.cancelAllPendingAsyncOps(adapter, inst, null, adapter.allocator);
@@ -48019,25 +48189,25 @@ fn startLiveHttpTestSession(
     sink: *LiveHttpTestSink,
     fixture: LiveHttpResponseFixture,
 ) !*InboundHttpResponseSession {
-    return startLiveHttpTestSessionForRequest(
+    return startLiveHttpTestSessionForMethod(
         adapter,
         ci,
         output,
         sink,
         fixture,
         false,
-        false,
+        .get,
     );
 }
 
-fn startLiveHttpTestSessionForRequest(
+fn startLiveHttpTestSessionForMethod(
     adapter: *WasiCliAdapter,
     ci: *ComponentInstance,
     output: *streams.OutputStream,
     sink: *LiveHttpTestSink,
     fixture: LiveHttpResponseFixture,
     keep_alive: bool,
-    request_is_head: bool,
+    request_method: HttpRequestMethod,
 ) !*InboundHttpResponseSession {
     const session = try InboundHttpResponseSession.create(
         adapter.allocator,
@@ -48045,7 +48215,7 @@ fn startLiveHttpTestSessionForRequest(
         ci,
         output,
         keep_alive,
-        request_is_head,
+        request_method,
         .{
             .context = sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -48115,6 +48285,39 @@ fn setLiveHttpResponseStatus(
     response_lease.value().*.status = status;
 }
 
+fn expectHttpParseErrorWire(
+    adapter: *WasiCliAdapter,
+    request_method: ?HttpRequestMethod,
+    err: anyerror,
+) !void {
+    const testing = std.testing;
+    const body = "bad request\n";
+    var output = streams.OutputStream.toBuffer();
+    defer output.deinit(testing.allocator);
+    try adapter.writeHttpSimpleResponseForMethod(
+        &output,
+        statusForRequestReadError(err),
+        body,
+        request_method orelse .other,
+    );
+    const wire = output.getBufferContents();
+    try testing.expect(
+        std.mem.indexOf(u8, wire, "Connection: close\r\n\r\n") != null,
+    );
+    const header_end = WasiCliAdapter.httpHeaderEnd(wire) orelse
+        return error.TestExpectedEqual;
+    if (request_method != null and request_method.? == .head) {
+        try testing.expectEqual(header_end, wire.len);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            wire,
+            "Content-Length: 12\r\n",
+        ) != null);
+    } else {
+        try testing.expectEqualStrings(body, wire[header_end..]);
+    }
+}
+
 fn waitForLiveHttpTransmitted(
     session: *InboundHttpResponseSession,
     expected: usize,
@@ -48154,14 +48357,14 @@ test "wasi:http #970: P3 HEAD drains its body and preserves pipelined framing" {
         null,
     );
     {
-        const session = try startLiveHttpTestSessionForRequest(
+        const session = try startLiveHttpTestSessionForMethod(
             &adapter,
             &ci,
             &output,
             &sink,
             head_fixture,
             true,
-            true,
+            .head,
         );
         defer session.destroy();
 
@@ -48207,14 +48410,14 @@ test "wasi:http #970: P3 HEAD drains its body and preserves pipelined framing" {
         null,
     );
     {
-        const session = try startLiveHttpTestSessionForRequest(
+        const session = try startLiveHttpTestSessionForMethod(
             &adapter,
             &ci,
             &output,
             &sink,
             get_fixture,
             false,
-            false,
+            .get,
         );
         defer session.destroy();
         try testing.expect(InboundHttpResponseSession.onBodyWrite(
@@ -48253,7 +48456,7 @@ test "wasi:http #970: P3 body-forbidden statuses omit body framing" {
         status: u16,
         reason: []const u8,
         content_length: ?usize,
-        expect_content_length: bool,
+        expected_content_length: ?usize,
         connection_reusable: bool,
     };
     const cases = [_]Case{
@@ -48261,28 +48464,35 @@ test "wasi:http #970: P3 body-forbidden statuses omit body framing" {
             .status = 103,
             .reason = "Early Hints",
             .content_length = 5,
-            .expect_content_length = false,
+            .expected_content_length = null,
             .connection_reusable = false,
         },
         .{
             .status = 204,
             .reason = "No Content",
             .content_length = 5,
-            .expect_content_length = false,
+            .expected_content_length = null,
+            .connection_reusable = true,
+        },
+        .{
+            .status = 205,
+            .reason = "Reset Content",
+            .content_length = 5,
+            .expected_content_length = 0,
             .connection_reusable = true,
         },
         .{
             .status = 304,
             .reason = "Not Modified",
             .content_length = 5,
-            .expect_content_length = true,
+            .expected_content_length = 5,
             .connection_reusable = true,
         },
         .{
             .status = 304,
             .reason = "Not Modified",
             .content_length = null,
-            .expect_content_length = false,
+            .expected_content_length = null,
             .connection_reusable = true,
         },
     };
@@ -48306,14 +48516,14 @@ test "wasi:http #970: P3 body-forbidden statuses omit body framing" {
             case.status,
         );
         var sink = LiveHttpTestSink{};
-        const session = try startLiveHttpTestSessionForRequest(
+        const session = try startLiveHttpTestSessionForMethod(
             &adapter,
             &ci,
             &output,
             &sink,
             fixture,
             true,
-            false,
+            .get,
         );
         defer session.destroy();
 
@@ -48350,20 +48560,24 @@ test "wasi:http #970: P3 body-forbidden statuses omit body framing" {
             case.connection_reusable,
             session.canReuseConnection(),
         );
-        try testing.expectEqual(
-            case.expect_content_length,
-            std.mem.indexOf(
-                u8,
-                wire,
-                "Content-Length: 5\r\n",
-            ) != null,
-        );
+        if (case.expected_content_length) |length| {
+            const expected = try std.fmt.allocPrint(
+                testing.allocator,
+                "Content-Length: {d}\r\n",
+                .{length},
+            );
+            defer testing.allocator.free(expected);
+            try testing.expect(std.mem.indexOf(u8, wire, expected) != null);
+        } else {
+            try testing.expect(
+                std.mem.indexOf(u8, wire, "Content-Length:") == null,
+            );
+        }
         try testing.expect(
             std.mem.indexOf(u8, wire, "Transfer-Encoding:") == null,
         );
         try testing.expect(std.mem.indexOf(u8, wire, "Trailer:") == null);
         try testing.expect(std.mem.indexOf(u8, wire, "hello") == null);
-        try testing.expect(std.mem.indexOf(u8, wire, "0\r\n") == null);
         try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
         try testing.expectEqual(
             async_mod.Future.State.ready,
@@ -48372,10 +48586,173 @@ test "wasi:http #970: P3 body-forbidden statuses omit body framing" {
     }
 }
 
-test "wasi:http #970: representation length mismatches forbid connection reuse" {
+test "wasi:http #970 review: P3 2xx CONNECT closes without HTTP body framing" {
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
-        .label = "representation length mismatches forbid connection reuse",
+        .label = "P3 2xx CONNECT closes without HTTP body framing",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    const cases = [_]struct {
+        content_length: ?usize,
+        with_trailer: bool,
+    }{
+        .{ .content_length = 5, .with_trailer = false },
+        .{ .content_length = null, .with_trailer = true },
+    };
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const fixture = if (case.with_trailer)
+            try makeLiveHttpResponseFixture(
+                &adapter,
+                &ci,
+                case.content_length,
+                true,
+                .{ .name = "x-tunnel", .value = "ignored" },
+            )
+        else
+            try makeLiveHttpResponseFixture(
+                &adapter,
+                &ci,
+                case.content_length,
+                true,
+                null,
+            );
+        var sink = LiveHttpTestSink{};
+        const session = try startLiveHttpTestSessionForMethod(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            fixture,
+            true,
+            .connect,
+        );
+        defer session.destroy();
+
+        try testing.expect(InboundHttpResponseSession.onBodyWrite(
+            session,
+            "hello",
+        ));
+        InboundHttpResponseSession.onBodyClosed(session);
+        session.handlerReturned(fixture.response_handle);
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+        try testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            sink.contents(),
+        );
+        try testing.expect(!session.canReuseConnection());
+        try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+        try testing.expectEqual(@as(usize, 0), session.bufferedHighWater());
+        try testing.expectEqual(
+            async_mod.Future.State.ready,
+            ci.futures.getPtr(fixture.transmission_handle).?.state,
+        );
+    }
+}
+
+test "wasi:http #970 review: non-2xx CONNECT keeps ordinary HTTP framing" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        5,
+        true,
+        null,
+    );
+    try setLiveHttpResponseStatus(&adapter, fixture.response_handle, 403);
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSessionForMethod(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+        true,
+        .connect,
+    );
+    defer session.destroy();
+
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        session,
+        "hello",
+    ));
+    InboundHttpResponseSession.onBodyClosed(session);
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(
+        HttpLiveTerminal.succeeded,
+        session.currentTerminal(),
+    );
+    try testing.expectEqualStrings(
+        "HTTP/1.1 403 Forbidden\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Connection: keep-alive\r\n\r\n" ++
+            "hello",
+        sink.contents(),
+    );
+    try testing.expect(session.canReuseConnection());
+    try testing.expectEqual(@as(usize, 5), session.transmitted_bytes);
+}
+
+test "wasi:http #970 review: 2xx CONNECT leaves tunnel bytes unparsed" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const tunnel_bytes = "\x16\x03\x01\x00\x05hello";
+    var input = streams.InputStream.fromBuffer(
+        "CONNECT example.com:443 HTTP/1.1\r\n" ++
+            "Host: example.com:443\r\n\r\n" ++ tunnel_bytes,
+    );
+    var reader = WasiCliAdapter.BufferedLineReader{
+        .allocator = testing.allocator,
+        .stream = &input,
+    };
+    defer reader.deinit();
+    const parsed = try adapter.readIncomingRequestP3FromBufferedReader(
+        &ci,
+        &reader,
+    );
+    try testing.expectEqual(HttpRequestMethod.connect, parsed.request_method);
+    try testing.expect(parsed.keep_alive);
+
+    const semantics = HttpResponseBodySemantics.classify(
+        parsed.request_method,
+        200,
+    );
+    try testing.expect(!semantics.connection_reusable);
+    try testing.expectEqualStrings(
+        tunnel_bytes,
+        reader.buf.items[reader.pos..],
+    );
+}
+
+test "wasi:http #970 review: HEAD and 304 Content-Length is metadata" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "HEAD and 304 Content-Length is metadata",
         .limit_ms = 60_000,
     };
     try watchdog.start();
@@ -48384,12 +48761,13 @@ test "wasi:http #970: representation length mismatches forbid connection reuse" 
     const Case = struct {
         body: []const u8,
         status: u16,
-        request_is_head: bool,
+        method: HttpRequestMethod,
     };
     const cases = [_]Case{
-        .{ .body = "four", .status = 200, .request_is_head = true },
-        .{ .body = "sixsix", .status = 200, .request_is_head = true },
-        .{ .body = "four", .status = 304, .request_is_head = false },
+        .{ .body = "", .status = 200, .method = .head },
+        .{ .body = "discarded HEAD bytes", .status = 200, .method = .head },
+        .{ .body = "", .status = 304, .method = .get },
+        .{ .body = "discarded 304 bytes", .status = 304, .method = .get },
     };
     for (cases) |case| {
         var adapter = WasiCliAdapter.init(testing.allocator);
@@ -48400,7 +48778,7 @@ test "wasi:http #970: representation length mismatches forbid connection reuse" 
         const fixture = try makeLiveHttpResponseFixture(
             &adapter,
             &ci,
-            5,
+            100,
             true,
             null,
         );
@@ -48410,46 +48788,279 @@ test "wasi:http #970: representation length mismatches forbid connection reuse" 
             case.status,
         );
         var sink = LiveHttpTestSink{};
-        const session = try startLiveHttpTestSessionForRequest(
+        const session = try startLiveHttpTestSessionForMethod(
             &adapter,
             &ci,
             &output,
             &sink,
             fixture,
             true,
-            case.request_is_head,
+            case.method,
         );
         defer session.destroy();
 
-        const accepted = InboundHttpResponseSession.onBodyWrite(
-            session,
-            case.body,
-        );
-        if (case.body.len < 5) {
-            try testing.expect(accepted);
-            InboundHttpResponseSession.onBodyClosed(session);
-        } else {
-            try testing.expect(!accepted);
+        if (case.body.len != 0) {
+            try testing.expect(InboundHttpResponseSession.onBodyWrite(
+                session,
+                case.body,
+            ));
         }
+        InboundHttpResponseSession.onBodyClosed(session);
         session.handlerReturned(fixture.response_handle);
         session.waitAndJoin();
         session.propagateTerminalToGuest();
 
         try testing.expectEqual(
-            HttpLiveTerminal.response_error,
+            HttpLiveTerminal.succeeded,
             session.currentTerminal(),
         );
-        try testing.expectEqual(
-            @as(?HttpErrorCode, .HTTP_response_body_size),
-            session.response_error_code,
+        try testing.expect(std.mem.indexOf(
+            u8,
+            sink.contents(),
+            "Content-Length: 100\r\n",
+        ) != null);
+        try testing.expect(std.mem.endsWith(
+            u8,
+            sink.contents(),
+            "Connection: keep-alive\r\n\r\n",
+        ));
+        try testing.expect(
+            std.mem.indexOf(u8, sink.contents(), case.body) == null or
+                case.body.len == 0,
         );
-        try testing.expect(!session.hasOutputStarted());
-        try testing.expectEqual(@as(usize, 0), sink.contents().len);
+        try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+        try testing.expectEqual(@as(usize, 0), session.bufferedHighWater());
         try testing.expectEqual(
-            async_mod.Future.State.closed,
+            async_mod.Future.State.ready,
             ci.futures.getPtr(fixture.transmission_handle).?.state,
         );
     }
+}
+
+test "wasi:http #970 review: content-bearing GET still rejects an underrun" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "content-bearing GET still rejects an underrun",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var output: streams.OutputStream = .{ .sink = .closed };
+    const fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        5,
+        true,
+        null,
+    );
+    var sink = LiveHttpTestSink{};
+    const session = try startLiveHttpTestSessionForMethod(
+        &adapter,
+        &ci,
+        &output,
+        &sink,
+        fixture,
+        true,
+        .get,
+    );
+    defer session.destroy();
+
+    try testing.expect(InboundHttpResponseSession.onBodyWrite(
+        session,
+        "four",
+    ));
+    InboundHttpResponseSession.onBodyClosed(session);
+    session.handlerReturned(fixture.response_handle);
+    session.waitAndJoin();
+    session.propagateTerminalToGuest();
+
+    try testing.expectEqual(
+        HttpLiveTerminal.response_error,
+        session.currentTerminal(),
+    );
+    try testing.expectEqual(
+        @as(?HttpErrorCode, .HTTP_response_body_size),
+        session.response_error_code,
+    );
+    try testing.expectEqual(
+        async_mod.Future.State.closed,
+        ci.futures.getPtr(fixture.transmission_handle).?.state,
+    );
+}
+
+test "wasi:http #970 review: P3 parse errors retain a recognized HEAD" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const oversized_body = try std.fmt.allocPrint(
+        testing.allocator,
+        "HEAD / HTTP/1.1\r\nContent-Length: {d}\r\n\r\n",
+        .{max_http_p3_body_bytes + 1},
+    );
+    defer testing.allocator.free(oversized_body);
+
+    var oversized_headers: std.ArrayListUnmanaged(u8) = .empty;
+    defer oversized_headers.deinit(testing.allocator);
+    try oversized_headers.appendSlice(
+        testing.allocator,
+        "HEAD / HTTP/1.1\r\nX-Fill: ",
+    );
+    try oversized_headers.appendNTimes(
+        testing.allocator,
+        'a',
+        max_http_p3_header_section_bytes,
+    );
+    try oversized_headers.appendSlice(testing.allocator, "\r\n\r\n");
+
+    const cases = [_]struct {
+        wire: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .wire = "HEAD / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+            .err = error.HttpUnsupportedTransferCoding,
+        },
+        .{
+            .wire = oversized_body,
+            .err = error.HttpRequestBodyTooLarge,
+        },
+        .{
+            .wire = oversized_headers.items,
+            .err = error.HttpRequestHeaderTooLarge,
+        },
+    };
+    for (cases) |case| {
+        var input = streams.InputStream.fromBuffer(case.wire);
+        var reader = WasiCliAdapter.BufferedLineReader{
+            .allocator = testing.allocator,
+            .stream = &input,
+        };
+        defer reader.deinit();
+        var request_method: ?HttpRequestMethod = null;
+        try testing.expectError(
+            case.err,
+            adapter.readIncomingRequestP3FromBufferedReaderWithMethod(
+                &ci,
+                &reader,
+                &request_method,
+            ),
+        );
+        try testing.expectEqual(
+            @as(?HttpRequestMethod, .head),
+            request_method,
+        );
+        try expectHttpParseErrorWire(&adapter, request_method, case.err);
+    }
+
+    var malformed_input = streams.InputStream.fromBuffer(
+        "HEAD / HTTP/9.9\r\n\r\n",
+    );
+    var malformed_reader = WasiCliAdapter.BufferedLineReader{
+        .allocator = testing.allocator,
+        .stream = &malformed_input,
+    };
+    defer malformed_reader.deinit();
+    var malformed_method: ?HttpRequestMethod = null;
+    try testing.expectError(
+        error.HttpBadRequest,
+        adapter.readIncomingRequestP3FromBufferedReaderWithMethod(
+            &ci,
+            &malformed_reader,
+            &malformed_method,
+        ),
+    );
+    try testing.expectEqual(@as(?HttpRequestMethod, null), malformed_method);
+    try expectHttpParseErrorWire(
+        &adapter,
+        malformed_method,
+        error.HttpBadRequest,
+    );
+}
+
+test "wasi:http #970 review: P2 parse errors retain a recognized HEAD" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const oversized_body = try std.fmt.allocPrint(
+        testing.allocator,
+        "HEAD / HTTP/1.1\r\nContent-Length: {d}\r\n\r\n",
+        .{max_http_body_bytes + 1},
+    );
+    defer testing.allocator.free(oversized_body);
+
+    var oversized_headers: std.ArrayListUnmanaged(u8) = .empty;
+    defer oversized_headers.deinit(testing.allocator);
+    try oversized_headers.appendSlice(
+        testing.allocator,
+        "HEAD / HTTP/1.1\r\nX-Fill: ",
+    );
+    try oversized_headers.appendNTimes(
+        testing.allocator,
+        'a',
+        max_http_header_bytes,
+    );
+    try oversized_headers.appendSlice(testing.allocator, "\r\n\r\n");
+
+    const cases = [_]struct {
+        wire: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .wire = "HEAD / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+            .err = error.HttpUnsupportedTransferCoding,
+        },
+        .{
+            .wire = oversized_body,
+            .err = error.HttpRequestBodyTooLarge,
+        },
+        .{
+            .wire = oversized_headers.items,
+            .err = error.HttpRequestHeaderTooLarge,
+        },
+    };
+    for (cases) |case| {
+        var input = streams.InputStream.fromBuffer(case.wire);
+        var request_method: ?HttpRequestMethod = null;
+        try testing.expectError(
+            case.err,
+            adapter.readIncomingRequestFromStreamWithMethod(
+                &input,
+                &request_method,
+            ),
+        );
+        try testing.expectEqual(
+            @as(?HttpRequestMethod, .head),
+            request_method,
+        );
+        try expectHttpParseErrorWire(&adapter, request_method, case.err);
+    }
+
+    var malformed_input = streams.InputStream.fromBuffer(
+        "HEAD / HTTP/9.9\r\n\r\n",
+    );
+    var malformed_method: ?HttpRequestMethod = null;
+    try testing.expectError(
+        error.HttpBadRequest,
+        adapter.readIncomingRequestFromStreamWithMethod(
+            &malformed_input,
+            &malformed_method,
+        ),
+    );
+    try testing.expectEqual(@as(?HttpRequestMethod, null), malformed_method);
+    try expectHttpParseErrorWire(
+        &adapter,
+        malformed_method,
+        error.HttpBadRequest,
+    );
 }
 
 test "wasi:http #616 A8 live: first body chunk reaches the client before handler return" {
@@ -48618,7 +49229,7 @@ test "wasi:http #616 A8 live: response streams are bounded before response.new a
         &ci,
         &output,
         false,
-        false,
+        .get,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -48688,7 +49299,7 @@ test "wasi:http #954 review: preassociated closed body starts writer before hand
         &ci,
         &output,
         false,
-        false,
+        .get,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -48750,7 +49361,7 @@ test "wasi:http #954 review: P3 callback lease blocks session destruction" {
         &ci,
         &output,
         false,
-        false,
+        .get,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -48842,7 +49453,7 @@ test "wasi:http #616 A8 live: P2 outgoing-body writes stream before handler retu
         &ci,
         &output,
         false,
-        false,
+        .get,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -48982,7 +49593,7 @@ test "wasi:http #954 review: P2 body finish and drop enforce child ownership" {
         &ci,
         &output,
         false,
-        false,
+        .get,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -49248,7 +49859,7 @@ test "wasi:http #954 review: P2 rejects an unselected prebuffered response witho
         &ci,
         &output,
         false,
-        false,
+        .get,
         .{
             .context = &sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -49633,21 +50244,21 @@ fn startLiveHttpP2TestSession(
     output: *streams.OutputStream,
     sink: *LiveHttpTestSink,
 ) !*InboundHttpResponseSession {
-    return startLiveHttpP2TestSessionForRequest(
+    return startLiveHttpP2TestSessionForMethod(
         adapter,
         ci,
         output,
         sink,
-        false,
+        .get,
     );
 }
 
-fn startLiveHttpP2TestSessionForRequest(
+fn startLiveHttpP2TestSessionForMethod(
     adapter: *WasiCliAdapter,
     ci: *ComponentInstance,
     output: *streams.OutputStream,
     sink: *LiveHttpTestSink,
-    request_is_head: bool,
+    request_method: HttpRequestMethod,
 ) !*InboundHttpResponseSession {
     const session = try InboundHttpResponseSession.create(
         adapter.allocator,
@@ -49655,7 +50266,7 @@ fn startLiveHttpP2TestSessionForRequest(
         ci,
         output,
         false,
-        request_is_head,
+        request_method,
         .{
             .context = sink,
             .callback = &LiveHttpTestSink.interrupt,
@@ -49723,12 +50334,12 @@ test "wasi:http #970: P2 HEAD drains its body but emits headers only" {
     var output: streams.OutputStream = .{ .sink = .closed };
     const fixture = try makeLiveHttpP2Fixture(&adapter, 5);
     var sink = LiveHttpTestSink{};
-    const session = try startLiveHttpP2TestSessionForRequest(
+    const session = try startLiveHttpP2TestSessionForMethod(
         &adapter,
         &ci,
         &output,
         &sink,
-        true,
+        .head,
     );
     defer session.destroy();
 
@@ -49783,6 +50394,191 @@ test "wasi:http #970: P2 HEAD drains its body but emits headers only" {
     );
 }
 
+test "wasi:http #970 review: P2 HEAD and 304 lengths are metadata" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P2 HEAD and 304 lengths are metadata",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    const Case = struct {
+        method: HttpRequestMethod,
+        status: u16,
+        body: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .method = .head, .status = 200, .body = "" },
+        .{ .method = .head, .status = 200, .body = "discarded HEAD" },
+        .{ .method = .get, .status = 304, .body = "" },
+        .{ .method = .get, .status = 304, .body = "discarded 304" },
+    };
+
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const fixture = try makeLiveHttpP2Fixture(&adapter, 100);
+        var response_lease = adapter.lookupOutgoingResponse(
+            fixture.response_handle,
+        ) orelse return error.InvalidHandle;
+        response_lease.value().*.status = case.status;
+        response_lease.release();
+
+        var sink = LiveHttpTestSink{};
+        const session = try startLiveHttpP2TestSessionForMethod(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            case.method,
+        );
+        defer session.destroy();
+
+        var thread_ctx = execution_context.ThreadExecutionContext{};
+        var active_scope = thread_ctx.enter();
+        defer active_scope.deinit();
+        var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+        defer host_scope.deinit();
+
+        const taken = try liveHttpTakeBodyStream(
+            &adapter,
+            &ci,
+            fixture.body_handle,
+        );
+        defer taken.owner.release();
+        try liveHttpSelectP2Response(&adapter, &ci, fixture);
+        if (case.body.len != 0) {
+            try testing.expect(
+                taken.owner.stream.write(case.body, testing.allocator) == .ok,
+            );
+        }
+        try WasiCliAdapter.dropOutputStream(
+            &adapter,
+            &ci,
+            &.{.{ .handle = taken.handle }},
+            &.{},
+            testing.allocator,
+        );
+        var finish_results: [1]InterfaceValue = undefined;
+        try WasiCliAdapter.httpOutgoingBodyFinish(
+            &adapter,
+            &ci,
+            &.{.{ .handle = fixture.body_handle }},
+            &finish_results,
+            testing.allocator,
+        );
+        defer finish_results[0].deinit(testing.allocator);
+        try testing.expect(finish_results[0].result_val.is_ok);
+        try testing.expect(session.handlerReturnedP2(
+            fixture.outparam_handle,
+        ));
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+        try testing.expect(std.mem.indexOf(
+            u8,
+            sink.contents(),
+            "Content-Length: 100\r\n",
+        ) != null);
+        try testing.expect(std.mem.endsWith(
+            u8,
+            sink.contents(),
+            "Connection: close\r\n\r\n",
+        ));
+        try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+        try testing.expectEqual(@as(usize, 0), session.bufferedHighWater());
+    }
+}
+
+test "wasi:http #970 review: P2 2xx CONNECT suppresses identity and chunked bodies" {
+    const testing = std.testing;
+    var watchdog = LiveHttpWatchdog{
+        .label = "P2 2xx CONNECT suppresses identity and chunked bodies",
+        .limit_ms = 60_000,
+    };
+    try watchdog.start();
+    defer watchdog.stop();
+
+    const content_lengths = [_]?usize{ 5, null };
+    for (content_lengths) |content_length| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        var output: streams.OutputStream = .{ .sink = .closed };
+        const fixture = try makeLiveHttpP2Fixture(
+            &adapter,
+            content_length,
+        );
+        var sink = LiveHttpTestSink{};
+        const session = try startLiveHttpP2TestSessionForMethod(
+            &adapter,
+            &ci,
+            &output,
+            &sink,
+            .connect,
+        );
+        defer session.destroy();
+
+        var thread_ctx = execution_context.ThreadExecutionContext{};
+        var active_scope = thread_ctx.enter();
+        defer active_scope.deinit();
+        var host_scope = thread_ctx.bindHostTaskContext(@ptrCast(session));
+        defer host_scope.deinit();
+
+        const taken = try liveHttpTakeBodyStream(
+            &adapter,
+            &ci,
+            fixture.body_handle,
+        );
+        defer taken.owner.release();
+        try testing.expect(
+            taken.owner.stream.write("hello", testing.allocator) == .ok,
+        );
+        try liveHttpSelectP2Response(&adapter, &ci, fixture);
+        try WasiCliAdapter.dropOutputStream(
+            &adapter,
+            &ci,
+            &.{.{ .handle = taken.handle }},
+            &.{},
+            testing.allocator,
+        );
+        var finish_results: [1]InterfaceValue = undefined;
+        try WasiCliAdapter.httpOutgoingBodyFinish(
+            &adapter,
+            &ci,
+            &.{.{ .handle = fixture.body_handle }},
+            &finish_results,
+            testing.allocator,
+        );
+        defer finish_results[0].deinit(testing.allocator);
+        try testing.expect(finish_results[0].result_val.is_ok);
+        try testing.expect(session.handlerReturnedP2(
+            fixture.outparam_handle,
+        ));
+        session.waitAndJoin();
+        session.propagateTerminalToGuest();
+
+        try testing.expectEqual(
+            HttpLiveTerminal.succeeded,
+            session.currentTerminal(),
+        );
+        try testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            sink.contents(),
+        );
+        try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
+    }
+}
+
 test "wasi:http #970: P2 body-forbidden statuses omit body framing" {
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
@@ -49795,23 +50591,28 @@ test "wasi:http #970: P2 body-forbidden statuses omit body framing" {
     const Case = struct {
         status: u16,
         reason: []const u8,
-        expect_content_length: bool,
+        expected_content_length: ?usize,
     };
     const cases = [_]Case{
         .{
             .status = 103,
             .reason = "Early Hints",
-            .expect_content_length = false,
+            .expected_content_length = null,
         },
         .{
             .status = 204,
             .reason = "No Content",
-            .expect_content_length = false,
+            .expected_content_length = null,
+        },
+        .{
+            .status = 205,
+            .reason = "Reset Content",
+            .expected_content_length = 0,
         },
         .{
             .status = 304,
             .reason = "Not Modified",
-            .expect_content_length = true,
+            .expected_content_length = 5,
         },
     };
 
@@ -49829,12 +50630,12 @@ test "wasi:http #970: P2 body-forbidden statuses omit body framing" {
         response_lease.release();
 
         var sink = LiveHttpTestSink{};
-        const session = try startLiveHttpP2TestSessionForRequest(
+        const session = try startLiveHttpP2TestSessionForMethod(
             &adapter,
             &ci,
             &output,
             &sink,
-            false,
+            .get,
         );
         defer session.destroy();
 
@@ -49894,24 +50695,28 @@ test "wasi:http #970: P2 body-forbidden statuses omit body framing" {
             wire,
             "Connection: close\r\n\r\n",
         ));
-        try testing.expectEqual(
-            case.expect_content_length,
-            std.mem.indexOf(
-                u8,
-                wire,
-                "Content-Length: 5\r\n",
-            ) != null,
-        );
+        if (case.expected_content_length) |length| {
+            const expected = try std.fmt.allocPrint(
+                testing.allocator,
+                "Content-Length: {d}\r\n",
+                .{length},
+            );
+            defer testing.allocator.free(expected);
+            try testing.expect(std.mem.indexOf(u8, wire, expected) != null);
+        } else {
+            try testing.expect(
+                std.mem.indexOf(u8, wire, "Content-Length:") == null,
+            );
+        }
         try testing.expect(
             std.mem.indexOf(u8, wire, "Transfer-Encoding:") == null,
         );
         try testing.expect(std.mem.indexOf(u8, wire, "hello") == null);
-        try testing.expect(std.mem.indexOf(u8, wire, "0\r\n") == null);
         try testing.expectEqual(@as(usize, 0), session.transmitted_bytes);
     }
 }
 
-test "wasi:http #970: non-live P2 and P3 HEAD fallbacks suppress bodies" {
+test "wasi:http #970 review: non-live HEAD accepts empty representation bodies" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
@@ -49921,39 +50726,37 @@ test "wasi:http #970: non-live P2 and P3 HEAD fallbacks suppress bodies" {
     const p3_fixture = try makeLiveHttpResponseFixture(
         &adapter,
         &ci,
-        5,
+        100,
         true,
         null,
     );
     const p3_body = ci.streams.getPtr(p3_fixture.body_handle.?).?;
-    try p3_body.buffer.appendSlice(testing.allocator, "hello");
     p3_body.write_closed = true;
     var p3_wire = streams.OutputStream.toBuffer();
     defer p3_wire.deinit(testing.allocator);
-    _ = try adapter.writeHttpResponseP3FromHandleForRequest(
+    _ = try adapter.writeHttpResponseP3FromHandleForMethod(
         &p3_wire,
         &ci,
         p3_fixture.response_handle,
         true,
-        true,
+        .head,
     );
     try testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\n" ++
-            "Content-Length: 5\r\n" ++
+            "Content-Length: 100\r\n" ++
             "Connection: keep-alive\r\n\r\n",
         p3_wire.getBufferContents(),
     );
 
-    const p2_fixture = try makeLiveHttpP2Fixture(&adapter, 5);
+    const p2_fixture = try makeLiveHttpP2Fixture(&adapter, 100);
+    var method_scope = InboundHttpRequestMethodScope.bind(.head);
+    defer method_scope.deinit();
     const taken = try liveHttpTakeBodyStream(
         &adapter,
         &ci,
         p2_fixture.body_handle,
     );
     defer taken.owner.release();
-    try testing.expect(
-        taken.owner.stream.write("hello", testing.allocator) == .ok,
-    );
     try WasiCliAdapter.dropOutputStream(
         &adapter,
         &ci,
@@ -49975,17 +50778,262 @@ test "wasi:http #970: non-live P2 and P3 HEAD fallbacks suppress bodies" {
 
     var p2_wire = streams.OutputStream.toBuffer();
     defer p2_wire.deinit(testing.allocator);
-    try adapter.writeHttpResponseFromOutparamForRequest(
+    try adapter.writeHttpResponseFromOutparamForMethod(
         &p2_wire,
         p2_fixture.outparam_handle,
-        true,
+        .head,
     );
     try testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\n" ++
-            "Content-Length: 5\r\n" ++
+            "Content-Length: 100\r\n" ++
             "Connection: close\r\n\r\n",
         p2_wire.getBufferContents(),
     );
+}
+
+test "wasi:http #970 review: non-live 304 accepts an empty producer" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const p3_fixture = try makeLiveHttpResponseFixture(
+        &adapter,
+        &ci,
+        100,
+        true,
+        null,
+    );
+    try setLiveHttpResponseStatus(
+        &adapter,
+        p3_fixture.response_handle,
+        304,
+    );
+    ci.streams.getPtr(p3_fixture.body_handle.?).?.write_closed = true;
+    var p3_wire = streams.OutputStream.toBuffer();
+    defer p3_wire.deinit(testing.allocator);
+    _ = try adapter.writeHttpResponseP3FromHandleForMethod(
+        &p3_wire,
+        &ci,
+        p3_fixture.response_handle,
+        true,
+        .get,
+    );
+    try testing.expectEqualStrings(
+        "HTTP/1.1 304 Not Modified\r\n" ++
+            "Content-Length: 100\r\n" ++
+            "Connection: keep-alive\r\n\r\n",
+        p3_wire.getBufferContents(),
+    );
+
+    const p2_fixture = try makeLiveHttpP2Fixture(&adapter, 100);
+    var response_lease = adapter.lookupOutgoingResponse(
+        p2_fixture.response_handle,
+    ) orelse return error.InvalidHandle;
+    response_lease.value().*.status = 304;
+    response_lease.release();
+    var method_scope = InboundHttpRequestMethodScope.bind(.get);
+    defer method_scope.deinit();
+    const taken = try liveHttpTakeBodyStream(
+        &adapter,
+        &ci,
+        p2_fixture.body_handle,
+    );
+    defer taken.owner.release();
+    try WasiCliAdapter.dropOutputStream(
+        &adapter,
+        &ci,
+        &.{.{ .handle = taken.handle }},
+        &.{},
+        testing.allocator,
+    );
+    var finish_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpOutgoingBodyFinish(
+        &adapter,
+        &ci,
+        &.{.{ .handle = p2_fixture.body_handle }},
+        &finish_results,
+        testing.allocator,
+    );
+    defer finish_results[0].deinit(testing.allocator);
+    try testing.expect(finish_results[0].result_val.is_ok);
+    try liveHttpSelectP2Response(&adapter, &ci, p2_fixture);
+    var p2_wire = streams.OutputStream.toBuffer();
+    defer p2_wire.deinit(testing.allocator);
+    try adapter.writeHttpResponseFromOutparamForMethod(
+        &p2_wire,
+        p2_fixture.outparam_handle,
+        .get,
+    );
+    try testing.expectEqualStrings(
+        "HTTP/1.1 304 Not Modified\r\n" ++
+            "Content-Length: 100\r\n" ++
+            "Connection: close\r\n\r\n",
+        p2_wire.getBufferContents(),
+    );
+}
+
+test "wasi:http #970 review: non-live CONNECT and 205 suppress framing" {
+    const testing = std.testing;
+    const Case = struct {
+        method: HttpRequestMethod,
+        status: u16,
+        expected: []const u8,
+        connection_reusable: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .method = .connect,
+            .status = 200,
+            .expected = "HTTP/1.1 200 OK\r\n" ++
+                "Connection: close\r\n\r\n",
+            .connection_reusable = false,
+        },
+        .{
+            .method = .get,
+            .status = 205,
+            .expected = "HTTP/1.1 205 Reset Content\r\n" ++
+                "Content-Length: 0\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .connection_reusable = true,
+        },
+    };
+
+    for (cases) |case| {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        var ci = p3HttpTestCi(testing.allocator);
+        defer p3HttpTestCiDeinit(&ci);
+        const p3_fixture = try makeLiveHttpResponseFixture(
+            &adapter,
+            &ci,
+            null,
+            true,
+            .{ .name = "x-final", .value = "ignored" },
+        );
+        try setLiveHttpResponseStatus(
+            &adapter,
+            p3_fixture.response_handle,
+            case.status,
+        );
+        const p3_body = ci.streams.getPtr(p3_fixture.body_handle.?).?;
+        try p3_body.buffer.appendSlice(testing.allocator, "hello");
+        p3_body.write_closed = true;
+        var p3_wire = streams.OutputStream.toBuffer();
+        defer p3_wire.deinit(testing.allocator);
+        const reusable = try adapter.writeHttpResponseP3FromHandleForMethod(
+            &p3_wire,
+            &ci,
+            p3_fixture.response_handle,
+            true,
+            case.method,
+        );
+        try testing.expectEqual(case.connection_reusable, reusable);
+        try testing.expectEqualStrings(
+            case.expected,
+            p3_wire.getBufferContents(),
+        );
+
+        const p2_fixture = try makeLiveHttpP2Fixture(&adapter, 100);
+        var response_lease = adapter.lookupOutgoingResponse(
+            p2_fixture.response_handle,
+        ) orelse return error.InvalidHandle;
+        response_lease.value().*.status = case.status;
+        response_lease.release();
+        const taken = try liveHttpTakeBodyStream(
+            &adapter,
+            &ci,
+            p2_fixture.body_handle,
+        );
+        defer taken.owner.release();
+        try testing.expect(
+            taken.owner.stream.write("hello", testing.allocator) == .ok,
+        );
+        var method_scope = InboundHttpRequestMethodScope.bind(case.method);
+        defer method_scope.deinit();
+        try WasiCliAdapter.dropOutputStream(
+            &adapter,
+            &ci,
+            &.{.{ .handle = taken.handle }},
+            &.{},
+            testing.allocator,
+        );
+        var finish_results: [1]InterfaceValue = undefined;
+        try WasiCliAdapter.httpOutgoingBodyFinish(
+            &adapter,
+            &ci,
+            &.{.{ .handle = p2_fixture.body_handle }},
+            &finish_results,
+            testing.allocator,
+        );
+        defer finish_results[0].deinit(testing.allocator);
+        try testing.expect(finish_results[0].result_val.is_ok);
+        try liveHttpSelectP2Response(&adapter, &ci, p2_fixture);
+        var p2_wire = streams.OutputStream.toBuffer();
+        defer p2_wire.deinit(testing.allocator);
+        try adapter.writeHttpResponseFromOutparamForMethod(
+            &p2_wire,
+            p2_fixture.outparam_handle,
+            case.method,
+        );
+        const p2_expected = if (case.status == 205)
+            "HTTP/1.1 205 Reset Content\r\n" ++
+                "Content-Length: 0\r\n" ++
+                "Connection: close\r\n\r\n"
+        else
+            case.expected;
+        try testing.expectEqualStrings(
+            p2_expected,
+            p2_wire.getBufferContents(),
+        );
+    }
+}
+
+test "wasi:http #970 review: simple responses share CONNECT and 205 policy" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const cases = [_]struct {
+        method: HttpRequestMethod,
+        status: u16,
+        expected: []const u8,
+    }{
+        .{
+            .method = .connect,
+            .status = 200,
+            .expected = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+        },
+        .{
+            .method = .get,
+            .status = 205,
+            .expected = "HTTP/1.1 205 Reset Content\r\n" ++
+                "Content-Length: 0\r\n" ++
+                "Connection: close\r\n\r\n",
+        },
+        .{
+            .method = .connect,
+            .status = 403,
+            .expected = "HTTP/1.1 403 Forbidden\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Connection: close\r\n\r\nhello",
+        },
+    };
+    for (cases) |case| {
+        var output = streams.OutputStream.toBuffer();
+        defer output.deinit(testing.allocator);
+        try adapter.writeHttpSimpleResponseForMethod(
+            &output,
+            case.status,
+            "hello",
+            case.method,
+        );
+        try testing.expectEqualStrings(
+            case.expected,
+            output.getBufferContents(),
+        );
+    }
 }
 
 const LiveHttpStreamWriter = struct {
@@ -50620,7 +51668,7 @@ test "wasi:http #967 review issue 2: P3 over-declared content-length cannot spli
         &ci,
         &output,
         true,
-        false,
+        .get,
         .{ .context = &sink, .callback = &LiveHttpTestSink.interrupt },
         .{ .context = &sink, .write = &LiveHttpTestSink.write },
     );
@@ -51025,7 +52073,7 @@ test "wasi:http #969 review: P3 trailers snapshotted twice keep one owned block"
             &ci,
             &output,
             false,
-            false,
+            .get,
             .{
                 .context = &sink,
                 .callback = &LiveHttpTestSink.interrupt,
