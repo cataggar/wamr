@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const config = @import("../../config.zig");
 
 const SpinMutex = struct {
     state: std.atomic.Value(u8) = .init(0),
@@ -69,21 +70,46 @@ pub const Source = struct {
     id: u32,
     refs: std.atomic.Value(u32) = .init(1),
     cancelled: std.atomic.Value(bool) = .init(false),
-    mutex: SpinMutex = .{},
-    registrations: ?*Registration = null,
+    mutex: if (config.lib_wasi_threads) SpinMutex else void =
+        if (config.lib_wasi_threads) .{} else {},
+    registrations: if (config.lib_wasi_threads) ?*Registration else void =
+        if (config.lib_wasi_threads) null else {},
     register_test_hook: if (builtin.is_test) ?*RegisterTestHook else void =
         if (builtin.is_test) null else {},
 
-    pub const Ref = struct {
+    /// Durable observation handle for one task cancellation generation.
+    ///
+    /// A ticket owns one source reference, may outlive the task, frame, and
+    /// TaskManager that created it, and never retains a raw Task pointer.
+    /// Clone with `clone`, query with `isCancelled`, and release exactly once
+    /// with `deinit`.
+    pub const Ticket = struct {
         source: *Source,
         active: bool = true,
 
-        pub fn deinit(self: *Ref) void {
+        pub fn clone(self: *const Ticket) Ticket {
+            std.debug.assert(self.active);
+            return self.source.acquire();
+        }
+
+        pub fn isCancelled(self: *const Ticket) bool {
+            std.debug.assert(self.active);
+            return self.source.isCancelled();
+        }
+
+        pub fn identity(self: *const Ticket) u32 {
+            std.debug.assert(self.active);
+            return self.source.id;
+        }
+
+        pub fn deinit(self: *Ticket) void {
             if (!self.active) return;
             self.source.release();
             self.active = false;
         }
     };
+
+    pub const Ref = Ticket;
 
     pub fn create(allocator: std.mem.Allocator) !*Source {
         const self = try allocator.create(Source);
@@ -94,7 +120,7 @@ pub const Source = struct {
         return self;
     }
 
-    pub fn acquire(self: *Source) Ref {
+    pub fn acquire(self: *Source) Ticket {
         const previous = self.refs.fetchAdd(1, .acq_rel);
         std.debug.assert(previous > 0 and previous < std.math.maxInt(u32));
         return .{ .source = self };
@@ -104,7 +130,8 @@ pub const Source = struct {
         const previous = self.refs.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
         if (previous != 1) return;
-        std.debug.assert(self.registrations == null);
+        if (comptime config.lib_wasi_threads)
+            std.debug.assert(self.registrations == null);
         self.allocator.destroy(self);
     }
 
@@ -117,6 +144,9 @@ pub const Source = struct {
         registration: *Registration,
         target: WakeTarget,
     ) RegisterResult {
+        if (comptime !config.lib_wasi_threads) {
+            return .cancelled;
+        }
         self.mutex.lock();
         if (comptime builtin.is_test) {
             if (self.register_test_hook) |hook| {
@@ -145,6 +175,10 @@ pub const Source = struct {
     /// Latch cancellation and synchronously wake every registered target.
     /// Repeated calls re-arm the wakeups without changing terminal state.
     pub fn cancel(self: *Source) void {
+        if (comptime !config.lib_wasi_threads) {
+            self.cancelled.store(true, .release);
+            return;
+        }
         self.mutex.lock();
         self.cancelled.store(true, .release);
         var registration = self.registrations;
@@ -154,6 +188,9 @@ pub const Source = struct {
     }
 
     fn unregister(self: *Source, registration: *Registration) void {
+        if (comptime !config.lib_wasi_threads) {
+            return;
+        }
         self.mutex.lock();
         if (registration.source != self) {
             self.mutex.unlock();
@@ -176,6 +213,9 @@ pub const Source = struct {
     }
 
     pub fn registrationCount(self: *Source) usize {
+        if (comptime !config.lib_wasi_threads) {
+            return 0;
+        }
         self.mutex.lock();
         defer self.mutex.unlock();
         var count: usize = 0;
@@ -192,6 +232,7 @@ const RegisterTestHook = struct {
 };
 
 test "task cancellation: register racing a latched cancel wakes immediately" {
+    if (comptime !config.lib_wasi_threads) return error.SkipZigTest;
     const Counter = struct {
         hits: usize = 0,
 
@@ -218,6 +259,7 @@ test "task cancellation: register racing a latched cancel wakes immediately" {
 }
 
 test "task cancellation: registrations retain source through owner release" {
+    if (comptime !config.lib_wasi_threads) return error.SkipZigTest;
     const Counter = struct {
         hits: usize = 0,
 
@@ -244,7 +286,8 @@ test "task cancellation: registrations retain source through owner release" {
 }
 
 test "task cancellation: cancel begun during registration cannot miss target" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded or !config.lib_wasi_threads)
+        return error.SkipZigTest;
     const Counter = struct {
         hits: std.atomic.Value(usize) = .init(0),
 
@@ -307,7 +350,8 @@ test "task cancellation: cancel begun during registration cannot miss target" {
 }
 
 test "task cancellation: unregister racing cancel keeps target lifetime safe" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded or !config.lib_wasi_threads)
+        return error.SkipZigTest;
     const Counter = struct {
         hits: std.atomic.Value(usize) = .init(0),
 

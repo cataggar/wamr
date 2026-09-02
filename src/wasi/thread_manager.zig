@@ -351,6 +351,8 @@ const TestHooks = struct {
     records_destroyed: ?*std.atomic.Value(usize) = null,
     spawn_group_captured: ?*std.atomic.Value(bool) = null,
     resume_spawn: ?*std.atomic.Value(bool) = null,
+    task_group_initialized: ?*std.atomic.Value(bool) = null,
+    resume_task_group_registration: ?*std.atomic.Value(bool) = null,
 };
 
 const tid_slot_bits = 16;
@@ -714,10 +716,6 @@ pub const ThreadManager = struct {
         source: *task_cancellation.Source,
     ) (error{OutOfMemory} || BindError)!TaskGroupScope {
         const group = try self.acquireTaskGroup(source);
-        group.windows_cancel.ensureInitialized(false) catch {
-            self.releaseTaskGroup(group);
-            return error.WindowsCancelEventUnavailable;
-        };
         if (source.isCancelled()) _ = self.cancelTaskGroup(group);
         const binding = context.bindCancellationGroup(
             @ptrCast(group),
@@ -733,7 +731,7 @@ pub const ThreadManager = struct {
     fn acquireTaskGroup(
         self: *ThreadManager,
         source: *task_cancellation.Source,
-    ) error{OutOfMemory}!*TaskCancelGroup {
+    ) (error{OutOfMemory} || BindError)!*TaskCancelGroup {
         while (true) {
             self.mutex.lock();
             var current = self.task_groups;
@@ -744,42 +742,52 @@ pub const ThreadManager = struct {
                     return group;
                 }
             }
-            if (self.free_task_groups) |group| {
-                self.free_task_groups = group.next;
-                std.debug.assert(group.registration.source == null);
-                if (group.epoch.begin()) |ticket| {
-                    group.manager = self;
-                    group.source_id = source.id;
-                    group.token = allocateTaskGroupToken();
-                    group.refs = 1;
-                    group.ticket = ticket;
-                    group.next = self.task_groups;
-                    self.task_groups = group;
-                    _ = source.register(
-                        &group.registration,
-                        .{
-                            .ctx = @ptrCast(group),
-                            .wake = wakeFromTaskCancellation,
-                        },
-                    );
-                    self.mutex.unlock();
-                    return group;
-                }
-                self.mutex.unlock();
-                group.windows_cancel.deinit();
-                self.allocator.destroy(group);
-                continue;
-            }
+            const recycled = self.free_task_groups;
+            if (recycled) |group| self.free_task_groups = group.next;
             self.mutex.unlock();
 
-            const candidate = self.allocator.create(TaskCancelGroup) catch
+            const candidate = recycled orelse
+                self.allocator.create(TaskCancelGroup) catch
                 return error.OutOfMemory;
-            candidate.* = .{
-                .manager = self,
-                .source_id = source.id,
-                .token = allocateTaskGroupToken(),
+            if (recycled == null) {
+                candidate.* = .{
+                    .manager = self,
+                    .source_id = source.id,
+                    .token = allocateTaskGroupToken(),
+                };
+            } else {
+                std.debug.assert(candidate.registration.source == null);
+                candidate.manager = self;
+                candidate.source_id = source.id;
+                candidate.token = allocateTaskGroupToken();
+                candidate.registration = .{};
+                candidate.next = null;
+            }
+            candidate.ticket = candidate.epoch.begin() orelse {
+                candidate.windows_cancel.deinit();
+                self.allocator.destroy(candidate);
+                continue;
             };
-            candidate.ticket = candidate.epoch.begin().?;
+            candidate.refs = 1;
+
+            const fail_for_test = if (self.test_hooks) |hooks|
+                hooks.fail_windows_cancel_event
+            else
+                false;
+            candidate.windows_cancel.ensureInitialized(fail_for_test) catch {
+                candidate.windows_cancel.deinit();
+                self.allocator.destroy(candidate);
+                return error.WindowsCancelEventUnavailable;
+            };
+            if (self.test_hooks) |hooks| {
+                if (hooks.task_group_initialized) |reached| {
+                    reached.store(true, .release);
+                    if (hooks.resume_task_group_registration) |resume_flag| {
+                        while (!resume_flag.load(.acquire))
+                            std.atomic.spinLoopHint();
+                    }
+                }
+            }
 
             self.mutex.lock();
             current = self.task_groups;
@@ -793,7 +801,6 @@ pub const ThreadManager = struct {
                 }
             }
             candidate.next = self.task_groups;
-            candidate.refs = 1;
             self.task_groups = candidate;
             _ = source.register(
                 &candidate.registration,
@@ -3003,6 +3010,59 @@ test "thread lifecycle: component task group registered after cancellation start
     );
 }
 
+test "thread lifecycle: task cancel between wake initialization and publication is replayed" {
+    try requireThreadLifecycle();
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var initialized = std.atomic.Value(bool).init(false);
+    var resume_registration = std.atomic.Value(bool).init(false);
+    const hooks = TestHooks{
+        .task_group_initialized = &initialized,
+        .resume_task_group_registration = &resume_registration,
+    };
+    var manager = ThreadManager.initWithTestHooks(std.testing.allocator, &hooks);
+    defer manager.deinit();
+    const source = try task_cancellation.Source.create(std.testing.allocator);
+    defer source.release();
+    var context = execution_context.ThreadExecutionContext{};
+    context.setThreadGroup(@ptrCast(&manager));
+
+    const BindCtx = struct {
+        manager: *ThreadManager,
+        context: *execution_context.ThreadExecutionContext,
+        source: *task_cancellation.Source,
+        scope: ?ThreadManager.TaskGroupScope = null,
+        bind_error: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.scope = self.manager.bindTaskGroup(
+                self.context,
+                self.source,
+            ) catch |err| {
+                self.bind_error = err;
+                return;
+            };
+        }
+    };
+    var bind_ctx = BindCtx{
+        .manager = &manager,
+        .context = &context,
+        .source = source,
+    };
+    const bind_thread = try std.Thread.spawn(.{}, BindCtx.run, .{&bind_ctx});
+    while (!initialized.load(.acquire)) std.atomic.spinLoopHint();
+
+    source.cancel();
+    resume_registration.store(true, .release);
+    bind_thread.join();
+
+    try std.testing.expect(bind_ctx.bind_error == null);
+    var scope = bind_ctx.scope.?;
+    defer scope.deinit();
+    try std.testing.expect(manager.isTaskCancelledForContext(&context));
+    try std.testing.expectEqual(@as(usize, 0), source.registrationCount());
+}
+
 test "thread lifecycle: component task cancel racing process exit and trap never replaces winner" {
     try requireThreadLifecycle();
     const Racer = struct {
@@ -3175,6 +3235,30 @@ test "ThreadManager: Windows cancel event creation failure is explicit" {
     );
     try std.testing.expect(manager.termination == null);
     try std.testing.expect(state.windowsCancelHandle() == null);
+}
+
+test "ThreadManager: Windows task cancel event failure rolls back unpublished group" {
+    if (builtin.os.tag != .windows or !config.lib_wasi_threads)
+        return error.SkipZigTest;
+
+    const hooks = TestHooks{ .fail_windows_cancel_event = true };
+    var manager = ThreadManager.initWithTestHooks(std.testing.allocator, &hooks);
+    defer manager.deinit();
+    const source = try task_cancellation.Source.create(std.testing.allocator);
+    defer source.release();
+    var context = execution_context.ThreadExecutionContext{};
+    context.setThreadGroup(@ptrCast(&manager));
+
+    try std.testing.expectError(
+        error.WindowsCancelEventUnavailable,
+        manager.bindTaskGroup(&context, source),
+    );
+    try std.testing.expectEqual(@as(usize, 0), source.registrationCount());
+    try std.testing.expectEqual(
+        TaskGroupStats{ .active = 0, .free = 0 },
+        manager.taskGroupStats(),
+    );
+    try std.testing.expect(context.cancellationGroup(TaskCancelGroup) == null);
 }
 
 test "ThreadManager: Windows task cancel events are scoped and reusable" {

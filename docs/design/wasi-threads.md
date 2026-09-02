@@ -247,35 +247,52 @@ permanent record:
 `canon task.cancel` is task-terminal, not process-terminal, so it uses a
 separate resumable state machine:
 
-1. Every `TaskManager.Task` owns a refcounted `task_cancellation.Source` with
-   a process-unique 32-bit source id. `task.cancel`, `subtask.cancel`, and all
-   failure paths call the same handle-based `TaskManager.cancelTask`; no
-   cancellation path depends on the currently executing frame.
-2. Each `ComponentInstance.ThreadManager` reached by that task creates one
+1. Every `TaskManager.Task`, including builds with `lib_wasi_threads=false`,
+   owns a refcounted `task_cancellation.Source` with a process-unique 32-bit
+   source id and terminal cancel flag. `task.cancel`, `subtask.cancel`, and
+   all failure paths call the same handle-based `TaskManager.cancelTask`; no
+   cancellation path depends on the currently executing frame. The default
+   build adds one 32-byte source allocation and one 8-byte pointer in `Task`;
+   manager-group locks, registration lists, futex/AOT fanout, and Windows wake
+   targets remain compiled behind `lib_wasi_threads`.
+2. `TaskManager.acquireCancellationTicket(handle)` captures an owning
+   `Source.Ticket` or returns `error.InvalidTaskHandle`. Capture while the
+   task handle is valid, move or `clone` it into the HTTP body/trailer
+   settlement owner, query `isCancelled`, and call `deinit` exactly once per
+   ticket. A ticket retains only the immutable source identity/generation and
+   may outlive its frame, task owner, and `TaskManager`; it never retains a raw
+   task pointer. Monotonic task handles prevent a stale handle from capturing
+   a later task's source after manager teardown.
+3. Each `ComponentInstance.ThreadManager` reached by that task creates one
    manager-local `TaskCancelGroup` and registers its wake target with the task
    source. Registration, cancellation, and unregistration serialize under the
    source lock: cancellation either visits the linked group, or registration
    sees the latched state and wakes the group before returning. Registrations
    retain the source, so TaskManager destruction cannot invalidate live child
    groups.
-3. The manager-local group starts with a
+   On Windows, the per-group cancel event is fully initialized before the
+   group is published in either the manager list or source registration.
+   Event-creation failure destroys the unpublished group, and cancellation
+   between initialization and registration is replayed by the source's
+   terminal flag.
+4. The manager-local group starts with a
    `ParkingLot.CancellationEpoch.Ticket` containing `{source, generation}`.
    Guest waits carry that ticket into the parking lot.
-4. The first group wake advances `source.generation` with an acq_rel CAS
+5. The first group wake advances `source.generation` with an acq_rel CAS
    **before** signalling the group's Windows cancel event, broadcasting to
    matching AOT `VmCtx`s, and sweeping matching parking-lot waiters. Repeated
    cancel does not advance again; it may harmlessly re-arm the targeted
    wakeups so a transient backend failure cannot strand a waiter.
-5. A waiter checks the generation with acquire ordering while holding the same
+6. A waiter checks the generation with acquire ordering while holding the same
    bucket lock used by the sweep. It is therefore either queued before its
    bucket is swept, or it observes the advanced generation and refuses to
    park. This preserves #959's lost-wakeup guarantee without clearing a latch.
-6. Every active manager-local group receives a process-unique, never-reused
+7. Every active manager-local group receives a process-unique, never-reused
    32-bit token. The AOT call scope release-publishes that value into
    `VmCtx.cancel_group_token`; targeted broadcast acquire-loads and compares
    only the value, never a mutable context pointer. Token zero is reserved for
    process-wide interruption.
-7. When the last frame/child reference is released, the group unregisters
+8. When the last frame/child reference is released, the group unregisters
    from the task source, then moves to a quiescent free list. Reuse calls
    `begin` at the current parking generation, allocates a new AOT token, and
    on Windows closes the old event and lazily creates a fresh handle. No shared
