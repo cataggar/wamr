@@ -87,6 +87,7 @@ const wait_failed: windows.DWORD = std.math.maxInt(windows.DWORD);
 const infinite: windows.DWORD = std.math.maxInt(windows.DWORD);
 const max_wait_handles = 64;
 const polling_slice_ms: windows.DWORD = 10;
+const worker_stop_budget_ms: windows.DWORD = 100;
 
 const file_type_unknown: windows.DWORD = 0;
 const file_type_disk: windows.DWORD = 1;
@@ -457,7 +458,7 @@ fn stopPipeWorker(worker: *PipeProbeWorker, thread: *?std.Thread) void {
             break;
         }
         if (result == wait_failed or
-            api.GetTickCount64() - started >= 2 * polling_slice_ms)
+            api.GetTickCount64() - started >= worker_stop_budget_ms)
         {
             running.detach();
             break;
