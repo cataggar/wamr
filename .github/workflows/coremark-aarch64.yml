@@ -143,8 +143,8 @@ jobs:
           python3 scripts/bench_simd.py \
             --baseline "$BASELINE" \
             --target "$TARGET" \
-            --runs 7 \
-            --iterations 10000 \
+            --runs 10 \
+            --iterations 100000 \
             --out simd-table.md \
             --emit github
 
