@@ -241,7 +241,7 @@ pub const component_version: u32 = 0x0001_000d;
 pub const aot_magic: u32 = 0x746f6100; // "\0aot"
 
 /// AOT format version
-pub const aot_version: u32 = 9;
+pub const aot_version: u32 = 10;
 
 test "ValType: numeric classification" {
     try std.testing.expect(ValType.i32.isNumeric());
@@ -1214,6 +1214,8 @@ pub const ModuleInstance = struct {
     state_mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.core_instance) = .init,
     /// Thread manager (shared across all instances in a thread group).
     thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager = null,
+    /// Root instance shared by Preview-1 thread clones.
+    thread_family_root: ?*const ModuleInstance = null,
     /// Track dropped elem segments (active segments dropped after instantiation)
     dropped_elems: []bool = &.{},
     /// Track dropped data segments (for data.drop instruction)
@@ -1231,6 +1233,16 @@ pub const ModuleInstance = struct {
     pub fn getMemory(self: *const ModuleInstance, idx: u32) ?*MemoryInstance {
         if (idx < self.memories.len) return self.memories[idx];
         return null;
+    }
+
+    pub fn sharesThreadFamily(
+        self: *const ModuleInstance,
+        other: *const ModuleInstance,
+    ) bool {
+        if (self.module != other.module) return false;
+        const self_root = self.thread_family_root orelse self;
+        const other_root = other.thread_family_root orelse other;
+        return self_root == other_root;
     }
 
     /// Retain and attach process-scoped host state. Acquiring before
@@ -1302,6 +1314,7 @@ pub const ModuleInstance = struct {
             .owns_host_func_entries = false,
             .tags = self.tags, // immutable identity, parent lifetime owns storage
             .thread_manager = self.thread_manager,
+            .thread_family_root = self.thread_family_root orelse self,
             .allocator = allocator,
         };
         if (self.process_state) |state| {
@@ -1649,6 +1662,18 @@ test "cloneForThread copies mutable segment state" {
 
     const clone = try parent.cloneForThread(allocator);
     defer clone.destroyThreadClone();
+    const grandchild = try clone.cloneForThread(allocator);
+    defer grandchild.destroyThreadClone();
+    var unrelated = ModuleInstance{
+        .module = &module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+    };
+    try std.testing.expect(parent.sharesThreadFamily(clone));
+    try std.testing.expect(clone.sharesThreadFamily(grandchild));
+    try std.testing.expect(!clone.sharesThreadFamily(&unrelated));
     clone.dropped_elems[0] = true;
     clone.dropped_data[0] = false;
     clone.cached_elem_values[0].?[0] = .{ .i32 = 99 };
