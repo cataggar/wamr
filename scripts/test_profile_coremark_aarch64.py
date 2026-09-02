@@ -20,16 +20,18 @@ SPEC.loader.exec_module(profile)
 class CoreMarkProfileTests(unittest.TestCase):
     def test_validated_coremark_run_counts_fail_closed(self):
         output = (
+            "2K performance run parameters for coremark.\n"
             "Iterations/Sec : 12000.0\n"
+            "Iterations : 400000\n"
             "Correct operation validated.\n"
         )
         self.assertEqual(
             [12000.0],
             profile.parse_validated_coremark(output, "engine", 1),
         )
-        with self.assertRaisesRegex(profile.ProfileError, "expected 2"):
+        with self.assertRaisesRegex(profile.ProfileError, "must be one"):
             profile.parse_validated_coremark(output, "engine", 2)
-        with self.assertRaisesRegex(profile.ProfileError, "CRC error"):
+        with self.assertRaisesRegex(profile.ProfileError, "CRC-validated"):
             profile.parse_validated_coremark(output + "ERROR! bad crc\n", "engine", 1)
 
     def test_spill_metrics_are_keyed_by_local_function(self):
@@ -125,10 +127,23 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
         self.assertEqual(4, result["classes"]["alu"]["samples"])
 
     def test_report_schema_requires_consistent_index_mapping(self):
+        schedule = [
+            {
+                "engine": engine,
+                "phase": phase,
+            }
+            for phase in ("warmup", "profile")
+            for engine in ("wamr", "wasmtime", "wasmtime", "wamr")
+        ]
         report = {
             "schema_version": profile.REPORT_SCHEMA_VERSION,
             "kind": profile.REPORT_KIND,
             "architecture": "aarch64",
+            "authoritative_baseline_run": profile.AUTHORITATIVE_BASELINE_RUN,
+            "guest_args": list(profile.bench_coremark.COREMARK_GUEST_ARGS),
+            "expected_iterations": profile.bench_coremark.EXPECTED_ITERATIONS,
+            "affinity": {"verified": True},
+            "profile_schedule": schedule,
             "wasm": {"imported_function_count": 12},
             "engines": {
                 "wamr": {"total_samples": 100, "attributed_samples": 99},
@@ -147,6 +162,69 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
         report["matched_functions"][0]["wasm_function_index"] = 14
         with self.assertRaisesRegex(profile.ProfileError, "inconsistent"):
             profile.validate_report(report)
+
+    def test_profile_aggregates_preserve_balanced_samples(self):
+        rankings = [
+            {
+                "text_size": 100,
+                "function_count": 2,
+                "total_samples": 100,
+                "attributed_samples": 99,
+                "top_functions": [
+                    {
+                        "local_func": 0,
+                        "samples": 60,
+                        "percent_of_run": 60.0,
+                        "code_bytes": 40,
+                    }
+                ],
+            },
+            {
+                "text_size": 100,
+                "function_count": 2,
+                "total_samples": 120,
+                "attributed_samples": 118,
+                "top_functions": [
+                    {
+                        "local_func": 0,
+                        "samples": 70,
+                        "percent_of_run": 58.3,
+                        "code_bytes": 40,
+                    }
+                ],
+            },
+        ]
+        merged = profile.aggregate_wamr_rankings(rankings)
+        self.assertEqual(220, merged["total_samples"])
+        self.assertEqual(130, merged["top_functions"][0]["samples"])
+
+        captures = [
+            {
+                "total_samples": 10,
+                "functions": {
+                    15: {
+                        "samples": 8,
+                        "names": {"core_bench_list"},
+                        "offsets": Counter({4: 8}),
+                        "mapping_methods": {"jitdump"},
+                    }
+                },
+            },
+            {
+                "total_samples": 12,
+                "functions": {
+                    15: {
+                        "samples": 9,
+                        "names": {"core_bench_list"},
+                        "offsets": Counter({4: 9}),
+                        "mapping_methods": {"jitdump"},
+                    }
+                },
+            },
+        ]
+        merged_wasmtime = profile.aggregate_wasmtime_samples(captures)
+        self.assertEqual(22, merged_wasmtime["total_samples"])
+        self.assertEqual(17, merged_wasmtime["functions"][15]["samples"])
 
     def test_current_aot_version_is_shared(self):
         aot = profile.load_aot_helper(ROOT)

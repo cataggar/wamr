@@ -15,10 +15,12 @@ import platform
 import re
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,8 @@ DEFAULT_MIN_SAMPLES = 1000
 DEFAULT_TOP_FUNCTIONS = 10
 DEFAULT_CLASSIFY_FUNCTIONS = 3
 DEFAULT_MAX_PERF_BYTES = 25 * 1024 * 1024
+AUTHORITATIVE_BASELINE_RUN = 33631050708
+PROFILE_CAPTURES_PER_ENGINE = 2
 WASMTIME_SYMBOL_RE = re.compile(
     r"wasm\[(?P<module>\d+)\]::function\[(?P<function>\d+)\]"
     r"(?:::(?P<name>[^+\s(]+))?"
@@ -139,16 +143,142 @@ class CommandRecorder:
 
 
 def parse_validated_coremark(output: str, engine: str, expected_runs: int) -> list[float]:
-    if re.search(r"(?m)^.*ERROR!", output):
-        raise ProfileError(f"{engine} reported a CoreMark CRC error")
-    validation_count = output.count(bench_coremark.VALIDATION_TEXT)
-    values = [float(value) for value in bench_coremark.ITER_PATTERN.findall(output)]
-    if validation_count != expected_runs or len(values) != expected_runs:
+    if expected_runs != 1:
         raise ProfileError(
-            f"{engine} produced {validation_count} validation markers and "
-            f"{len(values)} throughput values; expected {expected_runs} of each"
+            "profile invocations are validated individually; expected_runs "
+            "must be one"
         )
-    return values
+    try:
+        parsed = bench_coremark.parse_coremark_output(output, engine)
+    except RuntimeError as exc:
+        raise ProfileError(str(exc)) from exc
+    return [parsed.throughput]
+
+
+def aggregate_wamr_rankings(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    if not reports:
+        raise ProfileError("no WAMR attribution reports to aggregate")
+    text_size = reports[0]["text_size"]
+    function_count = reports[0]["function_count"]
+    samples = Counter()
+    code_bytes: dict[int, int] = {}
+    for report in reports:
+        if (
+            report["text_size"] != text_size
+            or report["function_count"] != function_count
+        ):
+            raise ProfileError("WAMR attribution captures disagree on cwasm layout")
+        for item in report["top_functions"]:
+            local_func = item["local_func"]
+            if local_func in code_bytes and code_bytes[local_func] != item["code_bytes"]:
+                raise ProfileError(
+                    f"WAMR local_func={local_func} code size changed across captures"
+                )
+            code_bytes[local_func] = item["code_bytes"]
+            samples[local_func] += item["samples"]
+    total = sum(report["total_samples"] for report in reports)
+    attributed = sum(report["attributed_samples"] for report in reports)
+    top = [
+        {
+            "local_func": local_func,
+            "samples": count,
+            "percent_of_run": 100.0 * count / total,
+            "code_bytes": code_bytes[local_func],
+        }
+        for local_func, count in samples.most_common()
+    ]
+    return {
+        "total_samples": total,
+        "attributed_samples": attributed,
+        "attribution_coverage_pct": 100.0 * attributed / total,
+        "text_size": text_size,
+        "function_count": function_count,
+        "top_functions": top,
+    }
+
+
+def aggregate_wamr_function(
+    reports: list[dict[str, Any]],
+    *,
+    total_samples: int,
+    function_start: int,
+) -> dict[str, Any]:
+    if not reports:
+        raise ProfileError("no WAMR function reports to aggregate")
+    local_func = reports[0]["classified_function"]["local_func"]
+    class_samples = Counter()
+    static_counts: dict[str, int] = {}
+    hot = Counter()
+    function_samples = 0
+    for report in reports:
+        function = report["classified_function"]
+        if function["local_func"] != local_func:
+            raise ProfileError("WAMR function captures disagree on local_func")
+        function_samples += function["samples"]
+        for name, values in function["classes"].items():
+            static = values.get("static_instructions", 0)
+            if name in static_counts and static_counts[name] != static:
+                raise ProfileError(
+                    f"WAMR {name} static count changed across captures"
+                )
+            static_counts[name] = static
+            class_samples[name] += values["samples"]
+        function_base = report["text_base"] + function_start
+        for item in function["hottest_instructions"]:
+            offset = item["address"] - function_base
+            hot[(offset, item["instruction"])] += item["samples"]
+    return {
+        "local_func": local_func,
+        "samples": function_samples,
+        "percent_of_run": 100.0 * function_samples / total_samples,
+        "instruction_count": reports[0]["classified_function"][
+            "instruction_count"
+        ],
+        "classes": {
+            name: {
+                "samples": class_samples.get(name, 0),
+                "percent_of_run": (
+                    100.0 * class_samples.get(name, 0) / total_samples
+                ),
+                "static_instructions": static_counts.get(name, 0),
+            }
+            for name in sorted(set(static_counts) | set(class_samples))
+        },
+        "hottest_instructions": [
+            {
+                "offset": offset,
+                "instruction": instruction,
+                "samples": count,
+                "percent_of_run": 100.0 * count / total_samples,
+            }
+            for (offset, instruction), count in hot.most_common(20)
+        ],
+    }
+
+
+def aggregate_wasmtime_samples(
+    captures: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not captures:
+        raise ProfileError("no Wasmtime samples to aggregate")
+    total = sum(capture["total_samples"] for capture in captures)
+    functions: dict[int, dict[str, Any]] = {}
+    for capture in captures:
+        for wasm_index, source in capture["functions"].items():
+            target = functions.setdefault(
+                wasm_index,
+                {
+                    "samples": 0,
+                    "names": set(),
+                    "offsets": Counter(),
+                    "mapping_methods": set(),
+                },
+            )
+            target["samples"] += source["samples"]
+            target["names"].update(source["names"])
+            target["offsets"].update(source["offsets"])
+            target["mapping_methods"].update(source["mapping_methods"])
+    return {"total_samples": total, "functions": functions}
 
 
 def parse_spill_metrics(text: str) -> dict[int, dict[str, Any]]:
@@ -377,6 +507,24 @@ def validate_report(report: dict[str, Any]) -> None:
         raise ProfileError("profile report has an unsupported kind")
     if report.get("architecture") != "aarch64":
         raise ProfileError("profile report architecture must be aarch64")
+    if report.get("authoritative_baseline_run") != AUTHORITATIVE_BASELINE_RUN:
+        raise ProfileError("profile report names the wrong authoritative baseline")
+    if report.get("guest_args") != list(bench_coremark.COREMARK_GUEST_ARGS):
+        raise ProfileError("profile report guest args are not authoritative")
+    if report.get("expected_iterations") != bench_coremark.EXPECTED_ITERATIONS:
+        raise ProfileError("profile report iteration count is not authoritative")
+    affinity = report.get("affinity")
+    if not isinstance(affinity, dict) or affinity.get("verified") is not True:
+        raise ProfileError("profile report lacks verified CPU affinity")
+    schedule = report.get("profile_schedule")
+    if not isinstance(schedule, list) or len(schedule) != 8:
+        raise ProfileError("profile report must contain four warmups and four captures")
+    order = [item.get("engine") for item in schedule]
+    phases = [item.get("phase") for item in schedule]
+    if order != ["wamr", "wasmtime", "wasmtime", "wamr"] * 2:
+        raise ProfileError("profile report execution order is not ABBA/ABBA")
+    if phases != ["warmup"] * 4 + ["profile"] * 4:
+        raise ProfileError("profile report phases are not balanced")
     engines = report.get("engines")
     if not isinstance(engines, dict) or set(engines) != {"wamr", "wasmtime"}:
         raise ProfileError("profile report must contain WAMR and Wasmtime engines")
@@ -406,12 +554,28 @@ def render_markdown(report: dict[str, Any]) -> str:
     host = report["host"]
     wamr = report["engines"]["wamr"]
     wasmtime = report["engines"]["wasmtime"]
+    order = "".join(
+        "A" if item["engine"] == "wamr" else "B"
+        for item in report["profile_schedule"]
+    )
     lines = [
         "### Matched-host AArch64 CoreMark profiles",
         "",
         f"- Commit: `{report['wamr']['commit']}` (`ReleaseFast`)",
+        f"- Authoritative baseline: run "
+        f"[{report['authoritative_baseline_run']}]"
+        f"(https://github.com/cataggar/wamr/actions/runs/"
+        f"{report['authoritative_baseline_run']})",
         f"- Fixture: `{report['fixture']['path']}` "
         f"(`sha256:{report['fixture']['sha256']}`)",
+        f"- Fixed guest args: `{' '.join(report['guest_args'])}`; every run "
+        f"required `Iterations: {report['expected_iterations']}`",
+        f"- CPU affinity: allowed "
+        f"`{','.join(map(str, report['affinity']['allowed_cpus']))}`; "
+        f"selected/verified CPU `{report['affinity']['selected_cpu']}` via "
+        f"`{report['affinity']['taskset']}`",
+        f"- Counterbalanced execution order: `{order}` "
+        f"(A=WAMR, B=Wasmtime; warmups then profile captures)",
         f"- Host: `{host['architecture']}` · {host['cpu_count']} vCPU · "
         f"`{host['cpu_model']}` · kernel `{host['kernel']}` · "
         f"fingerprint `{host['fingerprint']}`",
@@ -644,87 +808,6 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     if cwasm_info.version not in aot.SUPPORTED_AOT_VERSIONS:
         raise ProfileError("WAMR cwasm version is unsupported by attribution")
 
-    wamr_perf = out_dir / "wamr.perf.data"
-    wamr_run = recorder.run(
-        [
-            perf_binary(),
-            "record",
-            "-k",
-            "mono",
-            "-F",
-            str(args.frequency),
-            "-e",
-            "cycles:u",
-            "-o",
-            str(wamr_perf),
-            "--",
-            str(wamr),
-            "run",
-            str(cwasm),
-        ],
-        "wamr-run.log",
-        cwd=build_repo,
-    )
-    wamr_values = parse_validated_coremark(
-        wamr_run.stdout + wamr_run.stderr, "WAMR", 1
-    )
-
-    helper = repo / ".github/skills/aot-perf-profile/aot_jit_attr.py"
-    ranking_json = out_dir / "wamr-attribution.json"
-    recorder.run(
-        [
-            sys.executable,
-            str(helper),
-            "--perf",
-            str(wamr_perf),
-            "--cwasm",
-            str(cwasm),
-            "--arch",
-            "aarch64",
-            "--top",
-            str(args.top),
-            "--min-samples",
-            str(args.min_samples),
-            "--json-out",
-            str(ranking_json),
-        ],
-        "wamr-attribution.log",
-        cwd=repo,
-    )
-    wamr_attribution = json.loads(ranking_json.read_text(encoding="utf-8"))
-    top_functions = wamr_attribution["top_functions"][: args.classify]
-    if len(top_functions) != args.classify:
-        raise ProfileError(
-            f"WAMR attribution produced only {len(top_functions)} hot functions"
-        )
-    classified_wamr = {}
-    for item in top_functions:
-        local_func = item["local_func"]
-        path = out_dir / f"wamr-func-{local_func}.json"
-        recorder.run(
-            [
-                sys.executable,
-                str(helper),
-                "--perf",
-                str(wamr_perf),
-                "--cwasm",
-                str(cwasm),
-                "--arch",
-                "aarch64",
-                "--func",
-                str(local_func),
-                "--top",
-                str(args.top),
-                "--min-samples",
-                str(args.min_samples),
-                "--json-out",
-                str(path),
-            ],
-            f"wamr-func-{local_func}.log",
-            cwd=repo,
-        )
-        classified_wamr[local_func] = json.loads(path.read_text(encoding="utf-8"))
-
     wasmtime = bench_coremark.install_pinned_wasmtime(
         repo, out_dir / "wasmtime-tools"
     )
@@ -757,68 +840,259 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     ).stdout
     (out_dir / "wasmtime-objdump.txt").write_text(objdump, encoding="utf-8")
 
-    wasmtime_perf = out_dir / "wasmtime.perf.data"
-    wasmtime_run = recorder.run(
+    affinity = bench_coremark.select_cpu_affinity()
+    guest_args = bench_coremark.coremark_guest_args(
+        bench_coremark.EXPECTED_ITERATIONS
+    )
+    wamr_command = bench_coremark.apply_affinity(
+        [str(wamr), "run", str(cwasm), *guest_args], affinity
+    )
+    wasmtime_command = bench_coremark.apply_affinity(
         [
-            perf_binary(),
-            "record",
-            "-k",
-            "mono",
-            "-F",
-            str(args.frequency),
-            "-e",
-            "cycles:u",
-            "-o",
-            str(wasmtime_perf),
-            "--",
+            str(wasmtime),
+            "run",
+            "--allow-precompiled",
+            str(wasmtime_cwasm),
+            *guest_args,
+        ],
+        affinity,
+    )
+    wasmtime_profile_command = bench_coremark.apply_affinity(
+        [
             str(wasmtime),
             "run",
             "--allow-precompiled",
             "--profile=jitdump",
             str(wasmtime_cwasm),
+            *guest_args,
         ],
-        "wasmtime-run.log",
-        cwd=out_dir,
+        affinity,
     )
-    wasmtime_values = parse_validated_coremark(
-        wasmtime_run.stdout + wasmtime_run.stderr, "Wasmtime", 1
-    )
-    jitdumps = sorted(out_dir.glob("jit-*.dump"))
-    if len(jitdumps) != 1:
-        raise ProfileError(
-            f"Wasmtime jitdump mapping produced {len(jitdumps)} jit dump files; "
-            "expected exactly one"
+
+    profile_schedule = []
+    warmup_ordinals = Counter()
+    schedule_position = 0
+    for engine in bench_coremark.counterbalanced_order(
+        ["wamr", "wasmtime"], 2
+    ):
+        schedule_position += 1
+        warmup_ordinals[engine] += 1
+        command = wamr_command if engine == "wamr" else wasmtime_command
+        cwd = build_repo if engine == "wamr" else out_dir
+        started_at = datetime.now(timezone.utc).isoformat()
+        result = recorder.run(
+            command,
+            f"{engine}-warmup-{warmup_ordinals[engine]}.log",
+            cwd=cwd,
         )
-    wasmtime_injected = out_dir / "wasmtime.perf.jit.data"
-    recorder.run(
-        [
-            perf_binary(),
-            "inject",
-            "--jit",
-            "-i",
-            str(wasmtime_perf),
-            "-o",
-            str(wasmtime_injected),
-        ],
-        "wasmtime-perf-inject.log",
-        cwd=out_dir,
-    )
-    perf_script = recorder.run(
-        [
-            perf_binary(),
-            "script",
-            "-i",
-            str(wasmtime_injected),
-            "-F",
-            "ip,sym,symoff,dso",
-        ],
-        "wasmtime-perf-script.log",
-        cwd=out_dir,
-    ).stdout
-    (out_dir / "wasmtime-samples.txt").write_text(
-        perf_script, encoding="utf-8"
-    )
-    parsed_wasmtime = parse_wasmtime_samples(perf_script, wasm_identity)
+        completed_at = datetime.now(timezone.utc).isoformat()
+        value = parse_validated_coremark(
+            result.stdout + result.stderr, engine, 1
+        )[0]
+        profile_schedule.append(
+            {
+                "position": schedule_position,
+                "phase": "warmup",
+                "engine": engine,
+                "engine_ordinal": warmup_ordinals[engine],
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "iterations": bench_coremark.EXPECTED_ITERATIONS,
+                "iterations_per_second": value,
+            }
+        )
+
+    wamr_perfs = []
+    wasmtime_perfs = []
+    jitdumps = []
+    wamr_values = []
+    wasmtime_values = []
+    wasmtime_captures = []
+    profile_ordinals = Counter()
+    for engine in bench_coremark.counterbalanced_order(
+        ["wamr", "wasmtime"], PROFILE_CAPTURES_PER_ENGINE
+    ):
+        schedule_position += 1
+        profile_ordinals[engine] += 1
+        ordinal = profile_ordinals[engine]
+        started_at = datetime.now(timezone.utc).isoformat()
+        if engine == "wamr":
+            perf_path = out_dir / f"wamr-{ordinal}.perf.data"
+            result = recorder.run(
+                [
+                    perf_binary(),
+                    "record",
+                    "-k",
+                    "mono",
+                    "-F",
+                    str(args.frequency),
+                    "-e",
+                    "cycles:u",
+                    "-o",
+                    str(perf_path),
+                    "--",
+                    *wamr_command,
+                ],
+                f"wamr-run-{ordinal}.log",
+                cwd=build_repo,
+            )
+            value = parse_validated_coremark(
+                result.stdout + result.stderr, "WAMR", 1
+            )[0]
+            wamr_values.append(value)
+            wamr_perfs.append(perf_path)
+        else:
+            perf_path = out_dir / f"wasmtime-{ordinal}.perf.data"
+            before = set(out_dir.glob("jit-*.dump"))
+            result = recorder.run(
+                [
+                    perf_binary(),
+                    "record",
+                    "-k",
+                    "mono",
+                    "-F",
+                    str(args.frequency),
+                    "-e",
+                    "cycles:u",
+                    "-o",
+                    str(perf_path),
+                    "--",
+                    *wasmtime_profile_command,
+                ],
+                f"wasmtime-run-{ordinal}.log",
+                cwd=out_dir,
+            )
+            value = parse_validated_coremark(
+                result.stdout + result.stderr, "Wasmtime", 1
+            )[0]
+            wasmtime_values.append(value)
+            wasmtime_perfs.append(perf_path)
+            new_dumps = sorted(set(out_dir.glob("jit-*.dump")) - before)
+            if len(new_dumps) != 1:
+                raise ProfileError(
+                    f"Wasmtime capture {ordinal} produced {len(new_dumps)} "
+                    "new jitdump files; expected exactly one"
+                )
+            jitdumps.extend(new_dumps)
+            injected = out_dir / f"wasmtime-{ordinal}.perf.jit.data"
+            recorder.run(
+                [
+                    perf_binary(),
+                    "inject",
+                    "--jit",
+                    "-i",
+                    str(perf_path),
+                    "-o",
+                    str(injected),
+                ],
+                f"wasmtime-perf-inject-{ordinal}.log",
+                cwd=out_dir,
+            )
+            perf_script = recorder.run(
+                [
+                    perf_binary(),
+                    "script",
+                    "-i",
+                    str(injected),
+                    "-F",
+                    "ip,sym,symoff,dso",
+                ],
+                f"wasmtime-perf-script-{ordinal}.log",
+                cwd=out_dir,
+            ).stdout
+            (out_dir / f"wasmtime-samples-{ordinal}.txt").write_text(
+                perf_script, encoding="utf-8"
+            )
+            wasmtime_captures.append(
+                parse_wasmtime_samples(perf_script, wasm_identity)
+            )
+        completed_at = datetime.now(timezone.utc).isoformat()
+        profile_schedule.append(
+            {
+                "position": schedule_position,
+                "phase": "profile",
+                "engine": engine,
+                "engine_ordinal": ordinal,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "iterations": bench_coremark.EXPECTED_ITERATIONS,
+                "iterations_per_second": value,
+                "perf_file": perf_path.name,
+            }
+        )
+
+    helper = repo / ".github/skills/aot-perf-profile/aot_jit_attr.py"
+    ranking_reports = []
+    for ordinal, wamr_perf in enumerate(wamr_perfs, 1):
+        ranking_json = out_dir / f"wamr-attribution-{ordinal}.json"
+        recorder.run(
+            [
+                sys.executable,
+                str(helper),
+                "--perf",
+                str(wamr_perf),
+                "--cwasm",
+                str(cwasm),
+                "--arch",
+                "aarch64",
+                "--top",
+                str(len(cwasm_info.func_offsets)),
+                "--min-samples",
+                str(args.min_samples),
+                "--json-out",
+                str(ranking_json),
+            ],
+            f"wamr-attribution-{ordinal}.log",
+            cwd=repo,
+        )
+        ranking_reports.append(
+            json.loads(ranking_json.read_text(encoding="utf-8"))
+        )
+    wamr_attribution = aggregate_wamr_rankings(ranking_reports)
+    top_functions = wamr_attribution["top_functions"][: args.classify]
+    if len(top_functions) != args.classify:
+        raise ProfileError(
+            f"WAMR attribution produced only {len(top_functions)} hot functions"
+        )
+    classified_wamr = {}
+    for item in top_functions:
+        local_func = item["local_func"]
+        function_reports = []
+        for ordinal, wamr_perf in enumerate(wamr_perfs, 1):
+            path = out_dir / f"wamr-func-{local_func}-{ordinal}.json"
+            recorder.run(
+                [
+                    sys.executable,
+                    str(helper),
+                    "--perf",
+                    str(wamr_perf),
+                    "--cwasm",
+                    str(cwasm),
+                    "--arch",
+                    "aarch64",
+                    "--func",
+                    str(local_func),
+                    "--top",
+                    str(args.top),
+                    "--min-samples",
+                    str(args.min_samples),
+                    "--json-out",
+                    str(path),
+                ],
+                f"wamr-func-{local_func}-{ordinal}.log",
+                cwd=repo,
+            )
+            function_reports.append(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        function_start, _ = aot.function_bounds(cwasm_info, local_func)
+        classified_wamr[local_func] = aggregate_wamr_function(
+            function_reports,
+            total_samples=wamr_attribution["total_samples"],
+            function_start=function_start,
+        )
+
+    parsed_wasmtime = aggregate_wasmtime_samples(wasmtime_captures)
     validate_wasmtime_mapping(parsed_wasmtime, wasm_identity)
     if parsed_wasmtime["total_samples"] < args.min_samples:
         raise ProfileError(
@@ -842,7 +1116,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 f"{wasmtime_entry['samples']} symbol samples but only "
                 f"{sum(wasmtime_entry['offsets'].values())} symbol offsets"
             )
-        wamr_function = classified_wamr[local_func]["classified_function"]
+        wamr_function = classified_wamr[local_func]
         wasmtime_instruction = classify_wasmtime_function(
             aot=aot,
             objdump_text=objdump,
@@ -931,14 +1205,23 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         item["samples"] for item in parsed_wasmtime["functions"].values()
     )
     perf_artifacts = [
-        gzip_if_small(wamr_perf, args.max_perf_bytes),
-        gzip_if_small(wasmtime_perf, args.max_perf_bytes),
-        gzip_if_small(jitdumps[0], args.max_perf_bytes),
+        gzip_if_small(path, args.max_perf_bytes)
+        for path in [*wamr_perfs, *wasmtime_perfs, *jitdumps]
     ]
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "kind": REPORT_KIND,
         "architecture": "aarch64",
+        "authoritative_baseline_run": AUTHORITATIVE_BASELINE_RUN,
+        "guest_args": list(guest_args),
+        "expected_iterations": bench_coremark.EXPECTED_ITERATIONS,
+        "affinity": {
+            "allowed_cpus": list(affinity.allowed_cpus),
+            "selected_cpu": affinity.selected_cpu,
+            "taskset": affinity.taskset,
+            "verified": True,
+        },
+        "profile_schedule": profile_schedule,
         "fixture": {"path": str(fixture), "sha256": fixture_sha},
         "wasm": {
             "imported_function_count": wasm_identity.imported_function_count,
@@ -995,11 +1278,12 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 "attribution_coverage_pct": wamr_attribution[
                     "attribution_coverage_pct"
                 ],
-                "iterations_per_second": wamr_values[0],
-                "wall_seconds": next(
+                "iterations_per_second_samples": wamr_values,
+                "iterations_per_second": statistics.fmean(wamr_values),
+                "wall_seconds": sum(
                     entry["elapsed_seconds"]
                     for entry in recorder.commands
-                    if entry["log"] == "wamr-run.log"
+                    if entry["log"].startswith("wamr-run-")
                 ),
                 "top_functions": wamr_attribution["top_functions"],
             },
@@ -1011,11 +1295,12 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     * wasmtime_attributed
                     / parsed_wasmtime["total_samples"]
                 ),
-                "iterations_per_second": wasmtime_values[0],
-                "wall_seconds": next(
+                "iterations_per_second_samples": wasmtime_values,
+                "iterations_per_second": statistics.fmean(wasmtime_values),
+                "wall_seconds": sum(
                     entry["elapsed_seconds"]
                     for entry in recorder.commands
-                    if entry["log"] == "wasmtime-run.log"
+                    if entry["log"].startswith("wasmtime-run-")
                 ),
                 "top_functions": [
                     {
@@ -1046,6 +1331,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "Self samples only; WAMR generated code has no unwind CFI.",
             "AArch64 spill metrics are pre-emission estimates.",
             "Wasmtime wasm symbols use full function indices including imports.",
+            "Two captures per engine were collected in ABBA order after ABBA warmups.",
         ],
     }
     bench_coremark.validate_same_host(host_identity)
