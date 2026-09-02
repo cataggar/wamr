@@ -8,6 +8,7 @@ const std = @import("std");
 const config = @import("../config.zig");
 const stable_resource = @import("../shared/stable_resource.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
+const task_cancellation = @import("../runtime/common/task_cancellation.zig");
 
 // ── Task state ──────────────────────────────────────────────────────────────
 
@@ -21,22 +22,6 @@ pub const TaskState = enum(u8) {
     /// Task has been cancelled.
     cancelled = 3,
 };
-
-var next_task_manager_identity: std.atomic.Value(u32) = .init(1);
-
-fn allocateTaskManagerIdentity() u32 {
-    var current = next_task_manager_identity.load(.acquire);
-    while (true) {
-        if (current == std.math.maxInt(u32))
-            @panic("task-manager cancellation identity exhausted");
-        current = next_task_manager_identity.cmpxchgWeak(
-            current,
-            current + 1,
-            .acq_rel,
-            .acquire,
-        ) orelse return current;
-    }
-}
 
 /// Per-task `context.{get,set} i32 i` slots. The spec allows arbitrary
 /// `valtype` and arbitrary index range; sub-PR 1 of #478 caps both
@@ -54,6 +39,10 @@ pub const WaitableRegistration = struct {
 pub const Task = struct {
     id: u32,
     state: TaskState = .created,
+    cancellation_source: if (config.lib_wasi_threads)
+        *task_cancellation.Source
+    else
+        void,
     /// Return value buffer (set when state transitions to .returned).
     return_values: []u32 = &.{},
     return_values_allocator: ?std.mem.Allocator = null,
@@ -221,8 +210,6 @@ pub const WaitableSet = struct {
 pub const TaskManager = struct {
     tasks: std.ArrayListUnmanaged(Task) = .empty,
     next_id: u32 = 1,
-    cancellation_identity: if (config.lib_wasi_threads) u32 else void =
-        if (config.lib_wasi_threads) 0 else {},
     allocator: ?std.mem.Allocator = null,
     mutex: stable_resource.ConditionalMutex(stable_resource.LockRank.resource_registry) = .init,
 
@@ -239,17 +226,22 @@ pub const TaskManager = struct {
 
     /// Create a new task. Returns the task handle.
     pub fn createTask(self: *TaskManager, allocator: std.mem.Allocator) !u32 {
+        const cancellation_source = if (config.lib_wasi_threads)
+            try task_cancellation.Source.create(allocator)
+        else {};
+        errdefer if (comptime config.lib_wasi_threads)
+            cancellation_source.release();
+
         self.mutex.lock();
         defer self.mutex.unlock();
         const task_allocator = self.allocator orelse allocator;
         if (self.allocator == null) self.allocator = task_allocator;
-        if (comptime config.lib_wasi_threads) {
-            if (self.cancellation_identity == 0)
-                self.cancellation_identity = allocateTaskManagerIdentity();
-        }
         const id = self.next_id;
         const idx: u32 = @intCast(self.tasks.items.len);
-        try self.tasks.append(task_allocator, .{ .id = id });
+        try self.tasks.append(task_allocator, .{
+            .id = id,
+            .cancellation_source = cancellation_source,
+        });
         self.next_id += 1;
         return idx;
     }
@@ -327,11 +319,14 @@ pub const TaskManager = struct {
     /// cancelled after the call (including an idempotent repeated cancel).
     /// Return and cancellation are first-terminal under the manager lock.
     pub fn tryCancelTask(self: *TaskManager, handle: u32) bool {
+        var source_ref: ?task_cancellation.Source.Ref = null;
         self.mutex.lock();
-        defer self.mutex.unlock();
-        if (handle >= self.tasks.items.len) return false;
+        if (handle >= self.tasks.items.len) {
+            self.mutex.unlock();
+            return false;
+        }
         const task = &self.tasks.items[handle];
-        return switch (task.state) {
+        const cancelled = switch (task.state) {
             .created, .started => blk: {
                 task.state = .cancelled;
                 break :blk true;
@@ -339,6 +334,15 @@ pub const TaskManager = struct {
             .cancelled => true,
             .returned => false,
         };
+        if (cancelled and comptime config.lib_wasi_threads)
+            source_ref = task.cancellation_source.acquire();
+        self.mutex.unlock();
+
+        if (source_ref) |*source| {
+            source.source.cancel();
+            source.deinit();
+        }
+        return cancelled;
     }
 
     /// Get the state of a task.
@@ -384,6 +388,8 @@ pub const TaskManager = struct {
             if (task.return_values.len > 0) {
                 task.return_values_allocator.?.free(task.return_values);
             }
+            if (comptime config.lib_wasi_threads)
+                task.cancellation_source.release();
         }
         tasks.deinit(task_allocator);
     }
@@ -400,17 +406,18 @@ pub const TaskManager = struct {
         return binding.handle;
     }
 
-    /// Stable cancellation key for a task. The high word is a monotonic
-    /// TaskManager incarnation, preventing address-reuse ABA after a manager
-    /// is destroyed while child thread records still retain the old group.
-    pub fn cancellationKey(self: *TaskManager, handle: u32) ?u64 {
+    /// Retain the task-owned cancellation source. The returned reference can
+    /// outlive this TaskManager; manager-local groups register directly with
+    /// the source, so cancellation remains safe after task-manager teardown.
+    pub fn acquireCancellationSource(
+        self: *TaskManager,
+        handle: u32,
+    ) ?task_cancellation.Source.Ref {
         if (comptime !config.lib_wasi_threads) return null;
         self.mutex.lock();
         defer self.mutex.unlock();
         if (handle >= self.tasks.items.len) return null;
-        std.debug.assert(self.cancellation_identity != 0);
-        return (@as(u64, self.cancellation_identity) << 32) |
-            self.tasks.items[handle].id;
+        return self.tasks.items[handle].cancellation_source.acquire();
     }
 
     pub fn setWaitable(
@@ -917,21 +924,102 @@ test "TaskManager: cancel" {
     try std.testing.expectEqual(TaskState.cancelled, tm.getState(h).?);
 }
 
-test "TaskManager: cancellation keys distinguish manager incarnations" {
+test "TaskManager: handle cancellation fans out every registered target" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const Counter = struct {
+        hits: usize = 0,
+
+        fn wake(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.hits += 1;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var tm = TaskManager{};
+    defer tm.deinit(allocator);
+    const handle = try tm.createTask(allocator);
+    var source_ref = tm.acquireCancellationSource(handle).?;
+    defer source_ref.deinit();
+    var first = Counter{};
+    var second = Counter{};
+    var first_registration = task_cancellation.Registration{};
+    defer first_registration.unregister();
+    var second_registration = task_cancellation.Registration{};
+    defer second_registration.unregister();
+    try std.testing.expectEqual(
+        task_cancellation.RegisterResult.registered,
+        source_ref.source.register(&first_registration, .{
+            .ctx = @ptrCast(&first),
+            .wake = Counter.wake,
+        }),
+    );
+    try std.testing.expectEqual(
+        task_cancellation.RegisterResult.registered,
+        source_ref.source.register(&second_registration, .{
+            .ctx = @ptrCast(&second),
+            .wake = Counter.wake,
+        }),
+    );
+
+    tm.cancelTask(handle);
+    try std.testing.expectEqual(@as(usize, 1), first.hits);
+    try std.testing.expectEqual(@as(usize, 1), second.hits);
+    tm.cancelTask(handle);
+    try std.testing.expectEqual(@as(usize, 2), first.hits);
+    try std.testing.expectEqual(@as(usize, 2), second.hits);
+}
+
+test "TaskManager: registered cancellation source outlives manager teardown" {
+    if (!config.lib_wasi_threads) return error.SkipZigTest;
+    const Counter = struct {
+        hits: usize = 0,
+
+        fn wake(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.hits += 1;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var tm = TaskManager{};
+    const handle = try tm.createTask(allocator);
+    var source_ref = tm.acquireCancellationSource(handle).?;
+    defer source_ref.deinit();
+    var counter = Counter{};
+    var registration = task_cancellation.Registration{};
+    defer registration.unregister();
+    try std.testing.expectEqual(
+        task_cancellation.RegisterResult.registered,
+        source_ref.source.register(&registration, .{
+            .ctx = @ptrCast(&counter),
+            .wake = Counter.wake,
+        }),
+    );
+
+    tm.deinit(allocator);
+    source_ref.source.cancel();
+    try std.testing.expectEqual(@as(usize, 1), counter.hits);
+}
+
+test "TaskManager: cancellation sources distinguish task generations" {
     if (!config.lib_wasi_threads) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var first = TaskManager{};
-    defer first.deinit(allocator);
-    var second = TaskManager{};
-    defer second.deinit(allocator);
-    const first_handle = try first.createTask(allocator);
-    const second_handle = try second.createTask(allocator);
-    try std.testing.expect(first.cancellationKey(first_handle).? !=
-        second.cancellationKey(second_handle).?);
+    var tm = TaskManager{};
+    const first_handle = try tm.createTask(allocator);
+    var first_source = tm.acquireCancellationSource(first_handle).?;
+    defer first_source.deinit();
+    tm.deinit(allocator);
+
+    tm = .{};
+    defer tm.deinit(allocator);
+    const second_handle = try tm.createTask(allocator);
+    var second_source = tm.acquireCancellationSource(second_handle).?;
+    defer second_source.deinit();
+    try std.testing.expect(first_source.source.id != second_source.source.id);
 }
 
 test "TaskManager: return and cancel are first-terminal under races" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").single_threaded or !config.lib_wasi_threads)
+        return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tm = TaskManager{};
     defer tm.deinit(allocator);
@@ -956,11 +1044,31 @@ test "TaskManager: return and cancel are first-terminal under races" {
             );
         }
     };
+    const Counter = struct {
+        hits: std.atomic.Value(usize) = .init(0),
+
+        fn wake(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.hits.fetchAdd(1, .acq_rel);
+        }
+    };
 
     var round: usize = 0;
     while (round < 64) : (round += 1) {
         const handle = try tm.createTask(allocator);
         tm.startTask(handle);
+        var source_ref = tm.acquireCancellationSource(handle).?;
+        defer source_ref.deinit();
+        var counter = Counter{};
+        var registration = task_cancellation.Registration{};
+        defer registration.unregister();
+        try std.testing.expectEqual(
+            task_cancellation.RegisterResult.registered,
+            source_ref.source.register(&registration, .{
+                .ctx = @ptrCast(&counter),
+                .wake = Counter.wake,
+            }),
+        );
         const values = try allocator.dupe(u32, &.{@intCast(round)});
         var gate = std.atomic.Value(bool).init(false);
         var racer = Racer{
@@ -980,11 +1088,13 @@ test "TaskManager: return and cancel are first-terminal under races" {
                 try std.testing.expect(tm.tryCancelTask(handle));
                 tm.startTask(handle);
                 try std.testing.expectEqual(TaskState.cancelled, tm.getState(handle).?);
+                try std.testing.expect(counter.hits.load(.acquire) >= 1);
             },
             .returned => {
                 try std.testing.expect(!tm.tryCancelTask(handle));
                 tm.startTask(handle);
                 try std.testing.expectEqual(TaskState.returned, tm.getState(handle).?);
+                try std.testing.expectEqual(@as(usize, 0), counter.hits.load(.acquire));
             },
             else => return error.TestUnexpectedResult,
         }

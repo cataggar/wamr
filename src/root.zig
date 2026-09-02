@@ -32,6 +32,9 @@ pub const execution_context = @import("runtime/common/execution_context.zig");
 /// First-wins terminal outcome shared by every thread in a group.
 pub const termination = @import("runtime/common/termination.zig");
 
+/// Refcounted task-owned cancellation source and wake registry.
+pub const task_cancellation = @import("runtime/common/task_cancellation.zig");
+
 /// Process-global canonical FuncType → u32 sig_id registry (for AOT call_indirect).
 pub const sig_registry = @import("runtime/common/sig_registry.zig");
 
