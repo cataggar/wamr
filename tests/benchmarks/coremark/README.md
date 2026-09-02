@@ -70,6 +70,22 @@ PR CI deliberately uses `--profile ci` (zero warmups, three measured runs) to
 keep the regression gate affordable. Use the default `--profile authoritative`
 for publishable cross-engine numbers.
 
+The AArch64 workflow also exposes a manual `profile` mode. It installs the
+Ubuntu `linux-tools-$(uname -r)` package, verifies native `cycles:u` sampling,
+precompiles the canonical fixture once with WAMR spill/codegen diagnostics,
+and records load+execute-only self samples for WAMR and Wasmtime 44.0.1 on the
+same native host. Wasmtime uses its documented v44
+`--profile=jitdump` integration followed by `perf inject --jit`. Reports map
+WAMR `local_func` indices and Wasmtime's full wasm function indices through
+the fixture name section so the same functions are compared explicitly.
+
+Run it from GitHub Actions with **CoreMark (aarch64) → Run workflow → mode:
+profile**. `profile_ref` defaults to the exact merged-main commit measured by
+run 33576430466 (`e32b7b7d2d12007eb66679a66f943b1e4ea6a393`); the workflow
+builds that ref in an isolated worktree while using the merged profiling
+tooling. It uploads compact JSON/Markdown reports, diagnostics, and compressed
+raw perf/jitdump data when each input is at most 25 MiB.
+
 ## Options
 
 ```
