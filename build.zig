@@ -1065,6 +1065,7 @@ pub fn build(b: *std.Build) void {
             "wasi:http #962 regression:",
             "wasi:http #967 review",
             "wasi:http #969 review:",
+            "wasi:http #970:",
         },
     });
     const run_http_streaming_unit_tests = b.addRunArtifact(
@@ -1122,6 +1123,22 @@ pub fn build(b: *std.Build) void {
     );
     thread_lifecycle_test_step.dependOn(&run_thread_lifecycle_unit_tests.step);
     aot_thread_spawn_step.dependOn(&run_thread_lifecycle_unit_tests.step);
+
+    const windows_poll_unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = &.{
+            "Windows poll_oneoff:",
+            "group termination: a blocking poll_oneoff",
+            "group termination: poll_oneoff still honours",
+            "group termination: a blocking Windows stdin",
+        },
+    });
+    const run_windows_poll_unit_tests = b.addRunArtifact(windows_poll_unit_tests);
+    const windows_poll_test_step = b.step(
+        "test-windows-poll",
+        "Run Windows poll_oneoff readiness and interruption tests",
+    );
+    windows_poll_test_step.dependOn(&run_windows_poll_unit_tests.step);
 
     const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
