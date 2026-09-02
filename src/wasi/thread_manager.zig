@@ -11,6 +11,7 @@ const execution_context = @import("../runtime/common/execution_context.zig");
 const termination = @import("../runtime/common/termination.zig");
 const platform = @import("../platform/platform.zig");
 const parking_lot = @import("../platform/parking_lot.zig");
+const windows_poll = @import("../platform/windows_poll.zig");
 const config = @import("config");
 
 /// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
@@ -541,6 +542,9 @@ pub const ThreadManager = struct {
     /// recycled by starting from their monotonically advanced epoch.
     task_groups: ?*TaskCancelGroup = null,
     free_task_groups: ?*TaskCancelGroup = null,
+    /// Manual-reset event included in every Windows host wait set. The event
+    /// stays signalled after the first group interruption.
+    windows_cancel: windows_poll.CancelEvent,
 
     pub const TaskGroupScope = struct {
         manager: *ThreadManager,
@@ -560,6 +564,7 @@ pub const ThreadManager = struct {
         return .{
             .slots = .empty,
             .allocator = allocator,
+            .windows_cancel = windows_poll.CancelEvent.init(),
         };
     }
 
@@ -666,6 +671,7 @@ pub const ThreadManager = struct {
             free_groups = group.next;
             self.allocator.destroy(group);
         }
+        self.windows_cancel.deinit();
     }
 
     /// Bind one component task to a task-scoped cancellation epoch.
@@ -784,6 +790,7 @@ pub const ThreadManager = struct {
     /// every sibling through `interrupt`.
     pub fn bindTermination(self: *ThreadManager, state: *termination.State) void {
         self.termination = state;
+        state.bindWindowsCancelHandle(self.windows_cancel.opaqueHandle());
         state.bindWake(.{ .ctx = @ptrCast(self), .wake = wakeFromTermination });
     }
 
@@ -792,6 +799,7 @@ pub const ThreadManager = struct {
     pub fn unbindTermination(self: *ThreadManager) void {
         const state = self.termination orelse return;
         state.unbindWake(@ptrCast(self));
+        state.bindWindowsCancelHandle(null);
         self.termination = null;
     }
 
@@ -832,6 +840,7 @@ pub const ThreadManager = struct {
     /// threads unwind instead of hanging. Idempotent, safe from any thread.
     pub fn interrupt(self: *ThreadManager) void {
         self.trap_flag.store(true, .release);
+        self.windows_cancel.signal();
         if (self.cancel_broadcast) |hook| hook.broadcast(hook.ctx, null);
         if (self.shared_memory) |memory| _ = memory.cancelWaiters() catch {};
     }

@@ -56,6 +56,11 @@ fn StateFor(comptime enabled: bool) type {
         code: u32 = 0,
         hook_lock: HookLock = .{},
         hook: ?WakeHook = null,
+        /// Opaque manual-reset event owned by the bound Windows thread
+        /// manager. Blocking host waits load it directly so `interrupt()`
+        /// wakes them without polling the terminal state in time slices.
+        windows_cancel_handle: std.atomic.Value(usize) =
+            std.atomic.Value(usize).init(0),
 
         /// Record `proc_exit(code)`. Returns true when this call won.
         pub fn claimExit(self: *Self, code: u32) bool {
@@ -130,6 +135,18 @@ fn StateFor(comptime enabled: bool) type {
             }
         }
 
+        pub fn bindWindowsCancelHandle(self: *Self, handle: ?*anyopaque) void {
+            self.windows_cancel_handle.store(
+                if (handle) |value| @intFromPtr(value) else 0,
+                .release,
+            );
+        }
+
+        pub fn windowsCancelHandle(self: *const Self) ?*anyopaque {
+            const raw = self.windows_cancel_handle.load(.acquire);
+            return if (raw == 0) null else @ptrFromInt(raw);
+        }
+
         fn wakeGroup(self: *Self) void {
             self.hook_lock.lock();
             const hook = self.hook;
@@ -142,6 +159,7 @@ fn StateFor(comptime enabled: bool) type {
         claimed: bool = false,
         kind: Kind = .exit,
         code: u32 = 0,
+        windows_cancel_handle: ?*anyopaque = null,
 
         pub fn claimExit(self: *Self, code: u32) bool {
             return self.claim(.exit, code);
@@ -184,6 +202,14 @@ fn StateFor(comptime enabled: bool) type {
         pub fn unbindWake(self: *Self, ctx: *anyopaque) void {
             _ = self;
             _ = ctx;
+        }
+
+        pub fn bindWindowsCancelHandle(self: *Self, handle: ?*anyopaque) void {
+            self.windows_cancel_handle = handle;
+        }
+
+        pub fn windowsCancelHandle(self: *const Self) ?*anyopaque {
+            return self.windows_cancel_handle;
         }
     };
 }
