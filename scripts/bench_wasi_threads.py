@@ -238,8 +238,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--single-iterations", type=int, default=128_000_000)
     parser.add_argument("--hot-iterations", type=int, default=128_000_000)
     parser.add_argument("--atomic-iterations", type=int, default=64_000_000)
-    parser.add_argument("--wait-iterations", type=int, default=30_000)
-    parser.add_argument("--spawn-iterations", type=int, default=1_200)
+    parser.add_argument("--wait-iterations", type=int, default=64_000)
+    parser.add_argument("--spawn-iterations", type=int, default=3_000)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument(
         "--min-interval-ms", type=float, default=MIN_TIMED_INTERVAL_MS
