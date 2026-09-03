@@ -246,7 +246,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--samples", type=int)
     parser.add_argument("--modes", choices=("both", "interpreter", "aot"), default="both")
     parser.add_argument("--thread-counts", type=parse_thread_counts, default=(1, 2, 4, 8))
-    parser.add_argument("--single-iterations", type=int, default=128_000_000)
+    parser.add_argument("--single-iterations", type=int, default=256_000_000)
+    parser.add_argument("--cancel-iterations", type=int, default=256_000_000)
     parser.add_argument("--hot-iterations", type=int, default=128_000_000)
     parser.add_argument("--atomic-iterations", type=int, default=64_000_000)
     parser.add_argument("--wait-iterations", type=int, default=512_000)
@@ -288,6 +289,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--warmups must be >= 0 and --samples must be > 0")
     for name in (
         "single_iterations",
+        "cancel_iterations",
         "hot_iterations",
         "atomic_iterations",
         "wait_iterations",
@@ -1630,7 +1632,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     if "aot" in modes:
         aot_build = builds["enabled-aot"]
         for threads in args.thread_counts:
-            scenario = Scenario("hot", threads, args.hot_iterations)
+            scenario = Scenario("hot", threads, args.cancel_iterations)
 
             def poll_measure(
                 condition: str, fields: dict[str, Any]
@@ -1644,7 +1646,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     module=module,
                     workload="hot",
                     threads=threads,
-                    iterations=args.hot_iterations,
+                    iterations=args.cancel_iterations,
                     timeout=args.timeout,
                     min_interval_ns=minimum_interval_ns,
                     record_fields={
@@ -1661,7 +1663,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "workload": "hot",
                         "threads": threads,
-                        "iterations": args.hot_iterations,
+                        "iterations": args.cancel_iterations,
                     },
                 )
 
@@ -1686,6 +1688,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "thread_counts": list(args.thread_counts),
         "iterations": {
             "single-hot": args.single_iterations,
+            "cancel-hot": args.cancel_iterations,
             "hot": args.hot_iterations,
             "atomic": args.atomic_iterations,
             "wait-notify": args.wait_iterations,
