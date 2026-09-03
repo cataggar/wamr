@@ -283,7 +283,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             for scenario in bench.planned_scenarios(args)
             if scenario.workload == "wait-notify"
         }
-        self.assertEqual(wait_iterations, {1: 256_000, 4: 64_000, 8: 32_000})
+        self.assertEqual(wait_iterations, {1: 512_000, 4: 128_000, 8: 64_000})
         with self.assertRaises(SystemExit):
             bench.parse_args(["--thread-counts", "1,3"])
         with self.assertRaises(SystemExit):
