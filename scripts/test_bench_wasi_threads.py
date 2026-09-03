@@ -478,6 +478,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_barrier_calibration_accepts_same_clock_tick(self) -> None:
+        source = (
+            ROOT / "tests/benchmarks/wasi-threads/threaded.c"
+        ).read_text(encoding="UTF-8")
+        self.assertIn("if (end < start)", source)
+        self.assertNotIn("if (end <= start)", source)
+
     def test_cache_key_is_canonical_and_configuration_sensitive(self) -> None:
         left = {"target": "native", "threads": True, "mode": "aot"}
         right = {"mode": "aot", "threads": True, "target": "native"}
