@@ -117,9 +117,13 @@ def planned_scenarios(args: argparse.Namespace) -> list[Scenario]:
         Scenario(
             workload,
             threads,
-            iterations // threads
-            if workload == "wait-notify"
-            else iterations,
+            (
+                iterations // threads
+                if workload == "wait-notify"
+                else atomic_iterations(args, threads)
+                if workload == "atomic"
+                else iterations
+            ),
         )
         for workload, iterations in (
             ("hot", args.hot_iterations),
@@ -133,6 +137,10 @@ def planned_scenarios(args: argparse.Namespace) -> list[Scenario]:
 
 def cancel_iterations(args: argparse.Namespace, threads: int) -> int:
     return max(args.hot_iterations, args.cancel_iterations // threads)
+
+
+def atomic_iterations(args: argparse.Namespace, threads: int) -> int:
+    return max(args.atomic_iterations, args.atomic_total_iterations // threads)
 
 
 def planned_pair_specs(
@@ -258,6 +266,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cancel-iterations", type=int, default=224_000_000)
     parser.add_argument("--hot-iterations", type=int, default=128_000_000)
     parser.add_argument("--atomic-iterations", type=int, default=64_000_000)
+    parser.add_argument("--atomic-total-iterations", type=int, default=256_000_000)
     parser.add_argument("--wait-iterations", type=int, default=512_000)
     parser.add_argument("--spawn-iterations", type=int, default=3_000)
     parser.add_argument("--timeout", type=float, default=60.0)
@@ -300,6 +309,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "cancel_iterations",
         "hot_iterations",
         "atomic_iterations",
+        "atomic_total_iterations",
         "wait_iterations",
         "spawn_iterations",
     ):
@@ -1734,6 +1744,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "cancel-hot": args.cancel_iterations,
             "hot": args.hot_iterations,
             "atomic": args.atomic_iterations,
+            "atomic-total": args.atomic_total_iterations,
             "wait-notify": args.wait_iterations,
             "spawn-join": args.spawn_iterations,
         },

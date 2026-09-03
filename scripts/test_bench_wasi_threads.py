@@ -277,9 +277,23 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual((args.warmups, args.samples), (1, 3))
         self.assertEqual(args.single_iterations, 224_000_000)
         self.assertEqual(args.cancel_iterations, 224_000_000)
+        self.assertEqual(args.atomic_total_iterations, 256_000_000)
         self.assertEqual(
             [bench.cancel_iterations(args, threads) for threads in (1, 2, 4, 8)],
             [224_000_000, 128_000_000, 128_000_000, 128_000_000],
+        )
+        self.assertEqual(
+            [bench.atomic_iterations(args, threads) for threads in (1, 2, 4, 8)],
+            [256_000_000, 128_000_000, 64_000_000, 64_000_000],
+        )
+        atomic_scenarios = {
+            scenario.threads: scenario.iterations
+            for scenario in bench.planned_scenarios(args)
+            if scenario.workload == "atomic"
+        }
+        self.assertEqual(
+            atomic_scenarios,
+            {1: 256_000_000, 4: 64_000_000, 8: 64_000_000},
         )
         self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["smoke"], 8)
         self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"], 64)

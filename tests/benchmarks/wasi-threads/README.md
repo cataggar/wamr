@@ -59,10 +59,13 @@ The report retains raw guest time, corrected guest time, overhead and overhead
 ppm, plus host wall time as a watchdog/lifecycle diagnostic. Throughput uses
 only corrected guest time. Default inputs target at least hundreds of
 milliseconds per sample: 128 million hot-loop iterations per worker, 64
-million atomic RMWs per worker, 64,000 total wait/notify hand-offs divided
-evenly across the selected workers, and 3,000 spawn/join rounds. Keeping the
-wait/notify operation total fixed avoids turning its intentionally serialized
-controller/worker protocol into a multi-minute sample at higher thread counts.
+million atomic RMWs per worker with a 256 million aggregate floor, 512,000
+total wait/notify hand-offs divided evenly across the selected workers, and
+3,000 spawn/join rounds. The aggregate atomic floor lengthens the low-thread
+cells that are most exposed to hosted scheduling while retaining the existing
+per-worker floor for 4/8-thread scaling. Keeping the wait/notify operation
+total fixed avoids turning its intentionally serialized controller/worker
+protocol into a multi-minute sample at higher thread counts.
 
 ## Rebuild the fixtures
 
@@ -121,7 +124,8 @@ python3 scripts/bench_wasi_threads.py \
   --profile smoke --samples 1 --warmups 0 \
   --modes aot --thread-counts 1 \
   --single-iterations 100000 --hot-iterations 100000 \
-  --atomic-iterations 10000 --wait-iterations 10 --spawn-iterations 1 \
+  --atomic-iterations 10000 --atomic-total-iterations 10000 \
+  --wait-iterations 10 --spawn-iterations 1 \
   --min-interval-ms 1 \
   --target aarch64-linux-musl --aot-target aarch64 \
   --runner qemu-aarch64 \
