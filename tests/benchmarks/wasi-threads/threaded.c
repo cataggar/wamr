@@ -341,7 +341,7 @@ static int measure_barrier_overhead(
             controller_failure_code = 150;
             return -1;
         }
-        if (end <= start) {
+        if (end < start) {
             controller_failure_code = 151;
             return -1;
         }
