@@ -1204,15 +1204,21 @@ pub fn aotThrowUncaught(vmctx: *VmCtx, tag_inst: *types.TagInstance) callconv(.c
 
 // ── Futex helpers for atomic.wait / atomic.notify ────────────────────
 
+fn currentThreadContext(
+    vmctx: *VmCtx,
+) ?*execution_context.ThreadExecutionContext {
+    if (execution_context.current()) |context| return context;
+    if (vmctx.thread_context == 0) return null;
+    return @ptrFromInt(vmctx.thread_context);
+}
+
 /// True once the calling thread's group claimed a terminal outcome.
 ///
 /// AOT-compiled code has no interpreter-style poll, so every interruptible
 /// host blocking point consults this before and after it parks.
 pub fn threadGroupTerminating(vmctx: *VmCtx) bool {
     if (comptime !config.lib_wasi_threads) return false;
-    if (vmctx.thread_context == 0) return false;
-    const thread_context_ptr: *execution_context.ThreadExecutionContext =
-        @ptrFromInt(vmctx.thread_context);
+    const thread_context_ptr = currentThreadContext(vmctx) orelse return false;
     const manager = thread_context_ptr.threadGroup(thread_manager.ThreadManager) orelse
         return false;
     return manager.isTerminatingForContext(thread_context_ptr);
@@ -1222,9 +1228,7 @@ fn threadCancellation(
     vmctx: *VmCtx,
 ) ?parking_lot.CancellationEpoch.Ticket {
     if (comptime !config.lib_wasi_threads) return null;
-    if (vmctx.thread_context == 0) return null;
-    const thread_context_ptr: *execution_context.ThreadExecutionContext =
-        @ptrFromInt(vmctx.thread_context);
+    const thread_context_ptr = currentThreadContext(vmctx) orelse return null;
     const manager = thread_context_ptr.threadGroup(thread_manager.ThreadManager) orelse
         return null;
     return manager.cancellationForContext(thread_context_ptr);
@@ -1236,9 +1240,7 @@ fn threadCancellation(
 pub fn terminateAotThread(vmctx: *VmCtx) noreturn {
     var fallback: u8 = 1;
     if (comptime config.lib_wasi_threads) {
-        if (vmctx.thread_context != 0) {
-            const thread_context_ptr: *execution_context.ThreadExecutionContext =
-                @ptrFromInt(vmctx.thread_context);
+        if (currentThreadContext(vmctx)) |thread_context_ptr| {
             if (thread_context_ptr.backendContext(AotCallState)) |call_state|
                 call_state.cancel_unwind.store(true, .release);
             if (thread_context_ptr.threadGroup(thread_manager.ThreadManager)) |manager| {
@@ -2826,6 +2828,45 @@ test "AOT thread task cancellation targets only matching VmCtx subscribers" {
     );
     try std.testing.expect(!manager.isTaskCancelledForContext(&second_context));
     try std.testing.expect(terminal.outcome() == null);
+}
+
+test "AOT futex helpers use the calling thread context" {
+    if (!config.lib_wasi_threads or @import("builtin").single_threaded)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var terminal = termination.State{};
+    var manager = thread_manager.ThreadManager.init(allocator);
+    defer manager.deinit();
+    try manager.bindTermination(&terminal);
+
+    var first_context = execution_context.ThreadExecutionContext{};
+    first_context.setThreadGroup(@ptrCast(&manager));
+    const first_source = try task_cancellation.Source.create(allocator);
+    defer first_source.release();
+    var first_group = try manager.bindTaskGroup(&first_context, first_source);
+    defer first_group.deinit();
+
+    var second_context = execution_context.ThreadExecutionContext{};
+    second_context.setThreadGroup(@ptrCast(&manager));
+    const second_source = try task_cancellation.Source.create(allocator);
+    defer second_source.release();
+    var second_group = try manager.bindTaskGroup(&second_context, second_source);
+    defer second_group.deinit();
+
+    var vmctx = VmCtx{};
+    vmctx.thread_context = @intFromPtr(&first_context);
+    first_source.cancel();
+    try std.testing.expect(threadGroupTerminating(&vmctx));
+
+    var active = second_context.enter();
+    defer active.deinit();
+    try std.testing.expect(!threadGroupTerminating(&vmctx));
+    const ticket = threadCancellation(&vmctx) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expect(!ticket.isCancelled());
+    second_source.cancel();
+    try std.testing.expect(threadGroupTerminating(&vmctx));
+    try std.testing.expect(ticket.isCancelled());
 }
 
 test "AOT thread cancellation scope restores outer identity and recomputes state" {
