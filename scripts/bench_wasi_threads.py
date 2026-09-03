@@ -78,7 +78,7 @@ FIXTURES = {
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "c84e43f78ee333f67e510a70d9ba6df6ddddb88e239ff17f303bf1a23223a5d8",
+        "sha256": "f8c995e39b023176ddaed9976543a1514a977eed6cfb3c19a7d8ad32caf9a79c",
     },
 }
 MASK64 = (1 << 64) - 1
@@ -766,6 +766,8 @@ def classify_guest_failure(stderr: str, workload: str) -> str:
         return "atomic-wait-cancelled"
     if "outcome=closed" in stderr:
         return "atomic-wait-closed"
+    if "controller barrier failed:" in stderr:
+        return "controller-barrier-failure"
     if "failed: 13" in stderr:
         return "barrier-value-mismatch"
     if "failed: 12" in stderr:

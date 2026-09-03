@@ -469,6 +469,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "worker[0] failed: 12": "atomic-wait-invalid-result",
             "worker[0] failed: 11": "atomic-wait-unexpected-timeout",
             "worker[0] failed: 10": "barrier-peer-abort",
+            "controller barrier failed: 141": "controller-barrier-failure",
         }
         for stderr, expected in cases.items():
             with self.subTest(stderr=stderr):

@@ -36,6 +36,7 @@ static _Atomic int32_t completed_count;
 static _Atomic int32_t phase;
 static _Atomic int32_t gates[MAX_THREADS];
 static _Atomic int32_t acknowledgements[MAX_THREADS];
+static int controller_failure_code;
 
 enum wait_failure {
     WAIT_OK = 0,
@@ -111,12 +112,13 @@ static void notify_all(_Atomic int32_t *address) {
 static int wait_for_count(
     _Atomic int32_t *address, int32_t expected) {
     while (1) {
-        if (load_i32(&worker_failed) != 0) return -1;
+        if (load_i32(&worker_failed) != 0) return WAIT_ABORTED;
         int32_t current = load_i32(address);
-        if (current >= expected) return 0;
+        if (current >= expected) return WAIT_OK;
         int result = __builtin_wasm_memory_atomic_wait32(
             wait_address(address), current, INT64_C(-1));
-        if (result != 0 && result != 1) return -1;
+        if (result == 2) return WAIT_TIMED_OUT;
+        if (result != 0 && result != 1) return WAIT_INVALID_RESULT;
     }
 }
 
@@ -296,6 +298,7 @@ static void reset_timed_state(void) {
     store_i32(&phase, 0);
     store_i32(&abort_requested, 0);
     store_i32(&worker_failed, 0);
+    controller_failure_code = 0;
 }
 
 static void abort_workers(uint32_t threads) {
@@ -313,17 +316,33 @@ static void abort_workers(uint32_t threads) {
 
 static int measure_barrier_overhead(
     uint32_t threads, uint64_t *minimum) {
-    if (wait_for_count(&ready_count, threads) != 0) return -1;
+    int wait_result = wait_for_count(&ready_count, threads);
+    if (wait_result != WAIT_OK) {
+        controller_failure_code = 100 + wait_result;
+        return -1;
+    }
     *minimum = UINT64_MAX;
     for (int32_t epoch = 1; epoch <= CALIBRATION_EPOCHS; ++epoch) {
         store_i32(&completed_count, 0);
         uint64_t start = 0;
         uint64_t end = 0;
-        if (bench_now_ns(&start) != 0) return -1;
+        if (bench_now_ns(&start) != 0) {
+            controller_failure_code = 120;
+            return -1;
+        }
         store_i32(&phase, epoch);
         notify_all(&phase);
-        if (wait_for_count(&completed_count, threads) != 0 ||
-            bench_now_ns(&end) != 0 || end <= start) {
+        wait_result = wait_for_count(&completed_count, threads);
+        if (wait_result != WAIT_OK) {
+            controller_failure_code = 130 + wait_result;
+            return -1;
+        }
+        if (bench_now_ns(&end) != 0) {
+            controller_failure_code = 150;
+            return -1;
+        }
+        if (end <= start) {
+            controller_failure_code = 151;
             return -1;
         }
         uint64_t elapsed = end - start;
@@ -334,7 +353,10 @@ static int measure_barrier_overhead(
 
 static int begin_work(uint64_t *start) {
     store_i32(&completed_count, 0);
-    if (bench_now_ns(start) != 0) return -1;
+    if (bench_now_ns(start) != 0) {
+        controller_failure_code = 200;
+        return -1;
+    }
     store_i32(&phase, WORK_EPOCH);
     notify_all(&phase);
     return 0;
@@ -346,11 +368,20 @@ static int finish_work(
     uint64_t overhead,
     struct bench_timing *timing) {
     uint64_t end = 0;
-    if (wait_for_count(&completed_count, threads) != 0 ||
-        bench_now_ns(&end) != 0) {
+    int wait_result = wait_for_count(&completed_count, threads);
+    if (wait_result != WAIT_OK) {
+        controller_failure_code = 210 + wait_result;
         return -1;
     }
-    return bench_finish_timing(start, end, overhead, timing);
+    if (bench_now_ns(&end) != 0) {
+        controller_failure_code = 230;
+        return -1;
+    }
+    if (bench_finish_timing(start, end, overhead, timing) != 0) {
+        controller_failure_code = 231;
+        return -1;
+    }
+    return 0;
 }
 
 static int run_timed_workers(
@@ -376,6 +407,9 @@ static int run_timed_workers(
         finish_work(threads, start, overhead, timing) != 0;
     if (failed) abort_workers(started);
     if (join_workers(started, tids, args) != 0) failed = 1;
+    if (failed && controller_failure_code != 0)
+        fprintf(stderr, "controller barrier failed: %d\n",
+                controller_failure_code);
     return failed ? -1 : 0;
 }
 
@@ -414,9 +448,15 @@ static int run_wait_notify(
         for (uint32_t i = 0; i < threads; ++i) {
             store_i32(&gates[i], epoch);
             notify_all(&gates[i]);
-            if (wait_while_equal(
-                    &acknowledgements[i], epoch - 1) != 0 ||
-                load_i32(&acknowledgements[i]) != epoch) {
+            int wait_result = wait_while_equal(
+                &acknowledgements[i], epoch - 1);
+            if (wait_result != WAIT_OK) {
+                controller_failure_code = 300 + wait_result;
+                failed = 1;
+                break;
+            }
+            if (load_i32(&acknowledgements[i]) != epoch) {
+                controller_failure_code = 313;
                 failed = 1;
                 break;
             }
@@ -428,7 +468,12 @@ static int run_wait_notify(
     }
     if (failed) abort_workers(started);
     if (join_workers(started, tids, args) != 0) failed = 1;
-    if (failed) return -1;
+    if (failed) {
+        if (controller_failure_code != 0)
+            fprintf(stderr, "controller barrier failed: %d\n",
+                    controller_failure_code);
+        return -1;
+    }
     *checksum = sum_results(threads, args);
     return 0;
 }
