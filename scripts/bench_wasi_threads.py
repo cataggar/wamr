@@ -47,6 +47,10 @@ PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "smoke": (1, 3),
 }
+ATOMIC_WAIT_PREFLIGHT_RUNS = {
+    "authoritative": 64,
+    "smoke": 8,
+}
 MIN_TIMED_INTERVAL_MS = 100.0
 AOT_VERSION = 11
 # Stable fast-path signatures emitted by emitCancelPoint in each backend.
@@ -74,7 +78,7 @@ FIXTURES = {
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "3905e4d35da45fd7b60abde10388dc23b276439eb6f4c67e844fff05d76c5474",
+        "sha256": "c84e43f78ee333f67e510a70d9ba6df6ddddb88e239ff17f303bf1a23223a5d8",
     },
 }
 MASK64 = (1 << 64) - 1
@@ -125,6 +129,10 @@ def planned_scenarios(args: argparse.Namespace) -> list[Scenario]:
         )
         for threads in args.thread_counts
     ]
+
+
+def cancel_iterations(args: argparse.Namespace, threads: int) -> int:
+    return max(args.hot_iterations, args.cancel_iterations // threads)
 
 
 def planned_pair_specs(
@@ -246,7 +254,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--samples", type=int)
     parser.add_argument("--modes", choices=("both", "interpreter", "aot"), default="both")
     parser.add_argument("--thread-counts", type=parse_thread_counts, default=(1, 2, 4, 8))
-    parser.add_argument("--single-iterations", type=int, default=128_000_000)
+    parser.add_argument("--single-iterations", type=int, default=224_000_000)
+    parser.add_argument("--cancel-iterations", type=int, default=224_000_000)
     parser.add_argument("--hot-iterations", type=int, default=128_000_000)
     parser.add_argument("--atomic-iterations", type=int, default=64_000_000)
     parser.add_argument("--wait-iterations", type=int, default=512_000)
@@ -288,6 +297,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--warmups must be >= 0 and --samples must be > 0")
     for name in (
         "single_iterations",
+        "cancel_iterations",
         "hot_iterations",
         "atomic_iterations",
         "wait_iterations",
@@ -747,6 +757,26 @@ def run_process(command: list[str], cwd: Path, timeout: float) -> tuple[int, str
         ) from exc
 
 
+def classify_guest_failure(stderr: str, workload: str) -> str:
+    if "outcome=backend-error" in stderr:
+        return "atomic-wait-backend-error"
+    if "outcome=unexpected-timeout" in stderr or "failed: 11" in stderr:
+        return "atomic-wait-unexpected-timeout"
+    if "outcome=cancelled" in stderr:
+        return "atomic-wait-cancelled"
+    if "outcome=closed" in stderr:
+        return "atomic-wait-closed"
+    if "failed: 13" in stderr:
+        return "barrier-value-mismatch"
+    if "failed: 12" in stderr:
+        return "atomic-wait-invalid-result"
+    if "failed: 10" in stderr:
+        return "barrier-peer-abort"
+    if "worker[" in stderr and "failed:" in stderr:
+        return "barrier-unclassified-worker-failure"
+    return f"{workload}-guest-failure"
+
+
 def measure_once(
     *,
     repo: Path,
@@ -767,11 +797,25 @@ def measure_once(
     )
     command = [*runner, str(build.wamr), "run", str(module), *guest_args]
     started = time.perf_counter_ns()
-    returncode, stdout, stderr = run_process(command, repo, timeout)
+    try:
+        returncode, stdout, stderr = run_process(command, repo, timeout)
+    except HarnessError as exc:
+        if "command timed out" not in str(exc):
+            raise
+        classification = (
+            "notification-loss"
+            if workload == "wait-notify"
+            else "guest-watchdog-timeout"
+        )
+        raise HarnessError(
+            f"guest failure classification={classification}: {exc}"
+        ) from exc
     host_wall_elapsed_ns = time.perf_counter_ns() - started
     if returncode != 0:
+        classification = classify_guest_failure(stderr, workload)
         raise HarnessError(
-            f"guest failed with exit {returncode}: {' '.join(command)}\n{stderr}"
+            f"guest failure classification={classification}; "
+            f"exit {returncode}: {' '.join(command)}\n{stderr}"
         )
     expected = expected_result(workload, threads, iterations)
     guest = parse_guest_result(stdout, expected, min_interval_ns)
@@ -1449,6 +1493,39 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     single_wasm = repo / FIXTURES["single"]["path"]
     threaded_wasm = repo / FIXTURES["threaded"]["path"]
 
+    if "aot" in modes:
+        for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile]):
+            measure_once(
+                repo=repo,
+                runner=runner,
+                build=builds["enabled-aot"],
+                module=aot_artifacts["threaded-polls-on"],
+                workload="atomic",
+                threads=1,
+                iterations=1_000_000,
+                timeout=args.timeout,
+                min_interval_ns=1,
+                record_fields={
+                    "pair_kind": "atomic-wait-preflight",
+                    "pair_key": "atomic-wait-preflight",
+                    "pair_index": index,
+                    "phase": "preflight",
+                    "order": 0,
+                    "condition": "aot",
+                    "pair_left": "aot",
+                    "pair_right": "aot",
+                    "mode": "aot",
+                    "threads_enabled": True,
+                    "cancel_points": "on",
+                    "static_cancel_poll_sites": (
+                        aot_artifacts_metadata["cancel_poll_static"]["sites_enabled"]
+                    ),
+                    "workload": "atomic",
+                    "threads": 1,
+                    "iterations": 1_000_000,
+                },
+            )
+
     for mode in modes:
         disabled = builds[f"disabled-{mode}"]
         enabled = builds[f"enabled-{mode}"]
@@ -1596,7 +1673,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     if "aot" in modes:
         aot_build = builds["enabled-aot"]
         for threads in args.thread_counts:
-            scenario = Scenario("hot", threads, args.hot_iterations)
+            scenario = Scenario("hot", threads, cancel_iterations(args, threads))
 
             def poll_measure(
                 condition: str, fields: dict[str, Any]
@@ -1610,7 +1687,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     module=module,
                     workload="hot",
                     threads=threads,
-                    iterations=args.hot_iterations,
+                    iterations=scenario.iterations,
                     timeout=args.timeout,
                     min_interval_ns=minimum_interval_ns,
                     record_fields={
@@ -1627,7 +1704,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "workload": "hot",
                         "threads": threads,
-                        "iterations": args.hot_iterations,
+                        "iterations": scenario.iterations,
                     },
                 )
 
@@ -1652,6 +1729,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "thread_counts": list(args.thread_counts),
         "iterations": {
             "single-hot": args.single_iterations,
+            "cancel-hot": args.cancel_iterations,
             "hot": args.hot_iterations,
             "atomic": args.atomic_iterations,
             "wait-notify": args.wait_iterations,
@@ -1659,6 +1737,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         },
         "timeout_seconds": args.timeout,
         "minimum_timed_interval_ns": minimum_interval_ns,
+        "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
         "optimize": args.optimize,
         "pairs": pair_plan,
     }

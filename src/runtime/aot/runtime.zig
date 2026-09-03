@@ -1273,12 +1273,31 @@ pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32,
         error.InvalidArgument,
         error.Unsupported,
         error.SystemFailure,
-        => return 2,
+        => {
+            std.debug.print(
+                "wamr-aot-atomic-wait32 outcome=backend-error detail={s} timeout_ns={d}\n",
+                .{ @errorName(err), timeout_ns },
+            );
+            return 2;
+        },
     };
     return switch (result) {
-        .notified, .not_equal, .timed_out => @intCast(@intFromEnum(result)),
-        .cancelled, .closed => {
+        .notified, .not_equal => @intCast(@intFromEnum(result)),
+        .timed_out => timed_out: {
+            if (timeout_ns < 0) {
+                std.debug.print(
+                    "wamr-aot-atomic-wait32 outcome=unexpected-timeout timeout_ns={d}\n",
+                    .{timeout_ns},
+                );
+            }
+            break :timed_out @intCast(@intFromEnum(result));
+        },
+        .cancelled, .closed => |outcome| {
             if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
+            std.debug.print(
+                "wamr-aot-atomic-wait32 outcome={s} terminating=false timeout_ns={d}\n",
+                .{ @tagName(outcome), timeout_ns },
+            );
             return 2;
         },
     };
@@ -1303,12 +1322,31 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
         error.InvalidArgument,
         error.Unsupported,
         error.SystemFailure,
-        => return 2,
+        => {
+            std.debug.print(
+                "wamr-aot-atomic-wait64 outcome=backend-error detail={s} timeout_ns={d}\n",
+                .{ @errorName(err), timeout_ns },
+            );
+            return 2;
+        },
     };
     return switch (result) {
-        .notified, .not_equal, .timed_out => @intCast(@intFromEnum(result)),
-        .cancelled, .closed => {
+        .notified, .not_equal => @intCast(@intFromEnum(result)),
+        .timed_out => timed_out: {
+            if (timeout_ns < 0) {
+                std.debug.print(
+                    "wamr-aot-atomic-wait64 outcome=unexpected-timeout timeout_ns={d}\n",
+                    .{timeout_ns},
+                );
+            }
+            break :timed_out @intCast(@intFromEnum(result));
+        },
+        .cancelled, .closed => |outcome| {
             if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
+            std.debug.print(
+                "wamr-aot-atomic-wait64 outcome={s} terminating=false timeout_ns={d}\n",
+                .{ @tagName(outcome), timeout_ns },
+            );
             return 2;
         },
     };

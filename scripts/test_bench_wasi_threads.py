@@ -275,6 +275,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
             ]
         )
         self.assertEqual((args.warmups, args.samples), (1, 3))
+        self.assertEqual(args.single_iterations, 224_000_000)
+        self.assertEqual(args.cancel_iterations, 224_000_000)
+        self.assertEqual(
+            [bench.cancel_iterations(args, threads) for threads in (1, 2, 4, 8)],
+            [224_000_000, 128_000_000, 128_000_000, 128_000_000],
+        )
+        self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["smoke"], 8)
+        self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"], 64)
         self.assertEqual(args.thread_counts, (1, 4, 8))
         self.assertEqual(args.modes, "aot")
         self.assertEqual(args.min_interval_ms, 100)
@@ -446,6 +454,28 @@ class ThreadBenchmarkTests(unittest.TestCase):
             [sys.executable, str(failure)], ROOT, 5
         )
         self.assertEqual(returncode, 7)
+
+    def test_guest_failure_classification_is_specific(self) -> None:
+        cases = {
+            "wamr-aot-atomic-wait32 outcome=backend-error detail=SystemFailure": (
+                "atomic-wait-backend-error"
+            ),
+            "wamr-aot-atomic-wait32 outcome=unexpected-timeout": (
+                "atomic-wait-unexpected-timeout"
+            ),
+            "wamr-aot-atomic-wait32 outcome=cancelled": "atomic-wait-cancelled",
+            "wamr-aot-atomic-wait32 outcome=closed": "atomic-wait-closed",
+            "worker[0] failed: 13": "barrier-value-mismatch",
+            "worker[0] failed: 12": "atomic-wait-invalid-result",
+            "worker[0] failed: 11": "atomic-wait-unexpected-timeout",
+            "worker[0] failed: 10": "barrier-peer-abort",
+        }
+        for stderr, expected in cases.items():
+            with self.subTest(stderr=stderr):
+                self.assertEqual(
+                    bench.classify_guest_failure(stderr, "atomic"),
+                    expected,
+                )
 
     def test_cache_key_is_canonical_and_configuration_sensitive(self) -> None:
         left = {"target": "native", "threads": True, "mode": "aot"}
