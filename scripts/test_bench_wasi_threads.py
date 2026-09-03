@@ -277,6 +277,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual((args.warmups, args.samples), (1, 3))
         self.assertEqual(args.single_iterations, 224_000_000)
         self.assertEqual(args.cancel_iterations, 224_000_000)
+        self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["smoke"], 8)
+        self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"], 64)
         self.assertEqual(args.thread_counts, (1, 4, 8))
         self.assertEqual(args.modes, "aot")
         self.assertEqual(args.min_interval_ms, 100)

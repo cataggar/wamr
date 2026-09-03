@@ -47,6 +47,10 @@ PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "smoke": (1, 3),
 }
+ATOMIC_WAIT_PREFLIGHT_RUNS = {
+    "authoritative": 64,
+    "smoke": 8,
+}
 MIN_TIMED_INTERVAL_MS = 100.0
 AOT_VERSION = 11
 # Stable fast-path signatures emitted by emitCancelPoint in each backend.
@@ -1485,6 +1489,39 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     single_wasm = repo / FIXTURES["single"]["path"]
     threaded_wasm = repo / FIXTURES["threaded"]["path"]
 
+    if "aot" in modes:
+        for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile]):
+            measure_once(
+                repo=repo,
+                runner=runner,
+                build=builds["enabled-aot"],
+                module=aot_artifacts["threaded-polls-on"],
+                workload="atomic",
+                threads=1,
+                iterations=1_000_000,
+                timeout=args.timeout,
+                min_interval_ns=1,
+                record_fields={
+                    "pair_kind": "atomic-wait-preflight",
+                    "pair_key": "atomic-wait-preflight",
+                    "pair_index": index,
+                    "phase": "preflight",
+                    "order": 0,
+                    "condition": "aot",
+                    "pair_left": "aot",
+                    "pair_right": "aot",
+                    "mode": "aot",
+                    "threads_enabled": True,
+                    "cancel_points": "on",
+                    "static_cancel_poll_sites": (
+                        aot_artifacts_metadata["cancel_poll_static"]["sites_enabled"]
+                    ),
+                    "workload": "atomic",
+                    "threads": 1,
+                    "iterations": 1_000_000,
+                },
+            )
+
     for mode in modes:
         disabled = builds[f"disabled-{mode}"]
         enabled = builds[f"enabled-{mode}"]
@@ -1696,6 +1733,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         },
         "timeout_seconds": args.timeout,
         "minimum_timed_interval_ns": minimum_interval_ns,
+        "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
         "optimize": args.optimize,
         "pairs": pair_plan,
     }
