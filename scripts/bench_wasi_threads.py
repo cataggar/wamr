@@ -74,7 +74,7 @@ FIXTURES = {
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "3905e4d35da45fd7b60abde10388dc23b276439eb6f4c67e844fff05d76c5474",
+        "sha256": "c84e43f78ee333f67e510a70d9ba6df6ddddb88e239ff17f303bf1a23223a5d8",
     },
 }
 MASK64 = (1 << 64) - 1

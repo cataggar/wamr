@@ -1293,11 +1293,11 @@ pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32,
             break :timed_out @intCast(@intFromEnum(result));
         },
         .cancelled, .closed => |outcome| {
-            std.debug.print(
-                "wamr-aot-atomic-wait32 outcome={s} terminating={any} timeout_ns={d}\n",
-                .{ @tagName(outcome), threadGroupTerminating(vmctx), timeout_ns },
-            );
             if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
+            std.debug.print(
+                "wamr-aot-atomic-wait32 outcome={s} terminating=false timeout_ns={d}\n",
+                .{ @tagName(outcome), timeout_ns },
+            );
             return 2;
         },
     };
@@ -1342,11 +1342,11 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
             break :timed_out @intCast(@intFromEnum(result));
         },
         .cancelled, .closed => |outcome| {
-            std.debug.print(
-                "wamr-aot-atomic-wait64 outcome={s} terminating={any} timeout_ns={d}\n",
-                .{ @tagName(outcome), threadGroupTerminating(vmctx), timeout_ns },
-            );
             if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
+            std.debug.print(
+                "wamr-aot-atomic-wait64 outcome={s} terminating=false timeout_ns={d}\n",
+                .{ @tagName(outcome), timeout_ns },
+            );
             return 2;
         },
     };
