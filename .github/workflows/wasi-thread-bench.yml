@@ -129,6 +129,15 @@ jobs:
             --no-budget
           cat wasi-thread-bench-out/report.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload regenerated diagnostic fixture
+        if: always() && matrix.platform == 'ubuntu-22.04-x86_64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostic-threaded-wasm
+          path: tests/benchmarks/wasi-threads/threaded.wasm
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Upload retained report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

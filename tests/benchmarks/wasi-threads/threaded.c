@@ -36,6 +36,14 @@ static _Atomic int32_t completed_count;
 static _Atomic int32_t phase;
 static _Atomic int32_t gates[MAX_THREADS];
 static _Atomic int32_t acknowledgements[MAX_THREADS];
+
+enum wait_failure {
+    WAIT_OK = 0,
+    WAIT_ABORTED = 10,
+    WAIT_TIMED_OUT = 11,
+    WAIT_INVALID_RESULT = 12,
+    WAIT_VALUE_MISMATCH = 13,
+};
 static _Atomic int32_t abort_requested;
 static _Atomic int32_t worker_failed;
 static alignas(16) unsigned char
@@ -81,17 +89,18 @@ static int wait_while_equal(
     while (load_i32(address) == expected) {
         if (load_i32(&abort_requested) != 0 ||
             load_i32(&worker_failed) != 0) {
-            return -1;
+            return WAIT_ABORTED;
         }
         int result = __builtin_wasm_memory_atomic_wait32(
             wait_address(address), expected, INT64_C(-1));
-        if (result != 0 && result != 1) return -1;
+        if (result == 2) return WAIT_TIMED_OUT;
+        if (result != 0 && result != 1) return WAIT_INVALID_RESULT;
     }
     if (load_i32(&abort_requested) != 0 ||
         load_i32(&worker_failed) != 0) {
-        return -1;
+        return WAIT_ABORTED;
     }
-    return 0;
+    return WAIT_OK;
 }
 
 static void notify_all(_Atomic int32_t *address) {
@@ -119,17 +128,16 @@ static void signal_count(_Atomic int32_t *address) {
 static int worker_barrier_prelude(void) {
     signal_count(&ready_count);
     for (int32_t epoch = 1; epoch <= CALIBRATION_EPOCHS; ++epoch) {
-        if (wait_while_equal(&phase, epoch - 1) != 0 ||
-            load_i32(&abort_requested) != 0) {
-            return -1;
-        }
+        int wait_result = wait_while_equal(&phase, epoch - 1);
+        if (wait_result != WAIT_OK) return wait_result;
+        if (load_i32(&phase) != epoch) return WAIT_VALUE_MISMATCH;
         signal_count(&completed_count);
     }
-    if (wait_while_equal(&phase, CALIBRATION_EPOCHS) != 0 ||
-        load_i32(&abort_requested) != 0) {
-        return -1;
-    }
-    return 0;
+    int wait_result = wait_while_equal(&phase, CALIBRATION_EPOCHS);
+    if (wait_result != WAIT_OK) return wait_result;
+    return load_i32(&phase) == WORK_EPOCH
+        ? WAIT_OK
+        : WAIT_VALUE_MISMATCH;
 }
 
 static void worker_complete(struct worker_arg *arg) {
@@ -150,8 +158,9 @@ static void *hot_worker(void *opaque) {
     uint64_t warmup_iterations = arg->iterations / 64;
     if (warmup_iterations < 1024) warmup_iterations = 1024;
     (void)bench_hot_kernel(bench_seed(arg->index), warmup_iterations);
-    if (worker_barrier_prelude() != 0) {
-        arg->error = 1;
+    int barrier_result = worker_barrier_prelude();
+    if (barrier_result != WAIT_OK) {
+        arg->error = barrier_result;
         worker_complete(arg);
         return NULL;
     }
@@ -168,8 +177,9 @@ static void *atomic_worker(void *opaque) {
     if (warmup_iterations < 1024) warmup_iterations = 1024;
     for (uint64_t i = 0; i < warmup_iterations; ++i)
         atomic_fetch_add_explicit(&warmup, 1, memory_order_relaxed);
-    if (worker_barrier_prelude() != 0) {
-        arg->error = 1;
+    int barrier_result = worker_barrier_prelude();
+    if (barrier_result != WAIT_OK) {
+        arg->error = barrier_result;
         worker_complete(arg);
         return NULL;
     }
@@ -183,18 +193,20 @@ static void *atomic_worker(void *opaque) {
 
 static void *wait_notify_worker(void *opaque) {
     struct worker_arg *arg = opaque;
-    if (worker_barrier_prelude() != 0) {
-        arg->error = 1;
+    int barrier_result = worker_barrier_prelude();
+    if (barrier_result != WAIT_OK) {
+        arg->error = barrier_result;
         worker_complete(arg);
         return NULL;
     }
     _Atomic int32_t *gate = &gates[arg->index];
     _Atomic int32_t *ack = &acknowledgements[arg->index];
     for (int32_t epoch = 1; epoch <= (int32_t)arg->iterations; ++epoch) {
-        if (wait_while_equal(gate, epoch - 1) != 0 ||
-            load_i32(&abort_requested) != 0 ||
-            load_i32(gate) != epoch) {
-            arg->error = 1;
+        int wait_result = wait_while_equal(gate, epoch - 1);
+        if (wait_result != WAIT_OK || load_i32(gate) != epoch) {
+            arg->error = wait_result != WAIT_OK
+                ? wait_result
+                : WAIT_VALUE_MISMATCH;
             worker_complete(arg);
             return NULL;
         }

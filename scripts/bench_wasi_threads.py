@@ -747,6 +747,26 @@ def run_process(command: list[str], cwd: Path, timeout: float) -> tuple[int, str
         ) from exc
 
 
+def classify_guest_failure(stderr: str, workload: str) -> str:
+    if "outcome=backend-error" in stderr:
+        return "atomic-wait-backend-error"
+    if "outcome=unexpected-timeout" in stderr or "failed: 11" in stderr:
+        return "atomic-wait-unexpected-timeout"
+    if "outcome=cancelled" in stderr:
+        return "atomic-wait-cancelled"
+    if "outcome=closed" in stderr:
+        return "atomic-wait-closed"
+    if "failed: 13" in stderr:
+        return "barrier-value-mismatch"
+    if "failed: 12" in stderr:
+        return "atomic-wait-invalid-result"
+    if "failed: 10" in stderr:
+        return "barrier-peer-abort"
+    if "worker[" in stderr and "failed:" in stderr:
+        return "barrier-unclassified-worker-failure"
+    return f"{workload}-guest-failure"
+
+
 def measure_once(
     *,
     repo: Path,
@@ -767,11 +787,25 @@ def measure_once(
     )
     command = [*runner, str(build.wamr), "run", str(module), *guest_args]
     started = time.perf_counter_ns()
-    returncode, stdout, stderr = run_process(command, repo, timeout)
+    try:
+        returncode, stdout, stderr = run_process(command, repo, timeout)
+    except HarnessError as exc:
+        if "command timed out" not in str(exc):
+            raise
+        classification = (
+            "notification-loss"
+            if workload == "wait-notify"
+            else "guest-watchdog-timeout"
+        )
+        raise HarnessError(
+            f"guest failure classification={classification}: {exc}"
+        ) from exc
     host_wall_elapsed_ns = time.perf_counter_ns() - started
     if returncode != 0:
+        classification = classify_guest_failure(stderr, workload)
         raise HarnessError(
-            f"guest failed with exit {returncode}: {' '.join(command)}\n{stderr}"
+            f"guest failure classification={classification}; "
+            f"exit {returncode}: {' '.join(command)}\n{stderr}"
         )
     expected = expected_result(workload, threads, iterations)
     guest = parse_guest_result(stdout, expected, min_interval_ns)
