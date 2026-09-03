@@ -131,6 +131,10 @@ def planned_scenarios(args: argparse.Namespace) -> list[Scenario]:
     ]
 
 
+def cancel_iterations(args: argparse.Namespace, threads: int) -> int:
+    return max(args.hot_iterations, args.cancel_iterations // threads)
+
+
 def planned_pair_specs(
     args: argparse.Namespace,
     modes: tuple[str, ...],
@@ -1669,7 +1673,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     if "aot" in modes:
         aot_build = builds["enabled-aot"]
         for threads in args.thread_counts:
-            scenario = Scenario("hot", threads, args.cancel_iterations)
+            scenario = Scenario("hot", threads, cancel_iterations(args, threads))
 
             def poll_measure(
                 condition: str, fields: dict[str, Any]
@@ -1683,7 +1687,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     module=module,
                     workload="hot",
                     threads=threads,
-                    iterations=args.cancel_iterations,
+                    iterations=scenario.iterations,
                     timeout=args.timeout,
                     min_interval_ns=minimum_interval_ns,
                     record_fields={
@@ -1700,7 +1704,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "workload": "hot",
                         "threads": threads,
-                        "iterations": args.cancel_iterations,
+                        "iterations": scenario.iterations,
                     },
                 )
 
