@@ -766,6 +766,8 @@ def classify_guest_failure(stderr: str, workload: str) -> str:
         return "atomic-wait-cancelled"
     if "outcome=closed" in stderr:
         return "atomic-wait-closed"
+    if "controller barrier failed:" in stderr:
+        return "controller-barrier-failure"
     if "failed: 13" in stderr:
         return "barrier-value-mismatch"
     if "failed: 12" in stderr:
