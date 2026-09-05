@@ -118,6 +118,14 @@ pub const Source = struct {
             return self.source != null;
         }
 
+        /// Whether this ticket owns the source's only remaining reference.
+        /// A task owner, clone, wake registration, or registered task group
+        /// keeps the result false until its lifetime has ended.
+        pub fn isSoleOwner(self: *const Ticket) Error!bool {
+            const source = self.source orelse return error.InactiveTicket;
+            return source.refs.load(.acquire) == 1;
+        }
+
         /// Internal bridge for thread wake registration. Callers must not
         /// retain the returned pointer beyond this ticket's lifetime.
         pub fn sourceForRegistration(self: *const Ticket) Error!*Source {
@@ -262,6 +270,7 @@ test "task cancellation ticket: take transfers one owner and leaves source inert
     try std.testing.expectError(error.InactiveTicket, ticket.clone());
     try std.testing.expectError(error.InactiveTicket, ticket.isCancelled());
     try std.testing.expectError(error.InactiveTicket, ticket.identity());
+    try std.testing.expectError(error.InactiveTicket, ticket.isSoleOwner());
     try std.testing.expectError(
         error.InactiveTicket,
         ticket.sourceForRegistration(),
@@ -292,10 +301,13 @@ test "task cancellation ticket: clone creates an independent reference" {
     var ticket = source.acquire();
     var clone = try ticket.clone();
     try std.testing.expectEqual(@as(u32, 3), source.refs.load(.acquire));
+    try std.testing.expect(!try ticket.isSoleOwner());
 
     source.release();
+    try std.testing.expect(!try ticket.isSoleOwner());
     ticket.deinit();
     try std.testing.expect(clone.isActive());
+    try std.testing.expect(try clone.isSoleOwner());
     clone.deinit();
 }
 
