@@ -11,6 +11,7 @@ const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const executor_mod = @import("executor.zig");
 const indexspace = @import("indexspace.zig");
 const async_mod = @import("async.zig");
+const async_canon = @import("async_canon.zig");
 const core_backend = @import("core_backend.zig");
 const aot_loader = @import("../runtime/aot/loader.zig");
 const aot_runtime = @import("../runtime/aot/runtime.zig");
@@ -18,6 +19,8 @@ const host_trampolines = @import("../runtime/aot/host_trampolines.zig");
 const call_frame_mod = @import("call_frame.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
 const termination = @import("../runtime/common/termination.zig");
+const task_cancellation = @import("../runtime/common/task_cancellation.zig");
+const platform = @import("../platform/platform.zig");
 const CoreFuncIdxLocal = call_frame_mod.CoreFuncIdxLocal;
 const stable_resource = @import("../shared/stable_resource.zig");
 const thread_manager_mod = @import("../wasi/thread_manager.zig");
@@ -403,6 +406,21 @@ pub const WaitableSetTable = stable_resource.StableKeyedHandleTableFor(
     null,
 );
 
+pub const StreamTerminalWrite = struct {
+    owner_key: u64,
+    stream_handle: u32,
+    consumed: bool,
+    stream_retired: bool,
+};
+const StreamTerminalWriteOwner = struct {
+    owner_key: u64,
+    ticket: task_cancellation.Source.Ticket,
+};
+pub const max_stream_terminal_writes: usize = 64;
+pub const max_stream_terminal_writes_per_owner: usize = 4;
+pub const max_stream_terminal_write_bytes: usize =
+    max_stream_terminal_writes * @sizeOf(StreamTerminalWrite);
+
 const ResourceTableRegistry = struct {
     const Mutex = stable_resource.ConditionalMutex(
         stable_resource.LockRank.resource_registry,
@@ -656,6 +674,14 @@ pub const ComponentInstance = struct {
     streams: StreamTable,
     error_contexts: ErrorContextTable,
     waitable_sets: WaitableSetTable,
+    stream_terminal_write_mutex: platform.Mutex = .init,
+    /// Fixed backing storage: 16 bytes/record and 1024 bytes/instance on
+    /// 64-bit targets. No guest-controlled heap allocation survives stream
+    /// retirement.
+    stream_terminal_writes: [max_stream_terminal_writes]StreamTerminalWrite = undefined,
+    stream_terminal_write_count: usize = 0,
+    stream_terminal_write_owners: [max_stream_terminal_writes]StreamTerminalWriteOwner = undefined,
+    stream_terminal_write_owner_count: usize = 0,
     next_async_handle: if (config.lib_wasi_threads)
         std.atomic.Value(u32)
     else
@@ -829,6 +855,249 @@ pub const ComponentInstance = struct {
         const handle = self.next_async_handle;
         self.next_async_handle += 1;
         return handle;
+    }
+
+    pub fn publishStreamTerminalWrite(
+        self: *ComponentInstance,
+        stream_handle: u32,
+        owner_key: u64,
+    ) !void {
+        self.stream_terminal_write_mutex.lock();
+        defer self.stream_terminal_write_mutex.unlock();
+        self.collectStreamTerminalWriteOwnersLocked();
+        var owner_count: usize = 0;
+        for (self.stream_terminal_writes[0..self.stream_terminal_write_count]) |record| {
+            if (record.stream_handle == stream_handle) return;
+            if (record.owner_key == owner_key) owner_count += 1;
+        }
+        if (self.stream_terminal_write_count >= max_stream_terminal_writes) {
+            return error.StreamTerminalQuotaExceeded;
+        }
+        if (owner_count >= max_stream_terminal_writes_per_owner) {
+            return error.StreamTerminalOwnerQuotaExceeded;
+        }
+        self.stream_terminal_writes[self.stream_terminal_write_count] = .{
+            .owner_key = owner_key,
+            .stream_handle = stream_handle,
+            .consumed = false,
+            .stream_retired = false,
+        };
+        self.stream_terminal_write_count += 1;
+    }
+
+    pub fn markStreamTerminalWriteRetired(
+        self: *ComponentInstance,
+        stream_handle: u32,
+    ) void {
+        self.stream_terminal_write_mutex.lock();
+        defer self.stream_terminal_write_mutex.unlock();
+        for (self.stream_terminal_writes[0..self.stream_terminal_write_count], 0..) |*record, index| {
+            if (record.stream_handle != stream_handle) continue;
+            if (!record.consumed) {
+                record.stream_retired = true;
+                return;
+            }
+            const owner_key = record.owner_key;
+            self.removeStreamTerminalWriteAt(index);
+            self.removeRecordlessStreamTerminalWriteOwnerLocked(owner_key);
+            return;
+        }
+    }
+
+    pub fn joinStreamTerminalWrite(
+        self: *ComponentInstance,
+        stream_handle: u32,
+        waitable_set: *async_mod.WaitableSet,
+        allocator: std.mem.Allocator,
+    ) !bool {
+        self.stream_terminal_write_mutex.lock();
+        defer self.stream_terminal_write_mutex.unlock();
+        self.collectStreamTerminalWriteOwnersLocked();
+        var record_index: ?usize = null;
+        for (self.stream_terminal_writes[0..self.stream_terminal_write_count], 0..) |record, index| {
+            if (record.stream_handle == stream_handle) {
+                record_index = index;
+                break;
+            }
+        }
+        const index = record_index orelse return false;
+        const record = &self.stream_terminal_writes[index];
+        if (record.consumed) return true;
+        const idx = try waitable_set.register(.{
+            .kind = .stream_write,
+            .handle = stream_handle,
+        }, allocator);
+        if (!waitable_set.trySetReady(
+            idx,
+            allocator,
+            async_canon.packStatus(.dropped, 0),
+        )) {
+            waitable_set.unregister(idx);
+            return error.OutOfMemory;
+        }
+        record.consumed = true;
+        if (record.stream_retired) {
+            const owner_key = record.owner_key;
+            self.removeStreamTerminalWriteAt(index);
+            self.removeRecordlessStreamTerminalWriteOwnerLocked(owner_key);
+        }
+        return true;
+    }
+
+    fn removeStreamTerminalWriteAt(
+        self: *ComponentInstance,
+        index: usize,
+    ) void {
+        self.stream_terminal_write_count -= 1;
+        self.stream_terminal_writes[index] =
+            self.stream_terminal_writes[self.stream_terminal_write_count];
+    }
+
+    pub fn streamTerminalWriteCount(self: *ComponentInstance) usize {
+        self.stream_terminal_write_mutex.lock();
+        defer self.stream_terminal_write_mutex.unlock();
+        self.collectStreamTerminalWriteOwnersLocked();
+        return self.stream_terminal_write_count;
+    }
+
+    pub fn releaseStreamTerminalWriteOwner(
+        self: *ComponentInstance,
+        owner_key: u64,
+        ticket: *task_cancellation.Source.Ticket,
+    ) void {
+        self.stream_terminal_write_mutex.lock();
+        self.collectStreamTerminalWriteOwnersLocked();
+        const has_records = self.hasStreamTerminalWriteOwnerLocked(owner_key);
+        if (!has_records) {
+            self.stream_terminal_write_mutex.unlock();
+            ticket.deinit();
+            return;
+        }
+        if (!ticket.isActive() or
+            ticket.isSoleOwner() catch unreachable)
+        {
+            _ = self.removeStreamTerminalWritesLocked(owner_key);
+            self.stream_terminal_write_mutex.unlock();
+            ticket.deinit();
+            return;
+        }
+
+        if (self.stream_terminal_write_owner_count >=
+            max_stream_terminal_writes)
+        {
+            @panic("stream terminal owner table invariant violated");
+        }
+        for (self.stream_terminal_write_owners[0..self.stream_terminal_write_owner_count]) |owner| {
+            std.debug.assert(owner.owner_key != owner_key);
+        }
+        const index = self.stream_terminal_write_owner_count;
+        self.stream_terminal_write_owners[index].owner_key = owner_key;
+        self.stream_terminal_write_owners[index].ticket = ticket.take();
+        self.stream_terminal_write_owner_count += 1;
+        self.stream_terminal_write_mutex.unlock();
+    }
+
+    pub fn collectStreamTerminalWriteOwners(
+        self: *ComponentInstance,
+    ) void {
+        self.stream_terminal_write_mutex.lock();
+        defer self.stream_terminal_write_mutex.unlock();
+        self.collectStreamTerminalWriteOwnersLocked();
+    }
+
+    pub fn sweepStreamTerminalWrites(
+        self: *ComponentInstance,
+        owner_key: u64,
+    ) usize {
+        self.stream_terminal_write_mutex.lock();
+        defer self.stream_terminal_write_mutex.unlock();
+        self.collectStreamTerminalWriteOwnersLocked();
+        const removed = self.removeStreamTerminalWritesLocked(owner_key);
+        self.removeRecordlessStreamTerminalWriteOwnerLocked(owner_key);
+        return removed;
+    }
+
+    fn hasStreamTerminalWriteOwnerLocked(
+        self: *ComponentInstance,
+        owner_key: u64,
+    ) bool {
+        for (self.stream_terminal_writes[0..self.stream_terminal_write_count]) |record| {
+            if (record.owner_key == owner_key) return true;
+        }
+        return false;
+    }
+
+    fn removeStreamTerminalWritesLocked(
+        self: *ComponentInstance,
+        owner_key: u64,
+    ) usize {
+        var removed: usize = 0;
+        var index: usize = 0;
+        while (index < self.stream_terminal_write_count) {
+            if (self.stream_terminal_writes[index].owner_key != owner_key) {
+                index += 1;
+                continue;
+            }
+            self.removeStreamTerminalWriteAt(index);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    fn collectStreamTerminalWriteOwnersLocked(
+        self: *ComponentInstance,
+    ) void {
+        var index: usize = 0;
+        while (index < self.stream_terminal_write_owner_count) {
+            const owner = &self.stream_terminal_write_owners[index];
+            if (!self.hasStreamTerminalWriteOwnerLocked(owner.owner_key)) {
+                self.removeStreamTerminalWriteOwnerAt(index);
+                continue;
+            }
+            if (!(owner.ticket.isSoleOwner() catch unreachable)) {
+                index += 1;
+                continue;
+            }
+            _ = self.removeStreamTerminalWritesLocked(owner.owner_key);
+            self.removeStreamTerminalWriteOwnerAt(index);
+        }
+    }
+
+    fn removeRecordlessStreamTerminalWriteOwnerLocked(
+        self: *ComponentInstance,
+        owner_key: u64,
+    ) void {
+        if (self.hasStreamTerminalWriteOwnerLocked(owner_key)) return;
+        for (self.stream_terminal_write_owners[0..self.stream_terminal_write_owner_count], 0..) |owner, index| {
+            if (owner.owner_key != owner_key) continue;
+            self.removeStreamTerminalWriteOwnerAt(index);
+            return;
+        }
+    }
+
+    fn removeStreamTerminalWriteOwnerAt(
+        self: *ComponentInstance,
+        index: usize,
+    ) void {
+        var removed = self.stream_terminal_write_owners[index].ticket.take();
+        self.stream_terminal_write_owner_count -= 1;
+        if (index != self.stream_terminal_write_owner_count) {
+            const last =
+                &self.stream_terminal_write_owners[self.stream_terminal_write_owner_count];
+            self.stream_terminal_write_owners[index].owner_key = last.owner_key;
+            self.stream_terminal_write_owners[index].ticket =
+                last.ticket.take();
+        }
+        removed.deinit();
+    }
+
+    fn deinitStreamTerminalWrites(self: *ComponentInstance) void {
+        while (self.stream_terminal_write_owner_count != 0) {
+            self.removeStreamTerminalWriteOwnerAt(
+                self.stream_terminal_write_owner_count - 1,
+            );
+        }
+        self.stream_terminal_write_count = 0;
     }
 
     pub fn notifyWaitable(
@@ -1327,6 +1596,9 @@ pub const ComponentInstance = struct {
         self.error_contexts = try ErrorContextTable.init(allocator, allocator);
         errdefer self.error_contexts.deinit() catch {};
         self.waitable_sets = try WaitableSetTable.init(allocator, allocator);
+        self.stream_terminal_write_mutex = .init;
+        self.stream_terminal_write_count = 0;
+        self.stream_terminal_write_owner_count = 0;
         self.next_async_handle = if (config.lib_wasi_threads)
             std.atomic.Value(u32).init(1)
         else
@@ -1339,6 +1611,7 @@ pub const ComponentInstance = struct {
         self.streams.deinit() catch @panic("Stream leases outstanding");
         self.error_contexts.deinit() catch @panic("Error-context leases outstanding");
         self.waitable_sets.deinit() catch @panic("Waitable-set leases outstanding");
+        self.deinitStreamTerminalWrites();
     }
 
     /// Test-only: tear down a `TestGuestMem` previously installed via
@@ -2035,6 +2308,7 @@ pub const ComponentInstance = struct {
         self.streams.deinit() catch @panic("Stream leases outstanding");
         self.error_contexts.deinit() catch @panic("Error-context leases outstanding");
         self.waitable_sets.deinit() catch @panic("Waitable-set leases outstanding");
+        self.deinitStreamTerminalWrites();
         for (self.trampoline_ctxs.items) |ctx| {
             ctx.deinit(self.allocator);
             self.allocator.destroy(ctx);

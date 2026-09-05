@@ -4185,15 +4185,28 @@ fn dispatchAsyncCanon(
                 return;
             }
 
+            if (try comp_inst.joinStreamTerminalWrite(
+                waitable_handle,
+                ws,
+                allocator,
+            )) return;
+
             if (comp_inst.streams.acquire(waitable_handle)) |initial_lease| {
                 var stream_lease = initial_lease;
                 defer stream_lease.release();
+                // An acquire can retain the node before retirement unlinks
+                // it, then block on its value mutex while retirement
+                // publishes the terminal record. With the stream mutex held,
+                // retirement cannot publish after this recheck.
+                if (try comp_inst.joinStreamTerminalWrite(
+                    waitable_handle,
+                    ws,
+                    allocator,
+                )) return;
                 const s = stream_lease.value();
                 if (s.read_waitable != null or s.write_waitable != null) return;
                 const kind: async_mod.WaitableSet.WaitableItem.Kind =
-                    if (s.terminal_write_dropped)
-                        .stream_write
-                    else if (s.pending_read != null)
+                    if (s.pending_read != null)
                         .stream_read
                     else
                         .stream_write;
@@ -4212,21 +4225,25 @@ fn dispatchAsyncCanon(
                     break :blk null;
                 } else blk: {
                     s.write_waitable = registration;
-                    if (s.terminal_write_dropped or s.read_closed)
+                    if (s.read_closed)
                         break :blk async_canon.packStatus(.dropped, 0);
                     if (s.write_ready)
                         break :blk async_canon.packStatus(.completed, 0);
                     break :blk null;
                 };
-                const retire_after_join = s.terminal_write_dropped;
                 stream_lease.release();
                 if (ready_code) |code| _ = ws.trySetReady(idx, allocator, code);
-                if (retire_after_join) {
-                    _ = comp_inst.streams.remove(waitable_handle);
-                    comp_inst.streams.collectRetired();
-                }
                 return;
             }
+
+            // Retirement publishes the terminal record before unlinking the
+            // stream. Recheck after a failed stream acquisition so a join
+            // racing that transition observes one state or the other.
+            if (try comp_inst.joinStreamTerminalWrite(
+                waitable_handle,
+                ws,
+                allocator,
+            )) return;
 
             // Unknown waitable handle — silently no-op. Spec says trap,
             // but the conformance suite occasionally joins a
@@ -8022,16 +8039,14 @@ test "wasi:http #970 review: retired blocked writer joins a terminal tombstone" 
     );
     const ws_handle: u32 = @bitCast(try env.popI32());
 
-    // The write returned BLOCKED, then cancellation retired the stream
-    // before waitable.join could register. Keep only the terminal latch.
-    {
-        const stream = inst.streams.getPtr(stream_handle).?;
-        stream.pending_write = null;
-        stream.write_ready = false;
-        stream.read_closed = true;
-        stream.write_closed = true;
-        stream.terminal_write_dropped = true;
-    }
+    // The write returned BLOCKED, then cancellation freed the full stream
+    // before waitable.join could register. Keep only the bounded terminal
+    // record keyed by the generation-safe public handle.
+    try inst.publishStreamTerminalWrite(stream_handle, 1);
+    try testing.expect(inst.streams.remove(stream_handle));
+    inst.streams.collectRetired();
+    inst.markStreamTerminalWriteRetired(stream_handle);
+    try testing.expectEqual(@as(usize, 1), inst.streamTerminalWriteCount());
     try env.pushI32(@bitCast(stream_handle));
     try env.pushI32(@bitCast(ws_handle));
     try dispatchCanonBuiltin(
@@ -8042,6 +8057,7 @@ test "wasi:http #970 review: retired blocked writer joins a terminal tombstone" 
         testing.allocator,
     );
     try testing.expect(inst.streams.getPtr(stream_handle) == null);
+    try testing.expectEqual(@as(usize, 0), inst.streamTerminalWriteCount());
 
     const out_ptr: u32 = 0x100;
     try env.pushI32(@bitCast(ws_handle));
@@ -8116,6 +8132,38 @@ test "wasi:http #970 review: retired blocked writer joins a terminal tombstone" 
         @as(u32, @bitCast(try env.popI32())),
     );
     try testing.expect(inst.streams.getPtr(replacement_handle) != null);
+
+    const teardown_handle = inst.allocAsyncHandle();
+    try inst.publishStreamTerminalWrite(teardown_handle, 99);
+    try testing.expectEqual(
+        @as(usize, 1),
+        inst.sweepStreamTerminalWrites(99),
+    );
+    try env.pushI32(@bitCast(teardown_handle));
+    try env.pushI32(@bitCast(fresh_ws));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+    try env.pushI32(@bitCast(fresh_ws));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_poll = .{
+            .cancellable = false,
+            .memory = 0,
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @intFromEnum(async_canon.EventCode.none),
+        @as(u32, @bitCast(try env.popI32())),
+    );
 }
 
 test "waitable-set.poll: settled future surfaces FUTURE_READ event with the right handle/code (#550)" {

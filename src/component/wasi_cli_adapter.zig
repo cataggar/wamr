@@ -47,6 +47,7 @@ const debugAotEnabled = core_backend.debugAotEnabled;
 const adapter_resource = @import("../shared/adapter_resource.zig");
 const stable_resource = @import("../shared/stable_resource.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
+const task_cancellation = @import("../runtime/common/task_cancellation.zig");
 const platform = @import("../platform/platform.zig");
 const parking_lot = @import("../platform/parking_lot.zig");
 
@@ -4850,6 +4851,67 @@ const InboundHttpRequestMethodScope = struct {
         active_inbound_http_request_method = self.previous;
     }
 };
+
+/// Durable cancellation bridge for fallback response settlement.
+///
+/// Captured while the dispatch TaskManager is alive and retained until body,
+/// trailers, and transmission settlement have completed. The inert ticket is
+/// the explicit no-task state used by synthetic callers. `owner_key` remains
+/// generation-safe in either state.
+const P3FallbackCancellationTicket = struct {
+    const task_owner_tag: u64 = 1 << 32;
+    const inert_owner_tag: u64 = 2 << 32;
+
+    owner_key: u64,
+    ticket: task_cancellation.Source.Ticket = .{},
+
+    fn inert(owner_id: u32) P3FallbackCancellationTicket {
+        return .{ .owner_key = inert_owner_tag | owner_id };
+    }
+
+    fn isCancelled(self: *const P3FallbackCancellationTicket) bool {
+        if (!self.ticket.isActive()) return false;
+        return self.ticket.isCancelled() catch unreachable;
+    }
+
+    fn cancel(self: *const P3FallbackCancellationTicket) void {
+        if (!self.ticket.isActive()) return;
+        const source = self.ticket.sourceForRegistration() catch unreachable;
+        source.cancel();
+    }
+
+    fn adopt(
+        self: *P3FallbackCancellationTicket,
+        captured: *P3FallbackCancellationTicket,
+    ) void {
+        std.debug.assert(!self.ticket.isActive());
+        self.owner_key = captured.owner_key;
+        self.ticket = captured.ticket.take();
+    }
+
+    fn release(
+        self: *P3FallbackCancellationTicket,
+        ci: *ComponentInstance,
+    ) void {
+        ci.releaseStreamTerminalWriteOwner(
+            self.owner_key,
+            &self.ticket,
+        );
+    }
+};
+
+fn captureP3FallbackCancellationTicket(
+    task_manager: *async_mod.TaskManager,
+    task_handle: u32,
+) !P3FallbackCancellationTicket {
+    var acquired = try task_manager.acquireCancellationTicket(task_handle);
+    errdefer acquired.deinit();
+    return .{
+        .owner_key = P3FallbackCancellationTicket.task_owner_tag |
+            try acquired.identity(),
+        .ticket = acquired.take(),
+    };
+}
 
 const HttpResponseBodySemantics = struct {
     wire_body_allowed: bool,
@@ -25494,32 +25556,41 @@ pub const WasiCliAdapter = struct {
         ci: *ComponentInstance,
         handle: u32,
         cancelled: bool,
-    ) void {
+        cancellation_ticket: *const P3FallbackCancellationTicket,
+    ) !void {
         var write_waitable: ?async_mod.WaitableRegistration = null;
         var read_waitable: ?async_mod.WaitableRegistration = null;
         var wake_writer = false;
         var wake_reader = false;
-        var keep_terminal_tombstone = false;
+        var terminal_record_error: ?anyerror = null;
+        if (cancelled) cancellation_ticket.cancel();
         if (ci.streams.acquire(handle)) |initial_lease| {
             var stream_lease = initial_lease;
             const stream = stream_lease.value();
-            stream.buffer.clearRetainingCapacity();
             const writer_blocked =
                 stream.pending_write != null or stream.write_ready;
-            keep_terminal_tombstone = stream.terminal_write_dropped or
-                (cancelled and stream.write_waitable == null and
-                    writer_blocked);
+            const publish_terminal = cancelled and
+                stream.write_waitable == null and writer_blocked;
             wake_writer = cancelled and stream.pending_write != null and
                 stream.write_waitable != null;
             wake_reader = stream.pending_read != null;
+            stream.buffer.deinit(ci.allocator);
+            stream.buffer = .empty;
             stream.pending_write = null;
             stream.pending_read = null;
             stream.write_ready = false;
-            stream.terminal_write_dropped = keep_terminal_tombstone;
             stream.read_closed = true;
             if (cancelled) stream.write_closed = true;
             write_waitable = stream.write_waitable;
             read_waitable = stream.read_waitable;
+            if (publish_terminal) {
+                ci.publishStreamTerminalWrite(
+                    handle,
+                    cancellation_ticket.owner_key,
+                ) catch |err| {
+                    terminal_record_error = err;
+                };
+            }
             stream_lease.release();
         }
         if (wake_writer) {
@@ -25534,20 +25605,17 @@ pub const WasiCliAdapter = struct {
                 async_canon.packStatus(.dropped, 0),
             );
         }
-        if (!keep_terminal_tombstone) {
-            _ = ci.streams.remove(handle);
-            ci.streams.collectRetired();
-        }
+        _ = ci.streams.remove(handle);
+        ci.streams.collectRetired();
+        ci.markStreamTerminalWriteRetired(handle);
+        if (terminal_record_error) |err| return err;
     }
 
-    fn p3FallbackSettlementCancelled() bool {
+    fn p3FallbackSettlementCancelled(
+        cancellation_ticket: *const P3FallbackCancellationTicket,
+    ) bool {
         if (http_shutdown_requested.load(.acquire)) return true;
-        const thread_context = execution_context.current() orelse return false;
-        if (thread_context.isCancellationRequested()) return true;
-        const ThreadManager = @import("../wasi/thread_manager.zig").ThreadManager;
-        const manager = thread_context.threadGroup(ThreadManager) orelse
-            return false;
-        return manager.isTaskCancelledForContext(thread_context);
+        return cancellation_ticket.isCancelled();
     }
 
     /// Drain a fallback response stream through writer closure. Content
@@ -25560,14 +25628,20 @@ pub const WasiCliAdapter = struct {
         handle: u32,
         collect: bool,
         timeout_ns: u64,
+        cancellation_ticket: *const P3FallbackCancellationTicket,
     ) ![]u8 {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         errdefer body.deinit(self.allocator);
         var deadline = httpLiveMonotonicNs() +| timeout_ns;
 
         while (true) {
-            if (p3FallbackSettlementCancelled()) {
-                retireP3FallbackBodyStream(ci, handle, true);
+            if (p3FallbackSettlementCancelled(cancellation_ticket)) {
+                try retireP3FallbackBodyStream(
+                    ci,
+                    handle,
+                    true,
+                    cancellation_ticket,
+                );
                 return error.HttpResponseIncomplete;
             }
             var stream_lease = ci.streams.acquire(handle) orelse
@@ -25575,7 +25649,12 @@ pub const WasiCliAdapter = struct {
             const stream = stream_lease.value();
             if (stream.host_handler != null or stream.host_driver != null) {
                 stream_lease.release();
-                retireP3FallbackBodyStream(ci, handle, true);
+                try retireP3FallbackBodyStream(
+                    ci,
+                    handle,
+                    true,
+                    cancellation_ticket,
+                );
                 return error.InvalidHandle;
             }
 
@@ -25583,7 +25662,12 @@ pub const WasiCliAdapter = struct {
             if (collect and drained != 0) {
                 if (drained > max_http_p3_body_bytes -| body.items.len) {
                     stream_lease.release();
-                    retireP3FallbackBodyStream(ci, handle, true);
+                    try retireP3FallbackBodyStream(
+                        ci,
+                        handle,
+                        true,
+                        cancellation_ticket,
+                    );
                     return error.ResponseBodySize;
                 }
                 body.appendSlice(
@@ -25591,7 +25675,12 @@ pub const WasiCliAdapter = struct {
                     stream.buffer.items,
                 ) catch |err| {
                     stream_lease.release();
-                    retireP3FallbackBodyStream(ci, handle, true);
+                    try retireP3FallbackBodyStream(
+                        ci,
+                        handle,
+                        true,
+                        cancellation_ticket,
+                    );
                     return err;
                 };
             }
@@ -25612,12 +25701,22 @@ pub const WasiCliAdapter = struct {
                     async_canon.packStatus(.completed, 0),
                 );
             }
-            if (p3FallbackSettlementCancelled()) {
-                retireP3FallbackBodyStream(ci, handle, true);
+            if (p3FallbackSettlementCancelled(cancellation_ticket)) {
+                try retireP3FallbackBodyStream(
+                    ci,
+                    handle,
+                    true,
+                    cancellation_ticket,
+                );
                 return error.HttpResponseIncomplete;
             }
             if (write_closed) {
-                retireP3FallbackBodyStream(ci, handle, false);
+                try retireP3FallbackBodyStream(
+                    ci,
+                    handle,
+                    false,
+                    cancellation_ticket,
+                );
                 return body.toOwnedSlice(self.allocator);
             }
             if (drained != 0 or writer_was_parked) {
@@ -25625,13 +25724,23 @@ pub const WasiCliAdapter = struct {
             } else if (timeout_ns != 0 and
                 httpLiveMonotonicNs() >= deadline)
             {
-                retireP3FallbackBodyStream(ci, handle, true);
+                try retireP3FallbackBodyStream(
+                    ci,
+                    handle,
+                    true,
+                    cancellation_ticket,
+                );
                 return error.HttpResponseIncomplete;
             }
 
             _ = driveAsyncEvents(self, ci, null, self.allocator);
-            if (p3FallbackSettlementCancelled()) {
-                retireP3FallbackBodyStream(ci, handle, true);
+            if (p3FallbackSettlementCancelled(cancellation_ticket)) {
+                try retireP3FallbackBodyStream(
+                    ci,
+                    handle,
+                    true,
+                    cancellation_ticket,
+                );
                 return error.HttpResponseIncomplete;
             }
             platform.usleep(100);
@@ -26973,6 +27082,7 @@ pub const WasiCliAdapter = struct {
             export_dotted_name,
             request_handle,
             null,
+            null,
             allocator,
         );
     }
@@ -26983,6 +27093,7 @@ pub const WasiCliAdapter = struct {
         export_dotted_name: []const u8,
         request_handle: u32,
         live_response: ?*InboundHttpResponseSession,
+        fallback_ticket: ?*P3FallbackCancellationTicket,
         allocator: Allocator,
     ) !HandleP3Outcome {
         // Validate the export resolves to a callable local first so
@@ -27007,6 +27118,13 @@ pub const WasiCliAdapter = struct {
             if (live_response) |session| @ptrCast(session) else null,
             allocator,
         ) catch |e| return e;
+        if (fallback_ticket) |ticket| {
+            var captured = try captureP3FallbackCancellationTicket(
+                &task_mgr,
+                task_handle,
+            );
+            ticket.adopt(&captured);
+        }
 
         const return_values = try task_mgr.copyReturnValues(task_handle, allocator) orelse
             return error.NoHandleExport;
@@ -27349,6 +27467,31 @@ pub const WasiCliAdapter = struct {
         request_method: HttpRequestMethod,
         completion_timeout_ns: u64,
     ) !bool {
+        var cancellation_ticket = P3FallbackCancellationTicket.inert(
+            response_handle,
+        );
+        defer cancellation_ticket.release(ci);
+        return self.writeHttpResponseP3FromHandleForMethodWithTicket(
+            out,
+            ci,
+            response_handle,
+            keep_alive,
+            request_method,
+            completion_timeout_ns,
+            &cancellation_ticket,
+        );
+    }
+
+    fn writeHttpResponseP3FromHandleForMethodWithTicket(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        ci: *ComponentInstance,
+        response_handle: u32,
+        keep_alive: bool,
+        request_method: HttpRequestMethod,
+        completion_timeout_ns: u64,
+        cancellation_ticket: *const P3FallbackCancellationTicket,
+    ) !bool {
         var response_lease = self.lookupHttpResponseP3(response_handle) orelse {
             try self.writeHttpSimpleResponseForMethod(
                 out,
@@ -27373,6 +27516,7 @@ pub const WasiCliAdapter = struct {
                 stream_handle,
                 semantics.wire_body_allowed,
                 completion_timeout_ns,
+                cancellation_ticket,
             )
         else
             try self.allocator.alloc(u8, 0);
@@ -27417,6 +27561,7 @@ pub const WasiCliAdapter = struct {
         var trailer_fields_lease = try self.lookupTrailerFieldsFromFuture(
             ci,
             response.trailers_future_handle,
+            cancellation_ticket,
         );
         defer if (trailer_fields_lease) |*lease| lease.release();
         const trailer_fields: ?*HttpFields = if (trailer_fields_lease) |*lease|
@@ -27589,6 +27734,7 @@ pub const WasiCliAdapter = struct {
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
         future_handle: u32,
+        cancellation_ticket: *const P3FallbackCancellationTicket,
     ) !?HttpFieldsLease {
         const deadline = httpLiveMonotonicNs() +|
             http_live_response_completion_timeout_ns;
@@ -27599,7 +27745,9 @@ pub const WasiCliAdapter = struct {
                 self.allocator,
             )) {
                 .pending => {
-                    if (http_shutdown_requested.load(.acquire)) {
+                    if (http_shutdown_requested.load(.acquire) or
+                        cancellation_ticket.isCancelled())
+                    {
                         return error.HttpTrailersFailed;
                     }
                     // A future the guest never resolves would otherwise
@@ -27818,12 +27966,17 @@ pub const WasiCliAdapter = struct {
                 };
                 break :live session;
             };
+            var fallback_ticket = P3FallbackCancellationTicket.inert(
+                ci.allocAsyncHandle(),
+            );
+            defer fallback_ticket.release(ci);
 
             const outcome = self.dispatchHttpHandlerP3WithLiveResponse(
                 ci,
                 handler_name,
                 parsed.request_handle,
                 live_response,
+                &fallback_ticket,
                 self.allocator,
             ) catch {
                 // Dispatch trapped — graceful 503 instead of
@@ -27899,12 +28052,14 @@ pub const WasiCliAdapter = struct {
 
             if (live_terminal == .fallback) {
                 connection_reusable =
-                    self.writeHttpResponseP3FromHandleForMethod(
+                    self.writeHttpResponseP3FromHandleForMethodWithTicket(
                         output,
                         ci,
                         outcome.payload,
                         parsed.keep_alive,
                         parsed.request_method,
+                        http_live_response_completion_timeout_ns,
+                        &fallback_ticket,
                     ) catch {
                         self.failHttpResponseTransmission(ci, outcome.payload);
                         cancelAllPendingAsyncOps(
@@ -46450,6 +46605,92 @@ fn p3HttpTestCiDeinit(ci: *ComponentInstance) void {
     ci.deinitAsyncTablesForTest();
 }
 
+const P3HttpCountingAllocator = struct {
+    parent: Allocator,
+    bytes_in_use: usize = 0,
+
+    fn allocator(self: *P3HttpCountingAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(
+        ctx: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *P3HttpCountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.parent.rawAlloc(
+            len,
+            alignment,
+            return_address,
+        ) orelse return null;
+        self.bytes_in_use += len;
+        return result;
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        buffer: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *P3HttpCountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.parent.rawResize(
+            buffer,
+            alignment,
+            new_len,
+            return_address,
+        )) return false;
+        if (new_len > buffer.len)
+            self.bytes_in_use += new_len - buffer.len
+        else
+            self.bytes_in_use -= buffer.len - new_len;
+        return true;
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        buffer: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *P3HttpCountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.parent.rawRemap(
+            buffer,
+            alignment,
+            new_len,
+            return_address,
+        ) orelse return null;
+        if (new_len > buffer.len)
+            self.bytes_in_use += new_len - buffer.len
+        else
+            self.bytes_in_use -= buffer.len - new_len;
+        return result;
+    }
+
+    fn free(
+        ctx: *anyopaque,
+        buffer: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *P3HttpCountingAllocator = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(buffer, alignment, return_address);
+        self.bytes_in_use -= buffer.len;
+    }
+};
+
 /// Decode a `result<own<response>, error-code>` canonical-ABI lowered
 /// byte buffer (40 bytes — produced by `httpP3LowerAsyncPayload`) into
 /// a `(is_ok, payload)` pair. On `is_ok` the payload is the
@@ -51647,6 +51888,7 @@ test "wasi:http #970 review: response.new bounds a fallback body stream" {
 }
 
 test "wasi:http #970 review: bodyless fallback settles late producers" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
         .label = "bodyless fallback settles late producers",
@@ -51759,6 +52001,7 @@ test "wasi:http #970 review: bodyless fallback settles late producers" {
 }
 
 test "wasi:http #970 review: fallback drain wakes a parked producer" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
         .label = "fallback drain wakes a parked producer",
@@ -51829,6 +52072,7 @@ test "wasi:http #970 review: fallback drain wakes a parked producer" {
 }
 
 test "wasi:http #970 review: fallback producer timeout cancels and retires" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
         .label = "fallback producer timeout cancels and retires",
@@ -51900,7 +52144,11 @@ test "wasi:http #970 review: fallback producer timeout cancels and retires" {
 
 test "wasi:http #970 review: fallback retirement latches a pre-join writer" {
     const testing = std.testing;
-    var ci = p3HttpTestCi(testing.allocator);
+    var counting = P3HttpCountingAllocator{
+        .parent = testing.allocator,
+    };
+    const allocator = counting.allocator();
+    var ci = p3HttpTestCi(allocator);
     defer p3HttpTestCiDeinit(&ci);
     const handle = ci.allocAsyncHandle();
     var stream = async_mod.AsyncStream{
@@ -51911,26 +52159,468 @@ test "wasi:http #970 review: fallback retirement latches a pre-join writer" {
             .elem_size = 1,
         },
     };
-    try stream.buffer.append(testing.allocator, 'x');
-    try ci.streams.put(testing.allocator, handle, stream);
+    try stream.buffer.appendNTimes(
+        allocator,
+        'x',
+        http_live_response_buffer_bytes,
+    );
+    const buffer_capacity = stream.buffer.capacity;
+    try ci.streams.put(allocator, handle, stream);
+    const bytes_before_retirement = counting.bytes_in_use;
 
-    WasiCliAdapter.retireP3FallbackBodyStream(&ci, handle, true);
-    var stream_lease = ci.streams.acquire(handle) orelse
-        return error.InvalidHandle;
-    const terminal = stream_lease.value();
-    try testing.expect(terminal.terminal_write_dropped);
-    try testing.expect(terminal.read_closed);
-    try testing.expect(terminal.write_closed);
-    try testing.expect(terminal.pending_write == null);
-    try testing.expectEqual(@as(usize, 0), terminal.buffer.items.len);
-    stream_lease.release();
-
-    try testing.expect(ci.streams.remove(handle));
-    ci.streams.collectRetired();
+    var cancellation_ticket = P3FallbackCancellationTicket.inert(7);
+    try WasiCliAdapter.retireP3FallbackBodyStream(
+        &ci,
+        handle,
+        true,
+        &cancellation_ticket,
+    );
     try testing.expect(!p3FallbackStreamExists(&ci, handle));
+    try testing.expect(
+        bytes_before_retirement - counting.bytes_in_use >= buffer_capacity,
+    );
+    try testing.expectEqual(@as(usize, 1), ci.streamTerminalWriteCount());
+    try testing.expectEqual(
+        @as(usize, 16),
+        @sizeOf(instance_mod.StreamTerminalWrite),
+    );
+    try testing.expectEqual(
+        @as(usize, 1024),
+        instance_mod.max_stream_terminal_write_bytes,
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        ci.sweepStreamTerminalWrites(cancellation_ticket.owner_key),
+    );
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+}
+
+test "wasi:http #970 review: terminal record quota bounds abandoned writers" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var index: usize = 0;
+    while (index <= instance_mod.max_stream_terminal_writes) : (index += 1) {
+        const handle = ci.allocAsyncHandle();
+        var stream = async_mod.AsyncStream{
+            .elem_type_idx = 0,
+            .pending_write = .{
+                .guest_ptr = 0,
+                .count = 1,
+                .elem_size = 1,
+            },
+        };
+        try stream.buffer.appendNTimes(
+            testing.allocator,
+            'x',
+            http_live_response_buffer_bytes,
+        );
+        try ci.streams.put(testing.allocator, handle, stream);
+        var ticket = P3FallbackCancellationTicket.inert(
+            @intCast(index + 1),
+        );
+        if (index < instance_mod.max_stream_terminal_writes) {
+            try WasiCliAdapter.retireP3FallbackBodyStream(
+                &ci,
+                handle,
+                true,
+                &ticket,
+            );
+        } else {
+            try testing.expectError(
+                error.StreamTerminalQuotaExceeded,
+                WasiCliAdapter.retireP3FallbackBodyStream(
+                    &ci,
+                    handle,
+                    true,
+                    &ticket,
+                ),
+            );
+        }
+        try testing.expect(!p3FallbackStreamExists(&ci, handle));
+    }
+    try testing.expectEqual(
+        instance_mod.max_stream_terminal_writes,
+        ci.streamTerminalWriteCount(),
+    );
+    index = 0;
+    while (index < instance_mod.max_stream_terminal_writes) : (index += 1) {
+        const owner = P3FallbackCancellationTicket.inert(
+            @intCast(index + 1),
+        );
+        try testing.expectEqual(
+            @as(usize, 1),
+            ci.sweepStreamTerminalWrites(owner.owner_key),
+        );
+    }
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+
+    const reused_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, reused_handle, .{
+        .elem_type_idx = 0,
+        .pending_write = .{
+            .guest_ptr = 0,
+            .count = 1,
+            .elem_size = 1,
+        },
+    });
+    var reused_owner = P3FallbackCancellationTicket.inert(1);
+    try WasiCliAdapter.retireP3FallbackBodyStream(
+        &ci,
+        reused_handle,
+        true,
+        &reused_owner,
+    );
+    try testing.expectEqual(@as(usize, 1), ci.streamTerminalWriteCount());
+    reused_owner.release(&ci);
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+}
+
+test "wasi:http #970 review: terminal records are owner-scoped and swept" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    const owner_a_id: u32 = 11;
+    const owner_a = P3FallbackCancellationTicket.inert(owner_a_id).owner_key;
+    const owner_b: u64 = 22;
+
+    var index: usize = 0;
+    while (index < instance_mod.max_stream_terminal_writes_per_owner + 1) : (index += 1) {
+        const handle = ci.allocAsyncHandle();
+        try ci.streams.put(testing.allocator, handle, .{
+            .elem_type_idx = 0,
+            .pending_write = .{
+                .guest_ptr = 0,
+                .count = 1,
+                .elem_size = 1,
+            },
+        });
+        var ticket = P3FallbackCancellationTicket.inert(owner_a_id);
+        if (index <
+            instance_mod.max_stream_terminal_writes_per_owner)
+        {
+            try WasiCliAdapter.retireP3FallbackBodyStream(
+                &ci,
+                handle,
+                true,
+                &ticket,
+            );
+        } else {
+            try testing.expectError(
+                error.StreamTerminalOwnerQuotaExceeded,
+                WasiCliAdapter.retireP3FallbackBodyStream(
+                    &ci,
+                    handle,
+                    true,
+                    &ticket,
+                ),
+            );
+        }
+    }
+    try ci.publishStreamTerminalWrite(ci.allocAsyncHandle(), owner_b);
+    try testing.expectEqual(
+        instance_mod.max_stream_terminal_writes_per_owner + 1,
+        ci.streamTerminalWriteCount(),
+    );
+    try testing.expectEqual(
+        instance_mod.max_stream_terminal_writes_per_owner,
+        ci.sweepStreamTerminalWrites(owner_a),
+    );
+    try testing.expectEqual(@as(usize, 1), ci.streamTerminalWriteCount());
+    try testing.expectEqual(
+        @as(usize, 0),
+        ci.sweepStreamTerminalWrites(owner_a),
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        ci.sweepStreamTerminalWrites(owner_b),
+    );
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+}
+
+test "wasi:http #970 review: terminal join OOM preserves quota accounting" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    const handle = ci.allocAsyncHandle();
+    try ci.publishStreamTerminalWrite(handle, 17);
+
+    var waitable_set = async_mod.WaitableSet{};
+    defer waitable_set.deinit(testing.allocator);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    try testing.expectError(
+        error.OutOfMemory,
+        ci.joinStreamTerminalWrite(
+            handle,
+            &waitable_set,
+            failing.allocator(),
+        ),
+    );
+    try testing.expectEqual(@as(usize, 1), ci.streamTerminalWriteCount());
+    try testing.expect(try ci.joinStreamTerminalWrite(
+        handle,
+        &waitable_set,
+        testing.allocator,
+    ));
+    try testing.expectEqual(@as(usize, 1), ci.streamTerminalWriteCount());
+    try testing.expect(try ci.joinStreamTerminalWrite(
+        handle,
+        &waitable_set,
+        testing.allocator,
+    ));
+    ci.markStreamTerminalWriteRetired(handle);
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+    const event = waitable_set.popReadyEvent().?;
+    try testing.expectEqual(
+        async_canon.packStatus(.dropped, 0),
+        event.code,
+    );
+    try testing.expect(waitable_set.popReadyEvent() == null);
+}
+
+test "wasi:http #970 review: durable ticket survives dispatch owner unwind" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var task_manager = async_mod.TaskManager{};
+    const task_handle = try task_manager.createTask(testing.allocator);
+    var ticket = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        task_handle,
+    );
+    const source_id = try ticket.ticket.identity();
+    try testing.expectEqual(
+        P3FallbackCancellationTicket.task_owner_tag | source_id,
+        ticket.owner_key,
+    );
+    try testing.expect(
+        ticket.owner_key !=
+            P3FallbackCancellationTicket.inert(source_id).owner_key,
+    );
+    task_manager.deinit(testing.allocator);
+
+    try testing.expect(!ticket.isCancelled());
+    ticket.cancel();
+    try testing.expect(ticket.isCancelled());
+    ticket.release(&ci);
+}
+
+test "wasi:http #970 review: terminal owner waits for cancellation quiescence" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var task_manager = async_mod.TaskManager{};
+    const task_handle = try task_manager.createTask(testing.allocator);
+    var ticket = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        task_handle,
+    );
+    var ticket_released = false;
+    defer if (!ticket_released) ticket.release(&ci);
+    var active_group_owner = try ticket.ticket.clone();
+    var active_group_owner_released = false;
+    defer if (!active_group_owner_released) active_group_owner.deinit();
+    task_manager.deinit(testing.allocator);
+
+    try ci.publishStreamTerminalWrite(
+        ci.allocAsyncHandle(),
+        ticket.owner_key,
+    );
+    ticket.release(&ci);
+    ticket_released = true;
+    try testing.expectEqual(@as(usize, 1), ci.streamTerminalWriteCount());
+
+    active_group_owner.deinit();
+    active_group_owner_released = true;
+    ci.collectStreamTerminalWriteOwners();
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+}
+
+test "wasi:http #970 review: consumed terminal releases retained owner" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var task_manager = async_mod.TaskManager{};
+    const task_handle = try task_manager.createTask(testing.allocator);
+    var ticket = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        task_handle,
+    );
+    var active_group_owner = try ticket.ticket.clone();
+    task_manager.deinit(testing.allocator);
+
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.publishStreamTerminalWrite(stream_handle, ticket.owner_key);
+    ticket.release(&ci);
+
+    var waitable_set = async_mod.WaitableSet{};
+    defer waitable_set.deinit(testing.allocator);
+    try testing.expect(try ci.joinStreamTerminalWrite(
+        stream_handle,
+        &waitable_set,
+        testing.allocator,
+    ));
+    ci.markStreamTerminalWriteRetired(stream_handle);
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+    try testing.expect(try active_group_owner.isSoleOwner());
+    active_group_owner.deinit();
+}
+
+test "wasi:http #970 review: durable tickets isolate concurrent tasks" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var task_manager = async_mod.TaskManager{};
+    const handle_a = try task_manager.createTask(testing.allocator);
+    const handle_b = try task_manager.createTask(testing.allocator);
+    var ticket_a = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        handle_a,
+    );
+    defer ticket_a.release(&ci);
+    var ticket_b = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        handle_b,
+    );
+    defer ticket_b.release(&ci);
+    try testing.expect(task_manager.tryCancelTask(handle_a));
+    task_manager.deinit(testing.allocator);
+
+    try testing.expect(ticket_a.isCancelled());
+    try testing.expect(!ticket_b.isCancelled());
+}
+
+test "wasi:http #970 review: durable cancellation retires pending body after unwind" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const stream_handle = ci.allocAsyncHandle();
+    var stream = async_mod.AsyncStream{
+        .elem_type_idx = 0,
+        .pending_write = .{
+            .guest_ptr = 0,
+            .count = 1,
+            .elem_size = 1,
+        },
+    };
+    try stream.buffer.appendNTimes(
+        testing.allocator,
+        'x',
+        http_live_response_buffer_bytes,
+    );
+    try ci.streams.put(testing.allocator, stream_handle, stream);
+
+    var task_manager = async_mod.TaskManager{};
+    const task_handle = try task_manager.createTask(testing.allocator);
+    var ticket = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        task_handle,
+    );
+    ticket.cancel();
+    task_manager.deinit(testing.allocator);
+
+    try testing.expectError(
+        error.HttpResponseIncomplete,
+        adapter.settleP3FallbackBodyStream(
+            &ci,
+            stream_handle,
+            false,
+            http_live_response_completion_timeout_ns,
+            &ticket,
+        ),
+    );
+    try testing.expect(!p3FallbackStreamExists(&ci, stream_handle));
+    try testing.expectEqual(@as(usize, 1), ci.streamTerminalWriteCount());
+    ticket.release(&ci);
+    try testing.expectEqual(@as(usize, 0), ci.streamTerminalWriteCount());
+}
+
+test "wasi:http #970 review: durable cancellation settles pending trailers" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const future_handle = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, future_handle, .{
+        .elem_type_idx = 0,
+        .state = .pending,
+    });
+    var task_manager = async_mod.TaskManager{};
+    const task_handle = try task_manager.createTask(testing.allocator);
+    var ticket = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        task_handle,
+    );
+    ticket.cancel();
+    task_manager.deinit(testing.allocator);
+    defer ticket.release(&ci);
+
+    try testing.expectError(
+        error.HttpTrailersFailed,
+        adapter.lookupTrailerFieldsFromFuture(
+            &ci,
+            future_handle,
+            &ticket,
+        ),
+    );
+}
+
+test "wasi:http #970 review: owner quota cancellation fails offender" {
+    const testing = std.testing;
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+    var task_manager = async_mod.TaskManager{};
+    const task_handle = try task_manager.createTask(testing.allocator);
+    var ticket = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        task_handle,
+    );
+    task_manager.deinit(testing.allocator);
+    defer ticket.release(&ci);
+
+    var index: usize = 0;
+    while (index < instance_mod.max_stream_terminal_writes_per_owner) : (index += 1)
+        try ci.publishStreamTerminalWrite(
+            ci.allocAsyncHandle(),
+            ticket.owner_key,
+        );
+
+    const offender = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, offender, .{
+        .elem_type_idx = 0,
+        .pending_write = .{
+            .guest_ptr = 0,
+            .count = 1,
+            .elem_size = 1,
+        },
+    });
+    try testing.expectError(
+        error.StreamTerminalOwnerQuotaExceeded,
+        WasiCliAdapter.retireP3FallbackBodyStream(
+            &ci,
+            offender,
+            true,
+            &ticket,
+        ),
+    );
+    try testing.expect(ticket.isCancelled());
+    try testing.expect(!p3FallbackStreamExists(&ci, offender));
 }
 
 test "wasi:http #970 review: fallback shutdown interrupts progressing producer" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
         .label = "fallback shutdown interrupts progressing producer",
@@ -52077,23 +52767,33 @@ test "wasi:http #970 review: fallback settlement observes task cancellation" {
         true,
         null,
     );
-    var thread_context = execution_context.ThreadExecutionContext{};
-    thread_context.requestCancellation();
-    var active_scope = thread_context.enter();
-    defer active_scope.deinit();
+    var task_manager = async_mod.TaskManager{};
+    const task_handle = try task_manager.createTask(testing.allocator);
+    var cancellation_ticket = try captureP3FallbackCancellationTicket(
+        &task_manager,
+        task_handle,
+    );
+    task_manager.deinit(testing.allocator);
+    defer cancellation_ticket.release(&ci);
+    cancellation_ticket.cancel();
 
     var wire = streams.OutputStream.toBuffer();
     defer wire.deinit(testing.allocator);
+    const started = httpLiveMonotonicNs();
     try testing.expectError(
         error.HttpResponseIncomplete,
-        adapter.writeHttpResponseP3FromHandleForMethodWithTimeout(
+        adapter.writeHttpResponseP3FromHandleForMethodWithTicket(
             &wire,
             &ci,
             fixture.response_handle,
             true,
             .head,
             5 * std.time.ns_per_s,
+            &cancellation_ticket,
         ),
+    );
+    try testing.expect(
+        httpLiveMonotonicNs() - started < std.time.ns_per_s,
     );
     try testing.expectEqual(@as(usize, 0), wire.getBufferContents().len);
     try testing.expect(!p3FallbackStreamExists(
@@ -52103,6 +52803,7 @@ test "wasi:http #970 review: fallback settlement observes task cancellation" {
 }
 
 test "wasi:http #970 review: fallback close and shutdown race settles once" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
         .label = "fallback close and shutdown race settles once",
@@ -52174,6 +52875,7 @@ test "wasi:http #970 review: fallback close and shutdown race settles once" {
 }
 
 test "wasi:http #970 review: ordinary fallback GET collects late body bytes" {
+    if (!build_options.lib_wasi_threads) return error.SkipZigTest;
     const testing = std.testing;
     var watchdog = LiveHttpWatchdog{
         .label = "ordinary fallback GET collects late body bytes",
