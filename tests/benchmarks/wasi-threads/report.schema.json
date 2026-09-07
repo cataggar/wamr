@@ -34,6 +34,7 @@
         "plan_sha256",
         "measurement_plan_version",
         "measurement_plan_sha256",
+        "checksum_preparation",
         "host",
         "host_pair",
         "execution",
@@ -67,6 +68,43 @@
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "measurement_plan_version": { "const": 1 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
+        "checksum_preparation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm",
+            "complexity",
+            "unique_keys",
+            "total_ns",
+            "worst_ns",
+            "worst_key"
+          ],
+          "properties": {
+            "algorithm": { "const": "64-residue-xor-jump-ahead" },
+            "complexity": { "type": "string", "minLength": 1 },
+            "unique_keys": { "type": "integer", "minimum": 1 },
+            "total_ns": { "type": "integer", "minimum": 0 },
+            "worst_ns": { "type": "integer", "minimum": 0 },
+            "worst_key": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["workload", "threads", "iterations"],
+              "properties": {
+                "workload": {
+                  "enum": [
+                    "single-hot",
+                    "hot",
+                    "atomic",
+                    "wait-notify",
+                    "spawn-join"
+                  ]
+                },
+                "threads": { "type": "integer", "minimum": 1, "maximum": 8 },
+                "iterations": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        },
         "host": {
           "type": "object",
           "required": [

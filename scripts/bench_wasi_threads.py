@@ -67,21 +67,22 @@ MINIMUM_INTERVAL_HEADROOM_NS = (
     int(MIN_TIMED_INTERVAL_MS * 1_000_000)
     - TARGET_BARRIER_REQUIRED_INTERVAL_NS
 )
+SIZING_TARGET_NS = 1_750_000_000
 TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD = 4
 DEFAULT_ITERATION_PLAN = {
     "interpreter": {
-        "single-hot": 21_000_000,
+        "single-hot": 30_000_000,
         "hot": {
-            "1": 20_000_000,
-            "2": 20_000_000,
+            "1": 28_000_000,
+            "2": 28_000_000,
             "4": 20_000_000,
             "8": 10_000_000,
         },
         "atomic": {
-            "1": 64_000_000,
-            "2": 32_000_000,
-            "4": 20_000_000,
-            "8": 10_000_000,
+            "1": 72_000_000,
+            "2": 40_000_000,
+            "4": 28_000_000,
+            "8": 14_000_000,
         },
         "wait-notify": {
             "1": 128_000,
@@ -89,34 +90,34 @@ DEFAULT_ITERATION_PLAN = {
             "4": 32_000,
             "8": 16_000,
         },
-        "spawn-join": {"1": 8_000, "2": 4_500, "4": 2_250, "8": 1_250},
+        "spawn-join": {"1": 9_000, "2": 4_500, "4": 2_250, "8": 1_250},
     },
     "aot": {
-        "single-hot": 1_320_000_000,
+        "single-hot": 1_900_000_000,
         "hot": {
-            "1": 1_320_000_000,
-            "2": 1_320_000_000,
-            "4": 660_000_000,
-            "8": 330_000_000,
+            "1": 1_800_000_000,
+            "2": 1_800_000_000,
+            "4": 900_000_000,
+            "8": 450_000_000,
         },
         "atomic": {
-            "1": 640_000_000,
-            "2": 128_000_000,
+            "1": 850_000_000,
+            "2": 180_000_000,
             "4": 64_000_000,
             "8": 64_000_000,
         },
         "wait-notify": {
-            "1": 1_600_000,
+            "1": 2_400_000,
             "2": 64_000,
             "4": 32_000,
             "8": 16_000,
         },
         "spawn-join": {"1": 10_000, "2": 5_000, "4": 2_500, "8": 1_250},
         "cancel-hot": {
-            "1": 1_320_000_000,
-            "2": 1_320_000_000,
-            "4": 660_000_000,
-            "8": 330_000_000,
+            "1": 1_900_000_000,
+            "2": 1_900_000_000,
+            "4": 950_000_000,
+            "8": 475_000_000,
         },
     },
 }
@@ -159,6 +160,7 @@ FIXTURES = {
     },
 }
 MASK64 = (1 << 64) - 1
+HOT_KERNEL_COUNTER_BASE = 0xD1B54A32D192ED03
 
 
 def measurement_plan_sha256(plan: dict[str, Any]) -> str:
@@ -314,6 +316,38 @@ def resolved_iteration_plan(
             for threads in args.thread_counts
         }
     return plan
+
+
+def validate_iteration_plan_ranges(
+    plan: dict[str, dict[str, Any]],
+    thread_counts: tuple[int, ...],
+) -> None:
+    for mode, workloads in plan.items():
+        single = workloads["single-hot"]
+        if not 0 < single <= MASK64:
+            raise HarnessError(f"{mode} single-hot iterations must fit uint64")
+        for workload in ("hot", "atomic", "wait-notify", "spawn-join"):
+            for threads in thread_counts:
+                iterations = workloads[workload][str(threads)]
+                if not 0 < iterations <= MASK64 // threads:
+                    raise HarnessError(
+                        f"{mode} {workload}/{threads} operations overflow uint64"
+                    )
+                if (
+                    workload == "spawn-join"
+                    and iterations
+                    > MASK64 // (threads * (threads + 1) // 2)
+                ):
+                    raise HarnessError(
+                        f"{mode} spawn-join/{threads} checksum overflows uint64"
+                    )
+        if mode == "aot":
+            for threads in thread_counts:
+                iterations = workloads["cancel-hot"][str(threads)]
+                if not 0 < iterations <= MASK64 // threads:
+                    raise HarnessError(
+                        f"aot cancel-hot/{threads} operations overflow uint64"
+                    )
 
 
 def iteration_count(
@@ -581,6 +615,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
     args.iteration_plan = resolved_iteration_plan(args, modes)
+    try:
+        validate_iteration_plan_ranges(args.iteration_plan, args.thread_counts)
+    except HarnessError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -1128,12 +1166,52 @@ def aot_artifact_report(
     return report
 
 
+def rotate_left_u64(value: int, bits: int) -> int:
+    shift = bits & 63
+    value &= MASK64
+    if shift == 0:
+        return value
+    return ((value << shift) & MASK64) | (value >> (64 - shift))
+
+
+def xor_upto(value: int) -> int:
+    if value < 0:
+        return 0
+    return (value, 1, value + 1, 0)[value & 3]
+
+
+def xor_wrapped_u58_range(start: int, count: int) -> int:
+    modulus = 1 << 58
+    if not 0 <= count <= modulus:
+        raise HarnessError("hot-kernel grouped range exceeds uint64 iteration space")
+    if count == 0 or count == modulus:
+        return 0
+    start %= modulus
+    end = start + count
+    if end <= modulus:
+        return xor_upto(end - 1) ^ xor_upto(start - 1)
+    return (
+        xor_upto(modulus - 1)
+        ^ xor_upto(start - 1)
+        ^ xor_upto(end - modulus - 1)
+    )
+
+
 @functools.lru_cache(maxsize=None)
-def hot_kernel(seed: int, iterations: int) -> int:
-    value = seed & MASK64
-    for index in range(iterations):
-        value = (((value << 7) & MASK64) | (value >> 57))
-        value ^= (index + 0xD1B54A32D192ED03) & MASK64
+def hot_kernel_jump_ahead(seed: int, iterations: int) -> int:
+    if not 0 <= iterations <= MASK64:
+        raise HarnessError("hot-kernel iterations must fit uint64")
+    value = rotate_left_u64(seed, 7 * iterations)
+    for residue in range(min(64, iterations)):
+        terms = (iterations - 1 - residue) // 64 + 1
+        first = (HOT_KERNEL_COUNTER_BASE + residue) & MASK64
+        grouped_xor = xor_wrapped_u58_range(first >> 6, terms) << 6
+        if terms & 1:
+            grouped_xor ^= first & 63
+        value ^= rotate_left_u64(
+            grouped_xor,
+            7 * (iterations - 1 - residue),
+        )
     return value & MASK64
 
 
@@ -1144,18 +1222,25 @@ def worker_seed(index: int) -> int:
 
 
 @functools.lru_cache(maxsize=None)
-def expected_result(workload: str, threads: int, iterations: int) -> dict[str, int | str]:
+def expected_result(
+    workload: str, threads: int, iterations: int
+) -> dict[str, int | str]:
+    if not 0 < threads <= 8 or not 0 <= iterations <= MASK64 // threads:
+        raise HarnessError("expected-result operations must fit uint64")
     operations = threads * iterations
     if workload == "single-hot":
-        checksum = hot_kernel(worker_seed(0), iterations)
+        checksum = hot_kernel_jump_ahead(worker_seed(0), iterations)
     elif workload == "hot":
         checksum = sum(
-            hot_kernel(worker_seed(index), iterations) for index in range(threads)
+            hot_kernel_jump_ahead(worker_seed(index), iterations)
+            for index in range(threads)
         ) & MASK64
     elif workload in ("atomic", "wait-notify"):
         checksum = operations
     elif workload == "spawn-join":
         checksum = iterations * threads * (threads + 1) // 2
+        if checksum > MASK64:
+            raise HarnessError("spawn-join checksum must fit uint64")
     else:
         raise HarnessError(f"unknown workload {workload}")
     return {
@@ -1175,6 +1260,67 @@ def expected_result(workload: str, threads: int, iterations: int) -> dict[str, i
             operations if workload in ("single-hot", "hot") else 0
         ),
         "clock_calls_in_timed_loop": 0,
+    }
+
+
+def prepare_expected_results(
+    iteration_plan: dict[str, dict[str, Any]],
+    modes: tuple[str, ...],
+    thread_counts: tuple[int, ...],
+) -> dict[str, Any]:
+    requests: list[tuple[str, int, int]] = []
+    for mode in modes:
+        requests.append(
+            ("single-hot", 1, int(iteration_plan[mode]["single-hot"]))
+        )
+        for workload in ("hot", "atomic", "wait-notify", "spawn-join"):
+            for threads in thread_counts:
+                requests.append(
+                    (
+                        workload,
+                        threads,
+                        iteration_count(
+                            iteration_plan, mode, workload, threads
+                        ),
+                    )
+                )
+    if "aot" in modes:
+        for threads in thread_counts:
+            requests.append(
+                (
+                    "hot",
+                    threads,
+                    iteration_count(
+                        iteration_plan, "aot", "cancel-hot", threads
+                    ),
+                )
+            )
+    unique_requests = list(dict.fromkeys(requests))
+    samples = []
+    total_started = time.perf_counter_ns()
+    for workload, threads, iterations in unique_requests:
+        started = time.perf_counter_ns()
+        expected_result(workload, threads, iterations)
+        elapsed_ns = time.perf_counter_ns() - started
+        samples.append(
+            {
+                "workload": workload,
+                "threads": threads,
+                "iterations": iterations,
+                "elapsed_ns": elapsed_ns,
+            }
+        )
+    total_ns = time.perf_counter_ns() - total_started
+    worst = max(samples, key=lambda sample: sample["elapsed_ns"])
+    return {
+        "algorithm": "64-residue-xor-jump-ahead",
+        "complexity": "O(64 * threads), independent of iteration count",
+        "unique_keys": len(samples),
+        "total_ns": total_ns,
+        "worst_ns": worst["elapsed_ns"],
+        "worst_key": {
+            key: worst[key] for key in ("workload", "threads", "iterations")
+        },
     }
 
 
@@ -2999,6 +3145,10 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"- Profile: `{document['plan']['profile']}` "
         f"({document['plan']['warmups']} warmups, {document['plan']['samples']} samples)",
         f"- Budget: `{document['budget']['status']}`",
+        "- Checksum preparation: "
+        f"`{document['metadata']['checksum_preparation']['algorithm']}`; "
+        f"worst {document['metadata']['checksum_preparation']['worst_ns']} ns, "
+        f"total {document['metadata']['checksum_preparation']['total_ns']} ns",
     ]
     quality_preflight = document["quality_preflight"]
     if quality_preflight["enabled"]:
@@ -3215,6 +3365,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     }
     plan_sha256 = cache_key(plan)
     measurement_plan_identity = measurement_plan_sha256(plan)
+    checksum_preparation = prepare_expected_results(
+        iteration_plan, modes, args.thread_counts
+    )
     host = host_metadata(args.runner_environment)
     host_pair = host_pair_identity(args.platform_id, host, args.host_pair_id)
     host_quiescence_at_start = host_quiescence_diagnostics()
@@ -3720,6 +3873,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "plan_sha256": plan_sha256,
             "measurement_plan_version": MEASUREMENT_PLAN_IDENTITY_VERSION,
             "measurement_plan_sha256": measurement_plan_identity,
+            "checksum_preparation": checksum_preparation,
             "host": host,
             "host_pair": host_pair,
             "execution": {

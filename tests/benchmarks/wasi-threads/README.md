@@ -64,26 +64,50 @@ interpreter samples impractical:
 
 | mode/workload | 1 thread | 2 threads | 4 threads | 8 threads |
 |---|---:|---:|---:|---:|
-| interpreter `hot` | 20M | 20M | 20M | 10M |
-| AOT `hot` | 1.32B | 1.32B | 660M | 330M |
-| interpreter `atomic` | 64M | 32M | 20M | 10M |
-| AOT `atomic` | 640M | 128M | 64M | 64M |
+| interpreter `hot` | 28M | 28M | 20M | 10M |
+| AOT `hot` | 1.8B | 1.8B | 900M | 450M |
+| interpreter `atomic` | 72M | 40M | 28M | 14M |
+| AOT `atomic` | 850M | 180M | 64M | 64M |
 | interpreter `wait-notify` | 128K | 64K | 32K | 16K |
-| AOT `wait-notify` | 1.6M | 64K | 32K | 16K |
-| interpreter `spawn-join` | 8K | 4.5K | 2.25K | 1.25K |
+| AOT `wait-notify` | 2.4M | 64K | 32K | 16K |
+| interpreter `spawn-join` | 9K | 4.5K | 2.25K | 1.25K |
 | AOT `spawn-join` | 10K | 5K | 2.5K | 1.25K |
-| AOT `cancel-hot` | 1.32B | 1.32B | 660M | 330M |
+| AOT `cancel-hot` | 1.9B | 1.9B | 950M | 475M |
 
-Single-hot uses 21M interpreter iterations and 1.32B AOT iterations.
+Single-hot uses 30M interpreter iterations and 1.9B AOT iterations.
 Baseline and candidate always execute identical work for the same condition.
 Interpreter/AOT conditions may use different counts; throughput is normalized
 by each record's validated operation count and corrected guest interval.
-The counts are the smallest simple fixed values above the linear requirement
-from every warmup and measured record in retained replacement runs
-33822485228, 33822486948, 33822488505, and 33822489907. The shortest scaled
-retained cell is 1.259893 seconds; a bounded local all-cell check also passed,
-with a 1.260482-second minimum. The local result is sizing confirmation only,
-not calibration evidence.
+
+The 1.25-second quality floor remains derived independently from the retained
+12.456 ms barrier target and the strict `<1%` rule. Iteration sizing instead
+uses a fixed **1.75-second target**, 40% above the floor. This deliberately
+uses the upper end of the approximately 29–40% inter-host speed spread retained
+across x86 hosts rather than sizing barely above the floor.
+
+For every shared plan count, the sizing calculation selects the fastest
+individual corrected interval from every warmup and measured record in x86
+runs 33822485228, 33822486948, 33822488505, and 33822489907. It computes
+`ceil(1.75s * evidence_iterations / evidence_interval)` and rounds upward to a
+simple fixed count. An existing count is retained only if its exact scaled
+minimum already clears 1.75 seconds. Checked-in
+`sizing-provenance.json` records each report hash, fastest record, exact
+requirement, selected count, and scaled minimum for all 38 interpreter and AOT
+cells. The minimum is AOT `spawn-join` at two threads: 1.790981666 seconds,
+43.2785% above the quality floor and 2.3418% above the sizing target.
+
+A future host faster than this retained envelope does not adapt work or weaken
+the gate: every invocation still fails closed below 1.25 seconds or unless
+`99 * timing_overhead_ns < corrected_interval_ns`.
+
+The hot-kernel expected checksum is prepared with an exact jump-ahead. After
+unrolling the recurrence, terms with the same iteration index modulo 64 share
+one rotation. Each of the 64 residue classes becomes the XOR of a consecutive
+58-bit range plus fixed low six bits, so the result takes at most 64 groups per
+worker regardless of an iteration count in the billions. All operations are
+explicit unsigned 64-bit rotate/XOR arithmetic; no byte representation or host
+endianness is involved. The report records the worst and total preparation
+time for all unique plan keys before benchmark execution.
 
 ## Rebuild the fixtures
 
@@ -157,13 +181,23 @@ timing, build cache keys, medians/ranges, immutable commit/platform/plan
 identities, and every correctness result. JSON replacement is an fsynced
 same-directory atomic rename that preserves an existing report's mode.
 
-Each guest invocation has a fixed 90-second watchdog. Scaling all retained
-four-run replacement reports to the new counts gives a worst complete paired
-benchmark estimate of 44.5 minutes and a worst individual corrected interval
-of 25.2 seconds. The workflow job limit is 120 minutes, leaving build, fixture,
-test, upload, and hosted-variance margin. Even if every one of 20 cohort runs
-consumed the full job limit sequentially, it would take 40 hours; the declared
-72-hour dispatcher deadline therefore remains a fail-closed outer bound.
+Each guest invocation has a fixed 90-second watchdog. Exact linear projection
+from the slowest complete retained x86 report gives 53.648 minutes of guest
+work plus 2.811 minutes of retained process/invocation overhead. The 128 AOT
+atomic-wait probes and 16 trusted barrier probes add at most 0.700 minutes,
+for a 57.159-minute benchmark-path bound. The worst projected individual guest
+interval is 22.015 seconds (22.018 seconds including invocation overhead), so
+the watchdog retains more than 67 seconds and a 4.08x factor while remaining
+fail closed.
+
+The 180-minute job bound additionally reserves 48 minutes for all eight
+revision/runtime builds, 10 minutes for two checkouts plus Zig/cache setup,
+20 minutes for harness tests, SDK download, and fixture rebuild/verification,
+and 5 minutes for report generation, upload, and cleanup. Checksum preparation
+is measured in every report and is included in the remaining 39.8-minute
+hosted-variance margin (the automated bound is below one second total).
+Twenty sequential trusted x86 jobs at the full job timeout take 60 hours,
+leaving 12 hours (16.7%) before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
