@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -33,6 +34,8 @@ from bench_wasi_threads import (
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_PLATFORMS = tuple(CANONICAL_PLATFORMS)
 RUNNER_TARGETS = ("github-hosted", "trusted-calibration")
+TRUSTED_X86_RUNNER_NAME = "vm31e"
+DEFAULT_DISPATCH_TIMEOUT_SECONDS = 72 * 60 * 60
 RUNNER_ENVIRONMENTS = {
     "github-hosted": {
         "ubuntu-22.04-x86_64": "github-hosted",
@@ -53,16 +56,100 @@ def require_sha(value: str, name: str = "SHA") -> str:
     return value
 
 
-def gh_json(command: list[str]) -> Any:
-    output = subprocess.check_output(
-        ["gh", *command], text=True, stderr=subprocess.STDOUT
-    )
+def gh_json(command: list[str], timeout_seconds: float | None = None) -> Any:
+    try:
+        output = subprocess.check_output(
+            ["gh", *command],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HarnessError(
+            f"GitHub command timed out: gh {' '.join(command)}"
+        ) from exc
     return json.loads(output)
 
 
-def resolve_workflow_head(repository: str, workflow_ref: str) -> str:
+def remaining_timeout(deadline: float, context: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise HarnessError(f"cohort dispatch timed out while {context}")
+    return remaining
+
+
+def require_api_object(value: Any, context: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise HarnessError(f"GitHub returned an invalid {context} object")
+    return value
+
+
+def require_api_string(
+    value: dict[str, Any], key: str, context: str, *, allow_empty: bool = False
+) -> str:
+    result = value.get(key)
+    if not isinstance(result, str) or (not allow_empty and not result):
+        raise HarnessError(f"GitHub {context} is missing valid {key}")
+    return result
+
+
+def parse_workflow_run(value: Any, run_id: int) -> dict[str, str]:
+    run = require_api_object(value, f"workflow run {run_id}")
+    return {
+        "status": require_api_string(run, "status", f"workflow run {run_id}"),
+        "conclusion": require_api_string(
+            run,
+            "conclusion",
+            f"workflow run {run_id}",
+            allow_empty=True,
+        ),
+        "headSha": require_sha(
+            require_api_string(run, "headSha", f"workflow run {run_id}").lower(),
+            f"workflow run {run_id} head SHA",
+        ),
+        "url": require_api_string(run, "url", f"workflow run {run_id}"),
+    }
+
+
+def parse_artifacts(value: Any, run_id: int) -> list[dict[str, Any]]:
+    response = require_api_object(value, f"artifact response for run {run_id}")
+    artifacts = response.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise HarnessError(
+            f"GitHub artifact response for run {run_id} is missing artifacts"
+        )
+    parsed = []
+    for index, value in enumerate(artifacts):
+        context = f"artifact {index} for run {run_id}"
+        artifact = require_api_object(value, context)
+        artifact_id = artifact.get("id")
+        size = artifact.get("size_in_bytes")
+        expired = artifact.get("expired")
+        if not isinstance(artifact_id, int) or artifact_id <= 0:
+            raise HarnessError(f"GitHub {context} is missing valid id")
+        if not isinstance(size, int) or size < 0:
+            raise HarnessError(f"GitHub {context} is missing valid size_in_bytes")
+        if not isinstance(expired, bool):
+            raise HarnessError(f"GitHub {context} is missing valid expired")
+        parsed.append(
+            {
+                "id": artifact_id,
+                "name": require_api_string(artifact, "name", context),
+                "size_in_bytes": size,
+                "expired": expired,
+            }
+        )
+    return parsed
+
+
+def resolve_workflow_head(
+    repository: str,
+    workflow_ref: str,
+    timeout_seconds: float | None = None,
+) -> str:
     result = gh_json(
-        ["api", f"repos/{repository}/commits/{quote(workflow_ref, safe='')}"]
+        ["api", f"repos/{repository}/commits/{quote(workflow_ref, safe='')}"],
+        timeout_seconds,
     )
     if not isinstance(result, dict):
         raise HarnessError("GitHub returned an invalid workflow ref response")
@@ -103,14 +190,25 @@ def validate_dispatch_options(args: argparse.Namespace) -> tuple[str, str, int]:
         raise HarnessError(
             "the trusted calibration runner is reachable only from workflow ref main"
         )
+    timeout_seconds = getattr(args, "timeout_seconds", None)
     if (
         args.runs <= 1
         or args.max_in_flight <= 0
         or args.poll_seconds < 0
         or args.lookup_attempts <= 0
         or args.lookup_seconds < 0
+        or not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
     ):
-        raise HarnessError("--runs must exceed one and --max-in-flight must be positive")
+        raise HarnessError(
+            "--runs must exceed one; dispatch counts and timeout must be positive"
+        )
+    if args.runner_target == "trusted-calibration" and args.max_in_flight > 2:
+        raise HarnessError(
+            "trusted calibration --max-in-flight cannot exceed 2"
+        )
     training_runs = (
         args.runs // 2 if args.training_runs is None else args.training_runs
     )
@@ -123,8 +221,14 @@ def find_dispatched_run(
     args: argparse.Namespace,
     run_name: str,
     workflow_head_sha: str,
+    deadline: float | None = None,
 ) -> tuple[int, str]:
     for attempt in range(args.lookup_attempts):
+        timeout = (
+            remaining_timeout(deadline, f"locating {run_name!r}")
+            if deadline is not None
+            else None
+        )
         runs = gh_json(
             [
                 "run",
@@ -139,33 +243,49 @@ def find_dispatched_run(
                 "100",
                 "--json",
                 "databaseId,displayTitle,headSha,url",
-            ]
+            ],
+            timeout,
         )
         if not isinstance(runs, list):
             raise HarnessError("GitHub returned an invalid workflow run list")
-        matches = [
-            run
-            for run in runs
-            if isinstance(run, dict)
-            and run.get("displayTitle") == run_name
-            and str(run.get("headSha", "")).lower() == workflow_head_sha
-        ]
+        matches = []
+        for index, value in enumerate(runs):
+            context = f"workflow run list item {index}"
+            run = require_api_object(value, context)
+            run_id = run.get("databaseId")
+            if not isinstance(run_id, int) or run_id <= 0:
+                raise HarnessError(f"GitHub {context} is missing valid databaseId")
+            title = require_api_string(run, "displayTitle", context)
+            head_sha = require_sha(
+                require_api_string(run, "headSha", context).lower(),
+                f"{context} head SHA",
+            )
+            url = require_api_string(run, "url", context)
+            if title == run_name and head_sha == workflow_head_sha:
+                matches.append({"databaseId": run_id, "url": url})
         if len(matches) > 1:
             raise HarnessError(f"duplicate workflow runs found for {run_name!r}")
         if matches:
-            run_id = matches[0].get("databaseId")
-            url = matches[0].get("url")
-            if isinstance(run_id, int) and isinstance(url, str) and url:
-                return run_id, url
-            raise HarnessError("GitHub returned an invalid workflow run identity")
+            return matches[0]["databaseId"], matches[0]["url"]
         if attempt + 1 < args.lookup_attempts:
-            time.sleep(args.lookup_seconds)
+            sleep_seconds = args.lookup_seconds
+            if deadline is not None:
+                sleep_seconds = min(
+                    sleep_seconds,
+                    remaining_timeout(deadline, f"locating {run_name!r}"),
+                )
+            time.sleep(sleep_seconds)
     raise HarnessError(f"could not locate dispatched workflow run {run_name!r}")
 
 
 def dispatch(args: argparse.Namespace) -> int:
     baseline_sha, candidate_sha, training_runs = validate_dispatch_options(args)
-    workflow_head_sha = resolve_workflow_head(args.repository, args.workflow_ref)
+    deadline = time.monotonic() + args.timeout_seconds
+    workflow_head_sha = resolve_workflow_head(
+        args.repository,
+        args.workflow_ref,
+        remaining_timeout(deadline, "resolving the workflow head"),
+    )
     cohort_id = uuid.uuid4().hex
     state = {
         "schema_version": SCHEMA_VERSION,
@@ -187,6 +307,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "requested_runs": args.runs,
         "requested_reports": args.runs * len(DEFAULT_PLATFORMS),
         "max_in_flight": args.max_in_flight,
+        "timeout_seconds": args.timeout_seconds,
         "split": {
             "method": "predeclared-sequence",
             "training_runs": training_runs,
@@ -208,49 +329,59 @@ def dispatch(args: argparse.Namespace) -> int:
     launched = 0
     while launched < args.runs or active:
         while launched < args.runs and len(active) < args.max_in_flight:
+            remaining_timeout(deadline, "launching workflow runs")
             sequence = launched + 1
             partition = "training" if sequence <= training_runs else "holdout"
             run_name = (
                 f"WASI thread cohort-{cohort_id}-{sequence}-{partition}"
             )
-            output = subprocess.check_output(
-                [
-                    "gh",
-                    "workflow",
-                    "run",
-                    args.workflow,
-                    "--repo",
-                    args.repository,
-                    "--ref",
-                    args.workflow_ref,
-                    "-f",
-                    f"baseline_sha={baseline_sha}",
-                    "-f",
-                    f"candidate_sha={candidate_sha}",
-                    "-f",
-                    f"purpose={args.purpose}",
-                    "-f",
-                    f"profile={args.profile}",
-                    "-f",
-                    f"warmups={args.warmups}",
-                    "-f",
-                    f"samples={args.samples}",
-                    "-f",
-                    f"runner_target={args.runner_target}",
-                    "-f",
-                    f"cohort_id={cohort_id}",
-                    "-f",
-                    f"cohort_sequence={sequence}",
-                    "-f",
-                    f"cohort_partition={partition}",
-                ],
-                text=True,
-                stderr=subprocess.STDOUT,
-            ).strip()
+            try:
+                output = subprocess.check_output(
+                    [
+                        "gh",
+                        "workflow",
+                        "run",
+                        args.workflow,
+                        "--repo",
+                        args.repository,
+                        "--ref",
+                        args.workflow_ref,
+                        "-f",
+                        f"baseline_sha={baseline_sha}",
+                        "-f",
+                        f"candidate_sha={candidate_sha}",
+                        "-f",
+                        f"purpose={args.purpose}",
+                        "-f",
+                        f"profile={args.profile}",
+                        "-f",
+                        f"warmups={args.warmups}",
+                        "-f",
+                        f"samples={args.samples}",
+                        "-f",
+                        f"runner_target={args.runner_target}",
+                        "-f",
+                        f"cohort_id={cohort_id}",
+                        "-f",
+                        f"cohort_sequence={sequence}",
+                        "-f",
+                        f"cohort_partition={partition}",
+                    ],
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                    timeout=remaining_timeout(
+                        deadline, f"dispatching cohort sequence {sequence}"
+                    ),
+                ).strip()
+            except subprocess.TimeoutExpired as exc:
+                atomic_write_json(args.output, state)
+                raise HarnessError(
+                    f"cohort dispatch timed out while launching sequence {sequence}"
+                ) from exc
             match = re.search(r"(https?://\S+/actions/runs/(\d+))", output)
             if match is None:
                 run_id, run_url = find_dispatched_run(
-                    args, run_name, workflow_head_sha
+                    args, run_name, workflow_head_sha, deadline
                 )
             else:
                 run_id = int(match.group(2))
@@ -270,19 +401,31 @@ def dispatch(args: argparse.Namespace) -> int:
             launched += 1
             atomic_write_json(args.output, state)
 
-        time.sleep(args.poll_seconds)
+        try:
+            sleep_seconds = min(
+                args.poll_seconds,
+                remaining_timeout(deadline, "waiting for workflow runs"),
+            )
+        except HarnessError:
+            atomic_write_json(args.output, state)
+            raise
+        time.sleep(sleep_seconds)
         for run_id in list(active):
             record = active[run_id]
-            run = gh_json(
-                [
-                    "run",
-                    "view",
-                    str(run_id),
-                    "--repo",
-                    args.repository,
-                    "--json",
-                    "status,conclusion,headSha,url",
-                ]
+            run = parse_workflow_run(
+                gh_json(
+                    [
+                        "run",
+                        "view",
+                        str(run_id),
+                        "--repo",
+                        args.repository,
+                        "--json",
+                        "status,conclusion,headSha,url",
+                    ],
+                    remaining_timeout(deadline, f"polling workflow run {run_id}"),
+                ),
+                run_id,
             )
             record.update(
                 {
@@ -299,21 +442,19 @@ def dispatch(args: argparse.Namespace) -> int:
                     f"does not match immutable workflow head {workflow_head_sha}"
                 )
             if run["status"] == "completed":
-                artifacts = gh_json(
-                    [
-                        "api",
-                        f"repos/{args.repository}/actions/runs/{run_id}/artifacts",
-                    ]
+                record["artifacts"] = parse_artifacts(
+                    gh_json(
+                        [
+                            "api",
+                            f"repos/{args.repository}/actions/runs/"
+                            f"{run_id}/artifacts",
+                        ],
+                        remaining_timeout(
+                            deadline, f"listing artifacts for workflow run {run_id}"
+                        ),
+                    ),
+                    run_id,
                 )
-                record["artifacts"] = [
-                    {
-                        "id": item["id"],
-                        "name": item["name"],
-                        "size_in_bytes": item["size_in_bytes"],
-                        "expired": item["expired"],
-                    }
-                    for item in artifacts["artifacts"]
-                ]
                 if run["conclusion"] != "success":
                     atomic_write_json(args.output, state)
                     raise HarnessError(
@@ -386,12 +527,17 @@ def validate_dispatch_state(
         raise HarnessError("candidate evaluation dispatch has identical target SHAs")
     requested_runs = state.get("requested_runs")
     requested_reports = state.get("requested_reports")
+    timeout_seconds = state.get("timeout_seconds")
     if (
         not isinstance(requested_runs, int)
         or requested_runs <= 1
         or requested_reports != requested_runs * len(required_platforms)
+        or not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
     ):
-        raise HarnessError("dispatch manifest requested report count")
+        raise HarnessError("dispatch manifest requested report count or timeout")
     split = state.get("split")
     assignments = split.get("assignments") if isinstance(split, dict) else None
     if (
@@ -471,6 +617,7 @@ def validate_dispatch_state(
         "runner_target": runner_target,
         "requested_runs": requested_runs,
         "requested_reports": requested_reports,
+        "timeout_seconds": timeout_seconds,
         "run_by_id": run_by_id,
         "split": split,
     }
@@ -585,7 +732,10 @@ def validate_paired_documents(
     }
     fixture_identities: set[str] = set()
     plan_identities: set[str] = set()
-    host_fingerprints: dict[str, set[str]] = defaultdict(set)
+    host_fingerprints: dict[str, Counter[str]] = defaultdict(Counter)
+    host_cpus: dict[str, Counter[str]] = defaultdict(Counter)
+    runner_images: dict[str, Counter[str]] = defaultdict(Counter)
+    runner_names: dict[str, set[str]] = defaultdict(set)
     host_pair_ids: set[str] = set()
     observations: list[dict[str, Any]] = []
     expected_run_ids = set(expected["run_by_id"])
@@ -637,7 +787,15 @@ def validate_paired_documents(
         fingerprint = host["host_fingerprint"]["sha256"]
         if metadata["host_pair"]["host_fingerprint_sha256"] != fingerprint:
             raise HarnessError(f"{path}: mixed host fingerprint within report")
-        host_fingerprints[platform_id].add(fingerprint)
+        fingerprint_fields = host["host_fingerprint"]["fields"]
+        cpu = fingerprint_fields["cpu"]
+        runner_image = fingerprint_fields["runner_image"]
+        runner_name = host.get("runner_name", "")
+        host_fingerprints[platform_id][fingerprint] += 1
+        host_cpus[platform_id][cpu] += 1
+        runner_images[platform_id][runner_image] += 1
+        if runner_name:
+            runner_names[platform_id].add(runner_name)
         host_pair_id = metadata["host_pair"]["id"]
         if host_pair_id in host_pair_ids:
             raise HarnessError(f"{path}: duplicate host-pair identity")
@@ -677,8 +835,17 @@ def validate_paired_documents(
         raise HarnessError("cohort has mixed baseline/candidate/build identities")
     if len(fixture_identities) != 1 or len(plan_identities) != 1:
         raise HarnessError("cohort has mixed fixture or plan identity")
-    if any(len(items) != 1 for items in host_fingerprints.values()):
-        raise HarnessError("cohort has mixed host fingerprints within a platform")
+    trusted_x86 = "ubuntu-22.04-x86_64"
+    if expected["runner_target"] == "trusted-calibration":
+        if runner_names[trusted_x86] != {TRUSTED_X86_RUNNER_NAME}:
+            raise HarnessError(
+                f"trusted x86 reports must all come from runner "
+                f"{TRUSTED_X86_RUNNER_NAME!r}"
+            )
+        if len(host_fingerprints[trusted_x86]) != 1:
+            raise HarnessError(
+                "trusted x86 reports have mixed vm31e host fingerprints"
+            )
     observations.sort(key=lambda item: (item["sequence"], item["platform"]))
     if len(observations) != len(documents):
         raise HarnessError("cohort observation exclusion is forbidden")
@@ -732,8 +899,25 @@ def validate_paired_documents(
             platform_id: {
                 "reports": len(grouped[platform_id]),
                 "run_ids": sorted(grouped[platform_id]),
-                "host_fingerprint_sha256": next(
-                    iter(host_fingerprints[platform_id])
+                "host_fingerprint_distribution": dict(
+                    sorted(host_fingerprints[platform_id].items())
+                ),
+                "cpu_distribution": dict(
+                    sorted(host_cpus[platform_id].items())
+                ),
+                "runner_image_distribution": dict(
+                    sorted(runner_images[platform_id].items())
+                ),
+                **(
+                    {
+                        "trusted_runner_name": TRUSTED_X86_RUNNER_NAME,
+                        "host_fingerprint_sha256": next(
+                            iter(host_fingerprints[platform_id])
+                        ),
+                    }
+                    if expected["runner_target"] == "trusted-calibration"
+                    and platform_id == trusted_x86
+                    else {}
                 ),
             }
             for platform_id in required_platforms
@@ -822,6 +1006,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     dispatch_parser.add_argument("--runs", type=int, default=20)
     dispatch_parser.add_argument("--training-runs", type=int)
     dispatch_parser.add_argument("--max-in-flight", type=int, default=2)
+    dispatch_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=DEFAULT_DISPATCH_TIMEOUT_SECONDS,
+        help="wall-clock limit for dispatch and polling (default: 72 hours)",
+    )
     dispatch_parser.add_argument("--poll-seconds", type=float, default=60)
     dispatch_parser.add_argument("--lookup-attempts", type=int, default=30)
     dispatch_parser.add_argument("--lookup-seconds", type=float, default=2)

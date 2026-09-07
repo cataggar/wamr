@@ -65,6 +65,8 @@ def make_report(
     machine: str = "x86_64",
     cpu: str = "test cpu",
     runner_environment: str = "github-hosted",
+    runner_image: str = "ubuntu",
+    runner_name: str = "test-runner",
     commit: str = "a" * 40,
     baseline_commit: str | None = None,
     baseline_source: str = "e" * 64,
@@ -113,7 +115,7 @@ def make_report(
         "cpu": cpu,
         "logical_cpus": 4,
         "runner_environment": runner_environment,
-        "runner_image": "ubuntu",
+        "runner_image": runner_image,
         "runner_os": "Linux",
         "runner_arch": machine,
     }
@@ -239,6 +241,7 @@ def make_report(
                 "system": "Linux",
                 "machine": machine,
                 "runner_environment": runner_environment,
+                "runner_name": runner_name,
                 "github_run_id": run_id,
                 "host_fingerprint": {
                     "sha256": host_fingerprint,
@@ -393,6 +396,7 @@ def make_dispatch_state(
         "requested_runs": len(run_ids),
         "requested_reports": len(run_ids) * len(cohort.DEFAULT_PLATFORMS),
         "max_in_flight": 2,
+        "timeout_seconds": cohort.DEFAULT_DISPATCH_TIMEOUT_SECONDS,
         "split": {
             "method": "predeclared-sequence",
             "training_runs": training_runs,
@@ -1367,6 +1371,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                         Path(f"x86-{run_id}"),
                         make_report(
                             runner_environment="self-hosted",
+                            runner_name="vm31e",
                             **common,
                         ),
                     ),
@@ -1375,6 +1380,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                         make_report(
                             platform_id="ubuntu-24.04-aarch64",
                             machine="aarch64",
+                            cpu=f"hosted arm {run_id}",
+                            runner_image=f"ubuntu-arm-{run_id}",
                             **common,
                         ),
                     ),
@@ -1391,6 +1398,20 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             result["identity"]["comparison_purpose"], "noise-calibration"
+        )
+        self.assertEqual(
+            result["platforms"]["ubuntu-22.04-x86_64"][
+                "trusted_runner_name"
+            ],
+            "vm31e",
+        )
+        self.assertEqual(
+            len(
+                result["platforms"]["ubuntu-24.04-aarch64"][
+                    "host_fingerprint_distribution"
+                ]
+            ),
+            2,
         )
 
     def test_paired_cohort_requires_manifest_exact_count_and_no_legacy(self) -> None:
@@ -1437,7 +1458,94 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 dispatch_state,
             )
 
-    def test_paired_cohort_rejects_mixed_baseline_host_plan_and_pair_order(self) -> None:
+    def test_paired_cohort_accepts_hosted_host_distributions(self) -> None:
+        reports = make_paired_cohort_reports()
+        reports[2] = (
+            Path("x86-101-other-host"),
+            make_report(
+                run_id="101",
+                cpu="different cpu",
+                runner_image="ubuntu-24.04",
+            ),
+        )
+        result = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            1,
+            make_dispatch_state(),
+        )
+        x86 = result["platforms"]["ubuntu-22.04-x86_64"]
+        self.assertEqual(len(x86["host_fingerprint_distribution"]), 2)
+        self.assertEqual(
+            x86["cpu_distribution"], {"different cpu": 1, "test cpu": 1}
+        )
+        self.assertEqual(
+            x86["runner_image_distribution"],
+            {"ubuntu": 1, "ubuntu-24.04": 1},
+        )
+        self.assertEqual(len(result["observations"]), len(reports))
+        self.assertEqual(result["excluded_observations"], [])
+
+    def test_trusted_cohort_rejects_x86_drift_and_wrong_runner(self) -> None:
+        state = make_dispatch_state(
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+            runner_target="trusted-calibration",
+        )
+
+        def reports(second_cpu: str = "test cpu", runner_name: str = "vm31e"):
+            result = []
+            for run_id, cpu in (("100", "test cpu"), ("101", second_cpu)):
+                common = {
+                    "run_id": run_id,
+                    "baseline_commit": "a" * 40,
+                    "commit": "a" * 40,
+                    "baseline_source": "c" * 64,
+                    "candidate_source": "c" * 64,
+                    "comparison_purpose": "noise-calibration",
+                }
+                result.extend(
+                    [
+                        (
+                            Path(f"x86-{run_id}"),
+                            make_report(
+                                cpu=cpu,
+                                runner_environment="self-hosted",
+                                runner_name=runner_name,
+                                **common,
+                            ),
+                        ),
+                        (
+                            Path(f"arm-{run_id}"),
+                            make_report(
+                                platform_id="ubuntu-24.04-aarch64",
+                                machine="aarch64",
+                                **common,
+                            ),
+                        ),
+                    ]
+                )
+            return result
+
+        with self.assertRaisesRegex(
+            bench.HarnessError, "mixed vm31e host fingerprints"
+        ):
+            cohort.validate_documents(
+                reports(second_cpu="different cpu"),
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                state,
+            )
+        with self.assertRaisesRegex(bench.HarnessError, "runner 'vm31e'"):
+            cohort.validate_documents(
+                reports(runner_name="other-runner"),
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                state,
+            )
+
+    def test_paired_cohort_rejects_mixed_baseline_report_host_plan_and_pair_order(self) -> None:
         dispatch_state = make_dispatch_state()
         reports = make_paired_cohort_reports()
 
@@ -1456,14 +1564,17 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 dispatch_state,
             )
 
-        mixed_host = make_paired_cohort_reports()
-        mixed_host[2] = (
-            Path("x86-101-other-host"),
-            make_report(run_id="101", cpu="different cpu"),
-        )
-        with self.assertRaisesRegex(bench.HarnessError, "mixed host fingerprints"):
+        mixed_report_host = copy.deepcopy(reports)
+        changed = mixed_report_host[0][1]
+        changed["metadata"]["revisions"]["candidate"][
+            "host_fingerprint_sha256"
+        ] = "f" * 64
+        for record in changed["records"]:
+            if record["revision"] == "candidate":
+                record["host_fingerprint_sha256"] = "f" * 64
+        with self.assertRaisesRegex(BenchmarkDataError, "mixed host fingerprint"):
             cohort.validate_documents(
-                mixed_host,
+                mixed_report_host,
                 cohort.DEFAULT_PLATFORMS,
                 1,
                 dispatch_state,
@@ -1651,6 +1762,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     runs=2,
                     training_runs=1,
                     max_in_flight=1,
+                    timeout_seconds=3600,
                     output=output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
@@ -1736,6 +1848,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     runs=2,
                     training_runs=1,
                     max_in_flight=1,
+                    timeout_seconds=3600,
                     output=mismatch_output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
@@ -1761,6 +1874,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "runs": 2,
             "training_runs": 1,
             "max_in_flight": 1,
+            "timeout_seconds": 3600,
             "poll_seconds": 0,
             "lookup_attempts": 1,
             "lookup_seconds": 0,
@@ -1770,12 +1884,103 @@ class ThreadBenchmarkTests(unittest.TestCase):
             ("samples", 3, "even"),
             ("candidate_sha", "b" * 40, "distinct"),
             ("runner_target", "trusted-calibration", "noise calibration only"),
+            ("timeout_seconds", 0, "timeout"),
         ):
             args = Namespace(**dict(common, **{field: value}))
             with self.subTest(field=field), self.assertRaisesRegex(
                 bench.HarnessError, message
             ):
                 cohort.validate_dispatch_options(args)
+
+        trusted = Namespace(
+            **dict(
+                common,
+                baseline_sha="a" * 40,
+                candidate_sha="a" * 40,
+                purpose="noise-calibration",
+                runner_target="trusted-calibration",
+                max_in_flight=3,
+            )
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "cannot exceed 2"):
+            cohort.validate_dispatch_options(trusted)
+
+    def test_cohort_dispatch_times_out_queued_run_and_retains_state(self) -> None:
+        output = self.scratch / "dispatch-timeout.json"
+        with (
+            mock.patch.object(
+                cohort.subprocess,
+                "check_output",
+                side_effect=[
+                    json.dumps({"sha": "f" * 40}),
+                    "https://github.com/cataggar/wamr/actions/runs/123\n",
+                ],
+            ),
+            mock.patch.object(
+                cohort.time,
+                "monotonic",
+                side_effect=[0, 0, 0, 0, 2],
+            ),
+            mock.patch.object(
+                cohort.uuid,
+                "uuid4",
+                return_value=Namespace(hex="d" * 32),
+            ),
+            self.assertRaisesRegex(bench.HarnessError, "timed out"),
+        ):
+            cohort.dispatch(
+                Namespace(
+                    baseline_sha="b" * 40,
+                    candidate_sha="a" * 40,
+                    purpose="candidate-evaluation",
+                    profile="authoritative",
+                    warmups=2,
+                    samples=10,
+                    runner_target="github-hosted",
+                    runs=2,
+                    training_runs=1,
+                    max_in_flight=1,
+                    timeout_seconds=1,
+                    output=output,
+                    repository="cataggar/wamr",
+                    workflow="wasi-thread-bench.yml",
+                    workflow_ref="main",
+                    poll_seconds=60,
+                    lookup_attempts=1,
+                    lookup_seconds=0,
+                )
+            )
+        state = json.loads(output.read_text(encoding="UTF-8"))
+        self.assertEqual(state["runs"][0]["status"], "queued")
+        self.assertEqual(state["timeout_seconds"], 1)
+
+    def test_cohort_api_field_errors_are_contextual(self) -> None:
+        with self.assertRaisesRegex(
+            bench.HarnessError, "workflow run 123.*status"
+        ):
+            cohort.parse_workflow_run({"headSha": "f" * 40}, 123)
+        with self.assertRaisesRegex(
+            bench.HarnessError, "artifact response for run 123.*artifacts"
+        ):
+            cohort.parse_artifacts({}, 123)
+        args = Namespace(
+            repository="cataggar/wamr",
+            workflow="wasi-thread-bench.yml",
+            workflow_ref="main",
+            lookup_attempts=1,
+            lookup_seconds=0,
+        )
+        with (
+            mock.patch.object(
+                cohort,
+                "gh_json",
+                return_value=[{"displayTitle": "incomplete"}],
+            ),
+            self.assertRaisesRegex(
+                bench.HarnessError, "run list item 0.*databaseId"
+            ),
+        ):
+            cohort.find_dispatched_run(args, "expected", "f" * 40)
 
     def test_cohort_dispatch_finds_exact_named_run_when_cli_has_no_url(self) -> None:
         args = Namespace(
@@ -1827,7 +2032,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertIn("inputs.runner_target == 'trusted-calibration'", trusted_x86)
         self.assertIn("inputs.purpose == 'noise-calibration'", trusted_x86)
         self.assertIn("github.ref == 'refs/heads/main'", trusted_x86)
-        self.assertIn("runs-on: [self-hosted, wamr-temp-20260906]", trusted_x86)
+        self.assertIn("runs-on: wamr-temp-20260906", trusted_x86)
+        self.assertNotIn("runs-on: [", trusted_x86)
+        self.assertNotIn("runs-on: self-hosted", trusted_x86)
         self.assertNotIn("pull_request", trusted_x86)
         self.assertNotIn("\n  push:", trusted_x86)
 
@@ -1838,6 +2045,41 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertIn("inputs.runner_target == 'github-hosted'", hosted)
         self.assertNotIn("self-hosted", hosted)
         self.assertNotIn("wamr-temp-20260906", hosted)
+        self.assertNotIn("github.workspace }}/wasi-thread-bench-out", workflow)
+        self.assertEqual(
+            workflow.count("Clean run-scoped benchmark output and caches"), 3
+        )
+        self.assertEqual(workflow.count('rm -rf -- "$EXPECTED_ROOT"'), 3)
+        self.assertEqual(
+            workflow.count('echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"'),
+            3,
+        )
+        for start_marker, end_marker in (
+            ("\n  benchmark:", "\n  trusted-calibration-x86:"),
+            ("\n  trusted-calibration-x86:", "\n  trusted-calibration-arm:"),
+            ("\n  trusted-calibration-arm:", "\n  comment:"),
+        ):
+            block = workflow[
+                workflow.index(start_marker) : workflow.index(
+                    end_marker, workflow.index(start_marker) + 1
+                )
+            ]
+            self.assertLess(
+                block.index("Upload retained paired report"),
+                block.index("Clean run-scoped benchmark output and caches"),
+            )
+        self.assertIn("push:\n    branches: [main]\n    paths:", workflow)
+        self.assertIn(
+            "Download retained x86 report\n        continue-on-error: true",
+            workflow,
+        )
+        self.assertIn("prepare:\n    runs-on: ubuntu-22.04\n    timeout-minutes: 15", workflow)
+        self.assertIn(
+            "comment:\n    if: always() && github.event_name == 'pull_request'\n"
+            "    needs: benchmark\n    runs-on: ubuntu-22.04\n"
+            "    timeout-minutes: 10",
+            workflow,
+        )
         for input_name in (
             "baseline_sha:",
             "candidate_sha:",

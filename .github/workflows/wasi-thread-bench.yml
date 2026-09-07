@@ -19,6 +19,7 @@ on:
       - tests/benchmarks/wasi-threads/**
       - .github/workflows/wasi-thread-bench.yml
   push:
+    branches: [main]
     paths: *benchmark-paths
   workflow_dispatch:
     inputs:
@@ -75,6 +76,7 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
@@ -221,8 +223,6 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
-    env:
-      WASI_THREAD_OUTPUT: ${{ github.workspace }}/wasi-thread-bench-out-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -260,11 +260,13 @@ jobs:
       - name: Configure job-local caches and temporary files
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
-          mkdir -p "$ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache} "$WASI_THREAD_OUTPUT"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
+          mkdir -p "$EXPECTED_ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
           {
-            echo "TMPDIR=$ROOT/tmp"
-            echo "XDG_CACHE_HOME=$ROOT/xdg-cache"
+            echo "WASI_THREAD_ROOT=$EXPECTED_ROOT"
+            echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"
+            echo "TMPDIR=$EXPECTED_ROOT/tmp"
+            echo "XDG_CACHE_HOME=$EXPECTED_ROOT/xdg-cache"
           } >> "$GITHUB_ENV"
 
       - name: Install Zig 0.16.0
@@ -290,8 +292,8 @@ jobs:
           SDK_SHA256: 52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c
         run: |
           set -euo pipefail
-          SDK_ROOT="$RUNNER_TEMP/wasi-sdk-25"
-          ARCHIVE="$RUNNER_TEMP/wasi-sdk-25.tar.gz"
+          SDK_ROOT="$WASI_THREAD_ROOT/wasi-sdk-25"
+          ARCHIVE="$WASI_THREAD_ROOT/wasi-sdk-25.tar.gz"
           mkdir -p "$SDK_ROOT" "$TMPDIR"
           curl --fail --location --retry 3 "$SDK_URL" -o "$ARCHIVE"
           echo "$SDK_SHA256  $ARCHIVE" | sha256sum -c -
@@ -335,10 +337,22 @@ jobs:
         with:
           name: wasi-thread-bench-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.WASI_THREAD_OUTPUT }}/report.json
-            ${{ env.WASI_THREAD_OUTPUT }}/report.md
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.md
           if-no-files-found: warn
           retention-days: 90
+
+      - name: Clean run-scoped benchmark output and caches
+        if: always()
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
+          case "$EXPECTED_ROOT" in
+            "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}") ;;
+            *) exit 2 ;;
+          esac
+          rm -rf -- "$EXPECTED_ROOT"
 
   trusted-calibration-x86:
     if: >-
@@ -350,9 +364,7 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
-    env:
-      WASI_THREAD_OUTPUT: ${{ github.workspace }}/wasi-thread-bench-out-${{ github.run_id }}-${{ github.run_attempt }}-x86
-    runs-on: [self-hosted, wamr-temp-20260906]
+    runs-on: wamr-temp-20260906
     steps:
       - name: Require runner work directories under /d
         run: |
@@ -389,11 +401,14 @@ jobs:
       - name: Configure job-local caches and temporary files
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86"
-          mkdir -p "$ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache} "$WASI_THREAD_OUTPUT"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86"
+          case "$EXPECTED_ROOT" in /d/*) ;; *) exit 2 ;; esac
+          mkdir -p "$EXPECTED_ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
           {
-            echo "TMPDIR=$ROOT/tmp"
-            echo "XDG_CACHE_HOME=$ROOT/xdg-cache"
+            echo "WASI_THREAD_ROOT=$EXPECTED_ROOT"
+            echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"
+            echo "TMPDIR=$EXPECTED_ROOT/tmp"
+            echo "XDG_CACHE_HOME=$EXPECTED_ROOT/xdg-cache"
           } >> "$GITHUB_ENV"
 
       - name: Install Zig 0.16.0
@@ -417,8 +432,8 @@ jobs:
           SDK_SHA256: 52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c
         run: |
           set -euo pipefail
-          SDK_ROOT="$RUNNER_TEMP/wasi-sdk-25"
-          ARCHIVE="$RUNNER_TEMP/wasi-sdk-25.tar.gz"
+          SDK_ROOT="$WASI_THREAD_ROOT/wasi-sdk-25"
+          ARCHIVE="$WASI_THREAD_ROOT/wasi-sdk-25.tar.gz"
           mkdir -p "$SDK_ROOT" "$TMPDIR"
           curl --fail --location --retry 3 "$SDK_URL" -o "$ARCHIVE"
           echo "$SDK_SHA256  $ARCHIVE" | sha256sum -c -
@@ -462,10 +477,23 @@ jobs:
         with:
           name: wasi-thread-bench-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.WASI_THREAD_OUTPUT }}/report.json
-            ${{ env.WASI_THREAD_OUTPUT }}/report.md
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.md
           if-no-files-found: warn
           retention-days: 90
+
+      - name: Clean run-scoped benchmark output and caches
+        if: always()
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86"
+          case "$EXPECTED_ROOT" in
+            "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86") ;;
+            *) exit 2 ;;
+          esac
+          case "$EXPECTED_ROOT" in /d/*) ;; *) exit 2 ;; esac
+          rm -rf -- "$EXPECTED_ROOT"
 
   trusted-calibration-arm:
     if: >-
@@ -477,8 +505,6 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
-    env:
-      WASI_THREAD_OUTPUT: ${{ github.workspace }}/wasi-thread-bench-out-${{ github.run_id }}-${{ github.run_attempt }}-arm
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Check out baseline
@@ -508,11 +534,13 @@ jobs:
       - name: Configure job-local caches and temporary files
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm"
-          mkdir -p "$ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache} "$WASI_THREAD_OUTPUT"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm"
+          mkdir -p "$EXPECTED_ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
           {
-            echo "TMPDIR=$ROOT/tmp"
-            echo "XDG_CACHE_HOME=$ROOT/xdg-cache"
+            echo "WASI_THREAD_ROOT=$EXPECTED_ROOT"
+            echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"
+            echo "TMPDIR=$EXPECTED_ROOT/tmp"
+            echo "XDG_CACHE_HOME=$EXPECTED_ROOT/xdg-cache"
           } >> "$GITHUB_ENV"
 
       - name: Install Zig 0.16.0
@@ -559,20 +587,34 @@ jobs:
         with:
           name: wasi-thread-bench-ubuntu-24.04-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.WASI_THREAD_OUTPUT }}/report.json
-            ${{ env.WASI_THREAD_OUTPUT }}/report.md
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.md
           if-no-files-found: warn
           retention-days: 90
+
+      - name: Clean run-scoped benchmark output and caches
+        if: always()
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm"
+          case "$EXPECTED_ROOT" in
+            "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm") ;;
+            *) exit 2 ;;
+          esac
+          rm -rf -- "$EXPECTED_ROOT"
 
   comment:
     if: always() && github.event_name == 'pull_request'
     needs: benchmark
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write
     steps:
       - name: Download retained x86 report
+        continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: wasi-thread-bench-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
