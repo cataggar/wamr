@@ -86,7 +86,6 @@
       },
       "then": {
         "properties": {
-          "enforcement": { "const": true },
           "calibration_provenance": {
             "$ref": "#/$defs/calibration_provenance"
           },

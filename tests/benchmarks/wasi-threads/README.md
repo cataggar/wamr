@@ -308,6 +308,57 @@ training/holdout partition, and records an empty exclusion list. The old
 single-revision validation path remains non-authoritative compatibility only
 and cannot enter a dispatch-backed paired cohort.
 
+Validation also embeds each report's canonical SHA-256 identity and the raw
+per-sample comparison, ratio-of-ratios, and candidate
+`single-infrastructure/*` ratios. That makes subsequent derivation
+self-contained: it never re-discovers reports, changes membership, or selects
+observations after seeing results.
+
+## Deterministic budget derivation
+
+`derive` accepts only the previously validated authoritative paired cohort and
+a separately reviewed policy document. The policy format is
+`derivation-policy.schema.json`; `derivation-policy.synthetic.json` is test
+data only and must not be treated as a production policy. Production policy
+ceilings and the rounding cushion must be declared before derivation:
+
+```sh
+python3 scripts/wasi_thread_cohort.py derive \
+  --cohort /d/wasi-thread-cohort.json \
+  --policy /path/to/reviewed-derivation-policy.json \
+  --budget-output /d/wasi-thread-budget.candidate.json \
+  --evidence-json-output /d/wasi-thread-budget-evidence.json \
+  --evidence-markdown-output /d/wasi-thread-budget-evidence.md
+```
+
+For each condition and internal pair, derivation first takes the median of that
+report's retained raw ratio samples, then works in natural-log ratio space on
+TRAINING reports only. The adverse one-sided noise bound is the more permissive
+of:
+
+1. the worst observed training deviation from ratio 1; and
+2. the adverse endpoint of `median ± 6 × 1.4826 × MAD`.
+
+The predeclared log rounding cushion is added to that selected bound. Derivation
+fails if the result exceeds the separately declared engineering-policy ceiling.
+No observation is removed: points outside the robust interval are listed only
+as diagnostic outliers. Every untouched HOLDOUT report must satisfy every
+candidate threshold or no output is written.
+
+Every report on both architectures must also contain the direct candidate
+`threads-enabled / threads-disabled` single-infrastructure raw ratios. Both the
+absolute median throughput delta and absolute median elapsed delta must be
+strictly below the issue's 2% policy; missing proof or any failure aborts with
+the exact run/platform evidence.
+
+The emitted candidate budget has complete thresholds and calibration
+provenance, but intentionally sets `"enforcement": false`. A later proof/final
+PR must explicitly change that field after reviewing the machine-readable
+evidence. The evidence records workflow run IDs and immutable SHAs,
+fixture/plan/profile/purpose, predeclared split, policy inputs, every formula
+input/result, holdout results, and host/fingerprint/CPU/image distributions.
+It contains no future candidate revision identity.
+
 Schema version 3 separates the actual report revisions from budget calibration
 provenance. Paired reports use `metadata.revisions.baseline` and `.candidate`;
 single-revision compatibility reports contain only `.candidate`. These entries
@@ -336,9 +387,11 @@ uncalibrated threshold.
 Rebaseline only after an intentional baseline change or a reviewed methodology,
 fixture, plan, hosted runner class, or toolchain change. Retain the complete
 hosted paired cohort, update both calibration revision identities and every
-derived ratio threshold together, and keep `calibrated` and `enforcement`
-false until the replacement cohort meets the declared report-count and platform
-requirements. A candidate-only source change never requires rebaselining.
+derived ratio threshold together. Keep both `calibrated` and `enforcement`
+false while evidence is incomplete; after successful deterministic derivation,
+the candidate budget may set `calibrated` true but must keep `enforcement`
+false until the proof/final PR explicitly enables it. A candidate-only source
+change never requires rebaselining.
 
 Until that cohort exists, claiming a statistically sound hard gate would be
 fabricating evidence. Issue #966 must remain open and #963 remains dependent on

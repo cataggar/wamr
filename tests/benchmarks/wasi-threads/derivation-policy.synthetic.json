@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "wasi-thread-budget-derivation-policy",
+  "minimum_reports_per_platform": 20,
+  "rounding_cushion_log": 0.001,
+  "engineering_policy_ceiling_log": {
+    "comparison_throughput_lower": 0.5,
+    "comparison_elapsed_upper": 0.5,
+    "ratio_of_ratios_throughput_lower": 0.5,
+    "ratio_of_ratios_elapsed_upper": 0.5
+  },
+  "direct_candidate_single_infrastructure_max_delta_fraction": 0.02
+}
