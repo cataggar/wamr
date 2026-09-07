@@ -230,7 +230,8 @@ preparation job that the target is commit history reachable from `main`. Only
 its x86 job can select the repository-scoped `wamr-temp-20260906` label;
 AArch64 remains `ubuntu-24.04-arm`. The temporary runner was registered with
 `--no-default-labels`, so its complete job-routing inventory is the single
-`wamr-temp-20260906` label.
+`wamr-temp-20260906` label and its exact registered name is
+`vm31e-wamr-temp-20260906`.
 
 For a public repository, this route is protected only while the repository's
 fork approval setting remains `approval_policy: all_external_contributors` and
@@ -246,6 +247,18 @@ the calibration is abandoned or finally closed. Benchmark jobs have only
 head before dispatch, sends all paired inputs unchanged, retains failed run
 metadata without retrying, and predeclares a sequence-based training/holdout
 split before results exist:
+
+Before a `trusted-calibration` cohort resolves or dispatches any workflow, the
+script makes one bounded Actions runner inventory query against the target
+repository. It requires the complete returned inventory to contain exactly one
+runner with custom label `wamr-temp-20260906`; that runner must have exact name
+`vm31e-wamr-temp-20260906`, the custom label must be its sole label, and it must
+be online and idle. Missing or duplicate label matches, offline or busy state,
+and name or label drift abort with a contextual error before workflow dispatch.
+The GitHub-hosted target does not query runner inventory. This exact name/label
+pair is operational identity for the temporary registration, not a portable
+performance class; report host fingerprints remain the relevant performance
+identity.
 
 ```sh
 python3 scripts/wasi_thread_cohort.py dispatch \
@@ -284,11 +297,12 @@ legacy, or cherry-picked report is accepted. It verifies the immutable workflow
 head and target SHAs, purpose/profile/warmup/sample plan, fixture and plan
 identity, balanced sample ordering, the shared baseline/candidate host identity
 inside each report, and stable baseline/candidate build identities. Trusted
-calibration additionally requires every x86 report to identify runner `vm31e`
-and one exact host fingerprint across the cohort. GitHub-hosted x86 and AArch64
-reports may have heterogeneous hosts across runs; validation retains every
-observation and summarizes their fingerprint, CPU, and runner-image
-distributions instead of rejecting normal hosted-runner variation. The output
+calibration additionally requires every x86 report to identify runner
+`vm31e-wamr-temp-20260906` and one exact host fingerprint across the cohort.
+GitHub-hosted x86 and AArch64 reports may have heterogeneous hosts across runs;
+validation retains every observation and summarizes their fingerprint, CPU,
+and runner-image distributions instead of rejecting normal hosted-runner
+variation. The output
 lists every retained observation with its exact workflow run ID and predeclared
 training/holdout partition, and records an empty exclusion list. The old
 single-revision validation path remains non-authoritative compatibility only

@@ -34,7 +34,8 @@ from bench_wasi_threads import (
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_PLATFORMS = tuple(CANONICAL_PLATFORMS)
 RUNNER_TARGETS = ("github-hosted", "trusted-calibration")
-TRUSTED_X86_RUNNER_NAME = "vm31e"
+TRUSTED_X86_RUNNER_NAME = "vm31e-wamr-temp-20260906"
+TRUSTED_X86_RUNNER_LABEL = "wamr-temp-20260906"
 DEFAULT_DISPATCH_TIMEOUT_SECONDS = 72 * 60 * 60
 RUNNER_ENVIRONMENTS = {
     "github-hosted": {
@@ -154,6 +155,132 @@ def resolve_workflow_head(
     if not isinstance(result, dict):
         raise HarnessError("GitHub returned an invalid workflow ref response")
     return require_sha(str(result.get("sha", "")), "workflow head SHA")
+
+
+def preflight_runner_inventory(
+    repository: str,
+    runner_target: str,
+    timeout_seconds: float | None = None,
+) -> None:
+    if runner_target != "trusted-calibration":
+        return
+    response = require_api_object(
+        gh_json(
+            [
+                "api",
+                f"repos/{repository}/actions/runners?per_page=100",
+            ],
+            timeout_seconds,
+        ),
+        f"Actions runner inventory for {repository}",
+    )
+    total_count = response.get("total_count")
+    runners = response.get("runners")
+    if (
+        not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or total_count < 0
+    ):
+        raise HarnessError(
+            f"GitHub Actions runner inventory for {repository} "
+            "is missing valid total_count"
+        )
+    if not isinstance(runners, list):
+        raise HarnessError(
+            f"GitHub Actions runner inventory for {repository} "
+            "is missing runners"
+        )
+    if total_count != len(runners):
+        raise HarnessError(
+            f"GitHub Actions runner inventory for {repository} is incomplete: "
+            f"received {len(runners)} of {total_count} runners in the bounded query"
+        )
+
+    parsed = []
+    for index, value in enumerate(runners):
+        context = f"Actions runner inventory item {index} for {repository}"
+        runner = require_api_object(value, context)
+        name = require_api_string(runner, "name", context)
+        status = require_api_string(runner, "status", context)
+        busy = runner.get("busy")
+        if not isinstance(busy, bool):
+            raise HarnessError(f"GitHub {context} is missing valid busy")
+        labels = runner.get("labels")
+        if not isinstance(labels, list):
+            raise HarnessError(f"GitHub {context} is missing labels")
+        parsed_labels = []
+        for label_index, value in enumerate(labels):
+            label_context = f"{context} label {label_index}"
+            label = require_api_object(value, label_context)
+            parsed_labels.append(
+                {
+                    "name": require_api_string(label, "name", label_context),
+                    "type": require_api_string(label, "type", label_context),
+                }
+            )
+        parsed.append(
+            {
+                "name": name,
+                "status": status,
+                "busy": busy,
+                "labels": parsed_labels,
+            }
+        )
+
+    matching_label = [
+        runner
+        for runner in parsed
+        if any(
+            label["name"] == TRUSTED_X86_RUNNER_LABEL
+            for label in runner["labels"]
+        )
+    ]
+    if not matching_label:
+        if any(
+            runner["name"] == TRUSTED_X86_RUNNER_NAME for runner in parsed
+        ):
+            raise HarnessError(
+                f"trusted calibration runner label drift in {repository}: "
+                f"{TRUSTED_X86_RUNNER_NAME!r} must have sole label "
+                f"{TRUSTED_X86_RUNNER_LABEL!r}"
+            )
+        raise HarnessError(
+            f"trusted calibration runner is missing in {repository}: "
+            f"expected one runner with label {TRUSTED_X86_RUNNER_LABEL!r}"
+        )
+    if len(matching_label) != 1:
+        raise HarnessError(
+            f"trusted calibration runner label is duplicated in {repository}: "
+            f"found {len(matching_label)} runners with label "
+            f"{TRUSTED_X86_RUNNER_LABEL!r}"
+        )
+
+    runner = matching_label[0]
+    if runner["name"] != TRUSTED_X86_RUNNER_NAME:
+        raise HarnessError(
+            f"trusted calibration runner name drift in {repository}: label "
+            f"{TRUSTED_X86_RUNNER_LABEL!r} belongs to {runner['name']!r}, "
+            f"expected {TRUSTED_X86_RUNNER_NAME!r}"
+        )
+    expected_labels = [
+        {"name": TRUSTED_X86_RUNNER_LABEL, "type": "custom"}
+    ]
+    if runner["labels"] != expected_labels:
+        raise HarnessError(
+            f"trusted calibration runner label drift in {repository}: "
+            f"{TRUSTED_X86_RUNNER_NAME!r} has labels {runner['labels']!r}, "
+            f"expected sole custom label {TRUSTED_X86_RUNNER_LABEL!r}"
+        )
+    if runner["status"] != "online":
+        raise HarnessError(
+            f"trusted calibration runner is offline in {repository}: "
+            f"{TRUSTED_X86_RUNNER_NAME!r} reports status {runner['status']!r}"
+        )
+    if runner["busy"]:
+        raise HarnessError(
+            f"trusted calibration runner is busy in {repository}: "
+            f"{TRUSTED_X86_RUNNER_NAME!r} must be idle before cohort dispatch"
+        )
 
 
 def validate_dispatch_options(args: argparse.Namespace) -> tuple[str, str, int]:
@@ -281,6 +408,12 @@ def find_dispatched_run(
 def dispatch(args: argparse.Namespace) -> int:
     baseline_sha, candidate_sha, training_runs = validate_dispatch_options(args)
     deadline = time.monotonic() + args.timeout_seconds
+    if args.runner_target == "trusted-calibration":
+        preflight_runner_inventory(
+            args.repository,
+            args.runner_target,
+            remaining_timeout(deadline, "checking the runner inventory"),
+        )
     workflow_head_sha = resolve_workflow_head(
         args.repository,
         args.workflow_ref,
@@ -844,7 +977,8 @@ def validate_paired_documents(
             )
         if len(host_fingerprints[trusted_x86]) != 1:
             raise HarnessError(
-                "trusted x86 reports have mixed vm31e host fingerprints"
+                f"trusted x86 reports have mixed "
+                f"{TRUSTED_X86_RUNNER_NAME} host fingerprints"
             )
     observations.sort(key=lambda item: (item["sequence"], item["platform"]))
     if len(observations) != len(documents):

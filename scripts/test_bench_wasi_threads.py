@@ -1371,7 +1371,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                         Path(f"x86-{run_id}"),
                         make_report(
                             runner_environment="self-hosted",
-                            runner_name="vm31e",
+                            runner_name="vm31e-wamr-temp-20260906",
                             **common,
                         ),
                     ),
@@ -1403,7 +1403,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             result["platforms"]["ubuntu-22.04-x86_64"][
                 "trusted_runner_name"
             ],
-            "vm31e",
+            "vm31e-wamr-temp-20260906",
         )
         self.assertEqual(
             len(
@@ -1494,7 +1494,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
             runner_target="trusted-calibration",
         )
 
-        def reports(second_cpu: str = "test cpu", runner_name: str = "vm31e"):
+        def reports(
+            second_cpu: str = "test cpu",
+            runner_name: str = "vm31e-wamr-temp-20260906",
+        ):
             result = []
             for run_id, cpu in (("100", "test cpu"), ("101", second_cpu)):
                 common = {
@@ -1529,7 +1532,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             return result
 
         with self.assertRaisesRegex(
-            bench.HarnessError, "mixed vm31e host fingerprints"
+            bench.HarnessError,
+            "mixed vm31e-wamr-temp-20260906 host fingerprints",
         ):
             cohort.validate_documents(
                 reports(second_cpu="different cpu"),
@@ -1537,7 +1541,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
                 state,
             )
-        with self.assertRaisesRegex(bench.HarnessError, "runner 'vm31e'"):
+        with self.assertRaisesRegex(
+            bench.HarnessError, "runner 'vm31e-wamr-temp-20260906'"
+        ):
             cohort.validate_documents(
                 reports(runner_name="other-runner"),
                 cohort.DEFAULT_PLATFORMS,
@@ -1904,6 +1910,160 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(bench.HarnessError, "cannot exceed 2"):
             cohort.validate_dispatch_options(trusted)
+
+    def test_cohort_trusted_runner_inventory_preflight_succeeds(self) -> None:
+        inventory = {
+            "total_count": 1,
+            "runners": [
+                {
+                    "name": "vm31e-wamr-temp-20260906",
+                    "status": "online",
+                    "busy": False,
+                    "labels": [
+                        {
+                            "name": "wamr-temp-20260906",
+                            "type": "custom",
+                        }
+                    ],
+                }
+            ],
+        }
+        with mock.patch.object(
+            cohort, "gh_json", return_value=inventory
+        ) as gh_json:
+            cohort.preflight_runner_inventory(
+                "cataggar/wamr", "trusted-calibration", 30
+            )
+        gh_json.assert_called_once_with(
+            [
+                "api",
+                "repos/cataggar/wamr/actions/runners?per_page=100",
+            ],
+            30,
+        )
+
+    def test_cohort_hosted_runner_skips_inventory_preflight(self) -> None:
+        with mock.patch.object(cohort, "gh_json") as gh_json:
+            cohort.preflight_runner_inventory(
+                "cataggar/wamr", "github-hosted", 30
+            )
+        gh_json.assert_not_called()
+
+    def test_cohort_trusted_runner_inventory_preflight_failures(self) -> None:
+        expected = {
+            "name": "vm31e-wamr-temp-20260906",
+            "status": "online",
+            "busy": False,
+            "labels": [
+                {
+                    "name": "wamr-temp-20260906",
+                    "type": "custom",
+                }
+            ],
+        }
+        cases = (
+            (
+                "missing",
+                {"total_count": 0, "runners": []},
+                "runner is missing",
+            ),
+            (
+                "duplicate",
+                {"total_count": 2, "runners": [expected, dict(expected)]},
+                "label is duplicated",
+            ),
+            (
+                "offline",
+                {
+                    "total_count": 1,
+                    "runners": [dict(expected, status="offline")],
+                },
+                "runner is offline",
+            ),
+            (
+                "busy",
+                {
+                    "total_count": 1,
+                    "runners": [dict(expected, busy=True)],
+                },
+                "runner is busy",
+            ),
+            (
+                "name drift",
+                {
+                    "total_count": 1,
+                    "runners": [dict(expected, name="wrong-runner")],
+                },
+                "runner name drift",
+            ),
+            (
+                "label drift",
+                {
+                    "total_count": 1,
+                    "runners": [
+                        dict(
+                            expected,
+                            labels=[
+                                {
+                                    "name": "wamr-temp-20260906",
+                                    "type": "custom",
+                                },
+                                {
+                                    "name": "self-hosted",
+                                    "type": "read-only",
+                                },
+                            ],
+                        )
+                    ],
+                },
+                "runner label drift",
+            ),
+        )
+        for name, inventory, message in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    cohort, "gh_json", return_value=inventory
+                ) as gh_json,
+                self.assertRaisesRegex(bench.HarnessError, message),
+            ):
+                cohort.preflight_runner_inventory(
+                    "cataggar/wamr", "trusted-calibration", 30
+                )
+            gh_json.assert_called_once()
+
+    def test_cohort_trusted_runner_preflight_blocks_dispatch(self) -> None:
+        args = Namespace(
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+            profile="authoritative",
+            warmups=2,
+            samples=10,
+            runner_target="trusted-calibration",
+            repository="cataggar/wamr",
+            workflow="wasi-thread-bench.yml",
+            workflow_ref="main",
+            runs=2,
+            training_runs=1,
+            max_in_flight=1,
+            timeout_seconds=3600,
+            poll_seconds=0,
+            lookup_attempts=1,
+            lookup_seconds=0,
+            output=self.scratch / "dispatch.json",
+        )
+        with (
+            mock.patch.object(
+                cohort,
+                "gh_json",
+                return_value={"total_count": 0, "runners": []},
+            ),
+            mock.patch.object(cohort.subprocess, "check_output") as check_output,
+            self.assertRaisesRegex(bench.HarnessError, "runner is missing"),
+        ):
+            cohort.dispatch(args)
+        check_output.assert_not_called()
 
     def test_cohort_dispatch_times_out_queued_run_and_retains_state(self) -> None:
         output = self.scratch / "dispatch-timeout.json"
