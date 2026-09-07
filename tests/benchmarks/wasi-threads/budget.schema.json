@@ -1,21 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/cataggar/wamr/tests/benchmarks/wasi-threads/budget.schema.json",
-  "title": "Calibrated WAMR WASI thread benchmark budget",
+  "title": "Calibrated paired-revision WAMR WASI thread benchmark budget",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema_version",
     "kind",
     "calibrated",
+    "enforcement",
     "calibration_requirements",
-    "cohort",
+    "calibration_provenance",
     "platforms"
   ],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "const": 3 },
     "kind": { "const": "wasi-thread-benchmark-budget" },
     "calibrated": { "type": "boolean" },
+    "enforcement": { "type": "boolean" },
     "calibration_requirements": {
       "type": "object",
       "additionalProperties": false,
@@ -48,97 +50,126 @@
         }
       }
     },
-    "cohort": {
+    "calibration_provenance": {
       "oneOf": [
         { "type": "null" },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "baseline_commit",
-            "baseline_build_source_sha256",
-            "fixture_set_sha256",
-            "plan_sha256",
-            "profile",
-            "report_count_by_platform"
-          ],
-          "properties": {
-            "baseline_commit": {
-              "type": "string",
-              "pattern": "^[0-9a-f]{40}$"
-            },
-            "baseline_build_source_sha256": { "$ref": "#/$defs/sha256" },
-            "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
-            "plan_sha256": { "$ref": "#/$defs/sha256" },
-            "profile": { "const": "authoritative" },
-            "report_count_by_platform": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "ubuntu-22.04-x86_64",
-                "ubuntu-24.04-aarch64"
-              ],
-              "properties": {
-                "ubuntu-22.04-x86_64": {
-                  "type": "integer",
-                  "minimum": 20
-                },
-                "ubuntu-24.04-aarch64": {
-                  "type": "integer",
-                  "minimum": 20
-                }
-              }
-            }
-          }
-        }
+        { "$ref": "#/$defs/calibration_provenance" }
       ]
     },
     "platforms": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "ubuntu-22.04-x86_64",
-        "ubuntu-24.04-aarch64"
-      ],
       "properties": {
         "ubuntu-22.04-x86_64": { "$ref": "#/$defs/platform" },
         "ubuntu-24.04-aarch64": { "$ref": "#/$defs/platform" }
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "calibrated": { "const": false } },
+        "required": ["calibrated"]
+      },
+      "then": {
+        "properties": {
+          "enforcement": { "const": false },
+          "calibration_provenance": { "type": "null" },
+          "platforms": { "maxProperties": 0 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "calibrated": { "const": true } },
+        "required": ["calibrated"]
+      },
+      "then": {
+        "properties": {
+          "enforcement": { "const": true },
+          "calibration_provenance": {
+            "$ref": "#/$defs/calibration_provenance"
+          },
+          "platforms": {
+            "required": [
+              "ubuntu-22.04-x86_64",
+              "ubuntu-24.04-aarch64"
+            ]
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "build_source_sha256"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/commit" },
+        "build_source_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "calibration_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_revision",
+        "candidate_revision",
+        "fixture_set_sha256",
+        "plan_sha256",
+        "profile",
+        "report_count_by_platform"
+      ],
+      "properties": {
+        "baseline_revision": { "$ref": "#/$defs/revision" },
+        "candidate_revision": { "$ref": "#/$defs/revision" },
+        "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "profile": { "const": "authoritative" },
+        "report_count_by_platform": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ubuntu-22.04-x86_64",
+            "ubuntu-24.04-aarch64"
+          ],
+          "properties": {
+            "ubuntu-22.04-x86_64": {
+              "type": "integer",
+              "minimum": 20
+            },
+            "ubuntu-24.04-aarch64": {
+              "type": "integer",
+              "minimum": 20
+            }
+          }
+        }
+      }
+    },
     "platform": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["host_system", "host_machine", "pairs", "scenarios"],
+      "required": [
+        "host_system",
+        "host_machine",
+        "runner_environment",
+        "comparisons",
+        "ratio_of_ratios"
+      ],
       "properties": {
         "host_system": { "type": "string", "minLength": 1 },
         "host_machine": { "type": "string", "minLength": 1 },
-        "pairs": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "pair_key",
-              "left",
-              "right",
-              "max_median_elapsed_delta_pct"
-            ],
-            "properties": {
-              "pair_key": { "type": "string", "minLength": 1 },
-              "left": { "type": "string", "minLength": 1 },
-              "right": { "type": "string", "minLength": 1 },
-              "max_median_elapsed_delta_pct": { "type": "number" }
-            }
-          }
-        },
-        "scenarios": {
+        "runner_environment": { "type": "string", "minLength": 1 },
+        "comparisons": {
           "type": "array",
           "minItems": 1,
           "items": {
@@ -148,7 +179,8 @@
               "pair_key",
               "condition",
               "metric_kind",
-              "min_median_ops_per_second"
+              "min_candidate_over_baseline_throughput_ratio",
+              "max_candidate_over_baseline_elapsed_ratio"
             ],
             "properties": {
               "pair_key": { "type": "string", "minLength": 1 },
@@ -156,7 +188,39 @@
               "metric_kind": {
                 "enum": ["steady-state-kernel", "spawn-join-lifecycle"]
               },
-              "min_median_ops_per_second": {
+              "min_candidate_over_baseline_throughput_ratio": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "max_candidate_over_baseline_elapsed_ratio": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
+        },
+        "ratio_of_ratios": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "pair_key",
+              "left",
+              "right",
+              "min_candidate_over_baseline_throughput_ratio_of_ratios",
+              "max_candidate_over_baseline_elapsed_ratio_of_ratios"
+            ],
+            "properties": {
+              "pair_key": { "type": "string", "minLength": 1 },
+              "left": { "type": "string", "minLength": 1 },
+              "right": { "type": "string", "minLength": 1 },
+              "min_candidate_over_baseline_throughput_ratio_of_ratios": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "max_candidate_over_baseline_elapsed_ratio_of_ratios": {
                 "type": "number",
                 "exclusiveMinimum": 0
               }

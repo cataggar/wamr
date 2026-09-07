@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/cataggar/wamr/tests/benchmarks/wasi-threads/report.schema.json",
-  "title": "WAMR WASI thread benchmark report",
+  "title": "Paired-revision WAMR WASI thread benchmark report",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,10 +12,12 @@
     "records",
     "summaries",
     "paired_summaries",
+    "comparison_summaries",
+    "ratio_of_ratios_summaries",
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "const": 3 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -23,16 +25,108 @@
         "commit",
         "tracked_diff_sha256",
         "build_source_sha256",
+        "revisions",
         "collected_at",
         "platform_id",
         "fixture_set_sha256",
         "plan_sha256",
         "host",
+        "host_pair",
         "execution",
         "tools",
         "fixture_toolchain",
         "fixtures"
-      ]
+      ],
+      "properties": {
+        "commit": { "$ref": "#/$defs/commit" },
+        "tracked_diff_sha256": { "$ref": "#/$defs/sha256" },
+        "build_source_sha256": { "$ref": "#/$defs/sha256" },
+        "revisions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseline", "candidate"],
+          "properties": {
+            "baseline": { "$ref": "#/$defs/revision" },
+            "candidate": { "$ref": "#/$defs/revision" }
+          }
+        },
+        "collected_at": { "type": "string", "minLength": 1 },
+        "platform_id": { "type": "string", "minLength": 1 },
+        "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "host": {
+          "type": "object",
+          "required": [
+            "system",
+            "machine",
+            "runner_environment",
+            "host_fingerprint"
+          ],
+          "properties": {
+            "system": { "type": "string", "minLength": 1 },
+            "machine": { "type": "string", "minLength": 1 },
+            "runner_name": { "type": "string" },
+            "runner_environment": { "type": "string", "minLength": 1 },
+            "host_fingerprint": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["sha256", "fields"],
+              "properties": {
+                "sha256": { "$ref": "#/$defs/sha256" },
+                "fields": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "system",
+                    "machine",
+                    "cpu",
+                    "logical_cpus",
+                    "runner_environment",
+                    "runner_image",
+                    "runner_os",
+                    "runner_arch"
+                  ],
+                  "properties": {
+                    "system": { "type": "string" },
+                    "machine": { "type": "string" },
+                    "cpu": { "type": "string" },
+                    "logical_cpus": {
+                      "type": ["integer", "null"],
+                      "minimum": 1
+                    },
+                    "runner_environment": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "runner_image": { "type": "string" },
+                    "runner_os": { "type": "string" },
+                    "runner_arch": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "host_pair": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "runner_environment",
+            "host_fingerprint_sha256"
+          ],
+          "properties": {
+            "id": { "type": "string", "minLength": 1 },
+            "runner_environment": { "type": "string", "minLength": 1 },
+            "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "execution": { "type": "object" },
+        "tools": { "type": "object" },
+        "fixture_toolchain": { "type": "object" },
+        "fixtures": { "type": "object" },
+        "aot_artifacts": { "type": "object" }
+      }
     },
     "plan": {
       "type": "object",
@@ -40,6 +134,8 @@
         "profile",
         "warmups",
         "samples",
+        "revision_mode",
+        "revision_roles",
         "modes",
         "thread_counts",
         "iterations",
@@ -47,55 +143,337 @@
         "minimum_timed_interval_ns",
         "pairs",
         "optimize"
-      ]
+      ],
+      "properties": {
+        "profile": { "enum": ["authoritative", "smoke"] },
+        "warmups": { "type": "integer", "minimum": 0 },
+        "samples": { "type": "integer", "minimum": 1 },
+        "revision_mode": {
+          "enum": ["paired-revisions", "single-revision-compatibility"]
+        },
+        "revision_roles": {
+          "const": ["baseline", "candidate"]
+        },
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["interpreter", "aot"] }
+        },
+        "thread_counts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": [1, 2, 4, 8] }
+        },
+        "iterations": { "type": "object" },
+        "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "minimum_timed_interval_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pairs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/pair" }
+        },
+        "optimize": { "type": "string", "minLength": 1 }
+      }
     },
     "records": {
       "type": "array",
       "minItems": 1,
-      "items": {
-        "type": "object",
-        "required": [
-          "pair_kind",
-          "pair_key",
-          "pair_index",
-          "phase",
-          "order",
-          "condition",
-          "pair_left",
-          "pair_right",
-          "mode",
-          "threads_enabled",
-          "cancel_points",
-          "workload",
-          "threads",
-          "iterations",
-          "command",
-          "elapsed_ns",
-          "guest_elapsed_ns",
-          "raw_guest_elapsed_ns",
-          "timing_overhead_ns",
-          "timing_overhead_ppm",
-          "host_wall_elapsed_ns",
-          "host_wall_over_guest",
-          "metric_kind",
-          "cancel_polls_per_operation",
-          "static_cancel_poll_sites",
-          "operations",
-          "throughput_ops_per_second",
-          "per_thread_ops_per_second",
-          "guest",
-          "correct",
-          "correctness",
-          "stdout",
-          "stderr"
-        ]
-      }
+      "items": { "$ref": "#/$defs/record" }
     },
-    "summaries": { "type": "array", "minItems": 1 },
-    "paired_summaries": { "type": "array", "minItems": 1 },
+    "summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/revision_summary" }
+    },
+    "paired_summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/paired_summary" }
+    },
+    "comparison_summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/comparison_summary" }
+    },
+    "ratio_of_ratios_summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/ratio_of_ratios_summary" }
+    },
     "budget": {
       "type": "object",
-      "required": ["status", "path", "failures"]
+      "required": ["status", "path", "failures"],
+      "properties": {
+        "status": {
+          "enum": ["disabled", "not-selected", "passed", "failed"]
+        },
+        "path": { "type": ["string", "null"] },
+        "failures": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revision_role": {
+      "enum": ["baseline", "candidate"]
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "tracked_diff_sha256",
+        "build_source_sha256",
+        "fixture_set_sha256",
+        "plan_sha256",
+        "host_pair_id",
+        "host_fingerprint_sha256"
+      ],
+      "properties": {
+        "commit": { "$ref": "#/$defs/commit" },
+        "tracked_diff_sha256": { "$ref": "#/$defs/sha256" },
+        "build_source_sha256": { "$ref": "#/$defs/sha256" },
+        "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "host_pair_id": { "type": "string", "minLength": 1 },
+        "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pair_kind", "pair_key", "left", "right"],
+      "properties": {
+        "pair_kind": { "type": "string", "minLength": 1 },
+        "pair_key": { "type": "string", "minLength": 1 },
+        "left": { "type": "string", "minLength": 1 },
+        "right": { "type": "string", "minLength": 1 }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "required": ["runs", "mean", "median", "min", "max", "range"],
+      "properties": {
+        "runs": { "type": "integer", "minimum": 1 },
+        "mean": { "type": "number" },
+        "median": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "range": { "type": "number", "minimum": 0 },
+        "samples": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number" }
+        },
+        "samples_ns": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number" }
+        },
+        "samples_ops_per_second": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number" }
+        }
+      }
+    },
+    "record": {
+      "type": "object",
+      "required": [
+        "revision",
+        "revision_order",
+        "revision_commit",
+        "revision_build_source_sha256",
+        "fixture_set_sha256",
+        "plan_sha256",
+        "host_pair_id",
+        "host_fingerprint_sha256",
+        "pair_kind",
+        "pair_key",
+        "pair_index",
+        "phase",
+        "order",
+        "condition",
+        "pair_left",
+        "pair_right",
+        "mode",
+        "threads_enabled",
+        "cancel_points",
+        "workload",
+        "threads",
+        "iterations",
+        "command",
+        "elapsed_ns",
+        "guest_elapsed_ns",
+        "raw_guest_elapsed_ns",
+        "timing_overhead_ns",
+        "timing_overhead_ppm",
+        "host_wall_elapsed_ns",
+        "host_wall_over_guest",
+        "metric_kind",
+        "cancel_polls_per_operation",
+        "static_cancel_poll_sites",
+        "operations",
+        "throughput_ops_per_second",
+        "per_thread_ops_per_second",
+        "guest",
+        "correct",
+        "correctness",
+        "stdout",
+        "stderr"
+      ],
+      "properties": {
+        "revision": { "$ref": "#/$defs/revision_role" },
+        "revision_order": { "enum": [0, 1] },
+        "revision_commit": { "$ref": "#/$defs/commit" },
+        "revision_build_source_sha256": { "$ref": "#/$defs/sha256" },
+        "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "host_pair_id": { "type": "string", "minLength": 1 },
+        "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
+        "pair_kind": { "type": "string", "minLength": 1 },
+        "pair_key": { "type": "string", "minLength": 1 },
+        "pair_index": { "type": "integer", "minimum": 0 },
+        "phase": { "enum": ["warmup", "measure"] },
+        "order": { "enum": [0, 1] },
+        "condition": { "type": "string", "minLength": 1 },
+        "pair_left": { "type": "string", "minLength": 1 },
+        "pair_right": { "type": "string", "minLength": 1 },
+        "elapsed_ns": { "type": "integer", "minimum": 1 },
+        "guest_elapsed_ns": { "type": "integer", "minimum": 1 },
+        "throughput_ops_per_second": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "per_thread_ops_per_second": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "correct": { "const": true }
+      }
+    },
+    "revision_summary": {
+      "type": "object",
+      "required": [
+        "revision",
+        "pair_kind",
+        "pair_key",
+        "condition",
+        "metric_kind",
+        "elapsed",
+        "host_wall",
+        "throughput",
+        "per_thread_throughput"
+      ],
+      "properties": {
+        "revision": { "$ref": "#/$defs/revision_role" },
+        "pair_kind": { "type": "string", "minLength": 1 },
+        "pair_key": { "type": "string", "minLength": 1 },
+        "condition": { "type": "string", "minLength": 1 },
+        "metric_kind": {
+          "enum": ["steady-state-kernel", "spawn-join-lifecycle"]
+        },
+        "elapsed": { "$ref": "#/$defs/stats" },
+        "host_wall": { "$ref": "#/$defs/stats" },
+        "throughput": { "$ref": "#/$defs/stats" },
+        "per_thread_throughput": { "$ref": "#/$defs/stats" }
+      }
+    },
+    "paired_summary": {
+      "type": "object",
+      "required": [
+        "revision",
+        "pair_kind",
+        "pair_key",
+        "left",
+        "right",
+        "elapsed_right_over_left",
+        "throughput_right_over_left",
+        "median_elapsed_delta_pct",
+        "median_throughput_delta_pct"
+      ],
+      "properties": {
+        "revision": { "$ref": "#/$defs/revision_role" },
+        "pair_kind": { "type": "string", "minLength": 1 },
+        "pair_key": { "type": "string", "minLength": 1 },
+        "left": { "type": "string", "minLength": 1 },
+        "right": { "type": "string", "minLength": 1 },
+        "elapsed_right_over_left": { "$ref": "#/$defs/stats" },
+        "throughput_right_over_left": { "$ref": "#/$defs/stats" },
+        "median_elapsed_delta_pct": { "type": "number" },
+        "median_throughput_delta_pct": { "type": "number" }
+      }
+    },
+    "comparison_summary": {
+      "type": "object",
+      "required": [
+        "pair_kind",
+        "pair_key",
+        "condition",
+        "metric_kind",
+        "baseline",
+        "candidate",
+        "elapsed_candidate_over_baseline",
+        "throughput_candidate_over_baseline",
+        "median_elapsed_delta_pct",
+        "median_throughput_delta_pct"
+      ],
+      "properties": {
+        "pair_kind": { "type": "string", "minLength": 1 },
+        "pair_key": { "type": "string", "minLength": 1 },
+        "condition": { "type": "string", "minLength": 1 },
+        "metric_kind": {
+          "enum": ["steady-state-kernel", "spawn-join-lifecycle"]
+        },
+        "baseline": { "const": "baseline" },
+        "candidate": { "const": "candidate" },
+        "elapsed_candidate_over_baseline": { "$ref": "#/$defs/stats" },
+        "throughput_candidate_over_baseline": { "$ref": "#/$defs/stats" },
+        "median_elapsed_delta_pct": { "type": "number" },
+        "median_throughput_delta_pct": { "type": "number" }
+      }
+    },
+    "ratio_of_ratios_summary": {
+      "type": "object",
+      "required": [
+        "pair_kind",
+        "pair_key",
+        "left",
+        "right",
+        "baseline",
+        "candidate",
+        "elapsed_ratio_of_ratios",
+        "throughput_ratio_of_ratios",
+        "median_elapsed_delta_pct",
+        "median_throughput_delta_pct"
+      ],
+      "properties": {
+        "pair_kind": { "type": "string", "minLength": 1 },
+        "pair_key": { "type": "string", "minLength": 1 },
+        "left": { "type": "string", "minLength": 1 },
+        "right": { "type": "string", "minLength": 1 },
+        "baseline": { "const": "baseline" },
+        "candidate": { "const": "candidate" },
+        "elapsed_ratio_of_ratios": { "$ref": "#/$defs/stats" },
+        "throughput_ratio_of_ratios": { "$ref": "#/$defs/stats" },
+        "median_elapsed_delta_pct": { "type": "number" },
+        "median_throughput_delta_pct": { "type": "number" }
+      }
     }
   }
 }

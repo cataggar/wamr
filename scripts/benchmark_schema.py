@@ -15,7 +15,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+HOST_FINGERPRINT_FIELDS = (
+    "system",
+    "machine",
+    "cpu",
+    "logical_cpus",
+    "runner_environment",
+    "runner_image",
+    "runner_os",
+    "runner_arch",
+)
 
 
 class BenchmarkDataError(ValueError):
@@ -69,8 +79,19 @@ def cpu_model() -> str:
     return platform.processor() or "unknown"
 
 
-def host_metadata() -> dict[str, Any]:
-    return {
+def host_metadata(runner_environment: str | None = None) -> dict[str, Any]:
+    environment = (
+        runner_environment
+        if runner_environment is not None
+        else os.getenv("RUNNER_ENVIRONMENT", "")
+    )
+    if not environment:
+        environment = (
+            "github-actions-unspecified"
+            if os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+            else "local"
+        )
+    metadata = {
         "system": platform.system(),
         "release": platform.release(),
         "version": platform.version(),
@@ -83,10 +104,19 @@ def host_metadata() -> dict[str, Any]:
         "runner_image": os.getenv("ImageOS", ""),
         "runner_os": os.getenv("RUNNER_OS", ""),
         "runner_arch": os.getenv("RUNNER_ARCH", ""),
+        "runner_environment": environment,
         "github_run_id": os.getenv("GITHUB_RUN_ID", ""),
         "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
         "github_workflow": os.getenv("GITHUB_WORKFLOW", ""),
     }
+    fingerprint_fields = {
+        key: metadata[key] for key in HOST_FINGERPRINT_FIELDS
+    }
+    metadata["host_fingerprint"] = {
+        "sha256": cache_key(fingerprint_fields),
+        "fields": fingerprint_fields,
+    }
+    return metadata
 
 
 def collected_at() -> str:
@@ -153,8 +183,10 @@ def validate_common_report(document: dict[str, Any], kind: str) -> None:
         "commit",
         "tracked_diff_sha256",
         "build_source_sha256",
+        "revisions",
         "collected_at",
         "host",
+        "host_pair",
         "tools",
         "fixtures",
     ):

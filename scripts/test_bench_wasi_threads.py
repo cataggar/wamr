@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import shutil
 import struct
@@ -11,6 +12,8 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
+
+from jsonschema import Draft202012Validator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,12 +66,18 @@ def make_report(
     platform_id: str = "ubuntu-22.04-x86_64",
     machine: str = "x86_64",
     commit: str = "a" * 40,
+    baseline_commit: str | None = None,
+    baseline_source: str = "c" * 64,
+    candidate_source: str = "c" * 64,
     run_id: str = "1",
 ) -> dict:
+    baseline_commit = baseline_commit or commit
     plan = {
         "profile": "authoritative",
         "warmups": 0,
         "samples": 1,
+        "revision_mode": "paired-revisions",
+        "revision_roles": list(bench.REVISION_ROLES),
         "modes": ["aot"],
         "thread_counts": [1],
         "iterations": {
@@ -80,27 +89,86 @@ def make_report(
         },
         "timeout_seconds": 60,
         "minimum_timed_interval_ns": 1,
+        "atomic_wait_preflight_runs": 64,
         "optimize": "ReleaseFast",
         "pairs": [],
     }
     plan["pairs"] = bench.expected_pair_specs_for_plan(plan)
+    plan_sha256 = cache_key(plan)
+    host_fields = {
+        "system": "Linux",
+        "machine": machine,
+        "cpu": "test cpu",
+        "logical_cpus": 4,
+        "runner_environment": "github-hosted",
+        "runner_image": "ubuntu",
+        "runner_os": "Linux",
+        "runner_arch": machine,
+    }
+    host_fingerprint = cache_key(host_fields)
+    host_pair_id = f"github:{run_id}:1:{platform_id}"
+    revisions = {
+        "baseline": {
+            "commit": baseline_commit,
+            "tracked_diff_sha256": "b" * 64,
+            "build_source_sha256": baseline_source,
+            "fixture_set_sha256": "d" * 64,
+            "plan_sha256": plan_sha256,
+            "host_pair_id": host_pair_id,
+            "host_fingerprint_sha256": host_fingerprint,
+        },
+        "candidate": {
+            "commit": commit,
+            "tracked_diff_sha256": "b" * 64,
+            "build_source_sha256": candidate_source,
+            "fixture_set_sha256": "d" * 64,
+            "plan_sha256": plan_sha256,
+            "host_pair_id": host_pair_id,
+            "host_fingerprint_sha256": host_fingerprint,
+        },
+    }
+    revision_fields = {
+        role: {
+            "revision_commit": revision["commit"],
+            "revision_build_source_sha256": revision[
+                "build_source_sha256"
+            ],
+            "fixture_set_sha256": revision["fixture_set_sha256"],
+            "plan_sha256": revision["plan_sha256"],
+            "host_pair_id": revision["host_pair_id"],
+            "host_fingerprint_sha256": revision[
+                "host_fingerprint_sha256"
+            ],
+        }
+        for role, revision in revisions.items()
+    }
     records = []
-    summaries = []
-    paired = []
     for pair in plan["pairs"]:
-        pair_records = {}
-        for order, condition in enumerate((pair["left"], pair["right"])):
-            elapsed = 100 + order * 10
-            record = {
-                "pair_kind": pair["pair_kind"],
-                "pair_key": pair["pair_key"],
-                "pair_index": 0,
-                "phase": "measure",
-                "order": order,
-                "condition": condition,
-                "pair_left": pair["left"],
-                "pair_right": pair["right"],
-                "correct": True,
+        def measure(revision, condition, fields):
+            condition_index = (
+                0 if condition == pair["left"] else 1
+            )
+            elapsed = (
+                100 + condition_index * 20
+                if revision == "baseline"
+                else 90 + condition_index * 30
+            )
+            operations = 1_000
+            throughput = operations / (elapsed / 1e9)
+            metric_kind = (
+                "spawn-join-lifecycle"
+                if "spawn-join" in pair["pair_key"]
+                else "steady-state-kernel"
+            )
+            return {
+                **fields,
+                "mode": "aot",
+                "threads_enabled": True,
+                "cancel_points": "on",
+                "workload": "hot",
+                "threads": 1,
+                "iterations": 10,
+                "command": ["wamr"],
                 "elapsed_ns": elapsed,
                 "guest_elapsed_ns": elapsed,
                 "raw_guest_elapsed_ns": elapsed + 1,
@@ -108,64 +176,71 @@ def make_report(
                 "timing_overhead_ppm": 1,
                 "host_wall_elapsed_ns": elapsed + 100,
                 "host_wall_over_guest": (elapsed + 100) / elapsed,
-                "metric_kind": (
-                    "spawn-join-lifecycle"
-                    if "spawn-join" in pair["pair_key"]
-                    else "steady-state-kernel"
-                ),
-                "throughput_ops_per_second": 1.0,
-                "per_thread_ops_per_second": 1.0,
+                "metric_kind": metric_kind,
+                "cancel_polls_per_operation": 1.0,
+                "static_cancel_poll_sites": 1,
+                "operations": operations,
+                "throughput_ops_per_second": throughput,
+                "per_thread_ops_per_second": throughput,
+                "guest": {"metric_kind": metric_kind},
+                "correct": True,
+                "correctness": {"passed": True},
+                "stdout": "{}",
+                "stderr": "",
             }
-            records.append(record)
-            pair_records[condition] = record
-            summaries.append(
-                {
-                    "pair_kind": pair["pair_kind"],
-                    "pair_key": pair["pair_key"],
-                    "condition": condition,
-                    "metric_kind": record["metric_kind"],
-                    "elapsed": stats(elapsed, "samples_ns"),
-                    "host_wall": stats(elapsed + 100, "samples_ns"),
-                    "throughput": stats(1.0, "samples_ops_per_second"),
-                    "per_thread_throughput": stats(
-                        1.0, "samples_ops_per_second"
-                    ),
-                }
+
+        with mock.patch.object(bench.sys, "stderr", io.StringIO()):
+            bench.collect_revision_pair(
+                records=records,
+                pair_kind=pair["pair_kind"],
+                pair_key=pair["pair_key"],
+                left=pair["left"],
+                right=pair["right"],
+                warmups=0,
+                samples=1,
+                revision_fields=revision_fields,
+                measure=measure,
             )
-        ratio = pair_records[pair["right"]]["elapsed_ns"] / pair_records[pair["left"]]["elapsed_ns"]
-        paired.append(
-            {
-                "pair_kind": pair["pair_kind"],
-                "pair_key": pair["pair_key"],
-                "left": pair["left"],
-                "right": pair["right"],
-                "elapsed_right_over_left": stats(ratio, "samples"),
-                "median_elapsed_delta_pct": (ratio - 1) * 100,
-            }
-        )
     report = {
         "schema_version": SCHEMA_VERSION,
         "kind": bench.KIND,
         "metadata": {
             "commit": commit,
             "tracked_diff_sha256": "b" * 64,
-            "build_source_sha256": "c" * 64,
+            "build_source_sha256": candidate_source,
+            "revisions": revisions,
             "collected_at": "2026-09-02T00:00:00+00:00",
             "platform_id": platform_id,
             "fixture_set_sha256": "d" * 64,
-            "plan_sha256": cache_key(plan),
+            "plan_sha256": plan_sha256,
             "host": {
                 "system": "Linux",
                 "machine": machine,
+                "runner_environment": "github-hosted",
                 "github_run_id": run_id,
+                "host_fingerprint": {
+                    "sha256": host_fingerprint,
+                    "fields": host_fields,
+                },
             },
+            "host_pair": {
+                "id": host_pair_id,
+                "runner_environment": "github-hosted",
+                "host_fingerprint_sha256": host_fingerprint,
+            },
+            "execution": {},
             "tools": {},
+            "fixture_toolchain": {},
             "fixtures": {},
         },
         "plan": plan,
         "records": records,
-        "summaries": summaries,
-        "paired_summaries": paired,
+        "summaries": bench.summarize(records),
+        "paired_summaries": bench.paired_summaries(records),
+        "comparison_summaries": bench.comparison_summaries(records),
+        "ratio_of_ratios_summaries": bench.ratio_of_ratios_summaries(
+            records
+        ),
         "budget": {"status": "disabled", "path": None, "failures": []},
     }
     bench.validate_report(report)
@@ -183,37 +258,57 @@ def complete_budget(report: dict) -> dict:
     platform_budget = {
         "host_system": report["metadata"]["host"]["system"],
         "host_machine": report["metadata"]["host"]["machine"],
-        "pairs": [
-            {
-                "pair_key": item["pair_key"],
-                "left": item["left"],
-                "right": item["right"],
-                "max_median_elapsed_delta_pct": 100.0,
-            }
-            for item in report["plan"]["pairs"]
+        "runner_environment": report["metadata"]["host"][
+            "runner_environment"
         ],
-        "scenarios": [
+        "comparisons": [
             {
                 "pair_key": item["pair_key"],
                 "condition": item["condition"],
                 "metric_kind": item["metric_kind"],
-                "min_median_ops_per_second": 0.1,
+                "min_candidate_over_baseline_throughput_ratio": 0.1,
+                "max_candidate_over_baseline_elapsed_ratio": 10.0,
             }
-            for item in report["summaries"]
+            for item in report["comparison_summaries"]
+        ],
+        "ratio_of_ratios": [
+            {
+                "pair_key": item["pair_key"],
+                "left": item["left"],
+                "right": item["right"],
+                "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.1,
+                "max_candidate_over_baseline_elapsed_ratio_of_ratios": 10.0,
+            }
+            for item in report["ratio_of_ratios_summaries"]
         ],
     }
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "wasi-thread-benchmark-budget",
         "calibrated": True,
+        "enforcement": True,
         "calibration_requirements": {
             "minimum_reports_per_platform": 20,
             "required_profile": "authoritative",
             "required_platforms": list(bench.CANONICAL_PLATFORMS),
         },
-        "cohort": {
-            "baseline_commit": report["metadata"]["commit"],
-            "baseline_build_source_sha256": report["metadata"]["build_source_sha256"],
+        "calibration_provenance": {
+            "baseline_revision": {
+                "commit": report["metadata"]["revisions"]["baseline"][
+                    "commit"
+                ],
+                "build_source_sha256": report["metadata"]["revisions"][
+                    "baseline"
+                ]["build_source_sha256"],
+            },
+            "candidate_revision": {
+                "commit": report["metadata"]["revisions"]["candidate"][
+                    "commit"
+                ],
+                "build_source_sha256": report["metadata"]["revisions"][
+                    "candidate"
+                ]["build_source_sha256"],
+            },
             "fixture_set_sha256": report["metadata"]["fixture_set_sha256"],
             "plan_sha256": report["metadata"]["plan_sha256"],
             "profile": report["plan"]["profile"],
@@ -300,6 +395,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.thread_counts, (1, 4, 8))
         self.assertEqual(args.modes, "aot")
         self.assertEqual(args.min_interval_ms, 100)
+        self.assertIsNone(args.baseline_repo)
+        self.assertIsNone(args.candidate_repo)
         wait_iterations = {
             scenario.threads: scenario.iterations
             for scenario in bench.planned_scenarios(args)
@@ -317,36 +414,193 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "10",
                 ]
             )
+        with self.assertRaises(SystemExit):
+            bench.parse_args(["--baseline-repo", "baseline"])
+        paired = bench.parse_args(
+            [
+                "--baseline-repo",
+                "baseline",
+                "--candidate-repo",
+                "candidate",
+                "--runner-environment",
+                "github-hosted",
+                "--host-pair-id",
+                "run-1/x86",
+                "--no-budget",
+            ]
+        )
+        self.assertEqual(paired.baseline_repo, Path("baseline"))
+        self.assertEqual(paired.candidate_repo, Path("candidate"))
 
     def test_pair_direction_never_depends_on_condition_sorting(self) -> None:
         records = []
+        observed = []
 
-        def measure(condition, fields):
+        def measure(revision, condition, fields):
+            observed.append(
+                (
+                    fields["pair_index"],
+                    revision,
+                    fields["revision_order"],
+                    condition,
+                    fields["order"],
+                )
+            )
             return {
                 **fields,
                 "elapsed_ns": 10 if condition == "z-baseline" else 20,
                 "guest_elapsed_ns": 10 if condition == "z-baseline" else 20,
                 "host_wall_elapsed_ns": 30,
+                "throughput_ops_per_second": (
+                    20 if condition == "z-baseline" else 10
+                ),
                 "correct": True,
             }
 
-        bench.collect_pair(
+        bench.collect_revision_pair(
             records=records,
             pair_kind="test",
             pair_key="pair",
             left="z-baseline",
             right="a-target",
             warmups=0,
-            samples=1,
+            samples=2,
+            revision_fields={"baseline": {}, "candidate": {}},
             measure=measure,
         )
-        result = bench.paired_summaries(records)[0]
+        result = next(
+            item
+            for item in bench.paired_summaries(records)
+            if item["revision"] == "candidate"
+        )
         self.assertEqual(result["left"], "z-baseline")
         self.assertEqual(result["right"], "a-target")
         self.assertEqual(result["elapsed_right_over_left"]["median"], 2.0)
         self.assertEqual(
+            observed[:4],
+            [
+                (0, "baseline", 0, "z-baseline", 0),
+                (0, "baseline", 0, "a-target", 1),
+                (0, "candidate", 1, "z-baseline", 0),
+                (0, "candidate", 1, "a-target", 1),
+            ],
+        )
+        self.assertEqual(
+            observed[4:],
+            [
+                (1, "candidate", 0, "a-target", 0),
+                (1, "candidate", 0, "z-baseline", 1),
+                (1, "baseline", 1, "a-target", 0),
+                (1, "baseline", 1, "z-baseline", 1),
+            ],
+        )
+        self.assertEqual(
             alternating_pair_order(1, "left", "right"), ("right", "left")
         )
+
+    def test_single_revision_cli_executes_transitional_paired_report(self) -> None:
+        output = self.scratch / "compat-report"
+        args = bench.parse_args(
+            [
+                "--repo",
+                str(ROOT),
+                "--output-dir",
+                str(output),
+                "--profile",
+                "smoke",
+                "--warmups",
+                "0",
+                "--samples",
+                "1",
+                "--modes",
+                "interpreter",
+                "--thread-counts",
+                "1",
+                "--single-iterations",
+                "1",
+                "--cancel-iterations",
+                "1",
+                "--hot-iterations",
+                "1",
+                "--atomic-iterations",
+                "1",
+                "--atomic-total-iterations",
+                "1",
+                "--wait-iterations",
+                "1",
+                "--spawn-iterations",
+                "1",
+                "--min-interval-ms",
+                "0.000001",
+                "--no-budget",
+            ]
+        )
+
+        def fake_build(**kwargs):
+            name = (
+                f"{'enabled' if kwargs['threads_enabled'] else 'disabled'}-"
+                f"{kwargs['mode']}"
+            )
+            return bench.Build(
+                name,
+                kwargs["mode"],
+                kwargs["threads_enabled"],
+                output,
+                output / "wamr",
+                None,
+                name,
+                ["zig", "build"],
+                False,
+            )
+
+        def fake_measure(**kwargs):
+            fields = kwargs["record_fields"]
+            return {
+                **fields,
+                "command": ["wamr"],
+                "elapsed_ns": 100,
+                "guest_elapsed_ns": 100,
+                "raw_guest_elapsed_ns": 101,
+                "timing_overhead_ns": 1,
+                "timing_overhead_ppm": 1,
+                "host_wall_elapsed_ns": 200,
+                "host_wall_over_guest": 2.0,
+                "metric_kind": (
+                    "spawn-join-lifecycle"
+                    if kwargs["workload"] == "spawn-join"
+                    else "steady-state-kernel"
+                ),
+                "cancel_polls_per_operation": 0.0,
+                "operations": 1,
+                "throughput_ops_per_second": 10_000_000.0,
+                "per_thread_ops_per_second": 10_000_000.0,
+                "guest": {},
+                "correct": True,
+                "correctness": {"passed": True},
+                "stdout": "{}",
+                "stderr": "",
+            }
+
+        with (
+            mock.patch.object(bench, "build_variant", side_effect=fake_build),
+            mock.patch.object(bench, "measure_once", side_effect=fake_measure),
+            mock.patch.object(bench, "build_tool_report", return_value={}),
+            mock.patch.object(bench.sys, "stderr", io.StringIO()),
+        ):
+            report = bench.execute(args)
+        self.assertEqual(
+            report["plan"]["revision_mode"],
+            "single-revision-compatibility",
+        )
+        self.assertEqual(
+            report["metadata"]["revisions"]["baseline"],
+            report["metadata"]["revisions"]["candidate"],
+        )
+        self.assertEqual(
+            {record["revision"] for record in report["records"]},
+            set(bench.REVISION_ROLES),
+        )
+        self.assertTrue((output / "report.json").is_file())
 
     def test_guest_timing_parser_rejects_missing_duplicate_and_malformed(self) -> None:
         expected = bench.expected_result("atomic", 1, 10)
@@ -505,17 +759,174 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(cache_key(left), cache_key(right))
         self.assertNotEqual(cache_key(left), cache_key(dict(left, threads=False)))
 
+    def test_host_fingerprint_excludes_high_cardinality_runner_identity(self) -> None:
+        with mock.patch.dict(
+            schema.os.environ,
+            {
+                "RUNNER_NAME": "hosted-runner-123",
+                "GITHUB_RUN_ID": "100",
+                "GITHUB_RUN_ATTEMPT": "1",
+            },
+            clear=False,
+        ):
+            first = schema.host_metadata("github-hosted")
+        with mock.patch.dict(
+            schema.os.environ,
+            {
+                "RUNNER_NAME": "hosted-runner-987",
+                "GITHUB_RUN_ID": "200",
+                "GITHUB_RUN_ATTEMPT": "2",
+            },
+            clear=False,
+        ):
+            second = schema.host_metadata("github-hosted")
+        self.assertNotEqual(first["runner_name"], second["runner_name"])
+        self.assertEqual(
+            first["host_fingerprint"]["sha256"],
+            second["host_fingerprint"]["sha256"],
+        )
+        fields = first["host_fingerprint"]["fields"]
+        self.assertNotIn("runner_name", fields)
+        self.assertNotIn("github_run_id", fields)
+
+    def test_report_fails_closed_on_revision_and_provenance_corruption(self) -> None:
+        report = make_report(candidate_source="e" * 64)
+        self.assertNotEqual(
+            report["metadata"]["revisions"]["baseline"][
+                "build_source_sha256"
+            ],
+            report["metadata"]["revisions"]["candidate"][
+                "build_source_sha256"
+            ],
+        )
+
+        missing_revision = copy.deepcopy(report)
+        del missing_revision["metadata"]["revisions"]["candidate"]
+        with self.assertRaisesRegex(BenchmarkDataError, "metadata.revisions"):
+            bench.validate_report(missing_revision)
+
+        duplicate = copy.deepcopy(report)
+        duplicate["records"].append(copy.deepcopy(duplicate["records"][0]))
+        with self.assertRaisesRegex(BenchmarkDataError, "duplicate record"):
+            bench.validate_report(duplicate)
+
+        inverted = copy.deepcopy(report)
+        inverted["records"][0]["revision"] = "candidate"
+        with self.assertRaisesRegex(BenchmarkDataError, "mixed|duplicate"):
+            bench.validate_report(inverted)
+
+        inverted_order = copy.deepcopy(report)
+        inverted_order["records"][0], inverted_order["records"][1] = (
+            inverted_order["records"][1],
+            inverted_order["records"][0],
+        )
+        with self.assertRaisesRegex(BenchmarkDataError, "inverted pair order"):
+            bench.validate_report(inverted_order)
+
+        mutations = (
+            (
+                "host",
+                lambda value: value["metadata"]["revisions"]["candidate"].__setitem__(
+                    "host_pair_id", "other-host-pair"
+                ),
+            ),
+            (
+                "plan",
+                lambda value: value["metadata"]["revisions"]["candidate"].__setitem__(
+                    "plan_sha256", "f" * 64
+                ),
+            ),
+            (
+                "fixture",
+                lambda value: value["metadata"]["revisions"]["candidate"].__setitem__(
+                    "fixture_set_sha256", "f" * 64
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            corrupt = copy.deepcopy(report)
+            mutate(corrupt)
+            with self.subTest(label=label), self.assertRaisesRegex(
+                BenchmarkDataError, f"mixed {label}"
+            ):
+                bench.validate_report(corrupt)
+
+    def test_candidate_identity_is_not_calibration_provenance(self) -> None:
+        calibrated_report = make_report(
+            baseline_commit="a" * 40,
+            commit="a" * 40,
+            baseline_source="c" * 64,
+            candidate_source="c" * 64,
+        )
+        budget = complete_budget(calibrated_report)
+        future_candidate = make_report(
+            baseline_commit="a" * 40,
+            commit="e" * 40,
+            baseline_source="c" * 64,
+            candidate_source="f" * 64,
+        )
+        loaded = bench.load_budget(
+            self.write_budget(budget), future_candidate
+        )
+        self.assertEqual(
+            loaded["host_machine"],
+            future_candidate["metadata"]["host"]["machine"],
+        )
+
+        changed_baseline = make_report(
+            baseline_commit="e" * 40,
+            commit="f" * 40,
+            baseline_source="f" * 64,
+            candidate_source="e" * 64,
+        )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "baseline_revision"
+        ):
+            bench.load_budget(self.write_budget(budget), changed_baseline)
+
+    def test_ratio_of_ratios_direction_and_budget_limits(self) -> None:
+        report = make_report()
+        ratio = report["ratio_of_ratios_summaries"][0]
+        self.assertAlmostEqual(
+            ratio["elapsed_ratio_of_ratios"]["median"],
+            (120 / 90) / (120 / 100),
+        )
+        self.assertAlmostEqual(
+            ratio["throughput_ratio_of_ratios"]["median"],
+            (90 / 120) / (100 / 120),
+        )
+        budget = complete_budget(report)
+        platform = budget["platforms"][report["metadata"]["platform_id"]]
+        platform["ratio_of_ratios"][0][
+            "min_candidate_over_baseline_throughput_ratio_of_ratios"
+        ] = 0.95
+        platform["ratio_of_ratios"][0][
+            "max_candidate_over_baseline_elapsed_ratio_of_ratios"
+        ] = 1.05
+        loaded = bench.load_budget(self.write_budget(budget), report)
+        failures = bench.evaluate_budget(
+            loaded,
+            report["comparison_summaries"],
+            report["ratio_of_ratios_summaries"],
+        )
+        self.assertTrue(
+            any("throughput ratio-of-ratios" in item for item in failures)
+        )
+        self.assertTrue(
+            any("elapsed ratio-of-ratios" in item for item in failures)
+        )
+
     def test_report_rejects_missing_scenario_and_direction_corruption(self) -> None:
         report = make_report()
         missing = copy.deepcopy(report)
         missing["records"] = missing["records"][2:]
-        with self.assertRaisesRegex(BenchmarkDataError, "missing planned pairs"):
+        with self.assertRaisesRegex(BenchmarkDataError, "incomplete sample pairing"):
             bench.validate_report(missing)
 
         corrupt = copy.deepcopy(report)
         corrupt["plan"]["pairs"][0]["left"] = "renamed"
         corrupt["metadata"]["plan_sha256"] = cache_key(corrupt["plan"])
-        with self.assertRaisesRegex(BenchmarkDataError, "incomplete"):
+        with self.assertRaisesRegex(BenchmarkDataError, "plan identity|incomplete"):
             bench.validate_report(corrupt)
 
     def test_budget_rejects_empty_partial_unknown_duplicate_and_direction(self) -> None:
@@ -523,7 +934,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
         budget = complete_budget(report)
         loaded = bench.load_budget(self.write_budget(budget), report)
         self.assertFalse(bench.evaluate_budget(
-            loaded, report["summaries"], report["paired_summaries"]
+            loaded,
+            report["comparison_summaries"],
+            report["ratio_of_ratios_summaries"],
         ))
         uncalibrated = copy.deepcopy(budget)
         uncalibrated["calibrated"] = False
@@ -535,20 +948,37 @@ class ThreadBenchmarkTests(unittest.TestCase):
         value["platforms"] = {}
         cases["empty"] = value
         value = copy.deepcopy(budget)
-        value["platforms"][report["metadata"]["platform_id"]]["pairs"].pop()
+        value["platforms"][report["metadata"]["platform_id"]][
+            "comparisons"
+        ].pop()
         cases["partial"] = value
         value = copy.deepcopy(budget)
-        value["platforms"][report["metadata"]["platform_id"]]["pairs"][0]["pair_key"] = "unknown"
+        value["platforms"][report["metadata"]["platform_id"]][
+            "comparisons"
+        ][0]["pair_key"] = "unknown"
         cases["unknown"] = value
         value = copy.deepcopy(budget)
-        value["platforms"][report["metadata"]["platform_id"]]["pairs"].append(
-            copy.deepcopy(value["platforms"][report["metadata"]["platform_id"]]["pairs"][0])
+        value["platforms"][report["metadata"]["platform_id"]][
+            "comparisons"
+        ].append(
+            copy.deepcopy(
+                value["platforms"][report["metadata"]["platform_id"]][
+                    "comparisons"
+                ][0]
+            )
         )
         cases["duplicate"] = value
         value = copy.deepcopy(budget)
-        pair = value["platforms"][report["metadata"]["platform_id"]]["pairs"][0]
+        pair = value["platforms"][report["metadata"]["platform_id"]][
+            "ratio_of_ratios"
+        ][0]
         pair["left"], pair["right"] = pair["right"], pair["left"]
         cases["direction"] = value
+        value = copy.deepcopy(budget)
+        value["platforms"][report["metadata"]["platform_id"]][
+            "comparisons"
+        ][0]["min_candidate_over_baseline_throughput_ratio"] = float("nan")
+        cases["nonfinite"] = value
         for label, corrupt in cases.items():
             with self.subTest(label=label), self.assertRaises(bench.HarnessError):
                 bench.load_budget(self.write_budget(corrupt), report)
@@ -557,12 +987,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
         report = make_report()
         budget = complete_budget(report)
         mutations = (
-            ("commit", lambda value: value["cohort"].__setitem__("baseline_commit", "e" * 40)),
-            ("source", lambda value: value["cohort"].__setitem__("baseline_build_source_sha256", "e" * 64)),
-            ("fixture", lambda value: value["cohort"].__setitem__("fixture_set_sha256", "f" * 64)),
-            ("plan", lambda value: value["cohort"].__setitem__("plan_sha256", "f" * 64)),
-            ("profile", lambda value: value["cohort"].__setitem__("profile", "smoke")),
-            ("count", lambda value: value["cohort"]["report_count_by_platform"].__setitem__(report["metadata"]["platform_id"], 19)),
+            ("commit", lambda value: value["calibration_provenance"]["baseline_revision"].__setitem__("commit", "e" * 40)),
+            ("source", lambda value: value["calibration_provenance"]["baseline_revision"].__setitem__("build_source_sha256", "e" * 64)),
+            ("fixture", lambda value: value["calibration_provenance"].__setitem__("fixture_set_sha256", "f" * 64)),
+            ("plan", lambda value: value["calibration_provenance"].__setitem__("plan_sha256", "f" * 64)),
+            ("profile", lambda value: value["calibration_provenance"].__setitem__("profile", "smoke")),
+            ("count", lambda value: value["calibration_provenance"]["report_count_by_platform"].__setitem__(report["metadata"]["platform_id"], 19)),
             ("host", lambda value: value["platforms"][report["metadata"]["platform_id"]].__setitem__("host_machine", "aarch64")),
         )
         for label, mutate in mutations:
@@ -574,7 +1004,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
         duplicate_json = (
             '{"schema_version":2,"schema_version":2,'
             '"kind":"wasi-thread-benchmark-budget","calibrated":true,'
-            '"calibration_requirements":{},"cohort":{},"platforms":{}}'
+            '"enforcement":true,"calibration_requirements":{},'
+            '"calibration_provenance":{},"platforms":{}}'
         )
         with self.assertRaisesRegex(bench.HarnessError, "duplicate"):
             bench.load_budget(self.write_budget(duplicate_json), report)
@@ -622,8 +1053,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(result["identity"]["commit"], "a" * 40)
 
-        mixed = copy.deepcopy(arm)
-        mixed["metadata"]["commit"] = "e" * 40
+        mixed = make_report(
+            platform_id="ubuntu-24.04-aarch64",
+            machine="aarch64",
+            commit="e" * 40,
+            run_id="100",
+        )
         with self.assertRaisesRegex(bench.HarnessError, "mixed"):
             cohort.validate_documents(
                 [(Path("x86"), x86), (Path("arm"), mixed)],
@@ -848,6 +1283,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
             schema["properties"]["schema_version"]["const"], SCHEMA_VERSION
         )
         self.assertEqual(schema["properties"]["kind"]["const"], bench.KIND)
+        Draft202012Validator.check_schema(schema)
+        report_validator = Draft202012Validator(schema)
+        report = make_report()
+        self.assertFalse(list(report_validator.iter_errors(report)))
         budget_schema = json.loads(
             (
                 ROOT
@@ -861,6 +1300,21 @@ class ThreadBenchmarkTests(unittest.TestCase):
             budget_schema["properties"]["schema_version"]["const"],
             SCHEMA_VERSION,
         )
+        Draft202012Validator.check_schema(budget_schema)
+        budget_validator = Draft202012Validator(budget_schema)
+        self.assertFalse(
+            list(budget_validator.iter_errors(complete_budget(report)))
+        )
+        uncalibrated = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "benchmarks"
+                / "wasi-threads"
+                / "budget.json"
+            ).read_text(encoding="UTF-8")
+        )
+        self.assertFalse(list(budget_validator.iter_errors(uncalibrated)))
 
 
 if __name__ == "__main__":
