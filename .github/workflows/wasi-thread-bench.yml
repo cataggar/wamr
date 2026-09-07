@@ -1,8 +1,13 @@
 name: WASI thread benchmark
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' &&
+      format('WASI thread cohort-{0}-{1}-{2}',
+        inputs.cohort_id, inputs.cohort_sequence, inputs.cohort_partition) ||
+      format('WASI thread {0}', github.event_name) }}
 
 on:
   pull_request:
-    paths:
+    paths: &benchmark-paths
       - build.zig
       - src/compiler/**
       - src/runtime/**
@@ -13,11 +18,22 @@ on:
       - scripts/wasi_thread_cohort.py
       - tests/benchmarks/wasi-threads/**
       - .github/workflows/wasi-thread-bench.yml
+  push:
+    branches: [main]
+    paths: *benchmark-paths
   workflow_dispatch:
     inputs:
-      target_sha:
-        description: "Immutable 40-character commit SHA to benchmark"
+      baseline_sha:
+        description: "Immutable 40-character lowercase baseline commit SHA"
         required: true
+      candidate_sha:
+        description: "Immutable 40-character lowercase candidate commit SHA"
+        required: true
+      purpose:
+        description: "Explicit paired comparison purpose"
+        type: choice
+        options: [noise-calibration, candidate-evaluation]
+        default: noise-calibration
       profile:
         description: "Measurement profile"
         type: choice
@@ -27,20 +43,186 @@ on:
         description: "Discarded paired warmups"
         default: "2"
       samples:
-        description: "Measured paired samples"
+        description: "Measured paired samples (must be positive and even)"
         default: "10"
+      runner_target:
+        description: "Hosted runners, or the trusted temporary calibration route"
+        type: choice
+        options: [github-hosted, trusted-calibration]
+        default: github-hosted
+      cohort_id:
+        description: "Dispatcher correlation ID; leave manual for ad-hoc runs"
+        default: manual
+      cohort_sequence:
+        description: "Dispatcher sequence; leave zero for ad-hoc runs"
+        default: "0"
+      cohort_partition:
+        description: "Predeclared training/holdout partition, or unsplit"
+        default: unsplit
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && format('wasi-thread-calibration-{0}', github.run_id) || format('wasi-thread-bench-{0}', github.ref) }}
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' &&
+        inputs.runner_target == 'trusted-calibration' &&
+        'wasi-thread-temp-runner' ||
+        github.event_name == 'workflow_dispatch' &&
+        format('wasi-thread-authoritative-{0}', github.run_id) ||
+        format('wasi-thread-bench-{0}', github.ref) }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      baseline_sha: ${{ steps.revisions.outputs.baseline_sha }}
+      candidate_sha: ${{ steps.revisions.outputs.candidate_sha }}
+      purpose: ${{ steps.revisions.outputs.purpose }}
+      profile: ${{ steps.revisions.outputs.profile }}
+      warmups: ${{ steps.revisions.outputs.warmups }}
+      samples: ${{ steps.revisions.outputs.samples }}
+    steps:
+      - name: Check out trusted default branch for manual validation
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.runner_target == 'trusted-calibration'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve immutable paired revisions
+        id: revisions
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CURRENT_SHA: ${{ github.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          INPUT_BASELINE_SHA: ${{ inputs.baseline_sha }}
+          INPUT_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          INPUT_PURPOSE: ${{ inputs.purpose }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+          INPUT_WARMUPS: ${{ inputs.warmups }}
+          INPUT_SAMPLES: ${{ inputs.samples }}
+          INPUT_RUNNER_TARGET: ${{ inputs.runner_target }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            workflow_dispatch)
+              BASELINE_SHA="$INPUT_BASELINE_SHA"
+              CANDIDATE_SHA="$INPUT_CANDIDATE_SHA"
+              PURPOSE="$INPUT_PURPOSE"
+              PROFILE="$INPUT_PROFILE"
+              WARMUPS="$INPUT_WARMUPS"
+              SAMPLES="$INPUT_SAMPLES"
+              ;;
+            pull_request)
+              BASELINE_SHA="$PR_BASE_SHA"
+              CANDIDATE_SHA="$CURRENT_SHA"
+              PURPOSE=candidate-evaluation
+              PROFILE=smoke
+              WARMUPS=1
+              SAMPLES=4
+              ;;
+            push)
+              CANDIDATE_SHA="$CURRENT_SHA"
+              if [[ "$PUSH_BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] &&
+                 [ "$PUSH_BEFORE_SHA" != 0000000000000000000000000000000000000000 ]; then
+                BASELINE_SHA="$PUSH_BEFORE_SHA"
+                PURPOSE=candidate-evaluation
+              else
+                BASELINE_SHA="$CURRENT_SHA"
+                PURPOSE=noise-calibration
+              fi
+              PROFILE=smoke
+              WARMUPS=1
+              SAMPLES=4
+              ;;
+            *)
+              echo "unsupported event: $EVENT" >&2
+              exit 2
+              ;;
+          esac
+
+          for ITEM in "$BASELINE_SHA" "$CANDIDATE_SHA"; do
+            [[ "$ITEM" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "benchmark SHAs must be 40 lowercase hexadecimal characters" >&2
+              exit 2
+            }
+          done
+          [[ "$WARMUPS" =~ ^[0-9]+$ ]] || {
+            echo "warmups must be a non-negative integer" >&2
+            exit 2
+          }
+          [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]] && (( SAMPLES % 2 == 0 )) || {
+            echo "samples must be a positive even integer" >&2
+            exit 2
+          }
+          case "$PROFILE" in authoritative|smoke) ;; *)
+            echo "unsupported profile: $PROFILE" >&2; exit 2 ;;
+          esac
+          case "$PURPOSE" in
+            noise-calibration)
+              [ "$BASELINE_SHA" = "$CANDIDATE_SHA" ] || {
+                echo "noise calibration requires identical SHAs" >&2
+                exit 2
+              }
+              ;;
+            candidate-evaluation)
+              [ "$BASELINE_SHA" != "$CANDIDATE_SHA" ] || {
+                echo "candidate evaluation requires distinct SHAs" >&2
+                exit 2
+              }
+              ;;
+            *)
+              echo "unsupported comparison purpose: $PURPOSE" >&2
+              exit 2
+              ;;
+          esac
+
+          if [ "$EVENT" = workflow_dispatch ] &&
+             [ "$INPUT_RUNNER_TARGET" = trusted-calibration ]; then
+            [ "$REF" = refs/heads/main ] || {
+              echo "the self-hosted calibration route is reachable only from main" >&2
+              exit 2
+            }
+            [ "$PURPOSE" = noise-calibration ] || {
+              echo "the self-hosted route accepts noise calibration only" >&2
+              exit 2
+            }
+            for ITEM in "$BASELINE_SHA" "$CANDIDATE_SHA"; do
+              git cat-file -e "$ITEM^{commit}"
+              git merge-base --is-ancestor "$ITEM" origin/main || {
+                echo "$ITEM is not trusted history reachable from main" >&2
+                exit 2
+              }
+            done
+          fi
+
+          {
+            echo "baseline_sha=$BASELINE_SHA"
+            echo "candidate_sha=$CANDIDATE_SHA"
+            echo "purpose=$PURPOSE"
+            echo "profile=$PROFILE"
+            echo "warmups=$WARMUPS"
+            echo "samples=$SAMPLES"
+          } >> "$GITHUB_OUTPUT"
+
   benchmark:
-    timeout-minutes: 90
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.runner_target == 'github-hosted'
+    needs: prepare
+    timeout-minutes: 180
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -51,26 +233,41 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check out baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_sha || github.sha }}
+          ref: ${{ needs.prepare.outputs.baseline_sha }}
+          path: baseline
+          persist-credentials: false
 
-      - name: Resolve benchmark revision
-        id: revision
+      - name: Check out candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify independent immutable checkouts
         env:
-          EVENT: ${{ github.event_name }}
-          TARGET_SHA: ${{ github.event.inputs.target_sha }}
+          BASELINE_SHA: ${{ needs.prepare.outputs.baseline_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
         run: |
           set -euo pipefail
-          ACTUAL=$(git rev-parse HEAD)
-          if [ "$EVENT" = workflow_dispatch ]; then
-            [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-              echo "target_sha must be 40 lowercase hexadecimal characters" >&2
-              exit 2
-            }
-            test "$ACTUAL" = "$TARGET_SHA"
-          fi
-          echo "sha=$ACTUAL" >> "$GITHUB_OUTPUT"
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(realpath baseline)" != "$(realpath candidate)"
+
+      - name: Configure job-local caches and temporary files
+        run: |
+          set -euo pipefail
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
+          mkdir -p "$EXPECTED_ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
+          {
+            echo "WASI_THREAD_ROOT=$EXPECTED_ROOT"
+            echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"
+            echo "TMPDIR=$EXPECTED_ROOT/tmp"
+            echo "XDG_CACHE_HOME=$EXPECTED_ROOT/xdg-cache"
+          } >> "$GITHUB_ENV"
 
       - name: Install Zig 0.16.0
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -79,11 +276,14 @@ jobs:
           use-cache: false
 
       - name: Configure Zig caches
-        uses: ./.github/actions/zig-cache
+        uses: ./candidate/.github/actions/zig-cache
+        with:
+          global-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/zig-global-cache
+          local-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/zig-local-cache
 
-      - name: Test benchmark harness
+      - name: Test benchmark and cohort harness
         if: matrix.platform == 'ubuntu-22.04-x86_64'
-        run: python3 -m unittest scripts/test_bench_wasi_threads.py
+        run: python3 -m unittest candidate/scripts/test_bench_wasi_threads.py
 
       - name: Verify pinned wasi-libc fixtures
         if: matrix.platform == 'ubuntu-22.04-x86_64'
@@ -92,61 +292,340 @@ jobs:
           SDK_SHA256: 52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c
         run: |
           set -euo pipefail
-          SDK_ROOT="$RUNNER_TEMP/wasi-sdk-25"
-          ARCHIVE="$RUNNER_TEMP/wasi-sdk-25.tar.gz"
-          mkdir -p "$SDK_ROOT" "$RUNNER_TEMP/wasi-thread-fixture-tmp"
+          SDK_ROOT="$WASI_THREAD_ROOT/wasi-sdk-25"
+          ARCHIVE="$WASI_THREAD_ROOT/wasi-sdk-25.tar.gz"
+          mkdir -p "$SDK_ROOT" "$TMPDIR"
           curl --fail --location --retry 3 "$SDK_URL" -o "$ARCHIVE"
           echo "$SDK_SHA256  $ARCHIVE" | sha256sum -c -
           tar -xzf "$ARCHIVE" -C "$SDK_ROOT" --strip-components=1
-          WASI_SDK_PATH="$SDK_ROOT" \
-          TMPDIR="$RUNNER_TEMP/wasi-thread-fixture-tmp" \
-            tests/benchmarks/wasi-threads/build-fixtures.sh
-          git diff --exit-code -- tests/benchmarks/wasi-threads
+          (
+            cd candidate
+            WASI_SDK_PATH="$SDK_ROOT" \
+              tests/benchmarks/wasi-threads/build-fixtures.sh
+            git diff --exit-code -- tests/benchmarks/wasi-threads
+          )
 
-      - name: Run paired benchmark
+      - name: Run non-enforcing paired benchmark
         env:
-          EVENT: ${{ github.event_name }}
-          INPUT_PROFILE: ${{ github.event.inputs.profile }}
-          INPUT_WARMUPS: ${{ github.event.inputs.warmups }}
-          INPUT_SAMPLES: ${{ github.event.inputs.samples }}
+          PURPOSE: ${{ needs.prepare.outputs.purpose }}
+          PROFILE: ${{ needs.prepare.outputs.profile }}
+          WARMUPS: ${{ needs.prepare.outputs.warmups }}
+          SAMPLES: ${{ needs.prepare.outputs.samples }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = workflow_dispatch ]; then
-            PROFILE="${INPUT_PROFILE:-authoritative}"
-            WARMUPS="${INPUT_WARMUPS:-2}"
-            SAMPLES="${INPUT_SAMPLES:-10}"
-          else
-            PROFILE=smoke
-            WARMUPS=1
-            SAMPLES=3
-          fi
-          python3 scripts/bench_wasi_threads.py \
+          python3 candidate/scripts/bench_wasi_threads.py \
+            --baseline-repo "$PWD/baseline" \
+            --candidate-repo "$PWD/candidate" \
+            --comparison-purpose "$PURPOSE" \
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
             --platform-id '${{ matrix.platform }}' \
-            --output-dir "$PWD/wasi-thread-bench-out" \
+            --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${{ matrix.platform }}" \
+            --runner-environment github-hosted \
+            --output-dir "$WASI_THREAD_OUTPUT" \
             --no-budget
-          cat wasi-thread-bench-out/report.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "> **Non-enforcing:** budgets remain disabled pending a reviewed calibration cohort."
+            echo
+            cat "$WASI_THREAD_OUTPUT/report.md"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload retained report
+      - name: Upload retained paired report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wasi-thread-bench-${{ matrix.platform }}-${{ steps.revision.outputs.sha }}
+          name: wasi-thread-bench-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            wasi-thread-bench-out/report.json
-            wasi-thread-bench-out/report.md
-          if-no-files-found: ignore
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.md
+          if-no-files-found: warn
           retention-days: 90
 
-      - name: Comment on pull request
-        if: always() && github.event_name == 'pull_request' && matrix.platform == 'ubuntu-22.04-x86_64'
+      - name: Clean run-scoped benchmark output and caches
+        if: always()
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
+          case "$EXPECTED_ROOT" in
+            "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}") ;;
+            *) exit 2 ;;
+          esac
+          rm -rf -- "$EXPECTED_ROOT"
+
+  trusted-calibration-x86:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.runner_target == 'trusted-calibration' &&
+      inputs.purpose == 'noise-calibration' &&
+      github.ref == 'refs/heads/main'
+    needs: prepare
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    runs-on: wamr-temp-20260906
+    steps:
+      - name: Require runner work directories under /d
+        run: |
+          set -euo pipefail
+          case "$GITHUB_WORKSPACE:$RUNNER_TEMP" in
+            /d/*:/d/*) ;;
+            *) echo "self-hosted workspace and temp paths must remain under /d" >&2; exit 2 ;;
+          esac
+
+      - name: Check out baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.baseline_sha }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Check out candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify independent immutable checkouts
+        env:
+          BASELINE_SHA: ${{ needs.prepare.outputs.baseline_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(realpath baseline)" != "$(realpath candidate)"
+
+      - name: Configure job-local caches and temporary files
+        run: |
+          set -euo pipefail
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86"
+          case "$EXPECTED_ROOT" in /d/*) ;; *) exit 2 ;; esac
+          mkdir -p "$EXPECTED_ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
+          {
+            echo "WASI_THREAD_ROOT=$EXPECTED_ROOT"
+            echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"
+            echo "TMPDIR=$EXPECTED_ROOT/tmp"
+            echo "XDG_CACHE_HOME=$EXPECTED_ROOT/xdg-cache"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./candidate/.github/actions/zig-cache
+        with:
+          global-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-global-cache
+          local-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-local-cache
+
+      - name: Test benchmark and cohort harness
+        run: python3 -m unittest candidate/scripts/test_bench_wasi_threads.py
+
+      - name: Verify pinned wasi-libc fixtures
+        env:
+          SDK_URL: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+          SDK_SHA256: 52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c
+        run: |
+          set -euo pipefail
+          SDK_ROOT="$WASI_THREAD_ROOT/wasi-sdk-25"
+          ARCHIVE="$WASI_THREAD_ROOT/wasi-sdk-25.tar.gz"
+          mkdir -p "$SDK_ROOT" "$TMPDIR"
+          curl --fail --location --retry 3 "$SDK_URL" -o "$ARCHIVE"
+          echo "$SDK_SHA256  $ARCHIVE" | sha256sum -c -
+          tar -xzf "$ARCHIVE" -C "$SDK_ROOT" --strip-components=1
+          (
+            cd candidate
+            WASI_SDK_PATH="$SDK_ROOT" \
+              tests/benchmarks/wasi-threads/build-fixtures.sh
+            git diff --exit-code -- tests/benchmarks/wasi-threads
+          )
+
+      - name: Run non-enforcing paired noise calibration
+        env:
+          PURPOSE: ${{ needs.prepare.outputs.purpose }}
+          PROFILE: ${{ needs.prepare.outputs.profile }}
+          WARMUPS: ${{ needs.prepare.outputs.warmups }}
+          SAMPLES: ${{ needs.prepare.outputs.samples }}
+        run: |
+          set -euo pipefail
+          python3 candidate/scripts/bench_wasi_threads.py \
+            --baseline-repo "$PWD/baseline" \
+            --candidate-repo "$PWD/candidate" \
+            --comparison-purpose "$PURPOSE" \
+            --profile "$PROFILE" \
+            --warmups "$WARMUPS" \
+            --samples "$SAMPLES" \
+            --platform-id ubuntu-22.04-x86_64 \
+            --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
+            --runner-environment self-hosted \
+            --output-dir "$WASI_THREAD_OUTPUT" \
+            --no-budget
+          {
+            echo "> **Calibration only, non-enforcing:** budgets remain disabled."
+            echo
+            cat "$WASI_THREAD_OUTPUT/report.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload retained paired report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-bench-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.md
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Clean run-scoped benchmark output and caches
+        if: always()
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86"
+          case "$EXPECTED_ROOT" in
+            "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86") ;;
+            *) exit 2 ;;
+          esac
+          case "$EXPECTED_ROOT" in /d/*) ;; *) exit 2 ;; esac
+          rm -rf -- "$EXPECTED_ROOT"
+
+  trusted-calibration-arm:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.runner_target == 'trusted-calibration' &&
+      inputs.purpose == 'noise-calibration' &&
+      github.ref == 'refs/heads/main'
+    needs: prepare
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.baseline_sha }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Check out candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify independent immutable checkouts
+        env:
+          BASELINE_SHA: ${{ needs.prepare.outputs.baseline_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(realpath baseline)" != "$(realpath candidate)"
+
+      - name: Configure job-local caches and temporary files
+        run: |
+          set -euo pipefail
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm"
+          mkdir -p "$EXPECTED_ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
+          {
+            echo "WASI_THREAD_ROOT=$EXPECTED_ROOT"
+            echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"
+            echo "TMPDIR=$EXPECTED_ROOT/tmp"
+            echo "XDG_CACHE_HOME=$EXPECTED_ROOT/xdg-cache"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./candidate/.github/actions/zig-cache
+        with:
+          global-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-global-cache
+          local-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-local-cache
+
+      - name: Run non-enforcing paired noise calibration
+        env:
+          PURPOSE: ${{ needs.prepare.outputs.purpose }}
+          PROFILE: ${{ needs.prepare.outputs.profile }}
+          WARMUPS: ${{ needs.prepare.outputs.warmups }}
+          SAMPLES: ${{ needs.prepare.outputs.samples }}
+        run: |
+          set -euo pipefail
+          python3 candidate/scripts/bench_wasi_threads.py \
+            --baseline-repo "$PWD/baseline" \
+            --candidate-repo "$PWD/candidate" \
+            --comparison-purpose "$PURPOSE" \
+            --profile "$PROFILE" \
+            --warmups "$WARMUPS" \
+            --samples "$SAMPLES" \
+            --platform-id ubuntu-24.04-aarch64 \
+            --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-24.04-aarch64" \
+            --runner-environment github-hosted \
+            --output-dir "$WASI_THREAD_OUTPUT" \
+            --no-budget
+          {
+            echo "> **Calibration only, non-enforcing:** budgets remain disabled."
+            echo
+            cat "$WASI_THREAD_OUTPUT/report.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload retained paired report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-bench-ubuntu-24.04-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.md
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Clean run-scoped benchmark output and caches
+        if: always()
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+          EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm"
+          case "$EXPECTED_ROOT" in
+            "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm") ;;
+            *) exit 2 ;;
+          esac
+          rm -rf -- "$EXPECTED_ROOT"
+
+  comment:
+    if: always() && github.event_name == 'pull_request'
+    needs: benchmark
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download retained x86 report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wasi-thread-bench-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: retained-report
+
+      - name: Comment with non-enforcing report
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const fs = require('fs');
-            const path = 'wasi-thread-bench-out/report.md';
+            const path = 'retained-report/report.md';
             if (!fs.existsSync(path)) {
               core.warning('thread benchmark report was not produced');
               return;
@@ -155,5 +634,9 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: fs.readFileSync(path, 'utf8'),
+              body: [
+                '> **Non-enforcing:** budgets remain disabled pending calibration.',
+                '',
+                fs.readFileSync(path, 'utf8'),
+              ].join('\n'),
             });

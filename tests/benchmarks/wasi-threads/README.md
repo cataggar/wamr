@@ -109,8 +109,8 @@ python3 scripts/bench_wasi_threads.py \
   --no-budget
 ```
 
-Until the workflow PR supplies the two checkouts, the existing single-revision
-CLI remains valid:
+The workflow always supplies two checkouts. The single-revision CLI remains
+available only for local and required-check compatibility:
 
 ```sh
 python3 scripts/bench_wasi_threads.py \
@@ -206,42 +206,107 @@ python3 scripts/bench_wasi_threads.py \
   --no-budget
 ```
 
-## Hosted calibration and budgets
+## Hosted calibration, dispatch security, and cohorts
 
-The workflow remains path-filtered/manual and runs with `--no-budget`. Shared
-local machines are not an authoritative calibration source. Do not start a
-calibration cohort until the post-#979 methodology correction has passed
-independent review and one validation run on each hosted platform.
+The workflow remains path-filtered/manual and always runs with `--no-budget`.
+Every run is explicitly marked non-enforcing. No threshold is declared or
+enabled by this workflow/cohort phase.
 
-The commands below describe the currently checked-in single-revision dispatch
-plumbing. They cannot produce a schema-v3 paired calibration cohort by
-themselves. The current `scripts/wasi_thread_cohort.py` deliberately rejects
-schema-v3 paired reports rather than silently aggregating candidate aliases
-while ignoring baselines. The dependent workflow PR must create immutable
-baseline and candidate checkouts, pass their paths, comparison purpose, and one
-host-pair ID to the harness, and add baseline-aware cohort aggregation before
-calibration is enabled.
+Pull requests and `main` pushes use GitHub-hosted x86_64 and AArch64 runners
+only. A PR compares its trustworthy base commit with the tested merge commit. A
+push compares the valid `before` commit with the current commit; branch creation
+or another all-zero/invalid `before` value safely becomes an explicit same-SHA
+`noise-calibration`. Both revisions are checked out into distinct directories,
+even for same-SHA calibration, and each checked-out commit is verified before
+any benchmark code runs. Benchmark output, SDK files, and caches live in an
+explicit run/attempt/platform directory under `RUNNER_TEMP`; reports upload
+before an `always()` cleanup removes exactly that guarded directory.
 
-Manual runs require a lowercase immutable 40-character `target_sha`; their
-concurrency group uses `github.run_id` and never cancels another calibration
-run. `scripts/wasi_thread_cohort.py` dispatches a bounded number in parallel and
-records only run/artifact metadata, not build caches or large downloads:
+Manual dispatch requires lowercase immutable baseline and candidate SHAs,
+purpose, profile, warmup/sample counts, and a runner target. The
+`trusted-calibration` target is restricted to `workflow_dispatch` on `main`,
+accepts only same-SHA `noise-calibration`, and verifies on a GitHub-hosted
+preparation job that the target is commit history reachable from `main`. Only
+its x86 job can select the repository-scoped `wamr-temp-20260906` label;
+AArch64 remains `ubuntu-24.04-arm`. The temporary runner was registered with
+`--no-default-labels`, so its complete job-routing inventory is the single
+`wamr-temp-20260906` label and its exact registered name is
+`vm31e-wamr-temp-20260906`.
+
+For a public repository, this route is protected only while the repository's
+fork approval setting remains `approval_policy: all_external_contributors` and
+maintainers never approve a fork PR that adds or changes a job targeting
+`wamr-temp-20260906`. The committed workflow restricts its current routes, but
+does not by itself make future approved fork access impossible. Deregister the
+temporary runner immediately after calibration completes, or immediately when
+the calibration is abandoned or finally closed. Benchmark jobs have only
+`contents: read`; the separate hosted PR-comment job alone receives
+`pull-requests: write`.
+
+`scripts/wasi_thread_cohort.py` resolves and records the workflow ref's exact
+head before dispatch, sends all paired inputs unchanged, retains failed run
+metadata without retrying, and predeclares a sequence-based training/holdout
+split before results exist:
+
+Before a `trusted-calibration` cohort resolves or dispatches any workflow, the
+script makes one bounded Actions runner inventory query against the target
+repository. It requires the complete returned inventory to contain exactly one
+runner with custom label `wamr-temp-20260906`; that runner must have exact name
+`vm31e-wamr-temp-20260906`, the custom label must be its sole label, and it must
+be online and idle. Missing or duplicate label matches, offline or busy state,
+and name or label drift abort with a contextual error before workflow dispatch.
+The GitHub-hosted target does not query runner inventory. This exact name/label
+pair is operational identity for the temporary registration, not a portable
+performance class; report host fingerprints remain the relevant performance
+identity.
 
 ```sh
 python3 scripts/wasi_thread_cohort.py dispatch \
-  --target-sha <40-char-main-commit> \
+  --workflow-ref main \
+  --baseline-sha <40-char-main-commit> \
+  --candidate-sha <same-40-char-main-commit> \
+  --purpose noise-calibration \
+  --profile authoritative --warmups 2 --samples 10 \
+  --runner-target trusted-calibration \
   --runs 20 --max-in-flight 2 \
+  --timeout-seconds 259200 \
   --output /d/wasi-thread-cohort-dispatch.json
 ```
 
-After downloading only the retained report artifacts, validate the cohort:
+Do not run that command until this workflow has merged and the temporary runner
+route is intentionally ready. Trusted calibration caps `--max-in-flight` at 2:
+GitHub concurrency preserves only one pending run in addition to the active
+run. The dispatcher's validated wall-clock timeout defaults to 72 hours, which
+covers the authoritative job timeouts while ensuring a queued or never-scheduled
+run fails loudly. Do not manually dispatch this workflow while a cohort is in
+progress; any unrelated manual dispatch introduces uncontrolled contention and
+invalidates the cohort, and a displaced pending cohort run fails the dispatcher.
+After downloading every retained report artifact, validate against the exact
+dispatch manifest:
 
 ```sh
 python3 scripts/wasi_thread_cohort.py validate \
   --input-dir /d/wasi-thread-reports \
-  --minimum-reports 20 \
+  --dispatch-state /d/wasi-thread-cohort-dispatch.json \
   --output /d/wasi-thread-cohort.json
 ```
+
+Paired validation requires exactly one baseline/candidate report for every
+platform and workflow run: no missing, duplicate, inverted, partial, unexpected,
+legacy, or cherry-picked report is accepted. It verifies the immutable workflow
+head and target SHAs, purpose/profile/warmup/sample plan, fixture and plan
+identity, balanced sample ordering, the shared baseline/candidate host identity
+inside each report, and stable baseline/candidate build identities. Trusted
+calibration additionally requires every x86 report to identify runner
+`vm31e-wamr-temp-20260906` and one exact host fingerprint across the cohort.
+GitHub-hosted x86 and AArch64 reports may have heterogeneous hosts across runs;
+validation retains every observation and summarizes their fingerprint, CPU,
+and runner-image distributions instead of rejecting normal hosted-runner
+variation. The output
+lists every retained observation with its exact workflow run ID and predeclared
+training/holdout partition, and records an empty exclusion list. The old
+single-revision validation path remains non-authoritative compatibility only
+and cannot enter a dispatch-backed paired cohort.
 
 Schema version 3 separates the actual report revisions from budget calibration
 provenance. Paired reports use `metadata.revisions.baseline` and `.candidate`;

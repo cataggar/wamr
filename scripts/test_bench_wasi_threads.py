@@ -63,6 +63,10 @@ def stats(value: float, key: str) -> dict:
 def make_report(
     platform_id: str = "ubuntu-22.04-x86_64",
     machine: str = "x86_64",
+    cpu: str = "test cpu",
+    runner_environment: str = "github-hosted",
+    runner_image: str = "ubuntu",
+    runner_name: str = "test-runner",
     commit: str = "a" * 40,
     baseline_commit: str | None = None,
     baseline_source: str = "e" * 64,
@@ -108,10 +112,10 @@ def make_report(
     host_fields = {
         "system": "Linux",
         "machine": machine,
-        "cpu": "test cpu",
+        "cpu": cpu,
         "logical_cpus": 4,
-        "runner_environment": "github-hosted",
-        "runner_image": "ubuntu",
+        "runner_environment": runner_environment,
+        "runner_image": runner_image,
         "runner_os": "Linux",
         "runner_arch": machine,
     }
@@ -236,7 +240,8 @@ def make_report(
             "host": {
                 "system": "Linux",
                 "machine": machine,
-                "runner_environment": "github-hosted",
+                "runner_environment": runner_environment,
+                "runner_name": runner_name,
                 "github_run_id": run_id,
                 "host_fingerprint": {
                     "sha256": host_fingerprint,
@@ -245,7 +250,7 @@ def make_report(
             },
             "host_pair": {
                 "id": host_pair_id,
-                "runner_environment": "github-hosted",
+                "runner_environment": runner_environment,
                 "host_fingerprint_sha256": host_fingerprint,
             },
             "execution": {},
@@ -353,6 +358,95 @@ def make_single_report(**kwargs) -> dict:
         revision_mode="single-revision-compatibility",
         **kwargs,
     )
+
+
+def make_dispatch_state(
+    run_ids: tuple[str, ...] = ("100", "101"),
+    baseline_sha: str = "b" * 40,
+    candidate_sha: str = "a" * 40,
+    purpose: str = "candidate-evaluation",
+    runner_target: str = "github-hosted",
+) -> dict:
+    cohort_id = "d" * 32
+    training_runs = len(run_ids) // 2
+    assignments = [
+        {
+            "sequence": sequence,
+            "partition": "training" if sequence <= training_runs else "holdout",
+        }
+        for sequence in range(1, len(run_ids) + 1)
+    ]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "wasi-thread-cohort-dispatch",
+        "created_at": "2026-09-07T00:00:00+00:00",
+        "repository": "cataggar/wamr",
+        "workflow": "wasi-thread-bench.yml",
+        "workflow_ref": "main",
+        "workflow_head_sha": "f" * 40,
+        "cohort_id": cohort_id,
+        "baseline_sha": baseline_sha,
+        "candidate_sha": candidate_sha,
+        "comparison_purpose": purpose,
+        "profile": "authoritative",
+        "warmups": 0,
+        "samples": 2,
+        "runner_target": runner_target,
+        "required_platforms": list(cohort.DEFAULT_PLATFORMS),
+        "requested_runs": len(run_ids),
+        "requested_reports": len(run_ids) * len(cohort.DEFAULT_PLATFORMS),
+        "max_in_flight": 2,
+        "timeout_seconds": cohort.DEFAULT_DISPATCH_TIMEOUT_SECONDS,
+        "split": {
+            "method": "predeclared-sequence",
+            "training_runs": training_runs,
+            "holdout_runs": len(run_ids) - training_runs,
+            "assignments": assignments,
+        },
+        "runs": [
+            {
+                "sequence": sequence,
+                "partition": assignments[sequence - 1]["partition"],
+                "run_id": int(run_id),
+                "run_name": (
+                    f"WASI thread cohort-{cohort_id}-{sequence}-"
+                    f"{assignments[sequence - 1]['partition']}"
+                ),
+                "url": f"https://github.com/cataggar/wamr/actions/runs/{run_id}",
+                "status": "completed",
+                "conclusion": "success",
+                "workflow_head_sha": "f" * 40,
+                "artifacts": [],
+            }
+            for sequence, run_id in enumerate(run_ids, 1)
+        ],
+    }
+
+
+def make_paired_cohort_reports(
+    run_ids: tuple[str, ...] = ("100", "101"),
+    **kwargs,
+) -> list[tuple[Path, dict]]:
+    reports = []
+    for run_id in run_ids:
+        reports.extend(
+            [
+                (
+                    Path(f"x86-{run_id}"),
+                    make_report(run_id=run_id, **kwargs),
+                ),
+                (
+                    Path(f"arm-{run_id}"),
+                    make_report(
+                        platform_id="ubuntu-24.04-aarch64",
+                        machine="aarch64",
+                        run_id=run_id,
+                        **kwargs,
+                    ),
+                ),
+            ]
+        )
+    return reports
 
 
 class ThreadBenchmarkTests(unittest.TestCase):
@@ -1224,15 +1318,303 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 ):
                     bench.load_budget(self.write_budget(corrupt), report)
 
-    def test_cohort_rejects_schema_v3_paired_reports_until_updated(self) -> None:
-        paired = make_report(run_id="100")
-        with self.assertRaisesRegex(
-            bench.HarnessError, "baseline-aware cohort aggregation"
-        ):
+    def test_paired_cohort_preserves_exact_runs_and_predeclared_split(self) -> None:
+        dispatch_state = make_dispatch_state()
+        reports = make_paired_cohort_reports()
+        result = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            1,
+            dispatch_state,
+        )
+        self.assertTrue(result["authoritative"])
+        self.assertEqual(result["identity"]["baseline"]["commit"], "b" * 40)
+        self.assertEqual(result["identity"]["candidate"]["commit"], "a" * 40)
+        self.assertEqual(
+            result["split"]["run_ids"],
+            {"training": ["100"], "holdout": ["101"]},
+        )
+        self.assertEqual(len(result["observations"]), len(reports))
+        self.assertEqual(result["excluded_observations"], [])
+        self.assertEqual(
+            {
+                (item["run_id"], item["platform"])
+                for item in result["observations"]
+            },
+            {
+                (run_id, platform)
+                for run_id in ("100", "101")
+                for platform in cohort.DEFAULT_PLATFORMS
+            },
+        )
+
+    def test_trusted_noise_cohort_pairs_self_hosted_x86_with_hosted_arm(self) -> None:
+        dispatch_state = make_dispatch_state(
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+            runner_target="trusted-calibration",
+        )
+        reports = []
+        for run_id in ("100", "101"):
+            common = {
+                "run_id": run_id,
+                "baseline_commit": "a" * 40,
+                "commit": "a" * 40,
+                "baseline_source": "c" * 64,
+                "candidate_source": "c" * 64,
+                "comparison_purpose": "noise-calibration",
+            }
+            reports.extend(
+                [
+                    (
+                        Path(f"x86-{run_id}"),
+                        make_report(
+                            runner_environment="self-hosted",
+                            runner_name="vm31e-wamr-temp-20260906",
+                            **common,
+                        ),
+                    ),
+                    (
+                        Path(f"arm-{run_id}"),
+                        make_report(
+                            platform_id="ubuntu-24.04-aarch64",
+                            machine="aarch64",
+                            cpu=f"hosted arm {run_id}",
+                            runner_image=f"ubuntu-arm-{run_id}",
+                            **common,
+                        ),
+                    ),
+                ]
+            )
+        result = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            1,
+            dispatch_state,
+        )
+        self.assertEqual(
+            result["dispatch"]["runner_target"], "trusted-calibration"
+        )
+        self.assertEqual(
+            result["identity"]["comparison_purpose"], "noise-calibration"
+        )
+        self.assertEqual(
+            result["platforms"]["ubuntu-22.04-x86_64"][
+                "trusted_runner_name"
+            ],
+            "vm31e-wamr-temp-20260906",
+        )
+        self.assertEqual(
+            len(
+                result["platforms"]["ubuntu-24.04-aarch64"][
+                    "host_fingerprint_distribution"
+                ]
+            ),
+            2,
+        )
+
+    def test_paired_cohort_requires_manifest_exact_count_and_no_legacy(self) -> None:
+        reports = make_paired_cohort_reports()
+        dispatch_state = make_dispatch_state()
+        with self.assertRaisesRegex(bench.HarnessError, "dispatch manifest"):
             cohort.validate_documents(
-                [(Path("paired"), paired)],
+                reports,
                 cohort.DEFAULT_PLATFORMS,
                 1,
+            )
+        with self.assertRaisesRegex(bench.HarnessError, "expected exactly"):
+            cohort.validate_documents(
+                reports[:-1],
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+        duplicate = reports[:-1] + [
+            (Path("duplicate"), copy.deepcopy(reports[2][1]))
+        ]
+        with self.assertRaisesRegex(bench.HarnessError, "duplicate report"):
+            cohort.validate_documents(
+                duplicate,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+        mixed = reports[:-1] + [
+            (
+                Path("legacy"),
+                make_single_report(
+                    platform_id="ubuntu-24.04-aarch64",
+                    machine="aarch64",
+                    run_id="101",
+                ),
+            )
+        ]
+        with self.assertRaisesRegex(bench.HarnessError, "legacy or unpaired"):
+            cohort.validate_documents(
+                mixed,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+    def test_paired_cohort_accepts_hosted_host_distributions(self) -> None:
+        reports = make_paired_cohort_reports()
+        reports[2] = (
+            Path("x86-101-other-host"),
+            make_report(
+                run_id="101",
+                cpu="different cpu",
+                runner_image="ubuntu-24.04",
+            ),
+        )
+        result = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            1,
+            make_dispatch_state(),
+        )
+        x86 = result["platforms"]["ubuntu-22.04-x86_64"]
+        self.assertEqual(len(x86["host_fingerprint_distribution"]), 2)
+        self.assertEqual(
+            x86["cpu_distribution"], {"different cpu": 1, "test cpu": 1}
+        )
+        self.assertEqual(
+            x86["runner_image_distribution"],
+            {"ubuntu": 1, "ubuntu-24.04": 1},
+        )
+        self.assertEqual(len(result["observations"]), len(reports))
+        self.assertEqual(result["excluded_observations"], [])
+
+    def test_trusted_cohort_rejects_x86_drift_and_wrong_runner(self) -> None:
+        state = make_dispatch_state(
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+            runner_target="trusted-calibration",
+        )
+
+        def reports(
+            second_cpu: str = "test cpu",
+            runner_name: str = "vm31e-wamr-temp-20260906",
+        ):
+            result = []
+            for run_id, cpu in (("100", "test cpu"), ("101", second_cpu)):
+                common = {
+                    "run_id": run_id,
+                    "baseline_commit": "a" * 40,
+                    "commit": "a" * 40,
+                    "baseline_source": "c" * 64,
+                    "candidate_source": "c" * 64,
+                    "comparison_purpose": "noise-calibration",
+                }
+                result.extend(
+                    [
+                        (
+                            Path(f"x86-{run_id}"),
+                            make_report(
+                                cpu=cpu,
+                                runner_environment="self-hosted",
+                                runner_name=runner_name,
+                                **common,
+                            ),
+                        ),
+                        (
+                            Path(f"arm-{run_id}"),
+                            make_report(
+                                platform_id="ubuntu-24.04-aarch64",
+                                machine="aarch64",
+                                **common,
+                            ),
+                        ),
+                    ]
+                )
+            return result
+
+        with self.assertRaisesRegex(
+            bench.HarnessError,
+            "mixed vm31e-wamr-temp-20260906 host fingerprints",
+        ):
+            cohort.validate_documents(
+                reports(second_cpu="different cpu"),
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                state,
+            )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "runner 'vm31e-wamr-temp-20260906'"
+        ):
+            cohort.validate_documents(
+                reports(runner_name="other-runner"),
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                state,
+            )
+
+    def test_paired_cohort_rejects_mixed_baseline_report_host_plan_and_pair_order(self) -> None:
+        dispatch_state = make_dispatch_state()
+        reports = make_paired_cohort_reports()
+
+        mixed_baseline = copy.deepcopy(reports)
+        changed = mixed_baseline[-1][1]
+        changed["metadata"]["revisions"]["baseline"]["commit"] = "c" * 40
+        for record in changed["records"]:
+            if record["revision"] == "baseline":
+                record["revision_commit"] = "c" * 40
+        bench.validate_report(changed)
+        with self.assertRaisesRegex(bench.HarnessError, "baseline SHA"):
+            cohort.validate_documents(
+                mixed_baseline,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+        mixed_report_host = copy.deepcopy(reports)
+        changed = mixed_report_host[0][1]
+        changed["metadata"]["revisions"]["candidate"][
+            "host_fingerprint_sha256"
+        ] = "f" * 64
+        for record in changed["records"]:
+            if record["revision"] == "candidate":
+                record["host_fingerprint_sha256"] = "f" * 64
+        with self.assertRaisesRegex(BenchmarkDataError, "mixed host fingerprint"):
+            cohort.validate_documents(
+                mixed_report_host,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+        mixed_plan = copy.deepcopy(reports)
+        mixed_plan[-1][1]["plan"]["profile"] = "smoke"
+        mixed_plan[-1][1]["metadata"]["plan_sha256"] = cache_key(
+            mixed_plan[-1][1]["plan"]
+        )
+        for revision in mixed_plan[-1][1]["metadata"]["revisions"].values():
+            revision["plan_sha256"] = mixed_plan[-1][1]["metadata"]["plan_sha256"]
+        for record in mixed_plan[-1][1]["records"]:
+            record["plan_sha256"] = mixed_plan[-1][1]["metadata"]["plan_sha256"]
+        bench.validate_report(mixed_plan[-1][1])
+        with self.assertRaisesRegex(bench.HarnessError, "plan/profile"):
+            cohort.validate_documents(
+                mixed_plan,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+        inverted = copy.deepcopy(reports)
+        inverted[0][1]["records"][0], inverted[0][1]["records"][1] = (
+            inverted[0][1]["records"][1],
+            inverted[0][1]["records"][0],
+        )
+        with self.assertRaisesRegex(BenchmarkDataError, "inverted pair order"):
+            cohort.validate_documents(
+                inverted,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
             )
 
     def test_cohort_rejects_mixed_identity_and_duplicate_run_ids(self) -> None:
@@ -1332,47 +1714,113 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
             )
 
-    def test_cohort_dispatch_uses_ref_pinned_to_immutable_sha(self) -> None:
-        target = "a" * 40
+    def test_cohort_dispatch_sends_full_paired_identity_and_pins_workflow(self) -> None:
+        baseline = "b" * 40
+        candidate = "a" * 40
+        workflow_head = "f" * 40
         workflow_ref = "calibration/966-immutable"
         output = self.scratch / "dispatch.json"
         responses = [
+            json.dumps({"sha": workflow_head}),
             "https://github.com/cataggar/wamr/actions/runs/123\n",
             json.dumps(
                 {
                     "status": "completed",
                     "conclusion": "success",
-                    "headSha": target,
+                    "headSha": workflow_head,
                     "url": "https://github.com/cataggar/wamr/actions/runs/123",
                 }
             ),
             json.dumps({"artifacts": []}),
+            "https://github.com/cataggar/wamr/actions/runs/125\n",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": workflow_head,
+                    "url": "https://github.com/cataggar/wamr/actions/runs/125",
+                }
+            ),
+            json.dumps({"artifacts": []}),
         ]
-        with mock.patch.object(
-            cohort.subprocess,
-            "check_output",
-            side_effect=responses,
-        ) as run, mock.patch.object(cohort.time, "sleep"):
+        with (
+            mock.patch.object(
+                cohort.subprocess,
+                "check_output",
+                side_effect=responses,
+            ) as run,
+            mock.patch.object(cohort.time, "sleep"),
+            mock.patch.object(
+                cohort.uuid,
+                "uuid4",
+                return_value=Namespace(hex="d" * 32),
+            ),
+        ):
             cohort.dispatch(
                 Namespace(
-                    target_sha=target,
-                    runs=1,
+                    baseline_sha=baseline,
+                    candidate_sha=candidate,
+                    purpose="candidate-evaluation",
+                    profile="authoritative",
+                    warmups=2,
+                    samples=10,
+                    runner_target="github-hosted",
+                    runs=2,
+                    training_runs=1,
                     max_in_flight=1,
+                    timeout_seconds=3600,
                     output=output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
                     workflow_ref=workflow_ref,
                     poll_seconds=0,
+                    lookup_attempts=1,
+                    lookup_seconds=0,
                 )
             )
         dispatch_command = run.call_args_list[0].args[0]
         self.assertEqual(
+            dispatch_command,
+            [
+                "gh",
+                "api",
+                "repos/cataggar/wamr/commits/calibration%2F966-immutable",
+            ],
+        )
+        dispatch_command = run.call_args_list[1].args[0]
+        self.assertEqual(
             dispatch_command[dispatch_command.index("--ref") + 1],
             workflow_ref,
+        )
+        self.assertEqual(
+            {
+                dispatch_command[index + 1]
+                for index, value in enumerate(dispatch_command)
+                if value == "-f"
+            },
+            {
+                f"baseline_sha={baseline}",
+                f"candidate_sha={candidate}",
+                "purpose=candidate-evaluation",
+                "profile=authoritative",
+                "warmups=2",
+                "samples=10",
+                "runner_target=github-hosted",
+                f"cohort_id={'d' * 32}",
+                "cohort_sequence=1",
+                "cohort_partition=training",
+            },
+        )
+        state = json.loads(output.read_text(encoding="UTF-8"))
+        self.assertEqual(state["workflow_head_sha"], workflow_head)
+        self.assertEqual(
+            [item["partition"] for item in state["split"]["assignments"]],
+            ["training", "holdout"],
         )
 
         mismatch_output = self.scratch / "dispatch-mismatch.json"
         mismatch_responses = [
+            json.dumps({"sha": workflow_head}),
             "https://github.com/cataggar/wamr/actions/runs/124\n",
             json.dumps(
                 {
@@ -1390,20 +1838,418 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 side_effect=mismatch_responses,
             ),
             mock.patch.object(cohort.time, "sleep"),
-            self.assertRaisesRegex(bench.HarnessError, "does not match target"),
+            self.assertRaisesRegex(
+                bench.HarnessError, "does not match immutable workflow head"
+            ),
         ):
             cohort.dispatch(
                 Namespace(
-                    target_sha=target,
-                    runs=1,
+                    baseline_sha=baseline,
+                    candidate_sha=candidate,
+                    purpose="candidate-evaluation",
+                    profile="authoritative",
+                    warmups=2,
+                    samples=10,
+                    runner_target="github-hosted",
+                    runs=2,
+                    training_runs=1,
                     max_in_flight=1,
+                    timeout_seconds=3600,
                     output=mismatch_output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
                     workflow_ref=workflow_ref,
                     poll_seconds=0,
+                    lookup_attempts=1,
+                    lookup_seconds=0,
                 )
             )
+
+    def test_cohort_dispatch_rejects_mutable_or_incompatible_targets(self) -> None:
+        common = {
+            "baseline_sha": "b" * 40,
+            "candidate_sha": "a" * 40,
+            "purpose": "candidate-evaluation",
+            "profile": "authoritative",
+            "warmups": 2,
+            "samples": 10,
+            "runner_target": "github-hosted",
+            "repository": "cataggar/wamr",
+            "workflow": "wasi-thread-bench.yml",
+            "workflow_ref": "main",
+            "runs": 2,
+            "training_runs": 1,
+            "max_in_flight": 1,
+            "timeout_seconds": 3600,
+            "poll_seconds": 0,
+            "lookup_attempts": 1,
+            "lookup_seconds": 0,
+        }
+        for field, value, message in (
+            ("baseline_sha", "B" * 40, "lowercase"),
+            ("samples", 3, "even"),
+            ("candidate_sha", "b" * 40, "distinct"),
+            ("runner_target", "trusted-calibration", "noise calibration only"),
+            ("timeout_seconds", 0, "timeout"),
+        ):
+            args = Namespace(**dict(common, **{field: value}))
+            with self.subTest(field=field), self.assertRaisesRegex(
+                bench.HarnessError, message
+            ):
+                cohort.validate_dispatch_options(args)
+
+        trusted = Namespace(
+            **dict(
+                common,
+                baseline_sha="a" * 40,
+                candidate_sha="a" * 40,
+                purpose="noise-calibration",
+                runner_target="trusted-calibration",
+                max_in_flight=3,
+            )
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "cannot exceed 2"):
+            cohort.validate_dispatch_options(trusted)
+
+    def test_cohort_trusted_runner_inventory_preflight_succeeds(self) -> None:
+        inventory = {
+            "total_count": 1,
+            "runners": [
+                {
+                    "name": "vm31e-wamr-temp-20260906",
+                    "status": "online",
+                    "busy": False,
+                    "labels": [
+                        {
+                            "name": "wamr-temp-20260906",
+                            "type": "custom",
+                        }
+                    ],
+                }
+            ],
+        }
+        with mock.patch.object(
+            cohort, "gh_json", return_value=inventory
+        ) as gh_json:
+            cohort.preflight_runner_inventory(
+                "cataggar/wamr", "trusted-calibration", 30
+            )
+        gh_json.assert_called_once_with(
+            [
+                "api",
+                "repos/cataggar/wamr/actions/runners?per_page=100",
+            ],
+            30,
+        )
+
+    def test_cohort_hosted_runner_skips_inventory_preflight(self) -> None:
+        with mock.patch.object(cohort, "gh_json") as gh_json:
+            cohort.preflight_runner_inventory(
+                "cataggar/wamr", "github-hosted", 30
+            )
+        gh_json.assert_not_called()
+
+    def test_cohort_trusted_runner_inventory_preflight_failures(self) -> None:
+        expected = {
+            "name": "vm31e-wamr-temp-20260906",
+            "status": "online",
+            "busy": False,
+            "labels": [
+                {
+                    "name": "wamr-temp-20260906",
+                    "type": "custom",
+                }
+            ],
+        }
+        cases = (
+            (
+                "missing",
+                {"total_count": 0, "runners": []},
+                "runner is missing",
+            ),
+            (
+                "duplicate",
+                {"total_count": 2, "runners": [expected, dict(expected)]},
+                "label is duplicated",
+            ),
+            (
+                "offline",
+                {
+                    "total_count": 1,
+                    "runners": [dict(expected, status="offline")],
+                },
+                "runner is offline",
+            ),
+            (
+                "busy",
+                {
+                    "total_count": 1,
+                    "runners": [dict(expected, busy=True)],
+                },
+                "runner is busy",
+            ),
+            (
+                "name drift",
+                {
+                    "total_count": 1,
+                    "runners": [dict(expected, name="wrong-runner")],
+                },
+                "runner name drift",
+            ),
+            (
+                "label drift",
+                {
+                    "total_count": 1,
+                    "runners": [
+                        dict(
+                            expected,
+                            labels=[
+                                {
+                                    "name": "wamr-temp-20260906",
+                                    "type": "custom",
+                                },
+                                {
+                                    "name": "self-hosted",
+                                    "type": "read-only",
+                                },
+                            ],
+                        )
+                    ],
+                },
+                "runner label drift",
+            ),
+        )
+        for name, inventory, message in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    cohort, "gh_json", return_value=inventory
+                ) as gh_json,
+                self.assertRaisesRegex(bench.HarnessError, message),
+            ):
+                cohort.preflight_runner_inventory(
+                    "cataggar/wamr", "trusted-calibration", 30
+                )
+            gh_json.assert_called_once()
+
+    def test_cohort_trusted_runner_preflight_blocks_dispatch(self) -> None:
+        args = Namespace(
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+            profile="authoritative",
+            warmups=2,
+            samples=10,
+            runner_target="trusted-calibration",
+            repository="cataggar/wamr",
+            workflow="wasi-thread-bench.yml",
+            workflow_ref="main",
+            runs=2,
+            training_runs=1,
+            max_in_flight=1,
+            timeout_seconds=3600,
+            poll_seconds=0,
+            lookup_attempts=1,
+            lookup_seconds=0,
+            output=self.scratch / "dispatch.json",
+        )
+        with (
+            mock.patch.object(
+                cohort,
+                "gh_json",
+                return_value={"total_count": 0, "runners": []},
+            ),
+            mock.patch.object(cohort.subprocess, "check_output") as check_output,
+            self.assertRaisesRegex(bench.HarnessError, "runner is missing"),
+        ):
+            cohort.dispatch(args)
+        check_output.assert_not_called()
+
+    def test_cohort_dispatch_times_out_queued_run_and_retains_state(self) -> None:
+        output = self.scratch / "dispatch-timeout.json"
+        with (
+            mock.patch.object(
+                cohort.subprocess,
+                "check_output",
+                side_effect=[
+                    json.dumps({"sha": "f" * 40}),
+                    "https://github.com/cataggar/wamr/actions/runs/123\n",
+                ],
+            ),
+            mock.patch.object(
+                cohort.time,
+                "monotonic",
+                side_effect=[0, 0, 0, 0, 2],
+            ),
+            mock.patch.object(
+                cohort.uuid,
+                "uuid4",
+                return_value=Namespace(hex="d" * 32),
+            ),
+            self.assertRaisesRegex(bench.HarnessError, "timed out"),
+        ):
+            cohort.dispatch(
+                Namespace(
+                    baseline_sha="b" * 40,
+                    candidate_sha="a" * 40,
+                    purpose="candidate-evaluation",
+                    profile="authoritative",
+                    warmups=2,
+                    samples=10,
+                    runner_target="github-hosted",
+                    runs=2,
+                    training_runs=1,
+                    max_in_flight=1,
+                    timeout_seconds=1,
+                    output=output,
+                    repository="cataggar/wamr",
+                    workflow="wasi-thread-bench.yml",
+                    workflow_ref="main",
+                    poll_seconds=60,
+                    lookup_attempts=1,
+                    lookup_seconds=0,
+                )
+            )
+        state = json.loads(output.read_text(encoding="UTF-8"))
+        self.assertEqual(state["runs"][0]["status"], "queued")
+        self.assertEqual(state["timeout_seconds"], 1)
+
+    def test_cohort_api_field_errors_are_contextual(self) -> None:
+        with self.assertRaisesRegex(
+            bench.HarnessError, "workflow run 123.*status"
+        ):
+            cohort.parse_workflow_run({"headSha": "f" * 40}, 123)
+        with self.assertRaisesRegex(
+            bench.HarnessError, "artifact response for run 123.*artifacts"
+        ):
+            cohort.parse_artifacts({}, 123)
+        args = Namespace(
+            repository="cataggar/wamr",
+            workflow="wasi-thread-bench.yml",
+            workflow_ref="main",
+            lookup_attempts=1,
+            lookup_seconds=0,
+        )
+        with (
+            mock.patch.object(
+                cohort,
+                "gh_json",
+                return_value=[{"displayTitle": "incomplete"}],
+            ),
+            self.assertRaisesRegex(
+                bench.HarnessError, "run list item 0.*databaseId"
+            ),
+        ):
+            cohort.find_dispatched_run(args, "expected", "f" * 40)
+
+    def test_cohort_dispatch_finds_exact_named_run_when_cli_has_no_url(self) -> None:
+        args = Namespace(
+            repository="cataggar/wamr",
+            workflow="wasi-thread-bench.yml",
+            workflow_ref="main",
+            lookup_attempts=2,
+            lookup_seconds=0,
+        )
+        run_name = f"WASI thread cohort-{'d' * 32}-1-training"
+        with (
+            mock.patch.object(
+                cohort,
+                "gh_json",
+                side_effect=[
+                    [],
+                    [
+                        {
+                            "databaseId": 123,
+                            "displayTitle": run_name,
+                            "headSha": "f" * 40,
+                            "url": (
+                                "https://github.com/cataggar/wamr/"
+                                "actions/runs/123"
+                            ),
+                        }
+                    ],
+                ],
+            ),
+            mock.patch.object(cohort.time, "sleep"),
+        ):
+            self.assertEqual(
+                cohort.find_dispatched_run(args, run_name, "f" * 40),
+                (
+                    123,
+                    "https://github.com/cataggar/wamr/actions/runs/123",
+                ),
+            )
+
+    def test_workflow_self_hosted_label_is_manual_trusted_only(self) -> None:
+        workflow = (
+            ROOT / ".github/workflows/wasi-thread-bench.yml"
+        ).read_text(encoding="UTF-8")
+        self.assertEqual(workflow.count("wamr-temp-20260906"), 1)
+        start = workflow.index("\n  trusted-calibration-x86:")
+        end = workflow.index("\n  trusted-calibration-arm:", start)
+        trusted_x86 = workflow[start:end]
+        self.assertIn("github.event_name == 'workflow_dispatch'", trusted_x86)
+        self.assertIn("inputs.runner_target == 'trusted-calibration'", trusted_x86)
+        self.assertIn("inputs.purpose == 'noise-calibration'", trusted_x86)
+        self.assertIn("github.ref == 'refs/heads/main'", trusted_x86)
+        self.assertIn("runs-on: wamr-temp-20260906", trusted_x86)
+        self.assertNotIn("runs-on: [", trusted_x86)
+        self.assertNotIn("runs-on: self-hosted", trusted_x86)
+        self.assertNotIn("pull_request", trusted_x86)
+        self.assertNotIn("\n  push:", trusted_x86)
+
+        hosted_start = workflow.index("\n  benchmark:")
+        hosted_end = workflow.index("\n  trusted-calibration-x86:", hosted_start)
+        hosted = workflow[hosted_start:hosted_end]
+        self.assertIn("github.event_name != 'workflow_dispatch'", hosted)
+        self.assertIn("inputs.runner_target == 'github-hosted'", hosted)
+        self.assertNotIn("self-hosted", hosted)
+        self.assertNotIn("wamr-temp-20260906", hosted)
+        self.assertNotIn("github.workspace }}/wasi-thread-bench-out", workflow)
+        self.assertEqual(
+            workflow.count("Clean run-scoped benchmark output and caches"), 3
+        )
+        self.assertEqual(workflow.count('rm -rf -- "$EXPECTED_ROOT"'), 3)
+        self.assertEqual(
+            workflow.count('echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"'),
+            3,
+        )
+        for start_marker, end_marker in (
+            ("\n  benchmark:", "\n  trusted-calibration-x86:"),
+            ("\n  trusted-calibration-x86:", "\n  trusted-calibration-arm:"),
+            ("\n  trusted-calibration-arm:", "\n  comment:"),
+        ):
+            block = workflow[
+                workflow.index(start_marker) : workflow.index(
+                    end_marker, workflow.index(start_marker) + 1
+                )
+            ]
+            self.assertLess(
+                block.index("Upload retained paired report"),
+                block.index("Clean run-scoped benchmark output and caches"),
+            )
+        self.assertIn("push:\n    branches: [main]\n    paths:", workflow)
+        self.assertIn(
+            "Download retained x86 report\n        continue-on-error: true",
+            workflow,
+        )
+        self.assertIn("prepare:\n    runs-on: ubuntu-22.04\n    timeout-minutes: 15", workflow)
+        self.assertIn(
+            "comment:\n    if: always() && github.event_name == 'pull_request'\n"
+            "    needs: benchmark\n    runs-on: ubuntu-22.04\n"
+            "    timeout-minutes: 10",
+            workflow,
+        )
+        for input_name in (
+            "baseline_sha:",
+            "candidate_sha:",
+            "purpose:",
+            "profile:",
+            "warmups:",
+            "samples:",
+            "runner_target:",
+        ):
+            self.assertIn(input_name, workflow)
 
     def test_cohort_main_handles_report_schema_errors(self) -> None:
         with mock.patch.object(
