@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import os
 import platform
 import re
@@ -22,6 +23,7 @@ from typing import Any, Callable
 
 from benchmark_schema import (
     BenchmarkDataError,
+    HOST_FINGERPRINT_FIELDS,
     SCHEMA_VERSION,
     alternating_pair_order,
     atomic_write_json,
@@ -43,9 +45,12 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
+REVISION_ROLES = ("baseline", "candidate")
+SINGLE_REVISION_ROLES = ("candidate",)
+COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
-    "smoke": (1, 3),
+    "smoke": (1, 4),
 }
 ATOMIC_WAIT_PREFLIGHT_RUNS = {
     "authoritative": 64,
@@ -255,6 +260,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--repo", type=Path, default=Path(__file__).resolve().parents[1]
     )
     parser.add_argument(
+        "--baseline-repo",
+        type=Path,
+        help="immutable baseline checkout (requires --candidate-repo)",
+    )
+    parser.add_argument(
+        "--candidate-repo",
+        type=Path,
+        help="immutable candidate checkout (requires --baseline-repo)",
+    )
+    parser.add_argument(
+        "--comparison-purpose",
+        choices=COMPARISON_PURPOSES,
+        help="required purpose for paired baseline/candidate checkouts",
+    )
+    parser.add_argument(
         "--output-dir", type=Path, default=Path("zig-out/wasi-thread-bench")
     )
     parser.add_argument("--profile", choices=PROFILE_COUNTS, default="authoritative")
@@ -276,6 +296,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--platform-id",
         default=f"local-{platform.system().lower()}-{platform.machine().lower()}",
+    )
+    parser.add_argument(
+        "--runner-environment",
+        default=None,
+        help="stable runner class, for example github-hosted or self-hosted",
+    )
+    parser.add_argument(
+        "--host-pair-id",
+        default=None,
+        help="identity shared by the baseline/candidate measurements on one host",
     )
     parser.add_argument("--optimize", default="ReleaseFast")
     parser.add_argument(
@@ -328,6 +358,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--min-interval-ms must be > 0")
     if args.budget and args.no_budget:
         parser.error("--budget and --no-budget are mutually exclusive")
+    if (args.baseline_repo is None) != (args.candidate_repo is None):
+        parser.error("--baseline-repo and --candidate-repo must be supplied together")
+    paired = args.baseline_repo is not None
+    if paired and args.comparison_purpose is None:
+        parser.error("--comparison-purpose is required for paired revisions")
+    if not paired and args.comparison_purpose is not None:
+        parser.error("--comparison-purpose requires paired revisions")
+    if paired and args.samples % 2 != 0:
+        parser.error("paired revision measurements require an even --samples count")
+    if args.comparison_purpose == "noise-calibration" and not args.no_budget:
+        parser.error("noise calibration requires --no-budget")
+    if args.budget and args.comparison_purpose != "candidate-evaluation":
+        parser.error("budget enforcement requires paired candidate evaluation")
+    if args.host_pair_id is not None and not args.host_pair_id.strip():
+        parser.error("--host-pair-id must not be empty")
+    if args.runner_environment is not None and not args.runner_environment.strip():
+        parser.error("--runner-environment must not be empty")
     return args
 
 
@@ -366,6 +413,45 @@ def source_identity(repo: Path) -> dict[str, str]:
         "commit": git_output(repo, "rev-parse", "HEAD"),
         "tracked_diff_sha256": sha256_bytes(diff),
         "build_source_sha256": sha256_bytes(bytes(content)),
+    }
+
+
+def fixture_set_identity(fixtures: dict[str, dict[str, Any]]) -> str:
+    return cache_key(
+        {
+            name: {
+                "path": item["path"],
+                "sha256": item["sha256"],
+            }
+            for name, item in sorted(fixtures.items())
+        }
+    )
+
+
+def host_pair_identity(
+    platform_id: str,
+    host: dict[str, Any],
+    explicit: str | None,
+) -> dict[str, str]:
+    fingerprint = host.get("host_fingerprint")
+    require(isinstance(fingerprint, dict), "host.host_fingerprint")
+    fingerprint_sha256 = fingerprint.get("sha256")
+    require(
+        isinstance(fingerprint_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", fingerprint_sha256) is not None,
+        "host.host_fingerprint.sha256",
+    )
+    run_id = host.get("github_run_id", "")
+    run_attempt = host.get("github_run_attempt", "")
+    pair_id = explicit
+    if pair_id is None and run_id:
+        pair_id = f"github:{run_id}:{run_attempt or '1'}:{platform_id}"
+    if pair_id is None:
+        pair_id = f"local:{platform_id}:{fingerprint_sha256[:16]}"
+    return {
+        "id": pair_id,
+        "runner_environment": host["runner_environment"],
+        "host_fingerprint_sha256": fingerprint_sha256,
     }
 
 
@@ -868,7 +954,7 @@ def measure_once(
     }
 
 
-def collect_pair(
+def collect_revision_pair(
     *,
     records: list[dict[str, Any]],
     pair_kind: str,
@@ -877,52 +963,78 @@ def collect_pair(
     right: str,
     warmups: int,
     samples: int,
-    measure: Callable[[str, dict[str, Any]], dict[str, Any]],
+    revision_roles: tuple[str, ...],
+    revision_fields: dict[str, dict[str, Any]],
+    measure: Callable[[str, str, dict[str, Any]], dict[str, Any]],
 ) -> None:
+    require(
+        revision_roles in (REVISION_ROLES, SINGLE_REVISION_ROLES),
+        "revision roles",
+    )
+    require(set(revision_fields) == set(revision_roles), "revision fields")
     total = warmups + samples
     for index in range(total):
         phase = "warmup" if index < warmups else "measure"
         phase_index = index if phase == "warmup" else index - warmups
-        order = alternating_pair_order(index, left, right)
-        for order_index, condition in enumerate(order):
-            record = measure(
-                condition,
-                {
-                    "pair_kind": pair_kind,
-                    "pair_key": pair_key,
-                    "pair_index": phase_index,
-                    "phase": phase,
-                    "order": order_index,
-                    "condition": condition,
-                    "pair_left": left,
-                    "pair_right": right,
-                },
-            )
-            records.append(record)
-            print(
-                f"[thread-bench] {pair_key} {phase} {phase_index + 1}/"
-                f"{warmups if phase == 'warmup' else samples} {condition}: "
-                f"guest={record['guest_elapsed_ns'] / 1e6:.3f} ms "
-                f"host={record['host_wall_elapsed_ns'] / 1e6:.3f} ms",
-                file=sys.stderr,
-            )
+        condition_order = alternating_pair_order(index, left, right)
+        revision_order = (
+            alternating_pair_order(index, *REVISION_ROLES)
+            if revision_roles == REVISION_ROLES
+            else SINGLE_REVISION_ROLES
+        )
+        for revision_index, revision in enumerate(revision_order):
+            for condition_index, condition in enumerate(condition_order):
+                record = measure(
+                    revision,
+                    condition,
+                    {
+                        **revision_fields[revision],
+                        "revision": revision,
+                        "revision_order": revision_index,
+                        "pair_kind": pair_kind,
+                        "pair_key": pair_key,
+                        "pair_index": phase_index,
+                        "phase": phase,
+                        "order": condition_index,
+                        "condition": condition,
+                        "pair_left": left,
+                        "pair_right": right,
+                    },
+                )
+                records.append(record)
+                print(
+                    f"[thread-bench] {pair_key} {phase} {phase_index + 1}/"
+                    f"{warmups if phase == 'warmup' else samples} "
+                    f"{revision}/{condition}: "
+                    f"guest={record['guest_elapsed_ns'] / 1e6:.3f} ms "
+                    f"host={record['host_wall_elapsed_ns'] / 1e6:.3f} ms",
+                    file=sys.stderr,
+                )
 
 
 def summarize(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for record in records:
         if record["phase"] != "measure":
             continue
-        key = (record["pair_kind"], record["pair_key"], record["condition"])
+        key = (
+            record["revision"],
+            record["pair_kind"],
+            record["pair_key"],
+            record["condition"],
+        )
         grouped.setdefault(key, []).append(record)
     summaries = []
-    for (pair_kind, pair_key, condition), selected in sorted(grouped.items()):
+    for (revision, pair_kind, pair_key, condition), selected in sorted(
+        grouped.items()
+    ):
         elapsed = [record["elapsed_ns"] for record in selected]
         host_wall = [record["host_wall_elapsed_ns"] for record in selected]
         throughput = [record["throughput_ops_per_second"] for record in selected]
         per_thread = [record["per_thread_ops_per_second"] for record in selected]
         summaries.append(
             {
+                "revision": revision,
                 "pair_kind": pair_kind,
                 "pair_key": pair_key,
                 "condition": condition,
@@ -939,16 +1051,26 @@ def summarize(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def paired_summaries(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    cells: dict[tuple[str, str, int], dict[str, dict[str, Any]]] = {}
+    cells: dict[tuple[str, str, str, int], dict[str, dict[str, Any]]] = {}
     for record in records:
         if record["phase"] != "measure":
             continue
-        key = (record["pair_kind"], record["pair_key"], record["pair_index"])
+        key = (
+            record["revision"],
+            record["pair_kind"],
+            record["pair_key"],
+            record["pair_index"],
+        )
         cells.setdefault(key, {})[record["condition"]] = record
-    grouped: dict[tuple[str, str, str, str], list[float]] = {}
-    for (pair_kind, pair_key, _), conditions in cells.items():
+    grouped: dict[
+        tuple[str, str, str, str, str],
+        dict[str, list[float]],
+    ] = {}
+    for (revision, pair_kind, pair_key, _), conditions in cells.items():
         if len(conditions) != 2:
-            raise HarnessError(f"incomplete measured pair: {pair_key}")
+            raise HarnessError(
+                f"incomplete measured pair: {revision}/{pair_key}"
+            )
         pair_records = list(conditions.values())
         left = pair_records[0]["pair_left"]
         right = pair_records[0]["pair_right"]
@@ -956,13 +1078,213 @@ def paired_summaries(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             record["pair_left"] != left or record["pair_right"] != right
             for record in pair_records
         ):
-            raise HarnessError(f"inconsistent pair direction: {pair_key}")
+            raise HarnessError(
+                f"inconsistent pair direction: {revision}/{pair_key}"
+            )
         if set(conditions) != {left, right}:
-            raise HarnessError(f"pair conditions do not match direction: {pair_key}")
+            raise HarnessError(
+                f"pair conditions do not match direction: {revision}/{pair_key}"
+            )
         left_record = conditions[left]
         right_record = conditions[right]
-        ratio = right_record["elapsed_ns"] / left_record["elapsed_ns"]
-        grouped.setdefault((pair_kind, pair_key, left, right), []).append(ratio)
+        selected = grouped.setdefault(
+            (revision, pair_kind, pair_key, left, right),
+            {"elapsed": [], "throughput": []},
+        )
+        selected["elapsed"].append(
+            right_record["elapsed_ns"] / left_record["elapsed_ns"]
+        )
+        selected["throughput"].append(
+            right_record["throughput_ops_per_second"]
+            / left_record["throughput_ops_per_second"]
+        )
+    result = []
+    for (
+        revision,
+        pair_kind,
+        pair_key,
+        left,
+        right,
+    ), ratios in sorted(grouped.items()):
+        result.append(
+            {
+                "revision": revision,
+                "pair_kind": pair_kind,
+                "pair_key": pair_key,
+                "left": left,
+                "right": right,
+                "elapsed_right_over_left": sample_stats(
+                    ratios["elapsed"], "samples"
+                ),
+                "throughput_right_over_left": sample_stats(
+                    ratios["throughput"], "samples"
+                ),
+                "median_elapsed_delta_pct": (
+                    statistics.median(ratios["elapsed"]) - 1
+                )
+                * 100,
+                "median_throughput_delta_pct": (
+                    statistics.median(ratios["throughput"]) - 1
+                )
+                * 100,
+            }
+        )
+    return result
+
+
+def comparison_summaries(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    record_roles = {record["revision"] for record in records}
+    if record_roles == set(SINGLE_REVISION_ROLES):
+        return []
+    if record_roles != set(REVISION_ROLES):
+        raise HarnessError("comparison records have incomplete revision roles")
+    cells: dict[
+        tuple[str, str, str, int],
+        dict[str, dict[str, Any]],
+    ] = {}
+    for record in records:
+        if record["phase"] != "measure":
+            continue
+        key = (
+            record["pair_kind"],
+            record["pair_key"],
+            record["condition"],
+            record["pair_index"],
+        )
+        revision = record["revision"]
+        if revision in cells.setdefault(key, {}):
+            raise HarnessError(
+                f"duplicate revision sample: {revision}/{record['pair_key']}/"
+                f"{record['condition']}/{record['pair_index']}"
+            )
+        cells[key][revision] = record
+    grouped: dict[
+        tuple[str, str, str, str],
+        dict[str, list[float]],
+    ] = {}
+    for (pair_kind, pair_key, condition, _), revisions in cells.items():
+        if set(revisions) != set(REVISION_ROLES):
+            raise HarnessError(
+                f"incomplete revision pair: {pair_key}/{condition}"
+            )
+        baseline = revisions["baseline"]
+        candidate = revisions["candidate"]
+        if baseline["metric_kind"] != candidate["metric_kind"]:
+            raise HarnessError(
+                f"mixed metric kind: {pair_key}/{condition}"
+            )
+        selected = grouped.setdefault(
+            (pair_kind, pair_key, condition, baseline["metric_kind"]),
+            {"elapsed": [], "throughput": []},
+        )
+        selected["elapsed"].append(
+            candidate["elapsed_ns"] / baseline["elapsed_ns"]
+        )
+        selected["throughput"].append(
+            candidate["throughput_ops_per_second"]
+            / baseline["throughput_ops_per_second"]
+        )
+    result = []
+    for (
+        pair_kind,
+        pair_key,
+        condition,
+        metric_kind,
+    ), ratios in sorted(grouped.items()):
+        result.append(
+            {
+                "pair_kind": pair_kind,
+                "pair_key": pair_key,
+                "condition": condition,
+                "metric_kind": metric_kind,
+                "baseline": "baseline",
+                "candidate": "candidate",
+                "elapsed_candidate_over_baseline": sample_stats(
+                    ratios["elapsed"], "samples"
+                ),
+                "throughput_candidate_over_baseline": sample_stats(
+                    ratios["throughput"], "samples"
+                ),
+                "median_elapsed_delta_pct": (
+                    statistics.median(ratios["elapsed"]) - 1
+                )
+                * 100,
+                "median_throughput_delta_pct": (
+                    statistics.median(ratios["throughput"]) - 1
+                )
+                * 100,
+            }
+        )
+    return result
+
+
+def ratio_of_ratios_summaries(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    record_roles = {record["revision"] for record in records}
+    if record_roles == set(SINGLE_REVISION_ROLES):
+        return []
+    if record_roles != set(REVISION_ROLES):
+        raise HarnessError("ratio-of-ratios records have incomplete revision roles")
+    cells: dict[
+        tuple[str, str, int],
+        dict[str, dict[str, dict[str, Any]]],
+    ] = {}
+    for record in records:
+        if record["phase"] != "measure":
+            continue
+        key = (record["pair_kind"], record["pair_key"], record["pair_index"])
+        revision = record["revision"]
+        condition = record["condition"]
+        revisions = cells.setdefault(key, {})
+        conditions = revisions.setdefault(revision, {})
+        if condition in conditions:
+            raise HarnessError(
+                f"duplicate ratio-of-ratios sample: {revision}/"
+                f"{record['pair_key']}/{condition}/{record['pair_index']}"
+            )
+        conditions[condition] = record
+    grouped: dict[
+        tuple[str, str, str, str],
+        dict[str, list[float]],
+    ] = {}
+    for (pair_kind, pair_key, _), revisions in cells.items():
+        if set(revisions) != set(REVISION_ROLES):
+            raise HarnessError(f"incomplete revisions for pair {pair_key}")
+        first = next(iter(revisions["baseline"].values()))
+        left = first["pair_left"]
+        right = first["pair_right"]
+        if any(
+            set(revisions[revision]) != {left, right}
+            for revision in REVISION_ROLES
+        ):
+            raise HarnessError(f"incomplete internal pair for {pair_key}")
+        baseline = revisions["baseline"]
+        candidate = revisions["candidate"]
+        baseline_elapsed = (
+            baseline[right]["elapsed_ns"] / baseline[left]["elapsed_ns"]
+        )
+        candidate_elapsed = (
+            candidate[right]["elapsed_ns"] / candidate[left]["elapsed_ns"]
+        )
+        baseline_throughput = (
+            baseline[right]["throughput_ops_per_second"]
+            / baseline[left]["throughput_ops_per_second"]
+        )
+        candidate_throughput = (
+            candidate[right]["throughput_ops_per_second"]
+            / candidate[left]["throughput_ops_per_second"]
+        )
+        selected = grouped.setdefault(
+            (pair_kind, pair_key, left, right),
+            {"elapsed": [], "throughput": []},
+        )
+        selected["elapsed"].append(candidate_elapsed / baseline_elapsed)
+        selected["throughput"].append(
+            candidate_throughput / baseline_throughput
+        )
     result = []
     for (pair_kind, pair_key, left, right), ratios in sorted(grouped.items()):
         result.append(
@@ -971,8 +1293,22 @@ def paired_summaries(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "pair_key": pair_key,
                 "left": left,
                 "right": right,
-                "elapsed_right_over_left": sample_stats(ratios, "samples"),
-                "median_elapsed_delta_pct": (statistics.median(ratios) - 1) * 100,
+                "baseline": "baseline",
+                "candidate": "candidate",
+                "elapsed_ratio_of_ratios": sample_stats(
+                    ratios["elapsed"], "samples"
+                ),
+                "throughput_ratio_of_ratios": sample_stats(
+                    ratios["throughput"], "samples"
+                ),
+                "median_elapsed_delta_pct": (
+                    statistics.median(ratios["elapsed"]) - 1
+                )
+                * 100,
+                "median_throughput_delta_pct": (
+                    statistics.median(ratios["throughput"]) - 1
+                )
+                * 100,
             }
         )
     return result
@@ -987,7 +1323,8 @@ def validate_report(document: dict[str, Any]) -> None:
     )
     for key in ("fixture_set_sha256", "plan_sha256"):
         require(
-            isinstance(metadata.get(key), str) and len(metadata[key]) == 64,
+            isinstance(metadata.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", metadata[key]) is not None,
             f"metadata.{key}",
         )
     plan = document["plan"]
@@ -997,7 +1334,195 @@ def validate_report(document: dict[str, Any]) -> None:
         plan.get("minimum_timed_interval_ns", 0) > 0,
         "plan.minimum_timed_interval_ns",
     )
+    revision_mode = plan.get("revision_mode")
+    comparison_purpose = plan.get("comparison_purpose")
+    if revision_mode == "paired-revisions":
+        revision_roles = REVISION_ROLES
+        require(
+            comparison_purpose in COMPARISON_PURPOSES,
+            "plan.comparison_purpose",
+        )
+        require(
+            plan["samples"] % 2 == 0,
+            "paired revision samples must be even",
+        )
+    else:
+        require(
+            revision_mode == "single-revision-compatibility",
+            "plan.revision_mode",
+        )
+        revision_roles = SINGLE_REVISION_ROLES
+        require(
+            comparison_purpose == "single-revision-compatibility",
+            "plan.comparison_purpose",
+        )
+    require(
+        plan.get("revision_roles") == list(revision_roles),
+        "plan.revision_roles",
+    )
     require(metadata["plan_sha256"] == cache_key(plan), "metadata.plan_sha256")
+
+    revisions = metadata.get("revisions")
+    require(
+        isinstance(revisions, dict) and set(revisions) == set(revision_roles),
+        "metadata.revisions",
+    )
+    revision_checkouts = metadata.get("revision_checkouts")
+    require(
+        isinstance(revision_checkouts, dict)
+        and set(revision_checkouts) == set(revision_roles)
+        and all(
+            isinstance(path, str) and bool(path)
+            for path in revision_checkouts.values()
+        ),
+        "metadata.revision_checkouts",
+    )
+    if revision_mode == "paired-revisions":
+        require(
+            len(set(revision_checkouts.values())) == len(REVISION_ROLES),
+            "paired revisions use the same checkout path",
+        )
+    revision_keys = {
+        "commit",
+        "tracked_diff_sha256",
+        "build_source_sha256",
+        "fixture_set_sha256",
+        "plan_sha256",
+        "host_pair_id",
+        "host_fingerprint_sha256",
+    }
+    for role in revision_roles:
+        revision = revisions[role]
+        require(isinstance(revision, dict), f"metadata.revisions.{role}")
+        require(
+            set(revision) == revision_keys,
+            f"metadata.revisions.{role} fields",
+        )
+        require(
+            re.fullmatch(r"[0-9a-f]{40}", revision.get("commit", ""))
+            is not None,
+            f"metadata.revisions.{role}.commit",
+        )
+        for key in (
+            "tracked_diff_sha256",
+            "build_source_sha256",
+            "fixture_set_sha256",
+            "plan_sha256",
+            "host_fingerprint_sha256",
+        ):
+            require(
+                re.fullmatch(r"[0-9a-f]{64}", revision.get(key, ""))
+                is not None,
+                f"metadata.revisions.{role}.{key}",
+            )
+        require(
+            revision["fixture_set_sha256"] == metadata["fixture_set_sha256"],
+            f"mixed fixture identity for {role}",
+        )
+        require(
+            revision["plan_sha256"] == metadata["plan_sha256"],
+            f"mixed plan identity for {role}",
+        )
+    candidate = revisions["candidate"]
+    for key in ("commit", "tracked_diff_sha256", "build_source_sha256"):
+        require(
+            metadata.get(key) == candidate[key],
+            f"metadata.{key} candidate compatibility alias",
+        )
+    host = metadata.get("host")
+    require(isinstance(host, dict), "metadata.host")
+    fingerprint = host.get("host_fingerprint")
+    require(isinstance(fingerprint, dict), "metadata.host.host_fingerprint")
+    fingerprint_fields = fingerprint.get("fields")
+    require(
+        isinstance(fingerprint_fields, dict),
+        "metadata.host.host_fingerprint.fields",
+    )
+    require(
+        set(fingerprint_fields) == set(HOST_FINGERPRINT_FIELDS),
+        "host fingerprint fields",
+    )
+    require(
+        fingerprint.get("sha256")
+        == cache_key(fingerprint_fields),
+        "metadata.host.host_fingerprint",
+    )
+    host_pair = metadata.get("host_pair")
+    require(
+        isinstance(host_pair, dict)
+        and set(host_pair)
+        == {"id", "runner_environment", "host_fingerprint_sha256"},
+        "metadata.host_pair",
+    )
+    require(
+        isinstance(host_pair["id"], str) and bool(host_pair["id"]),
+        "metadata.host_pair.id",
+    )
+    require(
+        host_pair["runner_environment"] == host.get("runner_environment"),
+        "metadata.host_pair runner environment",
+    )
+    require(
+        isinstance(host_pair["runner_environment"], str)
+        and bool(host_pair["runner_environment"]),
+        "metadata.host_pair runner environment",
+    )
+    require(
+        host_pair["host_fingerprint_sha256"] == fingerprint.get("sha256"),
+        "metadata.host_pair fingerprint",
+    )
+    for role in revision_roles:
+        revision = revisions[role]
+        require(
+            revision["host_pair_id"] == host_pair["id"],
+            f"mixed host pair for {role}",
+        )
+        require(
+            revision["host_fingerprint_sha256"]
+            == host_pair["host_fingerprint_sha256"],
+            f"mixed host fingerprint for {role}",
+        )
+    if comparison_purpose == "noise-calibration":
+        require(
+            all(
+                revisions["baseline"][key] == revisions["candidate"][key]
+                for key in (
+                    "commit",
+                    "tracked_diff_sha256",
+                    "build_source_sha256",
+                )
+            ),
+            "noise calibration revision identity",
+        )
+    budget = document.get("budget")
+    require(isinstance(budget, dict), "budget")
+    budget_status = budget.get("status")
+    require(
+        budget_status in ("disabled", "not-selected", "passed", "failed"),
+        "budget.status",
+    )
+    if comparison_purpose == "noise-calibration":
+        require(
+            budget_status == "disabled"
+            and budget.get("path") is None
+            and budget.get("failures") == [],
+            "noise calibration must be non-enforcing",
+        )
+    if budget_status in ("passed", "failed"):
+        require(
+            comparison_purpose == "candidate-evaluation",
+            "budget enforcement requires candidate evaluation",
+        )
+        require(
+            revisions["baseline"]["commit"]
+            != revisions["candidate"]["commit"],
+            "budget enforcement requires distinct revision commits",
+        )
+        require(
+            revisions["baseline"]["build_source_sha256"]
+            != revisions["candidate"]["build_source_sha256"],
+            "budget enforcement requires distinct build identities",
+        )
     pair_plan = plan.get("pairs")
     require(isinstance(pair_plan, list) and pair_plan, "plan.pairs")
     expected_pair_plan = expected_pair_specs_for_plan(plan)
@@ -1011,10 +1536,21 @@ def validate_report(document: dict[str, Any]) -> None:
         require(pair.get("left") != pair.get("right"), f"pair direction {pair_key}")
         pair_by_key[pair_key] = pair
 
-    seen: set[tuple[str, str, int, str]] = set()
-    per_cell: dict[tuple[str, str, int], set[str]] = {}
+    seen: set[tuple[str, str, str, int, str]] = set()
+    per_cell: dict[
+        tuple[str, str, int],
+        set[tuple[str, str]],
+    ] = {}
+    cell_order: dict[
+        tuple[str, str, int],
+        list[tuple[str, str]],
+    ] = {}
     for record in document["records"]:
+        require(isinstance(record, dict), "record object")
         require(record.get("phase") in ("warmup", "measure"), "record phase")
+        revision_role = record.get("revision")
+        require(revision_role in revision_roles, "record revision")
+        revision = revisions[revision_role]
         require(record.get("correct") is True, "record correctness")
         require(record.get("guest_elapsed_ns", 0) > 0, "record guest elapsed")
         require(
@@ -1036,8 +1572,51 @@ def validate_report(document: dict[str, Any]) -> None:
             record.get("condition") in (pair["left"], pair["right"]),
             "record pair condition",
         )
+        for key in (
+            "commit",
+            "build_source_sha256",
+            "fixture_set_sha256",
+            "plan_sha256",
+            "host_pair_id",
+            "host_fingerprint_sha256",
+        ):
+            expected_key = (
+                "revision_commit"
+                if key == "commit"
+                else "revision_build_source_sha256"
+                if key == "build_source_sha256"
+                else key
+            )
+            require(
+                record.get(expected_key) == revision[key],
+                f"record mixed {key}",
+            )
+        global_index = (
+            record["pair_index"]
+            if record["phase"] == "warmup"
+            else plan["warmups"] + record["pair_index"]
+        )
+        expected_revisions = (
+            alternating_pair_order(global_index, *REVISION_ROLES)
+            if revision_roles == REVISION_ROLES
+            else SINGLE_REVISION_ROLES
+        )
+        expected_conditions = alternating_pair_order(
+            global_index, pair["left"], pair["right"]
+        )
+        require(
+            record.get("revision_order")
+            == expected_revisions.index(revision_role),
+            "record revision order",
+        )
+        require(
+            record.get("order")
+            == expected_conditions.index(record["condition"]),
+            "record condition order",
+        )
         key = (
             pair_key,
+            revision_role,
             record["condition"],
             record["pair_index"],
             record["phase"],
@@ -1045,8 +1624,17 @@ def validate_report(document: dict[str, Any]) -> None:
         require(key not in seen, f"duplicate record {key}")
         seen.add(key)
         cell = (pair_key, record["phase"], record["pair_index"])
-        per_cell.setdefault(cell, set()).add(record["condition"])
-    expected_records_per_pair = 2 * (plan["warmups"] + plan["samples"])
+        per_cell.setdefault(cell, set()).add(
+            (revision_role, record["condition"])
+        )
+        cell_order.setdefault(cell, []).append(
+            (revision_role, record["condition"])
+        )
+    expected_records_per_pair = (
+        len(revision_roles)
+        * 2
+        * (plan["warmups"] + plan["samples"])
+    )
     pair_counts: dict[str, int] = {}
     for record in document["records"]:
         pair_counts[record["pair_key"]] = pair_counts.get(record["pair_key"], 0) + 1
@@ -1069,26 +1657,60 @@ def validate_report(document: dict[str, Any]) -> None:
             for index in range(count):
                 require(
                     per_cell.get((pair_key, phase, index))
-                    == {pair["left"], pair["right"]},
+                    == {
+                        (revision, condition)
+                        for revision in revision_roles
+                        for condition in (pair["left"], pair["right"])
+                    },
                     f"incomplete pair cell {pair_key}/{phase}/{index}",
+                )
+                global_index = (
+                    index if phase == "warmup" else plan["warmups"] + index
+                )
+                require(
+                    cell_order.get((pair_key, phase, index))
+                    == [
+                        (revision, condition)
+                        for revision in (
+                            alternating_pair_order(
+                                global_index, *REVISION_ROLES
+                            )
+                            if revision_roles == REVISION_ROLES
+                            else SINGLE_REVISION_ROLES
+                        )
+                        for condition in alternating_pair_order(
+                            global_index, pair["left"], pair["right"]
+                        )
+                    ],
+                    f"inverted pair order {pair_key}/{phase}/{index}",
                 )
 
     expected_summary_keys = {
-        (pair_key, condition)
+        (revision, pair_key, condition)
+        for revision in revision_roles
         for pair_key, pair in pair_by_key.items()
         for condition in (pair["left"], pair["right"])
     }
     actual_summary_keys = {
-        (summary.get("pair_key"), summary.get("condition"))
+        (
+            summary.get("revision"),
+            summary.get("pair_key"),
+            summary.get("condition"),
+        )
         for summary in document["summaries"]
     }
     require(
         actual_summary_keys == expected_summary_keys,
         "summaries do not cover every planned condition",
     )
-    expected_paired_keys = set(pair_by_key)
+    expected_paired_keys = {
+        (revision, pair_key)
+        for revision in revision_roles
+        for pair_key in pair_by_key
+    }
     actual_paired_keys = {
-        summary.get("pair_key") for summary in document["paired_summaries"]
+        (summary.get("revision"), summary.get("pair_key"))
+        for summary in document["paired_summaries"]
     }
     require(
         actual_paired_keys == expected_paired_keys,
@@ -1098,6 +1720,49 @@ def validate_report(document: dict[str, Any]) -> None:
         pair = pair_by_key[summary["pair_key"]]
         require(summary.get("left") == pair["left"], "paired summary left")
         require(summary.get("right") == pair["right"], "paired summary right")
+    expected_comparison_keys = (
+        {
+            (pair_key, condition)
+            for pair_key, pair in pair_by_key.items()
+            for condition in (pair["left"], pair["right"])
+        }
+        if revision_roles == REVISION_ROLES
+        else set()
+    )
+    comparisons = document.get("comparison_summaries")
+    require(isinstance(comparisons, list), "comparison_summaries")
+    require(
+        {
+            (summary.get("pair_key"), summary.get("condition"))
+            for summary in comparisons
+        }
+        == expected_comparison_keys,
+        "comparison summaries do not cover every planned condition",
+    )
+    ratios = document.get("ratio_of_ratios_summaries")
+    require(isinstance(ratios, list), "ratio_of_ratios_summaries")
+    require(
+        {summary.get("pair_key") for summary in ratios}
+        == (set(pair_by_key) if revision_roles == REVISION_ROLES else set()),
+        "ratio-of-ratios summaries do not cover every planned pair",
+    )
+    require(
+        document["summaries"] == summarize(document["records"]),
+        "revision summaries do not match records",
+    )
+    require(
+        document["paired_summaries"]
+        == paired_summaries(document["records"]),
+        "paired summaries do not match records",
+    )
+    require(
+        comparisons == comparison_summaries(document["records"]),
+        "comparison summaries do not match records",
+    )
+    require(
+        ratios == ratio_of_ratios_summaries(document["records"]),
+        "ratio-of-ratios summaries do not match records",
+    )
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1121,7 +1786,47 @@ def _require_exact_keys(
         )
 
 
+def _positive_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def require_budget_eligible_report(report: dict[str, Any]) -> None:
+    try:
+        validate_report(report)
+    except BenchmarkDataError as exc:
+        raise HarnessError(f"invalid report for budget enforcement: {exc}") from exc
+    plan = report["plan"]
+    if (
+        plan["revision_mode"] != "paired-revisions"
+        or plan["comparison_purpose"] != "candidate-evaluation"
+    ):
+        raise HarnessError(
+            "budget enforcement requires a paired candidate-evaluation report"
+        )
+    report_revisions = report["metadata"]["revisions"]
+    if (
+        report_revisions["baseline"]["commit"]
+        == report_revisions["candidate"]["commit"]
+    ):
+        raise HarnessError(
+            "budget enforcement requires distinct baseline/candidate commits"
+        )
+    if (
+        report_revisions["baseline"]["build_source_sha256"]
+        == report_revisions["candidate"]["build_source_sha256"]
+    ):
+        raise HarnessError(
+            "budget enforcement requires distinct baseline/candidate build identities"
+        )
+
+
 def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
+    require_budget_eligible_report(report)
     try:
         budget = json.loads(
             path.read_text(encoding="UTF-8"),
@@ -1137,8 +1842,9 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "schema_version",
             "kind",
             "calibrated",
+            "enforcement",
             "calibration_requirements",
-            "cohort",
+            "calibration_provenance",
             "platforms",
         },
         "budget",
@@ -1150,11 +1856,19 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "budget is not calibrated; collect retained hosted reports and "
             "run with --no-budget"
         )
+    if budget["enforcement"] is not True:
+        raise HarnessError("budget enforcement is disabled; run with --no-budget")
     requirements = budget["calibration_requirements"]
-    cohort = budget["cohort"]
+    calibration = budget["calibration_provenance"]
     platforms = budget["platforms"]
-    if not isinstance(requirements, dict) or not isinstance(cohort, dict) or not isinstance(platforms, dict):
-        raise HarnessError("budget requirements/cohort/platforms must be objects")
+    if (
+        not isinstance(requirements, dict)
+        or not isinstance(calibration, dict)
+        or not isinstance(platforms, dict)
+    ):
+        raise HarnessError(
+            "budget requirements/calibration/platforms must be objects"
+        )
     _require_exact_keys(
         requirements,
         {
@@ -1166,7 +1880,11 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
     )
     minimum_reports = requirements["minimum_reports_per_platform"]
     required_platforms = requirements["required_platforms"]
-    if not isinstance(minimum_reports, int) or minimum_reports < 20:
+    if (
+        not isinstance(minimum_reports, int)
+        or isinstance(minimum_reports, bool)
+        or minimum_reports < 20
+    ):
         raise HarnessError("budget minimum_reports_per_platform must be >= 20")
     if requirements["required_profile"] != "authoritative":
         raise HarnessError("budget required_profile must be authoritative")
@@ -1180,52 +1898,98 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "budget required_platforms must be exactly the canonical hosted platforms"
         )
     _require_exact_keys(
-        cohort,
+        calibration,
         {
-            "baseline_commit",
-            "baseline_build_source_sha256",
+            "baseline_revision",
+            "candidate_revision",
+            "comparison_purpose",
             "fixture_set_sha256",
             "plan_sha256",
             "profile",
             "report_count_by_platform",
         },
-        "cohort",
+        "calibration_provenance",
     )
-    for key, length in (
-        ("baseline_commit", 40),
-        ("baseline_build_source_sha256", 64),
-        ("fixture_set_sha256", 64),
-        ("plan_sha256", 64),
+    if calibration["comparison_purpose"] != "noise-calibration":
+        raise HarnessError(
+            "budget calibration provenance must be noise calibration"
+        )
+    for role in REVISION_ROLES:
+        identity = calibration[f"{role}_revision"]
+        if not isinstance(identity, dict):
+            raise HarnessError(
+                f"budget calibration {role} revision must be an object"
+            )
+        _require_exact_keys(
+            identity,
+            {"commit", "build_source_sha256"},
+            f"calibration_provenance.{role}_revision",
+        )
+        for key, length in (("commit", 40), ("build_source_sha256", 64)):
+            value = identity[key]
+            if (
+                not isinstance(value, str)
+                or re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None
+            ):
+                raise HarnessError(
+                    f"budget calibration {role}.{key} has invalid identity"
+                )
+    if (
+        calibration["baseline_revision"]
+        != calibration["candidate_revision"]
     ):
-        value = cohort[key]
+        raise HarnessError(
+            "budget noise-calibration revisions must have identical identities"
+        )
+    for key in ("fixture_set_sha256", "plan_sha256"):
+        value = calibration[key]
         if (
             not isinstance(value, str)
-            or re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
         ):
-            raise HarnessError(f"budget cohort.{key} has invalid identity")
-    if cohort["profile"] != requirements["required_profile"]:
-        raise HarnessError("budget cohort profile mismatch")
-    counts = cohort["report_count_by_platform"]
+            raise HarnessError(
+                f"budget calibration_provenance.{key} has invalid identity"
+            )
+    if calibration["profile"] != requirements["required_profile"]:
+        raise HarnessError("budget calibration profile mismatch")
+    counts = calibration["report_count_by_platform"]
     if not isinstance(counts, dict) or set(counts) != set(required_platforms):
-        raise HarnessError("budget cohort report counts do not cover platforms")
-    if any(not isinstance(counts[item], int) or counts[item] < minimum_reports for item in required_platforms):
-        raise HarnessError("budget cohort has insufficient retained reports")
+        raise HarnessError(
+            "budget calibration report counts do not cover platforms"
+        )
+    if any(
+        not isinstance(counts[item], int)
+        or isinstance(counts[item], bool)
+        or counts[item] < minimum_reports
+        for item in required_platforms
+    ):
+        raise HarnessError(
+            "budget calibration has insufficient retained reports"
+        )
     if set(platforms) != set(required_platforms):
         raise HarnessError("budget platforms are incomplete or unknown")
 
     metadata = report["metadata"]
+    baseline = metadata["revisions"]["baseline"]
     identity_checks = {
-        "baseline_commit": metadata["commit"],
-        "baseline_build_source_sha256": metadata["build_source_sha256"],
+        "baseline_revision.commit": baseline["commit"],
+        "baseline_revision.build_source_sha256": baseline[
+            "build_source_sha256"
+        ],
         "fixture_set_sha256": metadata["fixture_set_sha256"],
         "plan_sha256": metadata["plan_sha256"],
         "profile": report["plan"]["profile"],
     }
     for key, actual in identity_checks.items():
-        if cohort[key] != actual:
+        if "." in key:
+            identity_key = key.split(".", 1)[1]
+            expected = calibration["baseline_revision"][identity_key]
+        else:
+            expected = calibration[key]
+        if expected != actual:
             raise HarnessError(
-                f"budget/report identity mismatch for {key}: "
-                f"{cohort[key]!r} != {actual!r}"
+                f"budget/report calibration mismatch for {key}: "
+                f"{expected!r} != {actual!r}"
             )
     platform_id = metadata["platform_id"]
     if platform_id not in platforms:
@@ -1235,7 +1999,13 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         raise HarnessError("platform budget must be an object")
     _require_exact_keys(
         platform_budget,
-        {"host_system", "host_machine", "pairs", "scenarios"},
+        {
+            "host_system",
+            "host_machine",
+            "runner_environment",
+            "comparisons",
+            "ratio_of_ratios",
+        },
         f"platforms.{platform_id}",
     )
     host = metadata["host"]
@@ -1244,98 +2014,159 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         raise HarnessError("report platform ID does not match its canonical host identity")
     if platform_budget["host_system"] != host["system"] or platform_budget["host_machine"] != host["machine"]:
         raise HarnessError("budget/report host platform mismatch")
+    if platform_budget["runner_environment"] != host["runner_environment"]:
+        raise HarnessError("budget/report runner environment mismatch")
 
-    pair_plan = {item["pair_key"]: item for item in report["plan"]["pairs"]}
-    pair_thresholds = platform_budget["pairs"]
-    if not isinstance(pair_thresholds, list):
-        raise HarnessError("platform pairs must be an array")
-    seen_pairs: set[str] = set()
-    for item in pair_thresholds:
-        if not isinstance(item, dict):
-            raise HarnessError("pair threshold must be an object")
-        _require_exact_keys(
-            item,
-            {"pair_key", "left", "right", "max_median_elapsed_delta_pct"},
-            "pair threshold",
-        )
-        pair_key = item["pair_key"]
-        if pair_key in seen_pairs:
-            raise HarnessError(f"duplicate pair threshold {pair_key}")
-        seen_pairs.add(pair_key)
-        if pair_key not in pair_plan:
-            raise HarnessError(f"unknown pair threshold {pair_key}")
-        planned = pair_plan[pair_key]
-        if item["left"] != planned["left"] or item["right"] != planned["right"]:
-            raise HarnessError(f"pair threshold direction mismatch for {pair_key}")
-        if not isinstance(item["max_median_elapsed_delta_pct"], (int, float)):
-            raise HarnessError(f"pair threshold limit must be numeric for {pair_key}")
-    if seen_pairs != set(pair_plan):
-        raise HarnessError("pair thresholds do not cover the complete report plan")
-
-    expected_scenarios = {
+    expected_comparisons = {
         (item["pair_key"], item["condition"]): item
-        for item in report["summaries"]
+        for item in report["comparison_summaries"]
     }
-    scenario_thresholds = platform_budget["scenarios"]
-    if not isinstance(scenario_thresholds, list):
-        raise HarnessError("platform scenarios must be an array")
-    seen_scenarios: set[tuple[str, str]] = set()
-    for item in scenario_thresholds:
+    comparison_thresholds = platform_budget["comparisons"]
+    if not isinstance(comparison_thresholds, list):
+        raise HarnessError("platform comparisons must be an array")
+    seen_comparisons: set[tuple[str, str]] = set()
+    for item in comparison_thresholds:
         if not isinstance(item, dict):
-            raise HarnessError("scenario threshold must be an object")
+            raise HarnessError("comparison threshold must be an object")
         _require_exact_keys(
             item,
             {
                 "pair_key",
                 "condition",
                 "metric_kind",
-                "min_median_ops_per_second",
+                "min_candidate_over_baseline_throughput_ratio",
+                "max_candidate_over_baseline_elapsed_ratio",
             },
-            "scenario threshold",
+            "comparison threshold",
         )
         key = (item["pair_key"], item["condition"])
-        if key in seen_scenarios:
-            raise HarnessError(f"duplicate scenario threshold {key}")
-        seen_scenarios.add(key)
-        if key not in expected_scenarios:
-            raise HarnessError(f"unknown scenario threshold {key}")
-        if item["metric_kind"] != expected_scenarios[key]["metric_kind"]:
-            raise HarnessError(f"scenario metric mismatch for {key}")
-        minimum = item["min_median_ops_per_second"]
-        if not isinstance(minimum, (int, float)) or minimum <= 0:
-            raise HarnessError(f"scenario minimum must be positive for {key}")
-    if seen_scenarios != set(expected_scenarios):
-        raise HarnessError("scenario thresholds do not cover every report summary")
+        if key in seen_comparisons:
+            raise HarnessError(f"duplicate comparison threshold {key}")
+        seen_comparisons.add(key)
+        if key not in expected_comparisons:
+            raise HarnessError(f"unknown comparison threshold {key}")
+        if item["metric_kind"] != expected_comparisons[key]["metric_kind"]:
+            raise HarnessError(f"comparison metric mismatch for {key}")
+        for threshold_key in (
+            "min_candidate_over_baseline_throughput_ratio",
+            "max_candidate_over_baseline_elapsed_ratio",
+        ):
+            value = item[threshold_key]
+            if not _positive_number(value):
+                raise HarnessError(
+                    f"comparison ratio must be positive for {key}"
+                )
+    if seen_comparisons != set(expected_comparisons):
+        raise HarnessError(
+            "comparison thresholds do not cover every report comparison"
+        )
+
+    pair_plan = {item["pair_key"]: item for item in report["plan"]["pairs"]}
+    ratio_thresholds = platform_budget["ratio_of_ratios"]
+    if not isinstance(ratio_thresholds, list):
+        raise HarnessError("platform ratio_of_ratios must be an array")
+    seen_pairs: set[str] = set()
+    for item in ratio_thresholds:
+        if not isinstance(item, dict):
+            raise HarnessError("ratio-of-ratios threshold must be an object")
+        _require_exact_keys(
+            item,
+            {
+                "pair_key",
+                "left",
+                "right",
+                "min_candidate_over_baseline_throughput_ratio_of_ratios",
+                "max_candidate_over_baseline_elapsed_ratio_of_ratios",
+            },
+            "ratio-of-ratios threshold",
+        )
+        pair_key = item["pair_key"]
+        if pair_key in seen_pairs:
+            raise HarnessError(f"duplicate ratio-of-ratios threshold {pair_key}")
+        seen_pairs.add(pair_key)
+        if pair_key not in pair_plan:
+            raise HarnessError(f"unknown ratio-of-ratios threshold {pair_key}")
+        planned = pair_plan[pair_key]
+        if item["left"] != planned["left"] or item["right"] != planned["right"]:
+            raise HarnessError(
+                f"ratio-of-ratios direction mismatch for {pair_key}"
+            )
+        for threshold_key in (
+            "min_candidate_over_baseline_throughput_ratio_of_ratios",
+            "max_candidate_over_baseline_elapsed_ratio_of_ratios",
+        ):
+            value = item[threshold_key]
+            if not _positive_number(value):
+                raise HarnessError(
+                    f"ratio-of-ratios limit must be positive for {pair_key}"
+                )
+    if seen_pairs != set(pair_plan):
+        raise HarnessError(
+            "ratio-of-ratios thresholds do not cover the complete report plan"
+        )
     return platform_budget
 
 
 def evaluate_budget(
     platform_budget: dict[str, Any],
-    summaries: list[dict[str, Any]],
-    pairs: list[dict[str, Any]],
+    report: dict[str, Any],
 ) -> list[str]:
+    require_budget_eligible_report(report)
+    comparisons = report["comparison_summaries"]
+    ratio_of_ratios = report["ratio_of_ratios_summaries"]
     failures: list[str] = []
-    pair_lookup = {item["pair_key"]: item for item in pairs}
-    for threshold in platform_budget["pairs"]:
-        pair_key = threshold["pair_key"]
-        actual = pair_lookup[pair_key]
-        limit = float(threshold["max_median_elapsed_delta_pct"])
-        if actual["median_elapsed_delta_pct"] > limit:
-            failures.append(
-                f"{pair_key}: {actual['median_elapsed_delta_pct']:+.2f}% "
-                f"> {limit:+.2f}%"
-            )
-    summary_lookup = {
-        f"{item['pair_key']}::{item['condition']}": item for item in summaries
+    comparison_lookup = {
+        (item["pair_key"], item["condition"]): item
+        for item in comparisons
     }
-    for threshold in platform_budget["scenarios"]:
-        key = f"{threshold['pair_key']}::{threshold['condition']}"
-        minimum = float(threshold["min_median_ops_per_second"])
-        actual = summary_lookup[key]
-        if actual["throughput"]["median"] < minimum:
+    for threshold in platform_budget["comparisons"]:
+        key = (threshold["pair_key"], threshold["condition"])
+        actual = comparison_lookup[key]
+        minimum = float(
+            threshold[
+                "min_candidate_over_baseline_throughput_ratio"
+            ]
+        )
+        maximum = float(
+            threshold["max_candidate_over_baseline_elapsed_ratio"]
+        )
+        throughput = actual["throughput_candidate_over_baseline"]["median"]
+        elapsed = actual["elapsed_candidate_over_baseline"]["median"]
+        if throughput < minimum:
             failures.append(
-                f"{key}: {actual['throughput']['median']:.3f} "
-                f"< {minimum:.3f}"
+                f"{key[0]}::{key[1]} candidate/baseline throughput: "
+                f"{throughput:.4f} < {minimum:.4f}"
+            )
+        if elapsed > maximum:
+            failures.append(
+                f"{key[0]}::{key[1]} candidate/baseline elapsed: "
+                f"{elapsed:.4f} > {maximum:.4f}"
+            )
+    ratio_lookup = {item["pair_key"]: item for item in ratio_of_ratios}
+    for threshold in platform_budget["ratio_of_ratios"]:
+        pair_key = threshold["pair_key"]
+        actual = ratio_lookup[pair_key]
+        minimum = float(
+            threshold[
+                "min_candidate_over_baseline_throughput_ratio_of_ratios"
+            ]
+        )
+        maximum = float(
+            threshold[
+                "max_candidate_over_baseline_elapsed_ratio_of_ratios"
+            ]
+        )
+        throughput = actual["throughput_ratio_of_ratios"]["median"]
+        elapsed = actual["elapsed_ratio_of_ratios"]["median"]
+        if throughput < minimum:
+            failures.append(
+                f"{pair_key} candidate/baseline throughput ratio-of-ratios: "
+                f"{throughput:.4f} < {minimum:.4f}"
+            )
+        if elapsed > maximum:
+            failures.append(
+                f"{pair_key} candidate/baseline elapsed ratio-of-ratios: "
+                f"{elapsed:.4f} > {maximum:.4f}"
             )
     return failures
 
@@ -1372,19 +2203,31 @@ def build_tool_report(builds: dict[str, Build], runner: list[str]) -> dict[str, 
 
 def render_markdown(document: dict[str, Any]) -> str:
     host = document["metadata"]["host"]
+    revisions = document["metadata"]["revisions"]
     lines = [
         "# WASI threaded benchmark",
         "",
-        f"- Commit: `{document['metadata']['commit']}`",
+        f"- Candidate: `{revisions['candidate']['commit']}`",
+    ]
+    if document["plan"]["revision_mode"] == "paired-revisions":
+        lines.insert(2, f"- Baseline: `{revisions['baseline']['commit']}`")
+    lines += [
+        f"- Comparison purpose: `{document['plan']['comparison_purpose']}`",
         f"- Platform identity: `{document['metadata']['platform_id']}`",
+        f"- Host pair: `{document['metadata']['host_pair']['id']}` · "
+        f"fingerprint `{document['metadata']['host_pair']['host_fingerprint_sha256']}`",
+        f"- Runner environment: `{host['runner_environment']}`",
         f"- Host: `{host['system']} {host['release']}` · `{host['machine']}` · "
         f"{host['logical_cpus']} CPUs · `{host['cpu']}`",
         f"- Profile: `{document['plan']['profile']}` "
         f"({document['plan']['warmups']} warmups, {document['plan']['samples']} samples)",
         f"- Budget: `{document['budget']['status']}`",
     ]
-    poll_static = document["metadata"].get("aot_artifacts", {}).get(
-        "cancel_poll_static"
+    poll_static = (
+        document["metadata"]
+        .get("aot_artifacts", {})
+        .get("candidate", {})
+        .get("cancel_poll_static")
     )
     if poll_static:
         lines.append(
@@ -1394,8 +2237,8 @@ def render_markdown(document: dict[str, Any]) -> str:
         )
     lines += [
         "",
-        "| Pair | Condition | Metric | Guest median ms | Host-wall median ms | Guest range ms | Median aggregate ops/s | Median per-thread ops/s |",
-        "|---|---|---|---:|---:|---:|---:|---:|",
+        "| Revision | Pair | Condition | Metric | Guest median ms | Host-wall median ms | Guest range ms | Median aggregate ops/s | Median per-thread ops/s |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for item in document["summaries"]:
         elapsed = item["elapsed"]
@@ -1403,7 +2246,8 @@ def render_markdown(document: dict[str, Any]) -> str:
         throughput = item["throughput"]
         per_thread = item["per_thread_throughput"]
         lines.append(
-            f"| `{item['pair_key']}` | `{item['condition']}` | "
+            f"| `{item['revision']}` | `{item['pair_key']}` | "
+            f"`{item['condition']}` | "
             f"`{item['metric_kind']}` | "
             f"{elapsed['median'] / 1e6:.3f} | "
             f"{host_wall['median'] / 1e6:.3f} | "
@@ -1412,22 +2256,47 @@ def render_markdown(document: dict[str, Any]) -> str:
         )
     lines += [
         "",
-        "| Paired comparison | Right / left guest-time median delta | Raw paired ratios |",
-        "|---|---:|---|",
+        "| Revision | Internal pair | Right / left guest-time median delta | Right / left throughput median delta |",
+        "|---|---|---:|---:|",
     ]
     for item in document["paired_summaries"]:
-        samples = ", ".join(
-            f"{value:.4f}" for value in item["elapsed_right_over_left"]["samples"]
-        )
         lines.append(
-            f"| `{item['pair_key']}`: `{item['right']}` / `{item['left']}` | "
-            f"{item['median_elapsed_delta_pct']:+.2f}% | {samples} |"
+            f"| `{item['revision']}` | `{item['pair_key']}`: "
+            f"`{item['right']}` / `{item['left']}` | "
+            f"{item['median_elapsed_delta_pct']:+.2f}% | "
+            f"{item['median_throughput_delta_pct']:+.2f}% |"
         )
+    if document["comparison_summaries"]:
+        lines += [
+            "",
+            "| Matched revision comparison | Candidate / baseline elapsed | Candidate / baseline throughput |",
+            "|---|---:|---:|",
+        ]
+        for item in document["comparison_summaries"]:
+            lines.append(
+                f"| `{item['pair_key']}` / `{item['condition']}` | "
+                f"{item['elapsed_candidate_over_baseline']['median']:.4f} | "
+                f"{item['throughput_candidate_over_baseline']['median']:.4f} |"
+            )
+        lines += [
+            "",
+            "| Internal-pair ratio-of-ratios | Candidate / baseline elapsed ratio | Candidate / baseline throughput ratio |",
+            "|---|---:|---:|",
+        ]
+        for item in document["ratio_of_ratios_summaries"]:
+            lines.append(
+                f"| `{item['pair_key']}`: `{item['right']}` / "
+                f"`{item['left']}` | "
+                f"{item['elapsed_ratio_of_ratios']['median']:.4f} | "
+                f"{item['throughput_ratio_of_ratios']['median']:.4f} |"
+            )
     lines += [
         "",
         "Kernel throughput uses guest monotonic time corrected by a same-process "
         "barrier/timer calibration below 1%; host wall time is diagnostic only. "
-        "Spawn/join is reported separately as a guest-timed lifecycle metric.",
+        "Spawn/join is reported separately as a guest-timed lifecycle metric. "
+        "Absolute values remain diagnostic; budget enforcement uses only "
+        "matched candidate/baseline ratios.",
         "",
         "Every warmup and measured invocation passed its deterministic timing, "
         "checksum, operation count, workload, thread-count, and iteration assertions.",
@@ -1437,118 +2306,240 @@ def render_markdown(document: dict[str, Any]) -> str:
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
-    repo = args.repo.resolve()
+    if args.baseline_repo is None:
+        candidate_repo = args.repo.resolve()
+        revision_mode = "single-revision-compatibility"
+        comparison_purpose = "single-revision-compatibility"
+        revision_roles = SINGLE_REVISION_ROLES
+        revision_repos = {"candidate": candidate_repo}
+    else:
+        baseline_repo = args.baseline_repo.resolve()
+        candidate_repo = args.candidate_repo.resolve()
+        if args.comparison_purpose not in COMPARISON_PURPOSES:
+            raise HarnessError("paired revisions require an explicit comparison purpose")
+        if args.samples % 2 != 0:
+            raise HarnessError("paired revision measurements require even samples")
+        if args.comparison_purpose == "noise-calibration" and not args.no_budget:
+            raise HarnessError("noise calibration must be non-enforcing")
+        if baseline_repo == candidate_repo:
+            raise HarnessError(
+                "paired revisions must use distinct independently built checkout paths"
+            )
+        revision_mode = "paired-revisions"
+        comparison_purpose = args.comparison_purpose
+        revision_roles = REVISION_ROLES
+        revision_repos = {
+            "baseline": baseline_repo,
+            "candidate": candidate_repo,
+        }
+    repo = candidate_repo
     output = (
         args.output_dir.resolve()
         if args.output_dir.is_absolute()
         else (repo / args.output_dir).resolve()
     )
     output.mkdir(parents=True, exist_ok=True)
-    source = source_identity(repo)
-    fixture_report = resolve_fixtures(repo)
-    fixture_set_sha256 = cache_key(
-        {
-            name: {
-                "path": item["path"],
-                "sha256": item["sha256"],
-            }
-            for name, item in sorted(fixture_report.items())
-        }
-    )
+    sources = {
+        role: source_identity(revision_repo)
+        for role, revision_repo in revision_repos.items()
+    }
+    if comparison_purpose == "noise-calibration":
+        if any(
+            sources["baseline"][key] != sources["candidate"][key]
+            for key in (
+                "commit",
+                "tracked_diff_sha256",
+                "build_source_sha256",
+            )
+        ):
+            raise HarnessError(
+                "noise calibration requires identical revision identities "
+                "from distinct checkout paths"
+            )
+    fixture_reports = {
+        role: resolve_fixtures(revision_repo)
+        for role, revision_repo in revision_repos.items()
+    }
+    fixture_set_identities = {
+        role: fixture_set_identity(fixtures)
+        for role, fixtures in fixture_reports.items()
+    }
+    if len(set(fixture_set_identities.values())) != 1:
+        raise HarnessError(
+            "baseline/candidate reports have mixed fixture identity"
+        )
+    fixture_set_sha256 = fixture_set_identities["candidate"]
     minimum_interval_ns = int(args.min_interval_ms * 1_000_000)
     modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
     pair_plan = planned_pair_specs(args, modes)
     runner = shlex.split(args.runner)
-    builds: dict[str, Build] = {}
-    for mode in modes:
-        for enabled in (False, True):
-            build = build_variant(
-                repo=repo,
-                root=output,
-                mode=mode,
-                threads_enabled=enabled,
-                optimize=args.optimize,
-                target=args.target,
-                source=source,
-                rebuild=args.rebuild,
-                compiler_toggle=enabled and mode == "aot",
-            )
-            builds[build.name] = build
+    plan = {
+        "profile": args.profile,
+        "warmups": args.warmups,
+        "samples": args.samples,
+        "revision_mode": revision_mode,
+        "comparison_purpose": comparison_purpose,
+        "revision_roles": list(revision_roles),
+        "modes": list(modes),
+        "thread_counts": list(args.thread_counts),
+        "iterations": {
+            "single-hot": args.single_iterations,
+            "cancel-hot": args.cancel_iterations,
+            "hot": args.hot_iterations,
+            "atomic": args.atomic_iterations,
+            "atomic-total": args.atomic_total_iterations,
+            "wait-notify": args.wait_iterations,
+            "spawn-join": args.spawn_iterations,
+        },
+        "timeout_seconds": args.timeout,
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
+        "optimize": args.optimize,
+        "pairs": pair_plan,
+    }
+    plan_sha256 = cache_key(plan)
+    host = host_metadata(args.runner_environment)
+    host_pair = host_pair_identity(args.platform_id, host, args.host_pair_id)
+    revisions = {
+        role: {
+            **sources[role],
+            "fixture_set_sha256": fixture_set_identities[role],
+            "plan_sha256": plan_sha256,
+            "host_pair_id": host_pair["id"],
+            "host_fingerprint_sha256": host_pair[
+                "host_fingerprint_sha256"
+            ],
+        }
+        for role in revision_roles
+    }
+    revision_fields = {
+        role: {
+            "revision_commit": revisions[role]["commit"],
+            "revision_build_source_sha256": revisions[role][
+                "build_source_sha256"
+            ],
+            "fixture_set_sha256": revisions[role]["fixture_set_sha256"],
+            "plan_sha256": plan_sha256,
+            "host_pair_id": host_pair["id"],
+            "host_fingerprint_sha256": host_pair[
+                "host_fingerprint_sha256"
+            ],
+        }
+        for role in revision_roles
+    }
 
-    compiler = None
-    aot_artifacts: dict[str, Path] = {}
-    aot_artifacts_metadata: dict[str, Any] = {}
-    if "aot" in modes:
-        if args.target:
-            compiler = build_variant(
-                repo=repo,
-                root=output,
-                mode="aot",
-                threads_enabled=True,
-                optimize=args.optimize,
-                target=None,
-                source=source,
-                rebuild=args.rebuild,
-                compiler_toggle=True,
+    contexts: dict[str, dict[str, Any]] = {}
+    for role in revision_roles:
+        revision_repo = revision_repos[role]
+        revision_output = output / "revisions" / role
+        builds: dict[str, Build] = {}
+        for mode in modes:
+            for enabled in (False, True):
+                build = build_variant(
+                    repo=revision_repo,
+                    root=revision_output,
+                    mode=mode,
+                    threads_enabled=enabled,
+                    optimize=args.optimize,
+                    target=args.target,
+                    source=sources[role],
+                    rebuild=args.rebuild,
+                    compiler_toggle=enabled and mode == "aot",
+                )
+                builds[build.name] = build
+        aot_artifacts: dict[str, Path] = {}
+        aot_artifacts_metadata: dict[str, Any] = {}
+        if "aot" in modes:
+            if args.target:
+                compiler = build_variant(
+                    repo=revision_repo,
+                    root=revision_output,
+                    mode="aot",
+                    threads_enabled=True,
+                    optimize=args.optimize,
+                    target=None,
+                    source=sources[role],
+                    rebuild=args.rebuild,
+                    compiler_toggle=True,
+                )
+                builds["host-compiler"] = compiler
+            else:
+                compiler = builds["enabled-aot"]
+            aot_artifacts = compile_aot_fixtures(
+                revision_repo,
+                revision_output,
+                compiler,
+                execution_arch(args),
             )
-            builds["host-compiler"] = compiler
-        else:
-            compiler = builds["enabled-aot"]
-        aot_artifacts = compile_aot_fixtures(
-            repo, output, compiler, execution_arch(args)
-        )
-        aot_artifacts_metadata = aot_artifact_report(
-            aot_artifacts, execution_arch(args)
-        )
+            aot_artifacts_metadata = aot_artifact_report(
+                aot_artifacts, execution_arch(args)
+            )
+        contexts[role] = {
+            "repo": revision_repo,
+            "builds": builds,
+            "aot_artifacts": aot_artifacts,
+            "aot_artifacts_metadata": aot_artifacts_metadata,
+            "single_wasm": revision_repo / FIXTURES["single"]["path"],
+            "threaded_wasm": revision_repo / FIXTURES["threaded"]["path"],
+        }
+
+    if "aot" in modes:
+        for role in revision_roles:
+            context = contexts[role]
+            for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile]):
+                measure_once(
+                    repo=context["repo"],
+                    runner=runner,
+                    build=context["builds"]["enabled-aot"],
+                    module=context["aot_artifacts"]["threaded-polls-on"],
+                    workload="atomic",
+                    threads=1,
+                    iterations=1_000_000,
+                    timeout=args.timeout,
+                    min_interval_ns=1,
+                    record_fields={
+                        "revision": role,
+                        "pair_kind": "atomic-wait-preflight",
+                        "pair_key": "atomic-wait-preflight",
+                        "pair_index": index,
+                        "phase": "preflight",
+                        "order": 0,
+                        "condition": "aot",
+                        "pair_left": "aot",
+                        "pair_right": "aot",
+                        "mode": "aot",
+                        "threads_enabled": True,
+                        "cancel_points": "on",
+                        "static_cancel_poll_sites": (
+                            context["aot_artifacts_metadata"][
+                                "cancel_poll_static"
+                            ]["sites_enabled"]
+                        ),
+                        "workload": "atomic",
+                        "threads": 1,
+                        "iterations": 1_000_000,
+                    },
+                )
 
     records: list[dict[str, Any]] = []
-    single_wasm = repo / FIXTURES["single"]["path"]
-    threaded_wasm = repo / FIXTURES["threaded"]["path"]
-
-    if "aot" in modes:
-        for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile]):
-            measure_once(
-                repo=repo,
-                runner=runner,
-                build=builds["enabled-aot"],
-                module=aot_artifacts["threaded-polls-on"],
-                workload="atomic",
-                threads=1,
-                iterations=1_000_000,
-                timeout=args.timeout,
-                min_interval_ns=1,
-                record_fields={
-                    "pair_kind": "atomic-wait-preflight",
-                    "pair_key": "atomic-wait-preflight",
-                    "pair_index": index,
-                    "phase": "preflight",
-                    "order": 0,
-                    "condition": "aot",
-                    "pair_left": "aot",
-                    "pair_right": "aot",
-                    "mode": "aot",
-                    "threads_enabled": True,
-                    "cancel_points": "on",
-                    "static_cancel_poll_sites": (
-                        aot_artifacts_metadata["cancel_poll_static"]["sites_enabled"]
-                    ),
-                    "workload": "atomic",
-                    "threads": 1,
-                    "iterations": 1_000_000,
-                },
-            )
-
     for mode in modes:
-        disabled = builds[f"disabled-{mode}"]
-        enabled = builds[f"enabled-{mode}"]
-        module = single_wasm if mode == "interpreter" else aot_artifacts["single"]
-
         def single_measure(
-            condition: str, fields: dict[str, Any]
+            revision: str,
+            condition: str,
+            fields: dict[str, Any],
         ) -> dict[str, Any]:
+            context = contexts[revision]
+            builds = context["builds"]
+            disabled = builds[f"disabled-{mode}"]
+            enabled = builds[f"enabled-{mode}"]
             selected = disabled if condition == "threads-disabled" else enabled
+            module = (
+                context["single_wasm"]
+                if mode == "interpreter"
+                else context["aot_artifacts"]["single"]
+            )
             return measure_once(
-                repo=repo,
+                repo=context["repo"],
                 runner=runner,
                 build=selected,
                 module=module,
@@ -1569,7 +2560,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 },
             )
 
-        collect_pair(
+        collect_revision_pair(
             records=records,
             pair_kind="single-infrastructure",
             pair_key=f"single-infrastructure/{mode}",
@@ -1577,6 +2568,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             right="threads-enabled",
             warmups=args.warmups,
             samples=args.samples,
+            revision_roles=revision_roles,
+            revision_fields=revision_fields,
             measure=single_measure,
         )
 
@@ -1584,17 +2577,20 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     for scenario in scenarios:
         if len(modes) == 2:
             def runtime_measure(
-                condition: str, fields: dict[str, Any]
+                revision: str,
+                condition: str,
+                fields: dict[str, Any],
             ) -> dict[str, Any]:
+                context = contexts[revision]
                 mode = condition
-                build = builds[f"enabled-{mode}"]
+                build = context["builds"][f"enabled-{mode}"]
                 module = (
-                    threaded_wasm
+                    context["threaded_wasm"]
                     if mode == "interpreter"
-                    else aot_artifacts["threaded-polls-on"]
+                    else context["aot_artifacts"]["threaded-polls-on"]
                 )
                 return measure_once(
-                    repo=repo,
+                    repo=context["repo"],
                     runner=runner,
                     build=build,
                     module=module,
@@ -1611,7 +2607,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                             "on" if mode == "aot" else "interpreter-dispatch"
                         ),
                         "static_cancel_poll_sites": (
-                            aot_artifacts_metadata["cancel_poll_static"]["sites_enabled"]
+                            context["aot_artifacts_metadata"][
+                                "cancel_poll_static"
+                            ]["sites_enabled"]
                             if mode == "aot"
                             else None
                         ),
@@ -1621,7 +2619,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     },
                 )
 
-            collect_pair(
+            collect_revision_pair(
                 records=records,
                 pair_kind="runtime-parity",
                 pair_key=f"runtime/{scenario.key}",
@@ -1629,22 +2627,27 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 right="aot",
                 warmups=args.warmups,
                 samples=args.samples,
+                revision_roles=revision_roles,
+                revision_fields=revision_fields,
                 measure=runtime_measure,
             )
         else:
             mode = modes[0]
-            build = builds[f"enabled-{mode}"]
-            module = (
-                threaded_wasm
-                if mode == "interpreter"
-                else aot_artifacts["threaded-polls-on"]
-            )
 
             def single_mode_measure(
-                condition: str, fields: dict[str, Any]
+                revision: str,
+                condition: str,
+                fields: dict[str, Any],
             ) -> dict[str, Any]:
+                context = contexts[revision]
+                build = context["builds"][f"enabled-{mode}"]
+                module = (
+                    context["threaded_wasm"]
+                    if mode == "interpreter"
+                    else context["aot_artifacts"]["threaded-polls-on"]
+                )
                 return measure_once(
-                    repo=repo,
+                    repo=context["repo"],
                     runner=runner,
                     build=build,
                     module=module,
@@ -1661,7 +2664,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                             "on" if mode == "aot" else "interpreter-dispatch"
                         ),
                         "static_cancel_poll_sites": (
-                            aot_artifacts_metadata["cancel_poll_static"]["sites_enabled"]
+                            context["aot_artifacts_metadata"][
+                                "cancel_poll_static"
+                            ]["sites_enabled"]
                             if mode == "aot"
                             else None
                         ),
@@ -1671,7 +2676,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     },
                 )
 
-            collect_pair(
+            collect_revision_pair(
                 records=records,
                 pair_kind="repeatability",
                 pair_key=f"runtime/{scenario.key}/{mode}",
@@ -1679,21 +2684,26 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 right=f"{mode}-b",
                 warmups=args.warmups,
                 samples=args.samples,
+                revision_roles=revision_roles,
+                revision_fields=revision_fields,
                 measure=single_mode_measure,
             )
 
     if "aot" in modes:
-        aot_build = builds["enabled-aot"]
         for threads in args.thread_counts:
             scenario = Scenario("hot", threads, cancel_iterations(args, threads))
 
             def poll_measure(
-                condition: str, fields: dict[str, Any]
+                revision: str,
+                condition: str,
+                fields: dict[str, Any],
             ) -> dict[str, Any]:
+                context = contexts[revision]
+                aot_build = context["builds"]["enabled-aot"]
                 polls = "off" if condition == "cancel-points-off" else "on"
-                module = aot_artifacts[f"threaded-polls-{polls}"]
+                module = context["aot_artifacts"][f"threaded-polls-{polls}"]
                 return measure_once(
-                    repo=repo,
+                    repo=context["repo"],
                     runner=runner,
                     build=aot_build,
                     module=module,
@@ -1708,7 +2718,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         "threads_enabled": True,
                         "cancel_points": polls,
                         "static_cancel_poll_sites": (
-                            aot_artifacts_metadata["cancel_poll_static"][
+                            context["aot_artifacts_metadata"][
+                                "cancel_poll_static"
+                            ][
                                 "sites_enabled"
                             ]
                             if polls == "on"
@@ -1720,7 +2732,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     },
                 )
 
-            collect_pair(
+            collect_revision_pair(
                 records=records,
                 pair_kind="cancel-point-cost",
                 pair_key=f"cancel-points/hot/{threads}",
@@ -1728,56 +2740,55 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 right="cancel-points-on",
                 warmups=args.warmups,
                 samples=args.samples,
+                revision_roles=revision_roles,
+                revision_fields=revision_fields,
                 measure=poll_measure,
             )
 
     summaries = summarize(records)
     pairs = paired_summaries(records)
-    plan = {
-        "profile": args.profile,
-        "warmups": args.warmups,
-        "samples": args.samples,
-        "modes": list(modes),
-        "thread_counts": list(args.thread_counts),
-        "iterations": {
-            "single-hot": args.single_iterations,
-            "cancel-hot": args.cancel_iterations,
-            "hot": args.hot_iterations,
-            "atomic": args.atomic_iterations,
-            "atomic-total": args.atomic_total_iterations,
-            "wait-notify": args.wait_iterations,
-            "spawn-join": args.spawn_iterations,
-        },
-        "timeout_seconds": args.timeout,
-        "minimum_timed_interval_ns": minimum_interval_ns,
-        "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
-        "optimize": args.optimize,
-        "pairs": pair_plan,
-    }
+    comparisons = comparison_summaries(records)
+    ratios = ratio_of_ratios_summaries(records)
+    candidate = revisions["candidate"]
     document = {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
         "metadata": {
-            **source,
+            "commit": candidate["commit"],
+            "tracked_diff_sha256": candidate["tracked_diff_sha256"],
+            "build_source_sha256": candidate["build_source_sha256"],
+            "revisions": revisions,
+            "revision_checkouts": {
+                role: str(revision_repos[role]) for role in revision_roles
+            },
             "collected_at": collected_at(),
             "platform_id": args.platform_id,
             "fixture_set_sha256": fixture_set_sha256,
-            "plan_sha256": cache_key(plan),
-            "host": host_metadata(),
+            "plan_sha256": plan_sha256,
+            "host": host,
+            "host_pair": host_pair,
             "execution": {
                 "target": args.target or "native",
                 "aot_target": execution_arch(args),
                 "runner": runner,
             },
-            "tools": build_tool_report(builds, runner),
+            "tools": {
+                role: build_tool_report(contexts[role]["builds"], runner)
+                for role in revision_roles
+            },
             "fixture_toolchain": WASI_SDK,
-            "fixtures": fixture_report,
-            "aot_artifacts": aot_artifacts_metadata,
+            "fixtures": fixture_reports["candidate"],
+            "aot_artifacts": {
+                role: contexts[role]["aot_artifacts_metadata"]
+                for role in revision_roles
+            },
         },
         "plan": plan,
         "records": records,
         "summaries": summaries,
         "paired_summaries": pairs,
+        "comparison_summaries": comparisons,
+        "ratio_of_ratios_summaries": ratios,
         "budget": {
             "status": "disabled" if args.no_budget else "not-selected",
             "path": str(args.budget.resolve()) if args.budget else None,
@@ -1788,11 +2799,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     budget_failures: list[str] = []
     if args.budget:
         platform_budget = load_budget(args.budget.resolve(), document)
-        budget_failures = evaluate_budget(platform_budget, summaries, pairs)
+        budget_failures = evaluate_budget(platform_budget, document)
         document["budget"]["status"] = (
             "passed" if not budget_failures else "failed"
         )
         document["budget"]["failures"] = budget_failures
+        validate_report(document)
     atomic_write_json(output / "report.json", document)
     (output / "report.md").write_text(
         render_markdown(document) + "\n", encoding="UTF-8"

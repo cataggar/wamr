@@ -41,7 +41,7 @@ passive-data start initialization, pthread lifecycle, serialization, and
 teardown. They are retained as historical whole-process diagnostics only and
 must not be used as throughput or #957 cancel-poll evidence.
 
-The corrected schema-v2 metric is guest-reported WASI monotonic time:
+The corrected metric is guest-reported WASI monotonic time:
 
 - `hot`, `atomic`, and `wait-notify` spawn their workers first, warm code where
   applicable, and wait until every worker is ready;
@@ -92,6 +92,26 @@ bytes.
 
 ## Run
 
+The paired-revision mode takes two immutable checkouts. The driver builds each
+revision into a separate output subtree, verifies that both use the same
+fixture set and plan, and tags every warmup and measured sample with its
+revision commit and build-source hash:
+
+```sh
+python3 scripts/bench_wasi_threads.py \
+  --baseline-repo /path/to/immutable-baseline \
+  --candidate-repo /path/to/immutable-candidate \
+  --comparison-purpose candidate-evaluation \
+  --profile authoritative \
+  --host-pair-id "$GITHUB_RUN_ID/$RUNNER_ARCH" \
+  --runner-environment github-hosted \
+  --output-dir "$PWD/zig-out/wasi-thread-bench" \
+  --no-budget
+```
+
+Until the workflow PR supplies the two checkouts, the existing single-revision
+CLI remains valid:
+
 ```sh
 python3 scripts/bench_wasi_threads.py \
   --profile authoritative \
@@ -99,13 +119,66 @@ python3 scripts/bench_wasi_threads.py \
   --no-budget
 ```
 
+That transitional invocation builds, runs, and emits only the `candidate`
+role, sets `plan.revision_mode` and `plan.comparison_purpose` to
+`single-revision-compatibility`, and emits no candidate/baseline comparisons.
+It preserves current PR smoke coverage without doubling every measurement and
+is not regression evidence between two source revisions.
+
 The authoritative profile alternates each pair, discards two warmups, and keeps
-ten measured samples. `report.json` follows `report.schema.json` and records
-raw warmups/samples, commands, host/CPU/compiler/runtime identities, fixture and
-source hashes, explicit pair direction, guest and host timing, build cache keys,
-medians/ranges, paired ratios, immutable commit/platform/plan identities, and
-every correctness result. JSON replacement is an fsynced same-directory atomic
-rename that preserves an existing report's mode.
+ten measured samples. The smoke default is four measured samples. Paired mode
+requires an even measured sample count: baseline and candidate each occupy the
+first revision position exactly half the time. Warmups may have any count
+because balance is enforced across the measured indices even when their
+starting parity is shifted by the warmups. Within every sample index, the
+left/right condition order continues to alternate independently. `report.json`
+follows `report.schema.json` and
+records raw warmups/samples, commands, host/CPU/compiler/runtime identities,
+fixture and source hashes, explicit pair and revision direction, guest and host
+timing, build cache keys, medians/ranges, immutable commit/platform/plan
+identities, and every correctness result. JSON replacement is an fsynced
+same-directory atomic rename that preserves an existing report's mode.
+
+The report exposes four metric layers:
+
+1. `summaries`: raw absolute elapsed time and throughput by revision and
+   condition. These remain diagnostic and are not portable performance gates.
+2. `paired_summaries`: the internal right/left condition ratio for each
+   revision.
+3. `comparison_summaries`: matched candidate/baseline elapsed and throughput
+   ratios for the same condition and sample index.
+4. `ratio_of_ratios_summaries`: candidate internal right/left ratio divided by
+   the baseline internal right/left ratio. A throughput value below 1 means the
+   candidate's internal-pair relationship regressed; an elapsed value above 1
+   means it regressed.
+
+Runner metadata separates the diagnostic, high-cardinality `runner_name` from
+`runner_environment` and the stable host fingerprint used as the performance
+class. The fingerprint includes system, machine, CPU, logical CPU count, runner
+image/OS/architecture, and runner environment. It deliberately excludes runner
+name, workflow run ID, attempt, and workflow name. `host_pair.id` identifies
+the particular matched baseline/candidate run without becoming a performance
+class.
+
+Paired checkouts must resolve to different paths so both roles are independently
+built. `candidate-evaluation` is the only purpose eligible for budget
+enforcement. A same-revision A/A run is allowed only as explicit
+`noise-calibration`, from two distinct checkout paths:
+
+```sh
+python3 scripts/bench_wasi_threads.py \
+  --baseline-repo /path/to/calibration-a \
+  --candidate-repo /path/to/calibration-b \
+  --comparison-purpose noise-calibration \
+  --samples 10 \
+  --no-budget
+```
+
+Both noise-calibration checkouts must have identical commit, tracked-diff, and
+build-source identities. Noise reports are always non-enforcing. Conversely,
+budget loading accepts only candidate-evaluation reports and rejects identical
+baseline/candidate commits or build-source identities. An accidentally reused
+checkout can therefore never produce a passing gate.
 
 The AOT hot loop is compiled twice from the same `threaded.wasm`. The
 `--benchmark-disable-cancel-points` compiler flag is accepted only by a wamrc
@@ -140,6 +213,15 @@ local machines are not an authoritative calibration source. Do not start a
 calibration cohort until the post-#979 methodology correction has passed
 independent review and one validation run on each hosted platform.
 
+The commands below describe the currently checked-in single-revision dispatch
+plumbing. They cannot produce a schema-v3 paired calibration cohort by
+themselves. The current `scripts/wasi_thread_cohort.py` deliberately rejects
+schema-v3 paired reports rather than silently aggregating candidate aliases
+while ignoring baselines. The dependent workflow PR must create immutable
+baseline and candidate checkouts, pass their paths, comparison purpose, and one
+host-pair ID to the harness, and add baseline-aware cohort aggregation before
+calibration is enabled.
+
 Manual runs require a lowercase immutable 40-character `target_sha`; their
 concurrency group uses `github.run_id` and never cancels another calibration
 run. `scripts/wasi_thread_cohort.py` dispatches a bounded number in parallel and
@@ -161,11 +243,37 @@ python3 scripts/wasi_thread_cohort.py validate \
   --output /d/wasi-thread-cohort.json
 ```
 
-Validation rejects mixed commit, source, fixture, plan, profile, platform, or
-duplicate workflow-run identity. A calibrated schema-v2 budget must identify
-that exact cohort and contain platform-scoped thresholds for every explicit
-left/right pair and every planned scenario/condition. Empty, partial, unknown,
-duplicate, direction-inverted, or identity-mismatched budgets fail closed.
+Schema version 3 separates the actual report revisions from budget calibration
+provenance. Paired reports use `metadata.revisions.baseline` and `.candidate`;
+single-revision compatibility reports contain only `.candidate`. These entries
+describe the code that produced the current samples. A calibrated budget separately records
+the baseline and candidate revisions plus the explicit `noise-calibration`
+purpose used to derive its thresholds. The
+current report baseline must match the calibrated baseline, fixture, plan, and
+profile. The current candidate commit and build-source hash are expected to
+change and are never required to equal the calibration candidate.
+
+Budgets contain only paired ratio limits:
+
+- a minimum candidate/baseline throughput ratio and maximum
+  candidate/baseline elapsed ratio for every condition;
+- a minimum throughput ratio-of-ratios and maximum elapsed ratio-of-ratios for
+  every internal left/right pair.
+
+Absolute throughput and elapsed values remain report diagnostics. A calibrated
+budget must cover every platform, condition, and internal pair in the exact
+declared direction. Missing or duplicate revisions, samples, conditions, or
+thresholds; inverted directions; unsupported or mixed hosts; mixed plan or
+fixture identities; stale baseline provenance; and partial platform coverage
+all fail closed. There is no success-shaped fallback to an absolute value or an
+uncalibrated threshold.
+
+Rebaseline only after an intentional baseline change or a reviewed methodology,
+fixture, plan, hosted runner class, or toolchain change. Retain the complete
+hosted paired cohort, update both calibration revision identities and every
+derived ratio threshold together, and keep `calibrated` and `enforcement`
+false until the replacement cohort meets the declared report-count and platform
+requirements. A candidate-only source change never requires rebaselining.
 
 Until that cohort exists, claiming a statistically sound hard gate would be
 fabricating evidence. Issue #966 must remain open and #963 remains dependent on
