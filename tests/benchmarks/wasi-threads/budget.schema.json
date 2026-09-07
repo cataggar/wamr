@@ -126,6 +126,8 @@
         "comparison_purpose",
         "fixture_set_sha256",
         "plan_sha256",
+        "measurement_plan_version",
+        "measurement_plan_sha256",
         "profile",
         "report_count_by_platform"
       ],
@@ -135,6 +137,8 @@
         "comparison_purpose": { "const": "noise-calibration" },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "measurement_plan_version": { "const": 1 },
+        "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "profile": { "const": "authoritative" },
         "report_count_by_platform": {
           "type": "object",

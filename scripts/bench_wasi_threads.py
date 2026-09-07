@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import functools
 import json
 import math
@@ -48,6 +49,8 @@ KIND = "wasi-thread-benchmark"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
+MEASUREMENT_PLAN_IDENTITY_VERSION = 1
+MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "smoke": (1, 4),
@@ -87,6 +90,24 @@ FIXTURES = {
     },
 }
 MASK64 = (1 << 64) - 1
+
+
+def measurement_plan_sha256(plan: dict[str, Any]) -> str:
+    """Hash every measurement-plan field except comparison purpose."""
+
+    require(
+        isinstance(plan, dict) and "comparison_purpose" in plan,
+        "measurement plan comparison_purpose",
+    )
+    normalized = copy.deepcopy(plan)
+    del normalized["comparison_purpose"]
+    return cache_key(
+        {
+            "schema_version": MEASUREMENT_PLAN_IDENTITY_VERSION,
+            "kind": MEASUREMENT_PLAN_IDENTITY_KIND,
+            "plan_without_comparison_purpose": normalized,
+        }
+    )
 
 
 class HarnessError(RuntimeError):
@@ -1321,12 +1342,21 @@ def validate_report(document: dict[str, Any]) -> None:
         isinstance(metadata.get("platform_id"), str) and metadata["platform_id"],
         "metadata.platform_id",
     )
-    for key in ("fixture_set_sha256", "plan_sha256"):
+    for key in (
+        "fixture_set_sha256",
+        "plan_sha256",
+        "measurement_plan_sha256",
+    ):
         require(
             isinstance(metadata.get(key), str)
             and re.fullmatch(r"[0-9a-f]{64}", metadata[key]) is not None,
             f"metadata.{key}",
         )
+    require(
+        metadata.get("measurement_plan_version")
+        == MEASUREMENT_PLAN_IDENTITY_VERSION,
+        "metadata.measurement_plan_version",
+    )
     plan = document["plan"]
     require(plan.get("warmups", -1) >= 0, "plan.warmups")
     require(plan.get("samples", 0) > 0, "plan.samples")
@@ -1361,6 +1391,11 @@ def validate_report(document: dict[str, Any]) -> None:
         "plan.revision_roles",
     )
     require(metadata["plan_sha256"] == cache_key(plan), "metadata.plan_sha256")
+    require(
+        metadata["measurement_plan_sha256"]
+        == measurement_plan_sha256(plan),
+        "metadata.measurement_plan_sha256",
+    )
 
     revisions = metadata.get("revisions")
     require(
@@ -1905,6 +1940,8 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "comparison_purpose",
             "fixture_set_sha256",
             "plan_sha256",
+            "measurement_plan_version",
+            "measurement_plan_sha256",
             "profile",
             "report_count_by_platform",
         },
@@ -1941,7 +1978,11 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         raise HarnessError(
             "budget noise-calibration revisions must have identical identities"
         )
-    for key in ("fixture_set_sha256", "plan_sha256"):
+    for key in (
+        "fixture_set_sha256",
+        "plan_sha256",
+        "measurement_plan_sha256",
+    ):
         value = calibration[key]
         if (
             not isinstance(value, str)
@@ -1950,6 +1991,11 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             raise HarnessError(
                 f"budget calibration_provenance.{key} has invalid identity"
             )
+    if (
+        calibration["measurement_plan_version"]
+        != MEASUREMENT_PLAN_IDENTITY_VERSION
+    ):
+        raise HarnessError("budget measurement plan identity version mismatch")
     if calibration["profile"] != requirements["required_profile"]:
         raise HarnessError("budget calibration profile mismatch")
     counts = calibration["report_count_by_platform"]
@@ -1977,7 +2023,8 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "build_source_sha256"
         ],
         "fixture_set_sha256": metadata["fixture_set_sha256"],
-        "plan_sha256": metadata["plan_sha256"],
+        "measurement_plan_version": metadata["measurement_plan_version"],
+        "measurement_plan_sha256": metadata["measurement_plan_sha256"],
         "profile": report["plan"]["profile"],
     }
     for key, actual in identity_checks.items():
@@ -2398,6 +2445,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "pairs": pair_plan,
     }
     plan_sha256 = cache_key(plan)
+    measurement_plan_identity = measurement_plan_sha256(plan)
     host = host_metadata(args.runner_environment)
     host_pair = host_pair_identity(args.platform_id, host, args.host_pair_id)
     revisions = {
@@ -2765,6 +2813,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "platform_id": args.platform_id,
             "fixture_set_sha256": fixture_set_sha256,
             "plan_sha256": plan_sha256,
+            "measurement_plan_version": MEASUREMENT_PLAN_IDENTITY_VERSION,
+            "measurement_plan_sha256": measurement_plan_identity,
             "host": host,
             "host_pair": host_pair,
             "execution": {

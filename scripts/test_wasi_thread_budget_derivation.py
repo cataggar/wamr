@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import math
+import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import bench_wasi_threads as bench  # noqa: E402
 import wasi_thread_cohort as cohort  # noqa: E402
 from bench_wasi_threads import HarnessError  # noqa: E402
 from benchmark_schema import cache_key  # noqa: E402
@@ -34,6 +38,39 @@ def synthetic_policy() -> dict:
 def synthetic_cohort() -> dict:
     """Build an explicitly synthetic 20-run calibration cohort."""
 
+    plan = {
+        "profile": "authoritative",
+        "warmups": 2,
+        "samples": 10,
+        "revision_mode": "paired-revisions",
+        "comparison_purpose": "noise-calibration",
+        "revision_roles": ["baseline", "candidate"],
+        "modes": ["aot"],
+        "thread_counts": [1],
+        "iterations": {
+            "single-hot": 100,
+            "cancel-hot": 100,
+            "hot": 100,
+            "atomic": 100,
+            "atomic-total": 100,
+            "wait-notify": 100,
+            "spawn-join": 10,
+        },
+        "timeout_seconds": 60,
+        "minimum_timed_interval_ns": 1,
+        "atomic_wait_preflight_runs": 64,
+        "optimize": "ReleaseFast",
+        "pairs": [
+            {
+                "pair_kind": "single-infrastructure",
+                "pair_key": "single-infrastructure/aot",
+                "left": "threads-disabled",
+                "right": "threads-enabled",
+            }
+        ],
+    }
+    plan_sha256 = cache_key(plan)
+    measurement_plan_sha256 = bench.measurement_plan_sha256(plan)
     run_ids = [str(10_000 + index) for index in range(20)]
     assignments = [
         {
@@ -51,7 +88,9 @@ def synthetic_cohort() -> dict:
         "baseline": dict(revision),
         "candidate": dict(revision),
         "fixture_set_sha256": "d" * 64,
-        "plan_sha256": "e" * 64,
+        "plan_sha256": plan_sha256,
+        "measurement_plan_version": bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
+        "measurement_plan_sha256": measurement_plan_sha256,
         "profile": "authoritative",
         "comparison_purpose": "noise-calibration",
         "warmups": 2,
@@ -72,15 +111,19 @@ def synthetic_cohort() -> dict:
                 "baseline": {
                     **revision,
                     "fixture_set_sha256": "d" * 64,
-                    "plan_sha256": "e" * 64,
+                    "plan_sha256": plan_sha256,
                 },
                 "candidate": {
                     **revision,
                     "fixture_set_sha256": "d" * 64,
-                    "plan_sha256": "e" * 64,
+                    "plan_sha256": plan_sha256,
                 },
                 "fixture_set_sha256": "d" * 64,
-                "plan_sha256": "e" * 64,
+                "plan_sha256": plan_sha256,
+                "measurement_plan_version": (
+                    bench.MEASUREMENT_PLAN_IDENTITY_VERSION
+                ),
+                "measurement_plan_sha256": measurement_plan_sha256,
                 "profile": "authoritative",
                 "comparison_purpose": "noise-calibration",
             }
@@ -100,6 +143,7 @@ def synthetic_cohort() -> dict:
                         {"synthetic": True, "platform": platform, "run_id": run_id}
                     ),
                     "identity": report_identity,
+                    "plan": copy.deepcopy(plan),
                     "metrics": {
                         "comparisons": [
                             {
@@ -209,6 +253,15 @@ def synthetic_cohort() -> dict:
 
 
 class BudgetDerivationTests(unittest.TestCase):
+    scratch = ROOT / "zig-out" / "test-wasi-thread-budget-derivation"
+
+    def setUp(self) -> None:
+        shutil.rmtree(self.scratch, ignore_errors=True)
+        self.scratch.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
     def test_directionality_and_zero_mad(self) -> None:
         lower = cohort.derive_one_sided_threshold(
             [0.99, 0.99],
@@ -405,6 +458,84 @@ class BudgetDerivationTests(unittest.TestCase):
                 set(platform_budget),
                 set(budget_schema["$defs"]["platform"]["required"]),
             )
+
+    def test_derive_cli_is_deterministic_and_fails_closed(self) -> None:
+        cohort_path = self.scratch / "cohort.json"
+        policy_path = self.scratch / "policy.json"
+        cohort_path.write_text(
+            json.dumps(synthetic_cohort(), sort_keys=True),
+            encoding="UTF-8",
+        )
+        policy_path.write_text(
+            json.dumps(synthetic_policy(), sort_keys=True),
+            encoding="UTF-8",
+        )
+
+        outputs = []
+        for suffix in ("one", "two"):
+            budget = self.scratch / f"budget-{suffix}.json"
+            evidence = self.scratch / f"evidence-{suffix}.json"
+            markdown = self.scratch / f"evidence-{suffix}.md"
+            self.assertEqual(
+                cohort.main(
+                    [
+                        "derive",
+                        "--cohort",
+                        str(cohort_path),
+                        "--policy",
+                        str(policy_path),
+                        "--budget-output",
+                        str(budget),
+                        "--evidence-json-output",
+                        str(evidence),
+                        "--evidence-markdown-output",
+                        str(markdown),
+                    ]
+                ),
+                0,
+            )
+            outputs.append(
+                (
+                    budget.read_bytes(),
+                    evidence.read_bytes(),
+                    markdown.read_bytes(),
+                )
+            )
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertTrue(outputs[0][0].endswith(b"\n"))
+        self.assertTrue(outputs[0][1].endswith(b"\n"))
+        self.assertIn(b"Enforcement: **disabled**", outputs[0][2])
+
+        invalid_policy = synthetic_policy()
+        invalid_policy["engineering_policy_ceiling_log"][
+            "comparison_throughput_lower"
+        ] = 0.0001
+        policy_path.write_text(
+            json.dumps(invalid_policy, sort_keys=True),
+            encoding="UTF-8",
+        )
+        failed_budget = self.scratch / "failed-budget.json"
+        with mock.patch.object(cohort.sys, "stderr", io.StringIO()) as stderr:
+            self.assertEqual(
+                cohort.main(
+                    [
+                        "derive",
+                        "--cohort",
+                        str(cohort_path),
+                        "--policy",
+                        str(policy_path),
+                        "--budget-output",
+                        str(failed_budget),
+                        "--evidence-json-output",
+                        str(self.scratch / "failed-evidence.json"),
+                        "--evidence-markdown-output",
+                        str(self.scratch / "failed-evidence.md"),
+                    ]
+                ),
+                2,
+            )
+        self.assertIn("rounding cushion exceeds", stderr.getvalue())
+        self.assertFalse(failed_budget.exists())
 
 
 if __name__ == "__main__":

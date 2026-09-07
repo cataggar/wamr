@@ -15,6 +15,7 @@ on:
       - scripts/benchmark_schema.py
       - scripts/bench_wasi_threads.py
       - scripts/test_bench_wasi_threads.py
+      - scripts/test_wasi_thread_budget_derivation.py
       - scripts/wasi_thread_cohort.py
       - tests/benchmarks/wasi-threads/**
       - .github/workflows/wasi-thread-bench.yml
@@ -283,7 +284,10 @@ jobs:
 
       - name: Test benchmark and cohort harness
         if: matrix.platform == 'ubuntu-22.04-x86_64'
-        run: python3 -m unittest candidate/scripts/test_bench_wasi_threads.py
+        run: >-
+          python3 -m unittest
+          candidate/scripts/test_bench_wasi_threads.py
+          candidate/scripts/test_wasi_thread_budget_derivation.py
 
       - name: Verify pinned wasi-libc fixtures
         if: matrix.platform == 'ubuntu-22.04-x86_64'
@@ -424,7 +428,10 @@ jobs:
           local-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-local-cache
 
       - name: Test benchmark and cohort harness
-        run: python3 -m unittest candidate/scripts/test_bench_wasi_threads.py
+        run: >-
+          python3 -m unittest
+          candidate/scripts/test_bench_wasi_threads.py
+          candidate/scripts/test_wasi_thread_budget_derivation.py
 
       - name: Verify pinned wasi-libc fixtures
         env:

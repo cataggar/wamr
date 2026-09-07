@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import re
@@ -28,7 +29,9 @@ from bench_wasi_threads import (
     CANONICAL_PLATFORMS,
     COMPARISON_PURPOSES,
     HarnessError,
+    MEASUREMENT_PLAN_IDENTITY_VERSION,
     PROFILE_COUNTS,
+    measurement_plan_sha256,
     validate_report,
 )
 
@@ -773,7 +776,7 @@ def validate_legacy_documents(
         raise HarnessError("minimum report count must be positive")
     validate_platforms(required_platforms)
     grouped: dict[str, list[tuple[Path, dict[str, Any]]]] = defaultdict(list)
-    identities: set[tuple[str, str, str, str, str]] = set()
+    identities: set[tuple[str, str, str, str, int, str, str]] = set()
     for path, document in documents:
         validate_report(document)
         if document["plan"]["revision_mode"] != "single-revision-compatibility":
@@ -799,6 +802,8 @@ def validate_legacy_documents(
                 metadata["build_source_sha256"],
                 metadata["fixture_set_sha256"],
                 metadata["plan_sha256"],
+                metadata["measurement_plan_version"],
+                metadata["measurement_plan_sha256"],
                 document["plan"]["profile"],
             )
         )
@@ -836,7 +841,9 @@ def validate_legacy_documents(
             "build_source_sha256": identity[1],
             "fixture_set_sha256": identity[2],
             "plan_sha256": identity[3],
-            "profile": identity[4],
+            "measurement_plan_version": identity[4],
+            "measurement_plan_sha256": identity[5],
+            "profile": identity[6],
         },
         "platforms": {
             platform_id: {
@@ -934,6 +941,7 @@ def validate_paired_documents(
     }
     fixture_identities: set[str] = set()
     plan_identities: set[str] = set()
+    measurement_plan_identities: set[tuple[int, str]] = set()
     host_fingerprints: dict[str, Counter[str]] = defaultdict(Counter)
     host_cpus: dict[str, Counter[str]] = defaultdict(Counter)
     runner_images: dict[str, Counter[str]] = defaultdict(Counter)
@@ -1012,6 +1020,12 @@ def validate_paired_documents(
             )
         fixture_identities.add(metadata["fixture_set_sha256"])
         plan_identities.add(metadata["plan_sha256"])
+        measurement_plan_identities.add(
+            (
+                metadata["measurement_plan_version"],
+                measurement_plan_sha256(plan),
+            )
+        )
         run = expected["run_by_id"][run_id]
         observations.append(
             {
@@ -1029,9 +1043,16 @@ def validate_paired_documents(
                     "candidate": revisions["candidate"],
                     "fixture_set_sha256": metadata["fixture_set_sha256"],
                     "plan_sha256": metadata["plan_sha256"],
+                    "measurement_plan_version": metadata[
+                        "measurement_plan_version"
+                    ],
+                    "measurement_plan_sha256": metadata[
+                        "measurement_plan_sha256"
+                    ],
                     "profile": plan["profile"],
                     "comparison_purpose": plan["comparison_purpose"],
                 },
+                "plan": copy.deepcopy(plan),
                 "metrics": report_calibration_metrics(document),
             }
         )
@@ -1047,6 +1068,8 @@ def validate_paired_documents(
         raise HarnessError("cohort has mixed baseline/candidate/build identities")
     if len(fixture_identities) != 1 or len(plan_identities) != 1:
         raise HarnessError("cohort has mixed fixture or plan identity")
+    if len(measurement_plan_identities) != 1:
+        raise HarnessError("cohort has mixed measurement plan identity")
     trusted_x86 = "ubuntu-22.04-x86_64"
     if expected["runner_target"] == "trusted-calibration":
         if runner_names[trusted_x86] != {TRUSTED_X86_RUNNER_NAME}:
@@ -1064,6 +1087,7 @@ def validate_paired_documents(
         raise HarnessError("cohort observation exclusion is forbidden")
     baseline_identity = next(iter(identity_by_role["baseline"]))
     candidate_identity = next(iter(identity_by_role["candidate"]))
+    measurement_plan_identity = next(iter(measurement_plan_identities))
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "wasi-thread-paired-cohort",
@@ -1092,6 +1116,8 @@ def validate_paired_documents(
             },
             "fixture_set_sha256": next(iter(fixture_identities)),
             "plan_sha256": next(iter(plan_identities)),
+            "measurement_plan_version": measurement_plan_identity[0],
+            "measurement_plan_sha256": measurement_plan_identity[1],
             "profile": expected["profile"],
             "comparison_purpose": expected["purpose"],
             "warmups": expected["warmups"],
@@ -1389,9 +1415,18 @@ def validate_calibration_cohort(
         for key in ("tracked_diff_sha256", "build_source_sha256"):
             if re.fullmatch(r"[0-9a-f]{64}", str(revision.get(key, ""))) is None:
                 raise HarnessError(f"calibration {role} {key} is invalid")
-    for key in ("fixture_set_sha256", "plan_sha256"):
+    for key in (
+        "fixture_set_sha256",
+        "plan_sha256",
+        "measurement_plan_sha256",
+    ):
         if re.fullmatch(r"[0-9a-f]{64}", str(identity.get(key, ""))) is None:
             raise HarnessError(f"validated cohort {key} is invalid")
+    if (
+        identity.get("measurement_plan_version")
+        != MEASUREMENT_PLAN_IDENTITY_VERSION
+    ):
+        raise HarnessError("validated cohort measurement plan version is invalid")
     if set(platforms) != set(DEFAULT_PLATFORMS):
         raise HarnessError("validated cohort platform set is partial or mixed")
     if dispatch.get("requested_reports") != len(observations):
@@ -1468,6 +1503,8 @@ def validate_calibration_cohort(
         "candidate": candidate,
         "fixture_set_sha256": identity["fixture_set_sha256"],
         "plan_sha256": identity["plan_sha256"],
+        "measurement_plan_version": identity["measurement_plan_version"],
+        "measurement_plan_sha256": identity["measurement_plan_sha256"],
         "profile": "authoritative",
         "comparison_purpose": "noise-calibration",
     }
@@ -1529,6 +1566,8 @@ def validate_calibration_cohort(
         for key in (
             "fixture_set_sha256",
             "plan_sha256",
+            "measurement_plan_version",
+            "measurement_plan_sha256",
             "profile",
             "comparison_purpose",
         ):
@@ -1536,6 +1575,23 @@ def validate_calibration_cohort(
                 raise HarnessError(
                     f"cohort observation {run_id}/{platform} has mixed {key}"
                 )
+        report_plan = observation.get("plan")
+        if not isinstance(report_plan, dict):
+            raise HarnessError(
+                f"cohort observation {run_id}/{platform} lacks its full report plan"
+            )
+        if cache_key(report_plan) != report_identity["plan_sha256"]:
+            raise HarnessError(
+                f"cohort observation {run_id}/{platform} full plan hash changed"
+            )
+        if (
+            measurement_plan_sha256(report_plan)
+            != report_identity["measurement_plan_sha256"]
+        ):
+            raise HarnessError(
+                f"cohort observation {run_id}/{platform} measurement plan "
+                "identity changed"
+            )
         for role in ("baseline", "candidate"):
             revision = report_identity.get(role)
             if not isinstance(revision, dict) or any(
@@ -2069,6 +2125,12 @@ def derive_budget_documents(
             "comparison_purpose": "noise-calibration",
             "fixture_set_sha256": identity["fixture_set_sha256"],
             "plan_sha256": identity["plan_sha256"],
+            "measurement_plan_version": identity[
+                "measurement_plan_version"
+            ],
+            "measurement_plan_sha256": identity[
+                "measurement_plan_sha256"
+            ],
             "profile": "authoritative",
             "report_count_by_platform": validated["platform_counts"],
         },
@@ -2118,6 +2180,12 @@ def derive_budget_documents(
             "candidate_revision": identity["candidate"],
             "fixture_set_sha256": identity["fixture_set_sha256"],
             "plan_sha256": identity["plan_sha256"],
+            "measurement_plan_version": identity[
+                "measurement_plan_version"
+            ],
+            "measurement_plan_sha256": identity[
+                "measurement_plan_sha256"
+            ],
             "profile": identity["profile"],
             "comparison_purpose": identity["comparison_purpose"],
             "warmups": identity.get("warmups"),

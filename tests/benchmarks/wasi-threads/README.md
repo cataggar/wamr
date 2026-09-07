@@ -139,6 +139,15 @@ timing, build cache keys, medians/ranges, immutable commit/platform/plan
 identities, and every correctness result. JSON replacement is an fsynced
 same-directory atomic rename that preserves an existing report's mode.
 
+Reports carry two plan identities. `plan_sha256` is the audit identity of the
+complete plan, including `comparison_purpose`.
+`measurement_plan_sha256` is version 1 of a purpose-independent measurement
+identity: it hashes the complete plan after removing only
+`comparison_purpose`, inside a versioned identity envelope. Profile, warmups,
+samples, revision mode and roles, modes, thread counts, iteration/scenario
+inputs, timeout, minimum interval, preflight count, optimization, and every
+ordered pair/condition remain hashed. `validate_report` recomputes both.
+
 The report exposes four metric layers:
 
 1. `summaries`: raw absolute elapsed time and throughput by revision and
@@ -364,10 +373,14 @@ provenance. Paired reports use `metadata.revisions.baseline` and `.candidate`;
 single-revision compatibility reports contain only `.candidate`. These entries
 describe the code that produced the current samples. A calibrated budget separately records
 the baseline and candidate revisions plus the explicit `noise-calibration`
-purpose used to derive its thresholds. The
-current report baseline must match the calibrated baseline, fixture, plan, and
-profile. The current candidate commit and build-source hash are expected to
-change and are never required to equal the calibration candidate.
+purpose used to derive its thresholds. The current report baseline must match
+the calibrated baseline, fixture, purpose-independent measurement-plan
+identity, and profile. The full
+noise-calibration `plan_sha256` remains in provenance for audit but is not
+compared to a candidate-evaluation full-plan hash, because the purpose field is
+intentionally different. The current candidate commit and build-source hash
+are expected to change and are never required to equal the calibration
+candidate.
 
 Budgets contain only paired ratio limits:
 
@@ -392,6 +405,12 @@ false while evidence is incomplete; after successful deterministic derivation,
 the candidate budget may set `calibrated` true but must keep `enforcement`
 false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
+
+Reports produced before measurement-plan identity version 1 do not satisfy the
+new report schema and cannot be mixed into a new authoritative cohort. Runs
+already executing old `main` remain valid for their old non-enforcing smoke
+workflow, but only reports produced by the updated harness carry the identity
+needed for future derivation and enforcement.
 
 Until that cohort exists, claiming a statistically sound hard gate would be
 fabricating evidence. Issue #966 must remain open and #963 remains dependent on
