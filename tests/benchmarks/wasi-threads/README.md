@@ -31,7 +31,8 @@ infrastructure comparison requested by #616.
 Every invocation prints one JSON object. The driver rejects an incorrect
 workload, thread count, iteration count, operation count, checksum, extra output,
 non-zero exit, watchdog timeout, malformed/duplicate timing, a corrected
-interval shorter than 100 ms, or measured timer/barrier overhead of 1% or more.
+interval shorter than 1.25 seconds, or measured timer/barrier overhead of 1%
+or more.
 
 ## Metric definitions
 
@@ -57,15 +58,32 @@ The corrected metric is guest-reported WASI monotonic time:
 
 The report retains raw guest time, corrected guest time, overhead and overhead
 ppm, plus host wall time as a watchdog/lifecycle diagnostic. Throughput uses
-only corrected guest time. Default inputs target at least hundreds of
-milliseconds per sample: 128 million hot-loop iterations per worker, 64
-million atomic RMWs per worker with a 256 million aggregate floor, 512,000
-total wait/notify hand-offs divided evenly across the selected workers, and
-3,000 spawn/join rounds. The aggregate atomic floor lengthens the low-thread
-cells that are most exposed to hosted scheduling while retaining the existing
-per-worker floor for 4/8-thread scaling. Keeping the wait/notify operation
-total fixed avoids turning its intentionally serialized controller/worker
-protocol into a multi-minute sample at higher thread counts.
+only corrected guest time. The fixed measurement plan uses explicit per-mode
+and per-thread counts so the fast AOT cells clear the floor without making
+interpreter samples impractical:
+
+| mode/workload | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---:|---:|---:|---:|
+| interpreter `hot` | 20M | 20M | 20M | 10M |
+| AOT `hot` | 1.32B | 1.32B | 660M | 330M |
+| interpreter `atomic` | 64M | 32M | 20M | 10M |
+| AOT `atomic` | 640M | 128M | 64M | 64M |
+| interpreter `wait-notify` | 128K | 64K | 32K | 16K |
+| AOT `wait-notify` | 1.6M | 64K | 32K | 16K |
+| interpreter `spawn-join` | 8K | 4.5K | 2.25K | 1.25K |
+| AOT `spawn-join` | 10K | 5K | 2.5K | 1.25K |
+| AOT `cancel-hot` | 1.32B | 1.32B | 660M | 330M |
+
+Single-hot uses 21M interpreter iterations and 1.32B AOT iterations.
+Baseline and candidate always execute identical work for the same condition.
+Interpreter/AOT conditions may use different counts; throughput is normalized
+by each record's validated operation count and corrected guest interval.
+The counts are the smallest simple fixed values above the linear requirement
+from every warmup and measured record in retained replacement runs
+33822485228, 33822486948, 33822488505, and 33822489907. The shortest scaled
+retained cell is 1.259893 seconds; a bounded local all-cell check also passed,
+with a 1.260482-second minimum. The local result is sizing confirmation only,
+not calibration evidence.
 
 ## Rebuild the fixtures
 
@@ -138,6 +156,14 @@ fixture and source hashes, explicit pair and revision direction, guest and host
 timing, build cache keys, medians/ranges, immutable commit/platform/plan
 identities, and every correctness result. JSON replacement is an fsynced
 same-directory atomic rename that preserves an existing report's mode.
+
+Each guest invocation has a fixed 90-second watchdog. Scaling all retained
+four-run replacement reports to the new counts gives a worst complete paired
+benchmark estimate of 44.5 minutes and a worst individual corrected interval
+of 25.2 seconds. The workflow job limit is 120 minutes, leaving build, fixture,
+test, upload, and hosted-variance margin. Even if every one of 20 cohort runs
+consumed the full job limit sequentially, it would take 40 hours; the declared
+72-hour dispatcher deadline therefore remains a fail-closed outer bound.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
@@ -243,24 +269,30 @@ PR/push diagnostics do not enable it.
 
 The preflight runs before any warmup or measured record. For each selected
 thread count it runs exactly four AOT `hot` invocations through the checked-in
-threaded guest's normal five-epoch release/completion barrier and runtime path.
-It never retries, discards a probe, or waits for quiet. Every probe is retained.
-With corrected minimum interval `E` and measured barrier `B`, the existing
-strict quality rule is `B / (E + B) < 0.01`, equivalently `99B < E`. At the
-fixed 100,000,000 ns minimum, the largest accepted barrier is therefore
-1,010,101 ns. All probes must also meet the minimum interval. Because that
-predeclared bound already guarantees the existing 1% rule at the shortest
-valid sample, no workload interval increase is required.
-The retained #966 diagnosis (result SHA-256
-`9cc9fcb34639a3756dfdc8ce9c267ffcecd1c8f1eec80a50c6d6f31e3d24a96f`)
-observed a 6,228,000 ns outlier, which this rule rejects rather than masking.
+threaded guest's normal five-epoch release/completion barrier and runtime path:
+16 fixed probes for the default 1/2/4/8 plan. It never retries, discards a
+probe, adapts work, or waits for quiet. Every probe is retained. Against the
+retained empirical one-in-257 tail, 16 independent probes have only
+`1 - (256/257)^16 ≈ 6.05%` detection power. This is therefore only a cheap
+fixed fail-fast check of current host state; it is not authoritative and
+cannot promise that a later sample will not stall.
+
+With corrected interval `E` and measured barrier `B`, the unchanged strict
+quality rule is `B / (E + B) < 0.01`, equivalently `99B < E`. The predeclared
+barrier target is 12,456,000 ns, exactly twice the retained 6,228,000 ns
+observation. It requires `E > 1,233,144,000 ns`. The fixed 1,250,000,000 ns
+floor adds exactly 16,856,000 ns of headroom; at that floor the largest
+accepted integer barrier is 12,626,262 ns. The later per-invocation timing gate
+is authoritative and fail-closed for every warmup and measured sample.
 
 The report retains the preflight values, min/median/max barrier summary, CPU
 affinity and availability, load average, Linux CPU pressure when available,
 the observable `Runner.Worker` process count, and runner/job identity. These
-host diagnostics are explanatory only; the guest-path preflight is the
-authoritative gate. A failed preflight, or a later sample rejected by the
-unchanged timing gate, writes `failure-diagnostic.json` and
+host diagnostics are explanatory only. Every run captures
+`host_quiescence_at_start`, including hosted runs. A failed preflight or later
+timing-quality failure takes a fresh `host_quiescence_at_failure` snapshot
+rather than reusing the start state, and records the ratio at the fixed minimum
+interval. It writes `failure-diagnostic.json` and
 `failure-diagnostic.md` before exiting. The always-running artifact step uploads
 those files even when no normal report exists, and cleanup remains after upload.
 
@@ -441,10 +473,14 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Reports produced before measurement-plan identity version 1 do not satisfy the
-new report schema and cannot be mixed into a new authoritative cohort. Runs
-already executing old `main` remain valid for their old non-enforcing smoke
-workflow, but only reports produced by the updated harness carry the identity
-needed for future derivation and enforcement.
+new report schema and cannot be mixed into a new authoritative cohort. The
+1.25-second floor and explicit per-mode iteration table change the
+purpose-independent measurement-plan hash. Fresh evidence at that exact new
+plan identity is mandatory for any future calibration or derivation. Reports
+from the old identity, all earlier failed/partial runs, and the retained
+6.228 ms timing-quality failure remain excluded; they cannot be retried,
+relabelled, or mixed into the fresh cohort. Runs already executing old `main`
+may finish only as old non-enforcing smoke diagnostics.
 
 Until that cohort exists, claiming a statistically sound hard gate would be
 fabricating evidence. Issue #966 must remain open and #963 remains dependent on

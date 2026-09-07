@@ -221,7 +221,7 @@ jobs:
       github.event_name != 'workflow_dispatch' ||
       inputs.runner_target == 'github-hosted'
     needs: prepare
-    timeout-minutes: 180
+    timeout-minutes: 120
     permissions:
       contents: read
     strategy:
@@ -324,6 +324,7 @@ jobs:
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
+            --timeout 90 \
             --platform-id '${{ matrix.platform }}' \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${{ matrix.platform }}" \
             --runner-environment github-hosted \
@@ -367,7 +368,7 @@ jobs:
       inputs.purpose == 'noise-calibration' &&
       github.ref == 'refs/heads/main'
     needs: prepare
-    timeout-minutes: 180
+    timeout-minutes: 120
     permissions:
       contents: read
     runs-on: wamr-temp-20260906
@@ -469,6 +470,7 @@ jobs:
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
+            --timeout 90 \
             --platform-id ubuntu-22.04-x86_64 \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
             --runner-environment self-hosted \
@@ -514,7 +516,7 @@ jobs:
       inputs.purpose == 'noise-calibration' &&
       github.ref == 'refs/heads/main'
     needs: prepare
-    timeout-minutes: 180
+    timeout-minutes: 120
     permissions:
       contents: read
     runs-on: ubuntu-24.04-arm
@@ -582,6 +584,7 @@ jobs:
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
+            --timeout 90 \
             --platform-id ubuntu-24.04-aarch64 \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-24.04-aarch64" \
             --runner-environment github-hosted \

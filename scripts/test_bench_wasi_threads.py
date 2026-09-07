@@ -13,6 +13,8 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
+import jsonschema
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -95,14 +97,17 @@ def make_report(
         "modes": ["aot"],
         "thread_counts": [1],
         "iterations": {
-            "single-hot": 10,
-            "hot": 10,
-            "atomic": 10,
-            "wait-notify": 10,
-            "spawn-join": 10,
+            "aot": {
+                "single-hot": 10,
+                "hot": {"1": 10},
+                "atomic": {"1": 10},
+                "wait-notify": {"1": 10},
+                "spawn-join": {"1": 10},
+                "cancel-hot": {"1": 10},
+            }
         },
-        "timeout_seconds": 60,
-        "minimum_timed_interval_ns": 1,
+        "timeout_seconds": 90,
+        "minimum_timed_interval_ns": 1_250_000_000,
         "atomic_wait_preflight_runs": 64,
         "scheduler_barrier_preflight": {
             "enabled": False,
@@ -115,8 +120,15 @@ def make_report(
             "timing_overhead_ratio_limit": (
                 bench.TIMING_OVERHEAD_RATIO_LIMIT
             ),
+            "target_barrier_ns": bench.TARGET_BARRIER_NS,
+            "target_required_interval_ns": (
+                bench.TARGET_BARRIER_REQUIRED_INTERVAL_NS
+            ),
+            "minimum_interval_headroom_ns": (
+                bench.MINIMUM_INTERVAL_HEADROOM_NS
+            ),
             "maximum_accepted_barrier_ns": (
-                bench.maximum_preflight_barrier_ns(1)
+                bench.maximum_preflight_barrier_ns(1_250_000_000)
             ),
             "acceptance_rule": (
                 "every probe must have timed_interval_ns >= "
@@ -185,9 +197,9 @@ def make_report(
                 0 if condition == pair["left"] else 1
             )
             elapsed = (
-                100 + condition_index * 20
+                1_500_000_000 + condition_index * 20_000_000
                 if revision == "baseline"
-                else 90 + condition_index * 30
+                else 1_400_000_000 + condition_index * 30_000_000
             )
             operations = 1_000
             throughput = operations / (elapsed / 1e9)
@@ -196,14 +208,37 @@ def make_report(
                 if "spawn-join" in pair["pair_key"]
                 else "steady-state-kernel"
             )
+            if pair["pair_kind"] == "single-infrastructure":
+                mode = pair["pair_key"].rsplit("/", 1)[1]
+                workload = "single-hot"
+                threads = 1
+                iterations = plan["iterations"][mode]["single-hot"]
+            elif pair["pair_kind"] == "cancel-point-cost":
+                mode = "aot"
+                workload = "hot"
+                threads = int(pair["pair_key"].rsplit("/", 1)[1])
+                iterations = plan["iterations"]["aot"]["cancel-hot"][
+                    str(threads)
+                ]
+            else:
+                _, workload, raw_threads, *_ = pair["pair_key"].split("/")
+                mode = (
+                    condition
+                    if pair["pair_kind"] == "runtime-parity"
+                    else pair["left"].removesuffix("-a")
+                )
+                threads = int(raw_threads)
+                iterations = plan["iterations"][mode][workload][
+                    str(threads)
+                ]
             return {
                 **fields,
-                "mode": "aot",
+                "mode": mode,
                 "threads_enabled": True,
                 "cancel_points": "on",
-                "workload": "hot",
-                "threads": 1,
-                "iterations": 10,
+                "workload": workload,
+                "threads": threads,
+                "iterations": iterations,
                 "command": ["wamr"],
                 "elapsed_ns": elapsed,
                 "guest_elapsed_ns": elapsed,
@@ -301,19 +336,19 @@ def make_report(
             "mode": "aot",
             "workload": "hot",
             "thread_counts": [1],
-            "minimum_timed_interval_ns": 1,
+            "minimum_timed_interval_ns": 1_250_000_000,
             "timing_overhead_ratio_limit": (
                 bench.TIMING_OVERHEAD_RATIO_LIMIT
             ),
             "maximum_accepted_barrier_ns": (
-                bench.maximum_preflight_barrier_ns(1)
+                bench.maximum_preflight_barrier_ns(1_250_000_000)
             ),
             "acceptance_rule": plan["scheduler_barrier_preflight"][
                 "acceptance_rule"
             ],
             "summary": None,
             "samples": [],
-            "host_quiescence": {},
+            "host_quiescence_at_start": {},
         },
         "budget": {"status": "disabled", "path": None, "failures": []},
     }
@@ -508,7 +543,7 @@ def flatten_report_ratios(report: dict) -> dict:
     """Make synthetic A/A and candidate ratios exactly one."""
 
     for record in report["records"]:
-        elapsed = 100
+        elapsed = 1_300_000_000
         record["elapsed_ns"] = elapsed
         record["guest_elapsed_ns"] = elapsed
         record["raw_guest_elapsed_ns"] = elapsed + 1
@@ -572,40 +607,64 @@ class ThreadBenchmarkTests(unittest.TestCase):
             ]
         )
         self.assertEqual((args.warmups, args.samples), (1, 4))
-        self.assertEqual(args.single_iterations, 224_000_000)
-        self.assertEqual(args.cancel_iterations, 224_000_000)
-        self.assertEqual(args.atomic_total_iterations, 256_000_000)
         self.assertEqual(
-            [bench.cancel_iterations(args, threads) for threads in (1, 2, 4, 8)],
-            [224_000_000, 128_000_000, 128_000_000, 128_000_000],
-        )
-        self.assertEqual(
-            [bench.atomic_iterations(args, threads) for threads in (1, 2, 4, 8)],
-            [256_000_000, 128_000_000, 64_000_000, 64_000_000],
-        )
-        atomic_scenarios = {
-            scenario.threads: scenario.iterations
-            for scenario in bench.planned_scenarios(args)
-            if scenario.workload == "atomic"
-        }
-        self.assertEqual(
-            atomic_scenarios,
-            {1: 256_000_000, 4: 64_000_000, 8: 64_000_000},
+            args.iteration_plan,
+            {
+                "aot": {
+                    "single-hot": 1_320_000_000,
+                    "hot": {
+                        "1": 1_320_000_000,
+                        "4": 660_000_000,
+                        "8": 330_000_000,
+                    },
+                    "atomic": {
+                        "1": 640_000_000,
+                        "4": 64_000_000,
+                        "8": 64_000_000,
+                    },
+                    "wait-notify": {
+                        "1": 1_600_000,
+                        "4": 32_000,
+                        "8": 16_000,
+                    },
+                    "spawn-join": {
+                        "1": 10_000,
+                        "4": 2_500,
+                        "8": 1_250,
+                    },
+                    "cancel-hot": {
+                        "1": 1_320_000_000,
+                        "4": 660_000_000,
+                        "8": 330_000_000,
+                    },
+                }
+            },
         )
         self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["smoke"], 8)
         self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"], 64)
         self.assertEqual(args.thread_counts, (1, 4, 8))
         self.assertEqual(args.modes, "aot")
-        self.assertEqual(args.min_interval_ms, 100)
+        self.assertEqual(args.min_interval_ms, 1_250)
+        self.assertEqual(args.timeout, 90)
         self.assertFalse(args.trusted_calibration_preflight)
         self.assertIsNone(args.baseline_repo)
         self.assertIsNone(args.candidate_repo)
-        wait_iterations = {
-            scenario.threads: scenario.iterations
-            for scenario in bench.planned_scenarios(args)
-            if scenario.workload == "wait-notify"
-        }
-        self.assertEqual(wait_iterations, {1: 512_000, 4: 128_000, 8: 64_000})
+        self.assertEqual(
+            [
+                (scenario.workload, scenario.threads)
+                for scenario in bench.planned_scenarios(args)
+            ],
+            [
+                (workload, threads)
+                for workload in (
+                    "hot",
+                    "atomic",
+                    "wait-notify",
+                    "spawn-join",
+                )
+                for threads in (1, 4, 8)
+            ],
+        )
         with self.assertRaises(SystemExit):
             bench.parse_args(["--thread-counts", "1,3"])
         with self.assertRaises(SystemExit):
@@ -619,6 +678,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             )
         with self.assertRaises(SystemExit):
             bench.parse_args(["--baseline-repo", "baseline"])
+        with self.assertRaises(SystemExit):
+            bench.parse_args(["--min-interval-ms", "1249", "--no-budget"])
         paired = bench.parse_args(
             [
                 "--baseline-repo",
@@ -677,8 +738,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
     def test_preflight_boundary_is_strict_and_interval_is_unchanged(self) -> None:
         minimum = int(bench.MIN_TIMED_INTERVAL_MS * 1_000_000)
         maximum = bench.maximum_preflight_barrier_ns(minimum)
-        self.assertEqual(minimum, 100_000_000)
-        self.assertEqual(maximum, 1_010_101)
+        self.assertEqual(minimum, 1_250_000_000)
+        self.assertEqual(maximum, 12_626_262)
+        self.assertEqual(bench.TARGET_BARRIER_NS, 12_456_000)
+        self.assertEqual(
+            bench.TARGET_BARRIER_REQUIRED_INTERVAL_NS, 1_233_144_000
+        )
+        self.assertEqual(bench.MINIMUM_INTERVAL_HEADROOM_NS, 16_856_000)
         self.assertTrue(
             bench.preflight_sample_accepted(maximum, minimum, minimum)
         )
@@ -688,6 +754,25 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertFalse(
             bench.preflight_sample_accepted(maximum, minimum - 1, minimum)
         )
+
+    def test_default_iteration_plan_is_explicit_per_mode_and_thread(self) -> None:
+        args = bench.parse_args(["--no-budget"])
+        self.assertEqual(args.iteration_plan, bench.DEFAULT_ITERATION_PLAN)
+        for mode in ("interpreter", "aot"):
+            self.assertEqual(
+                set(args.iteration_plan[mode]),
+                {
+                    "single-hot",
+                    "hot",
+                    "atomic",
+                    "wait-notify",
+                    "spawn-join",
+                }
+                | ({"cancel-hot"} if mode == "aot" else set()),
+            )
+            for workload, counts in args.iteration_plan[mode].items():
+                if workload != "single-hot":
+                    self.assertEqual(set(counts), {"1", "2", "4", "8"})
 
     def test_preflight_retains_every_fixed_probe_without_retry(self) -> None:
         build = bench.Build(
@@ -707,14 +792,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
             12_000,
             13_000,
             14_000,
-            1_010_102,
+            12_626_263,
             15_000,
             16_000,
         ]
 
         def fake_measure(**kwargs):
             overhead = values.pop(0)
-            timed = 100_000_000
+            timed = 1_250_000_000
             raw = timed + overhead
             return {
                 "timing_overhead_ns": overhead,
@@ -732,9 +817,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 build=build,
                 module=Path("fixture"),
                 thread_counts=(2, 8),
-                iterations=128_000_000,
+                iterations_by_thread={"2": 1_320_000_000, "8": 330_000_000},
                 timeout=60,
-                minimum_interval_ns=100_000_000,
+                minimum_interval_ns=1_250_000_000,
                 static_cancel_poll_sites=1,
             )
         self.assertEqual(measure.call_count, 8)
@@ -742,11 +827,24 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(len(result["samples"]), 8)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(
+            [sample["iterations"] for sample in result["samples"]],
+            [1_320_000_000] * 4 + [330_000_000] * 4,
+        )
+        self.assertEqual(
             [sample["timing_overhead_ns"] for sample in result["samples"]],
-            [10_000, 11_000, 12_000, 13_000, 14_000, 1_010_102, 15_000, 16_000],
+            [
+                10_000,
+                11_000,
+                12_000,
+                13_000,
+                14_000,
+                12_626_263,
+                15_000,
+                16_000,
+            ],
         )
 
-    def test_failure_diagnostic_is_written_before_error(self) -> None:
+    def test_measurement_wrapper_writes_diagnostic_before_rethrow(self) -> None:
         error = bench.TimingQualityError(
             "guest timing overhead 1.833% is not below 1%",
             raw_elapsed_ns=339_827_000,
@@ -765,33 +863,54 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "timing_overhead_ns": 16_000,
             }
         ]
-        with self.assertRaises(bench.TimingQualityError):
-            bench.raise_with_failure_diagnostic(
-                error,
-                output=output,
-                stage="measurement",
-                reason=error.reason,
-                scenario={
-                    "revision": "baseline",
-                    "mode": "aot",
-                    "workload": "hot",
-                    "threads": 2,
-                    "condition": "aot",
-                },
-                timing_overhead_ns=error.timing_overhead_ns,
-                timed_interval_ns=error.elapsed_ns,
-                raw_elapsed_ns=error.raw_elapsed_ns,
-                timing_overhead_ppm=error.timing_overhead_ppm,
-                minimum_interval_ns=100_000_000,
-                host={"runner_name": "runner"},
-                host_pair={
-                    "id": "pair",
-                    "runner_environment": "self-hosted",
-                    "host_fingerprint_sha256": "a" * 64,
-                },
-                host_quiescence={"available_cpu_count": 8},
-                preflight_samples=samples,
-            )
+        start_snapshot = {"available_cpu_count": 8, "snapshot": "start"}
+        failure_snapshot = {"available_cpu_count": 7, "snapshot": "failure"}
+        with (
+            mock.patch.object(bench, "measure_once", side_effect=error),
+            mock.patch.object(
+                bench,
+                "host_quiescence_diagnostics",
+                return_value=failure_snapshot,
+            ),
+        ):
+            try:
+                bench.measure_with_quality_diagnostic(
+                    output=output,
+                    stage="measurement",
+                    minimum_interval_ns=1_250_000_000,
+                    host={"runner_name": "runner"},
+                    host_pair={
+                        "id": "pair",
+                        "runner_environment": "github-hosted",
+                        "host_fingerprint_sha256": "a" * 64,
+                    },
+                    host_quiescence_at_start=start_snapshot,
+                    preflight_samples=samples,
+                    repo=ROOT,
+                    runner=[],
+                    build=mock.sentinel.build,
+                    module=Path("fixture"),
+                    workload="hot",
+                    threads=2,
+                    iterations=1_320_000_000,
+                    timeout=90,
+                    min_interval_ns=1_250_000_000,
+                    record_fields={
+                        "revision": "baseline",
+                        "mode": "aot",
+                        "condition": "aot",
+                        "pair_key": "runtime/hot/2",
+                        "pair_index": 0,
+                        "phase": "measure",
+                    },
+                )
+            except bench.TimingQualityError as caught:
+                self.assertIs(caught, error)
+                self.assertTrue(
+                    (output / "failure-diagnostic.json").is_file()
+                )
+            else:
+                self.fail("TimingQualityError was not rethrown")
         diagnostic = json.loads(
             (output / "failure-diagnostic.json").read_text(encoding="UTF-8")
         )
@@ -799,8 +918,20 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(diagnostic["timing_overhead_ns"], 6_228_000)
         self.assertEqual(diagnostic["timed_interval_ns"], 333_599_000)
         self.assertEqual(diagnostic["timing_overhead_ratio_limit"], 0.01)
+        self.assertAlmostEqual(
+            diagnostic["ratio_at_minimum_timed_interval"],
+            6_228_000 / 1_256_228_000,
+        )
+        self.assertEqual(
+            diagnostic["host_quiescence_at_start"], start_snapshot
+        )
+        self.assertEqual(
+            diagnostic["host_quiescence_at_failure"], failure_snapshot
+        )
         self.assertEqual(diagnostic["preflight_samples"], samples)
         self.assertTrue((output / "failure-diagnostic.md").is_file())
+        self.assertFalse((output / "report.json").exists())
+        self.assertFalse((output / "report.md").exists())
 
     def test_workflow_enables_trusted_preflight_and_retains_failures(self) -> None:
         workflow = (
@@ -819,6 +950,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             trusted_arm.count("--trusted-calibration-preflight"), 1
         )
         for section in (hosted, trusted_x86, trusted_arm):
+            self.assertIn("timeout-minutes: 120", section)
+            self.assertIn("--timeout 90", section)
             self.assertIn("failure-diagnostic.json", section)
             self.assertIn("failure-diagnostic.md", section)
             self.assertLess(
@@ -964,7 +1097,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "--spawn-iterations",
                 "1",
                 "--min-interval-ms",
-                "0.000001",
+                "1250",
                 "--no-budget",
             ]
         )
@@ -991,13 +1124,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
             return {
                 **fields,
                 "command": ["wamr"],
-                "elapsed_ns": 100,
-                "guest_elapsed_ns": 100,
-                "raw_guest_elapsed_ns": 101,
+                "elapsed_ns": 1_300_000_000,
+                "guest_elapsed_ns": 1_300_000_000,
+                "raw_guest_elapsed_ns": 1_300_000_001,
                 "timing_overhead_ns": 1,
                 "timing_overhead_ppm": 1,
-                "host_wall_elapsed_ns": 200,
-                "host_wall_over_guest": 2.0,
+                "host_wall_elapsed_ns": 1_300_000_100,
+                "host_wall_over_guest": 1_300_000_100 / 1_300_000_000,
                 "metric_kind": (
                     "spawn-join-lifecycle"
                     if kwargs["workload"] == "spawn-join"
@@ -1005,8 +1138,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 ),
                 "cancel_polls_per_operation": 0.0,
                 "operations": 1,
-                "throughput_ops_per_second": 10_000_000.0,
-                "per_thread_ops_per_second": 10_000_000.0,
+                "throughput_ops_per_second": 1 / 1.3,
+                "per_thread_ops_per_second": 1 / 1.3,
                 "guest": {},
                 "correct": True,
                 "correctness": {"passed": True},
@@ -1424,20 +1557,22 @@ class ThreadBenchmarkTests(unittest.TestCase):
         ratio = report["ratio_of_ratios_summaries"][0]
         self.assertAlmostEqual(
             ratio["elapsed_ratio_of_ratios"]["median"],
-            (120 / 90) / (120 / 100),
+            (1_430_000_000 / 1_400_000_000)
+            / (1_520_000_000 / 1_500_000_000),
         )
         self.assertAlmostEqual(
             ratio["throughput_ratio_of_ratios"]["median"],
-            (90 / 120) / (100 / 120),
+            (1_400_000_000 / 1_430_000_000)
+            / (1_500_000_000 / 1_520_000_000),
         )
         budget = complete_budget(report)
         platform = budget["platforms"][report["metadata"]["platform_id"]]
         platform["ratio_of_ratios"][0][
             "min_candidate_over_baseline_throughput_ratio_of_ratios"
-        ] = 0.95
+        ] = 0.995
         platform["ratio_of_ratios"][0][
             "max_candidate_over_baseline_elapsed_ratio_of_ratios"
-        ] = 1.05
+        ] = 1.005
         loaded = bench.load_budget(self.write_budget(budget), report)
         failures = bench.evaluate_budget(loaded, report)
         self.assertTrue(
@@ -1482,8 +1617,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             lambda value: value.__setitem__(
                 "timeout_seconds", value["timeout_seconds"] + 1
             ),
-            lambda value: value["iterations"].__setitem__(
-                "hot", value["iterations"]["hot"] + 1
+            lambda value: value["iterations"]["aot"]["hot"].__setitem__(
+                "1", value["iterations"]["aot"]["hot"]["1"] + 1
             ),
             lambda value: value.__setitem__("samples", value["samples"] + 2),
             lambda value: value["pairs"][0].__setitem__(
@@ -2680,6 +2815,84 @@ class ThreadBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(bench.HarnessError, "unsupported WAMR AOT version"):
             bench.aot_text_section(unsupported)
 
+    def test_enabled_quality_preflight_validates_in_code_and_schema(self) -> None:
+        report = make_report(
+            comparison_purpose="noise-calibration",
+            baseline_commit="a" * 40,
+            baseline_source="c" * 64,
+            candidate_source="c" * 64,
+        )
+        plan = report["plan"]
+        plan["scheduler_barrier_preflight"]["enabled"] = True
+        plan["scheduler_barrier_preflight"]["probe_count"] = 4
+        samples = []
+        for probe_index, overhead in enumerate(
+            (6_228_000, 40_000, 50_000, 60_000)
+        ):
+            timed = 1_300_000_000
+            raw = timed + overhead
+            samples.append(
+                {
+                    "probe_index": probe_index,
+                    "mode": "aot",
+                    "workload": "hot",
+                    "threads": 1,
+                    "iterations": 10,
+                    "timing_overhead_ns": overhead,
+                    "timed_interval_ns": timed,
+                    "raw_elapsed_ns": raw,
+                    "timing_overhead_ppm": overhead * 1_000_000 // raw,
+                    "timing_overhead_ratio": overhead / raw,
+                    "ratio_at_minimum_timed_interval": overhead
+                    / (1_250_000_000 + overhead),
+                    "accepted": True,
+                }
+            )
+        report["quality_preflight"] = {
+            "enabled": True,
+            "status": "passed",
+            "probe_count": 4,
+            "probes_per_thread": 4,
+            "mode": "aot",
+            "workload": "hot",
+            "thread_counts": [1],
+            "minimum_timed_interval_ns": 1_250_000_000,
+            "timing_overhead_ratio_limit": 0.01,
+            "maximum_accepted_barrier_ns": (
+                bench.maximum_preflight_barrier_ns(1_250_000_000)
+            ),
+            "acceptance_rule": plan["scheduler_barrier_preflight"][
+                "acceptance_rule"
+            ],
+            "summary": {
+                "minimum_barrier_ns": 40_000,
+                "median_barrier_ns": 55_000.0,
+                "maximum_barrier_ns": 6_228_000,
+            },
+            "samples": samples,
+            "host_quiescence_at_start": {"snapshot": "start"},
+        }
+        plan_sha256 = cache_key(plan)
+        report["metadata"]["plan_sha256"] = plan_sha256
+        report["metadata"]["measurement_plan_sha256"] = (
+            bench.measurement_plan_sha256(plan)
+        )
+        for revision in report["metadata"]["revisions"].values():
+            revision["plan_sha256"] = plan_sha256
+        for record in report["records"]:
+            record["plan_sha256"] = plan_sha256
+        schema_document = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "benchmarks"
+                / "wasi-threads"
+                / "report.schema.json"
+            ).read_text(encoding="UTF-8")
+        )
+        bench.validate_report(report)
+        jsonschema.Draft202012Validator(schema_document).validate(report)
+
     def test_fixture_hashes_and_schema_are_pinned(self) -> None:
         fixtures = bench.resolve_fixtures(ROOT)
         self.assertEqual(fixtures["single"]["sha256"], bench.FIXTURES["single"]["sha256"])
@@ -2701,6 +2914,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             schema["$schema"],
             "https://json-schema.org/draft/2020-12/schema",
         )
+        jsonschema.Draft202012Validator.check_schema(schema)
         self.assertIn("revision_checkouts", schema["properties"]["metadata"]["required"])
         self.assertIn("comparison_purpose", schema["properties"]["plan"]["required"])
         self.assertIn(
@@ -2712,6 +2926,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "measurement_plan_version"
             ]["const"],
             bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
+        )
+        preflight_schema = schema["$defs"]["scheduler_barrier_preflight_plan"]
+        self.assertEqual(
+            preflight_schema["properties"]["target_barrier_ns"]["const"],
+            bench.TARGET_BARRIER_NS,
+        )
+        self.assertIn(
+            "host_quiescence_at_start",
+            schema["$defs"]["quality_preflight"]["required"],
         )
         paired_contract = schema["allOf"][0]["then"]["properties"]
         self.assertEqual(
@@ -2733,6 +2956,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         for report in (make_report(), make_single_report()):
             self.assertEqual(set(report), set(schema["required"]))
             bench.validate_report(report)
+            jsonschema.Draft202012Validator(schema).validate(report)
         budget_schema = json.loads(
             (
                 ROOT
