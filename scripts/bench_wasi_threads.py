@@ -60,6 +60,8 @@ ATOMIC_WAIT_PREFLIGHT_RUNS = {
     "smoke": 8,
 }
 MIN_TIMED_INTERVAL_MS = 100.0
+TIMING_OVERHEAD_RATIO_LIMIT = 0.01
+TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD = 4
 AOT_VERSION = 11
 # Stable fast-path signatures emitted by emitCancelPoint in each backend.
 # Counting these signatures avoids treating instruction-sequence byte sizes as
@@ -112,6 +114,38 @@ def measurement_plan_sha256(plan: dict[str, Any]) -> str:
 
 class HarnessError(RuntimeError):
     pass
+
+
+class TimingQualityError(HarnessError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_elapsed_ns: int,
+        timing_overhead_ns: int,
+        elapsed_ns: int,
+        timing_overhead_ppm: int,
+        reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.raw_elapsed_ns = raw_elapsed_ns
+        self.timing_overhead_ns = timing_overhead_ns
+        self.elapsed_ns = elapsed_ns
+        self.timing_overhead_ppm = timing_overhead_ppm
+        self.reason = reason
+
+
+class PreflightProbeError(HarnessError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        samples: list[dict[str, Any]],
+        scenario: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.samples = samples
+        self.scenario = scenario
 
 
 @dataclass(frozen=True)
@@ -348,6 +382,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--budget", type=Path)
     parser.add_argument("--no-budget", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument(
+        "--trusted-calibration-preflight",
+        action="store_true",
+        help=(
+            "run the fixed scheduler/barrier quality preflight; valid only for "
+            "paired noise calibration"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.warmups is None or args.samples is None:
         default_warmups, default_samples = PROFILE_COUNTS[args.profile]
@@ -396,6 +438,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--host-pair-id must not be empty")
     if args.runner_environment is not None and not args.runner_environment.strip():
         parser.error("--runner-environment must not be empty")
+    if args.trusted_calibration_preflight and (
+        not paired or args.comparison_purpose != "noise-calibration"
+    ):
+        parser.error(
+            "--trusted-calibration-preflight requires paired noise calibration"
+        )
     return args
 
 
@@ -474,6 +522,169 @@ def host_pair_identity(
         "runner_environment": host["runner_environment"],
         "host_fingerprint_sha256": fingerprint_sha256,
     }
+
+
+def host_quiescence_diagnostics() -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "logical_cpus": os.cpu_count(),
+        "available_cpu_count": None,
+        "cpu_affinity": [],
+        "load_average": None,
+        "proc_loadavg": None,
+        "cpu_pressure": None,
+        "runner_worker_process_count": None,
+        "runner_job": {
+            "runner_name": os.getenv("RUNNER_NAME", ""),
+            "github_run_id": os.getenv("GITHUB_RUN_ID", ""),
+            "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
+            "github_job": os.getenv("GITHUB_JOB", ""),
+            "github_workflow": os.getenv("GITHUB_WORKFLOW", ""),
+        },
+    }
+    try:
+        affinity = sorted(os.sched_getaffinity(0))
+        diagnostics["cpu_affinity"] = affinity
+        diagnostics["available_cpu_count"] = len(affinity)
+    except (AttributeError, OSError):
+        pass
+    try:
+        diagnostics["load_average"] = list(os.getloadavg())
+    except (AttributeError, OSError):
+        pass
+    try:
+        diagnostics["proc_loadavg"] = Path("/proc/loadavg").read_text(
+            encoding="UTF-8"
+        ).strip()
+    except OSError:
+        pass
+    try:
+        diagnostics["cpu_pressure"] = Path("/proc/pressure/cpu").read_text(
+            encoding="UTF-8"
+        ).strip()
+    except OSError:
+        pass
+    try:
+        diagnostics["runner_worker_process_count"] = sum(
+            1
+            for comm in Path("/proc").glob("[0-9]*/comm")
+            if comm.read_text(encoding="UTF-8").strip() == "Runner.Worker"
+        )
+    except OSError:
+        pass
+    return diagnostics
+
+
+def maximum_preflight_barrier_ns(minimum_interval_ns: int) -> int:
+    if minimum_interval_ns <= 0:
+        raise HarnessError("minimum timed interval must be positive")
+    return (minimum_interval_ns - 1) // 99
+
+
+def preflight_sample_accepted(
+    timing_overhead_ns: int,
+    timed_interval_ns: int,
+    minimum_interval_ns: int,
+) -> bool:
+    return (
+        timed_interval_ns >= minimum_interval_ns
+        and timing_overhead_ns >= 0
+        and 99 * timing_overhead_ns < minimum_interval_ns
+    )
+
+
+def failure_diagnostic_markdown(document: dict[str, Any]) -> str:
+    scenario = document["scenario"]
+    lines = [
+        "# WASI threaded benchmark quality failure",
+        "",
+        f"- Stage: `{document['stage']}`",
+        f"- Reason: `{document['reason']}`",
+        f"- Scenario: `{scenario.get('workload', '')}` / "
+        f"`{scenario.get('mode', '')}` / {scenario.get('threads', '')} threads",
+        f"- Barrier: `{document['timing_overhead_ns']}` ns",
+        f"- Timed interval: `{document['timed_interval_ns']}` ns",
+        f"- Ratio: `{document['timing_overhead_ratio']}`",
+        (
+            "- Ratio at minimum interval: "
+            f"`{document['ratio_at_minimum_timed_interval']}`"
+        ),
+        f"- Fixed limit: `< {document['timing_overhead_ratio_limit']}`",
+        f"- Runner: `{document['host'].get('runner_name', '')}`",
+        f"- Host fingerprint: "
+        f"`{document['host_pair']['host_fingerprint_sha256']}`",
+        "",
+        f"All {len(document['preflight_samples'])} preflight samples are retained "
+        "in `failure-diagnostic.json`.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_failure_diagnostic(
+    *,
+    output: Path,
+    stage: str,
+    reason: str,
+    scenario: dict[str, Any],
+    timing_overhead_ns: int | None,
+    timed_interval_ns: int | None,
+    raw_elapsed_ns: int | None,
+    timing_overhead_ppm: int | None,
+    minimum_interval_ns: int,
+    host: dict[str, Any],
+    host_pair: dict[str, str],
+    host_quiescence: dict[str, Any],
+    preflight_samples: list[dict[str, Any]],
+    message: str,
+    ratio_at_minimum_timed_interval: float | None = None,
+) -> dict[str, Any]:
+    ratio = (
+        timing_overhead_ns / raw_elapsed_ns
+        if timing_overhead_ns is not None
+        and raw_elapsed_ns is not None
+        and raw_elapsed_ns > 0
+        else None
+    )
+    document = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "wasi-thread-benchmark-quality-failure",
+        "collected_at": collected_at(),
+        "stage": stage,
+        "reason": reason,
+        "message": message,
+        "scenario": scenario,
+        "timing_overhead_ns": timing_overhead_ns,
+        "timed_interval_ns": timed_interval_ns,
+        "raw_elapsed_ns": raw_elapsed_ns,
+        "timing_overhead_ppm": timing_overhead_ppm,
+        "timing_overhead_ratio": ratio,
+        "ratio_at_minimum_timed_interval": (
+            ratio_at_minimum_timed_interval
+        ),
+        "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "maximum_preflight_barrier_ns": maximum_preflight_barrier_ns(
+            minimum_interval_ns
+        ),
+        "host": host,
+        "host_pair": host_pair,
+        "host_quiescence": host_quiescence,
+        "preflight_samples": preflight_samples,
+    }
+    atomic_write_json(output / "failure-diagnostic.json", document)
+    (output / "failure-diagnostic.md").write_text(
+        failure_diagnostic_markdown(document) + "\n",
+        encoding="UTF-8",
+    )
+    return document
+
+
+def raise_with_failure_diagnostic(
+    error: HarnessError,
+    **diagnostic: Any,
+) -> None:
+    write_failure_diagnostic(**diagnostic, message=str(error))
+    raise error
 
 
 def controlled_env(cache_root: Path) -> dict[str, str]:
@@ -780,6 +991,8 @@ def parse_guest_result(
     stdout: str,
     expected: dict[str, int | str],
     min_interval_ns: int,
+    *,
+    enforce_timing_quality: bool = True,
 ) -> dict[str, int | str]:
     lines = [line for line in stdout.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -820,13 +1033,23 @@ def parse_guest_result(
     expected_ppm = overhead * 1_000_000 // raw
     if overhead_ppm != expected_ppm:
         raise HarnessError("guest timing_overhead_ppm is inconsistent")
-    if overhead_ppm >= 10_000:
-        raise HarnessError(
-            f"guest timing overhead {overhead_ppm / 10_000:.3f}% is not below 1%"
+    if enforce_timing_quality and overhead_ppm >= 10_000:
+        raise TimingQualityError(
+            f"guest timing overhead {overhead_ppm / 10_000:.3f}% is not below 1%",
+            raw_elapsed_ns=raw,
+            timing_overhead_ns=overhead,
+            elapsed_ns=elapsed,
+            timing_overhead_ppm=overhead_ppm,
+            reason="timing-overhead",
         )
-    if elapsed < min_interval_ns:
-        raise HarnessError(
-            f"guest timed interval {elapsed}ns is below required {min_interval_ns}ns"
+    if enforce_timing_quality and elapsed < min_interval_ns:
+        raise TimingQualityError(
+            f"guest timed interval {elapsed}ns is below required {min_interval_ns}ns",
+            raw_elapsed_ns=raw,
+            timing_overhead_ns=overhead,
+            elapsed_ns=elapsed,
+            timing_overhead_ppm=overhead_ppm,
+            reason="minimum-timed-interval",
         )
     return result
 
@@ -908,6 +1131,7 @@ def measure_once(
     timeout: float,
     min_interval_ns: int,
     record_fields: dict[str, Any],
+    enforce_timing_quality: bool = True,
 ) -> dict[str, Any]:
     guest_args = (
         [str(iterations)]
@@ -937,7 +1161,12 @@ def measure_once(
             f"exit {returncode}: {' '.join(command)}\n{stderr}"
         )
     expected = expected_result(workload, threads, iterations)
-    guest = parse_guest_result(stdout, expected, min_interval_ns)
+    guest = parse_guest_result(
+        stdout,
+        expected,
+        min_interval_ns,
+        enforce_timing_quality=enforce_timing_quality,
+    )
     operations = int(guest["operations"])
     guest_elapsed_ns = int(guest["elapsed_ns"])
     throughput = operations / (guest_elapsed_ns / 1e9)
@@ -972,6 +1201,108 @@ def measure_once(
         },
         "stdout": stdout,
         "stderr": stderr,
+    }
+
+
+def run_trusted_barrier_preflight(
+    *,
+    repo: Path,
+    runner: list[str],
+    build: Build,
+    module: Path,
+    thread_counts: tuple[int, ...],
+    iterations: int,
+    timeout: float,
+    minimum_interval_ns: int,
+    static_cancel_poll_sites: int,
+) -> dict[str, Any]:
+    samples: list[dict[str, Any]] = []
+    for threads in thread_counts:
+        for probe_index in range(TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD):
+            try:
+                measured = measure_once(
+                    repo=repo,
+                    runner=runner,
+                    build=build,
+                    module=module,
+                    workload="hot",
+                    threads=threads,
+                    iterations=iterations,
+                    timeout=timeout,
+                    min_interval_ns=minimum_interval_ns,
+                    enforce_timing_quality=False,
+                    record_fields={
+                        "mode": "aot",
+                        "threads_enabled": True,
+                        "cancel_points": "on",
+                        "static_cancel_poll_sites": static_cancel_poll_sites,
+                        "workload": "hot",
+                        "threads": threads,
+                        "iterations": iterations,
+                    },
+                )
+            except HarnessError as exc:
+                raise PreflightProbeError(
+                    str(exc),
+                    samples=copy.deepcopy(samples),
+                    scenario={
+                        "mode": "aot",
+                        "workload": "hot",
+                        "threads": threads,
+                        "probe_index": probe_index,
+                    },
+                ) from exc
+            overhead = measured["timing_overhead_ns"]
+            timed = measured["guest_elapsed_ns"]
+            raw = measured["raw_guest_elapsed_ns"]
+            samples.append(
+                {
+                    "probe_index": probe_index,
+                    "mode": "aot",
+                    "workload": "hot",
+                    "threads": threads,
+                    "iterations": iterations,
+                    "timing_overhead_ns": overhead,
+                    "timed_interval_ns": timed,
+                    "raw_elapsed_ns": raw,
+                    "timing_overhead_ppm": measured["timing_overhead_ppm"],
+                    "timing_overhead_ratio": overhead / raw,
+                    "ratio_at_minimum_timed_interval": (
+                        overhead / (minimum_interval_ns + overhead)
+                    ),
+                    "accepted": preflight_sample_accepted(
+                        overhead,
+                        timed,
+                        minimum_interval_ns,
+                    ),
+                }
+            )
+    overhead_values = [sample["timing_overhead_ns"] for sample in samples]
+    return {
+        "enabled": True,
+        "status": (
+            "passed" if all(sample["accepted"] for sample in samples) else "failed"
+        ),
+        "probe_count": len(samples),
+        "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
+        "mode": "aot",
+        "workload": "hot",
+        "thread_counts": list(thread_counts),
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
+            minimum_interval_ns
+        ),
+        "acceptance_rule": (
+            "every probe must have timed_interval_ns >= minimum_timed_interval_ns "
+            "and 99 * timing_overhead_ns < minimum_timed_interval_ns"
+        ),
+        "summary": {
+            "minimum_barrier_ns": min(overhead_values),
+            "median_barrier_ns": statistics.median(overhead_values),
+            "maximum_barrier_ns": max(overhead_values),
+        },
+        "samples": samples,
     }
 
 
@@ -1364,6 +1695,25 @@ def validate_report(document: dict[str, Any]) -> None:
         plan.get("minimum_timed_interval_ns", 0) > 0,
         "plan.minimum_timed_interval_ns",
     )
+    preflight_plan = plan.get("scheduler_barrier_preflight")
+    require(
+        isinstance(preflight_plan, dict),
+        "plan.scheduler_barrier_preflight",
+    )
+    require(
+        isinstance(preflight_plan.get("enabled"), bool)
+        and isinstance(preflight_plan.get("acceptance_rule"), str)
+        and bool(preflight_plan["acceptance_rule"])
+        and preflight_plan.get("mode") == "aot"
+        and preflight_plan.get("workload") == "hot"
+        and preflight_plan.get("probes_per_thread")
+        == TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+        and preflight_plan.get("timing_overhead_ratio_limit")
+        == TIMING_OVERHEAD_RATIO_LIMIT
+        and preflight_plan.get("maximum_accepted_barrier_ns")
+        == maximum_preflight_barrier_ns(plan["minimum_timed_interval_ns"]),
+        "plan.scheduler_barrier_preflight policy",
+    )
     revision_mode = plan.get("revision_mode")
     comparison_purpose = plan.get("comparison_purpose")
     if revision_mode == "paired-revisions":
@@ -1390,6 +1740,23 @@ def validate_report(document: dict[str, Any]) -> None:
         plan.get("revision_roles") == list(revision_roles),
         "plan.revision_roles",
     )
+    expected_preflight_count = (
+        TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+        * len(plan.get("thread_counts", []))
+        if preflight_plan.get("enabled") is True
+        else 0
+    )
+    require(
+        preflight_plan.get("probe_count") == expected_preflight_count,
+        "plan.scheduler_barrier_preflight probe count",
+    )
+    if preflight_plan["enabled"]:
+        require(
+            revision_mode == "paired-revisions"
+            and comparison_purpose == "noise-calibration"
+            and "aot" in plan.get("modes", []),
+            "trusted quality preflight activation",
+        )
     require(metadata["plan_sha256"] == cache_key(plan), "metadata.plan_sha256")
     require(
         metadata["measurement_plan_sha256"]
@@ -1557,6 +1924,108 @@ def validate_report(document: dict[str, Any]) -> None:
             revisions["baseline"]["build_source_sha256"]
             != revisions["candidate"]["build_source_sha256"],
             "budget enforcement requires distinct build identities",
+        )
+    quality_preflight = document.get("quality_preflight")
+    require(isinstance(quality_preflight, dict), "quality_preflight")
+    require(
+        quality_preflight.get("enabled") is preflight_plan.get("enabled"),
+        "quality_preflight enabled",
+    )
+    require(
+        quality_preflight.get("probe_count") == expected_preflight_count
+        and quality_preflight.get("probes_per_thread")
+        == TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+        and quality_preflight.get("minimum_timed_interval_ns")
+        == plan["minimum_timed_interval_ns"]
+        and quality_preflight.get("timing_overhead_ratio_limit")
+        == TIMING_OVERHEAD_RATIO_LIMIT
+        and quality_preflight.get("maximum_accepted_barrier_ns")
+        == maximum_preflight_barrier_ns(plan["minimum_timed_interval_ns"])
+        and quality_preflight.get("mode") == preflight_plan["mode"]
+        and quality_preflight.get("workload") == preflight_plan["workload"]
+        and quality_preflight.get("thread_counts") == plan["thread_counts"]
+        and quality_preflight.get("acceptance_rule")
+        == preflight_plan["acceptance_rule"]
+        and isinstance(quality_preflight.get("host_quiescence"), dict),
+        "quality_preflight policy",
+    )
+    preflight_samples = quality_preflight.get("samples")
+    require(isinstance(preflight_samples, list), "quality_preflight samples")
+    require(
+        len(preflight_samples) == expected_preflight_count,
+        "quality_preflight sample count",
+    )
+    if preflight_plan["enabled"]:
+        require(
+            quality_preflight.get("status") == "passed",
+            "quality_preflight status",
+        )
+        require(
+            all(
+                sample.get("accepted") is True
+                and preflight_sample_accepted(
+                    sample.get("timing_overhead_ns", -1),
+                    sample.get("timed_interval_ns", -1),
+                    plan["minimum_timed_interval_ns"],
+                )
+                for sample in preflight_samples
+            ),
+            "quality_preflight acceptance",
+        )
+        expected_probe_order = [
+            (threads, probe_index)
+            for threads in plan["thread_counts"]
+            for probe_index in range(
+                TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+            )
+        ]
+        require(
+            [
+                (sample.get("threads"), sample.get("probe_index"))
+                for sample in preflight_samples
+            ]
+            == expected_probe_order,
+            "quality_preflight probe order",
+        )
+        for sample in preflight_samples:
+            overhead = sample["timing_overhead_ns"]
+            timed = sample["timed_interval_ns"]
+            raw = sample.get("raw_elapsed_ns")
+            require(
+                sample.get("mode") == "aot"
+                and sample.get("workload") == "hot"
+                and sample.get("iterations") == plan["iterations"]["hot"]
+                and raw == timed + overhead
+                and sample.get("timing_overhead_ppm")
+                == overhead * 1_000_000 // raw
+                and math.isclose(
+                    sample.get("timing_overhead_ratio", -1),
+                    overhead / raw,
+                )
+                and math.isclose(
+                    sample.get("ratio_at_minimum_timed_interval", -1),
+                    overhead
+                    / (plan["minimum_timed_interval_ns"] + overhead),
+                ),
+                "quality_preflight sample",
+            )
+        overhead_values = [
+            sample["timing_overhead_ns"] for sample in preflight_samples
+        ]
+        require(
+            quality_preflight.get("summary")
+            == {
+                "minimum_barrier_ns": min(overhead_values),
+                "median_barrier_ns": statistics.median(overhead_values),
+                "maximum_barrier_ns": max(overhead_values),
+            },
+            "quality_preflight summary",
+        )
+    else:
+        require(
+            quality_preflight.get("status") == "not-requested"
+            and preflight_samples == [],
+            "disabled quality_preflight",
         )
     pair_plan = plan.get("pairs")
     require(isinstance(pair_plan, list) and pair_plan, "plan.pairs")
@@ -2270,6 +2739,15 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"({document['plan']['warmups']} warmups, {document['plan']['samples']} samples)",
         f"- Budget: `{document['budget']['status']}`",
     ]
+    quality_preflight = document["quality_preflight"]
+    if quality_preflight["enabled"]:
+        lines.append(
+            "- Scheduler/barrier preflight: "
+            f"`{quality_preflight['status']}`; "
+            f"{quality_preflight['probe_count']} fixed probes; maximum "
+            f"{quality_preflight['summary']['maximum_barrier_ns']} ns "
+            f"(limit {quality_preflight['maximum_accepted_barrier_ns']} ns)"
+        )
     poll_static = (
         document["metadata"]
         .get("aot_artifacts", {})
@@ -2386,6 +2864,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         else (repo / args.output_dir).resolve()
     )
     output.mkdir(parents=True, exist_ok=True)
+    for stale_output in (
+        output / "report.json",
+        output / "report.md",
+        output / "failure-diagnostic.json",
+        output / "failure-diagnostic.md",
+    ):
+        stale_output.unlink(missing_ok=True)
     sources = {
         role: source_identity(revision_repo)
         for role, revision_repo in revision_repos.items()
@@ -2418,6 +2903,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     fixture_set_sha256 = fixture_set_identities["candidate"]
     minimum_interval_ns = int(args.min_interval_ms * 1_000_000)
     modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
+    if args.trusted_calibration_preflight and "aot" not in modes:
+        raise HarnessError(
+            "trusted calibration preflight requires the AOT runtime path"
+        )
     pair_plan = planned_pair_specs(args, modes)
     runner = shlex.split(args.runner)
     plan = {
@@ -2441,6 +2930,27 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "timeout_seconds": args.timeout,
         "minimum_timed_interval_ns": minimum_interval_ns,
         "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
+        "scheduler_barrier_preflight": {
+            "enabled": args.trusted_calibration_preflight,
+            "mode": "aot",
+            "workload": "hot",
+            "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
+            "probe_count": (
+                TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+                * len(args.thread_counts)
+                if args.trusted_calibration_preflight
+                else 0
+            ),
+            "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+            "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
+                minimum_interval_ns
+            ),
+            "acceptance_rule": (
+                "every probe must have timed_interval_ns >= "
+                "minimum_timed_interval_ns and 99 * timing_overhead_ns < "
+                "minimum_timed_interval_ns"
+            ),
+        },
         "optimize": args.optimize,
         "pairs": pair_plan,
     }
@@ -2448,6 +2958,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     measurement_plan_identity = measurement_plan_sha256(plan)
     host = host_metadata(args.runner_environment)
     host_pair = host_pair_identity(args.platform_id, host, args.host_pair_id)
+    host_quiescence: dict[str, Any] = {}
     revisions = {
         role: {
             **sources[role],
@@ -2531,11 +3042,144 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "threaded_wasm": revision_repo / FIXTURES["threaded"]["path"],
         }
 
+    quality_preflight: dict[str, Any] = {
+        "enabled": False,
+        "status": "not-requested",
+        "probe_count": 0,
+        "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
+        "mode": "aot",
+        "workload": "hot",
+        "thread_counts": list(args.thread_counts),
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
+            minimum_interval_ns
+        ),
+        "acceptance_rule": plan["scheduler_barrier_preflight"][
+            "acceptance_rule"
+        ],
+        "summary": None,
+        "samples": [],
+        "host_quiescence": host_quiescence,
+    }
+    if args.trusted_calibration_preflight:
+        host_quiescence = host_quiescence_diagnostics()
+        context = contexts["candidate"]
+        try:
+            quality_preflight = run_trusted_barrier_preflight(
+                repo=context["repo"],
+                runner=runner,
+                build=context["builds"]["enabled-aot"],
+                module=context["aot_artifacts"]["threaded-polls-on"],
+                thread_counts=args.thread_counts,
+                iterations=args.hot_iterations,
+                timeout=args.timeout,
+                minimum_interval_ns=minimum_interval_ns,
+                static_cancel_poll_sites=context["aot_artifacts_metadata"][
+                    "cancel_poll_static"
+                ]["sites_enabled"],
+            )
+        except PreflightProbeError as exc:
+            raise_with_failure_diagnostic(
+                exc,
+                output=output,
+                stage="scheduler-barrier-preflight",
+                reason="probe-execution-failure",
+                scenario={
+                    "revision": "candidate",
+                    **exc.scenario,
+                    "condition": "cancel-points-on",
+                },
+                timing_overhead_ns=None,
+                timed_interval_ns=None,
+                raw_elapsed_ns=None,
+                timing_overhead_ppm=None,
+                minimum_interval_ns=minimum_interval_ns,
+                host=host,
+                host_pair=host_pair,
+                host_quiescence=host_quiescence,
+                preflight_samples=exc.samples,
+            )
+        quality_preflight["host_quiescence"] = host_quiescence
+        if quality_preflight["status"] != "passed":
+            failed = next(
+                sample
+                for sample in quality_preflight["samples"]
+                if not sample["accepted"]
+            )
+            message = (
+                "trusted scheduler/barrier preflight failed: "
+                f"{failed['timing_overhead_ns']}ns barrier cannot remain below "
+                f"1% at the fixed {minimum_interval_ns}ns minimum interval"
+            )
+            raise_with_failure_diagnostic(
+                HarnessError(message),
+                output=output,
+                stage="scheduler-barrier-preflight",
+                reason="timing-quality",
+                scenario={
+                    "revision": "candidate",
+                    "mode": failed["mode"],
+                    "workload": failed["workload"],
+                    "threads": failed["threads"],
+                    "condition": "cancel-points-on",
+                    "probe_index": failed["probe_index"],
+                },
+                timing_overhead_ns=failed["timing_overhead_ns"],
+                timed_interval_ns=failed["timed_interval_ns"],
+                raw_elapsed_ns=failed["raw_elapsed_ns"],
+                timing_overhead_ppm=failed["timing_overhead_ppm"],
+                minimum_interval_ns=minimum_interval_ns,
+                host=host,
+                host_pair=host_pair,
+                host_quiescence=host_quiescence,
+                preflight_samples=quality_preflight["samples"],
+                ratio_at_minimum_timed_interval=failed[
+                    "ratio_at_minimum_timed_interval"
+                ],
+            )
+
+    def measure_with_quality_diagnostic(
+        *,
+        stage: str = "measurement",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        try:
+            return measure_once(**kwargs)
+        except TimingQualityError as exc:
+            fields = kwargs["record_fields"]
+            raise_with_failure_diagnostic(
+                exc,
+                output=output,
+                stage=stage,
+                reason=exc.reason,
+                scenario={
+                    "revision": fields.get("revision"),
+                    "mode": fields.get("mode"),
+                    "workload": kwargs["workload"],
+                    "threads": kwargs["threads"],
+                    "condition": fields.get("condition"),
+                    "pair_key": fields.get("pair_key"),
+                    "pair_index": fields.get("pair_index"),
+                    "phase": fields.get("phase"),
+                },
+                timing_overhead_ns=exc.timing_overhead_ns,
+                timed_interval_ns=exc.elapsed_ns,
+                raw_elapsed_ns=exc.raw_elapsed_ns,
+                timing_overhead_ppm=exc.timing_overhead_ppm,
+                minimum_interval_ns=minimum_interval_ns,
+                host=host,
+                host_pair=host_pair,
+                host_quiescence=host_quiescence,
+                preflight_samples=quality_preflight["samples"],
+            )
+
     if "aot" in modes:
         for role in revision_roles:
             context = contexts[role]
             for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile]):
-                measure_once(
+                measure_with_quality_diagnostic(
+                    stage="atomic-wait-preflight",
                     repo=context["repo"],
                     runner=runner,
                     build=context["builds"]["enabled-aot"],
@@ -2586,7 +3230,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 if mode == "interpreter"
                 else context["aot_artifacts"]["single"]
             )
-            return measure_once(
+            return measure_with_quality_diagnostic(
                 repo=context["repo"],
                 runner=runner,
                 build=selected,
@@ -2637,7 +3281,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     if mode == "interpreter"
                     else context["aot_artifacts"]["threaded-polls-on"]
                 )
-                return measure_once(
+                return measure_with_quality_diagnostic(
                     repo=context["repo"],
                     runner=runner,
                     build=build,
@@ -2694,7 +3338,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     if mode == "interpreter"
                     else context["aot_artifacts"]["threaded-polls-on"]
                 )
-                return measure_once(
+                return measure_with_quality_diagnostic(
                     repo=context["repo"],
                     runner=runner,
                     build=build,
@@ -2750,7 +3394,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 aot_build = context["builds"]["enabled-aot"]
                 polls = "off" if condition == "cancel-points-off" else "on"
                 module = context["aot_artifacts"][f"threaded-polls-{polls}"]
-                return measure_once(
+                return measure_with_quality_diagnostic(
                     repo=context["repo"],
                     runner=runner,
                     build=aot_build,
@@ -2839,6 +3483,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "paired_summaries": pairs,
         "comparison_summaries": comparisons,
         "ratio_of_ratios_summaries": ratios,
+        "quality_preflight": quality_preflight,
         "budget": {
             "status": "disabled" if args.no_budget else "not-selected",
             "path": str(args.budget.resolve()) if args.budget else None,

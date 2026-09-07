@@ -237,7 +237,41 @@ purpose, profile, warmup/sample counts, and a runner target. The
 accepts only same-SHA `noise-calibration`, and verifies on a GitHub-hosted
 preparation job that the target is commit history reachable from `main`. Only
 its x86 job can select the repository-scoped `wamr-temp-20260906` label;
-AArch64 remains `ubuntu-24.04-arm`. The temporary runner was registered with
+AArch64 remains `ubuntu-24.04-arm`. Both trusted-calibration jobs explicitly
+enable the same fixed scheduler/barrier quality preflight; ordinary hosted
+PR/push diagnostics do not enable it.
+
+The preflight runs before any warmup or measured record. For each selected
+thread count it runs exactly four AOT `hot` invocations through the checked-in
+threaded guest's normal five-epoch release/completion barrier and runtime path.
+It never retries, discards a probe, or waits for quiet. Every probe is retained.
+With corrected minimum interval `E` and measured barrier `B`, the existing
+strict quality rule is `B / (E + B) < 0.01`, equivalently `99B < E`. At the
+fixed 100,000,000 ns minimum, the largest accepted barrier is therefore
+1,010,101 ns. All probes must also meet the minimum interval. Because that
+predeclared bound already guarantees the existing 1% rule at the shortest
+valid sample, no workload interval increase is required.
+The retained #966 diagnosis (result SHA-256
+`9cc9fcb34639a3756dfdc8ce9c267ffcecd1c8f1eec80a50c6d6f31e3d24a96f`)
+observed a 6,228,000 ns outlier, which this rule rejects rather than masking.
+
+The report retains the preflight values, min/median/max barrier summary, CPU
+affinity and availability, load average, Linux CPU pressure when available,
+the observable `Runner.Worker` process count, and runner/job identity. These
+host diagnostics are explanatory only; the guest-path preflight is the
+authoritative gate. A failed preflight, or a later sample rejected by the
+unchanged timing gate, writes `failure-diagnostic.json` and
+`failure-diagnostic.md` before exiting. The always-running artifact step uploads
+those files even when no normal report exists, and cleanup remains after upload.
+
+**Evidence validity and stop rule:** a run is eligible for cohort evidence only
+when the preflight passed and the complete normal report exists and validates.
+If any preflight probe or later sample fails, stop that workflow run, retain its
+diagnostic artifact, exclude the run rather than retrying or replacing its
+sample, and investigate host quiescence before starting a separately declared
+fresh run. Previously failed or partial evidence never becomes valid.
+
+The temporary runner was registered with
 `--no-default-labels`, so its complete job-routing inventory is the single
 `wamr-temp-20260906` label and its exact registered name is
 `vm31e-wamr-temp-20260906`.

@@ -104,6 +104,26 @@ def make_report(
         "timeout_seconds": 60,
         "minimum_timed_interval_ns": 1,
         "atomic_wait_preflight_runs": 64,
+        "scheduler_barrier_preflight": {
+            "enabled": False,
+            "mode": "aot",
+            "workload": "hot",
+            "probes_per_thread": (
+                bench.TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+            ),
+            "probe_count": 0,
+            "timing_overhead_ratio_limit": (
+                bench.TIMING_OVERHEAD_RATIO_LIMIT
+            ),
+            "maximum_accepted_barrier_ns": (
+                bench.maximum_preflight_barrier_ns(1)
+            ),
+            "acceptance_rule": (
+                "every probe must have timed_interval_ns >= "
+                "minimum_timed_interval_ns and 99 * timing_overhead_ns < "
+                "minimum_timed_interval_ns"
+            ),
+        },
         "optimize": "ReleaseFast",
         "pairs": [],
     }
@@ -271,6 +291,30 @@ def make_report(
         "ratio_of_ratios_summaries": bench.ratio_of_ratios_summaries(
             records
         ),
+        "quality_preflight": {
+            "enabled": False,
+            "status": "not-requested",
+            "probe_count": 0,
+            "probes_per_thread": (
+                bench.TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+            ),
+            "mode": "aot",
+            "workload": "hot",
+            "thread_counts": [1],
+            "minimum_timed_interval_ns": 1,
+            "timing_overhead_ratio_limit": (
+                bench.TIMING_OVERHEAD_RATIO_LIMIT
+            ),
+            "maximum_accepted_barrier_ns": (
+                bench.maximum_preflight_barrier_ns(1)
+            ),
+            "acceptance_rule": plan["scheduler_barrier_preflight"][
+                "acceptance_rule"
+            ],
+            "summary": None,
+            "samples": [],
+            "host_quiescence": {},
+        },
         "budget": {"status": "disabled", "path": None, "failures": []},
     }
     bench.validate_report(report)
@@ -553,6 +597,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.thread_counts, (1, 4, 8))
         self.assertEqual(args.modes, "aot")
         self.assertEqual(args.min_interval_ms, 100)
+        self.assertFalse(args.trusted_calibration_preflight)
         self.assertIsNone(args.baseline_repo)
         self.assertIsNone(args.candidate_repo)
         wait_iterations = {
@@ -613,6 +658,173 @@ class ThreadBenchmarkTests(unittest.TestCase):
             BenchmarkDataError, "samples must be even"
         ):
             make_report(samples=3)
+        with self.assertRaises(SystemExit):
+            bench.parse_args(["--trusted-calibration-preflight", "--no-budget"])
+        trusted = bench.parse_args(
+            [
+                "--baseline-repo",
+                "baseline",
+                "--candidate-repo",
+                "candidate",
+                "--comparison-purpose",
+                "noise-calibration",
+                "--trusted-calibration-preflight",
+                "--no-budget",
+            ]
+        )
+        self.assertTrue(trusted.trusted_calibration_preflight)
+
+    def test_preflight_boundary_is_strict_and_interval_is_unchanged(self) -> None:
+        minimum = int(bench.MIN_TIMED_INTERVAL_MS * 1_000_000)
+        maximum = bench.maximum_preflight_barrier_ns(minimum)
+        self.assertEqual(minimum, 100_000_000)
+        self.assertEqual(maximum, 1_010_101)
+        self.assertTrue(
+            bench.preflight_sample_accepted(maximum, minimum, minimum)
+        )
+        self.assertFalse(
+            bench.preflight_sample_accepted(maximum + 1, minimum, minimum)
+        )
+        self.assertFalse(
+            bench.preflight_sample_accepted(maximum, minimum - 1, minimum)
+        )
+
+    def test_preflight_retains_every_fixed_probe_without_retry(self) -> None:
+        build = bench.Build(
+            "enabled-aot",
+            "aot",
+            True,
+            self.scratch,
+            Path("wamr"),
+            Path("wamrc"),
+            "key",
+            [],
+            False,
+        )
+        values = [
+            10_000,
+            11_000,
+            12_000,
+            13_000,
+            14_000,
+            1_010_102,
+            15_000,
+            16_000,
+        ]
+
+        def fake_measure(**kwargs):
+            overhead = values.pop(0)
+            timed = 100_000_000
+            raw = timed + overhead
+            return {
+                "timing_overhead_ns": overhead,
+                "guest_elapsed_ns": timed,
+                "raw_guest_elapsed_ns": raw,
+                "timing_overhead_ppm": overhead * 1_000_000 // raw,
+            }
+
+        with mock.patch.object(
+            bench, "measure_once", side_effect=fake_measure
+        ) as measure:
+            result = bench.run_trusted_barrier_preflight(
+                repo=ROOT,
+                runner=[],
+                build=build,
+                module=Path("fixture"),
+                thread_counts=(2, 8),
+                iterations=128_000_000,
+                timeout=60,
+                minimum_interval_ns=100_000_000,
+                static_cancel_poll_sites=1,
+            )
+        self.assertEqual(measure.call_count, 8)
+        self.assertEqual(result["probe_count"], 8)
+        self.assertEqual(len(result["samples"]), 8)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            [sample["timing_overhead_ns"] for sample in result["samples"]],
+            [10_000, 11_000, 12_000, 13_000, 14_000, 1_010_102, 15_000, 16_000],
+        )
+
+    def test_failure_diagnostic_is_written_before_error(self) -> None:
+        error = bench.TimingQualityError(
+            "guest timing overhead 1.833% is not below 1%",
+            raw_elapsed_ns=339_827_000,
+            timing_overhead_ns=6_228_000,
+            elapsed_ns=333_599_000,
+            timing_overhead_ppm=18_326,
+            reason="timing-overhead",
+        )
+        output = self.scratch / "failure"
+        samples = [
+            {
+                "probe_index": 0,
+                "mode": "aot",
+                "workload": "hot",
+                "threads": 2,
+                "timing_overhead_ns": 16_000,
+            }
+        ]
+        with self.assertRaises(bench.TimingQualityError):
+            bench.raise_with_failure_diagnostic(
+                error,
+                output=output,
+                stage="measurement",
+                reason=error.reason,
+                scenario={
+                    "revision": "baseline",
+                    "mode": "aot",
+                    "workload": "hot",
+                    "threads": 2,
+                    "condition": "aot",
+                },
+                timing_overhead_ns=error.timing_overhead_ns,
+                timed_interval_ns=error.elapsed_ns,
+                raw_elapsed_ns=error.raw_elapsed_ns,
+                timing_overhead_ppm=error.timing_overhead_ppm,
+                minimum_interval_ns=100_000_000,
+                host={"runner_name": "runner"},
+                host_pair={
+                    "id": "pair",
+                    "runner_environment": "self-hosted",
+                    "host_fingerprint_sha256": "a" * 64,
+                },
+                host_quiescence={"available_cpu_count": 8},
+                preflight_samples=samples,
+            )
+        diagnostic = json.loads(
+            (output / "failure-diagnostic.json").read_text(encoding="UTF-8")
+        )
+        self.assertEqual(diagnostic["stage"], "measurement")
+        self.assertEqual(diagnostic["timing_overhead_ns"], 6_228_000)
+        self.assertEqual(diagnostic["timed_interval_ns"], 333_599_000)
+        self.assertEqual(diagnostic["timing_overhead_ratio_limit"], 0.01)
+        self.assertEqual(diagnostic["preflight_samples"], samples)
+        self.assertTrue((output / "failure-diagnostic.md").is_file())
+
+    def test_workflow_enables_trusted_preflight_and_retains_failures(self) -> None:
+        workflow = (
+            ROOT / ".github/workflows/wasi-thread-bench.yml"
+        ).read_text(encoding="UTF-8")
+        hosted, trusted = workflow.split("  trusted-calibration-x86:", 1)
+        trusted_x86, trusted_arm = trusted.split(
+            "  trusted-calibration-arm:", 1
+        )
+        trusted_arm = trusted_arm.split("  comment:", 1)[0]
+        self.assertNotIn("--trusted-calibration-preflight", hosted)
+        self.assertEqual(
+            trusted_x86.count("--trusted-calibration-preflight"), 1
+        )
+        self.assertEqual(
+            trusted_arm.count("--trusted-calibration-preflight"), 1
+        )
+        for section in (hosted, trusted_x86, trusted_arm):
+            self.assertIn("failure-diagnostic.json", section)
+            self.assertIn("failure-diagnostic.md", section)
+            self.assertLess(
+                section.index("Upload retained paired report"),
+                section.index("Clean run-scoped benchmark output"),
+            )
 
     def test_pair_direction_never_depends_on_condition_sorting(self) -> None:
         records = []
