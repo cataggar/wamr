@@ -124,6 +124,7 @@
       "required": [
         "baseline_revision",
         "candidate_revision",
+        "comparison_purpose",
         "fixture_set_sha256",
         "plan_sha256",
         "profile",
@@ -132,6 +133,7 @@
       "properties": {
         "baseline_revision": { "$ref": "#/$defs/revision" },
         "candidate_revision": { "$ref": "#/$defs/revision" },
+        "comparison_purpose": { "const": "noise-calibration" },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "profile": { "const": "authoritative" },

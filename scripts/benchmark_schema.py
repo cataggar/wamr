@@ -184,6 +184,7 @@ def validate_common_report(document: dict[str, Any], kind: str) -> None:
         "tracked_diff_sha256",
         "build_source_sha256",
         "revisions",
+        "revision_checkouts",
         "collected_at",
         "host",
         "host_pair",

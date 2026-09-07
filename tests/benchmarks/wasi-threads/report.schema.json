@@ -26,6 +26,7 @@
         "tracked_diff_sha256",
         "build_source_sha256",
         "revisions",
+        "revision_checkouts",
         "collected_at",
         "platform_id",
         "fixture_set_sha256",
@@ -44,10 +45,17 @@
         "revisions": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["baseline", "candidate"],
           "properties": {
             "baseline": { "$ref": "#/$defs/revision" },
             "candidate": { "$ref": "#/$defs/revision" }
+          }
+        },
+        "revision_checkouts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "baseline": { "type": "string", "minLength": 1 },
+            "candidate": { "type": "string", "minLength": 1 }
           }
         },
         "collected_at": { "type": "string", "minLength": 1 },
@@ -135,6 +143,7 @@
         "warmups",
         "samples",
         "revision_mode",
+        "comparison_purpose",
         "revision_roles",
         "modes",
         "thread_counts",
@@ -151,8 +160,18 @@
         "revision_mode": {
           "enum": ["paired-revisions", "single-revision-compatibility"]
         },
+        "comparison_purpose": {
+          "enum": [
+            "candidate-evaluation",
+            "noise-calibration",
+            "single-revision-compatibility"
+          ]
+        },
         "revision_roles": {
-          "const": ["baseline", "candidate"]
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/revision_role" }
         },
         "modes": {
           "type": "array",
@@ -197,12 +216,10 @@
     },
     "comparison_summaries": {
       "type": "array",
-      "minItems": 1,
       "items": { "$ref": "#/$defs/comparison_summary" }
     },
     "ratio_of_ratios_summaries": {
       "type": "array",
-      "minItems": 1,
       "items": { "$ref": "#/$defs/ratio_of_ratios_summary" }
     },
     "budget": {
@@ -220,6 +237,97 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "plan": {
+            "properties": {
+              "revision_mode": { "const": "paired-revisions" }
+            },
+            "required": ["revision_mode"]
+          }
+        },
+        "required": ["plan"]
+      },
+      "then": {
+        "properties": {
+          "metadata": {
+            "properties": {
+              "revisions": {
+                "required": ["baseline", "candidate"],
+                "minProperties": 2
+              },
+              "revision_checkouts": {
+                "required": ["baseline", "candidate"],
+                "minProperties": 2
+              }
+            }
+          },
+          "plan": {
+            "properties": {
+              "comparison_purpose": {
+                "enum": ["candidate-evaluation", "noise-calibration"]
+              },
+              "revision_roles": { "const": ["baseline", "candidate"] },
+              "samples": { "multipleOf": 2, "minimum": 2 }
+            }
+          },
+          "comparison_summaries": { "minItems": 1 },
+          "ratio_of_ratios_summaries": { "minItems": 1 }
+        }
+      },
+      "else": {
+        "properties": {
+          "metadata": {
+            "properties": {
+              "revisions": {
+                "required": ["candidate"],
+                "maxProperties": 1
+              },
+              "revision_checkouts": {
+                "required": ["candidate"],
+                "maxProperties": 1
+              }
+            }
+          },
+          "plan": {
+            "properties": {
+              "comparison_purpose": {
+                "const": "single-revision-compatibility"
+              },
+              "revision_roles": { "const": ["candidate"] }
+            }
+          },
+          "comparison_summaries": { "maxItems": 0 },
+          "ratio_of_ratios_summaries": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "plan": {
+            "properties": {
+              "comparison_purpose": { "const": "noise-calibration" }
+            },
+            "required": ["comparison_purpose"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "budget": {
+            "properties": {
+              "status": { "const": "disabled" },
+              "path": { "type": "null" },
+              "failures": { "maxItems": 0 }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "commit": {
       "type": "string",

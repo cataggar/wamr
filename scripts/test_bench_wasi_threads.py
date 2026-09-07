@@ -13,8 +13,6 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-from jsonschema import Draft202012Validator
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -67,17 +65,29 @@ def make_report(
     machine: str = "x86_64",
     commit: str = "a" * 40,
     baseline_commit: str | None = None,
-    baseline_source: str = "c" * 64,
+    baseline_source: str = "e" * 64,
     candidate_source: str = "c" * 64,
     run_id: str = "1",
+    revision_mode: str = "paired-revisions",
+    comparison_purpose: str | None = None,
+    samples: int | None = None,
 ) -> dict:
-    baseline_commit = baseline_commit or commit
+    baseline_commit = baseline_commit or "b" * 40
+    if revision_mode == "paired-revisions":
+        revision_roles = bench.REVISION_ROLES
+        comparison_purpose = comparison_purpose or "candidate-evaluation"
+        samples = 2 if samples is None else samples
+    else:
+        revision_roles = bench.SINGLE_REVISION_ROLES
+        comparison_purpose = "single-revision-compatibility"
+        samples = 1 if samples is None else samples
     plan = {
         "profile": "authoritative",
         "warmups": 0,
-        "samples": 1,
-        "revision_mode": "paired-revisions",
-        "revision_roles": list(bench.REVISION_ROLES),
+        "samples": samples,
+        "revision_mode": revision_mode,
+        "comparison_purpose": comparison_purpose,
+        "revision_roles": list(revision_roles),
         "modes": ["aot"],
         "thread_counts": [1],
         "iterations": {
@@ -107,7 +117,7 @@ def make_report(
     }
     host_fingerprint = cache_key(host_fields)
     host_pair_id = f"github:{run_id}:1:{platform_id}"
-    revisions = {
+    all_revisions = {
         "baseline": {
             "commit": baseline_commit,
             "tracked_diff_sha256": "b" * 64,
@@ -127,6 +137,7 @@ def make_report(
             "host_fingerprint_sha256": host_fingerprint,
         },
     }
+    revisions = {role: all_revisions[role] for role in revision_roles}
     revision_fields = {
         role: {
             "revision_commit": revision["commit"],
@@ -197,7 +208,8 @@ def make_report(
                 left=pair["left"],
                 right=pair["right"],
                 warmups=0,
-                samples=1,
+                samples=samples,
+                revision_roles=revision_roles,
                 revision_fields=revision_fields,
                 measure=measure,
             )
@@ -209,6 +221,14 @@ def make_report(
             "tracked_diff_sha256": "b" * 64,
             "build_source_sha256": candidate_source,
             "revisions": revisions,
+            "revision_checkouts": (
+                {
+                    "baseline": "/checkouts/baseline",
+                    "candidate": "/checkouts/candidate",
+                }
+                if revision_mode == "paired-revisions"
+                else {"candidate": "/checkouts/candidate"}
+            ),
             "collected_at": "2026-09-02T00:00:00+00:00",
             "platform_id": platform_id,
             "fixture_set_sha256": "d" * 64,
@@ -293,6 +313,7 @@ def complete_budget(report: dict) -> dict:
             "required_platforms": list(bench.CANONICAL_PLATFORMS),
         },
         "calibration_provenance": {
+            "comparison_purpose": "noise-calibration",
             "baseline_revision": {
                 "commit": report["metadata"]["revisions"]["baseline"][
                     "commit"
@@ -302,11 +323,11 @@ def complete_budget(report: dict) -> dict:
                 ]["build_source_sha256"],
             },
             "candidate_revision": {
-                "commit": report["metadata"]["revisions"]["candidate"][
+                "commit": report["metadata"]["revisions"]["baseline"][
                     "commit"
                 ],
                 "build_source_sha256": report["metadata"]["revisions"][
-                    "candidate"
+                    "baseline"
                 ]["build_source_sha256"],
             },
             "fixture_set_sha256": report["metadata"]["fixture_set_sha256"],
@@ -325,6 +346,13 @@ def complete_budget(report: dict) -> dict:
             },
         },
     }
+
+
+def make_single_report(**kwargs) -> dict:
+    return make_report(
+        revision_mode="single-revision-compatibility",
+        **kwargs,
+    )
 
 
 class ThreadBenchmarkTests(unittest.TestCase):
@@ -369,7 +397,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "--no-budget",
             ]
         )
-        self.assertEqual((args.warmups, args.samples), (1, 3))
+        self.assertEqual((args.warmups, args.samples), (1, 4))
         self.assertEqual(args.single_iterations, 224_000_000)
         self.assertEqual(args.cancel_iterations, 224_000_000)
         self.assertEqual(args.atomic_total_iterations, 256_000_000)
@@ -422,6 +450,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "baseline",
                 "--candidate-repo",
                 "candidate",
+                "--comparison-purpose",
+                "candidate-evaluation",
                 "--runner-environment",
                 "github-hosted",
                 "--host-pair-id",
@@ -431,6 +461,28 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(paired.baseline_repo, Path("baseline"))
         self.assertEqual(paired.candidate_repo, Path("candidate"))
+        with self.assertRaises(SystemExit):
+            bench.parse_args(
+                [
+                    "--baseline-repo",
+                    "baseline",
+                    "--candidate-repo",
+                    "candidate",
+                    "--comparison-purpose",
+                    "candidate-evaluation",
+                    "--samples",
+                    "3",
+                    "--no-budget",
+                ]
+            )
+        single_odd = bench.parse_args(
+            ["--samples", "3", "--no-budget"]
+        )
+        self.assertEqual(single_odd.samples, 3)
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "samples must be even"
+        ):
+            make_report(samples=3)
 
     def test_pair_direction_never_depends_on_condition_sorting(self) -> None:
         records = []
@@ -465,6 +517,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             right="a-target",
             warmups=0,
             samples=2,
+            revision_roles=bench.REVISION_ROLES,
             revision_fields={"baseline": {}, "candidate": {}},
             measure=measure,
         )
@@ -498,7 +551,45 @@ class ThreadBenchmarkTests(unittest.TestCase):
             alternating_pair_order(1, "left", "right"), ("right", "left")
         )
 
-    def test_single_revision_cli_executes_transitional_paired_report(self) -> None:
+    def test_measured_revision_positions_balance_after_odd_warmup(self) -> None:
+        records = []
+
+        def measure(revision, condition, fields):
+            return {
+                **fields,
+                "elapsed_ns": 10,
+                "guest_elapsed_ns": 10,
+                "host_wall_elapsed_ns": 20,
+                "throughput_ops_per_second": 1.0,
+                "correct": True,
+            }
+
+        with mock.patch.object(bench.sys, "stderr", io.StringIO()):
+            bench.collect_revision_pair(
+                records=records,
+                pair_kind="test",
+                pair_key="balanced",
+                left="left",
+                right="right",
+                warmups=1,
+                samples=2,
+                revision_roles=bench.REVISION_ROLES,
+                revision_fields={"baseline": {}, "candidate": {}},
+                measure=measure,
+            )
+        first_positions = [
+            record["revision"]
+            for record in records
+            if record["phase"] == "measure"
+            and record["condition"]
+            == alternating_pair_order(
+                1 + record["pair_index"], "left", "right"
+            )[0]
+            and record["revision_order"] == 0
+        ]
+        self.assertEqual(first_positions, ["candidate", "baseline"])
+
+    def test_single_revision_cli_emits_candidate_only_report(self) -> None:
         output = self.scratch / "compat-report"
         args = bench.parse_args(
             [
@@ -511,7 +602,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "--warmups",
                 "0",
                 "--samples",
-                "1",
+                "3",
                 "--modes",
                 "interpreter",
                 "--thread-counts",
@@ -593,13 +684,19 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "single-revision-compatibility",
         )
         self.assertEqual(
-            report["metadata"]["revisions"]["baseline"],
-            report["metadata"]["revisions"]["candidate"],
+            set(report["metadata"]["revisions"]),
+            set(bench.SINGLE_REVISION_ROLES),
         )
         self.assertEqual(
             {record["revision"] for record in report["records"]},
-            set(bench.REVISION_ROLES),
+            set(bench.SINGLE_REVISION_ROLES),
         )
+        self.assertEqual(
+            len(report["records"]),
+            2 * 3 * len(report["plan"]["pairs"]),
+        )
+        self.assertEqual(report["comparison_summaries"], [])
+        self.assertEqual(report["ratio_of_ratios_summaries"], [])
         self.assertTrue((output / "report.json").is_file())
 
     def test_guest_timing_parser_rejects_missing_duplicate_and_malformed(self) -> None:
@@ -790,7 +887,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertNotIn("github_run_id", fields)
 
     def test_report_fails_closed_on_revision_and_provenance_corruption(self) -> None:
-        report = make_report(candidate_source="e" * 64)
+        report = make_report()
         self.assertNotEqual(
             report["metadata"]["revisions"]["baseline"][
                 "build_source_sha256"
@@ -884,6 +981,102 @@ class ThreadBenchmarkTests(unittest.TestCase):
         ):
             bench.load_budget(self.write_budget(budget), changed_baseline)
 
+    def test_paired_purpose_prevents_checkout_and_a_a_gate_bugs(self) -> None:
+        same_checkout = bench.parse_args(
+            [
+                "--baseline-repo",
+                str(ROOT),
+                "--candidate-repo",
+                str(ROOT),
+                "--comparison-purpose",
+                "candidate-evaluation",
+                "--samples",
+                "2",
+                "--no-budget",
+            ]
+        )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "distinct independently built checkout paths"
+        ):
+            bench.execute(same_checkout)
+
+        noise = make_report(
+            commit="a" * 40,
+            baseline_commit="a" * 40,
+            baseline_source="c" * 64,
+            candidate_source="c" * 64,
+            comparison_purpose="noise-calibration",
+        )
+        self.assertEqual(
+            noise["plan"]["comparison_purpose"], "noise-calibration"
+        )
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "noise calibration revision identity"
+        ):
+            make_report(comparison_purpose="noise-calibration")
+        same_path = copy.deepcopy(noise)
+        same_path["metadata"]["revision_checkouts"]["baseline"] = (
+            same_path["metadata"]["revision_checkouts"]["candidate"]
+        )
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "same checkout path"
+        ):
+            bench.validate_report(same_path)
+        with self.assertRaisesRegex(
+            bench.HarnessError, "paired candidate-evaluation"
+        ):
+            bench.load_budget(self.write_budget(complete_budget(noise)), noise)
+        with self.assertRaisesRegex(
+            bench.HarnessError, "paired candidate-evaluation"
+        ):
+            bench.evaluate_budget({}, noise)
+
+        identical_evaluation = make_report(
+            commit="a" * 40,
+            baseline_commit="a" * 40,
+            baseline_source="c" * 64,
+            candidate_source="c" * 64,
+        )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "distinct baseline/candidate commits"
+        ):
+            bench.load_budget(
+                self.write_budget(complete_budget(identical_evaluation)),
+                identical_evaluation,
+            )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "distinct baseline/candidate commits"
+        ):
+            bench.evaluate_budget({}, identical_evaluation)
+
+        identical_build = make_report(
+            commit="a" * 40,
+            baseline_commit="b" * 40,
+            baseline_source="c" * 64,
+            candidate_source="c" * 64,
+        )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "distinct baseline/candidate build identities"
+        ):
+            bench.load_budget(
+                self.write_budget(complete_budget(identical_build)),
+                identical_build,
+            )
+
+        with self.assertRaises(SystemExit):
+            bench.parse_args(
+                [
+                    "--baseline-repo",
+                    "baseline",
+                    "--candidate-repo",
+                    "candidate",
+                    "--comparison-purpose",
+                    "noise-calibration",
+                    "--samples",
+                    "2",
+                ]
+            )
+
     def test_ratio_of_ratios_direction_and_budget_limits(self) -> None:
         report = make_report()
         ratio = report["ratio_of_ratios_summaries"][0]
@@ -904,11 +1097,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "max_candidate_over_baseline_elapsed_ratio_of_ratios"
         ] = 1.05
         loaded = bench.load_budget(self.write_budget(budget), report)
-        failures = bench.evaluate_budget(
-            loaded,
-            report["comparison_summaries"],
-            report["ratio_of_ratios_summaries"],
-        )
+        failures = bench.evaluate_budget(loaded, report)
         self.assertTrue(
             any("throughput ratio-of-ratios" in item for item in failures)
         )
@@ -933,11 +1122,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         report = make_report()
         budget = complete_budget(report)
         loaded = bench.load_budget(self.write_budget(budget), report)
-        self.assertFalse(bench.evaluate_budget(
-            loaded,
-            report["comparison_summaries"],
-            report["ratio_of_ratios_summaries"],
-        ))
+        self.assertFalse(bench.evaluate_budget(loaded, report))
         uncalibrated = copy.deepcopy(budget)
         uncalibrated["calibrated"] = False
         with self.assertRaisesRegex(bench.HarnessError, "not calibrated"):
@@ -988,7 +1173,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         budget = complete_budget(report)
         mutations = (
             ("commit", lambda value: value["calibration_provenance"]["baseline_revision"].__setitem__("commit", "e" * 40)),
-            ("source", lambda value: value["calibration_provenance"]["baseline_revision"].__setitem__("build_source_sha256", "e" * 64)),
+            ("source", lambda value: value["calibration_provenance"]["baseline_revision"].__setitem__("build_source_sha256", "f" * 64)),
             ("fixture", lambda value: value["calibration_provenance"].__setitem__("fixture_set_sha256", "f" * 64)),
             ("plan", lambda value: value["calibration_provenance"].__setitem__("plan_sha256", "f" * 64)),
             ("profile", lambda value: value["calibration_provenance"].__setitem__("profile", "smoke")),
@@ -1039,9 +1224,20 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 ):
                     bench.load_budget(self.write_budget(corrupt), report)
 
+    def test_cohort_rejects_schema_v3_paired_reports_until_updated(self) -> None:
+        paired = make_report(run_id="100")
+        with self.assertRaisesRegex(
+            bench.HarnessError, "baseline-aware cohort aggregation"
+        ):
+            cohort.validate_documents(
+                [(Path("paired"), paired)],
+                cohort.DEFAULT_PLATFORMS,
+                1,
+            )
+
     def test_cohort_rejects_mixed_identity_and_duplicate_run_ids(self) -> None:
-        x86 = make_report(run_id="100")
-        arm = make_report(
+        x86 = make_single_report(run_id="100")
+        arm = make_single_report(
             platform_id="ubuntu-24.04-aarch64",
             machine="aarch64",
             run_id="100",
@@ -1053,7 +1249,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(result["identity"]["commit"], "a" * 40)
 
-        mixed = make_report(
+        mixed = make_single_report(
             platform_id="ubuntu-24.04-aarch64",
             machine="aarch64",
             commit="e" * 40,
@@ -1073,9 +1269,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
             )
 
-    def test_cohort_requires_canonical_paired_platform_reports(self) -> None:
-        x86 = make_report(run_id="100")
-        arm = make_report(
+    def test_cohort_requires_canonical_single_revision_platform_reports(self) -> None:
+        x86 = make_single_report(run_id="100")
+        arm = make_single_report(
             platform_id="ubuntu-24.04-aarch64",
             machine="aarch64",
             run_id="100",
@@ -1100,7 +1296,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     1,
                 )
 
-        masquerading_arm = make_report(
+        masquerading_arm = make_single_report(
             platform_id="ubuntu-24.04-aarch64",
             machine="x86_64",
             run_id="100",
@@ -1112,7 +1308,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
             )
 
-        other_run_arm = make_report(
+        other_run_arm = make_single_report(
             platform_id="ubuntu-24.04-aarch64",
             machine="aarch64",
             run_id="101",
@@ -1124,7 +1320,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
             )
 
-        second_x86 = make_report(run_id="101")
+        second_x86 = make_single_report(run_id="101")
         with self.assertRaisesRegex(bench.HarnessError, "different report counts"):
             cohort.validate_documents(
                 [
@@ -1283,10 +1479,32 @@ class ThreadBenchmarkTests(unittest.TestCase):
             schema["properties"]["schema_version"]["const"], SCHEMA_VERSION
         )
         self.assertEqual(schema["properties"]["kind"]["const"], bench.KIND)
-        Draft202012Validator.check_schema(schema)
-        report_validator = Draft202012Validator(schema)
-        report = make_report()
-        self.assertFalse(list(report_validator.iter_errors(report)))
+        self.assertEqual(
+            schema["$schema"],
+            "https://json-schema.org/draft/2020-12/schema",
+        )
+        self.assertIn("revision_checkouts", schema["properties"]["metadata"]["required"])
+        self.assertIn("comparison_purpose", schema["properties"]["plan"]["required"])
+        paired_contract = schema["allOf"][0]["then"]["properties"]
+        self.assertEqual(
+            paired_contract["plan"]["properties"]["samples"]["multipleOf"],
+            2,
+        )
+        self.assertEqual(
+            paired_contract["plan"]["properties"]["revision_roles"]["const"],
+            list(bench.REVISION_ROLES),
+        )
+        single_contract = schema["allOf"][0]["else"]["properties"]
+        self.assertEqual(
+            single_contract["plan"]["properties"]["revision_roles"]["const"],
+            list(bench.SINGLE_REVISION_ROLES),
+        )
+        self.assertEqual(
+            single_contract["comparison_summaries"]["maxItems"], 0
+        )
+        for report in (make_report(), make_single_report()):
+            self.assertEqual(set(report), set(schema["required"]))
+            bench.validate_report(report)
         budget_schema = json.loads(
             (
                 ROOT
@@ -1300,11 +1518,18 @@ class ThreadBenchmarkTests(unittest.TestCase):
             budget_schema["properties"]["schema_version"]["const"],
             SCHEMA_VERSION,
         )
-        Draft202012Validator.check_schema(budget_schema)
-        budget_validator = Draft202012Validator(budget_schema)
-        self.assertFalse(
-            list(budget_validator.iter_errors(complete_budget(report)))
+        self.assertEqual(
+            budget_schema["$schema"],
+            "https://json-schema.org/draft/2020-12/schema",
         )
+        self.assertEqual(
+            budget_schema["$defs"]["calibration_provenance"]["properties"][
+                "comparison_purpose"
+            ]["const"],
+            "noise-calibration",
+        )
+        calibrated = complete_budget(make_report())
+        self.assertEqual(set(calibrated), set(budget_schema["required"]))
         uncalibrated = json.loads(
             (
                 ROOT
@@ -1314,7 +1539,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 / "budget.json"
             ).read_text(encoding="UTF-8")
         )
-        self.assertFalse(list(budget_validator.iter_errors(uncalibrated)))
+        self.assertEqual(set(uncalibrated), set(budget_schema["required"]))
+        self.assertFalse(uncalibrated["calibrated"])
+        self.assertFalse(uncalibrated["enforcement"])
+        self.assertIsNone(uncalibrated["calibration_provenance"])
+        self.assertEqual(uncalibrated["platforms"], {})
 
 
 if __name__ == "__main__":

@@ -46,9 +46,11 @@ CANONICAL_PLATFORMS = {
 
 KIND = "wasi-thread-benchmark"
 REVISION_ROLES = ("baseline", "candidate")
+SINGLE_REVISION_ROLES = ("candidate",)
+COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
-    "smoke": (1, 3),
+    "smoke": (1, 4),
 }
 ATOMIC_WAIT_PREFLIGHT_RUNS = {
     "authoritative": 64,
@@ -268,6 +270,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="immutable candidate checkout (requires --baseline-repo)",
     )
     parser.add_argument(
+        "--comparison-purpose",
+        choices=COMPARISON_PURPOSES,
+        help="required purpose for paired baseline/candidate checkouts",
+    )
+    parser.add_argument(
         "--output-dir", type=Path, default=Path("zig-out/wasi-thread-bench")
     )
     parser.add_argument("--profile", choices=PROFILE_COUNTS, default="authoritative")
@@ -353,6 +360,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--budget and --no-budget are mutually exclusive")
     if (args.baseline_repo is None) != (args.candidate_repo is None):
         parser.error("--baseline-repo and --candidate-repo must be supplied together")
+    paired = args.baseline_repo is not None
+    if paired and args.comparison_purpose is None:
+        parser.error("--comparison-purpose is required for paired revisions")
+    if not paired and args.comparison_purpose is not None:
+        parser.error("--comparison-purpose requires paired revisions")
+    if paired and args.samples % 2 != 0:
+        parser.error("paired revision measurements require an even --samples count")
+    if args.comparison_purpose == "noise-calibration" and not args.no_budget:
+        parser.error("noise calibration requires --no-budget")
+    if args.budget and args.comparison_purpose != "candidate-evaluation":
+        parser.error("budget enforcement requires paired candidate evaluation")
     if args.host_pair_id is not None and not args.host_pair_id.strip():
         parser.error("--host-pair-id must not be empty")
     if args.runner_environment is not None and not args.runner_environment.strip():
@@ -945,16 +963,25 @@ def collect_revision_pair(
     right: str,
     warmups: int,
     samples: int,
+    revision_roles: tuple[str, ...],
     revision_fields: dict[str, dict[str, Any]],
     measure: Callable[[str, str, dict[str, Any]], dict[str, Any]],
 ) -> None:
-    require(set(revision_fields) == set(REVISION_ROLES), "revision fields")
+    require(
+        revision_roles in (REVISION_ROLES, SINGLE_REVISION_ROLES),
+        "revision roles",
+    )
+    require(set(revision_fields) == set(revision_roles), "revision fields")
     total = warmups + samples
     for index in range(total):
         phase = "warmup" if index < warmups else "measure"
         phase_index = index if phase == "warmup" else index - warmups
         condition_order = alternating_pair_order(index, left, right)
-        revision_order = alternating_pair_order(index, *REVISION_ROLES)
+        revision_order = (
+            alternating_pair_order(index, *REVISION_ROLES)
+            if revision_roles == REVISION_ROLES
+            else SINGLE_REVISION_ROLES
+        )
         for revision_index, revision in enumerate(revision_order):
             for condition_index, condition in enumerate(condition_order):
                 record = measure(
@@ -1108,6 +1135,11 @@ def paired_summaries(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def comparison_summaries(
     records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    record_roles = {record["revision"] for record in records}
+    if record_roles == set(SINGLE_REVISION_ROLES):
+        return []
+    if record_roles != set(REVISION_ROLES):
+        raise HarnessError("comparison records have incomplete revision roles")
     cells: dict[
         tuple[str, str, str, int],
         dict[str, dict[str, Any]],
@@ -1191,6 +1223,11 @@ def comparison_summaries(
 def ratio_of_ratios_summaries(
     records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    record_roles = {record["revision"] for record in records}
+    if record_roles == set(SINGLE_REVISION_ROLES):
+        return []
+    if record_roles != set(REVISION_ROLES):
+        raise HarnessError("ratio-of-ratios records have incomplete revision roles")
     cells: dict[
         tuple[str, str, int],
         dict[str, dict[str, dict[str, Any]]],
@@ -1290,11 +1327,61 @@ def validate_report(document: dict[str, Any]) -> None:
             and re.fullmatch(r"[0-9a-f]{64}", metadata[key]) is not None,
             f"metadata.{key}",
         )
+    plan = document["plan"]
+    require(plan.get("warmups", -1) >= 0, "plan.warmups")
+    require(plan.get("samples", 0) > 0, "plan.samples")
+    require(
+        plan.get("minimum_timed_interval_ns", 0) > 0,
+        "plan.minimum_timed_interval_ns",
+    )
+    revision_mode = plan.get("revision_mode")
+    comparison_purpose = plan.get("comparison_purpose")
+    if revision_mode == "paired-revisions":
+        revision_roles = REVISION_ROLES
+        require(
+            comparison_purpose in COMPARISON_PURPOSES,
+            "plan.comparison_purpose",
+        )
+        require(
+            plan["samples"] % 2 == 0,
+            "paired revision samples must be even",
+        )
+    else:
+        require(
+            revision_mode == "single-revision-compatibility",
+            "plan.revision_mode",
+        )
+        revision_roles = SINGLE_REVISION_ROLES
+        require(
+            comparison_purpose == "single-revision-compatibility",
+            "plan.comparison_purpose",
+        )
+    require(
+        plan.get("revision_roles") == list(revision_roles),
+        "plan.revision_roles",
+    )
+    require(metadata["plan_sha256"] == cache_key(plan), "metadata.plan_sha256")
+
     revisions = metadata.get("revisions")
     require(
-        isinstance(revisions, dict) and set(revisions) == set(REVISION_ROLES),
+        isinstance(revisions, dict) and set(revisions) == set(revision_roles),
         "metadata.revisions",
     )
+    revision_checkouts = metadata.get("revision_checkouts")
+    require(
+        isinstance(revision_checkouts, dict)
+        and set(revision_checkouts) == set(revision_roles)
+        and all(
+            isinstance(path, str) and bool(path)
+            for path in revision_checkouts.values()
+        ),
+        "metadata.revision_checkouts",
+    )
+    if revision_mode == "paired-revisions":
+        require(
+            len(set(revision_checkouts.values())) == len(REVISION_ROLES),
+            "paired revisions use the same checkout path",
+        )
     revision_keys = {
         "commit",
         "tracked_diff_sha256",
@@ -1304,7 +1391,7 @@ def validate_report(document: dict[str, Any]) -> None:
         "host_pair_id",
         "host_fingerprint_sha256",
     }
-    for role in REVISION_ROLES:
+    for role in revision_roles:
         revision = revisions[role]
         require(isinstance(revision, dict), f"metadata.revisions.{role}")
         require(
@@ -1384,7 +1471,7 @@ def validate_report(document: dict[str, Any]) -> None:
         host_pair["host_fingerprint_sha256"] == fingerprint.get("sha256"),
         "metadata.host_pair fingerprint",
     )
-    for role in REVISION_ROLES:
+    for role in revision_roles:
         revision = revisions[role]
         require(
             revision["host_pair_id"] == host_pair["id"],
@@ -1395,24 +1482,7 @@ def validate_report(document: dict[str, Any]) -> None:
             == host_pair["host_fingerprint_sha256"],
             f"mixed host fingerprint for {role}",
         )
-    plan = document["plan"]
-    require(plan.get("warmups", -1) >= 0, "plan.warmups")
-    require(plan.get("samples", 0) > 0, "plan.samples")
-    require(
-        plan.get("minimum_timed_interval_ns", 0) > 0,
-        "plan.minimum_timed_interval_ns",
-    )
-    require(metadata["plan_sha256"] == cache_key(plan), "metadata.plan_sha256")
-    require(
-        plan.get("revision_roles") == list(REVISION_ROLES),
-        "plan.revision_roles",
-    )
-    require(
-        plan.get("revision_mode")
-        in ("paired-revisions", "single-revision-compatibility"),
-        "plan.revision_mode",
-    )
-    if plan["revision_mode"] == "single-revision-compatibility":
+    if comparison_purpose == "noise-calibration":
         require(
             all(
                 revisions["baseline"][key] == revisions["candidate"][key]
@@ -1422,7 +1492,36 @@ def validate_report(document: dict[str, Any]) -> None:
                     "build_source_sha256",
                 )
             ),
-            "single-revision compatibility identity",
+            "noise calibration revision identity",
+        )
+    budget = document.get("budget")
+    require(isinstance(budget, dict), "budget")
+    budget_status = budget.get("status")
+    require(
+        budget_status in ("disabled", "not-selected", "passed", "failed"),
+        "budget.status",
+    )
+    if comparison_purpose == "noise-calibration":
+        require(
+            budget_status == "disabled"
+            and budget.get("path") is None
+            and budget.get("failures") == [],
+            "noise calibration must be non-enforcing",
+        )
+    if budget_status in ("passed", "failed"):
+        require(
+            comparison_purpose == "candidate-evaluation",
+            "budget enforcement requires candidate evaluation",
+        )
+        require(
+            revisions["baseline"]["commit"]
+            != revisions["candidate"]["commit"],
+            "budget enforcement requires distinct revision commits",
+        )
+        require(
+            revisions["baseline"]["build_source_sha256"]
+            != revisions["candidate"]["build_source_sha256"],
+            "budget enforcement requires distinct build identities",
         )
     pair_plan = plan.get("pairs")
     require(isinstance(pair_plan, list) and pair_plan, "plan.pairs")
@@ -1450,7 +1549,7 @@ def validate_report(document: dict[str, Any]) -> None:
         require(isinstance(record, dict), "record object")
         require(record.get("phase") in ("warmup", "measure"), "record phase")
         revision_role = record.get("revision")
-        require(revision_role in REVISION_ROLES, "record revision")
+        require(revision_role in revision_roles, "record revision")
         revision = revisions[revision_role]
         require(record.get("correct") is True, "record correctness")
         require(record.get("guest_elapsed_ns", 0) > 0, "record guest elapsed")
@@ -1497,8 +1596,10 @@ def validate_report(document: dict[str, Any]) -> None:
             if record["phase"] == "warmup"
             else plan["warmups"] + record["pair_index"]
         )
-        expected_revisions = alternating_pair_order(
-            global_index, *REVISION_ROLES
+        expected_revisions = (
+            alternating_pair_order(global_index, *REVISION_ROLES)
+            if revision_roles == REVISION_ROLES
+            else SINGLE_REVISION_ROLES
         )
         expected_conditions = alternating_pair_order(
             global_index, pair["left"], pair["right"]
@@ -1530,7 +1631,7 @@ def validate_report(document: dict[str, Any]) -> None:
             (revision_role, record["condition"])
         )
     expected_records_per_pair = (
-        len(REVISION_ROLES)
+        len(revision_roles)
         * 2
         * (plan["warmups"] + plan["samples"])
     )
@@ -1558,7 +1659,7 @@ def validate_report(document: dict[str, Any]) -> None:
                     per_cell.get((pair_key, phase, index))
                     == {
                         (revision, condition)
-                        for revision in REVISION_ROLES
+                        for revision in revision_roles
                         for condition in (pair["left"], pair["right"])
                     },
                     f"incomplete pair cell {pair_key}/{phase}/{index}",
@@ -1570,8 +1671,12 @@ def validate_report(document: dict[str, Any]) -> None:
                     cell_order.get((pair_key, phase, index))
                     == [
                         (revision, condition)
-                        for revision in alternating_pair_order(
-                            global_index, *REVISION_ROLES
+                        for revision in (
+                            alternating_pair_order(
+                                global_index, *REVISION_ROLES
+                            )
+                            if revision_roles == REVISION_ROLES
+                            else SINGLE_REVISION_ROLES
                         )
                         for condition in alternating_pair_order(
                             global_index, pair["left"], pair["right"]
@@ -1582,7 +1687,7 @@ def validate_report(document: dict[str, Any]) -> None:
 
     expected_summary_keys = {
         (revision, pair_key, condition)
-        for revision in REVISION_ROLES
+        for revision in revision_roles
         for pair_key, pair in pair_by_key.items()
         for condition in (pair["left"], pair["right"])
     }
@@ -1600,7 +1705,7 @@ def validate_report(document: dict[str, Any]) -> None:
     )
     expected_paired_keys = {
         (revision, pair_key)
-        for revision in REVISION_ROLES
+        for revision in revision_roles
         for pair_key in pair_by_key
     }
     actual_paired_keys = {
@@ -1615,11 +1720,15 @@ def validate_report(document: dict[str, Any]) -> None:
         pair = pair_by_key[summary["pair_key"]]
         require(summary.get("left") == pair["left"], "paired summary left")
         require(summary.get("right") == pair["right"], "paired summary right")
-    expected_comparison_keys = {
-        (pair_key, condition)
-        for pair_key, pair in pair_by_key.items()
-        for condition in (pair["left"], pair["right"])
-    }
+    expected_comparison_keys = (
+        {
+            (pair_key, condition)
+            for pair_key, pair in pair_by_key.items()
+            for condition in (pair["left"], pair["right"])
+        }
+        if revision_roles == REVISION_ROLES
+        else set()
+    )
     comparisons = document.get("comparison_summaries")
     require(isinstance(comparisons, list), "comparison_summaries")
     require(
@@ -1633,7 +1742,8 @@ def validate_report(document: dict[str, Any]) -> None:
     ratios = document.get("ratio_of_ratios_summaries")
     require(isinstance(ratios, list), "ratio_of_ratios_summaries")
     require(
-        {summary.get("pair_key") for summary in ratios} == set(pair_by_key),
+        {summary.get("pair_key") for summary in ratios}
+        == (set(pair_by_key) if revision_roles == REVISION_ROLES else set()),
         "ratio-of-ratios summaries do not cover every planned pair",
     )
     require(
@@ -1685,7 +1795,38 @@ def _positive_number(value: Any) -> bool:
     )
 
 
+def require_budget_eligible_report(report: dict[str, Any]) -> None:
+    try:
+        validate_report(report)
+    except BenchmarkDataError as exc:
+        raise HarnessError(f"invalid report for budget enforcement: {exc}") from exc
+    plan = report["plan"]
+    if (
+        plan["revision_mode"] != "paired-revisions"
+        or plan["comparison_purpose"] != "candidate-evaluation"
+    ):
+        raise HarnessError(
+            "budget enforcement requires a paired candidate-evaluation report"
+        )
+    report_revisions = report["metadata"]["revisions"]
+    if (
+        report_revisions["baseline"]["commit"]
+        == report_revisions["candidate"]["commit"]
+    ):
+        raise HarnessError(
+            "budget enforcement requires distinct baseline/candidate commits"
+        )
+    if (
+        report_revisions["baseline"]["build_source_sha256"]
+        == report_revisions["candidate"]["build_source_sha256"]
+    ):
+        raise HarnessError(
+            "budget enforcement requires distinct baseline/candidate build identities"
+        )
+
+
 def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
+    require_budget_eligible_report(report)
     try:
         budget = json.loads(
             path.read_text(encoding="UTF-8"),
@@ -1761,6 +1902,7 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         {
             "baseline_revision",
             "candidate_revision",
+            "comparison_purpose",
             "fixture_set_sha256",
             "plan_sha256",
             "profile",
@@ -1768,6 +1910,10 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         },
         "calibration_provenance",
     )
+    if calibration["comparison_purpose"] != "noise-calibration":
+        raise HarnessError(
+            "budget calibration provenance must be noise calibration"
+        )
     for role in REVISION_ROLES:
         identity = calibration[f"{role}_revision"]
         if not isinstance(identity, dict):
@@ -1788,6 +1934,13 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
                 raise HarnessError(
                     f"budget calibration {role}.{key} has invalid identity"
                 )
+    if (
+        calibration["baseline_revision"]
+        != calibration["candidate_revision"]
+    ):
+        raise HarnessError(
+            "budget noise-calibration revisions must have identical identities"
+        )
     for key in ("fixture_set_sha256", "plan_sha256"):
         value = calibration[key]
         if (
@@ -1956,9 +2109,11 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
 
 def evaluate_budget(
     platform_budget: dict[str, Any],
-    comparisons: list[dict[str, Any]],
-    ratio_of_ratios: list[dict[str, Any]],
+    report: dict[str, Any],
 ) -> list[str]:
+    require_budget_eligible_report(report)
+    comparisons = report["comparison_summaries"]
+    ratio_of_ratios = report["ratio_of_ratios_summaries"]
     failures: list[str] = []
     comparison_lookup = {
         (item["pair_key"], item["condition"]): item
@@ -2052,8 +2207,12 @@ def render_markdown(document: dict[str, Any]) -> str:
     lines = [
         "# WASI threaded benchmark",
         "",
-        f"- Baseline: `{revisions['baseline']['commit']}`",
         f"- Candidate: `{revisions['candidate']['commit']}`",
+    ]
+    if document["plan"]["revision_mode"] == "paired-revisions":
+        lines.insert(2, f"- Baseline: `{revisions['baseline']['commit']}`")
+    lines += [
+        f"- Comparison purpose: `{document['plan']['comparison_purpose']}`",
         f"- Platform identity: `{document['metadata']['platform_id']}`",
         f"- Host pair: `{document['metadata']['host_pair']['id']}` · "
         f"fingerprint `{document['metadata']['host_pair']['host_fingerprint_sha256']}`",
@@ -2107,29 +2266,30 @@ def render_markdown(document: dict[str, Any]) -> str:
             f"{item['median_elapsed_delta_pct']:+.2f}% | "
             f"{item['median_throughput_delta_pct']:+.2f}% |"
         )
-    lines += [
-        "",
-        "| Matched revision comparison | Candidate / baseline elapsed | Candidate / baseline throughput |",
-        "|---|---:|---:|",
-    ]
-    for item in document["comparison_summaries"]:
-        lines.append(
-            f"| `{item['pair_key']}` / `{item['condition']}` | "
-            f"{item['elapsed_candidate_over_baseline']['median']:.4f} | "
-            f"{item['throughput_candidate_over_baseline']['median']:.4f} |"
-        )
-    lines += [
-        "",
-        "| Internal-pair ratio-of-ratios | Candidate / baseline elapsed ratio | Candidate / baseline throughput ratio |",
-        "|---|---:|---:|",
-    ]
-    for item in document["ratio_of_ratios_summaries"]:
-        lines.append(
-            f"| `{item['pair_key']}`: `{item['right']}` / "
-            f"`{item['left']}` | "
-            f"{item['elapsed_ratio_of_ratios']['median']:.4f} | "
-            f"{item['throughput_ratio_of_ratios']['median']:.4f} |"
-        )
+    if document["comparison_summaries"]:
+        lines += [
+            "",
+            "| Matched revision comparison | Candidate / baseline elapsed | Candidate / baseline throughput |",
+            "|---|---:|---:|",
+        ]
+        for item in document["comparison_summaries"]:
+            lines.append(
+                f"| `{item['pair_key']}` / `{item['condition']}` | "
+                f"{item['elapsed_candidate_over_baseline']['median']:.4f} | "
+                f"{item['throughput_candidate_over_baseline']['median']:.4f} |"
+            )
+        lines += [
+            "",
+            "| Internal-pair ratio-of-ratios | Candidate / baseline elapsed ratio | Candidate / baseline throughput ratio |",
+            "|---|---:|---:|",
+        ]
+        for item in document["ratio_of_ratios_summaries"]:
+            lines.append(
+                f"| `{item['pair_key']}`: `{item['right']}` / "
+                f"`{item['left']}` | "
+                f"{item['elapsed_ratio_of_ratios']['median']:.4f} | "
+                f"{item['throughput_ratio_of_ratios']['median']:.4f} |"
+            )
     lines += [
         "",
         "Kernel throughput uses guest monotonic time corrected by a same-process "
@@ -2148,16 +2308,30 @@ def render_markdown(document: dict[str, Any]) -> str:
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.baseline_repo is None:
         candidate_repo = args.repo.resolve()
-        baseline_repo = candidate_repo
         revision_mode = "single-revision-compatibility"
+        comparison_purpose = "single-revision-compatibility"
+        revision_roles = SINGLE_REVISION_ROLES
+        revision_repos = {"candidate": candidate_repo}
     else:
         baseline_repo = args.baseline_repo.resolve()
         candidate_repo = args.candidate_repo.resolve()
+        if args.comparison_purpose not in COMPARISON_PURPOSES:
+            raise HarnessError("paired revisions require an explicit comparison purpose")
+        if args.samples % 2 != 0:
+            raise HarnessError("paired revision measurements require even samples")
+        if args.comparison_purpose == "noise-calibration" and not args.no_budget:
+            raise HarnessError("noise calibration must be non-enforcing")
+        if baseline_repo == candidate_repo:
+            raise HarnessError(
+                "paired revisions must use distinct independently built checkout paths"
+            )
         revision_mode = "paired-revisions"
-    revision_repos = {
-        "baseline": baseline_repo,
-        "candidate": candidate_repo,
-    }
+        comparison_purpose = args.comparison_purpose
+        revision_roles = REVISION_ROLES
+        revision_repos = {
+            "baseline": baseline_repo,
+            "candidate": candidate_repo,
+        }
     repo = candidate_repo
     output = (
         args.output_dir.resolve()
@@ -2169,6 +2343,19 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         role: source_identity(revision_repo)
         for role, revision_repo in revision_repos.items()
     }
+    if comparison_purpose == "noise-calibration":
+        if any(
+            sources["baseline"][key] != sources["candidate"][key]
+            for key in (
+                "commit",
+                "tracked_diff_sha256",
+                "build_source_sha256",
+            )
+        ):
+            raise HarnessError(
+                "noise calibration requires identical revision identities "
+                "from distinct checkout paths"
+            )
     fixture_reports = {
         role: resolve_fixtures(revision_repo)
         for role, revision_repo in revision_repos.items()
@@ -2191,7 +2378,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "warmups": args.warmups,
         "samples": args.samples,
         "revision_mode": revision_mode,
-        "revision_roles": list(REVISION_ROLES),
+        "comparison_purpose": comparison_purpose,
+        "revision_roles": list(revision_roles),
         "modes": list(modes),
         "thread_counts": list(args.thread_counts),
         "iterations": {
@@ -2222,7 +2410,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "host_fingerprint_sha256"
             ],
         }
-        for role in REVISION_ROLES
+        for role in revision_roles
     }
     revision_fields = {
         role: {
@@ -2237,18 +2425,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "host_fingerprint_sha256"
             ],
         }
-        for role in REVISION_ROLES
+        for role in revision_roles
     }
 
     contexts: dict[str, dict[str, Any]] = {}
-    for role in REVISION_ROLES:
-        if (
-            role == "candidate"
-            and baseline_repo == candidate_repo
-            and sources["baseline"] == sources["candidate"]
-        ):
-            contexts[role] = contexts["baseline"]
-            continue
+    for role in revision_roles:
         revision_repo = revision_repos[role]
         revision_output = output / "revisions" / role
         builds: dict[str, Build] = {}
@@ -2303,13 +2484,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     if "aot" in modes:
-        preflighted: set[int] = set()
-        for role in REVISION_ROLES:
+        for role in revision_roles:
             context = contexts[role]
-            context_id = id(context)
-            if context_id in preflighted:
-                continue
-            preflighted.add(context_id)
             for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile]):
                 measure_once(
                     repo=context["repo"],
@@ -2392,6 +2568,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             right="threads-enabled",
             warmups=args.warmups,
             samples=args.samples,
+            revision_roles=revision_roles,
             revision_fields=revision_fields,
             measure=single_measure,
         )
@@ -2450,6 +2627,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 right="aot",
                 warmups=args.warmups,
                 samples=args.samples,
+                revision_roles=revision_roles,
                 revision_fields=revision_fields,
                 measure=runtime_measure,
             )
@@ -2506,6 +2684,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 right=f"{mode}-b",
                 warmups=args.warmups,
                 samples=args.samples,
+                revision_roles=revision_roles,
                 revision_fields=revision_fields,
                 measure=single_mode_measure,
             )
@@ -2561,6 +2740,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 right="cancel-points-on",
                 warmups=args.warmups,
                 samples=args.samples,
+                revision_roles=revision_roles,
                 revision_fields=revision_fields,
                 measure=poll_measure,
             )
@@ -2578,6 +2758,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "tracked_diff_sha256": candidate["tracked_diff_sha256"],
             "build_source_sha256": candidate["build_source_sha256"],
             "revisions": revisions,
+            "revision_checkouts": {
+                role: str(revision_repos[role]) for role in revision_roles
+            },
             "collected_at": collected_at(),
             "platform_id": args.platform_id,
             "fixture_set_sha256": fixture_set_sha256,
@@ -2591,13 +2774,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             },
             "tools": {
                 role: build_tool_report(contexts[role]["builds"], runner)
-                for role in REVISION_ROLES
+                for role in revision_roles
             },
             "fixture_toolchain": WASI_SDK,
             "fixtures": fixture_reports["candidate"],
             "aot_artifacts": {
                 role: contexts[role]["aot_artifacts_metadata"]
-                for role in REVISION_ROLES
+                for role in revision_roles
             },
         },
         "plan": plan,
@@ -2616,13 +2799,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     budget_failures: list[str] = []
     if args.budget:
         platform_budget = load_budget(args.budget.resolve(), document)
-        budget_failures = evaluate_budget(
-            platform_budget, comparisons, ratios
-        )
+        budget_failures = evaluate_budget(platform_budget, document)
         document["budget"]["status"] = (
             "passed" if not budget_failures else "failed"
         )
         document["budget"]["failures"] = budget_failures
+        validate_report(document)
     atomic_write_json(output / "report.json", document)
     (output / "report.md").write_text(
         render_markdown(document) + "\n", encoding="UTF-8"

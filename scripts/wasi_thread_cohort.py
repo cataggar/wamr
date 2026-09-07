@@ -175,6 +175,12 @@ def validate_documents(
     identities: set[tuple[str, str, str, str, str]] = set()
     for path, document in documents:
         validate_report(document)
+        if document["plan"]["revision_mode"] == "paired-revisions":
+            raise HarnessError(
+                f"{path}: schema-v3 paired reports require baseline-aware "
+                "cohort aggregation; update scripts/wasi_thread_cohort.py "
+                "before calibration"
+            )
         metadata = document["metadata"]
         platform_id = metadata["platform_id"]
         if platform_id not in required_platforms:
