@@ -63,6 +63,8 @@ def stats(value: float, key: str) -> dict:
 def make_report(
     platform_id: str = "ubuntu-22.04-x86_64",
     machine: str = "x86_64",
+    cpu: str = "test cpu",
+    runner_environment: str = "github-hosted",
     commit: str = "a" * 40,
     baseline_commit: str | None = None,
     baseline_source: str = "e" * 64,
@@ -108,9 +110,9 @@ def make_report(
     host_fields = {
         "system": "Linux",
         "machine": machine,
-        "cpu": "test cpu",
+        "cpu": cpu,
         "logical_cpus": 4,
-        "runner_environment": "github-hosted",
+        "runner_environment": runner_environment,
         "runner_image": "ubuntu",
         "runner_os": "Linux",
         "runner_arch": machine,
@@ -236,7 +238,7 @@ def make_report(
             "host": {
                 "system": "Linux",
                 "machine": machine,
-                "runner_environment": "github-hosted",
+                "runner_environment": runner_environment,
                 "github_run_id": run_id,
                 "host_fingerprint": {
                     "sha256": host_fingerprint,
@@ -245,7 +247,7 @@ def make_report(
             },
             "host_pair": {
                 "id": host_pair_id,
-                "runner_environment": "github-hosted",
+                "runner_environment": runner_environment,
                 "host_fingerprint_sha256": host_fingerprint,
             },
             "execution": {},
@@ -353,6 +355,94 @@ def make_single_report(**kwargs) -> dict:
         revision_mode="single-revision-compatibility",
         **kwargs,
     )
+
+
+def make_dispatch_state(
+    run_ids: tuple[str, ...] = ("100", "101"),
+    baseline_sha: str = "b" * 40,
+    candidate_sha: str = "a" * 40,
+    purpose: str = "candidate-evaluation",
+    runner_target: str = "github-hosted",
+) -> dict:
+    cohort_id = "d" * 32
+    training_runs = len(run_ids) // 2
+    assignments = [
+        {
+            "sequence": sequence,
+            "partition": "training" if sequence <= training_runs else "holdout",
+        }
+        for sequence in range(1, len(run_ids) + 1)
+    ]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "wasi-thread-cohort-dispatch",
+        "created_at": "2026-09-07T00:00:00+00:00",
+        "repository": "cataggar/wamr",
+        "workflow": "wasi-thread-bench.yml",
+        "workflow_ref": "main",
+        "workflow_head_sha": "f" * 40,
+        "cohort_id": cohort_id,
+        "baseline_sha": baseline_sha,
+        "candidate_sha": candidate_sha,
+        "comparison_purpose": purpose,
+        "profile": "authoritative",
+        "warmups": 0,
+        "samples": 2,
+        "runner_target": runner_target,
+        "required_platforms": list(cohort.DEFAULT_PLATFORMS),
+        "requested_runs": len(run_ids),
+        "requested_reports": len(run_ids) * len(cohort.DEFAULT_PLATFORMS),
+        "max_in_flight": 2,
+        "split": {
+            "method": "predeclared-sequence",
+            "training_runs": training_runs,
+            "holdout_runs": len(run_ids) - training_runs,
+            "assignments": assignments,
+        },
+        "runs": [
+            {
+                "sequence": sequence,
+                "partition": assignments[sequence - 1]["partition"],
+                "run_id": int(run_id),
+                "run_name": (
+                    f"WASI thread cohort-{cohort_id}-{sequence}-"
+                    f"{assignments[sequence - 1]['partition']}"
+                ),
+                "url": f"https://github.com/cataggar/wamr/actions/runs/{run_id}",
+                "status": "completed",
+                "conclusion": "success",
+                "workflow_head_sha": "f" * 40,
+                "artifacts": [],
+            }
+            for sequence, run_id in enumerate(run_ids, 1)
+        ],
+    }
+
+
+def make_paired_cohort_reports(
+    run_ids: tuple[str, ...] = ("100", "101"),
+    **kwargs,
+) -> list[tuple[Path, dict]]:
+    reports = []
+    for run_id in run_ids:
+        reports.extend(
+            [
+                (
+                    Path(f"x86-{run_id}"),
+                    make_report(run_id=run_id, **kwargs),
+                ),
+                (
+                    Path(f"arm-{run_id}"),
+                    make_report(
+                        platform_id="ubuntu-24.04-aarch64",
+                        machine="aarch64",
+                        run_id=run_id,
+                        **kwargs,
+                    ),
+                ),
+            ]
+        )
+    return reports
 
 
 class ThreadBenchmarkTests(unittest.TestCase):
@@ -1224,15 +1314,190 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 ):
                     bench.load_budget(self.write_budget(corrupt), report)
 
-    def test_cohort_rejects_schema_v3_paired_reports_until_updated(self) -> None:
-        paired = make_report(run_id="100")
-        with self.assertRaisesRegex(
-            bench.HarnessError, "baseline-aware cohort aggregation"
-        ):
+    def test_paired_cohort_preserves_exact_runs_and_predeclared_split(self) -> None:
+        dispatch_state = make_dispatch_state()
+        reports = make_paired_cohort_reports()
+        result = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            1,
+            dispatch_state,
+        )
+        self.assertTrue(result["authoritative"])
+        self.assertEqual(result["identity"]["baseline"]["commit"], "b" * 40)
+        self.assertEqual(result["identity"]["candidate"]["commit"], "a" * 40)
+        self.assertEqual(
+            result["split"]["run_ids"],
+            {"training": ["100"], "holdout": ["101"]},
+        )
+        self.assertEqual(len(result["observations"]), len(reports))
+        self.assertEqual(result["excluded_observations"], [])
+        self.assertEqual(
+            {
+                (item["run_id"], item["platform"])
+                for item in result["observations"]
+            },
+            {
+                (run_id, platform)
+                for run_id in ("100", "101")
+                for platform in cohort.DEFAULT_PLATFORMS
+            },
+        )
+
+    def test_trusted_noise_cohort_pairs_self_hosted_x86_with_hosted_arm(self) -> None:
+        dispatch_state = make_dispatch_state(
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+            runner_target="trusted-calibration",
+        )
+        reports = []
+        for run_id in ("100", "101"):
+            common = {
+                "run_id": run_id,
+                "baseline_commit": "a" * 40,
+                "commit": "a" * 40,
+                "baseline_source": "c" * 64,
+                "candidate_source": "c" * 64,
+                "comparison_purpose": "noise-calibration",
+            }
+            reports.extend(
+                [
+                    (
+                        Path(f"x86-{run_id}"),
+                        make_report(
+                            runner_environment="self-hosted",
+                            **common,
+                        ),
+                    ),
+                    (
+                        Path(f"arm-{run_id}"),
+                        make_report(
+                            platform_id="ubuntu-24.04-aarch64",
+                            machine="aarch64",
+                            **common,
+                        ),
+                    ),
+                ]
+            )
+        result = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            1,
+            dispatch_state,
+        )
+        self.assertEqual(
+            result["dispatch"]["runner_target"], "trusted-calibration"
+        )
+        self.assertEqual(
+            result["identity"]["comparison_purpose"], "noise-calibration"
+        )
+
+    def test_paired_cohort_requires_manifest_exact_count_and_no_legacy(self) -> None:
+        reports = make_paired_cohort_reports()
+        dispatch_state = make_dispatch_state()
+        with self.assertRaisesRegex(bench.HarnessError, "dispatch manifest"):
             cohort.validate_documents(
-                [(Path("paired"), paired)],
+                reports,
                 cohort.DEFAULT_PLATFORMS,
                 1,
+            )
+        with self.assertRaisesRegex(bench.HarnessError, "expected exactly"):
+            cohort.validate_documents(
+                reports[:-1],
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+        duplicate = reports[:-1] + [
+            (Path("duplicate"), copy.deepcopy(reports[2][1]))
+        ]
+        with self.assertRaisesRegex(bench.HarnessError, "duplicate report"):
+            cohort.validate_documents(
+                duplicate,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+        mixed = reports[:-1] + [
+            (
+                Path("legacy"),
+                make_single_report(
+                    platform_id="ubuntu-24.04-aarch64",
+                    machine="aarch64",
+                    run_id="101",
+                ),
+            )
+        ]
+        with self.assertRaisesRegex(bench.HarnessError, "legacy or unpaired"):
+            cohort.validate_documents(
+                mixed,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+    def test_paired_cohort_rejects_mixed_baseline_host_plan_and_pair_order(self) -> None:
+        dispatch_state = make_dispatch_state()
+        reports = make_paired_cohort_reports()
+
+        mixed_baseline = copy.deepcopy(reports)
+        changed = mixed_baseline[-1][1]
+        changed["metadata"]["revisions"]["baseline"]["commit"] = "c" * 40
+        for record in changed["records"]:
+            if record["revision"] == "baseline":
+                record["revision_commit"] = "c" * 40
+        bench.validate_report(changed)
+        with self.assertRaisesRegex(bench.HarnessError, "baseline SHA"):
+            cohort.validate_documents(
+                mixed_baseline,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+        mixed_host = make_paired_cohort_reports()
+        mixed_host[2] = (
+            Path("x86-101-other-host"),
+            make_report(run_id="101", cpu="different cpu"),
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "mixed host fingerprints"):
+            cohort.validate_documents(
+                mixed_host,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+        mixed_plan = copy.deepcopy(reports)
+        mixed_plan[-1][1]["plan"]["profile"] = "smoke"
+        mixed_plan[-1][1]["metadata"]["plan_sha256"] = cache_key(
+            mixed_plan[-1][1]["plan"]
+        )
+        for revision in mixed_plan[-1][1]["metadata"]["revisions"].values():
+            revision["plan_sha256"] = mixed_plan[-1][1]["metadata"]["plan_sha256"]
+        for record in mixed_plan[-1][1]["records"]:
+            record["plan_sha256"] = mixed_plan[-1][1]["metadata"]["plan_sha256"]
+        bench.validate_report(mixed_plan[-1][1])
+        with self.assertRaisesRegex(bench.HarnessError, "plan/profile"):
+            cohort.validate_documents(
+                mixed_plan,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
+            )
+
+        inverted = copy.deepcopy(reports)
+        inverted[0][1]["records"][0], inverted[0][1]["records"][1] = (
+            inverted[0][1]["records"][1],
+            inverted[0][1]["records"][0],
+        )
+        with self.assertRaisesRegex(BenchmarkDataError, "inverted pair order"):
+            cohort.validate_documents(
+                inverted,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                dispatch_state,
             )
 
     def test_cohort_rejects_mixed_identity_and_duplicate_run_ids(self) -> None:
@@ -1332,47 +1597,112 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
             )
 
-    def test_cohort_dispatch_uses_ref_pinned_to_immutable_sha(self) -> None:
-        target = "a" * 40
+    def test_cohort_dispatch_sends_full_paired_identity_and_pins_workflow(self) -> None:
+        baseline = "b" * 40
+        candidate = "a" * 40
+        workflow_head = "f" * 40
         workflow_ref = "calibration/966-immutable"
         output = self.scratch / "dispatch.json"
         responses = [
+            json.dumps({"sha": workflow_head}),
             "https://github.com/cataggar/wamr/actions/runs/123\n",
             json.dumps(
                 {
                     "status": "completed",
                     "conclusion": "success",
-                    "headSha": target,
+                    "headSha": workflow_head,
                     "url": "https://github.com/cataggar/wamr/actions/runs/123",
                 }
             ),
             json.dumps({"artifacts": []}),
+            "https://github.com/cataggar/wamr/actions/runs/125\n",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": workflow_head,
+                    "url": "https://github.com/cataggar/wamr/actions/runs/125",
+                }
+            ),
+            json.dumps({"artifacts": []}),
         ]
-        with mock.patch.object(
-            cohort.subprocess,
-            "check_output",
-            side_effect=responses,
-        ) as run, mock.patch.object(cohort.time, "sleep"):
+        with (
+            mock.patch.object(
+                cohort.subprocess,
+                "check_output",
+                side_effect=responses,
+            ) as run,
+            mock.patch.object(cohort.time, "sleep"),
+            mock.patch.object(
+                cohort.uuid,
+                "uuid4",
+                return_value=Namespace(hex="d" * 32),
+            ),
+        ):
             cohort.dispatch(
                 Namespace(
-                    target_sha=target,
-                    runs=1,
+                    baseline_sha=baseline,
+                    candidate_sha=candidate,
+                    purpose="candidate-evaluation",
+                    profile="authoritative",
+                    warmups=2,
+                    samples=10,
+                    runner_target="github-hosted",
+                    runs=2,
+                    training_runs=1,
                     max_in_flight=1,
                     output=output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
                     workflow_ref=workflow_ref,
                     poll_seconds=0,
+                    lookup_attempts=1,
+                    lookup_seconds=0,
                 )
             )
         dispatch_command = run.call_args_list[0].args[0]
         self.assertEqual(
+            dispatch_command,
+            [
+                "gh",
+                "api",
+                "repos/cataggar/wamr/commits/calibration%2F966-immutable",
+            ],
+        )
+        dispatch_command = run.call_args_list[1].args[0]
+        self.assertEqual(
             dispatch_command[dispatch_command.index("--ref") + 1],
             workflow_ref,
+        )
+        self.assertEqual(
+            {
+                dispatch_command[index + 1]
+                for index, value in enumerate(dispatch_command)
+                if value == "-f"
+            },
+            {
+                f"baseline_sha={baseline}",
+                f"candidate_sha={candidate}",
+                "purpose=candidate-evaluation",
+                "profile=authoritative",
+                "warmups=2",
+                "samples=10",
+                "runner_target=github-hosted",
+                f"cohort_id={'d' * 32}",
+                "cohort_sequence=1",
+                "cohort_partition=training",
+            },
+        )
+        state = json.loads(output.read_text(encoding="UTF-8"))
+        self.assertEqual(state["workflow_head_sha"], workflow_head)
+        self.assertEqual(
+            [item["partition"] for item in state["split"]["assignments"]],
+            ["training", "holdout"],
         )
 
         mismatch_output = self.scratch / "dispatch-mismatch.json"
         mismatch_responses = [
+            json.dumps({"sha": workflow_head}),
             "https://github.com/cataggar/wamr/actions/runs/124\n",
             json.dumps(
                 {
@@ -1390,20 +1720,134 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 side_effect=mismatch_responses,
             ),
             mock.patch.object(cohort.time, "sleep"),
-            self.assertRaisesRegex(bench.HarnessError, "does not match target"),
+            self.assertRaisesRegex(
+                bench.HarnessError, "does not match immutable workflow head"
+            ),
         ):
             cohort.dispatch(
                 Namespace(
-                    target_sha=target,
-                    runs=1,
+                    baseline_sha=baseline,
+                    candidate_sha=candidate,
+                    purpose="candidate-evaluation",
+                    profile="authoritative",
+                    warmups=2,
+                    samples=10,
+                    runner_target="github-hosted",
+                    runs=2,
+                    training_runs=1,
                     max_in_flight=1,
                     output=mismatch_output,
                     repository="cataggar/wamr",
                     workflow="wasi-thread-bench.yml",
                     workflow_ref=workflow_ref,
                     poll_seconds=0,
+                    lookup_attempts=1,
+                    lookup_seconds=0,
                 )
             )
+
+    def test_cohort_dispatch_rejects_mutable_or_incompatible_targets(self) -> None:
+        common = {
+            "baseline_sha": "b" * 40,
+            "candidate_sha": "a" * 40,
+            "purpose": "candidate-evaluation",
+            "profile": "authoritative",
+            "warmups": 2,
+            "samples": 10,
+            "runner_target": "github-hosted",
+            "repository": "cataggar/wamr",
+            "workflow": "wasi-thread-bench.yml",
+            "workflow_ref": "main",
+            "runs": 2,
+            "training_runs": 1,
+            "max_in_flight": 1,
+            "poll_seconds": 0,
+            "lookup_attempts": 1,
+            "lookup_seconds": 0,
+        }
+        for field, value, message in (
+            ("baseline_sha", "B" * 40, "lowercase"),
+            ("samples", 3, "even"),
+            ("candidate_sha", "b" * 40, "distinct"),
+            ("runner_target", "trusted-calibration", "noise calibration only"),
+        ):
+            args = Namespace(**dict(common, **{field: value}))
+            with self.subTest(field=field), self.assertRaisesRegex(
+                bench.HarnessError, message
+            ):
+                cohort.validate_dispatch_options(args)
+
+    def test_cohort_dispatch_finds_exact_named_run_when_cli_has_no_url(self) -> None:
+        args = Namespace(
+            repository="cataggar/wamr",
+            workflow="wasi-thread-bench.yml",
+            workflow_ref="main",
+            lookup_attempts=2,
+            lookup_seconds=0,
+        )
+        run_name = f"WASI thread cohort-{'d' * 32}-1-training"
+        with (
+            mock.patch.object(
+                cohort,
+                "gh_json",
+                side_effect=[
+                    [],
+                    [
+                        {
+                            "databaseId": 123,
+                            "displayTitle": run_name,
+                            "headSha": "f" * 40,
+                            "url": (
+                                "https://github.com/cataggar/wamr/"
+                                "actions/runs/123"
+                            ),
+                        }
+                    ],
+                ],
+            ),
+            mock.patch.object(cohort.time, "sleep"),
+        ):
+            self.assertEqual(
+                cohort.find_dispatched_run(args, run_name, "f" * 40),
+                (
+                    123,
+                    "https://github.com/cataggar/wamr/actions/runs/123",
+                ),
+            )
+
+    def test_workflow_self_hosted_label_is_manual_trusted_only(self) -> None:
+        workflow = (
+            ROOT / ".github/workflows/wasi-thread-bench.yml"
+        ).read_text(encoding="UTF-8")
+        self.assertEqual(workflow.count("wamr-temp-20260906"), 1)
+        start = workflow.index("\n  trusted-calibration-x86:")
+        end = workflow.index("\n  trusted-calibration-arm:", start)
+        trusted_x86 = workflow[start:end]
+        self.assertIn("github.event_name == 'workflow_dispatch'", trusted_x86)
+        self.assertIn("inputs.runner_target == 'trusted-calibration'", trusted_x86)
+        self.assertIn("inputs.purpose == 'noise-calibration'", trusted_x86)
+        self.assertIn("github.ref == 'refs/heads/main'", trusted_x86)
+        self.assertIn("runs-on: [self-hosted, wamr-temp-20260906]", trusted_x86)
+        self.assertNotIn("pull_request", trusted_x86)
+        self.assertNotIn("\n  push:", trusted_x86)
+
+        hosted_start = workflow.index("\n  benchmark:")
+        hosted_end = workflow.index("\n  trusted-calibration-x86:", hosted_start)
+        hosted = workflow[hosted_start:hosted_end]
+        self.assertIn("github.event_name != 'workflow_dispatch'", hosted)
+        self.assertIn("inputs.runner_target == 'github-hosted'", hosted)
+        self.assertNotIn("self-hosted", hosted)
+        self.assertNotIn("wamr-temp-20260906", hosted)
+        for input_name in (
+            "baseline_sha:",
+            "candidate_sha:",
+            "purpose:",
+            "profile:",
+            "warmups:",
+            "samples:",
+            "runner_target:",
+        ):
+            self.assertIn(input_name, workflow)
 
     def test_cohort_main_handles_report_schema_errors(self) -> None:
         with mock.patch.object(
