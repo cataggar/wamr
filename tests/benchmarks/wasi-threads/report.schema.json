@@ -31,6 +31,8 @@
         "platform_id",
         "fixture_set_sha256",
         "plan_sha256",
+        "measurement_plan_version",
+        "measurement_plan_sha256",
         "host",
         "host_pair",
         "execution",
@@ -62,6 +64,8 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "measurement_plan_version": { "const": 1 },
+        "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "host": {
           "type": "object",
           "required": [

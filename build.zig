@@ -1205,6 +1205,10 @@ pub fn build(b: *std.Build) void {
         "python3",
         "scripts/test_bench_wasi_threads.py",
     });
+    const thread_budget_derivation_tests = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_wasi_thread_budget_derivation.py",
+    });
     const frame_attribution_tests = b.addSystemCommand(&.{
         "python3",
         "tests/test_aot_jit_attr.py",
@@ -1221,6 +1225,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(wasi_threads_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
     test_step.dependOn(&thread_benchmark_harness_tests.step);
+    test_step.dependOn(&thread_budget_derivation_tests.step);
     test_step.dependOn(&frame_attribution_tests.step);
     if (target_arch == .x86_64 and target.result.os.tag == .linux) {
         const frame_attribution_smoke = b.addSystemCommand(&.{

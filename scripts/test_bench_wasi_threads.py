@@ -109,6 +109,7 @@ def make_report(
     }
     plan["pairs"] = bench.expected_pair_specs_for_plan(plan)
     plan_sha256 = cache_key(plan)
+    measurement_plan_sha256 = bench.measurement_plan_sha256(plan)
     host_fields = {
         "system": "Linux",
         "machine": machine,
@@ -237,6 +238,10 @@ def make_report(
             "platform_id": platform_id,
             "fixture_set_sha256": "d" * 64,
             "plan_sha256": plan_sha256,
+            "measurement_plan_version": (
+                bench.MEASUREMENT_PLAN_IDENTITY_VERSION
+            ),
+            "measurement_plan_sha256": measurement_plan_sha256,
             "host": {
                 "system": "Linux",
                 "machine": machine,
@@ -337,6 +342,12 @@ def complete_budget(report: dict) -> dict:
             },
             "fixture_set_sha256": report["metadata"]["fixture_set_sha256"],
             "plan_sha256": report["metadata"]["plan_sha256"],
+            "measurement_plan_version": (
+                report["metadata"]["measurement_plan_version"]
+            ),
+            "measurement_plan_sha256": report["metadata"][
+                "measurement_plan_sha256"
+            ],
             "profile": report["plan"]["profile"],
             "report_count_by_platform": {
                 item: 20 for item in bench.CANONICAL_PLATFORMS
@@ -447,6 +458,31 @@ def make_paired_cohort_reports(
             ]
         )
     return reports
+
+
+def flatten_report_ratios(report: dict) -> dict:
+    """Make synthetic A/A and candidate ratios exactly one."""
+
+    for record in report["records"]:
+        elapsed = 100
+        record["elapsed_ns"] = elapsed
+        record["guest_elapsed_ns"] = elapsed
+        record["raw_guest_elapsed_ns"] = elapsed + 1
+        record["host_wall_elapsed_ns"] = elapsed + 100
+        record["host_wall_over_guest"] = 2.0
+        throughput = record["operations"] / (elapsed / 1e9)
+        record["throughput_ops_per_second"] = throughput
+        record["per_thread_ops_per_second"] = throughput / record["threads"]
+    report["summaries"] = bench.summarize(report["records"])
+    report["paired_summaries"] = bench.paired_summaries(report["records"])
+    report["comparison_summaries"] = bench.comparison_summaries(
+        report["records"]
+    )
+    report["ratio_of_ratios_summaries"] = (
+        bench.ratio_of_ratios_summaries(report["records"])
+    )
+    bench.validate_report(report)
+    return report
 
 
 class ThreadBenchmarkTests(unittest.TestCase):
@@ -1209,8 +1245,47 @@ class ThreadBenchmarkTests(unittest.TestCase):
         corrupt = copy.deepcopy(report)
         corrupt["plan"]["pairs"][0]["left"] = "renamed"
         corrupt["metadata"]["plan_sha256"] = cache_key(corrupt["plan"])
-        with self.assertRaisesRegex(BenchmarkDataError, "plan identity|incomplete"):
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "measurement_plan_sha256"
+        ):
             bench.validate_report(corrupt)
+
+    def test_measurement_plan_identity_excludes_only_purpose(self) -> None:
+        plan = make_report()["plan"]
+        candidate_plan = copy.deepcopy(plan)
+        candidate_plan["comparison_purpose"] = "noise-calibration"
+        self.assertNotEqual(cache_key(plan), cache_key(candidate_plan))
+        self.assertEqual(
+            bench.measurement_plan_sha256(plan),
+            bench.measurement_plan_sha256(candidate_plan),
+        )
+        corrupt_report = make_report()
+        corrupt_report["metadata"]["measurement_plan_sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "measurement_plan_sha256"
+        ):
+            bench.validate_report(corrupt_report)
+
+        mutations = (
+            lambda value: value.__setitem__(
+                "timeout_seconds", value["timeout_seconds"] + 1
+            ),
+            lambda value: value["iterations"].__setitem__(
+                "hot", value["iterations"]["hot"] + 1
+            ),
+            lambda value: value.__setitem__("samples", value["samples"] + 2),
+            lambda value: value["pairs"][0].__setitem__(
+                "left", "different-condition"
+            ),
+        )
+        expected = bench.measurement_plan_sha256(plan)
+        for mutate in mutations:
+            changed = copy.deepcopy(plan)
+            mutate(changed)
+            self.assertNotEqual(
+                bench.measurement_plan_sha256(changed),
+                expected,
+            )
 
     def test_budget_rejects_empty_partial_unknown_duplicate_and_direction(self) -> None:
         report = make_report()
@@ -1269,7 +1344,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
             ("commit", lambda value: value["calibration_provenance"]["baseline_revision"].__setitem__("commit", "e" * 40)),
             ("source", lambda value: value["calibration_provenance"]["baseline_revision"].__setitem__("build_source_sha256", "f" * 64)),
             ("fixture", lambda value: value["calibration_provenance"].__setitem__("fixture_set_sha256", "f" * 64)),
-            ("plan", lambda value: value["calibration_provenance"].__setitem__("plan_sha256", "f" * 64)),
+            (
+                "measurement-plan",
+                lambda value: value["calibration_provenance"].__setitem__(
+                    "measurement_plan_sha256", "f" * 64
+                ),
+            ),
             ("profile", lambda value: value["calibration_provenance"].__setitem__("profile", "smoke")),
             ("count", lambda value: value["calibration_provenance"]["report_count_by_platform"].__setitem__(report["metadata"]["platform_id"], 19)),
             ("host", lambda value: value["platforms"][report["metadata"]["platform_id"]].__setitem__("host_machine", "aarch64")),
@@ -1288,6 +1368,83 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(bench.HarnessError, "duplicate"):
             bench.load_budget(self.write_budget(duplicate_json), report)
+
+    def test_derived_noise_budget_accepts_matching_candidate_measurement_plan(
+        self,
+    ) -> None:
+        run_ids = tuple(str(10_000 + index) for index in range(20))
+        dispatch_state = make_dispatch_state(
+            run_ids=run_ids,
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+        )
+        reports = [
+            (path, flatten_report_ratios(report))
+            for path, report in make_paired_cohort_reports(
+                run_ids=run_ids,
+                baseline_commit="a" * 40,
+                commit="a" * 40,
+                baseline_source="c" * 64,
+                candidate_source="c" * 64,
+                comparison_purpose="noise-calibration",
+            )
+        ]
+        validated = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            20,
+            dispatch_state,
+        )
+        policy = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "benchmarks"
+                / "wasi-threads"
+                / "derivation-policy.synthetic.json"
+            ).read_text(encoding="UTF-8")
+        )
+        budget, _, _ = cohort.derive_budget_documents(validated, policy)
+        budget["enforcement"] = True
+
+        candidate = flatten_report_ratios(
+            make_report(
+                baseline_commit="a" * 40,
+                commit="e" * 40,
+                baseline_source="c" * 64,
+                candidate_source="f" * 64,
+                comparison_purpose="candidate-evaluation",
+            )
+        )
+        self.assertNotEqual(
+            budget["calibration_provenance"]["plan_sha256"],
+            candidate["metadata"]["plan_sha256"],
+        )
+        self.assertEqual(
+            budget["calibration_provenance"]["measurement_plan_sha256"],
+            candidate["metadata"]["measurement_plan_sha256"],
+        )
+        loaded = bench.load_budget(self.write_budget(budget), candidate)
+        self.assertEqual(bench.evaluate_budget(loaded, candidate), [])
+
+        changed_measurement = flatten_report_ratios(
+            make_report(
+                baseline_commit="a" * 40,
+                commit="e" * 40,
+                baseline_source="c" * 64,
+                candidate_source="f" * 64,
+                comparison_purpose="candidate-evaluation",
+                samples=4,
+            )
+        )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "measurement_plan_sha256"
+        ):
+            bench.load_budget(
+                self.write_budget(budget),
+                changed_measurement,
+            )
 
     def test_budget_requires_exact_canonical_platform_set_in_either_order(self) -> None:
         report = make_report()
@@ -1590,6 +1747,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
         mixed_plan[-1][1]["plan"]["profile"] = "smoke"
         mixed_plan[-1][1]["metadata"]["plan_sha256"] = cache_key(
             mixed_plan[-1][1]["plan"]
+        )
+        mixed_plan[-1][1]["metadata"]["measurement_plan_sha256"] = (
+            bench.measurement_plan_sha256(mixed_plan[-1][1]["plan"])
         )
         for revision in mixed_plan[-1][1]["metadata"]["revisions"].values():
             revision["plan_sha256"] = mixed_plan[-1][1]["metadata"]["plan_sha256"]
@@ -2331,6 +2491,16 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertIn("revision_checkouts", schema["properties"]["metadata"]["required"])
         self.assertIn("comparison_purpose", schema["properties"]["plan"]["required"])
+        self.assertIn(
+            "measurement_plan_sha256",
+            schema["properties"]["metadata"]["required"],
+        )
+        self.assertEqual(
+            schema["properties"]["metadata"]["properties"][
+                "measurement_plan_version"
+            ]["const"],
+            bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
+        )
         paired_contract = schema["allOf"][0]["then"]["properties"]
         self.assertEqual(
             paired_contract["plan"]["properties"]["samples"]["multipleOf"],
@@ -2373,6 +2543,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "comparison_purpose"
             ]["const"],
             "noise-calibration",
+        )
+        self.assertEqual(
+            budget_schema["$defs"]["calibration_provenance"]["properties"][
+                "measurement_plan_version"
+            ]["const"],
+            bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
         )
         calibrated = complete_budget(make_report())
         self.assertEqual(set(calibrated), set(budget_schema["required"]))
