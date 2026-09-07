@@ -387,7 +387,7 @@ uses the passive-data helper fields and the data section now preserves active
 `ThreadManager.interrupt` publishes the word into every `VmCtx` subscribed to
 the process group's shared memory — the same mechanism memory-grow
 republication already uses. Component task cancellation uses the subscriber
-list too, but filters by the inherited task-group pointer.
+list too, but filters by the inherited, never-reused task-group token.
 
 `ThreadManager.terminateAndJoin(timeout_ns)` bounds teardown — a backstop
 that now only matters for a sibling wedged outside any interruption point. It closes the
