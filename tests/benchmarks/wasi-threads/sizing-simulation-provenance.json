@@ -1,0 +1,329 @@
+{
+  "cells": [
+    {
+      "key": "aot/atomic/1",
+      "pilot_iterations": 850000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1797212110,
+      "source_fastest_corrected_interval_ns": 541278000,
+      "source_iterations": 256000000
+    },
+    {
+      "key": "aot/atomic/2",
+      "pilot_iterations": 180000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1831381875,
+      "source_fastest_corrected_interval_ns": 1302316000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/atomic/4",
+      "pilot_iterations": 64000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 2550137000,
+      "source_fastest_corrected_interval_ns": 2550137000,
+      "source_iterations": 64000000
+    },
+    {
+      "key": "aot/atomic/8",
+      "pilot_iterations": 64000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 6697711000,
+      "source_fastest_corrected_interval_ns": 6697711000,
+      "source_iterations": 64000000
+    },
+    {
+      "key": "aot/cancel-hot/1",
+      "pilot_iterations": 1900000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1813482143,
+      "source_fastest_corrected_interval_ns": 213800000,
+      "source_iterations": 224000000
+    },
+    {
+      "key": "aot/cancel-hot/2",
+      "pilot_iterations": 1900000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1817839844,
+      "source_fastest_corrected_interval_ns": 122465000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/cancel-hot/4",
+      "pilot_iterations": 950000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1818003125,
+      "source_fastest_corrected_interval_ns": 244952000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/cancel-hot/8",
+      "pilot_iterations": 475000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1825506641,
+      "source_fastest_corrected_interval_ns": 491926000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/hot/1",
+      "pilot_iterations": 1800000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1816692188,
+      "source_fastest_corrected_interval_ns": 129187000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/hot/2",
+      "pilot_iterations": 1800000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1820882813,
+      "source_fastest_corrected_interval_ns": 129485000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/hot/4",
+      "pilot_iterations": 900000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1821283594,
+      "source_fastest_corrected_interval_ns": 259027000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/hot/8",
+      "pilot_iterations": 450000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1826676563,
+      "source_fastest_corrected_interval_ns": 519588000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "aot/single-hot/1",
+      "pilot_iterations": 1900000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1813490625,
+      "source_fastest_corrected_interval_ns": 213801000,
+      "source_iterations": 224000000
+    },
+    {
+      "key": "aot/spawn-join/1",
+      "pilot_iterations": 10000,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1846136667,
+      "source_fastest_corrected_interval_ns": 553841000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "aot/spawn-join/2",
+      "pilot_iterations": 5000,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1790981667,
+      "source_fastest_corrected_interval_ns": 1074589000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "aot/spawn-join/4",
+      "pilot_iterations": 2500,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1863348334,
+      "source_fastest_corrected_interval_ns": 2236018000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "aot/spawn-join/8",
+      "pilot_iterations": 1250,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1808100834,
+      "source_fastest_corrected_interval_ns": 4339442000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "aot/wait-notify/1",
+      "pilot_iterations": 1500000,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1181229493,
+      "source_fastest_corrected_interval_ns": 403193000,
+      "source_iterations": 512000
+    },
+    {
+      "key": "aot/wait-notify/2",
+      "pilot_iterations": 64000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1858706750,
+      "source_fastest_corrected_interval_ns": 7434827000,
+      "source_iterations": 256000
+    },
+    {
+      "key": "aot/wait-notify/4",
+      "pilot_iterations": 32000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1911842000,
+      "source_fastest_corrected_interval_ns": 7647368000,
+      "source_iterations": 128000
+    },
+    {
+      "key": "aot/wait-notify/8",
+      "pilot_iterations": 16000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1869062750,
+      "source_fastest_corrected_interval_ns": 7476251000,
+      "source_iterations": 64000
+    },
+    {
+      "key": "interpreter/atomic/1",
+      "pilot_iterations": 72000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1868801344,
+      "source_fastest_corrected_interval_ns": 6644627000,
+      "source_iterations": 256000000
+    },
+    {
+      "key": "interpreter/atomic/2",
+      "pilot_iterations": 40000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1867287813,
+      "source_fastest_corrected_interval_ns": 5975321000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "interpreter/atomic/4",
+      "pilot_iterations": 28000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1928403750,
+      "source_fastest_corrected_interval_ns": 4407780000,
+      "source_iterations": 64000000
+    },
+    {
+      "key": "interpreter/atomic/8",
+      "pilot_iterations": 14000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1930315844,
+      "source_fastest_corrected_interval_ns": 8824301000,
+      "source_iterations": 64000000
+    },
+    {
+      "key": "interpreter/hot/1",
+      "pilot_iterations": 28000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1871853375,
+      "source_fastest_corrected_interval_ns": 8557044000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "interpreter/hot/2",
+      "pilot_iterations": 28000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 1905118250,
+      "source_fastest_corrected_interval_ns": 8709112000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "interpreter/hot/4",
+      "pilot_iterations": 20000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 2185147813,
+      "source_fastest_corrected_interval_ns": 13984946000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "interpreter/hot/8",
+      "pilot_iterations": 10000000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 2191898985,
+      "source_fastest_corrected_interval_ns": 28056307000,
+      "source_iterations": 128000000
+    },
+    {
+      "key": "interpreter/single-hot/1",
+      "pilot_iterations": 30000000,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1871240759,
+      "source_fastest_corrected_interval_ns": 13971931000,
+      "source_iterations": 224000000
+    },
+    {
+      "key": "interpreter/spawn-join/1",
+      "pilot_iterations": 9000,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1935945000,
+      "source_fastest_corrected_interval_ns": 645315000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "interpreter/spawn-join/2",
+      "pilot_iterations": 4500,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1858347000,
+      "source_fastest_corrected_interval_ns": 1238898000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "interpreter/spawn-join/4",
+      "pilot_iterations": 2250,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1820712000,
+      "source_fastest_corrected_interval_ns": 2427616000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "interpreter/spawn-join/8",
+      "pilot_iterations": 1250,
+      "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
+      "retained_fastest_interval_ns": 1908010417,
+      "source_fastest_corrected_interval_ns": 4579225000,
+      "source_iterations": 3000
+    },
+    {
+      "key": "interpreter/wait-notify/1",
+      "pilot_iterations": 128000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 2032412500,
+      "source_fastest_corrected_interval_ns": 8129650000,
+      "source_iterations": 512000
+    },
+    {
+      "key": "interpreter/wait-notify/2",
+      "pilot_iterations": 64000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 2011442000,
+      "source_fastest_corrected_interval_ns": 8045768000,
+      "source_iterations": 256000
+    },
+    {
+      "key": "interpreter/wait-notify/4",
+      "pilot_iterations": 32000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 2031079750,
+      "source_fastest_corrected_interval_ns": 8124319000,
+      "source_iterations": 128000
+    },
+    {
+      "key": "interpreter/wait-notify/8",
+      "pilot_iterations": 16000,
+      "report_sha256": "cb15b11198bd525173f98481fd7574af9c147286fef3e32bd78bf5701fc43d2c",
+      "retained_fastest_interval_ns": 2036613000,
+      "source_fastest_corrected_interval_ns": 8146452000,
+      "source_iterations": 64000
+    }
+  ],
+  "derivation": {
+    "description": "Scale each pre-#1013 fastest retained corrected interval to the matching authoritative pilot count.",
+    "formula": "ceil(source_fastest_corrected_interval_ns * pilot_iterations / source_iterations)"
+  },
+  "epyc_9v45_reference": {
+    "relative_speedup": 1.7195,
+    "retained_fastest_interval_ns": 1054664000
+  },
+  "kind": "wasi-thread-sizing-simulation-provenance",
+  "pilot_plan_sha256": "c27d589dbea8e3844b07c8d99b91cfb82824b7af61ba09f77eaaacef0bb739f0",
+  "retained_reference": {
+    "key": "aot/single-hot/1",
+    "retained_fastest_interval_ns": 1813490625
+  },
+  "schema_version": 1,
+  "source_provenance": {
+    "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
+    "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",
+    "revision": "c9eb22f529215c1d0cda823d6bd02e5f30fa30ca",
+    "sha256": "aec6bb9fe838e95c6fb8826b3fe420c386bd0598e83193d46ae6f0eb2ee4df4b"
+  }
+}
