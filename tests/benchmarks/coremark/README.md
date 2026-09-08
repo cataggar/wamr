@@ -72,6 +72,13 @@ invocation to it. Engines are fully built/installed before timing and warmups
 and measured samples use a counterbalanced forward/reverse order (ABBA for two
 engines). The Markdown and JSON reports retain the exact order, per-sample UTC
 start/end timestamps, CPU selection, iterations, and raw throughput.
+Authoritative JSON reports use schema version 2. Each WAMR row contains the
+exact source SHA plus SHA-256 identities for `wamr`, `wamrc`, and the compiled
+CoreMark cwasm. Wasmtime rows contain the exact release/channel and runtime
+SHA-256. Report provenance includes a unique report ID, generation time,
+benchmark-harness source/script identity, and the GitHub Actions run identity
+(or an explicit local run ID). Schema-version-1 reports remain recognizable as
+legacy data, but lack these identities and cannot authorize a current profile.
 
 Run 33576430466 predates these controls and is explicitly non-authoritative:
 it allowed each engine to self-calibrate a different iteration count and
@@ -90,29 +97,80 @@ PR CI deliberately uses `--profile ci` (zero warmups, three measured runs) to
 keep the regression gate affordable. Use the default `--profile authoritative`
 for publishable cross-engine numbers.
 
-The AArch64 workflow also exposes a manual `profile` mode. It installs the
-Ubuntu `linux-tools-$(uname -r)` package, verifies native `cycles:u` sampling,
-precompiles the canonical fixture once with WAMR spill/codegen diagnostics,
-and records load+execute-only self samples for WAMR and Wasmtime 44.0.1 on the
-same native host. Wasmtime uses its documented v44
-`--profile=jitdump` integration followed by `perf inject --jit`. Reports map
-WAMR `local_func` indices and Wasmtime's full wasm function indices through
-the fixture name section so the same functions are compared explicitly.
+The AArch64 workflow also exposes a manual `profile` mode. For the requested
+`profile_ref` (or `target` when `profile_ref` is empty), it first resolves an
+exact SHA and runs a fresh authoritative WAMR/Wasmtime 44.0.1 benchmark on the
+profiling host. The profiler requires that schema-version-2 benchmark report;
+there is no historical-run fallback. It verifies the architecture, fixture and
+workload, host fingerprint and CPU affinity, GitHub run identity, tooling
+source SHA, exact WAMR source/runtime/compiler/cwasm identities, and exact
+Wasmtime version/runtime identity before collecting samples. The profile JSON
+retains the benchmark report ID and SHA-256, so a profile cannot silently claim
+association with an unrelated benchmark. Because optimized Zig binaries retain
+build-path identity, the benchmark explicitly copies the exact measured
+`wamr`, `wamrc`, and cwasm into an ephemeral runner-local handoff directory.
+The profiler validates its manifest and reuses those bytes; normal benchmark
+runs retain no build artifacts, and the handoff directory is not uploaded.
+The retained profile report records the ephemeral handoff manifest SHA-256.
+The handoff directory must not already exist; existing files are never replaced.
 
-Run it from GitHub Actions with **CoreMark (aarch64) → Run workflow → mode:
-profile**. `profile_ref` defaults to the corrected authoritative commit from
-run 33631050708 (`19d046a5b23b9c39acf5f7062976f04c5ca8ca75`); the workflow
-builds that ref in an isolated worktree while using the merged profiling
-tooling. Profiling uses the same fixed arguments and selected CPU as the
-authoritative benchmark, runs ABBA warmups, then records two captures per
-engine in ABBA order before aggregating self samples. Each WAMR capture must
-independently find exactly one anonymous executable mmap with the precise
-host-page-rounded cwasm text size and attribute at least 99% of all self
+Invoke a pinned current profile with:
+
+```
+gh workflow run coremark-aarch64.yml \
+  --ref <profiling-tooling-sha> \
+  -f mode=profile \
+  -f profile_ref=<wamr-source-sha>
+```
+
+The uploaded artifact is named
+`coremark-aarch64-profile-<wamr-source-sha>` and includes
+`benchmark-report.json`, `benchmark-table.md`, `profile.json`, and
+`profile.md`. The workflow installs Ubuntu `linux-tools-$(uname -r)`, verifies
+native `cycles:u` sampling, uses Wasmtime's documented v44
+`--profile=jitdump` integration followed by `perf inject --jit`, and maps WAMR
+`local_func` indices and Wasmtime full wasm indices through the fixture name
+section. Profiling uses the benchmark's fixed arguments and selected CPU, runs
+ABBA warmups, then records two captures per engine in ABBA order. Each WAMR
+capture must independently find exactly one anonymous executable mmap with the
+precise host-page-rounded cwasm text size and attribute at least 99% of all self
 samples; both Wasmtime captures must independently clear the same coverage
 gate. Manual mapping overrides are diagnostic-only and non-authoritative.
-It uploads compact
-JSON/Markdown reports, diagnostics, and compressed raw perf/jitdump data when
-each input is at most 25 MiB.
+
+For a local native AArch64 host, create and consume the identity explicitly:
+
+```
+sha="$(git rev-parse HEAD)"
+execution_id="coremark-${sha}-$(date -u +%Y%m%dT%H%M%SZ)"
+artifact_dir="$PWD/.cache/coremark-profile-${execution_id}"
+python3 scripts/bench_coremark.py \
+  --baseline "$sha" --target "$sha" \
+  --profile authoritative \
+  --wasmtime-baseline auto \
+  --require-native-arch aarch64 \
+  --execution-id "$execution_id" \
+  --json-out coremark-report.json \
+  --retain-target-artifacts "$artifact_dir"
+python3 scripts/profile_coremark_aarch64.py \
+  --benchmark-report coremark-report.json \
+  --benchmark-artifacts "$artifact_dir" \
+  --execution-id "$execution_id" \
+  --wamr-ref "$sha" \
+  --out-dir coremark-profile
+```
+
+Local benchmark/profile commands must receive the same nonempty
+`--execution-id` (or `COREMARK_RUN_ID`). A missing, stale, or mismatched local
+ID fails validation; a profile never becomes authoritative by copying the
+benchmark's ID into its output.
+Standalone JSON benchmarks still work without an explicit ID: they generate
+one in the report. Profiling that report requires explicitly supplying its ID.
+
+Profiles from separate workflow runs are independent snapshots, not a same-host
+paired experiment. Each is linked to its own same-host authoritative benchmark;
+optimization acceptance still requires a same-host baseline/target comparison.
+The mean-based `--min-delta-pct` benchmark option is not a median optimization
+gate.
 
 ## Options
 

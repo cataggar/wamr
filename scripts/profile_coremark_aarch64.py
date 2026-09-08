@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import bisect
 import gzip
 import hashlib
@@ -28,13 +27,14 @@ import bench_coremark
 import compare_hot_function
 
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 REPORT_KIND = "coremark-aarch64-matched-profile"
+HISTORICAL_REPORT_SCHEMA_VERSION = 1
+HISTORICAL_BASELINE_RUN = 33631050708
 DEFAULT_MIN_SAMPLES = 1000
 DEFAULT_TOP_FUNCTIONS = 10
 DEFAULT_CLASSIFY_FUNCTIONS = 3
 DEFAULT_MAX_PERF_BYTES = 25 * 1024 * 1024
-AUTHORITATIVE_BASELINE_RUN = 33631050708
 PROFILE_CAPTURES_PER_ENGINE = 2
 MIN_ATTRIBUTION_COVERAGE_PCT = 99.0
 ALL_ALU_WORDING = (
@@ -572,6 +572,51 @@ def classify_wasmtime_function(
     }
 
 
+def load_benchmark_report(path: Path) -> tuple[dict[str, Any], str]:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProfileError(f"cannot read benchmark report {path}: {exc}") from exc
+    if not isinstance(report, dict):
+        raise ProfileError("benchmark report root must be a JSON object")
+    try:
+        bench_coremark.validate_authoritative_benchmark_report(report)
+    except RuntimeError as exc:
+        raise ProfileError(str(exc)) from exc
+    return report, sha256_file(path)
+
+
+def profile_report_status(report: dict[str, Any]) -> dict[str, Any]:
+    if report.get("kind") != REPORT_KIND:
+        raise ProfileError("profile report has an unsupported kind")
+    if report.get("schema_version") == HISTORICAL_REPORT_SCHEMA_VERSION:
+        return {
+            "status": "historical-unverified",
+            "authoritative": False,
+            "baseline_run": report.get("authoritative_baseline_run"),
+            "known_historical_baseline": (
+                report.get("authoritative_baseline_run")
+                == HISTORICAL_BASELINE_RUN
+            ),
+            "reason": (
+                "schema version 1 named a historical run without embedding "
+                "validated benchmark/report provenance"
+            ),
+        }
+    validate_report(report)
+    return {"status": "current", "authoritative": True}
+
+
+def _require_sha(value: object, label: str, length: int) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or re.fullmatch(r"[0-9a-f]+", value) is None
+    ):
+        raise ProfileError(f"{label} must be a {length}-character lowercase hex digest")
+    return value
+
+
 def validate_report(report: dict[str, Any]) -> None:
     if report.get("schema_version") != REPORT_SCHEMA_VERSION:
         raise ProfileError("profile report has an unsupported schema_version")
@@ -579,8 +624,61 @@ def validate_report(report: dict[str, Any]) -> None:
         raise ProfileError("profile report has an unsupported kind")
     if report.get("architecture") != "aarch64":
         raise ProfileError("profile report architecture must be aarch64")
-    if report.get("authoritative_baseline_run") != AUTHORITATIVE_BASELINE_RUN:
-        raise ProfileError("profile report names the wrong authoritative baseline")
+    benchmark = report.get("benchmark")
+    if not isinstance(benchmark, dict):
+        raise ProfileError("profile report lacks benchmark provenance")
+    if not benchmark.get("report_id") or not benchmark.get("generated_at"):
+        raise ProfileError("profile report has incomplete benchmark linkage")
+    _require_sha(benchmark.get("report_sha256"), "benchmark report sha256", 64)
+    handoff = benchmark.get("artifact_handoff")
+    if not isinstance(handoff, dict) or not handoff.get("directory"):
+        raise ProfileError("profile report lacks benchmark artifact handoff")
+    _require_sha(
+        handoff.get("manifest_sha256"), "benchmark handoff manifest sha256", 64
+    )
+    target = benchmark.get("target")
+    if not isinstance(target, dict):
+        raise ProfileError("profile report lacks benchmark target identity")
+    target_source = target.get("identity", {}).get("source", {})
+    if target_source.get("sha") != report.get("wamr", {}).get("commit"):
+        raise ProfileError("profile and benchmark WAMR source SHAs differ")
+    target_identity = target.get("identity", {})
+    wamr = report.get("wamr", {})
+    if (
+        target_identity.get("runtime", {}).get("sha256")
+        != wamr.get("runtime_sha256")
+        or target_identity.get("compiler", {}).get("sha256")
+        != wamr.get("compiler_sha256")
+        or target_identity.get("module", {}).get("sha256")
+        != wamr.get("cwasm_sha256")
+    ):
+        raise ProfileError("profile and benchmark WAMR tool identities differ")
+    baseline = benchmark.get("wasmtime_baseline")
+    if not isinstance(baseline, dict):
+        raise ProfileError("profile report lacks benchmark Wasmtime identity")
+    baseline_identity = baseline.get("identity", {})
+    if (
+        baseline_identity.get("version") != report.get("wasmtime", {}).get("version")
+        or baseline_identity.get("runtime", {}).get("sha256")
+        != report.get("wasmtime", {}).get("sha256")
+    ):
+        raise ProfileError("profile and benchmark Wasmtime identities differ")
+    provenance = report.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ProfileError("profile report lacks producer provenance")
+    _require_sha(
+        provenance.get("producer_source_sha"), "profile producer source SHA", 40
+    )
+    _require_sha(
+        provenance.get("script_sha256"), "profile producer script sha256", 64
+    )
+    if (
+        provenance.get("producer_source_sha")
+        != benchmark.get("producer", {}).get("source_sha")
+    ):
+        raise ProfileError("profile and benchmark tooling source SHAs differ")
+    if provenance.get("execution") != benchmark.get("execution"):
+        raise ProfileError("profile and benchmark execution provenance differ")
     if report.get("guest_args") != list(bench_coremark.COREMARK_GUEST_ARGS):
         raise ProfileError("profile report guest args are not authoritative")
     if report.get("expected_iterations") != bench_coremark.EXPECTED_ITERATIONS:
@@ -648,6 +746,16 @@ def render_markdown(report: dict[str, Any]) -> str:
     host = report["host"]
     wamr = report["engines"]["wamr"]
     wasmtime = report["engines"]["wasmtime"]
+    benchmark = report["benchmark"]
+    execution = benchmark["execution"]
+    if execution.get("provider") == "github-actions":
+        repository = execution["repository"]
+        run_id = execution["run_id"]
+        benchmark_link = (
+            f"[{run_id}](https://github.com/{repository}/actions/runs/{run_id})"
+        )
+    else:
+        benchmark_link = f"`{execution['run_id']}`"
     order = "".join(
         "A" if item["engine"] == "wamr" else "B"
         for item in report["profile_schedule"]
@@ -663,10 +771,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         "### Matched-host AArch64 CoreMark profiles",
         "",
         f"- Commit: `{report['wamr']['commit']}` (`ReleaseFast`)",
-        f"- Authoritative baseline: run "
-        f"[{report['authoritative_baseline_run']}]"
-        f"(https://github.com/cataggar/wamr/actions/runs/"
-        f"{report['authoritative_baseline_run']})",
+        f"- Authoritative benchmark: report `{benchmark['report_id']}` "
+        f"(`sha256:{benchmark['report_sha256']}`), run {benchmark_link}",
+        f"- Exact WAMR artifact handoff: manifest "
+        f"`sha256:{benchmark['artifact_handoff']['manifest_sha256']}`",
+        f"- Benchmark target: "
+        f"`{benchmark['target']['identity']['source']['sha']}`; "
+        f"producer tooling `{benchmark['producer']['source_sha']}`",
         f"- Fixture: `{report['fixture']['path']}` "
         f"(`sha256:{report['fixture']['sha256']}`)",
         f"- Fixed guest args: `{' '.join(report['guest_args'])}`; every run "
@@ -811,15 +922,45 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     recorder = CommandRecorder(out_dir)
     aot = load_aot_helper(repo)
+    benchmark_report, benchmark_report_sha = load_benchmark_report(
+        args.benchmark_report.resolve()
+    )
+    benchmark_target = next(
+        engine
+        for engine in benchmark_report["engines"]
+        if engine["role"] == "wamr-target"
+    )
+    benchmark_target_sha = benchmark_target["identity"]["source"]["sha"]
+    current_execution = bench_coremark.capture_execution_identity(
+        args.execution_id
+    )
+    try:
+        bench_coremark.validate_execution_match(
+            benchmark_report["provenance"]["execution"], current_execution
+        )
+        handoff = bench_coremark.load_wamr_artifact_handoff(
+            args.benchmark_artifacts, benchmark_target["identity"]
+        )
+    except RuntimeError as exc:
+        raise ProfileError(str(exc)) from exc
+    handoff_manifest_sha = sha256_file(
+        args.benchmark_artifacts.resolve() / "manifest.json"
+    )
 
     host_identity = bench_coremark.validate_native_host("aarch64")
     fixture, fixture_sha = bench_coremark.resolve_fixture(
         repo, bench_coremark.DEFAULT_FIXTURE
     )
     wasm_identity = compare_hot_function.parse_core_wasm(fixture)
+    wamr_ref = args.wamr_ref or benchmark_target_sha
     commit = recorder.run(
-        ["git", "rev-parse", args.wamr_ref], "git-identity.log", cwd=repo
+        ["git", "rev-parse", wamr_ref], "git-identity.log", cwd=repo
     ).stdout.strip()
+    if commit != benchmark_target_sha:
+        raise ProfileError(
+            f"--wamr-ref resolves to {commit}, but the benchmark target is "
+            f"{benchmark_target_sha}"
+        )
     checkout_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
@@ -827,36 +968,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         text=True,
         capture_output=True,
     ).stdout.strip()
-    source_worktree = args.work_root.resolve()
-    worktree_created = commit != checkout_commit
-    if worktree_created:
-        shutil.rmtree(source_worktree, ignore_errors=True)
-        recorder.run(
-            [
-                "git",
-                "worktree",
-                "add",
-                "--detach",
-                str(source_worktree),
-                commit,
-            ],
-            "wamr-source-worktree.log",
-            cwd=repo,
-        )
-
-        def cleanup_worktree():
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(source_worktree)],
-                cwd=repo,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-        atexit.register(cleanup_worktree)
-        build_repo = source_worktree
-    else:
-        cleanup_worktree = None
-        build_repo = repo
+    build_repo = args.benchmark_artifacts.resolve()
     kernel = recorder.run(
         ["uname", "-r"], "kernel.log", cwd=repo
     ).stdout.strip()
@@ -867,19 +979,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         [perf_binary(), "--version"], "perf-version.log", cwd=repo
     ).stdout.strip()
 
-    build_env = os.environ.copy()
-    build_env.pop("ZIG_LOCAL_CACHE_DIR", None)
-    build_env["ZIG_GLOBAL_CACHE_DIR"] = str(
-        source_worktree.parent / f"zig-global-{commit[:12]}"
-    )
-    recorder.run(
-        ["zig", "build", "-Doptimize=ReleaseFast"],
-        "build.log",
-        cwd=build_repo,
-        env=build_env,
-    )
-    wamr = build_repo / "zig-out/bin/wamr"
-    wamrc = build_repo / "zig-out/bin/wamrc"
+    wamr = handoff["runtime"]
+    wamrc = handoff["compiler"]
+    cwasm = handoff["module"]
     wamr_version = recorder.run(
         [str(wamr), "version"], "wamr-version.log", cwd=build_repo
     ).stdout.strip()
@@ -887,7 +989,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         [str(wamrc), "version"], "wamrc-version.log", cwd=build_repo
     ).stdout.strip()
 
-    cwasm = out_dir / "coremark.wamr.cwasm"
+    diagnostic_cwasm = out_dir / "coremark.diagnostic.cwasm"
     compile_env = os.environ.copy()
     compile_env.update(
         {
@@ -898,7 +1000,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         }
     )
     compile_result = recorder.run(
-        [str(wamrc), "compile", str(fixture), "-o", str(cwasm)],
+        [str(wamrc), "compile", str(fixture), "-o", str(diagnostic_cwasm)],
         "wamr-compile.log",
         cwd=build_repo,
         env=compile_env,
@@ -906,21 +1008,38 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "WAMR_AOT_SPILL_METRIC=1 WAMR_AOT_SPILL_METRIC_MIN_SPILLS=1 "
             "WAMR_AOT_CODEGEN_TIMING=1 "
             "WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS=0 "
-            f"{shlex.join([str(wamrc), 'compile', str(fixture), '-o', str(cwasm)])}"
+            f"{shlex.join([str(wamrc), 'compile', str(fixture), '-o', str(diagnostic_cwasm)])}"
         ),
     )
     spill_metrics = parse_spill_metrics(
         compile_result.stdout + compile_result.stderr
     )
+    if sha256_file(diagnostic_cwasm) != sha256_file(cwasm):
+        raise ProfileError(
+            "diagnostic cwasm does not match the exact benchmark-built module"
+        )
+    diagnostic_cwasm.unlink()
     cwasm_info = aot.parse_cwasm(cwasm)
     if cwasm_info.version not in aot.SUPPORTED_AOT_VERSIONS:
         raise ProfileError("WAMR cwasm version is unsupported by attribution")
+    profile_wamr_identity = bench_coremark.make_wamr_identity(
+        ref=wamr_ref,
+        source_sha=commit,
+        optimize="ReleaseFast",
+        runtime_path=wamr,
+        compiler_path=wamrc,
+        module_path=cwasm,
+    )
 
     wasmtime = bench_coremark.install_pinned_wasmtime(
-        repo, out_dir / "wasmtime-tools"
+        repo, args.wasmtime_cache
     )
     wasmtime_version = bench_coremark.validate_pinned_wasmtime(wasmtime)
-    wasmtime_sha = sha256_file(wasmtime)
+    profile_wasmtime_identity = bench_coremark.make_wasmtime_identity(
+        version=wasmtime_version,
+        runtime_path=wasmtime,
+        channel="historical-pin",
+    )
     wasmtime_cwasm = out_dir / "coremark.wasmtime.cwasm"
     recorder.run(
         [
@@ -949,6 +1068,28 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     (out_dir / "wasmtime-objdump.txt").write_text(objdump, encoding="utf-8")
 
     affinity = bench_coremark.select_cpu_affinity()
+    try:
+        benchmark_identity = bench_coremark.validate_benchmark_profile_match(
+            benchmark_report,
+            expected_arch="aarch64",
+            fixture_sha=fixture_sha,
+            host=host_identity,
+            affinity=affinity,
+            wamr_source_sha=commit,
+            wamr_optimize="ReleaseFast",
+            wamr_runtime_sha=profile_wamr_identity["runtime"]["sha256"],
+            wamr_compiler_sha=profile_wamr_identity["compiler"]["sha256"],
+            wamr_module_sha=profile_wamr_identity["module"]["sha256"],
+            wasmtime_version_value=wasmtime_version,
+            wasmtime_runtime_sha=profile_wasmtime_identity["runtime"]["sha256"],
+            producer_source_sha=checkout_commit,
+            producer_script_sha=sha256_file(
+                Path(bench_coremark.__file__).resolve()
+            ),
+            current_execution=current_execution,
+        )
+    except RuntimeError as exc:
+        raise ProfileError(str(exc)) from exc
     guest_args = bench_coremark.coremark_guest_args(
         bench_coremark.EXPECTED_ITERATIONS
     )
@@ -1337,7 +1478,24 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": REPORT_SCHEMA_VERSION,
         "kind": REPORT_KIND,
         "architecture": "aarch64",
-        "authoritative_baseline_run": AUTHORITATIVE_BASELINE_RUN,
+        "benchmark": {
+            **benchmark_identity,
+            "report_path": str(args.benchmark_report.resolve()),
+            "report_sha256": benchmark_report_sha,
+            "schema_version": benchmark_report["schema_version"],
+            "kind": benchmark_report["kind"],
+            "artifact_handoff": {
+                "directory": str(args.benchmark_artifacts.resolve()),
+                "manifest_sha256": handoff_manifest_sha,
+            },
+        },
+        "provenance": {
+            "producer_source_sha": checkout_commit,
+            "script_path": str(Path(__file__).resolve().relative_to(repo)),
+            "script_sha256": sha256_file(Path(__file__).resolve()),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "execution": current_execution,
+        },
         "guest_args": list(guest_args),
         "expected_iterations": bench_coremark.EXPECTED_ITERATIONS,
         "affinity": {
@@ -1392,11 +1550,13 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "version": wamr_version,
             "wamrc_version": wamrc_version,
             "cwasm_aot_version": cwasm_info.version,
-            "cwasm_sha256": sha256_file(cwasm),
+            "runtime_sha256": profile_wamr_identity["runtime"]["sha256"],
+            "compiler_sha256": profile_wamr_identity["compiler"]["sha256"],
+            "cwasm_sha256": profile_wamr_identity["module"]["sha256"],
         },
         "wasmtime": {
             "version": wasmtime_version,
-            "sha256": wasmtime_sha,
+            "sha256": profile_wasmtime_identity["runtime"]["sha256"],
             "profile_strategy": "jitdump",
             "function_mapping": (
                 "Wasmtime v44 perf inject emitted name-only symbols in "
@@ -1475,9 +1635,6 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     }
     bench_coremark.validate_same_host(host_identity)
     validate_report(report)
-    if cleanup_worktree is not None:
-        cleanup_worktree()
-        atexit.unregister(cleanup_worktree)
     return report
 
 
@@ -1489,12 +1646,39 @@ def main() -> int:
         default=Path(__file__).resolve().parents[1],
     )
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--wamr-ref", default="HEAD")
     parser.add_argument(
-        "--work-root",
+        "--benchmark-report",
+        type=Path,
+        required=True,
+        help=(
+            "schema-version-2 authoritative bench_coremark.py JSON report "
+            "from this host/run"
+        ),
+    )
+    parser.add_argument(
+        "--wamr-ref",
+        default=None,
+        help="exact ref to profile (default: benchmark report target SHA)",
+    )
+    parser.add_argument(
+        "--benchmark-artifacts",
+        type=Path,
+        required=True,
+        help="exact target wamr/wamrc/cwasm handoff retained by bench_coremark.py",
+    )
+    parser.add_argument(
+        "--execution-id",
+        default=None,
+        help=(
+            "required shared local execution identity; GitHub Actions uses "
+            "the workflow run identity"
+        ),
+    )
+    parser.add_argument(
+        "--wasmtime-cache",
         type=Path,
         default=None,
-        help="isolated git worktree used when --wamr-ref differs from HEAD",
+        help="cache containing the checksum-verified Wasmtime 44.0.1 binary",
     )
     parser.add_argument("--frequency", type=int, default=999)
     parser.add_argument("--min-samples", type=int, default=DEFAULT_MIN_SAMPLES)
@@ -1506,8 +1690,6 @@ def main() -> int:
         "--max-perf-bytes", type=int, default=DEFAULT_MAX_PERF_BYTES
     )
     args = parser.parse_args()
-    if args.work_root is None:
-        args.work_root = args.repo.resolve().parent / "coremark-profile-wamr-source"
     if args.frequency <= 0 or args.min_samples <= 0:
         parser.error("--frequency and --min-samples must be positive")
     if args.top <= 0 or args.classify <= 0 or args.classify > args.top:
