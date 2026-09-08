@@ -2621,34 +2621,20 @@ fn computeMagicU32(d: u32) ?struct { magic: u64, shift: u6 } {
     // Power of two is handled by the shift path.
     if (d & (d - 1) == 0) return null;
 
-    // Iterate s upward until we find a magic multiplier that works for all x.
-    // magic = ceil(2^(32+s) / d), verified by testing boundary values.
+    // The lowering uses one wrapping i64 multiply. Divisors requiring a wider
+    // product or an add/correction step are left alone.
     var s: u6 = 0;
     while (s < 32) : (s += 1) {
-        // magic = ceil(2^(32+s) / d)
         const shift_amt: u7 = @as(u7, 32) + s;
-        if (shift_amt >= 64) break;
         const pow: u64 = @as(u64, 1) << @as(u6, @intCast(shift_amt));
-        const m: u64 = pow / d + @intFromBool(pow % d != 0); // ceil division
+        const m = pow / d + @intFromBool(pow % d != 0);
+        if (m > std.math.maxInt(u64) / std.math.maxInt(u32)) return null;
 
-        // Verify: m * d must be in (2^(32+s), 2^(32+s) + 2^s] for the
-        // rounding to work for all x. Simplified check: test boundary values.
-        // For correctness, verify: floor(m * x / 2^(32+s)) == floor(x / d)
-        // for x = d-1, x = d, x = 2*d, x = 2^32-1.
-        var ok = true;
-        const test_vals = [_]u64{ 0, 1, d - 1, d, d + 1, 2 * d, 0xFFFFFFFF };
-        for (test_vals) |x| {
-            if (x > 0xFFFFFFFF) continue;
-            const expected = x / d;
-            // Compute (x * m) >> (32 + s) using 128-bit arithmetic via two 64-bit muls.
-            const prod = @as(u128, x) * @as(u128, m);
-            const result = @as(u64, @truncate(prod >> shift_amt));
-            if (result != expected) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) return .{ .magic = m, .shift = s };
+        // The ceil reciprocal is exact for all u32 dividends at this shift
+        // when 0 < m*d - 2^(32+s) <= 2^s.
+        const product = m * @as(u64, d);
+        if (product > pow and product - pow <= (@as(u64, 1) << s))
+            return .{ .magic = m, .shift = s };
     }
     return null;
 }
@@ -14034,12 +14020,39 @@ test "strengthReduceDivRem: rewrites non-power-of-two divisor via reciprocal mul
     // div_u should be replaced with reciprocal multiply sequence.
     var has_div = false;
     var has_wrap = false;
+    var has_magic = false;
+    var has_shift = false;
     for (block.instructions.items) |inst| {
         if (inst.op == .div_u) has_div = true;
         if (inst.op == .wrap_i64) has_wrap = true;
+        if (inst.op == .iconst_64 and inst.op.iconst_64 == 3_435_973_837) has_magic = true;
+        if (inst.op == .iconst_64 and inst.op.iconst_64 == 35) has_shift = true;
     }
     try std.testing.expect(!has_div);
     try std.testing.expect(has_wrap);
+    try std.testing.expect(has_magic);
+    try std.testing.expect(has_shift);
+}
+
+test "strengthReduceDivRem: leaves divisors needing correction unchanged" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_q = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_q, .type = .i32 });
+    try block.append(.{ .op = .{ .rem_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    try std.testing.expect(!try strengthReduceDivRem(&func, allocator));
+    try std.testing.expect(block.instructions.items[1].op == .div_u);
+    try std.testing.expect(block.instructions.items[2].op == .rem_u);
 }
 
 test "strengthReduceDivRem: does not rewrite div_s / rem_s (signed left alone)" {
@@ -14937,21 +14950,90 @@ test "strengthReduceDivRem: div_u by 1 unchanged" {
 }
 
 test "computeMagicU32: known divisors" {
-    // Verify magic numbers produce correct results for several divisors.
-    const test_cases = [_]u32{ 3, 5, 7, 10, 11, 13, 100, 255, 1000 };
+    const test_cases = [_]u32{ 3, 5, 6, 9, 10, 11, 13, 17, 100, 255, 1000 };
     for (test_cases) |d| {
         const m = computeMagicU32(d) orelse {
-            try std.testing.expect(false); // should always find magic for these
+            try std.testing.expect(false);
             continue;
         };
-        // Verify correctness for boundary values.
-        const vals = [_]u64{ 0, 1, d - 1, d, d + 1, 2 * d, 0xFFFF, 0xFFFFFFFF };
+        const vals = [_]u32{ 0, 1, d - 1, d, d + 1, 2 * d, 0xFFFF, 0xFFFFFFFF };
         for (vals) |x| {
             const expected = x / d;
-            const prod = @as(u128, x) * @as(u128, m.magic);
-            const result = @as(u64, @truncate(prod >> (@as(u7, 32) + m.shift)));
+            const prod = @as(u64, x) * @as(u64, m.magic);
+            const result: u32 = @intCast(prod >> (@as(u6, 32) + m.shift));
             try std.testing.expectEqual(expected, result);
+            try std.testing.expectEqual(x % d, x - result * d);
         }
+    }
+}
+
+test "computeMagicU32: enforces reciprocal bound and multiply width" {
+    const div10 = computeMagicU32(10).?;
+    try std.testing.expectEqual(@as(u64, 3_435_973_837), div10.magic);
+    try std.testing.expectEqual(@as(u6, 3), div10.shift);
+    try std.testing.expect(computeMagicU32(7) == null);
+
+    const divisors = [_]u32{
+        3,           5,           6,      7,      9,           10,
+        11,          13,          14,     19,     31,          33,
+        63,          65,          127,    129,    255,         257,
+        1023,        1025,        65_535, 65_537, 0x7fff_ffff, 0x8000_0001,
+        0xffff_fffb, 0xffff_ffff,
+    };
+    const adversarial = [_]u32{
+        0,             1,             2,             9,             10,
+        11,            1_300_000_009, 1_385_676_899, 2_147_483_647, 2_147_483_648,
+        3_000_000_008, 0xffff_fffe,   0xffff_ffff,
+    };
+
+    for (divisors) |d| {
+        const magic = computeMagicU32(d) orelse continue;
+        const pow = @as(u64, 1) << @as(u6, @intCast(32 + magic.shift));
+        const excess = @as(u64, magic.magic) * d - pow;
+        try std.testing.expect(excess <= (@as(u64, 1) << magic.shift));
+
+        for (adversarial) |x| {
+            const q: u32 = @intCast(
+                (@as(u64, x) * magic.magic) >> (@as(u6, 32) + magic.shift),
+            );
+            try std.testing.expectEqual(x / d, q);
+            try std.testing.expectEqual(x % d, x - q * d);
+        }
+
+        const max_q = std.math.maxInt(u32) / d;
+        const quotients = [_]u32{ 0, 1, 2, 3, max_q / 2, max_q -| 1, max_q };
+        for (quotients) |q0| {
+            const transition = @as(u64, q0) * d;
+            var delta: i8 = -2;
+            while (delta <= 2) : (delta += 1) {
+                const candidate = @as(i64, @intCast(transition)) + delta;
+                if (candidate < 0 or candidate > std.math.maxInt(u32)) continue;
+                const x: u32 = @intCast(candidate);
+                const q: u32 = @intCast(
+                    (@as(u64, x) * magic.magic) >> (@as(u6, 32) + magic.shift),
+                );
+                try std.testing.expectEqual(x / d, q);
+                try std.testing.expectEqual(x % d, x - q * d);
+            }
+        }
+    }
+}
+
+test "computeMagicU32: deterministic broad quotient and remainder coverage" {
+    var state: u64 = 0xd1b5_4a32_d192_ed03;
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        state = state *% 6_364_136_223_846_793_005 +% 1_442_695_040_888_963_407;
+        const d: u32 = @truncate(state >> 16);
+        if (d < 3) continue;
+        const magic = computeMagicU32(d) orelse continue;
+        state = state *% 6_364_136_223_846_793_005 +% 1_442_695_040_888_963_407;
+        const x: u32 = @truncate(state >> 32);
+        const q: u32 = @intCast(
+            (@as(u64, x) * magic.magic) >> (@as(u6, 32) + magic.shift),
+        );
+        try std.testing.expectEqual(x / d, q);
+        try std.testing.expectEqual(x % d, x - q * d);
     }
 }
 

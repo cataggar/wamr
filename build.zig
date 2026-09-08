@@ -1464,6 +1464,29 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // #1008 regression: a bad unsigned /10 reciprocal made wasi-libc's
+    // decimal formatter emit invalid bytes for large values.
+    const aot_magic_u32_step = b.step(
+        "test-aot-magic-u32",
+        "Run the unsigned reciprocal decimal-formatting AOT regression (#1008)",
+    );
+    if (aot_executable_target) {
+        const run = b.addRunArtifact(wamrc);
+        run.addArg("run");
+        run.addArg("-o");
+        _ = run.addOutputFileArg("1008-printf-decimal.cwasm");
+        run.addFileArg(b.path("tests/regressions/1008-aot-magic-u32/printf-decimal.wasm"));
+        run.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+        run.step.dependOn(b.getInstallStep());
+        run.expectExitCode(0);
+        run.expectStdOutEqual(
+            "{\"checksum\":13856768990818897060,\"cases\":[[1385676899,138567689,9]," ++
+                "[2147483648,214748364,8],[3000000008,300000000,8]]}\n",
+        );
+        aot_magic_u32_step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+    }
+
     // #794: load-forwarding soundness gate. Compiles the shipped hand-written
     // wasm corpus with the dedicated Check-11 verify mode
     // (`--verify-ir=load-forwarding`) and requires a clean exit. Check 11 is a
@@ -1534,6 +1557,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_passes_tests = b.addRunArtifact(passes_tests);
     test_step.dependOn(&run_passes_tests.step);
+    const magic_passes_tests = b.addTest(.{
+        .root_module = passes_test_module,
+        .filters = &.{ "computeMagicU32", "strengthReduceDivRem" },
+    });
+    const run_magic_passes_tests = b.addRunArtifact(magic_passes_tests);
+    aot_magic_u32_step.dependOn(&run_magic_passes_tests.step);
 
     // Compiler IR analysis tests
     const analysis_test_module = b.createModule(.{
@@ -1680,6 +1709,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_differential_tests = b.addRunArtifact(differential_tests);
     test_step.dependOn(&run_differential_tests.step);
+    const magic_differential_tests = b.addTest(.{
+        .root_module = differential_test_module,
+        .filters = &.{"strength-reduced i32 div/rem_u by 10"},
+    });
+    const run_magic_differential_tests = b.addRunArtifact(magic_differential_tests);
+    aot_magic_u32_step.dependOn(&run_magic_differential_tests.step);
 
     // #694: regression test for active elem segments referencing
     // funcidx ≥ 256 (was capped by a fixed 256-entry buffer in
