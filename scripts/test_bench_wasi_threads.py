@@ -117,6 +117,49 @@ def attach_synthetic_sizing(
     }
 
 
+def authoritative_sizing_inputs(
+    pilot_elapsed_ns: int,
+    invocation_overhead_ns: int,
+) -> tuple[list[dict], list[dict], tuple[int, ...]]:
+    args = bench.parse_args(["--no-budget"])
+    modes = ("interpreter", "aot")
+    pairs = bench.planned_pair_specs(args, modes)
+    order = bench.pilot_order_for_plan(
+        pairs, bench.REVISION_ROLES, args.pilot_iteration_plan
+    )
+    pilots = []
+    timing_overhead_ns = 1_000_000
+    for spec in order:
+        workload = (
+            "hot" if spec["workload"] == "cancel-hot" else spec["workload"]
+        )
+        pilots.append(
+            {
+                **spec,
+                "phase": "pilot",
+                "correct": True,
+                "operations": bench.expected_result(
+                    workload, spec["threads"], spec["iterations"]
+                )["operations"],
+                "guest_elapsed_ns": pilot_elapsed_ns,
+                "elapsed_ns": pilot_elapsed_ns,
+                "raw_guest_elapsed_ns": (
+                    pilot_elapsed_ns + timing_overhead_ns
+                ),
+                "timing_overhead_ns": timing_overhead_ns,
+                "timing_overhead_ppm": (
+                    timing_overhead_ns
+                    * 1_000_000
+                    // (pilot_elapsed_ns + timing_overhead_ns)
+                ),
+                "host_wall_elapsed_ns": (
+                    pilot_elapsed_ns + invocation_overhead_ns
+                ),
+            }
+        )
+    return pilots, order, args.thread_counts
+
+
 def make_report(
     platform_id: str = "ubuntu-22.04-x86_64",
     machine: str = "x86_64",
@@ -1164,6 +1207,77 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 total_pilots=len(order),
                 warmups=100,
                 samples=100,
+            )
+
+    def test_authoritative_post_pilot_budget_charges_actual_wall_time(self) -> None:
+        pilots, order, thread_counts = authoritative_sizing_inputs(
+            bench.PROJECTED_EVIDENCE_MINIMUM_NS,
+            159_700_000,
+        )
+        _, resolved = bench.resolve_one_shot_sizing(
+            pilot_records=pilots,
+            pilot_order=order,
+            modes=("interpreter", "aot"),
+            thread_counts=thread_counts,
+            warmups=2,
+            samples=10,
+            timeout_seconds=90,
+        )
+        self.assertEqual(len(order), 88)
+        expected_actual_pilots = 88 * (
+            bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
+        )
+        expected_evidence = 1_056 * (
+            bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
+        )
+        expected_total = (
+            expected_actual_pilots
+            + expected_evidence
+            + bench.AUXILIARY_INVOCATION_BUDGET_NS
+        )
+        self.assertEqual(
+            resolved["maximum_pre_admission_pilot_bound_ns"],
+            88 * bench.MAXIMUM_PILOT_HOST_WALL_NS,
+        )
+        self.assertEqual(
+            resolved["pilot_host_wall_elapsed_ns"],
+            expected_actual_pilots,
+        )
+        self.assertEqual(
+            resolved["projected_evidence_host_wall_ns"],
+            expected_evidence,
+        )
+        self.assertEqual(
+            resolved["projected_evidence_limit_ns"],
+            bench.PROJECTED_BENCHMARK_LIMIT_NS
+            - expected_actual_pilots
+            - bench.AUXILIARY_INVOCATION_BUDGET_NS,
+        )
+        self.assertEqual(resolved["projected_benchmark_ns"], expected_total)
+        self.assertAlmostEqual(expected_total / 60e9, 49.74828, places=3)
+        self.assertLess(
+            resolved["projected_benchmark_ns"],
+            bench.PROJECTED_BENCHMARK_LIMIT_NS,
+        )
+
+    def test_authoritative_actual_projection_over_97_minutes_fails(self) -> None:
+        pilots, order, thread_counts = authoritative_sizing_inputs(
+            bench.MAXIMUM_PILOT_CORRECTED_NS,
+            bench.MAXIMUM_PILOT_HOST_WALL_NS
+            - bench.MAXIMUM_PILOT_CORRECTED_NS,
+        )
+        with self.assertRaisesRegex(
+            bench.HarnessError,
+            "97-minute benchmark bound|benchmark share",
+        ):
+            bench.resolve_one_shot_sizing(
+                pilot_records=pilots,
+                pilot_order=order,
+                modes=("interpreter", "aot"),
+                thread_counts=thread_counts,
+                warmups=2,
+                samples=10,
+                timeout_seconds=90,
             )
 
     def test_schema_v3_fixed_plan_report_is_rejected(self) -> None:

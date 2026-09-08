@@ -121,14 +121,23 @@ condition's projected invocation must remain strictly below the 90-second
 watchdog.
 
 The workflow reserves 83 minutes for non-benchmark work, leaving a 97-minute
-benchmark limit. For the full 88-pilot authoritative plan, the hard pilot bound
-is 51 minutes 20 seconds (`88 * 35s`). The minimum projected evidence bound is
-33 minutes 52.8 seconds (`88 * 12 * 1.925s`), and the auxiliary allowance is
-10 minutes. Their sum is 95 minutes 12.8 seconds; adding the 83-minute reserve
-is 178 minutes 12.8 seconds, strictly below the 180-minute job timeout. The
-harness accumulates actual pilot corrected and wall time after each one-shot
-pilot and aborts immediately when the remaining hard bound cannot fit. Any
-failure before evidence retains all completed pilots in the diagnostic.
+benchmark limit. Before and during the full 88-pilot authoritative plan,
+admission uses the hard 51-minute-20-second pilot bound (`88 * 35s`), the
+33-minute-52.8-second minimum evidence bound (`88 * 12 * 1.925s`), and the
+10-minute auxiliary allowance. Their sum is 95 minutes 12.8 seconds; adding
+the 83-minute reserve is 178 minutes 12.8 seconds, strictly below the
+180-minute job timeout. The harness accumulates actual pilot corrected and
+wall time after each one-shot pilot and aborts immediately when the remaining
+hard bound cannot fit.
+
+After all pilots finish, the hard pre-admission pilot allowance is no longer
+charged. The final `projected_evidence_limit_ns` is exactly
+`97m - actual_retained_pilot_wall - 600s`, and
+`projected_benchmark_ns` is exactly
+`actual_retained_pilot_wall + projected_evidence_wall + 600s`. Reports retain
+both the distinct `maximum_pre_admission_pilot_bound_ns` and
+`pilot_host_wall_elapsed_ns`; validation replays both. Any failure before
+evidence retains all completed pilots in the diagnostic.
 
 The hot-kernel expected checksum is prepared with an exact jump-ahead. After
 unrolling the recurrence, terms with the same iteration index modulo 64 share

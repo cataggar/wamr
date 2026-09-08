@@ -523,7 +523,7 @@
             "projections",
             "pilot_corrected_elapsed_ns",
             "pilot_host_wall_elapsed_ns",
-            "maximum_total_pilot_bound_ns",
+            "maximum_pre_admission_pilot_bound_ns",
             "projected_evidence_host_wall_ns",
             "projected_evidence_limit_ns",
             "auxiliary_invocation_budget_ns",
@@ -554,7 +554,7 @@
               "type": "integer",
               "minimum": 1
             },
-            "maximum_total_pilot_bound_ns": {
+            "maximum_pre_admission_pilot_bound_ns": {
               "type": "integer",
               "minimum": 1
             },

@@ -808,12 +808,12 @@ def resolve_one_shot_sizing(
         )
     pilot_host_ns = sum(record["host_wall_elapsed_ns"] for record in pilot_records)
     pilot_elapsed_ns = sum(record["guest_elapsed_ns"] for record in pilot_records)
-    maximum_total_pilot_bound_ns = (
+    maximum_pre_admission_pilot_bound_ns = (
         len(pilot_order) * MAXIMUM_PILOT_HOST_WALL_NS
     )
     projected_evidence_limit_ns = (
         PROJECTED_BENCHMARK_LIMIT_NS
-        - maximum_total_pilot_bound_ns
+        - pilot_host_ns
         - AUXILIARY_INVOCATION_BUDGET_NS
     )
     if projected_evidence_limit_ns <= 0:
@@ -823,7 +823,7 @@ def resolve_one_shot_sizing(
             "sizing evidence projection cannot fit the 97-minute benchmark bound"
         )
     projected_benchmark_ns = (
-        maximum_total_pilot_bound_ns
+        pilot_host_ns
         + projected_evidence_ns
         + AUXILIARY_INVOCATION_BUDGET_NS
     )
@@ -838,7 +838,9 @@ def resolve_one_shot_sizing(
         "projections": projections,
         "pilot_corrected_elapsed_ns": pilot_elapsed_ns,
         "pilot_host_wall_elapsed_ns": pilot_host_ns,
-        "maximum_total_pilot_bound_ns": maximum_total_pilot_bound_ns,
+        "maximum_pre_admission_pilot_bound_ns": (
+            maximum_pre_admission_pilot_bound_ns
+        ),
         "projected_evidence_host_wall_ns": projected_evidence_ns,
         "projected_evidence_limit_ns": projected_evidence_limit_ns,
         "auxiliary_invocation_budget_ns": AUXILIARY_INVOCATION_BUDGET_NS,
