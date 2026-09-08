@@ -26,7 +26,8 @@ fn branchDelta(word: u32) ?i32 {
 }
 
 fn isKnownStop(word: u32) bool {
-    return word == 0xD65F03C0 or // RET LR, the emitter's normal ABI return
+    return word & 0xFFFFFC1F == 0xD63F0000 or // BLR
+        word == 0xD65F03C0 or // RET LR, the emitter's normal ABI return
         word & 0xFFE0001F == 0xD4200000; // BRK
 }
 
@@ -40,8 +41,10 @@ fn killRegister(facts: *Facts, reg: u5) void {
 
 /// Run after local branches have been resolved and before tracing frame accesses.
 /// The emitter supplies instruction-only code and the scalar allocator's private
-/// FP-relative spill range. Refuse indirect branches/calls or potential
-/// literal pools rather than guessing their targets or decoding data as code.
+/// FP-relative spill range. Its BL/BLR instructions are ABI calls to function
+/// entries or VmCtx helpers, never intra-function dispatch; calls kill all facts.
+/// Refuse other indirect control flow or potential literal pools rather than
+/// guessing their targets or decoding data as code.
 pub fn eliminate(
     allocator: std.mem.Allocator,
     code: []u8,
@@ -66,7 +69,7 @@ pub fn eliminate(
             word & 0x3B000000 == 0x18000000 or // literal load
             (word & 0x1C000000 == 0x14000000 and word != nop and !isKnownStop(word)))
         {
-            // Includes BR/BLR, authenticated branches and unknown branch/system
+            // Includes BR, authenticated branches and unknown branch/system
             // encodings. HINT aliases are not generally side-effect free.
             return 0;
         }
@@ -206,12 +209,12 @@ test "calls returns traps and unconditional branches are barriers" {
     for ([_]u32{ 0x94000000, 0xD63F0200, ret, 0xD4200020, 0x14000001 }) |barrier| {
         try expectRemoved(&.{ load, barrier, load, ret }, &.{});
     }
+    try expectRemoved(&.{ load, load, 0xD63F0200, load, load, ret }, &.{ 1, 4 });
 }
 
 test "indirect internal branches, literal pools and unknown system effects refuse the function" {
     for ([_]u32{
         0xD61F0200, // br x16
-        0xD63F0200, // blr x16
         0xD65F0200, // ret x16, not a normal ABI return
         0xD71F0A00, // authenticated branch
         0xD503233F, // paciasp, a HINT alias
