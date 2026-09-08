@@ -69,7 +69,7 @@ used only for pilots:
 | interpreter `atomic` | 72M | 40M | 28M | 14M |
 | AOT `atomic` | 850M | 180M | 64M | 64M |
 | interpreter `wait-notify` | 128K | 64K | 32K | 16K |
-| AOT `wait-notify` | 2.4M | 64K | 32K | 16K |
+| AOT `wait-notify` | 1.5M | 64K | 32K | 16K |
 | interpreter `spawn-join` | 9K | 4.5K | 2.25K | 1.25K |
 | AOT `spawn-join` | 10K | 5K | 2.5K | 1.25K |
 | AOT `cancel-hot` | 1.9B | 1.9B | 950M | 475M |

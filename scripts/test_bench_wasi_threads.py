@@ -734,7 +734,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                         "8": 64_000_000,
                     },
                     "wait-notify": {
-                        "1": 2_400_000,
+                        "1": 1_500_000,
                         "4": 32_000,
                         "8": 16_000,
                     },
