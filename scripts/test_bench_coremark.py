@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import copy
+import io
+import json
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -478,7 +481,7 @@ class BenchCoremarkTests(unittest.TestCase):
             wasmtime_runtime_sha="3" * 64,
             producer_source_sha="c" * 40,
             producer_script_sha="d" * 64,
-            current_execution={"provider": "local", "run_id": ""},
+            current_execution={"provider": "local", "run_id": "test-run"},
         )
         self.assertEqual(
             report["provenance"]["report_id"], linkage["report_id"]
@@ -501,7 +504,7 @@ class BenchCoremarkTests(unittest.TestCase):
             "wasmtime_runtime_sha": "3" * 64,
             "producer_source_sha": "c" * 40,
             "producer_script_sha": "d" * 64,
-            "current_execution": {"provider": "local", "run_id": ""},
+            "current_execution": {"provider": "local", "run_id": "test-run"},
         }
         with self.assertRaisesRegex(RuntimeError, "WAMR source sha mismatch"):
             bench_coremark.validate_benchmark_profile_match(
@@ -537,6 +540,25 @@ class BenchCoremarkTests(unittest.TestCase):
                     ),
                 },
             )
+        with self.assertRaisesRegex(RuntimeError, "nonempty local execution IDs"):
+            bench_coremark.validate_benchmark_profile_match(
+                report,
+                **{
+                    **kwargs,
+                    "current_execution": {"provider": "local", "run_id": ""},
+                },
+            )
+        with self.assertRaisesRegex(RuntimeError, "local execution ID"):
+            bench_coremark.validate_benchmark_profile_match(
+                report,
+                **{
+                    **kwargs,
+                    "current_execution": {
+                        "provider": "local",
+                        "run_id": "stale-run",
+                    },
+                },
+            )
         github_report = copy.deepcopy(report)
         github_report["provenance"]["execution"] = {
             "provider": "github-actions",
@@ -570,6 +592,13 @@ class BenchCoremarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "guest args"):
             bench_coremark.validate_authoritative_benchmark_report(wrong_args)
 
+        missing_local_id = copy.deepcopy(report)
+        missing_local_id["provenance"]["execution"]["run_id"] = ""
+        with self.assertRaisesRegex(RuntimeError, "execution provenance"):
+            bench_coremark.validate_authoritative_benchmark_report(
+                missing_local_id
+            )
+
         legacy = {
             "schema_version": 1,
             "kind": bench_coremark.REPORT_KIND,
@@ -579,6 +608,277 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertEqual("legacy-unverified", status["status"])
         with self.assertRaisesRegex(RuntimeError, "legacy-unverified"):
             bench_coremark.validate_authoritative_benchmark_report(legacy)
+
+    @mock.patch.dict(bench_coremark.os.environ, {}, clear=True)
+    def test_local_execution_identity_must_be_explicit(self):
+        with self.assertRaisesRegex(RuntimeError, "local execution identity"):
+            bench_coremark.capture_execution_identity()
+        with self.assertRaisesRegex(RuntimeError, "local execution identity"):
+            bench_coremark.capture_execution_identity("   ")
+        self.assertEqual(
+            {"provider": "local", "run_id": "shared-run"},
+            bench_coremark.capture_execution_identity("shared-run"),
+        )
+
+    def test_target_artifact_handoff_survives_distinct_build_path(self):
+        root = REPO / ".cache/test-coremark-artifact-handoff"
+        source = root / "temporary-benchmark-worktree/zig-out/bin"
+        artifact_dir = root / "profile-artifacts"
+        shutil.rmtree(root, ignore_errors=True)
+        source.mkdir(parents=True)
+        wamr = source / "wamr"
+        wamrc = source / "wamrc"
+        cwasm = source.parent.parent / ".bench-coremark.cwasm"
+        wamr.write_bytes(b"wamr-with-build-path-a")
+        wamrc.write_bytes(b"wamrc-with-build-path-a")
+        cwasm.write_bytes(b"exact-cwasm")
+        prepared = bench_coremark.PreparedEngine(
+            "target",
+            "WAMR target",
+            "target",
+            "ReleaseFast",
+            [str(wamr), "run", str(cwasm)],
+            source,
+            {},
+            bench_coremark.EXPECTED_ITERATIONS,
+            identity=bench_coremark.make_wamr_identity(
+                ref="target",
+                source_sha="b" * 40,
+                optimize="ReleaseFast",
+                runtime_path=wamr,
+                compiler_path=wamrc,
+                module_path=cwasm,
+            ),
+        )
+        try:
+            retained = bench_coremark.retain_wamr_artifact_handoff(
+                prepared, artifact_dir
+            )
+            shutil.rmtree(root / "temporary-benchmark-worktree")
+            loaded = bench_coremark.load_wamr_artifact_handoff(
+                artifact_dir, retained
+            )
+            self.assertEqual(b"wamr-with-build-path-a", loaded["runtime"].read_bytes())
+            self.assertNotEqual(wamr.parent, loaded["runtime"].parent)
+
+            loaded["runtime"].write_bytes(b"tampered")
+            with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                bench_coremark.load_wamr_artifact_handoff(
+                    artifact_dir, retained
+                )
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_main_ordinary_pr_cli_path_renders_without_json_provenance(self):
+        host = bench_coremark.HostIdentity(
+            "x86_64", 4, "test CPU", "", "boot-id"
+        )
+        result = bench_coremark.EngineResult(
+            "WAMR",
+            "HEAD",
+            "ReleaseFast",
+            [100.0, 101.0, 102.0],
+            identity=wamr_identity("HEAD", "b" * 40, "2" * 64),
+        )
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "bench_coremark.py",
+                    "--baseline",
+                    "HEAD",
+                    "--target",
+                    "HEAD",
+                    "--profile",
+                    "ci",
+                ],
+            ),
+            mock.patch.object(
+                bench_coremark,
+                "resolve_fixture",
+                return_value=(Path("/fixture.wasm"), "f" * 64),
+            ),
+            mock.patch.object(
+                bench_coremark, "capture_host_identity", return_value=host
+            ),
+            mock.patch.object(
+                bench_coremark, "resolve_ref_sha", return_value="b" * 40
+            ),
+            mock.patch.object(
+                bench_coremark,
+                "make_worktree",
+                return_value=(Path("/benchmark-worktree"), "b" * 40),
+            ),
+            mock.patch.object(
+                bench_coremark, "build_and_run_wamr", return_value=result
+            ),
+            mock.patch.object(bench_coremark, "validate_same_host"),
+            mock.patch.object(bench_coremark, "run", return_value=""),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            self.assertEqual(0, bench_coremark.main())
+
+    def test_main_authoritative_json_cli_path_wires_provenance(self):
+        root = REPO / ".cache/test-coremark-main-json"
+        report_path = root / "report.json"
+        wasmtime = root / "wasmtime"
+        artifact_dir = root / "profile-artifacts"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        wasmtime.write_bytes(b"wasmtime")
+        build_dir = root / "benchmark-build"
+        build_dir.mkdir()
+        wamr = build_dir / "wamr"
+        wamrc = build_dir / "wamrc"
+        cwasm = build_dir / "coremark.cwasm"
+        wamr.write_bytes(b"wamr-benchmark-build")
+        wamrc.write_bytes(b"wamrc-benchmark-build")
+        cwasm.write_bytes(b"coremark-benchmark-module")
+        host = bench_coremark.HostIdentity(
+            "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
+        )
+        affinity = bench_coremark.AffinityInfo((0, 1), 0, "/usr/bin/taskset")
+        target_identity = bench_coremark.make_wamr_identity(
+            ref="HEAD",
+            source_sha="b" * 40,
+            optimize="ReleaseFast",
+            runtime_path=wamr,
+            compiler_path=wamrc,
+            module_path=cwasm,
+        )
+        target = bench_coremark.PreparedEngine(
+            "wamr-target",
+            "WAMR HEAD",
+            "HEAD",
+            "ReleaseFast",
+            ["wamr"],
+            root,
+            {},
+            bench_coremark.EXPECTED_ITERATIONS,
+            identity=target_identity,
+        )
+
+        def measured(engines, *, warmups, runs, affinity):
+            records = []
+            by_key = {engine.key: [] for engine in engines}
+            position = 0
+            for phase, count in (("warmup", warmups), ("measured", runs)):
+                ordinals = {engine.key: 0 for engine in engines}
+                for key in bench_coremark.counterbalanced_order(
+                    [engine.key for engine in engines], count
+                ):
+                    engine = next(item for item in engines if item.key == key)
+                    position += 1
+                    ordinals[key] += 1
+                    record = bench_coremark.SampleRecord(
+                        key,
+                        engine.engine,
+                        phase,
+                        ordinals[key],
+                        position,
+                        "2026-09-08T00:00:00+00:00",
+                        "2026-09-08T00:00:01+00:00",
+                        1.0,
+                        100.0,
+                        bench_coremark.EXPECTED_ITERATIONS,
+                    )
+                    records.append(record)
+                    by_key[key].append(record)
+            results = {
+                engine.key: bench_coremark.EngineResult(
+                    engine.engine,
+                    engine.version,
+                    engine.optimize,
+                    [100.0] * runs,
+                    by_key[engine.key],
+                    engine.identity,
+                )
+                for engine in engines
+            }
+            return results, records
+
+        try:
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "bench_coremark.py",
+                        "--baseline",
+                        "HEAD",
+                        "--target",
+                        "HEAD",
+                        "--profile",
+                        "authoritative",
+                        "--wasmtime-baseline",
+                        "auto",
+                        "--require-native-arch",
+                        "aarch64",
+                        "--execution-id",
+                        "cli-shared-run",
+                        "--json-out",
+                        str(report_path),
+                        "--retain-target-artifacts",
+                        str(artifact_dir),
+                    ],
+                ),
+                mock.patch.object(
+                    bench_coremark,
+                    "resolve_fixture",
+                    return_value=(Path("/fixture.wasm"), "f" * 64),
+                ),
+                mock.patch.object(
+                    bench_coremark, "validate_native_host", return_value=host
+                ),
+                mock.patch.object(
+                    bench_coremark, "select_cpu_affinity", return_value=affinity
+                ),
+                mock.patch.object(
+                    bench_coremark, "resolve_ref_sha", return_value="b" * 40
+                ),
+                mock.patch.object(
+                    bench_coremark,
+                    "make_worktree",
+                    return_value=(Path("/benchmark-worktree"), "b" * 40),
+                ),
+                mock.patch.object(
+                    bench_coremark, "prepare_wamr", return_value=target
+                ),
+                mock.patch.object(
+                    bench_coremark,
+                    "install_pinned_wasmtime",
+                    return_value=wasmtime,
+                ),
+                mock.patch.object(
+                    bench_coremark,
+                    "validate_pinned_wasmtime",
+                    return_value=bench_coremark.PINNED_WASMTIME_VERSION,
+                ),
+                mock.patch.object(
+                    bench_coremark,
+                    "measure_prepared_engines",
+                    side_effect=measured,
+                ),
+                mock.patch.object(bench_coremark, "validate_same_host"),
+                mock.patch.object(bench_coremark, "run", return_value=""),
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                self.assertEqual(0, bench_coremark.main())
+            report = json.loads(report_path.read_text())
+            self.assertEqual("cli-shared-run", report["provenance"]["execution"]["run_id"])
+            self.assertEqual(bench_coremark.REPORT_SCHEMA_VERSION, report["schema_version"])
+            target_report = next(
+                engine
+                for engine in report["engines"]
+                if engine["role"] == "wamr-target"
+            )
+            loaded = bench_coremark.load_wamr_artifact_handoff(
+                artifact_dir, target_report["identity"]
+            )
+            self.assertEqual(wamr.read_bytes(), loaded["runtime"].read_bytes())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     @mock.patch.object(
         bench_coremark, "run", return_value="wasmtime 44.0.1 (abcdef)"
@@ -684,6 +984,10 @@ class BenchCoremarkTests(unittest.TestCase):
             "--json-out coremark-profile/benchmark-report.json",
             identity_benchmark,
         )
+        self.assertIn(
+            '--retain-target-artifacts "$RUNNER_TEMP/coremark-profile-artifacts"',
+            identity_benchmark,
+        )
 
         perf_setup = workflow.split(
             "- name: Install matching perf for profiling", 1
@@ -704,7 +1008,12 @@ class BenchCoremarkTests(unittest.TestCase):
             "--benchmark-report coremark-profile/benchmark-report.json",
             profile_step,
         )
+        self.assertIn(
+            '--benchmark-artifacts "$RUNNER_TEMP/coremark-profile-artifacts"',
+            profile_step,
+        )
         self.assertIn('--wamr-ref "$PROFILE_SHA"', profile_step)
+        self.assertNotIn("--work-root", profile_step)
         self.assertIn(
             '--wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime"', profile_step
         )

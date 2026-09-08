@@ -250,6 +250,91 @@ def make_wasmtime_identity(
     }
 
 
+def retain_wamr_artifact_handoff(
+    prepared: PreparedEngine, artifact_dir: Path
+) -> dict:
+    identity = _validate_engine_identity(prepared.identity, "WAMR target")
+    if identity["type"] != "wamr":
+        raise RuntimeError("only WAMR target artifacts can be retained")
+    artifact_dir = artifact_dir.resolve()
+    shutil.rmtree(artifact_dir, ignore_errors=True)
+    artifact_dir.mkdir(parents=True)
+    names = {
+        "runtime": "wamr",
+        "compiler": "wamrc",
+        "module": "coremark.cwasm",
+    }
+    try:
+        retained = {
+            **identity,
+            "runtime": {**identity["runtime"]},
+            "compiler": {**identity["compiler"]},
+            "module": {**identity["module"]},
+        }
+        for key, name in names.items():
+            source = Path(identity[key]["path"])
+            destination = artifact_dir / name
+            shutil.copy2(source, destination)
+            digest = sha256_file(destination)
+            if digest != identity[key]["sha256"]:
+                raise RuntimeError(f"retained WAMR {key} hash changed while copying")
+            retained[key]["path"] = str(destination)
+        manifest = {
+            "schema_version": 1,
+            "kind": "coremark-wamr-artifact-handoff",
+            "identity": retained,
+        }
+        (artifact_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return retained
+    except Exception:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+        raise
+
+
+def load_wamr_artifact_handoff(
+    artifact_dir: Path, expected_identity: dict
+) -> dict[str, Path]:
+    artifact_dir = artifact_dir.resolve()
+    manifest_path = artifact_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot read benchmark artifact handoff {manifest_path}: {exc}"
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 1
+        or manifest.get("kind") != "coremark-wamr-artifact-handoff"
+    ):
+        raise RuntimeError("benchmark artifact handoff manifest is unsupported")
+    identity = _validate_engine_identity(
+        manifest.get("identity"), "retained WAMR target"
+    )
+    if identity != expected_identity:
+        raise RuntimeError(
+            "benchmark artifact handoff identity does not match the report target"
+        )
+    paths = {}
+    for key, name in (
+        ("runtime", "wamr"),
+        ("compiler", "wamrc"),
+        ("module", "coremark.cwasm"),
+    ):
+        path = artifact_dir / name
+        if Path(identity[key]["path"]).resolve() != path:
+            raise RuntimeError(f"benchmark artifact handoff has the wrong {key} path")
+        if not path.is_file():
+            raise RuntimeError(f"benchmark artifact handoff is missing {name}")
+        if sha256_file(path) != identity[key]["sha256"]:
+            raise RuntimeError(f"benchmark artifact handoff {name} hash mismatch")
+        paths[key] = path
+    return paths
+
+
 def resolve_fixture(repo: Path, fixture_arg: Path) -> tuple[Path, str]:
     fixture = fixture_arg if fixture_arg.is_absolute() else repo / fixture_arg
     fixture = fixture.resolve()
@@ -389,7 +474,7 @@ def resolve_ref_sha(repo: Path, ref: str) -> str:
     return run(["git", "rev-parse", ref], cwd=repo).strip()
 
 
-def capture_execution_identity() -> dict:
+def capture_execution_identity(local_run_id: str | None = None) -> dict:
     github_run_id = os.environ.get("GITHUB_RUN_ID")
     if github_run_id:
         return {
@@ -402,20 +487,23 @@ def capture_execution_identity() -> dict:
             "workflow_sha": os.environ.get("GITHUB_SHA", ""),
             "job": os.environ.get("GITHUB_JOB", ""),
         }
-    return {
-        "provider": "local",
-        "run_id": os.environ.get("COREMARK_RUN_ID", ""),
-    }
+    run_id = (local_run_id or os.environ.get("COREMARK_RUN_ID", "")).strip()
+    if not run_id:
+        raise RuntimeError(
+            "local execution identity is required; pass --execution-id or "
+            "set COREMARK_RUN_ID for both benchmark and profile commands"
+        )
+    return {"provider": "local", "run_id": run_id}
 
 
-def capture_report_provenance(repo: Path) -> dict:
+def capture_report_provenance(
+    repo: Path, local_run_id: str | None = None
+) -> dict:
     source_sha = _require_digest(
         resolve_ref_sha(repo, "HEAD"), "benchmark tooling source SHA", 40
     )
     script = Path(__file__).resolve()
-    execution = capture_execution_identity()
-    if execution["provider"] == "local" and not execution["run_id"]:
-        execution["run_id"] = str(uuid.uuid4())
+    execution = capture_execution_identity(local_run_id)
     return {
         "report_id": str(uuid.uuid4()),
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1385,6 +1473,28 @@ def _engine_with_role(report: dict, role: str) -> dict:
     return matches[0]
 
 
+def validate_execution_match(benchmark_execution: dict, current_execution: dict) -> None:
+    if benchmark_execution.get("provider") != current_execution.get("provider"):
+        raise RuntimeError("benchmark and profile execution providers do not match")
+    if benchmark_execution["provider"] == "github-actions":
+        for field in ("repository", "run_id", "run_attempt"):
+            if benchmark_execution.get(field) != current_execution.get(field):
+                raise RuntimeError(
+                    f"benchmark GitHub Actions {field} does not match the profile run"
+                )
+    else:
+        benchmark_run_id = benchmark_execution.get("run_id")
+        current_run_id = current_execution.get("run_id")
+        if not benchmark_run_id or not current_run_id:
+            raise RuntimeError(
+                "benchmark and profile require nonempty local execution IDs"
+            )
+        if benchmark_run_id != current_run_id:
+            raise RuntimeError(
+                "benchmark local execution ID does not match the profile run"
+            )
+
+
 def validate_benchmark_profile_match(
     report: dict,
     *,
@@ -1469,14 +1579,7 @@ def validate_benchmark_profile_match(
         )
 
     benchmark_execution = report["provenance"]["execution"]
-    if benchmark_execution["provider"] != current_execution.get("provider"):
-        raise RuntimeError("benchmark and profile execution providers do not match")
-    if benchmark_execution["provider"] == "github-actions":
-        for field in ("repository", "run_id", "run_attempt"):
-            if benchmark_execution.get(field) != current_execution.get(field):
-                raise RuntimeError(
-                    f"benchmark GitHub Actions {field} does not match the profile run"
-                )
+    validate_execution_match(benchmark_execution, current_execution)
 
     schedule = report.get("schedule")
     expected_schedule_length = 2 * sum(PROFILE_COUNTS["authoritative"])
@@ -1649,6 +1752,23 @@ def main() -> int:
         help="write machine-readable comparison report here",
     )
     p.add_argument(
+        "--execution-id",
+        default=None,
+        help=(
+            "required shared local benchmark/profile execution identity when "
+            "writing JSON outside GitHub Actions"
+        ),
+    )
+    p.add_argument(
+        "--retain-target-artifacts",
+        type=Path,
+        default=None,
+        help=(
+            "copy the exact measured target wamr/wamrc/cwasm plus a manifest "
+            "for an immediate profiling handoff"
+        ),
+    )
+    p.add_argument(
         "--emit",
         choices=["markdown", "github"],
         default="markdown",
@@ -1703,6 +1823,14 @@ def main() -> int:
         p.error("Wasmtime comparisons require a single --optimize mode")
     if args.optimize == "both" and args.json_out:
         p.error("--json-out is not supported with --optimize both")
+    if args.retain_target_artifacts and not args.json_out:
+        p.error("--retain-target-artifacts requires --json-out")
+    if args.retain_target_artifacts and not (
+        args.wasmtime_baseline or args.wasmtime
+    ):
+        p.error("--retain-target-artifacts requires a Wasmtime comparison")
+    if args.retain_target_artifacts and args.profile != "authoritative":
+        p.error("--retain-target-artifacts requires --profile authoritative")
 
     repo = args.repo.resolve()
     fixture, fixture_sha = resolve_fixture(repo, args.fixture)
@@ -1710,6 +1838,11 @@ def main() -> int:
         validate_native_host(args.require_native_arch)
         if args.require_native_arch
         else capture_host_identity()
+    )
+    report_provenance = (
+        capture_report_provenance(repo, args.execution_id)
+        if args.json_out
+        else None
     )
     work_root = repo / ".bench-coremark" / f"run-{uuid.uuid4().hex}"
     work_root.mkdir(parents=True)
@@ -1865,19 +1998,24 @@ def main() -> int:
                     affinity=affinity,
                 )
                 target_measured = measured[target_prepared.key]
+                target_identity = target_prepared.identity
+                if args.retain_target_artifacts:
+                    target_identity = retain_wamr_artifact_handoff(
+                        target_prepared, args.retain_target_artifacts
+                    )
                 target_result = EngineResult(
                     "WAMR",
                     target_prepared.version,
                     optimize,
                     target_measured.values,
                     target_measured.samples,
-                    target_prepared.identity,
+                    target_identity,
                 )
                 if baseline_sha == target_sha:
                     baseline_identity = {
-                        **target_prepared.identity,
+                        **target_identity,
                         "source": {
-                            **target_prepared.identity["source"],
+                            **target_identity["source"],
                             "ref": args.baseline,
                         },
                     }
@@ -1995,7 +2133,6 @@ def main() -> int:
                 host=host,
                 schedule_records=schedule_records,
                 affinity=affinity,
-                provenance=capture_report_provenance(repo),
                 guest_args=guest_args,
                 expected_iterations=expected_iterations,
             )
@@ -2009,6 +2146,7 @@ def main() -> int:
         args.out.write_text(table + "\n")
     if args.json_out:
         assert report_results is not None
+        assert report_provenance is not None
         report = build_json_report(
             report_results,
             profile=effective_profile,
@@ -2019,6 +2157,7 @@ def main() -> int:
             host=host,
             schedule_records=schedule_records,
             affinity=affinity,
+            provenance=report_provenance,
             guest_args=guest_args,
             expected_iterations=expected_iterations,
         )

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import bisect
 import gzip
 import hashlib
@@ -631,6 +630,12 @@ def validate_report(report: dict[str, Any]) -> None:
     if not benchmark.get("report_id") or not benchmark.get("generated_at"):
         raise ProfileError("profile report has incomplete benchmark linkage")
     _require_sha(benchmark.get("report_sha256"), "benchmark report sha256", 64)
+    handoff = benchmark.get("artifact_handoff")
+    if not isinstance(handoff, dict) or not handoff.get("directory"):
+        raise ProfileError("profile report lacks benchmark artifact handoff")
+    _require_sha(
+        handoff.get("manifest_sha256"), "benchmark handoff manifest sha256", 64
+    )
     target = benchmark.get("target")
     if not isinstance(target, dict):
         raise ProfileError("profile report lacks benchmark target identity")
@@ -768,6 +773,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Commit: `{report['wamr']['commit']}` (`ReleaseFast`)",
         f"- Authoritative benchmark: report `{benchmark['report_id']}` "
         f"(`sha256:{benchmark['report_sha256']}`), run {benchmark_link}",
+        f"- Exact WAMR artifact handoff: manifest "
+        f"`sha256:{benchmark['artifact_handoff']['manifest_sha256']}`",
         f"- Benchmark target: "
         f"`{benchmark['target']['identity']['source']['sha']}`; "
         f"producer tooling `{benchmark['producer']['source_sha']}`",
@@ -924,6 +931,21 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         if engine["role"] == "wamr-target"
     )
     benchmark_target_sha = benchmark_target["identity"]["source"]["sha"]
+    current_execution = bench_coremark.capture_execution_identity(
+        args.execution_id
+    )
+    try:
+        bench_coremark.validate_execution_match(
+            benchmark_report["provenance"]["execution"], current_execution
+        )
+        handoff = bench_coremark.load_wamr_artifact_handoff(
+            args.benchmark_artifacts, benchmark_target["identity"]
+        )
+    except RuntimeError as exc:
+        raise ProfileError(str(exc)) from exc
+    handoff_manifest_sha = sha256_file(
+        args.benchmark_artifacts.resolve() / "manifest.json"
+    )
 
     host_identity = bench_coremark.validate_native_host("aarch64")
     fixture, fixture_sha = bench_coremark.resolve_fixture(
@@ -946,36 +968,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         text=True,
         capture_output=True,
     ).stdout.strip()
-    source_worktree = args.work_root.resolve()
-    worktree_created = commit != checkout_commit
-    if worktree_created:
-        shutil.rmtree(source_worktree, ignore_errors=True)
-        recorder.run(
-            [
-                "git",
-                "worktree",
-                "add",
-                "--detach",
-                str(source_worktree),
-                commit,
-            ],
-            "wamr-source-worktree.log",
-            cwd=repo,
-        )
-
-        def cleanup_worktree():
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(source_worktree)],
-                cwd=repo,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-        atexit.register(cleanup_worktree)
-        build_repo = source_worktree
-    else:
-        cleanup_worktree = None
-        build_repo = repo
+    build_repo = args.benchmark_artifacts.resolve()
     kernel = recorder.run(
         ["uname", "-r"], "kernel.log", cwd=repo
     ).stdout.strip()
@@ -986,19 +979,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         [perf_binary(), "--version"], "perf-version.log", cwd=repo
     ).stdout.strip()
 
-    build_env = os.environ.copy()
-    build_env.pop("ZIG_LOCAL_CACHE_DIR", None)
-    build_env["ZIG_GLOBAL_CACHE_DIR"] = str(
-        source_worktree.parent / f"zig-global-{commit[:12]}"
-    )
-    recorder.run(
-        ["zig", "build", "-Doptimize=ReleaseFast"],
-        "build.log",
-        cwd=build_repo,
-        env=build_env,
-    )
-    wamr = build_repo / "zig-out/bin/wamr"
-    wamrc = build_repo / "zig-out/bin/wamrc"
+    wamr = handoff["runtime"]
+    wamrc = handoff["compiler"]
+    cwasm = handoff["module"]
     wamr_version = recorder.run(
         [str(wamr), "version"], "wamr-version.log", cwd=build_repo
     ).stdout.strip()
@@ -1006,7 +989,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         [str(wamrc), "version"], "wamrc-version.log", cwd=build_repo
     ).stdout.strip()
 
-    cwasm = out_dir / "coremark.wamr.cwasm"
+    diagnostic_cwasm = out_dir / "coremark.diagnostic.cwasm"
     compile_env = os.environ.copy()
     compile_env.update(
         {
@@ -1017,7 +1000,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         }
     )
     compile_result = recorder.run(
-        [str(wamrc), "compile", str(fixture), "-o", str(cwasm)],
+        [str(wamrc), "compile", str(fixture), "-o", str(diagnostic_cwasm)],
         "wamr-compile.log",
         cwd=build_repo,
         env=compile_env,
@@ -1025,12 +1008,17 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "WAMR_AOT_SPILL_METRIC=1 WAMR_AOT_SPILL_METRIC_MIN_SPILLS=1 "
             "WAMR_AOT_CODEGEN_TIMING=1 "
             "WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS=0 "
-            f"{shlex.join([str(wamrc), 'compile', str(fixture), '-o', str(cwasm)])}"
+            f"{shlex.join([str(wamrc), 'compile', str(fixture), '-o', str(diagnostic_cwasm)])}"
         ),
     )
     spill_metrics = parse_spill_metrics(
         compile_result.stdout + compile_result.stderr
     )
+    if sha256_file(diagnostic_cwasm) != sha256_file(cwasm):
+        raise ProfileError(
+            "diagnostic cwasm does not match the exact benchmark-built module"
+        )
+    diagnostic_cwasm.unlink()
     cwasm_info = aot.parse_cwasm(cwasm)
     if cwasm_info.version not in aot.SUPPORTED_AOT_VERSIONS:
         raise ProfileError("WAMR cwasm version is unsupported by attribution")
@@ -1098,7 +1086,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             producer_script_sha=sha256_file(
                 Path(bench_coremark.__file__).resolve()
             ),
-            current_execution=bench_coremark.capture_execution_identity(),
+            current_execution=current_execution,
         )
     except RuntimeError as exc:
         raise ProfileError(str(exc)) from exc
@@ -1496,13 +1484,17 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "report_sha256": benchmark_report_sha,
             "schema_version": benchmark_report["schema_version"],
             "kind": benchmark_report["kind"],
+            "artifact_handoff": {
+                "directory": str(args.benchmark_artifacts.resolve()),
+                "manifest_sha256": handoff_manifest_sha,
+            },
         },
         "provenance": {
             "producer_source_sha": checkout_commit,
             "script_path": str(Path(__file__).resolve().relative_to(repo)),
             "script_sha256": sha256_file(Path(__file__).resolve()),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "execution": benchmark_identity["execution"],
+            "execution": current_execution,
         },
         "guest_args": list(guest_args),
         "expected_iterations": bench_coremark.EXPECTED_ITERATIONS,
@@ -1643,9 +1635,6 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     }
     bench_coremark.validate_same_host(host_identity)
     validate_report(report)
-    if cleanup_worktree is not None:
-        cleanup_worktree()
-        atexit.unregister(cleanup_worktree)
     return report
 
 
@@ -1672,10 +1661,18 @@ def main() -> int:
         help="exact ref to profile (default: benchmark report target SHA)",
     )
     parser.add_argument(
-        "--work-root",
+        "--benchmark-artifacts",
         type=Path,
+        required=True,
+        help="exact target wamr/wamrc/cwasm handoff retained by bench_coremark.py",
+    )
+    parser.add_argument(
+        "--execution-id",
         default=None,
-        help="isolated git worktree used when --wamr-ref differs from HEAD",
+        help=(
+            "required shared local execution identity; GitHub Actions uses "
+            "the workflow run identity"
+        ),
     )
     parser.add_argument(
         "--wasmtime-cache",
@@ -1693,8 +1690,6 @@ def main() -> int:
         "--max-perf-bytes", type=int, default=DEFAULT_MAX_PERF_BYTES
     )
     args = parser.parse_args()
-    if args.work_root is None:
-        args.work_root = args.repo.resolve().parent / "coremark-profile-wamr-source"
     if args.frequency <= 0 or args.min_samples <= 0:
         parser.error("--frequency and --min-samples must be positive")
     if args.top <= 0 or args.classify <= 0 or args.classify > args.top:

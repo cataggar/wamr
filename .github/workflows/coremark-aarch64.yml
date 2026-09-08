@@ -153,6 +153,7 @@ jobs:
             --require-native-arch aarch64 \
             --out      coremark-profile/benchmark-table.md \
             --json-out coremark-profile/benchmark-report.json \
+            --retain-target-artifacts "$RUNNER_TEMP/coremark-profile-artifacts" \
             --emit     github
 
       - name: Install matching perf for profiling
@@ -223,8 +224,8 @@ jobs:
           python3 scripts/profile_coremark_aarch64.py \
             --out-dir coremark-profile \
             --benchmark-report coremark-profile/benchmark-report.json \
+            --benchmark-artifacts "$RUNNER_TEMP/coremark-profile-artifacts" \
             --wamr-ref "$PROFILE_SHA" \
-            --work-root "$RUNNER_TEMP/coremark-profile-wamr-source" \
             --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
             --frequency 999 \
             --min-samples 1000 \

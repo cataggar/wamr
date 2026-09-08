@@ -106,7 +106,12 @@ workload, host fingerprint and CPU affinity, GitHub run identity, tooling
 source SHA, exact WAMR source/runtime/compiler/cwasm identities, and exact
 Wasmtime version/runtime identity before collecting samples. The profile JSON
 retains the benchmark report ID and SHA-256, so a profile cannot silently claim
-association with an unrelated benchmark.
+association with an unrelated benchmark. Because optimized Zig binaries retain
+build-path identity, the benchmark explicitly copies the exact measured
+`wamr`, `wamrc`, and cwasm into an ephemeral runner-local handoff directory.
+The profiler validates its manifest and reuses those bytes; normal benchmark
+runs retain no build artifacts, and the handoff directory is not uploaded.
+The retained profile report records the ephemeral handoff manifest SHA-256.
 
 Invoke a pinned current profile with:
 
@@ -135,17 +140,28 @@ For a local native AArch64 host, create and consume the identity explicitly:
 
 ```
 sha="$(git rev-parse HEAD)"
+execution_id="coremark-${sha}-$(date -u +%Y%m%dT%H%M%SZ)"
+artifact_dir="$PWD/.cache/coremark-profile-artifacts"
 python3 scripts/bench_coremark.py \
   --baseline "$sha" --target "$sha" \
   --profile authoritative \
   --wasmtime-baseline auto \
   --require-native-arch aarch64 \
-  --json-out coremark-report.json
+  --execution-id "$execution_id" \
+  --json-out coremark-report.json \
+  --retain-target-artifacts "$artifact_dir"
 python3 scripts/profile_coremark_aarch64.py \
   --benchmark-report coremark-report.json \
+  --benchmark-artifacts "$artifact_dir" \
+  --execution-id "$execution_id" \
   --wamr-ref "$sha" \
   --out-dir coremark-profile
 ```
+
+Local benchmark/profile commands must receive the same nonempty
+`--execution-id` (or `COREMARK_RUN_ID`). A missing, stale, or mismatched local
+ID fails validation; a profile never becomes authoritative by copying the
+benchmark's ID into its output.
 
 For paired before/after evidence, run the workflow once for each exact source
 SHA and compare the two retained profile artifacts. Each side is independently

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import copy
 import sys
 import unittest
 from collections import Counter
@@ -143,6 +144,10 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
                 "report_id": "12345678-1234-5678-1234-567812345678",
                 "generated_at": "2026-09-08T00:00:00+00:00",
                 "report_sha256": "f" * 64,
+                "artifact_handoff": {
+                    "directory": "/artifacts",
+                    "manifest_sha256": "e" * 64,
+                },
                 "execution": {"provider": "local", "run_id": "test-run"},
                 "producer": {"source_sha": "c" * 40},
                 "target": {
@@ -212,6 +217,10 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             ],
         }
         profile.validate_report(report)
+        stale_execution = copy.deepcopy(report)
+        stale_execution["provenance"]["execution"]["run_id"] = "stale-run"
+        with self.assertRaisesRegex(profile.ProfileError, "execution provenance"):
+            profile.validate_report(stale_execution)
         report["matched_functions"][0]["wasm_function_index"] = 14
         with self.assertRaisesRegex(profile.ProfileError, "inconsistent"):
             profile.validate_report(report)
