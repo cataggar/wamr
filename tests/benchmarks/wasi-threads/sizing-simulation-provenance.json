@@ -309,6 +309,64 @@
     "description": "Scale each pre-#1013 fastest retained corrected interval to the matching authoritative pilot count.",
     "formula": "ceil(source_fastest_corrected_interval_ns * pilot_iterations / source_iterations)"
   },
+  "cell_specific_envelope": {
+    "algorithm_identity": {
+      "measurement_plan_identity_version": 4,
+      "sizing_algorithm_version": 3
+    },
+    "evidence": {
+      "attempts": [
+        {
+          "attempt": 1,
+          "fastest_pilot_rate": 739133.6269829108,
+          "general_selected_iterations": 1430000,
+          "measurement_to_fastest_pilot_ratio": 2.192262005124765,
+          "projected_benchmark_ns": 3034900135056,
+          "projected_later_elapsed_ns": 1370053595,
+          "selected_iterations": 2220000
+        },
+        {
+          "attempt": 2,
+          "fastest_pilot_rate": 853510.8028862322,
+          "general_selected_iterations": 1650000,
+          "measurement_to_fastest_pilot_ratio": 1.8362976197939525,
+          "projected_benchmark_ns": 3024705396534,
+          "projected_later_elapsed_ns": 1639762800,
+          "selected_iterations": 2570000
+        },
+        {
+          "attempt": 3,
+          "fastest_pilot_rate": 262449.4653554458,
+          "general_selected_iterations": 506000,
+          "measurement_to_fastest_pilot_ratio": 1.7370470506689346,
+          "projected_benchmark_ns": 3056826806075,
+          "projected_later_elapsed_ns": 1728498246,
+          "selected_iterations": 788000
+        }
+      ],
+      "declared_margin": 0.056048123805124916,
+      "diagnosis": {
+        "path": "zig-out/authoritative-gate/wait-diagnosis/diagnosis.json",
+        "sha256": "69a43a1129000d341da5581823bdf659a8a889327b7580f7d11e10733f9a0d35"
+      },
+      "maximum_projected_benchmark_ns": 3056826806075,
+      "prior_maximum_ordered_acceleration": 2.272623705208038
+    },
+    "failure_policy": "one-shot-no-retry-no-discard",
+    "formula": "round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*12/(E*5))))",
+    "measurement_to_pilot_rate_envelope": {
+      "denominator": 5,
+      "numerator": 12
+    },
+    "projected_pilot_duration_ns": 3000000000,
+    "quality_floor_ns": 1250000000,
+    "scope": {
+      "architectures": "all",
+      "mode": "aot",
+      "threads": 1,
+      "workload": "wait-notify"
+    }
+  },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,
     "retained_fastest_interval_ns": 1054664000
@@ -319,7 +377,7 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 1,
+  "schema_version": 2,
   "source_provenance": {
     "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
     "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",
