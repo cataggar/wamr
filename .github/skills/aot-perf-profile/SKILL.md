@@ -123,12 +123,14 @@ awk '/\[aot-spill-metric\]/{for(i=1;i<=NF;i++){n=index($i,"=");
 Note the per-core `<stem>.<N>.cwasm` files written next to the manifest —
 the biggest one is the hot core's text and you need it in Step 5.
 
-### Emit sound frame-origin metadata for a selected x86 function
+### Emit sound frame-origin metadata for a selected function
 
 After the first profile identifies the runtime-hot core/function, recompile
 that selection with the versioned sidecar enabled (or enable it before a
 fresh perf capture). The diagnostic does not change native code or default
-logging. Its parent directory must already exist:
+logging. It supports x86_64 and AArch64; add `--target aarch64` to the
+`wamrc` command when compiling AArch64 code. Its parent directory must already
+exist:
 
 ```sh
 mkdir -p /work/perf/frame
@@ -144,9 +146,9 @@ WAMR_AOT_SPILL_METRIC_FUNC=6145 \
 
 This writes
 `/work/perf/frame/keyvault.mod4.func6145.json`. Each compiler-emitted
-`rbp`/`rsp` frame access (including fixed prologue/epilogue pushes and pops)
-has a half-open function-relative native byte range, signed displacement,
-width, load/store direction, and one of:
+`rbp`/`rsp` or `x29`/`sp` frame access (including fixed
+prologue/epilogue state) has a half-open function-relative native byte range,
+encoded and effective address, width, load/store direction, and one of:
 
 - `allocator_spill`
 - `wasm_local_or_phi` (the lowered IR cannot soundly distinguish the two)
@@ -164,6 +166,15 @@ listed so objdump is restarted after data instead of silently decoding jump
 table bytes as instructions. A selected function bypasses codegen-cache reuse
 for that compile so metadata is regenerated from the exact current IR/emission;
 unselected functions may still reuse their cache entries.
+
+The current x86_64 sidecar remains schema v1 for compatibility. AArch64 uses
+schema v2, whose per-instruction `components` represent the two distinct frame
+values and encoded data-register identities in `ldp`/`stp` without counting one
+sampled instruction twice. Schema v2 records `bl` and direct-tail-call `b`
+relocations separately and normalizes only the declared imm26 field while
+validating the preserved opcode bits. Both schemas bind the sidecar to the
+complete core text, AOT format/ABI, target architecture, selected function
+offset/size, and normalized function bytes.
 
 ### Core wasm modules (e.g. CoreMark, #393)
 
@@ -240,20 +251,33 @@ instructions. With `--frame-metadata`, it also ranks allocator contributors by
 slot/vreg/source, reports static and sampled frame-attribution coverage and
 unknowns, and requires exact reconciliation between emitted allocator
 load/store records and the sidecar's `WAMR_AOT_SPILL_METRIC` totals.
-On x86, `spill_ld`/`spill_st` are now emitter-traced totals (so folded
-constant operands and fully suppressed constant defs no longer inflate the
-metric); the allocator-value records retain their IR use/def counts to make
-that difference inspectable. AArch64's standalone spill metric remains the
-pre-emission IR estimate.
+On x86_64, and for AArch64 functions selected for a frame sidecar,
+`spill_ld`/`spill_st` are emitter-traced totals. AArch64 metric-only runs
+retain the legacy IR estimate, including when an allocator is disabled.
+Pair accesses reconcile as two value components but carry samples only once.
+Allocator components in a mixed-origin pair remain in explicit component
+totals, while the indivisible instruction's samples remain unknown rather
+than entering allocator contributor rankings. The allocator-value records
+retain IR use/def counts so the distinction from emitted traffic stays inspectable.
 
 The tool fails closed on an incompatible AOT/metadata schema, stale full-core
 text hash or function native-code hash, malformed or overlapping native
-ranges, ambiguous mmap selection, or reconciliation mismatch. The full text
-hash binds identical-looking functions to the correct component core.
-Direct-call rel32 bytes are the only normalized relocations in the function
-hash and are listed explicitly in the sidecar.
+ranges, contradictory frame regions/slots/effective addresses, unproven
+materialized addresses, ambiguous mmap selection, or reconciliation mismatch.
+The full text hash binds identical-looking functions to the correct component
+core. Schema-v1 x86 direct-call rel32 bytes and schema-v2 AArch64 `bl`/`b`
+imm26 fields are the only normalized relocations in their respective function
+hashes and are listed explicitly in the sidecar.
 Without metadata, frame moves are reported as **unattributed frame traffic**,
 not guessed to be spills.
+
+The `.cwasm` must contain exactly one 40-byte target-info section. New
+artifacts encode a validated ELF64/COFF64 class, machine, relocatable-text
+type, and architecture; the consumer derives `sysv`, `win64`, or `aapcs64`
+from those artifact facts and requires an exact metadata match. Older
+containers whose target-info only says `bin_type=AOT` remain usable for
+metadata-free attribution, but their ABI is explicitly unverified and
+authoritative frame-sidecar validation fails closed.
 
 Authoritative size matching computes
 `ceil(cwasm_text_size / host_page_size) * host_page_size` because Linux
@@ -276,6 +300,18 @@ python3 $SKILL/aot_jit_attr.py \
   --frame-metadata /work/perf/frame/keyvault.mod4.func6145.json \
   --validate-frame-metadata
 ```
+
+For AArch64 add `--arch aarch64`. Always give the consumer the exact retained
+per-core `.cwasm` produced by the same compiler invocation as the sidecar; a
+rebuilt or renamed-equivalent core is not accepted merely because the selected
+function looks identical. Machine-readable `frame_attribution.origins`,
+`allocator_contributors`, `coverage`, and `reconciliation` fields provide the
+origin/sample summary for profiler integration.
+
+The CoreMark capture at source `66a97235` (run `34174622489`, recorded in
+issue #949) is historical pinned-source evidence. Reuse its samples only if
+the newly retained `.cwasm` code hash exactly matches that capture; otherwise
+take a fresh perf capture before reporting current-release percentages.
 
 The tracked `tests/benchmarks/frame_attribution/frame_origins.wasm` fixture is
 the small end-to-end smoke module used by `tests/test_aot_jit_attr.py`; it
@@ -343,9 +379,9 @@ distinguishes the two workload classes directly.
 - Issue #808 / PRs #809, #810 — the `WAMR_AOT_SPILL_METRIC*` diagnostic
   (`src/compiler/codegen/timing.zig:printSpill`,
   `src/compiler/ir/passes.zig:spillMetricOptionsFromEnv`).
-- `src/compiler/codegen/frame_attribution.zig` and x86
-  `compile.zig`/`emit.zig` — schema, slot/source metadata, and exact emitted
-  native ranges behind `WAMR_AOT_FRAME_ATTRIBUTION*`.
+- `src/compiler/codegen/frame_attribution.zig` and the x86_64/AArch64
+  `compile.zig`/`emit.zig` backends — schema, slot/source metadata, and exact
+  final-emission native ranges behind `WAMR_AOT_FRAME_ATTRIBUTION*`.
 - `src/runtime/aot/loader.zig:parseFunctionSection` — the `.cwasm`
   function section (`type=3`: count then `(offset:u32, type_idx:u32)`)
   that `aot_jit_attr.py` parses for `func_offsets[]`. Text section is

@@ -13,6 +13,7 @@ const range_split = @import("../../ir/range_split.zig");
 const codegen_cache = @import("../../codegen_cache.zig");
 const passes = @import("../../ir/passes.zig");
 const codegen_timing = @import("../timing.zig");
+const frame_attribution = @import("../frame_attribution.zig");
 
 /// Compile-time debug flag: when true, print per-function range-split
 /// stats to stderr. Flip via `zig build -Drange-split-debug=true` after
@@ -591,6 +592,9 @@ pub const CompileOptions = struct {
     /// `WAMR_AOT_SPILL_METRIC` is set. Combines the scalar (X) and v128 (V)
     /// allocations into one per-function report.
     spill_metric: passes.SpillMetricOptions = .{},
+    /// Versioned machine-readable AArch64 frame-origin metadata. Off unless
+    /// `WAMR_AOT_FRAME_ATTRIBUTION=<output-prefix>` is set.
+    frame_attribution: passes.FrameAttributionOptions = .{},
     /// Component core/module index, used only to match the
     /// `WAMR_AOT_CODEGEN_TIMING_MODULE` filter.
     module_idx: u32 = 0,
@@ -693,6 +697,8 @@ const FuncCompileCtx = struct {
     /// coalesce / post-emit-coalesce spans into it. Null is the normal
     /// (untimed) path — a hard no-op.
     codegen_timer: ?*codegen_timing.Aarch64FuncTimer = null,
+    frame_attribution_ctx: ?FrameAttributionCtx = null,
+    frame_attribution_out: ?*?PendingFrameAttribution = null,
     /// #808 Lever 1: local function index, used to label the spill-metric
     /// line and to match the `WAMR_AOT_SPILL_METRIC_FUNC` filter. Defaults
     /// to 0 on the single-function `compileFunctionWithOptions` entry.
@@ -997,6 +1003,7 @@ fn relaxOutOfRangeConditionalBranches(
     block_offsets: []usize,
     patches: *std.ArrayListUnmanaged(BranchPatch),
     call_patches: ?*std.ArrayListUnmanaged(CallPatch),
+    ir_ranges: ?[]EmittedIrRange,
     allocator: std.mem.Allocator,
 ) !void {
     const max_iter: u32 = 16;
@@ -1105,6 +1112,16 @@ fn relaxOutOfRangeConditionalBranches(
                 p.patch_offset += shift * 4;
             }
         }
+        if (ir_ranges) |ranges| {
+            for (ranges) |*range| {
+                range.native_start += @intCast(
+                    lowerBound(ins_points.items, range.native_start) * 4,
+                );
+                range.native_end += @intCast(
+                    lowerBound(ins_points.items, range.native_end) * 4,
+                );
+            }
+        }
 
         // 7. Repoint each OOR patch at the inserted unconditional B. The
         //    j-th OOR patch (zero-based by sorted order) has j prior
@@ -1151,6 +1168,838 @@ fn isOorIndex(sorted: []const usize, target: usize) bool {
         if (sorted[mid] < target) lo = mid + 1 else hi = mid;
     }
     return false;
+}
+
+const FrameAttributionCtx = struct {
+    output_prefix: []const u8,
+    module_idx: u32,
+    func_idx: u32,
+    cwasm_aot_version: u32,
+    compiler_build_id: []const u8,
+};
+
+const EmittedIrRange = struct {
+    native_start: u32,
+    native_end: u32,
+    ir_position: u32,
+    inst: ir.Inst,
+};
+
+const PendingFrameAttribution = struct {
+    ctx: FrameAttributionCtx,
+    function_name: []const u8,
+    function_offset: u32 = 0,
+    code_size: u32,
+    normalized_code_sha256: [64]u8,
+    normalized_relocations: []frame_attribution.Relocation,
+    frame_layout: frame_attribution.FrameLayout,
+    frame_regions: []frame_attribution.FrameRegion,
+    spill_metric: frame_attribution.SpillMetric,
+    emitted_allocator_loads: u32,
+    emitted_allocator_stores: u32,
+    allocator_values: []frame_attribution.SpillValue,
+    accesses: []frame_attribution.Access,
+
+    fn deinit(self: *PendingFrameAttribution, allocator: std.mem.Allocator) void {
+        allocator.free(self.normalized_relocations);
+        allocator.free(self.frame_regions);
+        allocator.free(self.allocator_values);
+        for (self.accesses) |access| allocator.free(access.components);
+        allocator.free(self.accesses);
+    }
+
+    fn write(
+        self: *const PendingFrameAttribution,
+        allocator: std.mem.Allocator,
+        module_text_size: u32,
+        module_text_sha256: []const u8,
+    ) !void {
+        try frame_attribution.writeReport(
+            allocator,
+            self.ctx.output_prefix,
+            self.ctx.module_idx,
+            self.ctx.func_idx,
+            .{
+                .schema_version = frame_attribution.format_version,
+                .cwasm_aot_version = self.ctx.cwasm_aot_version,
+                .compiler_build_id = self.ctx.compiler_build_id,
+                .architecture = "aarch64",
+                .abi = "aapcs64",
+                .module = self.ctx.module_idx,
+                .local_func = self.ctx.func_idx,
+                .function_name = self.function_name,
+                .module_text_size = module_text_size,
+                .module_text_sha256 = module_text_sha256,
+                .function_offset = self.function_offset,
+                .code_size = self.code_size,
+                .normalized_code_sha256 = &self.normalized_code_sha256,
+                .direct_call_rel32_offsets = &.{},
+                .normalized_relocations = self.normalized_relocations,
+                .inline_data_ranges = &.{},
+                .frame_layout = self.frame_layout,
+                .frame_regions = self.frame_regions,
+                .spill_metric = self.spill_metric,
+                .emitted_allocator_loads = self.emitted_allocator_loads,
+                .emitted_allocator_stores = self.emitted_allocator_stores,
+                .allocator_values = self.allocator_values,
+                .accesses = self.accesses,
+            },
+        );
+    }
+};
+
+const DefInfo = struct {
+    count: u32 = 0,
+    opcode: ?[]const u8 = null,
+    source_class: ?[]const u8 = null,
+};
+
+fn stableSourceClass(opcode: []const u8) []const u8 {
+    if (std.mem.eql(u8, opcode, "local_get")) return "wasm_local_or_phi";
+    if (std.mem.eql(u8, opcode, "phi") or
+        std.mem.eql(u8, opcode, "parallel_copy"))
+    {
+        return "phi_or_copy";
+    }
+    if (std.mem.startsWith(u8, opcode, "iconst_") or
+        std.mem.startsWith(u8, opcode, "fconst_") or
+        std.mem.eql(u8, opcode, "v128_const"))
+    {
+        return "constant";
+    }
+    if (std.mem.startsWith(u8, opcode, "call")) return "call_result";
+    if (std.mem.indexOf(u8, opcode, "load") != null or
+        std.mem.eql(u8, opcode, "global_get") or
+        std.mem.eql(u8, opcode, "table_get"))
+    {
+        return "memory_or_runtime";
+    }
+    return "computed";
+}
+
+fn rematerializationEligible(opcode: ?[]const u8) bool {
+    const op = opcode orelse return false;
+    return std.mem.eql(u8, op, "iconst_32") or std.mem.eql(u8, op, "iconst_64");
+}
+
+const SpillUseCountCtx = struct {
+    counts: *std.AutoHashMap(ir.VReg, u32),
+
+    fn visit(self: *SpillUseCountCtx, vreg: ir.VReg) anyerror!void {
+        if (self.counts.getPtr(vreg)) |count| count.* += 1;
+    }
+};
+
+fn buildAarch64SpillValues(
+    allocator: std.mem.Allocator,
+    block_order: []const ir.BlockId,
+    scheduled: *const schedule.FunctionSchedule,
+    live_ranges: []const analysis.LiveRange,
+    scalar_alloc: *const regalloc.AllocResult,
+    v128_alloc: *const regalloc.AllocResult,
+    spill_base: u32,
+) ![]frame_attribution.SpillValue {
+    var type_ranges = std.AutoHashMap(ir.VReg, analysis.LiveRange).init(allocator);
+    defer type_ranges.deinit();
+    for (live_ranges) |range| try type_ranges.put(range.vreg, range);
+
+    var use_counts = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer use_counts.deinit();
+    var def_infos = std.AutoHashMap(ir.VReg, DefInfo).init(allocator);
+    defer def_infos.deinit();
+    inline for (.{ scalar_alloc, v128_alloc }) |allocation| {
+        var it = allocation.assignments.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .stack) continue;
+            try use_counts.put(entry.key_ptr.*, 0);
+            try def_infos.put(entry.key_ptr.*, .{});
+        }
+    }
+
+    var use_ctx = SpillUseCountCtx{ .counts = &use_counts };
+    for (block_order) |block_id| {
+        for (scheduled.instructions(block_id)) |inst| {
+            if (inst.dest) |dest| {
+                if (def_infos.getPtr(dest)) |info| {
+                    const opcode = @tagName(inst.op);
+                    info.count += 1;
+                    if (info.count == 1) {
+                        info.opcode = opcode;
+                        info.source_class = stableSourceClass(opcode);
+                    } else {
+                        info.opcode = null;
+                        info.source_class = null;
+                    }
+                }
+            }
+            try schedule.forEachUse(inst, &use_ctx, SpillUseCountCtx.visit);
+        }
+    }
+
+    var values: std.ArrayList(frame_attribution.SpillValue) = .empty;
+    errdefer values.deinit(allocator);
+    inline for (.{ scalar_alloc, v128_alloc }) |allocation| {
+        var it = allocation.assignments.iterator();
+        while (it.next()) |entry| {
+            const frame_offset = switch (entry.value_ptr.*) {
+                .stack => |off| off,
+                .reg => continue,
+            };
+            const delta = frame_offset - @as(i32, @intCast(spill_base));
+            if (delta < 0 or @rem(delta, 8) != 0) return error.InvalidSpillFrameOffset;
+            const range = type_ranges.get(entry.key_ptr.*);
+            const info = def_infos.get(entry.key_ptr.*) orelse DefInfo{};
+            try values.append(allocator, .{
+                .vreg = entry.key_ptr.*,
+                .frame_offset = frame_offset,
+                .slot = @intCast(@divTrunc(delta, 8)),
+                .slot_count = if (range) |r| r.type.spillSlots64() else 1,
+                .value_type = if (range) |r| @tagName(r.type) else null,
+                .live_start = if (range) |r| r.start else null,
+                .live_end = if (range) |r| r.end else null,
+                .defining_opcode = info.opcode,
+                .source_class = info.source_class,
+                .ir_use_count = use_counts.get(entry.key_ptr.*) orelse 0,
+                .ir_def_count = info.count,
+                .reload_count = 0,
+                .store_count = 0,
+                .rematerialization_eligible = rematerializationEligible(info.opcode),
+                .reused = false,
+            });
+        }
+    }
+    std.mem.sort(frame_attribution.SpillValue, values.items, {}, struct {
+        fn lessThan(_: void, lhs: frame_attribution.SpillValue, rhs: frame_attribution.SpillValue) bool {
+            if (lhs.slot != rhs.slot) return lhs.slot < rhs.slot;
+            return lhs.vreg < rhs.vreg;
+        }
+    }.lessThan);
+    for (values.items, 0..) |value, i| {
+        const end_slot = value.slot + value.slot_count;
+        var j = i + 1;
+        while (j < values.items.len and values.items[j].slot < end_slot) : (j += 1) {
+            const other_end = values.items[j].slot + values.items[j].slot_count;
+            if (value.slot < other_end) {
+                values.items[i].reused = true;
+                values.items[j].reused = true;
+            }
+        }
+    }
+    return values.toOwnedSlice(allocator);
+}
+
+fn spillValueCoversOffset(value: frame_attribution.SpillValue, offset: i32) bool {
+    return offset >= value.frame_offset and
+        offset < value.frame_offset + @as(i32, value.slot_count) * 8;
+}
+
+fn spillValueSlotAtOffset(value: frame_attribution.SpillValue, offset: i32) u32 {
+    return value.slot + @as(u32, @intCast(@divTrunc(offset - value.frame_offset, 8)));
+}
+
+fn findOwningIrRange(
+    ranges: []const EmittedIrRange,
+    native_start: u32,
+) ?EmittedIrRange {
+    for (ranges) |range| {
+        if (range.native_start <= native_start and native_start < range.native_end) return range;
+    }
+    return null;
+}
+
+const ResolveSpillUseCtx = struct {
+    values: []const frame_attribution.SpillValue,
+    offset: i32,
+    match: ?usize = null,
+    ambiguous: bool = false,
+
+    fn visit(self: *ResolveSpillUseCtx, vreg: ir.VReg) anyerror!void {
+        for (self.values, 0..) |value, i| {
+            if (value.vreg != vreg or !spillValueCoversOffset(value, self.offset)) continue;
+            if (self.match) |prior| {
+                if (prior != i) self.ambiguous = true;
+            } else {
+                self.match = i;
+            }
+        }
+    }
+};
+
+fn resolveSpillValue(
+    values: []const frame_attribution.SpillValue,
+    offset: i32,
+    kind: emit.FrameAccessKind,
+    owning_ir: ?EmittedIrRange,
+) !struct { index: ?usize, candidate_count: u32 } {
+    var first: ?usize = null;
+    var candidate_count: u32 = 0;
+    for (values, 0..) |value, i| {
+        if (!spillValueCoversOffset(value, offset)) continue;
+        if (first == null) first = i;
+        candidate_count += 1;
+    }
+    if (candidate_count <= 1) return .{ .index = first, .candidate_count = candidate_count };
+    const range = owning_ir orelse return .{ .index = null, .candidate_count = candidate_count };
+    switch (kind) {
+        .store => {
+            const dest = range.inst.dest orelse
+                return .{ .index = null, .candidate_count = candidate_count };
+            var match: ?usize = null;
+            for (values, 0..) |value, i| {
+                if (value.vreg == dest and spillValueCoversOffset(value, offset)) {
+                    if (match != null) return .{ .index = null, .candidate_count = candidate_count };
+                    match = i;
+                }
+            }
+            return .{ .index = match, .candidate_count = candidate_count };
+        },
+        .load => {
+            var use_ctx = ResolveSpillUseCtx{ .values = values, .offset = offset };
+            try schedule.forEachUse(range.inst, &use_ctx, ResolveSpillUseCtx.visit);
+            return .{
+                .index = if (use_ctx.ambiguous) null else use_ctx.match,
+                .candidate_count = candidate_count,
+            };
+        },
+    }
+}
+
+fn frameRegName(reg: emit.Reg) []const u8 {
+    return switch (reg) {
+        .fp => "x29",
+        .sp => "sp",
+        else => @tagName(reg),
+    };
+}
+
+fn classifyAarch64Component(
+    raw_access: emit.FrameAccess,
+    raw_component: emit.FrameAccessComponent,
+    owning_ir: ?EmittedIrRange,
+    local_offsets: []const u32,
+    local_types: []const ir.IrType,
+    spill_values: []const frame_attribution.SpillValue,
+    frame_size: u32,
+    hrp_save_off: u32,
+    scratch_base: u32,
+    scratch_size: u32,
+    call_save_base: u32,
+    call_save_size: u32,
+    callee_save_base: u32,
+    callee_save_size: u32,
+) !frame_attribution.AccessComponent {
+    var component: frame_attribution.AccessComponent = .{
+        .base = frameRegName(raw_component.base),
+        .frame_offset = raw_component.displacement,
+        .width = raw_component.width,
+        .data_register = raw_component.data_register,
+        .data_register_class = @tagName(raw_component.data_register_class),
+        .origin = .unknown,
+        .detail = "unclassified_frame_access",
+        .ir_position = if (owning_ir) |range| range.ir_position else null,
+        .ir_opcode = if (owning_ir) |range| @tagName(range.inst.op) else null,
+    };
+    if (raw_component.base == .sp) {
+        component.origin = .fixed_runtime_frame_state;
+        const is_fp_lr_pair = raw_access.component_count == 2 and
+            raw_access.components[0].data_register_class == .gpr and
+            raw_access.components[1].data_register_class == .gpr and
+            raw_access.components[0].data_register == @intFromEnum(emit.Reg.fp) and
+            raw_access.components[1].data_register == @intFromEnum(emit.Reg.lr);
+        component.detail = if (is_fp_lr_pair)
+            switch (raw_access.kind) {
+                .store => "prologue_saved_fp_lr",
+                .load => "epilogue_restored_fp_lr",
+            }
+        else
+            "outgoing_abi_frame";
+        return component;
+    }
+
+    const resolved = try resolveSpillValue(
+        spill_values,
+        raw_component.displacement,
+        raw_access.kind,
+        owning_ir,
+    );
+    if (resolved.candidate_count > 0) {
+        component.origin = .allocator_spill;
+        component.detail = "allocator_slot";
+        if (resolved.index) |idx| {
+            const value = spill_values[idx];
+            component.slot = spillValueSlotAtOffset(value, raw_component.displacement);
+            component.vreg = value.vreg;
+            component.defining_opcode = value.defining_opcode;
+            component.source_class = value.source_class;
+            component.rematerialization_eligible = value.rematerialization_eligible;
+        } else {
+            component.vreg_ambiguous = resolved.candidate_count > 1;
+            for (spill_values) |value| {
+                if (spillValueCoversOffset(value, raw_component.displacement)) {
+                    component.slot = spillValueSlotAtOffset(value, raw_component.displacement);
+                    break;
+                }
+            }
+        }
+        return component;
+    }
+
+    for (local_offsets, 0..) |offset, local_index| {
+        const size = localSlotSize(localTypeAt(local_types, @intCast(local_index)));
+        if (raw_component.displacement >= offset and
+            raw_component.displacement + raw_component.width <= offset + size)
+        {
+            component.origin = .wasm_local_or_phi;
+            component.detail = "wasm_local_or_lowered_phi";
+            component.local_index = @intCast(local_index);
+            return component;
+        }
+    }
+    if (raw_component.displacement < 0) return component;
+    const offset: u32 = @intCast(raw_component.displacement);
+    if (offset < 16) {
+        component.origin = .fixed_runtime_frame_state;
+        component.detail = if (offset == 0) "saved_frame_pointer" else "return_address";
+    } else if (offset >= frame_size) {
+        component.origin = .fixed_runtime_frame_state;
+        component.detail = "incoming_abi_argument";
+    } else if (offset == vmctx_slot_offset) {
+        component.origin = .fixed_runtime_frame_state;
+        component.detail = "reserved_vmctx";
+    } else if (offset >= call_save_base and offset < call_save_base + call_save_size) {
+        component.origin = .fixed_runtime_frame_state;
+        component.detail = "caller_saved_register";
+    } else if (offset >= callee_save_base and offset < callee_save_base + callee_save_size) {
+        component.origin = .fixed_runtime_frame_state;
+        component.detail = "callee_saved_register";
+    } else if (offset >= hrp_save_off and offset < hrp_save_off + 8) {
+        component.origin = .explicit_frame_storage;
+        component.detail = "hidden_return_pointer";
+        component.explicit_slot = 0;
+    } else if (scratch_size > 0 and offset >= scratch_base and offset < scratch_base + scratch_size) {
+        component.origin = .explicit_frame_storage;
+        component.detail = "call_result_scratch";
+        component.explicit_slot = @intCast((offset - hrp_save_off) / 8);
+    }
+    return component;
+}
+
+fn buildAarch64FrameAccesses(
+    allocator: std.mem.Allocator,
+    raw_accesses: []const emit.FrameAccess,
+    ir_ranges: []const EmittedIrRange,
+    local_offsets: []const u32,
+    local_types: []const ir.IrType,
+    spill_values: []frame_attribution.SpillValue,
+    frame_size: u32,
+    hrp_save_off: u32,
+    scratch_base: u32,
+    scratch_size: u32,
+    call_save_base: u32,
+    call_save_size: u32,
+    callee_save_base: u32,
+    callee_save_size: u32,
+    emitted_loads: *u32,
+    emitted_stores: *u32,
+) ![]frame_attribution.Access {
+    var accesses: std.ArrayList(frame_attribution.Access) = .empty;
+    errdefer {
+        for (accesses.items) |access| allocator.free(access.components);
+        accesses.deinit(allocator);
+    }
+    try accesses.ensureTotalCapacity(allocator, raw_accesses.len);
+
+    var value_indices = std.AutoHashMap(ir.VReg, usize).init(allocator);
+    defer value_indices.deinit();
+    for (spill_values, 0..) |value, i| try value_indices.put(value.vreg, i);
+
+    for (raw_accesses) |raw| {
+        const owning_ir = findOwningIrRange(ir_ranges, raw.native_start);
+        const component_count: usize = raw.component_count;
+        const components = try allocator.alloc(frame_attribution.AccessComponent, component_count);
+        errdefer allocator.free(components);
+        for (components, 0..) |*component, i| {
+            component.* = try classifyAarch64Component(
+                raw,
+                raw.components[i],
+                owning_ir,
+                local_offsets,
+                local_types,
+                spill_values,
+                frame_size,
+                hrp_save_off,
+                scratch_base,
+                scratch_size,
+                call_save_base,
+                call_save_size,
+                callee_save_base,
+                callee_save_size,
+            );
+            if (component.origin == .allocator_spill) {
+                switch (raw.kind) {
+                    .load => emitted_loads.* += 1,
+                    .store => emitted_stores.* += 1,
+                }
+                if (component.vreg) |vreg| {
+                    const idx = value_indices.get(vreg) orelse
+                        return error.FrameAttributionUnknownVReg;
+                    switch (raw.kind) {
+                        .load => spill_values[idx].reload_count += 1,
+                        .store => spill_values[idx].store_count += 1,
+                    }
+                }
+            }
+        }
+
+        var uniform_origin = true;
+        var uniform_detail = true;
+        for (components[1..]) |component| {
+            uniform_origin = uniform_origin and component.origin == components[0].origin;
+            uniform_detail = uniform_detail and std.mem.eql(u8, component.detail, components[0].detail);
+        }
+        var access: frame_attribution.Access = .{
+            .native_start = raw.native_start,
+            .native_end = raw.native_end,
+            .kind = switch (raw.kind) {
+                .load => .load,
+                .store => .store,
+            },
+            .base = components[0].base,
+            .frame_offset = components[0].frame_offset,
+            .width = 0,
+            .origin = if (uniform_origin) components[0].origin else .unknown,
+            .detail = if (uniform_detail) components[0].detail else "mixed_pair_frame_access",
+            .ir_position = if (owning_ir) |range| range.ir_position else null,
+            .ir_opcode = if (owning_ir) |range| @tagName(range.inst.op) else null,
+            .encoded_base = frameRegName(raw.encoded_base),
+            .encoded_offset = raw.encoded_displacement,
+            .addressing_mode = @tagName(raw.addressing_mode),
+            .components = components,
+        };
+        for (components) |component| access.width += component.width;
+        if (components.len == 1) {
+            access.slot = components[0].slot;
+            access.local_index = components[0].local_index;
+            access.explicit_slot = components[0].explicit_slot;
+            access.vreg = components[0].vreg;
+            access.vreg_ambiguous = components[0].vreg_ambiguous;
+            access.defining_opcode = components[0].defining_opcode;
+            access.source_class = components[0].source_class;
+            access.rematerialization_eligible = components[0].rematerialization_eligible;
+        } else if (access.origin == .allocator_spill) {
+            access.vreg_ambiguous = true;
+        }
+        accesses.appendAssumeCapacity(access);
+    }
+    return accesses.toOwnedSlice(allocator);
+}
+
+fn normalizedAarch64CodeSha256(
+    code: []const u8,
+    relocations: []const frame_attribution.Relocation,
+    hex_out: *[64]u8,
+) !void {
+    var sh = std.crypto.hash.sha2.Sha256.init(.{});
+    var cursor: usize = 0;
+    for (relocations) |relocation| {
+        const start: usize = relocation.native_start;
+        const end: usize = relocation.native_end;
+        if (start < cursor or end != start + 4 or end > code.len) {
+            return error.InvalidDirectCallPatch;
+        }
+        const word = std.mem.readInt(u32, code[start..end][0..4], .little);
+        const expected_opcode: u32 = switch (relocation.kind) {
+            .aarch64_call_imm26 => 0x94000000,
+            .aarch64_tail_call_imm26 => 0x14000000,
+            else => return error.InvalidDirectCallPatch,
+        };
+        if ((word & 0xFC000000) != expected_opcode) return error.InvalidDirectCallPatch;
+        sh.update(code[cursor..start]);
+        var normalized: [4]u8 = undefined;
+        std.mem.writeInt(u32, &normalized, word & 0xFC000000, .little);
+        sh.update(&normalized);
+        cursor = end;
+    }
+    sh.update(code[cursor..]);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    sh.final(&digest);
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |byte, i| {
+        hex_out[i * 2] = hex[byte >> 4];
+        hex_out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+}
+
+fn sha256Hex(data: []const u8, hex_out: *[64]u8) void {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |byte, i| {
+        hex_out[i * 2] = hex[byte >> 4];
+        hex_out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+}
+
+test "AArch64 frame attribution normalizes declared BL and B imm26 fields" {
+    var first: [8]u8 = undefined;
+    var second: [8]u8 = undefined;
+    std.mem.writeInt(u32, first[0..4], 0x94000001, .little);
+    std.mem.writeInt(u32, first[4..8], 0xD503201F, .little);
+    std.mem.writeInt(u32, second[0..4], 0x97FFFFFF, .little);
+    std.mem.writeInt(u32, second[4..8], 0xD503201F, .little);
+    const relocations = [_]frame_attribution.Relocation{.{
+        .native_start = 0,
+        .native_end = 4,
+        .kind = .aarch64_call_imm26,
+    }};
+    var first_hash: [64]u8 = undefined;
+    var second_hash: [64]u8 = undefined;
+    try normalizedAarch64CodeSha256(&first, &relocations, &first_hash);
+    try normalizedAarch64CodeSha256(&second, &relocations, &second_hash);
+    try std.testing.expectEqualSlices(u8, &first_hash, &second_hash);
+
+    std.mem.writeInt(u32, second[0..4], 0x14000001, .little);
+    try std.testing.expectError(
+        error.InvalidDirectCallPatch,
+        normalizedAarch64CodeSha256(&second, &relocations, &second_hash),
+    );
+
+    const tail_relocations = [_]frame_attribution.Relocation{.{
+        .native_start = 0,
+        .native_end = 4,
+        .kind = .aarch64_tail_call_imm26,
+    }};
+    std.mem.writeInt(u32, first[0..4], 0x14000001, .little);
+    std.mem.writeInt(u32, second[0..4], 0x17FFFFFF, .little);
+    try normalizedAarch64CodeSha256(&first, &tail_relocations, &first_hash);
+    try normalizedAarch64CodeSha256(&second, &tail_relocations, &second_hash);
+    try std.testing.expectEqualSlices(u8, &first_hash, &second_hash);
+    try std.testing.expectError(
+        error.InvalidDirectCallPatch,
+        normalizedAarch64CodeSha256(&first, &relocations, &first_hash),
+    );
+}
+
+test "AArch64 frame attribution classifies locals, fixed state, and spill components" {
+    const spill_value: frame_attribution.SpillValue = .{
+        .vreg = 91,
+        .frame_offset = 64,
+        .slot = 5,
+        .slot_count = 2,
+        .value_type = "v128",
+        .live_start = 3,
+        .live_end = 12,
+        .defining_opcode = "v128_load",
+        .source_class = "memory_or_runtime",
+        .ir_use_count = 2,
+        .ir_def_count = 1,
+        .reload_count = 0,
+        .store_count = 0,
+        .rematerialization_eligible = false,
+        .reused = false,
+    };
+    const raw_access: emit.FrameAccess = .{
+        .native_start = 4,
+        .native_end = 8,
+        .kind = .load,
+        .encoded_base = .fp,
+        .encoded_displacement = 0,
+        .addressing_mode = .materialized,
+        .components = .{
+            .{ .base = .fp, .displacement = 0, .width = 8, .data_register = 0, .data_register_class = .gpr },
+            .{ .base = .fp, .displacement = 0, .width = 8, .data_register = 1, .data_register_class = .gpr },
+        },
+        .component_count = 1,
+    };
+    const local = try classifyAarch64Component(
+        raw_access,
+        .{ .base = .fp, .displacement = 24, .width = 8, .data_register = 0, .data_register_class = .gpr },
+        null,
+        &.{24},
+        &.{.i64},
+        &.{},
+        160,
+        40,
+        48,
+        8,
+        80,
+        16,
+        96,
+        16,
+    );
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.wasm_local_or_phi, local.origin);
+    try std.testing.expectEqual(@as(?u32, 0), local.local_index);
+
+    const fixed = try classifyAarch64Component(
+        raw_access,
+        .{ .base = .sp, .displacement = 0, .width = 8, .data_register = 0, .data_register_class = .gpr },
+        null,
+        &.{24},
+        &.{.i64},
+        &.{},
+        160,
+        40,
+        48,
+        8,
+        80,
+        16,
+        96,
+        16,
+    );
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.fixed_runtime_frame_state, fixed.origin);
+    try std.testing.expectEqualStrings("outgoing_abi_frame", fixed.detail);
+
+    const spill = try classifyAarch64Component(
+        raw_access,
+        .{ .base = .fp, .displacement = 72, .width = 8, .data_register = 0, .data_register_class = .simd },
+        null,
+        &.{24},
+        &.{.i64},
+        &.{spill_value},
+        160,
+        40,
+        48,
+        8,
+        80,
+        16,
+        96,
+        16,
+    );
+    try std.testing.expectEqual(frame_attribution.AccessOrigin.allocator_spill, spill.origin);
+    try std.testing.expectEqual(@as(?u32, 6), spill.slot);
+    try std.testing.expectEqual(@as(?u32, 91), spill.vreg);
+}
+
+test "AArch64 frame attribution recognizes FP/LR pairs across prologue threshold" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 504, 512, 520 }) |frame_size| {
+        var code = emit.CodeBuffer.init(allocator);
+        defer code.deinit();
+        try code.emitPrologue(frame_size);
+        try code.emitEpilogueNoRet(frame_size);
+        const raw_accesses = try emit.traceFrameAccesses(allocator, code.getCode());
+        defer allocator.free(raw_accesses);
+        try std.testing.expectEqual(@as(usize, 2), raw_accesses.len);
+
+        const prologue = try classifyAarch64Component(
+            raw_accesses[0],
+            raw_accesses[0].components[0],
+            null,
+            &.{},
+            &.{},
+            &.{},
+            frame_size,
+            16,
+            24,
+            0,
+            24,
+            0,
+            24,
+            0,
+        );
+        const epilogue = try classifyAarch64Component(
+            raw_accesses[1],
+            raw_accesses[1].components[0],
+            null,
+            &.{},
+            &.{},
+            &.{},
+            frame_size,
+            16,
+            24,
+            0,
+            24,
+            0,
+            24,
+            0,
+        );
+        try std.testing.expectEqualStrings("prologue_saved_fp_lr", prologue.detail);
+        try std.testing.expectEqualStrings("epilogue_restored_fp_lr", epilogue.detail);
+        try std.testing.expectEqual(@as(u5, 29), raw_accesses[0].components[0].data_register);
+        try std.testing.expectEqual(@as(u5, 30), raw_accesses[0].components[1].data_register);
+    }
+}
+
+fn buildAarch64FrameRegions(
+    allocator: std.mem.Allocator,
+    local_offsets: []const u32,
+    local_types: []const ir.IrType,
+    spill_base: u32,
+    scalar_spill_end: u32,
+    v128_spill_base: u32,
+    v128_spill_end: u32,
+    hrp_save_off: u32,
+    scratch_base: u32,
+    scratch_size: u32,
+    call_save_base: u32,
+    call_save_size: u32,
+    callee_save_base: u32,
+    callee_save_size: u32,
+) ![]frame_attribution.FrameRegion {
+    var regions: std.ArrayList(frame_attribution.FrameRegion) = .empty;
+    errdefer regions.deinit(allocator);
+    try regions.append(allocator, .{
+        .start = 0,
+        .end = 16,
+        .origin = .fixed_runtime_frame_state,
+        .detail = "saved_fp_lr",
+    });
+    try regions.append(allocator, .{
+        .start = vmctx_slot_offset,
+        .end = vmctx_slot_offset + 8,
+        .origin = .fixed_runtime_frame_state,
+        .detail = "reserved_vmctx",
+    });
+    for (local_offsets, 0..) |offset, i| {
+        try regions.append(allocator, .{
+            .start = @intCast(offset),
+            .end = @intCast(offset + localSlotSize(localTypeAt(local_types, @intCast(i)))),
+            .origin = .wasm_local_or_phi,
+            .detail = "wasm_local_or_lowered_phi",
+        });
+    }
+    if (scalar_spill_end > spill_base) try regions.append(allocator, .{
+        .start = @intCast(spill_base),
+        .end = @intCast(scalar_spill_end),
+        .origin = .allocator_spill,
+        .detail = "scalar_allocator_spills",
+    });
+    if (v128_spill_end > v128_spill_base) try regions.append(allocator, .{
+        .start = @intCast(v128_spill_base),
+        .end = @intCast(v128_spill_end),
+        .origin = .allocator_spill,
+        .detail = "v128_allocator_spills",
+    });
+    try regions.append(allocator, .{
+        .start = @intCast(hrp_save_off),
+        .end = @intCast(hrp_save_off + 8),
+        .origin = .explicit_frame_storage,
+        .detail = "hidden_return_pointer",
+    });
+    if (scratch_size > 0) try regions.append(allocator, .{
+        .start = @intCast(scratch_base),
+        .end = @intCast(scratch_base + scratch_size),
+        .origin = .explicit_frame_storage,
+        .detail = "call_result_scratch",
+    });
+    try regions.append(allocator, .{
+        .start = @intCast(call_save_base),
+        .end = @intCast(call_save_base + call_save_size),
+        .origin = .fixed_runtime_frame_state,
+        .detail = "caller_saved_registers",
+    });
+    try regions.append(allocator, .{
+        .start = @intCast(callee_save_base),
+        .end = @intCast(callee_save_base + callee_save_size),
+        .origin = .fixed_runtime_frame_state,
+        .detail = "callee_saved_registers",
+    });
+    std.mem.sort(frame_attribution.FrameRegion, regions.items, {}, struct {
+        fn lessThan(_: void, lhs: frame_attribution.FrameRegion, rhs: frame_attribution.FrameRegion) bool {
+            return lhs.start < rhs.start;
+        }
+    }.lessThan);
+    return regions.toOwnedSlice(allocator);
 }
 
 pub fn compileFunctionImpl(
@@ -1717,15 +2566,21 @@ pub fn compileFunctionImpl(
         if (tmr) |t| t.end(.regalloc);
     }
 
-    // #808 Lever 1: per-function spill-cost diagnostic. Combines the scalar
-    // (X-reg) and v128 (V-reg) allocations — disjoint vreg sets, distinct
-    // register files — into one report. Gated so the disabled path pays
-    // nothing; `printSpill` is further gated by `shouldLog`.
-    if (ctx.options.spill_metric.enabled and
-        ctx.options.spill_metric.moduleMatches(ctx.options.module_idx))
-    {
+    // Compute the architecture-neutral allocation summary when either the
+    // legacy stderr metric or the exact frame sidecar needs it. Selected
+    // sidecars replace the IR estimate with final machine-code tracing below.
+    const spill_metric_needed = ctx.frame_attribution_ctx != null or
+        (ctx.options.spill_metric.enabled and
+            ctx.options.spill_metric.moduleMatches(ctx.options.module_idx));
+    var spill_metric_value: ?regalloc.SpillMetric = null;
+    var spill_metric_total_slots: u32 = 0;
+    if (spill_metric_needed) {
+        if (ctx.frame_attribution_ctx != null and
+            (alloc_result_storage == null or v128_alloc_result_storage == null))
+        {
+            return error.FrameAttributionRequiresLinearScan;
+        }
         var metric: regalloc.SpillMetric = .{};
-        var total_slots: u32 = 0;
         if (alloc_result_storage) |*ar| {
             metric = metric.add(try regalloc.computeSpillMetric(
                 allocator,
@@ -1734,7 +2589,7 @@ pub fn compileFunctionImpl(
                 scalar_live_ranges.items,
                 ar,
             ));
-            total_slots += ar.spill_count;
+            spill_metric_total_slots += ar.spill_count;
         }
         if (v128_alloc_result_storage) |*ar| {
             metric = metric.add(try regalloc.computeSpillMetric(
@@ -1744,19 +2599,9 @@ pub fn compileFunctionImpl(
                 v128_live_ranges.items,
                 ar,
             ));
-            total_slots += ar.spill_count;
+            spill_metric_total_slots += ar.spill_count;
         }
-        if (ctx.options.spill_metric.shouldLog(ctx.options.module_idx, ctx.func_idx, metric.spilled_vregs)) {
-            codegen_timing.printSpill(.{
-                .module_idx = ctx.options.module_idx,
-                .func_idx = ctx.func_idx,
-                .func_name = func.name orelse "<anon>",
-                .insts = aarch64CountInstructions(func),
-                .clobbers = @intCast(clobbers.items.len),
-                .spill_count = total_slots,
-                .metric = metric,
-            });
-        }
+        spill_metric_value = metric;
     }
 
     // Finalize frame layout now that we know how many spill slots the
@@ -1996,6 +2841,9 @@ pub fn compileFunctionImpl(
     fctx.block_pos = pos_of_block;
     fctx.block_rep = rep;
 
+    var emitted_ir_ranges: std.ArrayList(EmittedIrRange) = .empty;
+    defer emitted_ir_ranges.deinit(allocator);
+    var ir_position: u32 = 0;
     var last_was_ret = false;
     for (block_order, 0..) |bi, order_idx| {
         block_offsets[bi] = code.len();
@@ -2026,9 +2874,19 @@ pub fn compileFunctionImpl(
                     .br => |target| fctx.targetIsFallthrough(target),
                     else => false,
                 };
+            const native_start = code.len();
             if (!elide_br) {
                 try compileInst(&code, inst, &reg_map, &v128_map, &v128_cache, frame_size, &patches, &fctx);
             }
+            if (ctx.frame_attribution_ctx != null) {
+                try emitted_ir_ranges.append(allocator, .{
+                    .native_start = @intCast(native_start),
+                    .native_end = @intCast(code.len()),
+                    .ir_position = ir_position,
+                    .inst = inst,
+                });
+            }
+            ir_position += 1;
             // Release physregs of vregs whose last static use is this inst.
             for (kill_lists[flat_idx].items) |v| {
                 reg_map.freeVReg(v);
@@ -2078,6 +2936,7 @@ pub fn compileFunctionImpl(
         block_offsets,
         &patches,
         ctx.call_patches,
+        if (ctx.frame_attribution_ctx != null) emitted_ir_ranges.items else null,
         allocator,
     );
 
@@ -2106,6 +2965,174 @@ pub fn compileFunctionImpl(
             },
         };
         code.patch32(p.patch_offset, new_word);
+    }
+
+    if (ctx.frame_attribution_ctx != null) {
+        const scalar_alloc = if (alloc_result_storage) |*ar| ar else return error.FrameAttributionRequiresLinearScan;
+        const v128_alloc = if (v128_alloc_result_storage) |*ar| ar else return error.FrameAttributionRequiresLinearScan;
+        const raw_accesses = try emit.traceFrameAccesses(allocator, code.getCode());
+        defer allocator.free(raw_accesses);
+
+        const spill_values = try buildAarch64SpillValues(
+            allocator,
+            block_order,
+            &scheduled,
+            live_ranges,
+            scalar_alloc,
+            v128_alloc,
+            spill_base,
+        );
+        var spill_values_owned = true;
+        defer if (spill_values_owned) allocator.free(spill_values);
+
+        var emitted_loads: u32 = 0;
+        var emitted_stores: u32 = 0;
+        const accesses = try buildAarch64FrameAccesses(
+            allocator,
+            raw_accesses,
+            emitted_ir_ranges.items,
+            local_layout.offsets,
+            fctx.local_types,
+            spill_values,
+            frame_size,
+            hrp_save_off,
+            scratch_base,
+            scratch_size,
+            call_save_base,
+            call_save_size,
+            callee_save_base,
+            callee_save_size,
+            &emitted_loads,
+            &emitted_stores,
+        );
+        var accesses_owned = true;
+        defer if (accesses_owned) {
+            for (accesses) |access| allocator.free(access.components);
+            allocator.free(accesses);
+        };
+
+        spill_metric_value.?.spill_loads = emitted_loads;
+        spill_metric_value.?.spill_stores = emitted_stores;
+        if (ctx.frame_attribution_ctx) |frame_ctx| {
+            const call_patches = if (ctx.call_patches) |patches_list|
+                patches_list.items
+            else
+                &.{};
+            const relocations = try allocator.alloc(
+                frame_attribution.Relocation,
+                call_patches.len,
+            );
+            errdefer allocator.free(relocations);
+            for (call_patches, relocations) |patch, *relocation| {
+                const word = std.mem.readInt(
+                    u32,
+                    code.getCode()[patch.patch_offset..][0..4],
+                    .little,
+                );
+                const opcode = word & 0xFC000000;
+                relocation.* = .{
+                    .native_start = @intCast(patch.patch_offset),
+                    .native_end = @intCast(patch.patch_offset + 4),
+                    .kind = switch (opcode) {
+                        0x94000000 => .aarch64_call_imm26,
+                        0x14000000 => .aarch64_tail_call_imm26,
+                        else => return error.InvalidDirectCallPatch,
+                    },
+                };
+            }
+            std.mem.sort(frame_attribution.Relocation, relocations, {}, struct {
+                fn lessThan(_: void, lhs: frame_attribution.Relocation, rhs: frame_attribution.Relocation) bool {
+                    return lhs.native_start < rhs.native_start;
+                }
+            }.lessThan);
+
+            const frame_regions = try buildAarch64FrameRegions(
+                allocator,
+                local_layout.offsets,
+                fctx.local_types,
+                spill_base,
+                scalar_spill_end,
+                final_v128_spill_base,
+                final_v128_spill_base + v128_spill_capacity,
+                hrp_save_off,
+                scratch_base,
+                scratch_size,
+                call_save_base,
+                call_save_size,
+                callee_save_base,
+                callee_save_size,
+            );
+            errdefer allocator.free(frame_regions);
+            var code_hash: [64]u8 = undefined;
+            try normalizedAarch64CodeSha256(code.getCode(), relocations, &code_hash);
+
+            const pending: PendingFrameAttribution = .{
+                .ctx = frame_ctx,
+                .function_name = func.name orelse "<anon>",
+                .code_size = @intCast(code.len()),
+                .normalized_code_sha256 = code_hash,
+                .normalized_relocations = relocations,
+                .frame_layout = .{
+                    .frame_pointer = "x29",
+                    .frame_size = frame_size,
+                    .local_count = func.local_count,
+                    .param_count = func.param_count,
+                    .reserved_vmctx_offset = vmctx_slot_offset,
+                    .locals_first_offset = if (local_layout.offsets.len > 0)
+                        @intCast(local_layout.offsets[0])
+                    else
+                        vmctx_slot_offset + 8,
+                    .explicit_storage_first_offset = @intCast(hrp_save_off),
+                    .explicit_storage_slots = @intCast(
+                        (scratch_base + scratch_size - hrp_save_off + 7) / 8,
+                    ),
+                    .spill_base = @intCast(spill_base),
+                    .spill_stride = 8,
+                    .spill_slots = @intCast(
+                        (final_v128_spill_base + v128_spill_capacity - spill_base + 7) / 8,
+                    ),
+                },
+                .frame_regions = frame_regions,
+                .spill_metric = .{
+                    .slots = spill_metric_total_slots,
+                    .spilled_vregs = spill_metric_value.?.spilled_vregs,
+                    .scalar = spill_metric_value.?.spilled_vregs_scalar,
+                    .v128 = spill_metric_value.?.spilled_vregs_v128,
+                    .slots_scalar = spill_metric_value.?.slots_scalar,
+                    .slots_v128 = spill_metric_value.?.slots_v128,
+                    .spill_ld = emitted_loads,
+                    .spill_st = emitted_stores,
+                    .remat = spill_metric_value.?.remat_vregs,
+                    .callee_saved = spill_metric_value.?.callee_saved_used,
+                },
+                .emitted_allocator_loads = emitted_loads,
+                .emitted_allocator_stores = emitted_stores,
+                .allocator_values = spill_values,
+                .accesses = accesses,
+            };
+            const output = ctx.frame_attribution_out orelse
+                return error.FrameAttributionOutputUnavailable;
+            output.* = pending;
+            spill_values_owned = false;
+            accesses_owned = false;
+        }
+    }
+    if (spill_metric_value) |metric| {
+        if (ctx.options.spill_metric.shouldLog(
+            ctx.options.module_idx,
+            ctx.func_idx,
+            metric.spilled_vregs,
+        )) {
+            codegen_timing.printSpill(.{
+                .module_idx = ctx.options.module_idx,
+                .func_idx = ctx.func_idx,
+                .func_name = func.name orelse "<anon>",
+                .insts = aarch64CountInstructions(func),
+                .clobbers = @intCast(clobbers.items.len),
+                .spill_count = spill_metric_total_slots,
+                .metric = metric,
+            });
+        }
     }
 
     return code.bytes.toOwnedSlice(allocator);
@@ -9049,8 +10076,23 @@ pub fn compileModuleCachedWithOptions(
 
     var global_call_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
     defer global_call_patches.deinit(allocator);
+    var frame_reports: std.ArrayList(PendingFrameAttribution) = .empty;
+    defer {
+        for (frame_reports.items) |*report| report.deinit(allocator);
+        frame_reports.deinit(allocator);
+    }
 
     const func_count: usize = ir_module.functions.items.len;
+    if (options.frame_attribution.enabled and
+        options.frame_attribution.moduleMatches(options.module_idx))
+    {
+        if (options.frame_attribution.func_filter) |f| {
+            if (f >= @as(u32, @intCast(func_count))) return error.FrameAttributionFunctionNotFound;
+            try frame_reports.ensureTotalCapacity(allocator, 1);
+        } else {
+            try frame_reports.ensureTotalCapacity(allocator, func_count);
+        }
+    }
     var cache_funcs = try allocator.alloc(codegen_cache.CachedFunction, func_count);
     var cache_init: usize = 0;
     errdefer {
@@ -9076,12 +10118,17 @@ pub fn compileModuleCachedWithOptions(
     for (ir_module.functions.items, 0..) |func, fi| {
         const func_base: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_base);
+        const frame_attr_live = options.frame_attribution.shouldEmit(
+            options.module_idx,
+            @intCast(fi),
+        );
 
         // #862 lazy-JIT spike: emit nothing for lazy-eligible functions.
         // Safe only under the invariants `lazy_jit.findLazyEligibleLeaves`
         // establishes (leaf, never a direct call target) — see that
         // function's doc comment and docs/design/lazy-jit-spike.md.
         if (fi < options.lazy_skip.len and options.lazy_skip[fi]) {
+            if (frame_attr_live) return error.FrameAttributionUnavailableForLazyFunction;
             cache_funcs[fi] = .{
                 .ir_sha256 = codegen_cache.hashFunction(&func),
                 .code = try allocator.dupe(u8, &.{}),
@@ -9106,13 +10153,15 @@ pub fn compileModuleCachedWithOptions(
         var reused = false;
         var hit_code: []const u8 = undefined;
         var hit_patches: []const codegen_cache.FuncCallPatch = undefined;
-        if (reuse) |r| {
-            if (fi < r.functions.len and
-                std.mem.eql(u8, &r.functions[fi].ir_sha256, &ir_sha))
-            {
-                hit_code = r.functions[fi].code;
-                hit_patches = r.functions[fi].call_patches;
-                reused = true;
+        if (!frame_attr_live) {
+            if (reuse) |r| {
+                if (fi < r.functions.len and
+                    std.mem.eql(u8, &r.functions[fi].ir_sha256, &ir_sha))
+                {
+                    hit_code = r.functions[fi].code;
+                    hit_patches = r.functions[fi].call_patches;
+                    reused = true;
+                }
             }
         }
 
@@ -9142,6 +10191,8 @@ pub fn compileModuleCachedWithOptions(
         } else {
             var func_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
             defer func_patches.deinit(allocator);
+            var pending_frame_attribution: ?PendingFrameAttribution = null;
+            errdefer if (pending_frame_attribution) |*report| report.deinit(allocator);
 
             const ctx: FuncCompileCtx = .{
                 .import_count = ir_module.import_count,
@@ -9162,6 +10213,17 @@ pub fn compileModuleCachedWithOptions(
                     break :blk per_func;
                 },
                 .codegen_timer = if (func_timer) |*t| t else null,
+                .frame_attribution_ctx = if (frame_attr_live) .{
+                    .output_prefix = options.frame_attribution.output_prefix.?,
+                    .module_idx = options.module_idx,
+                    .func_idx = @intCast(fi),
+                    .cwasm_aot_version = options.frame_attribution.cwasm_aot_version,
+                    .compiler_build_id = options.frame_attribution.compiler_build_id,
+                } else null,
+                .frame_attribution_out = if (frame_attr_live)
+                    &pending_frame_attribution
+                else
+                    null,
                 .func_idx = @intCast(fi),
                 .allocator = allocator,
             };
@@ -9190,6 +10252,12 @@ pub fn compileModuleCachedWithOptions(
             }
             cache_code_owned = func_code;
             cache_patches_owned = new_patches;
+            if (pending_frame_attribution) |report_value| {
+                var report = report_value;
+                report.function_offset = func_base;
+                frame_reports.appendAssumeCapacity(report);
+                pending_frame_attribution = null;
+            }
 
             for (func_patches.items) |p| {
                 try global_call_patches.append(allocator, .{
@@ -9250,6 +10318,17 @@ pub fn compileModuleCachedWithOptions(
         const imm26: u26 = @bitCast(@as(i26, @intCast(word_off)));
         const new_word: u32 = (existing & 0xFC000000) | imm26;
         std.mem.writeInt(u32, bytes, new_word, .little);
+    }
+    if (frame_reports.items.len > 0) {
+        var module_text_hash: [64]u8 = undefined;
+        sha256Hex(all_code.items, &module_text_hash);
+        for (frame_reports.items) |*report| {
+            try report.write(
+                allocator,
+                @intCast(all_code.items.len),
+                &module_text_hash,
+            );
+        }
     }
     if (ct_live) {
         const now = codegen_timing.nowNs();
@@ -15370,6 +16449,23 @@ test "compileFunction: enable_vreg_alloc false keeps legacy v128 fallback workin
     const counts = countQMemOps(code);
     try std.testing.expectEqual(@as(u32, 1), counts.loads);
     try std.testing.expectEqual(@as(u32, 1), counts.stores);
+
+    for ([_]bool{ false, true }) |enable_xreg_alloc| {
+        for ([_]bool{ false, true }) |enable_vreg_alloc| {
+            const baseline = try compileFunctionWithOptions(&func, allocator, .{
+                .enable_xreg_alloc = enable_xreg_alloc,
+                .enable_vreg_alloc = enable_vreg_alloc,
+            });
+            defer allocator.free(baseline);
+            const diagnosed = try compileFunctionWithOptions(&func, allocator, .{
+                .enable_xreg_alloc = enable_xreg_alloc,
+                .enable_vreg_alloc = enable_vreg_alloc,
+                .spill_metric = .{ .enabled = true },
+            });
+            defer allocator.free(diagnosed);
+            try std.testing.expectEqualSlices(u8, baseline, diagnosed);
+        }
+    }
 }
 
 test "compile: v128 cache survives scalar FP scratch op without stack traffic" {
@@ -16349,6 +17445,7 @@ test "relaxOutOfRangeConditionalBranches: rewrites out-of-range B.cond to B.!con
         &block_offsets,
         &patches,
         &call_patches,
+        null,
         allocator,
     );
 
@@ -16398,6 +17495,7 @@ test "relaxOutOfRangeConditionalBranches: in-range branches are not touched" {
         &code,
         &block_offsets,
         &patches,
+        null,
         null,
         allocator,
     );

@@ -1,7 +1,8 @@
 const std = @import("std");
 
 pub const schema_name = "wamr-aot-frame-attribution";
-pub const format_version: u32 = 1;
+pub const legacy_x86_format_version: u32 = 1;
+pub const format_version: u32 = 2;
 
 pub const AccessKind = enum {
     load,
@@ -14,6 +15,22 @@ pub const AccessOrigin = enum {
     explicit_frame_storage,
     fixed_runtime_frame_state,
     unknown,
+};
+
+pub const RelocationKind = enum {
+    x86_64_call_rel32,
+    aarch64_call_imm26,
+    aarch64_tail_call_imm26,
+};
+
+/// One architecture-specific direct-call relocation normalized for the
+/// per-function native-code hash. The range is function-relative and
+/// half-open. Consumers validate the instruction encoding before masking the
+/// relocation field.
+pub const Relocation = struct {
+    native_start: u32,
+    native_end: u32,
+    kind: RelocationKind,
 };
 
 pub const FrameLayout = struct {
@@ -67,10 +84,38 @@ pub const SpillValue = struct {
     reused: bool,
 };
 
-/// A single compiler-emitted x86 frame load/store. Native ranges are
-/// function-relative and half-open. `frame_offset` is the effective
-/// displacement from `base`; implicit PUSH/POP stack accesses are modeled as
-/// rsp-8 stores / rsp+0 loads.
+/// One memory element of a compiler-emitted frame instruction. AArch64 pair
+/// instructions use two components under one native range so sampled
+/// instructions are counted once while both accessed values remain explicit.
+pub const AccessComponent = struct {
+    /// Effective address after resolving compiler-materialized frame
+    /// addresses. Usually x29/rbp plus `frame_offset`; transient outgoing ABI
+    /// storage may remain sp/rsp relative.
+    base: []const u8,
+    frame_offset: i32,
+    width: u8,
+    /// Encoded architectural data register. AArch64 schema-v2 sidecars use
+    /// this together with `data_register_class` to preserve pair identity.
+    data_register: ?u8 = null,
+    data_register_class: ?[]const u8 = null,
+    origin: AccessOrigin,
+    detail: []const u8,
+    slot: ?u32 = null,
+    local_index: ?u32 = null,
+    explicit_slot: ?u32 = null,
+    vreg: ?u32 = null,
+    vreg_ambiguous: bool = false,
+    defining_opcode: ?[]const u8 = null,
+    source_class: ?[]const u8 = null,
+    rematerialization_eligible: ?bool = null,
+    ir_position: ?u32 = null,
+    ir_opcode: ?[]const u8 = null,
+};
+
+/// A single compiler-emitted frame load/store instruction. Native ranges are
+/// function-relative and half-open. Schema v1 x86 sidecars use the legacy
+/// top-level semantic fields. Schema v2 additionally records the encoded
+/// address and one or two effective-address components.
 pub const Access = struct {
     native_start: u32,
     native_end: u32,
@@ -90,6 +135,17 @@ pub const Access = struct {
     rematerialization_eligible: ?bool = null,
     ir_position: ?u32 = null,
     ir_opcode: ?[]const u8 = null,
+    encoded_base: ?[]const u8 = null,
+    encoded_offset: ?i32 = null,
+    addressing_mode: ?[]const u8 = null,
+    components: []const AccessComponent = &.{},
+};
+
+pub const FrameRegion = struct {
+    start: i32,
+    end: i32,
+    origin: AccessOrigin,
+    detail: []const u8,
 };
 
 pub const InlineDataRange = struct {
@@ -100,7 +156,7 @@ pub const InlineDataRange = struct {
 
 pub const Report = struct {
     schema: []const u8 = schema_name,
-    schema_version: u32 = format_version,
+    schema_version: u32 = legacy_x86_format_version,
     cwasm_aot_version: u32,
     compiler_build_id: []const u8,
     architecture: []const u8 = "x86_64",
@@ -117,8 +173,10 @@ pub const Report = struct {
     /// rel32 relocation. The normalized hash replaces those bytes with zero
     /// both before and after module-level call patching.
     direct_call_rel32_offsets: []const u32,
+    normalized_relocations: []const Relocation = &.{},
     inline_data_ranges: []const InlineDataRange,
     frame_layout: FrameLayout,
+    frame_regions: []const FrameRegion = &.{},
     spill_metric: SpillMetric,
     emitted_allocator_loads: u32,
     emitted_allocator_stores: u32,

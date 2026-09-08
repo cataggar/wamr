@@ -194,6 +194,27 @@ exact cwasm do not contain enough WAMR native bytes for sound def-use
 reclassification; rebuilding from source is not an evidence-preserving
 substitute.
 
+Exact frame-origin attribution is opt-in: pass `--frame-func 10` to the
+profiler, or set the workflow's `frame_func` input to `10`, for
+`core_state_transition` (module 0, local function 10, full wasm index 22).
+The benchmark target must contain the AArch64 sidecar feature: an older
+retained compiler cannot provide it, and a missing sidecar is a hard error.
+The profiler uses the exact retained benchmark compiler, requires the
+diagnostic compilation to reproduce the entire measured cwasm byte-for-byte,
+and validates the sidecar against that measured artifact before profiling.
+The sidecar and its SHA-256 are retained with the reports.
+
+Frame origins supplement, rather than replace, the existing broad instruction
+classes. Samples from both captures are combined by function-relative native
+address before origin attribution, so a paired instruction contributes its
+samples only once. Its two allocator components still contribute separately
+to emitted load/store counts. Static counts and per-vreg IR snapshots are not
+summed across captures. The selected function's spill metric is emitter-traced;
+unselected functions retain the pre-emission estimate. Unknown origins remain
+explicit. Mixed-origin pairs retain allocator component counts outside the
+contributor ranking without assigning their samples to either component.
+Origin attribution alone does not establish an optimization gain.
+
 For a local native AArch64 host, create and consume the identity explicitly:
 
 ```

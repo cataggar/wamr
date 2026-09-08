@@ -444,10 +444,6 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         frame_attribution.cwasm_aot_version = emit_aot.aot_version;
         frame_attribution.compiler_build_id = wamr.version.string;
     }
-    if (frame_attribution.enabled and target_arch != .x86_64) {
-        std.debug.print("Error: WAMR_AOT_FRAME_ATTRIBUTION is supported only for x86_64\n", .{});
-        std.process.exit(1);
-    }
     const compiled: codegen_cache.CompileResultCached = switch (target_arch) {
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
             .codegen_timing = codegen_timing,
@@ -462,6 +458,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             .enable_xreg_alloc = enable_aarch64_xreg_alloc,
             .codegen_timing = codegen_timing,
             .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
+            .frame_attribution = frame_attribution,
         }) catch |err| {
             std.debug.print("Error compiling to AArch64: {}\n", .{err});
             std.process.exit(1);
@@ -498,12 +495,6 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     }
 
     // 6. Emit AOT binary
-    var arch_name = std.mem.zeroes([16]u8);
-    switch (target_arch) {
-        .x86_64 => @memcpy(arch_name[0..6], "x86-64"),
-        .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
-    }
-
     // Build data segment entries from the parsed wasm module
     var data_segs: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     defer data_segs.deinit(allocator);
@@ -739,7 +730,11 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         compiled.code,
         compiled.offsets,
         exports.items,
-        .{ .arch = arch_name },
+        emit_aot.targetInfoOptions(switch (target_abi) {
+            .x86_64_sysv => .x86_64_sysv,
+            .x86_64_win64 => .x86_64_win64,
+            .aarch64_aapcs => .aarch64_aapcs64,
+        }),
         if (data_segs.items.len > 0) data_segs.items else null,
         if (import_entries.items.len > 0) import_entries.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
