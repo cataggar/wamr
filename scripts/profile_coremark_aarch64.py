@@ -48,6 +48,14 @@ NARROW_ALU_WORDING = (
     "universe as address_generation, structural_address_guard, "
     "algorithmic_alu, mixed, or unknown without engine-register heuristics"
 )
+REQUIRED_ANALYSIS_SOURCES = {
+    "scripts/profile_coremark_aarch64.py",
+    "scripts/aarch64_instruction_provenance.py",
+    "scripts/compare_hot_function.py",
+    "scripts/bench_coremark.py",
+    "scripts/bench_optimize.py",
+    ".github/skills/aot-perf-profile/aot_jit_attr.py",
+}
 WASMTIME_SYMBOL_RE = re.compile(
     r"wasm\[(?P<module>\d+)\]::function\[(?P<function>\d+)\]"
     r"(?:::(?P<name>[^+\s(]+))?"
@@ -97,6 +105,70 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def analysis_source_paths(repo: Path, aot) -> list[Path]:
+    repo = repo.resolve()
+    paths = {
+        Path(module.__file__).resolve()
+        for module in (
+            aot,
+            bench_coremark,
+            compare_hot_function,
+            aarch64_instruction_provenance,
+        )
+    } | {Path(__file__).resolve()}
+    if any(not path.is_relative_to(repo) for path in paths):
+        raise ProfileError("analysis dependencies must belong to the profiling checkout")
+    for module in tuple(sys.modules.values()):
+        filename = getattr(module, "__file__", None)
+        if isinstance(filename, str) and filename.endswith((".py", ".pyc", ".so", ".pyd")):
+            path = Path(filename)
+            if not path.is_absolute():
+                path = repo / path
+            if not path.is_relative_to(repo):
+                continue
+            path = path.resolve()
+            if not path.is_relative_to(repo):
+                raise ProfileError("analysis dependency resolves outside the checkout")
+            paths.add(path)
+    return sorted(paths)
+
+
+def capture_analysis_sources(repo: Path, aot, commit: str) -> dict[str, Any]:
+    repo = repo.resolve()
+    files = {}
+    for path in analysis_source_paths(repo, aot):
+        relative = path.relative_to(repo).as_posix()
+        committed = subprocess.run(
+            ["git", "show", f"{commit}:{relative}"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+        )
+        if committed.returncode != 0:
+            raise ProfileError(
+                f"analysis dependency {relative} is not tracked at {commit}"
+            )
+        current = path.read_bytes()
+        if current != committed.stdout:
+            raise ProfileError(
+                f"analysis dependency {relative} differs from {commit}; "
+                "commit tooling changes before an authoritative capture"
+            )
+        files[relative] = hashlib.sha256(current).hexdigest()
+    return {
+        "source_mode": "commit-verified",
+        "commit": commit,
+        "python_version": platform.python_version(),
+        "files": files,
+    }
+
+
+def validate_analysis_sources_unchanged(repo: Path, sources: dict[str, Any]) -> None:
+    for relative, expected in sources["files"].items():
+        if sha256_file(repo / relative) != expected:
+            raise ProfileError(f"analysis dependency {relative} changed during capture")
 
 
 def perf_binary() -> str:
@@ -794,93 +866,30 @@ def _validate_narrow_alu_analysis(
     *,
     engine: str,
     expected_samples: int,
+    function_samples: int,
     total_samples: int,
+    global_attributed_samples: int,
 ) -> None:
-    if (
-        analysis.get("schema_version")
-        != aarch64_instruction_provenance.SCHEMA_VERSION
-        or analysis.get("kind")
-        != aarch64_instruction_provenance.ANALYSIS_KIND
-        or analysis.get("status") != "measured"
-    ):
-        raise ProfileError(f"invalid {engine} narrow ALU analysis identity")
+    try:
+        aarch64_instruction_provenance.validate_analysis_samples(
+            analysis, name=engine
+        )
+    except aarch64_instruction_provenance.ProvenanceError as exc:
+        raise ProfileError(str(exc)) from exc
     if (
         analysis.get("total_run_samples") != total_samples
         or analysis.get("broad_alu_samples") != expected_samples
-        or analysis.get("partition_samples") != expected_samples
     ):
         raise ProfileError(
             f"{engine} narrow ALU samples do not reconcile to all_alu"
         )
-    categories = analysis.get("categories")
-    if (
-        not isinstance(categories, dict)
-        or set(categories) != set(aarch64_instruction_provenance.CATEGORIES)
-        or any(not isinstance(values, dict) for values in categories.values())
-        or sum(
-            values.get("samples", -1) for values in categories.values()
-        )
-        != expected_samples
-    ):
-        raise ProfileError(f"{engine} narrow ALU categories are incomplete")
-    common = analysis.get("common_gating_universe")
-    if (
-        not isinstance(common, dict)
-        or not isinstance(common.get("samples"), int)
-        or common.get("samples") < 0
-        or common.get("samples") > total_samples
-        or common.get("partition_samples") != common.get("samples")
-        or not isinstance(common.get("categories"), dict)
-        or set(common["categories"])
-        != set(aarch64_instruction_provenance.CATEGORIES)
-        or any(
-            not isinstance(values, dict)
-            for values in common["categories"].values()
-        )
-        or sum(
-            values.get("samples", -1)
-            for values in common["categories"].values()
-        )
-        != common.get("samples")
-    ):
-        raise ProfileError(
-            f"{engine} complete common gating universe is invalid"
-        )
-    global_mapping = analysis.get("global_sample_mapping")
-    if (
-        not isinstance(global_mapping, dict)
-        or global_mapping.get("total_samples") != total_samples
-        or not isinstance(global_mapping.get("attributed_samples"), int)
-        or not isinstance(global_mapping.get("unattributed_samples"), int)
-        or global_mapping["attributed_samples"] < 0
-        or global_mapping["unattributed_samples"] < 0
-        or global_mapping["attributed_samples"]
-        + global_mapping["unattributed_samples"]
-        != total_samples
-    ):
+    if analysis["global_sample_mapping"]["attributed_samples"] != global_attributed_samples:
         raise ProfileError(f"{engine} global sample mapping is invalid")
-    accounting = analysis.get("instruction_sample_accounting")
-    if (
-        not isinstance(accounting, dict)
-        or accounting.get("common_candidate_samples")
-        != common.get("samples")
-        or not isinstance(accounting.get("mapped_instruction_samples"), int)
-        or not isinstance(
-            accounting.get(
-                "conclusively_excluded_non_candidate_samples"
-            ),
-            int,
-        )
-        or accounting["mapped_instruction_samples"] < 0
-        or accounting[
-            "conclusively_excluded_non_candidate_samples"
-        ] < 0
-        or accounting["common_candidate_samples"]
-        + accounting["conclusively_excluded_non_candidate_samples"]
-        != accounting["mapped_instruction_samples"]
-    ):
+    mapped = analysis["instruction_sample_accounting"]["mapped_instruction_samples"]
+    unresolved = analysis.get("sample_mapping", {}).get("unresolved_function_samples", 0)
+    if mapped + unresolved != function_samples:
         raise ProfileError(
-            f"{engine} instruction sample accounting is invalid"
+            f"{engine} instruction samples do not reconcile to its matched function"
         )
 
 
@@ -971,6 +980,34 @@ def validate_report(report: dict[str, Any]) -> None:
             "ALU analysis module sha256",
             64,
         )
+        sources = provenance.get("analysis_sources")
+        if (
+            not isinstance(sources, dict)
+            or sources.get("source_mode") != "commit-verified"
+            or sources.get("commit") != provenance["producer_source_sha"]
+            or not isinstance(sources.get("files"), dict)
+            or not REQUIRED_ANALYSIS_SOURCES.issubset(sources["files"])
+        ):
+            raise ProfileError("profile report lacks complete committed analysis sources")
+        for path, digest in sources["files"].items():
+            if (
+                not isinstance(path, str)
+                or Path(path).is_absolute()
+                or ".." in Path(path).parts
+            ):
+                raise ProfileError("profile analysis source path is invalid")
+            _require_sha(digest, f"analysis source {path} sha256", 64)
+        if (
+            sources["files"]["scripts/profile_coremark_aarch64.py"]
+            != provenance["script_sha256"]
+            or provenance.get("script_path") != "scripts/profile_coremark_aarch64.py"
+            or sources["files"]["scripts/aarch64_instruction_provenance.py"]
+            != analysis_module["sha256"]
+            or analysis_module.get("path") != "scripts/aarch64_instruction_provenance.py"
+            or sources["files"]["scripts/bench_coremark.py"]
+            != benchmark.get("producer", {}).get("script", {}).get("sha256")
+        ):
+            raise ProfileError("profile analysis source identities disagree")
         if (
             narrow_summary.get("schema_version")
             != aarch64_instruction_provenance.SCHEMA_VERSION
@@ -1048,7 +1085,9 @@ def validate_report(report: dict[str, Any]) -> None:
                 expected_samples=item["class_groups"]["all_alu"][
                     "wamr_samples"
                 ],
+                function_samples=item["wamr"]["samples"],
                 total_samples=engines["wamr"]["total_samples"],
+                global_attributed_samples=engines["wamr"]["attributed_samples"],
             )
             _validate_narrow_alu_analysis(
                 narrow.get("wasmtime", {}),
@@ -1056,15 +1095,20 @@ def validate_report(report: dict[str, Any]) -> None:
                 expected_samples=item["class_groups"]["all_alu"][
                     "wasmtime_samples"
                 ],
+                function_samples=item["wasmtime"]["samples"],
                 total_samples=engines["wasmtime"]["total_samples"],
+                global_attributed_samples=engines["wasmtime"]["attributed_samples"],
             )
             gate = narrow.get("gate")
             if (
                 not isinstance(gate, dict)
                 or "all_alu" in gate.get("categories", {})
+                or gate != aarch64_instruction_provenance.compare_engine_analyses(
+                    narrow["wamr"], narrow["wasmtime"]
+                )
             ):
                 raise ProfileError(
-                    "narrow ALU gate is missing or uses broad all_alu"
+                    "narrow ALU gate does not match its validated sample evidence"
                 )
     if narrow_summary is not None:
         retained = report.get("retained_analysis_artifacts", {}).get(
@@ -1096,6 +1140,8 @@ def validate_report(report: dict[str, Any]) -> None:
             raise ProfileError(
                 "top-level narrow ALU gate does not match its target function"
             )
+        if target is None and narrow_summary.get("gate", {}).get("optimization_authorized"):
+            raise ProfileError("unmatched target function cannot authorize optimization")
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -1397,6 +1443,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         text=True,
         capture_output=True,
     ).stdout.strip()
+    analysis_sources = capture_analysis_sources(repo, aot, checkout_commit)
     build_repo = args.benchmark_artifacts.resolve()
     kernel = recorder.run(
         ["uname", "-r"], "kernel.log", cwd=repo
@@ -1962,6 +2009,8 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         ),
         None,
     )
+    validate_analysis_sources_unchanged(repo, analysis_sources)
+    analysis_sources = capture_analysis_sources(repo, aot, checkout_commit)
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "kind": REPORT_KIND,
@@ -1991,6 +2040,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     Path(aarch64_instruction_provenance.__file__).resolve()
                 ),
             },
+            "analysis_sources": analysis_sources,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "execution": current_execution,
         },
@@ -2160,6 +2210,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         ],
     }
     bench_coremark.validate_same_host(host_identity)
+    validate_analysis_sources_unchanged(repo, analysis_sources)
     validate_report(report)
     return report
 

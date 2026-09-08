@@ -11,6 +11,7 @@ classifier differences from becoming optimizer evidence.
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -161,7 +162,8 @@ VALUE_TRANSFORM_MNEMONICS = {
     "cls",
 }
 TRAP_MNEMONICS = {"brk", "hlt", "udf"}
-SIDE_EFFECT_FREE_TRAP_PATH_MNEMONICS = {"nop", "hint", "paciasp", "autiasp"}
+# HINT encodings can alias pointer-authentication instructions with implicit writes.
+SIDE_EFFECT_FREE_TRAP_PATH_MNEMONICS = {"nop"}
 
 
 class ProvenanceError(RuntimeError):
@@ -411,6 +413,7 @@ def _memory_effect(instruction: Instruction, operands: list[str]) -> Effect:
         writeback = True
         _add_uses(effect, post_index_operands, "value")
     if writeback:
+        effect.gating_candidate = True
         if not address_registers:
             return _opaque_effect(gating_candidate=False)
         else:
@@ -508,6 +511,7 @@ def instruction_effect(instruction: Instruction) -> Effect:
         return effect
 
     if mnemonic in FLOAT_FLAG_MNEMONICS:
+        effect.gating_candidate = True
         effect.definitions.add("nzcv")
         effect.primary_definitions.add("nzcv")
         if mnemonic.startswith("fcc"):
@@ -544,11 +548,12 @@ def instruction_effect(instruction: Instruction) -> Effect:
         return effect
 
     if mnemonic in MOVE_MNEMONICS:
+        effect.gating_candidate = True
         if not operands:
-            return _opaque_effect(gating_candidate=False)
+            return _opaque_effect(gating_candidate=True)
         destination = registers_in_operand(operands[0])
         if len(destination) != 1:
-            return _opaque_effect(gating_candidate=False)
+            return _opaque_effect(gating_candidate=True)
         dest = destination[0]
         effect.definitions.add(dest)
         effect.primary_definitions.add(dest)
@@ -558,19 +563,8 @@ def instruction_effect(instruction: Instruction) -> Effect:
         _add_uses(effect, sources, "value", (dest,))
         return effect
 
-    if mnemonic == "mrs":
-        if operands:
-            destination = registers_in_operand(operands[0])
-            if len(destination) == 1:
-                effect.definitions.add(destination[0])
-                effect.primary_definitions.add(destination[0])
-        return effect
-    if mnemonic == "msr":
-        _add_uses(effect, operands, "unknown")
-        if operands and operands[0].strip().lower() == "nzcv":
-            effect.definitions.add("nzcv")
-            effect.primary_definitions.add("nzcv")
-        return effect
+    if mnemonic in {"mrs", "msr"}:
+        return _opaque_effect(gating_candidate=True)
 
     return _opaque_effect(gating_candidate=True)
 
@@ -1058,6 +1052,12 @@ def _category(trace: Trace) -> tuple[str, str]:
     )
 
 
+def _sample_count(value: Any, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ProvenanceError(f"{label} must be a nonnegative integer")
+    return value
+
+
 def analyze_instruction_stream(
     instructions: Sequence[Any],
     *,
@@ -1067,10 +1067,12 @@ def analyze_instruction_stream(
     address_base: int = 0,
     global_attributed_samples: int | None = None,
 ) -> dict[str, Any]:
-    if total_run_samples <= 0:
+    _sample_count(total_run_samples, "total_run_samples")
+    if total_run_samples == 0:
         raise ProvenanceError("total_run_samples must be positive")
     if global_attributed_samples is None:
         global_attributed_samples = total_run_samples
+    _sample_count(global_attributed_samples, "global_attributed_samples")
     if not 0 <= global_attributed_samples <= total_run_samples:
         raise ProvenanceError(
             "global_attributed_samples must be within total_run_samples"
@@ -1082,20 +1084,21 @@ def analyze_instruction_stream(
         )
     known_offsets = {instruction.offset for instruction in normalized}
     invalid_sample_offsets = []
+    mapped_instruction_samples = 0
     for offset, samples in samples_by_offset.items():
-        try:
-            count = int(samples)
-        except (TypeError, ValueError) as exc:
-            raise ProvenanceError(
-                f"sample count at offset {offset!r} is not an integer"
-            ) from exc
-        if offset not in known_offsets or count < 0:
+        count = _sample_count(samples, f"sample count at offset {offset!r}")
+        mapped_instruction_samples += count
+        if type(offset) is not int or offset not in known_offsets:
             invalid_sample_offsets.append(offset)
     invalid_sample_offsets.sort(key=str)
     if invalid_sample_offsets:
         raise ProvenanceError(
             "sample mappings must use exact nonnegative instruction offsets; "
             f"invalid offsets: {invalid_sample_offsets[:8]}"
+        )
+    if mapped_instruction_samples > global_attributed_samples:
+        raise ProvenanceError(
+            "mapped instruction samples exceed globally attributed samples"
         )
     effects = [instruction_effect(instruction) for instruction in normalized]
     successors, predecessors, external_targets = build_cfg(normalized, effects)
@@ -1127,6 +1130,10 @@ def analyze_instruction_stream(
         elif not effect.recognized:
             category = "unknown"
             reason = "instruction semantics are not recognized conservatively"
+            trace = Trace(unknown_reasons={reason})
+        elif effect.memory:
+            category = "unknown"
+            reason = "combined memory and value-update costs cannot be isolated as pure ALU"
             trace = Trace(unknown_reasons={reason})
         else:
             definitions = {
@@ -1257,7 +1264,7 @@ def analyze_instruction_stream(
         for index, (broad_class, effect) in enumerate(
             zip(broad_classes, effects)
         )
-        if broad_class == "alu" or effect.gating_candidate
+        if broad_class == "alu" or effect.gating_candidate or not effect.recognized
     ]
     legacy = aggregate(
         legacy_indices, share_name="percent_of_broad_alu"
@@ -1273,9 +1280,6 @@ def analyze_instruction_stream(
         raise ProvenanceError(
             "common gating-universe sample partitions do not reconcile"
         )
-    mapped_instruction_samples = sum(
-        int(samples) for samples in samples_by_offset.values()
-    )
     excluded_instruction_samples = (
         mapped_instruction_samples - common["samples"]
     )
@@ -1384,14 +1388,117 @@ def unavailable_analysis(reason: str, *, total_run_samples: int | None = None) -
     }
 
 
+def validate_analysis_samples(
+    analysis: Mapping[str, Any], *, name: str = "analysis"
+) -> None:
+    if (
+        analysis.get("schema_version") != SCHEMA_VERSION
+        or analysis.get("kind") != ANALYSIS_KIND
+        or analysis.get("status") != "measured"
+    ):
+        raise ProvenanceError(f"{name} has an invalid analysis identity")
+
+    def mapping(value: Any, label: str) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ProvenanceError(f"{name} {label} is missing or invalid")
+        return value
+
+    total = _sample_count(analysis.get("total_run_samples"), f"{name} total")
+    if total == 0:
+        raise ProvenanceError(f"{name} total_run_samples must be positive")
+    global_mapping = mapping(analysis.get("global_sample_mapping"), "global mapping")
+    attributed = _sample_count(
+        global_mapping.get("attributed_samples"), f"{name} globally attributed"
+    )
+    unattributed = _sample_count(
+        global_mapping.get("unattributed_samples"), f"{name} globally unattributed"
+    )
+    if (
+        global_mapping.get("total_samples") != total
+        or attributed + unattributed != total
+    ):
+        raise ProvenanceError(f"{name} global sample mapping does not reconcile")
+
+    common = mapping(analysis.get("common_gating_universe"), "common universe")
+    common_samples = _sample_count(common.get("samples"), f"{name} common samples")
+    legacy_samples = _sample_count(
+        analysis.get("broad_alu_samples"), f"{name} legacy samples"
+    )
+    for label, summary, samples in (
+        ("legacy", analysis, legacy_samples),
+        ("common", common, common_samples),
+    ):
+        if summary.get("partition_samples") != samples:
+            raise ProvenanceError(f"{name} {label} sample partitions do not reconcile")
+        categories = mapping(summary.get("categories"), f"{label} categories")
+        if set(categories) != set(CATEGORIES):
+            raise ProvenanceError(f"{name} {label} categories are incomplete")
+        partition = 0
+        for category in CATEGORIES:
+            values = mapping(categories[category], f"{label} {category}")
+            count = _sample_count(
+                values.get("samples"), f"{name} {label} {category} samples"
+            )
+            partition += count
+            share = values.get("percent_of_run")
+            if (
+                type(share) not in (int, float)
+                or not math.isfinite(share)
+                or not math.isclose(
+                    share, 100.0 * count / total, rel_tol=1e-12, abs_tol=1e-9
+                )
+            ):
+                raise ProvenanceError(
+                    f"{name} {label} {category} share disagrees with sample counts"
+                )
+        if partition != samples:
+            raise ProvenanceError(f"{name} {label} category samples do not reconcile")
+
+    accounting = mapping(
+        analysis.get("instruction_sample_accounting"), "instruction accounting"
+    )
+    mapped = _sample_count(
+        accounting.get("mapped_instruction_samples"), f"{name} mapped instructions"
+    )
+    excluded = _sample_count(
+        accounting.get("conclusively_excluded_non_candidate_samples"),
+        f"{name} excluded instructions",
+    )
+    if (
+        accounting.get("common_candidate_samples") != common_samples
+        or common_samples + excluded != mapped
+        or legacy_samples > common_samples
+    ):
+        raise ProvenanceError(f"{name} instruction sample accounting does not reconcile")
+    if mapped > attributed:
+        raise ProvenanceError(
+            f"{name} mapped instruction samples exceed globally attributed samples"
+        )
+    function_mapping = mapping(analysis.get("sample_mapping", {}), "function mapping")
+    function_mapped = _sample_count(
+        function_mapping.get("mapped_function_samples", mapped),
+        f"{name} mapped function samples",
+    )
+    unresolved = _sample_count(
+        function_mapping.get("unresolved_function_samples", 0),
+        f"{name} unresolved function samples",
+    )
+    if function_mapped != mapped or mapped + unresolved > attributed:
+        raise ProvenanceError(f"{name} function sample mapping does not reconcile")
+
+
 def compare_engine_analyses(
     wamr: Mapping[str, Any],
     wasmtime: Mapping[str, Any],
     *,
     threshold_pct: float = DEFAULT_GATE_THRESHOLD_PCT,
 ) -> dict[str, Any]:
-    if threshold_pct < 0:
-        raise ProvenanceError("gate threshold must be nonnegative")
+    if (
+        type(threshold_pct) not in (int, float)
+        or not math.isfinite(threshold_pct)
+        or threshold_pct < 0
+    ):
+        raise ProvenanceError("gate threshold must be finite and nonnegative")
     unavailable = [
         f"{name}: {analysis.get('reason', 'analysis unavailable')}"
         for name, analysis in (("wamr", wamr), ("wasmtime", wasmtime))
@@ -1406,59 +1513,21 @@ def compare_engine_analyses(
             "categories": {},
         }
     for name, analysis in (("wamr", wamr), ("wasmtime", wasmtime)):
-        if analysis.get("partition_samples") != analysis.get("broad_alu_samples"):
-            raise ProvenanceError(
-                f"{name} narrow partitions do not reconcile to broad ALU"
-            )
-        common = analysis.get("common_gating_universe")
-        if (
-            not isinstance(common, Mapping)
-            or common.get("partition_samples") != common.get("samples")
-        ):
-            raise ProvenanceError(
-                f"{name} lacks a reconciled complete common gating universe"
-            )
+        validate_analysis_samples(analysis, name=name)
     wasmtime_common = wasmtime["common_gating_universe"]
-    wasmtime_global_unattributed = wasmtime.get(
-        "global_sample_mapping", {}
-    ).get("unattributed_samples")
-    if not isinstance(wasmtime_global_unattributed, int):
-        raise ProvenanceError(
-            "wasmtime global unattributed sample count is missing"
-        )
+    wasmtime_global_unattributed = wasmtime["global_sample_mapping"]["unattributed_samples"]
     wasmtime_instruction_unresolved = wasmtime.get(
         "sample_mapping", {}
     ).get("unresolved_function_samples", 0)
-    wasmtime_function_mapped = wasmtime.get(
-        "sample_mapping", {}
-    ).get("mapped_function_samples", 0)
-    if (
-        not isinstance(wasmtime_instruction_unresolved, int)
-        or wasmtime_instruction_unresolved < 0
-        or not isinstance(wasmtime_function_mapped, int)
-        or wasmtime_function_mapped < 0
-    ):
-        raise ProvenanceError(
-            "wasmtime function sample mapping is invalid"
-        )
-    if (
-        wasmtime_function_mapped + wasmtime_instruction_unresolved
-        > wasmtime["global_sample_mapping"]["attributed_samples"]
-    ):
-        raise ProvenanceError(
-            "wasmtime function-mapped samples exceed globally attributed samples"
-        )
     wasmtime_unknown_upper = (
-        wasmtime_common["categories"]["unknown"]["percent_of_run"]
-        + wasmtime_common["categories"]["mixed"]["percent_of_run"]
-        + (
-            100.0
-            * (
-                wasmtime_instruction_unresolved
-                + wasmtime_global_unattributed
-            )
-            / wasmtime["total_run_samples"]
+        100.0
+        * (
+            wasmtime_common["categories"]["unknown"]["samples"]
+            + wasmtime_common["categories"]["mixed"]["samples"]
+            + wasmtime_instruction_unresolved
+            + wasmtime_global_unattributed
         )
+        / wasmtime["total_run_samples"]
     )
     categories = {}
     for category in GATE_CATEGORIES:
@@ -1466,8 +1535,10 @@ def compare_engine_analyses(
             category
         ]
         wasmtime_category = wasmtime_common["categories"][category]
-        wamr_share = wamr_category["percent_of_run"]
-        wasmtime_share = wasmtime_category["percent_of_run"]
+        wamr_share = 100.0 * wamr_category["samples"] / wamr["total_run_samples"]
+        wasmtime_share = (
+            100.0 * wasmtime_category["samples"] / wasmtime["total_run_samples"]
+        )
         conservative_wasmtime_upper = wasmtime_share + wasmtime_unknown_upper
         conservative_headroom = wamr_share - conservative_wasmtime_upper
         categories[category] = {

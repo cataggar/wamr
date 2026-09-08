@@ -3,9 +3,11 @@
 import importlib.util
 import copy
 import sys
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -19,6 +21,53 @@ SPEC.loader.exec_module(profile)
 
 
 class CoreMarkProfileTests(unittest.TestCase):
+    def test_analysis_sources_include_loaded_comparison_dependencies(self):
+        aot = profile.load_aot_helper(ROOT)
+        sources = {
+            path.relative_to(ROOT).as_posix()
+            for path in profile.analysis_source_paths(ROOT, aot)
+        }
+        self.assertTrue(profile.REQUIRED_ANALYSIS_SOURCES.issubset(sources))
+
+    def test_analysis_dependencies_must_match_committed_source(self):
+        cache = ROOT / ".cache"
+        cache.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="profile-sources-", dir=cache) as temp:
+            repo = Path(temp)
+            files = [
+                repo / "scripts/compare_hot_function.py",
+                repo / ".github/skills/aot-perf-profile/aot_jit_attr.py",
+            ]
+            original = b"VALUE = 1\n"
+            for path in files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(original)
+            committed = SimpleNamespace(returncode=0, stdout=original)
+            with (
+                mock.patch.object(profile, "analysis_source_paths", return_value=files),
+                mock.patch.object(profile.subprocess, "run", return_value=committed),
+            ):
+                sources = profile.capture_analysis_sources(repo, None, "a" * 40)
+                self.assertEqual("commit-verified", sources["source_mode"])
+                profile.validate_analysis_sources_unchanged(repo, sources)
+                for path in files:
+                    with self.subTest(path=path):
+                        path.write_bytes(b"VALUE = 2\n")
+                        with self.assertRaisesRegex(profile.ProfileError, "differs from"):
+                            profile.capture_analysis_sources(repo, None, "a" * 40)
+                        with self.assertRaisesRegex(profile.ProfileError, "changed during"):
+                            profile.validate_analysis_sources_unchanged(repo, sources)
+                        path.write_bytes(original)
+            with (
+                mock.patch.object(profile, "analysis_source_paths", return_value=files),
+                mock.patch.object(
+                    profile.subprocess, "run",
+                    return_value=SimpleNamespace(returncode=128, stdout=b""),
+                ),
+                self.assertRaisesRegex(profile.ProfileError, "not tracked"),
+            ):
+                profile.capture_analysis_sources(repo, None, "a" * 40)
+
     def test_validated_coremark_run_counts_fail_closed(self):
         output = (
             "2K performance run parameters for coremark.\n"
@@ -328,17 +377,40 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             profile.aarch64_instruction_provenance.analyze_instruction_stream(
                 narrow_instructions,
                 broad_classes=["alu", "other", "other"],
-                samples_by_offset={0: 1},
+                samples_by_offset={0: 1, 4: 29},
                 total_run_samples=100,
+                global_attributed_samples=99,
             )
         )
-        narrow_wasmtime = copy.deepcopy(narrow_wamr)
+        narrow_wasmtime = profile.aarch64_instruction_provenance.analyze_instruction_stream(
+            narrow_instructions,
+            broad_classes=["alu", "other", "other"],
+            samples_by_offset={0: 1, 4: 27},
+            total_run_samples=100,
+            global_attributed_samples=98,
+        )
         report["classifier_wording"]["narrow_alu_provenance"] = (
             profile.NARROW_ALU_WORDING
         )
         report["provenance"]["analysis_module"] = {
             "path": "scripts/aarch64_instruction_provenance.py",
             "sha256": "a" * 64,
+        }
+        report["provenance"]["script_path"] = "scripts/profile_coremark_aarch64.py"
+        report["benchmark"]["producer"]["script"] = {
+            "path": "scripts/bench_coremark.py",
+            "sha256": "e" * 64,
+        }
+        source_hashes = {path: "f" * 64 for path in profile.REQUIRED_ANALYSIS_SOURCES}
+        source_hashes.update({
+            "scripts/profile_coremark_aarch64.py": "d" * 64,
+            "scripts/aarch64_instruction_provenance.py": "a" * 64,
+            "scripts/bench_coremark.py": "e" * 64,
+        })
+        report["provenance"]["analysis_sources"] = {
+            "source_mode": "commit-verified",
+            "commit": "c" * 40,
+            "files": source_hashes,
         }
         report["matched_functions"][0]["class_groups"] = {
             "all_alu": {"wamr_samples": 1, "wasmtime_samples": 1}
@@ -356,6 +428,8 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
                 profile.aarch64_instruction_provenance.SCHEMA_VERSION
             ),
             "kind": profile.aarch64_instruction_provenance.ANALYSIS_KIND,
+            "target_local_func": 3,
+            "target_wasm_function_index": 15,
             "gate": report["matched_functions"][0]["alu_provenance"]["gate"],
         }
         report["retained_analysis_artifacts"] = {
@@ -365,6 +439,26 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             }
         }
         profile.validate_report(report)
+        missing_dependency = copy.deepcopy(report)
+        del missing_dependency["provenance"]["analysis_sources"]["files"][
+            "scripts/compare_hot_function.py"
+        ]
+        with self.assertRaisesRegex(profile.ProfileError, "complete committed"):
+            profile.validate_report(missing_dependency)
+        wrong_global_mapping = copy.deepcopy(report)
+        wrong_global_mapping["engines"]["wasmtime"]["attributed_samples"] = 99
+        with self.assertRaisesRegex(profile.ProfileError, "global sample mapping"):
+            profile.validate_report(wrong_global_mapping)
+        missing_samples = copy.deepcopy(report)
+        missing_samples["matched_functions"][0]["wasmtime"]["samples"] = 29
+        with self.assertRaisesRegex(profile.ProfileError, "matched function"):
+            profile.validate_report(missing_samples)
+        forged_gate = copy.deepcopy(report)
+        forged_gate["matched_functions"][0]["alu_provenance"]["gate"][
+            "optimization_authorized"
+        ] = True
+        with self.assertRaisesRegex(profile.ProfileError, "validated sample evidence"):
+            profile.validate_report(forged_gate)
         stale_execution = copy.deepcopy(report)
         stale_execution["provenance"]["execution"]["run_id"] = "stale-run"
         with self.assertRaisesRegex(profile.ProfileError, "execution provenance"):

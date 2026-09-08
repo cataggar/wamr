@@ -142,7 +142,9 @@ complete common gating universe with
 `scripts/aarch64_instruction_provenance.py`. That second universe is based on
 architectural instruction effects rather than the legacy display classifier,
 so widening multiply/add forms and future opaque computational instructions
-cannot disappear merely because one engine calls them `other`. The same
+cannot disappear merely because one engine calls them `other`. Immediate,
+register, and SIMD move forms participate too, so aliases such as `orr` and
+`movz` cannot create false cross-engine headroom. The same
 architecture-only CFG, reaching-definition, and producer/consumer analysis is
 used for WAMR and Wasmtime. Every candidate instruction lands in exactly one
 category:
@@ -167,6 +169,9 @@ and trap-looking branches are never semantic proof. Both the legacy partition
 and complete common universe reconcile independently; mapped instruction
 samples are also accounted as common candidates plus explicitly excluded
 recognized non-candidates.
+Mapped instruction counts must fit the globally attributed sample budget,
+and serialized analyses are checked against both function and full-run
+totals. Gate percentages are derived from validated integer counts.
 
 The >=5 percentage-point optimizer gate uses only eligible categories from the
 complete common universe. Its Wasmtime upper bound includes common-universe
@@ -174,6 +179,13 @@ unknown/mixed samples, target-function instruction-unresolved samples, and
 globally unattributed samples. Those sets are disjoint and retain full-run
 denominators. The legacy `all_alu` differential and structural guard diagnostic
 never authorize optimization.
+
+Authoritative local captures require committed analysis tooling. The profiler
+verifies and records hashes for every loaded in-repository dependency,
+including the disassembly helper, comparison parser, and benchmark helpers,
+against the recorded commit. It rejects modified or untracked dependencies
+and detects changes during capture; a clean-looking `HEAD` alone is not proof
+of the code that produced an authorization decision.
 
 For forward reanalysis, the upload retains the exact benchmark-handoff WAMR
 cwasm as `wamr-profiled.cwasm.gz`, bound by SHA-256 in `profile.json`. Older

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -420,6 +421,119 @@ class AArch64InstructionProvenanceTests(unittest.TestCase):
             ],
         )
 
+    def test_move_aliases_cannot_disappear_from_reference_universe(self):
+        for left, right, broad in (
+            ("orr x9, xzr, #1", "movz x9, #1", "other"),
+            ("orr x9, xzr, x1", "mov x9, x1", "regmov"),
+        ):
+            with self.subTest(right=right):
+                analyses = []
+                for opcode, classification in ((left, "alu"), (right, broad)):
+                    analyses.append(
+                        provenance.analyze_instruction_stream(
+                            [
+                                instruction(0, opcode),
+                                instruction(4, "ldr w2, [x3, x9]"),
+                                instruction(8, "ret"),
+                            ],
+                            broad_classes=[classification, "other", "other"],
+                            samples_by_offset={0: 6},
+                            total_run_samples=100,
+                        )
+                    )
+                self.assertEqual(0, analyses[1]["broad_alu_samples"])
+                self.assertEqual(
+                    6, common_category(analyses[1], "address_generation")
+                )
+                gate = provenance.compare_engine_analyses(*analyses)
+                self.assertFalse(gate["optimization_authorized"])
+                self.assertEqual(
+                    0, gate["categories"]["address_generation"][
+                        "conservative_headroom_percentage_points"
+                    ]
+                )
+        for opcode in ("mov v0.16b, v1.16b", "fmov d0, d1", "movi v0.16b, #0"):
+            with self.subTest(opcode=opcode):
+                result = analyze([opcode, "ret"], [], {0: 6})
+                self.assertEqual(6, common_category(result, "unknown"))
+
+    def test_pointer_authentication_and_hint_aliases_invalidate_guards(self):
+        for opcode in ("paciasp", "autiasp", "hint #25", "hint #29"):
+            with self.subTest(opcode=opcode):
+                result = analyze(
+                    [
+                        "cmp x30, x10",
+                        "b.hs 0x14",
+                        opcode,
+                        "ldr w0, [x30]",
+                        "ret",
+                        "brk #0",
+                    ],
+                    [0],
+                    {0: 31},
+                )
+                self.assertEqual(31, category(result, "unknown"))
+                self.assertEqual(0, category(result, "structural_address_guard"))
+                self.assertEqual(0, result["cfg"]["structural_address_guard_branches"])
+
+    def test_sample_counts_must_fit_the_global_mapping(self):
+        instructions = [
+            instruction(0, "add x9, x1, #4"),
+            instruction(4, "ldr w0, [x2, x9]"),
+            instruction(8, "ret"),
+        ]
+        for count in (91, 150):
+            with self.subTest(count=count), self.assertRaisesRegex(
+                provenance.ProvenanceError, "exceed globally attributed"
+            ):
+                provenance.analyze_instruction_stream(
+                    instructions,
+                    broad_classes=["alu", "other", "other"],
+                    samples_by_offset={0: count},
+                    total_run_samples=100,
+                    global_attributed_samples=90,
+                )
+        for count in (True, 1.5, "6", -1):
+            with self.subTest(count=count), self.assertRaisesRegex(
+                provenance.ProvenanceError, "nonnegative integer"
+            ):
+                provenance.analyze_instruction_stream(
+                    instructions,
+                    broad_classes=["alu", "other", "other"],
+                    samples_by_offset={0: count},
+                    total_run_samples=100,
+                )
+
+    def test_preassembled_analysis_cannot_forge_counts_or_percentages(self):
+        lines = ["add x9, x1, #4", "ldr w0, [x2, x9]", "ret"]
+        oversized = analyze(lines, [0], {0: 150}, total=200)
+        oversized["total_run_samples"] = 100
+        oversized["global_sample_mapping"] = {
+            "total_samples": 100,
+            "attributed_samples": 90,
+            "unattributed_samples": 10,
+        }
+        for summary in (oversized, oversized["common_gating_universe"]):
+            summary["categories"]["address_generation"]["percent_of_run"] = 150.0
+        reference = analyze(lines, [0], {0: 1})
+        with self.assertRaisesRegex(
+            provenance.ProvenanceError, "exceed globally attributed"
+        ):
+            provenance.compare_engine_analyses(oversized, reference)
+        forged = copy.deepcopy(reference)
+        forged["common_gating_universe"]["categories"]["address_generation"][
+            "percent_of_run"
+        ] = 150.0
+        with self.assertRaisesRegex(provenance.ProvenanceError, "share disagrees"):
+            provenance.compare_engine_analyses(forged, reference)
+        forged = copy.deepcopy(reference)
+        forged["sample_mapping"] = {
+            "mapped_function_samples": 2,
+            "unresolved_function_samples": 0,
+        }
+        with self.assertRaisesRegex(provenance.ProvenanceError, "function sample mapping"):
+            provenance.compare_engine_analyses(forged, reference)
+
     def test_opaque_other_opcode_is_common_universe_uncertainty(self):
         result = provenance.analyze_instruction_stream(
             [
@@ -432,6 +546,23 @@ class AArch64InstructionProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(0, result["broad_alu_samples"])
         self.assertEqual(6, common_category(result, "unknown"))
+
+    def test_implicit_transforms_cannot_escape_reference_uncertainty(self):
+        for opcode in (
+            "mrs x9, nzcv",
+            "msr nzcv, x9",
+            "ldr w10, [x9], #4",
+            "stp x9, x10, [sp, #-16]!",
+        ):
+            with self.subTest(opcode=opcode):
+                result = analyze([opcode, "ret"], [], {0: 6})
+                self.assertEqual(6, common_category(result, "unknown"))
+        floating_compare = analyze(
+            ["fcmp d0, d1", "cset x9, eq", "ldr w2, [x3, x9]", "ret"],
+            [],
+            {0: 6},
+        )
+        self.assertEqual(6, floating_compare["common_gating_universe"]["samples"])
 
     def test_gate_subtracts_wasmtime_unknown_and_mixed_upper_bound(self):
         wamr = analyze(
@@ -534,7 +665,7 @@ class AArch64InstructionProvenanceTests(unittest.TestCase):
         wasmtime = provenance.analyze_instruction_stream(
             instructions,
             broad_classes=["alu", "other", "other"],
-            samples_by_offset={},
+            samples_by_offset={4: 10},
             total_run_samples=200,
             global_attributed_samples=198,
         )
