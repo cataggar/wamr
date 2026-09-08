@@ -22,10 +22,11 @@ import benchmark_schema as schema  # noqa: E402
 import wasi_thread_cohort as cohort  # noqa: E402
 from benchmark_schema import (  # noqa: E402
     BenchmarkDataError,
-    SCHEMA_VERSION,
     alternating_pair_order,
     cache_key,
 )
+
+SCHEMA_VERSION = bench.REPORT_SCHEMA_VERSION
 
 
 def guest_result(
@@ -60,6 +61,62 @@ def stats(value: float, key: str) -> dict:
     }
 
 
+def attach_synthetic_sizing(
+    plan: dict, pilot_base_elapsed_ns: int = 1_500_000_000
+) -> None:
+    pilot_iterations = copy.deepcopy(plan["iterations"])
+    revision_roles = tuple(plan["revision_roles"])
+    order = bench.pilot_order_for_plan(
+        plan["pairs"], revision_roles, pilot_iterations
+    )
+    pilots = []
+    for spec in order:
+        elapsed = pilot_base_elapsed_ns - spec["pilot_index"] * 1_000
+        overhead = 100_000
+        guest_workload = (
+            "hot" if spec["workload"] == "cancel-hot" else spec["workload"]
+        )
+        operations = bench.expected_result(
+            guest_workload,
+            spec["threads"],
+            spec["iterations"],
+        )["operations"]
+        pilots.append(
+            {
+                **spec,
+                "phase": "pilot",
+                "correct": True,
+                "operations": operations,
+                "guest_elapsed_ns": elapsed,
+                "elapsed_ns": elapsed,
+                "raw_guest_elapsed_ns": elapsed + overhead,
+                "timing_overhead_ns": overhead,
+                "timing_overhead_ppm": (
+                    overhead * 1_000_000 // (elapsed + overhead)
+                ),
+                "host_wall_elapsed_ns": elapsed + 1_000_000,
+            }
+        )
+    modes = tuple(plan["modes"])
+    thread_counts = tuple(plan["thread_counts"])
+    selected, resolved = bench.resolve_one_shot_sizing(
+        pilot_records=pilots,
+        pilot_order=order,
+        modes=modes,
+        thread_counts=thread_counts,
+        warmups=plan["warmups"],
+        samples=plan["samples"],
+        timeout_seconds=plan["timeout_seconds"],
+    )
+    plan["iterations"] = selected
+    plan["sizing"] = {
+        "algorithm": bench.sizing_algorithm_spec(plan["timeout_seconds"]),
+        "pilot_iterations": pilot_iterations,
+        "pilot_order": order,
+        "resolved": resolved,
+    }
+
+
 def make_report(
     platform_id: str = "ubuntu-22.04-x86_64",
     machine: str = "x86_64",
@@ -75,6 +132,7 @@ def make_report(
     revision_mode: str = "paired-revisions",
     comparison_purpose: str | None = None,
     samples: int | None = None,
+    pilot_base_elapsed_ns: int = 1_500_000_000,
 ) -> dict:
     baseline_commit = baseline_commit or "b" * 40
     if revision_mode == "paired-revisions":
@@ -138,6 +196,7 @@ def make_report(
         "pairs": [],
     }
     plan["pairs"] = bench.expected_pair_specs_for_plan(plan)
+    attach_synthetic_sizing(plan, pilot_base_elapsed_ns)
     plan_sha256 = cache_key(plan)
     measurement_plan_sha256 = bench.measurement_plan_sha256(plan)
     host_fields = {
@@ -304,7 +363,7 @@ def make_report(
                 "worst_key": {
                     "workload": "hot",
                     "threads": 1,
-                    "iterations": 10,
+                    "iterations": plan["iterations"]["aot"]["hot"]["1"],
                 },
             },
             "host": {
@@ -430,7 +489,6 @@ def complete_budget(report: dict) -> dict:
                 ]["build_source_sha256"],
             },
             "fixture_set_sha256": report["metadata"]["fixture_set_sha256"],
-            "plan_sha256": report["metadata"]["plan_sha256"],
             "measurement_plan_version": (
                 report["metadata"]["measurement_plan_version"]
             ),
@@ -784,215 +842,262 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 if workload != "single-hot":
                     self.assertEqual(set(counts), {"1", "2", "4", "8"})
 
-    @staticmethod
-    def sizing_provenance() -> dict:
-        return json.loads(
-            (
-                ROOT
-                / "tests"
-                / "benchmarks"
-                / "wasi-threads"
-                / "sizing-provenance.json"
-            ).read_text(encoding="UTF-8")
+    def test_exact_sizing_formula_and_rounding(self) -> None:
+        required, rounded = bench.selected_iterations_from_elapsed(
+            1_900_000_000, 1_054_664_000
         )
+        expected = bench.ceil_div(
+            1_900_000_000
+            * bench.SIZING_TARGET_NS
+            * bench.SIZING_SAFETY_NUMERATOR,
+            1_054_664_000 * bench.SIZING_SAFETY_DENOMINATOR,
+        )
+        self.assertEqual(required, expected)
+        self.assertEqual(rounded, 3_470_000_000)
+        self.assertEqual(bench.round_up_significant(1_001, 3), 1_010)
+        self.assertEqual(bench.round_up_significant(999, 3), 999)
 
-    def assert_sizing_provenance(self, provenance: dict) -> None:
-        self.assertEqual(provenance["iteration_plan"], bench.DEFAULT_ITERATION_PLAN)
-        self.assertEqual(provenance["quality_floor_ns"], 1_250_000_000)
-        self.assertEqual(provenance["sizing_target_ns"], bench.SIZING_TARGET_NS)
-        self.assertGreaterEqual(
-            provenance["sizing_target_ns"],
-            provenance["quality_floor_ns"] * 13 // 10,
+    def test_sizing_uses_fastest_revision_condition_and_freezes_count(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilots = plan["sizing"]["resolved"]["pilots"]
+        target = next(
+            item
+            for item in pilots
+            if item["mode"] == "aot"
+            and item["workload"] == "hot"
+            and item["threads"] == 1
         )
-        self.assertEqual(len(provenance["retained_reports"]), 4)
-        expected_cells = {}
-        for mode, workloads in bench.DEFAULT_ITERATION_PLAN.items():
-            for workload, counts in workloads.items():
-                if isinstance(counts, int):
-                    expected_cells[f"{mode}/{workload}"] = counts
-                else:
-                    for threads, count in counts.items():
-                        expected_cells[f"{mode}/{workload}/{threads}"] = count
-
-        self.assertEqual(len(provenance["cells"]), len(expected_cells))
-        observed = set()
-        recomputed_cells = []
-        for cell in provenance["cells"]:
-            key = cell["key"]
-            parts = key.split("/")
-            self.assertIn(len(parts), (2, 3), key)
-            mode, workload = parts[:2]
-            self.assertEqual(len(parts), 2 if workload == "single-hot" else 3, key)
-            if len(parts) == 2:
-                thread_text = None
-                threads = None
-            else:
-                thread_text = parts[2]
-                self.assertRegex(thread_text, r"^[1-9][0-9]*$", key)
-                self.assertEqual(str(int(thread_text)), thread_text, key)
-                threads = int(thread_text)
-            self.assertIn(key, expected_cells)
-            self.assertNotIn(key, observed)
-            observed.add(key)
-
-            self.assertEqual(cell["mode"], mode, key)
-            self.assertEqual(cell["workload"], workload, key)
-            self.assertEqual(cell["threads"], threads, key)
-            plan_counts = provenance["iteration_plan"][mode][workload]
-            if isinstance(plan_counts, int):
-                self.assertIsNone(thread_text, key)
-                selected_iterations = plan_counts
-            else:
-                self.assertIsNotNone(thread_text, key)
-                selected_iterations = plan_counts[thread_text]
-            self.assertEqual(selected_iterations, expected_cells[key], key)
-            self.assertEqual(
-                cell["selected_iterations"], selected_iterations, key
-            )
-
-            self.assertGreater(cell["source_iterations"], 0, key)
-            self.assertGreater(cell["fastest_corrected_interval_ns"], 0, key)
-            retained_scaled_minimum_ns = (
-                cell["fastest_corrected_interval_ns"]
-                * selected_iterations
-                // cell["source_iterations"]
-            )
-            self.assertEqual(
-                cell["retained_scaled_minimum_ns"],
-                retained_scaled_minimum_ns,
-                key,
-            )
-            self.assertGreaterEqual(
-                retained_scaled_minimum_ns,
-                provenance["sizing_target_ns"],
-                key,
-            )
-            required = (
-                provenance["sizing_target_ns"] * cell["source_iterations"]
-                + cell["fastest_corrected_interval_ns"]
-                - 1
-            ) // cell["fastest_corrected_interval_ns"]
-            self.assertEqual(cell["required_iterations_for_target"], required, key)
-            self.assertGreaterEqual(selected_iterations, required, key)
-            quality_margin = (
-                (retained_scaled_minimum_ns - provenance["quality_floor_ns"])
-                * 1_000_000
-                // provenance["quality_floor_ns"]
-            )
-            target_margin = (
-                (retained_scaled_minimum_ns - provenance["sizing_target_ns"])
-                * 1_000_000
-                // provenance["sizing_target_ns"]
-            )
-            self.assertEqual(
-                cell["margin_above_quality_floor_ppm"], quality_margin, key
-            )
-            self.assertEqual(
-                cell["margin_above_sizing_target_ppm"], target_margin, key
-            )
-            recomputed_cells.append(
-                {
-                    "key": key,
-                    "retained_scaled_minimum_ns": retained_scaled_minimum_ns,
-                    "margin_above_quality_floor_ppm": quality_margin,
-                    "margin_above_sizing_target_ppm": target_margin,
-                }
-            )
-        self.assertEqual(observed, set(expected_cells))
-        minimum_value = min(
-            cell["retained_scaled_minimum_ns"] for cell in recomputed_cells
+        target["guest_elapsed_ns"] //= 2
+        target["elapsed_ns"] = target["guest_elapsed_ns"]
+        target["raw_guest_elapsed_ns"] = (
+            target["guest_elapsed_ns"] + target["timing_overhead_ns"]
         )
-        minimum_cells = [
-            cell
-            for cell in recomputed_cells
-            if cell["retained_scaled_minimum_ns"] == minimum_value
-        ]
-        self.assertEqual(
-            len(minimum_cells),
-            1,
-            "retained scaled minimum must identify one exact cell",
+        target["timing_overhead_ppm"] = (
+            target["timing_overhead_ns"]
+            * 1_000_000
+            // target["raw_guest_elapsed_ns"]
         )
-        self.assertEqual(
-            provenance["minimum_retained_scaled_cell"],
-            minimum_cells[0],
+        target["host_wall_elapsed_ns"] = target["guest_elapsed_ns"] + 1_000_000
+        selected, resolved = bench.resolve_one_shot_sizing(
+            pilot_records=pilots,
+            pilot_order=plan["sizing"]["pilot_order"],
+            modes=tuple(plan["modes"]),
+            thread_counts=tuple(plan["thread_counts"]),
+            warmups=plan["warmups"],
+            samples=plan["samples"],
+            timeout_seconds=plan["timeout_seconds"],
         )
-
-    def test_complete_iteration_table_clears_checked_in_sizing_target(self) -> None:
-        provenance = self.sizing_provenance()
-        self.assert_sizing_provenance(provenance)
-        runtime = provenance["runtime_accounting"]
-        self.assertEqual(
-            runtime["benchmark_path_upper_ns"],
-            runtime["projected_paired_measurement_guest_ns"]
-            + runtime["retained_host_invocation_overhead_ns"]
-            + runtime["atomic_wait_preflight_upper_ns"]
-            + runtime["trusted_barrier_preflight_upper_ns"],
+        cell = next(
+            item for item in resolved["cells"] if item["key"] == "aot/hot/1"
         )
-        accounted = (
-            runtime["benchmark_path_upper_ns"]
-            + runtime["checksum_preparation_budget_ns"]
-            + runtime["eight_build_budget_ns"]
-            + runtime["checkout_and_zig_setup_budget_ns"]
-            + runtime["tests_sdk_fixture_budget_ns"]
-            + runtime["report_upload_cleanup_budget_ns"]
-            + runtime["job_unallocated_margin_ns"]
-        )
-        self.assertEqual(accounted, runtime["job_timeout_ns"])
+        self.assertEqual(cell["fastest_pilot_index"], target["pilot_index"])
         self.assertGreater(
-            runtime["invocation_timeout_ns"],
-            4 * runtime["worst_individual_guest_ns"],
+            selected["aot"]["hot"]["1"],
+            plan["iterations"]["aot"]["hot"]["1"],
         )
         self.assertEqual(
-            runtime["cohort_full_job_bound_ns"] + runtime["cohort_margin_ns"],
-            runtime["cohort_timeout_ns"],
+            {
+                record["iterations"]
+                for record in report["records"]
+                if record["mode"] == "aot"
+                and record["workload"] == "hot"
+                and record["threads"] == 1
+            },
+            {plan["iterations"]["aot"]["hot"]["1"]},
         )
-        self.assertEqual(runtime["cohort_margin_ns"], 12 * 3_600_000_000_000)
 
-    def test_sizing_provenance_rejects_stale_derived_fields(self) -> None:
-        def duplicate_cell(value: dict) -> None:
-            value["cells"][0] = copy.deepcopy(value["cells"][1])
+    def test_slow_candidate_cannot_lower_baseline_selection(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        for pilot in pilots:
+            if pilot["revision"] == "candidate":
+                pilot["guest_elapsed_ns"] *= 2
+                pilot["elapsed_ns"] = pilot["guest_elapsed_ns"]
+                pilot["raw_guest_elapsed_ns"] = (
+                    pilot["guest_elapsed_ns"] + pilot["timing_overhead_ns"]
+                )
+                pilot["timing_overhead_ppm"] = (
+                    pilot["timing_overhead_ns"]
+                    * 1_000_000
+                    // pilot["raw_guest_elapsed_ns"]
+                )
+                pilot["host_wall_elapsed_ns"] = (
+                    pilot["guest_elapsed_ns"] + 1_000_000
+                )
+        _, resolved = bench.resolve_one_shot_sizing(
+            pilot_records=pilots,
+            pilot_order=plan["sizing"]["pilot_order"],
+            modes=tuple(plan["modes"]),
+            thread_counts=tuple(plan["thread_counts"]),
+            warmups=plan["warmups"],
+            samples=plan["samples"],
+            timeout_seconds=plan["timeout_seconds"],
+        )
+        self.assertTrue(
+            all(
+                cell["selected_iterations"]
+                >= cell["baseline_rounded_iterations"]
+                for cell in resolved["cells"]
+            )
+        )
 
-        def stale_minimum(value: dict) -> None:
-            cell = value["cells"][0]
-            value["minimum_retained_scaled_cell"] = {
-                "key": cell["key"],
-                "retained_scaled_minimum_ns": cell[
-                    "retained_scaled_minimum_ns"
-                ],
-                "margin_above_quality_floor_ppm": cell[
-                    "margin_above_quality_floor_ppm"
-                ],
-                "margin_above_sizing_target_ppm": cell[
-                    "margin_above_sizing_target_ppm"
-                ],
-            }
-
-        mutations = {
-            "duplicate cell": duplicate_cell,
-            "selected count": lambda value: value["cells"][0].__setitem__(
-                "selected_iterations",
-                value["cells"][0]["selected_iterations"] + 1,
+    def test_sizing_rejects_missing_invalid_and_tampered_pilots(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        cases = {
+            "incomplete": lambda pilots: pilots.pop(),
+            "correctness": lambda pilots: pilots[0].__setitem__("correct", False),
+            "timing resolution": lambda pilots: pilots[0].__setitem__(
+                "guest_elapsed_ns", bench.MINIMUM_PILOT_INTERVAL_NS - 1
             ),
-            "scaled minimum": lambda value: value["cells"][0].__setitem__(
-                "retained_scaled_minimum_ns",
-                value["cells"][0]["retained_scaled_minimum_ns"] + 1,
+            "operation count": lambda pilots: pilots[0].__setitem__(
+                "operations", pilots[0]["operations"] + 1
             ),
-            "margin": lambda value: value["cells"][0].__setitem__(
-                "margin_above_sizing_target_ppm",
-                value["cells"][0]["margin_above_sizing_target_ppm"] + 1,
-            ),
-            "required iterations": lambda value: value["cells"][0].__setitem__(
-                "required_iterations_for_target",
-                value["cells"][0]["required_iterations_for_target"] + 1,
-            ),
-            "minimum declaration": stale_minimum,
+            "order": lambda pilots: pilots[0].__setitem__("pilot_index", 99),
         }
-        provenance = self.sizing_provenance()
-        for label, mutate in mutations.items():
-            corrupt = copy.deepcopy(provenance)
-            mutate(corrupt)
-            with self.subTest(label=label), self.assertRaises(AssertionError):
-                self.assert_sizing_provenance(corrupt)
+        for label, mutate in cases.items():
+            pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+            mutate(pilots)
+            with self.subTest(label=label), self.assertRaises(
+                (bench.HarnessError, BenchmarkDataError)
+            ):
+                bench.resolve_one_shot_sizing(
+                    pilot_records=pilots,
+                    pilot_order=plan["sizing"]["pilot_order"],
+                    modes=tuple(plan["modes"]),
+                    thread_counts=tuple(plan["thread_counts"]),
+                    warmups=plan["warmups"],
+                    samples=plan["samples"],
+                    timeout_seconds=plan["timeout_seconds"],
+                )
+
+    def test_pilot_order_covers_every_revision_and_condition_once(self) -> None:
+        plan = make_report()["plan"]
+        order = plan["sizing"]["pilot_order"]
+        expected = {
+            (pair["pair_key"], revision, condition)
+            for pair in plan["pairs"]
+            for revision in plan["revision_roles"]
+            for condition in (pair["left"], pair["right"])
+        }
+        self.assertEqual(
+            {
+                (item["pair_key"], item["revision"], item["condition"])
+                for item in order
+            },
+            expected,
+        )
+        self.assertEqual(len(order), len(expected))
+        self.assertEqual(
+            [item["pilot_index"] for item in order],
+            list(range(len(order))),
+        )
+
+    def test_sizing_fails_caps_and_per_invocation_projection(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        with mock.patch.dict(
+            bench.SIZING_WORKLOAD_CAPS, {"single-hot": 1}
+        ), self.assertRaisesRegex(bench.HarnessError, "above cap"):
+            bench.resolve_one_shot_sizing(
+                pilot_records=pilots,
+                pilot_order=plan["sizing"]["pilot_order"],
+                modes=tuple(plan["modes"]),
+                thread_counts=tuple(plan["thread_counts"]),
+                warmups=plan["warmups"],
+                samples=plan["samples"],
+                timeout_seconds=plan["timeout_seconds"],
+            )
+
+        same_cell = [
+            item
+            for item in pilots
+            if item["mode"] == "aot"
+            and item["workload"] == "single-hot"
+        ]
+        for item, elapsed in zip(
+            same_cell, (bench.MINIMUM_PILOT_INTERVAL_NS, 10_000_000_000)
+        ):
+            item["guest_elapsed_ns"] = elapsed
+            item["elapsed_ns"] = elapsed
+            item["raw_guest_elapsed_ns"] = elapsed + item["timing_overhead_ns"]
+            item["timing_overhead_ppm"] = (
+                item["timing_overhead_ns"]
+                * 1_000_000
+                // item["raw_guest_elapsed_ns"]
+            )
+            item["host_wall_elapsed_ns"] = elapsed + 1_000_000
+        with self.assertRaisesRegex(bench.HarnessError, "invocation timeout"):
+            bench.resolve_one_shot_sizing(
+                pilot_records=pilots,
+                pilot_order=plan["sizing"]["pilot_order"],
+                modes=tuple(plan["modes"]),
+                thread_counts=tuple(plan["thread_counts"]),
+                warmups=plan["warmups"],
+                samples=plan["samples"],
+                timeout_seconds=plan["timeout_seconds"],
+            )
+
+    def test_schema_v3_fixed_plan_report_is_rejected(self) -> None:
+        report = make_report()
+        report["schema_version"] = 3
+        with self.assertRaisesRegex(BenchmarkDataError, "schema_version"):
+            bench.validate_report(report)
+
+    def test_report_replays_sizing_after_plan_hash_tampering(self) -> None:
+        def rehash(report: dict) -> None:
+            plan_hash = cache_key(report["plan"])
+            report["metadata"]["plan_sha256"] = plan_hash
+            report["metadata"]["measurement_plan_sha256"] = (
+                bench.measurement_plan_sha256(report["plan"])
+            )
+            for revision in report["metadata"]["revisions"].values():
+                revision["plan_sha256"] = plan_hash
+            for record in report["records"]:
+                record["plan_sha256"] = plan_hash
+
+        selected = make_report()
+        selected["plan"]["iterations"]["aot"]["hot"]["1"] += 1
+        rehash(selected)
+        with self.assertRaisesRegex(
+            (BenchmarkDataError, bench.HarnessError),
+            "resolved iterations",
+        ):
+            bench.validate_report(selected)
+
+        pilot = make_report()
+        pilot["plan"]["sizing"]["resolved"]["pilots"][0][
+            "guest_elapsed_ns"
+        ] += 1
+        pilot["plan"]["sizing"]["resolved"]["pilots"][0][
+            "elapsed_ns"
+        ] += 1
+        pilot["plan"]["sizing"]["resolved"]["pilots"][0][
+            "raw_guest_elapsed_ns"
+        ] += 1
+        pilot["plan"]["sizing"]["resolved"]["pilots"][0][
+            "host_wall_elapsed_ns"
+        ] += 1
+        rehash(pilot)
+        with self.assertRaisesRegex(
+            (BenchmarkDataError, bench.HarnessError),
+            "sizing resolution",
+        ):
+            bench.validate_report(pilot)
+
+        algorithm = make_report()
+        algorithm["plan"]["sizing"]["algorithm"]["limits"][
+            "wait_notify_int32_max"
+        ] -= 1
+        rehash(algorithm)
+        with self.assertRaisesRegex(
+            (BenchmarkDataError, bench.HarnessError),
+            "sizing.algorithm",
+        ):
+            bench.validate_report(algorithm)
 
     def test_iteration_plan_rejects_uint64_overflow(self) -> None:
         plan = copy.deepcopy(bench.DEFAULT_ITERATION_PLAN)
@@ -1908,7 +2013,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         ):
             bench.validate_report(corrupt)
 
-    def test_measurement_plan_identity_excludes_only_purpose(self) -> None:
+    def test_measurement_plan_identity_excludes_host_sizing_only(self) -> None:
         plan = make_report()["plan"]
         candidate_plan = copy.deepcopy(plan)
         candidate_plan["comparison_purpose"] = "noise-calibration"
@@ -1924,23 +2029,46 @@ class ThreadBenchmarkTests(unittest.TestCase):
         ):
             bench.validate_report(corrupt_report)
 
-        mutations = (
+        canonical_mutations = (
             lambda value: value.__setitem__(
                 "timeout_seconds", value["timeout_seconds"] + 1
-            ),
-            lambda value: value["iterations"]["aot"]["hot"].__setitem__(
-                "1", value["iterations"]["aot"]["hot"]["1"] + 1
             ),
             lambda value: value.__setitem__("samples", value["samples"] + 2),
             lambda value: value["pairs"][0].__setitem__(
                 "left", "different-condition"
             ),
+            lambda value: value["sizing"]["algorithm"].__setitem__(
+                "target_duration_ns",
+                value["sizing"]["algorithm"]["target_duration_ns"] + 1,
+            ),
+            lambda value: value["sizing"]["pilot_iterations"]["aot"][
+                "hot"
+            ].__setitem__(
+                "1",
+                value["sizing"]["pilot_iterations"]["aot"]["hot"]["1"] + 1,
+            ),
         )
         expected = bench.measurement_plan_sha256(plan)
-        for mutate in mutations:
+        for mutate in canonical_mutations:
             changed = copy.deepcopy(plan)
             mutate(changed)
             self.assertNotEqual(
+                bench.measurement_plan_sha256(changed),
+                expected,
+            )
+        for mutate in (
+            lambda value: value["iterations"]["aot"]["hot"].__setitem__(
+                "1", value["iterations"]["aot"]["hot"]["1"] + 1
+            ),
+            lambda value: value["sizing"]["resolved"]["pilots"][0].__setitem__(
+                "guest_elapsed_ns",
+                value["sizing"]["resolved"]["pilots"][0]["guest_elapsed_ns"]
+                + 1,
+            ),
+        ):
+            changed = copy.deepcopy(plan)
+            mutate(changed)
+            self.assertEqual(
                 bench.measurement_plan_sha256(changed),
                 expected,
             )
@@ -2073,11 +2201,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 baseline_source="c" * 64,
                 candidate_source="f" * 64,
                 comparison_purpose="candidate-evaluation",
+                pilot_base_elapsed_ns=1_100_000_000,
             )
-        )
-        self.assertNotEqual(
-            budget["calibration_provenance"]["plan_sha256"],
-            candidate["metadata"]["plan_sha256"],
         )
         self.assertEqual(
             budget["calibration_provenance"]["measurement_plan_sha256"],
@@ -2434,6 +2559,51 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 1,
                 dispatch_state,
             )
+
+    def test_cohort_accepts_host_resolved_counts_with_same_algorithm(self) -> None:
+        dispatch_state = make_dispatch_state()
+        reports = []
+        for run_id in ("100", "101"):
+            reports.extend(
+                [
+                    (
+                        Path(f"x86-{run_id}"),
+                        make_report(
+                            run_id=run_id,
+                            pilot_base_elapsed_ns=1_500_000_000,
+                        ),
+                    ),
+                    (
+                        Path(f"arm-{run_id}"),
+                        make_report(
+                            platform_id="ubuntu-24.04-aarch64",
+                            machine="aarch64",
+                            run_id=run_id,
+                            pilot_base_elapsed_ns=1_100_000_000,
+                        ),
+                    ),
+                ]
+            )
+        validated = cohort.validate_documents(
+            reports,
+            cohort.DEFAULT_PLATFORMS,
+            1,
+            dispatch_state,
+        )
+        self.assertEqual(
+            validated["identity"]["measurement_plan_version"],
+            bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
+        )
+        self.assertEqual(
+            len(validated["identity"]["plan_sha256_distribution"]), 2
+        )
+        x86_counts = validated["platforms"]["ubuntu-22.04-x86_64"][
+            "selected_iteration_distribution"
+        ]
+        arm_counts = validated["platforms"]["ubuntu-24.04-aarch64"][
+            "selected_iteration_distribution"
+        ]
+        self.assertNotEqual(x86_counts, arm_counts)
 
     def test_cohort_rejects_mixed_identity_and_duplicate_run_ids(self) -> None:
         x86 = make_single_report(run_id="100")
@@ -3148,7 +3318,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "mode": "aot",
                     "workload": "hot",
                     "threads": 1,
-                    "iterations": 10,
+                    "iterations": plan["iterations"]["aot"]["hot"]["1"],
                     "timing_overhead_ns": overhead,
                     "timed_interval_ns": timed,
                     "raw_elapsed_ns": raw,

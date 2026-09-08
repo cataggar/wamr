@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 4 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -66,7 +66,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 1 },
+        "measurement_plan_version": { "const": 2 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "checksum_preparation": {
           "type": "object",
@@ -191,6 +191,7 @@
         "modes",
         "thread_counts",
         "iterations",
+        "sizing",
         "timeout_seconds",
         "minimum_timed_interval_ns",
         "atomic_wait_preflight_runs",
@@ -241,6 +242,7 @@
             "aot": { "$ref": "#/$defs/aot_iteration_plan" }
           }
         },
+        "sizing": { "$ref": "#/$defs/sizing_plan" },
         "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
         "minimum_timed_interval_ns": {
           "type": "integer",
@@ -404,6 +406,121 @@
     },
     "revision_role": {
       "enum": ["baseline", "candidate"]
+    },
+    "sizing_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "pilot_iterations",
+        "pilot_order",
+        "resolved"
+      ],
+      "properties": {
+        "algorithm": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "kind",
+            "selection_rate",
+            "formula",
+            "target_duration_ns",
+            "safety_factor",
+            "rounding",
+            "minimum_pilot_interval_ns",
+            "timing_overhead_ratio_limit",
+            "limits",
+            "failure_policy"
+          ],
+          "properties": {
+            "version": { "const": 1 },
+            "kind": { "const": "fastest-valid-one-shot-pilot" },
+            "target_duration_ns": { "const": 1750000000 },
+            "minimum_pilot_interval_ns": { "const": 100000000 },
+            "timing_overhead_ratio_limit": { "const": 0.01 },
+            "failure_policy": { "const": "one-shot-no-retry-no-discard" },
+            "selection_rate": { "type": "string", "minLength": 1 },
+            "formula": { "type": "string", "minLength": 1 },
+            "safety_factor": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["numerator", "denominator"],
+              "properties": {
+                "numerator": { "const": 11 },
+                "denominator": { "const": 10 }
+              }
+            },
+            "rounding": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "significant_digits"],
+              "properties": {
+                "kind": { "const": "decimal-significant-digits-ceiling" },
+                "significant_digits": { "const": 3 }
+              }
+            },
+            "limits": { "type": "object" }
+          }
+        },
+        "pilot_iterations": { "type": "object" },
+        "pilot_order": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "object" }
+        },
+        "resolved": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pilots",
+            "cells",
+            "projections",
+            "pilot_host_wall_elapsed_ns",
+            "projected_evidence_host_wall_ns",
+            "auxiliary_invocation_budget_ns",
+            "projected_benchmark_ns",
+            "projected_benchmark_limit_ns"
+          ],
+          "properties": {
+            "pilots": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "object" }
+            },
+            "cells": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "object" }
+            },
+            "projections": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "object" }
+            },
+            "pilot_host_wall_elapsed_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "projected_evidence_host_wall_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "auxiliary_invocation_budget_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "projected_benchmark_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "projected_benchmark_limit_ns": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
     },
     "revision": {
       "type": "object",
