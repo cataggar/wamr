@@ -92,17 +92,17 @@ This replaces fixed-count provenance after #1008 run 34173856468, job
 than the retained sizing host. That observation demonstrates that no finite
 fixed host margin is a defensible contract.
 
-For each cell, sizing version 1 selects the fastest valid pilot across all
+For each cell, sizing version 2 selects the fastest valid pilot across all
 revisions and conditions. With pilot iterations `P`, corrected elapsed
 nanoseconds `E`, target `T = 1,750,000,000`, and safety factor `11/10`, the
 unrounded count is exactly
-`max(P, ceil(P * T * 11 / (E * 10)))`, followed by an upward decimal
-three-significant-digit rounding. The pilot count is a no-downsize floor so
-fixed per-invocation overhead or cold-host variance cannot turn a long pilot
-into sub-floor evidence. The fastest baseline result is retained as the
-explicit lower-bound derivation: a slower candidate cannot lower work, while a
-faster candidate or condition increases it. The selected count is then frozen
-for both revisions, both conditions, all warmups, and all samples.
+`ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator)), then upward decimal rounding to 3 significant digits`.
+There is no pilot-count floor: a slow host downsizes a long pilot to
+target-sized evidence, while a fast host sizes up. The fastest baseline result
+is retained as the explicit lower-bound derivation: a slower candidate cannot
+lower work, while a faster candidate or condition increases it. The selected
+count is then frozen for both revisions, both conditions, all warmups, and all
+samples.
 
 Pilots must pass guest correctness and operation assertions, have positive
 timing fields, and provide at least a 1 ms corrected interval for clock
@@ -232,7 +232,7 @@ leaving 12 hours before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 2 of a purpose-independent portable
+`measurement_plan_sha256` is version 3 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -313,6 +313,10 @@ python3 scripts/bench_wasi_threads.py \
 The workflow remains path-filtered/manual and always runs with `--no-budget`.
 Every run is explicitly marked non-enforcing. No threshold is declared or
 enabled by this workflow/cohort phase.
+
+A successful hosted smoke run validates only smoke coverage; it does not
+validate the 88-pilot authoritative profile. This change requires a full
+hosted authoritative run before merge.
 
 Pull requests and `main` pushes use GitHub-hosted x86_64 and AArch64 runners
 only. A PR compares its trustworthy base commit with the tested merge commit. A
@@ -542,9 +546,10 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Schema-v3 fixed-plan reports and reports produced before measurement-plan
-identity version 2 are invalid for a new authoritative cohort. Fresh evidence
-with the canonical one-shot sizing identity is mandatory for calibration and
-derivation. Reports with different legitimate host-selected counts may mix;
+identity version 3, including version-2 reports from #1013, are invalid for a
+new authoritative cohort. Fresh evidence with the canonical one-shot sizing
+identity is mandatory for calibration and derivation. Reports with different
+legitimate host-selected counts may mix;
 reports with altered pilot specifications, target, safety factor, rounding,
 caps, timeouts, or algorithm identity may not. Earlier failed/partial runs and
 the retained timing-quality failure remain excluded and cannot be retried,
