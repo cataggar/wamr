@@ -32,8 +32,10 @@ on:
       - src/runtime/**
       - tests/benchmarks/coremark/**
       - scripts/bench_coremark.py
+      - scripts/aarch64_instruction_provenance.py
       - scripts/profile_coremark_aarch64.py
       - scripts/test_bench_coremark.py
+      - scripts/test_aarch64_instruction_provenance.py
       - scripts/test_profile_coremark_aarch64.py
       - scripts/compare_hot_function.py
       - .github/skills/aot-perf-profile/aot_jit_attr.py
@@ -73,6 +75,7 @@ jobs:
         run: |
           python3 -m unittest \
             scripts/test_bench_coremark.py \
+            scripts/test_aarch64_instruction_provenance.py \
             scripts/test_profile_coremark_aarch64.py \
             tests/test_aot_jit_attr.py
 
@@ -267,6 +270,7 @@ jobs:
             coremark-profile/wasmtime-objdump.txt
             coremark-profile/*.data.gz
             coremark-profile/*.dump.gz
+            coremark-profile/*.cwasm.gz
           if-no-files-found: error
           retention-days: 90
 
