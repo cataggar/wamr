@@ -133,8 +133,8 @@ pub const ModuleEpochInputs = struct {
     import_count: u32,
     has_memory64: bool = false,
     has_shared_memory: bool = false,
-    /// #616: threaded modules get loop-header cancel polls, so their code
-    /// must never be reused for (or from) a non-threaded compile.
+    /// #616/#963: threaded modules get entry and loop-header cancel polls, so
+    /// their code must never be reused for (or from) a non-threaded compile.
     spawns_threads: bool = false,
     /// Optional; treated as empty slice when null.
     global_types: ?[]const ir.IrType = null,

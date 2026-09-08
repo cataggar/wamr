@@ -788,8 +788,9 @@ pub const LazyCompileDriver = struct {
                     self.allocator,
                     .{
                         .local_call_lowering = .via_funcptrs,
-                        // #616: lazily compiled bodies of a threaded module
-                        // need the same loop-header interruption points.
+                        // #616/#963: lazily compiled bodies of a threaded
+                        // module need the same entry and loop interruption
+                        // points.
                         .cancel_points = self.lazy_out.ir_module.spawns_threads,
                     },
                 ) catch |err| {

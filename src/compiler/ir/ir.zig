@@ -1189,8 +1189,8 @@ pub const IrModule = struct {
     has_shared_memory: bool = false,
     /// True when the module imports `wasi.thread-spawn`, i.e. its code can
     /// run on several guest threads at once. Target codegen uses this to
-    /// decide whether loop headers need a group-cancel poll (#616); modules
-    /// that never spawn threads pay nothing.
+    /// decide whether function entries and loop headers need group-cancel
+    /// polls (#616/#963); modules that never spawn threads pay nothing.
     spawns_threads: bool = false,
     /// Wasm-flat global types (imported globals first, then local globals).
     /// Populated by the frontend so codegen can use the same byte offsets as

@@ -532,10 +532,11 @@ pub const CallPatch = struct {
 };
 
 pub const CompileOptions = struct {
-    /// #616: emit a `VmCtx.cancel_flag` poll at every loop header so a guest
-    /// loop that never calls a host function still has an interruption point
-    /// when the thread group terminates. Enabled only for modules that
-    /// import `wasi.thread-spawn`, so other artifacts are byte-identical.
+    /// #616/#963: emit a `VmCtx.cancel_flag` poll at function entry and every
+    /// loop header so recursive and iterative guest work both have an
+    /// interruption point when the thread group terminates. Enabled only for
+    /// modules that import `wasi.thread-spawn`, so other artifacts are
+    /// byte-identical.
     cancel_points: bool = false,
     enable_scheduler: bool = true,
     enable_peephole: bool = true,
@@ -1942,12 +1943,20 @@ pub fn compileFunctionImpl(
     var patches: std.ArrayListUnmanaged(BranchPatch) = .empty;
     defer patches.deinit(allocator);
 
+    const cancel_polls: ?[]bool = if (ctx.options.cancel_points)
+        try markCancelPollBlocks(func, block_order, allocator)
+    else
+        null;
+    defer if (cancel_polls) |p| allocator.free(p);
+
     // Fall-through elision precompute (#808): a terminating `br target` is a
     // redundant `b .+4` when `target` resolves to the same address as the
     // physical fall-through. Single-`br` blocks that are themselves elided
     // emit nothing, so they resolve to their physical successor. Compute, per
     // emission-order position, a "representative" block id = the address that
-    // position resolves to after elision. Walking backwards makes this O(n).
+    // position resolves to after elision. A cancel-poll block is never empty:
+    // keeping its own representative prevents a branch from resolving through
+    // it and skipping the poll. Walking backwards makes this O(n).
     const elide_enabled = ctx.options.enable_fallthrough_elision;
     const pos_of_block = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(pos_of_block);
@@ -1962,7 +1971,11 @@ pub fn compileFunctionImpl(
                 if (oi + 1 < block_order.len) rep[oi + 1] else null;
             var emits_nothing = false;
             const insts = scheduled.instructions(block_order[oi]);
-            if (elide_enabled and insts.len == 1 and phys_next_rep != null) {
+            const has_cancel_poll = if (cancel_polls) |polls|
+                polls[block_order[oi]]
+            else
+                false;
+            if (elide_enabled and !has_cancel_poll and insts.len == 1 and phys_next_rep != null) {
                 switch (insts[0].op) {
                     // A lone forward `br` whose target resolves to the
                     // physical fall-through emits nothing once elided.
@@ -1983,18 +1996,12 @@ pub fn compileFunctionImpl(
     fctx.block_pos = pos_of_block;
     fctx.block_rep = rep;
 
-    const cancel_polls: ?[]bool = if (ctx.options.cancel_points)
-        try markCancelPollBlocks(func, block_order, allocator)
-    else
-        null;
-    defer if (cancel_polls) |p| allocator.free(p);
-
     var last_was_ret = false;
     for (block_order, 0..) |bi, order_idx| {
         block_offsets[bi] = code.len();
         code.peepholeBarrier();
-        // Poll before the header's own instructions so every back-edge and
-        // every loop entry crosses it.
+        // Poll before the block's own instructions so function entry and
+        // every back-edge cross it.
         if (cancel_polls) |polls| {
             if (polls[bi]) {
                 try emitCancelPoint(&code);
@@ -7063,9 +7070,12 @@ const vmctx_table_set_fn_slot: u12 = 24; // byte 192, scale 8
 const vmctx_table_init_fn_slot: u12 = 18; // byte 144, scale 8
 const vmctx_elem_drop_fn_slot: u12 = 19; // byte 152, scale 8
 
-/// Blocks that need a #616 group-cancel poll: every branch target that is not
-/// strictly ahead of its source in emission order, i.e. every loop back-edge
-/// target. Mirrors `markLoopHeaders` in the x86_64 backend.
+/// Blocks that need a #616/#963 group-cancel poll: the function-entry block
+/// plus every branch target that is not strictly ahead of its source in
+/// emission order, i.e. every loop back-edge target. Marking entry in the same
+/// set deduplicates a function whose entry block is also a loop header without
+/// letting its back-edge jump past the poll. Mirrors `markLoopHeaders` in the
+/// x86_64 backend.
 fn markCancelPollBlocks(
     func: *const ir.IrFunction,
     block_order: []const ir.BlockId,
@@ -7078,6 +7088,7 @@ fn markCancelPollBlocks(
 
     const headers = try allocator.alloc(bool, func.blocks.items.len);
     @memset(headers, false);
+    if (block_order.len > 0) headers[block_order[0]] = true;
     for (block_order, 0..) |bid, pos| {
         for (func.blocks.items[bid].instructions.items) |inst| {
             switch (inst.op) {
@@ -9143,8 +9154,9 @@ pub fn compileModuleCachedWithOptions(
                 .func_type_indices = ir_module.func_type_indices.items,
                 .options = blk: {
                     var per_func = options;
-                    // Threaded modules need an interruption point in every
-                    // guest loop; everything else compiles unchanged (#616).
+                    // Threaded modules need interruption points at function
+                    // entry and in every guest loop; everything else compiles
+                    // unchanged (#616/#963).
                     per_func.cancel_points =
                         per_func.cancel_points or ir_module.spawns_threads;
                     break :blk per_func;
@@ -9756,6 +9768,113 @@ fn testCodeContainsMasked(code: []const u8, mask: u32, value: u32) bool {
         if ((w & mask) == value) return true;
     }
     return false;
+}
+
+fn testCountBytes(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or needle.len > haystack.len) return 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.mem.eql(u8, haystack[i..][0..needle.len], needle)) count += 1;
+    }
+    return count;
+}
+
+const CancelPollTestShape = enum {
+    straight_line,
+    entry_loop_header,
+    other_loop_header,
+};
+
+fn compileCancelPollTestModule(
+    allocator: std.mem.Allocator,
+    spawns_threads: bool,
+    shape: CancelPollTestShape,
+) !CompileResult {
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+    ir_module.spawns_threads = spawns_threads;
+
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    const entry = try func.newBlock();
+    switch (shape) {
+        .straight_line => try func.getBlock(entry).append(.{ .op = .{ .ret = null } }),
+        .entry_loop_header => try func.getBlock(entry).append(.{ .op = .{ .br = entry } }),
+        .other_loop_header => {
+            const loop_header = try func.newBlock();
+            try func.getBlock(entry).append(.{ .op = .{ .br = loop_header } });
+            try func.getBlock(loop_header).append(.{ .op = .{ .br = loop_header } });
+        },
+    }
+    _ = try ir_module.addFunction(func);
+    return compileModule(&ir_module, allocator);
+}
+
+fn cancelPollTestPattern(allocator: std.mem.Allocator) !emit.CodeBuffer {
+    var pattern = emit.CodeBuffer.init(allocator);
+    errdefer pattern.deinit();
+    try emitCancelPoint(&pattern);
+    return pattern;
+}
+
+test "#963 aarch64: threaded straight-line function polls at entry" {
+    const allocator = std.testing.allocator;
+    var pattern = try cancelPollTestPattern(allocator);
+    defer pattern.deinit();
+
+    const result = try compileCancelPollTestModule(allocator, true, .straight_line);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    try std.testing.expectEqual(@as(usize, 1), testCountBytes(result.code, pattern.bytes.items));
+}
+
+test "#963 aarch64: entry loop header has one cancel poll" {
+    const allocator = std.testing.allocator;
+    var pattern = try cancelPollTestPattern(allocator);
+    defer pattern.deinit();
+
+    const result = try compileCancelPollTestModule(allocator, true, .entry_loop_header);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    try std.testing.expectEqual(@as(usize, 1), testCountBytes(result.code, pattern.bytes.items));
+}
+
+test "#963 aarch64: other loop headers retain back-edge polls" {
+    const allocator = std.testing.allocator;
+    var pattern = try cancelPollTestPattern(allocator);
+    defer pattern.deinit();
+
+    const result = try compileCancelPollTestModule(allocator, true, .other_loop_header);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    try std.testing.expectEqual(@as(usize, 2), testCountBytes(result.code, pattern.bytes.items));
+}
+
+test "#963 aarch64: non-threaded output keeps the disabled path byte-identical" {
+    const allocator = std.testing.allocator;
+    var pattern = try cancelPollTestPattern(allocator);
+    defer pattern.deinit();
+
+    const module_result = try compileCancelPollTestModule(allocator, false, .straight_line);
+    defer allocator.free(module_result.code);
+    defer allocator.free(module_result.offsets);
+
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    try func.getBlock(entry).append(.{ .op = .{ .ret = null } });
+    const direct_code = try compileFunctionWithOptions(
+        &func,
+        allocator,
+        .{ .cancel_points = false },
+    );
+    defer allocator.free(direct_code);
+
+    try std.testing.expectEqual(@as(usize, 0), testCountBytes(module_result.code, pattern.bytes.items));
+    try std.testing.expectEqualSlices(u8, direct_code, module_result.code);
 }
 
 /// AArch64 `MOV Xd, Xn` is encoded as ORR Xd, XZR, Xn:

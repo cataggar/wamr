@@ -2767,7 +2767,7 @@ fn installDefaultVmCtxExecutionContext(inst: *AotInstance) void {
     );
 }
 
-/// Host helper invoked by an AOT loop-header cancel poll. Never returns:
+/// Host helper invoked by an AOT entry/loop cancel poll. Never returns:
 /// the thread unwinds through the trap path exactly like the interpreter's
 /// cross-thread interrupt does.
 pub fn aotCancelPoint(vmctx: *VmCtx) callconv(.c) noreturn {
