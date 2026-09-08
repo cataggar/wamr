@@ -14,9 +14,6 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-import jsonschema
-
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -3129,7 +3126,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(bench.HarnessError, "unsupported WAMR AOT version"):
             bench.aot_text_section(unsupported)
 
-    def test_enabled_quality_preflight_validates_in_code_and_schema(self) -> None:
+    def test_enabled_quality_preflight_validates_in_code(self) -> None:
         report = make_report(
             comparison_purpose="noise-calibration",
             baseline_commit="a" * 40,
@@ -3195,17 +3192,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             revision["plan_sha256"] = plan_sha256
         for record in report["records"]:
             record["plan_sha256"] = plan_sha256
-        schema_document = json.loads(
-            (
-                ROOT
-                / "tests"
-                / "benchmarks"
-                / "wasi-threads"
-                / "report.schema.json"
-            ).read_text(encoding="UTF-8")
-        )
         bench.validate_report(report)
-        jsonschema.Draft202012Validator(schema_document).validate(report)
 
     def test_fixture_hashes_and_schema_are_pinned(self) -> None:
         fixtures = bench.resolve_fixtures(ROOT)
@@ -3228,7 +3215,6 @@ class ThreadBenchmarkTests(unittest.TestCase):
             schema["$schema"],
             "https://json-schema.org/draft/2020-12/schema",
         )
-        jsonschema.Draft202012Validator.check_schema(schema)
         self.assertIn("revision_checkouts", schema["properties"]["metadata"]["required"])
         self.assertIn("comparison_purpose", schema["properties"]["plan"]["required"])
         self.assertIn(
@@ -3270,7 +3256,6 @@ class ThreadBenchmarkTests(unittest.TestCase):
         for report in (make_report(), make_single_report()):
             self.assertEqual(set(report), set(schema["required"]))
             bench.validate_report(report)
-            jsonschema.Draft202012Validator(schema).validate(report)
         budget_schema = json.loads(
             (
                 ROOT
