@@ -784,6 +784,108 @@ def analyze_wamr_alu_provenance(
     return result
 
 
+def analyze_wamr_frame_provenance(
+    *,
+    aot,
+    cwasm_info,
+    metadata_path: Path,
+    local_func: int,
+    capture_counts: list[tuple[dict[int, int], int]],
+    ranking_reports: list[dict[str, Any]],
+    total_samples: int,
+    spill_metric: dict[str, Any],
+    scratch_dir: Path,
+) -> dict[str, Any]:
+    start, end = aot.function_bounds(cwasm_info, local_func)
+    text = cwasm_info.data[
+        cwasm_info.text_file_offset : cwasm_info.text_file_offset + cwasm_info.text_size
+    ]
+    metadata = aot.load_frame_metadata(
+        metadata_path, local_func, text[start:end], cwasm_info.version,
+        text, start, cwasm_info,
+    )
+    if metadata.raw["module"] != 0:
+        raise ProfileError("CoreMark frame metadata must describe module 0")
+    instructions = aot.disassemble_function(
+        text[start:end], start, scratch_dir, f"frame-provenance-{local_func}",
+        metadata.inline_data_ranges, metadata.raw["architecture"],
+    )
+    aot.validate_metadata_disassembly(metadata, instructions)
+    if len(capture_counts) != len(ranking_reports):
+        raise ProfileError("frame counts and ranking captures disagree")
+    combined = Counter()
+    captures = []
+    for ordinal, ((counts, text_base), ranking) in enumerate(
+        zip(capture_counts, ranking_reports), 1
+    ):
+        normalized = Counter(
+            {
+                address - text_base: count
+                for address, count in counts.items()
+                if text_base + start <= address < text_base + end
+            }
+        )
+        expected = sum(
+            item["samples"]
+            for item in ranking["top_functions"]
+            if item["local_func"] == local_func
+        )
+        if sum(normalized.values()) != expected or expected <= 0:
+            raise ProfileError(
+                "frame function samples do not match the captured function ranking"
+            )
+        combined.update(normalized)
+        captures.append(
+            {
+                "ordinal": ordinal,
+                "total_samples": ranking["total_samples"],
+                "function_samples": expected,
+                "samples_by_offset": [
+                    [address - start, count]
+                    for address, count in sorted(normalized.items())
+                ],
+            }
+        )
+    # Reuse the consumer once on merged IP counts: pair samples are indivisible,
+    # while static component counts and per-vreg snapshots must not be added.
+    summary = aot.build_frame_summary(instructions, combined, metadata)
+    reconciliation = summary["reconciliation"]
+    if (
+        reconciliation["matches"] is not True
+        or reconciliation["emitted_allocator_loads"] != spill_metric.get("spill_ld")
+        or reconciliation["emitted_allocator_stores"] != spill_metric.get("spill_st")
+    ):
+        raise ProfileError("frame origins disagree with the emitted spill metric log")
+    for values in summary["origins"].values():
+        values["percent_of_run"] = 100.0 * values["samples"] / total_samples
+    for contributor in summary["allocator_contributors"]:
+        contributor["percent_of_run"] = (
+            100.0 * contributor["samples"] / total_samples
+        )
+    return {
+        "schema_version": 1,
+        "module": 0,
+        "local_func": local_func,
+        "code_size": end - start,
+        "function_samples": sum(combined.values()),
+        "total_samples": total_samples,
+        "sample_coordinates": "function-relative native byte offsets",
+        "metadata": {
+            "path": metadata_path.name,
+            "sha256": sha256_file(metadata_path),
+            **{
+                key: metadata.raw[key]
+                for key in (
+                    "schema", "schema_version", "architecture", "abi",
+                    "compiler_build_id", "module_text_sha256", "normalized_code_sha256",
+                )
+            },
+        },
+        "captures": captures,
+        "summary": summary,
+    }
+
+
 def assemble_alu_provenance(
     *,
     wamr: dict[str, Any],
@@ -891,6 +993,136 @@ def _validate_narrow_alu_analysis(
         raise ProfileError(
             f"{engine} instruction samples do not reconcile to its matched function"
         )
+
+
+def _frame_count(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ProfileError(f"invalid frame {name} count")
+    return value
+
+
+def validate_frame_provenance(frame: dict[str, Any], report: dict[str, Any]) -> None:
+    local_func = _frame_count(frame.get("local_func"), "local function")
+    total = report["engines"]["wamr"]["total_samples"]
+    if (
+        frame.get("schema_version") != 1
+        or frame.get("module") != 0
+        or local_func >= report["wasm"]["local_function_count"]
+        or frame.get("wasm_function_index")
+        != local_func + report["wasm"]["imported_function_count"]
+        or frame.get("total_samples") != total
+        or frame.get("compiler_sha256") != report["wamr"]["compiler_sha256"]
+        or frame.get("cwasm_sha256") != report["wamr"]["cwasm_sha256"]
+        or frame.get("sample_coordinates") != "function-relative native byte offsets"
+    ):
+        raise ProfileError("frame provenance disagrees with the measured artifact")
+    metadata = frame["metadata"]
+    if (
+        metadata.get("schema") != "wamr-aot-frame-attribution"
+        or metadata.get("schema_version") != 2
+        or metadata.get("architecture") != "aarch64"
+        or metadata.get("abi") != "aapcs64"
+        or metadata.get("path") != f"wamr-frame.mod0.func{local_func}.json"
+    ):
+        raise ProfileError("frame metadata identity is incompatible")
+    for key in ("sha256", "module_text_sha256", "normalized_code_sha256"):
+        _require_sha(metadata.get(key), f"frame metadata {key}", 64)
+    code_size = _frame_count(frame.get("code_size"), "code size")
+    if not code_size or code_size % 4:
+        raise ProfileError("frame code size is not AArch64 instruction-aligned")
+    captures = frame["captures"]
+    if len(captures) != PROFILE_CAPTURES_PER_ENGINE:
+        raise ProfileError("frame provenance must contain both WAMR captures")
+    function_samples = 0
+    for ordinal, (capture, measured) in enumerate(
+        zip(captures, report["wamr_captures"]), 1
+    ):
+        if (
+            capture.get("ordinal") != ordinal
+            or capture.get("total_samples") != measured["total_samples"]
+        ):
+            raise ProfileError("frame captures do not match the measured schedule")
+        samples = 0
+        previous = -1
+        for offset, count in capture["samples_by_offset"]:
+            _frame_count(offset, "instruction offset")
+            _frame_count(count, "instruction samples")
+            if not previous < offset < code_size or offset % 4 or count == 0:
+                raise ProfileError("frame instruction samples have invalid offsets/counts")
+            previous = offset
+            samples += count
+        if (
+            samples != capture.get("function_samples")
+            or not 0 < samples <= measured["attributed_samples"]
+        ):
+            raise ProfileError("frame function samples exceed their capture budget")
+        function_samples += samples
+    expected = sum(
+        item["samples"]
+        for item in report["engines"]["wamr"]["top_functions"]
+        if item["local_func"] == local_func
+    )
+    if frame.get("function_samples") != function_samples or expected != function_samples:
+        raise ProfileError("frame function samples do not reconcile to the ranking")
+    summary = frame["summary"]
+    coverage = summary["coverage"]
+    for suffix in ("instructions", "samples"):
+        whole = _frame_count(coverage.get(f"frame_{suffix}"), suffix)
+        mapped = _frame_count(coverage.get(f"attributed_frame_{suffix}"), f"mapped {suffix}")
+        proven = _frame_count(coverage.get(f"proven_origin_frame_{suffix}"), f"proven {suffix}")
+        unknown = _frame_count(coverage.get(f"unknown_frame_{suffix}"), f"unknown {suffix}")
+        if not proven <= mapped <= whole or unknown != whole - proven:
+            raise ProfileError("frame coverage does not conserve counts")
+    if (
+        coverage["frame_samples"] > function_samples
+        or coverage["frame_instructions"] > code_size // 4
+    ):
+        raise ProfileError("frame coverage exceeds the selected function")
+    origins = summary["origins"]
+    if not set(origins) <= {
+        "allocator_spill", "wasm_local_or_phi", "explicit_frame_storage",
+        "fixed_runtime_frame_state", "unknown",
+    }:
+        raise ProfileError("frame report has an unsupported origin")
+    for key, suffix in (("samples", "samples"), ("static_instructions", "instructions")):
+        values = {
+            origin: _frame_count(value.get(key), f"{origin} {key}")
+            for origin, value in origins.items()
+        }
+        if (
+            sum(values.values()) != coverage[f"frame_{suffix}"]
+            or sum(count for origin, count in values.items() if origin != "unknown")
+            != coverage[f"proven_origin_frame_{suffix}"]
+        ):
+            raise ProfileError("frame origins do not conserve coverage counts")
+    for value in origins.values():
+        if value.get("percent_of_run") != 100.0 * value["samples"] / total:
+            raise ProfileError("frame origin percentage disagrees with its samples")
+    contributors = summary["allocator_contributors"]
+    contributor_samples = sum(
+        _frame_count(item.get("samples"), "allocator contributor") for item in contributors
+    )
+    if contributor_samples != origins.get("allocator_spill", {}).get("samples", 0):
+        raise ProfileError("allocator contributor samples are duplicated or missing")
+    for item in contributors:
+        if item.get("percent_of_run") != 100.0 * item["samples"] / total:
+            raise ProfileError("allocator percentage disagrees with its samples")
+    reconciliation = summary["reconciliation"]
+    if reconciliation.get("matches") is not True:
+        raise ProfileError("frame emitted counts did not reconcile")
+    for direction in ("loads", "stores"):
+        emitted = _frame_count(
+            reconciliation.get(f"emitted_allocator_{direction}"), f"emitted {direction}"
+        )
+        metric = _frame_count(
+            reconciliation.get(f"spill_metric_{direction}"), f"spill metric {direction}"
+        )
+        components = sum(
+            _frame_count(item.get(f"static_{direction}"), f"component {direction}")
+            for item in contributors
+        )
+        if not emitted == metric == components:
+            raise ProfileError("frame static component counts were duplicated or lost")
 
 
 def validate_report(report: dict[str, Any]) -> None:
@@ -1142,6 +1374,10 @@ def validate_report(report: dict[str, Any]) -> None:
             )
         if target is None and narrow_summary.get("gate", {}).get("optimization_authorized"):
             raise ProfileError("unmatched target function cannot authorize optimization")
+    if report.get("frame_attribution") is not None:
+        if narrow_summary is None:
+            raise ProfileError("frame profiles require complete committed analysis sources")
+        validate_frame_provenance(report["frame_attribution"], report)
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -1307,12 +1543,81 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "of common universe | "
                 f"gate `{narrow['gate']['status']}` |"
             )
+    if report.get("frame_attribution") is not None:
+        frame = report["frame_attribution"]
+        summary = frame["summary"]
+        coverage = summary["coverage"]
+        lines.extend(
+            [
+                "",
+                "#### Exact WAMR frame origins",
+                "",
+                f"`{frame['name']}`: module 0, local_func {frame['local_func']}, "
+                f"wasm index {frame['wasm_function_index']}. "
+                f"Sidecar `{frame['metadata']['path']}` "
+                f"(`sha256:{frame['metadata']['sha256']}`).",
+                "",
+                f"Proven origins: {coverage['proven_origin_frame_instructions']}/"
+                f"{coverage['frame_instructions']} static native frame instructions; "
+                f"{coverage['proven_origin_frame_samples']}/"
+                f"{coverage['frame_samples']} frame samples. "
+                f"Unknown: {coverage['unknown_frame_instructions']} instructions / "
+                f"{coverage['unknown_frame_samples']} samples.",
+                "",
+                "| Origin | Static native instructions | Self samples | Run share |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for origin, values in sorted(
+            summary["origins"].items(), key=lambda pair: -pair[1]["samples"]
+        ):
+            lines.append(
+                f"| `{origin}` | {values['static_instructions']} | "
+                f"{values['samples']} | {values['percent_of_run']:.2f}% |"
+            )
+        lines.extend(
+            [
+                "",
+                "| Allocator slot / frame offset | Vreg(s) | Source | Self samples | Run share |",
+                "|---|---|---|---:|---:|",
+            ]
+        )
+        for item in summary["allocator_contributors"][:10]:
+            if item.get("paired_components"):
+                slot = "paired " + ", ".join(
+                    f"{component['slot']} / {component['frame_offset']}"
+                    for component in item["paired_components"]
+                )
+            else:
+                slot = f"{item['slot']} / {item['frame_offset']}"
+            vreg = (
+                f"{item['candidate_vregs']} (ambiguous)"
+                if item["vreg_ambiguous"] else str(item["vreg"])
+            )
+            source = f"{item['defining_opcode'] or '?'}/{item['source_class'] or '?'}"
+            lines.append(
+                f"| {slot} | {vreg} | `{source}` | {item['samples']} | "
+                f"{item['percent_of_run']:.2f}% |"
+            )
+        reconciliation = summary["reconciliation"]
+        lines.extend(
+            [
+                "",
+                "Emitter reconciliation: "
+                f"{reconciliation['emitted_allocator_loads']} allocator load "
+                f"components / {reconciliation['emitted_allocator_stores']} store "
+                "components, matching the selected-function spill metric. "
+                "Paired samples count once; static components and IR snapshots "
+                "are not multiplied by the capture count. Broad instruction "
+                "classes retain their original metadata-free definitions.",
+            ]
+        )
     lines.extend(
         [
             "",
             "#### Spill-metric cross-check",
             "",
-            "| Function | spill_ld/st estimate | Static frame ld/st | "
+            "| Function | spill_ld/st (basis) | Static frame ld/st | "
             "Frame-traffic run share |",
             "|---|---:|---:|---:|",
         ]
@@ -1321,7 +1626,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         spill = item["spill_metric"]
         frame = item["wamr"]["frame_cross_check"]
         lines.append(
-            f"| `{item['name']}` | {spill['spill_ld']}/{spill['spill_st']} | "
+            f"| `{item['name']}` | {spill['spill_ld']}/{spill['spill_st']} "
+            f"({item.get('spill_metric_basis', 'pre-emission IR estimate')}) | "
             f"{frame['static_frame_loads']}/{frame['static_frame_stores']} | "
             f"{frame['percent_of_run']:.2f}% |"
         )
@@ -1335,8 +1641,9 @@ def render_markdown(report: dict[str, Any]) -> str:
             "name section for every matched row.",
             "",
             "Caveats: perf self samples only; no DWARF unwinding through WAMR "
-            "generated code. AArch64 spill metrics are pre-emission estimates, "
-            "so static frame traffic is a conservative cross-check, not a claim "
+            "generated code. Unselected AArch64 spill metrics are pre-emission "
+            "estimates; a selected sidecar uses emitter-traced component counts. "
+            "Broad frame traffic is a conservative cross-check, not a claim "
             "that every frame access is an allocator spill. `all_alu` means "
             f"{report['classifier_wording']['all_alu']}; its cross-engine "
             "difference is not address/check headroom. Narrow provenance uses "
@@ -1391,6 +1698,85 @@ def retain_exact_binary(
     }
 
 
+def compile_wamr_diagnostics(
+    *,
+    recorder: CommandRecorder,
+    wamrc: Path,
+    fixture: Path,
+    cwasm: Path,
+    out_dir: Path,
+    build_repo: Path,
+    helper: Path,
+    frame_func: int | None,
+) -> tuple[dict[int, dict[str, Any]], Path | None]:
+    diagnostic_cwasm = out_dir / "coremark.diagnostic.cwasm"
+    compile_env = os.environ.copy()
+    for key in (
+        "WAMR_AOT_FRAME_ATTRIBUTION",
+        "WAMR_AOT_FRAME_ATTRIBUTION_MODULE",
+        "WAMR_AOT_FRAME_ATTRIBUTION_FUNC",
+    ):
+        compile_env.pop(key, None)
+    options = {
+        "WAMR_AOT_SPILL_METRIC": "1",
+        "WAMR_AOT_SPILL_METRIC_MIN_SPILLS": "1",
+        "WAMR_AOT_CODEGEN_TIMING": "1",
+        "WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS": "0",
+    }
+    metadata = None
+    if frame_func is not None:
+        if type(frame_func) is not int or frame_func < 0:
+            raise ProfileError("frame function must be a nonnegative local index")
+        prefix = out_dir / "wamr-frame"
+        metadata = out_dir / f"wamr-frame.mod0.func{frame_func}.json"
+        if metadata.exists():
+            raise ProfileError(f"refusing to reuse existing frame metadata: {metadata}")
+        options.update(
+            {
+                "WAMR_AOT_FRAME_ATTRIBUTION": str(prefix),
+                "WAMR_AOT_FRAME_ATTRIBUTION_MODULE": "0",
+                "WAMR_AOT_FRAME_ATTRIBUTION_FUNC": str(frame_func),
+            }
+        )
+    compile_env.update(options)
+    command = [
+        str(wamrc), "compile", str(fixture), "-o", str(diagnostic_cwasm)
+    ]
+    result = recorder.run(
+        command,
+        "wamr-compile.log",
+        cwd=build_repo,
+        env=compile_env,
+        display=shlex.join(
+            ["env", *(f"{key}={value}" for key, value in options.items()), *command]
+        ),
+    )
+    if sha256_file(diagnostic_cwasm) != sha256_file(cwasm):
+        raise ProfileError(
+            "diagnostic cwasm does not match the exact benchmark-built module"
+        )
+    diagnostic_cwasm.unlink()
+    if metadata is not None:
+        if not metadata.is_file():
+            raise ProfileError(
+                "the retained benchmark compiler did not emit requested frame "
+                "metadata; benchmark a candidate with AArch64 frame attribution"
+            )
+        recorder.run(
+            [
+                sys.executable, str(helper),
+                "--cwasm", str(cwasm),
+                "--arch", "aarch64",
+                "--func", str(frame_func),
+                "--frame-metadata", str(metadata),
+                "--validate-frame-metadata",
+            ],
+            "wamr-frame-validation.log",
+            cwd=build_repo,
+        )
+    return parse_spill_metrics(result.stdout + result.stderr), metadata
+
+
 def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     repo = args.repo.resolve()
     out_dir = args.out_dir.resolve()
@@ -1427,6 +1813,10 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         repo, bench_coremark.DEFAULT_FIXTURE
     )
     wasm_identity = compare_hot_function.parse_core_wasm(fixture)
+    if args.frame_func is not None and not (
+        0 <= args.frame_func < wasm_identity.local_function_count
+    ):
+        raise ProfileError("frame function is outside the benchmark module")
     wamr_ref = args.wamr_ref or benchmark_target_sha
     commit = recorder.run(
         ["git", "rev-parse", wamr_ref], "git-identity.log", cwd=repo
@@ -1465,36 +1855,20 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         [str(wamrc), "version"], "wamrc-version.log", cwd=build_repo
     ).stdout.strip()
 
-    diagnostic_cwasm = out_dir / "coremark.diagnostic.cwasm"
-    compile_env = os.environ.copy()
-    compile_env.update(
-        {
-            "WAMR_AOT_SPILL_METRIC": "1",
-            "WAMR_AOT_SPILL_METRIC_MIN_SPILLS": "1",
-            "WAMR_AOT_CODEGEN_TIMING": "1",
-            "WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS": "0",
-        }
+    helper = repo / ".github/skills/aot-perf-profile/aot_jit_attr.py"
+    spill_metrics, frame_metadata = compile_wamr_diagnostics(
+        recorder=recorder,
+        wamrc=wamrc,
+        fixture=fixture,
+        cwasm=cwasm,
+        out_dir=out_dir,
+        build_repo=build_repo,
+        helper=helper,
+        frame_func=args.frame_func,
     )
-    compile_result = recorder.run(
-        [str(wamrc), "compile", str(fixture), "-o", str(diagnostic_cwasm)],
-        "wamr-compile.log",
-        cwd=build_repo,
-        env=compile_env,
-        display=(
-            "WAMR_AOT_SPILL_METRIC=1 WAMR_AOT_SPILL_METRIC_MIN_SPILLS=1 "
-            "WAMR_AOT_CODEGEN_TIMING=1 "
-            "WAMR_AOT_CODEGEN_TIMING_THRESHOLD_MS=0 "
-            f"{shlex.join([str(wamrc), 'compile', str(fixture), '-o', str(diagnostic_cwasm)])}"
-        ),
+    frame_metadata_sha = (
+        sha256_file(frame_metadata) if frame_metadata is not None else None
     )
-    spill_metrics = parse_spill_metrics(
-        compile_result.stdout + compile_result.stderr
-    )
-    if sha256_file(diagnostic_cwasm) != sha256_file(cwasm):
-        raise ProfileError(
-            "diagnostic cwasm does not match the exact benchmark-built module"
-        )
-    diagnostic_cwasm.unlink()
     cwasm_info = aot.parse_cwasm(cwasm)
     if cwasm_info.version not in aot.SUPPORTED_AOT_VERSIONS:
         raise ProfileError("WAMR cwasm version is unsupported by attribution")
@@ -1761,7 +2135,6 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    helper = repo / ".github/skills/aot-perf-profile/aot_jit_attr.py"
     ranking_reports = []
     wamr_capture_validations = []
     for ordinal, wamr_perf in enumerate(wamr_perfs, 1):
@@ -1852,6 +2225,34 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 "WAMR perf sample totals changed while building ALU provenance"
             )
         wamr_capture_counts.append((counts, ranking_report["text_base"]))
+
+    frame_attribution = None
+    if frame_metadata is not None:
+        frame_attribution = analyze_wamr_frame_provenance(
+            aot=aot,
+            cwasm_info=cwasm_info,
+            metadata_path=frame_metadata,
+            local_func=args.frame_func,
+            capture_counts=wamr_capture_counts,
+            ranking_reports=ranking_reports,
+            total_samples=wamr_attribution["total_samples"],
+            spill_metric=spill_metrics.get(args.frame_func, {}),
+            scratch_dir=out_dir,
+        )
+        frame_attribution.update(
+            {
+                "wasm_function_index": (
+                    args.frame_func + wasm_identity.imported_function_count
+                ),
+                "name": wasm_identity.function_names.get(
+                    args.frame_func + wasm_identity.imported_function_count
+                ),
+                "compiler_sha256": profile_wamr_identity["compiler"]["sha256"],
+                "cwasm_sha256": profile_wamr_identity["module"]["sha256"],
+            }
+        )
+        if frame_attribution["metadata"]["sha256"] != frame_metadata_sha:
+            raise ProfileError("frame metadata changed during capture")
 
     parsed_wasmtime = aggregate_wasmtime_samples(wasmtime_captures)
     validate_wasmtime_mapping(parsed_wasmtime, wasm_identity)
@@ -1963,6 +2364,11 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                         "slots",
                     )
                 },
+                "spill_metric_basis": (
+                    "emitter-traced"
+                    if local_func == args.frame_func
+                    else "pre-emission IR estimate"
+                ),
                 "wamr": {
                     "samples": wamr_function["samples"],
                     "percent_of_run": wamr_function["percent_of_run"],
@@ -2198,7 +2604,8 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         },
         "caveats": [
             "Self samples only; WAMR generated code has no unwind CFI.",
-            "AArch64 spill metrics are pre-emission estimates.",
+            "Unselected AArch64 spill metrics are pre-emission estimates; "
+            "selected frame sidecars reconcile emitted component counts.",
             "Wasmtime wasm symbols use full function indices including imports.",
             "Two captures per engine were collected in ABBA order after ABBA warmups.",
             ALL_ALU_WORDING
@@ -2211,6 +2618,10 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     }
     bench_coremark.validate_same_host(host_identity)
     validate_analysis_sources_unchanged(repo, analysis_sources)
+    if frame_attribution is not None:
+        if sha256_file(frame_metadata) != frame_metadata_sha:
+            raise ProfileError("frame metadata changed during capture")
+        report["frame_attribution"] = frame_attribution
     validate_report(report)
     return report
 
@@ -2264,6 +2675,15 @@ def main() -> int:
         "--classify", type=int, default=DEFAULT_CLASSIFY_FUNCTIONS
     )
     parser.add_argument(
+        "--frame-func",
+        type=int,
+        default=None,
+        help=(
+            "opt-in exact frame origins for one module-0 local function "
+            "(core_state_transition is 10); requires a capable benchmark compiler"
+        ),
+    )
+    parser.add_argument(
         "--max-perf-bytes", type=int, default=DEFAULT_MAX_PERF_BYTES
     )
     args = parser.parse_args()
@@ -2271,6 +2691,8 @@ def main() -> int:
         parser.error("--frequency and --min-samples must be positive")
     if args.top <= 0 or args.classify <= 0 or args.classify > args.top:
         parser.error("--classify must be positive and no greater than --top")
+    if args.frame_func is not None and args.frame_func < 0:
+        parser.error("--frame-func must be nonnegative")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     try:

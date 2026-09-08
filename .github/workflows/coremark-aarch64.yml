@@ -26,6 +26,10 @@ on:
         description: "WAMR commit/ref to benchmark and profile (defaults to target)"
         required: false
         default: ""
+      frame_func:
+        description: "Optional module-0 local function for exact frame origins (10 for core_state_transition)"
+        required: false
+        default: ""
   pull_request:
     paths:
       - src/compiler/**
@@ -223,7 +227,12 @@ jobs:
         continue-on-error: true
         env:
           PROFILE_SHA: ${{ steps.refs.outputs.profile }}
+          FRAME_FUNC: ${{ github.event.inputs.frame_func }}
         run: |
+          frame_args=()
+          if [ -n "$FRAME_FUNC" ]; then
+            frame_args=(--frame-func "$FRAME_FUNC")
+          fi
           python3 scripts/profile_coremark_aarch64.py \
             --out-dir coremark-profile \
             --benchmark-report coremark-profile/benchmark-report.json \
@@ -233,7 +242,8 @@ jobs:
             --frequency 999 \
             --min-samples 1000 \
             --top 10 \
-            --classify 3
+            --classify 3 \
+            "${frame_args[@]}"
 
       - name: Upload benchmark table
         if: >-
@@ -266,6 +276,7 @@ jobs:
             coremark-profile/*.log
             coremark-profile/wamr-attribution*.json
             coremark-profile/wamr-func-*.json
+            coremark-profile/wamr-frame*.json
             coremark-profile/wasmtime-samples*.txt
             coremark-profile/wasmtime-objdump.txt
             coremark-profile/*.data.gz

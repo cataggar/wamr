@@ -21,6 +21,216 @@ SPEC.loader.exec_module(profile)
 
 
 class CoreMarkProfileTests(unittest.TestCase):
+    def test_frame_diagnostics_use_exact_compiler_and_artifact(self):
+        cache = ROOT / ".cache"
+        cache.mkdir(exist_ok=True)
+        for mode in ("enabled", "disabled", "unsupported", "changed-code", "stale"):
+            with (
+                self.subTest(mode=mode),
+                tempfile.TemporaryDirectory(dir=cache) as temp,
+            ):
+                root = Path(temp)
+                cwasm = root / "benchmark.cwasm"
+                cwasm.write_bytes(b"exact benchmark code")
+                compiler = root / "retained-wamrc"
+                fixture = root / "fixture.wasm"
+                helper = root / "aot_jit_attr.py"
+                metadata = root / "wamr-frame.mod0.func10.json"
+                if mode == "stale":
+                    metadata.write_text("old metadata")
+                calls = []
+
+                def run(command, log_name, **kwargs):
+                    calls.append((command, kwargs))
+                    if command[0] == str(compiler):
+                        self.assertEqual(root, kwargs["cwd"])
+                        self.assertEqual(str(fixture), command[2])
+                        env = kwargs["env"]
+                        if mode == "disabled":
+                            self.assertNotIn("WAMR_AOT_FRAME_ATTRIBUTION", env)
+                            self.assertNotIn("WAMR_AOT_FRAME_ATTRIBUTION_FUNC", env)
+                        else:
+                            self.assertEqual(
+                                str(root / "wamr-frame"),
+                                env["WAMR_AOT_FRAME_ATTRIBUTION"],
+                            )
+                            self.assertEqual("0", env["WAMR_AOT_FRAME_ATTRIBUTION_MODULE"])
+                            self.assertEqual("10", env["WAMR_AOT_FRAME_ATTRIBUTION_FUNC"])
+                        Path(command[-1]).write_bytes(
+                            b"changed code" if mode == "changed-code" else cwasm.read_bytes()
+                        )
+                        if mode not in ("disabled", "unsupported"):
+                            metadata.write_text("{}")
+                    else:
+                        self.assertEqual(str(helper), command[1])
+                        self.assertIn("--validate-frame-metadata", command)
+                        self.assertEqual(
+                            str(cwasm), command[command.index("--cwasm") + 1]
+                        )
+                        self.assertEqual(
+                            str(metadata), command[command.index("--frame-metadata") + 1]
+                        )
+                    return SimpleNamespace(stdout="", stderr="")
+
+                def compile_diagnostics():
+                    return profile.compile_wamr_diagnostics(
+                        recorder=SimpleNamespace(run=run),
+                        wamrc=compiler,
+                        fixture=fixture,
+                        cwasm=cwasm,
+                        out_dir=root,
+                        build_repo=root,
+                        helper=helper,
+                        frame_func=None if mode == "disabled" else 10,
+                    )
+
+                with mock.patch.dict(
+                    profile.os.environ,
+                    {
+                        "WAMR_AOT_FRAME_ATTRIBUTION": "/unrecorded",
+                        "WAMR_AOT_FRAME_ATTRIBUTION_MODULE": "9",
+                        "WAMR_AOT_FRAME_ATTRIBUTION_FUNC": "99",
+                    },
+                ):
+                    if mode == "unsupported":
+                        with self.assertRaisesRegex(profile.ProfileError, "benchmark a candidate"):
+                            compile_diagnostics()
+                        self.assertEqual(1, len(calls))
+                    elif mode == "changed-code":
+                        with self.assertRaisesRegex(profile.ProfileError, "exact benchmark"):
+                            compile_diagnostics()
+                        self.assertEqual(1, len(calls))
+                    elif mode == "stale":
+                        with self.assertRaisesRegex(profile.ProfileError, "existing frame metadata"):
+                            compile_diagnostics()
+                        self.assertEqual([], calls)
+                        self.assertEqual("old metadata", metadata.read_text())
+                    else:
+                        metrics, path = compile_diagnostics()
+                        self.assertEqual({}, metrics)
+                        self.assertEqual(metadata if mode == "enabled" else None, path)
+                        self.assertEqual(2 if mode == "enabled" else 1, len(calls))
+                        self.assertFalse((root / "coremark.diagnostic.cwasm").exists())
+
+    def test_frame_capture_merge_preserves_pairs_and_static_counts(self):
+        summary = {
+            "coverage": {
+                "frame_instructions": 2, "attributed_frame_instructions": 2,
+                "proven_origin_frame_instructions": 2, "unknown_frame_instructions": 0,
+                "frame_samples": 36, "attributed_frame_samples": 36,
+                "proven_origin_frame_samples": 36, "unknown_frame_samples": 0,
+            },
+            "origins": {
+                "allocator_spill": {"samples": 36, "static_instructions": 2},
+            },
+            "allocator_contributors": [
+                {"slot": 0, "vreg": 1, "samples": 16, "static_loads": 1, "static_stores": 0},
+                {"slot": 1, "vreg": 2, "samples": 0, "static_loads": 1, "static_stores": 0},
+                {"slot": 2, "vreg": 3, "samples": 0, "static_loads": 1, "static_stores": 0},
+                {
+                    "slot": 1, "vreg": None, "samples": 20,
+                    "static_loads": 0, "static_stores": 0,
+                    "paired_components": [{"slot": 1}, {"slot": 2}],
+                },
+            ],
+            "reconciliation": {
+                "emitted_allocator_loads": 3, "emitted_allocator_stores": 0,
+                "spill_metric_loads": 3, "spill_metric_stores": 0, "matches": True,
+            },
+            "unknown_instructions": [],
+        }
+        metadata = SimpleNamespace(
+            inline_data_ranges=[],
+            raw={
+                "module": 0, "schema": "wamr-aot-frame-attribution",
+                "schema_version": 2, "architecture": "aarch64", "abi": "aapcs64",
+                "compiler_build_id": "dev", "module_text_sha256": "a" * 64,
+                "normalized_code_sha256": "b" * 64,
+            },
+        )
+        instructions = [object(), object()]
+        aot = SimpleNamespace(
+            function_bounds=mock.Mock(return_value=(8, 24)),
+            load_frame_metadata=mock.Mock(return_value=metadata),
+            disassemble_function=mock.Mock(return_value=instructions),
+            validate_metadata_disassembly=mock.Mock(),
+            build_frame_summary=mock.Mock(return_value=summary),
+        )
+        counts = [
+            ({1012: 5, 1016: 7, 9999: 50}, 1000),
+            ({7012: 11, 7016: 13, 9999: 50}, 7000),
+        ]
+        rankings = [
+            {"total_samples": 100, "top_functions": [{"local_func": 10, "samples": 12}]},
+            {"total_samples": 100, "top_functions": [{"local_func": 10, "samples": 24}]},
+        ]
+        cache = ROOT / ".cache"
+        cache.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as temp:
+            root = Path(temp)
+            path = root / "wamr-frame.mod0.func10.json"
+            path.write_text("{}")
+            frame = profile.analyze_wamr_frame_provenance(
+                aot=aot,
+                cwasm_info=SimpleNamespace(
+                    data=b"\0" * 36, text_file_offset=4, text_size=32, version=11
+                ),
+                metadata_path=path,
+                local_func=10,
+                capture_counts=counts,
+                ranking_reports=rankings,
+                total_samples=200,
+                spill_metric={"spill_ld": 3, "spill_st": 0},
+                scratch_dir=root,
+            )
+        aot.build_frame_summary.assert_called_once_with(
+            instructions, Counter({12: 16, 16: 20}), metadata
+        )
+        self.assertEqual([[4, 5], [8, 7]], frame["captures"][0]["samples_by_offset"])
+        self.assertEqual(36, frame["function_samples"])
+        self.assertEqual(3, frame["summary"]["reconciliation"]["emitted_allocator_loads"])
+        self.assertEqual(18.0, frame["summary"]["origins"]["allocator_spill"]["percent_of_run"])
+        frame.update(
+            wasm_function_index=22, compiler_sha256="c" * 64, cwasm_sha256="d" * 64
+        )
+        report = {
+            "wasm": {"local_function_count": 73, "imported_function_count": 12},
+            "wamr": {"compiler_sha256": "c" * 64, "cwasm_sha256": "d" * 64},
+            "wamr_captures": [
+                {"total_samples": 100, "attributed_samples": 99},
+                {"total_samples": 100, "attributed_samples": 99},
+            ],
+            "engines": {
+                "wamr": {
+                    "total_samples": 200,
+                    "top_functions": [{"local_func": 10, "samples": 36}],
+                }
+            },
+        }
+        profile.validate_frame_provenance(frame, report)
+        for case in (
+            "duplicate-ip", "negative-samples", "wrong-capture", "wrong-artifact",
+            "double-pair", "double-static", "false-coverage",
+        ):
+            with self.subTest(case=case):
+                bad = copy.deepcopy(frame)
+                if case == "duplicate-ip":
+                    bad["captures"][0]["samples_by_offset"].append([8, 7])
+                elif case == "negative-samples":
+                    bad["captures"][0]["samples_by_offset"][0][1] = -5
+                elif case == "wrong-capture":
+                    bad["captures"][0]["total_samples"] = 101
+                elif case == "wrong-artifact":
+                    bad["cwasm_sha256"] = "e" * 64
+                elif case == "double-pair":
+                    bad["summary"]["allocator_contributors"][-1]["samples"] = 40
+                elif case == "double-static":
+                    bad["summary"]["allocator_contributors"][0]["static_loads"] = 2
+                else:
+                    bad["summary"]["coverage"]["unknown_frame_samples"] = 1
+                with self.assertRaises(profile.ProfileError):
+                    profile.validate_frame_provenance(bad, report)
+
     def test_analysis_sources_include_loaded_comparison_dependencies(self):
         aot = profile.load_aot_helper(ROOT)
         sources = {
