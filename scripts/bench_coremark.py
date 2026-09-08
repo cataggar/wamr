@@ -29,10 +29,11 @@ import tarfile
 import time
 import urllib.request
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import bench_simd
 from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
 
 ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
@@ -53,6 +54,12 @@ DEFAULT_FIXTURE_SHA256 = "f4b7591296ead10264e0f101f355bdf848865c31329325594e66fb
 PINNED_WASMTIME_VERSION = "44.0.1"
 REPORT_SCHEMA_VERSION = 2
 REPORT_KIND = "coremark-authoritative-comparison"
+HANDOFF_SCHEMA_VERSION = 2
+SIMD_ACCEPTANCE_SCHEMA_VERSION = 1
+DEFAULT_SIMD_WARMUPS = 1
+DEFAULT_SIMD_RUNS = 5
+DEFAULT_SIMD_ITERATIONS = 10_000
+DEFAULT_MAX_SIMD_REGRESSION_PCT = 2.0
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "ci": (0, 3),
@@ -206,8 +213,9 @@ def make_wamr_identity(
     runtime_path: Path,
     compiler_path: Path,
     module_path: Path,
+    simd_runner_path: Path | None = None,
 ) -> dict:
-    return {
+    identity = {
         "type": "wamr",
         "source": {
             "ref": ref,
@@ -230,6 +238,13 @@ def make_wamr_identity(
             "sha256": sha256_file(module_path),
         },
     }
+    if simd_runner_path is not None:
+        identity["simd_runner"] = {
+            "name": "simd-bench-runner",
+            "path": str(simd_runner_path),
+            "sha256": sha256_file(simd_runner_path),
+        }
+    return identity
 
 
 def make_wasmtime_identity(
@@ -251,17 +266,27 @@ def make_wasmtime_identity(
 
 
 def retain_wamr_artifact_handoff(
-    prepared: PreparedEngine, artifact_dir: Path
+    prepared: PreparedEngine,
+    artifact_dir: Path,
+    *,
+    role: str = "wamr-target",
 ) -> dict:
-    identity = _validate_engine_identity(prepared.identity, "WAMR target")
+    if role not in ("wamr-baseline", "wamr-target"):
+        raise RuntimeError(f"unsupported WAMR artifact role: {role}")
+    identity = _validate_engine_identity(prepared.identity, role)
     if identity["type"] != "wamr":
-        raise RuntimeError("only WAMR target artifacts can be retained")
-    artifact_dir = artifact_dir.resolve()
+        raise RuntimeError("only WAMR artifacts can be retained")
+    if "simd_runner" not in identity:
+        raise RuntimeError("WAMR artifact retention requires simd-bench-runner")
+    artifact_dir = artifact_dir.expanduser().resolve()
+    if artifact_dir.exists():
+        raise FileExistsError(f"{role} artifact handoff directory already exists")
     artifact_dir.mkdir(parents=True)
     names = {
         "runtime": "wamr",
         "compiler": "wamrc",
         "module": "coremark.cwasm",
+        "simd_runner": "simd-bench-runner",
     }
     try:
         retained = {
@@ -269,6 +294,7 @@ def retain_wamr_artifact_handoff(
             "runtime": {**identity["runtime"]},
             "compiler": {**identity["compiler"]},
             "module": {**identity["module"]},
+            "simd_runner": {**identity["simd_runner"]},
         }
         for key, name in names.items():
             source = Path(identity[key]["path"])
@@ -279,8 +305,9 @@ def retain_wamr_artifact_handoff(
                 raise RuntimeError(f"retained WAMR {key} hash changed while copying")
             retained[key]["path"] = str(destination)
         manifest = {
-            "schema_version": 1,
+            "schema_version": HANDOFF_SCHEMA_VERSION,
             "kind": "coremark-wamr-artifact-handoff",
+            "role": role,
             "identity": retained,
         }
         (artifact_dir / "manifest.json").write_text(
@@ -294,9 +321,12 @@ def retain_wamr_artifact_handoff(
 
 
 def load_wamr_artifact_handoff(
-    artifact_dir: Path, expected_identity: dict
+    artifact_dir: Path,
+    expected_identity: dict,
+    *,
+    role: str = "wamr-target",
 ) -> dict[str, Path]:
-    artifact_dir = artifact_dir.resolve()
+    artifact_dir = artifact_dir.expanduser().resolve()
     manifest_path = artifact_dir / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -304,25 +334,38 @@ def load_wamr_artifact_handoff(
         raise RuntimeError(
             f"cannot read benchmark artifact handoff {manifest_path}: {exc}"
         ) from exc
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("schema_version") != 1
-        or manifest.get("kind") != "coremark-wamr-artifact-handoff"
-    ):
+    schema_version = manifest.get("schema_version")
+    if not isinstance(manifest, dict) or schema_version not in (
+        1,
+        HANDOFF_SCHEMA_VERSION,
+    ) or manifest.get("kind") != "coremark-wamr-artifact-handoff":
         raise RuntimeError("benchmark artifact handoff manifest is unsupported")
+    if schema_version == 1:
+        if role != "wamr-target":
+            raise RuntimeError(
+                "legacy benchmark artifact handoffs can only prove wamr-target"
+            )
+    elif manifest.get("role") != role:
+        raise RuntimeError(
+            f"benchmark artifact handoff role is {manifest.get('role')!r}, "
+            f"expected {role!r}"
+        )
     identity = _validate_engine_identity(
-        manifest.get("identity"), "retained WAMR target"
+        manifest.get("identity"), f"retained {role}"
     )
     if identity != expected_identity:
         raise RuntimeError(
-            "benchmark artifact handoff identity does not match the report target"
+            f"benchmark artifact handoff identity does not match report {role}"
         )
     paths = {}
-    for key, name in (
+    artifacts = [
         ("runtime", "wamr"),
         ("compiler", "wamrc"),
         ("module", "coremark.cwasm"),
-    ):
+    ]
+    if schema_version == HANDOFF_SCHEMA_VERSION:
+        artifacts.append(("simd_runner", "simd-bench-runner"))
+    for key, name in artifacts:
         path = artifact_dir / name
         if Path(identity[key]["path"]).resolve() != path:
             raise RuntimeError(f"benchmark artifact handoff has the wrong {key} path")
@@ -711,6 +754,7 @@ def prepare_wamr(
 
     wamrc = wt / "zig-out/bin/wamrc"
     wamr = wt / "zig-out/bin/wamr"
+    simd_runner = wt / "zig-out/bin/simd-bench-runner"
     cwasm = wt / ".bench-coremark.cwasm"
     print(f"[harness] AOT-compiling tracked fixture with WAMR {ref}", file=sys.stderr)
     run(
@@ -740,6 +784,7 @@ def prepare_wamr(
             runtime_path=wamr,
             compiler_path=wamrc,
             module_path=cwasm,
+            simd_runner_path=simd_runner,
         ),
     )
 
@@ -976,6 +1021,183 @@ def fmt_stats(values: list[float]) -> tuple[float, float, float, float]:
 
 def compute_delta_pct(baseline_vals: list[float], target_vals: list[float]) -> float:
     return (statistics.fmean(target_vals) / statistics.fmean(baseline_vals) - 1.0) * 100.0
+
+
+def compute_median_delta_pct(
+    baseline_vals: list[float], target_vals: list[float]
+) -> float:
+    return (
+        statistics.median(target_vals) / statistics.median(baseline_vals) - 1.0
+    ) * 100.0
+
+
+def run_paired_simd_acceptance(
+    *,
+    baseline_runner: Path,
+    target_runner: Path,
+    affinity: AffinityInfo,
+    warmups: int = DEFAULT_SIMD_WARMUPS,
+    runs: int = DEFAULT_SIMD_RUNS,
+    iterations: int = DEFAULT_SIMD_ITERATIONS,
+    max_regression_pct: float = DEFAULT_MAX_SIMD_REGRESSION_PCT,
+) -> dict:
+    if warmups < 0 or runs <= 0 or iterations <= 0:
+        raise ValueError("SIMD warmups/runs/iterations must be nonnegative/positive")
+    runners = {
+        "wamr-baseline": baseline_runner.resolve(),
+        "wamr-target": target_runner.resolve(),
+    }
+    for role, runner in runners.items():
+        if not runner.is_file():
+            raise RuntimeError(f"{role} SIMD runner is missing: {runner}")
+
+    schedule: list[dict] = []
+    measured: dict[str, list[bench_simd.Measurement]] = {
+        role: [] for role in runners
+    }
+    ordinals = {
+        phase: {role: 0 for role in runners}
+        for phase in ("warmup", "measured")
+    }
+    expected_shape: set[tuple[str, str]] | None = None
+    position = 0
+    for phase, count in (("warmup", warmups), ("measured", runs)):
+        for role in counterbalanced_order(list(runners), count):
+            position += 1
+            ordinals[phase][role] += 1
+            output = run(
+                apply_affinity(
+                    [str(runners[role]), "--iterations", str(iterations)],
+                    affinity,
+                ),
+                cwd=runners[role].parent,
+            )
+            rows = bench_simd.parse_runner_output(output, ordinals[phase][role])
+            shape = {(row.case, row.engine) for row in rows}
+            if expected_shape is None:
+                expected_shape = shape
+            elif shape != expected_shape:
+                raise RuntimeError("paired SIMD runners emitted different case/engine rows")
+            if any(row.iterations != iterations for row in rows):
+                raise RuntimeError("paired SIMD runner changed the requested work")
+            schedule.append(
+                {
+                    "schedule_position": position,
+                    "phase": phase,
+                    "role": role,
+                    "role_ordinal": ordinals[phase][role],
+                    "runner_sha256": sha256_file(runners[role]),
+                    "raw_output": output,
+                    "rows": [asdict(row) for row in rows],
+                }
+            )
+            if phase == "measured":
+                measured[role].extend(rows)
+
+    cases = sorted(
+        row.case for row in measured["wamr-baseline"] if row.engine == "aot"
+    )
+    if not cases or len(cases) != len(set(cases)) * runs:
+        raise RuntimeError("paired SIMD baseline did not emit one AOT row per case/run")
+    cases = sorted(set(cases))
+    summaries = []
+    correctness_passed = True
+    performance_passed = True
+    for case in cases:
+        selected = {}
+        for role in runners:
+            rows = [
+                row
+                for row in measured[role]
+                if row.case == case and row.engine == "aot"
+            ]
+            if len(rows) != runs:
+                raise RuntimeError(
+                    f"{role} emitted {len(rows)} measured AOT rows for {case}; "
+                    f"expected {runs}"
+                )
+            selected[role] = rows
+        baseline_rows = selected["wamr-baseline"]
+        target_rows = selected["wamr-target"]
+        case_correct = all(
+            row.status == "ok" and row.result is not None
+            for row in [*baseline_rows, *target_rows]
+        )
+        baseline_results = {row.result for row in baseline_rows}
+        target_results = {row.result for row in target_rows}
+        case_correct = (
+            case_correct
+            and len(baseline_results) == 1
+            and baseline_results == target_results
+        )
+        baseline_times = [
+            row.run_ns for row in baseline_rows if row.run_ns is not None
+        ]
+        target_times = [row.run_ns for row in target_rows if row.run_ns is not None]
+        case_measured = (
+            len(baseline_times) == runs
+            and len(target_times) == runs
+            and all(value > 0 for value in [*baseline_times, *target_times])
+        )
+        baseline_median = (
+            statistics.median(baseline_times) if case_measured else None
+        )
+        target_median = statistics.median(target_times) if case_measured else None
+        regression_pct = (
+            (target_median / baseline_median - 1.0) * 100.0
+            if baseline_median is not None
+            and target_median is not None
+            and baseline_median > 0
+            else None
+        )
+        case_performance = (
+            regression_pct is not None and regression_pct <= max_regression_pct
+        )
+        correctness_passed = correctness_passed and case_correct
+        performance_passed = performance_passed and case_performance
+        summaries.append(
+            {
+                "case": case,
+                "iterations": iterations,
+                "baseline_aot_run_ns": [row.run_ns for row in baseline_rows],
+                "target_aot_run_ns": [row.run_ns for row in target_rows],
+                "baseline_aot_median_ns": baseline_median,
+                "target_aot_median_ns": target_median,
+                "regression_pct": regression_pct,
+                "correct": case_correct,
+                "within_regression_budget": case_performance,
+            }
+        )
+
+    all_rows_correct = all(
+        row["status"] == "ok"
+        for sample in schedule
+        if sample["phase"] == "measured"
+        for row in sample["rows"]
+        if row["engine"] in ("interp", "aot")
+    )
+    correctness_passed = correctness_passed and all_rows_correct
+    passed = correctness_passed and performance_passed
+    return {
+        "schema_version": SIMD_ACCEPTANCE_SCHEMA_VERSION,
+        "kind": "coremark-paired-simd-acceptance",
+        "status": "passed" if passed else "failed",
+        "warmups_per_role": warmups,
+        "measured_runs_per_role": runs,
+        "iterations": iterations,
+        "max_aot_regression_pct": max_regression_pct,
+        "runners": {
+            role: {
+                "path": str(path),
+                "sha256": sha256_file(path),
+            }
+            for role, path in runners.items()
+        },
+        "schedule": schedule,
+        "cases": summaries,
+        "correctness_passed": correctness_passed,
+        "performance_passed": performance_passed,
+    }
 
 
 def compute_ratio_stats(
@@ -1240,6 +1462,8 @@ def build_json_report(
     provenance: dict,
     guest_args: tuple[str, ...] = COREMARK_GUEST_ARGS,
     expected_iterations: int = EXPECTED_ITERATIONS,
+    minimum_median_delta_pct: float | None = None,
+    simd_acceptance: dict | None = None,
 ) -> dict:
     engines = []
     for index, result in enumerate(results):
@@ -1316,7 +1540,28 @@ def build_json_report(
         "schedule": [asdict(record) for record in schedule_records],
         "engines": engines,
         "ratios": ratios,
+        "wamr_comparison": {
+            "baseline_role": "wamr-baseline",
+            "target_role": "wamr-target",
+            "mean_delta_pct": compute_delta_pct(
+                results[0].values, results[1].values
+            ),
+            "median_delta_pct": compute_median_delta_pct(
+                results[0].values, results[1].values
+            ),
+            "minimum_median_delta_pct": minimum_median_delta_pct,
+            "median_gate_passed": (
+                None
+                if minimum_median_delta_pct is None
+                else compute_median_delta_pct(
+                    results[0].values, results[1].values
+                )
+                >= minimum_median_delta_pct
+            ),
+        },
     }
+    if simd_acceptance is not None:
+        report["simd_acceptance"] = simd_acceptance
     if (
         profile == "authoritative"
         and (warmups, runs) == PROFILE_COUNTS["authoritative"]
@@ -1362,6 +1607,13 @@ def _validate_engine_identity(identity: object, role: str) -> dict:
             raise RuntimeError(f"{role} is missing its compiled module identity")
         _require_digest(compiler.get("sha256"), f"{role} compiler sha256", 64)
         _require_digest(module.get("sha256"), f"{role} module sha256", 64)
+        simd_runner = identity.get("simd_runner")
+        if simd_runner is not None:
+            if not isinstance(simd_runner, dict):
+                raise RuntimeError(f"{role} has an invalid SIMD runner identity")
+            _require_digest(
+                simd_runner.get("sha256"), f"{role} SIMD runner sha256", 64
+            )
         if identity.get("optimize") not in ("ReleaseFast", "ReleaseSafe"):
             raise RuntimeError(f"{role} has an unsupported WAMR optimize mode")
     elif identity_type == "wasmtime":
@@ -1370,6 +1622,135 @@ def _validate_engine_identity(identity: object, role: str) -> dict:
     else:
         raise RuntimeError(f"{role} has an unsupported engine identity type")
     return identity
+
+
+def validate_simd_acceptance(report: dict, engines: dict[str, dict]) -> None:
+    if (
+        report.get("schema_version") != SIMD_ACCEPTANCE_SCHEMA_VERSION
+        or report.get("kind") != "coremark-paired-simd-acceptance"
+    ):
+        raise RuntimeError("SIMD acceptance report schema is unsupported")
+    runs = report.get("measured_runs_per_role")
+    warmups = report.get("warmups_per_role")
+    iterations = report.get("iterations")
+    if not isinstance(warmups, int) or warmups < 0:
+        raise RuntimeError("SIMD acceptance warmup count is invalid")
+    if not isinstance(runs, int) or runs <= 0:
+        raise RuntimeError("SIMD acceptance measured run count is invalid")
+    if not isinstance(iterations, int) or iterations <= 0:
+        raise RuntimeError("SIMD acceptance iteration count is invalid")
+    runners = report.get("runners")
+    if not isinstance(runners, dict):
+        raise RuntimeError("SIMD acceptance runner identities are missing")
+    for role in ("wamr-baseline", "wamr-target"):
+        runner = runners.get(role)
+        expected = engines[role]["identity"].get("simd_runner")
+        if not isinstance(runner, dict) or not isinstance(expected, dict):
+            raise RuntimeError(f"SIMD acceptance lacks the exact {role} runner")
+        if runner.get("sha256") != expected.get("sha256"):
+            raise RuntimeError(f"SIMD acceptance {role} runner hash mismatch")
+    schedule = report.get("schedule")
+    if not isinstance(schedule, list) or len(schedule) != 2 * (warmups + runs):
+        raise RuntimeError("SIMD acceptance schedule is incomplete")
+    expected_roles = []
+    expected_phases = []
+    for phase, count in (("warmup", warmups), ("measured", runs)):
+        expected_roles.extend(
+            counterbalanced_order(["wamr-baseline", "wamr-target"], count)
+        )
+        expected_phases.extend([phase] * (count * 2))
+    measured_rows: dict[str, dict[str, list[dict]]] = {
+        role: {} for role in ("wamr-baseline", "wamr-target")
+    }
+    all_rows_correct = True
+    for position, (sample, expected_role, expected_phase) in enumerate(
+        zip(schedule, expected_roles, expected_phases), 1
+    ):
+        if (
+            not isinstance(sample, dict)
+            or sample.get("schedule_position") != position
+            or sample.get("role") != expected_role
+            or sample.get("phase") != expected_phase
+            or sample.get("runner_sha256")
+            != runners[expected_role]["sha256"]
+            or not isinstance(sample.get("raw_output"), str)
+            or not isinstance(sample.get("rows"), list)
+            or not sample["rows"]
+        ):
+            raise RuntimeError("SIMD acceptance schedule provenance is inconsistent")
+        for row in sample["rows"]:
+            if not isinstance(row, dict) or row.get("iterations") != iterations:
+                raise RuntimeError("SIMD acceptance row changed the requested work")
+            if (
+                expected_phase == "measured"
+                and row.get("engine") in ("interp", "aot")
+                and row.get("status") != "ok"
+            ):
+                all_rows_correct = False
+            if expected_phase == "measured" and row.get("engine") == "aot":
+                measured_rows[expected_role].setdefault(row.get("case"), []).append(row)
+    cases = report.get("cases")
+    maximum = report.get("max_aot_regression_pct")
+    if not isinstance(maximum, (int, float)):
+        raise RuntimeError("SIMD acceptance regression budget is invalid")
+    if not isinstance(cases, list) or not cases:
+        raise RuntimeError("SIMD acceptance has no cases")
+    case_names = {
+        case.get("case") for case in cases if isinstance(case, dict)
+    }
+    if (
+        None in case_names
+        or case_names != set(measured_rows["wamr-baseline"])
+        or case_names != set(measured_rows["wamr-target"])
+    ):
+        raise RuntimeError("SIMD acceptance case set disagrees with raw samples")
+    correctness = True
+    performance = True
+    for case in cases:
+        if not isinstance(case, dict) or not case.get("case"):
+            raise RuntimeError("SIMD acceptance contains an invalid case")
+        baseline = case.get("baseline_aot_run_ns")
+        target = case.get("target_aot_run_ns")
+        if (
+            not isinstance(baseline, list)
+            or not isinstance(target, list)
+            or len(baseline) != runs
+            or len(target) != runs
+        ):
+            raise RuntimeError("SIMD acceptance lost raw AOT samples")
+        if any(
+            not isinstance(value, int) or value <= 0 for value in [*baseline, *target]
+        ):
+            raise RuntimeError("SIMD acceptance contains invalid AOT samples")
+        name = case["case"]
+        raw_baseline = measured_rows["wamr-baseline"].get(name, [])
+        raw_target = measured_rows["wamr-target"].get(name, [])
+        if (
+            [row.get("run_ns") for row in raw_baseline] != baseline
+            or [row.get("run_ns") for row in raw_target] != target
+        ):
+            raise RuntimeError("SIMD acceptance summary disagrees with raw samples")
+        baseline_median = statistics.median(baseline)
+        target_median = statistics.median(target)
+        regression = (target_median / baseline_median - 1.0) * 100.0
+        if (
+            case.get("baseline_aot_median_ns") != baseline_median
+            or case.get("target_aot_median_ns") != target_median
+            or case.get("regression_pct") != regression
+        ):
+            raise RuntimeError("SIMD acceptance median calculation is inconsistent")
+        correctness = correctness and case.get("correct") is True
+        performance = performance and (
+            regression <= maximum
+            and case.get("within_regression_budget") is True
+        )
+    correctness = correctness and all_rows_correct
+    if (
+        report.get("correctness_passed") is not correctness
+        or report.get("performance_passed") is not performance
+        or report.get("status") != ("passed" if correctness and performance else "failed")
+    ):
+        raise RuntimeError("SIMD acceptance aggregate status is inconsistent")
 
 
 def validate_authoritative_benchmark_report(report: dict) -> None:
@@ -1465,6 +1846,33 @@ def validate_authoritative_benchmark_report(report: dict) -> None:
                 f"{role} produced {len(values) if isinstance(values, list) else 0} "
                 f"measured samples; expected {expected_runs}"
             )
+    engines_by_role = {
+        engine["role"]: engine for engine in engines if isinstance(engine, dict)
+    }
+    comparison = report.get("wamr_comparison")
+    if comparison is not None:
+        if not isinstance(comparison, dict):
+            raise RuntimeError("benchmark WAMR comparison is invalid")
+        baseline_values = engines_by_role["wamr-baseline"]["values"]
+        target_values = engines_by_role["wamr-target"]["values"]
+        if (
+            comparison.get("mean_delta_pct")
+            != compute_delta_pct(baseline_values, target_values)
+            or comparison.get("median_delta_pct")
+            != compute_median_delta_pct(baseline_values, target_values)
+        ):
+            raise RuntimeError("benchmark WAMR comparison disagrees with raw samples")
+        minimum = comparison.get("minimum_median_delta_pct")
+        expected_gate = (
+            None
+            if minimum is None
+            else comparison["median_delta_pct"] >= minimum
+        )
+        if comparison.get("median_gate_passed") is not expected_gate:
+            raise RuntimeError("benchmark WAMR median gate is inconsistent")
+    simd_acceptance = report.get("simd_acceptance")
+    if simd_acceptance is not None:
+        validate_simd_acceptance(simd_acceptance, engines_by_role)
 
 
 def _engine_with_role(report: dict, role: str) -> dict:
@@ -1517,6 +1925,7 @@ def validate_benchmark_profile_match(
     producer_source_sha: str,
     producer_script_sha: str,
     current_execution: dict,
+    benchmark_role: str = "wamr-target",
 ) -> dict:
     validate_authoritative_benchmark_report(report)
     if report["host"]["arch"] != expected_arch:
@@ -1545,22 +1954,25 @@ def validate_benchmark_profile_match(
     if report["affinity"] != expected_affinity:
         raise RuntimeError("benchmark CPU affinity does not match the profile")
 
-    target = _engine_with_role(report, "wamr-target")
-    target_identity = target["identity"]
-    expected_target = {
+    if benchmark_role not in ("wamr-baseline", "wamr-target"):
+        raise RuntimeError(f"unsupported benchmark role: {benchmark_role}")
+    selected = _engine_with_role(report, benchmark_role)
+    selected_identity = selected["identity"]
+    expected_selected = {
         ("source", "sha"): wamr_source_sha,
         ("runtime", "sha256"): wamr_runtime_sha,
         ("compiler", "sha256"): wamr_compiler_sha,
         ("module", "sha256"): wamr_module_sha,
     }
-    for path, expected in expected_target.items():
-        actual = target_identity[path[0]][path[1]]
+    for path, expected in expected_selected.items():
+        actual = selected_identity[path[0]][path[1]]
         if actual != expected:
             raise RuntimeError(
-                f"benchmark WAMR {path[0]} {path[1]} mismatch: "
+                f"benchmark WAMR {path[0]} {path[1]} mismatch for "
+                f"{benchmark_role}: "
                 f"expected {expected}, got {actual}"
             )
-    if target_identity.get("optimize") != wamr_optimize:
+    if selected_identity.get("optimize") != wamr_optimize:
         raise RuntimeError("benchmark WAMR optimize mode does not match the profile")
 
     wasmtime = _engine_with_role(report, "wasmtime-baseline")
@@ -1587,21 +1999,32 @@ def validate_benchmark_profile_match(
     validate_execution_match(benchmark_execution, current_execution)
 
     schedule = report.get("schedule")
-    expected_schedule_length = 2 * sum(PROFILE_COUNTS["authoritative"])
+    baseline = _engine_with_role(report, "wamr-baseline")
+    target = _engine_with_role(report, "wamr-target")
+    participants = [baseline, target, wasmtime]
+    if (
+        baseline.get("sample_schedule_positions")
+        == target.get("sample_schedule_positions")
+    ):
+        participants.remove(baseline)
+    expected_samples = sum(PROFILE_COUNTS["authoritative"])
+    expected_schedule_length = len(participants) * expected_samples
     if not isinstance(schedule, list) or len(schedule) != expected_schedule_length:
         raise RuntimeError("benchmark report lacks a complete paired schedule")
-    target_positions = target.get("sample_schedule_positions")
-    wasmtime_positions = wasmtime.get("sample_schedule_positions")
-    if (
-        not isinstance(target_positions, list)
-        or not isinstance(wasmtime_positions, list)
-        or len(target_positions) != sum(PROFILE_COUNTS["authoritative"])
-        or len(wasmtime_positions) != sum(PROFILE_COUNTS["authoritative"])
-        or set(target_positions) & set(wasmtime_positions)
-        or set(target_positions) | set(wasmtime_positions)
-        != set(range(1, expected_schedule_length + 1))
-    ):
-        raise RuntimeError("benchmark report lacks paired target/Wasmtime samples")
+    position_to_engine = {}
+    participant_roles = []
+    for engine in participants:
+        role = engine["role"]
+        participant_roles.append(role)
+        positions = engine.get("sample_schedule_positions")
+        if not isinstance(positions, list) or len(positions) != expected_samples:
+            raise RuntimeError(f"benchmark report lacks complete {role} samples")
+        for position in positions:
+            if position in position_to_engine:
+                raise RuntimeError("benchmark schedule assigns one sample twice")
+            position_to_engine[position] = role
+    if set(position_to_engine) != set(range(1, expected_schedule_length + 1)):
+        raise RuntimeError("benchmark report schedule positions are incomplete")
     for record in schedule:
         if (
             not isinstance(record, dict)
@@ -1615,22 +2038,16 @@ def validate_benchmark_profile_match(
         range(1, expected_schedule_length + 1)
     ):
         raise RuntimeError("benchmark report schedule positions are incomplete")
-    position_to_engine = {
-        position: "target" for position in target_positions
-    } | {
-        position: "wasmtime" for position in wasmtime_positions
-    }
     warmups, runs = PROFILE_COUNTS["authoritative"]
     expected_order = []
     for phase, count in (("warmup", warmups), ("measured", runs)):
         phase_records = [record for record in schedule if record["phase"] == phase]
-        if len(phase_records) != count * 2:
+        if len(phase_records) != count * len(participants):
             raise RuntimeError(f"benchmark report has the wrong {phase} schedule")
-        expected_order.extend(
-            counterbalanced_order(["target", "wasmtime"], count)
-        )
+        expected_order.extend(counterbalanced_order(participant_roles, count))
     if [record["phase"] for record in ordered_schedule] != (
-        ["warmup"] * (warmups * 2) + ["measured"] * (runs * 2)
+        ["warmup"] * (warmups * len(participants))
+        + ["measured"] * (runs * len(participants))
     ):
         raise RuntimeError("benchmark report phases are not ordered")
     actual_order = [
@@ -1638,15 +2055,19 @@ def validate_benchmark_profile_match(
         for record in ordered_schedule
     ]
     if actual_order != expected_order:
-        raise RuntimeError("benchmark report target/Wasmtime order is not counterbalanced")
-    return {
+        raise RuntimeError("benchmark report engine order is not counterbalanced")
+    identity = {
         "report_id": report["provenance"]["report_id"],
         "generated_at": report["provenance"]["generated_at"],
         "execution": benchmark_execution,
         "producer": report["provenance"]["producer"],
-        "target": target,
+        "selected_role": benchmark_role,
+        "selected_wamr": selected,
         "wasmtime_baseline": wasmtime,
     }
+    if benchmark_role == "wamr-target":
+        identity["target"] = selected
+    return identity
 
 
 def render_optimize_table(
@@ -1765,12 +2186,21 @@ def main() -> int:
         ),
     )
     p.add_argument(
+        "--retain-baseline-artifacts",
+        type=Path,
+        default=None,
+        help=(
+            "copy the exact measured baseline wamr/wamrc/cwasm/SIMD runner "
+            "plus a role-bound manifest for immediate profiling"
+        ),
+    )
+    p.add_argument(
         "--retain-target-artifacts",
         type=Path,
         default=None,
         help=(
-            "copy the exact measured target wamr/wamrc/cwasm plus a manifest "
-            "for an immediate profiling handoff"
+            "copy the exact measured target wamr/wamrc/cwasm/SIMD runner plus "
+            "a role-bound manifest for an immediate profiling handoff"
         ),
     )
     p.add_argument(
@@ -1815,6 +2245,25 @@ def main() -> int:
         default=None,
         help="fail if WAMR target mean is below WAMR baseline by more than this delta",
     )
+    p.add_argument(
+        "--min-median-delta-pct",
+        type=float,
+        default=None,
+        help="fail if WAMR target median improvement is below this percentage",
+    )
+    p.add_argument(
+        "--paired-simd-acceptance",
+        action="store_true",
+        help="measure both retained SIMD runners in a counterbalanced schedule",
+    )
+    p.add_argument("--simd-warmups", type=int, default=DEFAULT_SIMD_WARMUPS)
+    p.add_argument("--simd-runs", type=int, default=DEFAULT_SIMD_RUNS)
+    p.add_argument("--simd-iterations", type=int, default=DEFAULT_SIMD_ITERATIONS)
+    p.add_argument(
+        "--max-simd-regression-pct",
+        type=float,
+        default=DEFAULT_MAX_SIMD_REGRESSION_PCT,
+    )
     args = p.parse_args()
 
     try:
@@ -1828,14 +2277,36 @@ def main() -> int:
         p.error("Wasmtime comparisons require a single --optimize mode")
     if args.optimize == "both" and args.json_out:
         p.error("--json-out is not supported with --optimize both")
-    if args.retain_target_artifacts and not args.json_out:
-        p.error("--retain-target-artifacts requires --json-out")
-    if args.retain_target_artifacts and not (
+    retained_dirs = [
+        path
+        for path in (args.retain_baseline_artifacts, args.retain_target_artifacts)
+        if path is not None
+    ]
+    if retained_dirs and not args.json_out:
+        p.error("artifact retention requires --json-out")
+    if retained_dirs and not (
         args.wasmtime_baseline or args.wasmtime
     ):
-        p.error("--retain-target-artifacts requires a Wasmtime comparison")
-    if args.retain_target_artifacts and args.profile != "authoritative":
-        p.error("--retain-target-artifacts requires --profile authoritative")
+        p.error("artifact retention requires a Wasmtime comparison")
+    if retained_dirs and args.profile != "authoritative":
+        p.error("artifact retention requires --profile authoritative")
+    if (
+        len(retained_dirs) == 2
+        and retained_dirs[0].expanduser().resolve()
+        == retained_dirs[1].expanduser().resolve()
+    ):
+        p.error("baseline and target artifact handoffs require distinct directories")
+    if args.paired_simd_acceptance and (
+        args.retain_baseline_artifacts is None
+        or args.retain_target_artifacts is None
+    ):
+        p.error(
+            "--paired-simd-acceptance requires both baseline and target retention"
+        )
+    if args.paired_simd_acceptance and args.require_native_arch is None:
+        p.error("--paired-simd-acceptance requires --require-native-arch")
+    if args.simd_warmups < 0 or args.simd_runs <= 0 or args.simd_iterations <= 0:
+        p.error("SIMD warmups/runs/iterations must be nonnegative/positive")
 
     repo = args.repo.resolve()
     fixture, fixture_sha = resolve_fixture(repo, args.fixture)
@@ -1860,6 +2331,7 @@ def main() -> int:
         select_cpu_affinity() if args.profile == "authoritative" else None
     )
     report_results: list[EngineResult] | None = None
+    simd_acceptance: dict | None = None
 
     try:
         if args.optimize == "both":
@@ -2006,7 +2478,41 @@ def main() -> int:
                 target_identity = target_prepared.identity
                 if args.retain_target_artifacts:
                     target_identity = retain_wamr_artifact_handoff(
-                        target_prepared, args.retain_target_artifacts
+                        target_prepared,
+                        args.retain_target_artifacts,
+                        role="wamr-target",
+                    )
+                baseline_identity = baseline_prepared.identity
+                if args.retain_baseline_artifacts:
+                    baseline_retention_prepared = baseline_prepared
+                    if baseline_sha == target_sha:
+                        baseline_retention_prepared = replace(
+                            baseline_prepared,
+                            identity={
+                                **baseline_prepared.identity,
+                                "source": {
+                                    **baseline_prepared.identity["source"],
+                                    "ref": args.baseline,
+                                },
+                            },
+                        )
+                    baseline_identity = retain_wamr_artifact_handoff(
+                        baseline_retention_prepared,
+                        args.retain_baseline_artifacts,
+                        role="wamr-baseline",
+                    )
+                if args.paired_simd_acceptance:
+                    assert affinity is not None
+                    simd_acceptance = run_paired_simd_acceptance(
+                        baseline_runner=Path(
+                            baseline_identity["simd_runner"]["path"]
+                        ),
+                        target_runner=Path(target_identity["simd_runner"]["path"]),
+                        affinity=affinity,
+                        warmups=args.simd_warmups,
+                        runs=args.simd_runs,
+                        iterations=args.simd_iterations,
+                        max_regression_pct=args.max_simd_regression_pct,
                     )
                 target_result = EngineResult(
                     "WAMR",
@@ -2017,13 +2523,14 @@ def main() -> int:
                     target_identity,
                 )
                 if baseline_sha == target_sha:
-                    baseline_identity = {
-                        **target_identity,
-                        "source": {
-                            **target_identity["source"],
-                            "ref": args.baseline,
-                        },
-                    }
+                    if args.retain_baseline_artifacts is None:
+                        baseline_identity = {
+                            **target_identity,
+                            "source": {
+                                **target_identity["source"],
+                                "ref": args.baseline,
+                            },
+                        }
                     baseline_result = EngineResult(
                         "WAMR",
                         f"{args.baseline} ({baseline_sha})",
@@ -2045,7 +2552,7 @@ def main() -> int:
                         optimize,
                         baseline_measured.values,
                         baseline_measured.samples,
-                        baseline_prepared.identity,
+                        baseline_identity,
                     )
                 results = [baseline_result, target_result]
                 for path, label, version in wasmtime_specs:
@@ -2165,6 +2672,8 @@ def main() -> int:
             provenance=report_provenance,
             guest_args=guest_args,
             expected_iterations=expected_iterations,
+            minimum_median_delta_pct=args.min_median_delta_pct,
+            simd_acceptance=simd_acceptance,
         )
         args.json_out.write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n"
@@ -2186,6 +2695,22 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+    if args.min_median_delta_pct is not None and baseline_vals is not None:
+        delta_pct = compute_median_delta_pct(baseline_vals, target_vals)
+        if delta_pct < args.min_median_delta_pct:
+            print(
+                f"CoreMark AOT median gain: {delta_pct:.2f}% is below "
+                f"required minimum {args.min_median_delta_pct:.2f}%",
+                file=sys.stderr,
+            )
+            return 1
+    if simd_acceptance is not None and simd_acceptance["status"] != "passed":
+        print(
+            "SIMD paired acceptance failed correctness or the per-case "
+            f"{args.max_simd_regression_pct:.2f}% regression budget",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

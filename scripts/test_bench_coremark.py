@@ -67,12 +67,41 @@ class BenchCoremarkTests(unittest.TestCase):
         )
         affinity = bench_coremark.AffinityInfo((0, 1, 2, 3), 0, "/usr/bin/taskset")
         target_identity = wamr_identity("target", "b" * 40, "2" * 64)
+        records = []
+        samples = {"baseline": [], "target": [], "wasmtime": []}
+        position = 0
+        for phase, count in (("warmup", 2), ("measured", 10)):
+            ordinals = {"baseline": 0, "target": 0, "wasmtime": 0}
+            for key in bench_coremark.counterbalanced_order(
+                ["baseline", "target", "wasmtime"], count
+            ):
+                position += 1
+                ordinals[key] += 1
+                record = bench_coremark.SampleRecord(
+                    key,
+                    (
+                        "Wasmtime"
+                        if key == "wasmtime"
+                        else f"WAMR {key}"
+                    ),
+                    phase,
+                    ordinals[key],
+                    position,
+                    "2026-09-08T00:00:00+00:00",
+                    "2026-09-08T00:00:01+00:00",
+                    1.0,
+                    100.0,
+                    bench_coremark.EXPECTED_ITERATIONS,
+                )
+                records.append(record)
+                samples[key].append(record)
         results = [
             bench_coremark.EngineResult(
                 "WAMR",
                 "baseline",
                 "ReleaseFast",
                 [100.0] * 10,
+                samples=samples["baseline"],
                 identity=wamr_identity("baseline", "a" * 40, "1" * 64),
             ),
             bench_coremark.EngineResult(
@@ -80,6 +109,7 @@ class BenchCoremarkTests(unittest.TestCase):
                 "target",
                 "ReleaseFast",
                 [110.0] * 10,
+                samples=samples["target"],
                 identity=target_identity,
             ),
             bench_coremark.EngineResult(
@@ -87,32 +117,10 @@ class BenchCoremarkTests(unittest.TestCase):
                 "44.0.1",
                 "default JIT",
                 [220.0] * 10,
+                samples=samples["wasmtime"],
                 identity=wasmtime_identity("3" * 64),
             ),
         ]
-        records = []
-        position = 0
-        for phase, count in (("warmup", 2), ("measured", 10)):
-            ordinals = {"target": 0, "wasmtime": 0}
-            for key in bench_coremark.counterbalanced_order(
-                ["target", "wasmtime"], count
-            ):
-                position += 1
-                ordinals[key] += 1
-                records.append(
-                    bench_coremark.SampleRecord(
-                        key,
-                        "WAMR target" if key == "target" else "Wasmtime",
-                        phase,
-                        ordinals[key],
-                        position,
-                        "2026-09-08T00:00:00+00:00",
-                        "2026-09-08T00:00:01+00:00",
-                        1.0,
-                        100.0,
-                        bench_coremark.EXPECTED_ITERATIONS,
-                    )
-                )
         report = bench_coremark.build_json_report(
             results,
             profile="authoritative",
@@ -125,19 +133,6 @@ class BenchCoremarkTests(unittest.TestCase):
             affinity=affinity,
             provenance=report_provenance(),
         )
-        for engine in report["engines"]:
-            if engine["role"] == "wamr-target":
-                engine["sample_schedule_positions"] = [
-                    record.schedule_position
-                    for record in records
-                    if record.engine_key == "target"
-                ]
-            elif engine["role"] == "wasmtime-baseline":
-                engine["sample_schedule_positions"] = [
-                    record.schedule_position
-                    for record in records
-                    if record.engine_key == "wasmtime"
-                ]
         return report, host, affinity, target_identity
 
     def test_tracked_fixture_checksum_is_pinned(self):
@@ -487,6 +482,104 @@ class BenchCoremarkTests(unittest.TestCase):
             report["provenance"]["report_id"], linkage["report_id"]
         )
         self.assertEqual("b" * 40, linkage["target"]["identity"]["source"]["sha"])
+        baseline = next(
+            engine
+            for engine in report["engines"]
+            if engine["role"] == "wamr-baseline"
+        )
+        baseline_linkage = bench_coremark.validate_benchmark_profile_match(
+            report,
+            expected_arch="aarch64",
+            fixture_sha="f" * 64,
+            host=host,
+            affinity=affinity,
+            wamr_source_sha="a" * 40,
+            wamr_optimize="ReleaseFast",
+            wamr_runtime_sha=baseline["identity"]["runtime"]["sha256"],
+            wamr_compiler_sha=baseline["identity"]["compiler"]["sha256"],
+            wamr_module_sha=baseline["identity"]["module"]["sha256"],
+            wasmtime_version_value=bench_coremark.PINNED_WASMTIME_VERSION,
+            wasmtime_runtime_sha="3" * 64,
+            producer_source_sha="c" * 40,
+            producer_script_sha="d" * 64,
+            current_execution={"provider": "local", "run_id": "test-run"},
+            benchmark_role="wamr-baseline",
+        )
+        self.assertEqual("wamr-baseline", baseline_linkage["selected_role"])
+        self.assertNotIn("target", baseline_linkage)
+
+    def test_paired_simd_uses_counterbalanced_raw_aot_medians(self):
+        root = REPO / ".cache/test-coremark-paired-simd"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+        baseline = root / "baseline-runner"
+        target = root / "target-runner"
+        baseline.write_bytes(b"baseline")
+        target.write_bytes(b"target")
+        calls = {"baseline": 0, "target": 0}
+
+        def runner_output(command, **_kwargs):
+            role = "target" if str(target) in command else "baseline"
+            calls[role] += 1
+            run_ns = 101 if role == "target" else 100
+            return (
+                "bench\tadd\tinterp\tok\t7\t-\t90\t10000\t-\n"
+                f"bench\tadd\taot\tok\t7\t10\t{run_ns}\t10000\t20\n"
+                "bench\tmul\tinterp\tok\t9\t-\t190\t10000\t-\n"
+                f"bench\tmul\taot\tok\t9\t10\t{run_ns * 2}\t10000\t20\n"
+            )
+
+        try:
+            with mock.patch.object(
+                bench_coremark, "run", side_effect=runner_output
+            ):
+                report = bench_coremark.run_paired_simd_acceptance(
+                    baseline_runner=baseline,
+                    target_runner=target,
+                    affinity=bench_coremark.AffinityInfo((0,), 0, "taskset"),
+                    warmups=1,
+                    runs=2,
+                    iterations=10_000,
+                    max_regression_pct=2.0,
+                )
+            self.assertEqual("passed", report["status"])
+            self.assertEqual(6, len(report["schedule"]))
+            self.assertEqual(
+                [
+                    "wamr-baseline",
+                    "wamr-target",
+                    "wamr-baseline",
+                    "wamr-target",
+                    "wamr-target",
+                    "wamr-baseline",
+                ],
+                [sample["role"] for sample in report["schedule"]],
+            )
+            self.assertEqual(3, calls["baseline"])
+            self.assertEqual(3, calls["target"])
+            self.assertEqual(
+                [100, 100],
+                report["cases"][0]["baseline_aot_run_ns"],
+            )
+            self.assertAlmostEqual(1.0, report["cases"][0]["regression_pct"])
+            self.assertIn("bench\tadd\taot", report["schedule"][0]["raw_output"])
+            engines = {
+                role: {
+                    "identity": {
+                        "simd_runner": {
+                            "sha256": report["runners"][role]["sha256"]
+                        }
+                    }
+                }
+                for role in ("wamr-baseline", "wamr-target")
+            }
+            bench_coremark.validate_simd_acceptance(report, engines)
+            corrupted = copy.deepcopy(report)
+            corrupted["cases"][0]["target_aot_run_ns"][0] += 1
+            with self.assertRaisesRegex(RuntimeError, "raw samples"):
+                bench_coremark.validate_simd_acceptance(corrupted, engines)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_benchmark_profile_mismatches_fail_closed(self):
         report, host, affinity, target_identity = self.authoritative_report()
@@ -638,13 +731,16 @@ class BenchCoremarkTests(unittest.TestCase):
         root = REPO / ".cache/test-coremark-artifact-handoff"
         source = root / "temporary-benchmark-worktree/zig-out/bin"
         artifact_dir = root / "profile-artifacts"
+        baseline_artifact_dir = root / "baseline-profile-artifacts"
         shutil.rmtree(root, ignore_errors=True)
         source.mkdir(parents=True)
         wamr = source / "wamr"
         wamrc = source / "wamrc"
+        simd_runner = source / "simd-bench-runner"
         cwasm = source.parent.parent / ".bench-coremark.cwasm"
         wamr.write_bytes(b"wamr-with-build-path-a")
         wamrc.write_bytes(b"wamrc-with-build-path-a")
+        simd_runner.write_bytes(b"simd-runner-with-build-path-a")
         cwasm.write_bytes(b"exact-cwasm")
         prepared = bench_coremark.PreparedEngine(
             "target",
@@ -662,18 +758,23 @@ class BenchCoremarkTests(unittest.TestCase):
                 runtime_path=wamr,
                 compiler_path=wamrc,
                 module_path=cwasm,
+                simd_runner_path=simd_runner,
             ),
         )
         try:
             retained = bench_coremark.retain_wamr_artifact_handoff(
-                prepared, artifact_dir
+                prepared, artifact_dir, role="wamr-target"
+            )
+            self.assertEqual(
+                "wamr-target",
+                json.loads((artifact_dir / "manifest.json").read_text())["role"],
             )
             manifest = (artifact_dir / "manifest.json").read_bytes()
             for existing_dir in (artifact_dir, root):
                 with self.subTest(existing_dir=existing_dir):
                     with self.assertRaises(FileExistsError):
                         bench_coremark.retain_wamr_artifact_handoff(
-                            prepared, existing_dir
+                            prepared, existing_dir, role="wamr-target"
                         )
                     self.assertEqual(
                         manifest, (artifact_dir / "manifest.json").read_bytes()
@@ -681,15 +782,98 @@ class BenchCoremarkTests(unittest.TestCase):
                     self.assertEqual(b"wamr-with-build-path-a", wamr.read_bytes())
             shutil.rmtree(root / "temporary-benchmark-worktree")
             loaded = bench_coremark.load_wamr_artifact_handoff(
-                artifact_dir, retained
+                artifact_dir, retained, role="wamr-target"
             )
             self.assertEqual(b"wamr-with-build-path-a", loaded["runtime"].read_bytes())
+            self.assertEqual(
+                b"simd-runner-with-build-path-a",
+                loaded["simd_runner"].read_bytes(),
+            )
             self.assertNotEqual(wamr.parent, loaded["runtime"].parent)
+            baseline_prepared = bench_coremark.PreparedEngine(
+                **{
+                    **prepared.__dict__,
+                    "identity": {
+                        **retained,
+                        "source": {
+                            **retained["source"],
+                            "ref": "baseline",
+                        },
+                    },
+                }
+            )
+            baseline_retained = bench_coremark.retain_wamr_artifact_handoff(
+                baseline_prepared,
+                baseline_artifact_dir,
+                role="wamr-baseline",
+            )
+            baseline_loaded = bench_coremark.load_wamr_artifact_handoff(
+                baseline_artifact_dir,
+                baseline_retained,
+                role="wamr-baseline",
+            )
+            self.assertEqual(
+                b"simd-runner-with-build-path-a",
+                baseline_loaded["simd_runner"].read_bytes(),
+            )
+            baseline_loaded["simd_runner"].write_bytes(b"tampered")
+            with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                bench_coremark.load_wamr_artifact_handoff(
+                    baseline_artifact_dir,
+                    baseline_retained,
+                    role="wamr-baseline",
+                )
+
+            legacy_dir = root / "legacy-target-artifacts"
+            legacy_dir.mkdir()
+            legacy_identity = {
+                key: value
+                for key, value in retained.items()
+                if key != "simd_runner"
+            }
+            for key, name in (
+                ("runtime", "wamr"),
+                ("compiler", "wamrc"),
+                ("module", "coremark.cwasm"),
+            ):
+                source_path = Path(legacy_identity[key]["path"])
+                destination = legacy_dir / name
+                shutil.copy2(source_path, destination)
+                legacy_identity[key] = {
+                    **legacy_identity[key],
+                    "path": str(destination),
+                }
+            (legacy_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": "coremark-wamr-artifact-handoff",
+                        "identity": legacy_identity,
+                    }
+                )
+            )
+            legacy_loaded = bench_coremark.load_wamr_artifact_handoff(
+                legacy_dir, legacy_identity
+            )
+            self.assertNotIn("simd_runner", legacy_loaded)
+            with self.assertRaisesRegex(RuntimeError, "legacy"):
+                bench_coremark.load_wamr_artifact_handoff(
+                    legacy_dir,
+                    legacy_identity,
+                    role="wamr-baseline",
+                )
 
             loaded["runtime"].write_bytes(b"tampered")
             with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
                 bench_coremark.load_wamr_artifact_handoff(
                     artifact_dir, retained
+                )
+            manifest = json.loads((artifact_dir / "manifest.json").read_text())
+            manifest["role"] = "wamr-baseline"
+            (artifact_dir / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(RuntimeError, "role"):
+                bench_coremark.load_wamr_artifact_handoff(
+                    artifact_dir, retained, role="wamr-target"
                 )
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -757,9 +941,11 @@ class BenchCoremarkTests(unittest.TestCase):
         build_dir.mkdir()
         wamr = build_dir / "wamr"
         wamrc = build_dir / "wamrc"
+        simd_runner = build_dir / "simd-bench-runner"
         cwasm = build_dir / "coremark.cwasm"
         wamr.write_bytes(b"wamr-benchmark-build")
         wamrc.write_bytes(b"wamrc-benchmark-build")
+        simd_runner.write_bytes(b"simd-runner-benchmark-build")
         cwasm.write_bytes(b"coremark-benchmark-module")
         host = bench_coremark.HostIdentity(
             "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
@@ -772,6 +958,7 @@ class BenchCoremarkTests(unittest.TestCase):
             runtime_path=wamr,
             compiler_path=wamrc,
             module_path=cwasm,
+            simd_runner_path=simd_runner,
         )
         target = bench_coremark.PreparedEngine(
             "wamr-target",
@@ -981,6 +1168,7 @@ class BenchCoremarkTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("- profile", workflow)
+        self.assertIn("- acceptance", workflow)
         self.assertNotIn("19d046a5b23b9c39acf5f7062976f04c5ca8ca75", workflow)
         self.assertIn('profile_sha="$(git rev-parse "$profile_ref")"', workflow)
         dispatch = workflow.split(
@@ -1045,6 +1233,45 @@ class BenchCoremarkTests(unittest.TestCase):
         )
         self.assertIn("--min-samples 1000", profile_step)
 
+        acceptance_benchmark = workflow.split(
+            "- name: Run paired native acceptance benchmark", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn('--baseline "$BASELINE"', acceptance_benchmark)
+        self.assertIn('--target   "$TARGET"', acceptance_benchmark)
+        self.assertIn("--retain-baseline-artifacts", acceptance_benchmark)
+        self.assertIn("--retain-target-artifacts", acceptance_benchmark)
+        self.assertIn("--min-median-delta-pct 2.0", acceptance_benchmark)
+        self.assertIn("--paired-simd-acceptance", acceptance_benchmark)
+        self.assertIn("--simd-runs 5", acceptance_benchmark)
+        self.assertIn("--max-simd-regression-pct 2.0", acceptance_benchmark)
+        self.assertNotIn("--min-delta-pct", acceptance_benchmark)
+        correctness = workflow.split(
+            "- name: Run candidate correctness suite", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn('test "$target_sha" = "$head_sha"', correctness)
+        self.assertIn(
+            "zig build -j4 test -Doptimize=ReleaseFast --summary all",
+            correctness,
+        )
+        self.assertIn("correctness.json", correctness)
+
+        baseline_profile = workflow.split(
+            "- name: Capture baseline frame profile", 1
+        )[1].split("\n      - name:", 1)[0]
+        target_profile = workflow.split(
+            "- name: Capture target frame profile", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn("--benchmark-role wamr-baseline", baseline_profile)
+        self.assertIn("--benchmark-role wamr-target", target_profile)
+        self.assertIn("--frame-func 10", baseline_profile)
+        self.assertIn("--frame-func 10", target_profile)
+        paired_gate = workflow.split(
+            "- name: Enforce paired native acceptance", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn("--acceptance-baseline-profile", paired_gate)
+        self.assertIn("--acceptance-target-profile", paired_gate)
+        self.assertIn("--acceptance-correctness-report", paired_gate)
+
         profile_script = PROFILE_SCRIPT.read_text()
         self.assertIn("--profile=jitdump", profile_script)
         self.assertIn("WAMR_AOT_SPILL_METRIC", profile_script)
@@ -1056,6 +1283,7 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("coremark_guest_args(", profile_script)
         self.assertIn("PROFILE_CAPTURES_PER_ENGINE = 2", profile_script)
         self.assertIn("MIN_ATTRIBUTION_COVERAGE_PCT = 99.0", profile_script)
+        self.assertIn("--benchmark-role", profile_script)
         self.assertIn('"--authoritative"', profile_script)
         self.assertIn('"--min-attribution-pct"', profile_script)
         self.assertIn("all_alu", profile_script)
