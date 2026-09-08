@@ -66,7 +66,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 2 },
+        "measurement_plan_version": { "const": 3 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "checksum_preparation": {
           "type": "object",
@@ -437,7 +437,7 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 1 },
+            "version": { "const": 2 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
@@ -450,7 +450,7 @@
               "const": "fastest-valid-pilot-across-all-revisions-and-conditions"
             },
             "formula": {
-              "const": "max(pilot_iterations, ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator))), then decimal significant-digits ceiling"
+              "const": "ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator)), then upward decimal rounding to 3 significant digits"
             },
             "safety_factor": {
               "type": "object",

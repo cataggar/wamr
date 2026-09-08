@@ -50,10 +50,15 @@ REPORT_SCHEMA_VERSION = 4
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 2
+MEASUREMENT_PLAN_IDENTITY_VERSION = 3
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 1
+SIZING_ALGORITHM_VERSION = 2
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
+SIZING_FORMULA = (
+    "ceil(pilot_iterations * target_duration_ns * safety_numerator / "
+    "(pilot_elapsed_ns * safety_denominator)), then upward decimal rounding "
+    "to 3 significant digits"
+)
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "smoke": (1, 4),
@@ -442,11 +447,7 @@ def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
         "version": SIZING_ALGORITHM_VERSION,
         "kind": SIZING_ALGORITHM_KIND,
         "selection_rate": "fastest-valid-pilot-across-all-revisions-and-conditions",
-        "formula": (
-            "max(pilot_iterations, ceil(pilot_iterations * target_duration_ns "
-            "* safety_numerator / (pilot_elapsed_ns * safety_denominator))), "
-            "then decimal significant-digits ceiling"
-        ),
+        "formula": SIZING_FORMULA,
         "target_duration_ns": SIZING_TARGET_NS,
         "safety_factor": {
             "numerator": SIZING_SAFETY_NUMERATOR,
@@ -726,11 +727,7 @@ def resolve_one_shot_sizing(
             fastest["iterations"],
             fastest["guest_elapsed_ns"],
         )
-        selected = max(
-            fastest["iterations"],
-            baseline_rounded,
-            fastest_rounded,
-        )
+        selected = fastest_rounded
         cap = effective_sizing_cap(workload, threads)
         if selected > cap:
             raise HarnessError(
