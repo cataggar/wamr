@@ -576,8 +576,7 @@ def _target_index(
     if target is None:
         return None
     by_address = {instruction.address: index for index, instruction in enumerate(instructions)}
-    by_offset = {instruction.offset: index for index, instruction in enumerate(instructions)}
-    return by_address.get(target, by_offset.get(target))
+    return by_address.get(target)
 
 
 def build_cfg(

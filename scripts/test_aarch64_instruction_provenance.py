@@ -476,6 +476,38 @@ class AArch64InstructionProvenanceTests(unittest.TestCase):
                 self.assertEqual(0, category(result, "structural_address_guard"))
                 self.assertEqual(0, result["cfg"]["structural_address_guard_branches"])
 
+    def test_absolute_external_target_cannot_alias_a_relative_trap_offset(self):
+        lines = [
+            "cmp x9, x10",
+            "b.hs 0x14",
+            "ldr w0, [x1, x9]",
+            "ret",
+            "nop",
+            "brk #0",
+        ]
+        instructions = []
+        for index, text in enumerate(lines):
+            mnemonic, operands = provenance.split_instruction_text(text)
+            instructions.append(
+                provenance.Instruction(
+                    offset=index * 4,
+                    size=4,
+                    mnemonic=mnemonic,
+                    operands=operands,
+                    text=text,
+                    address=0x1000 + index * 4,
+                )
+            )
+        result = provenance.analyze_instruction_stream(
+            instructions,
+            broad_classes=["alu", "other", "other", "other", "other", "other"],
+            samples_by_offset={0: 31},
+            total_run_samples=100,
+        )
+        self.assertEqual(0, category(result, "structural_address_guard"))
+        self.assertEqual(31, category(result, "unknown"))
+        self.assertEqual(0x14, result["cfg"]["external_branch_targets"][0]["target"])
+
     def test_sample_counts_must_fit_the_global_mapping(self):
         instructions = [
             instruction(0, "add x9, x1, #4"),
