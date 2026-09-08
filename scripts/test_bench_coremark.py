@@ -620,6 +620,20 @@ class BenchCoremarkTests(unittest.TestCase):
             bench_coremark.capture_execution_identity("shared-run"),
         )
 
+    @mock.patch.dict(bench_coremark.os.environ, {}, clear=True)
+    def test_standalone_json_provenance_generates_local_execution_id(self):
+        with mock.patch.object(
+            bench_coremark, "resolve_ref_sha", return_value="b" * 40
+        ):
+            provenance = bench_coremark.capture_report_provenance(REPO)
+        execution = provenance["execution"]
+        self.assertEqual("local", execution["provider"])
+        self.assertTrue(execution["run_id"])
+        with self.assertRaisesRegex(RuntimeError, "nonempty local execution IDs"):
+            bench_coremark.validate_execution_match(
+                execution, {"provider": "local", "run_id": ""}
+            )
+
     def test_target_artifact_handoff_survives_distinct_build_path(self):
         root = REPO / ".cache/test-coremark-artifact-handoff"
         source = root / "temporary-benchmark-worktree/zig-out/bin"
@@ -654,6 +668,17 @@ class BenchCoremarkTests(unittest.TestCase):
             retained = bench_coremark.retain_wamr_artifact_handoff(
                 prepared, artifact_dir
             )
+            manifest = (artifact_dir / "manifest.json").read_bytes()
+            for existing_dir in (artifact_dir, root):
+                with self.subTest(existing_dir=existing_dir):
+                    with self.assertRaises(FileExistsError):
+                        bench_coremark.retain_wamr_artifact_handoff(
+                            prepared, existing_dir
+                        )
+                    self.assertEqual(
+                        manifest, (artifact_dir / "manifest.json").read_bytes()
+                    )
+                    self.assertEqual(b"wamr-with-build-path-a", wamr.read_bytes())
             shutil.rmtree(root / "temporary-benchmark-worktree")
             loaded = bench_coremark.load_wamr_artifact_handoff(
                 artifact_dir, retained
@@ -719,6 +744,7 @@ class BenchCoremarkTests(unittest.TestCase):
         ):
             self.assertEqual(0, bench_coremark.main())
 
+    @mock.patch.dict(bench_coremark.os.environ, {}, clear=True)
     def test_main_authoritative_json_cli_path_wires_provenance(self):
         root = REPO / ".cache/test-coremark-main-json"
         report_path = root / "report.json"

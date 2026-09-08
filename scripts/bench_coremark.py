@@ -257,7 +257,6 @@ def retain_wamr_artifact_handoff(
     if identity["type"] != "wamr":
         raise RuntimeError("only WAMR target artifacts can be retained")
     artifact_dir = artifact_dir.resolve()
-    shutil.rmtree(artifact_dir, ignore_errors=True)
     artifact_dir.mkdir(parents=True)
     names = {
         "runtime": "wamr",
@@ -289,8 +288,8 @@ def retain_wamr_artifact_handoff(
             encoding="utf-8",
         )
         return retained
-    except Exception:
-        shutil.rmtree(artifact_dir, ignore_errors=True)
+    except (OSError, RuntimeError):
+        shutil.rmtree(artifact_dir)
         raise
 
 
@@ -503,6 +502,12 @@ def capture_report_provenance(
         resolve_ref_sha(repo, "HEAD"), "benchmark tooling source SHA", 40
     )
     script = Path(__file__).resolve()
+    if (
+        local_run_id is None
+        and "COREMARK_RUN_ID" not in os.environ
+        and not os.environ.get("GITHUB_RUN_ID")
+    ):
+        local_run_id = str(uuid.uuid4())
     execution = capture_execution_identity(local_run_id)
     return {
         "report_id": str(uuid.uuid4()),
@@ -1755,8 +1760,8 @@ def main() -> int:
         "--execution-id",
         default=None,
         help=(
-            "required shared local benchmark/profile execution identity when "
-            "writing JSON outside GitHub Actions"
+            "shared local benchmark/profile execution identity; standalone "
+            "JSON benchmarks generate an ID when omitted"
         ),
     )
     p.add_argument(

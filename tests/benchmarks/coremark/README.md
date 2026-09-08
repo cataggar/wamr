@@ -112,6 +112,7 @@ build-path identity, the benchmark explicitly copies the exact measured
 The profiler validates its manifest and reuses those bytes; normal benchmark
 runs retain no build artifacts, and the handoff directory is not uploaded.
 The retained profile report records the ephemeral handoff manifest SHA-256.
+The handoff directory must not already exist; existing files are never replaced.
 
 Invoke a pinned current profile with:
 
@@ -141,7 +142,7 @@ For a local native AArch64 host, create and consume the identity explicitly:
 ```
 sha="$(git rev-parse HEAD)"
 execution_id="coremark-${sha}-$(date -u +%Y%m%dT%H%M%SZ)"
-artifact_dir="$PWD/.cache/coremark-profile-artifacts"
+artifact_dir="$PWD/.cache/coremark-profile-${execution_id}"
 python3 scripts/bench_coremark.py \
   --baseline "$sha" --target "$sha" \
   --profile authoritative \
@@ -162,12 +163,14 @@ Local benchmark/profile commands must receive the same nonempty
 `--execution-id` (or `COREMARK_RUN_ID`). A missing, stale, or mismatched local
 ID fails validation; a profile never becomes authoritative by copying the
 benchmark's ID into its output.
+Standalone JSON benchmarks still work without an explicit ID: they generate
+one in the report. Profiling that report requires explicitly supplying its ID.
 
-For paired before/after evidence, run the workflow once for each exact source
-SHA and compare the two retained profile artifacts. Each side is independently
-linked to its own same-host authoritative benchmark identity; the profiler does
-not reinterpret the mean-based `--min-delta-pct` benchmark option as a median
-optimization gate.
+Profiles from separate workflow runs are independent snapshots, not a same-host
+paired experiment. Each is linked to its own same-host authoritative benchmark;
+optimization acceptance still requires a same-host baseline/target comparison.
+The mean-based `--min-delta-pct` benchmark option is not a median optimization
+gate.
 
 ## Options
 
