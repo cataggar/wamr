@@ -37,7 +37,9 @@ pub const AotSectionType = enum(u32) {
 // ─── Target info ────────────────────────────────────────────────────────────
 
 pub const TargetInfo = struct {
-    bin_type: u16, // 0=ELF, 1=AOT, 2=PE
+    // Upstream WAMR object-class value (2=ELF64LE, 6=COFF64);
+    // legacy Zig-emitted containers used 1=AOT.
+    bin_type: u16,
     abi_type: u16,
     e_type: u16,
     e_machine: u16,

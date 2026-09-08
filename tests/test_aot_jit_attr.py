@@ -33,8 +33,49 @@ if "--wamrc" in sys.argv:
 LOAD = bytes.fromhex("488b85d0fdffff")  # mov rax,QWORD PTR [rbp-0x230]
 STORE = bytes.fromhex("488985d0fdffff")  # mov QWORD PTR [rbp-0x230],rax
 ARM_BL = struct.pack("<I", 0x94000001)
+ARM_B = struct.pack("<I", 0x14000001)
 ARM_LDR = struct.pack("<I", 0xF9407FB0)  # ldr x16, [x29, #248]
 ARM_STR = struct.pack("<I", 0xF9007FB0)  # str x16, [x29, #248]
+
+
+def target_info(
+    architecture="x86_64",
+    bin_type=2,
+    e_type=1,
+    e_machine=0x3E,
+    abi_type=0,
+):
+    arch = architecture.encode("ascii").ljust(16, b"\0")
+    return struct.pack(
+        "<HHHHII16sQ",
+        bin_type,
+        abi_type,
+        e_type,
+        e_machine,
+        0,
+        0,
+        arch,
+        0,
+    )
+
+
+def section(section_type, payload):
+    return struct.pack("<II", section_type, len(payload)) + payload
+
+
+def artifact_info(code, architecture):
+    abi = "aapcs64" if architecture == "aarch64" else "sysv"
+    return aot.CwasmInfo(
+        [0],
+        len(code),
+        0,
+        code,
+        aot.AOT_VERSION,
+        architecture,
+        abi,
+        "elf64-little",
+        True,
+    )
 
 
 def metadata_for(code=LOAD + STORE):
@@ -168,7 +209,13 @@ def load_from_dict(raw, code=LOAD + STORE):
         aot.Path, "read_text", return_value=json.dumps(raw)
     ):
         return aot.load_frame_metadata(
-            "metadata.json", 7, code, aot.AOT_VERSION, code, 0
+            "metadata.json",
+            7,
+            code,
+            aot.AOT_VERSION,
+            code,
+            0,
+            artifact_info(code, "x86_64"),
         )
 
 
@@ -307,6 +354,8 @@ def aarch64_metadata_for(code=ARM_BL + ARM_LDR + ARM_STR):
                         "base": "x29",
                         "frame_offset": 248,
                         "width": 8,
+                        "data_register": 16,
+                        "data_register_class": "gpr",
                         "origin": "allocator_spill",
                         "detail": "allocator_slot",
                         "slot": 0,
@@ -349,6 +398,8 @@ def aarch64_metadata_for(code=ARM_BL + ARM_LDR + ARM_STR):
                         "base": "x29",
                         "frame_offset": 248,
                         "width": 8,
+                        "data_register": 16,
+                        "data_register_class": "gpr",
                         "origin": "allocator_spill",
                         "detail": "allocator_slot",
                         "slot": 0,
@@ -373,7 +424,13 @@ def load_aarch64_from_dict(raw, code=ARM_BL + ARM_LDR + ARM_STR):
         aot.Path, "read_text", return_value=json.dumps(raw)
     ):
         return aot.load_frame_metadata(
-            "metadata.json", 10, code, aot.AOT_VERSION, code, 0
+            "metadata.json",
+            10,
+            code,
+            aot.AOT_VERSION,
+            code,
+            0,
+            artifact_info(code, "aarch64"),
         )
 
 
@@ -464,6 +521,7 @@ class FrameAttributionUnitTests(unittest.TestCase):
                     aot.AOT_VERSION,
                     LOAD + STORE,
                     0,
+                    artifact_info(LOAD + STORE, "x86_64"),
                 )
 
         raw = metadata_for()
@@ -593,10 +651,9 @@ class FrameAttributionUnitTests(unittest.TestCase):
         function = struct.pack("<I", 1) + struct.pack("<II", 0, 0)
         good = (
             struct.pack("<II", aot.AOT_MAGIC, aot.AOT_VERSION)
-            + struct.pack("<II", aot.SEC_TEXT, len(text))
-            + text
-            + struct.pack("<II", aot.SEC_FUNCTION, len(function))
-            + function
+            + section(aot.SEC_TARGET_INFO, target_info())
+            + section(aot.SEC_TEXT, text)
+            + section(aot.SEC_FUNCTION, function)
         )
         with mock.patch.object(aot.Path, "read_bytes", return_value=good):
             info = aot.parse_cwasm("ok.cwasm")
@@ -624,16 +681,63 @@ class FrameAttributionUnitTests(unittest.TestCase):
         )
         duplicate = (
             struct.pack("<II", aot.AOT_MAGIC, aot.AOT_VERSION)
-            + struct.pack("<II", aot.SEC_TEXT, len(text))
-            + text
-            + struct.pack("<II", aot.SEC_FUNCTION, len(duplicate_function))
-            + duplicate_function
+            + section(aot.SEC_TARGET_INFO, target_info())
+            + section(aot.SEC_TEXT, text)
+            + section(aot.SEC_FUNCTION, duplicate_function)
         )
         with mock.patch.object(aot.Path, "read_bytes", return_value=duplicate):
             with self.assertRaisesRegex(
                 aot.AttributionError, "ambiguous/non-increasing"
             ):
                 aot.parse_cwasm("ambiguous.cwasm")
+
+    def test_cwasm_target_info_is_unique_and_architecture_bound(self):
+        text = b"\x90\xc3"
+        function = struct.pack("<I", 1) + struct.pack("<II", 0, 0)
+
+        def blob(target_sections):
+            return (
+                struct.pack("<II", aot.AOT_MAGIC, aot.AOT_VERSION)
+                + b"".join(
+                    section(aot.SEC_TARGET_INFO, payload)
+                    for payload in target_sections
+                )
+                + section(aot.SEC_TEXT, text)
+                + section(aot.SEC_FUNCTION, function)
+            )
+
+        with mock.patch.object(
+            aot.Path, "read_bytes", return_value=blob([target_info()])
+        ):
+            info = aot.parse_cwasm("verified.cwasm")
+        self.assertEqual(("x86_64", "sysv", True), (
+            info.architecture,
+            info.abi,
+            info.target_verified,
+        ))
+
+        legacy = target_info(bin_type=1, e_type=0, e_machine=0)
+        with mock.patch.object(
+            aot.Path, "read_bytes", return_value=blob([legacy])
+        ):
+            info = aot.parse_cwasm("legacy.cwasm")
+        self.assertEqual((None, False), (info.abi, info.target_verified))
+
+        failures = [
+            ([], "missing target-info"),
+            ([target_info()[:39]], "exactly 40"),
+            ([target_info(), target_info()], "duplicate target-info"),
+            (
+                [target_info(architecture="aarch64", e_machine=0x3E)],
+                "inconsistent target-info",
+            ),
+        ]
+        for targets, message in failures:
+            with self.subTest(message=message), mock.patch.object(
+                aot.Path, "read_bytes", return_value=blob(targets)
+            ):
+                with self.assertRaisesRegex(aot.AttributionError, message):
+                    aot.parse_cwasm("bad-target.cwasm")
 
     def test_exact_page_rounded_jit_mapping_is_required(self):
         with mock.patch.object(
@@ -823,21 +927,92 @@ class FrameAttributionUnitTests(unittest.TestCase):
         corrupt_bl = struct.pack("<I", 0x14000001) + ARM_LDR + ARM_STR
         raw = aarch64_metadata_for()
         raw["module_text_sha256"] = hashlib.sha256(corrupt_bl).hexdigest()
-        with self.assertRaisesRegex(aot.AttributionError, "not BL imm26"):
+        with self.assertRaisesRegex(aot.AttributionError, "does not match"):
             load_aarch64_from_dict(raw, corrupt_bl)
 
         raw = aarch64_metadata_for()
         raw["accesses"][0]["encoded_offset"] = 240
-        metadata = load_aarch64_from_dict(raw)
-        with self.assertRaisesRegex(aot.AttributionError, "offset mismatch"):
-            aot.validate_metadata_disassembly(metadata, instructions)
+        with self.assertRaisesRegex(aot.AttributionError, "native encoded_offset"):
+            load_aarch64_from_dict(raw)
+
+        tail_relocations = [{
+            "native_start": 0,
+            "native_end": 4,
+            "kind": "aarch64_tail_call_imm26",
+        }]
+        self.assertEqual(
+            aot.normalized_code_sha256_v2(ARM_B, tail_relocations, "aarch64"),
+            aot.normalized_code_sha256_v2(
+                struct.pack("<I", 0x140003FF),
+                tail_relocations,
+                "aarch64",
+            ),
+        )
+        with self.assertRaisesRegex(aot.AttributionError, "does not match"):
+            aot.normalized_code_sha256_v2(
+                ARM_BL, tail_relocations, "aarch64"
+            )
+
+    def test_frame_metadata_requires_verified_matching_artifact_target(self):
+        code = ARM_BL + ARM_LDR + ARM_STR
+        verified = aot.CwasmInfo(
+            [0],
+            len(code),
+            0,
+            code,
+            aot.AOT_VERSION,
+            "aarch64",
+            "aapcs64",
+            "elf64-little",
+            True,
+        )
+        with mock.patch.object(
+            aot.Path,
+            "read_text",
+            return_value=json.dumps(aarch64_metadata_for()),
+        ):
+            aot.load_frame_metadata(
+                "metadata.json",
+                10,
+                code,
+                aot.AOT_VERSION,
+                code,
+                0,
+                verified,
+            )
+
+        legacy = aot.CwasmInfo(
+            [0],
+            len(code),
+            0,
+            code,
+            aot.AOT_VERSION,
+            "aarch64",
+            None,
+            "legacy-unspecified",
+            False,
+        )
+        with mock.patch.object(
+            aot.Path,
+            "read_text",
+            return_value=json.dumps(aarch64_metadata_for()),
+        ), self.assertRaisesRegex(aot.AttributionError, "legacy/unspecified"):
+            aot.load_frame_metadata(
+                "metadata.json",
+                10,
+                code,
+                aot.AOT_VERSION,
+                code,
+                0,
+                legacy,
+            )
 
     def test_aarch64_schema_v2_fails_closed_on_corrupt_identity_and_components(
         self,
     ):
         raw = aarch64_metadata_for()
         raw["abi"] = "sysv"
-        with self.assertRaisesRegex(aot.AttributionError, "abi"):
+        with self.assertRaisesRegex(aot.AttributionError, "ABI|abi"):
             load_aarch64_from_dict(raw)
 
         raw = aarch64_metadata_for()
@@ -861,6 +1036,45 @@ class FrameAttributionUnitTests(unittest.TestCase):
             dict(raw["accesses"][0]["components"][0])
         )
         with self.assertRaisesRegex(aot.AttributionError, "not contiguous"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][0]["frame_offset"] = 504
+        raw["accesses"][0]["components"][0]["frame_offset"] = 504
+        raw["frame_regions"][-1].update({"start": 504, "end": 512})
+        with self.assertRaisesRegex(
+            aot.AttributionError, "slot/offset mismatch|native component"
+        ):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["allocator_values"][0]["frame_offset"] = 256
+        with self.assertRaisesRegex(aot.AttributionError, "allocator slot/offset"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][0]["components"][0]["slot"] = 1
+        with self.assertRaisesRegex(
+            aot.AttributionError, "unassigned slot|slot/offset"
+        ):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["frame_regions"][-1]["end"] = 252
+        with self.assertRaisesRegex(aot.AttributionError, "outside declared regions"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["frame_layout"]["spill_slots"] = 2
+        raw["frame_regions"][-1]["end"] = 264
+        raw["accesses"][0]["width"] = 16
+        raw["accesses"][0]["components"][0]["width"] = 16
+        with self.assertRaisesRegex(aot.AttributionError, "value coverage"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][0]["components"][0]["data_register"] = 17
+        with self.assertRaisesRegex(aot.AttributionError, "native component"):
             load_aarch64_from_dict(raw)
 
         raw = aarch64_metadata_for()
@@ -920,6 +1134,7 @@ class FrameAttributionUnitTests(unittest.TestCase):
                     "slot": slot,
                     "vreg": vreg,
                     "frame_offset": offset,
+                    "data_register": slot,
                 }
             )
         raw["accesses"] = [
@@ -960,6 +1175,75 @@ class FrameAttributionUnitTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(paired))
         self.assertEqual([70, 71], paired[0]["candidate_vregs"])
+
+    def test_aarch64_materialized_frame_address_is_proven_from_native_code(self):
+        movz_x16_9000 = struct.pack("<I", 0xD2920010)
+        add_x16_x16_fp = struct.pack("<I", 0x8B1D0210)
+        ldr_q0_x16 = struct.pack("<I", 0x3DC00200)
+        code = movz_x16_9000 + add_x16_x16_fp + ldr_q0_x16
+        raw = aarch64_metadata_for()
+        raw["module_text_size"] = len(code)
+        raw["module_text_sha256"] = hashlib.sha256(code).hexdigest()
+        raw["code_size"] = len(code)
+        raw["normalized_relocations"] = []
+        raw["normalized_code_sha256"] = hashlib.sha256(code).hexdigest()
+        raw["frame_layout"].update(
+            {"frame_size": 0xA000, "spill_base": 0x9000, "spill_slots": 2}
+        )
+        raw["frame_regions"][-1].update(
+            {"start": 0x9000, "end": 0x9010}
+        )
+        raw["spill_metric"].update(
+            {
+                "slots": 2,
+                "v128": 1,
+                "scalar": 0,
+                "slots_scalar": 0,
+                "slots_v128": 2,
+                "spill_ld": 1,
+                "spill_st": 0,
+            }
+        )
+        raw["emitted_allocator_loads"] = 1
+        raw["emitted_allocator_stores"] = 0
+        raw["allocator_values"][0].update(
+            {
+                "frame_offset": 0x9000,
+                "slot_count": 2,
+                "value_type": "v128",
+                "reload_count": 1,
+                "store_count": 0,
+            }
+        )
+        component = raw["accesses"][0]["components"][0]
+        component.update(
+            {
+                "frame_offset": 0x9000,
+                "width": 16,
+                "data_register": 0,
+                "data_register_class": "simd",
+            }
+        )
+        raw["accesses"] = [{
+            **raw["accesses"][0],
+            "native_start": 8,
+            "native_end": 12,
+            "frame_offset": 0x9000,
+            "width": 16,
+            "encoded_base": "x16",
+            "encoded_offset": 0,
+            "addressing_mode": "materialized",
+            "components": [component],
+        }]
+        load_aarch64_from_dict(raw, code)
+
+        corrupt = movz_x16_9000 + struct.pack("<I", 0x8B1D0231) + ldr_q0_x16
+        raw["module_text_sha256"] = hashlib.sha256(corrupt).hexdigest()
+        raw["normalized_code_sha256"] = hashlib.sha256(corrupt).hexdigest()
+        with self.assertRaisesRegex(
+            aot.AttributionError, "frame-access offsets disagree"
+        ):
+            load_aarch64_from_dict(raw, corrupt)
 
 
 @unittest.skipUnless(WAMRC, "pass --wamrc for compiler/sidecar smoke coverage")
@@ -1041,6 +1325,7 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
                 info.text_file_offset : info.text_file_offset + info.text_size
             ],
             start,
+            info,
         )
         self.assertEqual(architecture, metadata.raw["architecture"])
         self.assertEqual(
@@ -1106,6 +1391,104 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
 
     def test_tracked_aarch64_core_wasm_sidecar_reconciles(self):
         self._run_tracked_core_wasm_sidecar("aarch64")
+
+    def test_aarch64_direct_tail_call_metadata_and_bytes(self):
+        work = (
+            ROOT
+            / ".zig-cache"
+            / f"frame-attribution-tail-call-{os.getpid()}"
+        )
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(work, ignore_errors=True))
+        wasm = work / "tail-call.wasm"
+        wasm.write_bytes(
+            bytes.fromhex(
+                "0061736d01000000"
+                "0105016000017f"
+                "0303020000"
+                "0a0b02040041070b040012000b"
+            )
+        )
+        baseline = work / "baseline.cwasm"
+        diagnosed = work / "diagnosed.cwasm"
+        prefix = work / "tail"
+        command = [
+            str(WAMRC),
+            "compile",
+            "--target",
+            "aarch64",
+            str(wasm),
+        ]
+        baseline_result = subprocess.run(
+            command + ["-o", str(baseline)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            baseline_result.returncode,
+            baseline_result.stdout + baseline_result.stderr,
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "WAMR_AOT_FRAME_ATTRIBUTION": str(prefix),
+                "WAMR_AOT_FRAME_ATTRIBUTION_FUNC": "1",
+            }
+        )
+        diagnosed_result = subprocess.run(
+            command + ["-o", str(diagnosed)],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0,
+            diagnosed_result.returncode,
+            diagnosed_result.stdout + diagnosed_result.stderr,
+        )
+        self.assertEqual(baseline.read_bytes(), diagnosed.read_bytes())
+
+        sidecar = Path(f"{prefix}.mod0.func1.json")
+        raw = json.loads(sidecar.read_text())
+        tail = [
+            relocation
+            for relocation in raw["normalized_relocations"]
+            if relocation["kind"] == "aarch64_tail_call_imm26"
+        ]
+        self.assertEqual(1, len(tail))
+        info = aot.parse_cwasm(diagnosed)
+        start, end = aot.function_bounds(info, 1)
+        code = info.data[
+            info.text_file_offset + start : info.text_file_offset + end
+        ]
+        word = struct.unpack_from("<I", code, tail[0]["native_start"])[0]
+        self.assertEqual(0x14000000, word & 0xFC000000)
+
+        validate = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--cwasm",
+                str(diagnosed),
+                "--func",
+                "1",
+                "--arch",
+                "aarch64",
+                "--frame-metadata",
+                str(sidecar),
+                "--validate-frame-metadata",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            0, validate.returncode, validate.stdout + validate.stderr
+        )
 
 
 if __name__ == "__main__":

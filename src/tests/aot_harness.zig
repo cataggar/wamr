@@ -1276,12 +1276,6 @@ fn compileToAot(
         try data_entries.append(a, try emit_aot.dataSegmentEntry(seg));
     }
 
-    var arch_name = std.mem.zeroes([16]u8);
-    switch (builtin.cpu.arch) {
-        .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
-        else => @memcpy(arch_name[0..6], "x86-64"),
-    }
-
     // Sig-check tables: per-module FuncType descriptors + per-local-func
     // type index. Required for call_indirect's inline sig equality check.
     var ft_entries: std.ArrayList(emit_aot.FuncTypeEntry) = .empty;
@@ -1306,7 +1300,13 @@ fn compileToAot(
         code,
         offsets,
         exports.items,
-        .{ .arch = arch_name },
+        emit_aot.targetInfoOptions(switch (builtin.cpu.arch) {
+            .aarch64 => .aarch64_aapcs64,
+            else => if (builtin.os.tag == .windows)
+                .x86_64_win64
+            else
+                .x86_64_sysv,
+        }),
         if (data_entries.items.len > 0) data_entries.items else null,
         if (import_entries.items.len > 0) import_entries.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,

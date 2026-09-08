@@ -20,6 +20,7 @@ pub const AccessOrigin = enum {
 pub const RelocationKind = enum {
     x86_64_call_rel32,
     aarch64_call_imm26,
+    aarch64_tail_call_imm26,
 };
 
 /// One architecture-specific direct-call relocation normalized for the
@@ -93,6 +94,10 @@ pub const AccessComponent = struct {
     base: []const u8,
     frame_offset: i32,
     width: u8,
+    /// Encoded architectural data register. AArch64 schema-v2 sidecars use
+    /// this together with `data_register_class` to preserve pair identity.
+    data_register: ?u8 = null,
+    data_register_class: ?[]const u8 = null,
     origin: AccessOrigin,
     detail: []const u8,
     slot: ?u32 = null,

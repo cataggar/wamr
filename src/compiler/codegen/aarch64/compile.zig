@@ -1492,6 +1492,8 @@ fn classifyAarch64Component(
         .base = frameRegName(raw_component.base),
         .frame_offset = raw_component.displacement,
         .width = raw_component.width,
+        .data_register = raw_component.data_register,
+        .data_register_class = @tagName(raw_component.data_register_class),
         .origin = .unknown,
         .detail = "unclassified_frame_access",
         .ir_position = if (owning_ir) |range| range.ir_position else null,
@@ -1499,11 +1501,18 @@ fn classifyAarch64Component(
     };
     if (raw_component.base == .sp) {
         component.origin = .fixed_runtime_frame_state;
-        component.detail = switch (raw_access.addressing_mode) {
-            .pre_index => "prologue_saved_fp_lr",
-            .post_index => "epilogue_restored_fp_lr",
-            else => "outgoing_abi_frame",
-        };
+        const is_fp_lr_pair = raw_access.component_count == 2 and
+            raw_access.components[0].data_register_class == .gpr and
+            raw_access.components[1].data_register_class == .gpr and
+            raw_access.components[0].data_register == @intFromEnum(emit.Reg.fp) and
+            raw_access.components[1].data_register == @intFromEnum(emit.Reg.lr);
+        component.detail = if (is_fp_lr_pair)
+            switch (raw_access.kind) {
+                .store => "prologue_saved_fp_lr",
+                .load => "epilogue_restored_fp_lr",
+            }
+        else
+            "outgoing_abi_frame";
         return component;
     }
 
@@ -1570,7 +1579,7 @@ fn classifyAarch64Component(
     } else if (scratch_size > 0 and offset >= scratch_base and offset < scratch_base + scratch_size) {
         component.origin = .explicit_frame_storage;
         component.detail = "call_result_scratch";
-        component.explicit_slot = @intCast((offset - scratch_base) / 8);
+        component.explicit_slot = @intCast((offset - hrp_save_off) / 8);
     }
     return component;
 }
@@ -1695,13 +1704,16 @@ fn normalizedAarch64CodeSha256(
     for (relocations) |relocation| {
         const start: usize = relocation.native_start;
         const end: usize = relocation.native_end;
-        if (relocation.kind != .aarch64_call_imm26 or
-            start < cursor or end != start + 4 or end > code.len)
-        {
+        if (start < cursor or end != start + 4 or end > code.len) {
             return error.InvalidDirectCallPatch;
         }
         const word = std.mem.readInt(u32, code[start..end][0..4], .little);
-        if ((word & 0xFC000000) != 0x94000000) return error.InvalidDirectCallPatch;
+        const expected_opcode: u32 = switch (relocation.kind) {
+            .aarch64_call_imm26 => 0x94000000,
+            .aarch64_tail_call_imm26 => 0x14000000,
+            else => return error.InvalidDirectCallPatch,
+        };
+        if ((word & 0xFC000000) != expected_opcode) return error.InvalidDirectCallPatch;
         sh.update(code[cursor..start]);
         var normalized: [4]u8 = undefined;
         std.mem.writeInt(u32, &normalized, word & 0xFC000000, .little);
@@ -1728,7 +1740,7 @@ fn sha256Hex(data: []const u8, hex_out: *[64]u8) void {
     }
 }
 
-test "AArch64 frame attribution normalizes only declared BL imm26 fields" {
+test "AArch64 frame attribution normalizes declared BL and B imm26 fields" {
     var first: [8]u8 = undefined;
     var second: [8]u8 = undefined;
     std.mem.writeInt(u32, first[0..4], 0x94000001, .little);
@@ -1750,6 +1762,21 @@ test "AArch64 frame attribution normalizes only declared BL imm26 fields" {
     try std.testing.expectError(
         error.InvalidDirectCallPatch,
         normalizedAarch64CodeSha256(&second, &relocations, &second_hash),
+    );
+
+    const tail_relocations = [_]frame_attribution.Relocation{.{
+        .native_start = 0,
+        .native_end = 4,
+        .kind = .aarch64_tail_call_imm26,
+    }};
+    std.mem.writeInt(u32, first[0..4], 0x14000001, .little);
+    std.mem.writeInt(u32, second[0..4], 0x17FFFFFF, .little);
+    try normalizedAarch64CodeSha256(&first, &tail_relocations, &first_hash);
+    try normalizedAarch64CodeSha256(&second, &tail_relocations, &second_hash);
+    try std.testing.expectEqualSlices(u8, &first_hash, &second_hash);
+    try std.testing.expectError(
+        error.InvalidDirectCallPatch,
+        normalizedAarch64CodeSha256(&first, &relocations, &first_hash),
     );
 }
 
@@ -1779,14 +1806,14 @@ test "AArch64 frame attribution classifies locals, fixed state, and spill compon
         .encoded_displacement = 0,
         .addressing_mode = .materialized,
         .components = .{
-            .{ .base = .fp, .displacement = 0, .width = 8 },
-            .{ .base = .fp, .displacement = 0, .width = 8 },
+            .{ .base = .fp, .displacement = 0, .width = 8, .data_register = 0, .data_register_class = .gpr },
+            .{ .base = .fp, .displacement = 0, .width = 8, .data_register = 1, .data_register_class = .gpr },
         },
         .component_count = 1,
     };
     const local = try classifyAarch64Component(
         raw_access,
-        .{ .base = .fp, .displacement = 24, .width = 8 },
+        .{ .base = .fp, .displacement = 24, .width = 8, .data_register = 0, .data_register_class = .gpr },
         null,
         &.{24},
         &.{.i64},
@@ -1805,7 +1832,7 @@ test "AArch64 frame attribution classifies locals, fixed state, and spill compon
 
     const fixed = try classifyAarch64Component(
         raw_access,
-        .{ .base = .sp, .displacement = 0, .width = 8 },
+        .{ .base = .sp, .displacement = 0, .width = 8, .data_register = 0, .data_register_class = .gpr },
         null,
         &.{24},
         &.{.i64},
@@ -1820,10 +1847,11 @@ test "AArch64 frame attribution classifies locals, fixed state, and spill compon
         16,
     );
     try std.testing.expectEqual(frame_attribution.AccessOrigin.fixed_runtime_frame_state, fixed.origin);
+    try std.testing.expectEqualStrings("outgoing_abi_frame", fixed.detail);
 
     const spill = try classifyAarch64Component(
         raw_access,
-        .{ .base = .fp, .displacement = 72, .width = 8 },
+        .{ .base = .fp, .displacement = 72, .width = 8, .data_register = 0, .data_register_class = .simd },
         null,
         &.{24},
         &.{.i64},
@@ -1840,6 +1868,56 @@ test "AArch64 frame attribution classifies locals, fixed state, and spill compon
     try std.testing.expectEqual(frame_attribution.AccessOrigin.allocator_spill, spill.origin);
     try std.testing.expectEqual(@as(?u32, 6), spill.slot);
     try std.testing.expectEqual(@as(?u32, 91), spill.vreg);
+}
+
+test "AArch64 frame attribution recognizes FP/LR pairs across prologue threshold" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 504, 512, 520 }) |frame_size| {
+        var code = emit.CodeBuffer.init(allocator);
+        defer code.deinit();
+        try code.emitPrologue(frame_size);
+        try code.emitEpilogueNoRet(frame_size);
+        const raw_accesses = try emit.traceFrameAccesses(allocator, code.getCode());
+        defer allocator.free(raw_accesses);
+        try std.testing.expectEqual(@as(usize, 2), raw_accesses.len);
+
+        const prologue = try classifyAarch64Component(
+            raw_accesses[0],
+            raw_accesses[0].components[0],
+            null,
+            &.{},
+            &.{},
+            &.{},
+            frame_size,
+            16,
+            24,
+            0,
+            24,
+            0,
+            24,
+            0,
+        );
+        const epilogue = try classifyAarch64Component(
+            raw_accesses[1],
+            raw_accesses[1].components[0],
+            null,
+            &.{},
+            &.{},
+            &.{},
+            frame_size,
+            16,
+            24,
+            0,
+            24,
+            0,
+            24,
+            0,
+        );
+        try std.testing.expectEqualStrings("prologue_saved_fp_lr", prologue.detail);
+        try std.testing.expectEqualStrings("epilogue_restored_fp_lr", epilogue.detail);
+        try std.testing.expectEqual(@as(u5, 29), raw_accesses[0].components[0].data_register);
+        try std.testing.expectEqual(@as(u5, 30), raw_accesses[0].components[1].data_register);
+    }
 }
 
 fn buildAarch64FrameRegions(
@@ -2962,10 +3040,20 @@ pub fn compileFunctionImpl(
             );
             errdefer allocator.free(relocations);
             for (call_patches, relocations) |patch, *relocation| {
+                const word = std.mem.readInt(
+                    u32,
+                    code.getCode()[patch.patch_offset..][0..4],
+                    .little,
+                );
+                const opcode = word & 0xFC000000;
                 relocation.* = .{
                     .native_start = @intCast(patch.patch_offset),
                     .native_end = @intCast(patch.patch_offset + 4),
-                    .kind = .aarch64_call_imm26,
+                    .kind = switch (opcode) {
+                        0x94000000 => .aarch64_call_imm26,
+                        0x14000000 => .aarch64_tail_call_imm26,
+                        else => return error.InvalidDirectCallPatch,
+                    },
                 };
             }
             std.mem.sort(frame_attribution.Relocation, relocations, {}, struct {

@@ -62,12 +62,19 @@ pub const FrameAddressingMode = enum {
     materialized,
 };
 
+pub const FrameDataRegisterClass = enum {
+    gpr,
+    simd,
+};
+
 pub const FrameAccessComponent = struct {
     /// Effective frame base after resolving an address materialized from FP
     /// or SP. Only `.fp` and `.sp` are produced here.
     base: Reg,
     displacement: i32,
     width: u8,
+    data_register: u5,
+    data_register_class: FrameDataRegisterClass,
 };
 
 /// One final emitted AArch64 instruction that accesses compiler frame state.
@@ -2363,6 +2370,9 @@ const DecodedFrameMemory = struct {
     addressing_mode: FrameAddressingMode,
     width: u8,
     pair: bool = false,
+    data_rt1: u5,
+    data_rt2: ?u5 = null,
+    data_register_class: FrameDataRegisterClass,
     load_rt1: ?Reg = null,
     load_rt2: ?Reg = null,
     writeback_delta: ?i32 = null,
@@ -2402,6 +2412,8 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .encoded_displacement = @intCast(imm12 * decoded[2]),
             .addressing_mode = .unsigned_scaled,
             .width = decoded[1],
+            .data_rt1 = @intFromEnum(rt),
+            .data_register_class = .gpr,
             .load_rt1 = if (decoded[0] == .load) rt else null,
         };
     }
@@ -2431,6 +2443,13 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .encoded_displacement = signedBits((word >> 12) & 0x1FF, 9),
             .addressing_mode = .signed_unscaled,
             .width = decoded[1],
+            .data_rt1 = @intFromEnum(rt),
+            .data_register_class = if (unscaled_top == 0x3C800000 or
+                unscaled_top == 0x3CC00000 or
+                unscaled_top == 0xBC000000 or
+                unscaled_top == 0xBC400000 or
+                unscaled_top == 0xFC000000 or
+                unscaled_top == 0xFC400000) .simd else .gpr,
             .load_rt1 = if (decoded[0] == .load and
                 unscaled_top != 0x3CC00000 and
                 unscaled_top != 0xBC400000 and
@@ -2461,6 +2480,9 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .addressing_mode = decoded[2],
             .width = decoded[1],
             .pair = true,
+            .data_rt1 = @intFromEnum(rt),
+            .data_rt2 = @intFromEnum(rt2),
+            .data_register_class = .gpr,
             .load_rt1 = if (decoded[0] == .load) rt else null,
             .load_rt2 = if (decoded[0] == .load) rt2 else null,
             .writeback_delta = if (decoded[3] != null) byte_displacement else null,
@@ -2482,6 +2504,8 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .encoded_displacement = 0,
             .addressing_mode = .simd_zero_offset,
             .width = decoded[1],
+            .data_rt1 = @intFromEnum(rt),
+            .data_register_class = .simd,
         };
     }
     return null;
@@ -2569,6 +2593,8 @@ pub fn traceFrameAccesses(
                     .base = relation.base,
                     .displacement = @intCast(relation.displacement + memory.encoded_displacement),
                     .width = memory.width,
+                    .data_register = memory.data_rt1,
+                    .data_register_class = memory.data_register_class,
                 };
                 components[1] = if (memory.pair) .{
                     .base = relation.base,
@@ -2576,6 +2602,8 @@ pub fn traceFrameAccesses(
                         relation.displacement + memory.encoded_displacement + memory.width,
                     ),
                     .width = memory.width,
+                    .data_register = memory.data_rt2.?,
+                    .data_register_class = memory.data_register_class,
                 } else components[0];
                 try accesses.append(allocator, .{
                     .native_start = @intCast(native_start),
@@ -2716,6 +2744,8 @@ test "frame trace preserves paired accesses as one native instruction" {
     try std.testing.expectEqual(@as(u2, 2), accesses[0].component_count);
     try std.testing.expectEqual(@as(i32, 24), accesses[0].components[0].displacement);
     try std.testing.expectEqual(@as(i32, 32), accesses[0].components[1].displacement);
+    try std.testing.expectEqual(@as(u5, 0), accesses[0].components[0].data_register);
+    try std.testing.expectEqual(@as(u5, 1), accesses[0].components[1].data_register);
 }
 
 test "frame trace resolves materialized large vector offsets" {

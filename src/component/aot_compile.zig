@@ -648,12 +648,6 @@ pub fn compileCoreWasmCached(
         }) catch return error.OutOfMemory;
     }
 
-    var arch_name = std.mem.zeroes([16]u8);
-    switch (opts.target_arch) {
-        .x86_64 => @memcpy(arch_name[0..6], "x86-64"),
-        .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
-    }
-
     // Parse the wasm `name` custom section directly from the source
     // bytes for trap-decode diagnostics (#694). The interpreter loader
     // skips custom sections, so this is a separate pass over the same
@@ -675,7 +669,11 @@ pub fn compileCoreWasmCached(
         code,
         offsets,
         exports.items,
-        .{ .arch = arch_name },
+        emit_aot.targetInfoOptions(switch (target_abi) {
+            .x86_64_sysv => .x86_64_sysv,
+            .x86_64_win64 => .x86_64_win64,
+            .aarch64_aapcs => .aarch64_aapcs64,
+        }),
         if (data_segs.items.len > 0) data_segs.items else null,
         if (imports.items.len > 0) imports.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,

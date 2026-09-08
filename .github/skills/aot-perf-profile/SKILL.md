@@ -169,11 +169,12 @@ unselected functions may still reuse their cache entries.
 
 The current x86_64 sidecar remains schema v1 for compatibility. AArch64 uses
 schema v2, whose per-instruction `components` represent the two distinct frame
-values in `ldp`/`stp` without counting one sampled instruction twice. Schema v2
-also records architecture-specific normalized relocations: AArch64 normalizes
-only the immediate field of declared `bl` instructions, never x86 rel32 bytes.
-Both schemas bind the sidecar to the complete core text, AOT format/ABI, target
-architecture, selected function offset/size, and normalized function bytes.
+values and encoded data-register identities in `ldp`/`stp` without counting one
+sampled instruction twice. Schema v2 records `bl` and direct-tail-call `b`
+relocations separately and normalizes only the declared imm26 field while
+validating the preserved opcode bits. Both schemas bind the sidecar to the
+complete core text, AOT format/ABI, target architecture, selected function
+offset/size, and normalized function bytes.
 
 ### Core wasm modules (e.g. CoreMark, #393)
 
@@ -257,13 +258,22 @@ IR use/def counts so the distinction from emitted traffic stays inspectable.
 
 The tool fails closed on an incompatible AOT/metadata schema, stale full-core
 text hash or function native-code hash, malformed or overlapping native
-ranges, ambiguous mmap selection, or reconciliation mismatch. The full text
-hash binds identical-looking functions to the correct component core.
-Schema-v1 x86 direct-call rel32 bytes and schema-v2 AArch64 `bl` imm26 fields
-are the only normalized relocations in their respective function hashes and
-are listed explicitly in the sidecar.
+ranges, contradictory frame regions/slots/effective addresses, unproven
+materialized addresses, ambiguous mmap selection, or reconciliation mismatch.
+The full text hash binds identical-looking functions to the correct component
+core. Schema-v1 x86 direct-call rel32 bytes and schema-v2 AArch64 `bl`/`b`
+imm26 fields are the only normalized relocations in their respective function
+hashes and are listed explicitly in the sidecar.
 Without metadata, frame moves are reported as **unattributed frame traffic**,
 not guessed to be spills.
+
+The `.cwasm` must contain exactly one 40-byte target-info section. New
+artifacts encode a validated ELF64/COFF64 class, machine, relocatable-text
+type, and architecture; the consumer derives `sysv`, `win64`, or `aapcs64`
+from those artifact facts and requires an exact metadata match. Older
+containers whose target-info only says `bin_type=AOT` remain usable for
+metadata-free attribution, but their ABI is explicitly unverified and
+authoritative frame-sidecar validation fails closed.
 
 Authoritative size matching computes
 `ceil(cwasm_text_size / host_page_size) * host_page_size` because Linux
@@ -293,6 +303,11 @@ rebuilt or renamed-equivalent core is not accepted merely because the selected
 function looks identical. Machine-readable `frame_attribution.origins`,
 `allocator_contributors`, `coverage`, and `reconciliation` fields provide the
 origin/sample summary for profiler integration.
+
+The CoreMark capture at source `66a97235` (run `34174622489`, recorded in
+issue #949) is historical pinned-source evidence. Reuse its samples only if
+the newly retained `.cwasm` code hash exactly matches that capture; otherwise
+take a fresh perf capture before reporting current-release percentages.
 
 The tracked `tests/benchmarks/frame_attribution/frame_origins.wasm` fixture is
 the small end-to-end smoke module used by `tests/test_aot_jit_attr.py`; it

@@ -33,12 +33,44 @@ pub const ExternalKind = enum(u8) {
 
 pub const AotEmitOptions = struct {
     arch: [16]u8 = std.mem.zeroes([16]u8),
+    bin_type: u16 = 1,
     abi_type: u16 = 0,
     e_type: u16 = 0,
     e_machine: u16 = 0,
     e_flags: u32 = 0,
     target_features: u64 = 0,
 };
+
+pub const TargetInfoKind = enum {
+    x86_64_sysv,
+    x86_64_win64,
+    aarch64_aapcs64,
+};
+
+/// Populate target-info using the same ELF/COFF class and machine identifiers
+/// as upstream WAMR object inspection. `abi_type` remains the object OS-ABI
+/// field; the native calling ABI is derived from the validated
+/// format/machine tuple instead of inventing host-specific values.
+pub fn targetInfoOptions(kind: TargetInfoKind) AotEmitOptions {
+    var options: AotEmitOptions = .{
+        .bin_type = switch (kind) {
+            .x86_64_win64 => 6, // COFF64
+            else => 2, // ELF64 little-endian
+        },
+        .e_type = 1, // relocatable native text
+        .e_machine = switch (kind) {
+            .x86_64_sysv => 0x3e,
+            .x86_64_win64 => 0x8664,
+            .aarch64_aapcs64 => 0xb7,
+        },
+    };
+    const name = switch (kind) {
+        .x86_64_sysv, .x86_64_win64 => "x86_64",
+        .aarch64_aapcs64 => "aarch64",
+    };
+    @memcpy(options.arch[0..name.len], name);
+    return options;
+}
 
 pub const ExportEntry = struct {
     name: []const u8,
@@ -454,7 +486,7 @@ fn appendU32Le(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: u32) 
 ///   e_flags(u32) reserved(u32) arch([16]u8) features(u64)
 fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
     var info = std.mem.zeroes([40]u8);
-    std.mem.writeInt(u16, info[0..2], 1, .little); // bin_type = AOT
+    std.mem.writeInt(u16, info[0..2], options.bin_type, .little);
     std.mem.writeInt(u16, info[2..4], options.abi_type, .little);
     std.mem.writeInt(u16, info[4..6], options.e_type, .little);
     std.mem.writeInt(u16, info[6..8], options.e_machine, .little);
@@ -478,6 +510,18 @@ test "emit: minimal (no functions, no exports) has correct magic and version" {
     const version = std.mem.readInt(u32, data[4..8], .little);
     try std.testing.expectEqual(aot_magic, magic);
     try std.testing.expectEqual(aot_version, version);
+}
+
+test "emit: target-info binds format machine and architecture" {
+    const aarch64 = buildTargetInfo(targetInfoOptions(.aarch64_aapcs64));
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, aarch64[0..2], .little));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, aarch64[4..6], .little));
+    try std.testing.expectEqual(@as(u16, 0xb7), std.mem.readInt(u16, aarch64[6..8], .little));
+    try std.testing.expectEqualStrings("aarch64", std.mem.sliceTo(aarch64[16..32], 0));
+
+    const win64 = buildTargetInfo(targetInfoOptions(.x86_64_win64));
+    try std.testing.expectEqual(@as(u16, 6), std.mem.readInt(u16, win64[0..2], .little));
+    try std.testing.expectEqual(@as(u16, 0x8664), std.mem.readInt(u16, win64[6..8], .little));
 }
 
 test "emit: one function offset produces valid function section" {
@@ -585,13 +629,24 @@ test "roundtrip: emit then load with AOT loader" {
         .{ .name = "add", .kind = .function, .index = 0 },
         .{ .name = "mem", .kind = .memory, .index = 0 },
     };
-    var arch_name = std.mem.zeroes([16]u8);
-    @memcpy(arch_name[0..6], "x86_64");
-
-    const data = try emit(allocator, &code, &offsets, &exports, .{
-        .arch = arch_name,
-        .e_machine = 0x3E,
-    }, null, null, null, null, null, null, null, null, null, null, null);
+    const data = try emit(
+        allocator,
+        &code,
+        &offsets,
+        &exports,
+        targetInfoOptions(.x86_64_sysv),
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
     defer allocator.free(data);
 
     // Parse back with the AOT loader
@@ -601,7 +656,8 @@ test "roundtrip: emit then load with AOT loader" {
     // Verify target info
     try std.testing.expect(module.target_info != null);
     const ti = module.target_info.?;
-    try std.testing.expectEqual(@as(u16, 1), ti.bin_type);
+    try std.testing.expectEqual(@as(u16, 2), ti.bin_type);
+    try std.testing.expectEqual(@as(u16, 1), ti.e_type);
     try std.testing.expectEqual(@as(u16, 0x3E), ti.e_machine);
     try std.testing.expect(std.mem.startsWith(u8, &ti.arch, "x86_64"));
 
