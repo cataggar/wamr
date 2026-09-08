@@ -102,15 +102,33 @@ the explicit lower-bound derivation: a slower candidate cannot lower work,
 while a faster candidate or condition increases it. The selected count is then
 frozen for both revisions, both conditions, all warmups, and all samples.
 
-Pilots must pass guest correctness and operation assertions, produce a
-positive corrected interval of at least 100 ms, and satisfy the barrier/timer
-rule. Selected counts must fit uint64 operations, the wait/notify signed-32-bit
-epoch limit, checksum arithmetic, and declared workload caps. Every
-condition's linear projection must fit the 90-second watchdog. The retained
-pilot plus evidence projection, including a 10-minute auxiliary allowance,
-must fit a 120-minute benchmark budget, leaving 60 minutes inside the
-180-minute workflow timeout. Any failure aborts before evidence and retains
-completed pilots in the failure diagnostic.
+Pilots must pass guest correctness and operation assertions, have positive
+timing fields, and provide at least a 1 ms corrected interval for clock
+resolution. They are intentionally not required to satisfy the evidence
+`99B < E` rule at their short unsized count. After the frozen count is known,
+every retained pilot's barrier `B` is checked against its linearly projected
+corrected evidence interval `E`: `99B < E`. Every projected interval must also
+be at least both the 1.25-second evidence floor and the exact 1.925-second
+`1.75s * 11/10` sizing target. Actual warmups and samples independently enforce
+the unchanged `99B < E_actual` and 1.25-second floor.
+
+Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
+limit, checksum arithmetic, and declared workload caps. A pilot is rejected
+immediately above 30 seconds corrected time or 35 seconds host-wall time; the
+30-second corrected cap is above the retained approximately 22-second worst
+cell while preventing 88 watchdog-length pilots from exhausting a job. Every
+condition's projected invocation must remain strictly below the 90-second
+watchdog.
+
+The workflow reserves 83 minutes for non-benchmark work, leaving a 97-minute
+benchmark limit. For the full 88-pilot authoritative plan, the hard pilot bound
+is 51 minutes 20 seconds (`88 * 35s`). The minimum projected evidence bound is
+33 minutes 52.8 seconds (`88 * 12 * 1.925s`), and the auxiliary allowance is
+10 minutes. Their sum is 95 minutes 12.8 seconds; adding the 83-minute reserve
+is 178 minutes 12.8 seconds, strictly below the 180-minute job timeout. The
+harness accumulates actual pilot corrected and wall time after each one-shot
+pilot and aborts immediately when the remaining hard bound cannot fit. Any
+failure before evidence retains all completed pilots in the diagnostic.
 
 The hot-kernel expected checksum is prepared with an exact jump-ahead. After
 unrolling the recurrence, terms with the same iteration index modulo 64 share
@@ -195,9 +213,9 @@ same-directory atomic rename that preserves an existing report's mode.
 
 Each guest invocation has a fixed 90-second watchdog. Before evidence, the
 harness checks every pilot-derived per-condition projection against that
-watchdog and checks the complete projected benchmark path against 120 minutes.
-The workflow retains its 180-minute bound, reserving 60 minutes for builds,
-checkouts, tests, SDK/fixture verification, report upload, and cleanup. Twenty
+watchdog and checks the complete projected benchmark path against the strict
+97-minute limit. The workflow retains its 180-minute bound and 83-minute
+non-benchmark reserve. Twenty
 sequential trusted x86 jobs at the full job timeout still take 60 hours,
 leaving 12 hours before the unchanged 72-hour dispatcher deadline.
 

@@ -428,7 +428,10 @@
             "target_duration_ns",
             "safety_factor",
             "rounding",
-            "minimum_pilot_interval_ns",
+            "pilot_clock_resolution_minimum_ns",
+            "maximum_pilot_corrected_ns",
+            "maximum_pilot_host_wall_ns",
+            "projected_evidence_minimum_ns",
             "timing_overhead_ratio_limit",
             "limits",
             "failure_policy"
@@ -437,11 +440,18 @@
             "version": { "const": 1 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
-            "minimum_pilot_interval_ns": { "const": 100000000 },
+            "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
+            "maximum_pilot_corrected_ns": { "const": 30000000000 },
+            "maximum_pilot_host_wall_ns": { "const": 35000000000 },
+            "projected_evidence_minimum_ns": { "const": 1925000000 },
             "timing_overhead_ratio_limit": { "const": 0.01 },
             "failure_policy": { "const": "one-shot-no-retry-no-discard" },
-            "selection_rate": { "type": "string", "minLength": 1 },
-            "formula": { "type": "string", "minLength": 1 },
+            "selection_rate": {
+              "const": "fastest-valid-pilot-across-all-revisions-and-conditions"
+            },
+            "formula": {
+              "const": "ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator)), then decimal significant-digits ceiling"
+            },
             "safety_factor": {
               "type": "object",
               "additionalProperties": false,
@@ -460,7 +470,42 @@
                 "significant_digits": { "const": 3 }
               }
             },
-            "limits": { "type": "object" }
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "uint64_max",
+                "wait_notify_int32_max",
+                "workload_iteration_caps",
+                "per_invocation_timeout_ns",
+                "workflow_job_timeout_ns",
+                "job_non_benchmark_reserve_ns",
+                "projected_benchmark_limit_ns",
+                "auxiliary_invocation_budget_ns"
+              ],
+              "properties": {
+                "uint64_max": { "const": 18446744073709551615 },
+                "wait_notify_int32_max": { "const": 2147483647 },
+                "workload_iteration_caps": {
+                  "const": {
+                    "single-hot": 16000000000,
+                    "hot": 16000000000,
+                    "cancel-hot": 16000000000,
+                    "atomic": 8000000000,
+                    "wait-notify": 100000000,
+                    "spawn-join": 1000000
+                  }
+                },
+                "per_invocation_timeout_ns": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0
+                },
+                "workflow_job_timeout_ns": { "const": 10800000000000 },
+                "job_non_benchmark_reserve_ns": { "const": 4980000000000 },
+                "projected_benchmark_limit_ns": { "const": 5820000000000 },
+                "auxiliary_invocation_budget_ns": { "const": 600000000000 }
+              }
+            }
           }
         },
         "pilot_iterations": { "type": "object" },
@@ -476,8 +521,11 @@
             "pilots",
             "cells",
             "projections",
+            "pilot_corrected_elapsed_ns",
             "pilot_host_wall_elapsed_ns",
+            "maximum_total_pilot_bound_ns",
             "projected_evidence_host_wall_ns",
+            "projected_evidence_limit_ns",
             "auxiliary_invocation_budget_ns",
             "projected_benchmark_ns",
             "projected_benchmark_limit_ns"
@@ -502,7 +550,19 @@
               "type": "integer",
               "minimum": 1
             },
+            "pilot_corrected_elapsed_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maximum_total_pilot_bound_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
             "projected_evidence_host_wall_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "projected_evidence_limit_ns": {
               "type": "integer",
               "minimum": 1
             },

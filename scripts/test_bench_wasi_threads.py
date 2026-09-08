@@ -950,7 +950,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "incomplete": lambda pilots: pilots.pop(),
             "correctness": lambda pilots: pilots[0].__setitem__("correct", False),
             "timing resolution": lambda pilots: pilots[0].__setitem__(
-                "guest_elapsed_ns", bench.MINIMUM_PILOT_INTERVAL_NS - 1
+                "guest_elapsed_ns",
+                bench.PILOT_CLOCK_RESOLUTION_MINIMUM_NS - 1,
             ),
             "operation count": lambda pilots: pilots[0].__setitem__(
                 "operations", pilots[0]["operations"] + 1
@@ -1019,7 +1020,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             and item["workload"] == "single-hot"
         ]
         for item, elapsed in zip(
-            same_cell, (bench.MINIMUM_PILOT_INTERVAL_NS, 10_000_000_000)
+            same_cell,
+            (bench.PILOT_CLOCK_RESOLUTION_MINIMUM_NS, 10_000_000_000),
         ):
             item["guest_elapsed_ns"] = elapsed
             item["elapsed_ns"] = elapsed
@@ -1039,6 +1041,129 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 warmups=plan["warmups"],
                 samples=plan["samples"],
                 timeout_seconds=plan["timeout_seconds"],
+            )
+
+    def test_short_pilot_barriers_validate_against_projected_evidence(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        cell = [
+            item
+            for item in pilots
+            if item["mode"] == "aot"
+            and item["workload"] == "single-hot"
+        ]
+        for item, overhead in zip(cell, (6_228_000, 12_456_000)):
+            item["guest_elapsed_ns"] = 1_041_000_000
+            item["elapsed_ns"] = 1_041_000_000
+            item["timing_overhead_ns"] = overhead
+            item["raw_guest_elapsed_ns"] = 1_041_000_000 + overhead
+            item["timing_overhead_ppm"] = (
+                overhead * 1_000_000 // item["raw_guest_elapsed_ns"]
+            )
+            item["host_wall_elapsed_ns"] = 1_050_000_000
+        _, resolved = bench.resolve_one_shot_sizing(
+            pilot_records=pilots,
+            pilot_order=plan["sizing"]["pilot_order"],
+            modes=tuple(plan["modes"]),
+            thread_counts=tuple(plan["thread_counts"]),
+            warmups=plan["warmups"],
+            samples=plan["samples"],
+            timeout_seconds=plan["timeout_seconds"],
+        )
+        projected = {
+            item["pilot_index"]: item
+            for item in resolved["projections"]
+        }
+        for item in cell[:2]:
+            value = projected[item["pilot_index"]]
+            self.assertGreaterEqual(
+                value["projected_guest_elapsed_ns"],
+                bench.PROJECTED_EVIDENCE_MINIMUM_NS,
+            )
+            self.assertLess(
+                99 * item["timing_overhead_ns"],
+                value["projected_guest_elapsed_ns"],
+            )
+
+    def test_projected_barrier_failure_and_point_three_second_pilot(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        target = pilots[0]
+        target["guest_elapsed_ns"] = 300_000_000
+        target["elapsed_ns"] = 300_000_000
+        target["timing_overhead_ns"] = 100_000
+        target["raw_guest_elapsed_ns"] = 300_100_000
+        target["timing_overhead_ppm"] = 333
+        target["host_wall_elapsed_ns"] = 301_000_000
+        bench.resolve_one_shot_sizing(
+            pilot_records=pilots,
+            pilot_order=plan["sizing"]["pilot_order"],
+            modes=tuple(plan["modes"]),
+            thread_counts=tuple(plan["thread_counts"]),
+            warmups=plan["warmups"],
+            samples=plan["samples"],
+            timeout_seconds=plan["timeout_seconds"],
+        )
+        target["timing_overhead_ns"] = 25_000_000
+        target["raw_guest_elapsed_ns"] = 325_000_000
+        target["timing_overhead_ppm"] = 76_923
+        with self.assertRaisesRegex(
+            bench.HarnessError, "projected barrier ratio"
+        ):
+            bench.resolve_one_shot_sizing(
+                pilot_records=pilots,
+                pilot_order=plan["sizing"]["pilot_order"],
+                modes=tuple(plan["modes"]),
+                thread_counts=tuple(plan["thread_counts"]),
+                warmups=plan["warmups"],
+                samples=plan["samples"],
+                timeout_seconds=plan["timeout_seconds"],
+            )
+
+    def test_pilot_duration_and_job_bounds_are_hard(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        pilots[0]["guest_elapsed_ns"] = bench.MAXIMUM_PILOT_CORRECTED_NS + 1
+        pilots[0]["elapsed_ns"] = pilots[0]["guest_elapsed_ns"]
+        pilots[0]["raw_guest_elapsed_ns"] = (
+            pilots[0]["guest_elapsed_ns"] + pilots[0]["timing_overhead_ns"]
+        )
+        pilots[0]["host_wall_elapsed_ns"] = pilots[0]["raw_guest_elapsed_ns"]
+        with self.assertRaisesRegex(bench.HarnessError, "exceeds 30 seconds"):
+            bench.resolve_one_shot_sizing(
+                pilot_records=pilots,
+                pilot_order=plan["sizing"]["pilot_order"],
+                modes=tuple(plan["modes"]),
+                thread_counts=tuple(plan["thread_counts"]),
+                warmups=plan["warmups"],
+                samples=plan["samples"],
+                timeout_seconds=plan["timeout_seconds"],
+            )
+        args = bench.parse_args(["--no-budget"])
+        pairs = bench.planned_pair_specs(args, ("interpreter", "aot"))
+        order = bench.pilot_order_for_plan(
+            pairs, bench.REVISION_ROLES, args.pilot_iteration_plan
+        )
+        hard_bound = (
+            len(order) * bench.MAXIMUM_PILOT_HOST_WALL_NS
+            + len(order)
+            * (args.warmups + args.samples)
+            * bench.PROJECTED_EVIDENCE_MINIMUM_NS
+            + bench.AUXILIARY_INVOCATION_BUDGET_NS
+            + bench.JOB_NON_BENCHMARK_RESERVE_NS
+        )
+        self.assertEqual(bench.JOB_NON_BENCHMARK_RESERVE_NS, 83 * 60 * 10**9)
+        self.assertEqual(bench.PROJECTED_BENCHMARK_LIMIT_NS, 97 * 60 * 10**9)
+        self.assertLess(hard_bound, bench.WORKFLOW_JOB_TIMEOUT_NS)
+        with self.assertRaisesRegex(bench.HarnessError, "97-minute"):
+            bench.pilot_progress_bound(
+                pilot_records=[],
+                total_pilots=len(order),
+                warmups=100,
+                samples=100,
             )
 
     def test_schema_v3_fixed_plan_report_is_rejected(self) -> None:

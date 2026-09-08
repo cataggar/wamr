@@ -74,9 +74,16 @@ SIZING_TARGET_NS = 1_750_000_000
 SIZING_SAFETY_NUMERATOR = 11
 SIZING_SAFETY_DENOMINATOR = 10
 SIZING_SIGNIFICANT_DIGITS = 3
-MINIMUM_PILOT_INTERVAL_NS = 100_000_000
+PROJECTED_EVIDENCE_MINIMUM_NS = (
+    SIZING_TARGET_NS * SIZING_SAFETY_NUMERATOR
+    + SIZING_SAFETY_DENOMINATOR
+    - 1
+) // SIZING_SAFETY_DENOMINATOR
+PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
+MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
+MAXIMUM_PILOT_HOST_WALL_NS = 35_000_000_000
 WORKFLOW_JOB_TIMEOUT_NS = 180 * 60 * 1_000_000_000
-JOB_NON_BENCHMARK_RESERVE_NS = 60 * 60 * 1_000_000_000
+JOB_NON_BENCHMARK_RESERVE_NS = 83 * 60 * 1_000_000_000
 PROJECTED_BENCHMARK_LIMIT_NS = (
     WORKFLOW_JOB_TIMEOUT_NS - JOB_NON_BENCHMARK_RESERVE_NS
 )
@@ -449,7 +456,12 @@ def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
             "kind": "decimal-significant-digits-ceiling",
             "significant_digits": SIZING_SIGNIFICANT_DIGITS,
         },
-        "minimum_pilot_interval_ns": MINIMUM_PILOT_INTERVAL_NS,
+        "pilot_clock_resolution_minimum_ns": (
+            PILOT_CLOCK_RESOLUTION_MINIMUM_NS
+        ),
+        "maximum_pilot_corrected_ns": MAXIMUM_PILOT_CORRECTED_NS,
+        "maximum_pilot_host_wall_ns": MAXIMUM_PILOT_HOST_WALL_NS,
+        "projected_evidence_minimum_ns": PROJECTED_EVIDENCE_MINIMUM_NS,
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
         "limits": {
             "uint64_max": MASK64,
@@ -520,6 +532,105 @@ def selected_iterations_from_elapsed(
     )
 
 
+def validate_sizing_pilot(
+    record: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    for key in (
+        "pilot_index",
+        "revision",
+        "pair_kind",
+        "pair_key",
+        "condition",
+        "mode",
+        "workload",
+        "threads",
+        "iterations",
+    ):
+        if record.get(key) != expected[key]:
+            raise HarnessError(f"sizing pilot order mismatch for {key}")
+    if record.get("correct") is not True:
+        raise HarnessError("sizing pilot correctness failed")
+    elapsed = record.get("guest_elapsed_ns")
+    overhead = record.get("timing_overhead_ns")
+    raw = record.get("raw_guest_elapsed_ns")
+    host_wall = record.get("host_wall_elapsed_ns")
+    if (
+        not isinstance(elapsed, int)
+        or isinstance(elapsed, bool)
+        or elapsed < PILOT_CLOCK_RESOLUTION_MINIMUM_NS
+    ):
+        raise HarnessError("sizing pilot clock resolution is insufficient")
+    if elapsed > MAXIMUM_PILOT_CORRECTED_NS:
+        raise HarnessError("sizing pilot corrected duration exceeds 30 seconds")
+    if (
+        not isinstance(host_wall, int)
+        or isinstance(host_wall, bool)
+        or host_wall < elapsed
+        or host_wall > MAXIMUM_PILOT_HOST_WALL_NS
+    ):
+        raise HarnessError("sizing pilot host-wall duration exceeds 35 seconds")
+    if (
+        not isinstance(overhead, int)
+        or isinstance(overhead, bool)
+        or overhead < 0
+        or not isinstance(raw, int)
+        or isinstance(raw, bool)
+        or raw != elapsed + overhead
+    ):
+        raise HarnessError("sizing pilot barrier diagnostics are invalid")
+    expected_operations = expected_result(
+        "hot" if expected["workload"] == "cancel-hot" else expected["workload"],
+        expected["threads"],
+        expected["iterations"],
+    )["operations"]
+    if record.get("operations") != expected_operations:
+        raise HarnessError("sizing pilot operation count mismatch")
+
+
+def pilot_progress_bound(
+    *,
+    pilot_records: list[dict[str, Any]],
+    total_pilots: int,
+    warmups: int,
+    samples: int,
+) -> dict[str, int]:
+    completed_wall_ns = sum(
+        record["host_wall_elapsed_ns"] for record in pilot_records
+    )
+    completed_elapsed_ns = sum(
+        record["guest_elapsed_ns"] for record in pilot_records
+    )
+    remaining_pilots = total_pilots - len(pilot_records)
+    if remaining_pilots < 0:
+        raise HarnessError("sizing pilot progress exceeds declared order")
+    remaining_pilot_bound_ns = (
+        remaining_pilots * MAXIMUM_PILOT_HOST_WALL_NS
+    )
+    minimum_evidence_bound_ns = (
+        total_pilots
+        * (warmups + samples)
+        * PROJECTED_EVIDENCE_MINIMUM_NS
+    )
+    earliest_complete_bound_ns = (
+        completed_wall_ns
+        + remaining_pilot_bound_ns
+        + minimum_evidence_bound_ns
+        + AUXILIARY_INVOCATION_BUDGET_NS
+    )
+    if earliest_complete_bound_ns >= PROJECTED_BENCHMARK_LIMIT_NS:
+        raise HarnessError(
+            "sizing pilot progress cannot fit the 97-minute benchmark bound"
+        )
+    return {
+        "completed_pilot_elapsed_ns": completed_elapsed_ns,
+        "completed_pilot_host_wall_ns": completed_wall_ns,
+        "remaining_pilot_bound_ns": remaining_pilot_bound_ns,
+        "minimum_evidence_bound_ns": minimum_evidence_bound_ns,
+        "earliest_complete_bound_ns": earliest_complete_bound_ns,
+    }
+
+
 def empty_iteration_plan(
     modes: tuple[str, ...],
     thread_counts: tuple[int, ...],
@@ -565,47 +676,7 @@ def resolve_one_shot_sizing(
         raise HarnessError("sizing pilot set is incomplete")
     grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
     for expected, record in zip(pilot_order, pilot_records, strict=True):
-        for key in (
-            "pilot_index",
-            "revision",
-            "pair_kind",
-            "pair_key",
-            "condition",
-            "mode",
-            "workload",
-            "threads",
-            "iterations",
-        ):
-            if record.get(key) != expected[key]:
-                raise HarnessError(f"sizing pilot order mismatch for {key}")
-        if record.get("correct") is not True:
-            raise HarnessError("sizing pilot correctness failed")
-        elapsed = record.get("guest_elapsed_ns")
-        overhead = record.get("timing_overhead_ns")
-        raw = record.get("raw_guest_elapsed_ns")
-        if (
-            not isinstance(elapsed, int)
-            or isinstance(elapsed, bool)
-            or elapsed < MINIMUM_PILOT_INTERVAL_NS
-        ):
-            raise HarnessError("sizing pilot timing resolution is insufficient")
-        if (
-            not isinstance(overhead, int)
-            or isinstance(overhead, bool)
-            or overhead < 0
-            or not isinstance(raw, int)
-            or isinstance(raw, bool)
-            or raw != elapsed + overhead
-            or 99 * overhead >= elapsed
-        ):
-            raise HarnessError("sizing pilot barrier diagnostics are invalid")
-        expected_operations = expected_result(
-            "hot" if expected["workload"] == "cancel-hot" else expected["workload"],
-            expected["threads"],
-            expected["iterations"],
-        )["operations"]
-        if record.get("operations") != expected_operations:
-            raise HarnessError("sizing pilot operation count mismatch")
+        validate_sizing_pilot(record, expected)
         key = (
             expected["mode"],
             expected["workload"],
@@ -700,7 +771,20 @@ def resolve_one_shot_sizing(
         projected_host = ceil_div(
             record["host_wall_elapsed_ns"] * selected, record["iterations"]
         )
-        if projected_guest > timeout_ns or projected_host > timeout_ns:
+        if projected_guest < max(
+            int(MIN_TIMED_INTERVAL_MS * 1_000_000),
+            PROJECTED_EVIDENCE_MINIMUM_NS,
+        ):
+            raise HarnessError(
+                f"sizing projection is below the evidence minimum for pilot "
+                f"{record['pilot_index']}"
+            )
+        if 99 * record["timing_overhead_ns"] >= projected_guest:
+            raise HarnessError(
+                f"sizing projected barrier ratio is not below 1% for pilot "
+                f"{record['pilot_index']}"
+            )
+        if projected_guest >= timeout_ns or projected_host >= timeout_ns:
             raise HarnessError(
                 f"sizing projection exceeds {timeout_seconds:g}s invocation "
                 f"timeout for pilot {record['pilot_index']}"
@@ -712,15 +796,38 @@ def resolve_one_shot_sizing(
                 "selected_iterations": selected,
                 "projected_guest_elapsed_ns": projected_guest,
                 "projected_host_wall_elapsed_ns": projected_host,
+                "projected_timing_overhead_ratio": (
+                    record["timing_overhead_ns"]
+                    / (projected_guest + record["timing_overhead_ns"])
+                ),
+                "projected_evidence_minimum_ns": max(
+                    int(MIN_TIMED_INTERVAL_MS * 1_000_000),
+                    PROJECTED_EVIDENCE_MINIMUM_NS,
+                ),
             }
         )
     pilot_host_ns = sum(record["host_wall_elapsed_ns"] for record in pilot_records)
+    pilot_elapsed_ns = sum(record["guest_elapsed_ns"] for record in pilot_records)
+    maximum_total_pilot_bound_ns = (
+        len(pilot_order) * MAXIMUM_PILOT_HOST_WALL_NS
+    )
+    projected_evidence_limit_ns = (
+        PROJECTED_BENCHMARK_LIMIT_NS
+        - maximum_total_pilot_bound_ns
+        - AUXILIARY_INVOCATION_BUDGET_NS
+    )
+    if projected_evidence_limit_ns <= 0:
+        raise HarnessError("declared pilot set leaves no evidence runtime budget")
+    if projected_evidence_ns >= projected_evidence_limit_ns:
+        raise HarnessError(
+            "sizing evidence projection cannot fit the 97-minute benchmark bound"
+        )
     projected_benchmark_ns = (
-        pilot_host_ns
+        maximum_total_pilot_bound_ns
         + projected_evidence_ns
         + AUXILIARY_INVOCATION_BUDGET_NS
     )
-    if projected_benchmark_ns > PROJECTED_BENCHMARK_LIMIT_NS:
+    if projected_benchmark_ns >= PROJECTED_BENCHMARK_LIMIT_NS:
         raise HarnessError(
             "sizing projection exceeds the benchmark share of the workflow timeout"
         )
@@ -729,8 +836,11 @@ def resolve_one_shot_sizing(
         "pilots": copy.deepcopy(pilot_records),
         "cells": cells,
         "projections": projections,
+        "pilot_corrected_elapsed_ns": pilot_elapsed_ns,
         "pilot_host_wall_elapsed_ns": pilot_host_ns,
+        "maximum_total_pilot_bound_ns": maximum_total_pilot_bound_ns,
         "projected_evidence_host_wall_ns": projected_evidence_ns,
+        "projected_evidence_limit_ns": projected_evidence_limit_ns,
         "auxiliary_invocation_budget_ns": AUXILIARY_INVOCATION_BUDGET_NS,
         "projected_benchmark_ns": projected_benchmark_ns,
         "projected_benchmark_limit_ns": PROJECTED_BENCHMARK_LIMIT_NS,
@@ -1223,6 +1333,14 @@ def failure_diagnostic_markdown(document: dict[str, Any]) -> str:
             f"`{document['ratio_at_minimum_timed_interval']}`"
         ),
         f"- Fixed limit: `< {document['timing_overhead_ratio_limit']}`",
+        "- Pilot clock-resolution minimum / corrected cap / host-wall cap: "
+        f"`{document['pilot_clock_resolution_minimum_ns']}` / "
+        f"`{document['maximum_pilot_corrected_ns']}` / "
+        f"`{document['maximum_pilot_host_wall_ns']}` ns",
+        "- Projected evidence minimum / benchmark limit / job reserve: "
+        f"`{document['projected_evidence_minimum_ns']}` / "
+        f"`{document['projected_benchmark_limit_ns']}` / "
+        f"`{document['job_non_benchmark_reserve_ns']}` ns",
         f"- Runner: `{document['host'].get('runner_name', '')}`",
         f"- Host fingerprint: "
         f"`{document['host_pair']['host_fingerprint_sha256']}`",
@@ -1284,6 +1402,14 @@ def write_failure_diagnostic(
             ratio_at_minimum_timed_interval
         ),
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "pilot_clock_resolution_minimum_ns": (
+            PILOT_CLOCK_RESOLUTION_MINIMUM_NS
+        ),
+        "maximum_pilot_corrected_ns": MAXIMUM_PILOT_CORRECTED_NS,
+        "maximum_pilot_host_wall_ns": MAXIMUM_PILOT_HOST_WALL_NS,
+        "projected_evidence_minimum_ns": PROJECTED_EVIDENCE_MINIMUM_NS,
+        "projected_benchmark_limit_ns": PROJECTED_BENCHMARK_LIMIT_NS,
+        "job_non_benchmark_reserve_ns": JOB_NON_BENCHMARK_RESERVE_NS,
         "minimum_timed_interval_ns": minimum_interval_ns,
         "maximum_preflight_barrier_ns": maximum_preflight_barrier_ns(
             minimum_interval_ns
@@ -3882,11 +4008,17 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "host_quiescence_at_start": host_quiescence_at_start,
     }
     pilot_records: list[dict[str, Any]] = []
+    pilot_progress_bound(
+        pilot_records=pilot_records,
+        total_pilots=len(pilot_order),
+        warmups=args.warmups,
+        samples=args.samples,
+    )
     pilot_measured = functools.partial(
         measure_with_quality_diagnostic,
         output=output,
         stage="sizing-pilot",
-        minimum_interval_ns=MINIMUM_PILOT_INTERVAL_NS,
+        minimum_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
         host=host,
         host_pair=host_pair,
         host_quiescence_at_start=host_quiescence_at_start,
@@ -3958,7 +4090,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             threads=spec["threads"],
             iterations=spec["iterations"],
             timeout=args.timeout,
-            min_interval_ns=MINIMUM_PILOT_INTERVAL_NS,
+            min_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
+            enforce_timing_quality=False,
             record_fields={
                 **spec,
                 "phase": "pilot",
@@ -3968,6 +4101,41 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             },
         )
         pilot_records.append(pilot)
+        try:
+            validate_sizing_pilot(pilot, spec)
+            pilot_progress_bound(
+                pilot_records=pilot_records,
+                total_pilots=len(pilot_order),
+                warmups=args.warmups,
+                samples=args.samples,
+            )
+        except HarnessError as exc:
+            raise_with_failure_diagnostic(
+                exc,
+                output=output,
+                stage="sizing-pilot",
+                reason="pilot-quality-or-runtime-bound",
+                scenario={
+                    "revision": spec["revision"],
+                    "mode": spec["mode"],
+                    "workload": spec["workload"],
+                    "threads": spec["threads"],
+                    "iterations": spec["iterations"],
+                    "condition": spec["condition"],
+                    "pair_key": spec["pair_key"],
+                    "pilot_index": spec["pilot_index"],
+                },
+                timing_overhead_ns=pilot["timing_overhead_ns"],
+                timed_interval_ns=pilot["guest_elapsed_ns"],
+                raw_elapsed_ns=pilot["raw_guest_elapsed_ns"],
+                timing_overhead_ppm=pilot["timing_overhead_ppm"],
+                minimum_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
+                host=host,
+                host_pair=host_pair,
+                host_quiescence_at_start=host_quiescence_at_start,
+                host_quiescence_at_failure=host_quiescence_diagnostics(),
+                preflight_samples=pilot_records,
+            )
         print(
             f"[thread-bench] sizing pilot {spec['pilot_index'] + 1}/"
             f"{len(pilot_order)} {spec['revision']}/{spec['pair_key']}/"
@@ -3976,15 +4144,38 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             file=sys.stderr,
         )
 
-    iteration_plan, sizing_resolution = resolve_one_shot_sizing(
-        pilot_records=pilot_records,
-        pilot_order=pilot_order,
-        modes=modes,
-        thread_counts=args.thread_counts,
-        warmups=args.warmups,
-        samples=args.samples,
-        timeout_seconds=args.timeout,
-    )
+    try:
+        iteration_plan, sizing_resolution = resolve_one_shot_sizing(
+            pilot_records=pilot_records,
+            pilot_order=pilot_order,
+            modes=modes,
+            thread_counts=args.thread_counts,
+            warmups=args.warmups,
+            samples=args.samples,
+            timeout_seconds=args.timeout,
+        )
+    except HarnessError as exc:
+        raise_with_failure_diagnostic(
+            exc,
+            output=output,
+            stage="sizing-resolution",
+            reason="projected-quality-or-runtime-bound",
+            scenario={
+                "pilot_count": len(pilot_records),
+                "warmups": args.warmups,
+                "samples": args.samples,
+            },
+            timing_overhead_ns=None,
+            timed_interval_ns=None,
+            raw_elapsed_ns=None,
+            timing_overhead_ppm=None,
+            minimum_interval_ns=minimum_interval_ns,
+            host=host,
+            host_pair=host_pair,
+            host_quiescence_at_start=host_quiescence_at_start,
+            host_quiescence_at_failure=host_quiescence_diagnostics(),
+            preflight_samples=pilot_records,
+        )
     plan = {
         "profile": args.profile,
         "warmups": args.warmups,
