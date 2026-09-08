@@ -92,7 +92,7 @@ This replaces fixed-count provenance after #1008 run 34173856468, job
 than the retained sizing host. That observation demonstrates that no finite
 fixed host margin is a defensible contract.
 
-For each cell, sizing version 3 selects the fastest valid pilot across all
+For each cell, sizing version 4 selects the fastest valid pilot across all
 revisions and conditions. With pilot iterations `P` and corrected elapsed
 nanoseconds `E`, the general count is
 `round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))`,
@@ -100,28 +100,29 @@ where the target is 1.75 seconds and the safety factor is `11/10`.
 
 One declarative, portable cell envelope additionally applies to
 `mode=aot, workload=wait-notify, threads=1` on every architecture. Its count is
-`round_up_3_significant_digits(ceil(P*1250000000*12/(E*5)))`, and the selected
+`round_up_3_significant_digits(ceil(P*1250000000*8/E))`, and the selected
 count is the maximum of the general and envelope counts. Equivalently, the
 cell-specific formula is
-`round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*12/(E*5))))`.
-The `12/5` rate-acceleration envelope projects 3.0 seconds at the pilot rate,
-so a later measurement may accelerate by up to 2.4 times and still meet the
+`round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*8/E)))`.
+The `8/1` rate-acceleration envelope projects 10.0 seconds at the pilot rate,
+so a later measurement may accelerate by up to 8 times and still meet the
 1.25-second floor.
 
-The retained same-SHA PR #1016 attempts and prior ordered-rate evidence are:
+The retained failed hosted attempts and their ordered-rate evidence are:
 
-| evidence | fastest pilot rate (ops/s) | later/pilot acceleration | general count | v3 count | projected later duration |
+| evidence | fastest pilot rate (ops/s) | later/pilot acceleration | general count | v4 count | projected later duration |
 |---|---:|---:|---:|---:|---:|
-| attempt 1 | 739,133.627 | 2.192262005x | 1.43M | 2.22M | 1.370054s |
-| attempt 2 | 853,510.803 | 1.836297620x | 1.65M | 2.57M | 1.639763s |
-| attempt 3 | 262,449.465 | 1.737047051x | 506K | 788K | 1.728498s |
-| prior retained maximum | — | 2.272623705x | — | — | 1.320060s at the exact envelope |
+| attempt 1 | 739,133.627 | 2.192262005x | 1.43M | 7.40M | 4.566845s |
+| attempt 2 | 853,510.803 | 1.836297620x | 1.65M | 8.54M | 5.448862s |
+| attempt 3 | 262,449.465 | 1.737047051x | 506K | 2.63M | 5.768973s |
+| #1020 run 34284891299 | 182,566.439 | 5.367617735x | 352K | 1.83M | 1.867448s |
 
-The exact relative margin over the retained `2.272623705208038x` boundary is
-`2.4 / 2.272623705208038 - 1 = 0.056048123805124916`, or
-`5.6048123805124916%` (5.6048%). Replaying all 88 retained pilots and the
-12 evidence invocations per observation gives a maximum 3,056.826806075-second
-projection on attempt 3, bounded by 50.95 minutes and still below 97 minutes.
+The exact relative margin over the retained `5.367617734892188x` boundary is
+`8 / 5.367617734892188 - 1 = 0.49041910119567866`, or
+`49.041910119567866%` (49.0419%). Replaying all 88 retained pilots and the
+12 evidence invocations per observation gives a maximum 3,268.557360454-second
+projection on the #1020 failure, bounded by 54.48 minutes and still below
+97 minutes.
 This is a cell-specific rate envelope, not an x86 host allowance: the selector
 contains no CPU, runner, platform, or architecture identity and therefore
 applies identically to every canonical platform.
@@ -141,15 +142,15 @@ every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
 be at least both the 1.25-second evidence floor and the exact 1.925-second
 `1.75s * 11/10` sizing target; the declared special cell projects at least
-3.0 seconds at every retained pilot rate. Actual warmups and samples
+10.0 seconds at every retained pilot rate. Actual warmups and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
-There is no hidden retry or count increase if a later rate exceeds `2.4x`:
+There is no hidden retry or count increase if a later rate exceeds `8x`:
 even a just-over-boundary observation that falls below 1.25 seconds is retained
 and fails closed.
 
 Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
 limit, checksum arithmetic, and declared workload caps. A pilot is rejected
-immediately above 30 seconds corrected time or 35 seconds host-wall time; the
+immediately above 30 seconds corrected time or 33 seconds host-wall time; the
 30-second corrected cap is above the retained approximately 22-second worst
 cell while preventing 88 watchdog-length pilots from exhausting a job. Every
 condition's projected invocation must remain strictly below the 90-second
@@ -157,13 +158,13 @@ watchdog.
 
 The workflow reserves 83 minutes for non-benchmark work, leaving a 97-minute
 benchmark limit. Before and during the full 88-pilot authoritative plan,
-admission uses the hard 51-minute-20-second pilot bound (`88 * 35s`), the
-33-minute-52.8-second minimum evidence bound (`88 * 12 * 1.925s`), and the
-10-minute auxiliary allowance. Their sum is 95 minutes 12.8 seconds; adding
-the 83-minute reserve is 178 minutes 12.8 seconds, strictly below the
-180-minute job timeout. The harness accumulates actual pilot corrected and
-wall time after each one-shot pilot and aborts immediately when the remaining
-hard bound cannot fit.
+admission uses the hard 48-minute-24-second pilot bound (`88 * 33s`), the
+envelope-aware 37-minute-6.6-second minimum evidence bound
+(`86 * 12 * 1.925s + 2 * 12 * 10s`), and the 10-minute auxiliary allowance.
+Their sum is 95 minutes 30.6 seconds; adding the 83-minute reserve is
+178 minutes 30.6 seconds, strictly below the 180-minute job timeout. The
+harness accumulates actual pilot corrected and wall time after each one-shot
+pilot and aborts immediately when the remaining hard bound cannot fit.
 
 After all pilots finish, the hard pre-admission pilot allowance is no longer
 charged. The final `projected_evidence_limit_ns` is exactly
@@ -265,7 +266,7 @@ leaving 12 hours before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 4 of a purpose-independent portable
+`measurement_plan_sha256` is version 5 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -580,10 +581,11 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Schema-v3 fixed-plan reports and reports produced before measurement-plan
-identity version 4, including version-2 reports from #1013 and version-3 PR
-#1016 attempts, are invalid for a new authoritative cohort. Fresh evidence
-with the canonical one-shot sizing identity is mandatory for calibration and
-derivation. Reports with different legitimate host-selected counts may mix;
+identity version 5, including version-2 reports from #1013 and version-3/4
+#1016 and #1020 attempts, are invalid for a new authoritative cohort. Fresh
+evidence with the canonical one-shot sizing identity is mandatory for
+calibration and derivation. Reports with different legitimate host-selected
+counts may mix;
 reports with altered pilot specifications, target, safety factor, cell
 envelope, rounding, caps, timeouts, or algorithm identity may not. Earlier
 failed/partial runs and the retained timing-quality failure remain excluded

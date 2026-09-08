@@ -50,9 +50,9 @@ REPORT_SCHEMA_VERSION = 4
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 4
+MEASUREMENT_PLAN_IDENTITY_VERSION = 5
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 3
+SIZING_ALGORITHM_VERSION = 4
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -95,10 +95,10 @@ SIZING_CELL_ENVELOPES = (
         },
         "quality_floor_ns": 1_250_000_000,
         "measurement_to_pilot_rate_envelope": {
-            "numerator": 12,
-            "denominator": 5,
+            "numerator": 8,
+            "denominator": 1,
         },
-        "projected_pilot_duration_ns": 3_000_000_000,
+        "projected_pilot_duration_ns": 10_000_000_000,
         "formula": SIZING_CELL_ENVELOPE_FORMULA,
     },
 )
@@ -109,7 +109,7 @@ PROJECTED_EVIDENCE_MINIMUM_NS = (
 ) // SIZING_SAFETY_DENOMINATOR
 PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
 MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
-MAXIMUM_PILOT_HOST_WALL_NS = 35_000_000_000
+MAXIMUM_PILOT_HOST_WALL_NS = 33_000_000_000
 WORKFLOW_JOB_TIMEOUT_NS = 180 * 60 * 1_000_000_000
 JOB_NON_BENCHMARK_RESERVE_NS = 83 * 60 * 1_000_000_000
 PROJECTED_BENCHMARK_LIMIT_NS = (
@@ -655,7 +655,7 @@ def validate_sizing_pilot(
         or host_wall < elapsed
         or host_wall > MAXIMUM_PILOT_HOST_WALL_NS
     ):
-        raise HarnessError("sizing pilot host-wall duration exceeds 35 seconds")
+        raise HarnessError("sizing pilot host-wall duration exceeds 33 seconds")
     if (
         not isinstance(overhead, int)
         or isinstance(overhead, bool)
@@ -677,7 +677,7 @@ def validate_sizing_pilot(
 def pilot_progress_bound(
     *,
     pilot_records: list[dict[str, Any]],
-    total_pilots: int,
+    pilot_order: list[dict[str, Any]],
     warmups: int,
     samples: int,
 ) -> dict[str, int]:
@@ -687,16 +687,27 @@ def pilot_progress_bound(
     completed_elapsed_ns = sum(
         record["guest_elapsed_ns"] for record in pilot_records
     )
-    remaining_pilots = total_pilots - len(pilot_records)
+    remaining_pilots = len(pilot_order) - len(pilot_records)
     if remaining_pilots < 0:
         raise HarnessError("sizing pilot progress exceeds declared order")
     remaining_pilot_bound_ns = (
         remaining_pilots * MAXIMUM_PILOT_HOST_WALL_NS
     )
-    minimum_evidence_bound_ns = (
-        total_pilots
-        * (warmups + samples)
-        * PROJECTED_EVIDENCE_MINIMUM_NS
+    minimum_evidence_bound_ns = (warmups + samples) * sum(
+        max(
+            [PROJECTED_EVIDENCE_MINIMUM_NS]
+            + [
+                envelope["projected_pilot_duration_ns"]
+                for envelope in SIZING_CELL_ENVELOPES
+                if envelope["selector"]
+                == {
+                    "mode": spec["mode"],
+                    "workload": spec["workload"],
+                    "threads": spec["threads"],
+                }
+            ]
+        )
+        for spec in pilot_order
     )
     earliest_complete_bound_ns = (
         completed_wall_ns
@@ -4122,7 +4133,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     pilot_records: list[dict[str, Any]] = []
     pilot_progress_bound(
         pilot_records=pilot_records,
-        total_pilots=len(pilot_order),
+        pilot_order=pilot_order,
         warmups=args.warmups,
         samples=args.samples,
     )
@@ -4217,7 +4228,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             validate_sizing_pilot(pilot, spec)
             pilot_progress_bound(
                 pilot_records=pilot_records,
-                total_pilots=len(pilot_order),
+                pilot_order=pilot_order,
                 warmups=args.warmups,
                 samples=args.samples,
             )
