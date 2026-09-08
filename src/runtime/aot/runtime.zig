@@ -2828,7 +2828,8 @@ fn broadcastCancelToSharedMemory(
     defer mem.subscriber_mutex.unlock();
     for (mem.vmctx_subscribers.items) |subscriber_opaque| {
         const subscriber: *VmCtx = @ptrCast(@alignCast(subscriber_opaque));
-        const inst: *AotInstance = @fieldParentPtr("vmctx", subscriber);
+        if (subscriber.instance_ptr == 0) continue;
+        const inst: *AotInstance = @ptrFromInt(subscriber.instance_ptr);
         inst.lockCancellationContext();
         defer inst.unlockCancellationContext();
         if (target_token != 0 and
@@ -2894,6 +2895,7 @@ test "AOT thread task cancellation targets only matching VmCtx subscribers" {
         .allocator = allocator,
     };
     const first_vmctx = &first_inst.vmctx;
+    first_vmctx.instance_ptr = @intFromPtr(&first_inst);
     first_vmctx.thread_context = @intFromPtr(&first_context);
     @atomicStore(
         u32,
@@ -2909,6 +2911,7 @@ test "AOT thread task cancellation targets only matching VmCtx subscribers" {
         .allocator = allocator,
     };
     const second_vmctx = &second_inst.vmctx;
+    second_vmctx.instance_ptr = @intFromPtr(&second_inst);
     second_vmctx.thread_context = @intFromPtr(&second_context);
     @atomicStore(
         u32,
@@ -3097,7 +3100,7 @@ test "AOT thread cancellation scope restores outer identity and recomputes state
     process_outer_scope.deinit();
 }
 
-test "AOT targeted cancellation publication serializes with scope transition" {
+test "AOT thread targeted cancellation publication serializes with scope transition" {
     if (!config.lib_wasi_threads or builtin.single_threaded)
         return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -3175,7 +3178,18 @@ test "AOT targeted cancellation publication serializes with scope transition" {
         .leave_second_ = &leave_second,
     };
     const switch_thread = try std.Thread.spawn(.{}, Switcher.run, .{&switcher});
-    while (!first_entered.load(.acquire)) std.atomic.spinLoopHint();
+    const Wait = struct {
+        fn forTrue(value: *std.atomic.Value(bool)) bool {
+            const deadline_us =
+                platform.timeGetBootUs() +| 5 * std.time.us_per_s;
+            while (!value.load(.acquire)) {
+                if (platform.timeGetBootUs() >= deadline_us) return false;
+                std.atomic.spinLoopHint();
+            }
+            return true;
+        }
+    };
+    const first_scope_ready = Wait.forTrue(&first_entered);
 
     const Canceller = struct {
         source: *task_cancellation.Source,
@@ -3186,17 +3200,15 @@ test "AOT targeted cancellation publication serializes with scope transition" {
     };
     var canceller = Canceller{ .source = first_source };
     const cancel_thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
-    while (!hook.broadcast_observed.load(.acquire))
-        std.atomic.spinLoopHint();
+    const broadcast_observed = Wait.forTrue(&hook.broadcast_observed);
 
     enter_second.store(true, .release);
-    while (!hook.transition_blocked.load(.acquire))
-        std.atomic.spinLoopHint();
+    const transition_blocked = Wait.forTrue(&hook.transition_blocked);
     const transitioned_while_broadcast_paused = second_entered.load(.acquire);
 
     hook.resume_broadcast.store(true, .release);
     cancel_thread.join();
-    while (!second_entered.load(.acquire)) std.atomic.spinLoopHint();
+    const second_scope_ready = Wait.forTrue(&second_entered);
     const active_token =
         @atomicLoad(u32, &inst.vmctx.cancel_group_token, .acquire);
     const active_flag = @atomicLoad(u32, &inst.vmctx.cancel_flag, .acquire);
@@ -3206,6 +3218,10 @@ test "AOT targeted cancellation publication serializes with scope transition" {
     leave_second.store(true, .release);
     switch_thread.join();
 
+    try std.testing.expect(first_scope_ready);
+    try std.testing.expect(broadcast_observed);
+    try std.testing.expect(transition_blocked);
+    try std.testing.expect(second_scope_ready);
     try std.testing.expect(!transitioned_while_broadcast_paused);
     try std.testing.expectEqual(
         second_context.cancellationGroupToken(),
