@@ -342,6 +342,10 @@ pub const Mutex = struct {
 
     pub const init: Mutex = .{ .state = std.atomic.Value(u8).init(0) };
 
+    pub fn tryLock(self: *Mutex) bool {
+        return self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+    }
+
     pub fn lock(self: *Mutex) void {
         while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
