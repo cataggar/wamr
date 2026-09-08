@@ -341,6 +341,52 @@ fn buildBinI32Module(
     return out.toOwnedSlice(allocator);
 }
 
+fn buildGlobalBinI32Module(
+    allocator: std.mem.Allocator,
+    value: i32,
+    rhs: i32,
+    op: u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    try out.appendSlice(allocator, &[_]u8{
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+        0x03, 0x02, 0x01, 0x00,
+    });
+
+    var global: std.ArrayList(u8) = .empty;
+    defer global.deinit(allocator);
+    try global.appendSlice(allocator, &[_]u8{ 0x01, 0x7F, 0x01, 0x41 });
+    try encodeSLEB128(&global, allocator, value);
+    try global.append(allocator, 0x0B);
+    try out.append(allocator, 0x06);
+    try encodeULEB128(&out, allocator, @intCast(global.items.len));
+    try out.appendSlice(allocator, global.items);
+
+    try out.appendSlice(allocator, &[_]u8{
+        0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00,
+    });
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, &[_]u8{ 0x00, 0x23, 0x00, 0x41 });
+    try encodeSLEB128(&body, allocator, rhs);
+    try body.appendSlice(allocator, &[_]u8{ op, 0x0B });
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try code.append(allocator, 0x01);
+    try encodeULEB128(&code, allocator, @intCast(body.items.len));
+    try code.appendSlice(allocator, body.items);
+    try out.append(allocator, 0x0A);
+    try encodeULEB128(&out, allocator, @intCast(code.items.len));
+    try out.appendSlice(allocator, code.items);
+
+    return out.toOwnedSlice(allocator);
+}
+
 /// Build a wasm module exporting `() -> i32` that does
 ///   block
 ///     block
@@ -4763,6 +4809,26 @@ test "differential: 20 %u 6 == 2 (i32.rem_u)" {
     const wasm = try buildBinI32Module(testing.allocator, 20, 6, 0x70);
     defer testing.allocator.free(wasm);
     try expectDiffI32(wasm, "f", 2);
+}
+
+test "differential: strength-reduced i32 div/rem_u by 10" {
+    const values = [_]u32{
+        1_300_000_009,
+        1_385_676_899,
+        2_147_483_648,
+        3_000_000_008,
+        std.math.maxInt(u32),
+    };
+    for (values) |value| {
+        const signed_value: i32 = @bitCast(value);
+        const div_wasm = try buildGlobalBinI32Module(testing.allocator, signed_value, 10, 0x6E);
+        defer testing.allocator.free(div_wasm);
+        try expectDiffI32(div_wasm, "f", @bitCast(value / 10));
+
+        const rem_wasm = try buildGlobalBinI32Module(testing.allocator, signed_value, 10, 0x70);
+        defer testing.allocator.free(rem_wasm);
+        try expectDiffI32(rem_wasm, "f", @bitCast(value % 10));
+    }
 }
 
 // ── br_table ─────────────────────────────────────────────────────────────────
