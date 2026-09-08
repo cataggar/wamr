@@ -43,6 +43,13 @@ jobs:
         continue-on-error: true
         run: zig build
 
+      - name: Install cross-architecture disassembler
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends binutils-multiarch
+          objdump -i | grep -F aarch64 >/dev/null
+
       - name: Unit tests
         run: zig build test
 
@@ -354,6 +361,12 @@ jobs:
         run: |
           pip install --user -r tests/wasi-testsuite/test-runner/requirements.txt
 
+      - name: Install cross-architecture disassembler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends binutils-multiarch
+          objdump -i | grep -F aarch64 >/dev/null
+
       - name: Unit tests (Debug, includes #853/#854 JIT smoke tests)
         # Deliberately Debug here, not ReleaseSafe: `zig build test
         # -Doptimize=ReleaseSafe` currently fails 2 pre-existing,
@@ -409,6 +422,13 @@ jobs:
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
+
+      - name: Install cross-architecture disassembler
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends binutils-multiarch
+          objdump -i | grep -F aarch64 >/dev/null
 
       - name: Lazy-JIT unit and regression tests
         run: zig build test -Djit=true -Dlazy_jit=true
