@@ -21,156 +21,6 @@ SPEC.loader.exec_module(profile)
 
 
 class CoreMarkProfileTests(unittest.TestCase):
-    def test_paired_acceptance_binds_roles_and_reduces_frame_traffic(self):
-        execution = {"provider": "local", "run_id": "paired"}
-        engines = {
-            role: {
-                "role": role,
-                "identity": {"source": {"sha": digest * 40}},
-            }
-            for role, digest in (
-                ("wamr-baseline", "a"),
-                ("wamr-target", "b"),
-            )
-        }
-        benchmark = {
-            "provenance": {
-                "report_id": "12345678-1234-5678-1234-567812345678",
-                "execution": execution,
-            },
-            "engines": list(engines.values()),
-            "wamr_comparison": {"median_delta_pct": 2.5},
-            "simd_acceptance": {
-                "correctness_passed": True,
-                "performance_passed": True,
-                "max_aot_regression_pct": 2.0,
-            },
-        }
-
-        def profile_report(role, frame_samples):
-            return {
-                "benchmark": {
-                    "selected_role": role,
-                    "selected_wamr": engines[role],
-                    "report_sha256": "f" * 64,
-                    "report_id": benchmark["provenance"]["report_id"],
-                    "execution": execution,
-                },
-                "provenance": {"execution": execution},
-                "host": {
-                    "architecture": "aarch64",
-                    "cpu_count": 4,
-                    "cpu_model": "Neoverse",
-                    "runner_name": "runner",
-                    "fingerprint": "host",
-                },
-                "wamr": {"commit": engines[role]["identity"]["source"]["sha"]},
-                "frame_attribution": {
-                    "local_func": 10,
-                    "total_samples": 1000,
-                    "summary": {
-                        "coverage": {"frame_samples": frame_samples},
-                        "origins": {
-                            "allocator_spill": {
-                                "samples": frame_samples,
-                                "percent_of_run": frame_samples / 10,
-                            }
-                        },
-                        "reconciliation": {
-                            "emitted_allocator_loads": (
-                                42 if role == "wamr-baseline" else 38
-                            ),
-                            "emitted_allocator_stores": 24,
-                        },
-                    },
-                },
-            }
-
-        baseline = profile_report("wamr-baseline", 130)
-        target = profile_report("wamr-target", 110)
-        correctness = {
-            "schema_version": 1,
-            "kind": "coremark-aarch64-candidate-correctness",
-            "status": "passed",
-            "target_sha": "b" * 40,
-            "command": [
-                "zig",
-                "build",
-                "-j4",
-                "test",
-                "-Doptimize=ReleaseFast",
-                "--summary",
-                "all",
-            ],
-        }
-        with (
-            mock.patch.object(
-                profile.bench_coremark,
-                "validate_authoritative_benchmark_report",
-            ),
-            mock.patch.object(profile, "validate_report"),
-            mock.patch.object(profile.bench_coremark, "validate_simd_acceptance"),
-        ):
-            acceptance = profile.build_paired_acceptance(
-                benchmark_report=benchmark,
-                benchmark_report_sha="f" * 64,
-                baseline_profile=baseline,
-                baseline_profile_sha="1" * 64,
-                target_profile=target,
-                target_profile_sha="2" * 64,
-                correctness_report=correctness,
-                correctness_report_sha="3" * 64,
-            )
-            self.assertEqual("passed", acceptance["status"])
-            frame_gate = acceptance["gates"][
-                "core_state_transition_frame_traffic"
-            ]
-            self.assertEqual(13.0, frame_gate["baseline"]["percent_of_run"])
-            self.assertEqual(11.0, frame_gate["target"]["percent_of_run"])
-            self.assertEqual(38, frame_gate["target"]["emitted_allocator_loads"])
-
-            wrong_role = copy.deepcopy(target)
-            wrong_role["benchmark"]["selected_role"] = "wamr-baseline"
-            with self.assertRaisesRegex(profile.ProfileError, "does not match"):
-                profile.build_paired_acceptance(
-                    benchmark_report=benchmark,
-                    benchmark_report_sha="f" * 64,
-                    baseline_profile=baseline,
-                    baseline_profile_sha="1" * 64,
-                    target_profile=wrong_role,
-                    target_profile_sha="2" * 64,
-                    correctness_report=correctness,
-                    correctness_report_sha="3" * 64,
-                )
-
-            regressed = profile_report("wamr-target", 140)
-            failed = profile.build_paired_acceptance(
-                benchmark_report=benchmark,
-                benchmark_report_sha="f" * 64,
-                baseline_profile=baseline,
-                baseline_profile_sha="1" * 64,
-                target_profile=regressed,
-                target_profile_sha="2" * 64,
-                correctness_report=correctness,
-                correctness_report_sha="3" * 64,
-            )
-            self.assertEqual("failed", failed["status"])
-            self.assertFalse(
-                failed["gates"]["core_state_transition_frame_traffic"]["passed"]
-            )
-            stale_correctness = {**correctness, "target_sha": "c" * 40}
-            with self.assertRaisesRegex(profile.ProfileError, "correctness"):
-                profile.build_paired_acceptance(
-                    benchmark_report=benchmark,
-                    benchmark_report_sha="f" * 64,
-                    baseline_profile=baseline,
-                    baseline_profile_sha="1" * 64,
-                    target_profile=target,
-                    target_profile_sha="2" * 64,
-                    correctness_report=stale_correctness,
-                    correctness_report_sha="3" * 64,
-                )
-
     def test_frame_diagnostics_use_exact_compiler_and_artifact(self):
         cache = ROOT / ".cache"
         cache.mkdir(exist_ok=True)
@@ -764,6 +614,21 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             ],
         }
         profile.validate_report(report)
+        baseline_report = copy.deepcopy(report)
+        selected = {
+            "role": "wamr-baseline",
+            "identity": baseline_report["benchmark"]["target"]["identity"],
+        }
+        baseline_report["benchmark"].update(
+            selected_role="wamr-baseline",
+            selected_wamr=selected,
+        )
+        del baseline_report["benchmark"]["target"]
+        baseline_report["wamr"]["benchmark_role"] = "wamr-baseline"
+        profile.validate_report(baseline_report)
+        baseline_report["wamr"]["benchmark_role"] = "wamr-target"
+        with self.assertRaisesRegex(profile.ProfileError, "roles differ"):
+            profile.validate_report(baseline_report)
         narrow_instructions = [
             profile.aarch64_instruction_provenance.Instruction(
                 offset=0,

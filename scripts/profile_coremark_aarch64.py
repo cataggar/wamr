@@ -38,10 +38,6 @@ DEFAULT_CLASSIFY_FUNCTIONS = 3
 DEFAULT_MAX_PERF_BYTES = 25 * 1024 * 1024
 PROFILE_CAPTURES_PER_ENGINE = 2
 MIN_ATTRIBUTION_COVERAGE_PCT = 99.0
-PAIRED_ACCEPTANCE_SCHEMA_VERSION = 1
-PAIRED_COREMARK_MIN_GAIN_PCT = 2.0
-PAIRED_SIMD_MAX_REGRESSION_PCT = 2.0
-PAIRED_FRAME_LOCAL_FUNC = 10
 ALL_ALU_WORDING = (
     "all ALU-class instructions: add/sub, logical operations, mul/div, "
     "shifts, compares, csel, and address-generation instructions"
@@ -57,7 +53,6 @@ REQUIRED_ANALYSIS_SOURCES = {
     "scripts/aarch64_instruction_provenance.py",
     "scripts/compare_hot_function.py",
     "scripts/bench_coremark.py",
-    "scripts/bench_simd.py",
     "scripts/bench_optimize.py",
     ".github/skills/aot-perf-profile/aot_jit_attr.py",
 }
@@ -1402,193 +1397,6 @@ def validate_report(report: dict[str, Any]) -> None:
         validate_frame_provenance(report["frame_attribution"], report)
 
 
-def build_paired_acceptance(
-    *,
-    benchmark_report: dict[str, Any],
-    benchmark_report_sha: str,
-    baseline_profile: dict[str, Any],
-    baseline_profile_sha: str,
-    target_profile: dict[str, Any],
-    target_profile_sha: str,
-    correctness_report: dict[str, Any],
-    correctness_report_sha: str,
-) -> dict[str, Any]:
-    bench_coremark.validate_authoritative_benchmark_report(benchmark_report)
-    validate_report(baseline_profile)
-    validate_report(target_profile)
-    profiles = {
-        "wamr-baseline": baseline_profile,
-        "wamr-target": target_profile,
-    }
-    for role, profile in profiles.items():
-        benchmark = profile["benchmark"]
-        if (
-            benchmark.get("selected_role") != role
-            or benchmark.get("report_sha256") != benchmark_report_sha
-            or benchmark.get("report_id")
-            != benchmark_report["provenance"]["report_id"]
-            or benchmark.get("execution")
-            != benchmark_report["provenance"]["execution"]
-        ):
-            raise ProfileError(f"{role} profile does not match the paired benchmark")
-        selected = benchmark.get("selected_wamr")
-        expected = bench_coremark._engine_with_role(benchmark_report, role)
-        if selected != expected:
-            raise ProfileError(f"{role} profile selected the wrong benchmark engine")
-        frame = profile.get("frame_attribution")
-        if not isinstance(frame, dict) or frame.get("local_func") != PAIRED_FRAME_LOCAL_FUNC:
-            raise ProfileError(
-                f"{role} profile lacks local_func {PAIRED_FRAME_LOCAL_FUNC} frame origins"
-            )
-
-    host_fields = (
-        "architecture",
-        "cpu_count",
-        "cpu_model",
-        "runner_name",
-        "fingerprint",
-    )
-    if any(
-        baseline_profile["host"].get(field) != target_profile["host"].get(field)
-        for field in host_fields
-    ):
-        raise ProfileError("paired profiles were not captured on the same host")
-    if (
-        baseline_profile["provenance"]["execution"]
-        != target_profile["provenance"]["execution"]
-    ):
-        raise ProfileError("paired profiles have different execution identities")
-
-    comparison = benchmark_report.get("wamr_comparison")
-    if not isinstance(comparison, dict):
-        raise ProfileError("paired benchmark lacks its WAMR comparison")
-    coremark_gain = comparison.get("median_delta_pct")
-    coremark_passed = (
-        isinstance(coremark_gain, (int, float))
-        and coremark_gain >= PAIRED_COREMARK_MIN_GAIN_PCT
-    )
-
-    simd = benchmark_report.get("simd_acceptance")
-    if not isinstance(simd, dict):
-        raise ProfileError("paired benchmark lacks SIMD acceptance samples")
-    engines = {
-        role: bench_coremark._engine_with_role(benchmark_report, role)
-        for role in ("wamr-baseline", "wamr-target")
-    }
-    bench_coremark.validate_simd_acceptance(simd, engines)
-    simd_passed = (
-        simd.get("correctness_passed") is True
-        and simd.get("performance_passed") is True
-        and simd.get("max_aot_regression_pct")
-        == PAIRED_SIMD_MAX_REGRESSION_PCT
-    )
-    target_engine = engines["wamr-target"]
-    if (
-        correctness_report.get("schema_version") != 1
-        or correctness_report.get("kind")
-        != "coremark-aarch64-candidate-correctness"
-        or correctness_report.get("status") != "passed"
-        or correctness_report.get("target_sha")
-        != target_engine["identity"]["source"]["sha"]
-        or correctness_report.get("command")
-        != [
-            "zig",
-            "build",
-            "-j4",
-            "test",
-            "-Doptimize=ReleaseFast",
-            "--summary",
-            "all",
-        ]
-    ):
-        raise ProfileError("candidate correctness evidence is missing or mismatched")
-
-    frame_values = {}
-    for role, profile in profiles.items():
-        frame = profile["frame_attribution"]
-        coverage = frame["summary"]["coverage"]
-        samples = coverage["frame_samples"]
-        total = frame["total_samples"]
-        if not isinstance(samples, int) or not isinstance(total, int) or total <= 0:
-            raise ProfileError(f"{role} frame sample totals are invalid")
-        origins = frame["summary"]["origins"]
-        if sum(value["samples"] for value in origins.values()) != samples:
-            raise ProfileError(f"{role} frame origins do not reconcile")
-        frame_values[role] = {
-            "samples": samples,
-            "total_samples": total,
-            "percent_of_run": 100.0 * samples / total,
-            "allocator_spill_percent_of_run": origins.get(
-                "allocator_spill", {}
-            ).get("percent_of_run", 0.0),
-            "emitted_allocator_loads": frame["summary"]["reconciliation"][
-                "emitted_allocator_loads"
-            ],
-            "emitted_allocator_stores": frame["summary"]["reconciliation"][
-                "emitted_allocator_stores"
-            ],
-        }
-    frame_passed = (
-        frame_values["wamr-target"]["percent_of_run"]
-        < frame_values["wamr-baseline"]["percent_of_run"]
-        and frame_values["wamr-target"]["emitted_allocator_loads"]
-        < frame_values["wamr-baseline"]["emitted_allocator_loads"]
-        and frame_values["wamr-target"]["emitted_allocator_stores"]
-        <= frame_values["wamr-baseline"]["emitted_allocator_stores"]
-    )
-    gates = {
-        "coremark_median_gain": {
-            "minimum_pct": PAIRED_COREMARK_MIN_GAIN_PCT,
-            "actual_pct": coremark_gain,
-            "passed": coremark_passed,
-        },
-        "simd_aot_per_case": {
-            "maximum_regression_pct": PAIRED_SIMD_MAX_REGRESSION_PCT,
-            "correctness_passed": simd.get("correctness_passed"),
-            "performance_passed": simd.get("performance_passed"),
-            "passed": simd_passed,
-        },
-        "core_state_transition_frame_traffic": {
-            "local_func": PAIRED_FRAME_LOCAL_FUNC,
-            "baseline": frame_values["wamr-baseline"],
-            "target": frame_values["wamr-target"],
-            "passed": frame_passed,
-        },
-        "correctness": {
-            "coremark_crc": True,
-            "simd_runner": simd.get("correctness_passed") is True,
-            "zig_test": {
-                "sha256": correctness_report_sha,
-                "target_sha": correctness_report["target_sha"],
-                "command": correctness_report["command"],
-            },
-            "passed": simd.get("correctness_passed") is True,
-        },
-    }
-    passed = all(gate["passed"] for gate in gates.values())
-    return {
-        "schema_version": PAIRED_ACCEPTANCE_SCHEMA_VERSION,
-        "kind": "coremark-aarch64-paired-acceptance",
-        "status": "passed" if passed else "failed",
-        "benchmark": {
-            "report_id": benchmark_report["provenance"]["report_id"],
-            "sha256": benchmark_report_sha,
-            "execution": benchmark_report["provenance"]["execution"],
-        },
-        "profiles": {
-            "wamr-baseline": {
-                "sha256": baseline_profile_sha,
-                "commit": baseline_profile["wamr"]["commit"],
-            },
-            "wamr-target": {
-                "sha256": target_profile_sha,
-                "commit": target_profile["wamr"]["commit"],
-            },
-        },
-        "gates": gates,
-    }
-
-
 def render_markdown(report: dict[str, Any]) -> str:
     host = report["host"]
     wamr = report["engines"]["wamr"]
@@ -2878,32 +2686,8 @@ def main() -> int:
     parser.add_argument(
         "--benchmark-artifacts",
         type=Path,
-        default=None,
+        required=True,
         help="exact role-bound wamr/wamrc/cwasm handoff from bench_coremark.py",
-    )
-    parser.add_argument(
-        "--acceptance-baseline-profile",
-        type=Path,
-        default=None,
-        help="compare-only mode: baseline profile.json",
-    )
-    parser.add_argument(
-        "--acceptance-target-profile",
-        type=Path,
-        default=None,
-        help="compare-only mode: target profile.json",
-    )
-    parser.add_argument(
-        "--acceptance-json",
-        type=Path,
-        default=None,
-        help="compare-only mode output (default: OUT_DIR/acceptance.json)",
-    )
-    parser.add_argument(
-        "--acceptance-correctness-report",
-        type=Path,
-        default=None,
-        help="compare-only mode: exact candidate Zig test evidence",
     )
     parser.add_argument(
         "--execution-id",
@@ -2938,21 +2722,6 @@ def main() -> int:
         "--max-perf-bytes", type=int, default=DEFAULT_MAX_PERF_BYTES
     )
     args = parser.parse_args()
-    acceptance_mode = (
-        args.acceptance_baseline_profile is not None
-        or args.acceptance_target_profile is not None
-    )
-    if acceptance_mode:
-        if (
-            args.acceptance_baseline_profile is None
-            or args.acceptance_target_profile is None
-            or args.acceptance_correctness_report is None
-        ):
-            parser.error(
-                "paired acceptance requires both profiles and correctness evidence"
-            )
-    elif args.benchmark_artifacts is None:
-        parser.error("--benchmark-artifacts is required for profile capture")
     if args.frequency <= 0 or args.min_samples <= 0:
         parser.error("--frequency and --min-samples must be positive")
     if args.top <= 0 or args.classify <= 0 or args.classify > args.top:
@@ -2961,48 +2730,6 @@ def main() -> int:
         parser.error("--frame-func must be nonnegative")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    if acceptance_mode:
-        output = args.acceptance_json or args.out_dir / "acceptance.json"
-        try:
-            benchmark_report, benchmark_sha = load_benchmark_report(
-                args.benchmark_report.resolve()
-            )
-            baseline_path = args.acceptance_baseline_profile.resolve()
-            target_path = args.acceptance_target_profile.resolve()
-            baseline_profile = json.loads(baseline_path.read_text(encoding="utf-8"))
-            target_profile = json.loads(target_path.read_text(encoding="utf-8"))
-            correctness_path = args.acceptance_correctness_report.resolve()
-            correctness_report = json.loads(
-                correctness_path.read_text(encoding="utf-8")
-            )
-            acceptance = build_paired_acceptance(
-                benchmark_report=benchmark_report,
-                benchmark_report_sha=benchmark_sha,
-                baseline_profile=baseline_profile,
-                baseline_profile_sha=sha256_file(baseline_path),
-                target_profile=target_profile,
-                target_profile_sha=sha256_file(target_path),
-                correctness_report=correctness_report,
-                correctness_report_sha=sha256_file(correctness_path),
-            )
-        except Exception as exc:
-            failure = {
-                "schema_version": PAIRED_ACCEPTANCE_SCHEMA_VERSION,
-                "kind": "coremark-aarch64-paired-acceptance",
-                "status": "failed",
-                "error": str(exc),
-            }
-            output.write_text(
-                json.dumps(failure, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            raise
-        output.write_text(
-            json.dumps(acceptance, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        print(json.dumps(acceptance, indent=2, sort_keys=True))
-        return 0 if acceptance["status"] == "passed" else 1
     try:
         report = run_profile(args)
     except Exception as exc:

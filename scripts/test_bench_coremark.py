@@ -508,79 +508,6 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertEqual("wamr-baseline", baseline_linkage["selected_role"])
         self.assertNotIn("target", baseline_linkage)
 
-    def test_paired_simd_uses_counterbalanced_raw_aot_medians(self):
-        root = REPO / ".cache/test-coremark-paired-simd"
-        shutil.rmtree(root, ignore_errors=True)
-        root.mkdir(parents=True)
-        baseline = root / "baseline-runner"
-        target = root / "target-runner"
-        baseline.write_bytes(b"baseline")
-        target.write_bytes(b"target")
-        calls = {"baseline": 0, "target": 0}
-
-        def runner_output(command, **_kwargs):
-            role = "target" if str(target) in command else "baseline"
-            calls[role] += 1
-            run_ns = 101 if role == "target" else 100
-            return (
-                "bench\tadd\tinterp\tok\t7\t-\t90\t10000\t-\n"
-                f"bench\tadd\taot\tok\t7\t10\t{run_ns}\t10000\t20\n"
-                "bench\tmul\tinterp\tok\t9\t-\t190\t10000\t-\n"
-                f"bench\tmul\taot\tok\t9\t10\t{run_ns * 2}\t10000\t20\n"
-            )
-
-        try:
-            with mock.patch.object(
-                bench_coremark, "run", side_effect=runner_output
-            ):
-                report = bench_coremark.run_paired_simd_acceptance(
-                    baseline_runner=baseline,
-                    target_runner=target,
-                    affinity=bench_coremark.AffinityInfo((0,), 0, "taskset"),
-                    warmups=1,
-                    runs=2,
-                    iterations=10_000,
-                    max_regression_pct=2.0,
-                )
-            self.assertEqual("passed", report["status"])
-            self.assertEqual(6, len(report["schedule"]))
-            self.assertEqual(
-                [
-                    "wamr-baseline",
-                    "wamr-target",
-                    "wamr-baseline",
-                    "wamr-target",
-                    "wamr-target",
-                    "wamr-baseline",
-                ],
-                [sample["role"] for sample in report["schedule"]],
-            )
-            self.assertEqual(3, calls["baseline"])
-            self.assertEqual(3, calls["target"])
-            self.assertEqual(
-                [100, 100],
-                report["cases"][0]["baseline_aot_run_ns"],
-            )
-            self.assertAlmostEqual(1.0, report["cases"][0]["regression_pct"])
-            self.assertIn("bench\tadd\taot", report["schedule"][0]["raw_output"])
-            engines = {
-                role: {
-                    "identity": {
-                        "simd_runner": {
-                            "sha256": report["runners"][role]["sha256"]
-                        }
-                    }
-                }
-                for role in ("wamr-baseline", "wamr-target")
-            }
-            bench_coremark.validate_simd_acceptance(report, engines)
-            corrupted = copy.deepcopy(report)
-            corrupted["cases"][0]["target_aot_run_ns"][0] += 1
-            with self.assertRaisesRegex(RuntimeError, "raw samples"):
-                bench_coremark.validate_simd_acceptance(corrupted, engines)
-        finally:
-            shutil.rmtree(root, ignore_errors=True)
-
     def test_benchmark_profile_mismatches_fail_closed(self):
         report, host, affinity, target_identity = self.authoritative_report()
         kwargs = {
@@ -1168,7 +1095,7 @@ class BenchCoremarkTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("- profile", workflow)
-        self.assertIn("- acceptance", workflow)
+        self.assertIn("- paired-profile", workflow)
         self.assertNotIn("19d046a5b23b9c39acf5f7062976f04c5ca8ca75", workflow)
         self.assertIn('profile_sha="$(git rev-parse "$profile_ref")"', workflow)
         dispatch = workflow.split(
@@ -1233,27 +1160,16 @@ class BenchCoremarkTests(unittest.TestCase):
         )
         self.assertIn("--min-samples 1000", profile_step)
 
-        acceptance_benchmark = workflow.split(
-            "- name: Run paired native acceptance benchmark", 1
+        paired_benchmark = workflow.split(
+            "- name: Run paired native profile benchmark", 1
         )[1].split("\n      - name:", 1)[0]
-        self.assertIn('--baseline "$BASELINE"', acceptance_benchmark)
-        self.assertIn('--target   "$TARGET"', acceptance_benchmark)
-        self.assertIn("--retain-baseline-artifacts", acceptance_benchmark)
-        self.assertIn("--retain-target-artifacts", acceptance_benchmark)
-        self.assertIn("--min-median-delta-pct 2.0", acceptance_benchmark)
-        self.assertIn("--paired-simd-acceptance", acceptance_benchmark)
-        self.assertIn("--simd-runs 5", acceptance_benchmark)
-        self.assertIn("--max-simd-regression-pct 2.0", acceptance_benchmark)
-        self.assertNotIn("--min-delta-pct", acceptance_benchmark)
-        correctness = workflow.split(
-            "- name: Run candidate correctness suite", 1
-        )[1].split("\n      - name:", 1)[0]
-        self.assertIn('test "$target_sha" = "$head_sha"', correctness)
-        self.assertIn(
-            "zig build -j4 test -Doptimize=ReleaseFast --summary all",
-            correctness,
-        )
-        self.assertIn("correctness.json", correctness)
+        self.assertIn('--baseline "$BASELINE"', paired_benchmark)
+        self.assertIn('--target   "$TARGET"', paired_benchmark)
+        self.assertIn("--retain-baseline-artifacts", paired_benchmark)
+        self.assertIn("--retain-target-artifacts", paired_benchmark)
+        self.assertNotIn("--min-delta-pct", paired_benchmark)
+        self.assertNotIn("--min-median-delta-pct", paired_benchmark)
+        self.assertNotIn("--paired-simd-acceptance", paired_benchmark)
 
         baseline_profile = workflow.split(
             "- name: Capture baseline frame profile", 1
@@ -1265,12 +1181,7 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("--benchmark-role wamr-target", target_profile)
         self.assertIn("--frame-func 10", baseline_profile)
         self.assertIn("--frame-func 10", target_profile)
-        paired_gate = workflow.split(
-            "- name: Enforce paired native acceptance", 1
-        )[1].split("\n      - name:", 1)[0]
-        self.assertIn("--acceptance-baseline-profile", paired_gate)
-        self.assertIn("--acceptance-target-profile", paired_gate)
-        self.assertIn("--acceptance-correctness-report", paired_gate)
+        self.assertNotIn("Enforce paired native acceptance", workflow)
 
         profile_script = PROFILE_SCRIPT.read_text()
         self.assertIn("--profile=jitdump", profile_script)

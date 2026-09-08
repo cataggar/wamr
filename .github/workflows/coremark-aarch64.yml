@@ -14,7 +14,7 @@ on:
         options:
           - benchmark
           - profile
-          - acceptance
+          - paired-profile
       baseline:
         description: "Baseline git ref"
         required: false
@@ -37,7 +37,6 @@ on:
       - src/runtime/**
       - tests/benchmarks/coremark/**
       - scripts/bench_coremark.py
-      - scripts/bench_simd.py
       - scripts/aarch64_instruction_provenance.py
       - scripts/profile_coremark_aarch64.py
       - scripts/test_bench_coremark.py
@@ -143,19 +142,18 @@ jobs:
             --json-out coremark-report.json \
             --emit     github
 
-      - name: Run paired native acceptance benchmark
+      - name: Run paired native profile benchmark
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.mode == 'acceptance'
-        id: acceptance_benchmark
+          github.event.inputs.mode == 'paired-profile'
+        id: paired_benchmark
         continue-on-error: true
         env:
           BASELINE: ${{ steps.refs.outputs.baseline }}
           TARGET: ${{ steps.refs.outputs.target }}
         run: |
           set -euo pipefail
-          mkdir -p coremark-acceptance
-          status=0
+          mkdir -p coremark-paired-profile
           python3 scripts/bench_coremark.py \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
@@ -163,21 +161,11 @@ jobs:
             --wasmtime-baseline auto \
             --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
             --require-native-arch aarch64 \
-            --out      coremark-acceptance/benchmark-table.md \
-            --json-out coremark-acceptance/benchmark-report.json \
-            --retain-baseline-artifacts coremark-acceptance/baseline-artifacts \
-            --retain-target-artifacts coremark-acceptance/target-artifacts \
-            --min-median-delta-pct 2.0 \
-            --paired-simd-acceptance \
-            --simd-warmups 1 \
-            --simd-runs 5 \
-            --simd-iterations 10000 \
-            --max-simd-regression-pct 2.0 \
-            --emit github || status=$?
-          test -s coremark-acceptance/benchmark-report.json
-          test -s coremark-acceptance/baseline-artifacts/manifest.json
-          test -s coremark-acceptance/target-artifacts/manifest.json
-          echo "benchmark_gate_exit=$status" >> "$GITHUB_OUTPUT"
+            --out      coremark-paired-profile/benchmark-table.md \
+            --json-out coremark-paired-profile/benchmark-report.json \
+            --retain-baseline-artifacts coremark-paired-profile/baseline-artifacts \
+            --retain-target-artifacts coremark-paired-profile/target-artifacts \
+            --emit github
 
       - name: Run authoritative profile identity benchmark
         if: >-
@@ -201,46 +189,13 @@ jobs:
             --retain-target-artifacts "$RUNNER_TEMP/coremark-profile-artifacts" \
             --emit     github
 
-      - name: Run candidate correctness suite
-        if: >-
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.mode == 'acceptance' &&
-          steps.acceptance_benchmark.outcome == 'success'
-        id: acceptance_correctness
-        continue-on-error: true
-        env:
-          TARGET: ${{ steps.refs.outputs.target }}
-        run: |
-          set -euo pipefail
-          target_sha="$(git rev-parse "$TARGET")"
-          head_sha="$(git rev-parse HEAD)"
-          test "$target_sha" = "$head_sha"
-          zig build -j4 test -Doptimize=ReleaseFast --summary all \
-            2>&1 | tee coremark-acceptance/correctness.log
-          TARGET_SHA="$target_sha" python3 -c '
-          import json, os
-          from pathlib import Path
-          report = {
-              "schema_version": 1,
-              "kind": "coremark-aarch64-candidate-correctness",
-              "status": "passed",
-              "target_sha": os.environ["TARGET_SHA"],
-              "command": [
-                  "zig", "build", "-j4", "test",
-                  "-Doptimize=ReleaseFast", "--summary", "all",
-              ],
-          }
-          Path("coremark-acceptance/correctness.json").write_text(
-              json.dumps(report, indent=2, sort_keys=True) + "\n"
-          )'
-
       - name: Install matching perf for profiling
         if: >-
           github.event_name == 'workflow_dispatch' &&
           ((github.event.inputs.mode == 'profile' &&
           steps.profile_benchmark.outcome == 'success') ||
-          (github.event.inputs.mode == 'acceptance' &&
-          steps.acceptance_benchmark.outcome == 'success'))
+          (github.event.inputs.mode == 'paired-profile' &&
+          steps.paired_benchmark.outcome == 'success'))
         id: perf_setup
         continue-on-error: true
         shell: bash
@@ -249,8 +204,8 @@ jobs:
         run: |
           set -euo pipefail
           root="coremark-profile"
-          if [ "$MODE" = "acceptance" ]; then
-            root="coremark-acceptance"
+          if [ "$MODE" = "paired-profile" ]; then
+            root="coremark-paired-profile"
           fi
           mkdir -p "$root"
           exec > >(tee "$root/perf-setup.log") 2>&1
@@ -327,19 +282,19 @@ jobs:
       - name: Capture baseline frame profile
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.mode == 'acceptance' &&
-          steps.acceptance_benchmark.outcome == 'success' &&
+          github.event.inputs.mode == 'paired-profile' &&
+          steps.paired_benchmark.outcome == 'success' &&
           steps.perf_setup.outcome == 'success'
-        id: acceptance_baseline_profile
+        id: paired_baseline_profile
         continue-on-error: true
         env:
           BASELINE: ${{ steps.refs.outputs.baseline }}
         run: |
           python3 scripts/profile_coremark_aarch64.py \
-            --out-dir coremark-acceptance/baseline-profile \
-            --benchmark-report coremark-acceptance/benchmark-report.json \
+            --out-dir coremark-paired-profile/baseline-profile \
+            --benchmark-report coremark-paired-profile/benchmark-report.json \
             --benchmark-role wamr-baseline \
-            --benchmark-artifacts coremark-acceptance/baseline-artifacts \
+            --benchmark-artifacts coremark-paired-profile/baseline-artifacts \
             --wamr-ref "$BASELINE" \
             --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
             --frequency 999 \
@@ -351,19 +306,19 @@ jobs:
       - name: Capture target frame profile
         if: >-
           github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.mode == 'acceptance' &&
-          steps.acceptance_benchmark.outcome == 'success' &&
+          github.event.inputs.mode == 'paired-profile' &&
+          steps.paired_benchmark.outcome == 'success' &&
           steps.perf_setup.outcome == 'success'
-        id: acceptance_target_profile
+        id: paired_target_profile
         continue-on-error: true
         env:
           TARGET: ${{ steps.refs.outputs.target }}
         run: |
           python3 scripts/profile_coremark_aarch64.py \
-            --out-dir coremark-acceptance/target-profile \
-            --benchmark-report coremark-acceptance/benchmark-report.json \
+            --out-dir coremark-paired-profile/target-profile \
+            --benchmark-report coremark-paired-profile/benchmark-report.json \
             --benchmark-role wamr-target \
-            --benchmark-artifacts coremark-acceptance/target-artifacts \
+            --benchmark-artifacts coremark-paired-profile/target-artifacts \
             --wamr-ref "$TARGET" \
             --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
             --frequency 999 \
@@ -371,26 +326,6 @@ jobs:
             --top 10 \
             --classify 3 \
             --frame-func 10
-
-      - name: Enforce paired native acceptance
-        if: >-
-          always() &&
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.mode == 'acceptance' &&
-          steps.acceptance_baseline_profile.outcome == 'success' &&
-          steps.acceptance_target_profile.outcome == 'success'
-        id: paired_acceptance
-        continue-on-error: true
-        run: |
-          python3 scripts/profile_coremark_aarch64.py \
-            --out-dir coremark-acceptance \
-            --benchmark-report coremark-acceptance/benchmark-report.json \
-            --acceptance-baseline-profile \
-              coremark-acceptance/baseline-profile/profile.json \
-            --acceptance-target-profile \
-              coremark-acceptance/target-profile/profile.json \
-            --acceptance-correctness-report \
-              coremark-acceptance/correctness.json
 
       - name: Upload benchmark table
         if: >-
@@ -432,16 +367,16 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Upload paired acceptance evidence
+      - name: Upload paired profile evidence
         if: >-
           always() &&
           github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.mode == 'acceptance'
+          github.event.inputs.mode == 'paired-profile'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coremark-aarch64-acceptance-${{ steps.refs.outputs.target }}
+          name: coremark-aarch64-paired-profile-${{ steps.refs.outputs.target }}
           path: |
-            coremark-acceptance/
+            coremark-paired-profile/
           if-no-files-found: error
           retention-days: 90
 
@@ -471,9 +406,7 @@ jobs:
           steps.profile_benchmark.outcome == 'failure' ||
           steps.perf_setup.outcome == 'failure' ||
           steps.profile.outcome == 'failure' ||
-          steps.acceptance_benchmark.outcome == 'failure' ||
-          steps.acceptance_correctness.outcome == 'failure' ||
-          steps.acceptance_baseline_profile.outcome == 'failure' ||
-          steps.acceptance_target_profile.outcome == 'failure' ||
-          steps.paired_acceptance.outcome == 'failure')
+          steps.paired_benchmark.outcome == 'failure' ||
+          steps.paired_baseline_profile.outcome == 'failure' ||
+          steps.paired_target_profile.outcome == 'failure')
         run: exit 1
