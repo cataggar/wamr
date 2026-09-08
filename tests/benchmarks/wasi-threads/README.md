@@ -31,7 +31,8 @@ infrastructure comparison requested by #616.
 Every invocation prints one JSON object. The driver rejects an incorrect
 workload, thread count, iteration count, operation count, checksum, extra output,
 non-zero exit, watchdog timeout, malformed/duplicate timing, a corrected
-interval shorter than 100 ms, or measured timer/barrier overhead of 1% or more.
+interval shorter than 1.25 seconds, or measured timer/barrier overhead of 1%
+or more.
 
 ## Metric definitions
 
@@ -57,15 +58,56 @@ The corrected metric is guest-reported WASI monotonic time:
 
 The report retains raw guest time, corrected guest time, overhead and overhead
 ppm, plus host wall time as a watchdog/lifecycle diagnostic. Throughput uses
-only corrected guest time. Default inputs target at least hundreds of
-milliseconds per sample: 128 million hot-loop iterations per worker, 64
-million atomic RMWs per worker with a 256 million aggregate floor, 512,000
-total wait/notify hand-offs divided evenly across the selected workers, and
-3,000 spawn/join rounds. The aggregate atomic floor lengthens the low-thread
-cells that are most exposed to hosted scheduling while retaining the existing
-per-worker floor for 4/8-thread scaling. Keeping the wait/notify operation
-total fixed avoids turning its intentionally serialized controller/worker
-protocol into a multi-minute sample at higher thread counts.
+only corrected guest time. The fixed measurement plan uses explicit per-mode
+and per-thread counts so the fast AOT cells clear the floor without making
+interpreter samples impractical:
+
+| mode/workload | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---:|---:|---:|---:|
+| interpreter `hot` | 28M | 28M | 20M | 10M |
+| AOT `hot` | 1.8B | 1.8B | 900M | 450M |
+| interpreter `atomic` | 72M | 40M | 28M | 14M |
+| AOT `atomic` | 850M | 180M | 64M | 64M |
+| interpreter `wait-notify` | 128K | 64K | 32K | 16K |
+| AOT `wait-notify` | 2.4M | 64K | 32K | 16K |
+| interpreter `spawn-join` | 9K | 4.5K | 2.25K | 1.25K |
+| AOT `spawn-join` | 10K | 5K | 2.5K | 1.25K |
+| AOT `cancel-hot` | 1.9B | 1.9B | 950M | 475M |
+
+Single-hot uses 30M interpreter iterations and 1.9B AOT iterations.
+Baseline and candidate always execute identical work for the same condition.
+Interpreter/AOT conditions may use different counts; throughput is normalized
+by each record's validated operation count and corrected guest interval.
+
+The 1.25-second quality floor remains derived independently from the retained
+12.456 ms barrier target and the strict `<1%` rule. Iteration sizing instead
+uses a fixed **1.75-second target**, 40% above the floor. This deliberately
+uses the upper end of the approximately 29–40% inter-host speed spread retained
+across x86 hosts rather than sizing barely above the floor.
+
+For every shared plan count, the sizing calculation selects the fastest
+individual corrected interval from every warmup and measured record in x86
+runs 33822485228, 33822486948, 33822488505, and 33822489907. It computes
+`ceil(1.75s * evidence_iterations / evidence_interval)` and rounds upward to a
+simple fixed count. An existing count is retained only if its exact scaled
+minimum already clears 1.75 seconds. Checked-in
+`sizing-provenance.json` records each report hash, fastest record, exact
+requirement, selected count, and scaled minimum for all 38 interpreter and AOT
+cells. The minimum is AOT `spawn-join` at two threads: 1.790981666 seconds,
+43.2785% above the quality floor and 2.3418% above the sizing target.
+
+A future host faster than this retained envelope does not adapt work or weaken
+the gate: every invocation still fails closed below 1.25 seconds or unless
+`99 * timing_overhead_ns < corrected_interval_ns`.
+
+The hot-kernel expected checksum is prepared with an exact jump-ahead. After
+unrolling the recurrence, terms with the same iteration index modulo 64 share
+one rotation. Each of the 64 residue classes becomes the XOR of a consecutive
+58-bit range plus fixed low six bits, so the result takes at most 64 groups per
+worker regardless of an iteration count in the billions. All operations are
+explicit unsigned 64-bit rotate/XOR arithmetic; no byte representation or host
+endianness is involved. The report records the worst and total preparation
+time for all unique plan keys before benchmark execution.
 
 ## Rebuild the fixtures
 
@@ -138,6 +180,24 @@ fixture and source hashes, explicit pair and revision direction, guest and host
 timing, build cache keys, medians/ranges, immutable commit/platform/plan
 identities, and every correctness result. JSON replacement is an fsynced
 same-directory atomic rename that preserves an existing report's mode.
+
+Each guest invocation has a fixed 90-second watchdog. Exact linear projection
+from the slowest complete retained x86 report gives 53.648 minutes of guest
+work plus 2.811 minutes of retained process/invocation overhead. The 128 AOT
+atomic-wait probes and 16 trusted barrier probes add at most 0.700 minutes,
+for a 57.159-minute benchmark-path bound. The worst projected individual guest
+interval is 22.015 seconds (22.018 seconds including invocation overhead), so
+the watchdog retains more than 67 seconds and a 4.08x factor while remaining
+fail closed.
+
+The 180-minute job bound additionally reserves 48 minutes for all eight
+revision/runtime builds, 10 minutes for two checkouts plus Zig/cache setup,
+20 minutes for harness tests, SDK download, and fixture rebuild/verification,
+and 5 minutes for report generation, upload, and cleanup. Checksum preparation
+is measured in every report and is included in the remaining 39.8-minute
+hosted-variance margin (the automated bound is below one second total).
+Twenty sequential trusted x86 jobs at the full job timeout take 60 hours,
+leaving 12 hours (16.7%) before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
@@ -237,7 +297,47 @@ purpose, profile, warmup/sample counts, and a runner target. The
 accepts only same-SHA `noise-calibration`, and verifies on a GitHub-hosted
 preparation job that the target is commit history reachable from `main`. Only
 its x86 job can select the repository-scoped `wamr-temp-20260906` label;
-AArch64 remains `ubuntu-24.04-arm`. The temporary runner was registered with
+AArch64 remains `ubuntu-24.04-arm`. Both trusted-calibration jobs explicitly
+enable the same fixed scheduler/barrier quality preflight; ordinary hosted
+PR/push diagnostics do not enable it.
+
+The preflight runs before any warmup or measured record. For each selected
+thread count it runs exactly four AOT `hot` invocations through the checked-in
+threaded guest's normal five-epoch release/completion barrier and runtime path:
+16 fixed probes for the default 1/2/4/8 plan. It never retries, discards a
+probe, adapts work, or waits for quiet. Every probe is retained. Against the
+retained empirical one-in-257 tail, 16 independent probes have only
+`1 - (256/257)^16 ≈ 6.05%` detection power. This is therefore only a cheap
+fixed fail-fast check of current host state; it is not authoritative and
+cannot promise that a later sample will not stall.
+
+With corrected interval `E` and measured barrier `B`, the unchanged strict
+quality rule is `B / (E + B) < 0.01`, equivalently `99B < E`. The predeclared
+barrier target is 12,456,000 ns, exactly twice the retained 6,228,000 ns
+observation. It requires `E > 1,233,144,000 ns`. The fixed 1,250,000,000 ns
+floor adds exactly 16,856,000 ns of headroom; at that floor the largest
+accepted integer barrier is 12,626,262 ns. The later per-invocation timing gate
+is authoritative and fail-closed for every warmup and measured sample.
+
+The report retains the preflight values, min/median/max barrier summary, CPU
+affinity and availability, load average, Linux CPU pressure when available,
+the observable `Runner.Worker` process count, and runner/job identity. These
+host diagnostics are explanatory only. Every run captures
+`host_quiescence_at_start`, including hosted runs. A failed preflight or later
+timing-quality failure takes a fresh `host_quiescence_at_failure` snapshot
+rather than reusing the start state, and records the ratio at the fixed minimum
+interval. It writes `failure-diagnostic.json` and
+`failure-diagnostic.md` before exiting. The always-running artifact step uploads
+those files even when no normal report exists, and cleanup remains after upload.
+
+**Evidence validity and stop rule:** a run is eligible for cohort evidence only
+when the preflight passed and the complete normal report exists and validates.
+If any preflight probe or later sample fails, stop that workflow run, retain its
+diagnostic artifact, exclude the run rather than retrying or replacing its
+sample, and investigate host quiescence before starting a separately declared
+fresh run. Previously failed or partial evidence never becomes valid.
+
+The temporary runner was registered with
 `--no-default-labels`, so its complete job-routing inventory is the single
 `wamr-temp-20260906` label and its exact registered name is
 `vm31e-wamr-temp-20260906`.
@@ -407,10 +507,14 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Reports produced before measurement-plan identity version 1 do not satisfy the
-new report schema and cannot be mixed into a new authoritative cohort. Runs
-already executing old `main` remain valid for their old non-enforcing smoke
-workflow, but only reports produced by the updated harness carry the identity
-needed for future derivation and enforcement.
+new report schema and cannot be mixed into a new authoritative cohort. The
+1.25-second floor and explicit per-mode iteration table change the
+purpose-independent measurement-plan hash. Fresh evidence at that exact new
+plan identity is mandatory for any future calibration or derivation. Reports
+from the old identity, all earlier failed/partial runs, and the retained
+6.228 ms timing-quality failure remain excluded; they cannot be retried,
+relabelled, or mixed into the fresh cohort. Runs already executing old `main`
+may finish only as old non-enforcing smoke diagnostics.
 
 Until that cohort exists, claiming a statistically sound hard gate would be
 fabricating evidence. Issue #966 must remain open and #963 remains dependent on

@@ -14,6 +14,7 @@
     "paired_summaries",
     "comparison_summaries",
     "ratio_of_ratios_summaries",
+    "quality_preflight",
     "budget"
   ],
   "properties": {
@@ -33,6 +34,7 @@
         "plan_sha256",
         "measurement_plan_version",
         "measurement_plan_sha256",
+        "checksum_preparation",
         "host",
         "host_pair",
         "execution",
@@ -66,6 +68,43 @@
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "measurement_plan_version": { "const": 1 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
+        "checksum_preparation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm",
+            "complexity",
+            "unique_keys",
+            "total_ns",
+            "worst_ns",
+            "worst_key"
+          ],
+          "properties": {
+            "algorithm": { "const": "64-residue-xor-jump-ahead" },
+            "complexity": { "type": "string", "minLength": 1 },
+            "unique_keys": { "type": "integer", "minimum": 1 },
+            "total_ns": { "type": "integer", "minimum": 0 },
+            "worst_ns": { "type": "integer", "minimum": 0 },
+            "worst_key": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["workload", "threads", "iterations"],
+              "properties": {
+                "workload": {
+                  "enum": [
+                    "single-hot",
+                    "hot",
+                    "atomic",
+                    "wait-notify",
+                    "spawn-join"
+                  ]
+                },
+                "threads": { "type": "integer", "minimum": 1, "maximum": 8 },
+                "iterations": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        },
         "host": {
           "type": "object",
           "required": [
@@ -154,6 +193,8 @@
         "iterations",
         "timeout_seconds",
         "minimum_timed_interval_ns",
+        "atomic_wait_preflight_runs",
+        "scheduler_barrier_preflight",
         "pairs",
         "optimize"
       ],
@@ -189,11 +230,28 @@
           "uniqueItems": true,
           "items": { "enum": [1, 2, 4, 8] }
         },
-        "iterations": { "type": "object" },
+        "iterations": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "interpreter": {
+              "$ref": "#/$defs/interpreter_iteration_plan"
+            },
+            "aot": { "$ref": "#/$defs/aot_iteration_plan" }
+          }
+        },
         "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
         "minimum_timed_interval_ns": {
           "type": "integer",
+          "minimum": 1250000000
+        },
+        "atomic_wait_preflight_runs": {
+          "type": "integer",
           "minimum": 1
+        },
+        "scheduler_barrier_preflight": {
+          "$ref": "#/$defs/scheduler_barrier_preflight_plan"
         },
         "pairs": {
           "type": "array",
@@ -225,6 +283,9 @@
     "ratio_of_ratios_summaries": {
       "type": "array",
       "items": { "$ref": "#/$defs/ratio_of_ratios_summary" }
+    },
+    "quality_preflight": {
+      "$ref": "#/$defs/quality_preflight"
     },
     "budget": {
       "type": "object",
@@ -375,6 +436,178 @@
         "pair_key": { "type": "string", "minLength": 1 },
         "left": { "type": "string", "minLength": 1 },
         "right": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scheduler_barrier_preflight_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mode",
+        "workload",
+        "probes_per_thread",
+        "probe_count",
+        "timing_overhead_ratio_limit",
+        "target_barrier_ns",
+        "target_required_interval_ns",
+        "minimum_interval_headroom_ns",
+        "maximum_accepted_barrier_ns",
+        "acceptance_rule"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "mode": { "const": "aot" },
+        "workload": { "const": "hot" },
+        "probes_per_thread": { "const": 4 },
+        "probe_count": { "type": "integer", "minimum": 0 },
+        "timing_overhead_ratio_limit": { "const": 0.01 },
+        "target_barrier_ns": { "const": 12456000 },
+        "target_required_interval_ns": { "const": 1233144000 },
+        "minimum_interval_headroom_ns": {
+          "type": "integer",
+          "minimum": 16856000
+        },
+        "maximum_accepted_barrier_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "acceptance_rule": { "type": "string", "minLength": 1 }
+      }
+    },
+    "quality_preflight_sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "probe_index",
+        "mode",
+        "workload",
+        "threads",
+        "iterations",
+        "timing_overhead_ns",
+        "timed_interval_ns",
+        "raw_elapsed_ns",
+        "timing_overhead_ppm",
+        "timing_overhead_ratio",
+        "ratio_at_minimum_timed_interval",
+        "accepted"
+      ],
+      "properties": {
+        "probe_index": { "type": "integer", "minimum": 0 },
+        "mode": { "const": "aot" },
+        "workload": { "const": "hot" },
+        "threads": { "enum": [1, 2, 4, 8] },
+        "iterations": { "type": "integer", "minimum": 1 },
+        "timing_overhead_ns": { "type": "integer", "minimum": 0 },
+        "timed_interval_ns": { "type": "integer", "minimum": 1 },
+        "raw_elapsed_ns": { "type": "integer", "minimum": 1 },
+        "timing_overhead_ppm": { "type": "integer", "minimum": 0 },
+        "timing_overhead_ratio": { "type": "number", "minimum": 0 },
+        "ratio_at_minimum_timed_interval": {
+          "type": "number",
+          "minimum": 0
+        },
+        "accepted": { "type": "boolean" }
+      }
+    },
+    "quality_preflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "status",
+        "probe_count",
+        "probes_per_thread",
+        "mode",
+        "workload",
+        "thread_counts",
+        "minimum_timed_interval_ns",
+        "timing_overhead_ratio_limit",
+        "maximum_accepted_barrier_ns",
+        "acceptance_rule",
+        "summary",
+        "samples",
+        "host_quiescence_at_start"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "status": { "enum": ["not-requested", "passed"] },
+        "probe_count": { "type": "integer", "minimum": 0 },
+        "probes_per_thread": { "const": 4 },
+        "mode": { "const": "aot" },
+        "workload": { "const": "hot" },
+        "thread_counts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": [1, 2, 4, 8] }
+        },
+        "minimum_timed_interval_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timing_overhead_ratio_limit": { "const": 0.01 },
+        "maximum_accepted_barrier_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "acceptance_rule": { "type": "string", "minLength": 1 },
+        "summary": {
+          "type": ["object", "null"]
+        },
+        "samples": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/quality_preflight_sample" }
+        },
+        "host_quiescence_at_start": { "type": "object" }
+      }
+    },
+    "thread_iteration_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "1": { "type": "integer", "minimum": 1 },
+        "2": { "type": "integer", "minimum": 1 },
+        "4": { "type": "integer", "minimum": 1 },
+        "8": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "interpreter_iteration_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "single-hot",
+        "hot",
+        "atomic",
+        "wait-notify",
+        "spawn-join"
+      ],
+      "properties": {
+        "single-hot": { "type": "integer", "minimum": 1 },
+        "hot": { "$ref": "#/$defs/thread_iteration_counts" },
+        "atomic": { "$ref": "#/$defs/thread_iteration_counts" },
+        "wait-notify": { "$ref": "#/$defs/thread_iteration_counts" },
+        "spawn-join": { "$ref": "#/$defs/thread_iteration_counts" }
+      }
+    },
+    "aot_iteration_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "single-hot",
+        "hot",
+        "atomic",
+        "wait-notify",
+        "spawn-join",
+        "cancel-hot"
+      ],
+      "properties": {
+        "single-hot": { "type": "integer", "minimum": 1 },
+        "hot": { "$ref": "#/$defs/thread_iteration_counts" },
+        "atomic": { "$ref": "#/$defs/thread_iteration_counts" },
+        "wait-notify": { "$ref": "#/$defs/thread_iteration_counts" },
+        "spawn-join": { "$ref": "#/$defs/thread_iteration_counts" },
+        "cancel-hot": { "$ref": "#/$defs/thread_iteration_counts" }
       }
     },
     "stats": {

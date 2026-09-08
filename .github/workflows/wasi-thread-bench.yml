@@ -324,6 +324,7 @@ jobs:
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
+            --timeout 90 \
             --platform-id '${{ matrix.platform }}' \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${{ matrix.platform }}" \
             --runner-environment github-hosted \
@@ -343,6 +344,8 @@ jobs:
           path: |
             ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.json
             ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.md
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/failure-diagnostic.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/failure-diagnostic.md
           if-no-files-found: warn
           retention-days: 90
 
@@ -467,10 +470,12 @@ jobs:
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
+            --timeout 90 \
             --platform-id ubuntu-22.04-x86_64 \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
             --runner-environment self-hosted \
             --output-dir "$WASI_THREAD_OUTPUT" \
+            --trusted-calibration-preflight \
             --no-budget
           {
             echo "> **Calibration only, non-enforcing:** budgets remain disabled."
@@ -486,6 +491,8 @@ jobs:
           path: |
             ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.json
             ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.md
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/failure-diagnostic.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/output/failure-diagnostic.md
           if-no-files-found: warn
           retention-days: 90
 
@@ -577,10 +584,12 @@ jobs:
             --profile "$PROFILE" \
             --warmups "$WARMUPS" \
             --samples "$SAMPLES" \
+            --timeout 90 \
             --platform-id ubuntu-24.04-aarch64 \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-24.04-aarch64" \
             --runner-environment github-hosted \
             --output-dir "$WASI_THREAD_OUTPUT" \
+            --trusted-calibration-preflight \
             --no-budget
           {
             echo "> **Calibration only, non-enforcing:** budgets remain disabled."
@@ -596,6 +605,8 @@ jobs:
           path: |
             ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.json
             ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.md
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/failure-diagnostic.json
+            ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/output/failure-diagnostic.md
           if-no-files-found: warn
           retention-days: 90
 

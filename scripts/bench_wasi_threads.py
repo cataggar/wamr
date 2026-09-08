@@ -59,7 +59,77 @@ ATOMIC_WAIT_PREFLIGHT_RUNS = {
     "authoritative": 64,
     "smoke": 8,
 }
-MIN_TIMED_INTERVAL_MS = 100.0
+MIN_TIMED_INTERVAL_MS = 1_250.0
+TIMING_OVERHEAD_RATIO_LIMIT = 0.01
+TARGET_BARRIER_NS = 12_456_000
+TARGET_BARRIER_REQUIRED_INTERVAL_NS = 99 * TARGET_BARRIER_NS
+MINIMUM_INTERVAL_HEADROOM_NS = (
+    int(MIN_TIMED_INTERVAL_MS * 1_000_000)
+    - TARGET_BARRIER_REQUIRED_INTERVAL_NS
+)
+SIZING_TARGET_NS = 1_750_000_000
+TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD = 4
+DEFAULT_ITERATION_PLAN = {
+    "interpreter": {
+        "single-hot": 30_000_000,
+        "hot": {
+            "1": 28_000_000,
+            "2": 28_000_000,
+            "4": 20_000_000,
+            "8": 10_000_000,
+        },
+        "atomic": {
+            "1": 72_000_000,
+            "2": 40_000_000,
+            "4": 28_000_000,
+            "8": 14_000_000,
+        },
+        "wait-notify": {
+            "1": 128_000,
+            "2": 64_000,
+            "4": 32_000,
+            "8": 16_000,
+        },
+        "spawn-join": {"1": 9_000, "2": 4_500, "4": 2_250, "8": 1_250},
+    },
+    "aot": {
+        "single-hot": 1_900_000_000,
+        "hot": {
+            "1": 1_800_000_000,
+            "2": 1_800_000_000,
+            "4": 900_000_000,
+            "8": 450_000_000,
+        },
+        "atomic": {
+            "1": 850_000_000,
+            "2": 180_000_000,
+            "4": 64_000_000,
+            "8": 64_000_000,
+        },
+        "wait-notify": {
+            "1": 2_400_000,
+            "2": 64_000,
+            "4": 32_000,
+            "8": 16_000,
+        },
+        "spawn-join": {"1": 10_000, "2": 5_000, "4": 2_500, "8": 1_250},
+        "cancel-hot": {
+            "1": 1_900_000_000,
+            "2": 1_900_000_000,
+            "4": 950_000_000,
+            "8": 475_000_000,
+        },
+    },
+}
+LEGACY_ITERATION_DEFAULTS = {
+    "single": 224_000_000,
+    "cancel": 224_000_000,
+    "hot": 128_000_000,
+    "atomic": 64_000_000,
+    "atomic_total": 256_000_000,
+    "wait": 512_000,
+    "spawn": 3_000,
+}
 AOT_VERSION = 11
 # Stable fast-path signatures emitted by emitCancelPoint in each backend.
 # Counting these signatures avoids treating instruction-sequence byte sizes as
@@ -90,6 +160,7 @@ FIXTURES = {
     },
 }
 MASK64 = (1 << 64) - 1
+HOT_KERNEL_COUNTER_BASE = 0xD1B54A32D192ED03
 
 
 def measurement_plan_sha256(plan: dict[str, Any]) -> str:
@@ -114,6 +185,38 @@ class HarnessError(RuntimeError):
     pass
 
 
+class TimingQualityError(HarnessError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_elapsed_ns: int,
+        timing_overhead_ns: int,
+        elapsed_ns: int,
+        timing_overhead_ppm: int,
+        reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.raw_elapsed_ns = raw_elapsed_ns
+        self.timing_overhead_ns = timing_overhead_ns
+        self.elapsed_ns = elapsed_ns
+        self.timing_overhead_ppm = timing_overhead_ppm
+        self.reason = reason
+
+
+class PreflightProbeError(HarnessError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        samples: list[dict[str, Any]],
+        scenario: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.samples = samples
+        self.scenario = scenario
+
+
 @dataclass(frozen=True)
 class Build:
     name: str
@@ -131,42 +234,138 @@ class Build:
 class Scenario:
     workload: str
     threads: int
-    iterations: int
 
     @property
     def key(self) -> str:
         return f"{self.workload}/{self.threads}"
 
 
+def resolved_iteration_plan(
+    args: argparse.Namespace,
+    modes: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    plan = {
+        mode: copy.deepcopy(DEFAULT_ITERATION_PLAN[mode])
+        for mode in modes
+    }
+    selected_threads = {str(threads) for threads in args.thread_counts}
+    for values in plan.values():
+        for workload, count in list(values.items()):
+            if isinstance(count, dict):
+                values[workload] = {
+                    thread: iterations
+                    for thread, iterations in count.items()
+                    if thread in selected_threads
+                }
+
+    if args.single_iterations is not None:
+        for values in plan.values():
+            values["single-hot"] = args.single_iterations
+    if args.hot_iterations is not None:
+        for values in plan.values():
+            values["hot"] = {
+                str(threads): args.hot_iterations
+                for threads in args.thread_counts
+            }
+    if (
+        args.atomic_iterations is not None
+        or args.atomic_total_iterations is not None
+    ):
+        per_worker = (
+            args.atomic_iterations
+            if args.atomic_iterations is not None
+            else LEGACY_ITERATION_DEFAULTS["atomic"]
+        )
+        aggregate = (
+            args.atomic_total_iterations
+            if args.atomic_total_iterations is not None
+            else LEGACY_ITERATION_DEFAULTS["atomic_total"]
+        )
+        for values in plan.values():
+            values["atomic"] = {
+                str(threads): max(per_worker, aggregate // threads)
+                for threads in args.thread_counts
+            }
+    if args.wait_iterations is not None:
+        for values in plan.values():
+            values["wait-notify"] = {
+                str(threads): args.wait_iterations // threads
+                for threads in args.thread_counts
+            }
+    if args.spawn_iterations is not None:
+        for values in plan.values():
+            values["spawn-join"] = {
+                str(threads): args.spawn_iterations
+                for threads in args.thread_counts
+            }
+    if "aot" in plan and (
+        args.cancel_iterations is not None or args.hot_iterations is not None
+    ):
+        cancel_total = (
+            args.cancel_iterations
+            if args.cancel_iterations is not None
+            else LEGACY_ITERATION_DEFAULTS["cancel"]
+        )
+        hot_floor = (
+            args.hot_iterations
+            if args.hot_iterations is not None
+            else LEGACY_ITERATION_DEFAULTS["hot"]
+        )
+        plan["aot"]["cancel-hot"] = {
+            str(threads): max(hot_floor, cancel_total // threads)
+            for threads in args.thread_counts
+        }
+    return plan
+
+
+def validate_iteration_plan_ranges(
+    plan: dict[str, dict[str, Any]],
+    thread_counts: tuple[int, ...],
+) -> None:
+    for mode, workloads in plan.items():
+        single = workloads["single-hot"]
+        if not 0 < single <= MASK64:
+            raise HarnessError(f"{mode} single-hot iterations must fit uint64")
+        for workload in ("hot", "atomic", "wait-notify", "spawn-join"):
+            for threads in thread_counts:
+                iterations = workloads[workload][str(threads)]
+                if not 0 < iterations <= MASK64 // threads:
+                    raise HarnessError(
+                        f"{mode} {workload}/{threads} operations overflow uint64"
+                    )
+                if (
+                    workload == "spawn-join"
+                    and iterations
+                    > MASK64 // (threads * (threads + 1) // 2)
+                ):
+                    raise HarnessError(
+                        f"{mode} spawn-join/{threads} checksum overflows uint64"
+                    )
+        if mode == "aot":
+            for threads in thread_counts:
+                iterations = workloads["cancel-hot"][str(threads)]
+                if not 0 < iterations <= MASK64 // threads:
+                    raise HarnessError(
+                        f"aot cancel-hot/{threads} operations overflow uint64"
+                    )
+
+
+def iteration_count(
+    iteration_plan: dict[str, dict[str, Any]],
+    mode: str,
+    workload: str,
+    threads: int,
+) -> int:
+    value = iteration_plan[mode][workload]
+    return value if isinstance(value, int) else value[str(threads)]
+
+
 def planned_scenarios(args: argparse.Namespace) -> list[Scenario]:
     return [
-        Scenario(
-            workload,
-            threads,
-            (
-                iterations // threads
-                if workload == "wait-notify"
-                else atomic_iterations(args, threads)
-                if workload == "atomic"
-                else iterations
-            ),
-        )
-        for workload, iterations in (
-            ("hot", args.hot_iterations),
-            ("atomic", args.atomic_iterations),
-            ("wait-notify", args.wait_iterations),
-            ("spawn-join", args.spawn_iterations),
-        )
+        Scenario(workload, threads)
+        for workload in ("hot", "atomic", "wait-notify", "spawn-join")
         for threads in args.thread_counts
     ]
-
-
-def cancel_iterations(args: argparse.Namespace, threads: int) -> int:
-    return max(args.hot_iterations, args.cancel_iterations // threads)
-
-
-def atomic_iterations(args: argparse.Namespace, threads: int) -> int:
-    return max(args.atomic_iterations, args.atomic_total_iterations // threads)
 
 
 def planned_pair_specs(
@@ -229,7 +428,10 @@ def expected_pair_specs_for_plan(plan: dict[str, Any]) -> list[dict[str, str]]:
         for mode in modes
     ]
     for workload in ("hot", "atomic", "wait-notify", "spawn-join"):
-        require(workload in iterations, f"plan iterations missing {workload}")
+        require(
+            all(workload in iterations[mode] for mode in modes),
+            f"plan iterations missing {workload}",
+        )
         for threads in thread_counts:
             if len(modes) == 2:
                 pairs.append(
@@ -303,14 +505,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--samples", type=int)
     parser.add_argument("--modes", choices=("both", "interpreter", "aot"), default="both")
     parser.add_argument("--thread-counts", type=parse_thread_counts, default=(1, 2, 4, 8))
-    parser.add_argument("--single-iterations", type=int, default=224_000_000)
-    parser.add_argument("--cancel-iterations", type=int, default=224_000_000)
-    parser.add_argument("--hot-iterations", type=int, default=128_000_000)
-    parser.add_argument("--atomic-iterations", type=int, default=64_000_000)
-    parser.add_argument("--atomic-total-iterations", type=int, default=256_000_000)
-    parser.add_argument("--wait-iterations", type=int, default=512_000)
-    parser.add_argument("--spawn-iterations", type=int, default=3_000)
-    parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--single-iterations", type=int)
+    parser.add_argument("--cancel-iterations", type=int)
+    parser.add_argument("--hot-iterations", type=int)
+    parser.add_argument("--atomic-iterations", type=int)
+    parser.add_argument("--atomic-total-iterations", type=int)
+    parser.add_argument("--wait-iterations", type=int)
+    parser.add_argument("--spawn-iterations", type=int)
+    parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument(
         "--min-interval-ms", type=float, default=MIN_TIMED_INTERVAL_MS
     )
@@ -348,6 +550,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--budget", type=Path)
     parser.add_argument("--no-budget", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument(
+        "--trusted-calibration-preflight",
+        action="store_true",
+        help=(
+            "run the fixed scheduler/barrier quality preflight; valid only for "
+            "paired noise calibration"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.warmups is None or args.samples is None:
         default_warmups, default_samples = PROFILE_COUNTS[args.profile]
@@ -364,19 +574,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "wait_iterations",
         "spawn_iterations",
     ):
-        if getattr(args, name) <= 0:
+        if getattr(args, name) is not None and getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be > 0")
-    if any(
-        args.wait_iterations % threads != 0
-        for threads in args.thread_counts
+    if args.wait_iterations is not None and any(
+        args.wait_iterations % threads != 0 for threads in args.thread_counts
     ):
         parser.error(
             "--wait-iterations must be divisible by every selected thread count"
         )
     if args.timeout <= 0:
         parser.error("--timeout must be > 0")
-    if args.min_interval_ms <= 0:
-        parser.error("--min-interval-ms must be > 0")
+    if args.min_interval_ms < MIN_TIMED_INTERVAL_MS:
+        parser.error(
+            f"--min-interval-ms must be >= {MIN_TIMED_INTERVAL_MS:g}"
+        )
     if args.budget and args.no_budget:
         parser.error("--budget and --no-budget are mutually exclusive")
     if (args.baseline_repo is None) != (args.candidate_repo is None):
@@ -396,6 +607,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--host-pair-id must not be empty")
     if args.runner_environment is not None and not args.runner_environment.strip():
         parser.error("--runner-environment must not be empty")
+    if args.trusted_calibration_preflight and (
+        not paired or args.comparison_purpose != "noise-calibration"
+    ):
+        parser.error(
+            "--trusted-calibration-preflight requires paired noise calibration"
+        )
+    modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
+    args.iteration_plan = resolved_iteration_plan(args, modes)
+    try:
+        validate_iteration_plan_ranges(args.iteration_plan, args.thread_counts)
+    except HarnessError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -474,6 +697,223 @@ def host_pair_identity(
         "runner_environment": host["runner_environment"],
         "host_fingerprint_sha256": fingerprint_sha256,
     }
+
+
+def host_quiescence_diagnostics() -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "collected_at": collected_at(),
+        "logical_cpus": os.cpu_count(),
+        "available_cpu_count": None,
+        "cpu_affinity": [],
+        "load_average": None,
+        "proc_loadavg": None,
+        "cpu_pressure": None,
+        "runner_worker_process_count": None,
+        "runner_job": {
+            "runner_name": os.getenv("RUNNER_NAME", ""),
+            "github_run_id": os.getenv("GITHUB_RUN_ID", ""),
+            "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
+            "github_job": os.getenv("GITHUB_JOB", ""),
+            "github_workflow": os.getenv("GITHUB_WORKFLOW", ""),
+        },
+    }
+    try:
+        affinity = sorted(os.sched_getaffinity(0))
+        diagnostics["cpu_affinity"] = affinity
+        diagnostics["available_cpu_count"] = len(affinity)
+    except (AttributeError, OSError):
+        pass
+    try:
+        diagnostics["load_average"] = list(os.getloadavg())
+    except (AttributeError, OSError):
+        pass
+    try:
+        diagnostics["proc_loadavg"] = Path("/proc/loadavg").read_text(
+            encoding="UTF-8"
+        ).strip()
+    except OSError:
+        pass
+    try:
+        diagnostics["cpu_pressure"] = Path("/proc/pressure/cpu").read_text(
+            encoding="UTF-8"
+        ).strip()
+    except OSError:
+        pass
+    try:
+        diagnostics["runner_worker_process_count"] = sum(
+            1
+            for comm in Path("/proc").glob("[0-9]*/comm")
+            if comm.read_text(encoding="UTF-8").strip() == "Runner.Worker"
+        )
+    except OSError:
+        pass
+    return diagnostics
+
+
+def maximum_preflight_barrier_ns(minimum_interval_ns: int) -> int:
+    if minimum_interval_ns <= 0:
+        raise HarnessError("minimum timed interval must be positive")
+    return (minimum_interval_ns - 1) // 99
+
+
+def preflight_sample_accepted(
+    timing_overhead_ns: int,
+    timed_interval_ns: int,
+    minimum_interval_ns: int,
+) -> bool:
+    return (
+        timed_interval_ns >= minimum_interval_ns
+        and timing_overhead_ns >= 0
+        and 99 * timing_overhead_ns < minimum_interval_ns
+    )
+
+
+def failure_diagnostic_markdown(document: dict[str, Any]) -> str:
+    scenario = document["scenario"]
+    lines = [
+        "# WASI threaded benchmark quality failure",
+        "",
+        f"- Stage: `{document['stage']}`",
+        f"- Reason: `{document['reason']}`",
+        f"- Scenario: `{scenario.get('workload', '')}` / "
+        f"`{scenario.get('mode', '')}` / {scenario.get('threads', '')} threads",
+        f"- Barrier: `{document['timing_overhead_ns']}` ns",
+        f"- Timed interval: `{document['timed_interval_ns']}` ns",
+        f"- Ratio: `{document['timing_overhead_ratio']}`",
+        (
+            "- Ratio at minimum interval: "
+            f"`{document['ratio_at_minimum_timed_interval']}`"
+        ),
+        f"- Fixed limit: `< {document['timing_overhead_ratio_limit']}`",
+        f"- Runner: `{document['host'].get('runner_name', '')}`",
+        f"- Host fingerprint: "
+        f"`{document['host_pair']['host_fingerprint_sha256']}`",
+        "",
+        f"All {len(document['preflight_samples'])} preflight samples are retained "
+        "in `failure-diagnostic.json`.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_failure_diagnostic(
+    *,
+    output: Path,
+    stage: str,
+    reason: str,
+    scenario: dict[str, Any],
+    timing_overhead_ns: int | None,
+    timed_interval_ns: int | None,
+    raw_elapsed_ns: int | None,
+    timing_overhead_ppm: int | None,
+    minimum_interval_ns: int,
+    host: dict[str, Any],
+    host_pair: dict[str, str],
+    host_quiescence_at_start: dict[str, Any],
+    host_quiescence_at_failure: dict[str, Any],
+    preflight_samples: list[dict[str, Any]],
+    message: str,
+    ratio_at_minimum_timed_interval: float | None = None,
+) -> dict[str, Any]:
+    ratio = (
+        timing_overhead_ns / raw_elapsed_ns
+        if timing_overhead_ns is not None
+        and raw_elapsed_ns is not None
+        and raw_elapsed_ns > 0
+        else None
+    )
+    if (
+        ratio_at_minimum_timed_interval is None
+        and timing_overhead_ns is not None
+    ):
+        ratio_at_minimum_timed_interval = timing_overhead_ns / (
+            minimum_interval_ns + timing_overhead_ns
+        )
+    document = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "wasi-thread-benchmark-quality-failure",
+        "collected_at": collected_at(),
+        "stage": stage,
+        "reason": reason,
+        "message": message,
+        "scenario": scenario,
+        "timing_overhead_ns": timing_overhead_ns,
+        "timed_interval_ns": timed_interval_ns,
+        "raw_elapsed_ns": raw_elapsed_ns,
+        "timing_overhead_ppm": timing_overhead_ppm,
+        "timing_overhead_ratio": ratio,
+        "ratio_at_minimum_timed_interval": (
+            ratio_at_minimum_timed_interval
+        ),
+        "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "maximum_preflight_barrier_ns": maximum_preflight_barrier_ns(
+            minimum_interval_ns
+        ),
+        "host": host,
+        "host_pair": host_pair,
+        "host_quiescence_at_start": host_quiescence_at_start,
+        "host_quiescence_at_failure": host_quiescence_at_failure,
+        "preflight_samples": preflight_samples,
+    }
+    atomic_write_json(output / "failure-diagnostic.json", document)
+    (output / "failure-diagnostic.md").write_text(
+        failure_diagnostic_markdown(document) + "\n",
+        encoding="UTF-8",
+    )
+    return document
+
+
+def raise_with_failure_diagnostic(
+    error: HarnessError,
+    **diagnostic: Any,
+) -> None:
+    write_failure_diagnostic(**diagnostic, message=str(error))
+    raise error
+
+
+def measure_with_quality_diagnostic(
+    *,
+    output: Path,
+    stage: str,
+    minimum_interval_ns: int,
+    host: dict[str, Any],
+    host_pair: dict[str, str],
+    host_quiescence_at_start: dict[str, Any],
+    preflight_samples: list[dict[str, Any]],
+    **measure_args: Any,
+) -> dict[str, Any]:
+    try:
+        return measure_once(**measure_args)
+    except TimingQualityError as exc:
+        fields = measure_args["record_fields"]
+        raise_with_failure_diagnostic(
+            exc,
+            output=output,
+            stage=stage,
+            reason=exc.reason,
+            scenario={
+                "revision": fields.get("revision"),
+                "mode": fields.get("mode"),
+                "workload": measure_args["workload"],
+                "threads": measure_args["threads"],
+                "iterations": measure_args["iterations"],
+                "condition": fields.get("condition"),
+                "pair_key": fields.get("pair_key"),
+                "pair_index": fields.get("pair_index"),
+                "phase": fields.get("phase"),
+            },
+            timing_overhead_ns=exc.timing_overhead_ns,
+            timed_interval_ns=exc.elapsed_ns,
+            raw_elapsed_ns=exc.raw_elapsed_ns,
+            timing_overhead_ppm=exc.timing_overhead_ppm,
+            minimum_interval_ns=minimum_interval_ns,
+            host=host,
+            host_pair=host_pair,
+            host_quiescence_at_start=host_quiescence_at_start,
+            host_quiescence_at_failure=host_quiescence_diagnostics(),
+            preflight_samples=preflight_samples,
+        )
 
 
 def controlled_env(cache_root: Path) -> dict[str, str]:
@@ -726,12 +1166,52 @@ def aot_artifact_report(
     return report
 
 
+def rotate_left_u64(value: int, bits: int) -> int:
+    shift = bits & 63
+    value &= MASK64
+    if shift == 0:
+        return value
+    return ((value << shift) & MASK64) | (value >> (64 - shift))
+
+
+def xor_upto(value: int) -> int:
+    if value < 0:
+        return 0
+    return (value, 1, value + 1, 0)[value & 3]
+
+
+def xor_wrapped_u58_range(start: int, count: int) -> int:
+    modulus = 1 << 58
+    if not 0 <= count <= modulus:
+        raise HarnessError("hot-kernel grouped range exceeds uint64 iteration space")
+    if count == 0 or count == modulus:
+        return 0
+    start %= modulus
+    end = start + count
+    if end <= modulus:
+        return xor_upto(end - 1) ^ xor_upto(start - 1)
+    return (
+        xor_upto(modulus - 1)
+        ^ xor_upto(start - 1)
+        ^ xor_upto(end - modulus - 1)
+    )
+
+
 @functools.lru_cache(maxsize=None)
-def hot_kernel(seed: int, iterations: int) -> int:
-    value = seed & MASK64
-    for index in range(iterations):
-        value = (((value << 7) & MASK64) | (value >> 57))
-        value ^= (index + 0xD1B54A32D192ED03) & MASK64
+def hot_kernel_jump_ahead(seed: int, iterations: int) -> int:
+    if not 0 <= iterations <= MASK64:
+        raise HarnessError("hot-kernel iterations must fit uint64")
+    value = rotate_left_u64(seed, 7 * iterations)
+    for residue in range(min(64, iterations)):
+        terms = (iterations - 1 - residue) // 64 + 1
+        first = (HOT_KERNEL_COUNTER_BASE + residue) & MASK64
+        grouped_xor = xor_wrapped_u58_range(first >> 6, terms) << 6
+        if terms & 1:
+            grouped_xor ^= first & 63
+        value ^= rotate_left_u64(
+            grouped_xor,
+            7 * (iterations - 1 - residue),
+        )
     return value & MASK64
 
 
@@ -742,18 +1222,25 @@ def worker_seed(index: int) -> int:
 
 
 @functools.lru_cache(maxsize=None)
-def expected_result(workload: str, threads: int, iterations: int) -> dict[str, int | str]:
+def expected_result(
+    workload: str, threads: int, iterations: int
+) -> dict[str, int | str]:
+    if not 0 < threads <= 8 or not 0 <= iterations <= MASK64 // threads:
+        raise HarnessError("expected-result operations must fit uint64")
     operations = threads * iterations
     if workload == "single-hot":
-        checksum = hot_kernel(worker_seed(0), iterations)
+        checksum = hot_kernel_jump_ahead(worker_seed(0), iterations)
     elif workload == "hot":
         checksum = sum(
-            hot_kernel(worker_seed(index), iterations) for index in range(threads)
+            hot_kernel_jump_ahead(worker_seed(index), iterations)
+            for index in range(threads)
         ) & MASK64
     elif workload in ("atomic", "wait-notify"):
         checksum = operations
     elif workload == "spawn-join":
         checksum = iterations * threads * (threads + 1) // 2
+        if checksum > MASK64:
+            raise HarnessError("spawn-join checksum must fit uint64")
     else:
         raise HarnessError(f"unknown workload {workload}")
     return {
@@ -776,10 +1263,73 @@ def expected_result(workload: str, threads: int, iterations: int) -> dict[str, i
     }
 
 
+def prepare_expected_results(
+    iteration_plan: dict[str, dict[str, Any]],
+    modes: tuple[str, ...],
+    thread_counts: tuple[int, ...],
+) -> dict[str, Any]:
+    requests: list[tuple[str, int, int]] = []
+    for mode in modes:
+        requests.append(
+            ("single-hot", 1, int(iteration_plan[mode]["single-hot"]))
+        )
+        for workload in ("hot", "atomic", "wait-notify", "spawn-join"):
+            for threads in thread_counts:
+                requests.append(
+                    (
+                        workload,
+                        threads,
+                        iteration_count(
+                            iteration_plan, mode, workload, threads
+                        ),
+                    )
+                )
+    if "aot" in modes:
+        for threads in thread_counts:
+            requests.append(
+                (
+                    "hot",
+                    threads,
+                    iteration_count(
+                        iteration_plan, "aot", "cancel-hot", threads
+                    ),
+                )
+            )
+    unique_requests = list(dict.fromkeys(requests))
+    samples = []
+    total_started = time.perf_counter_ns()
+    for workload, threads, iterations in unique_requests:
+        started = time.perf_counter_ns()
+        expected_result(workload, threads, iterations)
+        elapsed_ns = time.perf_counter_ns() - started
+        samples.append(
+            {
+                "workload": workload,
+                "threads": threads,
+                "iterations": iterations,
+                "elapsed_ns": elapsed_ns,
+            }
+        )
+    total_ns = time.perf_counter_ns() - total_started
+    worst = max(samples, key=lambda sample: sample["elapsed_ns"])
+    return {
+        "algorithm": "64-residue-xor-jump-ahead",
+        "complexity": "O(64 * threads), independent of iteration count",
+        "unique_keys": len(samples),
+        "total_ns": total_ns,
+        "worst_ns": worst["elapsed_ns"],
+        "worst_key": {
+            key: worst[key] for key in ("workload", "threads", "iterations")
+        },
+    }
+
+
 def parse_guest_result(
     stdout: str,
     expected: dict[str, int | str],
     min_interval_ns: int,
+    *,
+    enforce_timing_quality: bool = True,
 ) -> dict[str, int | str]:
     lines = [line for line in stdout.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -820,13 +1370,23 @@ def parse_guest_result(
     expected_ppm = overhead * 1_000_000 // raw
     if overhead_ppm != expected_ppm:
         raise HarnessError("guest timing_overhead_ppm is inconsistent")
-    if overhead_ppm >= 10_000:
-        raise HarnessError(
-            f"guest timing overhead {overhead_ppm / 10_000:.3f}% is not below 1%"
+    if enforce_timing_quality and 99 * overhead >= elapsed:
+        raise TimingQualityError(
+            f"guest timing overhead {overhead / raw * 100:.3f}% is not below 1%",
+            raw_elapsed_ns=raw,
+            timing_overhead_ns=overhead,
+            elapsed_ns=elapsed,
+            timing_overhead_ppm=overhead_ppm,
+            reason="timing-overhead",
         )
-    if elapsed < min_interval_ns:
-        raise HarnessError(
-            f"guest timed interval {elapsed}ns is below required {min_interval_ns}ns"
+    if enforce_timing_quality and elapsed < min_interval_ns:
+        raise TimingQualityError(
+            f"guest timed interval {elapsed}ns is below required {min_interval_ns}ns",
+            raw_elapsed_ns=raw,
+            timing_overhead_ns=overhead,
+            elapsed_ns=elapsed,
+            timing_overhead_ppm=overhead_ppm,
+            reason="minimum-timed-interval",
         )
     return result
 
@@ -908,6 +1468,7 @@ def measure_once(
     timeout: float,
     min_interval_ns: int,
     record_fields: dict[str, Any],
+    enforce_timing_quality: bool = True,
 ) -> dict[str, Any]:
     guest_args = (
         [str(iterations)]
@@ -937,7 +1498,12 @@ def measure_once(
             f"exit {returncode}: {' '.join(command)}\n{stderr}"
         )
     expected = expected_result(workload, threads, iterations)
-    guest = parse_guest_result(stdout, expected, min_interval_ns)
+    guest = parse_guest_result(
+        stdout,
+        expected,
+        min_interval_ns,
+        enforce_timing_quality=enforce_timing_quality,
+    )
     operations = int(guest["operations"])
     guest_elapsed_ns = int(guest["elapsed_ns"])
     throughput = operations / (guest_elapsed_ns / 1e9)
@@ -972,6 +1538,109 @@ def measure_once(
         },
         "stdout": stdout,
         "stderr": stderr,
+    }
+
+
+def run_trusted_barrier_preflight(
+    *,
+    repo: Path,
+    runner: list[str],
+    build: Build,
+    module: Path,
+    thread_counts: tuple[int, ...],
+    iterations_by_thread: dict[str, int],
+    timeout: float,
+    minimum_interval_ns: int,
+    static_cancel_poll_sites: int,
+) -> dict[str, Any]:
+    samples: list[dict[str, Any]] = []
+    for threads in thread_counts:
+        iterations = iterations_by_thread[str(threads)]
+        for probe_index in range(TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD):
+            try:
+                measured = measure_once(
+                    repo=repo,
+                    runner=runner,
+                    build=build,
+                    module=module,
+                    workload="hot",
+                    threads=threads,
+                    iterations=iterations,
+                    timeout=timeout,
+                    min_interval_ns=minimum_interval_ns,
+                    enforce_timing_quality=False,
+                    record_fields={
+                        "mode": "aot",
+                        "threads_enabled": True,
+                        "cancel_points": "on",
+                        "static_cancel_poll_sites": static_cancel_poll_sites,
+                        "workload": "hot",
+                        "threads": threads,
+                        "iterations": iterations,
+                    },
+                )
+            except HarnessError as exc:
+                raise PreflightProbeError(
+                    str(exc),
+                    samples=copy.deepcopy(samples),
+                    scenario={
+                        "mode": "aot",
+                        "workload": "hot",
+                        "threads": threads,
+                        "probe_index": probe_index,
+                    },
+                ) from exc
+            overhead = measured["timing_overhead_ns"]
+            timed = measured["guest_elapsed_ns"]
+            raw = measured["raw_guest_elapsed_ns"]
+            samples.append(
+                {
+                    "probe_index": probe_index,
+                    "mode": "aot",
+                    "workload": "hot",
+                    "threads": threads,
+                    "iterations": iterations,
+                    "timing_overhead_ns": overhead,
+                    "timed_interval_ns": timed,
+                    "raw_elapsed_ns": raw,
+                    "timing_overhead_ppm": measured["timing_overhead_ppm"],
+                    "timing_overhead_ratio": overhead / raw,
+                    "ratio_at_minimum_timed_interval": (
+                        overhead / (minimum_interval_ns + overhead)
+                    ),
+                    "accepted": preflight_sample_accepted(
+                        overhead,
+                        timed,
+                        minimum_interval_ns,
+                    ),
+                }
+            )
+    overhead_values = [sample["timing_overhead_ns"] for sample in samples]
+    return {
+        "enabled": True,
+        "status": (
+            "passed" if all(sample["accepted"] for sample in samples) else "failed"
+        ),
+        "probe_count": len(samples),
+        "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
+        "mode": "aot",
+        "workload": "hot",
+        "thread_counts": list(thread_counts),
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
+            minimum_interval_ns
+        ),
+        "acceptance_rule": (
+            "every probe must have timed_interval_ns >= minimum_timed_interval_ns "
+            "and 99 * timing_overhead_ns < minimum_timed_interval_ns"
+        ),
+        "summary": {
+            "minimum_barrier_ns": min(overhead_values),
+            "median_barrier_ns": statistics.median(overhead_values),
+            "maximum_barrier_ns": max(overhead_values),
+        },
+        "samples": samples,
     }
 
 
@@ -1361,9 +2030,74 @@ def validate_report(document: dict[str, Any]) -> None:
     require(plan.get("warmups", -1) >= 0, "plan.warmups")
     require(plan.get("samples", 0) > 0, "plan.samples")
     require(
-        plan.get("minimum_timed_interval_ns", 0) > 0,
+        plan.get("minimum_timed_interval_ns", 0)
+        >= int(MIN_TIMED_INTERVAL_MS * 1_000_000),
         "plan.minimum_timed_interval_ns",
     )
+    preflight_plan = plan.get("scheduler_barrier_preflight")
+    require(
+        isinstance(preflight_plan, dict),
+        "plan.scheduler_barrier_preflight",
+    )
+    require(
+        isinstance(preflight_plan.get("enabled"), bool)
+        and isinstance(preflight_plan.get("acceptance_rule"), str)
+        and bool(preflight_plan["acceptance_rule"])
+        and preflight_plan.get("mode") == "aot"
+        and preflight_plan.get("workload") == "hot"
+        and preflight_plan.get("probes_per_thread")
+        == TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+        and preflight_plan.get("timing_overhead_ratio_limit")
+        == TIMING_OVERHEAD_RATIO_LIMIT
+        and preflight_plan.get("target_barrier_ns") == TARGET_BARRIER_NS
+        and preflight_plan.get("target_required_interval_ns")
+        == TARGET_BARRIER_REQUIRED_INTERVAL_NS
+        and preflight_plan.get("minimum_interval_headroom_ns")
+        == plan["minimum_timed_interval_ns"]
+        - TARGET_BARRIER_REQUIRED_INTERVAL_NS
+        and preflight_plan.get("maximum_accepted_barrier_ns")
+        == maximum_preflight_barrier_ns(plan["minimum_timed_interval_ns"]),
+        "plan.scheduler_barrier_preflight policy",
+    )
+    iterations = plan.get("iterations")
+    require(
+        isinstance(iterations, dict) and set(iterations) == set(plan["modes"]),
+        "plan.iterations modes",
+    )
+    thread_keys = {str(threads) for threads in plan["thread_counts"]}
+    for mode, values in iterations.items():
+        expected_workloads = {
+            "single-hot",
+            "hot",
+            "atomic",
+            "wait-notify",
+            "spawn-join",
+        } | ({"cancel-hot"} if mode == "aot" else set())
+        require(
+            isinstance(values, dict) and set(values) == expected_workloads,
+            f"plan.iterations.{mode} workloads",
+        )
+        require(
+            isinstance(values["single-hot"], int)
+            and not isinstance(values["single-hot"], bool)
+            and values["single-hot"] > 0,
+            f"plan.iterations.{mode}.single-hot",
+        )
+        for workload in expected_workloads - {"single-hot"}:
+            counts = values[workload]
+            require(
+                isinstance(counts, dict) and set(counts) == thread_keys,
+                f"plan.iterations.{mode}.{workload} threads",
+            )
+            require(
+                all(
+                    isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count > 0
+                    for count in counts.values()
+                ),
+                f"plan.iterations.{mode}.{workload} counts",
+            )
     revision_mode = plan.get("revision_mode")
     comparison_purpose = plan.get("comparison_purpose")
     if revision_mode == "paired-revisions":
@@ -1390,6 +2124,23 @@ def validate_report(document: dict[str, Any]) -> None:
         plan.get("revision_roles") == list(revision_roles),
         "plan.revision_roles",
     )
+    expected_preflight_count = (
+        TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+        * len(plan.get("thread_counts", []))
+        if preflight_plan.get("enabled") is True
+        else 0
+    )
+    require(
+        preflight_plan.get("probe_count") == expected_preflight_count,
+        "plan.scheduler_barrier_preflight probe count",
+    )
+    if preflight_plan["enabled"]:
+        require(
+            revision_mode == "paired-revisions"
+            and comparison_purpose == "noise-calibration"
+            and "aot" in plan.get("modes", []),
+            "trusted quality preflight activation",
+        )
     require(metadata["plan_sha256"] == cache_key(plan), "metadata.plan_sha256")
     require(
         metadata["measurement_plan_sha256"]
@@ -1558,6 +2309,111 @@ def validate_report(document: dict[str, Any]) -> None:
             != revisions["candidate"]["build_source_sha256"],
             "budget enforcement requires distinct build identities",
         )
+    quality_preflight = document.get("quality_preflight")
+    require(isinstance(quality_preflight, dict), "quality_preflight")
+    require(
+        quality_preflight.get("enabled") is preflight_plan.get("enabled"),
+        "quality_preflight enabled",
+    )
+    require(
+        quality_preflight.get("probe_count") == expected_preflight_count
+        and quality_preflight.get("probes_per_thread")
+        == TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+        and quality_preflight.get("minimum_timed_interval_ns")
+        == plan["minimum_timed_interval_ns"]
+        and quality_preflight.get("timing_overhead_ratio_limit")
+        == TIMING_OVERHEAD_RATIO_LIMIT
+        and quality_preflight.get("maximum_accepted_barrier_ns")
+        == maximum_preflight_barrier_ns(plan["minimum_timed_interval_ns"])
+        and quality_preflight.get("mode") == preflight_plan["mode"]
+        and quality_preflight.get("workload") == preflight_plan["workload"]
+        and quality_preflight.get("thread_counts") == plan["thread_counts"]
+        and quality_preflight.get("acceptance_rule")
+        == preflight_plan["acceptance_rule"]
+        and isinstance(
+            quality_preflight.get("host_quiescence_at_start"), dict
+        ),
+        "quality_preflight policy",
+    )
+    preflight_samples = quality_preflight.get("samples")
+    require(isinstance(preflight_samples, list), "quality_preflight samples")
+    require(
+        len(preflight_samples) == expected_preflight_count,
+        "quality_preflight sample count",
+    )
+    if preflight_plan["enabled"]:
+        require(
+            quality_preflight.get("status") == "passed",
+            "quality_preflight status",
+        )
+        require(
+            all(
+                sample.get("accepted") is True
+                and preflight_sample_accepted(
+                    sample.get("timing_overhead_ns", -1),
+                    sample.get("timed_interval_ns", -1),
+                    plan["minimum_timed_interval_ns"],
+                )
+                for sample in preflight_samples
+            ),
+            "quality_preflight acceptance",
+        )
+        expected_probe_order = [
+            (threads, probe_index)
+            for threads in plan["thread_counts"]
+            for probe_index in range(
+                TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+            )
+        ]
+        require(
+            [
+                (sample.get("threads"), sample.get("probe_index"))
+                for sample in preflight_samples
+            ]
+            == expected_probe_order,
+            "quality_preflight probe order",
+        )
+        for sample in preflight_samples:
+            overhead = sample["timing_overhead_ns"]
+            timed = sample["timed_interval_ns"]
+            raw = sample.get("raw_elapsed_ns")
+            require(
+                sample.get("mode") == "aot"
+                and sample.get("workload") == "hot"
+                and sample.get("iterations")
+                == plan["iterations"]["aot"]["hot"][str(sample["threads"])]
+                and raw == timed + overhead
+                and sample.get("timing_overhead_ppm")
+                == overhead * 1_000_000 // raw
+                and math.isclose(
+                    sample.get("timing_overhead_ratio", -1),
+                    overhead / raw,
+                )
+                and math.isclose(
+                    sample.get("ratio_at_minimum_timed_interval", -1),
+                    overhead
+                    / (plan["minimum_timed_interval_ns"] + overhead),
+                ),
+                "quality_preflight sample",
+            )
+        overhead_values = [
+            sample["timing_overhead_ns"] for sample in preflight_samples
+        ]
+        require(
+            quality_preflight.get("summary")
+            == {
+                "minimum_barrier_ns": min(overhead_values),
+                "median_barrier_ns": statistics.median(overhead_values),
+                "maximum_barrier_ns": max(overhead_values),
+            },
+            "quality_preflight summary",
+        )
+    else:
+        require(
+            quality_preflight.get("status") == "not-requested"
+            and preflight_samples == [],
+            "disabled quality_preflight",
+        )
     pair_plan = plan.get("pairs")
     require(isinstance(pair_plan, list) and pair_plan, "plan.pairs")
     expected_pair_plan = expected_pair_specs_for_plan(plan)
@@ -1592,7 +2448,11 @@ def validate_report(document: dict[str, Any]) -> None:
             record.get("host_wall_elapsed_ns", 0) >= record["guest_elapsed_ns"],
             "record host wall diagnostic",
         )
-        require(record.get("timing_overhead_ppm", 10_000) < 10_000, "timing overhead")
+        require(
+            99 * record.get("timing_overhead_ns", -1)
+            < record["guest_elapsed_ns"],
+            "timing overhead",
+        )
         require(
             record["guest_elapsed_ns"] >= plan["minimum_timed_interval_ns"],
             "record minimum timed interval",
@@ -1606,6 +2466,22 @@ def validate_report(document: dict[str, Any]) -> None:
         require(
             record.get("condition") in (pair["left"], pair["right"]),
             "record pair condition",
+        )
+        if record["pair_kind"] == "single-infrastructure":
+            expected_iterations = plan["iterations"][record["mode"]][
+                "single-hot"
+            ]
+        elif record["pair_kind"] == "cancel-point-cost":
+            expected_iterations = plan["iterations"]["aot"]["cancel-hot"][
+                str(record["threads"])
+            ]
+        else:
+            expected_iterations = plan["iterations"][record["mode"]][
+                record["workload"]
+            ][str(record["threads"])]
+        require(
+            record.get("iterations") == expected_iterations,
+            "record plan iterations",
         )
         for key in (
             "commit",
@@ -2269,7 +3145,20 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"- Profile: `{document['plan']['profile']}` "
         f"({document['plan']['warmups']} warmups, {document['plan']['samples']} samples)",
         f"- Budget: `{document['budget']['status']}`",
+        "- Checksum preparation: "
+        f"`{document['metadata']['checksum_preparation']['algorithm']}`; "
+        f"worst {document['metadata']['checksum_preparation']['worst_ns']} ns, "
+        f"total {document['metadata']['checksum_preparation']['total_ns']} ns",
     ]
+    quality_preflight = document["quality_preflight"]
+    if quality_preflight["enabled"]:
+        lines.append(
+            "- Scheduler/barrier preflight: "
+            f"`{quality_preflight['status']}`; "
+            f"{quality_preflight['probe_count']} fixed probes; maximum "
+            f"{quality_preflight['summary']['maximum_barrier_ns']} ns "
+            f"(limit {quality_preflight['maximum_accepted_barrier_ns']} ns)"
+        )
     poll_static = (
         document["metadata"]
         .get("aot_artifacts", {})
@@ -2386,6 +3275,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         else (repo / args.output_dir).resolve()
     )
     output.mkdir(parents=True, exist_ok=True)
+    for stale_output in (
+        output / "report.json",
+        output / "report.md",
+        output / "failure-diagnostic.json",
+        output / "failure-diagnostic.md",
+    ):
+        stale_output.unlink(missing_ok=True)
     sources = {
         role: source_identity(revision_repo)
         for role, revision_repo in revision_repos.items()
@@ -2418,6 +3314,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     fixture_set_sha256 = fixture_set_identities["candidate"]
     minimum_interval_ns = int(args.min_interval_ms * 1_000_000)
     modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
+    iteration_plan = args.iteration_plan
+    if args.trusted_calibration_preflight and "aot" not in modes:
+        raise HarnessError(
+            "trusted calibration preflight requires the AOT runtime path"
+        )
     pair_plan = planned_pair_specs(args, modes)
     runner = shlex.split(args.runner)
     plan = {
@@ -2429,25 +3330,47 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "revision_roles": list(revision_roles),
         "modes": list(modes),
         "thread_counts": list(args.thread_counts),
-        "iterations": {
-            "single-hot": args.single_iterations,
-            "cancel-hot": args.cancel_iterations,
-            "hot": args.hot_iterations,
-            "atomic": args.atomic_iterations,
-            "atomic-total": args.atomic_total_iterations,
-            "wait-notify": args.wait_iterations,
-            "spawn-join": args.spawn_iterations,
-        },
+        "iterations": copy.deepcopy(iteration_plan),
         "timeout_seconds": args.timeout,
         "minimum_timed_interval_ns": minimum_interval_ns,
         "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
+        "scheduler_barrier_preflight": {
+            "enabled": args.trusted_calibration_preflight,
+            "mode": "aot",
+            "workload": "hot",
+            "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
+            "probe_count": (
+                TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+                * len(args.thread_counts)
+                if args.trusted_calibration_preflight
+                else 0
+            ),
+            "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+            "target_barrier_ns": TARGET_BARRIER_NS,
+            "target_required_interval_ns": TARGET_BARRIER_REQUIRED_INTERVAL_NS,
+            "minimum_interval_headroom_ns": (
+                minimum_interval_ns - TARGET_BARRIER_REQUIRED_INTERVAL_NS
+            ),
+            "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
+                minimum_interval_ns
+            ),
+            "acceptance_rule": (
+                "every probe must have timed_interval_ns >= "
+                "minimum_timed_interval_ns and 99 * timing_overhead_ns < "
+                "minimum_timed_interval_ns"
+            ),
+        },
         "optimize": args.optimize,
         "pairs": pair_plan,
     }
     plan_sha256 = cache_key(plan)
     measurement_plan_identity = measurement_plan_sha256(plan)
+    checksum_preparation = prepare_expected_results(
+        iteration_plan, modes, args.thread_counts
+    )
     host = host_metadata(args.runner_environment)
     host_pair = host_pair_identity(args.platform_id, host, args.host_pair_id)
+    host_quiescence_at_start = host_quiescence_diagnostics()
     revisions = {
         role: {
             **sources[role],
@@ -2531,11 +3454,124 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "threaded_wasm": revision_repo / FIXTURES["threaded"]["path"],
         }
 
+    quality_preflight: dict[str, Any] = {
+        "enabled": False,
+        "status": "not-requested",
+        "probe_count": 0,
+        "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
+        "mode": "aot",
+        "workload": "hot",
+        "thread_counts": list(args.thread_counts),
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
+            minimum_interval_ns
+        ),
+        "acceptance_rule": plan["scheduler_barrier_preflight"][
+            "acceptance_rule"
+        ],
+        "summary": None,
+        "samples": [],
+        "host_quiescence_at_start": host_quiescence_at_start,
+    }
+    if args.trusted_calibration_preflight:
+        context = contexts["candidate"]
+        try:
+            quality_preflight = run_trusted_barrier_preflight(
+                repo=context["repo"],
+                runner=runner,
+                build=context["builds"]["enabled-aot"],
+                module=context["aot_artifacts"]["threaded-polls-on"],
+                thread_counts=args.thread_counts,
+                iterations_by_thread=iteration_plan["aot"]["hot"],
+                timeout=args.timeout,
+                minimum_interval_ns=minimum_interval_ns,
+                static_cancel_poll_sites=context["aot_artifacts_metadata"][
+                    "cancel_poll_static"
+                ]["sites_enabled"],
+            )
+        except PreflightProbeError as exc:
+            raise_with_failure_diagnostic(
+                exc,
+                output=output,
+                stage="scheduler-barrier-preflight",
+                reason="probe-execution-failure",
+                scenario={
+                    "revision": "candidate",
+                    **exc.scenario,
+                    "condition": "cancel-points-on",
+                },
+                timing_overhead_ns=None,
+                timed_interval_ns=None,
+                raw_elapsed_ns=None,
+                timing_overhead_ppm=None,
+                minimum_interval_ns=minimum_interval_ns,
+                host=host,
+                host_pair=host_pair,
+                host_quiescence_at_start=host_quiescence_at_start,
+                host_quiescence_at_failure=host_quiescence_diagnostics(),
+                preflight_samples=exc.samples,
+            )
+        quality_preflight["host_quiescence_at_start"] = (
+            host_quiescence_at_start
+        )
+        if quality_preflight["status"] != "passed":
+            failed = next(
+                sample
+                for sample in quality_preflight["samples"]
+                if not sample["accepted"]
+            )
+            message = (
+                "trusted scheduler/barrier preflight failed: "
+                f"{failed['timing_overhead_ns']}ns barrier cannot remain below "
+                f"1% at the fixed {minimum_interval_ns}ns minimum interval"
+            )
+            raise_with_failure_diagnostic(
+                HarnessError(message),
+                output=output,
+                stage="scheduler-barrier-preflight",
+                reason="timing-quality",
+                scenario={
+                    "revision": "candidate",
+                    "mode": failed["mode"],
+                    "workload": failed["workload"],
+                    "threads": failed["threads"],
+                    "condition": "cancel-points-on",
+                    "probe_index": failed["probe_index"],
+                },
+                timing_overhead_ns=failed["timing_overhead_ns"],
+                timed_interval_ns=failed["timed_interval_ns"],
+                raw_elapsed_ns=failed["raw_elapsed_ns"],
+                timing_overhead_ppm=failed["timing_overhead_ppm"],
+                minimum_interval_ns=minimum_interval_ns,
+                host=host,
+                host_pair=host_pair,
+                host_quiescence_at_start=host_quiescence_at_start,
+                host_quiescence_at_failure=host_quiescence_diagnostics(),
+                preflight_samples=quality_preflight["samples"],
+                ratio_at_minimum_timed_interval=failed[
+                    "ratio_at_minimum_timed_interval"
+                ],
+            )
+
+    measured = functools.partial(
+        measure_with_quality_diagnostic,
+        output=output,
+        stage="measurement",
+        minimum_interval_ns=minimum_interval_ns,
+        host=host,
+        host_pair=host_pair,
+        host_quiescence_at_start=host_quiescence_at_start,
+        preflight_samples=quality_preflight["samples"],
+    )
+
     if "aot" in modes:
         for role in revision_roles:
             context = contexts[role]
             for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile]):
-                measure_once(
+                measured(
+                    stage="atomic-wait-preflight",
+                    minimum_interval_ns=1,
                     repo=context["repo"],
                     runner=runner,
                     build=context["builds"]["enabled-aot"],
@@ -2586,14 +3622,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 if mode == "interpreter"
                 else context["aot_artifacts"]["single"]
             )
-            return measure_once(
+            return measured(
                 repo=context["repo"],
                 runner=runner,
                 build=selected,
                 module=module,
                 workload="single-hot",
                 threads=1,
-                iterations=args.single_iterations,
+                iterations=iteration_plan[mode]["single-hot"],
                 timeout=args.timeout,
                 min_interval_ns=minimum_interval_ns,
                 record_fields={
@@ -2604,7 +3640,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     "static_cancel_poll_sites": 0,
                     "workload": "single-hot",
                     "threads": 1,
-                    "iterations": args.single_iterations,
+                    "iterations": iteration_plan[mode]["single-hot"],
                 },
             )
 
@@ -2637,14 +3673,19 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     if mode == "interpreter"
                     else context["aot_artifacts"]["threaded-polls-on"]
                 )
-                return measure_once(
+                return measured(
                     repo=context["repo"],
                     runner=runner,
                     build=build,
                     module=module,
                     workload=scenario.workload,
                     threads=scenario.threads,
-                    iterations=scenario.iterations,
+                    iterations=iteration_count(
+                        iteration_plan,
+                        mode,
+                        scenario.workload,
+                        scenario.threads,
+                    ),
                     timeout=args.timeout,
                     min_interval_ns=minimum_interval_ns,
                     record_fields={
@@ -2663,7 +3704,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "workload": scenario.workload,
                         "threads": scenario.threads,
-                        "iterations": scenario.iterations,
+                        "iterations": iteration_count(
+                            iteration_plan,
+                            mode,
+                            scenario.workload,
+                            scenario.threads,
+                        ),
                     },
                 )
 
@@ -2694,14 +3740,19 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     if mode == "interpreter"
                     else context["aot_artifacts"]["threaded-polls-on"]
                 )
-                return measure_once(
+                return measured(
                     repo=context["repo"],
                     runner=runner,
                     build=build,
                     module=module,
                     workload=scenario.workload,
                     threads=scenario.threads,
-                    iterations=scenario.iterations,
+                    iterations=iteration_count(
+                        iteration_plan,
+                        mode,
+                        scenario.workload,
+                        scenario.threads,
+                    ),
                     timeout=args.timeout,
                     min_interval_ns=minimum_interval_ns,
                     record_fields={
@@ -2720,7 +3771,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "workload": scenario.workload,
                         "threads": scenario.threads,
-                        "iterations": scenario.iterations,
+                        "iterations": iteration_count(
+                            iteration_plan,
+                            mode,
+                            scenario.workload,
+                            scenario.threads,
+                        ),
                     },
                 )
 
@@ -2739,7 +3795,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
 
     if "aot" in modes:
         for threads in args.thread_counts:
-            scenario = Scenario("hot", threads, cancel_iterations(args, threads))
+            iterations = iteration_count(
+                iteration_plan, "aot", "cancel-hot", threads
+            )
 
             def poll_measure(
                 revision: str,
@@ -2750,14 +3808,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 aot_build = context["builds"]["enabled-aot"]
                 polls = "off" if condition == "cancel-points-off" else "on"
                 module = context["aot_artifacts"][f"threaded-polls-{polls}"]
-                return measure_once(
+                return measured(
                     repo=context["repo"],
                     runner=runner,
                     build=aot_build,
                     module=module,
                     workload="hot",
                     threads=threads,
-                    iterations=scenario.iterations,
+                    iterations=iterations,
                     timeout=args.timeout,
                     min_interval_ns=minimum_interval_ns,
                     record_fields={
@@ -2776,7 +3834,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "workload": "hot",
                         "threads": threads,
-                        "iterations": scenario.iterations,
+                        "iterations": iterations,
                     },
                 )
 
@@ -2815,6 +3873,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "plan_sha256": plan_sha256,
             "measurement_plan_version": MEASUREMENT_PLAN_IDENTITY_VERSION,
             "measurement_plan_sha256": measurement_plan_identity,
+            "checksum_preparation": checksum_preparation,
             "host": host,
             "host_pair": host_pair,
             "execution": {
@@ -2839,6 +3898,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "paired_summaries": pairs,
         "comparison_summaries": comparisons,
         "ratio_of_ratios_summaries": ratios,
+        "quality_preflight": quality_preflight,
         "budget": {
             "status": "disabled" if args.no_budget else "not-selected",
             "path": str(args.budget.resolve()) if args.budget else None,
