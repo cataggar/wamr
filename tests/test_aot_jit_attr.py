@@ -32,12 +32,15 @@ if "--wamrc" in sys.argv:
 
 LOAD = bytes.fromhex("488b85d0fdffff")  # mov rax,QWORD PTR [rbp-0x230]
 STORE = bytes.fromhex("488985d0fdffff")  # mov QWORD PTR [rbp-0x230],rax
+ARM_BL = struct.pack("<I", 0x94000001)
+ARM_LDR = struct.pack("<I", 0xF9407FB0)  # ldr x16, [x29, #248]
+ARM_STR = struct.pack("<I", 0xF9007FB0)  # str x16, [x29, #248]
 
 
 def metadata_for(code=LOAD + STORE):
     return {
         "schema": aot.FRAME_SCHEMA,
-        "schema_version": aot.FRAME_SCHEMA_VERSION,
+        "schema_version": 1,
         "cwasm_aot_version": aot.AOT_VERSION,
         "compiler_build_id": "test",
         "architecture": "x86_64",
@@ -166,6 +169,211 @@ def load_from_dict(raw, code=LOAD + STORE):
     ):
         return aot.load_frame_metadata(
             "metadata.json", 7, code, aot.AOT_VERSION, code, 0
+        )
+
+
+def aarch64_metadata_for(code=ARM_BL + ARM_LDR + ARM_STR):
+    return {
+        "schema": aot.FRAME_SCHEMA,
+        "schema_version": 2,
+        "cwasm_aot_version": aot.AOT_VERSION,
+        "compiler_build_id": "test",
+        "architecture": "aarch64",
+        "abi": "aapcs64",
+        "module": 0,
+        "local_func": 10,
+        "function_name": "core_state_transition",
+        "module_text_size": len(code),
+        "module_text_sha256": hashlib.sha256(code).hexdigest(),
+        "function_offset": 0,
+        "code_size": len(code),
+        "normalized_code_sha256": aot.normalized_code_sha256_v2(
+            code,
+            [
+                {
+                    "native_start": 0,
+                    "native_end": 4,
+                    "kind": "aarch64_call_imm26",
+                }
+            ],
+            "aarch64",
+        ),
+        "direct_call_rel32_offsets": [],
+        "normalized_relocations": [
+            {
+                "native_start": 0,
+                "native_end": 4,
+                "kind": "aarch64_call_imm26",
+            }
+        ],
+        "inline_data_ranges": [],
+        "frame_layout": {
+            "frame_pointer": "x29",
+            "frame_size": 512,
+            "local_count": 1,
+            "param_count": 0,
+            "reserved_vmctx_offset": 16,
+            "locals_first_offset": 24,
+            "explicit_storage_first_offset": 264,
+            "explicit_storage_slots": 1,
+            "spill_base": 248,
+            "spill_stride": 8,
+            "spill_slots": 1,
+        },
+        "frame_regions": [
+            {
+                "start": 0,
+                "end": 16,
+                "origin": "fixed_runtime_frame_state",
+                "detail": "saved_fp_lr",
+            },
+            {
+                "start": 16,
+                "end": 24,
+                "origin": "fixed_runtime_frame_state",
+                "detail": "reserved_vmctx",
+            },
+            {
+                "start": 24,
+                "end": 32,
+                "origin": "wasm_local_or_phi",
+                "detail": "wasm_local_or_lowered_phi",
+            },
+            {
+                "start": 248,
+                "end": 256,
+                "origin": "allocator_spill",
+                "detail": "scalar_allocator_spills",
+            },
+        ],
+        "spill_metric": {
+            "slots": 1,
+            "spilled_vregs": 1,
+            "scalar": 1,
+            "v128": 0,
+            "slots_scalar": 1,
+            "slots_v128": 0,
+            "spill_ld": 1,
+            "spill_st": 1,
+            "remat": 0,
+            "callee_saved": 0,
+        },
+        "emitted_allocator_loads": 1,
+        "emitted_allocator_stores": 1,
+        "allocator_values": [
+            {
+                "vreg": 77,
+                "frame_offset": 248,
+                "slot": 0,
+                "slot_count": 1,
+                "value_type": "i64",
+                "live_start": 4,
+                "live_end": 12,
+                "defining_opcode": "load",
+                "source_class": "memory_or_runtime",
+                "ir_use_count": 1,
+                "ir_def_count": 1,
+                "reload_count": 1,
+                "store_count": 1,
+                "rematerialization_eligible": False,
+                "reused": False,
+            }
+        ],
+        "accesses": [
+            {
+                "native_start": 4,
+                "native_end": 8,
+                "kind": "load",
+                "base": "x29",
+                "frame_offset": 248,
+                "width": 8,
+                "origin": "allocator_spill",
+                "detail": "allocator_slot",
+                "slot": 0,
+                "local_index": None,
+                "explicit_slot": None,
+                "vreg": 77,
+                "vreg_ambiguous": False,
+                "defining_opcode": "load",
+                "source_class": "memory_or_runtime",
+                "rematerialization_eligible": False,
+                "ir_position": 8,
+                "ir_opcode": "add",
+                "encoded_base": "x29",
+                "encoded_offset": 248,
+                "addressing_mode": "unsigned_scaled",
+                "components": [
+                    {
+                        "base": "x29",
+                        "frame_offset": 248,
+                        "width": 8,
+                        "origin": "allocator_spill",
+                        "detail": "allocator_slot",
+                        "slot": 0,
+                        "local_index": None,
+                        "explicit_slot": None,
+                        "vreg": 77,
+                        "vreg_ambiguous": False,
+                        "defining_opcode": "load",
+                        "source_class": "memory_or_runtime",
+                        "rematerialization_eligible": False,
+                        "ir_position": 8,
+                        "ir_opcode": "add",
+                    }
+                ],
+            },
+            {
+                "native_start": 8,
+                "native_end": 12,
+                "kind": "store",
+                "base": "x29",
+                "frame_offset": 248,
+                "width": 8,
+                "origin": "allocator_spill",
+                "detail": "allocator_slot",
+                "slot": 0,
+                "local_index": None,
+                "explicit_slot": None,
+                "vreg": 77,
+                "vreg_ambiguous": False,
+                "defining_opcode": "load",
+                "source_class": "memory_or_runtime",
+                "rematerialization_eligible": False,
+                "ir_position": 9,
+                "ir_opcode": "local_set",
+                "encoded_base": "x29",
+                "encoded_offset": 248,
+                "addressing_mode": "unsigned_scaled",
+                "components": [
+                    {
+                        "base": "x29",
+                        "frame_offset": 248,
+                        "width": 8,
+                        "origin": "allocator_spill",
+                        "detail": "allocator_slot",
+                        "slot": 0,
+                        "local_index": None,
+                        "explicit_slot": None,
+                        "vreg": 77,
+                        "vreg_ambiguous": False,
+                        "defining_opcode": "load",
+                        "source_class": "memory_or_runtime",
+                        "rematerialization_eligible": False,
+                        "ir_position": 9,
+                        "ir_opcode": "local_set",
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def load_aarch64_from_dict(raw, code=ARM_BL + ARM_LDR + ARM_STR):
+    with mock.patch.object(
+        aot.Path, "read_text", return_value=json.dumps(raw)
+    ):
+        return aot.load_frame_metadata(
+            "metadata.json", 10, code, aot.AOT_VERSION, code, 0
         )
 
 
@@ -595,11 +803,173 @@ class FrameAttributionUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(aot.AttributionError, "overlapping"):
             aot.normalized_code_sha256(first, [2, 3])
 
+    def test_aarch64_schema_v2_relocation_and_encoded_address_validation(self):
+        metadata = load_aarch64_from_dict(aarch64_metadata_for())
+        self.assertEqual("aarch64", metadata.raw["architecture"])
+        instructions = [
+            aot.Instruction(0, 0, 4, "bl 0x4"),
+            aot.Instruction(4, 4, 4, "ldr x16, [x29, #248]"),
+            aot.Instruction(8, 8, 4, "str x16, [x29, #248]"),
+        ]
+        aot.validate_metadata_disassembly(metadata, instructions)
+
+        raw = aarch64_metadata_for()
+        raw["normalized_relocations"][0]["kind"] = "x86_64_call_rel32"
+        with self.assertRaisesRegex(
+            aot.AttributionError, "AArch64 relocation kind"
+        ):
+            load_aarch64_from_dict(raw)
+
+        corrupt_bl = struct.pack("<I", 0x14000001) + ARM_LDR + ARM_STR
+        raw = aarch64_metadata_for()
+        raw["module_text_sha256"] = hashlib.sha256(corrupt_bl).hexdigest()
+        with self.assertRaisesRegex(aot.AttributionError, "not BL imm26"):
+            load_aarch64_from_dict(raw, corrupt_bl)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][0]["encoded_offset"] = 240
+        metadata = load_aarch64_from_dict(raw)
+        with self.assertRaisesRegex(aot.AttributionError, "offset mismatch"):
+            aot.validate_metadata_disassembly(metadata, instructions)
+
+    def test_aarch64_schema_v2_fails_closed_on_corrupt_identity_and_components(
+        self,
+    ):
+        raw = aarch64_metadata_for()
+        raw["abi"] = "sysv"
+        with self.assertRaisesRegex(aot.AttributionError, "abi"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["module_text_sha256"] = "0" * 64
+        with self.assertRaisesRegex(aot.AttributionError, "module text hash"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][0]["components"][0]["width"] = 4
+        with self.assertRaisesRegex(aot.AttributionError, "component widths"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][0]["encoded_base"] = "x31"
+        with self.assertRaisesRegex(aot.AttributionError, "encoded address"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][0]["width"] = 16
+        raw["accesses"][0]["components"].append(
+            dict(raw["accesses"][0]["components"][0])
+        )
+        with self.assertRaisesRegex(aot.AttributionError, "not contiguous"):
+            load_aarch64_from_dict(raw)
+
+        raw = aarch64_metadata_for()
+        raw["accesses"][1]["native_start"] = 6
+        with self.assertRaisesRegex(
+            aot.AttributionError, "overlapping/out-of-range"
+        ):
+            load_aarch64_from_dict(raw)
+
+    def test_aarch64_pair_samples_are_not_double_counted(self):
+        code = struct.pack("<I", 0xA94307A0)  # ldp x0, x1, [x29, #48]
+        raw = aarch64_metadata_for()
+        raw["module_text_size"] = len(code)
+        raw["module_text_sha256"] = hashlib.sha256(code).hexdigest()
+        raw["code_size"] = len(code)
+        raw["normalized_relocations"] = []
+        raw["normalized_code_sha256"] = hashlib.sha256(code).hexdigest()
+        raw["frame_regions"][-1]["start"] = 48
+        raw["frame_regions"][-1]["end"] = 64
+        raw["frame_layout"]["spill_base"] = 48
+        raw["frame_layout"]["spill_slots"] = 2
+        raw["spill_metric"].update(
+            {
+                "slots": 2,
+                "spilled_vregs": 2,
+                "scalar": 2,
+                "slots_scalar": 2,
+                "spill_ld": 2,
+                "spill_st": 0,
+            }
+        )
+        raw["emitted_allocator_loads"] = 2
+        raw["emitted_allocator_stores"] = 0
+        raw["allocator_values"] = [
+            {
+                **raw["allocator_values"][0],
+                "vreg": 70,
+                "frame_offset": 48,
+                "slot": 0,
+                "reload_count": 1,
+                "store_count": 0,
+            },
+            {
+                **raw["allocator_values"][0],
+                "vreg": 71,
+                "frame_offset": 56,
+                "slot": 1,
+                "reload_count": 1,
+                "store_count": 0,
+            },
+        ]
+        components = []
+        for slot, vreg, offset in ((0, 70, 48), (1, 71, 56)):
+            components.append(
+                {
+                    **raw["accesses"][0]["components"][0],
+                    "slot": slot,
+                    "vreg": vreg,
+                    "frame_offset": offset,
+                }
+            )
+        raw["accesses"] = [
+            {
+                **raw["accesses"][0],
+                "native_start": 0,
+                "native_end": 4,
+                "frame_offset": 48,
+                "width": 16,
+                "vreg": None,
+                "vreg_ambiguous": True,
+                "encoded_offset": 48,
+                "addressing_mode": "signed_pair",
+                "components": components,
+            }
+        ]
+        metadata = load_aarch64_from_dict(raw, code)
+        instructions = [
+            aot.Instruction(0x1000, 0, 4, "ldp x0, x1, [x29, #48]")
+        ]
+        summary = aot.build_frame_summary(
+            instructions, {0x1000: 19}, metadata
+        )
+        self.assertEqual(
+            19, summary["origins"]["allocator_spill"]["samples"]
+        )
+        self.assertEqual(
+            19,
+            sum(
+                item["samples"]
+                for item in summary["allocator_contributors"]
+            ),
+        )
+        paired = [
+            item
+            for item in summary["allocator_contributors"]
+            if item.get("paired_components")
+        ]
+        self.assertEqual(1, len(paired))
+        self.assertEqual([70, 71], paired[0]["candidate_vregs"])
+
 
 @unittest.skipUnless(WAMRC, "pass --wamrc for compiler/sidecar smoke coverage")
 class FrameAttributionCompilerSmoke(unittest.TestCase):
-    def test_tracked_core_wasm_sidecar_reconciles(self):
-        work = ROOT / ".zig-cache" / f"frame-attribution-smoke-{os.getpid()}"
+    def _run_tracked_core_wasm_sidecar(self, architecture):
+        work = (
+            ROOT
+            / ".zig-cache"
+            / f"frame-attribution-smoke-{architecture}-{os.getpid()}"
+        )
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True)
         self.addCleanup(lambda: shutil.rmtree(work, ignore_errors=True))
@@ -608,8 +978,18 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
         cwasm = work / "frame_origins.cwasm"
         baseline_cwasm = work / "frame_origins.baseline.cwasm"
         prefix = work / "frame"
+        cache = work / "codegen.cache"
+        compile_args = [
+            str(WAMRC),
+            "compile",
+            "--target",
+            architecture,
+            "--cache",
+            str(cache),
+            str(fixture),
+        ]
         baseline_result = subprocess.run(
-            [str(WAMRC), "compile", str(fixture), "-o", str(baseline_cwasm)],
+            compile_args + ["-o", str(baseline_cwasm)],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -629,7 +1009,7 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
             }
         )
         compile_result = subprocess.run(
-            [str(WAMRC), "compile", str(fixture), "-o", str(cwasm)],
+            compile_args + ["-o", str(cwasm)],
             cwd=ROOT,
             env=env,
             capture_output=True,
@@ -662,6 +1042,11 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
             ],
             start,
         )
+        self.assertEqual(architecture, metadata.raw["architecture"])
+        self.assertEqual(
+            1 if architecture == "x86_64" else 2,
+            metadata.raw["schema_version"],
+        )
         spill_line = re.search(
             r"\[aot-spill-metric\].*spill_ld=(\d+)\s+spill_st=(\d+)",
             compile_result.stderr,
@@ -675,19 +1060,11 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
             int(spill_line.group(2)),
             metadata.reconciliation["emitted_allocator_stores"],
         )
-        instructions = aot.disassemble_blob(code, 0, work, "smoke")
-        aot.validate_metadata_disassembly(metadata, instructions)
-        summary = aot.build_frame_summary(instructions, {}, metadata)
-        self.assertTrue(metadata.reconciliation["matches"])
-        self.assertGreater(
-            metadata.reconciliation["emitted_allocator_loads"], 0
-        )
-        self.assertIn("allocator_spill", summary["origins"])
-        self.assertIn("wasm_local_or_phi", summary["origins"])
-        self.assertEqual(0, summary["coverage"]["unknown_frame_instructions"])
-
         wamr = WAMRC.with_name("wamr")
-        if wamr.exists():
+        if (
+            architecture == aot.normalize_architecture()
+            and wamr.exists()
+        ):
             run_result = subprocess.run(
                 [str(wamr), "run", str(cwasm)],
                 cwd=ROOT,
@@ -697,6 +1074,38 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
             self.assertEqual(
                 0, run_result.returncode, run_result.stdout + run_result.stderr
             )
+
+        try:
+            instructions = aot.disassemble_blob(
+                code, 0, work, "smoke", 0, architecture
+            )
+        except aot.AttributionError as error:
+            if (
+                architecture == "x86_64"
+                and "can't use supplied machine i386:x86-64" in str(error)
+            ):
+                return
+            raise
+        aot.validate_metadata_disassembly(metadata, instructions)
+        summary = aot.build_frame_summary(instructions, {}, metadata)
+        self.assertTrue(metadata.reconciliation["matches"])
+        self.assertGreater(
+            metadata.reconciliation["emitted_allocator_loads"], 0
+        )
+        self.assertIn("allocator_spill", summary["origins"])
+        if architecture == "x86_64":
+            self.assertIn("wasm_local_or_phi", summary["origins"])
+        else:
+            self.assertIn(
+                "fixed_runtime_frame_state", summary["origins"]
+            )
+        self.assertEqual(0, summary["coverage"]["unknown_frame_instructions"])
+
+    def test_tracked_x86_64_core_wasm_sidecar_reconciles(self):
+        self._run_tracked_core_wasm_sidecar("x86_64")
+
+    def test_tracked_aarch64_core_wasm_sidecar_reconciles(self):
+        self._run_tracked_core_wasm_sidecar("aarch64")
 
 
 if __name__ == "__main__":

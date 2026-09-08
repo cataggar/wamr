@@ -4,7 +4,8 @@
 The optional compiler sidecar is deliberately authoritative: it identifies
 each emitted frame-access instruction by a function-relative native byte
 range and binds allocator traffic to a physical slot and, only when sound, a
-vreg/source on x86_64. Without a sidecar, x86_64 and AArch64 frame moves remain
+vreg/source where the emitter can prove it. Without a sidecar, x86_64 and
+AArch64 frame moves remain
 "unattributed" rather than being mislabeled as spills.
 """
 
@@ -29,7 +30,8 @@ SUPPORTED_AOT_VERSIONS = {9, 10, AOT_VERSION}
 SEC_TEXT = 2
 SEC_FUNCTION = 3
 FRAME_SCHEMA = "wamr-aot-frame-attribution"
-FRAME_SCHEMA_VERSION = 1
+FRAME_SCHEMA_VERSION = 2
+SUPPORTED_FRAME_SCHEMA_VERSIONS = {1, FRAME_SCHEMA_VERSION}
 FRAME_ORIGINS = {
     "allocator_spill",
     "wasm_local_or_phi",
@@ -515,8 +517,8 @@ def parse_frame_operand(text):
     return None
 
 
-def parse_aarch64_frame_operand(text):
-    """Identify AArch64 x29/sp frame loads and stores."""
+def parse_aarch64_memory_operand(text, frame_only=False):
+    """Identify an AArch64 load/store memory operand."""
     mnemonic, operands = _split_operands(text)
     load_mnemonics = {
         "ldr",
@@ -546,18 +548,26 @@ def parse_aarch64_frame_operand(text):
     if mnemonic not in load_mnemonics | store_mnemonics:
         return None
     for operand in operands:
+        base_pattern = (
+            r"(x29|fp|sp)"
+            if frame_only
+            else r"(x(?:30|[12][0-9]|[0-9])|fp|sp)"
+        )
         bracket = re.search(
-            r"\[\s*(x29|fp|sp)\s*(?:,\s*#?(-?(?:0x[0-9a-f]+|\d+)))?",
+            rf"\[\s*{base_pattern}\b\s*"
+            r"(?:,\s*#?(-?(?:0x[0-9a-f]+|\d+)))?",
             operand.lower(),
         )
         if not bracket:
             continue
         base = "x29" if bracket.group(1) in {"x29", "fp"} else "sp"
+        if bracket.group(1) not in {"x29", "fp", "sp"}:
+            base = bracket.group(1)
         offset = int(bracket.group(2), 0) if bracket.group(2) else 0
         complex_address = bool(
             re.search(
-                r"\[\s*(?:x29|fp|sp)\s*,\s*"
-                r"(?!#?-?(?:0x[0-9a-f]+|\d+))",
+                r"\[\s*(?:x(?:30|[12][0-9]|[0-9])|fp|sp)\b\s*,"
+                r"(?!\s*#?-?(?:0x[0-9a-f]+|\d+))",
                 operand.lower(),
             )
         )
@@ -568,6 +578,11 @@ def parse_aarch64_frame_operand(text):
             complex_address,
         )
     return None
+
+
+def parse_aarch64_frame_operand(text):
+    """Identify AArch64 x29/sp frame loads and stores."""
+    return parse_aarch64_memory_operand(text, frame_only=True)
 
 
 def instruction_frame_operand(text, architecture=None):
@@ -591,6 +606,50 @@ def normalized_code_sha256(code, rel32_offsets):
             )
         normalized[offset : offset + 4] = b"\0\0\0\0"
         prior_end = offset + 4
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def normalized_code_sha256_v2(code, relocations, architecture):
+    normalized = bytearray(code)
+    prior_end = 0
+    for relocation in relocations:
+        if not isinstance(relocation, dict):
+            raise AttributionError(
+                "normalized_relocations entries must be objects"
+            )
+        start = _require_int(relocation, "native_start")
+        end = _require_int(relocation, "native_end")
+        kind = relocation.get("kind")
+        if start < prior_end or end != start + 4 or end > len(normalized):
+            raise AttributionError(
+                f"invalid/overlapping normalized relocation [{start},{end})"
+            )
+        if architecture == "aarch64":
+            if kind != "aarch64_call_imm26":
+                raise AttributionError(
+                    f"invalid AArch64 relocation kind {kind!r}"
+                )
+            word = struct.unpack_from("<I", normalized, start)[0]
+            if word & 0xFC000000 != 0x94000000:
+                raise AttributionError(
+                    f"AArch64 relocation at {start} is not BL imm26"
+                )
+            struct.pack_into("<I", normalized, start, word & 0xFC000000)
+        elif architecture == "x86_64":
+            if kind != "x86_64_call_rel32" or start == 0:
+                raise AttributionError(
+                    f"invalid x86_64 relocation kind/range at {start}"
+                )
+            if normalized[start - 1] != 0xE8:
+                raise AttributionError(
+                    f"x86_64 relocation at {start} is not CALL rel32"
+                )
+            normalized[start:end] = b"\0\0\0\0"
+        else:
+            raise AttributionError(
+                f"unsupported metadata architecture {architecture!r}"
+            )
+        prior_end = end
     return hashlib.sha256(normalized).hexdigest()
 
 
@@ -626,18 +685,30 @@ def load_frame_metadata(
         raise AttributionError(
             f"{path}: incompatible frame schema {raw.get('schema')!r}"
         )
-    if raw.get("schema_version") != FRAME_SCHEMA_VERSION:
+    schema_version = raw.get("schema_version")
+    if schema_version not in SUPPORTED_FRAME_SCHEMA_VERSIONS:
         raise AttributionError(
             f"{path}: incompatible frame schema_version="
-            f"{raw.get('schema_version')!r}; expected {FRAME_SCHEMA_VERSION}"
+            f"{schema_version!r}; expected one of "
+            f"{sorted(SUPPORTED_FRAME_SCHEMA_VERSIONS)}"
         )
-    if raw.get("architecture") != "x86_64":
+    architecture = raw.get("architecture")
+    if architecture not in SUPPORTED_ARCHITECTURES:
         raise AttributionError(
-            f"{path}: frame metadata architecture must be x86_64"
+            f"{path}: unsupported frame metadata architecture {architecture!r}"
+        )
+    if schema_version == 1 and architecture != "x86_64":
+        raise AttributionError(
+            f"{path}: schema-v1 frame metadata is x86_64-only"
         )
     _require_int(raw, "module")
-    if raw.get("abi") not in {"sysv", "win64"}:
-        raise AttributionError(f"{path}: frame metadata abi must be sysv or win64")
+    valid_abis = (
+        {"sysv", "win64"} if architecture == "x86_64" else {"aapcs64"}
+    )
+    if raw.get("abi") not in valid_abis:
+        raise AttributionError(
+            f"{path}: frame metadata abi must be one of {sorted(valid_abis)}"
+        )
     if not isinstance(raw.get("compiler_build_id"), str):
         raise AttributionError(f"{path}: compiler_build_id must be a string")
     if _require_int(raw, "cwasm_aot_version") != cwasm_version:
@@ -680,8 +751,14 @@ def load_frame_metadata(
             f"{path}: metadata code_size={code_size} does not match cwasm "
             f"function span={len(function_code)}"
         )
-    rel32_offsets = _require_list(raw, "direct_call_rel32_offsets")
-    actual_hash = normalized_code_sha256(function_code, rel32_offsets)
+    if schema_version == 1:
+        rel32_offsets = _require_list(raw, "direct_call_rel32_offsets")
+        actual_hash = normalized_code_sha256(function_code, rel32_offsets)
+    else:
+        relocations = _require_list(raw, "normalized_relocations")
+        actual_hash = normalized_code_sha256_v2(
+            function_code, relocations, architecture
+        )
     expected_hash = raw.get("normalized_code_sha256")
     if not isinstance(expected_hash, str) or not re.fullmatch(
         r"[0-9a-f]{64}", expected_hash
@@ -725,6 +802,30 @@ def load_frame_metadata(
         "callee_saved",
     ):
         _require_int(metric, key)
+    if schema_version == 2:
+        regions = _require_list(raw, "frame_regions")
+        prior_region_end = None
+        for region in regions:
+            if not isinstance(region, dict):
+                raise AttributionError(
+                    f"{path}: frame_regions entries must be objects"
+                )
+            region_start = _require_int(region, "start")
+            region_end = _require_int(region, "end")
+            if (
+                region_end <= region_start
+                or (
+                    prior_region_end is not None
+                    and region_start < prior_region_end
+                )
+                or region.get("origin") not in FRAME_ORIGINS
+                or not isinstance(region.get("detail"), str)
+            ):
+                raise AttributionError(
+                    f"{path}: invalid/overlapping frame region "
+                    f"[{region_start},{region_end})"
+                )
+            prior_region_end = region_end
 
     values = _require_list(raw, "allocator_values")
     value_by_vreg = {}
@@ -794,6 +895,78 @@ def load_frame_metadata(
     prior_end = 0
     emitted_loads = emitted_stores = 0
     resolved_by_vreg = defaultdict(lambda: {"load": 0, "store": 0})
+
+    def validate_component(component, kind, start):
+        nonlocal emitted_loads, emitted_stores
+        if not isinstance(component, dict):
+            raise AttributionError(
+                f"{path}: access components must be objects"
+            )
+        base = component.get("base")
+        valid_bases = (
+            {"rbp", "rsp"} if architecture == "x86_64" else {"x29", "sp"}
+        )
+        if base not in valid_bases:
+            raise AttributionError(
+                f"{path}: invalid effective frame base {base!r} at {start}"
+            )
+        _require_int(component, "frame_offset")
+        width = _require_int(component, "width")
+        if width <= 0:
+            raise AttributionError(
+                f"{path}: invalid frame access width at {start}"
+            )
+        origin = component.get("origin")
+        if origin not in FRAME_ORIGINS:
+            raise AttributionError(
+                f"{path}: invalid frame origin {origin!r} at offset {start}"
+            )
+        vreg = component.get("vreg")
+        ambiguous = component.get("vreg_ambiguous")
+        if vreg is not None and (
+            isinstance(vreg, bool) or not isinstance(vreg, int)
+        ):
+            raise AttributionError(f"{path}: vreg must be integer or null")
+        if not isinstance(ambiguous, bool) or (
+            vreg is not None and ambiguous
+        ):
+            raise AttributionError(
+                f"{path}: invalid vreg/vreg_ambiguous combination at {start}"
+            )
+        if origin != "allocator_spill":
+            return
+        slot = component.get("slot")
+        if isinstance(slot, bool) or not isinstance(slot, int):
+            raise AttributionError(
+                f"{path}: allocator access at {start} lacks integer slot"
+            )
+        candidates = values_by_slot.get(slot, [])
+        if not candidates:
+            raise AttributionError(
+                f"{path}: allocator access at {start} names unassigned slot {slot}"
+            )
+        if vreg is not None and all(
+            item["vreg"] != vreg for item in candidates
+        ):
+            raise AttributionError(
+                f"{path}: access vreg={vreg} does not occupy slot {slot}"
+            )
+        if len(candidates) > 1 and vreg is None and not ambiguous:
+            raise AttributionError(
+                f"{path}: reused slot {slot} lacks a resolved vreg or "
+                "vreg_ambiguous=true"
+            )
+        if len(candidates) == 1 and vreg is None:
+            raise AttributionError(
+                f"{path}: unique allocator slot {slot} omitted provable vreg"
+            )
+        if vreg is not None:
+            resolved_by_vreg[vreg][kind] += 1
+        if kind == "load":
+            emitted_loads += 1
+        else:
+            emitted_stores += 1
+
     for access in accesses:
         if not isinstance(access, dict):
             raise AttributionError(f"{path}: accesses entries must be objects")
@@ -803,14 +976,17 @@ def load_frame_metadata(
         base = access.get("base")
         origin = access.get("origin")
         _require_int(access, "frame_offset")
-        _require_int(access, "width")
+        width = _require_int(access, "width")
         if start < prior_end or end <= start or end > code_size:
             raise AttributionError(
                 f"{path}: overlapping/out-of-range native access [{start},{end})"
             )
         if start in access_by_start:
             raise AttributionError(f"{path}: duplicate access at native offset {start}")
-        if kind not in {"load", "store"} or base not in {"rbp", "rsp"}:
+        valid_bases = (
+            {"rbp", "rsp"} if architecture == "x86_64" else {"x29", "sp"}
+        )
+        if kind not in {"load", "store"} or base not in valid_bases:
             raise AttributionError(
                 f"{path}: invalid frame access kind/base at offset {start}"
             )
@@ -825,44 +1001,70 @@ def load_frame_metadata(
             raise AttributionError(
                 f"{path}: frame access at {start} overlaps inline data"
             )
-        vreg = access.get("vreg")
-        ambiguous = access.get("vreg_ambiguous")
-        if vreg is not None and (isinstance(vreg, bool) or not isinstance(vreg, int)):
-            raise AttributionError(f"{path}: vreg must be integer or null")
-        if not isinstance(ambiguous, bool) or (vreg is not None and ambiguous):
-            raise AttributionError(
-                f"{path}: invalid vreg/vreg_ambiguous combination at {start}"
+        if schema_version == 1:
+            validate_component(access, kind, start)
+        else:
+            encoded_base = access.get("encoded_base")
+            encoded_offset = access.get("encoded_offset")
+            addressing_mode = access.get("addressing_mode")
+            valid_encoded_bases = (
+                {"rbp", "rsp"}
+                if architecture == "x86_64"
+                else {"sp", *(f"x{index}" for index in range(31))}
             )
-        if origin == "allocator_spill":
-            slot = access.get("slot")
-            if isinstance(slot, bool) or not isinstance(slot, int):
+            valid_addressing_modes = {
+                "unsigned_scaled",
+                "signed_unscaled",
+                "signed_pair",
+                "pre_index",
+                "post_index",
+                "simd_zero_offset",
+                "materialized",
+            }
+            if encoded_base not in valid_encoded_bases or (
+                isinstance(encoded_offset, bool)
+                or not isinstance(encoded_offset, int)
+            ) or addressing_mode not in valid_addressing_modes:
                 raise AttributionError(
-                    f"{path}: allocator access at {start} lacks integer slot"
+                    f"{path}: schema-v2 access at {start} lacks encoded address"
                 )
-            candidates = values_by_slot.get(slot, [])
-            if not candidates:
+            components = _require_list(access, "components")
+            if not 1 <= len(components) <= 2:
                 raise AttributionError(
-                    f"{path}: allocator access at {start} names unassigned slot {slot}"
+                    f"{path}: access at {start} must have one or two components"
                 )
-            if vreg is not None and all(item["vreg"] != vreg for item in candidates):
+            for component in components:
+                validate_component(component, kind, start)
+            if sum(_require_int(item, "width") for item in components) != width:
                 raise AttributionError(
-                    f"{path}: access vreg={vreg} does not occupy slot {slot}"
+                    f"{path}: component widths disagree at {start}"
                 )
-            if len(candidates) > 1 and vreg is None and not ambiguous:
+            if len(components) == 2 and (
+                components[1].get("base") != components[0].get("base")
+                or components[1].get("frame_offset")
+                != components[0].get("frame_offset")
+                + components[0].get("width")
+            ):
                 raise AttributionError(
-                    f"{path}: reused slot {slot} lacks a resolved vreg or "
-                    f"vreg_ambiguous=true"
+                    f"{path}: pair components are not contiguous at {start}"
                 )
-            if len(candidates) == 1 and vreg is None:
+            component_origins = {item.get("origin") for item in components}
+            expected_origin = (
+                next(iter(component_origins))
+                if len(component_origins) == 1
+                else "unknown"
+            )
+            if origin != expected_origin:
                 raise AttributionError(
-                    f"{path}: unique allocator slot {slot} omitted provable vreg"
+                    f"{path}: top-level/component origin mismatch at {start}"
                 )
-            if vreg is not None:
-                resolved_by_vreg[vreg][kind] += 1
-            if kind == "load":
-                emitted_loads += 1
-            else:
-                emitted_stores += 1
+            if access.get("base") != components[0].get("base") or (
+                access.get("frame_offset")
+                != components[0].get("frame_offset")
+            ):
+                raise AttributionError(
+                    f"{path}: top-level/component address mismatch at {start}"
+                )
         access_by_start[start] = access
         prior_end = end
 
@@ -912,6 +1114,7 @@ def load_frame_metadata(
 
 
 def validate_metadata_disassembly(metadata, instructions):
+    architecture = metadata.raw["architecture"]
     instruction_by_offset = {instruction.offset: instruction for instruction in instructions}
     for start, access in metadata.access_by_start.items():
         instruction = instruction_by_offset.get(start)
@@ -924,22 +1127,36 @@ def validate_metadata_disassembly(metadata, instructions):
                 f"metadata range [{start},{access['native_end']}) disagrees with "
                 f"objdump instruction size {instruction.size}"
             )
-        operand = parse_frame_operand(instruction.text)
+        operand = (
+            parse_frame_operand(instruction.text)
+            if architecture == "x86_64"
+            else parse_aarch64_memory_operand(instruction.text)
+        )
         if operand is None:
             raise AttributionError(
                 f"metadata access at +0x{start:x} is not a frame load/store: "
                 f"{instruction.text}"
             )
-        if operand.kind != access["kind"] or operand.base != access["base"]:
+        expected_base = (
+            access["base"]
+            if metadata.raw["schema_version"] == 1
+            else access["encoded_base"]
+        )
+        expected_offset = (
+            access["frame_offset"]
+            if metadata.raw["schema_version"] == 1
+            else access["encoded_offset"]
+        )
+        if operand.kind != access["kind"] or operand.base != expected_base:
             raise AttributionError(
                 f"metadata access kind/base mismatch at +0x{start:x}: "
-                f"{access['kind']}/{access['base']} vs "
+                f"{access['kind']}/{expected_base} vs "
                 f"{operand.kind}/{operand.base}"
             )
-        if operand.offset is not None and operand.offset != access["frame_offset"]:
+        if operand.offset is not None and operand.offset != expected_offset:
             raise AttributionError(
                 f"metadata frame offset mismatch at +0x{start:x}: "
-                f"{access['frame_offset']} vs {operand.offset}"
+                f"{expected_offset} vs {operand.offset}"
             )
 
 
@@ -1170,6 +1387,8 @@ def require_attribution_coverage(attributed, total, minimum_pct):
 
 
 def build_frame_summary(instructions, counts, metadata):
+    architecture = metadata.raw.get("architecture", "x86_64")
+    schema_version = metadata.raw.get("schema_version", 1)
     origin_static = Counter()
     origin_samples = Counter()
     frame_instruction_count = 0
@@ -1182,13 +1401,13 @@ def build_frame_summary(instructions, counts, metadata):
     contributors = {}
 
     for instruction in instructions:
-        operand = parse_frame_operand(instruction.text)
-        if operand is None:
+        access = metadata.access_by_start.get(instruction.offset)
+        operand = instruction_frame_operand(instruction.text, architecture)
+        if access is None and operand is None:
             continue
         samples = counts.get(instruction.address, 0)
         frame_instruction_count += 1
         frame_samples += samples
-        access = metadata.access_by_start.get(instruction.offset)
         if access is None:
             unknown.append(
                 {
@@ -1229,36 +1448,97 @@ def build_frame_summary(instructions, counts, metadata):
         if origin != "allocator_spill":
             continue
 
-        slot = access["slot"]
-        vreg = access.get("vreg")
-        key = (slot, vreg)
-        if key not in contributors:
-            value = metadata.value_by_vreg.get(vreg) if vreg is not None else None
-            contributors[key] = {
-                "slot": slot,
-                "frame_offset": access["frame_offset"],
-                "vreg": vreg,
-                "vreg_ambiguous": access["vreg_ambiguous"],
-                "candidate_vregs": [
-                    candidate["vreg"]
-                    for candidate in metadata.values_by_slot.get(slot, [])
-                ],
-                "defining_opcode": access.get("defining_opcode"),
-                "source_class": access.get("source_class"),
-                "rematerialization_eligible": access.get(
-                    "rematerialization_eligible"
+        components = (
+            access["components"] if schema_version == 2 else [access]
+        )
+        allocator_components = [
+            component
+            for component in components
+            if component["origin"] == "allocator_spill"
+        ]
+        component_keys = []
+        for component in allocator_components:
+            slot = component["slot"]
+            vreg = component.get("vreg")
+            key = (slot, vreg)
+            component_keys.append(key)
+            if key not in contributors:
+                value = (
+                    metadata.value_by_vreg.get(vreg)
+                    if vreg is not None
+                    else None
+                )
+                contributors[key] = {
+                    "slot": slot,
+                    "frame_offset": component["frame_offset"],
+                    "vreg": vreg,
+                    "vreg_ambiguous": component["vreg_ambiguous"],
+                    "candidate_vregs": [
+                        candidate["vreg"]
+                        for candidate in metadata.values_by_slot.get(slot, [])
+                    ],
+                    "defining_opcode": component.get("defining_opcode"),
+                    "source_class": component.get("source_class"),
+                    "rematerialization_eligible": component.get(
+                        "rematerialization_eligible"
+                    ),
+                    "source_reload_count": (
+                        value.get("reload_count") if value else None
+                    ),
+                    "source_store_count": (
+                        value.get("store_count") if value else None
+                    ),
+                    "source_ir_use_count": (
+                        value.get("ir_use_count") if value else None
+                    ),
+                    "source_ir_def_count": (
+                        value.get("ir_def_count") if value else None
+                    ),
+                    "static_loads": 0,
+                    "static_stores": 0,
+                    "samples": 0,
+                }
+            contributors[key][f"static_{access['kind']}s"] += 1
+
+        unique_keys = list(dict.fromkeys(component_keys))
+        if len(unique_keys) == 1:
+            contributors[unique_keys[0]]["samples"] += samples
+        elif unique_keys:
+            paired_key = ("paired", instruction.offset)
+            contributors[paired_key] = {
+                "slot": min(component["slot"] for component in allocator_components),
+                "frame_offset": min(
+                    component["frame_offset"]
+                    for component in allocator_components
                 ),
-                "source_reload_count": value.get("reload_count") if value else None,
-                "source_store_count": value.get("store_count") if value else None,
-                "source_ir_use_count": value.get("ir_use_count") if value else None,
-                "source_ir_def_count": value.get("ir_def_count") if value else None,
+                "vreg": None,
+                "vreg_ambiguous": True,
+                "candidate_vregs": sorted(
+                    {
+                        component["vreg"]
+                        for component in allocator_components
+                        if component.get("vreg") is not None
+                    }
+                ),
+                "paired_components": [
+                    {
+                        "slot": component["slot"],
+                        "frame_offset": component["frame_offset"],
+                        "vreg": component.get("vreg"),
+                    }
+                    for component in allocator_components
+                ],
+                "defining_opcode": None,
+                "source_class": "paired_allocator_access",
+                "rematerialization_eligible": None,
+                "source_reload_count": None,
+                "source_store_count": None,
+                "source_ir_use_count": None,
+                "source_ir_def_count": None,
                 "static_loads": 0,
                 "static_stores": 0,
-                "samples": 0,
+                "samples": samples,
             }
-        record = contributors[key]
-        record[f"static_{access['kind']}s"] += 1
-        record["samples"] += samples
 
     ranked = sorted(
         contributors.values(),
@@ -1435,8 +1715,6 @@ def main():
         parser.error("--validate-frame-metadata requires --func and --frame-metadata")
     if args.frame_metadata and args.func is None:
         parser.error("--frame-metadata requires --func")
-    if args.frame_metadata and args.arch != "x86_64":
-        parser.error("--frame-metadata is currently supported only for x86_64")
     if not 0.0 <= args.min_attribution_pct <= 100.0:
         parser.error("--min-attribution-pct must be between 0 and 100")
     if args.authoritative and args.base:
@@ -1564,6 +1842,12 @@ def main():
             ],
             start,
         )
+        if metadata.raw["architecture"] != args.arch:
+            raise AttributionError(
+                "frame metadata architecture "
+                f"{metadata.raw['architecture']} does not match --arch "
+                f"{args.arch}"
+            )
         instructions = disassemble_function(
             function_code,
             function_base,

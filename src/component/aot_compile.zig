@@ -408,13 +408,11 @@ pub fn compileCoreWasmCached(
         frame_attribution_opts.cwasm_aot_version = emit_aot.aot_version;
         frame_attribution_opts.compiler_build_id = config.version;
     }
-    if (frame_attribution_opts.enabled and opts.target_arch != .x86_64) {
-        return error.UnsupportedFrameAttributionTarget;
-    }
     const compiled: codegen_cache.CompileResultCached = switch (opts.target_arch) {
         .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
             .codegen_timing = opts.codegen_timing,
             .spill_metric = opts.spill_metric,
+            .frame_attribution = frame_attribution_opts,
             .module_idx = opts.module_idx,
             .lazy_skip = lazy_skip,
         }) catch
