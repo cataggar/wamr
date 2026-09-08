@@ -986,6 +986,54 @@ class ThreadBenchmarkTests(unittest.TestCase):
             )
         )
 
+    def test_sizing_never_downsizes_below_pilot_count(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        target_pilots = [
+            pilot
+            for pilot in pilots
+            if pilot["mode"] == "aot"
+            and pilot["workload"] == "wait-notify"
+            and pilot["threads"] == 1
+        ]
+        for pilot in target_pilots:
+            pilot["guest_elapsed_ns"] = 10_000_000_000
+            pilot["elapsed_ns"] = pilot["guest_elapsed_ns"]
+            pilot["raw_guest_elapsed_ns"] = (
+                pilot["guest_elapsed_ns"] + pilot["timing_overhead_ns"]
+            )
+            pilot["timing_overhead_ppm"] = (
+                pilot["timing_overhead_ns"]
+                * 1_000_000
+                // pilot["raw_guest_elapsed_ns"]
+            )
+            pilot["host_wall_elapsed_ns"] = (
+                pilot["guest_elapsed_ns"] + 1_000_000
+            )
+        selected, resolved = bench.resolve_one_shot_sizing(
+            pilot_records=pilots,
+            pilot_order=plan["sizing"]["pilot_order"],
+            modes=tuple(plan["modes"]),
+            thread_counts=tuple(plan["thread_counts"]),
+            warmups=plan["warmups"],
+            samples=plan["samples"],
+            timeout_seconds=plan["timeout_seconds"],
+        )
+        cell = next(
+            item
+            for item in resolved["cells"]
+            if item["key"] == "aot/wait-notify/1"
+        )
+        self.assertLess(
+            cell["fastest_required_iterations"],
+            cell["pilot_count"],
+        )
+        self.assertEqual(
+            selected["aot"]["wait-notify"]["1"],
+            cell["pilot_count"],
+        )
+
     def test_sizing_rejects_missing_invalid_and_tampered_pilots(self) -> None:
         report = make_report()
         plan = report["plan"]

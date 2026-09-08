@@ -450,7 +450,7 @@
               "const": "fastest-valid-pilot-across-all-revisions-and-conditions"
             },
             "formula": {
-              "const": "ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator)), then decimal significant-digits ceiling"
+              "const": "max(pilot_iterations, ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator))), then decimal significant-digits ceiling"
             },
             "safety_factor": {
               "type": "object",

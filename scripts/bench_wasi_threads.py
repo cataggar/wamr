@@ -443,9 +443,9 @@ def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
         "kind": SIZING_ALGORITHM_KIND,
         "selection_rate": "fastest-valid-pilot-across-all-revisions-and-conditions",
         "formula": (
-            "ceil(pilot_iterations * target_duration_ns * safety_numerator / "
-            "(pilot_elapsed_ns * safety_denominator)), then decimal "
-            "significant-digits ceiling"
+            "max(pilot_iterations, ceil(pilot_iterations * target_duration_ns "
+            "* safety_numerator / (pilot_elapsed_ns * safety_denominator))), "
+            "then decimal significant-digits ceiling"
         ),
         "target_duration_ns": SIZING_TARGET_NS,
         "safety_factor": {
@@ -726,7 +726,11 @@ def resolve_one_shot_sizing(
             fastest["iterations"],
             fastest["guest_elapsed_ns"],
         )
-        selected = max(baseline_rounded, fastest_rounded)
+        selected = max(
+            fastest["iterations"],
+            baseline_rounded,
+            fastest_rounded,
+        )
         cap = effective_sizing_cap(workload, threads)
         if selected > cap:
             raise HarnessError(

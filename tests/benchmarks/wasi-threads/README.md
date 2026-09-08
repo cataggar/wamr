@@ -96,11 +96,13 @@ For each cell, sizing version 1 selects the fastest valid pilot across all
 revisions and conditions. With pilot iterations `P`, corrected elapsed
 nanoseconds `E`, target `T = 1,750,000,000`, and safety factor `11/10`, the
 unrounded count is exactly
-`ceil(P * T * 11 / (E * 10))`, followed by an upward decimal
-three-significant-digit rounding. The fastest baseline result is retained as
-the explicit lower-bound derivation: a slower candidate cannot lower work,
-while a faster candidate or condition increases it. The selected count is then
-frozen for both revisions, both conditions, all warmups, and all samples.
+`max(P, ceil(P * T * 11 / (E * 10)))`, followed by an upward decimal
+three-significant-digit rounding. The pilot count is a no-downsize floor so
+fixed per-invocation overhead or cold-host variance cannot turn a long pilot
+into sub-floor evidence. The fastest baseline result is retained as the
+explicit lower-bound derivation: a slower candidate cannot lower work, while a
+faster candidate or condition increases it. The selected count is then frozen
+for both revisions, both conditions, all warmups, and all samples.
 
 Pilots must pass guest correctness and operation assertions, have positive
 timing fields, and provide at least a 1 ms corrected interval for clock
