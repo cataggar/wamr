@@ -29,7 +29,7 @@ import tarfile
 import time
 import urllib.request
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,6 +53,7 @@ DEFAULT_FIXTURE_SHA256 = "f4b7591296ead10264e0f101f355bdf848865c31329325594e66fb
 PINNED_WASMTIME_VERSION = "44.0.1"
 REPORT_SCHEMA_VERSION = 2
 REPORT_KIND = "coremark-authoritative-comparison"
+HANDOFF_SCHEMA_VERSION = 2
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "ci": (0, 3),
@@ -206,8 +207,9 @@ def make_wamr_identity(
     runtime_path: Path,
     compiler_path: Path,
     module_path: Path,
+    simd_runner_path: Path | None = None,
 ) -> dict:
-    return {
+    identity = {
         "type": "wamr",
         "source": {
             "ref": ref,
@@ -230,6 +232,13 @@ def make_wamr_identity(
             "sha256": sha256_file(module_path),
         },
     }
+    if simd_runner_path is not None:
+        identity["simd_runner"] = {
+            "name": "simd-bench-runner",
+            "path": str(simd_runner_path),
+            "sha256": sha256_file(simd_runner_path),
+        }
+    return identity
 
 
 def make_wasmtime_identity(
@@ -251,24 +260,31 @@ def make_wasmtime_identity(
 
 
 def retain_wamr_artifact_handoff(
-    prepared: PreparedEngine, artifact_dir: Path
+    prepared: PreparedEngine,
+    artifact_dir: Path,
+    *,
+    role: str = "wamr-target",
 ) -> dict:
-    identity = _validate_engine_identity(prepared.identity, "WAMR target")
+    if role not in ("wamr-baseline", "wamr-target"):
+        raise RuntimeError(f"unsupported WAMR artifact role: {role}")
+    identity = _validate_engine_identity(prepared.identity, role)
     if identity["type"] != "wamr":
-        raise RuntimeError("only WAMR target artifacts can be retained")
-    artifact_dir = artifact_dir.resolve()
+        raise RuntimeError("only WAMR artifacts can be retained")
+    artifact_dir = artifact_dir.expanduser().resolve()
+    if artifact_dir.exists():
+        raise FileExistsError(f"{role} artifact handoff directory already exists")
     artifact_dir.mkdir(parents=True)
     names = {
         "runtime": "wamr",
         "compiler": "wamrc",
         "module": "coremark.cwasm",
     }
+    if "simd_runner" in identity:
+        names["simd_runner"] = "simd-bench-runner"
     try:
         retained = {
             **identity,
-            "runtime": {**identity["runtime"]},
-            "compiler": {**identity["compiler"]},
-            "module": {**identity["module"]},
+            **{key: {**identity[key]} for key in names},
         }
         for key, name in names.items():
             source = Path(identity[key]["path"])
@@ -279,8 +295,9 @@ def retain_wamr_artifact_handoff(
                 raise RuntimeError(f"retained WAMR {key} hash changed while copying")
             retained[key]["path"] = str(destination)
         manifest = {
-            "schema_version": 1,
+            "schema_version": HANDOFF_SCHEMA_VERSION,
             "kind": "coremark-wamr-artifact-handoff",
+            "role": role,
             "identity": retained,
         }
         (artifact_dir / "manifest.json").write_text(
@@ -294,9 +311,14 @@ def retain_wamr_artifact_handoff(
 
 
 def load_wamr_artifact_handoff(
-    artifact_dir: Path, expected_identity: dict
+    artifact_dir: Path,
+    expected_identity: dict,
+    *,
+    role: str = "wamr-target",
 ) -> dict[str, Path]:
-    artifact_dir = artifact_dir.resolve()
+    if role not in ("wamr-baseline", "wamr-target"):
+        raise RuntimeError(f"unsupported WAMR artifact role: {role}")
+    artifact_dir = artifact_dir.expanduser().resolve()
     manifest_path = artifact_dir / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -304,27 +326,47 @@ def load_wamr_artifact_handoff(
         raise RuntimeError(
             f"cannot read benchmark artifact handoff {manifest_path}: {exc}"
         ) from exc
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("schema_version") != 1
-        or manifest.get("kind") != "coremark-wamr-artifact-handoff"
-    ):
+    if not isinstance(manifest, dict):
         raise RuntimeError("benchmark artifact handoff manifest is unsupported")
+    schema_version = manifest.get("schema_version")
+    if type(schema_version) is not int or schema_version not in (
+        1,
+        HANDOFF_SCHEMA_VERSION,
+    ) or manifest.get("kind") != "coremark-wamr-artifact-handoff":
+        raise RuntimeError("benchmark artifact handoff manifest is unsupported")
+    if schema_version == 1:
+        if role != "wamr-target" or manifest.get("role", role) != role:
+            raise RuntimeError(
+                "legacy benchmark artifact handoffs can only prove wamr-target"
+            )
+    elif manifest.get("role") != role:
+        raise RuntimeError(
+            f"benchmark artifact handoff role is {manifest.get('role')!r}, "
+            f"expected {role!r}"
+        )
     identity = _validate_engine_identity(
-        manifest.get("identity"), "retained WAMR target"
+        manifest.get("identity"), f"retained {role}"
     )
+    if identity["type"] != "wamr":
+        raise RuntimeError("benchmark artifact handoff must identify WAMR")
     if identity != expected_identity:
         raise RuntimeError(
-            "benchmark artifact handoff identity does not match the report target"
+            f"benchmark artifact handoff identity does not match report {role}"
         )
     paths = {}
-    for key, name in (
+    artifacts = [
         ("runtime", "wamr"),
         ("compiler", "wamrc"),
         ("module", "coremark.cwasm"),
-    ):
+    ]
+    if "simd_runner" in identity:
+        artifacts.append(("simd_runner", "simd-bench-runner"))
+    for key, name in artifacts:
         path = artifact_dir / name
-        if Path(identity[key]["path"]).resolve() != path:
+        recorded_path = identity[key].get("path")
+        if not isinstance(recorded_path, str) or not recorded_path:
+            raise RuntimeError(f"benchmark artifact handoff lacks its {key} path")
+        if Path(recorded_path).resolve() != path:
             raise RuntimeError(f"benchmark artifact handoff has the wrong {key} path")
         if not path.is_file():
             raise RuntimeError(f"benchmark artifact handoff is missing {name}")
@@ -711,6 +753,7 @@ def prepare_wamr(
 
     wamrc = wt / "zig-out/bin/wamrc"
     wamr = wt / "zig-out/bin/wamr"
+    simd_runner = wt / "zig-out/bin/simd-bench-runner"
     cwasm = wt / ".bench-coremark.cwasm"
     print(f"[harness] AOT-compiling tracked fixture with WAMR {ref}", file=sys.stderr)
     run(
@@ -740,6 +783,7 @@ def prepare_wamr(
             runtime_path=wamr,
             compiler_path=wamrc,
             module_path=cwasm,
+            simd_runner_path=simd_runner if simd_runner.is_file() else None,
         ),
     )
 
@@ -976,6 +1020,14 @@ def fmt_stats(values: list[float]) -> tuple[float, float, float, float]:
 
 def compute_delta_pct(baseline_vals: list[float], target_vals: list[float]) -> float:
     return (statistics.fmean(target_vals) / statistics.fmean(baseline_vals) - 1.0) * 100.0
+
+
+def compute_median_delta_pct(
+    baseline_vals: list[float], target_vals: list[float]
+) -> float:
+    return (
+        statistics.median(target_vals) / statistics.median(baseline_vals) - 1.0
+    ) * 100.0
 
 
 def compute_ratio_stats(
@@ -1316,6 +1368,16 @@ def build_json_report(
         "schedule": [asdict(record) for record in schedule_records],
         "engines": engines,
         "ratios": ratios,
+        "wamr_comparison": {
+            "baseline_role": "wamr-baseline",
+            "target_role": "wamr-target",
+            "mean_delta_pct": compute_delta_pct(
+                results[0].values, results[1].values
+            ),
+            "median_delta_pct": compute_median_delta_pct(
+                results[0].values, results[1].values
+            ),
+        },
     }
     if (
         profile == "authoritative"
@@ -1341,6 +1403,10 @@ def benchmark_report_status(report: dict) -> dict:
     return {"status": "current", "authoritative": True}
 
 
+def _positive_finite_number(value: object) -> bool:
+    return type(value) in (int, float) and 0 < value <= sys.float_info.max
+
+
 def _validate_engine_identity(identity: object, role: str) -> dict:
     if not isinstance(identity, dict):
         raise RuntimeError(f"{role} is missing its engine identity")
@@ -1362,6 +1428,13 @@ def _validate_engine_identity(identity: object, role: str) -> dict:
             raise RuntimeError(f"{role} is missing its compiled module identity")
         _require_digest(compiler.get("sha256"), f"{role} compiler sha256", 64)
         _require_digest(module.get("sha256"), f"{role} module sha256", 64)
+        simd_runner = identity.get("simd_runner")
+        if "simd_runner" in identity:
+            if not isinstance(simd_runner, dict):
+                raise RuntimeError(f"{role} has an invalid SIMD runner identity")
+            _require_digest(
+                simd_runner.get("sha256"), f"{role} SIMD runner sha256", 64
+            )
         if identity.get("optimize") not in ("ReleaseFast", "ReleaseSafe"):
             raise RuntimeError(f"{role} has an unsupported WAMR optimize mode")
     elif identity_type == "wasmtime":
@@ -1465,6 +1538,29 @@ def validate_authoritative_benchmark_report(report: dict) -> None:
                 f"{role} produced {len(values) if isinstance(values, list) else 0} "
                 f"measured samples; expected {expected_runs}"
             )
+        if not all(_positive_finite_number(value) for value in values):
+            raise RuntimeError(f"{role} has invalid measured samples")
+    engines_by_role = {
+        engine["role"]: engine for engine in engines if isinstance(engine, dict)
+    }
+    comparison = report.get("wamr_comparison")
+    if comparison is not None:
+        if not isinstance(comparison, dict):
+            raise RuntimeError("benchmark WAMR comparison is invalid")
+        if (
+            comparison.get("baseline_role") != "wamr-baseline"
+            or comparison.get("target_role") != "wamr-target"
+        ):
+            raise RuntimeError("benchmark WAMR comparison has invalid roles")
+        baseline_values = engines_by_role["wamr-baseline"]["values"]
+        target_values = engines_by_role["wamr-target"]["values"]
+        if (
+            comparison.get("mean_delta_pct")
+            != compute_delta_pct(baseline_values, target_values)
+            or comparison.get("median_delta_pct")
+            != compute_median_delta_pct(baseline_values, target_values)
+        ):
+            raise RuntimeError("benchmark WAMR comparison disagrees with raw samples")
 
 
 def _engine_with_role(report: dict, role: str) -> dict:
@@ -1517,6 +1613,7 @@ def validate_benchmark_profile_match(
     producer_source_sha: str,
     producer_script_sha: str,
     current_execution: dict,
+    benchmark_role: str = "wamr-target",
 ) -> dict:
     validate_authoritative_benchmark_report(report)
     if report["host"]["arch"] != expected_arch:
@@ -1545,22 +1642,25 @@ def validate_benchmark_profile_match(
     if report["affinity"] != expected_affinity:
         raise RuntimeError("benchmark CPU affinity does not match the profile")
 
-    target = _engine_with_role(report, "wamr-target")
-    target_identity = target["identity"]
-    expected_target = {
+    if benchmark_role not in ("wamr-baseline", "wamr-target"):
+        raise RuntimeError(f"unsupported benchmark role: {benchmark_role}")
+    selected = _engine_with_role(report, benchmark_role)
+    selected_identity = selected["identity"]
+    expected_selected = {
         ("source", "sha"): wamr_source_sha,
         ("runtime", "sha256"): wamr_runtime_sha,
         ("compiler", "sha256"): wamr_compiler_sha,
         ("module", "sha256"): wamr_module_sha,
     }
-    for path, expected in expected_target.items():
-        actual = target_identity[path[0]][path[1]]
+    for path, expected in expected_selected.items():
+        actual = selected_identity[path[0]][path[1]]
         if actual != expected:
             raise RuntimeError(
-                f"benchmark WAMR {path[0]} {path[1]} mismatch: "
+                f"benchmark WAMR {path[0]} {path[1]} mismatch for "
+                f"{benchmark_role}: "
                 f"expected {expected}, got {actual}"
             )
-    if target_identity.get("optimize") != wamr_optimize:
+    if selected_identity.get("optimize") != wamr_optimize:
         raise RuntimeError("benchmark WAMR optimize mode does not match the profile")
 
     wasmtime = _engine_with_role(report, "wasmtime-baseline")
@@ -1587,27 +1687,57 @@ def validate_benchmark_profile_match(
     validate_execution_match(benchmark_execution, current_execution)
 
     schedule = report.get("schedule")
-    expected_schedule_length = 2 * sum(PROFILE_COUNTS["authoritative"])
+    baseline = _engine_with_role(report, "wamr-baseline")
+    target = _engine_with_role(report, "wamr-target")
+    participants = [baseline, target, wasmtime]
+    if (
+        baseline.get("sample_schedule_positions")
+        == target.get("sample_schedule_positions")
+    ):
+        left, right = baseline["identity"], target["identity"]
+        if (
+            left["source"]["sha"] != right["source"]["sha"]
+            or left["optimize"] != right["optimize"]
+            or any(
+                left[key]["sha256"] != right[key]["sha256"]
+                for key in ("runtime", "compiler", "module")
+            )
+            or baseline["values"] != target["values"]
+        ):
+            raise RuntimeError(
+                "different WAMR identities or values cannot share samples"
+            )
+        participants.remove(baseline)
+    expected_samples = sum(PROFILE_COUNTS["authoritative"])
+    expected_schedule_length = len(participants) * expected_samples
     if not isinstance(schedule, list) or len(schedule) != expected_schedule_length:
         raise RuntimeError("benchmark report lacks a complete paired schedule")
-    target_positions = target.get("sample_schedule_positions")
-    wasmtime_positions = wasmtime.get("sample_schedule_positions")
-    if (
-        not isinstance(target_positions, list)
-        or not isinstance(wasmtime_positions, list)
-        or len(target_positions) != sum(PROFILE_COUNTS["authoritative"])
-        or len(wasmtime_positions) != sum(PROFILE_COUNTS["authoritative"])
-        or set(target_positions) & set(wasmtime_positions)
-        or set(target_positions) | set(wasmtime_positions)
-        != set(range(1, expected_schedule_length + 1))
-    ):
-        raise RuntimeError("benchmark report lacks paired target/Wasmtime samples")
+    position_to_engine = {}
+    participant_roles = []
+    for engine in participants:
+        role = engine["role"]
+        participant_roles.append(role)
+        positions = engine.get("sample_schedule_positions")
+        if not isinstance(positions, list) or len(positions) != expected_samples:
+            raise RuntimeError(f"benchmark report lacks complete {role} samples")
+        for position in positions:
+            if type(position) is not int:
+                raise RuntimeError("benchmark report contains an invalid sample position")
+            if position in position_to_engine:
+                raise RuntimeError("benchmark schedule assigns one sample twice")
+            position_to_engine[position] = role
+    if set(position_to_engine) != set(range(1, expected_schedule_length + 1)):
+        raise RuntimeError("benchmark report schedule positions are incomplete")
     for record in schedule:
         if (
             not isinstance(record, dict)
-            or not isinstance(record.get("schedule_position"), int)
+            or type(record.get("schedule_position")) is not int
             or record.get("iterations") != EXPECTED_ITERATIONS
             or record.get("phase") not in ("warmup", "measured")
+            or not isinstance(record.get("engine_key"), str)
+            or not record["engine_key"]
+            or not _positive_finite_number(record.get("elapsed_seconds"))
+            or not _positive_finite_number(record.get("iterations_per_second"))
         ):
             raise RuntimeError("benchmark report contains an invalid schedule record")
     ordered_schedule = sorted(schedule, key=lambda item: item["schedule_position"])
@@ -1615,22 +1745,34 @@ def validate_benchmark_profile_match(
         range(1, expected_schedule_length + 1)
     ):
         raise RuntimeError("benchmark report schedule positions are incomplete")
-    position_to_engine = {
-        position: "target" for position in target_positions
-    } | {
-        position: "wasmtime" for position in wasmtime_positions
-    }
+    participant_keys = set()
+    for engine in participants:
+        records = [
+            record
+            for record in ordered_schedule
+            if position_to_engine[record["schedule_position"]] == engine["role"]
+        ]
+        keys = {record["engine_key"] for record in records}
+        if len(keys) != 1 or participant_keys.intersection(keys):
+            raise RuntimeError("benchmark schedule engine keys are inconsistent")
+        participant_keys.update(keys)
+        measured_values = [
+            record["iterations_per_second"]
+            for record in records
+            if record["phase"] == "measured"
+        ]
+        if measured_values != engine["values"]:
+            raise RuntimeError("benchmark values disagree with measured schedule")
     warmups, runs = PROFILE_COUNTS["authoritative"]
     expected_order = []
     for phase, count in (("warmup", warmups), ("measured", runs)):
         phase_records = [record for record in schedule if record["phase"] == phase]
-        if len(phase_records) != count * 2:
+        if len(phase_records) != count * len(participants):
             raise RuntimeError(f"benchmark report has the wrong {phase} schedule")
-        expected_order.extend(
-            counterbalanced_order(["target", "wasmtime"], count)
-        )
+        expected_order.extend(counterbalanced_order(participant_roles, count))
     if [record["phase"] for record in ordered_schedule] != (
-        ["warmup"] * (warmups * 2) + ["measured"] * (runs * 2)
+        ["warmup"] * (warmups * len(participants))
+        + ["measured"] * (runs * len(participants))
     ):
         raise RuntimeError("benchmark report phases are not ordered")
     actual_order = [
@@ -1638,15 +1780,19 @@ def validate_benchmark_profile_match(
         for record in ordered_schedule
     ]
     if actual_order != expected_order:
-        raise RuntimeError("benchmark report target/Wasmtime order is not counterbalanced")
-    return {
+        raise RuntimeError("benchmark report engine order is not counterbalanced")
+    identity = {
         "report_id": report["provenance"]["report_id"],
         "generated_at": report["provenance"]["generated_at"],
         "execution": benchmark_execution,
         "producer": report["provenance"]["producer"],
-        "target": target,
+        "selected_role": benchmark_role,
+        "selected_wamr": selected,
         "wasmtime_baseline": wasmtime,
     }
+    if benchmark_role == "wamr-target":
+        identity["target"] = selected
+    return identity
 
 
 def render_optimize_table(
@@ -1765,12 +1911,21 @@ def main() -> int:
         ),
     )
     p.add_argument(
+        "--retain-baseline-artifacts",
+        type=Path,
+        default=None,
+        help=(
+            "copy the exact measured baseline wamr/wamrc/cwasm and available SIMD runner "
+            "plus a role-bound manifest for immediate profiling"
+        ),
+    )
+    p.add_argument(
         "--retain-target-artifacts",
         type=Path,
         default=None,
         help=(
-            "copy the exact measured target wamr/wamrc/cwasm plus a manifest "
-            "for an immediate profiling handoff"
+            "copy the exact measured target wamr/wamrc/cwasm and available SIMD runner plus "
+            "a role-bound manifest for an immediate profiling handoff"
         ),
     )
     p.add_argument(
@@ -1828,14 +1983,25 @@ def main() -> int:
         p.error("Wasmtime comparisons require a single --optimize mode")
     if args.optimize == "both" and args.json_out:
         p.error("--json-out is not supported with --optimize both")
-    if args.retain_target_artifacts and not args.json_out:
-        p.error("--retain-target-artifacts requires --json-out")
-    if args.retain_target_artifacts and not (
+    retained_dirs = [
+        path
+        for path in (args.retain_baseline_artifacts, args.retain_target_artifacts)
+        if path is not None
+    ]
+    if retained_dirs and not args.json_out:
+        p.error("artifact retention requires --json-out")
+    if retained_dirs and not (
         args.wasmtime_baseline or args.wasmtime
     ):
-        p.error("--retain-target-artifacts requires a Wasmtime comparison")
-    if args.retain_target_artifacts and args.profile != "authoritative":
-        p.error("--retain-target-artifacts requires --profile authoritative")
+        p.error("artifact retention requires a Wasmtime comparison")
+    if retained_dirs and args.profile != "authoritative":
+        p.error("artifact retention requires --profile authoritative")
+    if (
+        len(retained_dirs) == 2
+        and retained_dirs[0].expanduser().resolve()
+        == retained_dirs[1].expanduser().resolve()
+    ):
+        p.error("baseline and target artifact handoffs require distinct directories")
 
     repo = args.repo.resolve()
     fixture, fixture_sha = resolve_fixture(repo, args.fixture)
@@ -2006,7 +2172,28 @@ def main() -> int:
                 target_identity = target_prepared.identity
                 if args.retain_target_artifacts:
                     target_identity = retain_wamr_artifact_handoff(
-                        target_prepared, args.retain_target_artifacts
+                        target_prepared,
+                        args.retain_target_artifacts,
+                        role="wamr-target",
+                    )
+                baseline_identity = baseline_prepared.identity
+                if args.retain_baseline_artifacts:
+                    baseline_retention_prepared = baseline_prepared
+                    if baseline_sha == target_sha:
+                        baseline_retention_prepared = replace(
+                            baseline_prepared,
+                            identity={
+                                **baseline_prepared.identity,
+                                "source": {
+                                    **baseline_prepared.identity["source"],
+                                    "ref": args.baseline,
+                                },
+                            },
+                        )
+                    baseline_identity = retain_wamr_artifact_handoff(
+                        baseline_retention_prepared,
+                        args.retain_baseline_artifacts,
+                        role="wamr-baseline",
                     )
                 target_result = EngineResult(
                     "WAMR",
@@ -2017,13 +2204,14 @@ def main() -> int:
                     target_identity,
                 )
                 if baseline_sha == target_sha:
-                    baseline_identity = {
-                        **target_identity,
-                        "source": {
-                            **target_identity["source"],
-                            "ref": args.baseline,
-                        },
-                    }
+                    if args.retain_baseline_artifacts is None:
+                        baseline_identity = {
+                            **target_identity,
+                            "source": {
+                                **target_identity["source"],
+                                "ref": args.baseline,
+                            },
+                        }
                     baseline_result = EngineResult(
                         "WAMR",
                         f"{args.baseline} ({baseline_sha})",
@@ -2045,7 +2233,7 @@ def main() -> int:
                         optimize,
                         baseline_measured.values,
                         baseline_measured.samples,
-                        baseline_prepared.identity,
+                        baseline_identity,
                     )
                 results = [baseline_result, target_result]
                 for path, label, version in wasmtime_specs:

@@ -1151,20 +1151,35 @@ def validate_report(report: dict[str, Any]) -> None:
     _require_sha(
         handoff.get("manifest_sha256"), "benchmark handoff manifest sha256", 64
     )
-    target = benchmark.get("target")
-    if not isinstance(target, dict):
-        raise ProfileError("profile report lacks benchmark target identity")
-    target_source = target.get("identity", {}).get("source", {})
-    if target_source.get("sha") != report.get("wamr", {}).get("commit"):
-        raise ProfileError("profile and benchmark WAMR source SHAs differ")
-    target_identity = target.get("identity", {})
-    wamr = report.get("wamr", {})
+    selected_role = benchmark.get("selected_role", "wamr-target")
+    selected = benchmark.get("selected_wamr")
+    legacy_target = selected is None and selected_role == "wamr-target"
+    if selected is None and selected_role == "wamr-target":
+        selected = benchmark.get("target")
     if (
-        target_identity.get("runtime", {}).get("sha256")
+        selected_role not in ("wamr-baseline", "wamr-target")
+        or not isinstance(selected, dict)
+        or selected.get("role", selected_role if legacy_target else None)
+        != selected_role
+    ):
+        raise ProfileError("profile report lacks its selected benchmark WAMR identity")
+    if "target" in benchmark and (
+        selected_role != "wamr-target" or benchmark["target"] != selected
+    ):
+        raise ProfileError("profile benchmark target alias contradicts its selected role")
+    wamr = report.get("wamr", {})
+    if wamr.get("benchmark_role", "wamr-target") != selected_role:
+        raise ProfileError("profile and benchmark WAMR roles differ")
+    selected_source = selected.get("identity", {}).get("source", {})
+    if selected_source.get("sha") != wamr.get("commit"):
+        raise ProfileError("profile and benchmark WAMR source SHAs differ")
+    selected_identity = selected.get("identity", {})
+    if (
+        selected_identity.get("runtime", {}).get("sha256")
         != wamr.get("runtime_sha256")
-        or target_identity.get("compiler", {}).get("sha256")
+        or selected_identity.get("compiler", {}).get("sha256")
         != wamr.get("compiler_sha256")
-        or target_identity.get("module", {}).get("sha256")
+        or selected_identity.get("module", {}).get("sha256")
         != wamr.get("cwasm_sha256")
     ):
         raise ProfileError("profile and benchmark WAMR tool identities differ")
@@ -1420,8 +1435,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"(`sha256:{benchmark['report_sha256']}`), run {benchmark_link}",
         f"- Exact WAMR artifact handoff: manifest "
         f"`sha256:{benchmark['artifact_handoff']['manifest_sha256']}`",
-        f"- Benchmark target: "
-        f"`{benchmark['target']['identity']['source']['sha']}`; "
+        f"- Benchmarked WAMR role: `{benchmark.get('selected_role', 'wamr-target')}` "
+        f"at `{(benchmark.get('selected_wamr') or benchmark.get('target'))['identity']['source']['sha']}`; "
         f"producer tooling `{benchmark['producer']['source_sha']}`",
         f"- Fixture: `{report['fixture']['path']}` "
         f"(`sha256:{report['fixture']['sha256']}`)",
@@ -1801,12 +1816,12 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     benchmark_report, benchmark_report_sha = load_benchmark_report(
         args.benchmark_report.resolve()
     )
-    benchmark_target = next(
+    benchmark_wamr = next(
         engine
         for engine in benchmark_report["engines"]
-        if engine["role"] == "wamr-target"
+        if engine["role"] == args.benchmark_role
     )
-    benchmark_target_sha = benchmark_target["identity"]["source"]["sha"]
+    benchmark_wamr_sha = benchmark_wamr["identity"]["source"]["sha"]
     current_execution = bench_coremark.capture_execution_identity(
         args.execution_id
     )
@@ -1815,7 +1830,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             benchmark_report["provenance"]["execution"], current_execution
         )
         handoff = bench_coremark.load_wamr_artifact_handoff(
-            args.benchmark_artifacts, benchmark_target["identity"]
+            args.benchmark_artifacts,
+            benchmark_wamr["identity"],
+            role=args.benchmark_role,
         )
     except RuntimeError as exc:
         raise ProfileError(str(exc)) from exc
@@ -1832,14 +1849,14 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         0 <= args.frame_func < wasm_identity.local_function_count
     ):
         raise ProfileError("frame function is outside the benchmark module")
-    wamr_ref = args.wamr_ref or benchmark_target_sha
+    wamr_ref = args.wamr_ref or benchmark_wamr_sha
     commit = recorder.run(
         ["git", "rev-parse", wamr_ref], "git-identity.log", cwd=repo
     ).stdout.strip()
-    if commit != benchmark_target_sha:
+    if commit != benchmark_wamr_sha:
         raise ProfileError(
-            f"--wamr-ref resolves to {commit}, but the benchmark target is "
-            f"{benchmark_target_sha}"
+            f"--wamr-ref resolves to {commit}, but benchmark role "
+            f"{args.benchmark_role} is {benchmark_wamr_sha}"
         )
     checkout_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -1962,6 +1979,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 Path(bench_coremark.__file__).resolve()
             ),
             current_execution=current_execution,
+            benchmark_role=args.benchmark_role,
         )
     except RuntimeError as exc:
         raise ProfileError(str(exc)) from exc
@@ -2518,6 +2536,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "sampling_permitted": True,
         },
         "wamr": {
+            "benchmark_role": args.benchmark_role,
             "commit": commit,
             "version": wamr_version,
             "wamrc_version": wamrc_version,
@@ -2661,13 +2680,19 @@ def main() -> int:
     parser.add_argument(
         "--wamr-ref",
         default=None,
-        help="exact ref to profile (default: benchmark report target SHA)",
+        help="exact ref to profile (default: selected benchmark role SHA)",
+    )
+    parser.add_argument(
+        "--benchmark-role",
+        choices=("wamr-baseline", "wamr-target"),
+        default="wamr-target",
+        help="WAMR role from the paired benchmark to profile (default: target)",
     )
     parser.add_argument(
         "--benchmark-artifacts",
         type=Path,
         required=True,
-        help="exact target wamr/wamrc/cwasm handoff retained by bench_coremark.py",
+        help="exact role-bound wamr/wamrc/cwasm handoff from bench_coremark.py",
     )
     parser.add_argument(
         "--execution-id",

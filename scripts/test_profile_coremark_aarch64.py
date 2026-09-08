@@ -614,6 +614,37 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             ],
         }
         profile.validate_report(report)
+        baseline_report = copy.deepcopy(report)
+        selected = {
+            "role": "wamr-baseline",
+            "identity": baseline_report["benchmark"]["target"]["identity"],
+        }
+        baseline_report["benchmark"].update(
+            selected_role="wamr-baseline",
+            selected_wamr=selected,
+        )
+        del baseline_report["benchmark"]["target"]
+        baseline_report["wamr"]["benchmark_role"] = "wamr-baseline"
+        profile.validate_report(baseline_report)
+        baseline_report["benchmark"]["target"] = selected
+        with self.assertRaisesRegex(profile.ProfileError, "target alias"):
+            profile.validate_report(baseline_report)
+        del baseline_report["benchmark"]["target"]
+        baseline_report["wamr"]["benchmark_role"] = "wamr-target"
+        with self.assertRaisesRegex(profile.ProfileError, "roles differ"):
+            profile.validate_report(baseline_report)
+        contradictory = copy.deepcopy(report)
+        contradictory["benchmark"]["selected_role"] = "wamr-target"
+        contradictory["benchmark"]["selected_wamr"] = {
+            "role": "wamr-target",
+            **copy.deepcopy(contradictory["benchmark"]["target"]),
+        }
+        with self.assertRaisesRegex(profile.ProfileError, "target alias"):
+            profile.validate_report(contradictory)
+        wrong_legacy_role = copy.deepcopy(report)
+        wrong_legacy_role["benchmark"]["target"]["role"] = "wamr-baseline"
+        with self.assertRaisesRegex(profile.ProfileError, "selected benchmark"):
+            profile.validate_report(wrong_legacy_role)
         narrow_instructions = [
             profile.aarch64_instruction_provenance.Instruction(
                 offset=0,
