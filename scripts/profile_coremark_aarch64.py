@@ -1159,9 +1159,14 @@ def validate_report(report: dict[str, Any]) -> None:
     if (
         selected_role not in ("wamr-baseline", "wamr-target")
         or not isinstance(selected, dict)
-        or (not legacy_target and selected.get("role") != selected_role)
+        or selected.get("role", selected_role if legacy_target else None)
+        != selected_role
     ):
         raise ProfileError("profile report lacks its selected benchmark WAMR identity")
+    if "target" in benchmark and (
+        selected_role != "wamr-target" or benchmark["target"] != selected
+    ):
+        raise ProfileError("profile benchmark target alias contradicts its selected role")
     wamr = report.get("wamr", {})
     if wamr.get("benchmark_role", "wamr-target") != selected_role:
         raise ProfileError("profile and benchmark WAMR roles differ")

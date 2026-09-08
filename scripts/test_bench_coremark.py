@@ -90,7 +90,7 @@ class BenchCoremarkTests(unittest.TestCase):
                     "2026-09-08T00:00:00+00:00",
                     "2026-09-08T00:00:01+00:00",
                     1.0,
-                    100.0,
+                    {"baseline": 100.0, "target": 110.0, "wasmtime": 220.0}[key],
                     bench_coremark.EXPECTED_ITERATIONS,
                 )
                 records.append(record)
@@ -600,6 +600,45 @@ class BenchCoremarkTests(unittest.TestCase):
                 },
             )
 
+        shared = copy.deepcopy(report)
+        shared.pop("wamr_comparison")
+        shared["schedule"] = [
+            record for record in shared["schedule"]
+            if record["engine_key"] != "baseline"
+        ]
+        for position, record in enumerate(shared["schedule"], 1):
+            record["schedule_position"] = position
+        by_role = {engine["role"]: engine for engine in shared["engines"]}
+        for role, key in (
+            ("wamr-baseline", "target"),
+            ("wamr-target", "target"),
+            ("wasmtime-baseline", "wasmtime"),
+        ):
+            by_role[role]["sample_schedule_positions"] = [
+                record["schedule_position"] for record in shared["schedule"]
+                if record["engine_key"] == key
+            ]
+        with self.assertRaisesRegex(RuntimeError, "cannot share samples"):
+            bench_coremark.validate_benchmark_profile_match(shared, **kwargs)
+        baseline = by_role["wamr-baseline"]
+        target = by_role["wamr-target"]
+        baseline["identity"] = copy.deepcopy(target["identity"])
+        baseline["identity"]["source"]["ref"] = "baseline-alias"
+        baseline["values"] = target["values"].copy()
+        bench_coremark.validate_benchmark_profile_match(shared, **kwargs)
+        baseline["values"][0] += 1
+        with self.assertRaisesRegex(RuntimeError, "cannot share samples"):
+            bench_coremark.validate_benchmark_profile_match(shared, **kwargs)
+
+        wrong_values = copy.deepcopy(report)
+        wrong_values["schedule"][-1]["iterations_per_second"] += 1
+        with self.assertRaisesRegex(RuntimeError, "measured schedule"):
+            bench_coremark.validate_benchmark_profile_match(wrong_values, **kwargs)
+        wrong_keys = copy.deepcopy(report)
+        wrong_keys["schedule"][0]["engine_key"] = "other"
+        with self.assertRaisesRegex(RuntimeError, "engine keys"):
+            bench_coremark.validate_benchmark_profile_match(wrong_keys, **kwargs)
+
     def test_missing_or_legacy_benchmark_provenance_is_not_authoritative(self):
         report, _, _, _ = self.authoritative_report()
         missing = copy.deepcopy(report)
@@ -783,6 +822,15 @@ class BenchCoremarkTests(unittest.TestCase):
                 legacy_dir, legacy_identity
             )
             self.assertNotIn("simd_runner", legacy_loaded)
+            no_simd_dir = root / "new-target-without-simd"
+            no_simd = bench_coremark.retain_wamr_artifact_handoff(
+                bench_coremark.replace(prepared, identity=legacy_identity),
+                no_simd_dir,
+            )
+            self.assertNotIn(
+                "simd_runner",
+                bench_coremark.load_wamr_artifact_handoff(no_simd_dir, no_simd),
+            )
             with self.assertRaisesRegex(RuntimeError, "legacy"):
                 bench_coremark.load_wamr_artifact_handoff(
                     legacy_dir,
@@ -804,6 +852,29 @@ class BenchCoremarkTests(unittest.TestCase):
                 )
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+    def test_malformed_handoff_shapes_fail_explicitly(self):
+        root = REPO / ".cache/test-coremark-malformed-handoff"
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            for payload in (None, [], "invalid", 1, {
+                "schema_version": True,
+                "kind": "coremark-wamr-artifact-handoff",
+            }):
+                with self.subTest(payload=payload):
+                    (root / "manifest.json").write_text(json.dumps(payload))
+                    with self.assertRaisesRegex(RuntimeError, "unsupported"):
+                        bench_coremark.load_wamr_artifact_handoff(root, {})
+        finally:
+            shutil.rmtree(root)
+
+    def test_invalid_raw_benchmark_scores_fail_explicitly(self):
+        for value in (None, True, "100", 0, -1, float("nan"), float("inf"), 10**400):
+            with self.subTest(value=value):
+                report, _, _, _ = self.authoritative_report()
+                report["engines"][0]["values"][0] = value
+                with self.assertRaisesRegex(RuntimeError, "invalid measured samples"):
+                    bench_coremark.validate_authoritative_benchmark_report(report)
 
     def test_main_ordinary_pr_cli_path_renders_without_json_provenance(self):
         host = bench_coremark.HostIdentity(
@@ -1097,7 +1168,13 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("- profile", workflow)
         self.assertIn("- paired-profile", workflow)
         self.assertNotIn("19d046a5b23b9c39acf5f7062976f04c5ca8ca75", workflow)
-        self.assertIn('profile_sha="$(git rev-parse "$profile_ref")"', workflow)
+        self.assertIn(
+            'profile_sha="$(git rev-parse --verify --end-of-options "${profile_ref}^{commit}")"',
+            workflow,
+        )
+        self.assertIn('echo "baseline=$baseline_sha"', workflow)
+        self.assertIn('echo "target=$target_sha"', workflow)
+        self.assertIn("Unsupported mode:", workflow)
         dispatch = workflow.split(
             "- name: Run authoritative same-host CoreMark comparison", 1
         )[1].split("\n      - name:", 1)[0]
@@ -1179,9 +1256,17 @@ class BenchCoremarkTests(unittest.TestCase):
         )[1].split("\n      - name:", 1)[0]
         self.assertIn("--benchmark-role wamr-baseline", baseline_profile)
         self.assertIn("--benchmark-role wamr-target", target_profile)
-        self.assertIn("--frame-func 10", baseline_profile)
-        self.assertIn("--frame-func 10", target_profile)
+        self.assertIn('--frame-func "${FRAME_FUNC:-10}"', baseline_profile)
+        self.assertIn('--frame-func "${FRAME_FUNC:-10}"', target_profile)
         self.assertNotIn("Enforce paired native acceptance", workflow)
+        paired_upload = workflow.split(
+            "- name: Upload paired profile evidence", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertNotIn("coremark-paired-profile/\n", paired_upload)
+        self.assertIn("baseline-profile/*.data.gz", paired_upload)
+        self.assertIn("target-profile/*.data.gz", paired_upload)
+        self.assertIn("- name: Retain paired baseline tools", workflow)
+        self.assertIn("- name: Retain paired target tools", workflow)
 
         profile_script = PROFILE_SCRIPT.read_text()
         self.assertIn("--profile=jitdump", profile_script)

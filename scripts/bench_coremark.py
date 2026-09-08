@@ -270,8 +270,6 @@ def retain_wamr_artifact_handoff(
     identity = _validate_engine_identity(prepared.identity, role)
     if identity["type"] != "wamr":
         raise RuntimeError("only WAMR artifacts can be retained")
-    if "simd_runner" not in identity:
-        raise RuntimeError("WAMR artifact retention requires simd-bench-runner")
     artifact_dir = artifact_dir.expanduser().resolve()
     if artifact_dir.exists():
         raise FileExistsError(f"{role} artifact handoff directory already exists")
@@ -280,15 +278,13 @@ def retain_wamr_artifact_handoff(
         "runtime": "wamr",
         "compiler": "wamrc",
         "module": "coremark.cwasm",
-        "simd_runner": "simd-bench-runner",
     }
+    if "simd_runner" in identity:
+        names["simd_runner"] = "simd-bench-runner"
     try:
         retained = {
             **identity,
-            "runtime": {**identity["runtime"]},
-            "compiler": {**identity["compiler"]},
-            "module": {**identity["module"]},
-            "simd_runner": {**identity["simd_runner"]},
+            **{key: {**identity[key]} for key in names},
         }
         for key, name in names.items():
             source = Path(identity[key]["path"])
@@ -320,6 +316,8 @@ def load_wamr_artifact_handoff(
     *,
     role: str = "wamr-target",
 ) -> dict[str, Path]:
+    if role not in ("wamr-baseline", "wamr-target"):
+        raise RuntimeError(f"unsupported WAMR artifact role: {role}")
     artifact_dir = artifact_dir.expanduser().resolve()
     manifest_path = artifact_dir / "manifest.json"
     try:
@@ -328,14 +326,16 @@ def load_wamr_artifact_handoff(
         raise RuntimeError(
             f"cannot read benchmark artifact handoff {manifest_path}: {exc}"
         ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("benchmark artifact handoff manifest is unsupported")
     schema_version = manifest.get("schema_version")
-    if not isinstance(manifest, dict) or schema_version not in (
+    if type(schema_version) is not int or schema_version not in (
         1,
         HANDOFF_SCHEMA_VERSION,
     ) or manifest.get("kind") != "coremark-wamr-artifact-handoff":
         raise RuntimeError("benchmark artifact handoff manifest is unsupported")
     if schema_version == 1:
-        if role != "wamr-target":
+        if role != "wamr-target" or manifest.get("role", role) != role:
             raise RuntimeError(
                 "legacy benchmark artifact handoffs can only prove wamr-target"
             )
@@ -347,6 +347,8 @@ def load_wamr_artifact_handoff(
     identity = _validate_engine_identity(
         manifest.get("identity"), f"retained {role}"
     )
+    if identity["type"] != "wamr":
+        raise RuntimeError("benchmark artifact handoff must identify WAMR")
     if identity != expected_identity:
         raise RuntimeError(
             f"benchmark artifact handoff identity does not match report {role}"
@@ -357,11 +359,14 @@ def load_wamr_artifact_handoff(
         ("compiler", "wamrc"),
         ("module", "coremark.cwasm"),
     ]
-    if schema_version == HANDOFF_SCHEMA_VERSION:
+    if "simd_runner" in identity:
         artifacts.append(("simd_runner", "simd-bench-runner"))
     for key, name in artifacts:
         path = artifact_dir / name
-        if Path(identity[key]["path"]).resolve() != path:
+        recorded_path = identity[key].get("path")
+        if not isinstance(recorded_path, str) or not recorded_path:
+            raise RuntimeError(f"benchmark artifact handoff lacks its {key} path")
+        if Path(recorded_path).resolve() != path:
             raise RuntimeError(f"benchmark artifact handoff has the wrong {key} path")
         if not path.is_file():
             raise RuntimeError(f"benchmark artifact handoff is missing {name}")
@@ -778,7 +783,7 @@ def prepare_wamr(
             runtime_path=wamr,
             compiler_path=wamrc,
             module_path=cwasm,
-            simd_runner_path=simd_runner,
+            simd_runner_path=simd_runner if simd_runner.is_file() else None,
         ),
     )
 
@@ -1398,6 +1403,10 @@ def benchmark_report_status(report: dict) -> dict:
     return {"status": "current", "authoritative": True}
 
 
+def _positive_finite_number(value: object) -> bool:
+    return type(value) in (int, float) and 0 < value <= sys.float_info.max
+
+
 def _validate_engine_identity(identity: object, role: str) -> dict:
     if not isinstance(identity, dict):
         raise RuntimeError(f"{role} is missing its engine identity")
@@ -1420,7 +1429,7 @@ def _validate_engine_identity(identity: object, role: str) -> dict:
         _require_digest(compiler.get("sha256"), f"{role} compiler sha256", 64)
         _require_digest(module.get("sha256"), f"{role} module sha256", 64)
         simd_runner = identity.get("simd_runner")
-        if simd_runner is not None:
+        if "simd_runner" in identity:
             if not isinstance(simd_runner, dict):
                 raise RuntimeError(f"{role} has an invalid SIMD runner identity")
             _require_digest(
@@ -1529,6 +1538,8 @@ def validate_authoritative_benchmark_report(report: dict) -> None:
                 f"{role} produced {len(values) if isinstance(values, list) else 0} "
                 f"measured samples; expected {expected_runs}"
             )
+        if not all(_positive_finite_number(value) for value in values):
+            raise RuntimeError(f"{role} has invalid measured samples")
     engines_by_role = {
         engine["role"]: engine for engine in engines if isinstance(engine, dict)
     }
@@ -1536,6 +1547,11 @@ def validate_authoritative_benchmark_report(report: dict) -> None:
     if comparison is not None:
         if not isinstance(comparison, dict):
             raise RuntimeError("benchmark WAMR comparison is invalid")
+        if (
+            comparison.get("baseline_role") != "wamr-baseline"
+            or comparison.get("target_role") != "wamr-target"
+        ):
+            raise RuntimeError("benchmark WAMR comparison has invalid roles")
         baseline_values = engines_by_role["wamr-baseline"]["values"]
         target_values = engines_by_role["wamr-target"]["values"]
         if (
@@ -1678,6 +1694,19 @@ def validate_benchmark_profile_match(
         baseline.get("sample_schedule_positions")
         == target.get("sample_schedule_positions")
     ):
+        left, right = baseline["identity"], target["identity"]
+        if (
+            left["source"]["sha"] != right["source"]["sha"]
+            or left["optimize"] != right["optimize"]
+            or any(
+                left[key]["sha256"] != right[key]["sha256"]
+                for key in ("runtime", "compiler", "module")
+            )
+            or baseline["values"] != target["values"]
+        ):
+            raise RuntimeError(
+                "different WAMR identities or values cannot share samples"
+            )
         participants.remove(baseline)
     expected_samples = sum(PROFILE_COUNTS["authoritative"])
     expected_schedule_length = len(participants) * expected_samples
@@ -1692,6 +1721,8 @@ def validate_benchmark_profile_match(
         if not isinstance(positions, list) or len(positions) != expected_samples:
             raise RuntimeError(f"benchmark report lacks complete {role} samples")
         for position in positions:
+            if type(position) is not int:
+                raise RuntimeError("benchmark report contains an invalid sample position")
             if position in position_to_engine:
                 raise RuntimeError("benchmark schedule assigns one sample twice")
             position_to_engine[position] = role
@@ -1700,9 +1731,13 @@ def validate_benchmark_profile_match(
     for record in schedule:
         if (
             not isinstance(record, dict)
-            or not isinstance(record.get("schedule_position"), int)
+            or type(record.get("schedule_position")) is not int
             or record.get("iterations") != EXPECTED_ITERATIONS
             or record.get("phase") not in ("warmup", "measured")
+            or not isinstance(record.get("engine_key"), str)
+            or not record["engine_key"]
+            or not _positive_finite_number(record.get("elapsed_seconds"))
+            or not _positive_finite_number(record.get("iterations_per_second"))
         ):
             raise RuntimeError("benchmark report contains an invalid schedule record")
     ordered_schedule = sorted(schedule, key=lambda item: item["schedule_position"])
@@ -1710,6 +1745,24 @@ def validate_benchmark_profile_match(
         range(1, expected_schedule_length + 1)
     ):
         raise RuntimeError("benchmark report schedule positions are incomplete")
+    participant_keys = set()
+    for engine in participants:
+        records = [
+            record
+            for record in ordered_schedule
+            if position_to_engine[record["schedule_position"]] == engine["role"]
+        ]
+        keys = {record["engine_key"] for record in records}
+        if len(keys) != 1 or participant_keys.intersection(keys):
+            raise RuntimeError("benchmark schedule engine keys are inconsistent")
+        participant_keys.update(keys)
+        measured_values = [
+            record["iterations_per_second"]
+            for record in records
+            if record["phase"] == "measured"
+        ]
+        if measured_values != engine["values"]:
+            raise RuntimeError("benchmark values disagree with measured schedule")
     warmups, runs = PROFILE_COUNTS["authoritative"]
     expected_order = []
     for phase, count in (("warmup", warmups), ("measured", runs)):
@@ -1862,7 +1915,7 @@ def main() -> int:
         type=Path,
         default=None,
         help=(
-            "copy the exact measured baseline wamr/wamrc/cwasm/SIMD runner "
+            "copy the exact measured baseline wamr/wamrc/cwasm and available SIMD runner "
             "plus a role-bound manifest for immediate profiling"
         ),
     )
@@ -1871,7 +1924,7 @@ def main() -> int:
         type=Path,
         default=None,
         help=(
-            "copy the exact measured target wamr/wamrc/cwasm/SIMD runner plus "
+            "copy the exact measured target wamr/wamrc/cwasm and available SIMD runner plus "
             "a role-bound manifest for an immediate profiling handoff"
         ),
     )

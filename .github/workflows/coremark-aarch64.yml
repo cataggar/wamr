@@ -24,11 +24,11 @@ on:
         required: false
         default: "HEAD"
       profile_ref:
-        description: "WAMR commit/ref to benchmark and profile (defaults to target)"
+        description: "Single-profile mode source (defaults to target)"
         required: false
         default: ""
       frame_func:
-        description: "Optional module-0 local function for exact frame origins (10 for core_state_transition)"
+        description: "Local function for frame origins (paired-profile defaults to 10, core_state_transition)"
         required: false
         default: ""
   pull_request:
@@ -93,15 +93,23 @@ jobs:
           INPUT_BASELINE: ${{ github.event.inputs.baseline }}
           INPUT_TARGET: ${{ github.event.inputs.target }}
           INPUT_PROFILE_REF: ${{ github.event.inputs.profile_ref }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
+          set -euo pipefail
           if [ "$EVENT" = "pull_request" ]; then
             echo "baseline=$BASE_SHA" >> "$GITHUB_OUTPUT"
             echo "target=$HEAD_SHA"   >> "$GITHUB_OUTPUT"
           else
-            echo "baseline=${INPUT_BASELINE:-origin/main}" >> "$GITHUB_OUTPUT"
-            echo "target=${INPUT_TARGET:-HEAD}"            >> "$GITHUB_OUTPUT"
+            case "$INPUT_MODE" in
+              benchmark|profile|paired-profile) ;;
+              *) echo "Unsupported mode: $INPUT_MODE" >&2; exit 1 ;;
+            esac
+            baseline_sha="$(git rev-parse --verify --end-of-options "${INPUT_BASELINE:-origin/main}^{commit}")"
+            target_sha="$(git rev-parse --verify --end-of-options "${INPUT_TARGET:-HEAD}^{commit}")"
+            echo "baseline=$baseline_sha" >> "$GITHUB_OUTPUT"
+            echo "target=$target_sha"     >> "$GITHUB_OUTPUT"
             profile_ref="${INPUT_PROFILE_REF:-${INPUT_TARGET:-HEAD}}"
-            profile_sha="$(git rev-parse "$profile_ref")"
+            profile_sha="$(git rev-parse --verify --end-of-options "${profile_ref}^{commit}")"
             echo "profile=$profile_sha" >> "$GITHUB_OUTPUT"
           fi
 
@@ -289,6 +297,7 @@ jobs:
         continue-on-error: true
         env:
           BASELINE: ${{ steps.refs.outputs.baseline }}
+          FRAME_FUNC: ${{ github.event.inputs.frame_func }}
         run: |
           python3 scripts/profile_coremark_aarch64.py \
             --out-dir coremark-paired-profile/baseline-profile \
@@ -301,7 +310,7 @@ jobs:
             --min-samples 1000 \
             --top 10 \
             --classify 3 \
-            --frame-func 10
+            --frame-func "${FRAME_FUNC:-10}"
 
       - name: Capture target frame profile
         if: >-
@@ -313,6 +322,7 @@ jobs:
         continue-on-error: true
         env:
           TARGET: ${{ steps.refs.outputs.target }}
+          FRAME_FUNC: ${{ github.event.inputs.frame_func }}
         run: |
           python3 scripts/profile_coremark_aarch64.py \
             --out-dir coremark-paired-profile/target-profile \
@@ -325,7 +335,7 @@ jobs:
             --min-samples 1000 \
             --top 10 \
             --classify 3 \
-            --frame-func 10
+            --frame-func "${FRAME_FUNC:-10}"
 
       - name: Upload benchmark table
         if: >-
@@ -376,8 +386,52 @@ jobs:
         with:
           name: coremark-aarch64-paired-profile-${{ steps.refs.outputs.target }}
           path: |
-            coremark-paired-profile/
+            coremark-paired-profile/*.json
+            coremark-paired-profile/*.md
+            coremark-paired-profile/*.log
+            coremark-paired-profile/baseline-profile/*.json
+            coremark-paired-profile/baseline-profile/*.md
+            coremark-paired-profile/baseline-profile/*.txt
+            coremark-paired-profile/baseline-profile/*.log
+            coremark-paired-profile/baseline-profile/*.data.gz
+            coremark-paired-profile/baseline-profile/*.dump.gz
+            coremark-paired-profile/baseline-profile/*.cwasm.gz
+            coremark-paired-profile/target-profile/*.json
+            coremark-paired-profile/target-profile/*.md
+            coremark-paired-profile/target-profile/*.txt
+            coremark-paired-profile/target-profile/*.log
+            coremark-paired-profile/target-profile/*.data.gz
+            coremark-paired-profile/target-profile/*.dump.gz
+            coremark-paired-profile/target-profile/*.cwasm.gz
           if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain paired baseline tools
+        if: >-
+          always() &&
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mode == 'paired-profile' &&
+          steps.paired_benchmark.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coremark-aarch64-baseline-tools-${{ steps.refs.outputs.baseline }}
+          path: coremark-paired-profile/baseline-artifacts/
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 90
+
+      - name: Retain paired target tools
+        if: >-
+          always() &&
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mode == 'paired-profile' &&
+          steps.paired_benchmark.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coremark-aarch64-target-tools-${{ steps.refs.outputs.target }}
+          path: coremark-paired-profile/target-artifacts/
+          if-no-files-found: error
+          compression-level: 9
           retention-days: 90
 
       - name: Comment on PR
