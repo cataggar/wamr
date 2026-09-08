@@ -35,6 +35,52 @@ def synthetic_policy() -> dict:
     return json.loads(POLICY_PATH.read_text(encoding="UTF-8"))
 
 
+def attach_synthetic_sizing(plan: dict) -> None:
+    pilot_iterations = copy.deepcopy(plan["iterations"])
+    order = bench.pilot_order_for_plan(
+        plan["pairs"], tuple(plan["revision_roles"]), pilot_iterations
+    )
+    pilots = []
+    for spec in order:
+        elapsed = 1_500_000_000 - spec["pilot_index"] * 1_000
+        overhead = 100_000
+        workload = "hot" if spec["workload"] == "cancel-hot" else spec["workload"]
+        pilots.append(
+            {
+                **spec,
+                "phase": "pilot",
+                "correct": True,
+                "operations": bench.expected_result(
+                    workload, spec["threads"], spec["iterations"]
+                )["operations"],
+                "guest_elapsed_ns": elapsed,
+                "elapsed_ns": elapsed,
+                "raw_guest_elapsed_ns": elapsed + overhead,
+                "timing_overhead_ns": overhead,
+                "timing_overhead_ppm": (
+                    overhead * 1_000_000 // (elapsed + overhead)
+                ),
+                "host_wall_elapsed_ns": elapsed + 1_000_000,
+            }
+        )
+    selected, resolved = bench.resolve_one_shot_sizing(
+        pilot_records=pilots,
+        pilot_order=order,
+        modes=tuple(plan["modes"]),
+        thread_counts=tuple(plan["thread_counts"]),
+        warmups=plan["warmups"],
+        samples=plan["samples"],
+        timeout_seconds=plan["timeout_seconds"],
+    )
+    plan["iterations"] = selected
+    plan["sizing"] = {
+        "algorithm": bench.sizing_algorithm_spec(plan["timeout_seconds"]),
+        "pilot_iterations": pilot_iterations,
+        "pilot_order": order,
+        "resolved": resolved,
+    }
+
+
 def synthetic_cohort() -> dict:
     """Build an explicitly synthetic 20-run calibration cohort."""
 
@@ -48,27 +94,23 @@ def synthetic_cohort() -> dict:
         "modes": ["aot"],
         "thread_counts": [1],
         "iterations": {
-            "single-hot": 100,
-            "cancel-hot": 100,
-            "hot": 100,
-            "atomic": 100,
-            "atomic-total": 100,
-            "wait-notify": 100,
-            "spawn-join": 10,
+            "aot": {
+                "single-hot": 100,
+                "hot": {"1": 100},
+                "atomic": {"1": 100},
+                "wait-notify": {"1": 100},
+                "spawn-join": {"1": 10},
+                "cancel-hot": {"1": 100},
+            }
         },
         "timeout_seconds": 60,
         "minimum_timed_interval_ns": 1,
         "atomic_wait_preflight_runs": 64,
         "optimize": "ReleaseFast",
-        "pairs": [
-            {
-                "pair_kind": "single-infrastructure",
-                "pair_key": "single-infrastructure/aot",
-                "left": "threads-disabled",
-                "right": "threads-enabled",
-            }
-        ],
+        "pairs": [],
     }
+    plan["pairs"] = bench.expected_pair_specs_for_plan(plan)
+    attach_synthetic_sizing(plan)
     plan_sha256 = cache_key(plan)
     measurement_plan_sha256 = bench.measurement_plan_sha256(plan)
     run_ids = [str(10_000 + index) for index in range(20)]
@@ -88,7 +130,7 @@ def synthetic_cohort() -> dict:
         "baseline": dict(revision),
         "candidate": dict(revision),
         "fixture_set_sha256": "d" * 64,
-        "plan_sha256": plan_sha256,
+        "plan_sha256_distribution": {plan_sha256: 40},
         "measurement_plan_version": bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
         "measurement_plan_sha256": measurement_plan_sha256,
         "profile": "authoritative",
@@ -221,7 +263,7 @@ def synthetic_cohort() -> dict:
         for index, platform in enumerate(cohort.DEFAULT_PLATFORMS)
     }
     return {
-        "schema_version": 3,
+        "schema_version": bench.REPORT_SCHEMA_VERSION,
         "kind": "wasi-thread-paired-cohort",
         "authoritative": True,
         "validated_at": "synthetic-time",

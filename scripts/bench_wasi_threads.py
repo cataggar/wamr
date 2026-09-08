@@ -46,11 +46,14 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
+REPORT_SCHEMA_VERSION = 4
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 1
+MEASUREMENT_PLAN_IDENTITY_VERSION = 2
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
+SIZING_ALGORITHM_VERSION = 1
+SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "smoke": (1, 4),
@@ -68,8 +71,34 @@ MINIMUM_INTERVAL_HEADROOM_NS = (
     - TARGET_BARRIER_REQUIRED_INTERVAL_NS
 )
 SIZING_TARGET_NS = 1_750_000_000
+SIZING_SAFETY_NUMERATOR = 11
+SIZING_SAFETY_DENOMINATOR = 10
+SIZING_SIGNIFICANT_DIGITS = 3
+PROJECTED_EVIDENCE_MINIMUM_NS = (
+    SIZING_TARGET_NS * SIZING_SAFETY_NUMERATOR
+    + SIZING_SAFETY_DENOMINATOR
+    - 1
+) // SIZING_SAFETY_DENOMINATOR
+PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
+MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
+MAXIMUM_PILOT_HOST_WALL_NS = 35_000_000_000
+WORKFLOW_JOB_TIMEOUT_NS = 180 * 60 * 1_000_000_000
+JOB_NON_BENCHMARK_RESERVE_NS = 83 * 60 * 1_000_000_000
+PROJECTED_BENCHMARK_LIMIT_NS = (
+    WORKFLOW_JOB_TIMEOUT_NS - JOB_NON_BENCHMARK_RESERVE_NS
+)
+AUXILIARY_INVOCATION_BUDGET_NS = 10 * 60 * 1_000_000_000
+INT32_MAX = (1 << 31) - 1
+SIZING_WORKLOAD_CAPS = {
+    "single-hot": 16_000_000_000,
+    "hot": 16_000_000_000,
+    "cancel-hot": 16_000_000_000,
+    "atomic": 8_000_000_000,
+    "wait-notify": 100_000_000,
+    "spawn-join": 1_000_000,
+}
 TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD = 4
-DEFAULT_ITERATION_PLAN = {
+DEFAULT_PILOT_ITERATION_PLAN = {
     "interpreter": {
         "single-hot": 30_000_000,
         "hot": {
@@ -107,7 +136,7 @@ DEFAULT_ITERATION_PLAN = {
             "8": 64_000_000,
         },
         "wait-notify": {
-            "1": 2_400_000,
+            "1": 1_500_000,
             "2": 64_000,
             "4": 32_000,
             "8": 16_000,
@@ -121,6 +150,9 @@ DEFAULT_ITERATION_PLAN = {
         },
     },
 }
+# Compatibility alias for callers that used the old fixed-count name. These
+# counts are pilots only; evidence counts are resolved once per report.
+DEFAULT_ITERATION_PLAN = DEFAULT_PILOT_ITERATION_PLAN
 LEGACY_ITERATION_DEFAULTS = {
     "single": 224_000_000,
     "cancel": 224_000_000,
@@ -163,20 +195,32 @@ MASK64 = (1 << 64) - 1
 HOT_KERNEL_COUNTER_BASE = 0xD1B54A32D192ED03
 
 
-def measurement_plan_sha256(plan: dict[str, Any]) -> str:
-    """Hash every measurement-plan field except comparison purpose."""
+def canonical_measurement_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Return the portable plan, excluding only purpose and host resolutions."""
 
     require(
-        isinstance(plan, dict) and "comparison_purpose" in plan,
+        isinstance(plan, dict)
+        and "comparison_purpose" in plan
+        and "iterations" in plan
+        and isinstance(plan.get("sizing"), dict)
+        and "resolved" in plan["sizing"],
         "measurement plan comparison_purpose",
     )
     normalized = copy.deepcopy(plan)
     del normalized["comparison_purpose"]
+    del normalized["iterations"]
+    del normalized["sizing"]["resolved"]
+    return normalized
+
+
+def measurement_plan_sha256(plan: dict[str, Any]) -> str:
+    """Hash the canonical portable sizing and measurement contract."""
+
     return cache_key(
         {
             "schema_version": MEASUREMENT_PLAN_IDENTITY_VERSION,
             "kind": MEASUREMENT_PLAN_IDENTITY_KIND,
-            "plan_without_comparison_purpose": normalized,
+            "canonical_plan": canonical_measurement_plan(plan),
         }
     )
 
@@ -333,6 +377,10 @@ def validate_iteration_plan_ranges(
                     raise HarnessError(
                         f"{mode} {workload}/{threads} operations overflow uint64"
                     )
+                if workload == "wait-notify" and iterations > INT32_MAX:
+                    raise HarnessError(
+                        f"{mode} wait-notify/{threads} iterations exceed int32"
+                    )
                 if (
                     workload == "spawn-join"
                     and iterations
@@ -348,6 +396,509 @@ def validate_iteration_plan_ranges(
                     raise HarnessError(
                         f"aot cancel-hot/{threads} operations overflow uint64"
                     )
+
+
+def ceil_div(numerator: int, denominator: int) -> int:
+    if numerator < 0 or denominator <= 0:
+        raise HarnessError("ceiling division requires non-negative/positive inputs")
+    return (numerator + denominator - 1) // denominator
+
+
+def round_up_significant(value: int, significant_digits: int) -> int:
+    if value <= 0 or significant_digits <= 0:
+        raise HarnessError("sizing rounding inputs must be positive")
+    digits = len(str(value))
+    quantum = 10 ** max(0, digits - significant_digits)
+    return ceil_div(value, quantum) * quantum
+
+
+def sizing_cell_key(mode: str, workload: str, threads: int) -> str:
+    return f"{mode}/{workload}/{threads}"
+
+
+def sizing_cell_for_condition(
+    pair: dict[str, str],
+    condition: str,
+) -> tuple[str, str, int]:
+    if condition not in (pair["left"], pair["right"]):
+        raise HarnessError(f"condition {condition!r} is outside {pair['pair_key']}")
+    if pair["pair_kind"] == "single-infrastructure":
+        return pair["pair_key"].rsplit("/", 1)[1], "single-hot", 1
+    if pair["pair_kind"] == "cancel-point-cost":
+        return "aot", "cancel-hot", int(pair["pair_key"].rsplit("/", 1)[1])
+    _, workload, raw_threads, *_ = pair["pair_key"].split("/")
+    if pair["pair_kind"] == "runtime-parity":
+        mode = condition
+    elif pair["pair_kind"] == "repeatability":
+        mode = pair["left"].removesuffix("-a")
+    else:
+        raise HarnessError(f"unsupported pair kind {pair['pair_kind']!r}")
+    return mode, workload, int(raw_threads)
+
+
+def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
+    timeout_ns = int(timeout_seconds * 1_000_000_000)
+    return {
+        "version": SIZING_ALGORITHM_VERSION,
+        "kind": SIZING_ALGORITHM_KIND,
+        "selection_rate": "fastest-valid-pilot-across-all-revisions-and-conditions",
+        "formula": (
+            "max(pilot_iterations, ceil(pilot_iterations * target_duration_ns "
+            "* safety_numerator / (pilot_elapsed_ns * safety_denominator))), "
+            "then decimal significant-digits ceiling"
+        ),
+        "target_duration_ns": SIZING_TARGET_NS,
+        "safety_factor": {
+            "numerator": SIZING_SAFETY_NUMERATOR,
+            "denominator": SIZING_SAFETY_DENOMINATOR,
+        },
+        "rounding": {
+            "kind": "decimal-significant-digits-ceiling",
+            "significant_digits": SIZING_SIGNIFICANT_DIGITS,
+        },
+        "pilot_clock_resolution_minimum_ns": (
+            PILOT_CLOCK_RESOLUTION_MINIMUM_NS
+        ),
+        "maximum_pilot_corrected_ns": MAXIMUM_PILOT_CORRECTED_NS,
+        "maximum_pilot_host_wall_ns": MAXIMUM_PILOT_HOST_WALL_NS,
+        "projected_evidence_minimum_ns": PROJECTED_EVIDENCE_MINIMUM_NS,
+        "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "limits": {
+            "uint64_max": MASK64,
+            "wait_notify_int32_max": INT32_MAX,
+            "workload_iteration_caps": copy.deepcopy(SIZING_WORKLOAD_CAPS),
+            "per_invocation_timeout_ns": timeout_ns,
+            "workflow_job_timeout_ns": WORKFLOW_JOB_TIMEOUT_NS,
+            "job_non_benchmark_reserve_ns": JOB_NON_BENCHMARK_RESERVE_NS,
+            "projected_benchmark_limit_ns": PROJECTED_BENCHMARK_LIMIT_NS,
+            "auxiliary_invocation_budget_ns": AUXILIARY_INVOCATION_BUDGET_NS,
+        },
+        "failure_policy": "one-shot-no-retry-no-discard",
+    }
+
+
+def pilot_order_for_plan(
+    pairs: list[dict[str, str]],
+    revision_roles: tuple[str, ...],
+    pilot_plan: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    order = []
+    for pair in pairs:
+        for revision in revision_roles:
+            for condition in (pair["left"], pair["right"]):
+                mode, workload, threads = sizing_cell_for_condition(
+                    pair, condition
+                )
+                order.append(
+                    {
+                        "pilot_index": len(order),
+                        "revision": revision,
+                        "pair_kind": pair["pair_kind"],
+                        "pair_key": pair["pair_key"],
+                        "condition": condition,
+                        "mode": mode,
+                        "workload": workload,
+                        "threads": threads,
+                        "iterations": iteration_count(
+                            pilot_plan, mode, workload, threads
+                        ),
+                    }
+                )
+    return order
+
+
+def effective_sizing_cap(workload: str, threads: int) -> int:
+    cap = SIZING_WORKLOAD_CAPS[workload]
+    cap = min(cap, MASK64 // threads)
+    if workload == "wait-notify":
+        cap = min(cap, INT32_MAX)
+    if workload == "spawn-join":
+        cap = min(cap, MASK64 // (threads * (threads + 1) // 2))
+    return cap
+
+
+def selected_iterations_from_elapsed(
+    pilot_iterations: int,
+    pilot_elapsed_ns: int,
+) -> tuple[int, int]:
+    if pilot_iterations <= 0 or pilot_elapsed_ns <= 0:
+        raise HarnessError("pilot sizing inputs must be positive")
+    required = ceil_div(
+        pilot_iterations * SIZING_TARGET_NS * SIZING_SAFETY_NUMERATOR,
+        pilot_elapsed_ns * SIZING_SAFETY_DENOMINATOR,
+    )
+    return required, round_up_significant(
+        required, SIZING_SIGNIFICANT_DIGITS
+    )
+
+
+def validate_sizing_pilot(
+    record: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    for key in (
+        "pilot_index",
+        "revision",
+        "pair_kind",
+        "pair_key",
+        "condition",
+        "mode",
+        "workload",
+        "threads",
+        "iterations",
+    ):
+        if record.get(key) != expected[key]:
+            raise HarnessError(f"sizing pilot order mismatch for {key}")
+    if record.get("correct") is not True:
+        raise HarnessError("sizing pilot correctness failed")
+    elapsed = record.get("guest_elapsed_ns")
+    overhead = record.get("timing_overhead_ns")
+    raw = record.get("raw_guest_elapsed_ns")
+    host_wall = record.get("host_wall_elapsed_ns")
+    if (
+        not isinstance(elapsed, int)
+        or isinstance(elapsed, bool)
+        or elapsed < PILOT_CLOCK_RESOLUTION_MINIMUM_NS
+    ):
+        raise HarnessError("sizing pilot clock resolution is insufficient")
+    if elapsed > MAXIMUM_PILOT_CORRECTED_NS:
+        raise HarnessError("sizing pilot corrected duration exceeds 30 seconds")
+    if (
+        not isinstance(host_wall, int)
+        or isinstance(host_wall, bool)
+        or host_wall < elapsed
+        or host_wall > MAXIMUM_PILOT_HOST_WALL_NS
+    ):
+        raise HarnessError("sizing pilot host-wall duration exceeds 35 seconds")
+    if (
+        not isinstance(overhead, int)
+        or isinstance(overhead, bool)
+        or overhead < 0
+        or not isinstance(raw, int)
+        or isinstance(raw, bool)
+        or raw != elapsed + overhead
+    ):
+        raise HarnessError("sizing pilot barrier diagnostics are invalid")
+    expected_operations = expected_result(
+        "hot" if expected["workload"] == "cancel-hot" else expected["workload"],
+        expected["threads"],
+        expected["iterations"],
+    )["operations"]
+    if record.get("operations") != expected_operations:
+        raise HarnessError("sizing pilot operation count mismatch")
+
+
+def pilot_progress_bound(
+    *,
+    pilot_records: list[dict[str, Any]],
+    total_pilots: int,
+    warmups: int,
+    samples: int,
+) -> dict[str, int]:
+    completed_wall_ns = sum(
+        record["host_wall_elapsed_ns"] for record in pilot_records
+    )
+    completed_elapsed_ns = sum(
+        record["guest_elapsed_ns"] for record in pilot_records
+    )
+    remaining_pilots = total_pilots - len(pilot_records)
+    if remaining_pilots < 0:
+        raise HarnessError("sizing pilot progress exceeds declared order")
+    remaining_pilot_bound_ns = (
+        remaining_pilots * MAXIMUM_PILOT_HOST_WALL_NS
+    )
+    minimum_evidence_bound_ns = (
+        total_pilots
+        * (warmups + samples)
+        * PROJECTED_EVIDENCE_MINIMUM_NS
+    )
+    earliest_complete_bound_ns = (
+        completed_wall_ns
+        + remaining_pilot_bound_ns
+        + minimum_evidence_bound_ns
+        + AUXILIARY_INVOCATION_BUDGET_NS
+    )
+    if earliest_complete_bound_ns >= PROJECTED_BENCHMARK_LIMIT_NS:
+        raise HarnessError(
+            "sizing pilot progress cannot fit the 97-minute benchmark bound"
+        )
+    return {
+        "completed_pilot_elapsed_ns": completed_elapsed_ns,
+        "completed_pilot_host_wall_ns": completed_wall_ns,
+        "remaining_pilot_bound_ns": remaining_pilot_bound_ns,
+        "minimum_evidence_bound_ns": minimum_evidence_bound_ns,
+        "earliest_complete_bound_ns": earliest_complete_bound_ns,
+    }
+
+
+def empty_iteration_plan(
+    modes: tuple[str, ...],
+    thread_counts: tuple[int, ...],
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for mode in modes:
+        result[mode] = {"single-hot": 0}
+        for workload in ("hot", "atomic", "wait-notify", "spawn-join"):
+            result[mode][workload] = {
+                str(threads): 0 for threads in thread_counts
+            }
+        if mode == "aot":
+            result[mode]["cancel-hot"] = {
+                str(threads): 0 for threads in thread_counts
+            }
+    return result
+
+
+def set_iteration_count(
+    plan: dict[str, dict[str, Any]],
+    mode: str,
+    workload: str,
+    threads: int,
+    value: int,
+) -> None:
+    if workload == "single-hot":
+        plan[mode][workload] = value
+    else:
+        plan[mode][workload][str(threads)] = value
+
+
+def resolve_one_shot_sizing(
+    *,
+    pilot_records: list[dict[str, Any]],
+    pilot_order: list[dict[str, Any]],
+    modes: tuple[str, ...],
+    thread_counts: tuple[int, ...],
+    warmups: int,
+    samples: int,
+    timeout_seconds: float,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if len(pilot_records) != len(pilot_order):
+        raise HarnessError("sizing pilot set is incomplete")
+    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+    for expected, record in zip(pilot_order, pilot_records, strict=True):
+        validate_sizing_pilot(record, expected)
+        key = (
+            expected["mode"],
+            expected["workload"],
+            expected["threads"],
+        )
+        grouped.setdefault(key, []).append(record)
+
+    expected_cells = {
+        (
+            mode,
+            workload,
+            threads,
+        )
+        for mode in modes
+        for workload in (
+            "single-hot",
+            "hot",
+            "atomic",
+            "wait-notify",
+            "spawn-join",
+            *(("cancel-hot",) if mode == "aot" else ()),
+        )
+        for threads in ((1,) if workload == "single-hot" else thread_counts)
+    }
+    if set(grouped) != expected_cells:
+        raise HarnessError("sizing pilots do not cover every selected cell")
+
+    selected_plan = empty_iteration_plan(modes, thread_counts)
+    cells = []
+    selected_by_key: dict[tuple[str, str, int], int] = {}
+    for key in sorted(grouped):
+        mode, workload, threads = key
+        records = grouped[key]
+        fastest = min(records, key=lambda item: item["guest_elapsed_ns"])
+        baseline_records = [
+            item for item in records if item["revision"] == "baseline"
+        ]
+        baseline_fastest = min(
+            baseline_records or records,
+            key=lambda item: item["guest_elapsed_ns"],
+        )
+        baseline_required, baseline_rounded = selected_iterations_from_elapsed(
+            baseline_fastest["iterations"],
+            baseline_fastest["guest_elapsed_ns"],
+        )
+        fastest_required, fastest_rounded = selected_iterations_from_elapsed(
+            fastest["iterations"],
+            fastest["guest_elapsed_ns"],
+        )
+        selected = max(
+            fastest["iterations"],
+            baseline_rounded,
+            fastest_rounded,
+        )
+        cap = effective_sizing_cap(workload, threads)
+        if selected > cap:
+            raise HarnessError(
+                f"sizing cell {sizing_cell_key(*key)} requires {selected} "
+                f"iterations above cap {cap}"
+            )
+        set_iteration_count(
+            selected_plan, mode, workload, threads, selected
+        )
+        selected_by_key[key] = selected
+        cells.append(
+            {
+                "key": sizing_cell_key(*key),
+                "mode": mode,
+                "workload": workload,
+                "threads": threads,
+                "pilot_count": fastest["iterations"],
+                "pilot_observations": len(records),
+                "baseline_fastest_pilot_index": baseline_fastest["pilot_index"],
+                "baseline_fastest_elapsed_ns": baseline_fastest[
+                    "guest_elapsed_ns"
+                ],
+                "baseline_required_iterations": baseline_required,
+                "baseline_rounded_iterations": baseline_rounded,
+                "fastest_pilot_index": fastest["pilot_index"],
+                "fastest_elapsed_ns": fastest["guest_elapsed_ns"],
+                "fastest_required_iterations": fastest_required,
+                "selected_iterations": selected,
+                "effective_iteration_cap": cap,
+            }
+        )
+
+    timeout_ns = int(timeout_seconds * 1_000_000_000)
+    projections = []
+    projected_evidence_ns = 0
+    for record in pilot_records:
+        key = (record["mode"], record["workload"], record["threads"])
+        selected = selected_by_key[key]
+        projected_guest = ceil_div(
+            record["guest_elapsed_ns"] * selected, record["iterations"]
+        )
+        projected_host = ceil_div(
+            record["host_wall_elapsed_ns"] * selected, record["iterations"]
+        )
+        if projected_guest < max(
+            int(MIN_TIMED_INTERVAL_MS * 1_000_000),
+            PROJECTED_EVIDENCE_MINIMUM_NS,
+        ):
+            raise HarnessError(
+                f"sizing projection is below the evidence minimum for pilot "
+                f"{record['pilot_index']}"
+            )
+        if 99 * record["timing_overhead_ns"] >= projected_guest:
+            raise HarnessError(
+                f"sizing projected barrier ratio is not below 1% for pilot "
+                f"{record['pilot_index']}"
+            )
+        if projected_guest >= timeout_ns or projected_host >= timeout_ns:
+            raise HarnessError(
+                f"sizing projection exceeds {timeout_seconds:g}s invocation "
+                f"timeout for pilot {record['pilot_index']}"
+            )
+        projected_evidence_ns += projected_host * (warmups + samples)
+        projections.append(
+            {
+                "pilot_index": record["pilot_index"],
+                "selected_iterations": selected,
+                "projected_guest_elapsed_ns": projected_guest,
+                "projected_host_wall_elapsed_ns": projected_host,
+                "projected_timing_overhead_ratio": (
+                    record["timing_overhead_ns"]
+                    / (projected_guest + record["timing_overhead_ns"])
+                ),
+                "projected_evidence_minimum_ns": max(
+                    int(MIN_TIMED_INTERVAL_MS * 1_000_000),
+                    PROJECTED_EVIDENCE_MINIMUM_NS,
+                ),
+            }
+        )
+    pilot_host_ns = sum(record["host_wall_elapsed_ns"] for record in pilot_records)
+    pilot_elapsed_ns = sum(record["guest_elapsed_ns"] for record in pilot_records)
+    maximum_pre_admission_pilot_bound_ns = (
+        len(pilot_order) * MAXIMUM_PILOT_HOST_WALL_NS
+    )
+    projected_evidence_limit_ns = (
+        PROJECTED_BENCHMARK_LIMIT_NS
+        - pilot_host_ns
+        - AUXILIARY_INVOCATION_BUDGET_NS
+    )
+    if projected_evidence_limit_ns <= 0:
+        raise HarnessError("declared pilot set leaves no evidence runtime budget")
+    if projected_evidence_ns >= projected_evidence_limit_ns:
+        raise HarnessError(
+            "sizing evidence projection cannot fit the 97-minute benchmark bound"
+        )
+    projected_benchmark_ns = (
+        pilot_host_ns
+        + projected_evidence_ns
+        + AUXILIARY_INVOCATION_BUDGET_NS
+    )
+    if projected_benchmark_ns >= PROJECTED_BENCHMARK_LIMIT_NS:
+        raise HarnessError(
+            "sizing projection exceeds the benchmark share of the workflow timeout"
+        )
+    validate_iteration_plan_ranges(selected_plan, thread_counts)
+    return selected_plan, {
+        "pilots": copy.deepcopy(pilot_records),
+        "cells": cells,
+        "projections": projections,
+        "pilot_corrected_elapsed_ns": pilot_elapsed_ns,
+        "pilot_host_wall_elapsed_ns": pilot_host_ns,
+        "maximum_pre_admission_pilot_bound_ns": (
+            maximum_pre_admission_pilot_bound_ns
+        ),
+        "projected_evidence_host_wall_ns": projected_evidence_ns,
+        "projected_evidence_limit_ns": projected_evidence_limit_ns,
+        "auxiliary_invocation_budget_ns": AUXILIARY_INVOCATION_BUDGET_NS,
+        "projected_benchmark_ns": projected_benchmark_ns,
+        "projected_benchmark_limit_ns": PROJECTED_BENCHMARK_LIMIT_NS,
+    }
+
+
+def validate_sizing_plan(plan: dict[str, Any]) -> None:
+    sizing = plan.get("sizing")
+    require(
+        isinstance(sizing, dict)
+        and set(sizing)
+        == {"algorithm", "pilot_iterations", "pilot_order", "resolved"},
+        "plan.sizing",
+    )
+    require(
+        sizing["algorithm"] == sizing_algorithm_spec(plan["timeout_seconds"]),
+        "plan.sizing.algorithm",
+    )
+    pilot_iterations = sizing["pilot_iterations"]
+    require(
+        isinstance(pilot_iterations, dict)
+        and set(pilot_iterations) == set(plan["modes"]),
+        "plan.sizing.pilot_iterations",
+    )
+    validate_iteration_plan_ranges(
+        pilot_iterations, tuple(plan["thread_counts"])
+    )
+    revision_roles = tuple(plan["revision_roles"])
+    expected_pilot_order = pilot_order_for_plan(
+        plan["pairs"], revision_roles, pilot_iterations
+    )
+    require(
+        sizing["pilot_order"] == expected_pilot_order,
+        "plan.sizing.pilot_order",
+    )
+    recomputed_iterations, recomputed_resolution = resolve_one_shot_sizing(
+        pilot_records=sizing["resolved"].get("pilots", []),
+        pilot_order=expected_pilot_order,
+        modes=tuple(plan["modes"]),
+        thread_counts=tuple(plan["thread_counts"]),
+        warmups=plan["warmups"],
+        samples=plan["samples"],
+        timeout_seconds=plan["timeout_seconds"],
+    )
+    require(
+        plan["iterations"] == recomputed_iterations,
+        "plan resolved iterations",
+    )
+    require(
+        sizing["resolved"] == recomputed_resolution,
+        "plan sizing resolution",
+    )
 
 
 def iteration_count(
@@ -614,9 +1165,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--trusted-calibration-preflight requires paired noise calibration"
         )
     modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
-    args.iteration_plan = resolved_iteration_plan(args, modes)
+    args.pilot_iteration_plan = resolved_iteration_plan(args, modes)
+    args.iteration_plan = args.pilot_iteration_plan
     try:
-        validate_iteration_plan_ranges(args.iteration_plan, args.thread_counts)
+        validate_iteration_plan_ranges(
+            args.pilot_iteration_plan, args.thread_counts
+        )
     except HarnessError as exc:
         parser.error(str(exc))
     return args
@@ -785,6 +1339,14 @@ def failure_diagnostic_markdown(document: dict[str, Any]) -> str:
             f"`{document['ratio_at_minimum_timed_interval']}`"
         ),
         f"- Fixed limit: `< {document['timing_overhead_ratio_limit']}`",
+        "- Pilot clock-resolution minimum / corrected cap / host-wall cap: "
+        f"`{document['pilot_clock_resolution_minimum_ns']}` / "
+        f"`{document['maximum_pilot_corrected_ns']}` / "
+        f"`{document['maximum_pilot_host_wall_ns']}` ns",
+        "- Projected evidence minimum / benchmark limit / job reserve: "
+        f"`{document['projected_evidence_minimum_ns']}` / "
+        f"`{document['projected_benchmark_limit_ns']}` / "
+        f"`{document['job_non_benchmark_reserve_ns']}` ns",
         f"- Runner: `{document['host'].get('runner_name', '')}`",
         f"- Host fingerprint: "
         f"`{document['host_pair']['host_fingerprint_sha256']}`",
@@ -830,7 +1392,7 @@ def write_failure_diagnostic(
             minimum_interval_ns + timing_overhead_ns
         )
     document = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "wasi-thread-benchmark-quality-failure",
         "collected_at": collected_at(),
         "stage": stage,
@@ -846,6 +1408,14 @@ def write_failure_diagnostic(
             ratio_at_minimum_timed_interval
         ),
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+        "pilot_clock_resolution_minimum_ns": (
+            PILOT_CLOCK_RESOLUTION_MINIMUM_NS
+        ),
+        "maximum_pilot_corrected_ns": MAXIMUM_PILOT_CORRECTED_NS,
+        "maximum_pilot_host_wall_ns": MAXIMUM_PILOT_HOST_WALL_NS,
+        "projected_evidence_minimum_ns": PROJECTED_EVIDENCE_MINIMUM_NS,
+        "projected_benchmark_limit_ns": PROJECTED_BENCHMARK_LIMIT_NS,
+        "job_non_benchmark_reserve_ns": JOB_NON_BENCHMARK_RESERVE_NS,
         "minimum_timed_interval_ns": minimum_interval_ns,
         "maximum_preflight_barrier_ns": maximum_preflight_barrier_ns(
             minimum_interval_ns
@@ -907,6 +1477,35 @@ def measure_with_quality_diagnostic(
             timed_interval_ns=exc.elapsed_ns,
             raw_elapsed_ns=exc.raw_elapsed_ns,
             timing_overhead_ppm=exc.timing_overhead_ppm,
+            minimum_interval_ns=minimum_interval_ns,
+            host=host,
+            host_pair=host_pair,
+            host_quiescence_at_start=host_quiescence_at_start,
+            host_quiescence_at_failure=host_quiescence_diagnostics(),
+            preflight_samples=preflight_samples,
+        )
+    except HarnessError as exc:
+        fields = measure_args["record_fields"]
+        raise_with_failure_diagnostic(
+            exc,
+            output=output,
+            stage=stage,
+            reason="execution-or-correctness-failure",
+            scenario={
+                "revision": fields.get("revision"),
+                "mode": fields.get("mode"),
+                "workload": fields.get("workload"),
+                "threads": measure_args["threads"],
+                "iterations": measure_args["iterations"],
+                "condition": fields.get("condition"),
+                "pair_key": fields.get("pair_key"),
+                "pair_index": fields.get("pair_index"),
+                "phase": fields.get("phase"),
+            },
+            timing_overhead_ns=None,
+            timed_interval_ns=None,
+            raw_elapsed_ns=None,
+            timing_overhead_ppm=None,
             minimum_interval_ns=minimum_interval_ns,
             host=host,
             host_pair=host_pair,
@@ -2005,7 +2604,7 @@ def ratio_of_ratios_summaries(
 
 
 def validate_report(document: dict[str, Any]) -> None:
-    validate_common_report(document, KIND)
+    validate_common_report(document, KIND, REPORT_SCHEMA_VERSION)
     metadata = document["metadata"]
     require(
         isinstance(metadata.get("platform_id"), str) and metadata["platform_id"],
@@ -2418,6 +3017,7 @@ def validate_report(document: dict[str, Any]) -> None:
     require(isinstance(pair_plan, list) and pair_plan, "plan.pairs")
     expected_pair_plan = expected_pair_specs_for_plan(plan)
     require(pair_plan == expected_pair_plan, "plan.pairs is incomplete or reordered")
+    validate_sizing_plan(plan)
     pair_by_key: dict[str, dict[str, str]] = {}
     for pair in pair_plan:
         require(isinstance(pair, dict), "plan pair object")
@@ -2760,7 +3360,10 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         },
         "budget",
     )
-    if budget["schema_version"] != SCHEMA_VERSION or budget["kind"] != "wasi-thread-benchmark-budget":
+    if (
+        budget["schema_version"] != REPORT_SCHEMA_VERSION
+        or budget["kind"] != "wasi-thread-benchmark-budget"
+    ):
         raise HarnessError("budget schema/kind mismatch")
     if budget["calibrated"] is not True:
         raise HarnessError(
@@ -2815,7 +3418,6 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "candidate_revision",
             "comparison_purpose",
             "fixture_set_sha256",
-            "plan_sha256",
             "measurement_plan_version",
             "measurement_plan_sha256",
             "profile",
@@ -2856,7 +3458,6 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         )
     for key in (
         "fixture_set_sha256",
-        "plan_sha256",
         "measurement_plan_sha256",
     ):
         value = calibration[key]
@@ -3144,6 +3745,13 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"{host['logical_cpus']} CPUs · `{host['cpu']}`",
         f"- Profile: `{document['plan']['profile']}` "
         f"({document['plan']['warmups']} warmups, {document['plan']['samples']} samples)",
+        "- One-shot sizing: "
+        f"`{document['plan']['sizing']['algorithm']['kind']}` v"
+        f"{document['plan']['sizing']['algorithm']['version']}; "
+        f"{len(document['plan']['sizing']['resolved']['pilots'])} retained pilots, "
+        f"{len(document['plan']['sizing']['resolved']['cells'])} frozen cells; "
+        f"projected benchmark "
+        f"{document['plan']['sizing']['resolved']['projected_benchmark_ns'] / 1e9:.1f}s",
         f"- Budget: `{document['budget']['status']}`",
         "- Checksum preparation: "
         f"`{document['metadata']['checksum_preparation']['algorithm']}`; "
@@ -3314,90 +3922,23 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     fixture_set_sha256 = fixture_set_identities["candidate"]
     minimum_interval_ns = int(args.min_interval_ms * 1_000_000)
     modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
-    iteration_plan = args.iteration_plan
+    pilot_iteration_plan = args.pilot_iteration_plan
     if args.trusted_calibration_preflight and "aot" not in modes:
         raise HarnessError(
             "trusted calibration preflight requires the AOT runtime path"
         )
     pair_plan = planned_pair_specs(args, modes)
+    pilot_order = pilot_order_for_plan(
+        pair_plan, revision_roles, pilot_iteration_plan
+    )
     runner = shlex.split(args.runner)
-    plan = {
-        "profile": args.profile,
-        "warmups": args.warmups,
-        "samples": args.samples,
-        "revision_mode": revision_mode,
-        "comparison_purpose": comparison_purpose,
-        "revision_roles": list(revision_roles),
-        "modes": list(modes),
-        "thread_counts": list(args.thread_counts),
-        "iterations": copy.deepcopy(iteration_plan),
-        "timeout_seconds": args.timeout,
-        "minimum_timed_interval_ns": minimum_interval_ns,
-        "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
-        "scheduler_barrier_preflight": {
-            "enabled": args.trusted_calibration_preflight,
-            "mode": "aot",
-            "workload": "hot",
-            "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
-            "probe_count": (
-                TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
-                * len(args.thread_counts)
-                if args.trusted_calibration_preflight
-                else 0
-            ),
-            "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
-            "target_barrier_ns": TARGET_BARRIER_NS,
-            "target_required_interval_ns": TARGET_BARRIER_REQUIRED_INTERVAL_NS,
-            "minimum_interval_headroom_ns": (
-                minimum_interval_ns - TARGET_BARRIER_REQUIRED_INTERVAL_NS
-            ),
-            "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
-                minimum_interval_ns
-            ),
-            "acceptance_rule": (
-                "every probe must have timed_interval_ns >= "
-                "minimum_timed_interval_ns and 99 * timing_overhead_ns < "
-                "minimum_timed_interval_ns"
-            ),
-        },
-        "optimize": args.optimize,
-        "pairs": pair_plan,
-    }
-    plan_sha256 = cache_key(plan)
-    measurement_plan_identity = measurement_plan_sha256(plan)
-    checksum_preparation = prepare_expected_results(
-        iteration_plan, modes, args.thread_counts
+    preflight_acceptance_rule = (
+        "every probe must have timed_interval_ns >= minimum_timed_interval_ns "
+        "and 99 * timing_overhead_ns < minimum_timed_interval_ns"
     )
     host = host_metadata(args.runner_environment)
     host_pair = host_pair_identity(args.platform_id, host, args.host_pair_id)
     host_quiescence_at_start = host_quiescence_diagnostics()
-    revisions = {
-        role: {
-            **sources[role],
-            "fixture_set_sha256": fixture_set_identities[role],
-            "plan_sha256": plan_sha256,
-            "host_pair_id": host_pair["id"],
-            "host_fingerprint_sha256": host_pair[
-                "host_fingerprint_sha256"
-            ],
-        }
-        for role in revision_roles
-    }
-    revision_fields = {
-        role: {
-            "revision_commit": revisions[role]["commit"],
-            "revision_build_source_sha256": revisions[role][
-                "build_source_sha256"
-            ],
-            "fixture_set_sha256": revisions[role]["fixture_set_sha256"],
-            "plan_sha256": plan_sha256,
-            "host_pair_id": host_pair["id"],
-            "host_fingerprint_sha256": host_pair[
-                "host_fingerprint_sha256"
-            ],
-        }
-        for role in revision_roles
-    }
 
     contexts: dict[str, dict[str, Any]] = {}
     for role in revision_roles:
@@ -3467,13 +4008,257 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
             minimum_interval_ns
         ),
-        "acceptance_rule": plan["scheduler_barrier_preflight"][
-            "acceptance_rule"
-        ],
+        "acceptance_rule": preflight_acceptance_rule,
         "summary": None,
         "samples": [],
         "host_quiescence_at_start": host_quiescence_at_start,
     }
+    pilot_records: list[dict[str, Any]] = []
+    pilot_progress_bound(
+        pilot_records=pilot_records,
+        total_pilots=len(pilot_order),
+        warmups=args.warmups,
+        samples=args.samples,
+    )
+    pilot_measured = functools.partial(
+        measure_with_quality_diagnostic,
+        output=output,
+        stage="sizing-pilot",
+        minimum_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
+        host=host,
+        host_pair=host_pair,
+        host_quiescence_at_start=host_quiescence_at_start,
+        preflight_samples=pilot_records,
+    )
+    for spec in pilot_order:
+        context = contexts[spec["revision"]]
+        mode = spec["mode"]
+        sizing_workload = spec["workload"]
+        guest_workload = (
+            "hot" if sizing_workload == "cancel-hot" else sizing_workload
+        )
+        if sizing_workload == "single-hot":
+            selected = context["builds"][
+                (
+                    "disabled-"
+                    if spec["condition"] == "threads-disabled"
+                    else "enabled-"
+                )
+                + mode
+            ]
+            module = (
+                context["single_wasm"]
+                if mode == "interpreter"
+                else context["aot_artifacts"]["single"]
+            )
+            cancel_points = "not-applicable"
+            static_cancel_poll_sites = 0
+        elif sizing_workload == "cancel-hot":
+            selected = context["builds"]["enabled-aot"]
+            cancel_points = (
+                "off"
+                if spec["condition"] == "cancel-points-off"
+                else "on"
+            )
+            module = context["aot_artifacts"][
+                f"threaded-polls-{cancel_points}"
+            ]
+            static_cancel_poll_sites = (
+                context["aot_artifacts_metadata"]["cancel_poll_static"][
+                    "sites_enabled"
+                ]
+                if cancel_points == "on"
+                else 0
+            )
+        else:
+            selected = context["builds"][f"enabled-{mode}"]
+            module = (
+                context["threaded_wasm"]
+                if mode == "interpreter"
+                else context["aot_artifacts"]["threaded-polls-on"]
+            )
+            cancel_points = (
+                "on" if mode == "aot" else "interpreter-dispatch"
+            )
+            static_cancel_poll_sites = (
+                context["aot_artifacts_metadata"]["cancel_poll_static"][
+                    "sites_enabled"
+                ]
+                if mode == "aot"
+                else None
+            )
+        pilot = pilot_measured(
+            repo=context["repo"],
+            runner=runner,
+            build=selected,
+            module=module,
+            workload=guest_workload,
+            threads=spec["threads"],
+            iterations=spec["iterations"],
+            timeout=args.timeout,
+            min_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
+            enforce_timing_quality=False,
+            record_fields={
+                **spec,
+                "phase": "pilot",
+                "threads_enabled": selected.threads_enabled,
+                "cancel_points": cancel_points,
+                "static_cancel_poll_sites": static_cancel_poll_sites,
+            },
+        )
+        pilot_records.append(pilot)
+        try:
+            validate_sizing_pilot(pilot, spec)
+            pilot_progress_bound(
+                pilot_records=pilot_records,
+                total_pilots=len(pilot_order),
+                warmups=args.warmups,
+                samples=args.samples,
+            )
+        except HarnessError as exc:
+            raise_with_failure_diagnostic(
+                exc,
+                output=output,
+                stage="sizing-pilot",
+                reason="pilot-quality-or-runtime-bound",
+                scenario={
+                    "revision": spec["revision"],
+                    "mode": spec["mode"],
+                    "workload": spec["workload"],
+                    "threads": spec["threads"],
+                    "iterations": spec["iterations"],
+                    "condition": spec["condition"],
+                    "pair_key": spec["pair_key"],
+                    "pilot_index": spec["pilot_index"],
+                },
+                timing_overhead_ns=pilot["timing_overhead_ns"],
+                timed_interval_ns=pilot["guest_elapsed_ns"],
+                raw_elapsed_ns=pilot["raw_guest_elapsed_ns"],
+                timing_overhead_ppm=pilot["timing_overhead_ppm"],
+                minimum_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
+                host=host,
+                host_pair=host_pair,
+                host_quiescence_at_start=host_quiescence_at_start,
+                host_quiescence_at_failure=host_quiescence_diagnostics(),
+                preflight_samples=pilot_records,
+            )
+        print(
+            f"[thread-bench] sizing pilot {spec['pilot_index'] + 1}/"
+            f"{len(pilot_order)} {spec['revision']}/{spec['pair_key']}/"
+            f"{spec['condition']}: "
+            f"guest={pilot['guest_elapsed_ns'] / 1e6:.3f} ms",
+            file=sys.stderr,
+        )
+
+    try:
+        iteration_plan, sizing_resolution = resolve_one_shot_sizing(
+            pilot_records=pilot_records,
+            pilot_order=pilot_order,
+            modes=modes,
+            thread_counts=args.thread_counts,
+            warmups=args.warmups,
+            samples=args.samples,
+            timeout_seconds=args.timeout,
+        )
+    except HarnessError as exc:
+        raise_with_failure_diagnostic(
+            exc,
+            output=output,
+            stage="sizing-resolution",
+            reason="projected-quality-or-runtime-bound",
+            scenario={
+                "pilot_count": len(pilot_records),
+                "warmups": args.warmups,
+                "samples": args.samples,
+            },
+            timing_overhead_ns=None,
+            timed_interval_ns=None,
+            raw_elapsed_ns=None,
+            timing_overhead_ppm=None,
+            minimum_interval_ns=minimum_interval_ns,
+            host=host,
+            host_pair=host_pair,
+            host_quiescence_at_start=host_quiescence_at_start,
+            host_quiescence_at_failure=host_quiescence_diagnostics(),
+            preflight_samples=pilot_records,
+        )
+    plan = {
+        "profile": args.profile,
+        "warmups": args.warmups,
+        "samples": args.samples,
+        "revision_mode": revision_mode,
+        "comparison_purpose": comparison_purpose,
+        "revision_roles": list(revision_roles),
+        "modes": list(modes),
+        "thread_counts": list(args.thread_counts),
+        "iterations": copy.deepcopy(iteration_plan),
+        "sizing": {
+            "algorithm": sizing_algorithm_spec(args.timeout),
+            "pilot_iterations": copy.deepcopy(pilot_iteration_plan),
+            "pilot_order": copy.deepcopy(pilot_order),
+            "resolved": sizing_resolution,
+        },
+        "timeout_seconds": args.timeout,
+        "minimum_timed_interval_ns": minimum_interval_ns,
+        "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
+        "scheduler_barrier_preflight": {
+            "enabled": args.trusted_calibration_preflight,
+            "mode": "aot",
+            "workload": "hot",
+            "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
+            "probe_count": (
+                TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+                * len(args.thread_counts)
+                if args.trusted_calibration_preflight
+                else 0
+            ),
+            "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
+            "target_barrier_ns": TARGET_BARRIER_NS,
+            "target_required_interval_ns": TARGET_BARRIER_REQUIRED_INTERVAL_NS,
+            "minimum_interval_headroom_ns": (
+                minimum_interval_ns - TARGET_BARRIER_REQUIRED_INTERVAL_NS
+            ),
+            "maximum_accepted_barrier_ns": maximum_preflight_barrier_ns(
+                minimum_interval_ns
+            ),
+            "acceptance_rule": preflight_acceptance_rule,
+        },
+        "optimize": args.optimize,
+        "pairs": pair_plan,
+    }
+    plan_sha256 = cache_key(plan)
+    measurement_plan_identity = measurement_plan_sha256(plan)
+    checksum_preparation = prepare_expected_results(
+        iteration_plan, modes, args.thread_counts
+    )
+    revisions = {
+        role: {
+            **sources[role],
+            "fixture_set_sha256": fixture_set_identities[role],
+            "plan_sha256": plan_sha256,
+            "host_pair_id": host_pair["id"],
+            "host_fingerprint_sha256": host_pair[
+                "host_fingerprint_sha256"
+            ],
+        }
+        for role in revision_roles
+    }
+    revision_fields = {
+        role: {
+            "revision_commit": revisions[role]["commit"],
+            "revision_build_source_sha256": revisions[role][
+                "build_source_sha256"
+            ],
+            "fixture_set_sha256": revisions[role]["fixture_set_sha256"],
+            "plan_sha256": plan_sha256,
+            "host_pair_id": host_pair["id"],
+            "host_fingerprint_sha256": host_pair[
+                "host_fingerprint_sha256"
+            ],
+        }
+        for role in revision_roles
+    }
+
     if args.trusted_calibration_preflight:
         context = contexts["candidate"]
         try:
@@ -3510,7 +4295,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 host_pair=host_pair,
                 host_quiescence_at_start=host_quiescence_at_start,
                 host_quiescence_at_failure=host_quiescence_diagnostics(),
-                preflight_samples=exc.samples,
+                preflight_samples=[*pilot_records, *exc.samples],
             )
         quality_preflight["host_quiescence_at_start"] = (
             host_quiescence_at_start
@@ -3548,7 +4333,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 host_pair=host_pair,
                 host_quiescence_at_start=host_quiescence_at_start,
                 host_quiescence_at_failure=host_quiescence_diagnostics(),
-                preflight_samples=quality_preflight["samples"],
+                preflight_samples=[
+                    *pilot_records,
+                    *quality_preflight["samples"],
+                ],
                 ratio_at_minimum_timed_interval=failed[
                     "ratio_at_minimum_timed_interval"
                 ],
@@ -3562,7 +4350,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         host=host,
         host_pair=host_pair,
         host_quiescence_at_start=host_quiescence_at_start,
-        preflight_samples=quality_preflight["samples"],
+        preflight_samples=[
+            *pilot_records,
+            *quality_preflight["samples"],
+        ],
     )
 
     if "aot" in modes:
@@ -3857,7 +4648,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     ratios = ratio_of_ratios_summaries(records)
     candidate = revisions["candidate"]
     document = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "kind": KIND,
         "metadata": {
             "commit": candidate["commit"],

@@ -20,7 +20,6 @@ from urllib.parse import quote
 
 from benchmark_schema import (
     BenchmarkDataError,
-    SCHEMA_VERSION,
     atomic_write_json,
     cache_key,
     collected_at,
@@ -31,7 +30,9 @@ from bench_wasi_threads import (
     HarnessError,
     MEASUREMENT_PLAN_IDENTITY_VERSION,
     PROFILE_COUNTS,
+    REPORT_SCHEMA_VERSION,
     measurement_plan_sha256,
+    validate_sizing_plan,
     validate_report,
 )
 
@@ -431,7 +432,7 @@ def dispatch(args: argparse.Namespace) -> int:
     )
     cohort_id = uuid.uuid4().hex
     state = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "wasi-thread-cohort-dispatch",
         "created_at": collected_at(),
         "repository": args.repository,
@@ -624,10 +625,10 @@ def validate_dispatch_state(
 ) -> dict[str, Any]:
     if (
         not isinstance(state, dict)
-        or state.get("schema_version") != SCHEMA_VERSION
+        or state.get("schema_version") != REPORT_SCHEMA_VERSION
         or state.get("kind") != "wasi-thread-cohort-dispatch"
     ):
-        raise HarnessError("paired cohort requires a schema-v3 dispatch manifest")
+        raise HarnessError("paired cohort requires a schema-v4 dispatch manifest")
     validate_platforms(required_platforms)
     if state.get("required_platforms") != list(required_platforms):
         raise HarnessError("dispatch manifest platform order or identity changed")
@@ -782,7 +783,7 @@ def validate_legacy_documents(
         if document["plan"]["revision_mode"] != "single-revision-compatibility":
             raise HarnessError(
                 f"{path}: paired authoritative reports require their exact "
-                "schema-v3 dispatch manifest"
+                "schema-v4 dispatch manifest"
             )
         metadata = document["metadata"]
         platform_id = metadata["platform_id"]
@@ -832,7 +833,7 @@ def validate_legacy_documents(
         raise HarnessError("cohort platforms do not contain the same workflow runs")
     identity = next(iter(identities))
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "wasi-thread-cohort-legacy-compatibility",
         "authoritative": False,
         "validated_at": collected_at(),
@@ -940,12 +941,18 @@ def validate_paired_documents(
         "candidate": set(),
     }
     fixture_identities: set[str] = set()
-    plan_identities: set[str] = set()
+    plan_identities: Counter[str] = Counter()
     measurement_plan_identities: set[tuple[int, str]] = set()
     host_fingerprints: dict[str, Counter[str]] = defaultdict(Counter)
     host_cpus: dict[str, Counter[str]] = defaultdict(Counter)
     runner_images: dict[str, Counter[str]] = defaultdict(Counter)
     runner_names: dict[str, set[str]] = defaultdict(set)
+    selected_counts: dict[str, dict[str, Counter[str]]] = defaultdict(
+        lambda: defaultdict(Counter)
+    )
+    pilot_elapsed: dict[str, dict[str, list[int]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     host_pair_ids: set[str] = set()
     observations: list[dict[str, Any]] = []
     expected_run_ids = set(expected["run_by_id"])
@@ -1019,13 +1026,27 @@ def validate_paired_documents(
                 )
             )
         fixture_identities.add(metadata["fixture_set_sha256"])
-        plan_identities.add(metadata["plan_sha256"])
+        plan_identities[metadata["plan_sha256"]] += 1
         measurement_plan_identities.add(
             (
                 metadata["measurement_plan_version"],
                 measurement_plan_sha256(plan),
             )
         )
+        for cell in plan["sizing"]["resolved"]["cells"]:
+            selected_counts[platform_id][cell["key"]][
+                str(cell["selected_iterations"])
+            ] += 1
+        cell_by_index = {
+            pilot["pilot_index"]: (
+                f"{pilot['mode']}/{pilot['workload']}/{pilot['threads']}"
+            )
+            for pilot in plan["sizing"]["resolved"]["pilots"]
+        }
+        for pilot in plan["sizing"]["resolved"]["pilots"]:
+            pilot_elapsed[platform_id][
+                cell_by_index[pilot["pilot_index"]]
+            ].append(pilot["guest_elapsed_ns"])
         run = expected["run_by_id"][run_id]
         observations.append(
             {
@@ -1066,8 +1087,8 @@ def validate_paired_documents(
             )
     if any(len(items) != 1 for items in identity_by_role.values()):
         raise HarnessError("cohort has mixed baseline/candidate/build identities")
-    if len(fixture_identities) != 1 or len(plan_identities) != 1:
-        raise HarnessError("cohort has mixed fixture or plan identity")
+    if len(fixture_identities) != 1:
+        raise HarnessError("cohort has mixed fixture identity")
     if len(measurement_plan_identities) != 1:
         raise HarnessError("cohort has mixed measurement plan identity")
     trusted_x86 = "ubuntu-22.04-x86_64"
@@ -1089,7 +1110,7 @@ def validate_paired_documents(
     candidate_identity = next(iter(identity_by_role["candidate"]))
     measurement_plan_identity = next(iter(measurement_plan_identities))
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "wasi-thread-paired-cohort",
         "authoritative": True,
         "validated_at": collected_at(),
@@ -1115,7 +1136,7 @@ def validate_paired_documents(
                 "build_source_sha256": candidate_identity[2],
             },
             "fixture_set_sha256": next(iter(fixture_identities)),
-            "plan_sha256": next(iter(plan_identities)),
+            "plan_sha256_distribution": dict(sorted(plan_identities.items())),
             "measurement_plan_version": measurement_plan_identity[0],
             "measurement_plan_sha256": measurement_plan_identity[1],
             "profile": expected["profile"],
@@ -1147,6 +1168,23 @@ def validate_paired_documents(
                 "runner_image_distribution": dict(
                     sorted(runner_images[platform_id].items())
                 ),
+                "selected_iteration_distribution": {
+                    key: dict(sorted(values.items()))
+                    for key, values in sorted(
+                        selected_counts[platform_id].items()
+                    )
+                },
+                "pilot_elapsed_ns_summary": {
+                    key: {
+                        "observations": len(values),
+                        "minimum": min(values),
+                        "median": statistics.median(values),
+                        "maximum": max(values),
+                    }
+                    for key, values in sorted(
+                        pilot_elapsed[platform_id].items()
+                    )
+                },
                 **(
                     {
                         "trusted_runner_name": TRUSTED_X86_RUNNER_NAME,
@@ -1183,7 +1221,7 @@ def validate_documents(
             raise HarnessError("paired cohort contains legacy or unpaired reports")
         if dispatch_state is None:
             raise HarnessError(
-                "paired authoritative reports require their exact schema-v3 "
+                "paired authoritative reports require their exact schema-v4 "
                 "dispatch manifest"
             )
         return validate_paired_documents(
@@ -1380,12 +1418,12 @@ def validate_calibration_cohort(
     policy: dict[str, Any],
 ) -> dict[str, Any]:
     if (
-        cohort.get("schema_version") != SCHEMA_VERSION
+        cohort.get("schema_version") != REPORT_SCHEMA_VERSION
         or cohort.get("kind") != "wasi-thread-paired-cohort"
         or cohort.get("authoritative") is not True
     ):
         raise HarnessError(
-            "derivation requires a validated authoritative schema-v3 paired cohort"
+            "derivation requires a validated authoritative schema-v4 paired cohort"
         )
     if cohort.get("excluded_observations") != []:
         raise HarnessError("derivation forbids excluded observations or outlier drops")
@@ -1417,11 +1455,23 @@ def validate_calibration_cohort(
                 raise HarnessError(f"calibration {role} {key} is invalid")
     for key in (
         "fixture_set_sha256",
-        "plan_sha256",
         "measurement_plan_sha256",
     ):
         if re.fullmatch(r"[0-9a-f]{64}", str(identity.get(key, ""))) is None:
             raise HarnessError(f"validated cohort {key} is invalid")
+    plan_distribution = identity.get("plan_sha256_distribution")
+    if (
+        not isinstance(plan_distribution, dict)
+        or not plan_distribution
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(key)) is None
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            for key, value in plan_distribution.items()
+        )
+    ):
+        raise HarnessError("validated cohort plan hash distribution is invalid")
     if (
         identity.get("measurement_plan_version")
         != MEASUREMENT_PLAN_IDENTITY_VERSION
@@ -1502,7 +1552,6 @@ def validate_calibration_cohort(
         "baseline": baseline,
         "candidate": candidate,
         "fixture_set_sha256": identity["fixture_set_sha256"],
-        "plan_sha256": identity["plan_sha256"],
         "measurement_plan_version": identity["measurement_plan_version"],
         "measurement_plan_sha256": identity["measurement_plan_sha256"],
         "profile": "authoritative",
@@ -1519,6 +1568,7 @@ def validate_calibration_cohort(
     run_platforms: dict[str, set[str]] = defaultdict(set)
     run_sequences: dict[str, int] = {}
     sequence_runs: dict[int, str] = {}
+    observed_plan_hashes: Counter[str] = Counter()
     for index, observation in enumerate(observations):
         if not isinstance(observation, dict):
             raise HarnessError(f"cohort observation {index} must be an object")
@@ -1565,7 +1615,6 @@ def validate_calibration_cohort(
             )
         for key in (
             "fixture_set_sha256",
-            "plan_sha256",
             "measurement_plan_version",
             "measurement_plan_sha256",
             "profile",
@@ -1584,6 +1633,7 @@ def validate_calibration_cohort(
             raise HarnessError(
                 f"cohort observation {run_id}/{platform} full plan hash changed"
             )
+        observed_plan_hashes[report_identity["plan_sha256"]] += 1
         if (
             measurement_plan_sha256(report_plan)
             != report_identity["measurement_plan_sha256"]
@@ -1592,6 +1642,13 @@ def validate_calibration_cohort(
                 f"cohort observation {run_id}/{platform} measurement plan "
                 "identity changed"
             )
+        try:
+            validate_sizing_plan(report_plan)
+        except (BenchmarkDataError, HarnessError) as exc:
+            raise HarnessError(
+                f"cohort observation {run_id}/{platform} sizing evidence changed: "
+                f"{exc}"
+            ) from exc
         for role in ("baseline", "candidate"):
             revision = report_identity.get(role)
             if not isinstance(revision, dict) or any(
@@ -1661,6 +1718,10 @@ def validate_calibration_cohort(
                 "direct": direct,
             }
         )
+    if dict(sorted(observed_plan_hashes.items())) != dict(
+        sorted(plan_distribution.items())
+    ):
+        raise HarnessError("validated cohort plan hash distribution changed")
     if observed_by_partition != declared_run_ids:
         raise HarnessError("validated cohort split membership changed after validation")
     all_run_ids = declared_run_ids["training"] | declared_run_ids["holdout"]
@@ -2087,6 +2148,12 @@ def derive_budget_documents(
             "runner_image_distribution": validated["platforms"][platform].get(
                 "runner_image_distribution", {}
             ),
+            "selected_iteration_distribution": validated["platforms"][
+                platform
+            ].get("selected_iteration_distribution", {}),
+            "pilot_elapsed_ns_summary": validated["platforms"][platform].get(
+                "pilot_elapsed_ns_summary", {}
+            ),
             "comparisons": comparison_evidence,
             "ratio_of_ratios": ratio_evidence,
             "direct_candidate_single_infrastructure": direct_evidence,
@@ -2108,7 +2175,7 @@ def derive_budget_documents(
         "build_source_sha256": identity["baseline"]["build_source_sha256"],
     }
     budget = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "wasi-thread-benchmark-budget",
         "calibrated": True,
         "enforcement": False,
@@ -2124,7 +2191,6 @@ def derive_budget_documents(
             "candidate_revision": dict(calibration_revision),
             "comparison_purpose": "noise-calibration",
             "fixture_set_sha256": identity["fixture_set_sha256"],
-            "plan_sha256": identity["plan_sha256"],
             "measurement_plan_version": identity[
                 "measurement_plan_version"
             ],
@@ -2179,7 +2245,9 @@ def derive_budget_documents(
             "baseline_revision": identity["baseline"],
             "candidate_revision": identity["candidate"],
             "fixture_set_sha256": identity["fixture_set_sha256"],
-            "plan_sha256": identity["plan_sha256"],
+            "plan_sha256_distribution": identity[
+                "plan_sha256_distribution"
+            ],
             "measurement_plan_version": identity[
                 "measurement_plan_version"
             ],
@@ -2300,7 +2368,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     validate_parser.add_argument(
         "--dispatch-state",
         type=Path,
-        help="exact schema-v3 dispatch manifest (required for paired cohorts)",
+        help="exact schema-v4 dispatch manifest (required for paired cohorts)",
     )
     validate_parser.add_argument(
         "--minimum-reports",

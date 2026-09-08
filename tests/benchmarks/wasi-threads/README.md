@@ -58,9 +58,9 @@ The corrected metric is guest-reported WASI monotonic time:
 
 The report retains raw guest time, corrected guest time, overhead and overhead
 ppm, plus host wall time as a watchdog/lifecycle diagnostic. Throughput uses
-only corrected guest time. The fixed measurement plan uses explicit per-mode
-and per-thread counts so the fast AOT cells clear the floor without making
-interpreter samples impractical:
+only corrected guest time. Evidence counts are selected once per job by a
+versioned deterministic sizing algorithm. The following checked-in table is
+used only for pilots:
 
 | mode/workload | 1 thread | 2 threads | 4 threads | 8 threads |
 |---|---:|---:|---:|---:|
@@ -69,36 +69,77 @@ interpreter samples impractical:
 | interpreter `atomic` | 72M | 40M | 28M | 14M |
 | AOT `atomic` | 850M | 180M | 64M | 64M |
 | interpreter `wait-notify` | 128K | 64K | 32K | 16K |
-| AOT `wait-notify` | 2.4M | 64K | 32K | 16K |
+| AOT `wait-notify` | 1.5M | 64K | 32K | 16K |
 | interpreter `spawn-join` | 9K | 4.5K | 2.25K | 1.25K |
 | AOT `spawn-join` | 10K | 5K | 2.5K | 1.25K |
 | AOT `cancel-hot` | 1.9B | 1.9B | 950M | 475M |
 
 Single-hot uses 30M interpreter iterations and 1.9B AOT iterations.
-Baseline and candidate always execute identical work for the same condition.
+Baseline and candidate always execute identical frozen work for the same cell.
 Interpreter/AOT conditions may use different counts; throughput is normalized
 by each record's validated operation count and corrected guest interval.
 
 The 1.25-second quality floor remains derived independently from the retained
-12.456 ms barrier target and the strict `<1%` rule. Iteration sizing instead
-uses a fixed **1.75-second target**, 40% above the floor. This deliberately
-uses the upper end of the approximately 29–40% inter-host speed spread retained
-across x86 hosts rather than sizing barely above the floor.
+12.456 ms barrier target and the strict `<1%` rule. Before evidence, the
+harness runs exactly one fixed-count pilot for every baseline/candidate and
+left/right condition that uses a cell. The pilot order is canonical and every
+pilot is retained; there are no retries, discarded pilots, adaptive sleeps, or
+replacement observations.
 
-For every shared plan count, the sizing calculation selects the fastest
-individual corrected interval from every warmup and measured record in x86
-runs 33822485228, 33822486948, 33822488505, and 33822489907. It computes
-`ceil(1.75s * evidence_iterations / evidence_interval)` and rounds upward to a
-simple fixed count. An existing count is retained only if its exact scaled
-minimum already clears 1.75 seconds. Checked-in
-`sizing-provenance.json` records each report hash, fastest record, exact
-requirement, selected count, and scaled minimum for all 38 interpreter and AOT
-cells. The minimum is AOT `spawn-join` at two threads: 1.790981666 seconds,
-43.2785% above the quality floor and 2.3418% above the sizing target.
+This replaces fixed-count provenance after #1008 run 34173856468, job
+101899360065 measured the AOT single-hot/one-thread threads-disabled warmup at
+1.054664 seconds for 1.9 billion iterations on AMD EPYC 9V45, 71.95% faster
+than the retained sizing host. That observation demonstrates that no finite
+fixed host margin is a defensible contract.
 
-A future host faster than this retained envelope does not adapt work or weaken
-the gate: every invocation still fails closed below 1.25 seconds or unless
-`99 * timing_overhead_ns < corrected_interval_ns`.
+For each cell, sizing version 1 selects the fastest valid pilot across all
+revisions and conditions. With pilot iterations `P`, corrected elapsed
+nanoseconds `E`, target `T = 1,750,000,000`, and safety factor `11/10`, the
+unrounded count is exactly
+`max(P, ceil(P * T * 11 / (E * 10)))`, followed by an upward decimal
+three-significant-digit rounding. The pilot count is a no-downsize floor so
+fixed per-invocation overhead or cold-host variance cannot turn a long pilot
+into sub-floor evidence. The fastest baseline result is retained as the
+explicit lower-bound derivation: a slower candidate cannot lower work, while a
+faster candidate or condition increases it. The selected count is then frozen
+for both revisions, both conditions, all warmups, and all samples.
+
+Pilots must pass guest correctness and operation assertions, have positive
+timing fields, and provide at least a 1 ms corrected interval for clock
+resolution. They are intentionally not required to satisfy the evidence
+`99B < E` rule at their short unsized count. After the frozen count is known,
+every retained pilot's barrier `B` is checked against its linearly projected
+corrected evidence interval `E`: `99B < E`. Every projected interval must also
+be at least both the 1.25-second evidence floor and the exact 1.925-second
+`1.75s * 11/10` sizing target. Actual warmups and samples independently enforce
+the unchanged `99B < E_actual` and 1.25-second floor.
+
+Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
+limit, checksum arithmetic, and declared workload caps. A pilot is rejected
+immediately above 30 seconds corrected time or 35 seconds host-wall time; the
+30-second corrected cap is above the retained approximately 22-second worst
+cell while preventing 88 watchdog-length pilots from exhausting a job. Every
+condition's projected invocation must remain strictly below the 90-second
+watchdog.
+
+The workflow reserves 83 minutes for non-benchmark work, leaving a 97-minute
+benchmark limit. Before and during the full 88-pilot authoritative plan,
+admission uses the hard 51-minute-20-second pilot bound (`88 * 35s`), the
+33-minute-52.8-second minimum evidence bound (`88 * 12 * 1.925s`), and the
+10-minute auxiliary allowance. Their sum is 95 minutes 12.8 seconds; adding
+the 83-minute reserve is 178 minutes 12.8 seconds, strictly below the
+180-minute job timeout. The harness accumulates actual pilot corrected and
+wall time after each one-shot pilot and aborts immediately when the remaining
+hard bound cannot fit.
+
+After all pilots finish, the hard pre-admission pilot allowance is no longer
+charged. The final `projected_evidence_limit_ns` is exactly
+`97m - actual_retained_pilot_wall - 600s`, and
+`projected_benchmark_ns` is exactly
+`actual_retained_pilot_wall + projected_evidence_wall + 600s`. Reports retain
+both the distinct `maximum_pre_admission_pilot_bound_ns` and
+`pilot_host_wall_elapsed_ns`; validation replays both. Any failure before
+evidence retains all completed pilots in the diagnostic.
 
 The hot-kernel expected checksum is prepared with an exact jump-ahead. After
 unrolling the recurrence, terms with the same iteration index modulo 64 share
@@ -181,32 +222,24 @@ timing, build cache keys, medians/ranges, immutable commit/platform/plan
 identities, and every correctness result. JSON replacement is an fsynced
 same-directory atomic rename that preserves an existing report's mode.
 
-Each guest invocation has a fixed 90-second watchdog. Exact linear projection
-from the slowest complete retained x86 report gives 53.648 minutes of guest
-work plus 2.811 minutes of retained process/invocation overhead. The 128 AOT
-atomic-wait probes and 16 trusted barrier probes add at most 0.700 minutes,
-for a 57.159-minute benchmark-path bound. The worst projected individual guest
-interval is 22.015 seconds (22.018 seconds including invocation overhead), so
-the watchdog retains more than 67 seconds and a 4.08x factor while remaining
-fail closed.
-
-The 180-minute job bound additionally reserves 48 minutes for all eight
-revision/runtime builds, 10 minutes for two checkouts plus Zig/cache setup,
-20 minutes for harness tests, SDK download, and fixture rebuild/verification,
-and 5 minutes for report generation, upload, and cleanup. Checksum preparation
-is measured in every report and is included in the remaining 39.8-minute
-hosted-variance margin (the automated bound is below one second total).
-Twenty sequential trusted x86 jobs at the full job timeout take 60 hours,
-leaving 12 hours (16.7%) before the unchanged 72-hour dispatcher deadline.
+Each guest invocation has a fixed 90-second watchdog. Before evidence, the
+harness checks every pilot-derived per-condition projection against that
+watchdog and checks the complete projected benchmark path against the strict
+97-minute limit. The workflow retains its 180-minute bound and 83-minute
+non-benchmark reserve. Twenty
+sequential trusted x86 jobs at the full job timeout still take 60 hours,
+leaving 12 hours before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 1 of a purpose-independent measurement
-identity: it hashes the complete plan after removing only
-`comparison_purpose`, inside a versioned identity envelope. Profile, warmups,
-samples, revision mode and roles, modes, thread counts, iteration/scenario
-inputs, timeout, minimum interval, preflight count, optimization, and every
-ordered pair/condition remain hashed. `validate_report` recomputes both.
+`measurement_plan_sha256` is version 2 of a purpose-independent portable
+identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
+pilot outcomes, and their projections. It includes the workload/scenario
+definitions, fixed pilot counts and order, sizing algorithm/version, target,
+safety factor, rounding, caps, timeouts, modes, thread counts, pairs, profile,
+samples, warmups, optimization, and quality policy. `plan_sha256` hashes the
+complete report-specific plan, including every pilot and selected count.
+`validate_report` recomputes both and independently replays sizing.
 
 The report exposes four metric layers:
 
@@ -492,10 +525,12 @@ Budgets contain only paired ratio limits:
 Absolute throughput and elapsed values remain report diagnostics. A calibrated
 budget must cover every platform, condition, and internal pair in the exact
 declared direction. Missing or duplicate revisions, samples, conditions, or
-thresholds; inverted directions; unsupported or mixed hosts; mixed plan or
-fixture identities; stale baseline provenance; and partial platform coverage
-all fail closed. There is no success-shaped fallback to an absolute value or an
-uncalibrated threshold.
+thresholds; inverted directions; unsupported hosts; mixed canonical sizing or
+fixture identities; incomplete pilots; stale baseline provenance; and partial
+platform coverage all fail closed. Host-resolved selected counts and full plan
+hashes may differ, and their distributions are retained without exclusions.
+There is no success-shaped fallback to an absolute value or an uncalibrated
+threshold.
 
 Rebaseline only after an intentional baseline change or a reviewed methodology,
 fixture, plan, hosted runner class, or toolchain change. Retain the complete
@@ -506,15 +541,14 @@ the candidate budget may set `calibrated` true but must keep `enforcement`
 false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
-Reports produced before measurement-plan identity version 1 do not satisfy the
-new report schema and cannot be mixed into a new authoritative cohort. The
-1.25-second floor and explicit per-mode iteration table change the
-purpose-independent measurement-plan hash. Fresh evidence at that exact new
-plan identity is mandatory for any future calibration or derivation. Reports
-from the old identity, all earlier failed/partial runs, and the retained
-6.228 ms timing-quality failure remain excluded; they cannot be retried,
-relabelled, or mixed into the fresh cohort. Runs already executing old `main`
-may finish only as old non-enforcing smoke diagnostics.
+Schema-v3 fixed-plan reports and reports produced before measurement-plan
+identity version 2 are invalid for a new authoritative cohort. Fresh evidence
+with the canonical one-shot sizing identity is mandatory for calibration and
+derivation. Reports with different legitimate host-selected counts may mix;
+reports with altered pilot specifications, target, safety factor, rounding,
+caps, timeouts, or algorithm identity may not. Earlier failed/partial runs and
+the retained timing-quality failure remain excluded and cannot be retried,
+relabelled, or mixed into the fresh cohort.
 
 Until that cohort exists, claiming a statistically sound hard gate would be
 fabricating evidence. Issue #966 must remain open and #963 remains dependent on

@@ -173,9 +173,13 @@ def atomic_write_json(path: Path, document: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def validate_common_report(document: dict[str, Any], kind: str) -> None:
+def validate_common_report(
+    document: dict[str, Any],
+    kind: str,
+    schema_version: int = SCHEMA_VERSION,
+) -> None:
     require(isinstance(document, dict), "report must be an object")
-    require(document.get("schema_version") == SCHEMA_VERSION, "schema_version")
+    require(document.get("schema_version") == schema_version, "schema_version")
     require(document.get("kind") == kind, "report kind")
     metadata = document.get("metadata")
     require(isinstance(metadata, dict), "metadata")

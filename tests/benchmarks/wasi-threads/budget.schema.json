@@ -14,7 +14,7 @@
     "platforms"
   ],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 4 },
     "kind": { "const": "wasi-thread-benchmark-budget" },
     "calibrated": { "type": "boolean" },
     "enforcement": { "type": "boolean" },
@@ -125,7 +125,6 @@
         "candidate_revision",
         "comparison_purpose",
         "fixture_set_sha256",
-        "plan_sha256",
         "measurement_plan_version",
         "measurement_plan_sha256",
         "profile",
@@ -136,8 +135,7 @@
         "candidate_revision": { "$ref": "#/$defs/revision" },
         "comparison_purpose": { "const": "noise-calibration" },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
-        "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 1 },
+        "measurement_plan_version": { "const": 2 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "profile": { "const": "authoritative" },
         "report_count_by_platform": {
