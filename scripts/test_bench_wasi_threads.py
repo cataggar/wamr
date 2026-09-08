@@ -787,8 +787,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 if workload != "single-hot":
                     self.assertEqual(set(counts), {"1", "2", "4", "8"})
 
-    def test_complete_iteration_table_clears_checked_in_sizing_target(self) -> None:
-        provenance = json.loads(
+    @staticmethod
+    def sizing_provenance() -> dict:
+        return json.loads(
             (
                 ROOT
                 / "tests"
@@ -797,6 +798,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 / "sizing-provenance.json"
             ).read_text(encoding="UTF-8")
         )
+
+    def assert_sizing_provenance(self, provenance: dict) -> None:
         self.assertEqual(provenance["iteration_plan"], bench.DEFAULT_ITERATION_PLAN)
         self.assertEqual(provenance["quality_floor_ns"], 1_250_000_000)
         self.assertEqual(provenance["sizing_target_ns"], bench.SIZING_TARGET_NS)
@@ -805,32 +808,121 @@ class ThreadBenchmarkTests(unittest.TestCase):
             provenance["quality_floor_ns"] * 13 // 10,
         )
         self.assertEqual(len(provenance["retained_reports"]), 4)
-        self.assertEqual(len(provenance["cells"]), 38)
+        expected_cells = {}
+        for mode, workloads in bench.DEFAULT_ITERATION_PLAN.items():
+            for workload, counts in workloads.items():
+                if isinstance(counts, int):
+                    expected_cells[f"{mode}/{workload}"] = counts
+                else:
+                    for threads, count in counts.items():
+                        expected_cells[f"{mode}/{workload}/{threads}"] = count
+
+        self.assertEqual(len(provenance["cells"]), len(expected_cells))
         observed = set()
+        recomputed_cells = []
         for cell in provenance["cells"]:
-            observed.add(cell["key"])
-            self.assertGreaterEqual(
+            key = cell["key"]
+            parts = key.split("/")
+            self.assertIn(len(parts), (2, 3), key)
+            mode, workload = parts[:2]
+            self.assertEqual(len(parts), 2 if workload == "single-hot" else 3, key)
+            if len(parts) == 2:
+                thread_text = None
+                threads = None
+            else:
+                thread_text = parts[2]
+                self.assertRegex(thread_text, r"^[1-9][0-9]*$", key)
+                self.assertEqual(str(int(thread_text)), thread_text, key)
+                threads = int(thread_text)
+            self.assertIn(key, expected_cells)
+            self.assertNotIn(key, observed)
+            observed.add(key)
+
+            self.assertEqual(cell["mode"], mode, key)
+            self.assertEqual(cell["workload"], workload, key)
+            self.assertEqual(cell["threads"], threads, key)
+            plan_counts = provenance["iteration_plan"][mode][workload]
+            if isinstance(plan_counts, int):
+                self.assertIsNone(thread_text, key)
+                selected_iterations = plan_counts
+            else:
+                self.assertIsNotNone(thread_text, key)
+                selected_iterations = plan_counts[thread_text]
+            self.assertEqual(selected_iterations, expected_cells[key], key)
+            self.assertEqual(
+                cell["selected_iterations"], selected_iterations, key
+            )
+
+            self.assertGreater(cell["source_iterations"], 0, key)
+            self.assertGreater(cell["fastest_corrected_interval_ns"], 0, key)
+            retained_scaled_minimum_ns = (
+                cell["fastest_corrected_interval_ns"]
+                * selected_iterations
+                // cell["source_iterations"]
+            )
+            self.assertEqual(
                 cell["retained_scaled_minimum_ns"],
+                retained_scaled_minimum_ns,
+                key,
+            )
+            self.assertGreaterEqual(
+                retained_scaled_minimum_ns,
                 provenance["sizing_target_ns"],
-                cell["key"],
+                key,
             )
             required = (
                 provenance["sizing_target_ns"] * cell["source_iterations"]
                 + cell["fastest_corrected_interval_ns"]
                 - 1
             ) // cell["fastest_corrected_interval_ns"]
-            self.assertEqual(cell["required_iterations_for_target"], required)
-            self.assertGreaterEqual(cell["selected_iterations"], required)
-        self.assertEqual(len(observed), 38)
+            self.assertEqual(cell["required_iterations_for_target"], required, key)
+            self.assertGreaterEqual(selected_iterations, required, key)
+            quality_margin = (
+                (retained_scaled_minimum_ns - provenance["quality_floor_ns"])
+                * 1_000_000
+                // provenance["quality_floor_ns"]
+            )
+            target_margin = (
+                (retained_scaled_minimum_ns - provenance["sizing_target_ns"])
+                * 1_000_000
+                // provenance["sizing_target_ns"]
+            )
+            self.assertEqual(
+                cell["margin_above_quality_floor_ppm"], quality_margin, key
+            )
+            self.assertEqual(
+                cell["margin_above_sizing_target_ppm"], target_margin, key
+            )
+            recomputed_cells.append(
+                {
+                    "key": key,
+                    "retained_scaled_minimum_ns": retained_scaled_minimum_ns,
+                    "margin_above_quality_floor_ppm": quality_margin,
+                    "margin_above_sizing_target_ppm": target_margin,
+                }
+            )
+        self.assertEqual(observed, set(expected_cells))
+        minimum_value = min(
+            cell["retained_scaled_minimum_ns"] for cell in recomputed_cells
+        )
+        minimum_cells = [
+            cell
+            for cell in recomputed_cells
+            if cell["retained_scaled_minimum_ns"] == minimum_value
+        ]
+        self.assertEqual(
+            len(minimum_cells),
+            1,
+            "retained scaled minimum must identify one exact cell",
+        )
         self.assertEqual(
             provenance["minimum_retained_scaled_cell"],
-            {
-                "key": "aot/spawn-join/2",
-                "retained_scaled_minimum_ns": 1_790_981_666,
-                "margin_above_quality_floor_ppm": 432_785,
-                "margin_above_sizing_target_ppm": 23_418,
-            },
+            minimum_cells[0],
         )
+
+    def test_complete_iteration_table_clears_checked_in_sizing_target(self) -> None:
+        provenance = self.sizing_provenance()
+        self.assert_sizing_provenance(provenance)
         runtime = provenance["runtime_accounting"]
         self.assertEqual(
             runtime["benchmark_path_upper_ns"],
@@ -858,6 +950,52 @@ class ThreadBenchmarkTests(unittest.TestCase):
             runtime["cohort_timeout_ns"],
         )
         self.assertEqual(runtime["cohort_margin_ns"], 12 * 3_600_000_000_000)
+
+    def test_sizing_provenance_rejects_stale_derived_fields(self) -> None:
+        def duplicate_cell(value: dict) -> None:
+            value["cells"][0] = copy.deepcopy(value["cells"][1])
+
+        def stale_minimum(value: dict) -> None:
+            cell = value["cells"][0]
+            value["minimum_retained_scaled_cell"] = {
+                "key": cell["key"],
+                "retained_scaled_minimum_ns": cell[
+                    "retained_scaled_minimum_ns"
+                ],
+                "margin_above_quality_floor_ppm": cell[
+                    "margin_above_quality_floor_ppm"
+                ],
+                "margin_above_sizing_target_ppm": cell[
+                    "margin_above_sizing_target_ppm"
+                ],
+            }
+
+        mutations = {
+            "duplicate cell": duplicate_cell,
+            "selected count": lambda value: value["cells"][0].__setitem__(
+                "selected_iterations",
+                value["cells"][0]["selected_iterations"] + 1,
+            ),
+            "scaled minimum": lambda value: value["cells"][0].__setitem__(
+                "retained_scaled_minimum_ns",
+                value["cells"][0]["retained_scaled_minimum_ns"] + 1,
+            ),
+            "margin": lambda value: value["cells"][0].__setitem__(
+                "margin_above_sizing_target_ppm",
+                value["cells"][0]["margin_above_sizing_target_ppm"] + 1,
+            ),
+            "required iterations": lambda value: value["cells"][0].__setitem__(
+                "required_iterations_for_target",
+                value["cells"][0]["required_iterations_for_target"] + 1,
+            ),
+            "minimum declaration": stale_minimum,
+        }
+        provenance = self.sizing_provenance()
+        for label, mutate in mutations.items():
+            corrupt = copy.deepcopy(provenance)
+            mutate(corrupt)
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                self.assert_sizing_provenance(corrupt)
 
     def test_iteration_plan_rejects_uint64_overflow(self) -> None:
         plan = copy.deepcopy(bench.DEFAULT_ITERATION_PLAN)
