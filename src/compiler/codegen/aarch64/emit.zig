@@ -47,6 +47,49 @@ pub const Reg = enum(u5) {
     }
 };
 
+pub const FrameAccessKind = enum {
+    load,
+    store,
+};
+
+pub const FrameAddressingMode = enum {
+    unsigned_scaled,
+    signed_unscaled,
+    signed_pair,
+    pre_index,
+    post_index,
+    simd_zero_offset,
+    materialized,
+};
+
+pub const FrameDataRegisterClass = enum {
+    gpr,
+    simd,
+};
+
+pub const FrameAccessComponent = struct {
+    /// Effective frame base after resolving an address materialized from FP
+    /// or SP. Only `.fp` and `.sp` are produced here.
+    base: Reg,
+    displacement: i32,
+    width: u8,
+    data_register: u5,
+    data_register_class: FrameDataRegisterClass,
+};
+
+/// One final emitted AArch64 instruction that accesses compiler frame state.
+/// Pair instructions carry two components under the same native range.
+pub const FrameAccess = struct {
+    native_start: u32,
+    native_end: u32,
+    kind: FrameAccessKind,
+    encoded_base: Reg,
+    encoded_displacement: i32,
+    addressing_mode: FrameAddressingMode,
+    components: [2]FrameAccessComponent,
+    component_count: u2,
+};
+
 /// Condition codes for B.cond instructions.
 pub const Cond = enum(u4) {
     eq = 0b0000, // equal (Z=1)
@@ -2320,6 +2363,360 @@ pub const CodeBuffer = struct {
     }
 };
 
+const DecodedFrameMemory = struct {
+    kind: FrameAccessKind,
+    encoded_base: Reg,
+    encoded_displacement: i32,
+    addressing_mode: FrameAddressingMode,
+    width: u8,
+    pair: bool = false,
+    data_rt1: u5,
+    data_rt2: ?u5 = null,
+    data_register_class: FrameDataRegisterClass,
+    load_rt1: ?Reg = null,
+    load_rt2: ?Reg = null,
+    writeback_delta: ?i32 = null,
+};
+
+const FrameRelation = struct {
+    base: Reg,
+    displacement: i64,
+};
+
+fn signedBits(value: u32, comptime bits: comptime_int) i32 {
+    const Shift = std.math.Log2Int(u32);
+    const shift: Shift = @intCast(32 - bits);
+    return @as(i32, @bitCast(value << shift)) >> shift;
+}
+
+fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
+    const rn: Reg = @enumFromInt(@as(u5, @truncate(word >> 5)));
+    const rt: Reg = @enumFromInt(@as(u5, @truncate(word)));
+    const top = word & 0xFFC00000;
+    const unsigned = switch (top) {
+        0xF9400000 => .{ FrameAccessKind.load, @as(u8, 8), @as(u8, 8) },
+        0xF9000000 => .{ FrameAccessKind.store, @as(u8, 8), @as(u8, 8) },
+        0xB9400000, 0xB9800000 => .{ FrameAccessKind.load, @as(u8, 4), @as(u8, 4) },
+        0xB9000000 => .{ FrameAccessKind.store, @as(u8, 4), @as(u8, 4) },
+        0x39400000, 0x39800000, 0x39C00000 => .{ FrameAccessKind.load, @as(u8, 1), @as(u8, 1) },
+        0x39000000 => .{ FrameAccessKind.store, @as(u8, 1), @as(u8, 1) },
+        0x79400000, 0x79800000, 0x79C00000 => .{ FrameAccessKind.load, @as(u8, 2), @as(u8, 2) },
+        0x79000000 => .{ FrameAccessKind.store, @as(u8, 2), @as(u8, 2) },
+        else => null,
+    };
+    if (unsigned) |decoded| {
+        const imm12 = (word >> 10) & 0xFFF;
+        return .{
+            .kind = decoded[0],
+            .encoded_base = rn,
+            .encoded_displacement = @intCast(imm12 * decoded[2]),
+            .addressing_mode = .unsigned_scaled,
+            .width = decoded[1],
+            .data_rt1 = @intFromEnum(rt),
+            .data_register_class = .gpr,
+            .load_rt1 = if (decoded[0] == .load) rt else null,
+        };
+    }
+
+    const unscaled_top = word & 0xFFE00C00;
+    const unscaled = switch (unscaled_top) {
+        0xF8000000 => .{ FrameAccessKind.store, @as(u8, 8) },
+        0xF8400000 => .{ FrameAccessKind.load, @as(u8, 8) },
+        0xB8000000 => .{ FrameAccessKind.store, @as(u8, 4) },
+        0xB8400000, 0xB8800000 => .{ FrameAccessKind.load, @as(u8, 4) },
+        0x38000000 => .{ FrameAccessKind.store, @as(u8, 1) },
+        0x38400000, 0x38800000, 0x38C00000 => .{ FrameAccessKind.load, @as(u8, 1) },
+        0x78000000 => .{ FrameAccessKind.store, @as(u8, 2) },
+        0x78400000, 0x78800000, 0x78C00000 => .{ FrameAccessKind.load, @as(u8, 2) },
+        0x3C800000 => .{ FrameAccessKind.store, @as(u8, 16) },
+        0x3CC00000 => .{ FrameAccessKind.load, @as(u8, 16) },
+        0xBC000000 => .{ FrameAccessKind.store, @as(u8, 4) },
+        0xBC400000 => .{ FrameAccessKind.load, @as(u8, 4) },
+        0xFC000000 => .{ FrameAccessKind.store, @as(u8, 8) },
+        0xFC400000 => .{ FrameAccessKind.load, @as(u8, 8) },
+        else => null,
+    };
+    if (unscaled) |decoded| {
+        return .{
+            .kind = decoded[0],
+            .encoded_base = rn,
+            .encoded_displacement = signedBits((word >> 12) & 0x1FF, 9),
+            .addressing_mode = .signed_unscaled,
+            .width = decoded[1],
+            .data_rt1 = @intFromEnum(rt),
+            .data_register_class = if (unscaled_top == 0x3C800000 or
+                unscaled_top == 0x3CC00000 or
+                unscaled_top == 0xBC000000 or
+                unscaled_top == 0xBC400000 or
+                unscaled_top == 0xFC000000 or
+                unscaled_top == 0xFC400000) .simd else .gpr,
+            .load_rt1 = if (decoded[0] == .load and
+                unscaled_top != 0x3CC00000 and
+                unscaled_top != 0xBC400000 and
+                unscaled_top != 0xFC400000) rt else null,
+        };
+    }
+
+    const pair = switch (top) {
+        0xA9000000 => .{ FrameAccessKind.store, @as(u8, 8), FrameAddressingMode.signed_pair, @as(?i32, null) },
+        0xA9400000 => .{ FrameAccessKind.load, @as(u8, 8), FrameAddressingMode.signed_pair, @as(?i32, null) },
+        0xA9800000 => .{ FrameAccessKind.store, @as(u8, 8), FrameAddressingMode.pre_index, @as(?i32, 0) },
+        0xA8C00000 => .{ FrameAccessKind.load, @as(u8, 8), FrameAddressingMode.post_index, @as(?i32, 0) },
+        0x29000000 => .{ FrameAccessKind.store, @as(u8, 4), FrameAddressingMode.signed_pair, @as(?i32, null) },
+        0x29400000 => .{ FrameAccessKind.load, @as(u8, 4), FrameAddressingMode.signed_pair, @as(?i32, null) },
+        else => null,
+    };
+    if (pair) |decoded| {
+        const byte_displacement = signedBits((word >> 15) & 0x7F, 7) * decoded[1];
+        const memory_displacement = if (decoded[2] == .post_index)
+            0
+        else
+            byte_displacement;
+        const rt2: Reg = @enumFromInt(@as(u5, @truncate(word >> 10)));
+        return .{
+            .kind = decoded[0],
+            .encoded_base = rn,
+            .encoded_displacement = memory_displacement,
+            .addressing_mode = decoded[2],
+            .width = decoded[1],
+            .pair = true,
+            .data_rt1 = @intFromEnum(rt),
+            .data_rt2 = @intFromEnum(rt2),
+            .data_register_class = .gpr,
+            .load_rt1 = if (decoded[0] == .load) rt else null,
+            .load_rt2 = if (decoded[0] == .load) rt2 else null,
+            .writeback_delta = if (decoded[3] != null) byte_displacement else null,
+        };
+    }
+
+    const simd_top = word & 0xFFFFFC00;
+    const simd = switch (simd_top) {
+        0x3DC00000 => .{ FrameAccessKind.load, @as(u8, 16) },
+        0x3D800000 => .{ FrameAccessKind.store, @as(u8, 16) },
+        0xBD400000 => .{ FrameAccessKind.load, @as(u8, 4) },
+        0xFD400000 => .{ FrameAccessKind.load, @as(u8, 8) },
+        else => null,
+    };
+    if (simd) |decoded| {
+        return .{
+            .kind = decoded[0],
+            .encoded_base = rn,
+            .encoded_displacement = 0,
+            .addressing_mode = .simd_zero_offset,
+            .width = decoded[1],
+            .data_rt1 = @intFromEnum(rt),
+            .data_register_class = .simd,
+        };
+    }
+    return null;
+}
+
+fn decodeMoveWide(word: u32) ?struct { reg: Reg, value: u64, keep: bool, shift: u6 } {
+    const top = word & 0xFF800000;
+    if (top != 0xD2800000 and top != 0xF2800000) return null;
+    return .{
+        .reg = @enumFromInt(@as(u5, @truncate(word))),
+        .value = @as(u64, (word >> 5) & 0xFFFF),
+        .keep = top == 0xF2800000,
+        .shift = @intCast(((word >> 21) & 0x3) * 16),
+    };
+}
+
+fn decodeAddSubImmediate(word: u32) ?struct {
+    rd: Reg,
+    rn: Reg,
+    displacement: i64,
+} {
+    if ((word & 0x1F000000) != 0x11000000 or ((word >> 31) & 1) == 0) return null;
+    const shift: u6 = if (((word >> 22) & 1) != 0) 12 else 0;
+    const imm = @as(i64, (word >> 10) & 0xFFF) << shift;
+    return .{
+        .rd = @enumFromInt(@as(u5, @truncate(word))),
+        .rn = @enumFromInt(@as(u5, @truncate(word >> 5))),
+        .displacement = if (((word >> 30) & 1) != 0) -imm else imm,
+    };
+}
+
+fn decodeAddRegister(word: u32) ?struct { rd: Reg, rn: Reg, rm: Reg } {
+    if ((word & 0xFFE0FC00) != 0x8B000000) return null;
+    return .{
+        .rd = @enumFromInt(@as(u5, @truncate(word))),
+        .rn = @enumFromInt(@as(u5, @truncate(word >> 5))),
+        .rm = @enumFromInt(@as(u5, @truncate(word >> 16))),
+    };
+}
+
+fn isControlTransfer(word: u32) bool {
+    return (word & 0x7C000000) == 0x14000000 or // B/BL immediate
+        (word & 0xFF000010) == 0x54000000 or // B.cond
+        (word & 0x7E000000) == 0x34000000 or // CBZ/CBNZ
+        (word & 0x7E000000) == 0x36000000 or // TBZ/TBNZ
+        (word & 0xFFFFFC1F) == 0xD61F0000 or // BR
+        (word & 0xFFFFFC1F) == 0xD63F0000 or // BLR
+        (word & 0xFFFFFC1F) == 0xD65F0000; // RET
+}
+
+fn relationForBase(
+    reg: Reg,
+    relations: *const [32]?FrameRelation,
+    sp_from_fp: ?i64,
+) ?FrameRelation {
+    _ = sp_from_fp;
+    if (reg == .fp) return .{ .base = .fp, .displacement = 0 };
+    if (reg == .sp) return .{ .base = .sp, .displacement = 0 };
+    return relations[@intFromEnum(reg)];
+}
+
+/// Decode final emitted words, after peepholes, NOP patching, post-emission
+/// coalescing, and branch relaxation. This makes diagnostics observe exactly
+/// the code that will be stored in the AOT text section.
+pub fn traceFrameAccesses(
+    allocator: std.mem.Allocator,
+    code: []const u8,
+) ![]FrameAccess {
+    if (code.len % 4 != 0) return error.MisalignedAarch64Code;
+    var accesses: std.ArrayList(FrameAccess) = .empty;
+    errdefer accesses.deinit(allocator);
+
+    var relations: [32]?FrameRelation = .{null} ** 32;
+    var constants: [32]?u64 = .{null} ** 32;
+    var sp_from_fp: ?i64 = null;
+
+    var native_start: usize = 0;
+    while (native_start < code.len) : (native_start += 4) {
+        const word = std.mem.readInt(u32, code[native_start..][0..4], .little);
+        if (decodeFrameMemory(word)) |memory| {
+            if (relationForBase(memory.encoded_base, &relations, sp_from_fp)) |relation| {
+                const component_count: u2 = if (memory.pair) 2 else 1;
+                var components: [2]FrameAccessComponent = undefined;
+                components[0] = .{
+                    .base = relation.base,
+                    .displacement = @intCast(relation.displacement + memory.encoded_displacement),
+                    .width = memory.width,
+                    .data_register = memory.data_rt1,
+                    .data_register_class = memory.data_register_class,
+                };
+                components[1] = if (memory.pair) .{
+                    .base = relation.base,
+                    .displacement = @intCast(
+                        relation.displacement + memory.encoded_displacement + memory.width,
+                    ),
+                    .width = memory.width,
+                    .data_register = memory.data_rt2.?,
+                    .data_register_class = memory.data_register_class,
+                } else components[0];
+                try accesses.append(allocator, .{
+                    .native_start = @intCast(native_start),
+                    .native_end = @intCast(native_start + 4),
+                    .kind = memory.kind,
+                    .encoded_base = memory.encoded_base,
+                    .encoded_displacement = memory.encoded_displacement,
+                    .addressing_mode = if (memory.encoded_base == .fp or memory.encoded_base == .sp)
+                        memory.addressing_mode
+                    else
+                        .materialized,
+                    .components = components,
+                    .component_count = component_count,
+                });
+            }
+            if (memory.load_rt1) |rt| {
+                relations[@intFromEnum(rt)] = null;
+                constants[@intFromEnum(rt)] = null;
+            }
+            if (memory.load_rt2) |rt| {
+                relations[@intFromEnum(rt)] = null;
+                constants[@intFromEnum(rt)] = null;
+            }
+            if (memory.writeback_delta) |delta| {
+                if (memory.encoded_base == .sp and sp_from_fp != null) {
+                    sp_from_fp.? += delta;
+                }
+                relations[@intFromEnum(memory.encoded_base)] = null;
+                constants[@intFromEnum(memory.encoded_base)] = null;
+            }
+            continue;
+        }
+
+        if (decodeMoveWide(word)) |move| {
+            const idx = @intFromEnum(move.reg);
+            if (move.keep) {
+                if (constants[idx]) |prior| {
+                    const mask = ~(@as(u64, 0xFFFF) << move.shift);
+                    constants[idx] = (prior & mask) | (move.value << move.shift);
+                } else {
+                    constants[idx] = null;
+                }
+            } else {
+                constants[idx] = move.value << move.shift;
+            }
+            relations[idx] = null;
+            continue;
+        }
+
+        if (decodeAddSubImmediate(word)) |add| {
+            const rd_idx = @intFromEnum(add.rd);
+            if (add.rd == .fp and add.rn == .sp and add.displacement == 0) {
+                relations[rd_idx] = .{ .base = .fp, .displacement = 0 };
+                sp_from_fp = 0;
+            } else if (relationForBase(add.rn, &relations, sp_from_fp)) |relation| {
+                relations[rd_idx] = .{
+                    .base = relation.base,
+                    .displacement = relation.displacement + add.displacement,
+                };
+            } else {
+                relations[rd_idx] = null;
+            }
+            constants[rd_idx] = null;
+            if (add.rd == .sp and add.rn == .sp) {
+                if (sp_from_fp) |delta| sp_from_fp = delta + add.displacement;
+            }
+            continue;
+        }
+
+        if (decodeAddRegister(word)) |add| {
+            const rd_idx = @intFromEnum(add.rd);
+            const rn_relation = relationForBase(add.rn, &relations, sp_from_fp);
+            const rm_relation = relationForBase(add.rm, &relations, sp_from_fp);
+            if (rn_relation != null and constants[@intFromEnum(add.rm)] != null) {
+                relations[rd_idx] = .{
+                    .base = rn_relation.?.base,
+                    .displacement = rn_relation.?.displacement +
+                        @as(i64, @intCast(constants[@intFromEnum(add.rm)].?)),
+                };
+            } else if (rm_relation != null and constants[@intFromEnum(add.rn)] != null) {
+                relations[rd_idx] = .{
+                    .base = rm_relation.?.base,
+                    .displacement = rm_relation.?.displacement +
+                        @as(i64, @intCast(constants[@intFromEnum(add.rn)].?)),
+                };
+            } else {
+                relations[rd_idx] = null;
+            }
+            constants[rd_idx] = null;
+            continue;
+        }
+
+        if (isControlTransfer(word)) {
+            for (0..29) |idx| {
+                relations[idx] = null;
+                constants[idx] = null;
+            }
+            continue;
+        }
+
+        // Conservatively forget the architectural Rd field for unrecognized
+        // data-processing instructions. Store instructions were handled
+        // above; clearing extra state only turns uncertain derived addresses
+        // into explicit non-attribution.
+        const rd: usize = @truncate(word);
+        if (rd < 29) {
+            relations[rd] = null;
+            constants[rd] = null;
+        }
+    }
+    return accesses.toOwnedSlice(allocator);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "emit: ADD x0, x1, x2" {
@@ -2329,6 +2726,100 @@ test "emit: ADD x0, x1, x2" {
     try std.testing.expectEqual(@as(usize, 4), code.len());
     const word = std.mem.readInt(u32, code.getCode()[0..4], .little);
     try std.testing.expectEqual(@as(u32, 0x8B020020), word);
+}
+
+test "frame trace preserves paired accesses as one native instruction" {
+    const allocator = std.testing.allocator;
+    var code = CodeBuffer.initWithPeephole(allocator, .{ .enabled = true });
+    defer code.deinit();
+
+    try code.ldrImm(.x0, .fp, 3);
+    try code.ldrImm(.x1, .fp, 4);
+    const accesses = try traceFrameAccesses(allocator, code.getCode());
+    defer allocator.free(accesses);
+
+    try std.testing.expectEqual(@as(usize, 4), code.len());
+    try std.testing.expectEqual(@as(usize, 1), accesses.len);
+    try std.testing.expectEqual(FrameAccessKind.load, accesses[0].kind);
+    try std.testing.expectEqual(@as(u2, 2), accesses[0].component_count);
+    try std.testing.expectEqual(@as(i32, 24), accesses[0].components[0].displacement);
+    try std.testing.expectEqual(@as(i32, 32), accesses[0].components[1].displacement);
+    try std.testing.expectEqual(@as(u5, 0), accesses[0].components[0].data_register);
+    try std.testing.expectEqual(@as(u5, 1), accesses[0].components[1].data_register);
+}
+
+test "frame trace resolves materialized large vector offsets" {
+    const allocator = std.testing.allocator;
+    var code = CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    try code.movz(.x16, 0x9000, 0);
+    try code.addRegReg(.x16, .x16, .fp);
+    try code.ldrQ(0, .x16);
+    const accesses = try traceFrameAccesses(allocator, code.getCode());
+    defer allocator.free(accesses);
+
+    try std.testing.expectEqual(@as(usize, 1), accesses.len);
+    try std.testing.expectEqual(Reg.x16, accesses[0].encoded_base);
+    try std.testing.expectEqual(FrameAddressingMode.materialized, accesses[0].addressing_mode);
+    try std.testing.expectEqual(Reg.fp, accesses[0].components[0].base);
+    try std.testing.expectEqual(@as(i32, 0x9000), accesses[0].components[0].displacement);
+    try std.testing.expectEqual(@as(u8, 16), accesses[0].components[0].width);
+}
+
+test "frame trace decodes signed unscaled scalar and vector offsets" {
+    const allocator = std.testing.allocator;
+    var code = CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    try code.emit32(0xF85F83A1); // ldur x1, [x29, #-8]
+    try code.emit32(0x3C9F03A0); // stur q0, [x29, #-16]
+    const accesses = try traceFrameAccesses(allocator, code.getCode());
+    defer allocator.free(accesses);
+
+    try std.testing.expectEqual(@as(usize, 2), accesses.len);
+    try std.testing.expectEqual(FrameAddressingMode.signed_unscaled, accesses[0].addressing_mode);
+    try std.testing.expectEqual(@as(i32, -8), accesses[0].components[0].displacement);
+    try std.testing.expectEqual(@as(u8, 8), accesses[0].components[0].width);
+    try std.testing.expectEqual(FrameAddressingMode.signed_unscaled, accesses[1].addressing_mode);
+    try std.testing.expectEqual(@as(i32, -16), accesses[1].components[0].displacement);
+    try std.testing.expectEqual(@as(u8, 16), accesses[1].components[0].width);
+}
+
+test "frame trace distinguishes prologue and epilogue SP addressing" {
+    const allocator = std.testing.allocator;
+    var code = CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    try code.stpPre(.fp, .lr, .sp, -8);
+    try code.movFromSp(.fp);
+    try code.ldpPost(.fp, .lr, .sp, 8);
+    const accesses = try traceFrameAccesses(allocator, code.getCode());
+    defer allocator.free(accesses);
+
+    try std.testing.expectEqual(@as(usize, 2), accesses.len);
+    try std.testing.expectEqual(FrameAddressingMode.pre_index, accesses[0].addressing_mode);
+    try std.testing.expectEqual(@as(i32, -64), accesses[0].encoded_displacement);
+    try std.testing.expectEqual(FrameAddressingMode.post_index, accesses[1].addressing_mode);
+    try std.testing.expectEqual(@as(i32, 0), accesses[1].encoded_displacement);
+    try std.testing.expectEqual(@as(i32, 0), accesses[1].components[0].displacement);
+}
+
+test "frame trace forgets materialized addresses at compare-and-branch control flow" {
+    const allocator = std.testing.allocator;
+    var code = CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    try code.movImm64(.x16, 64);
+    try code.addRegReg(.x16, .x16, .fp);
+    try code.cbz64(.x0, 1);
+    try code.ldrImm(.x1, .x16, 0);
+    const accesses = try traceFrameAccesses(allocator, code.getCode());
+    defer allocator.free(accesses);
+
+    try std.testing.expectEqual(@as(usize, 0), accesses.len);
+    try std.testing.expect(isControlTransfer(0x36000000));
+    try std.testing.expect(isControlTransfer(0x37000000));
 }
 
 test "emit: SUB x3, x4, x5" {

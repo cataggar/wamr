@@ -313,8 +313,21 @@ class KeyvaultHarnessTest(unittest.TestCase):
         cwasm = self.scratch / "core.cwasm"
         text = b"\x90" * 8
         functions = struct.pack("<III", 1, 0, 0)
+        target_info = struct.pack(
+            "<HHHHII16sQ",
+            2,
+            0,
+            1,
+            0x3E,
+            0,
+            0,
+            b"x86_64".ljust(16, b"\0"),
+            0,
+        )
         cwasm.write_bytes(
             struct.pack("<II", attr.AOT_MAGIC, attr.AOT_VERSION)
+            + struct.pack("<II", attr.SEC_TARGET_INFO, len(target_info))
+            + target_info
             + struct.pack("<II", attr.SEC_TEXT, len(text))
             + text
             + struct.pack("<II", attr.SEC_FUNCTION, len(functions))
@@ -330,6 +343,8 @@ class KeyvaultHarnessTest(unittest.TestCase):
             str(perf),
             "--cwasm",
             str(cwasm),
+            "--arch",
+            "x86_64",
             "--json-out",
             str(output),
             "--min-samples",
