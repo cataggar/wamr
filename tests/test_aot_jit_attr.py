@@ -9,6 +9,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -434,7 +435,103 @@ def load_aarch64_from_dict(raw, code=ARM_BL + ARM_LDR + ARM_STR):
         )
 
 
+def aarch64_pair_metadata_for(mixed=False):
+    code = struct.pack("<I", 0xA94307A0)  # ldp x0, x1, [x29, #48]
+    raw = aarch64_metadata_for()
+    raw.update(
+        module_text_size=len(code),
+        module_text_sha256=hashlib.sha256(code).hexdigest(),
+        code_size=len(code),
+        normalized_relocations=[],
+        normalized_code_sha256=hashlib.sha256(code).hexdigest(),
+    )
+    spill_base = 56 if mixed else 48
+    slots = 1 if mixed else 2
+    raw["frame_regions"][-1].update(start=spill_base, end=64)
+    raw["frame_layout"].update(spill_base=spill_base, spill_slots=slots)
+    if mixed:
+        raw["frame_layout"]["locals_first_offset"] = 48
+        raw["frame_regions"][-2].update(start=48, end=56)
+    raw["spill_metric"].update(
+        slots=slots, spilled_vregs=slots, scalar=slots,
+        slots_scalar=slots, spill_ld=slots, spill_st=0,
+    )
+    raw["emitted_allocator_loads"] = slots
+    raw["emitted_allocator_stores"] = 0
+    value_template = raw["allocator_values"][0]
+    raw["allocator_values"] = [
+        {
+            **value_template,
+            "vreg": 70 + index,
+            "frame_offset": 48 + index * 8,
+            "slot": index - int(mixed),
+            "reload_count": 1,
+            "store_count": 0,
+        }
+        for index in range(int(mixed), 2)
+    ]
+    components = []
+    for index in range(2):
+        component = {
+            **raw["accesses"][0]["components"][0],
+            "slot": index - int(mixed),
+            "vreg": 70 + index,
+            "frame_offset": 48 + index * 8,
+            "data_register": index,
+        }
+        if mixed and index == 0:
+            component.update(
+                origin="wasm_local_or_phi", detail="wasm_local_or_lowered_phi",
+                slot=None, local_index=0, vreg=None, defining_opcode=None,
+                source_class=None, rematerialization_eligible=None,
+            )
+        components.append(component)
+    raw["accesses"] = [
+        {
+            **raw["accesses"][0],
+            "native_start": 0, "native_end": 4,
+            "frame_offset": 48, "width": 16,
+            "vreg": None, "vreg_ambiguous": True,
+            "defining_opcode": None, "source_class": None,
+            "rematerialization_eligible": None,
+            "encoded_offset": 48, "addressing_mode": "signed_pair",
+            "origin": "unknown" if mixed else "allocator_spill",
+            "detail": "mixed_pair_frame_access" if mixed else "allocator_slot",
+            "components": components,
+        }
+    ]
+    return raw, code
+
+
 class FrameAttributionUnitTests(unittest.TestCase):
+    def test_allocator_sources_must_match_canonical_values(self):
+        for architecture in ("x86_64", "aarch64"):
+            for key, value in (
+                ("defining_opcode", "iconst_32"),
+                ("source_class", "constant"),
+                ("rematerialization_eligible", True),
+                ("rematerialization_eligible", 0),
+            ):
+                with self.subTest(architecture=architecture, field=key, value=value):
+                    raw = metadata_for() if architecture == "x86_64" else aarch64_metadata_for()
+                    access = raw["accesses"][0]
+                    access[key] = value
+                    if architecture == "aarch64":
+                        access["components"][0][key] = value
+                    loader = load_from_dict if architecture == "x86_64" else load_aarch64_from_dict
+                    with self.assertRaisesRegex(aot.AttributionError, "allocator source"):
+                        loader(raw)
+        for key, value in (
+            ("defining_opcode", "load"),
+            ("source_class", "memory_or_runtime"),
+            ("rematerialization_eligible", False),
+        ):
+            with self.subTest(ambiguous_field=key):
+                raw = metadata_for()
+                raw["accesses"][1][key] = value
+                with self.assertRaisesRegex(aot.AttributionError, "must be null"):
+                    load_from_dict(raw)
+
     def test_frame_operand_supports_signed_rsp_and_complex_forms(self):
         self.assertEqual(
             aot.FrameOperand("load", "rbp", -560, False),
@@ -1085,72 +1182,7 @@ class FrameAttributionUnitTests(unittest.TestCase):
             load_aarch64_from_dict(raw)
 
     def test_aarch64_pair_samples_are_not_double_counted(self):
-        code = struct.pack("<I", 0xA94307A0)  # ldp x0, x1, [x29, #48]
-        raw = aarch64_metadata_for()
-        raw["module_text_size"] = len(code)
-        raw["module_text_sha256"] = hashlib.sha256(code).hexdigest()
-        raw["code_size"] = len(code)
-        raw["normalized_relocations"] = []
-        raw["normalized_code_sha256"] = hashlib.sha256(code).hexdigest()
-        raw["frame_regions"][-1]["start"] = 48
-        raw["frame_regions"][-1]["end"] = 64
-        raw["frame_layout"]["spill_base"] = 48
-        raw["frame_layout"]["spill_slots"] = 2
-        raw["spill_metric"].update(
-            {
-                "slots": 2,
-                "spilled_vregs": 2,
-                "scalar": 2,
-                "slots_scalar": 2,
-                "spill_ld": 2,
-                "spill_st": 0,
-            }
-        )
-        raw["emitted_allocator_loads"] = 2
-        raw["emitted_allocator_stores"] = 0
-        raw["allocator_values"] = [
-            {
-                **raw["allocator_values"][0],
-                "vreg": 70,
-                "frame_offset": 48,
-                "slot": 0,
-                "reload_count": 1,
-                "store_count": 0,
-            },
-            {
-                **raw["allocator_values"][0],
-                "vreg": 71,
-                "frame_offset": 56,
-                "slot": 1,
-                "reload_count": 1,
-                "store_count": 0,
-            },
-        ]
-        components = []
-        for slot, vreg, offset in ((0, 70, 48), (1, 71, 56)):
-            components.append(
-                {
-                    **raw["accesses"][0]["components"][0],
-                    "slot": slot,
-                    "vreg": vreg,
-                    "frame_offset": offset,
-                    "data_register": slot,
-                }
-            )
-        raw["accesses"] = [
-            {
-                **raw["accesses"][0],
-                "native_start": 0,
-                "native_end": 4,
-                "frame_offset": 48,
-                "width": 16,
-                "vreg": None,
-                "vreg_ambiguous": True,
-                "encoded_offset": 48,
-                "addressing_mode": "signed_pair",
-                "components": components,
-            }
-        ]
+        raw, code = aarch64_pair_metadata_for()
         metadata = load_aarch64_from_dict(raw, code)
         instructions = [
             aot.Instruction(0x1000, 0, 4, "ldp x0, x1, [x29, #48]")
@@ -1175,6 +1207,21 @@ class FrameAttributionUnitTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(paired))
         self.assertEqual([70, 71], paired[0]["candidate_vregs"])
+
+    def test_mixed_pair_preserves_unranked_allocator_components(self):
+        raw, code = aarch64_pair_metadata_for(mixed=True)
+        metadata = load_aarch64_from_dict(raw, code)
+        instructions = [aot.Instruction(0x1000, 0, 4, "ldp x0, x1, [x29, #48]")]
+        aot.validate_metadata_disassembly(metadata, instructions)
+        summary = aot.build_frame_summary(instructions, {0x1000: 5}, metadata)
+        self.assertEqual(5, summary["origins"]["unknown"]["samples"])
+        self.assertEqual([], summary["allocator_contributors"])
+        self.assertEqual(
+            {"total_loads": 1, "total_stores": 0, "unranked_loads": 1, "unranked_stores": 0},
+            summary["allocator_component_counts"],
+        )
+        self.assertEqual(1, summary["reconciliation"]["emitted_allocator_loads"])
+        self.assertTrue(summary["reconciliation"]["matches"])
 
     def test_aarch64_materialized_frame_address_is_proven_from_native_code(self):
         movz_x16_9000 = struct.pack("<I", 0xD2920010)
@@ -1248,6 +1295,38 @@ class FrameAttributionUnitTests(unittest.TestCase):
 
 @unittest.skipUnless(WAMRC, "pass --wamrc for compiler/sidecar smoke coverage")
 class FrameAttributionCompilerSmoke(unittest.TestCase):
+    def test_metric_only_scalar_fallback_preserves_native_bytes(self):
+        with tempfile.TemporaryDirectory(
+            prefix="frame-metric-fallback-", dir=ROOT / ".zig-cache"
+        ) as temp:
+            work = Path(temp)
+            baseline = work / "baseline.cwasm"
+            diagnosed = work / "diagnosed.cwasm"
+            command = [
+                str(WAMRC), "compile", "--target=aarch64",
+                "--aarch64-no-xreg-alloc", str(ROOT / "tests/coldstart/noop.wasm"),
+            ]
+            env = os.environ.copy()
+            for key in (
+                "WAMR_AOT_FRAME_ATTRIBUTION", "WAMR_AOT_FRAME_ATTRIBUTION_MODULE",
+                "WAMR_AOT_FRAME_ATTRIBUTION_FUNC", "WAMR_AOT_SPILL_METRIC",
+                "WAMR_AOT_SPILL_METRIC_MODULE", "WAMR_AOT_SPILL_METRIC_FUNC",
+            ):
+                env.pop(key, None)
+            result = subprocess.run(
+                command + ["-o", str(baseline)],
+                cwd=ROOT, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            env.update(WAMR_AOT_SPILL_METRIC="1", WAMR_AOT_SPILL_METRIC_MIN_SPILLS="0")
+            result = subprocess.run(
+                command + ["-o", str(diagnosed)],
+                cwd=ROOT, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("[aot-spill-metric]", result.stderr)
+            self.assertEqual(baseline.read_bytes(), diagnosed.read_bytes())
+
     def _run_tracked_core_wasm_sidecar(self, architecture):
         work = (
             ROOT

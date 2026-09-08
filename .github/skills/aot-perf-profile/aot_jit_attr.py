@@ -1438,12 +1438,30 @@ def load_frame_metadata(
             )
         if vreg is not None:
             value = value_by_vreg[vreg]
+            for key in (
+                "defining_opcode", "source_class", "rematerialization_eligible"
+            ):
+                if component.get(key) != value.get(key) or type(
+                    component.get(key)
+                ) is not type(value.get(key)):
+                    raise AttributionError(
+                        f"{path}: allocator source {key} disagrees with vreg {vreg}"
+                    )
             remaining_slots = value["slot"] + value["slot_count"] - slot
             if remaining_slots <= 0 or width > remaining_slots * stride:
                 raise AttributionError(
                     f"{path}: allocator component at {start} exceeds vreg "
                     f"{vreg} slot coverage"
                 )
+        elif any(
+            component.get(key) is not None
+            for key in (
+                "defining_opcode", "source_class", "rematerialization_eligible"
+            )
+        ):
+            raise AttributionError(
+                f"{path}: unresolved allocator source fields must be null at {start}"
+            )
         if len(candidates) > 1 and vreg is None and not ambiguous:
             raise AttributionError(
                 f"{path}: reused slot {slot} lacks a resolved vreg or "
@@ -1995,6 +2013,7 @@ def build_frame_summary(instructions, counts, metadata):
     proven_origin_samples = 0
     unknown = []
     contributors = {}
+    allocator_component_counts = Counter()
 
     for instruction in instructions:
         access = metadata.access_by_start.get(instruction.offset)
@@ -2041,9 +2060,6 @@ def build_frame_summary(instructions, counts, metadata):
                     "detail": access.get("detail"),
                 }
             )
-        if origin != "allocator_spill":
-            continue
-
         components = (
             access["components"] if schema_version == 2 else [access]
         )
@@ -2052,6 +2068,12 @@ def build_frame_summary(instructions, counts, metadata):
             for component in components
             if component["origin"] == "allocator_spill"
         ]
+        direction = f"{access['kind']}s"
+        allocator_component_counts[f"total_{direction}"] += len(allocator_components)
+        if origin != "allocator_spill":
+            allocator_component_counts[f"unranked_{direction}"] += len(allocator_components)
+            continue
+
         component_keys = []
         for component in allocator_components:
             slot = component["slot"]
@@ -2073,10 +2095,10 @@ def build_frame_summary(instructions, counts, metadata):
                         candidate["vreg"]
                         for candidate in metadata.values_by_slot.get(slot, [])
                     ],
-                    "defining_opcode": component.get("defining_opcode"),
-                    "source_class": component.get("source_class"),
-                    "rematerialization_eligible": component.get(
-                        "rematerialization_eligible"
+                    "defining_opcode": value.get("defining_opcode") if value else None,
+                    "source_class": value.get("source_class") if value else None,
+                    "rematerialization_eligible": (
+                        value.get("rematerialization_eligible") if value else None
                     ),
                     "source_reload_count": (
                         value.get("reload_count") if value else None
@@ -2183,6 +2205,10 @@ def build_frame_summary(instructions, counts, metadata):
         },
         "origins": origins,
         "allocator_contributors": ranked,
+        "allocator_component_counts": {
+            key: allocator_component_counts[key]
+            for key in ("total_loads", "total_stores", "unranked_loads", "unranked_stores")
+        },
         "unknown_instructions": unknown,
         "reconciliation": metadata.reconciliation,
     }
@@ -2218,6 +2244,13 @@ def print_frame_summary(summary, total_samples, top):
         f"{reconciliation['spill_metric_loads']}/"
         f"{reconciliation['spill_metric_stores']} (match)"
     )
+    components = summary["allocator_component_counts"]
+    if components["unranked_loads"] or components["unranked_stores"]:
+        print(
+            "  mixed-origin allocator components outside sample ranking: "
+            f"ld/st={components['unranked_loads']}/{components['unranked_stores']}; "
+            "instruction samples remain unknown"
+        )
     for origin, values in sorted(
         summary["origins"].items(),
         key=lambda item: (-item[1]["samples"], item[0]),

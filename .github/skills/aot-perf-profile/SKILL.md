@@ -251,10 +251,14 @@ instructions. With `--frame-metadata`, it also ranks allocator contributors by
 slot/vreg/source, reports static and sampled frame-attribution coverage and
 unknowns, and requires exact reconciliation between emitted allocator
 load/store records and the sidecar's `WAMR_AOT_SPILL_METRIC` totals.
-On x86_64 and AArch64, `spill_ld`/`spill_st` are emitter-traced totals (so
-folded/suppressed values do not inflate the metric, and AArch64 pair accesses
-reconcile as two value components). The allocator-value records retain their
-IR use/def counts so the distinction from emitted traffic stays inspectable.
+On x86_64, and for AArch64 functions selected for a frame sidecar,
+`spill_ld`/`spill_st` are emitter-traced totals. AArch64 metric-only runs
+retain the legacy IR estimate, including when an allocator is disabled.
+Pair accesses reconcile as two value components but carry samples only once.
+Allocator components in a mixed-origin pair remain in explicit component
+totals, while the indivisible instruction's samples remain unknown rather
+than entering allocator contributor rankings. The allocator-value records
+retain IR use/def counts so the distinction from emitted traffic stays inspectable.
 
 The tool fails closed on an incompatible AOT/metadata schema, stale full-core
 text hash or function native-code hash, malformed or overlapping native

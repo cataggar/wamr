@@ -2567,8 +2567,8 @@ pub fn compileFunctionImpl(
     }
 
     // Compute the architecture-neutral allocation summary when either the
-    // legacy stderr metric or the exact frame sidecar needs it. Emitted
-    // reload/store totals are replaced from final machine-code tracing below.
+    // legacy stderr metric or the exact frame sidecar needs it. Selected
+    // sidecars replace the IR estimate with final machine-code tracing below.
     const spill_metric_needed = ctx.frame_attribution_ctx != null or
         (ctx.options.spill_metric.enabled and
             ctx.options.spill_metric.moduleMatches(ctx.options.module_idx));
@@ -2967,7 +2967,7 @@ pub fn compileFunctionImpl(
         code.patch32(p.patch_offset, new_word);
     }
 
-    if (spill_metric_needed) {
+    if (ctx.frame_attribution_ctx != null) {
         const scalar_alloc = if (alloc_result_storage) |*ar| ar else return error.FrameAttributionRequiresLinearScan;
         const v128_alloc = if (v128_alloc_result_storage) |*ar| ar else return error.FrameAttributionRequiresLinearScan;
         const raw_accesses = try emit.traceFrameAccesses(allocator, code.getCode());
@@ -3013,22 +3013,6 @@ pub fn compileFunctionImpl(
 
         spill_metric_value.?.spill_loads = emitted_loads;
         spill_metric_value.?.spill_stores = emitted_stores;
-        if (ctx.options.spill_metric.shouldLog(
-            ctx.options.module_idx,
-            ctx.func_idx,
-            spill_metric_value.?.spilled_vregs,
-        )) {
-            codegen_timing.printSpill(.{
-                .module_idx = ctx.options.module_idx,
-                .func_idx = ctx.func_idx,
-                .func_name = func.name orelse "<anon>",
-                .insts = aarch64CountInstructions(func),
-                .clobbers = @intCast(clobbers.items.len),
-                .spill_count = spill_metric_total_slots,
-                .metric = spill_metric_value.?,
-            });
-        }
-
         if (ctx.frame_attribution_ctx) |frame_ctx| {
             const call_patches = if (ctx.call_patches) |patches_list|
                 patches_list.items
@@ -3131,6 +3115,23 @@ pub fn compileFunctionImpl(
             output.* = pending;
             spill_values_owned = false;
             accesses_owned = false;
+        }
+    }
+    if (spill_metric_value) |metric| {
+        if (ctx.options.spill_metric.shouldLog(
+            ctx.options.module_idx,
+            ctx.func_idx,
+            metric.spilled_vregs,
+        )) {
+            codegen_timing.printSpill(.{
+                .module_idx = ctx.options.module_idx,
+                .func_idx = ctx.func_idx,
+                .func_name = func.name orelse "<anon>",
+                .insts = aarch64CountInstructions(func),
+                .clobbers = @intCast(clobbers.items.len),
+                .spill_count = spill_metric_total_slots,
+                .metric = metric,
+            });
         }
     }
 
@@ -16448,6 +16449,23 @@ test "compileFunction: enable_vreg_alloc false keeps legacy v128 fallback workin
     const counts = countQMemOps(code);
     try std.testing.expectEqual(@as(u32, 1), counts.loads);
     try std.testing.expectEqual(@as(u32, 1), counts.stores);
+
+    for ([_]bool{ false, true }) |enable_xreg_alloc| {
+        for ([_]bool{ false, true }) |enable_vreg_alloc| {
+            const baseline = try compileFunctionWithOptions(&func, allocator, .{
+                .enable_xreg_alloc = enable_xreg_alloc,
+                .enable_vreg_alloc = enable_vreg_alloc,
+            });
+            defer allocator.free(baseline);
+            const diagnosed = try compileFunctionWithOptions(&func, allocator, .{
+                .enable_xreg_alloc = enable_xreg_alloc,
+                .enable_vreg_alloc = enable_vreg_alloc,
+                .spill_metric = .{ .enabled = true },
+            });
+            defer allocator.free(diagnosed);
+            try std.testing.expectEqualSlices(u8, baseline, diagnosed);
+        }
+    }
 }
 
 test "compile: v128 cache survives scalar FP scratch op without stack traffic" {

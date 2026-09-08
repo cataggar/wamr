@@ -211,7 +211,9 @@ samples only once. Its two allocator components still contribute separately
 to emitted load/store counts. Static counts and per-vreg IR snapshots are not
 summed across captures. The selected function's spill metric is emitter-traced;
 unselected functions retain the pre-emission estimate. Unknown origins remain
-explicit, and origin attribution alone does not establish an optimization gain.
+explicit. Mixed-origin pairs retain allocator component counts outside the
+contributor ranking without assigning their samples to either component.
+Origin attribution alone does not establish an optimization gain.
 
 For a local native AArch64 host, create and consume the identity explicitly:
 

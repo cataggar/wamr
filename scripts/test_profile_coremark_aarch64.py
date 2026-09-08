@@ -137,6 +137,10 @@ class CoreMarkProfileTests(unittest.TestCase):
                 "emitted_allocator_loads": 3, "emitted_allocator_stores": 0,
                 "spill_metric_loads": 3, "spill_metric_stores": 0, "matches": True,
             },
+            "allocator_component_counts": {
+                "total_loads": 3, "total_stores": 0,
+                "unranked_loads": 0, "unranked_stores": 0,
+            },
             "unknown_instructions": [],
         }
         metadata = SimpleNamespace(
@@ -230,6 +234,59 @@ class CoreMarkProfileTests(unittest.TestCase):
                     bad["summary"]["coverage"]["unknown_frame_samples"] = 1
                 with self.assertRaises(profile.ProfileError):
                     profile.validate_frame_provenance(bad, report)
+
+    def test_real_mixed_pair_passes_frame_report_conservation(self):
+        from tests.test_aot_jit_attr import (
+            aot, aarch64_pair_metadata_for, load_aarch64_from_dict,
+        )
+
+        raw, code = aarch64_pair_metadata_for(mixed=True)
+        metadata = load_aarch64_from_dict(raw, code)
+        summary = aot.build_frame_summary(
+            [aot.Instruction(0, 0, 4, "ldp x0, x1, [x29, #48]")],
+            {0: 12},
+            metadata,
+        )
+        for values in summary["origins"].values():
+            values["percent_of_run"] = 100.0 * values["samples"] / 200
+        frame = {
+            "schema_version": 1, "module": 0, "local_func": 10,
+            "wasm_function_index": 22, "total_samples": 200,
+            "compiler_sha256": "c" * 64, "cwasm_sha256": "d" * 64,
+            "sample_coordinates": "function-relative native byte offsets",
+            "metadata": {
+                **{key: raw[key] for key in (
+                    "schema", "schema_version", "architecture", "abi",
+                    "module_text_sha256", "normalized_code_sha256",
+                )},
+                "path": "wamr-frame.mod0.func10.json", "sha256": "e" * 64,
+            },
+            "code_size": 4, "function_samples": 12, "summary": summary,
+            "captures": [
+                {"ordinal": 1, "total_samples": 100, "function_samples": 5, "samples_by_offset": [[0, 5]]},
+                {"ordinal": 2, "total_samples": 100, "function_samples": 7, "samples_by_offset": [[0, 7]]},
+            ],
+        }
+        report = {
+            "wasm": {"local_function_count": 73, "imported_function_count": 12},
+            "wamr": {"compiler_sha256": "c" * 64, "cwasm_sha256": "d" * 64},
+            "wamr_captures": [
+                {"total_samples": 100, "attributed_samples": 99},
+                {"total_samples": 100, "attributed_samples": 99},
+            ],
+            "engines": {
+                "wamr": {
+                    "total_samples": 200,
+                    "top_functions": [{"local_func": 10, "samples": 12}],
+                }
+            },
+        }
+        profile.validate_frame_provenance(frame, report)
+        self.assertEqual([], frame["summary"]["allocator_contributors"])
+        self.assertEqual(12, frame["summary"]["coverage"]["unknown_frame_samples"])
+        frame["summary"]["allocator_component_counts"]["unranked_loads"] = 0
+        with self.assertRaisesRegex(profile.ProfileError, "static component"):
+            profile.validate_frame_provenance(frame, report)
 
     def test_analysis_sources_include_loaded_comparison_dependencies(self):
         aot = profile.load_aot_helper(ROOT)

@@ -1117,11 +1117,18 @@ def validate_frame_provenance(frame: dict[str, Any], report: dict[str, Any]) -> 
         metric = _frame_count(
             reconciliation.get(f"spill_metric_{direction}"), f"spill metric {direction}"
         )
-        components = sum(
+        ranked_components = sum(
             _frame_count(item.get(f"static_{direction}"), f"component {direction}")
             for item in contributors
         )
-        if not emitted == metric == components:
+        component_counts = summary["allocator_component_counts"]
+        components = _frame_count(
+            component_counts.get(f"total_{direction}"), f"total component {direction}"
+        )
+        unranked = _frame_count(
+            component_counts.get(f"unranked_{direction}"), f"unranked component {direction}"
+        )
+        if not emitted == metric == components == ranked_components + unranked:
             raise ProfileError("frame static component counts were duplicated or lost")
 
 
@@ -1612,6 +1619,14 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "classes retain their original metadata-free definitions.",
             ]
         )
+        components = summary["allocator_component_counts"]
+        if components["unranked_loads"] or components["unranked_stores"]:
+            lines.append(
+                "Mixed-origin allocator components outside the sample ranking: "
+                f"{components['unranked_loads']} loads / "
+                f"{components['unranked_stores']} stores. Their indivisible "
+                "instruction samples remain unknown."
+            )
     lines.extend(
         [
             "",

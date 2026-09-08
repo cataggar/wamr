@@ -19,3 +19,8 @@ are identical, and the standalone `aot_jit_attr.py
 pair. Consumer fixtures also cover target-info architecture/ABI binding,
 materialized large offsets, pair register/width identity, and corrupt
 offset/slot/region metadata.
+
+Resolved access source fields must match their allocator-value records;
+ambiguous accesses cannot claim a source or rematerialization eligibility.
+Mixed local/spill pairs retain both static components, but their samples
+remain unknown and are not assigned to the allocator contributor ranking.
