@@ -43,9 +43,10 @@ ALL_ALU_WORDING = (
     "shifts, compares, csel, and address-generation instructions"
 )
 NARROW_ALU_WORDING = (
-    "architecture-only CFG and reaching-definition paths partition existing "
-    "all_alu samples into address_generation, proven_bounds_check, "
-    "algorithmic_alu, mixed, and unknown without engine-register heuristics"
+    "architecture-only CFG and reaching-definition paths preserve the legacy "
+    "all_alu partition and separately classify a complete common gating "
+    "universe as address_generation, structural_address_guard, "
+    "algorithmic_alu, mixed, or unknown without engine-register heuristics"
 )
 WASMTIME_SYMBOL_RE = re.compile(
     r"wasm\[(?P<module>\d+)\]::function\[(?P<function>\d+)\]"
@@ -622,6 +623,7 @@ def analyze_wasmtime_alu_provenance(
     wasm_index: int,
     offsets: Counter,
     total_samples: int,
+    global_attributed_samples: int | None = None,
 ) -> dict[str, Any]:
     instructions = compare_hot_function.parse_disassembly(
         objdump_text, wasmtime_wasm_index=wasm_index
@@ -649,6 +651,7 @@ def analyze_wasmtime_alu_provenance(
         address_base=_wasmtime_function_address_base(
             objdump_text, wasm_index
         ),
+        global_attributed_samples=global_attributed_samples,
     )
     result["sample_mapping"] = {
         "mapped_function_samples": sum(mapped.values()),
@@ -665,6 +668,7 @@ def analyze_wamr_alu_provenance(
     capture_counts: list[tuple[dict[int, int], int]],
     total_samples: int,
     scratch_dir: Path,
+    global_attributed_samples: int | None = None,
 ) -> dict[str, Any]:
     start, end = aot.function_bounds(cwasm_info, local_func)
     function_code = cwasm_info.data[
@@ -699,6 +703,7 @@ def analyze_wamr_alu_provenance(
         broad_classes=broad_classes,
         samples_by_offset=samples,
         total_run_samples=total_samples,
+        global_attributed_samples=global_attributed_samples,
     )
     result["sample_mapping"] = {
         "mapped_function_samples": sum(samples.values()),
@@ -818,6 +823,65 @@ def _validate_narrow_alu_analysis(
         != expected_samples
     ):
         raise ProfileError(f"{engine} narrow ALU categories are incomplete")
+    common = analysis.get("common_gating_universe")
+    if (
+        not isinstance(common, dict)
+        or not isinstance(common.get("samples"), int)
+        or common.get("samples") < 0
+        or common.get("samples") > total_samples
+        or common.get("partition_samples") != common.get("samples")
+        or not isinstance(common.get("categories"), dict)
+        or set(common["categories"])
+        != set(aarch64_instruction_provenance.CATEGORIES)
+        or any(
+            not isinstance(values, dict)
+            for values in common["categories"].values()
+        )
+        or sum(
+            values.get("samples", -1)
+            for values in common["categories"].values()
+        )
+        != common.get("samples")
+    ):
+        raise ProfileError(
+            f"{engine} complete common gating universe is invalid"
+        )
+    global_mapping = analysis.get("global_sample_mapping")
+    if (
+        not isinstance(global_mapping, dict)
+        or global_mapping.get("total_samples") != total_samples
+        or not isinstance(global_mapping.get("attributed_samples"), int)
+        or not isinstance(global_mapping.get("unattributed_samples"), int)
+        or global_mapping["attributed_samples"] < 0
+        or global_mapping["unattributed_samples"] < 0
+        or global_mapping["attributed_samples"]
+        + global_mapping["unattributed_samples"]
+        != total_samples
+    ):
+        raise ProfileError(f"{engine} global sample mapping is invalid")
+    accounting = analysis.get("instruction_sample_accounting")
+    if (
+        not isinstance(accounting, dict)
+        or accounting.get("common_candidate_samples")
+        != common.get("samples")
+        or not isinstance(accounting.get("mapped_instruction_samples"), int)
+        or not isinstance(
+            accounting.get(
+                "conclusively_excluded_non_candidate_samples"
+            ),
+            int,
+        )
+        or accounting["mapped_instruction_samples"] < 0
+        or accounting[
+            "conclusively_excluded_non_candidate_samples"
+        ] < 0
+        or accounting["common_candidate_samples"]
+        + accounting["conclusively_excluded_non_candidate_samples"]
+        != accounting["mapped_instruction_samples"]
+    ):
+        raise ProfileError(
+            f"{engine} instruction sample accounting is invalid"
+        )
 
 
 def validate_report(report: dict[str, Any]) -> None:
@@ -1158,7 +1222,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(
             [
                 "",
-                "#### Conservative ALU provenance",
+                "#### Conservative common-universe ALU provenance",
                 "",
                 "| Function | Category | WAMR samples / run share | "
                 "Wasmtime samples / run share | Conservative headroom |",
@@ -1169,8 +1233,12 @@ def render_markdown(report: dict[str, Any]) -> str:
             narrow = item["alu_provenance"]
             gate_categories = narrow["gate"].get("categories", {})
             for category in aarch64_instruction_provenance.CATEGORIES:
-                wamr_values = narrow["wamr"]["categories"][category]
-                wasmtime_values = narrow["wasmtime"]["categories"][category]
+                wamr_values = narrow["wamr"]["common_gating_universe"][
+                    "categories"
+                ][category]
+                wasmtime_values = narrow["wasmtime"][
+                    "common_gating_universe"
+                ]["categories"][category]
                 gate_value = gate_categories.get(category)
                 headroom = (
                     f"{gate_value['conservative_headroom_percentage_points']:+.2f} pp"
@@ -1187,10 +1255,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                 )
             lines.append(
                 f"| `{item['name']}` | `proven coverage` | "
-                f"{narrow['wamr']['coverage']['proven_percent_of_broad_alu']:.2f}% "
-                "of ALU | "
-                f"{narrow['wasmtime']['coverage']['proven_percent_of_broad_alu']:.2f}% "
-                "of ALU | "
+                f"{narrow['wamr']['common_gating_universe']['coverage']['proven_percent']:.2f}% "
+                "of common universe | "
+                f"{narrow['wasmtime']['common_gating_universe']['coverage']['proven_percent']:.2f}% "
+                "of common universe | "
                 f"gate `{narrow['gate']['status']}` |"
             )
     lines.extend(
@@ -1226,10 +1294,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             "that every frame access is an allocator spill. `all_alu` means "
             f"{report['classifier_wording']['all_alu']}; its cross-engine "
             "difference is not address/check headroom. Narrow provenance uses "
-            "the same architecture-only CFG/def-use rules for both engines. "
-            "Unknown, mixed, and unresolved samples remain possible upper "
-            "bounds on the reference engine and cannot clear the optimization "
-            "gate.",
+            "the same complete architecture-only gating universe and CFG/"
+            "def-use rules for both engines. Common-universe unknown/mixed, "
+            "instruction-unresolved, and globally unattributed reference "
+            "samples remain possible upper bounds. Structural address guards "
+            "are diagnostic only and do not imply removable engine checks.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -1743,6 +1812,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         raise ProfileError(
             f"Wasmtime perf data has only {parsed_wasmtime['total_samples']} samples"
         )
+    wasmtime_attributed = sum(
+        item["samples"] for item in parsed_wasmtime["functions"].values()
+    )
 
     matched = []
     for top in top_functions:
@@ -1808,6 +1880,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             capture_counts=wamr_capture_counts,
             total_samples=wamr_attribution["total_samples"],
             scratch_dir=out_dir,
+            global_attributed_samples=wamr_attribution[
+                "attributed_samples"
+            ],
         )
         wasmtime_alu_provenance = analyze_wasmtime_alu_provenance(
             aot=aot,
@@ -1815,6 +1890,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             wasm_index=wasm_index,
             offsets=wasmtime_entry["offsets"],
             total_samples=parsed_wasmtime["total_samples"],
+            global_attributed_samples=wasmtime_attributed,
         )
         narrow_alu = assemble_alu_provenance(
             wamr=wamr_alu_provenance,
@@ -1872,9 +1948,6 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    wasmtime_attributed = sum(
-        item["samples"] for item in parsed_wasmtime["functions"].values()
-    )
     perf_artifacts = [
         gzip_if_small(path, args.max_perf_bytes)
         for path in [*wamr_perfs, *wasmtime_perfs, *jitdumps]
@@ -2080,9 +2153,10 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "Two captures per engine were collected in ABBA order after ABBA warmups.",
             ALL_ALU_WORDING
             + "; the all-ALU differential is not address/check headroom.",
-            "Narrow ALU provenance uses identical architecture-only CFG and "
-            "def-use rules in both engines; unknown, mixed, and unresolved "
-            "samples cannot clear the optimization gate.",
+            "Narrow ALU provenance uses an identical complete architecture-only "
+            "gating universe in both engines; common unknown/mixed, instruction-"
+            "unresolved, and globally unattributed reference samples cannot "
+            "clear the optimization gate. Structural guards are diagnostic only.",
         ],
     }
     bench_coremark.validate_same_host(host_identity)

@@ -4,8 +4,9 @@
 The analysis deliberately uses only architectural instruction semantics.  It
 does not assign meaning to engine-selected registers, nearby instructions, or
 trap-looking branch targets.  Every ALU instruction is placed in exactly one
-of address generation, proven bounds/check work, algorithmic ALU, mixed, or
-unknown.
+of address generation, structural address guard, algorithmic ALU, mixed, or
+unknown.  A separate complete common gating universe prevents legacy display
+classifier differences from becoming optimizer evidence.
 """
 
 from __future__ import annotations
@@ -16,24 +17,28 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ANALYSIS_KIND = "aarch64-conservative-alu-provenance"
 CATEGORIES = (
     "address_generation",
-    "proven_bounds_check",
+    "structural_address_guard",
     "algorithmic_alu",
     "mixed",
     "unknown",
 )
 GATE_CATEGORIES = (
     "address_generation",
-    "proven_bounds_check",
+    "algorithmic_alu",
+)
+PROVEN_CATEGORIES = (
+    "address_generation",
+    "structural_address_guard",
     "algorithmic_alu",
 )
 DEFAULT_GATE_THRESHOLD_PCT = 5.0
 CALLER_CLOBBERED = tuple(f"x{index}" for index in range(19)) + ("x30", "nzcv")
 POSSIBLE_CALL_ARGUMENTS = tuple(f"x{index}" for index in range(8))
-POSSIBLE_RETURN_VALUES = ("x0",)
+POSSIBLE_RETURN_VALUES = ("x0", "x1")
 TRACKED_REGISTERS = (
     tuple(f"x{index}" for index in range(31)) + ("sp", "nzcv")
 )
@@ -128,7 +133,9 @@ ALU_DEST_MNEMONICS = {
     "adr",
     "adrp",
 }
-FLAG_ONLY_MNEMONICS = {"cmp", "cmn", "tst", "ccmp", "ccmn"}
+FLAG_ONLY_MNEMONICS = {"cmp", "cmn", "tst"}
+CONDITIONAL_FLAG_MNEMONICS = {"ccmp", "ccmn"}
+FLOAT_FLAG_MNEMONICS = {"fcmp", "fcmpe", "fccmp", "fccmpe"}
 FLAG_WRITING_MNEMONICS = {
     "adds",
     "subs",
@@ -189,6 +196,8 @@ class Effect:
     trap: bool = False
     memory: bool = False
     recognized: bool = True
+    gating_candidate: bool = False
+    opaque_barrier: bool = False
 
 
 @dataclass(frozen=True)
@@ -335,15 +344,37 @@ def _is_store(mnemonic: str) -> bool:
     return mnemonic.startswith(STORE_PREFIXES)
 
 
+def _opaque_effect(*, gating_candidate: bool) -> Effect:
+    effect = Effect(
+        recognized=False,
+        gating_candidate=gating_candidate,
+        opaque_barrier=True,
+        branch_kind="opaque",
+    )
+    for register in TRACKED_REGISTERS:
+        effect.uses.append(Use(register, "unknown"))
+    effect.definitions.update(TRACKED_REGISTERS)
+    effect.secondary_definitions.update(TRACKED_REGISTERS)
+    return effect
+
+
 def _memory_effect(instruction: Instruction, operands: list[str]) -> Effect:
     effect = Effect(memory=True)
     memory_indices = [
         index for index, operand in enumerate(operands) if "[" in operand
     ]
-    if len(memory_indices) != 1:
-        effect.recognized = False
-        _add_uses(effect, operands, "unknown")
+    if (
+        not memory_indices
+        and _is_load(instruction.mnemonic)
+        and len(operands) >= 2
+    ):
+        destination = registers_in_operand(operands[0])
+        if len(destination) == 1:
+            effect.definitions.add(destination[0])
+            effect.primary_definitions.add(destination[0])
         return effect
+    if len(memory_indices) != 1:
+        return _opaque_effect(gating_candidate=False)
     memory_index = memory_indices[0]
     memory_operand = operands[memory_index]
     address_registers = registers_in_operand(memory_operand)
@@ -353,19 +384,15 @@ def _memory_effect(instruction: Instruction, operands: list[str]) -> Effect:
     load = _is_load(instruction.mnemonic)
     store = _is_store(instruction.mnemonic)
     if not load and not store:
-        effect.recognized = False
-        _add_uses(effect, operands, "unknown")
-        return effect
+        return _opaque_effect(gating_candidate=False)
 
     value_operands = operands[:memory_index]
     if load:
         for operand in value_operands:
             registers = registers_in_operand(operand)
-            if len(registers) != 1:
-                effect.recognized = False
-                continue
-            effect.definitions.add(registers[0])
-            effect.primary_definitions.add(registers[0])
+            if len(registers) == 1:
+                effect.definitions.add(registers[0])
+                effect.primary_definitions.add(registers[0])
     else:
         status_result = instruction.mnemonic.startswith(("stxr", "stlxr"))
         if status_result and value_operands:
@@ -376,7 +403,7 @@ def _memory_effect(instruction: Instruction, operands: list[str]) -> Effect:
             else:
                 effect.recognized = False
             value_operands = value_operands[1:]
-        _add_uses(effect, value_operands, "stored_data")
+        _add_uses(effect, value_operands, "escape")
 
     writeback = memory_operand.rstrip().endswith("]!")
     post_index_operands = operands[memory_index + 1 :]
@@ -385,7 +412,7 @@ def _memory_effect(instruction: Instruction, operands: list[str]) -> Effect:
         _add_uses(effect, post_index_operands, "value")
     if writeback:
         if not address_registers:
-            effect.recognized = False
+            return _opaque_effect(gating_candidate=False)
         else:
             base = address_registers[0]
             effect.definitions.add(base)
@@ -407,6 +434,15 @@ def instruction_effect(instruction: Instruction) -> Effect:
 
     if _is_load(mnemonic) or _is_store(mnemonic):
         return _memory_effect(instruction, operands)
+    if mnemonic == "prfm":
+        memory_operands = [
+            operand for operand in operands if "[" in operand
+        ]
+        if len(memory_operands) != 1:
+            return _opaque_effect(gating_candidate=False)
+        effect = Effect(memory=True)
+        _add_uses(effect, memory_operands, "address")
+        return effect
 
     effect = Effect()
     if mnemonic in TRAP_MNEMONICS:
@@ -453,26 +489,38 @@ def instruction_effect(instruction: Instruction) -> Effect:
         else:
             effect.uses.append(Use("x30", "control"))
         for register in POSSIBLE_RETURN_VALUES:
-            effect.uses.append(Use(register, "return_data"))
+            effect.uses.append(Use(register, "escape"))
+        return effect
+
+    if mnemonic in CONDITIONAL_FLAG_MNEMONICS:
+        effect.gating_candidate = True
+        effect.definitions.add("nzcv")
+        effect.primary_definitions.add("nzcv")
+        effect.uses.append(Use("nzcv", "unknown"))
+        _add_uses(effect, operands, "unknown")
         return effect
 
     if mnemonic in FLAG_ONLY_MNEMONICS:
+        effect.gating_candidate = True
         effect.definitions.add("nzcv")
         effect.primary_definitions.add("nzcv")
         _add_uses(effect, operands, "compare")
-        if mnemonic in {"ccmp", "ccmn"}:
-            effect.uses.append(Use("nzcv", "value", ("nzcv",)))
+        return effect
+
+    if mnemonic in FLOAT_FLAG_MNEMONICS:
+        effect.definitions.add("nzcv")
+        effect.primary_definitions.add("nzcv")
+        if mnemonic.startswith("fcc"):
+            effect.uses.append(Use("nzcv", "unknown"))
         return effect
 
     if mnemonic in ALU_DEST_MNEMONICS or mnemonic in VALUE_TRANSFORM_MNEMONICS:
+        effect.gating_candidate = True
         if not operands:
-            effect.recognized = False
-            return effect
+            return _opaque_effect(gating_candidate=True)
         destination = registers_in_operand(operands[0])
         if len(destination) != 1:
-            effect.recognized = False
-            _add_uses(effect, operands, "unknown")
-            return effect
+            return _opaque_effect(gating_candidate=True)
         dest = destination[0]
         effect.definitions.add(dest)
         effect.primary_definitions.add(dest)
@@ -497,13 +545,10 @@ def instruction_effect(instruction: Instruction) -> Effect:
 
     if mnemonic in MOVE_MNEMONICS:
         if not operands:
-            effect.recognized = False
-            return effect
+            return _opaque_effect(gating_candidate=False)
         destination = registers_in_operand(operands[0])
         if len(destination) != 1:
-            effect.recognized = False
-            _add_uses(effect, operands, "unknown")
-            return effect
+            return _opaque_effect(gating_candidate=False)
         dest = destination[0]
         effect.definitions.add(dest)
         effect.primary_definitions.add(dest)
@@ -513,35 +558,21 @@ def instruction_effect(instruction: Instruction) -> Effect:
         _add_uses(effect, sources, "value", (dest,))
         return effect
 
-    if mnemonic == "prfm":
-        return _memory_effect(instruction, operands)
     if mnemonic == "mrs":
         if operands:
             destination = registers_in_operand(operands[0])
             if len(destination) == 1:
                 effect.definitions.add(destination[0])
                 effect.primary_definitions.add(destination[0])
-        effect.recognized = False
         return effect
     if mnemonic == "msr":
         _add_uses(effect, operands, "unknown")
-        effect.recognized = False
+        if operands and operands[0].strip().lower() == "nzcv":
+            effect.definitions.add("nzcv")
+            effect.primary_definitions.add("nzcv")
         return effect
 
-    explicit_registers = [
-        register
-        for operand in operands
-        for register in registers_in_operand(operand)
-    ]
-    for register in dict.fromkeys(explicit_registers):
-        effect.uses.append(Use(register, "unknown"))
-    if operands:
-        destination = registers_in_operand(operands[0])
-        if len(destination) == 1:
-            effect.definitions.add(destination[0])
-            effect.primary_definitions.add(destination[0])
-    effect.recognized = False
-    return effect
+    return _opaque_effect(gating_candidate=True)
 
 
 def _target_index(
@@ -583,7 +614,7 @@ def build_cfg(
                 successors[index].add(following)
             if target_index is not None:
                 successors[index].add(target_index)
-        elif effect.branch_kind in {"indirect", "return", "trap"}:
+        elif effect.branch_kind in {"indirect", "return", "trap", "opaque"}:
             pass
         elif following is not None:
             successors[index].add(following)
@@ -731,15 +762,15 @@ def _use_sources(
     return incoming[instruction].get(use.register, frozenset())
 
 
-def _proven_bounds_branches(
+def _structural_address_guard_branches(
     effects: Sequence[Effect],
     successors: Sequence[set[int]],
     incoming: Sequence[dict[str, frozenset[Definition]]],
     dominators: Sequence[set[int]],
     reachable: set[int],
 ) -> tuple[set[int], set[Definition], list[dict[str, Any]]]:
-    proven_branches: set[int] = set()
-    proven_definitions: set[Definition] = set()
+    guard_branches: set[int] = set()
+    guard_definitions: set[Definition] = set()
     evidence: list[dict[str, Any]] = []
     trap_memo: dict[int, bool] = {}
     for branch_index, effect in enumerate(effects):
@@ -830,8 +861,8 @@ def _proven_bounds_branches(
         if guarded_access is None:
             continue
 
-        proven_branches.add(branch_index)
-        proven_definitions.update(control_sources)
+        guard_branches.add(branch_index)
+        guard_definitions.update(control_sources)
         evidence.append(
             {
                 "branch_instruction_index": branch_index,
@@ -842,7 +873,7 @@ def _proven_bounds_branches(
                 "compared_definition_register": guarded_access[2],
             }
         )
-    return proven_branches, proven_definitions, evidence
+    return guard_branches, guard_definitions, evidence
 
 
 def _build_consumers(
@@ -870,8 +901,8 @@ def _trace_definition(
     instructions: Sequence[Instruction],
     effects: Sequence[Effect],
     consumers: Mapping[Definition, Sequence[Consumer]],
-    proven_branches: set[int],
-    proven_bounds_definitions: set[Definition],
+    structural_guard_branches: set[int],
+    structural_guard_definitions: set[Definition],
     stack: set[Definition],
     memo: dict[Definition, Trace],
 ) -> Trace:
@@ -907,19 +938,21 @@ def _trace_definition(
         role = consumer.use.role
         if role == "address":
             result.roles.add("address")
-        elif role in {"stored_data", "return_data"}:
-            result.roles.add("data")
+        elif role == "escape":
+            result.unknown_reasons.add(
+                "value escapes through untyped memory or a signatureless return"
+            )
         elif role == "control":
-            if consumer.instruction in proven_branches:
-                result.roles.add("bounds")
+            if consumer.instruction in structural_guard_branches:
+                result.roles.add("structural_guard")
             else:
                 result.roles.add("control")
         elif role == "compare":
             if (
                 Definition(consumer.instruction, "nzcv")
-                in proven_bounds_definitions
+                in structural_guard_definitions
             ):
-                result.roles.add("bounds")
+                result.roles.add("structural_guard")
             else:
                 result.roles.add("control")
         elif role == "unknown":
@@ -964,8 +997,8 @@ def _trace_definition(
                     instructions=instructions,
                     effects=effects,
                     consumers=consumers,
-                    proven_branches=proven_branches,
-                    proven_bounds_definitions=proven_bounds_definitions,
+                    structural_guard_branches=structural_guard_branches,
+                    structural_guard_definitions=structural_guard_definitions,
                     stack=next_stack,
                     memo=memo,
                 )
@@ -987,8 +1020,8 @@ def _category(trace: Trace) -> tuple[str, str]:
     semantic_groups: set[str] = set()
     if "address" in trace.roles:
         semantic_groups.add("address")
-    if "bounds" in trace.roles:
-        semantic_groups.add("bounds")
+    if "structural_guard" in trace.roles:
+        semantic_groups.add("structural_guard")
     if "data" in trace.roles:
         semantic_groups.add("algorithmic")
     if "control" in trace.roles:
@@ -1012,15 +1045,16 @@ def _category(trace: Trace) -> tuple[str, str]:
             "address_generation",
             "all proven producer-consumer paths terminate in memory-address operands",
         )
-    if only == "bounds":
+    if only == "structural_guard":
         return (
-            "proven_bounds_check",
-            "flags/control path guards a dominated memory access and the other "
-            "complete CFG path reaches an architectural trap",
+            "structural_address_guard",
+            "flags/control structurally guard a dominated eventual address "
+            "and the other complete CFG path reaches an architectural trap; "
+            "linear-memory limit or removable-check semantics are not proven",
         )
     return (
         "algorithmic_alu",
-        "all proven terminal uses are stored data or return data",
+        "all terminal uses have explicit typed non-address data provenance",
     )
 
 
@@ -1031,9 +1065,16 @@ def analyze_instruction_stream(
     samples_by_offset: Mapping[int, int],
     total_run_samples: int,
     address_base: int = 0,
+    global_attributed_samples: int | None = None,
 ) -> dict[str, Any]:
     if total_run_samples <= 0:
         raise ProvenanceError("total_run_samples must be positive")
+    if global_attributed_samples is None:
+        global_attributed_samples = total_run_samples
+    if not 0 <= global_attributed_samples <= total_run_samples:
+        raise ProvenanceError(
+            "global_attributed_samples must be within total_run_samples"
+        )
     normalized = normalize_instructions(instructions, address_base=address_base)
     if len(broad_classes) != len(normalized):
         raise ProvenanceError(
@@ -1061,8 +1102,8 @@ def analyze_instruction_stream(
     reachable = _reachable(successors)
     incoming, _ = _reaching_definitions(effects, predecessors, reachable)
     dominators = _dominators(predecessors, reachable)
-    proven_branches, proven_bounds_definitions, bounds_evidence = (
-        _proven_bounds_branches(
+    structural_guard_branches, structural_guard_definitions, guard_evidence = (
+        _structural_address_guard_branches(
             effects,
             successors,
             incoming,
@@ -1072,16 +1113,13 @@ def analyze_instruction_stream(
     )
     consumers = _build_consumers(effects, incoming, reachable)
     memo: dict[Definition, Trace] = {}
-    static_counts = Counter()
-    sample_counts = Counter()
-    reason_counts = Counter()
-    sampled_instructions: list[dict[str, Any]] = []
+    decision_cache: dict[int, tuple[str, str, Trace]] = {}
 
-    for index, (instruction, broad_class, effect) in enumerate(
-        zip(normalized, broad_classes, effects)
-    ):
-        if broad_class != "alu":
-            continue
+    def classify_index(index: int) -> tuple[str, str, Trace]:
+        if index in decision_cache:
+            return decision_cache[index]
+        instruction = normalized[index]
+        effect = effects[index]
         if index not in reachable:
             category = "unknown"
             reason = "instruction is unreachable in the recovered CFG"
@@ -1109,97 +1147,184 @@ def analyze_instruction_stream(
                         instructions=normalized,
                         effects=effects,
                         consumers=consumers,
-                        proven_branches=proven_branches,
-                        proven_bounds_definitions=proven_bounds_definitions,
+                        structural_guard_branches=structural_guard_branches,
+                        structural_guard_definitions=structural_guard_definitions,
                         stack=set(),
                         memo=memo,
                     )
                 )
             trace = combined
             category, reason = _category(trace)
-        static_counts[category] += 1
-        samples = int(samples_by_offset.get(instruction.offset, 0))
-        sample_counts[category] += samples
-        reason_counts[(category, reason)] += 1
-        if samples:
-            sampled_instructions.append(
+        decision_cache[index] = (category, reason, trace)
+        return decision_cache[index]
+
+    def aggregate(indices: Sequence[int], *, share_name: str) -> dict[str, Any]:
+        static_counts = Counter()
+        sample_counts = Counter()
+        reason_counts = Counter()
+        sampled_instructions: list[dict[str, Any]] = []
+        for index in indices:
+            instruction = normalized[index]
+            category, reason, trace = classify_index(index)
+            static_counts[category] += 1
+            samples = int(samples_by_offset.get(instruction.offset, 0))
+            sample_counts[category] += samples
+            reason_counts[(category, reason)] += 1
+            if samples:
+                sampled_instructions.append(
+                    {
+                        "offset": instruction.offset,
+                        "address": instruction.address,
+                        "instruction": instruction.text,
+                        "samples": samples,
+                        "percent_of_run": (
+                            100.0 * samples / total_run_samples
+                        ),
+                        "category": category,
+                        "reason": reason,
+                        "path_evidence": trace.evidence[:12],
+                    }
+                )
+        universe_samples = sum(sample_counts.values())
+        proven_samples = sum(
+            sample_counts[category] for category in PROVEN_CATEGORIES
+        )
+        sampled_instructions.sort(
+            key=lambda item: (-item["samples"], item["offset"])
+        )
+        return {
+            "samples": universe_samples,
+            "partition_samples": sum(sample_counts.values()),
+            "static_instructions": len(indices),
+            "categories": {
+                category: {
+                    "samples": sample_counts[category],
+                    "percent_of_run": (
+                        100.0
+                        * sample_counts[category]
+                        / total_run_samples
+                    ),
+                    share_name: (
+                        100.0
+                        * sample_counts[category]
+                        / universe_samples
+                        if universe_samples
+                        else 0.0
+                    ),
+                    "static_instructions": static_counts[category],
+                }
+                for category in CATEGORIES
+            },
+            "coverage": {
+                "proven_samples": proven_samples,
+                "proven_percent": (
+                    100.0 * proven_samples / universe_samples
+                    if universe_samples
+                    else 0.0
+                ),
+                "unknown_samples": sample_counts["unknown"],
+                "unknown_percent_of_run": (
+                    100.0
+                    * sample_counts["unknown"]
+                    / total_run_samples
+                ),
+                "mixed_samples": sample_counts["mixed"],
+                "mixed_percent_of_run": (
+                    100.0 * sample_counts["mixed"] / total_run_samples
+                ),
+            },
+            "sampled_instructions": sampled_instructions,
+            "reason_counts": [
                 {
-                    "offset": instruction.offset,
-                    "address": instruction.address,
-                    "instruction": instruction.text,
-                    "samples": samples,
-                    "percent_of_run": 100.0 * samples / total_run_samples,
                     "category": category,
                     "reason": reason,
-                    "path_evidence": trace.evidence[:12],
+                    "static_instructions": count,
                 }
-            )
+                for (category, reason), count in sorted(
+                    reason_counts.items(),
+                    key=lambda item: (item[0][0], item[0][1]),
+                )
+            ],
+        }
 
-    broad_static = sum(
-        1 for broad_class in broad_classes if broad_class == "alu"
-    )
-    broad_samples = sum(
-        int(samples_by_offset.get(instruction.offset, 0))
-        for instruction, broad_class in zip(normalized, broad_classes)
+    legacy_indices = [
+        index
+        for index, broad_class in enumerate(broad_classes)
         if broad_class == "alu"
-    )
-    partition_samples = sum(sample_counts.values())
-    if partition_samples != broad_samples:
-        raise ProvenanceError(
-            "narrow ALU sample partitions do not reconcile to broad ALU samples"
+    ]
+    common_indices = [
+        index
+        for index, (broad_class, effect) in enumerate(
+            zip(broad_classes, effects)
         )
-    proven_samples = sum(
-        sample_counts[category]
-        for category in GATE_CATEGORIES
+        if broad_class == "alu" or effect.gating_candidate
+    ]
+    legacy = aggregate(
+        legacy_indices, share_name="percent_of_broad_alu"
     )
-    sampled_instructions.sort(key=lambda item: (-item["samples"], item["offset"]))
+    common = aggregate(
+        common_indices, share_name="percent_of_common_universe"
+    )
+    if legacy["partition_samples"] != legacy["samples"]:
+        raise ProvenanceError(
+            "legacy ALU sample partitions do not reconcile"
+        )
+    if common["partition_samples"] != common["samples"]:
+        raise ProvenanceError(
+            "common gating-universe sample partitions do not reconcile"
+        )
+    mapped_instruction_samples = sum(
+        int(samples) for samples in samples_by_offset.values()
+    )
+    excluded_instruction_samples = (
+        mapped_instruction_samples - common["samples"]
+    )
+    if excluded_instruction_samples < 0:
+        raise ProvenanceError(
+            "common gating universe exceeds mapped instruction samples"
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": ANALYSIS_KIND,
         "status": "measured",
         "broad_class": "all_alu",
         "total_run_samples": total_run_samples,
-        "broad_alu_samples": broad_samples,
-        "broad_alu_percent_of_run": 100.0 * broad_samples / total_run_samples,
-        "partition_samples": partition_samples,
+        "broad_alu_samples": legacy["samples"],
+        "broad_alu_percent_of_run": (
+            100.0 * legacy["samples"] / total_run_samples
+        ),
+        "partition_samples": legacy["partition_samples"],
         "instruction_count": len(normalized),
-        "broad_alu_static_instructions": broad_static,
-        "categories": {
-            category: {
-                "samples": sample_counts[category],
-                "percent_of_run": (
-                    100.0 * sample_counts[category] / total_run_samples
-                ),
-                "percent_of_broad_alu": (
-                    100.0 * sample_counts[category] / broad_samples
-                    if broad_samples
-                    else 0.0
-                ),
-                "static_instructions": static_counts[category],
-            }
-            for category in CATEGORIES
-        },
+        "broad_alu_static_instructions": legacy["static_instructions"],
+        "categories": legacy["categories"],
         "coverage": {
-            "proven_samples": proven_samples,
-            "proven_percent_of_broad_alu": (
-                100.0 * proven_samples / broad_samples
-                if broad_samples
-                else 0.0
+            **legacy["coverage"],
+            "proven_percent_of_broad_alu": legacy["coverage"][
+                "proven_percent"
+            ],
+        },
+        "common_gating_universe": common,
+        "instruction_sample_accounting": {
+            "mapped_instruction_samples": mapped_instruction_samples,
+            "common_candidate_samples": common["samples"],
+            "conclusively_excluded_non_candidate_samples": (
+                excluded_instruction_samples
             ),
-            "unknown_samples": sample_counts["unknown"],
-            "unknown_percent_of_run": (
-                100.0 * sample_counts["unknown"] / total_run_samples
+        },
+        "global_sample_mapping": {
+            "attributed_samples": global_attributed_samples,
+            "unattributed_samples": (
+                total_run_samples - global_attributed_samples
             ),
-            "mixed_samples": sample_counts["mixed"],
-            "mixed_percent_of_run": (
-                100.0 * sample_counts["mixed"] / total_run_samples
-            ),
+            "total_samples": total_run_samples,
         },
         "cfg": {
             "reachable_instructions": len(reachable),
             "external_branch_targets": external_targets,
-            "proven_bounds_branches": len(proven_branches),
-            "bounds_evidence": [
+            "structural_address_guard_branches": len(
+                structural_guard_branches
+            ),
+            "structural_address_guard_evidence": [
                 {
                     **item,
                     "branch_offset": normalized[
@@ -1215,21 +1340,11 @@ def analyze_instruction_stream(
                         item["guarded_memory_instruction_index"]
                     ].text,
                 }
-                for item in bounds_evidence
+                for item in guard_evidence
             ],
         },
-        "sampled_instructions": sampled_instructions,
-        "reason_counts": [
-            {
-                "category": category,
-                "reason": reason,
-                "static_instructions": count,
-            }
-            for (category, reason), count in sorted(
-                reason_counts.items(),
-                key=lambda item: (item[0][0], item[0][1]),
-            )
-        ],
+        "sampled_instructions": legacy["sampled_instructions"],
+        "reason_counts": legacy["reason_counts"],
         "soundness": {
             "register_aliases": (
                 "Wn and Xn share one architectural value; W writes replace "
@@ -1244,14 +1359,16 @@ def analyze_instruction_stream(
                 "x30, and NZCV are clobbered. No engine-specific register "
                 "meaning is assumed."
             ),
-            "bounds": (
-                "A check is proven only by a complete CFG trap path plus a "
-                "dominated memory address sharing the compared definition."
+            "structural_address_guard": (
+                "A structural guard requires a complete CFG trap path plus a "
+                "dominated eventual address sharing the compared definition. "
+                "It does not prove a linear-memory limit, engine bounds check, "
+                "or removable check."
             ),
             "mixed": (
-                "Address values also consumed as data, return values, "
-                "or another proven category are mixed; unproven control "
-                "semantics remain unknown instead."
+                "Only independently proven semantic roles can produce mixed. "
+                "Untyped stores, signatureless returns, and unproven control "
+                "remain unknown escapes instead."
             ),
         },
     }
@@ -1293,31 +1410,80 @@ def compare_engine_analyses(
             raise ProvenanceError(
                 f"{name} narrow partitions do not reconcile to broad ALU"
             )
+        common = analysis.get("common_gating_universe")
+        if (
+            not isinstance(common, Mapping)
+            or common.get("partition_samples") != common.get("samples")
+        ):
+            raise ProvenanceError(
+                f"{name} lacks a reconciled complete common gating universe"
+            )
+    wasmtime_common = wasmtime["common_gating_universe"]
+    wasmtime_global_unattributed = wasmtime.get(
+        "global_sample_mapping", {}
+    ).get("unattributed_samples")
+    if not isinstance(wasmtime_global_unattributed, int):
+        raise ProvenanceError(
+            "wasmtime global unattributed sample count is missing"
+        )
+    wasmtime_instruction_unresolved = wasmtime.get(
+        "sample_mapping", {}
+    ).get("unresolved_function_samples", 0)
+    wasmtime_function_mapped = wasmtime.get(
+        "sample_mapping", {}
+    ).get("mapped_function_samples", 0)
+    if (
+        not isinstance(wasmtime_instruction_unresolved, int)
+        or wasmtime_instruction_unresolved < 0
+        or not isinstance(wasmtime_function_mapped, int)
+        or wasmtime_function_mapped < 0
+    ):
+        raise ProvenanceError(
+            "wasmtime function sample mapping is invalid"
+        )
+    if (
+        wasmtime_function_mapped + wasmtime_instruction_unresolved
+        > wasmtime["global_sample_mapping"]["attributed_samples"]
+    ):
+        raise ProvenanceError(
+            "wasmtime function-mapped samples exceed globally attributed samples"
+        )
     wasmtime_unknown_upper = (
-        wasmtime["categories"]["unknown"]["percent_of_run"]
-        + wasmtime["categories"]["mixed"]["percent_of_run"]
+        wasmtime_common["categories"]["unknown"]["percent_of_run"]
+        + wasmtime_common["categories"]["mixed"]["percent_of_run"]
         + (
             100.0
-            * wasmtime.get("sample_mapping", {}).get(
-                "unresolved_function_samples", 0
+            * (
+                wasmtime_instruction_unresolved
+                + wasmtime_global_unattributed
             )
             / wasmtime["total_run_samples"]
         )
     )
     categories = {}
     for category in GATE_CATEGORIES:
-        wamr_share = wamr["categories"][category]["percent_of_run"]
-        wasmtime_share = wasmtime["categories"][category]["percent_of_run"]
+        wamr_category = wamr["common_gating_universe"]["categories"][
+            category
+        ]
+        wasmtime_category = wasmtime_common["categories"][category]
+        wamr_share = wamr_category["percent_of_run"]
+        wasmtime_share = wasmtime_category["percent_of_run"]
         conservative_wasmtime_upper = wasmtime_share + wasmtime_unknown_upper
         conservative_headroom = wamr_share - conservative_wasmtime_upper
         categories[category] = {
-            "wamr_samples": wamr["categories"][category]["samples"],
-            "wasmtime_samples": wasmtime["categories"][category]["samples"],
+            "wamr_samples": wamr_category["samples"],
+            "wasmtime_samples": wasmtime_category["samples"],
             "wamr_percent_of_run": wamr_share,
             "wasmtime_percent_of_run": wasmtime_share,
             "observed_delta_percentage_points": wamr_share - wasmtime_share,
-            "wasmtime_unknown_mixed_or_unresolved_upper_percentage_points": (
+            "wasmtime_unknown_mixed_instruction_unresolved_or_global_unattributed_upper_percentage_points": (
                 wasmtime_unknown_upper
+            ),
+            "wasmtime_instruction_unresolved_samples": (
+                wasmtime_instruction_unresolved
+            ),
+            "wasmtime_global_unattributed_samples": (
+                wasmtime_global_unattributed
             ),
             "conservative_headroom_percentage_points": conservative_headroom,
             "clears_threshold": conservative_headroom >= threshold_pct,
@@ -1337,8 +1503,9 @@ def compare_engine_analyses(
             "run-wide threshold"
             if cleared
             else "no shared proven category clears the conservative run-wide "
-            "threshold after treating Wasmtime unknown, mixed, and unresolved "
-            "samples as a possible upper bound"
+            "threshold after treating Wasmtime common-universe unknown/mixed, "
+            "instruction-unresolved, and globally unattributed samples as a "
+            "possible upper bound"
         ),
         "categories": categories,
     }

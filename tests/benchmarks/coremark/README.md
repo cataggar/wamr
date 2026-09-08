@@ -137,26 +137,43 @@ precise host-page-rounded cwasm text size and attribute at least 99% of all self
 samples; both Wasmtime captures must independently clear the same coverage
 gate. Manual mapping overrides are diagnostic-only and non-authoritative.
 
-The profile also partitions the existing broad `all_alu` samples with
-`scripts/aarch64_instruction_provenance.py`. The same architecture-only CFG,
-reaching-definition, and producer/consumer analysis is used for WAMR and
-Wasmtime. Every sampled ALU instruction lands in exactly one category:
+The profile preserves the existing broad `all_alu` partition and also builds a
+complete common gating universe with
+`scripts/aarch64_instruction_provenance.py`. That second universe is based on
+architectural instruction effects rather than the legacy display classifier,
+so widening multiply/add forms and future opaque computational instructions
+cannot disappear merely because one engine calls them `other`. The same
+architecture-only CFG, reaching-definition, and producer/consumer analysis is
+used for WAMR and Wasmtime. Every candidate instruction lands in exactly one
+category:
 
 - `address_generation`: every proven value path terminates as a memory address;
-- `proven_bounds_check`: a complete CFG path reaches an architectural trap,
-  while the other path dominates a memory access using the compared definition;
-- `algorithmic_alu`: every proven terminal use is stored or returned data;
+- `structural_address_guard`: a complete CFG path reaches an architectural
+  trap while the other path dominates an eventual address using the compared
+  definition. This is diagnostic only: it does not prove an engine
+  linear-memory limit, a removable bounds check, or optimizer authorization;
+- `algorithmic_alu`: every terminal use has explicit typed non-address data
+  provenance;
 - `mixed`: the value has proven consumers in multiple semantic categories;
 - `unknown`: joins, loops, calls, opaque instructions, unproven control,
-  missing consumers, or incomplete paths prevent a sound classification.
+  untyped stores, signatureless returns, missing consumers, or incomplete
+  paths prevent a sound classification.
 
 `Wn`/`Xn` aliases, zero extension, NZCV definitions/clobbers, pre/post-indexed
-addressing, scaled/extended indices, AAPCS64 call clobbers, and multi-use values
-are modeled explicitly. Register names, adjacency to a load, and trap-looking
-branches are never semantic evidence. The category samples must sum exactly to
-the prior `all_alu` total. The >=5 percentage-point gate subtracts all Wasmtime
-unknown, mixed, and unresolved reference-engine sample share as possible work;
-broad `all_alu` never participates in that gate.
+addressing, literal-load definitions, scaled/extended indices, floating and
+opaque NZCV clobbers, AAPCS64 call clobbers, and multi-use values are modeled
+explicitly. Register names, adjacency to a load, stores, signatureless returns,
+and trap-looking branches are never semantic proof. Both the legacy partition
+and complete common universe reconcile independently; mapped instruction
+samples are also accounted as common candidates plus explicitly excluded
+recognized non-candidates.
+
+The >=5 percentage-point optimizer gate uses only eligible categories from the
+complete common universe. Its Wasmtime upper bound includes common-universe
+unknown/mixed samples, target-function instruction-unresolved samples, and
+globally unattributed samples. Those sets are disjoint and retain full-run
+denominators. The legacy `all_alu` differential and structural guard diagnostic
+never authorize optimization.
 
 For forward reanalysis, the upload retains the exact benchmark-handoff WAMR
 cwasm as `wamr-profiled.cwasm.gz`, bound by SHA-256 in `profile.json`. Older

@@ -140,6 +140,7 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             wasm_index=15,
             offsets=Counter({0: 9, 4: 3, 8: 1}),
             total_samples=20,
+            global_attributed_samples=18,
         )
         self.assertEqual(9, result["broad_alu_samples"])
         self.assertEqual(
@@ -147,6 +148,9 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
         )
         self.assertEqual(13, result["sample_mapping"]["mapped_function_samples"])
         self.assertEqual(0, result["sample_mapping"]["unresolved_function_samples"])
+        self.assertEqual(
+            2, result["global_sample_mapping"]["unattributed_samples"]
+        )
 
     def test_narrow_report_assembly_reconciles_existing_all_alu(self):
         instructions = [
