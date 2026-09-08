@@ -118,7 +118,7 @@ def attach_synthetic_sizing(
 
 
 def authoritative_sizing_inputs(
-    pilot_elapsed_ns: int,
+    pilot_elapsed_ns: int | dict[str, int],
     invocation_overhead_ns: int,
 ) -> tuple[list[dict], list[dict], tuple[int, ...]]:
     args = bench.parse_args(["--no-budget"])
@@ -130,6 +130,14 @@ def authoritative_sizing_inputs(
     pilots = []
     timing_overhead_ns = 1_000_000
     for spec in order:
+        cell_key = bench.sizing_cell_key(
+            spec["mode"], spec["workload"], spec["threads"]
+        )
+        elapsed_ns = (
+            pilot_elapsed_ns[cell_key]
+            if isinstance(pilot_elapsed_ns, dict)
+            else pilot_elapsed_ns
+        )
         workload = (
             "hot" if spec["workload"] == "cancel-hot" else spec["workload"]
         )
@@ -141,19 +149,19 @@ def authoritative_sizing_inputs(
                 "operations": bench.expected_result(
                     workload, spec["threads"], spec["iterations"]
                 )["operations"],
-                "guest_elapsed_ns": pilot_elapsed_ns,
-                "elapsed_ns": pilot_elapsed_ns,
+                "guest_elapsed_ns": elapsed_ns,
+                "elapsed_ns": elapsed_ns,
                 "raw_guest_elapsed_ns": (
-                    pilot_elapsed_ns + timing_overhead_ns
+                    elapsed_ns + timing_overhead_ns
                 ),
                 "timing_overhead_ns": timing_overhead_ns,
                 "timing_overhead_ppm": (
                     timing_overhead_ns
                     * 1_000_000
-                    // (pilot_elapsed_ns + timing_overhead_ns)
+                    // (elapsed_ns + timing_overhead_ns)
                 ),
                 "host_wall_elapsed_ns": (
-                    pilot_elapsed_ns + invocation_overhead_ns
+                    elapsed_ns + invocation_overhead_ns
                 ),
             }
         )
@@ -1116,19 +1124,107 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(selected["aot"]["hot"]["1"], 617)
 
     def test_full_authoritative_sizing_across_host_rates(self) -> None:
-        retained_elapsed_ns = bench.ceil_div(
-            1_054_664_000 * 10_000,
-            2_805,
+        provenance_path = (
+            ROOT
+            / "tests"
+            / "benchmarks"
+            / "wasi-threads"
+            / "sizing-simulation-provenance.json"
         )
+        provenance = json.loads(provenance_path.read_text(encoding="UTF-8"))
+        self.assertEqual(
+            provenance["kind"], "wasi-thread-sizing-simulation-provenance"
+        )
+        self.assertEqual(provenance["schema_version"], 1)
+        self.assertEqual(
+            provenance["source_provenance"],
+            {
+                "revision": "c9eb22f529215c1d0cda823d6bd02e5f30fa30ca",
+                "path": (
+                    "tests/benchmarks/wasi-threads/sizing-provenance.json"
+                ),
+                "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
+                "sha256": (
+                    "aec6bb9fe838e95c6fb8826b3fe420c386bd0598e83193d46"
+                    "ae6f0eb2ee4df4b"
+                ),
+            },
+        )
+
+        args = bench.parse_args(["--no-budget"])
+        order = bench.pilot_order_for_plan(
+            bench.planned_pair_specs(args, ("interpreter", "aot")),
+            bench.REVISION_ROLES,
+            args.pilot_iteration_plan,
+        )
+        production_pilots = {}
+        for spec in order:
+            key = bench.sizing_cell_key(
+                spec["mode"], spec["workload"], spec["threads"]
+            )
+            self.assertEqual(
+                production_pilots.setdefault(key, spec["iterations"]),
+                spec["iterations"],
+            )
+        fixture_cells = provenance["cells"]
+        retained_by_key = {
+            cell["key"]: cell["retained_fastest_interval_ns"]
+            for cell in fixture_cells
+        }
+        self.assertEqual(len(retained_by_key), len(fixture_cells))
+        self.assertEqual(set(retained_by_key), set(production_pilots))
+        self.assertEqual(
+            provenance["pilot_plan_sha256"],
+            cache_key(production_pilots),
+        )
+        for cell in fixture_cells:
+            self.assertEqual(
+                cell["pilot_iterations"],
+                production_pilots[cell["key"]],
+            )
+            self.assertEqual(
+                cell["retained_fastest_interval_ns"],
+                bench.ceil_div(
+                    cell["source_fastest_corrected_interval_ns"]
+                    * cell["pilot_iterations"],
+                    cell["source_iterations"],
+                ),
+            )
+
+        retained_reference = provenance["retained_reference"]
+        epyc_reference = provenance["epyc_9v45_reference"]
+        self.assertEqual(retained_reference["key"], "aot/single-hot/1")
+        self.assertEqual(
+            retained_by_key[retained_reference["key"]],
+            1_813_490_625,
+        )
+        self.assertEqual(
+            epyc_reference["retained_fastest_interval_ns"],
+            1_054_664_000,
+        )
+        self.assertAlmostEqual(
+            1_813_490_625 / 1_054_664_000,
+            epyc_reference["relative_speedup"],
+            places=4,
+        )
+
         rates = (
-            ("retained-1x", retained_elapsed_ns, "down"),
-            ("2x-slower", retained_elapsed_ns * 2, "down"),
-            ("3x-slower", retained_elapsed_ns * 3, "down"),
-            ("71.95%-faster", 1_054_664_000, "up"),
+            ("retained-1x", 1, 1),
+            ("1.7195x-faster", 1_054_664_000, 1_813_490_625),
+            ("2x-slower", 2, 1),
+            ("3x-slower", 3, 1),
         )
-        for label, pilot_elapsed_ns, direction in rates:
+        selected_by_rate = {}
+        direction_counts = {}
+        for label, rate_numerator, rate_denominator in rates:
+            elapsed_by_key = {
+                key: bench.ceil_div(
+                    elapsed_ns * rate_numerator, rate_denominator
+                )
+                for key, elapsed_ns in retained_by_key.items()
+            }
             pilots, order, thread_counts = authoritative_sizing_inputs(
-                pilot_elapsed_ns,
+                elapsed_by_key,
                 0,
             )
             selected, resolved = bench.resolve_one_shot_sizing(
@@ -1140,6 +1236,34 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 samples=10,
                 timeout_seconds=90,
             )
+            selected_by_rate[label] = {
+                cell["key"]: bench.iteration_count(
+                    selected,
+                    cell["mode"],
+                    cell["workload"],
+                    cell["threads"],
+                )
+                for cell in resolved["cells"]
+            }
+            directions = {"up": 0, "down": 0, "same": 0}
+            for cell in resolved["cells"]:
+                selected_count = selected_by_rate[label][cell["key"]]
+                direction = (
+                    "up"
+                    if selected_count > cell["pilot_count"]
+                    else "down"
+                    if selected_count < cell["pilot_count"]
+                    else "same"
+                )
+                directions[direction] += 1
+                self.assertEqual(
+                    selected_count,
+                    bench.round_up_significant(
+                        cell["fastest_required_iterations"],
+                        bench.SIZING_SIGNIFICANT_DIGITS,
+                    ),
+                )
+            direction_counts[label] = directions
             with self.subTest(rate=label):
                 self.assertEqual(len(order), 88)
                 self.assertEqual(len(resolved["pilots"]), 88)
@@ -1160,28 +1284,34 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     resolved["projected_benchmark_ns"],
                     bench.PROJECTED_BENCHMARK_LIMIT_NS,
                 )
-                for cell in resolved["cells"]:
-                    selected_count = bench.iteration_count(
-                        selected,
-                        cell["mode"],
-                        cell["workload"],
-                        cell["threads"],
-                    )
-                    self.assertEqual(
-                        selected_count,
-                        bench.round_up_significant(
-                            cell["fastest_required_iterations"],
-                            bench.SIZING_SIGNIFICANT_DIGITS,
-                        ),
-                    )
-                    if direction == "down":
-                        self.assertLess(
-                            selected_count, cell["pilot_count"]
-                        )
-                    else:
-                        self.assertGreater(
-                            selected_count, cell["pilot_count"]
-                        )
+
+        self.assertEqual(
+            direction_counts["retained-1x"],
+            {"up": 27, "down": 9, "same": 2},
+        )
+        self.assertEqual(
+            direction_counts["2x-slower"],
+            {"up": 0, "down": 38, "same": 0},
+        )
+        self.assertEqual(
+            direction_counts["3x-slower"],
+            {"up": 0, "down": 38, "same": 0},
+        )
+        for key, retained_selected in selected_by_rate[
+            "retained-1x"
+        ].items():
+            self.assertGreater(
+                selected_by_rate["1.7195x-faster"][key],
+                retained_selected,
+            )
+            self.assertLess(
+                selected_by_rate["2x-slower"][key],
+                retained_selected,
+            )
+            self.assertLess(
+                selected_by_rate["3x-slower"][key],
+                retained_selected,
+            )
 
     def test_sizing_rejects_missing_invalid_and_tampered_pilots(self) -> None:
         report = make_report()
