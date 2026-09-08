@@ -92,11 +92,40 @@ This replaces fixed-count provenance after #1008 run 34173856468, job
 than the retained sizing host. That observation demonstrates that no finite
 fixed host margin is a defensible contract.
 
-For each cell, sizing version 2 selects the fastest valid pilot across all
-revisions and conditions. With pilot iterations `P`, corrected elapsed
-nanoseconds `E`, target `T = 1,750,000,000`, and safety factor `11/10`, the
-unrounded count is exactly
-`ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator)), then upward decimal rounding to 3 significant digits`.
+For each cell, sizing version 3 selects the fastest valid pilot across all
+revisions and conditions. With pilot iterations `P` and corrected elapsed
+nanoseconds `E`, the general count is
+`round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))`,
+where the target is 1.75 seconds and the safety factor is `11/10`.
+
+One declarative, portable cell envelope additionally applies to
+`mode=aot, workload=wait-notify, threads=1` on every architecture. Its count is
+`round_up_3_significant_digits(ceil(P*1250000000*12/(E*5)))`, and the selected
+count is the maximum of the general and envelope counts. Equivalently, the
+cell-specific formula is
+`round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*12/(E*5))))`.
+The `12/5` rate-acceleration envelope projects 3.0 seconds at the pilot rate,
+so a later measurement may accelerate by up to 2.4 times and still meet the
+1.25-second floor.
+
+The retained same-SHA PR #1016 attempts and prior ordered-rate evidence are:
+
+| evidence | fastest pilot rate (ops/s) | later/pilot acceleration | general count | v3 count | projected later duration |
+|---|---:|---:|---:|---:|---:|
+| attempt 1 | 739,133.627 | 2.192262005x | 1.43M | 2.22M | 1.370054s |
+| attempt 2 | 853,510.803 | 1.836297620x | 1.65M | 2.57M | 1.639763s |
+| attempt 3 | 262,449.465 | 1.737047051x | 506K | 788K | 1.728498s |
+| prior retained maximum | — | 2.272623705x | — | — | 1.320060s at the exact envelope |
+
+The exact relative margin over the retained `2.272623705208038x` boundary is
+`2.4 / 2.272623705208038 - 1 = 0.056048123805124916`, or
+`5.6048123805124916%` (5.6048%). Replaying all 88 retained pilots and the
+12 evidence invocations per observation gives a maximum 3,056.826806075-second
+projection on attempt 3, bounded by 50.95 minutes and still below 97 minutes.
+This is a cell-specific rate envelope, not an x86 host allowance: the selector
+contains no CPU, runner, platform, or architecture identity and therefore
+applies identically to every canonical platform.
+
 There is no pilot-count floor: a slow host downsizes a long pilot to
 target-sized evidence, while a fast host sizes up. The fastest baseline result
 is retained as the explicit lower-bound derivation: a slower candidate cannot
@@ -111,8 +140,12 @@ resolution. They are intentionally not required to satisfy the evidence
 every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
 be at least both the 1.25-second evidence floor and the exact 1.925-second
-`1.75s * 11/10` sizing target. Actual warmups and samples independently enforce
-the unchanged `99B < E_actual` and 1.25-second floor.
+`1.75s * 11/10` sizing target; the declared special cell projects at least
+3.0 seconds at every retained pilot rate. Actual warmups and samples
+independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
+There is no hidden retry or count increase if a later rate exceeds `2.4x`:
+even a just-over-boundary observation that falls below 1.25 seconds is retained
+and fails closed.
 
 Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
 limit, checksum arithmetic, and declared workload caps. A pilot is rejected
@@ -232,14 +265,15 @@ leaving 12 hours before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 3 of a purpose-independent portable
+`measurement_plan_sha256` is version 4 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
-safety factor, rounding, caps, timeouts, modes, thread counts, pairs, profile,
-samples, warmups, optimization, and quality policy. `plan_sha256` hashes the
-complete report-specific plan, including every pilot and selected count.
-`validate_report` recomputes both and independently replays sizing.
+safety factor, declarative cell envelopes, rounding, caps, timeouts, modes,
+thread counts, pairs, profile, samples, warmups, optimization, and quality
+policy. `plan_sha256` hashes the complete report-specific plan, including every
+pilot and selected count. `validate_report` recomputes both and independently
+replays sizing.
 
 The report exposes four metric layers:
 
@@ -546,14 +580,14 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Schema-v3 fixed-plan reports and reports produced before measurement-plan
-identity version 3, including version-2 reports from #1013, are invalid for a
-new authoritative cohort. Fresh evidence with the canonical one-shot sizing
-identity is mandatory for calibration and derivation. Reports with different
-legitimate host-selected counts may mix;
-reports with altered pilot specifications, target, safety factor, rounding,
-caps, timeouts, or algorithm identity may not. Earlier failed/partial runs and
-the retained timing-quality failure remain excluded and cannot be retried,
-relabelled, or mixed into the fresh cohort.
+identity version 4, including version-2 reports from #1013 and version-3 PR
+#1016 attempts, are invalid for a new authoritative cohort. Fresh evidence
+with the canonical one-shot sizing identity is mandatory for calibration and
+derivation. Reports with different legitimate host-selected counts may mix;
+reports with altered pilot specifications, target, safety factor, cell
+envelope, rounding, caps, timeouts, or algorithm identity may not. Earlier
+failed/partial runs and the retained timing-quality failure remain excluded
+and cannot be retried, relabelled, or mixed into the fresh cohort.
 
 Until that cohort exists, claiming a statistically sound hard gate would be
 fabricating evidence. Issue #966 must remain open and #963 remains dependent on
