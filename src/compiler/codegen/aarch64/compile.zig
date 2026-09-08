@@ -9,6 +9,7 @@ const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
 const schedule = @import("schedule.zig");
 const coalesce_post = @import("coalesce_post.zig");
+const spill_reload_pass = @import("spill_reload.zig");
 const range_split = @import("../../ir/range_split.zig");
 const codegen_cache = @import("../../codegen_cache.zig");
 const passes = @import("../../ir/passes.zig");
@@ -540,6 +541,7 @@ pub const CompileOptions = struct {
     /// byte-identical.
     cancel_points: bool = false,
     enable_scheduler: bool = true,
+    /// Emit-time peepholes and post-emission scalar spill reload reuse.
     enable_peephole: bool = true,
     /// Use the Stage-A scalar X-register linear-scan allocator.
     /// When disabled, codegen falls back to the legacy greedy RegMap path.
@@ -2965,6 +2967,10 @@ pub fn compileFunctionImpl(
             },
         };
         code.patch32(p.patch_offset, new_word);
+    }
+
+    if (ctx.options.enable_peephole) {
+        _ = try spill_reload_pass.eliminate(allocator, code.bytes.items, spill_base, scalar_spill_end);
     }
 
     if (ctx.frame_attribution_ctx != null) {
