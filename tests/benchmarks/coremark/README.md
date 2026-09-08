@@ -137,6 +137,34 @@ precise host-page-rounded cwasm text size and attribute at least 99% of all self
 samples; both Wasmtime captures must independently clear the same coverage
 gate. Manual mapping overrides are diagnostic-only and non-authoritative.
 
+The profile also partitions the existing broad `all_alu` samples with
+`scripts/aarch64_instruction_provenance.py`. The same architecture-only CFG,
+reaching-definition, and producer/consumer analysis is used for WAMR and
+Wasmtime. Every sampled ALU instruction lands in exactly one category:
+
+- `address_generation`: every proven value path terminates as a memory address;
+- `proven_bounds_check`: a complete CFG path reaches an architectural trap,
+  while the other path dominates a memory access using the compared definition;
+- `algorithmic_alu`: every proven terminal use is stored or returned data;
+- `mixed`: the value has proven consumers in multiple semantic categories;
+- `unknown`: joins, loops, calls, opaque instructions, unproven control,
+  missing consumers, or incomplete paths prevent a sound classification.
+
+`Wn`/`Xn` aliases, zero extension, NZCV definitions/clobbers, pre/post-indexed
+addressing, scaled/extended indices, AAPCS64 call clobbers, and multi-use values
+are modeled explicitly. Register names, adjacency to a load, and trap-looking
+branches are never semantic evidence. The category samples must sum exactly to
+the prior `all_alu` total. The >=5 percentage-point gate subtracts all Wasmtime
+unknown, mixed, and unresolved reference-engine sample share as possible work;
+broad `all_alu` never participates in that gate.
+
+For forward reanalysis, the upload retains the exact benchmark-handoff WAMR
+cwasm as `wamr-profiled.cwasm.gz`, bound by SHA-256 in `profile.json`. Older
+profile downloads that contain perf captures and summary JSON but not that
+exact cwasm do not contain enough WAMR native bytes for sound def-use
+reclassification; rebuilding from source is not an evidence-preserving
+substitute.
+
 For a local native AArch64 host, create and consume the identity explicitly:
 
 ```

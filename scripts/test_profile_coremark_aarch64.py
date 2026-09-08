@@ -127,6 +127,83 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
         self.assertEqual(6, result["classes"]["regmov"]["samples"])
         self.assertEqual(4, result["classes"]["alu"]["samples"])
 
+    def test_wasmtime_narrow_alu_uses_real_parser_and_instruction_mapping(self):
+        objdump = """\
+00000100 wasm[0]::function[15]::core_bench_list:
+       100: 29 04 00 91                  add     x9, x1, #1
+       104: 40 68 69 b8                  ldr     w0, [x2, x9]
+       108: c0 03 5f d6                  ret
+"""
+        result = profile.analyze_wasmtime_alu_provenance(
+            aot=profile.load_aot_helper(ROOT),
+            objdump_text=objdump,
+            wasm_index=15,
+            offsets=Counter({0: 9, 4: 3, 8: 1}),
+            total_samples=20,
+        )
+        self.assertEqual(9, result["broad_alu_samples"])
+        self.assertEqual(
+            9, result["categories"]["address_generation"]["samples"]
+        )
+        self.assertEqual(13, result["sample_mapping"]["mapped_function_samples"])
+        self.assertEqual(0, result["sample_mapping"]["unresolved_function_samples"])
+
+    def test_narrow_report_assembly_reconciles_existing_all_alu(self):
+        instructions = [
+            profile.aarch64_instruction_provenance.Instruction(
+                offset=0,
+                size=4,
+                mnemonic="add",
+                operands="x9, x1, #4",
+                text="add x9, x1, #4",
+                address=0,
+            ),
+            profile.aarch64_instruction_provenance.Instruction(
+                offset=4,
+                size=4,
+                mnemonic="ldr",
+                operands="w0, [x2, x9]",
+                text="ldr w0, [x2, x9]",
+                address=4,
+            ),
+            profile.aarch64_instruction_provenance.Instruction(
+                offset=8,
+                size=4,
+                mnemonic="ret",
+                operands="",
+                text="ret",
+                address=8,
+            ),
+        ]
+        wamr = profile.aarch64_instruction_provenance.analyze_instruction_stream(
+            instructions,
+            broad_classes=["alu", "other", "other"],
+            samples_by_offset={0: 8},
+            total_run_samples=100,
+        )
+        wasmtime = (
+            profile.aarch64_instruction_provenance.analyze_instruction_stream(
+                instructions,
+                broad_classes=["alu", "other", "other"],
+                samples_by_offset={0: 1},
+                total_run_samples=100,
+            )
+        )
+        assembled = profile.assemble_alu_provenance(
+            wamr=wamr,
+            wasmtime=wasmtime,
+            expected_wamr_all_alu_samples=8,
+            expected_wasmtime_all_alu_samples=1,
+        )
+        self.assertTrue(assembled["gate"]["optimization_authorized"])
+        with self.assertRaisesRegex(profile.ProfileError, "existing all_alu"):
+            profile.assemble_alu_provenance(
+                wamr=wamr,
+                wasmtime=wasmtime,
+                expected_wamr_all_alu_samples=7,
+                expected_wasmtime_all_alu_samples=1,
+            )
+
     def test_report_schema_requires_consistent_index_mapping(self):
         schedule = [
             {
@@ -215,6 +292,73 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
                     "wasmtime": {"samples": 28},
                 }
             ],
+        }
+        profile.validate_report(report)
+        narrow_instructions = [
+            profile.aarch64_instruction_provenance.Instruction(
+                offset=0,
+                size=4,
+                mnemonic="add",
+                operands="x9, x1, #4",
+                text="add x9, x1, #4",
+                address=0,
+            ),
+            profile.aarch64_instruction_provenance.Instruction(
+                offset=4,
+                size=4,
+                mnemonic="ldr",
+                operands="w0, [x2, x9]",
+                text="ldr w0, [x2, x9]",
+                address=4,
+            ),
+            profile.aarch64_instruction_provenance.Instruction(
+                offset=8,
+                size=4,
+                mnemonic="ret",
+                operands="",
+                text="ret",
+                address=8,
+            ),
+        ]
+        narrow_wamr = (
+            profile.aarch64_instruction_provenance.analyze_instruction_stream(
+                narrow_instructions,
+                broad_classes=["alu", "other", "other"],
+                samples_by_offset={0: 1},
+                total_run_samples=100,
+            )
+        )
+        narrow_wasmtime = copy.deepcopy(narrow_wamr)
+        report["classifier_wording"]["narrow_alu_provenance"] = (
+            profile.NARROW_ALU_WORDING
+        )
+        report["provenance"]["analysis_module"] = {
+            "path": "scripts/aarch64_instruction_provenance.py",
+            "sha256": "a" * 64,
+        }
+        report["matched_functions"][0]["class_groups"] = {
+            "all_alu": {"wamr_samples": 1, "wasmtime_samples": 1}
+        }
+        report["matched_functions"][0]["alu_provenance"] = (
+            profile.assemble_alu_provenance(
+                wamr=narrow_wamr,
+                wasmtime=narrow_wasmtime,
+                expected_wamr_all_alu_samples=1,
+                expected_wasmtime_all_alu_samples=1,
+            )
+        )
+        report["alu_provenance"] = {
+            "schema_version": (
+                profile.aarch64_instruction_provenance.SCHEMA_VERSION
+            ),
+            "kind": profile.aarch64_instruction_provenance.ANALYSIS_KIND,
+            "gate": report["matched_functions"][0]["alu_provenance"]["gate"],
+        }
+        report["retained_analysis_artifacts"] = {
+            "wamr_cwasm": {
+                "retained": True,
+                "source_sha256": "1" * 64,
+            }
         }
         profile.validate_report(report)
         stale_execution = copy.deepcopy(report)

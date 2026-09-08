@@ -25,6 +25,7 @@ from typing import Any
 
 import bench_coremark
 import compare_hot_function
+import aarch64_instruction_provenance
 
 
 REPORT_SCHEMA_VERSION = 2
@@ -40,6 +41,11 @@ MIN_ATTRIBUTION_COVERAGE_PCT = 99.0
 ALL_ALU_WORDING = (
     "all ALU-class instructions: add/sub, logical operations, mul/div, "
     "shifts, compares, csel, and address-generation instructions"
+)
+NARROW_ALU_WORDING = (
+    "architecture-only CFG and reaching-definition paths partition existing "
+    "all_alu samples into address_generation, proven_bounds_check, "
+    "algorithmic_alu, mixed, and unknown without engine-register heuristics"
 )
 WASMTIME_SYMBOL_RE = re.compile(
     r"wasm\[(?P<module>\d+)\]::function\[(?P<function>\d+)\]"
@@ -572,6 +578,167 @@ def classify_wasmtime_function(
     }
 
 
+def _wasmtime_function_address_base(
+    objdump_text: str, wasm_index: int
+) -> int:
+    for line in objdump_text.splitlines():
+        match = compare_hot_function.WASMTIME_HEADER_RE.match(line)
+        if (
+            match is not None
+            and int(match.group(1)) == 0
+            and int(match.group(2)) == wasm_index
+        ):
+            address = re.match(r"\s*([0-9a-fA-F]+)\s+", line)
+            if address is None:
+                raise ProfileError(
+                    f"Wasmtime function {wasm_index} header lacks an address"
+                )
+            return int(address.group(1), 16)
+    raise ProfileError(
+        f"Wasmtime objdump lacks function header for wasm index {wasm_index}"
+    )
+
+
+def _map_samples_to_instruction_starts(
+    instructions: list[compare_hot_function.Instruction],
+    offsets: Counter,
+) -> tuple[Counter, int]:
+    starts = [item.offset for item in instructions]
+    mapped = Counter()
+    unresolved = 0
+    for offset, samples in offsets.items():
+        index = bisect.bisect_right(starts, offset) - 1
+        if index < 0 or offset >= instructions[index].offset + instructions[index].size:
+            unresolved += samples
+            continue
+        mapped[instructions[index].offset] += samples
+    return mapped, unresolved
+
+
+def analyze_wasmtime_alu_provenance(
+    *,
+    aot,
+    objdump_text: str,
+    wasm_index: int,
+    offsets: Counter,
+    total_samples: int,
+) -> dict[str, Any]:
+    instructions = compare_hot_function.parse_disassembly(
+        objdump_text, wasmtime_wasm_index=wasm_index
+    )
+    adapter = [
+        aot.Instruction(
+            address=item.offset,
+            offset=item.offset,
+            size=item.size,
+            text=item.text,
+        )
+        for item in instructions
+    ]
+    broad_classes = aot.classify_instruction_stream(
+        adapter, architecture="aarch64"
+    )
+    mapped, unresolved = _map_samples_to_instruction_starts(
+        instructions, offsets
+    )
+    result = aarch64_instruction_provenance.analyze_instruction_stream(
+        instructions,
+        broad_classes=broad_classes,
+        samples_by_offset=mapped,
+        total_run_samples=total_samples,
+        address_base=_wasmtime_function_address_base(
+            objdump_text, wasm_index
+        ),
+    )
+    result["sample_mapping"] = {
+        "mapped_function_samples": sum(mapped.values()),
+        "unresolved_function_samples": unresolved,
+    }
+    return result
+
+
+def analyze_wamr_alu_provenance(
+    *,
+    aot,
+    cwasm_info,
+    local_func: int,
+    capture_counts: list[tuple[dict[int, int], int]],
+    total_samples: int,
+    scratch_dir: Path,
+) -> dict[str, Any]:
+    start, end = aot.function_bounds(cwasm_info, local_func)
+    function_code = cwasm_info.data[
+        cwasm_info.text_file_offset + start :
+        cwasm_info.text_file_offset + end
+    ]
+    instructions = aot.disassemble_blob(
+        function_code,
+        0,
+        scratch_dir,
+        f"alu-provenance-{local_func}",
+        architecture="aarch64",
+    )
+    broad_classes = aot.classify_instruction_stream(
+        instructions, architecture="aarch64"
+    )
+    samples = Counter()
+    instruction_offsets = {instruction.offset for instruction in instructions}
+    unresolved = 0
+    for counts, text_base in capture_counts:
+        function_base = text_base + start
+        for address, count in counts.items():
+            if not function_base <= address < function_base + len(function_code):
+                continue
+            offset = address - function_base
+            if offset in instruction_offsets:
+                samples[offset] += count
+            else:
+                unresolved += count
+    result = aarch64_instruction_provenance.analyze_instruction_stream(
+        instructions,
+        broad_classes=broad_classes,
+        samples_by_offset=samples,
+        total_run_samples=total_samples,
+    )
+    result["sample_mapping"] = {
+        "mapped_function_samples": sum(samples.values()),
+        "unresolved_function_samples": unresolved,
+    }
+    return result
+
+
+def assemble_alu_provenance(
+    *,
+    wamr: dict[str, Any],
+    wasmtime: dict[str, Any],
+    expected_wamr_all_alu_samples: int,
+    expected_wasmtime_all_alu_samples: int,
+) -> dict[str, Any]:
+    if wamr.get("status") == "measured" and (
+        wamr.get("broad_alu_samples") != expected_wamr_all_alu_samples
+    ):
+        raise ProfileError(
+            "WAMR narrow ALU partitions do not match existing all_alu samples"
+        )
+    if wasmtime.get("status") == "measured" and (
+        wasmtime.get("broad_alu_samples")
+        != expected_wasmtime_all_alu_samples
+    ):
+        raise ProfileError(
+            "Wasmtime narrow ALU partitions do not match existing all_alu samples"
+        )
+    return {
+        "schema_version": aarch64_instruction_provenance.SCHEMA_VERSION,
+        "kind": aarch64_instruction_provenance.ANALYSIS_KIND,
+        "wording": NARROW_ALU_WORDING,
+        "wamr": wamr,
+        "wasmtime": wasmtime,
+        "gate": aarch64_instruction_provenance.compare_engine_analyses(
+            wamr, wasmtime
+        ),
+    }
+
+
 def load_benchmark_report(path: Path) -> tuple[dict[str, Any], str]:
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
@@ -615,6 +782,42 @@ def _require_sha(value: object, label: str, length: int) -> str:
     ):
         raise ProfileError(f"{label} must be a {length}-character lowercase hex digest")
     return value
+
+
+def _validate_narrow_alu_analysis(
+    analysis: dict[str, Any],
+    *,
+    engine: str,
+    expected_samples: int,
+    total_samples: int,
+) -> None:
+    if (
+        analysis.get("schema_version")
+        != aarch64_instruction_provenance.SCHEMA_VERSION
+        or analysis.get("kind")
+        != aarch64_instruction_provenance.ANALYSIS_KIND
+        or analysis.get("status") != "measured"
+    ):
+        raise ProfileError(f"invalid {engine} narrow ALU analysis identity")
+    if (
+        analysis.get("total_run_samples") != total_samples
+        or analysis.get("broad_alu_samples") != expected_samples
+        or analysis.get("partition_samples") != expected_samples
+    ):
+        raise ProfileError(
+            f"{engine} narrow ALU samples do not reconcile to all_alu"
+        )
+    categories = analysis.get("categories")
+    if (
+        not isinstance(categories, dict)
+        or set(categories) != set(aarch64_instruction_provenance.CATEGORIES)
+        or any(not isinstance(values, dict) for values in categories.values())
+        or sum(
+            values.get("samples", -1) for values in categories.values()
+        )
+        != expected_samples
+    ):
+        raise ProfileError(f"{engine} narrow ALU categories are incomplete")
 
 
 def validate_report(report: dict[str, Any]) -> None:
@@ -685,6 +888,32 @@ def validate_report(report: dict[str, Any]) -> None:
         raise ProfileError("profile report iteration count is not authoritative")
     if report.get("classifier_wording", {}).get("all_alu") != ALL_ALU_WORDING:
         raise ProfileError("profile report has ambiguous ALU classifier wording")
+    narrow_summary = report.get("alu_provenance")
+    if narrow_summary is not None:
+        if (
+            report.get("classifier_wording", {}).get(
+                "narrow_alu_provenance"
+            )
+            != NARROW_ALU_WORDING
+        ):
+            raise ProfileError(
+                "profile report has ambiguous narrow ALU classifier wording"
+            )
+        analysis_module = provenance.get("analysis_module")
+        if not isinstance(analysis_module, dict):
+            raise ProfileError("profile report lacks ALU analysis module identity")
+        _require_sha(
+            analysis_module.get("sha256"),
+            "ALU analysis module sha256",
+            64,
+        )
+        if (
+            narrow_summary.get("schema_version")
+            != aarch64_instruction_provenance.SCHEMA_VERSION
+            or narrow_summary.get("kind")
+            != aarch64_instruction_provenance.ANALYSIS_KIND
+        ):
+            raise ProfileError("profile report has invalid narrow ALU summary")
     affinity = report.get("affinity")
     if not isinstance(affinity, dict) or affinity.get("verified") is not True:
         raise ProfileError("profile report lacks verified CPU affinity")
@@ -740,6 +969,69 @@ def validate_report(report: dict[str, Any]) -> None:
             raise ProfileError("local_func/wasm function mapping is inconsistent")
         if item["wamr"]["samples"] <= 0 or item["wasmtime"]["samples"] <= 0:
             raise ProfileError("matched functions must have samples in both engines")
+        if narrow_summary is not None:
+            narrow = item.get("alu_provenance")
+            if (
+                not isinstance(narrow, dict)
+                or narrow.get("wording") != NARROW_ALU_WORDING
+            ):
+                raise ProfileError(
+                    "matched function lacks narrow ALU provenance"
+                )
+            _validate_narrow_alu_analysis(
+                narrow.get("wamr", {}),
+                engine="WAMR",
+                expected_samples=item["class_groups"]["all_alu"][
+                    "wamr_samples"
+                ],
+                total_samples=engines["wamr"]["total_samples"],
+            )
+            _validate_narrow_alu_analysis(
+                narrow.get("wasmtime", {}),
+                engine="Wasmtime",
+                expected_samples=item["class_groups"]["all_alu"][
+                    "wasmtime_samples"
+                ],
+                total_samples=engines["wasmtime"]["total_samples"],
+            )
+            gate = narrow.get("gate")
+            if (
+                not isinstance(gate, dict)
+                or "all_alu" in gate.get("categories", {})
+            ):
+                raise ProfileError(
+                    "narrow ALU gate is missing or uses broad all_alu"
+                )
+    if narrow_summary is not None:
+        retained = report.get("retained_analysis_artifacts", {}).get(
+            "wamr_cwasm"
+        )
+        if (
+            not isinstance(retained, dict)
+            or retained.get("retained") is not True
+            or retained.get("source_sha256") != wamr.get("cwasm_sha256")
+        ):
+            raise ProfileError(
+                "profile report did not retain the exact analyzed WAMR cwasm"
+            )
+        target = next(
+            (
+                item
+                for item in matched
+                if item["local_func"]
+                == narrow_summary.get("target_local_func")
+                and item["wasm_function_index"]
+                == narrow_summary.get("target_wasm_function_index")
+            ),
+            None,
+        )
+        if target is not None and (
+            narrow_summary.get("gate")
+            != target["alu_provenance"].get("gate")
+        ):
+            raise ProfileError(
+                "top-level narrow ALU gate does not match its target function"
+            )
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -862,6 +1154,45 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{values['wasmtime_percent_of_run']:.2f}% | "
                 f"{values['delta_percentage_points']:+.2f} pp |"
             )
+    if report.get("alu_provenance") is not None:
+        lines.extend(
+            [
+                "",
+                "#### Conservative ALU provenance",
+                "",
+                "| Function | Category | WAMR samples / run share | "
+                "Wasmtime samples / run share | Conservative headroom |",
+                "|---|---|---:|---:|---:|",
+            ]
+        )
+        for item in report["matched_functions"]:
+            narrow = item["alu_provenance"]
+            gate_categories = narrow["gate"].get("categories", {})
+            for category in aarch64_instruction_provenance.CATEGORIES:
+                wamr_values = narrow["wamr"]["categories"][category]
+                wasmtime_values = narrow["wasmtime"]["categories"][category]
+                gate_value = gate_categories.get(category)
+                headroom = (
+                    f"{gate_value['conservative_headroom_percentage_points']:+.2f} pp"
+                    if gate_value is not None
+                    else "not gate-eligible"
+                )
+                lines.append(
+                    f"| `{item['name']}` | `{category}` | "
+                    f"{wamr_values['samples']} / "
+                    f"{wamr_values['percent_of_run']:.2f}% | "
+                    f"{wasmtime_values['samples']} / "
+                    f"{wasmtime_values['percent_of_run']:.2f}% | "
+                    f"{headroom} |"
+                )
+            lines.append(
+                f"| `{item['name']}` | `proven coverage` | "
+                f"{narrow['wamr']['coverage']['proven_percent_of_broad_alu']:.2f}% "
+                "of ALU | "
+                f"{narrow['wasmtime']['coverage']['proven_percent_of_broad_alu']:.2f}% "
+                "of ALU | "
+                f"gate `{narrow['gate']['status']}` |"
+            )
     lines.extend(
         [
             "",
@@ -894,8 +1225,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             "so static frame traffic is a conservative cross-check, not a claim "
             "that every frame access is an allocator spill. `all_alu` means "
             f"{report['classifier_wording']['all_alu']}; its cross-engine "
-            "difference is not address/check headroom. Narrower attribution "
-            "requires matched semantic value/path tracing in both engines.",
+            "difference is not address/check headroom. Narrow provenance uses "
+            "the same architecture-only CFG/def-use rules for both engines. "
+            "Unknown, mixed, and unresolved samples remain possible upper "
+            "bounds on the reference engine and cannot clear the optimization "
+            "gate.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -911,6 +1245,32 @@ def gzip_if_small(path: Path, max_bytes: int) -> dict[str, Any]:
     return {
         "path": target.name,
         "source_size_bytes": size,
+        "size_bytes": target.stat().st_size,
+        "retained": True,
+    }
+
+
+def retain_exact_binary(
+    source: Path, target: Path, max_bytes: int
+) -> dict[str, Any]:
+    size = source.stat().st_size
+    source_sha = sha256_file(source)
+    if size > max_bytes:
+        return {
+            "path": target.name,
+            "source_size_bytes": size,
+            "source_sha256": source_sha,
+            "retained": False,
+            "reason": f"source exceeds retention limit {max_bytes}",
+        }
+    with source.open("rb") as input_stream, gzip.open(
+        target, "wb", compresslevel=9
+    ) as output_stream:
+        shutil.copyfileobj(input_stream, output_stream)
+    return {
+        "path": target.name,
+        "source_size_bytes": size,
+        "source_sha256": source_sha,
         "size_bytes": target.stat().st_size,
         "retained": True,
     }
@@ -1030,6 +1390,16 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         compiler_path=wamrc,
         module_path=cwasm,
     )
+    retained_wamr_binary = retain_exact_binary(
+        cwasm,
+        out_dir / "wamr-profiled.cwasm.gz",
+        args.max_perf_bytes,
+    )
+    if (
+        retained_wamr_binary["source_sha256"]
+        != profile_wamr_identity["module"]["sha256"]
+    ):
+        raise ProfileError("retained WAMR cwasm identity changed during handoff")
 
     wasmtime = bench_coremark.install_pinned_wasmtime(
         repo, args.wasmtime_cache
@@ -1358,6 +1728,15 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             function_start=function_start,
         )
 
+    wamr_capture_counts = []
+    for wamr_perf, ranking_report in zip(wamr_perfs, ranking_reports):
+        counts, total = aot.addr_counts(str(wamr_perf))
+        if total != ranking_report["total_samples"]:
+            raise ProfileError(
+                "WAMR perf sample totals changed while building ALU provenance"
+            )
+        wamr_capture_counts.append((counts, ranking_report["text_base"]))
+
     parsed_wasmtime = aggregate_wasmtime_samples(wasmtime_captures)
     validate_wasmtime_mapping(parsed_wasmtime, wasm_identity)
     if parsed_wasmtime["total_samples"] < args.min_samples:
@@ -1422,6 +1801,31 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             if key in {"frame_store_unattributed", "unknown_frame_store"}
         )
         frame_samples = class_groups["frame_traffic"]["wamr_samples"]
+        wamr_alu_provenance = analyze_wamr_alu_provenance(
+            aot=aot,
+            cwasm_info=cwasm_info,
+            local_func=local_func,
+            capture_counts=wamr_capture_counts,
+            total_samples=wamr_attribution["total_samples"],
+            scratch_dir=out_dir,
+        )
+        wasmtime_alu_provenance = analyze_wasmtime_alu_provenance(
+            aot=aot,
+            objdump_text=objdump,
+            wasm_index=wasm_index,
+            offsets=wasmtime_entry["offsets"],
+            total_samples=parsed_wasmtime["total_samples"],
+        )
+        narrow_alu = assemble_alu_provenance(
+            wamr=wamr_alu_provenance,
+            wasmtime=wasmtime_alu_provenance,
+            expected_wamr_all_alu_samples=class_groups["all_alu"][
+                "wamr_samples"
+            ],
+            expected_wasmtime_all_alu_samples=class_groups["all_alu"][
+                "wasmtime_samples"
+            ],
+        )
         matched.append(
             {
                 "local_func": local_func,
@@ -1464,6 +1868,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     **wasmtime_instruction,
                 },
                 "class_groups": class_groups,
+                "alu_provenance": narrow_alu,
             }
         )
 
@@ -1474,6 +1879,16 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         gzip_if_small(path, args.max_perf_bytes)
         for path in [*wamr_perfs, *wasmtime_perfs, *jitdumps]
     ]
+    target_alu = next(
+        (
+            item["alu_provenance"]
+            for item in matched
+            if item["local_func"] == 3
+            and item["wasm_function_index"]
+            == 3 + wasm_identity.imported_function_count
+        ),
+        None,
+    )
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "kind": REPORT_KIND,
@@ -1493,6 +1908,16 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "producer_source_sha": checkout_commit,
             "script_path": str(Path(__file__).resolve().relative_to(repo)),
             "script_sha256": sha256_file(Path(__file__).resolve()),
+            "analysis_module": {
+                "path": str(
+                    Path(aarch64_instruction_provenance.__file__)
+                    .resolve()
+                    .relative_to(repo)
+                ),
+                "sha256": sha256_file(
+                    Path(aarch64_instruction_provenance.__file__).resolve()
+                ),
+            },
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "execution": current_execution,
         },
@@ -1505,7 +1930,10 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "verified": True,
         },
         "profile_schedule": profile_schedule,
-        "classifier_wording": {"all_alu": ALL_ALU_WORDING},
+        "classifier_wording": {
+            "all_alu": ALL_ALU_WORDING,
+            "narrow_alu_provenance": NARROW_ALU_WORDING,
+        },
         "minimum_attribution_coverage_pct": MIN_ATTRIBUTION_COVERAGE_PCT,
         "wamr_captures": wamr_capture_validations,
         "wasmtime_captures": [
@@ -1620,8 +2048,31 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             },
         },
         "matched_functions": matched,
+        "alu_provenance": {
+            "schema_version": aarch64_instruction_provenance.SCHEMA_VERSION,
+            "kind": aarch64_instruction_provenance.ANALYSIS_KIND,
+            "target_local_func": 3,
+            "target_wasm_function_index": (
+                3 + wasm_identity.imported_function_count
+            ),
+            "gate": (
+                target_alu["gate"]
+                if target_alu is not None
+                else {
+                    "status": "blocked",
+                    "optimization_authorized": False,
+                    "reason": (
+                        "core_bench_list was not among the classified "
+                        "functions"
+                    ),
+                }
+            ),
+        },
         "commands": recorder.commands,
         "retained_perf_artifacts": perf_artifacts,
+        "retained_analysis_artifacts": {
+            "wamr_cwasm": retained_wamr_binary,
+        },
         "caveats": [
             "Self samples only; WAMR generated code has no unwind CFI.",
             "AArch64 spill metrics are pre-emission estimates.",
@@ -1629,8 +2080,9 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             "Two captures per engine were collected in ABBA order after ABBA warmups.",
             ALL_ALU_WORDING
             + "; the all-ALU differential is not address/check headroom.",
-            "Narrower address/check attribution requires matched semantic "
-            "value/path tracing in both engines.",
+            "Narrow ALU provenance uses identical architecture-only CFG and "
+            "def-use rules in both engines; unknown, mixed, and unresolved "
+            "samples cannot clear the optimization gate.",
         ],
     }
     bench_coremark.validate_same_host(host_identity)
