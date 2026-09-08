@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -21,7 +22,121 @@ Correct operation validated. See README.md for run and reporting rules.
 """
 
 
+def wamr_identity(ref: str, source_sha: str, digest: str) -> dict:
+    return {
+        "type": "wamr",
+        "source": {"ref": ref, "sha": source_sha},
+        "optimize": "ReleaseFast",
+        "runtime": {"name": "wamr", "path": "/wamr", "sha256": digest},
+        "compiler": {"name": "wamrc", "path": "/wamrc", "sha256": digest},
+        "module": {"format": "cwasm", "path": "/coremark.cwasm", "sha256": digest},
+    }
+
+
+def wasmtime_identity(digest: str) -> dict:
+    return {
+        "type": "wasmtime",
+        "channel": "historical-pin",
+        "version": bench_coremark.PINNED_WASMTIME_VERSION,
+        "runtime": {"name": "wasmtime", "path": "/wasmtime", "sha256": digest},
+    }
+
+
+def report_provenance() -> dict:
+    return {
+        "report_id": "12345678-1234-5678-1234-567812345678",
+        "generated_at": "2026-09-08T00:00:00+00:00",
+        "producer": {
+            "source_sha": "c" * 40,
+            "script": {
+                "path": "scripts/bench_coremark.py",
+                "sha256": "d" * 64,
+            },
+        },
+        "execution": {"provider": "local", "run_id": "test-run"},
+    }
+
+
 class BenchCoremarkTests(unittest.TestCase):
+    def authoritative_report(self):
+        host = bench_coremark.HostIdentity(
+            "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
+        )
+        affinity = bench_coremark.AffinityInfo((0, 1, 2, 3), 0, "/usr/bin/taskset")
+        target_identity = wamr_identity("target", "b" * 40, "2" * 64)
+        results = [
+            bench_coremark.EngineResult(
+                "WAMR",
+                "baseline",
+                "ReleaseFast",
+                [100.0] * 10,
+                identity=wamr_identity("baseline", "a" * 40, "1" * 64),
+            ),
+            bench_coremark.EngineResult(
+                "WAMR",
+                "target",
+                "ReleaseFast",
+                [110.0] * 10,
+                identity=target_identity,
+            ),
+            bench_coremark.EngineResult(
+                "Wasmtime historical pin",
+                "44.0.1",
+                "default JIT",
+                [220.0] * 10,
+                identity=wasmtime_identity("3" * 64),
+            ),
+        ]
+        records = []
+        position = 0
+        for phase, count in (("warmup", 2), ("measured", 10)):
+            ordinals = {"target": 0, "wasmtime": 0}
+            for key in bench_coremark.counterbalanced_order(
+                ["target", "wasmtime"], count
+            ):
+                position += 1
+                ordinals[key] += 1
+                records.append(
+                    bench_coremark.SampleRecord(
+                        key,
+                        "WAMR target" if key == "target" else "Wasmtime",
+                        phase,
+                        ordinals[key],
+                        position,
+                        "2026-09-08T00:00:00+00:00",
+                        "2026-09-08T00:00:01+00:00",
+                        1.0,
+                        100.0,
+                        bench_coremark.EXPECTED_ITERATIONS,
+                    )
+                )
+        report = bench_coremark.build_json_report(
+            results,
+            profile="authoritative",
+            warmups=2,
+            runs=10,
+            fixture=Path("coremark.wasm"),
+            fixture_sha="f" * 64,
+            host=host,
+            schedule_records=records,
+            affinity=affinity,
+            provenance=report_provenance(),
+        )
+        for engine in report["engines"]:
+            if engine["role"] == "wamr-target":
+                engine["sample_schedule_positions"] = [
+                    record.schedule_position
+                    for record in records
+                    if record.engine_key == "target"
+                ]
+            elif engine["role"] == "wasmtime-baseline":
+                engine["sample_schedule_positions"] = [
+                    record.schedule_position
+                    for record in records
+                    if record.engine_key == "wasmtime"
+                ]
+        return report, host, affinity, target_identity
+
     def test_tracked_fixture_checksum_is_pinned(self):
         fixture, digest = bench_coremark.resolve_fixture(
             REPO, bench_coremark.DEFAULT_FIXTURE
@@ -204,6 +319,7 @@ class BenchCoremarkTests(unittest.TestCase):
             ),
             schedule_records=records,
             affinity=None,
+            provenance=report_provenance(),
         )
         self.assertAlmostEqual(11 / 21, report["ratios"][0]["median_ratio"])
 
@@ -319,6 +435,7 @@ class BenchCoremarkTests(unittest.TestCase):
             ),
             schedule_records=[],
             affinity=None,
+            provenance=report_provenance(),
         )
         self.assertEqual(raw_ratio, payload["ratios"][0]["median_ratio"])
 
@@ -343,6 +460,125 @@ class BenchCoremarkTests(unittest.TestCase):
                     "aarch64", 4, "Neoverse-N2", "runner", "boot-id"
                 ),
             )
+
+    def test_current_benchmark_profile_identity_is_validated(self):
+        report, host, affinity, target_identity = self.authoritative_report()
+        linkage = bench_coremark.validate_benchmark_profile_match(
+            report,
+            expected_arch="aarch64",
+            fixture_sha="f" * 64,
+            host=host,
+            affinity=affinity,
+            wamr_source_sha="b" * 40,
+            wamr_optimize="ReleaseFast",
+            wamr_runtime_sha=target_identity["runtime"]["sha256"],
+            wamr_compiler_sha=target_identity["compiler"]["sha256"],
+            wamr_module_sha=target_identity["module"]["sha256"],
+            wasmtime_version_value=bench_coremark.PINNED_WASMTIME_VERSION,
+            wasmtime_runtime_sha="3" * 64,
+            producer_source_sha="c" * 40,
+            producer_script_sha="d" * 64,
+            current_execution={"provider": "local", "run_id": ""},
+        )
+        self.assertEqual(
+            report["provenance"]["report_id"], linkage["report_id"]
+        )
+        self.assertEqual("b" * 40, linkage["target"]["identity"]["source"]["sha"])
+
+    def test_benchmark_profile_mismatches_fail_closed(self):
+        report, host, affinity, target_identity = self.authoritative_report()
+        kwargs = {
+            "expected_arch": "aarch64",
+            "fixture_sha": "f" * 64,
+            "host": host,
+            "affinity": affinity,
+            "wamr_source_sha": "b" * 40,
+            "wamr_optimize": "ReleaseFast",
+            "wamr_runtime_sha": target_identity["runtime"]["sha256"],
+            "wamr_compiler_sha": target_identity["compiler"]["sha256"],
+            "wamr_module_sha": target_identity["module"]["sha256"],
+            "wasmtime_version_value": bench_coremark.PINNED_WASMTIME_VERSION,
+            "wasmtime_runtime_sha": "3" * 64,
+            "producer_source_sha": "c" * 40,
+            "producer_script_sha": "d" * 64,
+            "current_execution": {"provider": "local", "run_id": ""},
+        }
+        with self.assertRaisesRegex(RuntimeError, "WAMR source sha mismatch"):
+            bench_coremark.validate_benchmark_profile_match(
+                report, **{**kwargs, "wamr_source_sha": "9" * 40}
+            )
+        with self.assertRaisesRegex(RuntimeError, "runtime sha256 mismatch"):
+            bench_coremark.validate_benchmark_profile_match(
+                report, **{**kwargs, "wamr_runtime_sha": "9" * 64}
+            )
+        with self.assertRaisesRegex(RuntimeError, "compiler sha256 mismatch"):
+            bench_coremark.validate_benchmark_profile_match(
+                report, **{**kwargs, "wamr_compiler_sha": "9" * 64}
+            )
+        with self.assertRaisesRegex(RuntimeError, "Wasmtime runtime sha256"):
+            bench_coremark.validate_benchmark_profile_match(
+                report, **{**kwargs, "wasmtime_runtime_sha": "9" * 64}
+            )
+        with self.assertRaisesRegex(RuntimeError, "fixture/input hash"):
+            bench_coremark.validate_benchmark_profile_match(
+                report, **{**kwargs, "fixture_sha": "9" * 64}
+            )
+        with self.assertRaisesRegex(RuntimeError, "architecture mismatch"):
+            bench_coremark.validate_benchmark_profile_match(
+                report, **{**kwargs, "expected_arch": "x86_64"}
+            )
+        with self.assertRaisesRegex(RuntimeError, "host cpu_model"):
+            bench_coremark.validate_benchmark_profile_match(
+                report,
+                **{
+                    **kwargs,
+                    "host": bench_coremark.HostIdentity(
+                        "aarch64", 4, "different", "runner", "boot-id"
+                    ),
+                },
+            )
+        github_report = copy.deepcopy(report)
+        github_report["provenance"]["execution"] = {
+            "provider": "github-actions",
+            "repository": "cataggar/wamr",
+            "run_id": "100",
+            "run_attempt": "1",
+        }
+        with self.assertRaisesRegex(RuntimeError, "run_id"):
+            bench_coremark.validate_benchmark_profile_match(
+                github_report,
+                **{
+                    **kwargs,
+                    "current_execution": {
+                        "provider": "github-actions",
+                        "repository": "cataggar/wamr",
+                        "run_id": "101",
+                        "run_attempt": "1",
+                    },
+                },
+            )
+
+    def test_missing_or_legacy_benchmark_provenance_is_not_authoritative(self):
+        report, _, _, _ = self.authoritative_report()
+        missing = copy.deepcopy(report)
+        del missing["provenance"]
+        with self.assertRaisesRegex(RuntimeError, "missing required provenance"):
+            bench_coremark.validate_authoritative_benchmark_report(missing)
+
+        wrong_args = copy.deepcopy(report)
+        wrong_args["guest_args"][-2] = "300000"
+        with self.assertRaisesRegex(RuntimeError, "guest args"):
+            bench_coremark.validate_authoritative_benchmark_report(wrong_args)
+
+        legacy = {
+            "schema_version": 1,
+            "kind": bench_coremark.REPORT_KIND,
+        }
+        status = bench_coremark.benchmark_report_status(legacy)
+        self.assertFalse(status["authoritative"])
+        self.assertEqual("legacy-unverified", status["status"])
+        with self.assertRaisesRegex(RuntimeError, "legacy-unverified"):
+            bench_coremark.validate_authoritative_benchmark_report(legacy)
 
     @mock.patch.object(
         bench_coremark, "run", return_value="wasmtime 44.0.1 (abcdef)"
@@ -419,10 +655,8 @@ class BenchCoremarkTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("- profile", workflow)
-        self.assertIn(
-            'default: "19d046a5b23b9c39acf5f7062976f04c5ca8ca75"',
-            workflow,
-        )
+        self.assertNotIn("19d046a5b23b9c39acf5f7062976f04c5ca8ca75", workflow)
+        self.assertIn('profile_sha="$(git rev-parse "$profile_ref")"', workflow)
         dispatch = workflow.split(
             "- name: Run authoritative same-host CoreMark comparison", 1
         )[1].split("\n      - name:", 1)[0]
@@ -440,6 +674,17 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("--profile  ci", pr)
         self.assertNotIn("--wasmtime-baseline", pr)
 
+        identity_benchmark = workflow.split(
+            "- name: Run authoritative profile identity benchmark", 1
+        )[1].split("\n      - name:", 1)[0]
+        self.assertIn('--baseline "$PROFILE_SHA"', identity_benchmark)
+        self.assertIn('--target   "$PROFILE_SHA"', identity_benchmark)
+        self.assertIn("--profile  authoritative", identity_benchmark)
+        self.assertIn(
+            "--json-out coremark-profile/benchmark-report.json",
+            identity_benchmark,
+        )
+
         perf_setup = workflow.split(
             "- name: Install matching perf for profiling", 1
         )[1].split("\n      - name:", 1)[0]
@@ -455,7 +700,14 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("github.event_name == 'workflow_dispatch'", profile_step)
         self.assertIn("github.event.inputs.mode == 'profile'", profile_step)
         self.assertIn("profile_coremark_aarch64.py", profile_step)
-        self.assertIn('--wamr-ref "$PROFILE_REF"', profile_step)
+        self.assertIn(
+            "--benchmark-report coremark-profile/benchmark-report.json",
+            profile_step,
+        )
+        self.assertIn('--wamr-ref "$PROFILE_SHA"', profile_step)
+        self.assertIn(
+            '--wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime"', profile_step
+        )
         self.assertIn("--min-samples 1000", profile_step)
 
         profile_script = PROFILE_SCRIPT.read_text()
@@ -463,7 +715,8 @@ class BenchCoremarkTests(unittest.TestCase):
         self.assertIn("WAMR_AOT_SPILL_METRIC", profile_script)
         self.assertIn("WAMR_AOT_CODEGEN_TIMING", profile_script)
         self.assertIn('"cycles:u"', profile_script)
-        self.assertIn("AUTHORITATIVE_BASELINE_RUN = 33631050708", profile_script)
+        self.assertNotIn("AUTHORITATIVE_BASELINE_RUN", profile_script)
+        self.assertIn("--benchmark-report", profile_script)
         self.assertIn("select_cpu_affinity()", profile_script)
         self.assertIn("coremark_guest_args(", profile_script)
         self.assertIn("PROFILE_CAPTURES_PER_ENGINE = 2", profile_script)

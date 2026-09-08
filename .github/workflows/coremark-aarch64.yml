@@ -23,9 +23,9 @@ on:
         required: false
         default: "HEAD"
       profile_ref:
-        description: "Exact WAMR commit/ref to profile"
+        description: "WAMR commit/ref to benchmark and profile (defaults to target)"
         required: false
-        default: "19d046a5b23b9c39acf5f7062976f04c5ca8ca75"
+        default: ""
   pull_request:
     paths:
       - src/compiler/**
@@ -84,6 +84,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           INPUT_BASELINE: ${{ github.event.inputs.baseline }}
           INPUT_TARGET: ${{ github.event.inputs.target }}
+          INPUT_PROFILE_REF: ${{ github.event.inputs.profile_ref }}
         run: |
           if [ "$EVENT" = "pull_request" ]; then
             echo "baseline=$BASE_SHA" >> "$GITHUB_OUTPUT"
@@ -91,6 +92,9 @@ jobs:
           else
             echo "baseline=${INPUT_BASELINE:-origin/main}" >> "$GITHUB_OUTPUT"
             echo "target=${INPUT_TARGET:-HEAD}"            >> "$GITHUB_OUTPUT"
+            profile_ref="${INPUT_PROFILE_REF:-${INPUT_TARGET:-HEAD}}"
+            profile_sha="$(git rev-parse "$profile_ref")"
+            echo "profile=$profile_sha" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run CoreMark PR comparison
@@ -130,10 +134,32 @@ jobs:
             --json-out coremark-report.json \
             --emit     github
 
-      - name: Install matching perf for profiling
+      - name: Run authoritative profile identity benchmark
         if: >-
           github.event_name == 'workflow_dispatch' &&
           github.event.inputs.mode == 'profile'
+        id: profile_benchmark
+        continue-on-error: true
+        env:
+          PROFILE_SHA: ${{ steps.refs.outputs.profile }}
+        run: |
+          mkdir -p coremark-profile
+          python3 scripts/bench_coremark.py \
+            --baseline "$PROFILE_SHA" \
+            --target   "$PROFILE_SHA" \
+            --profile  authoritative \
+            --wasmtime-baseline auto \
+            --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
+            --require-native-arch aarch64 \
+            --out      coremark-profile/benchmark-table.md \
+            --json-out coremark-profile/benchmark-report.json \
+            --emit     github
+
+      - name: Install matching perf for profiling
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.mode == 'profile' &&
+          steps.profile_benchmark.outcome == 'success'
         id: perf_setup
         continue-on-error: true
         shell: bash
@@ -187,16 +213,19 @@ jobs:
         if: >-
           github.event_name == 'workflow_dispatch' &&
           github.event.inputs.mode == 'profile' &&
+          steps.profile_benchmark.outcome == 'success' &&
           steps.perf_setup.outcome == 'success'
         id: profile
         continue-on-error: true
         env:
-          PROFILE_REF: ${{ github.event.inputs.profile_ref }}
+          PROFILE_SHA: ${{ steps.refs.outputs.profile }}
         run: |
           python3 scripts/profile_coremark_aarch64.py \
             --out-dir coremark-profile \
-            --wamr-ref "$PROFILE_REF" \
+            --benchmark-report coremark-profile/benchmark-report.json \
+            --wamr-ref "$PROFILE_SHA" \
             --work-root "$RUNNER_TEMP/coremark-profile-wamr-source" \
+            --wasmtime-cache "$RUNNER_TEMP/coremark-wasmtime" \
             --frequency 999 \
             --min-samples 1000 \
             --top 10 \
@@ -223,8 +252,10 @@ jobs:
           github.event.inputs.mode == 'profile'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coremark-aarch64-profile-${{ github.sha }}
+          name: coremark-aarch64-profile-${{ steps.refs.outputs.profile }}
           path: |
+            coremark-profile/benchmark-report.json
+            coremark-profile/benchmark-table.md
             coremark-profile/profile.json
             coremark-profile/profile.md
             coremark-profile/failure.json
@@ -261,6 +292,7 @@ jobs:
           always() &&
           (steps.bench_pr.outcome == 'failure' ||
           steps.bench_authoritative.outcome == 'failure' ||
+          steps.profile_benchmark.outcome == 'failure' ||
           steps.perf_setup.outcome == 'failure' ||
           steps.profile.outcome == 'failure')
         run: exit 1

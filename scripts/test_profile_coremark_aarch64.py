@@ -139,7 +139,32 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
             "schema_version": profile.REPORT_SCHEMA_VERSION,
             "kind": profile.REPORT_KIND,
             "architecture": "aarch64",
-            "authoritative_baseline_run": profile.AUTHORITATIVE_BASELINE_RUN,
+            "benchmark": {
+                "report_id": "12345678-1234-5678-1234-567812345678",
+                "generated_at": "2026-09-08T00:00:00+00:00",
+                "report_sha256": "f" * 64,
+                "execution": {"provider": "local", "run_id": "test-run"},
+                "producer": {"source_sha": "c" * 40},
+                "target": {
+                    "identity": {
+                        "source": {"sha": "b" * 40},
+                        "runtime": {"sha256": "1" * 64},
+                        "compiler": {"sha256": "1" * 64},
+                        "module": {"sha256": "1" * 64},
+                    }
+                },
+                "wasmtime_baseline": {
+                    "identity": {
+                        "version": profile.bench_coremark.PINNED_WASMTIME_VERSION,
+                        "runtime": {"sha256": "3" * 64},
+                    }
+                },
+            },
+            "provenance": {
+                "producer_source_sha": "c" * 40,
+                "script_sha256": "d" * 64,
+                "execution": {"provider": "local", "run_id": "test-run"},
+            },
             "guest_args": list(profile.bench_coremark.COREMARK_GUEST_ARGS),
             "expected_iterations": profile.bench_coremark.EXPECTED_ITERATIONS,
             "classifier_wording": {"all_alu": profile.ALL_ALU_WORDING},
@@ -163,6 +188,16 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
                 {"coverage_pct": 99.9},
             ],
             "wasm": {"imported_function_count": 12},
+            "wamr": {
+                "commit": "b" * 40,
+                "runtime_sha256": "1" * 64,
+                "compiler_sha256": "1" * 64,
+                "cwasm_sha256": "1" * 64,
+            },
+            "wasmtime": {
+                "version": profile.bench_coremark.PINNED_WASMTIME_VERSION,
+                "sha256": "3" * 64,
+            },
             "engines": {
                 "wamr": {"total_samples": 100, "attributed_samples": 99},
                 "wasmtime": {"total_samples": 100, "attributed_samples": 98},
@@ -180,6 +215,18 @@ aaaa0000 wasmtime::runtime+0x10 (/bin/wasmtime)
         report["matched_functions"][0]["wasm_function_index"] = 14
         with self.assertRaisesRegex(profile.ProfileError, "inconsistent"):
             profile.validate_report(report)
+
+    def test_historical_profile_is_readable_but_not_current_authority(self):
+        status = profile.profile_report_status(
+            {
+                "schema_version": profile.HISTORICAL_REPORT_SCHEMA_VERSION,
+                "kind": profile.REPORT_KIND,
+                "authoritative_baseline_run": profile.HISTORICAL_BASELINE_RUN,
+            }
+        )
+        self.assertEqual("historical-unverified", status["status"])
+        self.assertFalse(status["authoritative"])
+        self.assertTrue(status["known_historical_baseline"])
 
     def test_each_wamr_capture_must_pass_exact_mapping_and_coverage(self):
         base = {

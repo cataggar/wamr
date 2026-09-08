@@ -51,6 +51,8 @@ PROFILE_ITERATIONS = {
 DEFAULT_FIXTURE = Path("tests/benchmarks/coremark/coremark_wasi.wasm")
 DEFAULT_FIXTURE_SHA256 = "f4b7591296ead10264e0f101f355bdf848865c31329325594e66fbabefec235b"
 PINNED_WASMTIME_VERSION = "44.0.1"
+REPORT_SCHEMA_VERSION = 2
+REPORT_KIND = "coremark-authoritative-comparison"
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "ci": (0, 3),
@@ -83,6 +85,7 @@ class EngineResult:
     optimize: str
     values: list[float]
     samples: list["SampleRecord"] = field(default_factory=list)
+    identity: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,7 @@ class PreparedEngine:
     env: dict
     expected_iterations: int
     retry_wamr_flake: bool = False
+    identity: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -182,6 +186,68 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _require_digest(value: object, label: str, length: int) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or re.fullmatch(r"[0-9a-f]+", value) is None
+    ):
+        raise RuntimeError(f"{label} must be a {length}-character lowercase hex digest")
+    return value
+
+
+def make_wamr_identity(
+    *,
+    ref: str,
+    source_sha: str,
+    optimize: str,
+    runtime_path: Path,
+    compiler_path: Path,
+    module_path: Path,
+) -> dict:
+    return {
+        "type": "wamr",
+        "source": {
+            "ref": ref,
+            "sha": _require_digest(source_sha, "WAMR source SHA", 40),
+        },
+        "optimize": optimize,
+        "runtime": {
+            "name": "wamr",
+            "path": str(runtime_path),
+            "sha256": sha256_file(runtime_path),
+        },
+        "compiler": {
+            "name": "wamrc",
+            "path": str(compiler_path),
+            "sha256": sha256_file(compiler_path),
+        },
+        "module": {
+            "format": "cwasm",
+            "path": str(module_path),
+            "sha256": sha256_file(module_path),
+        },
+    }
+
+
+def make_wasmtime_identity(
+    *,
+    version: str,
+    runtime_path: Path,
+    channel: str,
+) -> dict:
+    return {
+        "type": "wasmtime",
+        "channel": channel,
+        "version": version,
+        "runtime": {
+            "name": "wasmtime",
+            "path": str(runtime_path),
+            "sha256": sha256_file(runtime_path),
+        },
+    }
 
 
 def resolve_fixture(repo: Path, fixture_arg: Path) -> tuple[Path, str]:
@@ -321,6 +387,47 @@ def coremark_guest_args(iterations: int) -> tuple[str, ...]:
 
 def resolve_ref_sha(repo: Path, ref: str) -> str:
     return run(["git", "rev-parse", ref], cwd=repo).strip()
+
+
+def capture_execution_identity() -> dict:
+    github_run_id = os.environ.get("GITHUB_RUN_ID")
+    if github_run_id:
+        return {
+            "provider": "github-actions",
+            "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+            "run_id": github_run_id,
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+            "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
+            "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF", ""),
+            "workflow_sha": os.environ.get("GITHUB_SHA", ""),
+            "job": os.environ.get("GITHUB_JOB", ""),
+        }
+    return {
+        "provider": "local",
+        "run_id": os.environ.get("COREMARK_RUN_ID", ""),
+    }
+
+
+def capture_report_provenance(repo: Path) -> dict:
+    source_sha = _require_digest(
+        resolve_ref_sha(repo, "HEAD"), "benchmark tooling source SHA", 40
+    )
+    script = Path(__file__).resolve()
+    execution = capture_execution_identity()
+    if execution["provider"] == "local" and not execution["run_id"]:
+        execution["run_id"] = str(uuid.uuid4())
+    return {
+        "report_id": str(uuid.uuid4()),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "producer": {
+            "source_sha": source_sha,
+            "script": {
+                "path": str(script.relative_to(repo)),
+                "sha256": sha256_file(script),
+            },
+        },
+        "execution": execution,
+    }
 
 
 def make_worktree(repo: Path, ref: str, root: Path, label: str) -> tuple[Path, str]:
@@ -491,6 +598,7 @@ def measure_prepared_engines(
             engine.optimize,
             [record.iterations_per_second for record in measured],
             engine_records[engine.key],
+            engine.identity,
         )
     return results, records
 
@@ -532,6 +640,14 @@ def prepare_wamr(
         env=env,
         expected_iterations=expected_iterations,
         retry_wamr_flake=True,
+        identity=make_wamr_identity(
+            ref=ref,
+            source_sha=sha,
+            optimize=optimize,
+            runtime_path=wamr,
+            compiler_path=wamrc,
+            module_path=cwasm,
+        ),
     )
 
 
@@ -567,7 +683,13 @@ def build_and_run_wamr(
         affinity=affinity,
         expected_iterations=expected_iterations,
     )
-    return EngineResult("WAMR", f"{ref} ({sha})", optimize, values)
+    return EngineResult(
+        "WAMR",
+        f"{ref} ({sha})",
+        optimize,
+        values,
+        identity=prepared.identity,
+    )
 
 
 def normalize_arch_name(arch: str) -> str:
@@ -684,7 +806,6 @@ def measure_wasmtime(
     guest_args: tuple[str, ...] = COREMARK_GUEST_ARGS,
     expected_iterations: int = EXPECTED_ITERATIONS,
 ) -> EngineResult:
-    binary_sha = sha256_file(path)
     values = measure_command(
         engine=label,
         cmd=[
@@ -702,9 +823,18 @@ def measure_wasmtime(
     )
     return EngineResult(
         label,
-        f"{version} (sha256:{binary_sha}; {path})",
+        f"{version} (sha256:{sha256_file(path)}; {path})",
         "default JIT",
         values,
+        identity=make_wasmtime_identity(
+            version=version,
+            runtime_path=path,
+            channel=(
+                "historical-pin"
+                if label == "Wasmtime historical pin"
+                else "caller-selected"
+            ),
+        ),
     )
 
 
@@ -716,11 +846,10 @@ def prepare_wasmtime(
     guest_args: tuple[str, ...] = COREMARK_GUEST_ARGS,
     expected_iterations: int = EXPECTED_ITERATIONS,
 ) -> PreparedEngine:
-    binary_sha = sha256_file(path)
     return PreparedEngine(
         key=f"wasmtime:{path.resolve()}",
         engine=label,
-        version=f"{version} (sha256:{binary_sha}; {path})",
+        version=f"{version} (sha256:{sha256_file(path)}; {path})",
         optimize="default JIT",
         cmd=[
             str(path),
@@ -731,6 +860,15 @@ def prepare_wasmtime(
         cwd=fixture.parent,
         env=os.environ.copy(),
         expected_iterations=expected_iterations,
+        identity=make_wasmtime_identity(
+            version=version,
+            runtime_path=path,
+            channel=(
+                "historical-pin"
+                if label == "Wasmtime historical pin"
+                else "caller-selected"
+            ),
+        ),
     )
 
 
@@ -1006,17 +1144,31 @@ def build_json_report(
     host: HostIdentity,
     schedule_records: list[SampleRecord],
     affinity: AffinityInfo | None,
+    provenance: dict,
     guest_args: tuple[str, ...] = COREMARK_GUEST_ARGS,
     expected_iterations: int = EXPECTED_ITERATIONS,
 ) -> dict:
     engines = []
-    for result in results:
+    for index, result in enumerate(results):
         mean, median, minimum, maximum = fmt_stats(result.values)
+        if index == 0:
+            role = "wamr-baseline"
+        elif index == 1:
+            role = "wamr-target"
+        elif result.identity.get("channel") == "historical-pin":
+            role = "wasmtime-baseline"
+        else:
+            role = "wasmtime-context"
         engines.append(
             {
+                "role": role,
                 "engine": result.engine,
                 "version": result.version,
                 "optimize": result.optimize,
+                "identity": result.identity,
+                "sample_schedule_positions": [
+                    sample.schedule_position for sample in result.samples
+                ],
                 "mean_iterations_per_second": mean,
                 "median_iterations_per_second": median,
                 "minimum_iterations_per_second": minimum,
@@ -1038,9 +1190,10 @@ def build_json_report(
                 "mean_ratio": mean_ratio,
             }
         )
-    return {
-        "schema_version": 1,
-        "kind": "coremark-authoritative-comparison",
+    report = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "kind": REPORT_KIND,
+        "provenance": provenance,
         "profile": profile,
         "warmups_per_engine": warmups,
         "measured_samples_per_engine": runs,
@@ -1070,6 +1223,321 @@ def build_json_report(
         "schedule": [asdict(record) for record in schedule_records],
         "engines": engines,
         "ratios": ratios,
+    }
+    if (
+        profile == "authoritative"
+        and (warmups, runs) == PROFILE_COUNTS["authoritative"]
+    ):
+        validate_authoritative_benchmark_report(report)
+    return report
+
+
+def benchmark_report_status(report: dict) -> dict:
+    if report.get("kind") != REPORT_KIND:
+        raise RuntimeError("benchmark report has an unsupported kind")
+    if report.get("schema_version") == 1:
+        return {
+            "status": "legacy-unverified",
+            "authoritative": False,
+            "reason": (
+                "schema version 1 predates explicit source, tool, run, and "
+                "report provenance"
+            ),
+        }
+    validate_authoritative_benchmark_report(report)
+    return {"status": "current", "authoritative": True}
+
+
+def _validate_engine_identity(identity: object, role: str) -> dict:
+    if not isinstance(identity, dict):
+        raise RuntimeError(f"{role} is missing its engine identity")
+    identity_type = identity.get("type")
+    runtime = identity.get("runtime")
+    if not isinstance(runtime, dict):
+        raise RuntimeError(f"{role} is missing its runtime identity")
+    _require_digest(runtime.get("sha256"), f"{role} runtime sha256", 64)
+    if identity_type == "wamr":
+        source = identity.get("source")
+        compiler = identity.get("compiler")
+        module = identity.get("module")
+        if not isinstance(source, dict) or not source.get("ref"):
+            raise RuntimeError(f"{role} is missing its WAMR source identity")
+        _require_digest(source.get("sha"), f"{role} WAMR source SHA", 40)
+        if not isinstance(compiler, dict):
+            raise RuntimeError(f"{role} is missing its compiler identity")
+        if not isinstance(module, dict):
+            raise RuntimeError(f"{role} is missing its compiled module identity")
+        _require_digest(compiler.get("sha256"), f"{role} compiler sha256", 64)
+        _require_digest(module.get("sha256"), f"{role} module sha256", 64)
+        if identity.get("optimize") not in ("ReleaseFast", "ReleaseSafe"):
+            raise RuntimeError(f"{role} has an unsupported WAMR optimize mode")
+    elif identity_type == "wasmtime":
+        if not identity.get("version") or not identity.get("channel"):
+            raise RuntimeError(f"{role} is missing its Wasmtime release identity")
+    else:
+        raise RuntimeError(f"{role} has an unsupported engine identity type")
+    return identity
+
+
+def validate_authoritative_benchmark_report(report: dict) -> None:
+    schema_version = report.get("schema_version")
+    if schema_version == 1:
+        raise RuntimeError(
+            "benchmark report schema_version 1 is legacy-unverified and lacks "
+            "required provenance; create a new authoritative report"
+        )
+    if schema_version != REPORT_SCHEMA_VERSION:
+        raise RuntimeError("benchmark report has an unsupported schema_version")
+    if report.get("kind") != REPORT_KIND:
+        raise RuntimeError("benchmark report has an unsupported kind")
+    if report.get("profile") != "authoritative":
+        raise RuntimeError("benchmark report must use the authoritative profile")
+    expected_warmups, expected_runs = PROFILE_COUNTS["authoritative"]
+    if report.get("warmups_per_engine") != expected_warmups:
+        raise RuntimeError("benchmark report has the wrong authoritative warmup count")
+    if report.get("measured_samples_per_engine") != expected_runs:
+        raise RuntimeError("benchmark report has the wrong authoritative sample count")
+    fixture = report.get("fixture")
+    if not isinstance(fixture, dict):
+        raise RuntimeError("benchmark report is missing its fixture identity")
+    _require_digest(fixture.get("sha256"), "benchmark fixture sha256", 64)
+    if report.get("guest_args") != list(COREMARK_GUEST_ARGS):
+        raise RuntimeError("benchmark report guest args are not authoritative")
+    if report.get("expected_iterations") != EXPECTED_ITERATIONS:
+        raise RuntimeError("benchmark report iteration count is not authoritative")
+    if report.get("required_performance_marker") != PERFORMANCE_MARKER:
+        raise RuntimeError("benchmark report has the wrong performance marker")
+    if report.get("required_crc_marker") != VALIDATION_TEXT:
+        raise RuntimeError("benchmark report has the wrong CRC marker")
+
+    provenance = report.get("provenance")
+    if not isinstance(provenance, dict):
+        raise RuntimeError("benchmark report is missing required provenance")
+    try:
+        uuid.UUID(str(provenance.get("report_id")))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise RuntimeError("benchmark report has an invalid report_id") from exc
+    if not provenance.get("generated_at"):
+        raise RuntimeError("benchmark report is missing its generation timestamp")
+    producer = provenance.get("producer")
+    if not isinstance(producer, dict):
+        raise RuntimeError("benchmark report is missing producer provenance")
+    _require_digest(
+        producer.get("source_sha"), "benchmark producer source SHA", 40
+    )
+    script = producer.get("script")
+    if not isinstance(script, dict) or not script.get("path"):
+        raise RuntimeError("benchmark report is missing producer script provenance")
+    _require_digest(script.get("sha256"), "benchmark producer script sha256", 64)
+    execution = provenance.get("execution")
+    if (
+        not isinstance(execution, dict)
+        or execution.get("provider") not in ("github-actions", "local")
+        or not execution.get("run_id")
+    ):
+        raise RuntimeError("benchmark report is missing execution provenance")
+
+    host = report.get("host")
+    if (
+        not isinstance(host, dict)
+        or not host.get("arch")
+        or not host.get("cpu_model")
+        or not isinstance(host.get("cpu_count"), int)
+        or host["cpu_count"] <= 0
+        or not host.get("fingerprint")
+    ):
+        raise RuntimeError("benchmark report is missing its host identity")
+    affinity = report.get("affinity")
+    if not isinstance(affinity, dict) or affinity.get("verified") is not True:
+        raise RuntimeError("benchmark report lacks verified CPU affinity")
+
+    engines = report.get("engines")
+    if not isinstance(engines, list) or len(engines) < 2:
+        raise RuntimeError("benchmark report must contain baseline and target engines")
+    roles = [engine.get("role") for engine in engines if isinstance(engine, dict)]
+    if roles.count("wamr-baseline") != 1 or roles.count("wamr-target") != 1:
+        raise RuntimeError("benchmark report must identify one WAMR baseline and target")
+    for engine in engines:
+        if not isinstance(engine, dict):
+            raise RuntimeError("benchmark report contains an invalid engine entry")
+        role = engine.get("role", "engine")
+        identity = _validate_engine_identity(engine.get("identity"), role)
+        if role.startswith("wamr-") and identity["type"] != "wamr":
+            raise RuntimeError(f"{role} must have a WAMR engine identity")
+        if role.startswith("wasmtime-") and identity["type"] != "wasmtime":
+            raise RuntimeError(f"{role} must have a Wasmtime engine identity")
+        values = engine.get("values")
+        if not isinstance(values, list) or len(values) != expected_runs:
+            raise RuntimeError(
+                f"{role} produced {len(values) if isinstance(values, list) else 0} "
+                f"measured samples; expected {expected_runs}"
+            )
+
+
+def _engine_with_role(report: dict, role: str) -> dict:
+    matches = [
+        engine
+        for engine in report["engines"]
+        if isinstance(engine, dict) and engine.get("role") == role
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"benchmark report must identify exactly one {role}")
+    return matches[0]
+
+
+def validate_benchmark_profile_match(
+    report: dict,
+    *,
+    expected_arch: str,
+    fixture_sha: str,
+    host: HostIdentity,
+    affinity: AffinityInfo,
+    wamr_source_sha: str,
+    wamr_optimize: str,
+    wamr_runtime_sha: str,
+    wamr_compiler_sha: str,
+    wamr_module_sha: str,
+    wasmtime_version_value: str,
+    wasmtime_runtime_sha: str,
+    producer_source_sha: str,
+    producer_script_sha: str,
+    current_execution: dict,
+) -> dict:
+    validate_authoritative_benchmark_report(report)
+    if report["host"]["arch"] != expected_arch:
+        raise RuntimeError(
+            f"benchmark architecture mismatch: expected {expected_arch}, "
+            f"got {report['host']['arch']}"
+        )
+    if report["fixture"]["sha256"] != fixture_sha:
+        raise RuntimeError("benchmark fixture/input hash does not match the profile")
+    expected_host = {
+        "arch": host.arch,
+        "cpu_count": host.cpu_count,
+        "cpu_model": host.cpu_model,
+        "runner_name": host.runner_name,
+        "fingerprint": host.fingerprint(),
+    }
+    for field, value in expected_host.items():
+        if report["host"].get(field) != value:
+            raise RuntimeError(f"benchmark host {field} does not match the profile host")
+    expected_affinity = {
+        "allowed_cpus": list(affinity.allowed_cpus),
+        "selected_cpu": affinity.selected_cpu,
+        "taskset": affinity.taskset,
+        "verified": True,
+    }
+    if report["affinity"] != expected_affinity:
+        raise RuntimeError("benchmark CPU affinity does not match the profile")
+
+    target = _engine_with_role(report, "wamr-target")
+    target_identity = target["identity"]
+    expected_target = {
+        ("source", "sha"): wamr_source_sha,
+        ("runtime", "sha256"): wamr_runtime_sha,
+        ("compiler", "sha256"): wamr_compiler_sha,
+        ("module", "sha256"): wamr_module_sha,
+    }
+    for path, expected in expected_target.items():
+        actual = target_identity[path[0]][path[1]]
+        if actual != expected:
+            raise RuntimeError(
+                f"benchmark WAMR {path[0]} {path[1]} mismatch: "
+                f"expected {expected}, got {actual}"
+            )
+    if target_identity.get("optimize") != wamr_optimize:
+        raise RuntimeError("benchmark WAMR optimize mode does not match the profile")
+
+    wasmtime = _engine_with_role(report, "wasmtime-baseline")
+    wasmtime_identity = wasmtime["identity"]
+    if wasmtime_identity.get("channel") != "historical-pin":
+        raise RuntimeError("benchmark Wasmtime baseline is not the historical pin")
+    if wasmtime_identity.get("version") != wasmtime_version_value:
+        raise RuntimeError("benchmark Wasmtime version does not match the profile")
+    if wasmtime_identity["runtime"]["sha256"] != wasmtime_runtime_sha:
+        raise RuntimeError("benchmark Wasmtime runtime sha256 does not match the profile")
+    if report["provenance"]["producer"]["source_sha"] != producer_source_sha:
+        raise RuntimeError(
+            "benchmark tooling source SHA does not match the profiling tooling"
+        )
+    if (
+        report["provenance"]["producer"]["script"]["sha256"]
+        != producer_script_sha
+    ):
+        raise RuntimeError(
+            "benchmark harness script identity does not match the profiling tooling"
+        )
+
+    benchmark_execution = report["provenance"]["execution"]
+    if benchmark_execution["provider"] != current_execution.get("provider"):
+        raise RuntimeError("benchmark and profile execution providers do not match")
+    if benchmark_execution["provider"] == "github-actions":
+        for field in ("repository", "run_id", "run_attempt"):
+            if benchmark_execution.get(field) != current_execution.get(field):
+                raise RuntimeError(
+                    f"benchmark GitHub Actions {field} does not match the profile run"
+                )
+
+    schedule = report.get("schedule")
+    expected_schedule_length = 2 * sum(PROFILE_COUNTS["authoritative"])
+    if not isinstance(schedule, list) or len(schedule) != expected_schedule_length:
+        raise RuntimeError("benchmark report lacks a complete paired schedule")
+    target_positions = target.get("sample_schedule_positions")
+    wasmtime_positions = wasmtime.get("sample_schedule_positions")
+    if (
+        not isinstance(target_positions, list)
+        or not isinstance(wasmtime_positions, list)
+        or len(target_positions) != sum(PROFILE_COUNTS["authoritative"])
+        or len(wasmtime_positions) != sum(PROFILE_COUNTS["authoritative"])
+        or set(target_positions) & set(wasmtime_positions)
+        or set(target_positions) | set(wasmtime_positions)
+        != set(range(1, expected_schedule_length + 1))
+    ):
+        raise RuntimeError("benchmark report lacks paired target/Wasmtime samples")
+    for record in schedule:
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("schedule_position"), int)
+            or record.get("iterations") != EXPECTED_ITERATIONS
+            or record.get("phase") not in ("warmup", "measured")
+        ):
+            raise RuntimeError("benchmark report contains an invalid schedule record")
+    ordered_schedule = sorted(schedule, key=lambda item: item["schedule_position"])
+    if [record["schedule_position"] for record in ordered_schedule] != list(
+        range(1, expected_schedule_length + 1)
+    ):
+        raise RuntimeError("benchmark report schedule positions are incomplete")
+    position_to_engine = {
+        position: "target" for position in target_positions
+    } | {
+        position: "wasmtime" for position in wasmtime_positions
+    }
+    warmups, runs = PROFILE_COUNTS["authoritative"]
+    expected_order = []
+    for phase, count in (("warmup", warmups), ("measured", runs)):
+        phase_records = [record for record in schedule if record["phase"] == phase]
+        if len(phase_records) != count * 2:
+            raise RuntimeError(f"benchmark report has the wrong {phase} schedule")
+        expected_order.extend(
+            counterbalanced_order(["target", "wasmtime"], count)
+        )
+    if [record["phase"] for record in ordered_schedule] != (
+        ["warmup"] * (warmups * 2) + ["measured"] * (runs * 2)
+    ):
+        raise RuntimeError("benchmark report phases are not ordered")
+    actual_order = [
+        position_to_engine[record["schedule_position"]]
+        for record in ordered_schedule
+    ]
+    if actual_order != expected_order:
+        raise RuntimeError("benchmark report target/Wasmtime order is not counterbalanced")
+    return {
+        "report_id": report["provenance"]["report_id"],
+        "generated_at": report["provenance"]["generated_at"],
+        "execution": benchmark_execution,
+        "producer": report["provenance"]["producer"],
+        "target": target,
+        "wasmtime_baseline": wasmtime,
     }
 
 
@@ -1403,14 +1871,23 @@ def main() -> int:
                     optimize,
                     target_measured.values,
                     target_measured.samples,
+                    target_prepared.identity,
                 )
                 if baseline_sha == target_sha:
+                    baseline_identity = {
+                        **target_prepared.identity,
+                        "source": {
+                            **target_prepared.identity["source"],
+                            "ref": args.baseline,
+                        },
+                    }
                     baseline_result = EngineResult(
                         "WAMR",
                         f"{args.baseline} ({baseline_sha})",
                         optimize,
                         target_result.values.copy(),
                         target_result.samples,
+                        baseline_identity,
                     )
                     print(
                         "[harness] WAMR baseline and target resolve to the same "
@@ -1425,6 +1902,7 @@ def main() -> int:
                         optimize,
                         baseline_measured.values,
                         baseline_measured.samples,
+                        baseline_prepared.identity,
                     )
                 results = [baseline_result, target_result]
                 for path, label, version in wasmtime_specs:
@@ -1438,6 +1916,7 @@ def main() -> int:
                             "default JIT",
                             measured_result.values,
                             measured_result.samples,
+                            prepared_wasmtime[path.resolve()].identity,
                         )
                     )
             else:
@@ -1462,6 +1941,13 @@ def main() -> int:
                         f"{args.baseline} ({baseline_sha})",
                         optimize,
                         target_result.values.copy(),
+                        identity={
+                            **target_result.identity,
+                            "source": {
+                                **target_result.identity["source"],
+                                "ref": args.baseline,
+                            },
+                        },
                     )
                 else:
                     baseline_wt, baseline_sha = make_worktree(
@@ -1509,6 +1995,7 @@ def main() -> int:
                 host=host,
                 schedule_records=schedule_records,
                 affinity=affinity,
+                provenance=capture_report_provenance(repo),
                 guest_args=guest_args,
                 expected_iterations=expected_iterations,
             )
