@@ -20,6 +20,12 @@ and AOT bindings enabled by `-Dlib_wasi_threads=true`.
   parent trap. These gate the AOT loop-header cancel poll; without it the run
   only ends on the teardown deadline, which the fixtures reject by requiring
   empty stderr.
+- `terminate-recursive-child`: after publishing readiness, a child repeatedly
+  reaches itself through a true tail call with no loop/back-edge or host call.
+  A sibling claims `proc_exit(7)`, and the bounded runner requires the process
+  to finish within 1500 ms, before the 2-second teardown fallback can pass the
+  test. This gates AOT function-entry cancel polls on both native and qemu
+  AArch64 runs without risking native stack exhaustion.
 - `trap-beats-late-exit` / `exit-beats-late-trap`: first-wins ordering — a
   losing `proc_exit(0)` cannot mask a trap (status 1) and a losing trap cannot
   mask `proc_exit(6)`.
@@ -50,6 +56,8 @@ Run them through either backend with:
 ```sh
 zig build test-wasi-threads -Dlib_wasi_threads=true -Daot=false
 zig build test-aot-threads -Dlib_wasi_threads=true -Dinterp=false
+zig build test-aot-threads -Dlib_wasi_threads=true -Dinterp=false \
+  -Dtarget=aarch64-linux -fqemu
 ```
 
 The pinned `cataggar/wabt` parses atomic mnemonics but not the WAT `shared`

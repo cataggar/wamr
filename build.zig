@@ -443,6 +443,7 @@ pub fn build(b: *std.Build) void {
         "terminate-futex-waiter",
         "terminate-poll-waiter",
         "terminate-spinning-child",
+        "terminate-recursive-child",
         "parent-trap-spinning-child",
         "trap-beats-late-exit",
         "exit-beats-late-trap",
@@ -483,6 +484,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/wasi-threads/run_bounded.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
+            .link_libc = if (b.graph.host.result.os.tag.isDarwin()) true else null,
         }),
     });
 
@@ -574,6 +576,21 @@ pub fn build(b: *std.Build) void {
                 if (termination_case[2]) run.expectStdErrEqual("");
                 wasi_threads_test_step.dependOn(&run.step);
             }
+
+            const terminate_recursive_child = b.addRunArtifact(bounded_runner);
+            terminate_recursive_child.addArgs(&.{
+                termination_timeout_seconds,
+                "--max-elapsed-ms=1500",
+            });
+            terminate_recursive_child.addFileArg(exe.getEmittedBin());
+            terminate_recursive_child.addArgs(&.{
+                "run",
+                "tests/wasi-threads/terminate-recursive-child.wasm",
+            });
+            terminate_recursive_child.expectExitCode(7);
+            terminate_recursive_child.expectStdOutEqual("");
+            terminate_recursive_child.expectStdErrEqual("");
+            wasi_threads_test_step.dependOn(&terminate_recursive_child.step);
 
             inline for (.{
                 "unaligned-atomic-load",
@@ -690,12 +707,13 @@ pub fn build(b: *std.Build) void {
             );
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-trap", 1, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "child-proc-exit", 7, null, null);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-futex-waiter", 5, true);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-poll-waiter", 5, true);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-spinning-child", 7, true);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "parent-trap-spinning-child", 1, false);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "trap-beats-late-exit", 1, false);
-            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "exit-beats-late-trap", 6, true);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-futex-waiter", 5, true, null);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-poll-waiter", 5, true, null);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-spinning-child", 7, true, null);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "terminate-recursive-child", 7, true, "1500");
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "parent-trap-spinning-child", 1, false, null);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "trap-beats-late-exit", 1, false, null);
+            addBoundedAotThreadFixture(b, aot_thread_spawn_step, wamrc, exe, bounded_runner, "exit-beats-late-trap", 6, true, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "missing-thread-start", 0, null, null);
             addAotThreadFixture(b, aot_thread_spawn_step, wamrc, "wrong-thread-start-signature", 0, null, null);
             inline for (.{
@@ -1130,6 +1148,7 @@ pub fn build(b: *std.Build) void {
     const thread_lifecycle_unit_tests = b.addTest(.{
         .root_module = test_module,
         .filters = &.{
+            "#963",
             "ThreadManager:",
             "AuxStackPool:",
             "thread lifecycle:",
@@ -2445,6 +2464,7 @@ fn addBoundedAotThreadFixture(
     name: []const u8,
     expected_exit: u8,
     quiet_stderr: bool,
+    max_elapsed_ms: ?[]const u8,
 ) void {
     const compile = b.addRunArtifact(wamrc);
     compile.addArg("compile");
@@ -2454,6 +2474,9 @@ fn addBoundedAotThreadFixture(
 
     const run = b.addRunArtifact(bounded_runner);
     run.addArg(termination_timeout_seconds);
+    if (max_elapsed_ms) |ms| {
+        run.addArg(b.fmt("--max-elapsed-ms={s}", .{ms}));
+    }
     // Use the built artifact rather than an install path: the executable
     // suffix and install layout differ per host.
     run.addFileArg(wamr_exe.getEmittedBin());

@@ -1649,7 +1649,7 @@ const compile_usage =
     \\  --aarch64-no-scheduler        Disable AArch64 instruction scheduler
     \\  --aarch64-no-xreg-alloc       Disable AArch64 X-register allocator
     \\  --benchmark-disable-cancel-points
-    \\                                 Suppress loop-header cancel polls only
+    \\                                 Suppress entry/loop cancel polls only
     \\                                 in a wamrc built with
     \\                                 -Dbenchmark-cancel-point-toggle=true.
     \\

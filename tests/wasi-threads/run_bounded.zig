@@ -4,15 +4,18 @@
 //! makes them hang rather than fail. Running them through this wrapper turns
 //! a hang into a deterministic failure instead of a stuck CI job.
 //!
-//! Usage: run-bounded <timeout-seconds> <exe> [args...]
+//! Usage: run-bounded <timeout-seconds> [--max-elapsed-ms=N] <exe> [args...]
 //!
 //! Exits with the child's status, or 124 (the `timeout(1)` convention) when
-//! the deadline expired and the child had to be killed.
+//! the deadline expired and the child had to be killed. The optional elapsed
+//! bound rejects a child that exits normally but only after a runtime fallback
+//! deadline; it returns 126 so this failure is distinct from the hard timeout.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const is_posix = builtin.os.tag != .windows;
+const max_elapsed_prefix = "--max-elapsed-ms=";
 
 const Watchdog = struct {
     child: *std.process.Child,
@@ -66,11 +69,44 @@ fn sleepNs(ns: u64) void {
     }
 }
 
+fn monotonicNs() u64 {
+    return switch (comptime builtin.os.tag) {
+        .linux => blk: {
+            const linux = std.os.linux;
+            var ts: linux.timespec = undefined;
+            if (linux.clock_gettime(.MONOTONIC, &ts) != 0) break :blk 0;
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
+                @as(u64, @intCast(ts.nsec));
+        },
+        .macos, .ios, .tvos, .watchos, .visionos => blk: {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) break :blk 0;
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
+                @as(u64, @intCast(ts.nsec));
+        },
+        .windows => blk: {
+            const ntdll = std.os.windows.ntdll;
+            var counter: std.os.windows.LARGE_INTEGER = undefined;
+            var freq: std.os.windows.LARGE_INTEGER = undefined;
+            _ = ntdll.RtlQueryPerformanceCounter(&counter);
+            _ = ntdll.RtlQueryPerformanceFrequency(&freq);
+            const ticks: u128 = @intCast(counter);
+            const hz: u128 = @intCast(freq);
+            if (hz == 0) break :blk 0;
+            break :blk @as(u64, @truncate(ticks * std.time.ns_per_s / hz));
+        },
+        else => 0,
+    };
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 3) {
-        std.debug.print("usage: run-bounded <timeout-seconds> <exe> [args...]\n", .{});
+        std.debug.print(
+            "usage: run-bounded <timeout-seconds> [--max-elapsed-ms=N] <exe> [args...]\n",
+            .{},
+        );
         return 2;
     }
 
@@ -79,8 +115,41 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
 
+    var child_arg_index: usize = 2;
+    var max_elapsed_ns: ?u64 = null;
+    if (std.mem.startsWith(u8, args[child_arg_index], max_elapsed_prefix)) {
+        const raw_ms = args[child_arg_index][max_elapsed_prefix.len..];
+        const max_elapsed_ms = std.fmt.parseInt(u64, raw_ms, 10) catch {
+            std.debug.print("run-bounded: invalid elapsed bound '{s}'\n", .{raw_ms});
+            return 2;
+        };
+        if (max_elapsed_ms == 0) {
+            std.debug.print("run-bounded: elapsed bound must be positive\n", .{});
+            return 2;
+        }
+        max_elapsed_ns = std.math.mul(
+            u64,
+            max_elapsed_ms,
+            std.time.ns_per_ms,
+        ) catch {
+            std.debug.print("run-bounded: elapsed bound is too large\n", .{});
+            return 2;
+        };
+        child_arg_index += 1;
+        if (child_arg_index >= args.len) {
+            std.debug.print("run-bounded: missing executable\n", .{});
+            return 2;
+        }
+    }
+
+    const started_ns = if (max_elapsed_ns != null) monotonicNs() else 0;
+    if (max_elapsed_ns != null and started_ns == 0) {
+        std.debug.print("run-bounded: monotonic clock unavailable\n", .{});
+        return 2;
+    }
+
     var child = try std.process.spawn(io, .{
-        .argv = args[2..],
+        .argv = args[child_arg_index..],
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -99,15 +168,35 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("run-bounded: wait failed: {s}\n", .{@errorName(err)});
         return 2;
     };
+    const finished_ns = if (max_elapsed_ns != null) monotonicNs() else 0;
     watchdog.finished.store(true, .release);
     watcher.join();
 
     if (watchdog.expired.load(.acquire)) {
         std.debug.print(
             "run-bounded: '{s}' did not exit within {d}s — killed\n",
-            .{ args[2], timeout_s },
+            .{ args[child_arg_index], timeout_s },
         );
         return 124;
+    }
+
+    if (max_elapsed_ns) |limit_ns| {
+        if (finished_ns == 0 or finished_ns < started_ns) {
+            std.debug.print("run-bounded: monotonic clock failed during run\n", .{});
+            return 2;
+        }
+        const elapsed_ns = finished_ns - started_ns;
+        if (elapsed_ns > limit_ns) {
+            std.debug.print(
+                "run-bounded: '{s}' took {d}ms, exceeding the {d}ms bound\n",
+                .{
+                    args[child_arg_index],
+                    elapsed_ns / std.time.ns_per_ms,
+                    limit_ns / std.time.ns_per_ms,
+                },
+            );
+            return 126;
+        }
     }
 
     return switch (term) {

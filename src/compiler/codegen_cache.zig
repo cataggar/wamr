@@ -56,7 +56,8 @@ const passes = @import("ir/passes.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const cache_magic = "WAMRCAC\x00".*;
-pub const cache_format_version: u32 = 1;
+/// Reject cached code predating function-entry cancellation, including dev builds.
+pub const cache_format_version: u32 = 2;
 
 /// Sentinel cap on cache-file size we'll accept on load. 256 MiB is
 /// more than 10× the largest cwasm we've seen (#743 keyvault ≈ 37 MB
@@ -133,8 +134,8 @@ pub const ModuleEpochInputs = struct {
     import_count: u32,
     has_memory64: bool = false,
     has_shared_memory: bool = false,
-    /// #616: threaded modules get loop-header cancel polls, so their code
-    /// must never be reused for (or from) a non-threaded compile.
+    /// #616/#963: threaded modules get entry and loop-header cancel polls, so
+    /// their code must never be reused for (or from) a non-threaded compile.
     spawns_threads: bool = false,
     /// Optional; treated as empty slice when null.
     global_types: ?[]const ir.IrType = null,
@@ -841,7 +842,7 @@ test "deserialize: rejects bad magic" {
     try testing.expectError(error.BadMagic, deserialize(mut, allocator));
 }
 
-test "deserialize: rejects wrong version" {
+test "deserialize: #963 rejects pre-entry-poll and unsupported cache versions" {
     const allocator = testing.allocator;
     var cache = try buildSampleCache(allocator);
     defer cache.deinit(allocator);
@@ -850,8 +851,10 @@ test "deserialize: rejects wrong version" {
     var mut = try allocator.dupe(u8, bytes);
     defer allocator.free(mut);
     // version is at offset 8 (after 8-byte magic).
-    std.mem.writeInt(u32, mut[8..12], 999, .little);
-    try testing.expectError(error.UnsupportedVersion, deserialize(mut, allocator));
+    for ([_]u32{ 1, 999 }) |version| {
+        std.mem.writeInt(u32, mut[8..12], version, .little);
+        try testing.expectError(error.UnsupportedVersion, deserialize(mut, allocator));
+    }
 }
 
 test "deserialize: rejects truncated input" {
