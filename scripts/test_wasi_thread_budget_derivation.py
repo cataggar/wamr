@@ -106,6 +106,8 @@ def synthetic_cohort() -> dict:
         "timeout_seconds": 60,
         "minimum_timed_interval_ns": 1,
         "atomic_wait_preflight_runs": 64,
+        "atomic_wait_preflight_iterations": 1_000_000,
+        "atomic_wait_preflight_timing_quality": "correctness-only",
         "optimize": "ReleaseFast",
         "pairs": [],
     }

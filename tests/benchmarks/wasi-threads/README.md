@@ -414,6 +414,17 @@ retained empirical one-in-257 tail, 16 independent probes have only
 fixed fail-fast check of current host state; it is not authoritative and
 cannot promise that a later sample will not stall.
 
+A separate atomic-wait stress preflight runs the one-thread AOT atomic path
+eight times for smoke and 64 times for authoritative runs, per revision. Each
+short probe uses exactly 1,000,000 iterations and remains fail-closed for
+process exits, watchdog timeouts, malformed output, checksum mismatches, and
+classified atomic-wait failures. These probes are correctness-only: they are
+not retained as performance evidence, so clock/barrier overhead and the
+measurement interval do not decide their acceptance. The measurement identity
+records both the fixed work and this timing-quality policy. Every sizing pilot,
+warmup, measured sample, and trusted scheduler/barrier probe keeps its strict
+timing-quality gate.
+
 With corrected interval `E` and measured barrier `B`, the unchanged strict
 quality rule is `B / (E + B) < 0.01`, equivalently `99B < E`. The predeclared
 barrier target is 12,456,000 ns, exactly twice the retained 6,228,000 ns

@@ -216,6 +216,8 @@ def make_report(
         "timeout_seconds": 90,
         "minimum_timed_interval_ns": 1_250_000_000,
         "atomic_wait_preflight_runs": 64,
+        "atomic_wait_preflight_iterations": 1_000_000,
+        "atomic_wait_preflight_timing_quality": "correctness-only",
         "scheduler_barrier_preflight": {
             "enabled": False,
             "mode": "aot",
@@ -761,6 +763,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["smoke"], 8)
         self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"], 64)
+        self.assertEqual(bench.ATOMIC_WAIT_PREFLIGHT_ITERATIONS, 1_000_000)
         self.assertEqual(args.thread_counts, (1, 4, 8))
         self.assertEqual(args.modes, "aot")
         self.assertEqual(args.min_interval_ms, 1_250)
@@ -1496,7 +1499,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             envelope_provenance["algorithm_identity"],
             {
-                "measurement_plan_identity_version": 8,
+                "measurement_plan_identity_version": 9,
                 "sizing_algorithm_version": 7,
             },
         )
@@ -1580,7 +1583,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             general_envelope["algorithm_identity"],
             {
-                "measurement_plan_identity_version": 8,
+                "measurement_plan_identity_version": 9,
                 "sizing_algorithm_version": 7,
             },
         )
@@ -1660,7 +1663,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             reserve_admission["algorithm_identity"],
             {
-                "measurement_plan_identity_version": 8,
+                "measurement_plan_identity_version": 9,
                 "sizing_algorithm_version": 7,
             },
         )
@@ -2834,6 +2837,30 @@ class ThreadBenchmarkTests(unittest.TestCase):
             bench.parse_guest_result(duplicate_key, expected, 1)
         with self.assertRaisesRegex(bench.HarnessError, "one guest JSON"):
             bench.parse_guest_result("{}\n{}\n", expected, 1)
+
+    def test_correctness_preflight_ignores_only_timing_quality(self) -> None:
+        expected = bench.expected_result("atomic", 1, 10)
+        noisy = guest_result(
+            elapsed_ns=5_699_000,
+            overhead_ns=138_000,
+        )
+        self.assertEqual(
+            bench.parse_guest_result(
+                json.dumps(noisy),
+                expected,
+                1_250_000_000,
+                enforce_timing_quality=False,
+            ),
+            noisy,
+        )
+        invalid = dict(noisy, checksum=noisy["checksum"] + 1)
+        with self.assertRaisesRegex(bench.HarnessError, "checksum"):
+            bench.parse_guest_result(
+                json.dumps(invalid),
+                expected,
+                1,
+                enforce_timing_quality=False,
+            )
 
     def test_actual_samples_keep_exact_interval_and_overhead_gates(self) -> None:
         expected = bench.expected_result("atomic", 1, 10)
@@ -4743,6 +4770,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "measurement_plan_version"
             ]["const"],
             bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
+        )
+        plan_properties = schema["properties"]["plan"]["properties"]
+        self.assertEqual(
+            plan_properties["atomic_wait_preflight_iterations"]["const"],
+            bench.ATOMIC_WAIT_PREFLIGHT_ITERATIONS,
+        )
+        self.assertEqual(
+            plan_properties["atomic_wait_preflight_timing_quality"]["const"],
+            "correctness-only",
         )
         sizing_algorithm = schema["$defs"]["sizing_plan"]["properties"][
             "algorithm"
