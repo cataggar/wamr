@@ -17,6 +17,8 @@ from pathlib import Path
 
 import requests  # type: ignore[import-untyped]
 
+from release_artifacts import to_pep440
+
 IMPORT_NAME = "wamrc_cli"
 DIST_NAME = "wamrc_bin"
 WAMR_REPO = "cataggar/wamr"
@@ -129,14 +131,6 @@ def build_wheel(
 
     print(f"  Built {wheel_name} ({wheel_path.stat().st_size / 1024 / 1024:.1f} MB)")
     return wheel_path
-
-
-def to_pep440(version: str) -> str:
-    import re
-    m = re.match(r"^(\d+\.\d+\.\d+)-dev\.(\d+)$", version)
-    if m:
-        return f"{m.group(1)}.dev{m.group(2)}"
-    return version
 
 
 def main() -> None:

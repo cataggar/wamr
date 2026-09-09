@@ -43,6 +43,10 @@ jobs:
         continue-on-error: true
         run: zig build
 
+      - name: Release artifact tooling tests
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: python3 -m unittest discover -s scripts -p test_release_artifacts.py
+
       - name: Install cross-architecture disassembler
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
