@@ -311,8 +311,8 @@
   },
   "wait_notify_1_cell_specific_envelope": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 6,
-      "sizing_algorithm_version": 5
+      "measurement_plan_identity_version": 7,
+      "sizing_algorithm_version": 6
     },
     "evidence": {
       "attempts": [
@@ -420,8 +420,8 @@
   },
   "hot_8_cell_specific_envelope": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 6,
-      "sizing_algorithm_version": 5
+      "measurement_plan_identity_version": 7,
+      "sizing_algorithm_version": 6
     },
     "evidence": {
       "attempt": {
@@ -464,6 +464,52 @@
       "workload": "hot"
     }
   },
+  "interpreter_wait_notify_4_cell_specific_envelope": {
+    "algorithm_identity": {
+      "measurement_plan_identity_version": 7,
+      "sizing_algorithm_version": 6
+    },
+    "evidence": {
+      "attempt": {
+        "fastest_pilot_elapsed_ns": 4553145000,
+        "fastest_pilot_rate": 7028.10914214241,
+        "general_selected_iterations": 13600,
+        "later_elapsed_ns": 1122137000,
+        "later_iterations": 13600,
+        "pilot_iterations": 32000,
+        "projected_benchmark_ns": 3544805100182,
+        "projected_later_elapsed_ns": 1452177295,
+        "selected_iterations": 17600
+      },
+      "declared_margin": 0.15977960418180248,
+      "diagnosis": {
+        "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34337339856-1",
+        "run_attempt": 1,
+        "run_id": 34337339856,
+        "sha256": "d05ca21d0557074aa356574b29d8ddf488c7e4a7ca31976e35bb6da92bb9f447"
+      },
+      "maximum_projected_benchmark_ns": 3544805100182,
+      "projection_profile": {
+        "samples": 10,
+        "warmups": 2
+      },
+      "retained_maximum_ordered_acceleration": 1.7244655732767034
+    },
+    "failure_policy": "one-shot-no-retry-no-discard",
+    "formula": "round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*2/E)))",
+    "measurement_to_pilot_rate_envelope": {
+      "denominator": 1,
+      "numerator": 2
+    },
+    "projected_pilot_duration_ns": 2500000000,
+    "quality_floor_ns": 1250000000,
+    "scope": {
+      "architectures": "all",
+      "mode": "interpreter",
+      "threads": 4,
+      "workload": "wait-notify"
+    }
+  },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,
     "retained_fastest_interval_ns": 1054664000
@@ -474,7 +520,7 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 4,
+  "schema_version": 5,
   "source_provenance": {
     "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
     "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",
