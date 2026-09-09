@@ -311,8 +311,8 @@
   },
   "wait_notify_1_cell_specific_envelope": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 7,
-      "sizing_algorithm_version": 6
+      "measurement_plan_identity_version": 8,
+      "sizing_algorithm_version": 7
     },
     "evidence": {
       "attempts": [
@@ -320,12 +320,12 @@
           "attempt": 1,
           "fastest_pilot_elapsed_ns": 2029403000,
           "fastest_pilot_rate": 739133.6269829108,
-          "general_selected_iterations": 1430000,
+          "general_selected_iterations": 1850000,
           "later_elapsed_ns": 882512000,
           "later_iterations": 1430000,
           "measurement_to_fastest_pilot_ratio": 2.192262005124765,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3206394673032,
+          "projected_benchmark_ns": 3830660701500,
           "projected_later_elapsed_ns": 4566845315,
           "selected_iterations": 7400000
         },
@@ -333,12 +333,12 @@
           "attempt": 2,
           "fastest_pilot_elapsed_ns": 1757447000,
           "fastest_pilot_rate": 853510.8028862322,
-          "general_selected_iterations": 1650000,
+          "general_selected_iterations": 2140000,
           "later_elapsed_ns": 1052766000,
           "later_iterations": 1650000,
           "measurement_to_fastest_pilot_ratio": 1.8362976197939525,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3238452001350,
+          "projected_benchmark_ns": 3864131701758,
           "projected_later_elapsed_ns": 5448861600,
           "selected_iterations": 8540000
         },
@@ -346,12 +346,12 @@
           "attempt": 3,
           "fastest_pilot_elapsed_ns": 5715386000,
           "fastest_pilot_rate": 262449.4653554458,
-          "general_selected_iterations": 506000,
+          "general_selected_iterations": 657000,
           "later_elapsed_ns": 1109924000,
           "later_iterations": 506000,
           "measurement_to_fastest_pilot_ratio": 1.7370470506689346,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3235389472775,
+          "projected_benchmark_ns": 3869754696359,
           "projected_later_elapsed_ns": 5768972570,
           "selected_iterations": 2630000
         },
@@ -359,12 +359,12 @@
           "attempt": 4,
           "fastest_pilot_elapsed_ns": 8216187000,
           "fastest_pilot_rate": 182566.43866552698,
-          "general_selected_iterations": 352000,
+          "general_selected_iterations": 457000,
           "later_elapsed_ns": 559214000,
           "later_iterations": 548000,
           "measurement_to_fastest_pilot_ratio": 5.367617734892188,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3268557360454,
+          "projected_benchmark_ns": 3905574194278,
           "projected_later_elapsed_ns": 1867448212,
           "selected_iterations": 1830000
         }
@@ -396,7 +396,7 @@
           "sha256": "1c8f13621986f4678999a19a4104dfdcd938642f837aae666d97ca101b6b0173"
         }
       ],
-      "maximum_projected_benchmark_ns": 3268557360454,
+      "maximum_projected_benchmark_ns": 3905574194278,
       "projection_profile": {
         "samples": 10,
         "warmups": 2
@@ -418,77 +418,85 @@
       "workload": "wait-notify"
     }
   },
-  "hot_8_cell_specific_envelope": {
+  "general_rate_envelope": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 7,
-      "sizing_algorithm_version": 6
+      "measurement_plan_identity_version": 8,
+      "sizing_algorithm_version": 7
     },
     "evidence": {
-      "attempt": {
-        "fastest_pilot_elapsed_ns": 2171788000,
-        "fastest_pilot_rate": 207202544.63142812,
-        "general_selected_iterations": 399000000,
-        "later_elapsed_ns": 1228191000,
-        "later_iterations": 399000000,
-        "pilot_iterations": 450000000,
-        "projected_benchmark_ns": 3470969552499,
-        "projected_later_elapsed_ns": 1597571752,
-        "selected_iterations": 519000000
-      },
-      "declared_margin": 0.275610528789064,
-      "diagnosis": {
-        "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34322503291-1",
-        "run_attempt": 1,
-        "run_id": 34322503291,
-        "sha256": "95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995"
-      },
-      "maximum_projected_benchmark_ns": 3470969552499,
-      "projection_profile": {
-        "samples": 10,
-        "warmups": 2
-      },
-      "retained_maximum_ordered_acceleration": 1.567876679332992
-    },
-    "failure_policy": "one-shot-no-retry-no-discard",
-    "formula": "round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*2/E)))",
-    "measurement_to_pilot_rate_envelope": {
-      "denominator": 1,
-      "numerator": 2
-    },
-    "projected_pilot_duration_ns": 2500000000,
-    "quality_floor_ns": 1250000000,
-    "scope": {
-      "architectures": "all",
-      "mode": "aot",
-      "threads": 8,
-      "workload": "hot"
-    }
-  },
-  "interpreter_wait_notify_4_cell_specific_envelope": {
-    "algorithm_identity": {
-      "measurement_plan_identity_version": 7,
-      "sizing_algorithm_version": 6
-    },
-    "evidence": {
-      "attempt": {
-        "fastest_pilot_elapsed_ns": 4553145000,
-        "fastest_pilot_rate": 7028.10914214241,
-        "general_selected_iterations": 13600,
-        "later_elapsed_ns": 1122137000,
-        "later_iterations": 13600,
-        "pilot_iterations": 32000,
-        "projected_benchmark_ns": 3544805100182,
-        "projected_later_elapsed_ns": 1452177295,
-        "selected_iterations": 17600
-      },
+      "attempts": [
+        {
+          "diagnosis": {
+            "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34322503291-1",
+            "run_attempt": 1,
+            "run_id": 34322503291,
+            "sha256": "95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995"
+          },
+          "fastest_pilot_elapsed_ns": 2171788000,
+          "fastest_pilot_rate": 207202544.63142812,
+          "later_elapsed_ns": 1228191000,
+          "later_iterations": 399000000,
+          "ordered_rate_acceleration": 1.567876679332992,
+          "pilot_iterations": 450000000,
+          "previous_selected_iterations": 399000000,
+          "projected_benchmark_ns": 4115105465211,
+          "projected_later_elapsed_ns": 1597571752,
+          "selected_iterations": 519000000,
+          "selector": {
+            "mode": "aot",
+            "threads": 8,
+            "workload": "hot"
+          }
+        },
+        {
+          "diagnosis": {
+            "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34337339856-1",
+            "run_attempt": 1,
+            "run_id": 34337339856,
+            "sha256": "d05ca21d0557074aa356574b29d8ddf488c7e4a7ca31976e35bb6da92bb9f447"
+          },
+          "fastest_pilot_elapsed_ns": 4553145000,
+          "fastest_pilot_rate": 7028.10914214241,
+          "later_elapsed_ns": 1122137000,
+          "later_iterations": 13600,
+          "ordered_rate_acceleration": 1.7244655732767034,
+          "pilot_iterations": 32000,
+          "previous_selected_iterations": 13600,
+          "projected_benchmark_ns": 4164647814134,
+          "projected_later_elapsed_ns": 1452177295,
+          "selected_iterations": 17600,
+          "selector": {
+            "mode": "interpreter",
+            "threads": 4,
+            "workload": "wait-notify"
+          }
+        },
+        {
+          "diagnosis": {
+            "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34351942414-1",
+            "run_attempt": 1,
+            "run_id": 34351942414,
+            "sha256": "098a466f98da6899f2e7dba657078eb3853500a9bfca4e06727c23b51c0cbed3"
+          },
+          "fastest_pilot_elapsed_ns": 4775669000,
+          "fastest_pilot_rate": 8375789.863158439,
+          "later_elapsed_ns": 1205846000,
+          "later_iterations": 16200000,
+          "ordered_rate_acceleration": 1.6039742595654836,
+          "pilot_iterations": 40000000,
+          "previous_selected_iterations": 16200000,
+          "projected_benchmark_ns": 4205813468912,
+          "projected_later_elapsed_ns": 1563133704,
+          "selected_iterations": 21000000,
+          "selector": {
+            "mode": "interpreter",
+            "threads": 2,
+            "workload": "atomic"
+          }
+        }
+      ],
       "declared_margin": 0.15977960418180248,
-      "diagnosis": {
-        "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34337339856-1",
-        "run_attempt": 1,
-        "run_id": 34337339856,
-        "sha256": "d05ca21d0557074aa356574b29d8ddf488c7e4a7ca31976e35bb6da92bb9f447"
-      },
-      "maximum_projected_benchmark_ns": 3544805100182,
+      "maximum_projected_benchmark_ns": 4205813468912,
       "projection_profile": {
         "samples": 10,
         "warmups": 2
@@ -496,7 +504,7 @@
       "retained_maximum_ordered_acceleration": 1.7244655732767034
     },
     "failure_policy": "one-shot-no-retry-no-discard",
-    "formula": "round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*2/E)))",
+    "formula": "round_up_3_significant_digits(ceil(P*1750000000*10/(E*7)))",
     "measurement_to_pilot_rate_envelope": {
       "denominator": 1,
       "numerator": 2
@@ -505,10 +513,33 @@
     "quality_floor_ns": 1250000000,
     "scope": {
       "architectures": "all",
-      "mode": "interpreter",
-      "threads": 4,
-      "workload": "wait-notify"
+      "cells": "all"
     }
+  },
+  "job_reserve_admission": {
+    "algorithm_identity": {
+      "measurement_plan_identity_version": 8,
+      "sizing_algorithm_version": 7
+    },
+    "auxiliary_invocation_budget_ns": 600000000000,
+    "benchmark_limit_ns": 6420000000000,
+    "evidence": {
+      "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34351942414-1",
+      "combined_allowance_margin": 0.4466450776384425,
+      "job_id": 102467148543,
+      "pilot_host_wall_elapsed_ns": 261734442318,
+      "record_host_wall_elapsed_ns": 996817871668,
+      "report_sha256": "5c81165f59ca3ce285ec260967df91480e41c14aa2319282696ac4a0c55366e8",
+      "run_id": 34351942414,
+      "step_completed_at": "2026-09-09T13:54:35Z",
+      "step_started_at": "2026-09-09T12:36:14Z",
+      "step_wall_elapsed_ns": 4701000000000,
+      "unaccounted_step_wall_ns": 3442447686014
+    },
+    "hard_preadmission_benchmark_ns": 6324000000000,
+    "job_non_benchmark_reserve_ns": 4380000000000,
+    "timeout_headroom_ns": 96000000000,
+    "workflow_job_timeout_ns": 10800000000000
   },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,
@@ -520,7 +551,7 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 5,
+  "schema_version": 6,
   "source_provenance": {
     "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
     "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",

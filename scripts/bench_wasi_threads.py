@@ -50,9 +50,9 @@ REPORT_SCHEMA_VERSION = 4
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 7
+MEASUREMENT_PLAN_IDENTITY_VERSION = 8
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 6
+SIZING_ALGORITHM_VERSION = 7
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -82,8 +82,8 @@ MINIMUM_INTERVAL_HEADROOM_NS = (
     - TARGET_BARRIER_REQUIRED_INTERVAL_NS
 )
 SIZING_TARGET_NS = 1_750_000_000
-SIZING_SAFETY_NUMERATOR = 11
-SIZING_SAFETY_DENOMINATOR = 10
+SIZING_SAFETY_NUMERATOR = 10
+SIZING_SAFETY_DENOMINATOR = 7
 SIZING_SIGNIFICANT_DIGITS = 3
 SIZING_CELL_ENVELOPES = (
     {
@@ -101,36 +101,6 @@ SIZING_CELL_ENVELOPES = (
         "projected_pilot_duration_ns": 10_000_000_000,
         "formula": SIZING_CELL_ENVELOPE_FORMULA,
     },
-    {
-        "name": "aot-hot-8-rate-acceleration",
-        "selector": {
-            "mode": "aot",
-            "workload": "hot",
-            "threads": 8,
-        },
-        "quality_floor_ns": 1_250_000_000,
-        "measurement_to_pilot_rate_envelope": {
-            "numerator": 2,
-            "denominator": 1,
-        },
-        "projected_pilot_duration_ns": 2_500_000_000,
-        "formula": SIZING_CELL_ENVELOPE_FORMULA,
-    },
-    {
-        "name": "interpreter-wait-notify-4-rate-acceleration",
-        "selector": {
-            "mode": "interpreter",
-            "workload": "wait-notify",
-            "threads": 4,
-        },
-        "quality_floor_ns": 1_250_000_000,
-        "measurement_to_pilot_rate_envelope": {
-            "numerator": 2,
-            "denominator": 1,
-        },
-        "projected_pilot_duration_ns": 2_500_000_000,
-        "formula": SIZING_CELL_ENVELOPE_FORMULA,
-    },
 )
 PROJECTED_EVIDENCE_MINIMUM_NS = (
     SIZING_TARGET_NS * SIZING_SAFETY_NUMERATOR
@@ -141,7 +111,7 @@ PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
 MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
 MAXIMUM_PILOT_HOST_WALL_NS = 33_000_000_000
 WORKFLOW_JOB_TIMEOUT_NS = 180 * 60 * 1_000_000_000
-JOB_NON_BENCHMARK_RESERVE_NS = 83 * 60 * 1_000_000_000
+JOB_NON_BENCHMARK_RESERVE_NS = 73 * 60 * 1_000_000_000
 PROJECTED_BENCHMARK_LIMIT_NS = (
     WORKFLOW_JOB_TIMEOUT_NS - JOB_NON_BENCHMARK_RESERVE_NS
 )
@@ -747,7 +717,9 @@ def pilot_progress_bound(
     )
     if earliest_complete_bound_ns >= PROJECTED_BENCHMARK_LIMIT_NS:
         raise HarnessError(
-            "sizing pilot progress cannot fit the 97-minute benchmark bound"
+            "sizing pilot progress cannot fit the "
+            f"{PROJECTED_BENCHMARK_LIMIT_NS // (60 * 1_000_000_000)}-minute "
+            "benchmark bound"
         )
     return {
         "completed_pilot_elapsed_ns": completed_elapsed_ns,
@@ -969,7 +941,9 @@ def resolve_one_shot_sizing(
         raise HarnessError("declared pilot set leaves no evidence runtime budget")
     if projected_evidence_ns >= projected_evidence_limit_ns:
         raise HarnessError(
-            "sizing evidence projection cannot fit the 97-minute benchmark bound"
+            "sizing evidence projection cannot fit the "
+            f"{PROJECTED_BENCHMARK_LIMIT_NS // (60 * 1_000_000_000)}-minute "
+            "benchmark bound"
         )
     projected_benchmark_ns = (
         pilot_host_ns

@@ -66,7 +66,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 7 },
+        "measurement_plan_version": { "const": 8 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "checksum_preparation": {
           "type": "object",
@@ -439,13 +439,13 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 6 },
+            "version": { "const": 7 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
             "maximum_pilot_corrected_ns": { "const": 30000000000 },
             "maximum_pilot_host_wall_ns": { "const": 33000000000 },
-            "projected_evidence_minimum_ns": { "const": 1925000000 },
+            "projected_evidence_minimum_ns": { "const": 2500000000 },
             "timing_overhead_ratio_limit": { "const": 0.01 },
             "failure_policy": { "const": "one-shot-no-retry-no-discard" },
             "selection_rate": {
@@ -473,36 +473,6 @@
                   },
                   "projected_pilot_duration_ns": 10000000000,
                   "formula": "round_up_3_significant_digits(ceil(P*quality_floor_ns*acceleration_numerator/(E*acceleration_denominator)))"
-                },
-                {
-                  "name": "aot-hot-8-rate-acceleration",
-                  "selector": {
-                    "mode": "aot",
-                    "workload": "hot",
-                    "threads": 8
-                  },
-                  "quality_floor_ns": 1250000000,
-                  "measurement_to_pilot_rate_envelope": {
-                    "numerator": 2,
-                    "denominator": 1
-                  },
-                  "projected_pilot_duration_ns": 2500000000,
-                  "formula": "round_up_3_significant_digits(ceil(P*quality_floor_ns*acceleration_numerator/(E*acceleration_denominator)))"
-                },
-                {
-                  "name": "interpreter-wait-notify-4-rate-acceleration",
-                  "selector": {
-                    "mode": "interpreter",
-                    "workload": "wait-notify",
-                    "threads": 4
-                  },
-                  "quality_floor_ns": 1250000000,
-                  "measurement_to_pilot_rate_envelope": {
-                    "numerator": 2,
-                    "denominator": 1
-                  },
-                  "projected_pilot_duration_ns": 2500000000,
-                  "formula": "round_up_3_significant_digits(ceil(P*quality_floor_ns*acceleration_numerator/(E*acceleration_denominator)))"
                 }
               ]
             },
@@ -511,8 +481,8 @@
               "additionalProperties": false,
               "required": ["numerator", "denominator"],
               "properties": {
-                "numerator": { "const": 11 },
-                "denominator": { "const": 10 }
+                "numerator": { "const": 10 },
+                "denominator": { "const": 7 }
               }
             },
             "rounding": {
@@ -555,8 +525,8 @@
                   "exclusiveMinimum": 0
                 },
                 "workflow_job_timeout_ns": { "const": 10800000000000 },
-                "job_non_benchmark_reserve_ns": { "const": 4980000000000 },
-                "projected_benchmark_limit_ns": { "const": 5820000000000 },
+                "job_non_benchmark_reserve_ns": { "const": 4380000000000 },
+                "projected_benchmark_limit_ns": { "const": 6420000000000 },
                 "auxiliary_invocation_budget_ns": { "const": 600000000000 }
               }
             }
