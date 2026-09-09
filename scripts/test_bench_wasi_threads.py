@@ -3861,11 +3861,35 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 candidate_sha="a" * 40,
                 purpose="noise-calibration",
                 runner_target="trusted-calibration",
+                workflow_ref="wasi-thread-calibration-966-v1",
                 max_in_flight=3,
             )
         )
         with self.assertRaisesRegex(bench.HarnessError, "cannot exceed 2"):
             cohort.validate_dispatch_options(trusted)
+
+        for workflow_ref in (
+            "main",
+            "calibration/966-immutable",
+            "wasi-thread-calibration-",
+            "wasi-thread-calibration-966/v1",
+        ):
+            with (
+                self.subTest(workflow_ref=workflow_ref),
+                self.assertRaisesRegex(bench.HarnessError, "immutable.*workflow tag"),
+            ):
+                cohort.validate_dispatch_options(
+                    Namespace(
+                        **dict(
+                            common,
+                            baseline_sha="a" * 40,
+                            candidate_sha="a" * 40,
+                            purpose="noise-calibration",
+                            runner_target="trusted-calibration",
+                            workflow_ref=workflow_ref,
+                        )
+                    )
+                )
 
     def test_cohort_trusted_runner_inventory_preflight_succeeds(self) -> None:
         inventory = {
@@ -3999,7 +4023,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             runner_target="trusted-calibration",
             repository="cataggar/wamr",
             workflow="wasi-thread-bench.yml",
-            workflow_ref="main",
+            workflow_ref="wasi-thread-calibration-966-v1",
             runs=2,
             training_runs=1,
             max_in_flight=1,
@@ -4017,6 +4041,52 @@ class ThreadBenchmarkTests(unittest.TestCase):
             ),
             mock.patch.object(cohort.subprocess, "check_output") as check_output,
             self.assertRaisesRegex(bench.HarnessError, "runner is missing"),
+        ):
+            cohort.dispatch(args)
+        check_output.assert_not_called()
+
+    def test_cohort_trusted_dispatch_requires_tagged_revision(self) -> None:
+        args = Namespace(
+            baseline_sha="a" * 40,
+            candidate_sha="a" * 40,
+            purpose="noise-calibration",
+            profile="authoritative",
+            warmups=2,
+            samples=10,
+            runner_target="trusted-calibration",
+            repository="cataggar/wamr",
+            workflow="wasi-thread-bench.yml",
+            workflow_ref="wasi-thread-calibration-966-v1",
+            runs=2,
+            training_runs=1,
+            max_in_flight=1,
+            timeout_seconds=3600,
+            poll_seconds=0,
+            lookup_attempts=1,
+            lookup_seconds=0,
+            output=self.scratch / "dispatch.json",
+        )
+        inventory = {
+            "total_count": 1,
+            "runners": [
+                {
+                    "name": "vm31e-wamr-temp-20260906",
+                    "status": "online",
+                    "busy": False,
+                    "labels": [
+                        {"name": "wamr-temp-20260906", "type": "custom"}
+                    ],
+                }
+            ],
+        }
+        with (
+            mock.patch.object(
+                cohort,
+                "gh_json",
+                side_effect=[inventory, {"sha": "b" * 40}],
+            ),
+            mock.patch.object(cohort.subprocess, "check_output") as check_output,
+            self.assertRaisesRegex(bench.HarnessError, "must equal.*tag commit"),
         ):
             cohort.dispatch(args)
         check_output.assert_not_called()
@@ -4147,7 +4217,34 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertIn("github.event_name == 'workflow_dispatch'", trusted_x86)
         self.assertIn("inputs.runner_target == 'trusted-calibration'", trusted_x86)
         self.assertIn("inputs.purpose == 'noise-calibration'", trusted_x86)
-        self.assertIn("github.ref == 'refs/heads/main'", trusted_x86)
+        self.assertIn(
+            "startsWith(github.ref, 'refs/tags/wasi-thread-calibration-')",
+            trusted_x86,
+        )
+        self.assertEqual(
+            workflow.count(
+                "startsWith(github.ref, 'refs/tags/wasi-thread-calibration-')"
+            ),
+            2,
+        )
+        self.assertIn(
+            r"^refs/tags/wasi-thread-calibration-[A-Za-z0-9]"
+            r"[A-Za-z0-9._-]*$",
+            workflow,
+        )
+        self.assertIn(
+            'git merge-base --is-ancestor "$CURRENT_SHA" origin/main',
+            workflow,
+        )
+        self.assertIn(
+            "trusted calibration revisions must equal the calibration tag commit",
+            workflow,
+        )
+        self.assertIn("MIN_AVAILABLE_KIB=$((80 * 1024 * 1024))", trusted_x86)
+        self.assertIn(
+            "trusted calibration requires at least 80 GiB free under /d",
+            trusted_x86,
+        )
         self.assertIn("runs-on: wamr-temp-20260906", trusted_x86)
         self.assertNotIn("runs-on: [", trusted_x86)
         self.assertNotIn("runs-on: self-hosted", trusted_x86)
