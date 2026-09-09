@@ -311,7 +311,7 @@
   },
   "wait_notify_1_cell_specific_envelope": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 8,
+      "measurement_plan_identity_version": 9,
       "sizing_algorithm_version": 7
     },
     "evidence": {
@@ -420,7 +420,7 @@
   },
   "general_rate_envelope": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 8,
+      "measurement_plan_identity_version": 9,
       "sizing_algorithm_version": 7
     },
     "evidence": {
@@ -518,7 +518,7 @@
   },
   "job_reserve_admission": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 8,
+      "measurement_plan_identity_version": 9,
       "sizing_algorithm_version": 7
     },
     "auxiliary_invocation_budget_ns": 600000000000,

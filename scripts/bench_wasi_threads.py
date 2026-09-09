@@ -50,7 +50,7 @@ REPORT_SCHEMA_VERSION = 4
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 8
+MEASUREMENT_PLAN_IDENTITY_VERSION = 9
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 SIZING_ALGORITHM_VERSION = 7
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
@@ -73,6 +73,7 @@ ATOMIC_WAIT_PREFLIGHT_RUNS = {
     "authoritative": 64,
     "smoke": 8,
 }
+ATOMIC_WAIT_PREFLIGHT_ITERATIONS = 1_000_000
 MIN_TIMED_INTERVAL_MS = 1_250.0
 TIMING_OVERHEAD_RATIO_LIMIT = 0.01
 TARGET_BARRIER_NS = 12_456_000
@@ -4322,6 +4323,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "timeout_seconds": args.timeout,
         "minimum_timed_interval_ns": minimum_interval_ns,
         "atomic_wait_preflight_runs": ATOMIC_WAIT_PREFLIGHT_RUNS[args.profile],
+        "atomic_wait_preflight_iterations": ATOMIC_WAIT_PREFLIGHT_ITERATIONS,
+        "atomic_wait_preflight_timing_quality": "correctness-only",
         "scheduler_barrier_preflight": {
             "enabled": args.trusted_calibration_preflight,
             "mode": "aot",
@@ -4490,9 +4493,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     module=context["aot_artifacts"]["threaded-polls-on"],
                     workload="atomic",
                     threads=1,
-                    iterations=1_000_000,
+                    iterations=ATOMIC_WAIT_PREFLIGHT_ITERATIONS,
                     timeout=args.timeout,
                     min_interval_ns=1,
+                    enforce_timing_quality=False,
                     record_fields={
                         "revision": role,
                         "pair_kind": "atomic-wait-preflight",
@@ -4513,7 +4517,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "workload": "atomic",
                         "threads": 1,
-                        "iterations": 1_000_000,
+                        "iterations": ATOMIC_WAIT_PREFLIGHT_ITERATIONS,
                     },
                 )
 
