@@ -1,9 +1,9 @@
 //! Interpreter-vs-AOT differential harness.
 //!
-//! For each embedded wasm module, this runs the exported `() -> i32`
+//! For each embedded wasm module, this runs an exported scalar integer
 //! function through both the bytecode interpreter and the AOT pipeline
 //! (frontend → passes → codegen → emit_aot → aot_loader → aot_runtime),
-//! and asserts the two results match.
+//! and asserts exact agreement or the required WebAssembly NaN class.
 //!
 //! This is the minimum test that would have caught the `readI32`/`readI64`
 //! LEB128 sign-extension bug fixed in commit 709ad073: a wasm module that
@@ -36,18 +36,19 @@ const triage_mode: bool = blk: {
     break :blk opt.verify_ir_triage;
 };
 
-/// Runtime-arch gate for the AOT half of these tests. We deliberately keep
-/// this narrower than `aot_harness.can_exec_aot` (which also lists aarch64):
-/// the specific i32 AOT results asserted below have only ever been validated
-/// on x86_64, and the aarch64 codegen still has known spill-path gaps that
-/// would surface as false failures in this suite. Re-widening is tracked
-/// separately — do not flip this back to the harness's constant without
-/// first fixing the aarch64 AOT codegen.
+/// Runtime-arch gate for the AOT half of these tests.
 const can_exec_aot = builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64;
+// The x86_64 backend rejects UnsupportedV128; SIMD interpreter/class checks
+// still run there, while SIMD AOT assertions remain native AArch64 coverage.
 const can_exec_simd_aot = builtin.cpu.arch == .aarch64;
 
 /// Run `name` (a `() -> i32` export) through the interpreter.
 fn runInterpI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !i32 {
+    return runInterpInt(i32, allocator, wasm, name);
+}
+
+fn runInterpInt(comptime Int: type, allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !Int {
+    comptime std.debug.assert(Int == i32 or Int == i64);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const module = try loader_mod.load(wasm, arena.allocator());
@@ -60,13 +61,18 @@ fn runInterpI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8
     var env = try ExecEnv.create(inst, 4096, allocator);
     defer env.destroy();
     try interp.executeFunction(env, exp.index);
-    return env.popI32();
+    return if (Int == i32) env.popI32() else env.popI64();
 }
 
 /// Run `name` (a `() -> i32` export) through the AOT pipeline via the shared
 /// `aot_harness.Harness`. Kept as a thin wrapper so `expectDiffI32` reads
 /// symmetrically against `runInterpI32`.
 fn runAotI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !i32 {
+    return runAotInt(i32, allocator, wasm, name);
+}
+
+fn runAotInt(comptime Int: type, allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !Int {
+    comptime std.debug.assert(Int == i32 or Int == i64);
     const h = if (comptime triage_mode)
         aot_harness.Harness.initWithOptions(allocator, wasm, null, .{ .verify_ir = true }) catch |err| {
             if (err == error.CompileFailed) {
@@ -84,7 +90,8 @@ fn runAotI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !
     const results = try h.callScalar(func_idx, &.{}, &results_buf);
     if (results.len != 1) return error.UnsupportedSignature;
     return switch (results[0]) {
-        .i32 => |v| v,
+        .i32 => |v| if (Int == i32) v else error.InvalidArgType,
+        .i64 => |v| if (Int == i64) v else error.InvalidArgType,
         else => error.InvalidArgType,
     };
 }
@@ -208,6 +215,78 @@ fn expectSimdDiffI32MatchesInterp(wasm: []const u8, name: []const u8) !void {
         std.debug.print("SIMD AOT MISMATCH: interp={d} got={d}\n", .{ interp_result, aot_result });
     }
     try testing.expectEqual(interp_result, aot_result);
+}
+
+const NaNClass = enum { canonical, arithmetic };
+
+// Core NaN propagation permits either sign, but arithmetic NaNs must be quiet.
+// https://webassembly.github.io/spec/core/exec/numerics.html#nan-propagation
+fn matchesNaNClass(comptime UInt: type, bits: UInt, expected: NaNClass) bool {
+    const canonical: UInt = if (UInt == u32) 0x7fc0_0000 else if (UInt == u64) 0x7ff8_0000_0000_0000 else @compileError("expected u32 or u64");
+    const magnitude = bits & (std.math.maxInt(UInt) >> 1);
+    return switch (expected) {
+        .canonical => magnitude == canonical,
+        .arithmetic => (magnitude & canonical) == canonical,
+    };
+}
+
+fn expectNaNClass(comptime Int: type, result: Int, expected: NaNClass, engine: []const u8) !void {
+    const UInt = std.meta.Int(.unsigned, @bitSizeOf(Int));
+    const bits: UInt = @bitCast(result);
+    const matches = matchesNaNClass(UInt, bits, expected);
+    if (!matches) {
+        std.debug.print("SIMD sqrt {s}: expected {s} NaN, got 0x{x}\n", .{ engine, @tagName(expected), bits });
+    }
+    try testing.expect(matches);
+}
+
+fn expectSimdSqrtNaN(
+    comptime Int: type,
+    lanes: [128 / @bitSizeOf(Int)]std.meta.Int(.unsigned, @bitSizeOf(Int)),
+    lane: u8,
+    expected: NaNClass,
+) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    if (Int == i32) {
+        try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
+        try appendSimdOpcode(&body, testing.allocator, 0xE3);
+        try appendI32x4ExtractLane(&body, testing.allocator, lane);
+    } else {
+        try appendV128ConstI64x2(&body, testing.allocator, lanes);
+        try appendSimdOpcode(&body, testing.allocator, 0xEF);
+        try appendI64x2ExtractLane(&body, testing.allocator, lane);
+    }
+    try body.append(testing.allocator, 0x0B);
+
+    // Return every bit from one evaluation, rather than combining f64 halves
+    // from separate evaluations of an operation with nondeterministic results.
+    const wasm = try buildCustomIntModule(Int, testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectNaNClass(Int, try runInterpInt(Int, testing.allocator, wasm, "f"), expected, "interpreter");
+    if (comptime !can_exec_simd_aot) return;
+    try expectNaNClass(Int, try runAotInt(Int, testing.allocator, wasm, "f"), expected, "AOT");
+}
+
+test "SIMD sqrt NaN classification checks quietness and the full payload" {
+    inline for (.{ u32, u64 }) |UInt| {
+        const canonical: UInt = if (UInt == u32) 0x7fc0_0000 else 0x7ff8_0000_0000_0000;
+        const infinity: UInt = if (UInt == u32) 0x7f80_0000 else 0x7ff0_0000_0000_0000;
+        const sign: UInt = @as(UInt, 1) << (@bitSizeOf(UInt) - 1);
+        for ([_]UInt{ canonical, canonical | sign }) |bits| {
+            try testing.expect(matchesNaNClass(UInt, bits, .canonical));
+            try testing.expect(matchesNaNClass(UInt, bits, .arithmetic));
+        }
+        for ([_]UInt{ canonical | 1, canonical | 0x12345, canonical | sign | 1 }) |bits| {
+            try testing.expect(!matchesNaNClass(UInt, bits, .canonical));
+            try testing.expect(matchesNaNClass(UInt, bits, .arithmetic));
+        }
+        for ([_]UInt{ 0, sign, 1, sign | 1, infinity, infinity | sign, infinity | 1, infinity | sign | 1, infinity - 1, (infinity - 1) | sign }) |bits| {
+            try testing.expect(!matchesNaNClass(UInt, bits, .canonical));
+            try testing.expect(!matchesNaNClass(UInt, bits, .arithmetic));
+        }
+    }
 }
 
 fn expectSimdMemoryTrap(wasm: []const u8, name: []const u8) !void {
@@ -1425,44 +1504,6 @@ fn expectF64x2UnLaneHigh(opcode: u32, lanes: [2]u64, lane: u8, expected: i32) !v
     try expectF64x2UnLanePart(opcode, lanes, lane, 32, expected);
 }
 
-/// #872: `sqrt` of a NaN is explicitly implementation-defined by the wasm
-/// spec (`fsqrt(NaN)` may return *any* NaN, unlike `abs`/`neg`, which are
-/// deterministic bitwise sign-bit operations). Zig's `@sqrt` canonicalizes
-/// the NaN payload in Debug builds but compiles straight to the hardware
-/// `SQRTSD` instruction in ReleaseSafe/ReleaseFast, which preserves the
-/// source NaN's payload unchanged instead — both are spec-legal, so
-/// asserting an exact hardcoded payload (as `expectF64x2UnLanePart` does)
-/// is over-specified and optimize-mode-dependent. This variant only
-/// checks that the interpreter and AOT-compiled code agree with EACH
-/// OTHER (the actual point of a *differential* test), not against a
-/// specific golden NaN bit pattern.
-fn expectF64x2UnLanePartMatchesInterp(opcode: u32, lanes: [2]u64, lane: u8, shift: u6) !void {
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(testing.allocator);
-    try body.append(testing.allocator, 0x00);
-    try appendV128ConstI64x2(&body, testing.allocator, lanes);
-    try appendSimdOpcode(&body, testing.allocator, opcode);
-    try appendI64x2ExtractLane(&body, testing.allocator, lane);
-    if (shift != 0) {
-        try appendI64Const(&body, testing.allocator, shift);
-        try appendI64ShrU(&body, testing.allocator);
-    }
-    try appendI32WrapI64(&body, testing.allocator);
-    try body.append(testing.allocator, 0x0B);
-
-    const wasm = try buildCustomModule(testing.allocator, body.items);
-    defer testing.allocator.free(wasm);
-    try expectSimdDiffI32MatchesInterp(wasm, "f");
-}
-
-fn expectF64x2UnLaneLowMatchesInterp(opcode: u32, lanes: [2]u64, lane: u8) !void {
-    try expectF64x2UnLanePartMatchesInterp(opcode, lanes, lane, 0);
-}
-
-fn expectF64x2UnLaneHighMatchesInterp(opcode: u32, lanes: [2]u64, lane: u8) !void {
-    try expectF64x2UnLanePartMatchesInterp(opcode, lanes, lane, 32);
-}
-
 test "differential SIMD: f32x4.convert_i32x4_s lane 0 matches interpreter" {
     try expectF32x4ConvertLane0(
         0xFA,
@@ -1672,23 +1713,6 @@ fn expectF32x4UnLaneBits(opcode: u32, lanes: [4]u32, lane: u8, expected_bits: u3
     try expectSimdDiffI32(wasm, "f", bitsI32(expected_bits));
 }
 
-/// #872: see `expectF64x2UnLanePartMatchesInterp`'s doc comment — `sqrt` of
-/// a NaN is implementation-defined per the wasm spec, so this variant only
-/// checks interpreter/AOT agreement, not an exact hardcoded NaN payload.
-fn expectF32x4UnLaneBitsMatchesInterp(opcode: u32, lanes: [4]u32, lane: u8) !void {
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(testing.allocator);
-    try body.append(testing.allocator, 0x00);
-    try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
-    try appendSimdOpcode(&body, testing.allocator, opcode);
-    try appendI32x4ExtractLane(&body, testing.allocator, lane);
-    try body.append(testing.allocator, 0x0B);
-
-    const wasm = try buildCustomModule(testing.allocator, body.items);
-    defer testing.allocator.free(wasm);
-    try expectSimdDiffI32MatchesInterp(wasm, "f");
-}
-
 test "differential SIMD: f32x4 unary normal lanes match interpreter" {
     try expectF32x4UnLaneBits(
         0xE0,
@@ -1755,7 +1779,7 @@ test "differential SIMD: f32x4 unary signed zero and infinity edges match interp
     );
 }
 
-test "differential SIMD: f32x4 unary NaN behavior matches interpreter" {
+test "differential SIMD: f32x4 unary NaN abs/neg preserve exact bits" {
     try expectF32x4UnLaneBits(
         0xE0,
         .{ 0xffc1_2345, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
@@ -1768,19 +1792,29 @@ test "differential SIMD: f32x4 unary NaN behavior matches interpreter" {
         0,
         0xffc1_2345,
     );
-    // #872: sqrt(NaN)'s exact payload is implementation-defined by the
-    // wasm spec (unlike abs/neg above, deterministic sign-bit ops) — see
-    // `expectF32x4UnLaneBitsMatchesInterp`'s doc comment.
-    try expectF32x4UnLaneBitsMatchesInterp(
-        0xE3,
+    for ([_]u32{ 0x7fc0_0000, 0xffc0_0000, 0x7f80_0001, 0xff80_0001 }) |bits| {
+        try expectF32x4UnLaneBits(0xE0, .{ bits, 0, 0, 0 }, 0, bits & 0x7fff_ffff);
+        try expectF32x4UnLaneBits(0xE1, .{ bits, 0, 0, 0 }, 0, bits ^ 0x8000_0000);
+    }
+}
+
+test "differential SIMD: f32x4 unary NaN sqrt obeys per-lane NaN classes" {
+    try expectSimdSqrtNaN(
+        i32,
         .{ 0x7fc1_2345, 0xbf80_0000, 0xc080_0000, 0x4080_0000 },
         0,
+        .arithmetic,
     );
-    try expectF32x4UnLaneBitsMatchesInterp(
-        0xE3,
+    try expectSimdSqrtNaN(
+        i32,
         .{ 0x7fc1_2345, 0xbf80_0000, 0xc080_0000, 0x4080_0000 },
         2,
+        .canonical,
     );
+    for (0..4) |lane| {
+        try expectSimdSqrtNaN(i32, .{ 0x7fc0_0000, 0xffc0_0000, 0x7f80_0001, 0xff80_0001 }, @intCast(lane), if (lane < 2) .canonical else .arithmetic);
+        try expectSimdSqrtNaN(i32, .{ 0xff80_0000, 0x8000_0001, 0xbf80_0000, 0x7fc0_0000 }, @intCast(lane), .canonical);
+    }
 }
 
 test "differential SIMD: f32x4 rounding fractions match interpreter" {
@@ -2495,7 +2529,7 @@ test "differential SIMD: f64x2 unary signed zero infinity and subnormal edges ma
     );
 }
 
-test "differential SIMD: f64x2 unary NaN behavior matches interpreter" {
+test "differential SIMD: f64x2 unary NaN abs/neg preserve exact bits" {
     try expectF64x2UnLaneHigh(
         0xEC,
         .{ 0xfff8_0000_0000_1234, 0x3ff0_0000_0000_0000 },
@@ -2520,29 +2554,34 @@ test "differential SIMD: f64x2 unary NaN behavior matches interpreter" {
         0,
         0x1234,
     );
-    // #872: sqrt(NaN)'s exact payload is implementation-defined by the
-    // wasm spec (unlike abs/neg above, deterministic sign-bit ops) — see
-    // `expectF64x2UnLanePartMatchesInterp`'s doc comment.
-    try expectF64x2UnLaneHighMatchesInterp(
-        0xEF,
+    for ([_]u64{ 0x7ff8_0000_0000_0000, 0xfff8_0000_0000_0000, 0x7ff0_0000_0000_0001, 0xfff0_0000_0000_0001 }) |bits| {
+        const abs_bits = bits & 0x7fff_ffff_ffff_ffff;
+        const neg_bits = bits ^ 0x8000_0000_0000_0000;
+        try expectF64x2UnLaneHigh(0xEC, .{ bits, 0 }, 0, bitsI64High(abs_bits));
+        try expectF64x2UnLaneLow(0xEC, .{ bits, 0 }, 0, bitsI64Low(abs_bits));
+        try expectF64x2UnLaneHigh(0xED, .{ bits, 0 }, 0, bitsI64High(neg_bits));
+        try expectF64x2UnLaneLow(0xED, .{ bits, 0 }, 0, bitsI64Low(neg_bits));
+    }
+}
+
+test "differential SIMD: f64x2 unary NaN sqrt obeys per-lane NaN classes" {
+    try expectSimdSqrtNaN(
+        i64,
         .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
         0,
+        .arithmetic,
     );
-    try expectF64x2UnLaneLowMatchesInterp(
-        0xEF,
-        .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
-        0,
-    );
-    try expectF64x2UnLaneHighMatchesInterp(
-        0xEF,
+    try expectSimdSqrtNaN(
+        i64,
         .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
         1,
+        .canonical,
     );
-    try expectF64x2UnLaneLowMatchesInterp(
-        0xEF,
-        .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
-        1,
-    );
+    for (0..2) |lane| {
+        try expectSimdSqrtNaN(i64, .{ 0x7ff8_0000_0000_0000, 0xfff8_0000_0000_0000 }, @intCast(lane), .canonical);
+        try expectSimdSqrtNaN(i64, .{ 0x7ff0_0000_0000_0001, 0xfff0_0000_0000_0001 }, @intCast(lane), .arithmetic);
+        try expectSimdSqrtNaN(i64, .{ 0xfff0_0000_0000_0000, 0x8000_0000_0000_0001 }, @intCast(lane), .canonical);
+    }
 }
 
 test "differential SIMD: f64x2 rounding fractions match interpreter" {
@@ -3536,12 +3575,17 @@ test "differential SIMD: v128.storeN_lane out-of-bounds traps" {
 
 /// Build a wasm module with a custom bytecode body for a `() -> i32` function.
 fn buildCustomModule(allocator: std.mem.Allocator, bytecode: []const u8) ![]u8 {
+    return buildCustomIntModule(i32, allocator, bytecode);
+}
+
+fn buildCustomIntModule(comptime Int: type, allocator: std.mem.Allocator, bytecode: []const u8) ![]u8 {
+    const result_type: u8 = if (Int == i32) 0x7F else if (Int == i64) 0x7E else @compileError("expected i32 or i64");
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
     try out.appendSlice(allocator, &[_]u8{
-        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, result_type,
     });
     try out.appendSlice(allocator, &[_]u8{ 0x03, 0x02, 0x01, 0x00 });
     try out.appendSlice(allocator, &[_]u8{

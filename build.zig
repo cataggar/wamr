@@ -1716,6 +1716,13 @@ pub fn build(b: *std.Build) void {
     const run_magic_differential_tests = b.addRunArtifact(magic_differential_tests);
     aot_magic_u32_step.dependOn(&run_magic_differential_tests.step);
 
+    const simd_nan_step = b.step("test-simd-nan", "Run SIMD NaN conformance tests");
+    const simd_nan_tests = b.addTest(.{
+        .root_module = differential_test_module,
+        .filters = &.{ "unary NaN", "SIMD sqrt NaN classification" },
+    });
+    simd_nan_step.dependOn(&b.addRunArtifact(simd_nan_tests).step);
+
     // #694: regression test for active elem segments referencing
     // funcidx ≥ 256 (was capped by a fixed 256-entry buffer in
     // `mapCodeExecutable`, silently dropping both the native pointer
