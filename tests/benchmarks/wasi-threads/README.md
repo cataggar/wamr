@@ -92,67 +92,63 @@ This replaces fixed-count provenance after #1008 run 34173856468, job
 than the retained sizing host. That observation demonstrates that no finite
 fixed host margin is a defensible contract.
 
-For each cell, sizing version 6 selects the fastest valid pilot across all
+For each cell, sizing version 7 selects the fastest valid pilot across all
 revisions and conditions. With pilot iterations `P` and corrected elapsed
 nanoseconds `E`, the general count is
 `round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))`,
-where the target is 1.75 seconds and the safety factor is `11/10`.
+where the target is 1.75 seconds and the safety factor is `10/7`. This projects
+exactly 2.5 seconds at the fastest pilot rate: a portable 2x
+measurement-to-pilot rate envelope over the 1.25-second evidence floor.
 
-Three declarative, portable cell envelopes additionally apply. The first covers
+Three wholly new immutable-tag smoke cohorts retained ordinary-cell
+accelerations above the old 1.925-second general target's `1.54x` tolerance:
+
+| evidence | cell | fastest pilot rate (ops/s) | acceleration | old count | v7 count | projected failure |
+|---|---|---:|---:|---:|---:|---:|
+| run 34322503291 | AOT hot/8 | 207,202,544.631 | 1.567876679x | 399M | 519M | 1.597572s |
+| run 34337339856 | interpreter wait/4 | 7,028.109 | 1.724465573x | 13.6K | 17.6K | 1.452177s |
+| run 34351942414 | interpreter atomic/2 | 8,375,789.863 | 1.603974260x | 16.2M | 21.0M | 1.563134s |
+
+The distinct modes, workloads, and thread counts make continued cell-specific
+exceptions indefensible. The general 2x envelope has
+`2 / 1.7244655732767034 - 1 = 0.15977960418180248`, or 15.9780%, margin over
+the retained maximum. The three diagnostics are pinned respectively by
+SHA-256 `95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995`,
+`d05ca21d0557074aa356574b29d8ddf488c7e4a7ca31976e35bb6da92bb9f447`,
+and `098a466f98da6899f2e7dba657078eb3853500a9bfca4e06727c23b51c0cbed3`.
+Replaying every retained pilot under the 2x rule projects at most
+4,205.813468912 seconds, or 70.10 minutes, below the 107-minute benchmark
+limit.
+
+One stronger declarative cell envelope additionally covers
 `mode=aot, workload=wait-notify, threads=1` on every architecture. Its count is
 `round_up_3_significant_digits(ceil(P*1250000000*8/E))`, and the selected
 count is the maximum of the general and envelope counts. Equivalently, the
 cell-specific formula is
-`round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*8/E)))`.
+`round_up_3_significant_digits(max(ceil(P*1750000000*10/(E*7)), ceil(P*1250000000*8/E)))`.
 The `8/1` rate-acceleration envelope projects 10.0 seconds at the pilot rate,
 so a later measurement may accelerate by up to 8 times and still meet the
 1.25-second floor.
 
 The retained failed hosted attempts and their ordered-rate evidence are:
 
-| evidence | fastest pilot rate (ops/s) | later/pilot acceleration | general count | v6 count | projected later duration |
+| evidence | fastest pilot rate (ops/s) | later/pilot acceleration | v7 general count | v7 selected count | projected later duration |
 |---|---:|---:|---:|---:|---:|
-| attempt 1 | 739,133.627 | 2.192262005x | 1.43M | 7.40M | 4.566845s |
-| attempt 2 | 853,510.803 | 1.836297620x | 1.65M | 8.54M | 5.448862s |
-| attempt 3 | 262,449.465 | 1.737047051x | 506K | 2.63M | 5.768973s |
-| #1020 run 34284891299 | 182,566.439 | 5.367617735x | 352K | 1.83M | 1.867448s |
+| attempt 1 | 739,133.627 | 2.192262005x | 1.85M | 7.40M | 4.566845s |
+| attempt 2 | 853,510.803 | 1.836297620x | 2.14M | 8.54M | 5.448862s |
+| attempt 3 | 262,449.465 | 1.737047051x | 657K | 2.63M | 5.768973s |
+| #1020 run 34284891299 | 182,566.439 | 5.367617735x | 457K | 1.83M | 1.867448s |
 
 The exact relative margin over the retained `5.367617734892188x` boundary is
 `8 / 5.367617734892188 - 1 = 0.49041910119567866`, or
 `49.041910119567866%` (49.0419%). Replaying all 88 retained pilots and the
-12 evidence invocations per observation gives a maximum 3,268.557360454-second
-projection on the #1020 failure, bounded by 54.48 minutes and still below
-97 minutes.
-This is a cell-specific rate envelope, not an x86 host allowance: the selector
+12 evidence invocations per observation gives a maximum 3,905.574194278-second
+projection on the #1020 failure, bounded by 65.10 minutes and still below
+107 minutes.
+This stronger rule is a cell-specific rate envelope, not an x86 host
+allowance: the selector
 contains no CPU, runner, platform, or architecture identity and therefore
 applies identically to every canonical platform.
-
-The second envelope covers `mode=aot, workload=hot, threads=8` on every
-architecture:
-`round_up_3_significant_digits(ceil(P*1250000000*2/E))`. Immutable-tag smoke
-run 34322503291 selected 399M iterations from its fastest retained 450M pilot
-at 2.171788 seconds, projecting 1.925652027 seconds. A later baseline sample
-completed in 1.228191 seconds, a `1.567876679332992x` ordered rate
-acceleration. The 2x envelope selects 519M iterations and projects that sample
-to 1.597571752 seconds. Its exact relative margin is
-`2 / 1.567876679332992 - 1 = 0.275610528789064`, or 27.5611%. The complete
-failure diagnostic is pinned by SHA-256
-`95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995`.
-Like the wait/notify envelope, this selector contains no host or architecture
-identity.
-
-The third envelope covers
-`mode=interpreter, workload=wait-notify, threads=4` on every architecture:
-`round_up_3_significant_digits(ceil(P*1250000000*2/E))`. Immutable-tag smoke
-run 34337339856 selected 13,600 iterations from its fastest retained 32,000
-pilot at 4.553145 seconds, projecting 1.935086625 seconds. A later baseline
-sample completed in 1.122137 seconds, a `1.7244655732767034x` ordered rate
-acceleration. The 2x envelope selects 17,600 iterations and projects that
-sample to 1.452177295 seconds. Its exact relative margin is
-`2 / 1.7244655732767034 - 1 = 0.15977960418180248`, or 15.9780%. The complete
-failure diagnostic is pinned by SHA-256
-`d05ca21d0557074aa356574b29d8ddf488c7e4a7ca31976e35bb6da92bb9f447`.
-This selector is likewise independent of host and architecture identity.
 
 There is no pilot-count floor: a slow host downsizes a long pilot to
 target-sized evidence, while a fast host sizes up. The fastest baseline result
@@ -167,38 +163,43 @@ resolution. They are intentionally not required to satisfy the evidence
 `99B < E` rule at their short unsized count. After the frozen count is known,
 every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
-be at least both the 1.25-second evidence floor and the exact 1.925-second
-`1.75s * 11/10` sizing target; the AOT wait/notify/1 special cell projects at
-least 10.0 seconds, while the AOT hot/8 and interpreter wait/notify/4 special
-cells project at least 2.5 seconds at every retained pilot rate. Actual warmups
-and samples
+be at least both the 1.25-second evidence floor and the exact 2.5-second
+`1.75s * 10/7` sizing target; AOT wait/notify/1 projects at least 10.0 seconds.
+Actual warmups and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
 There is no hidden retry or count increase if a later rate exceeds its
-declared 8x or 2x envelopes: even a just-over-boundary observation that falls
+declared 2x or 8x envelope: even a just-over-boundary observation that falls
 below 1.25 seconds is retained and fails closed.
 
 Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
 limit, checksum arithmetic, and declared workload caps. A pilot is rejected
 immediately above 30 seconds corrected time or 33 seconds host-wall time; the
-30-second corrected cap is above the retained approximately 22-second worst
+30-second corrected cap is above the retained approximately 23-second worst
 cell while preventing 88 watchdog-length pilots from exhausting a job. Every
 condition's projected invocation must remain strictly below the 90-second
 watchdog.
 
-The workflow reserves 83 minutes for non-benchmark work, leaving a 97-minute
+The workflow reserves 73 minutes for non-benchmark work, leaving a 107-minute
 benchmark limit. Before and during the full 88-pilot authoritative plan,
 admission uses the hard 48-minute-24-second pilot bound (`88 * 33s`), the
-envelope-aware 37-minute-34.2-second minimum evidence bound
-(`82 * 12 * 1.925s + 2 * 12 * 10s + 4 * 12 * 2.5s`), and the 10-minute
-auxiliary allowance. Their sum is 95 minutes 58.2 seconds; adding the
-83-minute reserve is 178 minutes 58.2 seconds, strictly below the 180-minute
-job timeout. The
+47-minute minimum evidence bound
+(`86 * 12 * 2.5s + 2 * 12 * 10s`), and the 10-minute auxiliary allowance.
+Their sum is 105 minutes 24 seconds; adding the 73-minute reserve is 178
+minutes 24 seconds, strictly below the 180-minute job timeout. The
 harness accumulates actual pilot corrected and wall time after each one-shot
 pilot and aborts immediately when the remaining hard bound cannot fit.
 
+The reserve reduction is bounded by retained v3 AArch64 smoke job
+102467148543. Its benchmark step occupied 4,701 seconds; retained pilots and
+records account for 1,258.552313986 seconds, leaving 3,442.447686014 seconds
+for builds, orchestration, preflights, and gaps. The combined 73-minute reserve
+and 10-minute auxiliary allowance is 4,980 seconds, 44.6645% above that
+unaccounted wall time. The report hash, timestamps, and replay arithmetic are
+pinned in `sizing-simulation-provenance.json`.
+
 After all pilots finish, the hard pre-admission pilot allowance is no longer
 charged. The final `projected_evidence_limit_ns` is exactly
-`97m - actual_retained_pilot_wall - 600s`, and
+`107m - actual_retained_pilot_wall - 600s`, and
 `projected_benchmark_ns` is exactly
 `actual_retained_pilot_wall + projected_evidence_wall + 600s`. Reports retain
 both the distinct `maximum_pre_admission_pilot_bound_ns` and
@@ -289,14 +290,14 @@ same-directory atomic rename that preserves an existing report's mode.
 Each guest invocation has a fixed 90-second watchdog. Before evidence, the
 harness checks every pilot-derived per-condition projection against that
 watchdog and checks the complete projected benchmark path against the strict
-97-minute limit. The workflow retains its 180-minute bound and 83-minute
+107-minute limit. The workflow retains its 180-minute bound and 73-minute
 non-benchmark reserve. Twenty
 sequential trusted x86 jobs at the full job timeout still take 60 hours,
 leaving 12 hours before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 7 of a purpose-independent portable
+`measurement_plan_sha256` is version 8 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -480,7 +481,7 @@ inspection appears clean.
 
 ```sh
 python3 scripts/wasi_thread_cohort.py dispatch \
-  --workflow-ref wasi-thread-calibration-966-v1 \
+  --workflow-ref wasi-thread-calibration-966-vN \
   --baseline-sha <40-char-tagged-main-commit> \
   --candidate-sha <same-40-char-tagged-main-commit> \
   --purpose noise-calibration \
@@ -618,8 +619,8 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Schema-v3 fixed-plan reports and reports produced before measurement-plan
-identity version 7, including version-2 reports from #1013, version-3/4
-#1016 attempts, version-5 #1020 evidence, and version-6 pre-wait/4-envelope
+identity version 8, including version-2 reports from #1013, version-3/4
+#1016 attempts, version-5 #1020 evidence, and version-6/7 cell-envelope
 evidence, are invalid for a new authoritative cohort. Fresh
 evidence with the canonical one-shot sizing identity is mandatory for
 calibration and derivation. Reports with different legitimate host-selected
