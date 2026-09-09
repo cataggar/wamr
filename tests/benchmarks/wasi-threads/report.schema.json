@@ -66,7 +66,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 2 },
+        "measurement_plan_version": { "const": 5 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "checksum_preparation": {
           "type": "object",
@@ -425,6 +425,8 @@
             "kind",
             "selection_rate",
             "formula",
+            "cell_selection",
+            "cell_envelopes",
             "target_duration_ns",
             "safety_factor",
             "rounding",
@@ -437,12 +439,12 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 1 },
+            "version": { "const": 4 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
             "maximum_pilot_corrected_ns": { "const": 30000000000 },
-            "maximum_pilot_host_wall_ns": { "const": 35000000000 },
+            "maximum_pilot_host_wall_ns": { "const": 33000000000 },
             "projected_evidence_minimum_ns": { "const": 1925000000 },
             "timing_overhead_ratio_limit": { "const": 0.01 },
             "failure_policy": { "const": "one-shot-no-retry-no-discard" },
@@ -450,7 +452,29 @@
               "const": "fastest-valid-pilot-across-all-revisions-and-conditions"
             },
             "formula": {
-              "const": "max(pilot_iterations, ceil(pilot_iterations * target_duration_ns * safety_numerator / (pilot_elapsed_ns * safety_denominator))), then decimal significant-digits ceiling"
+              "const": "round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))"
+            },
+            "cell_selection": {
+              "const": "max(general_rounded_iterations, applicable_envelope_rounded_iterations)"
+            },
+            "cell_envelopes": {
+              "const": [
+                {
+                  "name": "aot-wait-notify-1-rate-acceleration",
+                  "selector": {
+                    "mode": "aot",
+                    "workload": "wait-notify",
+                    "threads": 1
+                  },
+                  "quality_floor_ns": 1250000000,
+                  "measurement_to_pilot_rate_envelope": {
+                    "numerator": 8,
+                    "denominator": 1
+                  },
+                  "projected_pilot_duration_ns": 10000000000,
+                  "formula": "round_up_3_significant_digits(ceil(P*quality_floor_ns*acceleration_numerator/(E*acceleration_denominator)))"
+                }
+              ]
             },
             "safety_factor": {
               "type": "object",
@@ -539,7 +563,122 @@
             "cells": {
               "type": "array",
               "minItems": 1,
-              "items": { "type": "object" }
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key",
+                  "mode",
+                  "workload",
+                  "threads",
+                  "pilot_count",
+                  "pilot_observations",
+                  "baseline_fastest_pilot_index",
+                  "baseline_fastest_elapsed_ns",
+                  "baseline_required_iterations",
+                  "baseline_rounded_iterations",
+                  "fastest_pilot_index",
+                  "fastest_elapsed_ns",
+                  "fastest_required_iterations",
+                  "general_required_iterations",
+                  "general_rounded_iterations",
+                  "applicable_envelopes",
+                  "selected_iterations",
+                  "selected_sources",
+                  "effective_iteration_cap"
+                ],
+                "properties": {
+                  "key": { "type": "string", "minLength": 1 },
+                  "mode": { "enum": ["interpreter", "aot"] },
+                  "workload": {
+                    "enum": [
+                      "single-hot",
+                      "hot",
+                      "cancel-hot",
+                      "atomic",
+                      "wait-notify",
+                      "spawn-join"
+                    ]
+                  },
+                  "threads": { "type": "integer", "minimum": 1 },
+                  "pilot_count": { "type": "integer", "minimum": 1 },
+                  "pilot_observations": { "type": "integer", "minimum": 1 },
+                  "baseline_fastest_pilot_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "baseline_fastest_elapsed_ns": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "baseline_required_iterations": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "baseline_rounded_iterations": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "fastest_pilot_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "fastest_elapsed_ns": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "fastest_required_iterations": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "general_required_iterations": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "general_rounded_iterations": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "applicable_envelopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "name",
+                        "required_iterations",
+                        "rounded_iterations"
+                      ],
+                      "properties": {
+                        "name": {
+                          "const": "aot-wait-notify-1-rate-acceleration"
+                        },
+                        "required_iterations": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "rounded_iterations": {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      }
+                    }
+                  },
+                  "selected_iterations": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "selected_sources": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "minLength": 1 }
+                  },
+                  "effective_iteration_cap": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
             },
             "projections": {
               "type": "array",

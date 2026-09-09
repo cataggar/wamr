@@ -50,10 +50,21 @@ REPORT_SCHEMA_VERSION = 4
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 2
+MEASUREMENT_PLAN_IDENTITY_VERSION = 5
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 1
+SIZING_ALGORITHM_VERSION = 4
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
+SIZING_FORMULA = (
+    "round_up_3_significant_digits(ceil(P*target_duration_ns*"
+    "safety_numerator/(E*safety_denominator)))"
+)
+SIZING_CELL_ENVELOPE_FORMULA = (
+    "round_up_3_significant_digits(ceil(P*quality_floor_ns*"
+    "acceleration_numerator/(E*acceleration_denominator)))"
+)
+SIZING_CELL_SELECTION = (
+    "max(general_rounded_iterations, applicable_envelope_rounded_iterations)"
+)
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "smoke": (1, 4),
@@ -74,6 +85,23 @@ SIZING_TARGET_NS = 1_750_000_000
 SIZING_SAFETY_NUMERATOR = 11
 SIZING_SAFETY_DENOMINATOR = 10
 SIZING_SIGNIFICANT_DIGITS = 3
+SIZING_CELL_ENVELOPES = (
+    {
+        "name": "aot-wait-notify-1-rate-acceleration",
+        "selector": {
+            "mode": "aot",
+            "workload": "wait-notify",
+            "threads": 1,
+        },
+        "quality_floor_ns": 1_250_000_000,
+        "measurement_to_pilot_rate_envelope": {
+            "numerator": 8,
+            "denominator": 1,
+        },
+        "projected_pilot_duration_ns": 10_000_000_000,
+        "formula": SIZING_CELL_ENVELOPE_FORMULA,
+    },
+)
 PROJECTED_EVIDENCE_MINIMUM_NS = (
     SIZING_TARGET_NS * SIZING_SAFETY_NUMERATOR
     + SIZING_SAFETY_DENOMINATOR
@@ -81,7 +109,7 @@ PROJECTED_EVIDENCE_MINIMUM_NS = (
 ) // SIZING_SAFETY_DENOMINATOR
 PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
 MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
-MAXIMUM_PILOT_HOST_WALL_NS = 35_000_000_000
+MAXIMUM_PILOT_HOST_WALL_NS = 33_000_000_000
 WORKFLOW_JOB_TIMEOUT_NS = 180 * 60 * 1_000_000_000
 JOB_NON_BENCHMARK_RESERVE_NS = 83 * 60 * 1_000_000_000
 PROJECTED_BENCHMARK_LIMIT_NS = (
@@ -442,11 +470,9 @@ def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
         "version": SIZING_ALGORITHM_VERSION,
         "kind": SIZING_ALGORITHM_KIND,
         "selection_rate": "fastest-valid-pilot-across-all-revisions-and-conditions",
-        "formula": (
-            "max(pilot_iterations, ceil(pilot_iterations * target_duration_ns "
-            "* safety_numerator / (pilot_elapsed_ns * safety_denominator))), "
-            "then decimal significant-digits ceiling"
-        ),
+        "formula": SIZING_FORMULA,
+        "cell_selection": SIZING_CELL_SELECTION,
+        "cell_envelopes": copy.deepcopy(list(SIZING_CELL_ENVELOPES)),
         "target_duration_ns": SIZING_TARGET_NS,
         "safety_factor": {
             "numerator": SIZING_SAFETY_NUMERATOR,
@@ -532,6 +558,66 @@ def selected_iterations_from_elapsed(
     )
 
 
+def sizing_candidates_for_cell(
+    mode: str,
+    workload: str,
+    threads: int,
+    pilot_iterations: int,
+    pilot_elapsed_ns: int,
+) -> dict[str, Any]:
+    general_required, general_rounded = selected_iterations_from_elapsed(
+        pilot_iterations, pilot_elapsed_ns
+    )
+    envelope_candidates = []
+    selector = {
+        "mode": mode,
+        "workload": workload,
+        "threads": threads,
+    }
+    for envelope in SIZING_CELL_ENVELOPES:
+        if envelope["selector"] != selector:
+            continue
+        acceleration = envelope["measurement_to_pilot_rate_envelope"]
+        required = ceil_div(
+            pilot_iterations
+            * envelope["quality_floor_ns"]
+            * acceleration["numerator"],
+            pilot_elapsed_ns * acceleration["denominator"],
+        )
+        envelope_candidates.append(
+            {
+                "name": envelope["name"],
+                "required_iterations": required,
+                "rounded_iterations": round_up_significant(
+                    required, SIZING_SIGNIFICANT_DIGITS
+                ),
+            }
+        )
+    selected_required = max(
+        [general_required]
+        + [item["required_iterations"] for item in envelope_candidates]
+    )
+    selected = max(
+        [general_rounded]
+        + [item["rounded_iterations"] for item in envelope_candidates]
+    )
+    selected_sources = (
+        ["general"] if general_rounded == selected else []
+    ) + [
+        item["name"]
+        for item in envelope_candidates
+        if item["rounded_iterations"] == selected
+    ]
+    return {
+        "general_required_iterations": general_required,
+        "general_rounded_iterations": general_rounded,
+        "applicable_envelopes": envelope_candidates,
+        "selected_required_iterations": selected_required,
+        "selected_iterations": selected,
+        "selected_sources": selected_sources,
+    }
+
+
 def validate_sizing_pilot(
     record: dict[str, Any],
     expected: dict[str, Any],
@@ -569,7 +655,7 @@ def validate_sizing_pilot(
         or host_wall < elapsed
         or host_wall > MAXIMUM_PILOT_HOST_WALL_NS
     ):
-        raise HarnessError("sizing pilot host-wall duration exceeds 35 seconds")
+        raise HarnessError("sizing pilot host-wall duration exceeds 33 seconds")
     if (
         not isinstance(overhead, int)
         or isinstance(overhead, bool)
@@ -591,7 +677,7 @@ def validate_sizing_pilot(
 def pilot_progress_bound(
     *,
     pilot_records: list[dict[str, Any]],
-    total_pilots: int,
+    pilot_order: list[dict[str, Any]],
     warmups: int,
     samples: int,
 ) -> dict[str, int]:
@@ -601,16 +687,27 @@ def pilot_progress_bound(
     completed_elapsed_ns = sum(
         record["guest_elapsed_ns"] for record in pilot_records
     )
-    remaining_pilots = total_pilots - len(pilot_records)
+    remaining_pilots = len(pilot_order) - len(pilot_records)
     if remaining_pilots < 0:
         raise HarnessError("sizing pilot progress exceeds declared order")
     remaining_pilot_bound_ns = (
         remaining_pilots * MAXIMUM_PILOT_HOST_WALL_NS
     )
-    minimum_evidence_bound_ns = (
-        total_pilots
-        * (warmups + samples)
-        * PROJECTED_EVIDENCE_MINIMUM_NS
+    minimum_evidence_bound_ns = (warmups + samples) * sum(
+        max(
+            [PROJECTED_EVIDENCE_MINIMUM_NS]
+            + [
+                envelope["projected_pilot_duration_ns"]
+                for envelope in SIZING_CELL_ENVELOPES
+                if envelope["selector"]
+                == {
+                    "mode": spec["mode"],
+                    "workload": spec["workload"],
+                    "threads": spec["threads"],
+                }
+            ]
+        )
+        for spec in pilot_order
     )
     earliest_complete_bound_ns = (
         completed_wall_ns
@@ -718,19 +815,21 @@ def resolve_one_shot_sizing(
             baseline_records or records,
             key=lambda item: item["guest_elapsed_ns"],
         )
-        baseline_required, baseline_rounded = selected_iterations_from_elapsed(
+        baseline_candidates = sizing_candidates_for_cell(
+            mode,
+            workload,
+            threads,
             baseline_fastest["iterations"],
             baseline_fastest["guest_elapsed_ns"],
         )
-        fastest_required, fastest_rounded = selected_iterations_from_elapsed(
+        fastest_candidates = sizing_candidates_for_cell(
+            mode,
+            workload,
+            threads,
             fastest["iterations"],
             fastest["guest_elapsed_ns"],
         )
-        selected = max(
-            fastest["iterations"],
-            baseline_rounded,
-            fastest_rounded,
-        )
+        selected = fastest_candidates["selected_iterations"]
         cap = effective_sizing_cap(workload, threads)
         if selected > cap:
             raise HarnessError(
@@ -753,12 +852,28 @@ def resolve_one_shot_sizing(
                 "baseline_fastest_elapsed_ns": baseline_fastest[
                     "guest_elapsed_ns"
                 ],
-                "baseline_required_iterations": baseline_required,
-                "baseline_rounded_iterations": baseline_rounded,
+                "baseline_required_iterations": baseline_candidates[
+                    "selected_required_iterations"
+                ],
+                "baseline_rounded_iterations": baseline_candidates[
+                    "selected_iterations"
+                ],
                 "fastest_pilot_index": fastest["pilot_index"],
                 "fastest_elapsed_ns": fastest["guest_elapsed_ns"],
-                "fastest_required_iterations": fastest_required,
+                "fastest_required_iterations": fastest_candidates[
+                    "selected_required_iterations"
+                ],
+                "general_required_iterations": fastest_candidates[
+                    "general_required_iterations"
+                ],
+                "general_rounded_iterations": fastest_candidates[
+                    "general_rounded_iterations"
+                ],
+                "applicable_envelopes": fastest_candidates[
+                    "applicable_envelopes"
+                ],
                 "selected_iterations": selected,
+                "selected_sources": fastest_candidates["selected_sources"],
                 "effective_iteration_cap": cap,
             }
         )
@@ -3749,7 +3864,9 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"`{document['plan']['sizing']['algorithm']['kind']}` v"
         f"{document['plan']['sizing']['algorithm']['version']}; "
         f"{len(document['plan']['sizing']['resolved']['pilots'])} retained pilots, "
-        f"{len(document['plan']['sizing']['resolved']['cells'])} frozen cells; "
+        f"{len(document['plan']['sizing']['resolved']['cells'])} frozen cells, "
+        f"{len(document['plan']['sizing']['algorithm']['cell_envelopes'])} "
+        "declarative cell envelope; "
         f"projected benchmark "
         f"{document['plan']['sizing']['resolved']['projected_benchmark_ns'] / 1e9:.1f}s",
         f"- Budget: `{document['budget']['status']}`",
@@ -4016,7 +4133,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     pilot_records: list[dict[str, Any]] = []
     pilot_progress_bound(
         pilot_records=pilot_records,
-        total_pilots=len(pilot_order),
+        pilot_order=pilot_order,
         warmups=args.warmups,
         samples=args.samples,
     )
@@ -4111,7 +4228,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             validate_sizing_pilot(pilot, spec)
             pilot_progress_bound(
                 pilot_records=pilot_records,
-                total_pilots=len(pilot_order),
+                pilot_order=pilot_order,
                 warmups=args.warmups,
                 samples=args.samples,
             )
