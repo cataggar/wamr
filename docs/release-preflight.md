@@ -27,6 +27,8 @@ contain exactly `wamr`, `wamrc`, `LICENSE`, and `README.md` in the expected layo
 The verifier checks ELF64, Mach-O64, or PE32+ machine identities, executable
 permissions where applicable, and documentation contents. CRLF/LF differences in
 packaged documentation are allowed; binary hashes always describe the exact bytes.
+Windows ZIP separators are normalized before applying the same member whitelist
+on every host; traversal and duplicate normalized names remain errors.
 Machine-header checks do not establish a libc deployment floor.
 
 The verifier extracts only the expected regular files into a fresh directory.

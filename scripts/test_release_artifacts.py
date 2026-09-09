@@ -208,6 +208,57 @@ class ReleaseArtifactTests(unittest.TestCase):
             release.inspect_package(self.archive("windows-x64", entries), VERSION,
                                     "windows-x64", self.repo)
 
+    def test_windows_zip_separators_and_directories_are_host_independent(self):
+        name = "windows-x64"
+        archive = self.assets / release.archive_name(VERSION, name)
+        root = release.package_name(VERSION, name)
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                with zipfile.ZipFile(archive, "w") as package:
+                    for filename in (root + "\\", root + "\\bin\\"):
+                        info = zipfile.ZipInfo(filename)
+                        info.filename = filename
+                        info.create_system = 0
+                        info.external_attr = 0x10
+                        package.writestr(info, b"")
+                    for filename, data, _ in self.entries(name):
+                        raw = filename.replace("/", "\\", 1) if mixed else filename.replace("/", "\\")
+                        info = zipfile.ZipInfo(raw)
+                        info.filename = raw
+                        info.create_system = 0
+                        info.external_attr = 0x20
+                        package.writestr(info, data)
+                files = release.inspect_package(archive, VERSION, name, self.repo)
+                self.assertEqual(set(files), {entry[0] for entry in self.entries(name)})
+
+    def test_windows_zip_normalization_rejects_collisions_and_traversal(self):
+        name = "windows-x64"
+        root = release.package_name(VERSION, name)
+        for filename in (root + "\\LICENSE", "..\\outside", root + "\\..\\outside",
+                         "\\\\server\\share", "C:\\outside"):
+            with self.subTest(filename=filename):
+                archive = self.archive(name)
+                with zipfile.ZipFile(archive, "a") as package:
+                    info = zipfile.ZipInfo(filename)
+                    info.filename = filename
+                    info.create_system = 0
+                    info.external_attr = 0x20
+                    package.writestr(info, b"bad")
+                with self.assertRaisesRegex(ValueError, "duplicate|unexpected"):
+                    release.inspect_package(archive, VERSION, name, self.repo)
+
+    def test_windows_zip_directory_symlink_is_rejected(self):
+        name = "windows-x64"
+        archive = self.archive(name)
+        filename = release.package_name(VERSION, name) + "\\bin\\"
+        with zipfile.ZipFile(archive, "a") as package:
+            info = zipfile.ZipInfo(filename)
+            info.filename = filename
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            package.writestr(info, "/outside")
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            release.inspect_package(archive, VERSION, name, self.repo)
+
     def test_required_native_smoke_cannot_be_silently_skipped(self):
         archive = self.archive("linux-arm64")
         with mock.patch.object(release, "host_target", return_value=("linux", "x86_64")), \
