@@ -74,6 +74,12 @@ jobs:
         continue-on-error: true
         run: zig build -Doptimize=ReleaseSafe
 
+      - name: SIMD NaN conformance (ReleaseSafe)
+        # Both hosts cover the interpreter and class predicates; SIMD AOT is
+        # currently supported only by the AArch64 backend.
+        if: runner.os == 'Linux'
+        run: zig build test-simd-nan -Doptimize=ReleaseSafe -j4
+
       - name: Spec tests (JSON)
         if: runner.os != 'Windows'
         shell: bash
@@ -368,13 +374,8 @@ jobs:
           objdump -i | grep -F aarch64 >/dev/null
 
       - name: Unit tests (Debug, includes #853/#854 JIT smoke tests)
-        # Deliberately Debug here, not ReleaseSafe: `zig build test
-        # -Doptimize=ReleaseSafe` currently fails 2 pre-existing,
-        # JIT-unrelated differential SIMD NaN tests (#872, reproduces
-        # identically without `-Djit=true` too). Running Debug first
-        # dodges that bug while still exercising everything actually
-        # relevant to this job (the #853/#854 JIT smoke tests aren't
-        # optimize-mode-specific). The ReleaseSafe build below reinstalls
+        # Run the full unit suite in Debug; the native Linux matrix also
+        # covers SIMD NaN conformance in ReleaseSafe. The build below reinstalls
         # `zig-out/bin/wamr`/`wamrc` before the conformance steps run, so
         # this doesn't leave a stale Debug binary behind for them.
         run: zig build test -Djit=true
