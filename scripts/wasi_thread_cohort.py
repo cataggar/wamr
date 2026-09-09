@@ -38,6 +38,9 @@ from bench_wasi_threads import (
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+TRUSTED_CALIBRATION_TAG_RE = re.compile(
+    r"^wasi-thread-calibration-[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
 DEFAULT_PLATFORMS = tuple(CANONICAL_PLATFORMS)
 RUNNER_TARGETS = ("github-hosted", "trusted-calibration")
 TRUSTED_X86_RUNNER_NAME = "vm31e-wamr-temp-20260906"
@@ -323,10 +326,11 @@ def validate_dispatch_options(args: argparse.Namespace) -> tuple[str, str, int]:
         )
     if (
         args.runner_target == "trusted-calibration"
-        and args.workflow_ref != "main"
+        and TRUSTED_CALIBRATION_TAG_RE.fullmatch(args.workflow_ref) is None
     ):
         raise HarnessError(
-            "the trusted calibration runner is reachable only from workflow ref main"
+            "the trusted calibration runner requires an immutable "
+            "wasi-thread-calibration-* workflow tag"
         )
     timeout_seconds = getattr(args, "timeout_seconds", None)
     if (
@@ -430,6 +434,17 @@ def dispatch(args: argparse.Namespace) -> int:
         args.workflow_ref,
         remaining_timeout(deadline, "resolving the workflow head"),
     )
+    if (
+        args.runner_target == "trusted-calibration"
+        and (
+            baseline_sha != workflow_head_sha
+            or candidate_sha != workflow_head_sha
+        )
+    ):
+        raise HarnessError(
+            "trusted calibration baseline and candidate SHAs must equal the "
+            "immutable workflow tag commit"
+        )
     cohort_id = uuid.uuid4().hex
     state = {
         "schema_version": REPORT_SCHEMA_VERSION,

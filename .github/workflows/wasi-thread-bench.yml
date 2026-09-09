@@ -190,12 +190,22 @@ jobs:
 
           if [ "$EVENT" = workflow_dispatch ] &&
              [ "$INPUT_RUNNER_TARGET" = trusted-calibration ]; then
-            [ "$REF" = refs/heads/main ] || {
-              echo "the self-hosted calibration route is reachable only from main" >&2
+            [[ "$REF" =~ ^refs/tags/wasi-thread-calibration-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+              echo "the self-hosted calibration route requires an immutable calibration tag" >&2
               exit 2
             }
             [ "$PURPOSE" = noise-calibration ] || {
               echo "the self-hosted route accepts noise calibration only" >&2
+              exit 2
+            }
+            git cat-file -e "$CURRENT_SHA^{commit}"
+            git merge-base --is-ancestor "$CURRENT_SHA" origin/main || {
+              echo "the calibration tag commit is not trusted history reachable from main" >&2
+              exit 2
+            }
+            [ "$BASELINE_SHA" = "$CURRENT_SHA" ] &&
+              [ "$CANDIDATE_SHA" = "$CURRENT_SHA" ] || {
+              echo "trusted calibration revisions must equal the calibration tag commit" >&2
               exit 2
             }
             for ITEM in "$BASELINE_SHA" "$CANDIDATE_SHA"; do
@@ -366,7 +376,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       inputs.runner_target == 'trusted-calibration' &&
       inputs.purpose == 'noise-calibration' &&
-      github.ref == 'refs/heads/main'
+      startsWith(github.ref, 'refs/tags/wasi-thread-calibration-')
     needs: prepare
     timeout-minutes: 180
     permissions:
@@ -380,6 +390,16 @@ jobs:
             /d/*:/d/*) ;;
             *) echo "self-hosted workspace and temp paths must remain under /d" >&2; exit 2 ;;
           esac
+          AVAILABLE_KIB="$(df --output=avail -k "$RUNNER_TEMP" | tail -n 1 | tr -d ' ')"
+          [[ "$AVAILABLE_KIB" =~ ^[0-9]+$ ]] || {
+            echo "could not determine available runner storage" >&2
+            exit 2
+          }
+          MIN_AVAILABLE_KIB=$((80 * 1024 * 1024))
+          (( AVAILABLE_KIB >= MIN_AVAILABLE_KIB )) || {
+            echo "trusted calibration requires at least 80 GiB free under /d" >&2
+            exit 2
+          }
 
       - name: Check out baseline
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -514,7 +534,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       inputs.runner_target == 'trusted-calibration' &&
       inputs.purpose == 'noise-calibration' &&
-      github.ref == 'refs/heads/main'
+      startsWith(github.ref, 'refs/tags/wasi-thread-calibration-')
     needs: prepare
     timeout-minutes: 180
     permissions:

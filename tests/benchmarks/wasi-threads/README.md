@@ -427,7 +427,11 @@ the calibration is abandoned or finally closed. Benchmark jobs have only
 `scripts/wasi_thread_cohort.py` resolves and records the workflow ref's exact
 head before dispatch, sends all paired inputs unchanged, retains failed run
 metadata without retrying, and predeclares a sequence-based training/holdout
-split before results exist:
+split before results exist. Trusted calibration requires an immutable
+`wasi-thread-calibration-*` tag whose commit is reachable from `main`; baseline
+and candidate must both equal that tagged commit. Every dispatched run must
+report the same resolved workflow head, so moving the tag after dispatch fails
+closed rather than mixing workflow revisions:
 
 Before a `trusted-calibration` cohort resolves or dispatches any workflow, the
 script makes one bounded Actions runner inventory query against the target
@@ -439,13 +443,16 @@ and name or label drift abort with a contextual error before workflow dispatch.
 The GitHub-hosted target does not query runner inventory. This exact name/label
 pair is operational identity for the temporary registration, not a portable
 performance class; report host fingerprints remain the relevant performance
-identity.
+identity. The x86 job also requires at least 80 GiB available on its `/d`
+filesystem before checkout or compilation. This catches deleted run caches
+that remain held open by a cancelled compiler process even when directory
+inspection appears clean.
 
 ```sh
 python3 scripts/wasi_thread_cohort.py dispatch \
-  --workflow-ref main \
-  --baseline-sha <40-char-main-commit> \
-  --candidate-sha <same-40-char-main-commit> \
+  --workflow-ref wasi-thread-calibration-966-v1 \
+  --baseline-sha <40-char-tagged-main-commit> \
+  --candidate-sha <same-40-char-tagged-main-commit> \
   --purpose noise-calibration \
   --profile authoritative --warmups 2 --samples 10 \
   --runner-target trusted-calibration \
