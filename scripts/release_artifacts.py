@@ -137,8 +137,12 @@ def inspect_package(archive: Path, version: str, name: str, repo: Path = REPO):
         with zipfile.ZipFile(archive) as package:
             for member in package.infolist():
                 mode = member.external_attr >> 16
-                add(member.filename, member.is_dir(),
-                    not member.is_dir() and stat.S_IFMT(mode) in (0, stat.S_IFREG),
+                # ZipInfo normalizes Windows separators only on Windows hosts.
+                filename = member.filename.replace("\\", "/")
+                directory = filename.endswith("/")
+                kind = stat.S_IFMT(mode)
+                add(filename, directory and kind in (0, stat.S_IFDIR),
+                    not directory and kind in (0, stat.S_IFREG),
                     mode, lambda member=member: package.read(member))
     else:
         with tarfile.open(archive, "r:gz") as package:
