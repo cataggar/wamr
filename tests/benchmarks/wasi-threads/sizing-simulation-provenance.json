@@ -309,10 +309,10 @@
     "description": "Scale each pre-#1013 fastest retained corrected interval to the matching authoritative pilot count.",
     "formula": "ceil(source_fastest_corrected_interval_ns * pilot_iterations / source_iterations)"
   },
-  "cell_specific_envelope": {
+  "wait_notify_1_cell_specific_envelope": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 5,
-      "sizing_algorithm_version": 4
+      "measurement_plan_identity_version": 6,
+      "sizing_algorithm_version": 5
     },
     "evidence": {
       "attempts": [
@@ -418,6 +418,52 @@
       "workload": "wait-notify"
     }
   },
+  "hot_8_cell_specific_envelope": {
+    "algorithm_identity": {
+      "measurement_plan_identity_version": 6,
+      "sizing_algorithm_version": 5
+    },
+    "evidence": {
+      "attempt": {
+        "fastest_pilot_elapsed_ns": 2171788000,
+        "fastest_pilot_rate": 207202544.63142812,
+        "general_selected_iterations": 399000000,
+        "later_elapsed_ns": 1228191000,
+        "later_iterations": 399000000,
+        "pilot_iterations": 450000000,
+        "projected_benchmark_ns": 3470969552499,
+        "projected_later_elapsed_ns": 1597571752,
+        "selected_iterations": 519000000
+      },
+      "declared_margin": 0.275610528789064,
+      "diagnosis": {
+        "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34322503291-1",
+        "run_attempt": 1,
+        "run_id": 34322503291,
+        "sha256": "95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995"
+      },
+      "maximum_projected_benchmark_ns": 3470969552499,
+      "projection_profile": {
+        "samples": 10,
+        "warmups": 2
+      },
+      "retained_maximum_ordered_acceleration": 1.567876679332992
+    },
+    "failure_policy": "one-shot-no-retry-no-discard",
+    "formula": "round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*2/E)))",
+    "measurement_to_pilot_rate_envelope": {
+      "denominator": 1,
+      "numerator": 2
+    },
+    "projected_pilot_duration_ns": 2500000000,
+    "quality_floor_ns": 1250000000,
+    "scope": {
+      "architectures": "all",
+      "mode": "aot",
+      "threads": 8,
+      "workload": "hot"
+    }
+  },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,
     "retained_fastest_interval_ns": 1054664000
@@ -428,7 +474,7 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 3,
+  "schema_version": 4,
   "source_provenance": {
     "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
     "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",

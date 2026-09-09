@@ -935,13 +935,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
             list(bench.SIZING_CELL_ENVELOPES),
         )
 
-    def test_only_declared_wait_cell_gets_acceleration_envelope(self) -> None:
-        target = bench.sizing_candidates_for_cell(
+    def test_only_declared_cells_get_acceleration_envelopes(self) -> None:
+        wait_target = bench.sizing_candidates_for_cell(
             "aot", "wait-notify", 1, 1_500_000, 2_000_000_000
         )
-        self.assertEqual(target["general_rounded_iterations"], 1_450_000)
         self.assertEqual(
-            target["applicable_envelopes"],
+            wait_target["general_rounded_iterations"], 1_450_000
+        )
+        self.assertEqual(
+            wait_target["applicable_envelopes"],
             [
                 {
                     "name": "aot-wait-notify-1-rate-acceleration",
@@ -950,11 +952,27 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(target["selected_iterations"], 7_500_000)
+        self.assertEqual(wait_target["selected_iterations"], 7_500_000)
+        hot_target = bench.sizing_candidates_for_cell(
+            "aot", "hot", 8, 450_000_000, 2_171_788_000
+        )
+        self.assertEqual(hot_target["general_rounded_iterations"], 399_000_000)
+        self.assertEqual(
+            hot_target["applicable_envelopes"],
+            [
+                {
+                    "name": "aot-hot-8-rate-acceleration",
+                    "required_iterations": 518_006_362,
+                    "rounded_iterations": 519_000_000,
+                }
+            ],
+        )
+        self.assertEqual(hot_target["selected_iterations"], 519_000_000)
         for mode, workload, threads in (
             ("interpreter", "wait-notify", 1),
             ("aot", "wait-notify", 2),
             ("aot", "atomic", 1),
+            ("aot", "hot", 4),
         ):
             with self.subTest(cell=(mode, workload, threads)):
                 candidates = bench.sizing_candidates_for_cell(
@@ -965,8 +983,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     candidates["selected_iterations"],
                     candidates["general_rounded_iterations"],
                 )
-        envelope = bench.SIZING_CELL_ENVELOPES[0]
-        self.assertNotIn("platform", envelope["selector"])
+        for envelope in bench.SIZING_CELL_ENVELOPES:
+            self.assertNotIn("platform", envelope["selector"])
         self.assertEqual(len(bench.CANONICAL_PLATFORMS), 2)
 
     def test_wait_attempt_envelope_counts_and_later_projections(self) -> None:
@@ -1064,6 +1082,53 @@ class ThreadBenchmarkTests(unittest.TestCase):
             bench.parse_guest_result(
                 json.dumps(result),
                 bench.expected_result("wait-notify", 1, selected),
+                1_250_000_000,
+            )
+
+    def test_hot8_failure_envelope_and_boundary_remain_fail_closed(self) -> None:
+        pilot_iterations = 450_000_000
+        pilot_elapsed_ns = 2_171_788_000
+        later_iterations = 399_000_000
+        later_elapsed_ns = 1_228_191_000
+        retained = (
+            later_iterations / later_elapsed_ns
+        ) / (
+            pilot_iterations / pilot_elapsed_ns
+        )
+        self.assertAlmostEqual(retained, 1.567876679332992, places=15)
+        self.assertAlmostEqual(2 / retained - 1, 0.275610528789064, places=15)
+        candidates = bench.sizing_candidates_for_cell(
+            "aot", "hot", 8, pilot_iterations, pilot_elapsed_ns
+        )
+        self.assertEqual(candidates["general_rounded_iterations"], 399_000_000)
+        self.assertEqual(candidates["selected_iterations"], 519_000_000)
+        self.assertEqual(
+            bench.ceil_div(
+                later_elapsed_ns * candidates["selected_iterations"],
+                later_iterations,
+            ),
+            1_597_571_752,
+        )
+
+        just_over_envelope_elapsed = (
+            2_500_000_000 * 1_000_000 // 2_000_001
+        )
+        self.assertLess(just_over_envelope_elapsed, 1_250_000_000)
+        result = guest_result(
+            workload="hot",
+            threads=8,
+            iterations=candidates["selected_iterations"],
+            elapsed_ns=just_over_envelope_elapsed,
+            overhead_ns=1,
+        )
+        with self.assertRaisesRegex(
+            bench.TimingQualityError, "below required"
+        ):
+            bench.parse_guest_result(
+                json.dumps(result),
+                bench.expected_result(
+                    "hot", 8, candidates["selected_iterations"]
+                ),
                 1_250_000_000,
             )
 
@@ -1278,7 +1343,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             provenance["kind"], "wasi-thread-sizing-simulation-provenance"
         )
-        self.assertEqual(provenance["schema_version"], 3)
+        self.assertEqual(provenance["schema_version"], 4)
         self.assertEqual(
             provenance["source_provenance"],
             {
@@ -1320,12 +1385,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
             provenance["pilot_plan_sha256"],
             cache_key(production_pilots),
         )
-        envelope_provenance = provenance["cell_specific_envelope"]
+        envelope_provenance = provenance[
+            "wait_notify_1_cell_specific_envelope"
+        ]
         self.assertEqual(
             envelope_provenance["algorithm_identity"],
             {
-                "measurement_plan_identity_version": 5,
-                "sizing_algorithm_version": 4,
+                "measurement_plan_identity_version": 6,
+                "sizing_algorithm_version": 5,
             },
         )
         self.assertEqual(
@@ -1403,6 +1470,73 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "maximum_projected_benchmark_ns"
             ],
             54.5 * 60 * 1_000_000_000,
+        )
+        hot_envelope = provenance["hot_8_cell_specific_envelope"]
+        self.assertEqual(
+            hot_envelope["algorithm_identity"],
+            {
+                "measurement_plan_identity_version": 6,
+                "sizing_algorithm_version": 5,
+            },
+        )
+        hot_attempt = hot_envelope["evidence"]["attempt"]
+        self.assertEqual(
+            hot_envelope["evidence"]["diagnosis"]["sha256"],
+            "95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995",
+        )
+        hot_candidates = bench.sizing_candidates_for_cell(
+            "aot",
+            "hot",
+            8,
+            hot_attempt["pilot_iterations"],
+            hot_attempt["fastest_pilot_elapsed_ns"],
+        )
+        self.assertEqual(
+            hot_candidates["general_rounded_iterations"],
+            hot_attempt["general_selected_iterations"],
+        )
+        self.assertEqual(
+            hot_candidates["selected_iterations"],
+            hot_attempt["selected_iterations"],
+        )
+        self.assertEqual(
+            bench.ceil_div(
+                hot_attempt["later_elapsed_ns"]
+                * hot_attempt["selected_iterations"],
+                hot_attempt["later_iterations"],
+            ),
+            hot_attempt["projected_later_elapsed_ns"],
+        )
+        self.assertAlmostEqual(
+            (
+                hot_attempt["later_iterations"]
+                / hot_attempt["later_elapsed_ns"]
+            )
+            / (
+                hot_attempt["pilot_iterations"]
+                / hot_attempt["fastest_pilot_elapsed_ns"]
+            ),
+            hot_envelope["evidence"][
+                "retained_maximum_ordered_acceleration"
+            ],
+            places=15,
+        )
+        self.assertAlmostEqual(
+            hot_envelope["evidence"]["declared_margin"],
+            0.275610528789064,
+            places=15,
+        )
+        self.assertEqual(
+            hot_attempt["projected_benchmark_ns"],
+            3_470_969_552_499,
+        )
+        self.assertEqual(
+            hot_envelope["evidence"]["maximum_projected_benchmark_ns"],
+            hot_attempt["projected_benchmark_ns"],
+        )
+        self.assertLess(
+            hot_attempt["projected_benchmark_ns"],
+            58 * 60 * 1_000_000_000,
         )
         for cell in fixture_cells:
             self.assertEqual(
@@ -1483,7 +1617,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     else "same"
                 )
                 directions[direction] += 1
-                if cell["key"] == "aot/wait-notify/1":
+                if cell["key"] in ("aot/wait-notify/1", "aot/hot/8"):
                     self.assertEqual(
                         selected_count,
                         max(
@@ -1505,15 +1639,22 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 self.assertEqual(len(resolved["pilots"]), 88)
                 self.assertEqual(len(resolved["projections"]), 88)
                 projected_guest = []
-                target_projected_guest = []
+                wait_projected_guest = []
+                hot8_projected_guest = []
                 for item in resolved["projections"]:
                     pilot = pilots[item["pilot_index"]]
                     destination = (
-                        target_projected_guest
+                        wait_projected_guest
                         if (
                             pilot["mode"] == "aot"
                             and pilot["workload"] == "wait-notify"
                             and pilot["threads"] == 1
+                        )
+                        else hot8_projected_guest
+                        if (
+                            pilot["mode"] == "aot"
+                            and pilot["workload"] == "hot"
+                            and pilot["threads"] == 8
                         )
                         else projected_guest
                     )
@@ -1527,11 +1668,18 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     bench.PROJECTED_EVIDENCE_MINIMUM_NS * 101 // 100,
                 )
                 self.assertGreaterEqual(
-                    min(target_projected_guest), 10_000_000_000
+                    min(wait_projected_guest), 10_000_000_000
                 )
                 self.assertLess(
-                    max(target_projected_guest),
+                    max(wait_projected_guest),
                     10_000_000_000 * 101 // 100,
+                )
+                self.assertGreaterEqual(
+                    min(hot8_projected_guest), 2_500_000_000
+                )
+                self.assertLess(
+                    max(hot8_projected_guest),
+                    2_500_000_000 * 101 // 100,
                 )
                 self.assertLess(
                     resolved["projected_benchmark_ns"],
@@ -1807,7 +1955,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(bench.JOB_NON_BENCHMARK_RESERVE_NS, 83 * 60 * 10**9)
         self.assertEqual(bench.PROJECTED_BENCHMARK_LIMIT_NS, 97 * 60 * 10**9)
-        self.assertEqual(hard_bound, 10_710_600_000_000)
+        self.assertEqual(hard_bound, 10_724_400_000_000)
         self.assertLess(hard_bound, bench.WORKFLOW_JOB_TIMEOUT_NS)
         with self.assertRaisesRegex(bench.HarnessError, "97-minute"):
             bench.pilot_progress_bound(
@@ -1835,24 +1983,38 @@ class ThreadBenchmarkTests(unittest.TestCase):
         expected_actual_pilots = 88 * (
             bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
         )
-        ordinary_invocations = 1_056 - 2 * (2 + 10)
-        target_selected = bench.sizing_candidates_for_cell(
+        ordinary_invocations = 1_056 - 4 * (2 + 10)
+        wait_selected = bench.sizing_candidates_for_cell(
             "aot",
             "wait-notify",
             1,
             1_500_000,
             bench.PROJECTED_EVIDENCE_MINIMUM_NS,
         )["selected_iterations"]
-        target_host_wall = bench.ceil_div(
+        wait_host_wall = bench.ceil_div(
             (
                 bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
             )
-            * target_selected,
+            * wait_selected,
             1_500_000,
+        )
+        hot8_selected = bench.sizing_candidates_for_cell(
+            "aot",
+            "hot",
+            8,
+            450_000_000,
+            bench.PROJECTED_EVIDENCE_MINIMUM_NS,
+        )["selected_iterations"]
+        hot8_host_wall = bench.ceil_div(
+            (
+                bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
+            )
+            * hot8_selected,
+            450_000_000,
         )
         expected_evidence = ordinary_invocations * (
             bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
-        ) + 2 * (2 + 10) * target_host_wall
+        ) + 2 * (2 + 10) * (wait_host_wall + hot8_host_wall)
         expected_total = (
             expected_actual_pilots
             + expected_evidence
@@ -1877,7 +2039,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             - bench.AUXILIARY_INVOCATION_BUDGET_NS,
         )
         self.assertEqual(resolved["projected_benchmark_ns"], expected_total)
-        self.assertAlmostEqual(expected_total / 60e9, 53.250576, places=3)
+        self.assertAlmostEqual(expected_total / 60e9, 53.50074, places=3)
         self.assertLess(
             resolved["projected_benchmark_ns"],
             bench.PROJECTED_BENCHMARK_LIMIT_NS,
@@ -1895,8 +2057,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
             samples=10,
         )
         expected_evidence = (
-            86 * 12 * bench.PROJECTED_EVIDENCE_MINIMUM_NS
+            84 * 12 * bench.PROJECTED_EVIDENCE_MINIMUM_NS
             + 2 * 12 * 10_000_000_000
+            + 2 * 12 * 2_500_000_000
         )
         self.assertEqual(len(order), 88)
         self.assertEqual(bench.MAXIMUM_PILOT_HOST_WALL_NS, 33_000_000_000)
@@ -1910,7 +2073,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             progress["earliest_complete_bound_ns"],
-            5_730_600_000_000,
+            5_744_400_000_000,
         )
         self.assertLess(
             progress["earliest_complete_bound_ns"],
