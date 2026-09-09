@@ -92,13 +92,13 @@ This replaces fixed-count provenance after #1008 run 34173856468, job
 than the retained sizing host. That observation demonstrates that no finite
 fixed host margin is a defensible contract.
 
-For each cell, sizing version 5 selects the fastest valid pilot across all
+For each cell, sizing version 6 selects the fastest valid pilot across all
 revisions and conditions. With pilot iterations `P` and corrected elapsed
 nanoseconds `E`, the general count is
 `round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))`,
 where the target is 1.75 seconds and the safety factor is `11/10`.
 
-Two declarative, portable cell envelopes additionally apply. The first covers
+Three declarative, portable cell envelopes additionally apply. The first covers
 `mode=aot, workload=wait-notify, threads=1` on every architecture. Its count is
 `round_up_3_significant_digits(ceil(P*1250000000*8/E))`, and the selected
 count is the maximum of the general and envelope counts. Equivalently, the
@@ -110,7 +110,7 @@ so a later measurement may accelerate by up to 8 times and still meet the
 
 The retained failed hosted attempts and their ordered-rate evidence are:
 
-| evidence | fastest pilot rate (ops/s) | later/pilot acceleration | general count | v5 count | projected later duration |
+| evidence | fastest pilot rate (ops/s) | later/pilot acceleration | general count | v6 count | projected later duration |
 |---|---:|---:|---:|---:|---:|
 | attempt 1 | 739,133.627 | 2.192262005x | 1.43M | 7.40M | 4.566845s |
 | attempt 2 | 853,510.803 | 1.836297620x | 1.65M | 8.54M | 5.448862s |
@@ -141,6 +141,19 @@ failure diagnostic is pinned by SHA-256
 Like the wait/notify envelope, this selector contains no host or architecture
 identity.
 
+The third envelope covers
+`mode=interpreter, workload=wait-notify, threads=4` on every architecture:
+`round_up_3_significant_digits(ceil(P*1250000000*2/E))`. Immutable-tag smoke
+run 34337339856 selected 13,600 iterations from its fastest retained 32,000
+pilot at 4.553145 seconds, projecting 1.935086625 seconds. A later baseline
+sample completed in 1.122137 seconds, a `1.7244655732767034x` ordered rate
+acceleration. The 2x envelope selects 17,600 iterations and projects that
+sample to 1.452177295 seconds. Its exact relative margin is
+`2 / 1.7244655732767034 - 1 = 0.15977960418180248`, or 15.9780%. The complete
+failure diagnostic is pinned by SHA-256
+`d05ca21d0557074aa356574b29d8ddf488c7e4a7ca31976e35bb6da92bb9f447`.
+This selector is likewise independent of host and architecture identity.
+
 There is no pilot-count floor: a slow host downsizes a long pilot to
 target-sized evidence, while a fast host sizes up. The fastest baseline result
 is retained as the explicit lower-bound derivation: a slower candidate cannot
@@ -155,12 +168,13 @@ resolution. They are intentionally not required to satisfy the evidence
 every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
 be at least both the 1.25-second evidence floor and the exact 1.925-second
-`1.75s * 11/10` sizing target; the wait/notify special cell projects at least
-10.0 seconds and the AOT hot/8 special cell projects at least 2.5 seconds at
-every retained pilot rate. Actual warmups and samples
+`1.75s * 11/10` sizing target; the AOT wait/notify/1 special cell projects at
+least 10.0 seconds, while the AOT hot/8 and interpreter wait/notify/4 special
+cells project at least 2.5 seconds at every retained pilot rate. Actual warmups
+and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
 There is no hidden retry or count increase if a later rate exceeds its
-declared 8x or 2x envelope: even a just-over-boundary observation that falls
+declared 8x or 2x envelopes: even a just-over-boundary observation that falls
 below 1.25 seconds is retained and fails closed.
 
 Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
@@ -174,10 +188,10 @@ watchdog.
 The workflow reserves 83 minutes for non-benchmark work, leaving a 97-minute
 benchmark limit. Before and during the full 88-pilot authoritative plan,
 admission uses the hard 48-minute-24-second pilot bound (`88 * 33s`), the
-envelope-aware 37-minute-20.4-second minimum evidence bound
-(`84 * 12 * 1.925s + 2 * 12 * 10s + 2 * 12 * 2.5s`), and the 10-minute
-auxiliary allowance. Their sum is 95 minutes 44.4 seconds; adding the
-83-minute reserve is 178 minutes 44.4 seconds, strictly below the 180-minute
+envelope-aware 37-minute-34.2-second minimum evidence bound
+(`82 * 12 * 1.925s + 2 * 12 * 10s + 4 * 12 * 2.5s`), and the 10-minute
+auxiliary allowance. Their sum is 95 minutes 58.2 seconds; adding the
+83-minute reserve is 178 minutes 58.2 seconds, strictly below the 180-minute
 job timeout. The
 harness accumulates actual pilot corrected and wall time after each one-shot
 pilot and aborts immediately when the remaining hard bound cannot fit.
@@ -282,7 +296,7 @@ leaving 12 hours before the unchanged 72-hour dispatcher deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 6 of a purpose-independent portable
+`measurement_plan_sha256` is version 7 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -604,9 +618,9 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Schema-v3 fixed-plan reports and reports produced before measurement-plan
-identity version 6, including version-2 reports from #1013, version-3/4
-#1016 attempts, and version-5 #1020 and pre-hot/8-envelope evidence, are invalid
-for a new authoritative cohort. Fresh
+identity version 7, including version-2 reports from #1013, version-3/4
+#1016 attempts, version-5 #1020 evidence, and version-6 pre-wait/4-envelope
+evidence, are invalid for a new authoritative cohort. Fresh
 evidence with the canonical one-shot sizing identity is mandatory for
 calibration and derivation. Reports with different legitimate host-selected
 counts may mix;

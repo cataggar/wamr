@@ -66,7 +66,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 6 },
+        "measurement_plan_version": { "const": 7 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "checksum_preparation": {
           "type": "object",
@@ -439,7 +439,7 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 5 },
+            "version": { "const": 6 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
@@ -480,6 +480,21 @@
                     "mode": "aot",
                     "workload": "hot",
                     "threads": 8
+                  },
+                  "quality_floor_ns": 1250000000,
+                  "measurement_to_pilot_rate_envelope": {
+                    "numerator": 2,
+                    "denominator": 1
+                  },
+                  "projected_pilot_duration_ns": 2500000000,
+                  "formula": "round_up_3_significant_digits(ceil(P*quality_floor_ns*acceleration_numerator/(E*acceleration_denominator)))"
+                },
+                {
+                  "name": "interpreter-wait-notify-4-rate-acceleration",
+                  "selector": {
+                    "mode": "interpreter",
+                    "workload": "wait-notify",
+                    "threads": 4
                   },
                   "quality_floor_ns": 1250000000,
                   "measurement_to_pilot_rate_envelope": {

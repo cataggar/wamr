@@ -50,9 +50,9 @@ REPORT_SCHEMA_VERSION = 4
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 6
+MEASUREMENT_PLAN_IDENTITY_VERSION = 7
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 5
+SIZING_ALGORITHM_VERSION = 6
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -107,6 +107,21 @@ SIZING_CELL_ENVELOPES = (
             "mode": "aot",
             "workload": "hot",
             "threads": 8,
+        },
+        "quality_floor_ns": 1_250_000_000,
+        "measurement_to_pilot_rate_envelope": {
+            "numerator": 2,
+            "denominator": 1,
+        },
+        "projected_pilot_duration_ns": 2_500_000_000,
+        "formula": SIZING_CELL_ENVELOPE_FORMULA,
+    },
+    {
+        "name": "interpreter-wait-notify-4-rate-acceleration",
+        "selector": {
+            "mode": "interpreter",
+            "workload": "wait-notify",
+            "threads": 4,
         },
         "quality_floor_ns": 1_250_000_000,
         "measurement_to_pilot_rate_envelope": {
