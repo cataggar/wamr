@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to verify without publishing (for example 3.0.0-dev.14)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,9 +17,28 @@ permissions:
   attestations: write
 
 jobs:
+  prepare:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      pep440: ${{ steps.version.outputs.pep440 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Release tooling tests
+        run: python3 -m unittest discover -s scripts -p test_release_artifacts.py
+      - name: Resolve version
+        id: version
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: python3 scripts/release_artifacts.py version "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.name }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     # Windows targets sign via Azure Trusted Signing over OIDC. Run those
     # jobs in the `release` GitHub Environment so their OIDC subject is the
     # tag-independent `repo:cataggar/wamr:environment:release`, matched by a
@@ -68,29 +93,9 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
-      - name: Get version
-        id: version
-        shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
       - name: Build
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=${{ steps.version.outputs.version }}"
-
-      - name: Verify CLI version
-        if: matrix.name == 'linux-x64' || matrix.name == 'linux-arm64' || matrix.name == 'macos-arm64' || matrix.name == 'windows-x64'
         shell: bash
-        run: |
-          case "${{ matrix.target }}" in
-            *-windows) EXE="zig-out/bin/wamr.exe" ;;
-            *) EXE="zig-out/bin/wamr" ;;
-          esac
-          VERSION_OUTPUT="$("$EXE" --version 2>&1)"
-          EXPECTED="wamr ${{ steps.version.outputs.version }}"
-          if [ "$VERSION_OUTPUT" != "$EXPECTED" ]; then
-            echo "Expected: $EXPECTED"
-            echo "Actual:   $VERSION_OUTPUT"
-            exit 1
-          fi
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=$RELEASE_VERSION" -j4
 
       - name: Azure login (for signing)
         if: endsWith(matrix.target, '-windows')
@@ -116,7 +121,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          PKGNAME="wamr-${{ steps.version.outputs.version }}-${{ matrix.name }}"
+          PKGNAME="wamr-$RELEASE_VERSION-${{ matrix.name }}"
           TOOLS="wamr wamrc"
           mkdir -p "$PKGNAME/bin"
           case "${{ matrix.target }}" in
@@ -141,85 +146,136 @@ jobs:
               ;;
           esac
 
+      - name: Verify packaged tools
+        shell: bash
+        run: |
+          PKGNAME="wamr-$RELEASE_VERSION-${{ matrix.name }}"
+          EXTRA=()
+          case "${{ matrix.name }}" in
+            linux-x64|linux-arm64|macos-arm64|windows-x64)
+              EXTRA+=(--require-smoke) ;;
+          esac
+          case "${{ matrix.target }}" in
+            *-windows)
+              PYTHON=python
+              ARCHIVE="$PKGNAME.zip"
+              EXTRA+=(--require-signature)
+              ;;
+            *)
+              PYTHON=python3
+              ARCHIVE="$PKGNAME.tar.gz"
+              ;;
+          esac
+          "$PYTHON" scripts/release_artifacts.py verify \
+            --version "$RELEASE_VERSION" --source-sha "$GITHUB_SHA" \
+            --platform "${{ matrix.name }}" --archive "$ARCHIVE" \
+            --work-dir .release-smoke --output "$PKGNAME.verification.json" \
+            "${EXTRA[@]}"
+
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          path: zig-out/bin/
-          output-file: wamr-${{ steps.version.outputs.version }}-${{ matrix.name }}.sbom.spdx.json
+          path: wamr-${{ needs.prepare.outputs.version }}-${{ matrix.name }}/
+          output-file: wamr-${{ needs.prepare.outputs.version }}-${{ matrix.name }}.sbom.spdx.json
           upload-artifact: false
+          # Publishing is centralized in the tag-only release step.
+          upload-release-assets: false
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.name }}
+          retention-days: 7
           path: |
             wamr-*.tar.gz
             wamr-*.zip
             wamr-*.sbom.spdx.json
+            wamr-*.verification.json
 
   source:
     name: Source tarball
+    needs: prepare
     runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
       - name: Package source
         run: |
-          PKGNAME="wamr-${{ steps.version.outputs.version }}"
+          PKGNAME="wamr-$RELEASE_VERSION"
           git archive --format=tar --prefix="$PKGNAME/" HEAD | xz > "$PKGNAME.tar.xz"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: source
+          retention-days: 7
           path: |
             wamr-*.tar.xz
 
   release:
-    name: Create Release
-    needs: [build, source]
+    name: Verify release inventory
+    needs: [prepare, build, source]
     runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
+          path: release-assets
 
-      - name: Get version
-        id: version
+      - name: Verify inventory and generate checksums
         run: |
-          RAW="${GITHUB_REF_NAME#v}"
-          echo "version=${RAW}" >> "$GITHUB_OUTPUT"
-          PEP440=$(echo "$RAW" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-dev\.([0-9]+)$/\1.dev\2/')
-          echo "pep440=${PEP440}" >> "$GITHUB_OUTPUT"
+          python3 scripts/release_artifacts.py manifest \
+            --version "$RELEASE_VERSION" --source-sha "$GITHUB_SHA" \
+            --directory release-assets
+          cd release-assets
+          sha256sum --check SHA256SUMS
 
       - name: Attest build provenance
+        id: provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
           subject-path: |
-            wamr-*.tar.gz
-            wamr-*.tar.xz
-            wamr-*.zip
+            release-assets/wamr-*.tar.gz
+            release-assets/wamr-*.tar.xz
+            release-assets/wamr-*.zip
+            release-assets/wamr-*.sbom.spdx.json
+            release-assets/wamr-*.verification.json
+            release-assets/release-manifest.json
+            release-assets/RELEASE_NOTES.md
+            release-assets/SHA256SUMS
+
+      - name: Retain release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-evidence
+          retention-days: 30
+          path: |
+            release-assets/*.json
+            release-assets/SHA256SUMS
+            release-assets/RELEASE_NOTES.md
+            ${{ steps.provenance.outputs.bundle-path }}
 
       - name: Create release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
-          name: wamr ${{ steps.version.outputs.version }}
-          body: |
-            **Install:**
-
-            ```
-            ghr install cataggar/wamr@v${{ steps.version.outputs.version }}
-            ```
-
-            See [INSTALL.md](https://github.com/cataggar/wamr/blob/main/INSTALL.md) for more options.
+          name: wamr ${{ needs.prepare.outputs.version }}
+          body_path: release-assets/RELEASE_NOTES.md
           files: |
-            wamr-*.tar.gz
-            wamr-*.tar.xz
-            wamr-*.zip
-            wamr-*.sbom.spdx.json
+            release-assets/wamr-*.tar.gz
+            release-assets/wamr-*.tar.xz
+            release-assets/wamr-*.zip
+            release-assets/wamr-*.sbom.spdx.json
+            release-assets/wamr-*.verification.json
+            release-assets/release-manifest.json
+            release-assets/RELEASE_NOTES.md
+            release-assets/SHA256SUMS
+          fail_on_unmatched_files: true
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}
+          prerelease: ${{ contains(needs.prepare.outputs.version, 'dev') }}
+          make_latest: ${{ contains(needs.prepare.outputs.version, 'dev') && 'false' || 'legacy' }}
