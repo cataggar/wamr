@@ -45,7 +45,7 @@ DEFAULT_PLATFORMS = tuple(CANONICAL_PLATFORMS)
 RUNNER_TARGETS = ("github-hosted", "trusted-calibration")
 TRUSTED_X86_RUNNER_NAME = "vm31e-wamr-temp-20260906"
 TRUSTED_X86_RUNNER_LABEL = "wamr-temp-20260906"
-DEFAULT_DISPATCH_TIMEOUT_SECONDS = 72 * 60 * 60
+DEFAULT_DISPATCH_TIMEOUT_SECONDS = 96 * 60 * 60
 RUNNER_ENVIRONMENTS = {
     "github-hosted": {
         "ubuntu-22.04-x86_64": "github-hosted",
@@ -2369,7 +2369,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--timeout-seconds",
         type=float,
         default=DEFAULT_DISPATCH_TIMEOUT_SECONDS,
-        help="wall-clock limit for dispatch and polling (default: 72 hours)",
+        help="wall-clock limit for dispatch and polling (default: 96 hours)",
     )
     dispatch_parser.add_argument("--poll-seconds", type=float, default=60)
     dispatch_parser.add_argument("--lookup-attempts", type=int, default=30)

@@ -445,13 +445,13 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 8 },
+            "version": { "const": 9 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
             "maximum_pilot_corrected_ns": { "const": 30000000000 },
             "maximum_pilot_host_wall_ns": { "const": 33000000000 },
-            "projected_evidence_minimum_ns": { "const": 2500000000 },
+            "projected_evidence_minimum_ns": { "const": 5000000000 },
             "timing_overhead_ratio_limit": { "const": 0.01 },
             "failure_policy": { "const": "one-shot-no-retry-no-discard" },
             "selection_rate": {
@@ -487,7 +487,7 @@
               "additionalProperties": false,
               "required": ["numerator", "denominator"],
               "properties": {
-                "numerator": { "const": 10 },
+                "numerator": { "const": 20 },
                 "denominator": { "const": 7 }
               }
             },
@@ -530,9 +530,9 @@
                   "type": "integer",
                   "exclusiveMinimum": 0
                 },
-                "workflow_job_timeout_ns": { "const": 10800000000000 },
+                "workflow_job_timeout_ns": { "const": 14400000000000 },
                 "job_non_benchmark_reserve_ns": { "const": 4140000000000 },
-                "projected_benchmark_limit_ns": { "const": 6660000000000 },
+                "projected_benchmark_limit_ns": { "const": 10260000000000 },
                 "auxiliary_invocation_budget_ns": { "const": 600000000000 }
               }
             }
