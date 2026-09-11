@@ -445,7 +445,7 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 7 },
+            "version": { "const": 8 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
@@ -474,10 +474,10 @@
                   },
                   "quality_floor_ns": 1250000000,
                   "measurement_to_pilot_rate_envelope": {
-                    "numerator": 8,
+                    "numerator": 16,
                     "denominator": 1
                   },
-                  "projected_pilot_duration_ns": 10000000000,
+                  "projected_pilot_duration_ns": 20000000000,
                   "formula": "round_up_3_significant_digits(ceil(P*quality_floor_ns*acceleration_numerator/(E*acceleration_denominator)))"
                 }
               ]
@@ -531,8 +531,8 @@
                   "exclusiveMinimum": 0
                 },
                 "workflow_job_timeout_ns": { "const": 10800000000000 },
-                "job_non_benchmark_reserve_ns": { "const": 4380000000000 },
-                "projected_benchmark_limit_ns": { "const": 6420000000000 },
+                "job_non_benchmark_reserve_ns": { "const": 4140000000000 },
+                "projected_benchmark_limit_ns": { "const": 6660000000000 },
                 "auxiliary_invocation_budget_ns": { "const": 600000000000 }
               }
             }
