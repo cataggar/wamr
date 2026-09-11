@@ -312,7 +312,7 @@
   "wait_notify_1_cell_specific_envelope": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 7
+      "sizing_algorithm_version": 8
     },
     "evidence": {
       "attempts": [
@@ -325,9 +325,9 @@
           "later_iterations": 1430000,
           "measurement_to_fastest_pilot_ratio": 2.192262005124765,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3830660701500,
-          "projected_later_elapsed_ns": 4566845315,
-          "selected_iterations": 7400000
+          "projected_benchmark_ns": 4075652898612,
+          "projected_later_elapsed_ns": 9133690630,
+          "selected_iterations": 14800000
         },
         {
           "attempt": 2,
@@ -338,9 +338,9 @@
           "later_iterations": 1650000,
           "measurement_to_fastest_pilot_ratio": 1.8362976197939525,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3864131701758,
-          "projected_later_elapsed_ns": 5448861600,
-          "selected_iterations": 8540000
+          "projected_benchmark_ns": 4170609245658,
+          "projected_later_elapsed_ns": 10910484000,
+          "selected_iterations": 17100000
         },
         {
           "attempt": 3,
@@ -351,9 +351,9 @@
           "later_iterations": 506000,
           "measurement_to_fastest_pilot_ratio": 1.7370470506689346,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3869754696359,
-          "projected_later_elapsed_ns": 5768972570,
-          "selected_iterations": 2630000
+          "projected_benchmark_ns": 4123736339519,
+          "projected_later_elapsed_ns": 11516009882,
+          "selected_iterations": 5250000
         },
         {
           "attempt": 4,
@@ -364,12 +364,25 @@
           "later_iterations": 548000,
           "measurement_to_fastest_pilot_ratio": 5.367617734892188,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 3905574194278,
-          "projected_later_elapsed_ns": 1867448212,
-          "selected_iterations": 1830000
+          "projected_benchmark_ns": 4185178753642,
+          "projected_later_elapsed_ns": 3734896424,
+          "selected_iterations": 3660000
+        },
+        {
+          "attempt": 5,
+          "fastest_pilot_elapsed_ns": 20044907000,
+          "fastest_pilot_rate": 74831.97602263756,
+          "general_selected_iterations": 188000,
+          "later_elapsed_ns": 1029372000,
+          "later_iterations": 749000,
+          "measurement_to_fastest_pilot_ratio": 9.723491826731898,
+          "pilot_iterations": 1500000,
+          "projected_benchmark_ns": 4193807262141,
+          "projected_later_elapsed_ns": 2061492657,
+          "selected_iterations": 1500000
         }
       ],
-      "declared_margin": 0.49041910119567866,
+      "declared_margin": 0.645499403415209,
       "diagnoses": [
         {
           "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34222872840-1",
@@ -394,22 +407,28 @@
           "run_attempt": 1,
           "run_id": 34284891299,
           "sha256": "1c8f13621986f4678999a19a4104dfdcd938642f837aae666d97ca101b6b0173"
+        },
+        {
+          "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34528848245-1",
+          "run_attempt": 1,
+          "run_id": 34528848245,
+          "sha256": "8e8c9c7f0075ac7c9e36917dde73294a415f6756784107b06fb0055317035496"
         }
       ],
-      "maximum_projected_benchmark_ns": 3905574194278,
+      "maximum_projected_benchmark_ns": 4193807262141,
       "projection_profile": {
         "samples": 10,
         "warmups": 2
       },
-      "retained_maximum_ordered_acceleration": 5.367617734892188
+      "retained_maximum_ordered_acceleration": 9.723491826731898
     },
     "failure_policy": "one-shot-no-retry-no-discard",
-    "formula": "round_up_3_significant_digits(max(ceil(P*1750000000*11/(E*10)), ceil(P*1250000000*8/E)))",
+    "formula": "round_up_3_significant_digits(max(ceil(P*1750000000*10/(E*7)), ceil(P*1250000000*16/E)))",
     "measurement_to_pilot_rate_envelope": {
       "denominator": 1,
-      "numerator": 8
+      "numerator": 16
     },
-    "projected_pilot_duration_ns": 10000000000,
+    "projected_pilot_duration_ns": 20000000000,
     "quality_floor_ns": 1250000000,
     "scope": {
       "architectures": "all",
@@ -421,7 +440,7 @@
   "general_rate_envelope": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 7
+      "sizing_algorithm_version": 8
     },
     "evidence": {
       "attempts": [
@@ -519,25 +538,26 @@
   "job_reserve_admission": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 7
+      "sizing_algorithm_version": 8
     },
     "auxiliary_invocation_budget_ns": 600000000000,
-    "benchmark_limit_ns": 6420000000000,
+    "benchmark_limit_ns": 6660000000000,
     "evidence": {
       "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34351942414-1",
-      "combined_allowance_margin": 0.4466450776384425,
+      "combined_allowance_margin": 0.37692724257152976,
       "job_id": 102467148543,
       "pilot_host_wall_elapsed_ns": 261734442318,
       "record_host_wall_elapsed_ns": 996817871668,
       "report_sha256": "5c81165f59ca3ce285ec260967df91480e41c14aa2319282696ac4a0c55366e8",
+      "reserve_only_margin": 0.20263265490424742,
       "run_id": 34351942414,
       "step_completed_at": "2026-09-09T13:54:35Z",
       "step_started_at": "2026-09-09T12:36:14Z",
       "step_wall_elapsed_ns": 4701000000000,
       "unaccounted_step_wall_ns": 3442447686014
     },
-    "hard_preadmission_benchmark_ns": 6324000000000,
-    "job_non_benchmark_reserve_ns": 4380000000000,
+    "hard_preadmission_benchmark_ns": 6564000000000,
+    "job_non_benchmark_reserve_ns": 4140000000000,
     "timeout_headroom_ns": 96000000000,
     "workflow_job_timeout_ns": 10800000000000
   },
@@ -551,7 +571,7 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 6,
+  "schema_version": 7,
   "source_provenance": {
     "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
     "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",

@@ -52,7 +52,7 @@ SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
 MEASUREMENT_PLAN_IDENTITY_VERSION = 9
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 7
+SIZING_ALGORITHM_VERSION = 8
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -96,10 +96,10 @@ SIZING_CELL_ENVELOPES = (
         },
         "quality_floor_ns": 1_250_000_000,
         "measurement_to_pilot_rate_envelope": {
-            "numerator": 8,
+            "numerator": 16,
             "denominator": 1,
         },
-        "projected_pilot_duration_ns": 10_000_000_000,
+        "projected_pilot_duration_ns": 20_000_000_000,
         "formula": SIZING_CELL_ENVELOPE_FORMULA,
     },
 )
@@ -112,7 +112,7 @@ PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
 MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
 MAXIMUM_PILOT_HOST_WALL_NS = 33_000_000_000
 WORKFLOW_JOB_TIMEOUT_NS = 180 * 60 * 1_000_000_000
-JOB_NON_BENCHMARK_RESERVE_NS = 73 * 60 * 1_000_000_000
+JOB_NON_BENCHMARK_RESERVE_NS = 69 * 60 * 1_000_000_000
 PROJECTED_BENCHMARK_LIMIT_NS = (
     WORKFLOW_JOB_TIMEOUT_NS - JOB_NON_BENCHMARK_RESERVE_NS
 )
