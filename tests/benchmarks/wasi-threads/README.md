@@ -92,7 +92,7 @@ This replaces fixed-count provenance after #1008 run 34173856468, job
 than the retained sizing host. That observation demonstrates that no finite
 fixed host margin is a defensible contract.
 
-Sizing version 9 selects the fastest valid pilot across all revisions and
+Sizing version 10 selects the fastest valid pilot across all revisions and
 conditions. For every workload except spawn/join, with pilot iterations `P`
 and corrected elapsed nanoseconds `E`, the general count is
 `round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))`,
@@ -132,11 +132,16 @@ functionally at the 4x-selected 33.3K iterations with
 1.503949 seconds; the 2x policy selects 16.7K and projects 2.511594830 seconds.
 This remains twice the 1.25-second quality floor without driving one sample
 into an unrelated per-process lifecycle resource boundary. A hard limit of
-25K created threads per spawn/join invocation rejects faster-host sizing
+27K created threads per spawn/join invocation rejects faster-host sizing
 before measurement rather than risking the observed runtime failure. It is
-24.9249% below the failed count while admitting the retained 1.7195x
-faster-host simulation, whose largest projected spawn/join invocation is
-24.2K thread lifecycles. The failed diagnostic is pinned by SHA-256
+18.9189% below the failed count. #1032 run 34571155771 confirmed that the
+initial 25K cap was too restrictive on hosted x86_64: the first rejected cell
+required 26.4K lifecycles, while replaying all 88 retained pilots requires at
+most 26.68K. That diagnostic is pinned by SHA-256
+`ff4736745a12e384168c90f702d17301b2c0598340dcf5b330bc73542af1357b`.
+The cap also admits the retained 1.7195x faster-host simulation, whose largest
+projected spawn/join invocation is 24.2K thread lifecycles. The AArch64
+functional-failure diagnostic is pinned by SHA-256
 `56d67f22d3c4713661da6147ec4aadea666c817045ea94e1846259a17e512b0e`.
 The override applies to spawn/join in every mode, thread count, and
 architecture. Actual samples remain fail-closed on the unchanged timing floor

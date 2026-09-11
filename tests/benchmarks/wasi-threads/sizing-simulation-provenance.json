@@ -312,7 +312,7 @@
   "wait_notify_1_cell_specific_envelope": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 9
+      "sizing_algorithm_version": 10
     },
     "evidence": {
       "attempts": [
@@ -440,7 +440,7 @@
   "general_rate_envelope": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 9
+      "sizing_algorithm_version": 10
     },
     "evidence": {
       "attempts": [
@@ -561,7 +561,7 @@
   "job_reserve_admission": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 9
+      "sizing_algorithm_version": 10
     },
     "auxiliary_invocation_budget_ns": 600000000000,
     "benchmark_limit_ns": 10260000000000,
@@ -594,13 +594,92 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 9,
+  "schema_version": 10,
   "spawn_join_base_override": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 9
+      "sizing_algorithm_version": 10
     },
     "evidence": {
+      "cap_diagnosis": {
+        "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34571155771-1",
+        "cells": [
+          {
+            "fastest_pilot_elapsed_ns": 1006987000,
+            "key": "aot/spawn-join/1",
+            "pilot_iterations": 10000,
+            "selected_iterations": 24900,
+            "thread_lifecycles": 24900,
+            "threads": 1
+          },
+          {
+            "fastest_pilot_elapsed_ns": 948874000,
+            "key": "aot/spawn-join/2",
+            "pilot_iterations": 5000,
+            "selected_iterations": 13200,
+            "thread_lifecycles": 26400,
+            "threads": 2
+          },
+          {
+            "fastest_pilot_elapsed_ns": 937753000,
+            "key": "aot/spawn-join/4",
+            "pilot_iterations": 2500,
+            "selected_iterations": 6670,
+            "thread_lifecycles": 26680,
+            "threads": 4
+          },
+          {
+            "fastest_pilot_elapsed_ns": 941130000,
+            "key": "aot/spawn-join/8",
+            "pilot_iterations": 1250,
+            "selected_iterations": 3330,
+            "thread_lifecycles": 26640,
+            "threads": 8
+          },
+          {
+            "fastest_pilot_elapsed_ns": 974457000,
+            "key": "interpreter/spawn-join/1",
+            "pilot_iterations": 9000,
+            "selected_iterations": 23100,
+            "thread_lifecycles": 23100,
+            "threads": 1
+          },
+          {
+            "fastest_pilot_elapsed_ns": 939860000,
+            "key": "interpreter/spawn-join/2",
+            "pilot_iterations": 4500,
+            "selected_iterations": 12000,
+            "thread_lifecycles": 24000,
+            "threads": 2
+          },
+          {
+            "fastest_pilot_elapsed_ns": 887925000,
+            "key": "interpreter/spawn-join/4",
+            "pilot_iterations": 2250,
+            "selected_iterations": 6340,
+            "thread_lifecycles": 25360,
+            "threads": 4
+          },
+          {
+            "fastest_pilot_elapsed_ns": 1006786000,
+            "key": "interpreter/spawn-join/8",
+            "pilot_iterations": 1250,
+            "selected_iterations": 3110,
+            "thread_lifecycles": 24880,
+            "threads": 8
+          }
+        ],
+        "diagnostic_sha256": "ff4736745a12e384168c90f702d17301b2c0598340dcf5b330bc73542af1357b",
+        "job_id": 103173381095,
+        "maximum_required_thread_lifecycles": 26680,
+        "rejected_cell": {
+          "iterations": 13200,
+          "key": "aot/spawn-join/2",
+          "thread_lifecycles": 26400
+        },
+        "run_attempt": 1,
+        "run_id": 34571155771
+      },
       "diagnosis": {
         "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34563740560-1",
         "job_id": 103151533896,
@@ -623,8 +702,8 @@
       }
     },
     "formula": "round_up_3_significant_digits(ceil(P*1750000000*10/(E*7)))",
-    "failed_count_headroom": 0.24924924924924924,
-    "maximum_thread_lifecycles_per_invocation": 25000,
+    "failed_count_headroom": 0.1891891891891892,
+    "maximum_thread_lifecycles_per_invocation": 27000,
     "retained_epyc_maximum_projected_thread_lifecycles": 24200,
     "measurement_to_pilot_rate_envelope": {
       "denominator": 1,

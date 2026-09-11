@@ -52,7 +52,7 @@ SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
 MEASUREMENT_PLAN_IDENTITY_VERSION = 9
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 9
+SIZING_ALGORITHM_VERSION = 10
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -137,7 +137,7 @@ PROJECTED_BENCHMARK_LIMIT_NS = (
 )
 AUXILIARY_INVOCATION_BUDGET_NS = 10 * 60 * 1_000_000_000
 INT32_MAX = (1 << 31) - 1
-SPAWN_JOIN_THREAD_LIFECYCLE_CAP = 25_000
+SPAWN_JOIN_THREAD_LIFECYCLE_CAP = 27_000
 SIZING_WORKLOAD_CAPS = {
     "single-hot": 16_000_000_000,
     "hot": 16_000_000_000,

@@ -446,7 +446,7 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 9 },
+            "version": { "const": 10 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
@@ -539,7 +539,7 @@
               "properties": {
                 "uint64_max": { "const": 18446744073709551615 },
                 "wait_notify_int32_max": { "const": 2147483647 },
-                "spawn_join_thread_lifecycle_cap": { "const": 25000 },
+                "spawn_join_thread_lifecycle_cap": { "const": 27000 },
                 "workload_iteration_caps": {
                   "const": {
                     "single-hot": 16000000000,

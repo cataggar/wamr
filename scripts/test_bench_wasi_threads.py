@@ -1559,7 +1559,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             provenance["kind"], "wasi-thread-sizing-simulation-provenance"
         )
-        self.assertEqual(provenance["schema_version"], 9)
+        self.assertEqual(provenance["schema_version"], 10)
         self.assertEqual(
             provenance["source_provenance"],
             {
@@ -1608,7 +1608,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             envelope_provenance["algorithm_identity"],
             {
                 "measurement_plan_identity_version": 9,
-                "sizing_algorithm_version": 9,
+                "sizing_algorithm_version": 10,
             },
         )
         self.assertEqual(
@@ -1705,7 +1705,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             general_envelope["algorithm_identity"],
             {
                 "measurement_plan_identity_version": 9,
-                "sizing_algorithm_version": 9,
+                "sizing_algorithm_version": 10,
             },
         )
         self.assertEqual(
@@ -1786,7 +1786,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             spawn_override["algorithm_identity"],
             {
                 "measurement_plan_identity_version": 9,
-                "sizing_algorithm_version": 9,
+                "sizing_algorithm_version": 10,
             },
         )
         self.assertEqual(
@@ -1798,6 +1798,39 @@ class ThreadBenchmarkTests(unittest.TestCase):
             spawn_override[
                 "retained_epyc_maximum_projected_thread_lifecycles"
             ],
+        )
+        self.assertGreaterEqual(
+            bench.SPAWN_JOIN_THREAD_LIFECYCLE_CAP,
+            spawn_override["evidence"]["cap_diagnosis"][
+                "maximum_required_thread_lifecycles"
+            ],
+        )
+        cap_diagnosis = spawn_override["evidence"]["cap_diagnosis"]
+        for cell in cap_diagnosis["cells"]:
+            mode, workload, threads = cell["key"].split("/")
+            self.assertEqual(workload, "spawn-join")
+            self.assertEqual(int(threads), cell["threads"])
+            candidates = bench.sizing_candidates_for_cell(
+                mode,
+                workload,
+                cell["threads"],
+                cell["pilot_iterations"],
+                cell["fastest_pilot_elapsed_ns"],
+            )
+            self.assertEqual(
+                candidates["selected_iterations"],
+                cell["selected_iterations"],
+            )
+            self.assertEqual(
+                cell["selected_iterations"] * cell["threads"],
+                cell["thread_lifecycles"],
+            )
+        self.assertEqual(
+            max(
+                cell["thread_lifecycles"]
+                for cell in cap_diagnosis["cells"]
+            ),
+            cap_diagnosis["maximum_required_thread_lifecycles"],
         )
         self.assertAlmostEqual(
             1
@@ -1835,7 +1868,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             reserve_admission["algorithm_identity"],
             {
                 "measurement_plan_identity_version": 9,
-                "sizing_algorithm_version": 9,
+                "sizing_algorithm_version": 10,
             },
         )
         reserve_evidence = reserve_admission["evidence"]
