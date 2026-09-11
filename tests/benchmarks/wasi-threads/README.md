@@ -92,9 +92,9 @@ This replaces fixed-count provenance after #1008 run 34173856468, job
 than the retained sizing host. That observation demonstrates that no finite
 fixed host margin is a defensible contract.
 
-For each cell, sizing version 9 selects the fastest valid pilot across all
-revisions and conditions. With pilot iterations `P` and corrected elapsed
-nanoseconds `E`, the general count is
+Sizing version 9 selects the fastest valid pilot across all revisions and
+conditions. For every workload except spawn/join, with pilot iterations `P`
+and corrected elapsed nanoseconds `E`, the general count is
 `round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))`,
 where the target is 1.75 seconds and the safety factor is `20/7`. This projects
 exactly 5 seconds at the fastest pilot rate: a portable 4x
@@ -119,8 +119,29 @@ SHA-256 `95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995`,
 `098a466f98da6899f2e7dba657078eb3853500a9bfca4e06727c23b51c0cbed3`,
 and `af3b627429f8f732fb8ee19d28f56950ec7ad56f67dd9558e7ee893efb24f4b5`.
 Replaying every retained pilot under the 4x rule projects at most
-7,436.527737140 seconds, or 123.94 minutes, below the 171-minute benchmark
+6,851.601334604 seconds, or 114.19 minutes, below the 171-minute benchmark
 limit.
+
+Spawn/join retains an explicit architecture-neutral 2x base policy:
+`round_up_3_significant_digits(ceil(P*1750000000*10/(E*7)))`. Unlike the
+steady-state workloads, every iteration creates and joins host threads. In
+#1032 run 34563740560, the AArch64 interpreter warmup completed 29K iterations
+in 5.063717 seconds, but the immediately following AOT warmup failed
+functionally at the 4x-selected 33.3K iterations with
+`pthread_create[0] failed: 6`. The fastest AOT pilot was 10K iterations in
+1.503949 seconds; the 2x policy selects 16.7K and projects 2.511594830 seconds.
+This remains twice the 1.25-second quality floor without driving one sample
+into an unrelated per-process lifecycle resource boundary. A hard limit of
+25K created threads per spawn/join invocation rejects faster-host sizing
+before measurement rather than risking the observed runtime failure. It is
+24.9249% below the failed count while admitting the retained 1.7195x
+faster-host simulation, whose largest projected spawn/join invocation is
+24.2K thread lifecycles. The failed diagnostic is pinned by SHA-256
+`56d67f22d3c4713661da6147ec4aadea666c817045ea94e1846259a17e512b0e`.
+The override applies to spawn/join in every mode, thread count, and
+architecture. Actual samples remain fail-closed on the unchanged timing floor
+and every process or correctness failure. The failed-step log is pinned by
+SHA-256 `860a8927bf77f8dcbab50a1a0ba184f391f86543e59eb66eb462e4aed296941b`.
 
 One stronger declarative cell envelope additionally covers
 `mode=aot, workload=wait-notify, threads=1` on every architecture. Its count is
@@ -145,8 +166,8 @@ The retained failed hosted attempts and their ordered-rate evidence are:
 The exact relative margin over the retained `9.723491826731898x` boundary is
 `16 / 9.723491826731898 - 1 = 0.645499403415209`, or 64.5499%.
 Replaying all 88 retained pilots and the 12 evidence invocations per
-observation gives a maximum 6,950.331691426-second projection on the #1020
-failure, bounded by 115.84 minutes and still below 171 minutes. The v4
+observation gives a maximum 6,378.047861506-second projection on the #1020
+failure, bounded by 106.30 minutes and still below 171 minutes. The v4
 diagnostic is pinned by SHA-256
 `8e8c9c7f0075ac7c9e36917dde73294a415f6756784107b06fb0055317035496`.
 This stronger rule is a cell-specific rate envelope, not an x86 host
@@ -168,12 +189,13 @@ resolution. They are intentionally not required to satisfy the evidence
 every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
 be at least both the 1.25-second evidence floor and the exact 5-second
-`1.75s * 20/7` sizing target; AOT wait/notify/1 projects at least 20.0 seconds.
+`1.75s * 20/7` sizing target. Spawn/join uses its declared 2.5-second base
+target, and AOT wait/notify/1 projects at least 20.0 seconds.
 Actual warmups and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
 There is no hidden retry or count increase if a later rate exceeds its
-declared 4x or 16x envelope: even a just-over-boundary observation that falls
-below 1.25 seconds is retained and fails closed.
+declared 2x, 4x, or 16x envelope: even a just-over-boundary observation that
+falls below 1.25 seconds is retained and fails closed.
 
 Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
 limit, checksum arithmetic, and declared workload caps. A pilot is rejected
@@ -186,13 +208,13 @@ watchdog.
 The workflow reserves 69 minutes for non-benchmark work, leaving a 171-minute
 benchmark limit. Before and during the full 88-pilot authoritative plan,
 admission uses the hard 48-minute-24-second pilot bound (`88 * 33s`), the
-94-minute minimum evidence bound
-(`86 * 12 * 5s + 2 * 12 * 20s`), and the 10-minute auxiliary allowance.
-Their sum is 152 minutes 24 seconds; adding the 69-minute reserve is 221
-minutes 24 seconds, strictly below the 240-minute job timeout with 18 minutes
-36 seconds of headroom. The
-harness accumulates actual pilot corrected and wall time after each one-shot
-pilot and aborts immediately when the remaining hard bound cannot fit.
+86-minute minimum evidence bound
+(`70 * 12 * 5s + 16 * 12 * 2.5s + 2 * 12 * 20s`), and the 10-minute
+auxiliary allowance. Their sum is 144 minutes 24 seconds; adding the 69-minute
+reserve is 213 minutes 24 seconds, strictly below the 240-minute job timeout
+with 26 minutes 36 seconds of headroom. The harness accumulates actual pilot
+corrected and wall time after each one-shot pilot and aborts immediately when
+the remaining hard bound cannot fit.
 
 The reserve reduction is bounded by retained v3 AArch64 smoke job
 102467148543. Its benchmark step occupied 4,701 seconds; retained pilots and
@@ -307,10 +329,11 @@ complete plan, including `comparison_purpose`.
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
-safety factor, declarative cell envelopes, rounding, caps, timeouts, modes,
-thread counts, pairs, profile, samples, warmups, optimization, and quality
-policy. `plan_sha256` hashes the complete report-specific plan, including every
-pilot and selected count. `validate_report` recomputes both and independently
+safety factor, declarative cell base overrides and envelopes, rounding, caps,
+timeouts, modes, thread counts, pairs, profile, samples, warmups, optimization,
+and quality policy. `plan_sha256` hashes the complete report-specific plan,
+including every pilot and selected count. `validate_report` recomputes both and
+independently
 replays sizing.
 
 The report exposes four metric layers:

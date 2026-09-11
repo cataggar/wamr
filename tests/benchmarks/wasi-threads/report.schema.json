@@ -432,6 +432,7 @@
             "selection_rate",
             "formula",
             "cell_selection",
+            "cell_base_overrides",
             "cell_envelopes",
             "target_duration_ns",
             "safety_factor",
@@ -462,6 +463,27 @@
             },
             "cell_selection": {
               "const": "max(general_rounded_iterations, applicable_envelope_rounded_iterations)"
+            },
+            "cell_base_overrides": {
+              "const": [
+                {
+                  "name": "spawn-join-2x-rate-envelope",
+                  "selector": {
+                    "workload": "spawn-join"
+                  },
+                  "target_duration_ns": 1750000000,
+                  "safety_factor": {
+                    "numerator": 10,
+                    "denominator": 7
+                  },
+                  "measurement_to_pilot_rate_envelope": {
+                    "numerator": 2,
+                    "denominator": 1
+                  },
+                  "projected_pilot_duration_ns": 2500000000,
+                  "formula": "round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))"
+                }
+              ]
             },
             "cell_envelopes": {
               "const": [
@@ -506,6 +528,7 @@
               "required": [
                 "uint64_max",
                 "wait_notify_int32_max",
+                "spawn_join_thread_lifecycle_cap",
                 "workload_iteration_caps",
                 "per_invocation_timeout_ns",
                 "workflow_job_timeout_ns",
@@ -516,6 +539,7 @@
               "properties": {
                 "uint64_max": { "const": 18446744073709551615 },
                 "wait_notify_int32_max": { "const": 2147483647 },
+                "spawn_join_thread_lifecycle_cap": { "const": 25000 },
                 "workload_iteration_caps": {
                   "const": {
                     "single-hot": 16000000000,

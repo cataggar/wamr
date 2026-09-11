@@ -325,7 +325,7 @@
           "later_iterations": 1430000,
           "measurement_to_fastest_pilot_ratio": 2.192262005124765,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 6789119289876,
+          "projected_benchmark_ns": 6239579868132,
           "projected_later_elapsed_ns": 9133690630,
           "selected_iterations": 14800000
         },
@@ -338,7 +338,7 @@
           "later_iterations": 1650000,
           "measurement_to_fastest_pilot_ratio": 1.8362976197939525,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 6890968180770,
+          "projected_benchmark_ns": 6344840620482,
           "projected_later_elapsed_ns": 10910484000,
           "selected_iterations": 17100000
         },
@@ -351,7 +351,7 @@
           "later_iterations": 506000,
           "measurement_to_fastest_pilot_ratio": 1.7370470506689346,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 6885530168267,
+          "projected_benchmark_ns": 6316356374471,
           "projected_later_elapsed_ns": 11516009882,
           "selected_iterations": 5250000
         },
@@ -364,7 +364,7 @@
           "later_iterations": 548000,
           "measurement_to_fastest_pilot_ratio": 5.367617734892188,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 6950331691426,
+          "projected_benchmark_ns": 6378047861506,
           "projected_later_elapsed_ns": 3734896424,
           "selected_iterations": 3660000
         },
@@ -377,7 +377,7 @@
           "later_iterations": 749000,
           "measurement_to_fastest_pilot_ratio": 9.723491826731898,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 6939464504133,
+          "projected_benchmark_ns": 6375217741821,
           "projected_later_elapsed_ns": 2061492657,
           "selected_iterations": 1500000
         }
@@ -415,7 +415,7 @@
           "sha256": "8e8c9c7f0075ac7c9e36917dde73294a415f6756784107b06fb0055317035496"
         }
       ],
-      "maximum_projected_benchmark_ns": 6950331691426,
+      "maximum_projected_benchmark_ns": 6378047861506,
       "projection_profile": {
         "samples": 10,
         "warmups": 2
@@ -458,7 +458,7 @@
           "ordered_rate_acceleration": 1.567876679332992,
           "pilot_iterations": 450000000,
           "previous_selected_iterations": 399000000,
-          "projected_benchmark_ns": 7263711040539,
+          "projected_benchmark_ns": 6678343962195,
           "projected_later_elapsed_ns": 3201299850,
           "selected_iterations": 1040000000,
           "selector": {
@@ -481,7 +481,7 @@
           "ordered_rate_acceleration": 1.7244655732767034,
           "pilot_iterations": 32000,
           "previous_selected_iterations": 13600,
-          "projected_benchmark_ns": 7292175425834,
+          "projected_benchmark_ns": 6730237698302,
           "projected_later_elapsed_ns": 2904354589,
           "selected_iterations": 35200,
           "selector": {
@@ -504,7 +504,7 @@
           "ordered_rate_acceleration": 1.6039742595654836,
           "pilot_iterations": 40000000,
           "previous_selected_iterations": 16200000,
-          "projected_benchmark_ns": 7436527737140,
+          "projected_benchmark_ns": 6851601334604,
           "projected_later_elapsed_ns": 3118823914,
           "selected_iterations": 41900000,
           "selector": {
@@ -527,7 +527,7 @@
           "ordered_rate_acceleration": 2.74645411248677,
           "pilot_iterations": 180000000,
           "previous_selected_iterations": 78700000,
-          "projected_benchmark_ns": 7169015079986,
+          "projected_benchmark_ns": 6597493941950,
           "projected_later_elapsed_ns": 1828292885,
           "selected_iterations": 158000000,
           "selector": {
@@ -538,7 +538,7 @@
         }
       ],
       "declared_margin": 0.456423386727627,
-      "maximum_projected_benchmark_ns": 7436527737140,
+      "maximum_projected_benchmark_ns": 6851601334604,
       "projection_profile": {
         "samples": 10,
         "warmups": 2
@@ -555,7 +555,7 @@
     "quality_floor_ns": 1250000000,
     "scope": {
       "architectures": "all",
-      "cells": "all"
+      "cells": "all-except-spawn-join"
     }
   },
   "job_reserve_admission": {
@@ -579,9 +579,9 @@
       "step_wall_elapsed_ns": 4701000000000,
       "unaccounted_step_wall_ns": 3442447686014
     },
-    "hard_preadmission_benchmark_ns": 9144000000000,
+    "hard_preadmission_benchmark_ns": 8664000000000,
     "job_non_benchmark_reserve_ns": 4140000000000,
-    "timeout_headroom_ns": 1116000000000,
+    "timeout_headroom_ns": 1596000000000,
     "workflow_job_timeout_ns": 14400000000000
   },
   "epyc_9v45_reference": {
@@ -594,7 +594,48 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 8,
+  "schema_version": 9,
+  "spawn_join_base_override": {
+    "algorithm_identity": {
+      "measurement_plan_identity_version": 9,
+      "sizing_algorithm_version": 9
+    },
+    "evidence": {
+      "diagnosis": {
+        "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34563740560-1",
+        "job_id": 103151533896,
+        "run_attempt": 1,
+        "run_id": 34563740560,
+        "sha256": "56d67f22d3c4713661da6147ec4aadea666c817045ea94e1846259a17e512b0e",
+        "failed_step_log_sha256": "860a8927bf77f8dcbab50a1a0ba184f391f86543e59eb66eb462e4aed296941b"
+      },
+      "failed_general_iterations": 33300,
+      "failure_classification": "spawn-join-guest-failure",
+      "failure_message": "pthread_create[0] failed: 6",
+      "fastest_pilot_elapsed_ns": 1503949000,
+      "fastest_pilot_iterations": 10000,
+      "override_projected_elapsed_ns": 2511594830,
+      "override_selected_iterations": 16700,
+      "selector": {
+        "mode": "aot",
+        "threads": 1,
+        "workload": "spawn-join"
+      }
+    },
+    "formula": "round_up_3_significant_digits(ceil(P*1750000000*10/(E*7)))",
+    "failed_count_headroom": 0.24924924924924924,
+    "maximum_thread_lifecycles_per_invocation": 25000,
+    "retained_epyc_maximum_projected_thread_lifecycles": 24200,
+    "measurement_to_pilot_rate_envelope": {
+      "denominator": 1,
+      "numerator": 2
+    },
+    "projected_pilot_duration_ns": 2500000000,
+    "scope": {
+      "architectures": "all",
+      "workload": "spawn-join"
+    }
+  },
   "source_provenance": {
     "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
     "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",

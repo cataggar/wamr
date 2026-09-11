@@ -934,6 +934,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
             algorithm["cell_selection"], bench.SIZING_CELL_SELECTION
         )
         self.assertEqual(
+            algorithm["cell_base_overrides"],
+            list(bench.SIZING_CELL_BASE_OVERRIDES),
+        )
+        self.assertEqual(
             algorithm["cell_envelopes"],
             list(bench.SIZING_CELL_ENVELOPES),
         )
@@ -972,6 +976,18 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(wait4_target["general_rounded_iterations"], 35_200)
         self.assertEqual(wait4_target["applicable_envelopes"], [])
         self.assertEqual(wait4_target["selected_iterations"], 35_200)
+        spawn_target = bench.sizing_candidates_for_cell(
+            "aot", "spawn-join", 1, 10_000, 1_500_000_000
+        )
+        self.assertEqual(
+            spawn_target["general_rounded_iterations"], 16_700
+        )
+        self.assertEqual(spawn_target["applicable_envelopes"], [])
+        self.assertEqual(spawn_target["selected_iterations"], 16_700)
+        self.assertEqual(
+            spawn_target["selected_sources"],
+            ["spawn-join-2x-rate-envelope"],
+        )
         for mode, workload, threads in (
             ("interpreter", "wait-notify", 1),
             ("interpreter", "wait-notify", 2),
@@ -990,7 +1006,51 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 )
         for envelope in bench.SIZING_CELL_ENVELOPES:
             self.assertNotIn("platform", envelope["selector"])
+        for override in bench.SIZING_CELL_BASE_OVERRIDES:
+            self.assertNotIn("platform", override["selector"])
         self.assertEqual(len(bench.CANONICAL_PLATFORMS), 2)
+
+    def test_spawn_join_override_remains_fail_closed(self) -> None:
+        candidates = bench.sizing_candidates_for_cell(
+            "aot", "spawn-join", 1, 10_000, 1_500_000_000
+        )
+        self.assertEqual(
+            bench.projected_duration_floor_for_cell(
+                "aot", "spawn-join", 1
+            ),
+            2_500_000_000,
+        )
+        self.assertEqual(
+            bench.projected_duration_floor_for_cell("aot", "hot", 1),
+            5_000_000_000,
+        )
+        self.assertEqual(
+            bench.projected_duration_floor_for_cell(
+                "aot", "wait-notify", 1
+            ),
+            20_000_000_000,
+        )
+        just_over_envelope_elapsed = (
+            2_500_000_000 * 1_000_000 // 2_000_001
+        )
+        self.assertLess(just_over_envelope_elapsed, 1_250_000_000)
+        result = guest_result(
+            workload="spawn-join",
+            threads=1,
+            iterations=candidates["selected_iterations"],
+            elapsed_ns=just_over_envelope_elapsed,
+            overhead_ns=1,
+        )
+        with self.assertRaisesRegex(
+            bench.TimingQualityError, "below required"
+        ):
+            bench.parse_guest_result(
+                json.dumps(result),
+                bench.expected_result(
+                    "spawn-join", 1, candidates["selected_iterations"]
+                ),
+                1_250_000_000,
+            )
 
     def test_wait_attempt_envelope_counts_and_later_projections(self) -> None:
         attempts = (
@@ -1499,7 +1559,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             provenance["kind"], "wasi-thread-sizing-simulation-provenance"
         )
-        self.assertEqual(provenance["schema_version"], 8)
+        self.assertEqual(provenance["schema_version"], 9)
         self.assertEqual(
             provenance["source_provenance"],
             {
@@ -1620,18 +1680,22 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 item["projected_benchmark_ns"]
                 for item in envelope_provenance["evidence"]["attempts"]
             ),
-            6_950_331_691_426,
+            6_378_047_861_506,
         )
         self.assertLess(
             envelope_provenance["evidence"][
                 "maximum_projected_benchmark_ns"
             ],
-            116 * 60 * 1_000_000_000,
+            107 * 60 * 1_000_000_000,
         )
         general_envelope = provenance["general_rate_envelope"]
         self.assertEqual(
             general_envelope["measurement_to_pilot_rate_envelope"],
             {"numerator": 4, "denominator": 1},
+        )
+        self.assertEqual(
+            general_envelope["scope"]["cells"],
+            "all-except-spawn-join",
         )
         self.assertEqual(
             general_envelope["projected_pilot_duration_ns"],
@@ -1702,11 +1766,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 attempt["projected_benchmark_ns"]
                 for attempt in general_envelope["evidence"]["attempts"]
             ),
-            7_436_527_737_140,
+            6_851_601_334_604,
         )
         self.assertEqual(
             general_envelope["evidence"]["maximum_projected_benchmark_ns"],
-            7_436_527_737_140,
+            6_851_601_334_604,
         )
         self.assertAlmostEqual(
             general_envelope["evidence"]["declared_margin"],
@@ -1715,7 +1779,56 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertLess(
             general_envelope["evidence"]["maximum_projected_benchmark_ns"],
-            124 * 60 * 1_000_000_000,
+            115 * 60 * 1_000_000_000,
+        )
+        spawn_override = provenance["spawn_join_base_override"]
+        self.assertEqual(
+            spawn_override["algorithm_identity"],
+            {
+                "measurement_plan_identity_version": 9,
+                "sizing_algorithm_version": 9,
+            },
+        )
+        self.assertEqual(
+            spawn_override["maximum_thread_lifecycles_per_invocation"],
+            bench.SPAWN_JOIN_THREAD_LIFECYCLE_CAP,
+        )
+        self.assertGreaterEqual(
+            bench.SPAWN_JOIN_THREAD_LIFECYCLE_CAP,
+            spawn_override[
+                "retained_epyc_maximum_projected_thread_lifecycles"
+            ],
+        )
+        self.assertAlmostEqual(
+            1
+            - bench.SPAWN_JOIN_THREAD_LIFECYCLE_CAP
+            / spawn_override["evidence"]["failed_general_iterations"],
+            spawn_override["failed_count_headroom"],
+            places=15,
+        )
+        self.assertEqual(
+            spawn_override["evidence"]["diagnosis"]["sha256"],
+            "56d67f22d3c4713661da6147ec4aadea666c817045ea94e1846259a17e512b0e",
+        )
+        spawn_evidence = spawn_override["evidence"]
+        spawn_candidates = bench.sizing_candidates_for_cell(
+            spawn_evidence["selector"]["mode"],
+            spawn_evidence["selector"]["workload"],
+            spawn_evidence["selector"]["threads"],
+            spawn_evidence["fastest_pilot_iterations"],
+            spawn_evidence["fastest_pilot_elapsed_ns"],
+        )
+        self.assertEqual(
+            spawn_candidates["selected_iterations"],
+            spawn_evidence["override_selected_iterations"],
+        )
+        self.assertEqual(
+            bench.ceil_div(
+                spawn_evidence["fastest_pilot_elapsed_ns"]
+                * spawn_evidence["override_selected_iterations"],
+                spawn_evidence["fastest_pilot_iterations"],
+            ),
+            spawn_evidence["override_projected_elapsed_ns"],
         )
         reserve_admission = provenance["job_reserve_admission"]
         self.assertEqual(
@@ -1740,11 +1853,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             reserve_admission["hard_preadmission_benchmark_ns"],
-            9_144_000_000_000,
+            8_664_000_000_000,
         )
         self.assertEqual(
             reserve_admission["timeout_headroom_ns"],
-            18 * 60 * 1_000_000_000 + 36 * 1_000_000_000,
+            26 * 60 * 1_000_000_000 + 36 * 1_000_000_000,
         )
         self.assertEqual(
             reserve_evidence["step_wall_elapsed_ns"]
@@ -1876,6 +1989,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 self.assertEqual(len(resolved["pilots"]), 88)
                 self.assertEqual(len(resolved["projections"]), 88)
                 projected_guest = []
+                spawn_projected_guest = []
                 wait_projected_guest = []
                 for item in resolved["projections"]:
                     pilot = pilots[item["pilot_index"]]
@@ -1886,6 +2000,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                             and pilot["workload"] == "wait-notify"
                             and pilot["threads"] == 1
                         )
+                        else spawn_projected_guest
+                        if pilot["workload"] == "spawn-join"
                         else projected_guest
                     )
                     destination.append(item["projected_guest_elapsed_ns"])
@@ -1896,6 +2012,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 self.assertLess(
                     max(projected_guest),
                     bench.PROJECTED_EVIDENCE_MINIMUM_NS * 101 // 100,
+                )
+                self.assertGreaterEqual(
+                    min(spawn_projected_guest), 2_500_000_000
+                )
+                self.assertLess(
+                    max(spawn_projected_guest),
+                    2_500_000_000 * 101 // 100,
                 )
                 self.assertGreaterEqual(
                     min(wait_projected_guest), 20_000_000_000
@@ -1915,7 +2038,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             direction_counts["2x-slower"],
-            {"up": 36, "down": 2, "same": 0},
+            {"up": 28, "down": 10, "same": 0},
         )
         self.assertEqual(
             direction_counts["3x-slower"],
@@ -1994,6 +2117,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             bench.effective_sizing_cap("wait-notify", 1), 100_000_000
         )
+        for threads in (1, 2, 4, 8):
+            with self.subTest(spawn_join_threads=threads):
+                self.assertEqual(
+                    bench.effective_sizing_cap("spawn-join", threads),
+                    bench.SPAWN_JOIN_THREAD_LIFECYCLE_CAP // threads,
+                )
         with mock.patch.dict(
             bench.SIZING_WORKLOAD_CAPS,
             {"wait-notify": bench.INT32_MAX + 1},
@@ -2179,10 +2308,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(bench.JOB_NON_BENCHMARK_RESERVE_NS, 69 * 60 * 10**9)
         self.assertEqual(bench.WORKFLOW_JOB_TIMEOUT_NS, 240 * 60 * 10**9)
         self.assertEqual(bench.PROJECTED_BENCHMARK_LIMIT_NS, 171 * 60 * 10**9)
-        self.assertEqual(hard_bound, 13_284_000_000_000)
+        self.assertEqual(hard_bound, 12_804_000_000_000)
         self.assertEqual(
             bench.WORKFLOW_JOB_TIMEOUT_NS - hard_bound,
-            18 * 60 * 10**9 + 36 * 10**9,
+            26 * 60 * 10**9 + 36 * 10**9,
         )
         self.assertLess(hard_bound, bench.WORKFLOW_JOB_TIMEOUT_NS)
         with self.assertRaisesRegex(bench.HarnessError, "171-minute"):
@@ -2211,7 +2340,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
         expected_actual_pilots = 88 * (
             bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
         )
-        ordinary_invocations = 1_056 - 2 * (2 + 10)
+        wait_invocations = 2 * (2 + 10)
+        spawn_specs = [
+            spec for spec in order if spec["workload"] == "spawn-join"
+        ]
+        spawn_invocations = len(spawn_specs) * (2 + 10)
+        ordinary_invocations = 1_056 - wait_invocations - spawn_invocations
         wait_selected = bench.sizing_candidates_for_cell(
             "aot",
             "wait-notify",
@@ -2226,9 +2360,23 @@ class ThreadBenchmarkTests(unittest.TestCase):
             * wait_selected,
             1_500_000,
         )
+        spawn_evidence = (2 + 10) * sum(
+            bench.ceil_div(
+                (bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000)
+                * bench.sizing_candidates_for_cell(
+                    spec["mode"],
+                    spec["workload"],
+                    spec["threads"],
+                    spec["iterations"],
+                    bench.PROJECTED_EVIDENCE_MINIMUM_NS,
+                )["selected_iterations"],
+                spec["iterations"],
+            )
+            for spec in spawn_specs
+        )
         expected_evidence = ordinary_invocations * (
             bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
-        ) + 2 * (2 + 10) * wait_host_wall
+        ) + wait_invocations * wait_host_wall + spawn_evidence
         expected_total = (
             expected_actual_pilots
             + expected_evidence
@@ -2253,7 +2401,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             - bench.AUXILIARY_INVOCATION_BUDGET_NS,
         )
         self.assertEqual(resolved["projected_benchmark_ns"], expected_total)
-        self.assertAlmostEqual(expected_total / 60e9, 114.56992, places=3)
+        self.assertAlmostEqual(expected_total / 60e9, 106.3189864, places=3)
         self.assertLess(
             resolved["projected_benchmark_ns"],
             bench.PROJECTED_BENCHMARK_LIMIT_NS,
@@ -2271,7 +2419,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             samples=10,
         )
         expected_evidence = (
-            86 * 12 * bench.PROJECTED_EVIDENCE_MINIMUM_NS
+            70 * 12 * bench.PROJECTED_EVIDENCE_MINIMUM_NS
+            + 16 * 12 * 2_500_000_000
             + 2 * 12 * 20_000_000_000
         )
         self.assertEqual(len(order), 88)
@@ -2286,7 +2435,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             progress["earliest_complete_bound_ns"],
-            9_144_000_000_000,
+            8_664_000_000_000,
         )
         self.assertLess(
             progress["earliest_complete_bound_ns"],
@@ -2400,6 +2549,17 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "sizing.algorithm",
         ):
             bench.validate_report(envelope)
+
+        base_override = make_report()
+        base_override["plan"]["sizing"]["algorithm"][
+            "cell_base_overrides"
+        ][0]["projected_pilot_duration_ns"] -= 1
+        rehash(base_override)
+        with self.assertRaisesRegex(
+            (BenchmarkDataError, bench.HarnessError),
+            "sizing.algorithm",
+        ):
+            bench.validate_report(base_override)
 
     def test_iteration_plan_rejects_uint64_overflow(self) -> None:
         plan = copy.deepcopy(bench.DEFAULT_ITERATION_PLAN)
@@ -4884,6 +5044,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             sizing_algorithm["cell_selection"]["const"],
             bench.SIZING_CELL_SELECTION,
+        )
+        self.assertEqual(
+            sizing_algorithm["cell_base_overrides"]["const"],
+            list(bench.SIZING_CELL_BASE_OVERRIDES),
         )
         self.assertEqual(
             sizing_algorithm["cell_envelopes"]["const"],
