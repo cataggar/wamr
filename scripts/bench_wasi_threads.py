@@ -52,7 +52,7 @@ SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
 MEASUREMENT_PLAN_IDENTITY_VERSION = 9
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-SIZING_ALGORITHM_VERSION = 8
+SIZING_ALGORITHM_VERSION = 10
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -83,9 +83,28 @@ MINIMUM_INTERVAL_HEADROOM_NS = (
     - TARGET_BARRIER_REQUIRED_INTERVAL_NS
 )
 SIZING_TARGET_NS = 1_750_000_000
-SIZING_SAFETY_NUMERATOR = 10
+SIZING_SAFETY_NUMERATOR = 20
 SIZING_SAFETY_DENOMINATOR = 7
 SIZING_SIGNIFICANT_DIGITS = 3
+SIZING_CELL_BASE_OVERRIDES = (
+    {
+        "name": "spawn-join-2x-rate-envelope",
+        "selector": {
+            "workload": "spawn-join",
+        },
+        "target_duration_ns": SIZING_TARGET_NS,
+        "safety_factor": {
+            "numerator": 10,
+            "denominator": 7,
+        },
+        "measurement_to_pilot_rate_envelope": {
+            "numerator": 2,
+            "denominator": 1,
+        },
+        "projected_pilot_duration_ns": 2_500_000_000,
+        "formula": SIZING_FORMULA,
+    },
+)
 SIZING_CELL_ENVELOPES = (
     {
         "name": "aot-wait-notify-1-rate-acceleration",
@@ -111,13 +130,14 @@ PROJECTED_EVIDENCE_MINIMUM_NS = (
 PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
 MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
 MAXIMUM_PILOT_HOST_WALL_NS = 33_000_000_000
-WORKFLOW_JOB_TIMEOUT_NS = 180 * 60 * 1_000_000_000
+WORKFLOW_JOB_TIMEOUT_NS = 240 * 60 * 1_000_000_000
 JOB_NON_BENCHMARK_RESERVE_NS = 69 * 60 * 1_000_000_000
 PROJECTED_BENCHMARK_LIMIT_NS = (
     WORKFLOW_JOB_TIMEOUT_NS - JOB_NON_BENCHMARK_RESERVE_NS
 )
 AUXILIARY_INVOCATION_BUDGET_NS = 10 * 60 * 1_000_000_000
 INT32_MAX = (1 << 31) - 1
+SPAWN_JOIN_THREAD_LIFECYCLE_CAP = 27_000
 SIZING_WORKLOAD_CAPS = {
     "single-hot": 16_000_000_000,
     "hot": 16_000_000_000,
@@ -473,6 +493,9 @@ def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
         "selection_rate": "fastest-valid-pilot-across-all-revisions-and-conditions",
         "formula": SIZING_FORMULA,
         "cell_selection": SIZING_CELL_SELECTION,
+        "cell_base_overrides": copy.deepcopy(
+            list(SIZING_CELL_BASE_OVERRIDES)
+        ),
         "cell_envelopes": copy.deepcopy(list(SIZING_CELL_ENVELOPES)),
         "target_duration_ns": SIZING_TARGET_NS,
         "safety_factor": {
@@ -493,6 +516,9 @@ def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
         "limits": {
             "uint64_max": MASK64,
             "wait_notify_int32_max": INT32_MAX,
+            "spawn_join_thread_lifecycle_cap": (
+                SPAWN_JOIN_THREAD_LIFECYCLE_CAP
+            ),
             "workload_iteration_caps": copy.deepcopy(SIZING_WORKLOAD_CAPS),
             "per_invocation_timeout_ns": timeout_ns,
             "workflow_job_timeout_ns": WORKFLOW_JOB_TIMEOUT_NS,
@@ -540,7 +566,11 @@ def effective_sizing_cap(workload: str, threads: int) -> int:
     if workload == "wait-notify":
         cap = min(cap, INT32_MAX)
     if workload == "spawn-join":
-        cap = min(cap, MASK64 // (threads * (threads + 1) // 2))
+        cap = min(
+            cap,
+            MASK64 // (threads * (threads + 1) // 2),
+            SPAWN_JOIN_THREAD_LIFECYCLE_CAP // threads,
+        )
     return cap
 
 
@@ -559,6 +589,54 @@ def selected_iterations_from_elapsed(
     )
 
 
+def base_sizing_policy_for_cell(
+    mode: str,
+    workload: str,
+    threads: int,
+) -> dict[str, Any]:
+    cell = {
+        "mode": mode,
+        "workload": workload,
+        "threads": threads,
+    }
+    for override in SIZING_CELL_BASE_OVERRIDES:
+        if all(
+            cell.get(key) == value
+            for key, value in override["selector"].items()
+        ):
+            return override
+    return {
+        "name": "general",
+        "target_duration_ns": SIZING_TARGET_NS,
+        "safety_factor": {
+            "numerator": SIZING_SAFETY_NUMERATOR,
+            "denominator": SIZING_SAFETY_DENOMINATOR,
+        },
+        "projected_pilot_duration_ns": PROJECTED_EVIDENCE_MINIMUM_NS,
+    }
+
+
+def projected_duration_floor_for_cell(
+    mode: str,
+    workload: str,
+    threads: int,
+) -> int:
+    cell = {
+        "mode": mode,
+        "workload": workload,
+        "threads": threads,
+    }
+    base_policy = base_sizing_policy_for_cell(mode, workload, threads)
+    return max(
+        [base_policy["projected_pilot_duration_ns"]]
+        + [
+            envelope["projected_pilot_duration_ns"]
+            for envelope in SIZING_CELL_ENVELOPES
+            if envelope["selector"] == cell
+        ]
+    )
+
+
 def sizing_candidates_for_cell(
     mode: str,
     workload: str,
@@ -566,8 +644,16 @@ def sizing_candidates_for_cell(
     pilot_iterations: int,
     pilot_elapsed_ns: int,
 ) -> dict[str, Any]:
-    general_required, general_rounded = selected_iterations_from_elapsed(
-        pilot_iterations, pilot_elapsed_ns
+    base_policy = base_sizing_policy_for_cell(mode, workload, threads)
+    base_safety = base_policy["safety_factor"]
+    general_required = ceil_div(
+        pilot_iterations
+        * base_policy["target_duration_ns"]
+        * base_safety["numerator"],
+        pilot_elapsed_ns * base_safety["denominator"],
+    )
+    general_rounded = round_up_significant(
+        general_required, SIZING_SIGNIFICANT_DIGITS
     )
     envelope_candidates = []
     selector = {
@@ -603,7 +689,7 @@ def sizing_candidates_for_cell(
         + [item["rounded_iterations"] for item in envelope_candidates]
     )
     selected_sources = (
-        ["general"] if general_rounded == selected else []
+        [base_policy["name"]] if general_rounded == selected else []
     ) + [
         item["name"]
         for item in envelope_candidates
@@ -695,18 +781,10 @@ def pilot_progress_bound(
         remaining_pilots * MAXIMUM_PILOT_HOST_WALL_NS
     )
     minimum_evidence_bound_ns = (warmups + samples) * sum(
-        max(
-            [PROJECTED_EVIDENCE_MINIMUM_NS]
-            + [
-                envelope["projected_pilot_duration_ns"]
-                for envelope in SIZING_CELL_ENVELOPES
-                if envelope["selector"]
-                == {
-                    "mode": spec["mode"],
-                    "workload": spec["workload"],
-                    "threads": spec["threads"],
-                }
-            ]
+        projected_duration_floor_for_cell(
+            spec["mode"],
+            spec["workload"],
+            spec["threads"],
         )
         for spec in pilot_order
     )
@@ -893,10 +971,11 @@ def resolve_one_shot_sizing(
         projected_host = ceil_div(
             record["host_wall_elapsed_ns"] * selected, record["iterations"]
         )
-        if projected_guest < max(
+        projected_minimum = max(
             int(MIN_TIMED_INTERVAL_MS * 1_000_000),
-            PROJECTED_EVIDENCE_MINIMUM_NS,
-        ):
+            projected_duration_floor_for_cell(*key),
+        )
+        if projected_guest < projected_minimum:
             raise HarnessError(
                 f"sizing projection is below the evidence minimum for pilot "
                 f"{record['pilot_index']}"
@@ -922,10 +1001,7 @@ def resolve_one_shot_sizing(
                     record["timing_overhead_ns"]
                     / (projected_guest + record["timing_overhead_ns"])
                 ),
-                "projected_evidence_minimum_ns": max(
-                    int(MIN_TIMED_INTERVAL_MS * 1_000_000),
-                    PROJECTED_EVIDENCE_MINIMUM_NS,
-                ),
+                "projected_evidence_minimum_ns": projected_minimum,
             }
         )
     pilot_host_ns = sum(record["host_wall_elapsed_ns"] for record in pilot_records)

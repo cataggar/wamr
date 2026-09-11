@@ -312,7 +312,7 @@
   "wait_notify_1_cell_specific_envelope": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 8
+      "sizing_algorithm_version": 10
     },
     "evidence": {
       "attempts": [
@@ -320,12 +320,12 @@
           "attempt": 1,
           "fastest_pilot_elapsed_ns": 2029403000,
           "fastest_pilot_rate": 739133.6269829108,
-          "general_selected_iterations": 1850000,
+          "general_selected_iterations": 3700000,
           "later_elapsed_ns": 882512000,
           "later_iterations": 1430000,
           "measurement_to_fastest_pilot_ratio": 2.192262005124765,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 4075652898612,
+          "projected_benchmark_ns": 6239579868132,
           "projected_later_elapsed_ns": 9133690630,
           "selected_iterations": 14800000
         },
@@ -333,12 +333,12 @@
           "attempt": 2,
           "fastest_pilot_elapsed_ns": 1757447000,
           "fastest_pilot_rate": 853510.8028862322,
-          "general_selected_iterations": 2140000,
+          "general_selected_iterations": 4270000,
           "later_elapsed_ns": 1052766000,
           "later_iterations": 1650000,
           "measurement_to_fastest_pilot_ratio": 1.8362976197939525,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 4170609245658,
+          "projected_benchmark_ns": 6344840620482,
           "projected_later_elapsed_ns": 10910484000,
           "selected_iterations": 17100000
         },
@@ -346,12 +346,12 @@
           "attempt": 3,
           "fastest_pilot_elapsed_ns": 5715386000,
           "fastest_pilot_rate": 262449.4653554458,
-          "general_selected_iterations": 657000,
+          "general_selected_iterations": 1320000,
           "later_elapsed_ns": 1109924000,
           "later_iterations": 506000,
           "measurement_to_fastest_pilot_ratio": 1.7370470506689346,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 4123736339519,
+          "projected_benchmark_ns": 6316356374471,
           "projected_later_elapsed_ns": 11516009882,
           "selected_iterations": 5250000
         },
@@ -359,12 +359,12 @@
           "attempt": 4,
           "fastest_pilot_elapsed_ns": 8216187000,
           "fastest_pilot_rate": 182566.43866552698,
-          "general_selected_iterations": 457000,
+          "general_selected_iterations": 913000,
           "later_elapsed_ns": 559214000,
           "later_iterations": 548000,
           "measurement_to_fastest_pilot_ratio": 5.367617734892188,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 4185178753642,
+          "projected_benchmark_ns": 6378047861506,
           "projected_later_elapsed_ns": 3734896424,
           "selected_iterations": 3660000
         },
@@ -372,12 +372,12 @@
           "attempt": 5,
           "fastest_pilot_elapsed_ns": 20044907000,
           "fastest_pilot_rate": 74831.97602263756,
-          "general_selected_iterations": 188000,
+          "general_selected_iterations": 375000,
           "later_elapsed_ns": 1029372000,
           "later_iterations": 749000,
           "measurement_to_fastest_pilot_ratio": 9.723491826731898,
           "pilot_iterations": 1500000,
-          "projected_benchmark_ns": 4193807262141,
+          "projected_benchmark_ns": 6375217741821,
           "projected_later_elapsed_ns": 2061492657,
           "selected_iterations": 1500000
         }
@@ -415,7 +415,7 @@
           "sha256": "8e8c9c7f0075ac7c9e36917dde73294a415f6756784107b06fb0055317035496"
         }
       ],
-      "maximum_projected_benchmark_ns": 4193807262141,
+      "maximum_projected_benchmark_ns": 6378047861506,
       "projection_profile": {
         "samples": 10,
         "warmups": 2
@@ -440,7 +440,7 @@
   "general_rate_envelope": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 8
+      "sizing_algorithm_version": 10
     },
     "evidence": {
       "attempts": [
@@ -458,9 +458,9 @@
           "ordered_rate_acceleration": 1.567876679332992,
           "pilot_iterations": 450000000,
           "previous_selected_iterations": 399000000,
-          "projected_benchmark_ns": 4115105465211,
-          "projected_later_elapsed_ns": 1597571752,
-          "selected_iterations": 519000000,
+          "projected_benchmark_ns": 6678343962195,
+          "projected_later_elapsed_ns": 3201299850,
+          "selected_iterations": 1040000000,
           "selector": {
             "mode": "aot",
             "threads": 8,
@@ -481,9 +481,9 @@
           "ordered_rate_acceleration": 1.7244655732767034,
           "pilot_iterations": 32000,
           "previous_selected_iterations": 13600,
-          "projected_benchmark_ns": 4164647814134,
-          "projected_later_elapsed_ns": 1452177295,
-          "selected_iterations": 17600,
+          "projected_benchmark_ns": 6730237698302,
+          "projected_later_elapsed_ns": 2904354589,
+          "selected_iterations": 35200,
           "selector": {
             "mode": "interpreter",
             "threads": 4,
@@ -504,44 +504,67 @@
           "ordered_rate_acceleration": 1.6039742595654836,
           "pilot_iterations": 40000000,
           "previous_selected_iterations": 16200000,
-          "projected_benchmark_ns": 4205813468912,
-          "projected_later_elapsed_ns": 1563133704,
-          "selected_iterations": 21000000,
+          "projected_benchmark_ns": 6851601334604,
+          "projected_later_elapsed_ns": 3118823914,
+          "selected_iterations": 41900000,
           "selector": {
             "mode": "interpreter",
             "threads": 2,
             "workload": "atomic"
           }
+        },
+        {
+          "diagnosis": {
+            "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34553003586-1",
+            "run_attempt": 1,
+            "run_id": 34553003586,
+            "sha256": "af3b627429f8f732fb8ee19d28f56950ec7ad56f67dd9558e7ee893efb24f4b5"
+          },
+          "fastest_pilot_elapsed_ns": 5720494000,
+          "fastest_pilot_rate": 31465813.966416188,
+          "later_elapsed_ns": 910675000,
+          "later_iterations": 78700000,
+          "ordered_rate_acceleration": 2.74645411248677,
+          "pilot_iterations": 180000000,
+          "previous_selected_iterations": 78700000,
+          "projected_benchmark_ns": 6597493941950,
+          "projected_later_elapsed_ns": 1828292885,
+          "selected_iterations": 158000000,
+          "selector": {
+            "mode": "aot",
+            "threads": 2,
+            "workload": "atomic"
+          }
         }
       ],
-      "declared_margin": 0.15977960418180248,
-      "maximum_projected_benchmark_ns": 4205813468912,
+      "declared_margin": 0.456423386727627,
+      "maximum_projected_benchmark_ns": 6851601334604,
       "projection_profile": {
         "samples": 10,
         "warmups": 2
       },
-      "retained_maximum_ordered_acceleration": 1.7244655732767034
+      "retained_maximum_ordered_acceleration": 2.74645411248677
     },
     "failure_policy": "one-shot-no-retry-no-discard",
-    "formula": "round_up_3_significant_digits(ceil(P*1750000000*10/(E*7)))",
+    "formula": "round_up_3_significant_digits(ceil(P*1750000000*20/(E*7)))",
     "measurement_to_pilot_rate_envelope": {
       "denominator": 1,
-      "numerator": 2
+      "numerator": 4
     },
-    "projected_pilot_duration_ns": 2500000000,
+    "projected_pilot_duration_ns": 5000000000,
     "quality_floor_ns": 1250000000,
     "scope": {
       "architectures": "all",
-      "cells": "all"
+      "cells": "all-except-spawn-join"
     }
   },
   "job_reserve_admission": {
     "algorithm_identity": {
       "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 8
+      "sizing_algorithm_version": 10
     },
     "auxiliary_invocation_budget_ns": 600000000000,
-    "benchmark_limit_ns": 6660000000000,
+    "benchmark_limit_ns": 10260000000000,
     "evidence": {
       "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34351942414-1",
       "combined_allowance_margin": 0.37692724257152976,
@@ -556,10 +579,10 @@
       "step_wall_elapsed_ns": 4701000000000,
       "unaccounted_step_wall_ns": 3442447686014
     },
-    "hard_preadmission_benchmark_ns": 6564000000000,
+    "hard_preadmission_benchmark_ns": 8664000000000,
     "job_non_benchmark_reserve_ns": 4140000000000,
-    "timeout_headroom_ns": 96000000000,
-    "workflow_job_timeout_ns": 10800000000000
+    "timeout_headroom_ns": 1596000000000,
+    "workflow_job_timeout_ns": 14400000000000
   },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,
@@ -571,7 +594,127 @@
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625
   },
-  "schema_version": 7,
+  "schema_version": 10,
+  "spawn_join_base_override": {
+    "algorithm_identity": {
+      "measurement_plan_identity_version": 9,
+      "sizing_algorithm_version": 10
+    },
+    "evidence": {
+      "cap_diagnosis": {
+        "artifact": "wasi-thread-bench-ubuntu-22.04-x86_64-34571155771-1",
+        "cells": [
+          {
+            "fastest_pilot_elapsed_ns": 1006987000,
+            "key": "aot/spawn-join/1",
+            "pilot_iterations": 10000,
+            "selected_iterations": 24900,
+            "thread_lifecycles": 24900,
+            "threads": 1
+          },
+          {
+            "fastest_pilot_elapsed_ns": 948874000,
+            "key": "aot/spawn-join/2",
+            "pilot_iterations": 5000,
+            "selected_iterations": 13200,
+            "thread_lifecycles": 26400,
+            "threads": 2
+          },
+          {
+            "fastest_pilot_elapsed_ns": 937753000,
+            "key": "aot/spawn-join/4",
+            "pilot_iterations": 2500,
+            "selected_iterations": 6670,
+            "thread_lifecycles": 26680,
+            "threads": 4
+          },
+          {
+            "fastest_pilot_elapsed_ns": 941130000,
+            "key": "aot/spawn-join/8",
+            "pilot_iterations": 1250,
+            "selected_iterations": 3330,
+            "thread_lifecycles": 26640,
+            "threads": 8
+          },
+          {
+            "fastest_pilot_elapsed_ns": 974457000,
+            "key": "interpreter/spawn-join/1",
+            "pilot_iterations": 9000,
+            "selected_iterations": 23100,
+            "thread_lifecycles": 23100,
+            "threads": 1
+          },
+          {
+            "fastest_pilot_elapsed_ns": 939860000,
+            "key": "interpreter/spawn-join/2",
+            "pilot_iterations": 4500,
+            "selected_iterations": 12000,
+            "thread_lifecycles": 24000,
+            "threads": 2
+          },
+          {
+            "fastest_pilot_elapsed_ns": 887925000,
+            "key": "interpreter/spawn-join/4",
+            "pilot_iterations": 2250,
+            "selected_iterations": 6340,
+            "thread_lifecycles": 25360,
+            "threads": 4
+          },
+          {
+            "fastest_pilot_elapsed_ns": 1006786000,
+            "key": "interpreter/spawn-join/8",
+            "pilot_iterations": 1250,
+            "selected_iterations": 3110,
+            "thread_lifecycles": 24880,
+            "threads": 8
+          }
+        ],
+        "diagnostic_sha256": "ff4736745a12e384168c90f702d17301b2c0598340dcf5b330bc73542af1357b",
+        "job_id": 103173381095,
+        "maximum_required_thread_lifecycles": 26680,
+        "rejected_cell": {
+          "iterations": 13200,
+          "key": "aot/spawn-join/2",
+          "thread_lifecycles": 26400
+        },
+        "run_attempt": 1,
+        "run_id": 34571155771
+      },
+      "diagnosis": {
+        "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34563740560-1",
+        "job_id": 103151533896,
+        "run_attempt": 1,
+        "run_id": 34563740560,
+        "sha256": "56d67f22d3c4713661da6147ec4aadea666c817045ea94e1846259a17e512b0e",
+        "failed_step_log_sha256": "860a8927bf77f8dcbab50a1a0ba184f391f86543e59eb66eb462e4aed296941b"
+      },
+      "failed_general_iterations": 33300,
+      "failure_classification": "spawn-join-guest-failure",
+      "failure_message": "pthread_create[0] failed: 6",
+      "fastest_pilot_elapsed_ns": 1503949000,
+      "fastest_pilot_iterations": 10000,
+      "override_projected_elapsed_ns": 2511594830,
+      "override_selected_iterations": 16700,
+      "selector": {
+        "mode": "aot",
+        "threads": 1,
+        "workload": "spawn-join"
+      }
+    },
+    "formula": "round_up_3_significant_digits(ceil(P*1750000000*10/(E*7)))",
+    "failed_count_headroom": 0.1891891891891892,
+    "maximum_thread_lifecycles_per_invocation": 27000,
+    "retained_epyc_maximum_projected_thread_lifecycles": 24200,
+    "measurement_to_pilot_rate_envelope": {
+      "denominator": 1,
+      "numerator": 2
+    },
+    "projected_pilot_duration_ns": 2500000000,
+    "scope": {
+      "architectures": "all",
+      "workload": "spawn-join"
+    }
+  },
   "source_provenance": {
     "git_blob_oid": "85cbd8a3e613a6d9b436e1ece832ff0521e456ad",
     "path": "tests/benchmarks/wasi-threads/sizing-provenance.json",
