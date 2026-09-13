@@ -326,6 +326,71 @@ class BudgetDerivationTests(unittest.TestCase):
         self.assertEqual(lower["mad_log_ratio"], 0.0)
         self.assertEqual(upper["mad_log_ratio"], 0.0)
 
+    def test_trusted_self_hosted_x86_allows_empty_runner_image(self) -> None:
+        value = synthetic_cohort()
+        value["dispatch"]["runner_target"] = "trusted-calibration"
+        x86 = value["platforms"][cohort.TRUSTED_X86_PLATFORM]
+        x86["runner_image_distribution"] = {}
+        x86["trusted_runner_name"] = cohort.TRUSTED_X86_RUNNER_NAME
+        x86["host_fingerprint_sha256"] = next(
+            iter(x86["host_fingerprint_distribution"])
+        )
+
+        budget, evidence, _ = cohort.derive_budget_documents(
+            value, synthetic_policy()
+        )
+
+        self.assertEqual(
+            budget["platforms"][cohort.TRUSTED_X86_PLATFORM][
+                "runner_environment"
+            ],
+            "self-hosted",
+        )
+        self.assertEqual(
+            evidence["platforms"][cohort.TRUSTED_X86_PLATFORM][
+                "runner_image_distribution"
+            ],
+            {},
+        )
+
+    def test_runner_image_and_trusted_x86_mutations_fail(self) -> None:
+        hosted = synthetic_cohort()
+        hosted["platforms"][cohort.TRUSTED_X86_PLATFORM][
+            "runner_image_distribution"
+        ] = {}
+        trusted = synthetic_cohort()
+        trusted["dispatch"]["runner_target"] = "trusted-calibration"
+        trusted_x86 = trusted["platforms"][cohort.TRUSTED_X86_PLATFORM]
+        trusted_x86["runner_image_distribution"] = {}
+        trusted_x86["trusted_runner_name"] = cohort.TRUSTED_X86_RUNNER_NAME
+        trusted_x86["host_fingerprint_sha256"] = next(
+            iter(trusted_x86["host_fingerprint_distribution"])
+        )
+
+        cases = []
+        missing_runner = copy.deepcopy(trusted)
+        del missing_runner["platforms"][cohort.TRUSTED_X86_PLATFORM][
+            "trusted_runner_name"
+        ]
+        cases.append((missing_runner, "trusted x86 runner identity changed"))
+        changed_fingerprint = copy.deepcopy(trusted)
+        changed_fingerprint["platforms"][cohort.TRUSTED_X86_PLATFORM][
+            "host_fingerprint_sha256"
+        ] = "f" * 64
+        cases.append((changed_fingerprint, "host fingerprint changed"))
+        partial_image = copy.deepcopy(trusted)
+        partial_image["platforms"][cohort.TRUSTED_X86_PLATFORM][
+            "runner_image_distribution"
+        ] = {"partial-image": 19}
+        cases.append((partial_image, "runner_image_distribution is incomplete"))
+        cases.append((hosted, "runner_image_distribution is incomplete"))
+
+        for mutated, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                HarnessError, message
+            ):
+                cohort.derive_budget_documents(mutated, synthetic_policy())
+
     def test_selects_worst_or_mad_whichever_is_more_permissive(self) -> None:
         worst = cohort.derive_one_sided_threshold(
             [1.0] * 10 + [0.8],

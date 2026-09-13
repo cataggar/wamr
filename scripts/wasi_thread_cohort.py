@@ -45,6 +45,7 @@ DEFAULT_PLATFORMS = tuple(CANONICAL_PLATFORMS)
 RUNNER_TARGETS = ("github-hosted", "trusted-calibration")
 TRUSTED_X86_RUNNER_NAME = "vm31e-wamr-temp-20260906"
 TRUSTED_X86_RUNNER_LABEL = "wamr-temp-20260906"
+TRUSTED_X86_PLATFORM = "ubuntu-22.04-x86_64"
 DEFAULT_DISPATCH_TIMEOUT_SECONDS = 96 * 60 * 60
 RUNNER_ENVIRONMENTS = {
     "github-hosted": {
@@ -1025,7 +1026,8 @@ def validate_paired_documents(
         runner_name = host.get("runner_name", "")
         host_fingerprints[platform_id][fingerprint] += 1
         host_cpus[platform_id][cpu] += 1
-        runner_images[platform_id][runner_image] += 1
+        if runner_image:
+            runner_images[platform_id][runner_image] += 1
         if runner_name:
             runner_names[platform_id].add(runner_name)
         host_pair_id = metadata["host_pair"]["id"]
@@ -1106,14 +1108,13 @@ def validate_paired_documents(
         raise HarnessError("cohort has mixed fixture identity")
     if len(measurement_plan_identities) != 1:
         raise HarnessError("cohort has mixed measurement plan identity")
-    trusted_x86 = "ubuntu-22.04-x86_64"
     if expected["runner_target"] == "trusted-calibration":
-        if runner_names[trusted_x86] != {TRUSTED_X86_RUNNER_NAME}:
+        if runner_names[TRUSTED_X86_PLATFORM] != {TRUSTED_X86_RUNNER_NAME}:
             raise HarnessError(
                 f"trusted x86 reports must all come from runner "
                 f"{TRUSTED_X86_RUNNER_NAME!r}"
             )
-        if len(host_fingerprints[trusted_x86]) != 1:
+        if len(host_fingerprints[TRUSTED_X86_PLATFORM]) != 1:
             raise HarnessError(
                 f"trusted x86 reports have mixed "
                 f"{TRUSTED_X86_RUNNER_NAME} host fingerprints"
@@ -1208,7 +1209,7 @@ def validate_paired_documents(
                         ),
                     }
                     if expected["runner_target"] == "trusted-calibration"
-                    and platform_id == trusted_x86
+                    and platform_id == TRUSTED_X86_PLATFORM
                     else {}
                 ),
             }
@@ -1754,12 +1755,11 @@ def validate_calibration_cohort(
         for platform in DEFAULT_PLATFORMS
     ):
         raise HarnessError("validated cohort platform report counts changed")
+    runner_target = dispatch["runner_target"]
+    if runner_target not in RUNNER_ENVIRONMENTS:
+        raise HarnessError("validated cohort runner target is unknown")
     for platform in DEFAULT_PLATFORMS:
-        for key in (
-            "host_fingerprint_distribution",
-            "cpu_distribution",
-            "runner_image_distribution",
-        ):
+        for key in ("host_fingerprint_distribution", "cpu_distribution"):
             distribution = platforms[platform].get(key)
             if (
                 not isinstance(distribution, dict)
@@ -1776,6 +1776,50 @@ def validate_calibration_cohort(
             ):
                 raise HarnessError(
                     f"validated cohort {platform} {key} is incomplete"
+                )
+        runner_images = platforms[platform].get("runner_image_distribution")
+        self_hosted_x86 = (
+            runner_target == "trusted-calibration"
+            and platform == TRUSTED_X86_PLATFORM
+        )
+        if (
+            not isinstance(runner_images, dict)
+            or (not runner_images and not self_hosted_x86)
+            or (
+                runner_images
+                and (
+                    any(
+                        not isinstance(name, str)
+                        or not name
+                        or not isinstance(count, int)
+                        or isinstance(count, bool)
+                        or count <= 0
+                        for name, count in runner_images.items()
+                    )
+                    or sum(runner_images.values()) != platform_counts[platform]
+                )
+            )
+        ):
+            raise HarnessError(
+                f"validated cohort {platform} "
+                "runner_image_distribution is incomplete"
+            )
+        if self_hosted_x86:
+            if (
+                platforms[platform].get("trusted_runner_name")
+                != TRUSTED_X86_RUNNER_NAME
+            ):
+                raise HarnessError(
+                    "validated cohort trusted x86 runner identity changed"
+                )
+            trusted_fingerprint = platforms[platform].get(
+                "host_fingerprint_sha256"
+            )
+            if set(
+                platforms[platform]["host_fingerprint_distribution"]
+            ) != {trusted_fingerprint}:
+                raise HarnessError(
+                    "validated cohort trusted x86 host fingerprint changed"
                 )
     return {
         "identity": identity,
