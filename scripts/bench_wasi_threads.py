@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import signal
 import statistics
 import struct
@@ -46,12 +47,26 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 4
+REPORT_SCHEMA_VERSION = 5
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 9
+MEASUREMENT_PLAN_IDENTITY_VERSION = 10
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
+CPU_PLACEMENT_VERSION = 1
+CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
+CPU_PLACEMENT_POLICY = {
+    "version": CPU_PLACEMENT_VERSION,
+    "kind": CPU_PLACEMENT_KIND,
+    "physical_core_order": "descending-package-core",
+    "logical_cpu_order": "one-lowest-logical-cpu-per-core-before-siblings",
+    "single_hot_logical_cpus": 1,
+    "threaded_logical_cpus": "min(available,workers+controller)",
+    "failure_policy": "fail-closed",
+}
+REVISION_ARTIFACT_POLICY = (
+    "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
+)
 SIZING_ALGORITHM_VERSION = 10
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
@@ -332,6 +347,172 @@ class Scenario:
     def key(self) -> str:
         return f"{self.workload}/{self.threads}"
 
+
+def cpu_placement_from_topology(
+    allowed_logical_cpus: list[int],
+    topology: dict[int, tuple[int, int]],
+    thread_counts: tuple[int, ...],
+    taskset_version: str,
+) -> dict[str, Any]:
+    if (
+        not allowed_logical_cpus
+        or len(set(allowed_logical_cpus)) != len(allowed_logical_cpus)
+        or any(cpu < 0 for cpu in allowed_logical_cpus)
+        or set(topology) != set(allowed_logical_cpus)
+    ):
+        raise HarnessError(
+            "CPU placement requires a complete unique allowed CPU set"
+        )
+    groups: dict[tuple[int, int], list[int]] = {}
+    for cpu in allowed_logical_cpus:
+        groups.setdefault(topology[cpu], []).append(cpu)
+    ordered_groups = sorted(groups.items(), reverse=True)
+    physical_core_groups = [
+        {
+            "physical_package_id": package,
+            "core_id": core,
+            "logical_cpus": sorted(cpus),
+        }
+        for (package, core), cpus in ordered_groups
+    ]
+    ordered_logical_cpus = [
+        group["logical_cpus"][0] for group in physical_core_groups
+    ]
+    ordered_logical_cpus.extend(
+        cpu
+        for group in physical_core_groups
+        for cpu in group["logical_cpus"][1:]
+    )
+    return {
+        "policy": copy.deepcopy(CPU_PLACEMENT_POLICY),
+        "taskset_version": taskset_version,
+        "allowed_logical_cpus": sorted(allowed_logical_cpus),
+        "physical_core_groups": physical_core_groups,
+        "ordered_logical_cpus": ordered_logical_cpus,
+        "assignments": {
+            "single-hot": ordered_logical_cpus[:1],
+            "threaded": {
+                str(threads): ordered_logical_cpus[
+                    : min(len(ordered_logical_cpus), threads + 1)
+                ]
+                for threads in thread_counts
+            },
+        },
+    }
+
+
+def discover_cpu_placement(thread_counts: tuple[int, ...]) -> dict[str, Any]:
+    if platform.system() != "Linux" or not hasattr(os, "sched_getaffinity"):
+        raise HarnessError("fixed CPU placement requires Linux sched_getaffinity")
+    taskset = shutil.which("taskset")
+    if taskset is None:
+        raise HarnessError("fixed CPU placement requires taskset")
+    allowed = sorted(os.sched_getaffinity(0))
+    topology: dict[int, tuple[int, int]] = {}
+    topology_root = Path("/sys/devices/system/cpu")
+    for cpu in allowed:
+        try:
+            package = int(
+                (
+                    topology_root
+                    / f"cpu{cpu}"
+                    / "topology"
+                    / "physical_package_id"
+                ).read_text(encoding="UTF-8")
+            )
+            core = int(
+                (
+                    topology_root / f"cpu{cpu}" / "topology" / "core_id"
+                ).read_text(encoding="UTF-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise HarnessError(
+                f"cannot resolve physical topology for allowed CPU {cpu}"
+            ) from exc
+        topology[cpu] = (package, core)
+    return cpu_placement_from_topology(
+        allowed,
+        topology,
+        thread_counts,
+        command_identity([taskset, "--version"]),
+    )
+
+
+def cpu_affinity_for(
+    cpu_placement: dict[str, Any],
+    workload: str,
+    threads: int,
+) -> list[int]:
+    if workload == "single-hot":
+        return list(cpu_placement["assignments"]["single-hot"])
+    try:
+        return list(cpu_placement["assignments"]["threaded"][str(threads)])
+    except KeyError as exc:
+        raise HarnessError(
+            f"CPU placement has no assignment for {threads} threads"
+        ) from exc
+
+
+def validate_cpu_placement(
+    cpu_placement: dict[str, Any],
+    thread_counts: tuple[int, ...],
+) -> None:
+    require(
+        isinstance(cpu_placement, dict)
+        and cpu_placement.get("policy") == CPU_PLACEMENT_POLICY
+        and isinstance(cpu_placement.get("taskset_version"), str)
+        and bool(cpu_placement["taskset_version"]),
+        "metadata.cpu_placement policy",
+    )
+    allowed = cpu_placement.get("allowed_logical_cpus")
+    groups = cpu_placement.get("physical_core_groups")
+    require(
+        isinstance(allowed, list)
+        and allowed
+        and all(
+            isinstance(cpu, int) and not isinstance(cpu, bool) and cpu >= 0
+            for cpu in allowed
+        )
+        and len(set(allowed)) == len(allowed)
+        and allowed == sorted(allowed)
+        and isinstance(groups, list)
+        and groups,
+        "metadata.cpu_placement topology",
+    )
+    topology: dict[int, tuple[int, int]] = {}
+    for group in groups:
+        require(
+            isinstance(group, dict)
+            and set(group)
+            == {"physical_package_id", "core_id", "logical_cpus"}
+            and isinstance(group["physical_package_id"], int)
+            and not isinstance(group["physical_package_id"], bool)
+            and isinstance(group["core_id"], int)
+            and not isinstance(group["core_id"], bool)
+            and isinstance(group["logical_cpus"], list)
+            and group["logical_cpus"],
+            "metadata.cpu_placement physical core group",
+        )
+        for cpu in group["logical_cpus"]:
+            require(
+                cpu in allowed and cpu not in topology,
+                "metadata.cpu_placement logical CPU membership",
+            )
+            topology[cpu] = (
+                group["physical_package_id"],
+                group["core_id"],
+            )
+    require(
+        set(topology) == set(allowed),
+        "metadata.cpu_placement complete topology",
+    )
+    expected = cpu_placement_from_topology(
+        allowed,
+        topology,
+        thread_counts,
+        cpu_placement["taskset_version"],
+    )
+    require(cpu_placement == expected, "metadata.cpu_placement assignments")
 
 def resolved_iteration_plan(
     args: argparse.Namespace,
@@ -2255,6 +2436,7 @@ def measure_once(
     *,
     repo: Path,
     runner: list[str],
+    cpu_placement: dict[str, Any],
     build: Build,
     module: Path,
     workload: str,
@@ -2270,7 +2452,17 @@ def measure_once(
         if workload == "single-hot"
         else [workload, str(threads), str(iterations)]
     )
-    command = [*runner, str(build.wamr), "run", str(module), *guest_args]
+    cpu_affinity = cpu_affinity_for(cpu_placement, workload, threads)
+    command = [
+        "taskset",
+        "--cpu-list",
+        ",".join(str(cpu) for cpu in cpu_affinity),
+        *runner,
+        str(build.wamr),
+        "run",
+        str(module),
+        *guest_args,
+    ]
     started = time.perf_counter_ns()
     try:
         returncode, stdout, stderr = run_process(command, repo, timeout)
@@ -2312,6 +2504,7 @@ def measure_once(
     return {
         **record_fields,
         "command": command,
+        "cpu_affinity": cpu_affinity,
         "elapsed_ns": guest_elapsed_ns,
         "guest_elapsed_ns": guest_elapsed_ns,
         "raw_guest_elapsed_ns": int(guest["raw_elapsed_ns"]),
@@ -2340,6 +2533,7 @@ def run_trusted_barrier_preflight(
     *,
     repo: Path,
     runner: list[str],
+    cpu_placement: dict[str, Any],
     build: Build,
     module: Path,
     thread_counts: tuple[int, ...],
@@ -2356,6 +2550,7 @@ def run_trusted_barrier_preflight(
                 measured = measure_once(
                     repo=repo,
                     runner=runner,
+                    cpu_placement=cpu_placement,
                     build=build,
                     module=module,
                     workload="hot",
@@ -2395,6 +2590,7 @@ def run_trusted_barrier_preflight(
                     "workload": "hot",
                     "threads": threads,
                     "iterations": iterations,
+                    "cpu_affinity": measured["cpu_affinity"],
                     "timing_overhead_ns": overhead,
                     "timed_interval_ns": timed,
                     "raw_elapsed_ns": raw,
@@ -2835,6 +3031,14 @@ def validate_report(document: dict[str, Any]) -> None:
         "plan.scheduler_barrier_preflight",
     )
     require(
+        plan.get("cpu_placement") == CPU_PLACEMENT_POLICY,
+        "plan.cpu_placement",
+    )
+    require(
+        plan.get("revision_artifact_policy") == REVISION_ARTIFACT_POLICY,
+        "plan.revision_artifact_policy",
+    )
+    require(
         isinstance(preflight_plan.get("enabled"), bool)
         and isinstance(preflight_plan.get("acceptance_rule"), str)
         and bool(preflight_plan["acceptance_rule"])
@@ -2942,6 +3146,8 @@ def validate_report(document: dict[str, Any]) -> None:
         == measurement_plan_sha256(plan),
         "metadata.measurement_plan_sha256",
     )
+    cpu_placement = metadata.get("cpu_placement")
+    validate_cpu_placement(cpu_placement, tuple(plan["thread_counts"]))
 
     revisions = metadata.get("revisions")
     require(
@@ -3075,6 +3281,45 @@ def validate_report(document: dict[str, Any]) -> None:
             ),
             "noise calibration revision identity",
         )
+    revision_artifacts = metadata.get("revision_artifacts")
+    require(
+        isinstance(revision_artifacts, dict)
+        and set(revision_artifacts) == {"policy", "strategy", "source_role"}
+        and revision_artifacts["policy"] == REVISION_ARTIFACT_POLICY,
+        "metadata.revision_artifacts policy",
+    )
+    expected_artifact_strategy = (
+        "shared-exact-build"
+        if comparison_purpose == "noise-calibration"
+        else "independent-builds"
+        if revision_mode == "paired-revisions"
+        else "single-revision-build"
+    )
+    require(
+        revision_artifacts["strategy"] == expected_artifact_strategy
+        and revision_artifacts["source_role"]
+        == (
+            "baseline"
+            if expected_artifact_strategy == "shared-exact-build"
+            else None
+        ),
+        "metadata.revision_artifacts strategy",
+    )
+    tools = metadata.get("tools")
+    aot_artifacts = metadata.get("aot_artifacts")
+    require(
+        isinstance(tools, dict)
+        and set(tools) == set(revision_roles)
+        and isinstance(aot_artifacts, dict)
+        and set(aot_artifacts) == set(revision_roles),
+        "metadata revision artifact roles",
+    )
+    if comparison_purpose == "noise-calibration":
+        require(
+            tools["baseline"] == tools["candidate"]
+            and aot_artifacts["baseline"] == aot_artifacts["candidate"],
+            "noise calibration exact artifact reuse",
+        )
     budget = document.get("budget")
     require(isinstance(budget, dict), "budget")
     budget_status = budget.get("status")
@@ -3175,6 +3420,12 @@ def validate_report(document: dict[str, Any]) -> None:
             require(
                 sample.get("mode") == "aot"
                 and sample.get("workload") == "hot"
+                and sample.get("cpu_affinity")
+                == cpu_affinity_for(
+                    cpu_placement,
+                    "hot",
+                    sample["threads"],
+                )
                 and sample.get("iterations")
                 == plan["iterations"]["aot"]["hot"][str(sample["threads"])]
                 and raw == timed + overhead
@@ -3262,6 +3513,24 @@ def validate_report(document: dict[str, Any]) -> None:
         require(
             record.get("condition") in (pair["left"], pair["right"]),
             "record pair condition",
+        )
+        expected_cpu_affinity = cpu_affinity_for(
+            cpu_placement,
+            record.get("workload"),
+            record.get("threads"),
+        )
+        require(
+            record.get("cpu_affinity") == expected_cpu_affinity,
+            "record CPU affinity",
+        )
+        require(
+            record.get("command", [])[:3]
+            == [
+                "taskset",
+                "--cpu-list",
+                ",".join(str(cpu) for cpu in expected_cpu_affinity),
+            ],
+            "record CPU affinity command",
         )
         if record["pair_kind"] == "single-infrastructure":
             expected_iterations = plan["iterations"][record["mode"]][
@@ -3937,6 +4206,11 @@ def render_markdown(document: dict[str, Any]) -> str:
         f"- Host pair: `{document['metadata']['host_pair']['id']}` · "
         f"fingerprint `{document['metadata']['host_pair']['host_fingerprint_sha256']}`",
         f"- Runner environment: `{host['runner_environment']}`",
+        f"- CPU placement: `{document['plan']['cpu_placement']['kind']}` · "
+        f"ordered logical CPUs "
+        f"`{document['metadata']['cpu_placement']['ordered_logical_cpus']}`",
+        f"- Revision artifacts: "
+        f"`{document['metadata']['revision_artifacts']['strategy']}`",
         f"- Host: `{host['system']} {host['release']}` · `{host['machine']}` · "
         f"{host['logical_cpus']} CPUs · `{host['cpu']}`",
         f"- Profile: `{document['plan']['profile']}` "
@@ -4130,6 +4404,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         pair_plan, revision_roles, pilot_iteration_plan
     )
     runner = shlex.split(args.runner)
+    cpu_placement = discover_cpu_placement(args.thread_counts)
+    revision_artifact_strategy = (
+        "shared-exact-build"
+        if comparison_purpose == "noise-calibration"
+        else "independent-builds"
+        if revision_mode == "paired-revisions"
+        else "single-revision-build"
+    )
     preflight_acceptance_rule = (
         "every probe must have timed_interval_ns >= minimum_timed_interval_ns "
         "and 99 * timing_overhead_ns < minimum_timed_interval_ns"
@@ -4140,6 +4422,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
 
     contexts: dict[str, dict[str, Any]] = {}
     for role in revision_roles:
+        if (
+            revision_artifact_strategy == "shared-exact-build"
+            and role == "candidate"
+        ):
+            contexts[role] = contexts["baseline"]
+            continue
         revision_repo = revision_repos[role]
         revision_output = output / "revisions" / role
         builds: dict[str, Build] = {}
@@ -4227,6 +4515,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         host_pair=host_pair,
         host_quiescence_at_start=host_quiescence_at_start,
         preflight_samples=pilot_records,
+        cpu_placement=cpu_placement,
     )
     for spec in pilot_order:
         context = contexts[spec["revision"]]
@@ -4423,6 +4712,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "acceptance_rule": preflight_acceptance_rule,
         },
+        "cpu_placement": copy.deepcopy(CPU_PLACEMENT_POLICY),
+        "revision_artifact_policy": REVISION_ARTIFACT_POLICY,
         "optimize": args.optimize,
         "pairs": pair_plan,
     }
@@ -4465,6 +4756,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             quality_preflight = run_trusted_barrier_preflight(
                 repo=context["repo"],
                 runner=runner,
+                cpu_placement=cpu_placement,
                 build=context["builds"]["enabled-aot"],
                 module=context["aot_artifacts"]["threaded-polls-on"],
                 thread_counts=args.thread_counts,
@@ -4554,6 +4846,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             *pilot_records,
             *quality_preflight["samples"],
         ],
+        cpu_placement=cpu_placement,
     )
 
     if "aot" in modes:
@@ -4865,6 +5158,16 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "plan_sha256": plan_sha256,
             "measurement_plan_version": MEASUREMENT_PLAN_IDENTITY_VERSION,
             "measurement_plan_sha256": measurement_plan_identity,
+            "cpu_placement": cpu_placement,
+            "revision_artifacts": {
+                "policy": REVISION_ARTIFACT_POLICY,
+                "strategy": revision_artifact_strategy,
+                "source_role": (
+                    "baseline"
+                    if revision_artifact_strategy == "shared-exact-build"
+                    else None
+                ),
+            },
             "checksum_preparation": checksum_preparation,
             "host": host,
             "host_pair": host_pair,

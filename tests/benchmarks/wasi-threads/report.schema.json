@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 4 },
+    "schema_version": { "const": 5 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -34,13 +34,16 @@
         "plan_sha256",
         "measurement_plan_version",
         "measurement_plan_sha256",
+        "cpu_placement",
+        "revision_artifacts",
         "checksum_preparation",
         "host",
         "host_pair",
         "execution",
         "tools",
         "fixture_toolchain",
-        "fixtures"
+        "fixtures",
+        "aot_artifacts"
       ],
       "properties": {
         "commit": { "$ref": "#/$defs/commit" },
@@ -66,8 +69,30 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 9 },
+        "measurement_plan_version": { "const": 10 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
+        "cpu_placement": { "$ref": "#/$defs/cpu_placement" },
+        "revision_artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "strategy", "source_role"],
+          "properties": {
+            "policy": {
+              "const": "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
+            },
+            "strategy": {
+              "enum": [
+                "shared-exact-build",
+                "independent-builds",
+                "single-revision-build"
+              ]
+            },
+            "source_role": {
+              "type": ["string", "null"],
+              "enum": ["baseline", null]
+            }
+          }
+        },
         "checksum_preparation": {
           "type": "object",
           "additionalProperties": false,
@@ -198,6 +223,8 @@
         "atomic_wait_preflight_iterations",
         "atomic_wait_preflight_timing_quality",
         "scheduler_barrier_preflight",
+        "cpu_placement",
+        "revision_artifact_policy",
         "pairs",
         "optimize"
       ],
@@ -260,6 +287,10 @@
         },
         "scheduler_barrier_preflight": {
           "$ref": "#/$defs/scheduler_barrier_preflight_plan"
+        },
+        "cpu_placement": { "$ref": "#/$defs/cpu_placement_policy" },
+        "revision_artifact_policy": {
+          "const": "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
         },
         "pairs": {
           "type": "array",
@@ -773,6 +804,98 @@
         "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "cpu_placement_policy": {
+      "const": {
+        "version": 1,
+        "kind": "fixed-linux-physical-core-affinity",
+        "physical_core_order": "descending-package-core",
+        "logical_cpu_order": "one-lowest-logical-cpu-per-core-before-siblings",
+        "single_hot_logical_cpus": 1,
+        "threaded_logical_cpus": "min(available,workers+controller)",
+        "failure_policy": "fail-closed"
+      }
+    },
+    "cpu_placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy",
+        "taskset_version",
+        "allowed_logical_cpus",
+        "physical_core_groups",
+        "ordered_logical_cpus",
+        "assignments"
+      ],
+      "properties": {
+        "policy": { "$ref": "#/$defs/cpu_placement_policy" },
+        "taskset_version": { "type": "string", "minLength": 1 },
+        "allowed_logical_cpus": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "physical_core_groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "physical_package_id",
+              "core_id",
+              "logical_cpus"
+            ],
+            "properties": {
+              "physical_package_id": { "type": "integer" },
+              "core_id": { "type": "integer" },
+              "logical_cpus": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+        "ordered_logical_cpus": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "assignments": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["single-hot", "threaded"],
+          "properties": {
+            "single-hot": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": { "type": "integer", "minimum": 0 }
+            },
+            "threaded": {
+              "type": "object",
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "1": { "$ref": "#/$defs/cpu_affinity" },
+                "2": { "$ref": "#/$defs/cpu_affinity" },
+                "4": { "$ref": "#/$defs/cpu_affinity" },
+                "8": { "$ref": "#/$defs/cpu_affinity" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "cpu_affinity": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 0 }
+    },
     "pair": {
       "type": "object",
       "additionalProperties": false,
@@ -829,6 +952,7 @@
         "workload",
         "threads",
         "iterations",
+        "cpu_affinity",
         "timing_overhead_ns",
         "timed_interval_ns",
         "raw_elapsed_ns",
@@ -843,6 +967,7 @@
         "workload": { "const": "hot" },
         "threads": { "enum": [1, 2, 4, 8] },
         "iterations": { "type": "integer", "minimum": 1 },
+        "cpu_affinity": { "$ref": "#/$defs/cpu_affinity" },
         "timing_overhead_ns": { "type": "integer", "minimum": 0 },
         "timed_interval_ns": { "type": "integer", "minimum": 1 },
         "raw_elapsed_ns": { "type": "integer", "minimum": 1 },
@@ -1009,6 +1134,7 @@
         "threads",
         "iterations",
         "command",
+        "cpu_affinity",
         "elapsed_ns",
         "guest_elapsed_ns",
         "raw_guest_elapsed_ns",
@@ -1037,6 +1163,7 @@
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "host_pair_id": { "type": "string", "minLength": 1 },
         "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
+        "cpu_affinity": { "$ref": "#/$defs/cpu_affinity" },
         "pair_kind": { "type": "string", "minLength": 1 },
         "pair_key": { "type": "string", "minLength": 1 },
         "pair_index": { "type": "integer", "minimum": 0 },

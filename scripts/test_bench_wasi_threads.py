@@ -29,6 +29,22 @@ from benchmark_schema import (  # noqa: E402
 SCHEMA_VERSION = bench.REPORT_SCHEMA_VERSION
 
 
+def test_cpu_placement(
+    thread_counts: tuple[int, ...] = (1, 2, 4, 8),
+) -> dict:
+    return bench.cpu_placement_from_topology(
+        [0, 1, 2, 3],
+        {
+            0: (0, 0),
+            1: (0, 1),
+            2: (0, 2),
+            3: (0, 3),
+        },
+        thread_counts,
+        "taskset test version",
+    )
+
+
 def guest_result(
     workload: str = "atomic",
     threads: int = 1,
@@ -245,6 +261,8 @@ def make_report(
                 "minimum_timed_interval_ns"
             ),
         },
+        "cpu_placement": copy.deepcopy(bench.CPU_PLACEMENT_POLICY),
+        "revision_artifact_policy": bench.REVISION_ARTIFACT_POLICY,
         "optimize": "ReleaseFast",
         "pairs": [],
     }
@@ -252,6 +270,7 @@ def make_report(
     attach_synthetic_sizing(plan, pilot_base_elapsed_ns)
     plan_sha256 = cache_key(plan)
     measurement_plan_sha256 = bench.measurement_plan_sha256(plan)
+    cpu_placement = test_cpu_placement(tuple(plan["thread_counts"]))
     host_fields = {
         "system": "Linux",
         "machine": machine,
@@ -349,7 +368,24 @@ def make_report(
                 "workload": workload,
                 "threads": threads,
                 "iterations": iterations,
-                "command": ["wamr"],
+                "command": [
+                    "taskset",
+                    "--cpu-list",
+                    ",".join(
+                        str(cpu)
+                        for cpu in bench.cpu_affinity_for(
+                            cpu_placement,
+                            workload,
+                            threads,
+                        )
+                    ),
+                    "wamr",
+                ],
+                "cpu_affinity": bench.cpu_affinity_for(
+                    cpu_placement,
+                    workload,
+                    threads,
+                ),
                 "elapsed_ns": elapsed,
                 "guest_elapsed_ns": elapsed,
                 "raw_guest_elapsed_ns": elapsed + 1,
@@ -407,6 +443,22 @@ def make_report(
                 bench.MEASUREMENT_PLAN_IDENTITY_VERSION
             ),
             "measurement_plan_sha256": measurement_plan_sha256,
+            "cpu_placement": cpu_placement,
+            "revision_artifacts": {
+                "policy": bench.REVISION_ARTIFACT_POLICY,
+                "strategy": (
+                    "shared-exact-build"
+                    if comparison_purpose == "noise-calibration"
+                    else "independent-builds"
+                    if revision_mode == "paired-revisions"
+                    else "single-revision-build"
+                ),
+                "source_role": (
+                    "baseline"
+                    if comparison_purpose == "noise-calibration"
+                    else None
+                ),
+            },
             "checksum_preparation": {
                 "algorithm": "64-residue-xor-jump-ahead",
                 "complexity": "O(64 * threads), independent of iteration count",
@@ -436,9 +488,10 @@ def make_report(
                 "host_fingerprint_sha256": host_fingerprint,
             },
             "execution": {},
-            "tools": {},
+            "tools": {role: {} for role in revision_roles},
             "fixture_toolchain": {},
             "fixtures": {},
+            "aot_artifacts": {role: {} for role in revision_roles},
         },
         "plan": plan,
         "records": records,
@@ -2713,6 +2766,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
             timed = 1_250_000_000
             raw = timed + overhead
             return {
+                "cpu_affinity": bench.cpu_affinity_for(
+                    kwargs["cpu_placement"],
+                    kwargs["workload"],
+                    kwargs["threads"],
+                ),
                 "timing_overhead_ns": overhead,
                 "guest_elapsed_ns": timed,
                 "raw_guest_elapsed_ns": raw,
@@ -2725,6 +2783,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             result = bench.run_trusted_barrier_preflight(
                 repo=ROOT,
                 runner=[],
+                cpu_placement=test_cpu_placement((2, 8)),
                 build=build,
                 module=Path("fixture"),
                 thread_counts=(2, 8),
@@ -3032,9 +3091,20 @@ class ThreadBenchmarkTests(unittest.TestCase):
 
         def fake_measure(**kwargs):
             fields = kwargs["record_fields"]
+            cpu_affinity = bench.cpu_affinity_for(
+                kwargs["cpu_placement"],
+                kwargs["workload"],
+                kwargs["threads"],
+            )
             return {
                 **fields,
-                "command": ["wamr"],
+                "command": [
+                    "taskset",
+                    "--cpu-list",
+                    ",".join(str(cpu) for cpu in cpu_affinity),
+                    "wamr",
+                ],
+                "cpu_affinity": cpu_affinity,
                 "elapsed_ns": 1_300_000_000,
                 "guest_elapsed_ns": 1_300_000_000,
                 "raw_guest_elapsed_ns": 1_300_000_001,
@@ -3199,6 +3269,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             first = bench.measure_once(
                 repo=ROOT,
                 runner=[],
+                cpu_placement=test_cpu_placement((1,)),
                 build=build,
                 module=Path("fixture"),
                 workload="atomic",
@@ -3216,6 +3287,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             delayed = bench.measure_once(
                 repo=ROOT,
                 runner=[],
+                cpu_placement=test_cpu_placement((1,)),
                 build=build,
                 module=Path("fixture"),
                 workload="atomic",
@@ -3244,6 +3316,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             slower = bench.measure_once(
                 repo=ROOT,
                 runner=[],
+                cpu_placement=test_cpu_placement((1,)),
                 build=build,
                 module=Path("fixture"),
                 workload="atomic",
@@ -3527,6 +3600,75 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "2",
                 ]
             )
+
+    def test_cpu_placement_prefers_distinct_nonboot_cores(self) -> None:
+        placement = bench.cpu_placement_from_topology(
+            [0, 1, 2, 3, 4, 5],
+            {
+                0: (0, 0),
+                1: (0, 0),
+                2: (0, 1),
+                3: (0, 1),
+                4: (0, 2),
+                5: (0, 2),
+            },
+            (1, 4),
+            "taskset test version",
+        )
+        self.assertEqual(
+            placement["ordered_logical_cpus"],
+            [4, 2, 0, 5, 3, 1],
+        )
+        self.assertEqual(placement["assignments"]["single-hot"], [4])
+        self.assertEqual(placement["assignments"]["threaded"]["1"], [4, 2])
+        self.assertEqual(
+            placement["assignments"]["threaded"]["4"],
+            [4, 2, 0, 5, 3],
+        )
+        bench.validate_cpu_placement(placement, (1, 4))
+
+        corrupt = copy.deepcopy(placement)
+        corrupt["assignments"]["threaded"]["1"] = [4, 0]
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "cpu_placement assignments"
+        ):
+            bench.validate_cpu_placement(corrupt, (1, 4))
+
+    def test_report_rejects_cpu_and_exact_artifact_mutations(self) -> None:
+        report = make_report(
+            commit="a" * 40,
+            baseline_commit="a" * 40,
+            baseline_source="c" * 64,
+            candidate_source="c" * 64,
+            comparison_purpose="noise-calibration",
+        )
+        corrupt = copy.deepcopy(report)
+        corrupt["records"][0]["cpu_affinity"] = [0]
+        with self.assertRaisesRegex(BenchmarkDataError, "record CPU affinity"):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        corrupt["records"][0]["command"][2] = "0"
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "record CPU affinity command"
+        ):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        corrupt["metadata"]["tools"]["candidate"] = {"different": True}
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "exact artifact reuse"
+        ):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        corrupt["metadata"]["revision_artifacts"]["strategy"] = (
+            "independent-builds"
+        )
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "revision_artifacts strategy"
+        ):
+            bench.validate_report(corrupt)
 
     def test_ratio_of_ratios_direction_and_budget_limits(self) -> None:
         report = make_report()
@@ -4983,6 +5125,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "workload": "hot",
                     "threads": 1,
                     "iterations": plan["iterations"]["aot"]["hot"]["1"],
+                    "cpu_affinity": bench.cpu_affinity_for(
+                        report["metadata"]["cpu_placement"],
+                        "hot",
+                        1,
+                    ),
                     "timing_overhead_ns": overhead,
                     "timed_interval_ns": timed,
                     "raw_elapsed_ns": raw,
@@ -5055,6 +5202,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "measurement_plan_sha256",
             schema["properties"]["metadata"]["required"],
         )
+        self.assertIn(
+            "cpu_placement",
+            schema["properties"]["metadata"]["required"],
+        )
+        self.assertIn(
+            "revision_artifacts",
+            schema["properties"]["metadata"]["required"],
+        )
         self.assertEqual(
             schema["properties"]["metadata"]["properties"][
                 "measurement_plan_version"
@@ -5062,6 +5217,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
             bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
         )
         plan_properties = schema["properties"]["plan"]["properties"]
+        self.assertEqual(
+            plan_properties["cpu_placement"]["$ref"],
+            "#/$defs/cpu_placement_policy",
+        )
+        self.assertEqual(
+            plan_properties["revision_artifact_policy"]["const"],
+            bench.REVISION_ARTIFACT_POLICY,
+        )
         self.assertEqual(
             plan_properties["atomic_wait_preflight_iterations"]["const"],
             bench.ATOMIC_WAIT_PREFLIGHT_ITERATIONS,
