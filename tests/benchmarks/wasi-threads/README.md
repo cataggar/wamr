@@ -566,7 +566,9 @@ calibration additionally requires every x86 report to identify runner
 GitHub-hosted x86 and AArch64 reports may have heterogeneous hosts across runs;
 validation retains every observation and summarizes their fingerprint, CPU,
 and runner-image distributions instead of rejecting normal hosted-runner
-variation. The output
+variation. A trusted self-hosted x86 report has no GitHub runner-image
+identifier, so its image distribution is empty while its exact runner name and
+single host fingerprint remain mandatory through derivation. The output
 lists every retained observation with its exact workflow run ID and predeclared
 training/holdout partition, and records an empty exclusion list. The old
 single-revision validation path remains non-authoritative compatibility only

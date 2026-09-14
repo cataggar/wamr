@@ -3871,6 +3871,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                         Path(f"x86-{run_id}"),
                         make_report(
                             runner_environment="self-hosted",
+                            runner_image="",
                             runner_name="vm31e-wamr-temp-20260906",
                             **common,
                         ),
@@ -3898,6 +3899,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             result["identity"]["comparison_purpose"], "noise-calibration"
+        )
+        self.assertEqual(
+            result["platforms"]["ubuntu-22.04-x86_64"][
+                "runner_image_distribution"
+            ],
+            {},
         )
         self.assertEqual(
             result["platforms"]["ubuntu-22.04-x86_64"][
