@@ -330,16 +330,28 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 9 of a purpose-independent portable
+`measurement_plan_sha256` is version 10 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
 safety factor, declarative cell base overrides and envelopes, rounding, caps,
 timeouts, modes, thread counts, pairs, profile, samples, warmups, optimization,
-and quality policy. `plan_sha256` hashes the complete report-specific plan,
-including every pilot and selected count. `validate_report` recomputes both and
-independently
-replays sizing.
+quality policy, fixed CPU-placement policy, and revision-artifact policy.
+`plan_sha256` hashes the complete report-specific plan, including every pilot
+and selected count. `validate_report` recomputes both and independently replays
+sizing.
+
+Every guest process is launched through `taskset`. Linux sysfs topology is
+resolved fail-closed from the process's allowed CPU set. Physical cores are
+ordered from the highest package/core identity down, one lowest-numbered
+logical CPU per core is selected before any SMT siblings, and CPU 0 is
+therefore avoided whenever another physical core is available. `single-hot`
+uses one logical CPU. Threaded workloads use
+`min(available logical CPUs, workers + one controller)` so a one-worker
+wait/notify pair receives two distinct physical cores when the host exposes
+them. The report retains the complete topology, deterministic assignments,
+`taskset` version, per-record affinity, and command prefix; validation rejects
+missing, reordered, or mutated placement evidence.
 
 The report exposes four metric layers:
 
@@ -362,9 +374,9 @@ name, workflow run ID, attempt, and workflow name. `host_pair.id` identifies
 the particular matched baseline/candidate run without becoming a performance
 class.
 
-Paired checkouts must resolve to different paths so both roles are independently
-built. `candidate-evaluation` is the only purpose eligible for budget
-enforcement. A same-revision A/A run is allowed only as explicit
+Paired checkouts must resolve to different paths. `candidate-evaluation` builds
+both distinct source revisions independently and is the only purpose eligible
+for budget enforcement. A same-revision A/A run is allowed only as explicit
 `noise-calibration`, from two distinct checkout paths:
 
 ```sh
@@ -377,7 +389,13 @@ python3 scripts/bench_wasi_threads.py \
 ```
 
 Both noise-calibration checkouts must have identical commit, tracked-diff, and
-build-source identities. Noise reports are always non-enforcing. Conversely,
+build-source identities. The harness then builds the baseline once and reuses
+those exact runtime/compiler/AOT artifacts for the candidate role. This makes
+calibration an artifact-identical A/A scheduling measurement rather than a
+comparison of independently emitted same-source executables. The report pins
+the conditional artifact policy and strategy and requires byte-identical tool
+and AOT metadata across both noise roles. Noise reports are always
+non-enforcing. Conversely,
 budget loading accepts only candidate-evaluation reports and rejects identical
 baseline/candidate commits or build-source identities. An accidentally reused
 checkout can therefore never produce a passing gate.
