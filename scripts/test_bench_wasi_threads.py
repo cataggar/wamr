@@ -3129,6 +3129,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
             }
 
         with (
+            mock.patch.object(
+                bench,
+                "discover_cpu_placement",
+                return_value=test_cpu_placement((1,)),
+            ),
             mock.patch.object(bench, "build_variant", side_effect=fake_build),
             mock.patch.object(bench, "measure_once", side_effect=fake_measure),
             mock.patch.object(bench, "build_tool_report", return_value={}),
