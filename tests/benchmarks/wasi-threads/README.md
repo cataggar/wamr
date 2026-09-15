@@ -334,7 +334,7 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 11 of a purpose-independent portable
+`measurement_plan_sha256` is version 12 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -373,6 +373,11 @@ fixture measures the WASI process-CPU clock so descheduling does not compress a
 real runtime cost toward zero. The report retains monotonic host intervals and
 validation requires both processes to overlap on the declared CPU pair with
 commands that differ only by affinity and the manager toggle.
+All other paired measurements use condition-major ordering: baseline and
+candidate executions of the same condition are adjacent, and the complete
+four-execution order reverses on alternating samples. This minimizes host drift
+in the absolute revision comparison while preserving balanced revision and
+condition positions.
 Threaded workloads use
 `min(available logical CPUs, workers + one controller)` so a one-worker
 wait/notify pair receives two distinct physical cores when the host exposes

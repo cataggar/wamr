@@ -3040,8 +3040,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             observed[:4],
             [
                 (0, "baseline", 0, "z-baseline", 0),
-                (0, "baseline", 0, "a-target", 1),
                 (0, "candidate", 1, "z-baseline", 0),
+                (0, "baseline", 0, "a-target", 1),
                 (0, "candidate", 1, "a-target", 1),
             ],
         )
@@ -3049,8 +3049,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             observed[4:],
             [
                 (1, "candidate", 0, "a-target", 0),
-                (1, "candidate", 0, "z-baseline", 1),
                 (1, "baseline", 1, "a-target", 0),
+                (1, "candidate", 0, "z-baseline", 1),
                 (1, "baseline", 1, "z-baseline", 1),
             ],
         )
