@@ -2420,6 +2420,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 samples=plan["samples"],
                 timeout_seconds=plan["timeout_seconds"],
             )
+
         pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
         pilots[0]["host_wall_elapsed_ns"] = (
             bench.MAXIMUM_PILOT_HOST_WALL_NS + 1
@@ -2465,6 +2466,30 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 warmups=100,
                 samples=100,
             )
+
+    def test_process_cpu_pilot_may_exceed_host_wall(self) -> None:
+        report = make_report()
+        plan = report["plan"]
+        pilot_order = plan["sizing"]["pilot_order"]
+        pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        hot_index = next(
+            index
+            for index, spec in enumerate(pilot_order)
+            if spec["workload"] == "hot" and spec["threads"] == 1
+        )
+        hot = pilots[hot_index]
+        hot["host_wall_elapsed_ns"] = hot["guest_elapsed_ns"] // 2
+        bench.validate_sizing_pilot(hot, pilot_order[hot_index])
+
+        wait_index = next(
+            index
+            for index, spec in enumerate(pilot_order)
+            if spec["workload"] == "wait-notify" and spec["threads"] == 1
+        )
+        wait = pilots[wait_index]
+        wait["host_wall_elapsed_ns"] = wait["guest_elapsed_ns"] // 2
+        with self.assertRaisesRegex(bench.HarnessError, "exceeds 33 seconds"):
+            bench.validate_sizing_pilot(wait, pilot_order[wait_index])
 
     def test_authoritative_post_pilot_budget_charges_actual_wall_time(self) -> None:
         pilots, order, thread_counts = authoritative_sizing_inputs(
