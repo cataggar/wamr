@@ -1,5 +1,5 @@
 {
-  "schema_version": 10,
+  "schema_version": 11,
   "kind": "wasi-thread-benchmark-budget",
   "calibrated": false,
   "enforcement": false,
