@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 5 },
+    "schema_version": { "const": 6 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -69,7 +69,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 10 },
+        "measurement_plan_version": { "const": 11 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "cpu_placement": { "$ref": "#/$defs/cpu_placement" },
         "revision_artifacts": {
@@ -224,6 +224,7 @@
         "atomic_wait_preflight_timing_quality",
         "scheduler_barrier_preflight",
         "cpu_placement",
+        "pair_execution",
         "revision_artifact_policy",
         "pairs",
         "optimize"
@@ -289,6 +290,7 @@
           "$ref": "#/$defs/scheduler_barrier_preflight_plan"
         },
         "cpu_placement": { "$ref": "#/$defs/cpu_placement_policy" },
+        "pair_execution": { "$ref": "#/$defs/pair_execution_policy" },
         "revision_artifact_policy": {
           "const": "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
         },
@@ -806,13 +808,25 @@
     },
     "cpu_placement_policy": {
       "const": {
-        "version": 1,
+        "version": 2,
         "kind": "fixed-linux-physical-core-affinity",
         "physical_core_order": "descending-package-core",
         "logical_cpu_order": "one-lowest-logical-cpu-per-core-before-siblings",
         "single_hot_logical_cpus": 1,
+        "single_hot_pair_logical_cpus": 2,
+        "single_hot_pair_preference": "smt-siblings-then-separate-physical-cores",
         "threaded_logical_cpus": "min(available,workers+controller)",
         "failure_policy": "fail-closed"
+      }
+    },
+    "pair_execution_policy": {
+      "const": {
+        "default": "sequential-alternating",
+        "single_infrastructure": "concurrent-topology-paired-cpus",
+        "single_infrastructure_artifact": "same-enabled-runtime-binary",
+        "single_infrastructure_condition": "benchmark-runtime-thread-manager-enabled-or-disabled",
+        "single_infrastructure_assignment": "condition-order-maps-to-cpu-order-and-swaps-each-sample",
+        "overlap_requirement": "both-guest-process-host-intervals-overlap"
       }
     },
     "cpu_placement": {
@@ -867,13 +881,30 @@
         "assignments": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["single-hot", "threaded"],
+          "required": ["single-hot", "single-hot-pair", "threaded"],
           "properties": {
             "single-hot": {
               "type": "array",
               "minItems": 1,
               "maxItems": 1,
               "items": { "type": "integer", "minimum": 0 }
+            },
+            "single-hot-pair": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "logical_cpus"],
+              "properties": {
+                "kind": {
+                  "enum": ["smt-siblings", "separate-physical-cores"]
+                },
+                "logical_cpus": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "uniqueItems": true,
+                  "items": { "type": "integer", "minimum": 0 }
+                }
+              }
             },
             "threaded": {
               "type": "object",
@@ -1129,12 +1160,16 @@
         "pair_right",
         "mode",
         "threads_enabled",
+        "thread_manager_enabled",
         "cancel_points",
         "workload",
         "threads",
         "iterations",
         "command",
         "cpu_affinity",
+        "pair_execution",
+        "host_started_ns",
+        "host_finished_ns",
         "elapsed_ns",
         "guest_elapsed_ns",
         "raw_guest_elapsed_ns",
@@ -1164,6 +1199,16 @@
         "host_pair_id": { "type": "string", "minLength": 1 },
         "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
         "cpu_affinity": { "$ref": "#/$defs/cpu_affinity" },
+        "pair_execution": {
+          "enum": [
+            "sequential-alternating",
+            "concurrent-topology-paired-cpus"
+          ]
+        },
+        "host_started_ns": { "type": "integer", "minimum": 0 },
+        "host_finished_ns": { "type": "integer", "minimum": 1 },
+        "threads_enabled": { "const": true },
+        "thread_manager_enabled": { "type": "boolean" },
         "pair_kind": { "type": "string", "minLength": 1 },
         "pair_key": { "type": "string", "minLength": 1 },
         "pair_index": { "type": "integer", "minimum": 0 },

@@ -31,9 +31,14 @@ COMMON=(
 )
 
 "$SDK/bin/clang" \
-  --target=wasm32-wasi \
+  --target=wasm32-wasi-threads \
   "--sysroot=$SDK/share/wasi-sysroot" \
   "${COMMON[@]}" \
+  -pthread \
+  -matomics \
+  -mbulk-memory \
+  -mmutable-globals \
+  -Wl,--max-memory=536870912 \
   "$DIR/single.c" \
   -o "$DIR/single.wasm"
 

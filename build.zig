@@ -112,6 +112,16 @@ pub fn build(b: *std.Build) void {
         "Allow the benchmark-only wamrc flag that suppresses AOT cancel points",
     ) orelse false;
     options.addOption(bool, "benchmark_cancel_point_toggle", benchmark_cancel_point_toggle);
+    const benchmark_wasi_thread_manager_toggle = b.option(
+        bool,
+        "benchmark-wasi-thread-manager-toggle",
+        "Allow the benchmark-only runtime flag that disables the WASI thread manager",
+    ) orelse false;
+    options.addOption(
+        bool,
+        "benchmark_wasi_thread_manager_toggle",
+        benchmark_wasi_thread_manager_toggle,
+    );
 
     const thread_mgr = (b.option(bool, "thread_mgr", "Enable thread manager") orelse false) or lib_wasi_threads;
     options.addOption(bool, "thread_mgr", thread_mgr);
@@ -333,6 +343,7 @@ pub fn build(b: *std.Build) void {
             "host functions resolved for wasi thread-spawn import",
             "enabled wasi thread-spawn validates import ABI and shared memory",
             "disabled feature preserves the negative rejection result",
+            "clockTimeGetCore: CPU clocks succeed on Linux",
         },
     });
     const run_threads_runtime_tests = b.addRunArtifact(threads_runtime_tests);

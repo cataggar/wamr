@@ -4,6 +4,9 @@
 #include <errno.h>
 #include <stdlib.h>
 
+__attribute__((import_module("wasi"), import_name("thread-spawn")))
+extern int wasi_thread_spawn(int start_arg);
+
 static int parse_u64(const char *text, uint64_t *out) {
     char *end = NULL;
     errno = 0;
@@ -14,6 +17,8 @@ static int parse_u64(const char *text, uint64_t *out) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 0) return wasi_thread_spawn(0);
+
     uint64_t iterations = 0;
     if (argc != 2 || parse_u64(argv[1], &iterations) != 0) {
         return 2;
@@ -27,12 +32,12 @@ int main(int argc, char **argv) {
     uint64_t start = 0;
     uint64_t end = 0;
     struct bench_timing timing;
-    if (bench_clock_overhead(&overhead) != 0 ||
-        bench_now_ns(&start) != 0) {
+    if (bench_process_cpu_clock_overhead(&overhead) != 0 ||
+        bench_process_cpu_now_ns(&start) != 0) {
         return 1;
     }
     uint64_t checksum = bench_hot_kernel(bench_seed(0), iterations);
-    if (bench_now_ns(&end) != 0 ||
+    if (bench_process_cpu_now_ns(&end) != 0 ||
         bench_finish_timing(start, end, overhead, &timing) != 0) {
         return 1;
     }
@@ -42,6 +47,7 @@ int main(int argc, char **argv) {
         iterations,
         iterations,
         checksum,
+        "wasi-process-cputime",
         "steady-state-kernel",
         iterations,
         &timing);

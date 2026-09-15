@@ -227,6 +227,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // no override (adapter keeps its built-in default of `.trace`,
     // which admits every level).
     var log_level: ?wamr.wasi_cli_adapter.WasiLogLevel = null;
+    var benchmark_wasi_thread_manager_enabled = true;
     var past_options = false;
 
     var i: usize = 0;
@@ -366,6 +367,27 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 precompiled_manifest = spec;
             } else if (std.mem.eql(u8, arg, "--trace-aot-wasi")) {
                 wamr.aot_host_bridge.trace_enabled = true;
+            } else if (std.mem.startsWith(u8, arg, "--benchmark-wasi-thread-manager=")) {
+                if (comptime !wamr.config.benchmark_wasi_thread_manager_toggle) {
+                    std.debug.print(
+                        "error: --benchmark-wasi-thread-manager requires a benchmark-enabled build\n",
+                        .{},
+                    );
+                    return 2;
+                }
+                const value = arg["--benchmark-wasi-thread-manager=".len..];
+                benchmark_wasi_thread_manager_enabled =
+                    if (std.mem.eql(u8, value, "enabled"))
+                        true
+                    else if (std.mem.eql(u8, value, "disabled"))
+                        false
+                    else {
+                        std.debug.print(
+                            "error: --benchmark-wasi-thread-manager must be enabled or disabled\n",
+                            .{},
+                        );
+                        return 2;
+                    };
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
@@ -406,6 +428,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             env_flags.items,
             init.environ_map,
             map_dirs.items,
+            benchmark_wasi_thread_manager_enabled,
         );
     }
 
@@ -486,6 +509,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             init.environ_map,
             map_dirs.items,
             stack_size,
+            benchmark_wasi_thread_manager_enabled,
         );
     }
 
@@ -516,6 +540,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             env_flags.items,
             init.environ_map,
             map_dirs.items,
+            benchmark_wasi_thread_manager_enabled,
         );
     }
 
@@ -1435,6 +1460,7 @@ fn runInterpreterCore(
     environ_map: *const std.process.Environ.Map,
     map_dirs: []const MapDir,
     stack_size: u32,
+    benchmark_wasi_thread_manager_enabled: bool,
 ) u8 {
     var module_arena = std.heap.ArenaAllocator.init(allocator);
     defer module_arena.deinit();
@@ -1519,7 +1545,9 @@ fn runInterpreterCore(
 
     var manager = wamr.thread_manager.ThreadManager.init(allocator);
     defer manager.deinit();
-    const manager_enabled = wamr.config.lib_wasi_threads and uses_wasi_threads;
+    const manager_enabled = wamr.config.lib_wasi_threads and
+        uses_wasi_threads and
+        benchmark_wasi_thread_manager_enabled;
     if (manager_enabled) {
         manager.prepareInterpreterInstance(module_inst) catch |err| {
             std.debug.print(
@@ -1632,9 +1660,19 @@ fn runAot(
     env_flags: []const []const u8,
     environ_map: *const std.process.Environ.Map,
     map_dirs: []const MapDir,
+    benchmark_wasi_thread_manager_enabled: bool,
 ) u8 {
     if (comptime aot_supported) {
-        return runAotReal(io, allocator, data, wasm_args, env_flags, environ_map, map_dirs);
+        return runAotReal(
+            io,
+            allocator,
+            data,
+            wasm_args,
+            env_flags,
+            environ_map,
+            map_dirs,
+            benchmark_wasi_thread_manager_enabled,
+        );
     } else {
         std.debug.print("Error: AOT execution not supported on this architecture\n", .{});
         return 1;
@@ -1675,6 +1713,7 @@ fn runAotReal(
     env_flags: []const []const u8,
     environ_map: *const std.process.Environ.Map,
     map_dirs: []const MapDir,
+    benchmark_wasi_thread_manager_enabled: bool,
 ) u8 {
     const aot_loader = wamr.aot_loader;
     const aot_runtime = wamr.aot_runtime;
@@ -1751,7 +1790,9 @@ fn runAotReal(
     var manager = wamr.thread_manager.ThreadManager.init(allocator);
     defer manager.deinit();
     const manager_enabled =
-        wamr.config.lib_wasi_threads and aot_runtime.usesWasiThreads(&aot_module);
+        wamr.config.lib_wasi_threads and
+        aot_runtime.usesWasiThreads(&aot_module) and
+        benchmark_wasi_thread_manager_enabled;
     if (manager_enabled) {
         aot_runtime.prepareWasiThreads(aot_inst, &manager) catch |err| {
             std.debug.print(

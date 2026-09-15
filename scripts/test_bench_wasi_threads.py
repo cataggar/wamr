@@ -9,6 +9,8 @@ import random
 import shutil
 import struct
 import sys
+import threading
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -262,6 +264,7 @@ def make_report(
             ),
         },
         "cpu_placement": copy.deepcopy(bench.CPU_PLACEMENT_POLICY),
+        "pair_execution": copy.deepcopy(bench.PAIR_EXECUTION_POLICY),
         "revision_artifact_policy": bench.REVISION_ARTIFACT_POLICY,
         "optimize": "ReleaseFast",
         "pairs": [],
@@ -360,10 +363,41 @@ def make_report(
                 iterations = plan["iterations"][mode][workload][
                     str(threads)
                 ]
+            global_index = (
+                fields["pair_index"]
+                if fields["phase"] == "warmup"
+                else plan["warmups"] + fields["pair_index"]
+            )
+            pair_execution = (
+                bench.PAIR_EXECUTION_POLICY["single_infrastructure"]
+                if pair["pair_kind"] == "single-infrastructure"
+                else bench.PAIR_EXECUTION_POLICY["default"]
+            )
+            manager_enabled = (
+                condition == "threads-enabled"
+                if pair["pair_kind"] == "single-infrastructure"
+                else True
+            )
+            cpu_affinity = (
+                bench.direct_pair_cpu_affinity(
+                    cpu_placement,
+                    global_index,
+                    condition,
+                    pair["left"],
+                    pair["right"],
+                )
+                if pair["pair_kind"] == "single-infrastructure"
+                else bench.cpu_affinity_for(
+                    cpu_placement,
+                    workload,
+                    threads,
+                )
+            )
             return {
                 **fields,
                 "mode": mode,
                 "threads_enabled": True,
+                "thread_manager_enabled": manager_enabled,
                 "cancel_points": "on",
                 "workload": workload,
                 "threads": threads,
@@ -371,21 +405,26 @@ def make_report(
                 "command": [
                     "taskset",
                     "--cpu-list",
-                    ",".join(
-                        str(cpu)
-                        for cpu in bench.cpu_affinity_for(
-                            cpu_placement,
-                            workload,
-                            threads,
-                        )
-                    ),
+                    ",".join(str(cpu) for cpu in cpu_affinity),
                     "wamr",
+                    "run",
+                    *(
+                        [
+                            "--benchmark-wasi-thread-manager="
+                            + (
+                                "enabled"
+                                if manager_enabled
+                                else "disabled"
+                            )
+                        ]
+                        if pair["pair_kind"] == "single-infrastructure"
+                        else []
+                    ),
                 ],
-                "cpu_affinity": bench.cpu_affinity_for(
-                    cpu_placement,
-                    workload,
-                    threads,
-                ),
+                "cpu_affinity": cpu_affinity,
+                "pair_execution": pair_execution,
+                "host_started_ns": 100,
+                "host_finished_ns": elapsed + 200,
                 "elapsed_ns": elapsed,
                 "guest_elapsed_ns": elapsed,
                 "raw_guest_elapsed_ns": elapsed + 1,
@@ -399,7 +438,14 @@ def make_report(
                 "operations": operations,
                 "throughput_ops_per_second": throughput,
                 "per_thread_ops_per_second": throughput,
-                "guest": {"metric_kind": metric_kind},
+                "guest": {
+                    "metric_kind": metric_kind,
+                    "clock_id": (
+                        "wasi-process-cpu"
+                        if pair["pair_kind"] == "single-infrastructure"
+                        else "wasi-monotonic"
+                    ),
+                },
                 "correct": True,
                 "correctness": {"passed": True},
                 "stdout": "{}",
@@ -721,6 +767,8 @@ def flatten_report_ratios(report: dict) -> dict:
         record["elapsed_ns"] = elapsed
         record["guest_elapsed_ns"] = elapsed
         record["raw_guest_elapsed_ns"] = elapsed + 1
+        record["host_started_ns"] = 100
+        record["host_finished_ns"] = elapsed + 200
         record["host_wall_elapsed_ns"] = elapsed + 100
         record["host_wall_over_guest"] = 2.0
         throughput = record["operations"] / (elapsed / 1e9)
@@ -2725,6 +2773,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
         }
         for key, checksum in retained.items():
             self.assertEqual(bench.expected_result(*key)["checksum"], checksum)
+        self.assertEqual(
+            bench.expected_result("single-hot", 1, 10)["clock_id"],
+            "wasi-process-cputime",
+        )
+        self.assertEqual(
+            bench.expected_result("hot", 1, 10)["clock_id"],
+            "wasi-monotonic",
+        )
 
     def test_production_checksum_preparation_is_bounded(self) -> None:
         bench.expected_result.cache_clear()
@@ -3091,10 +3147,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
 
         def fake_measure(**kwargs):
             fields = kwargs["record_fields"]
-            cpu_affinity = bench.cpu_affinity_for(
-                kwargs["cpu_placement"],
-                kwargs["workload"],
-                kwargs["threads"],
+            cpu_affinity = kwargs.get(
+                "cpu_affinity_override",
+                bench.cpu_affinity_for(
+                    kwargs["cpu_placement"],
+                    kwargs["workload"],
+                    kwargs["threads"],
+                ),
             )
             return {
                 **fields,
@@ -3103,8 +3162,12 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "--cpu-list",
                     ",".join(str(cpu) for cpu in cpu_affinity),
                     "wamr",
+                    "run",
+                    *kwargs.get("runtime_args", ()),
                 ],
                 "cpu_affinity": cpu_affinity,
+                "host_started_ns": 100,
+                "host_finished_ns": 1_300_000_200,
                 "elapsed_ns": 1_300_000_000,
                 "guest_elapsed_ns": 1_300_000_000,
                 "raw_guest_elapsed_ns": 1_300_000_001,
@@ -3121,7 +3184,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "operations": 1,
                 "throughput_ops_per_second": 1 / 1.3,
                 "per_thread_ops_per_second": 1 / 1.3,
-                "guest": {},
+                "guest": {
+                    "clock_id": (
+                        "wasi-process-cpu"
+                        if kwargs["workload"] == "single-hot"
+                        else "wasi-monotonic"
+                    ),
+                },
                 "correct": True,
                 "correctness": {"passed": True},
                 "stdout": "{}",
@@ -3625,12 +3694,36 @@ class ThreadBenchmarkTests(unittest.TestCase):
             [4, 2, 0, 5, 3, 1],
         )
         self.assertEqual(placement["assignments"]["single-hot"], [4])
+        self.assertEqual(
+            placement["assignments"]["single-hot-pair"],
+            {"kind": "smt-siblings", "logical_cpus": [4, 5]},
+        )
         self.assertEqual(placement["assignments"]["threaded"]["1"], [4, 2])
         self.assertEqual(
             placement["assignments"]["threaded"]["4"],
             [4, 2, 0, 5, 3],
         )
         bench.validate_cpu_placement(placement, (1, 4))
+        self.assertEqual(
+            bench.direct_pair_cpu_affinity(
+                placement, 0, "threads-disabled"
+            ),
+            [4],
+        )
+        self.assertEqual(
+            bench.direct_pair_cpu_affinity(
+                placement, 1, "threads-disabled"
+            ),
+            [5],
+        )
+        no_smt = test_cpu_placement((1,))
+        self.assertEqual(
+            no_smt["assignments"]["single-hot-pair"],
+            {
+                "kind": "separate-physical-cores",
+                "logical_cpus": [3, 2],
+            },
+        )
 
         corrupt = copy.deepcopy(placement)
         corrupt["assignments"]["threaded"]["1"] = [4, 0]
@@ -3659,6 +3752,100 @@ class ThreadBenchmarkTests(unittest.TestCase):
         ):
             bench.validate_report(corrupt)
 
+        direct = next(
+            record
+            for record in report["records"]
+            if record["pair_kind"] == "single-infrastructure"
+        )
+        corrupt = copy.deepcopy(report)
+        changed = next(
+            record
+            for record in corrupt["records"]
+            if record["pair_kind"] == "single-infrastructure"
+            and record["condition"] == direct["condition"]
+            and record["revision"] == direct["revision"]
+            and record["pair_index"] == direct["pair_index"]
+        )
+        changed["pair_execution"] = bench.PAIR_EXECUTION_POLICY["default"]
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "record pair execution"
+        ):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        changed = next(
+            record
+            for record in corrupt["records"]
+            if record["pair_kind"] == "single-infrastructure"
+            and record["condition"] == "threads-enabled"
+        )
+        changed["command"][
+            changed["command"].index(
+                "--benchmark-wasi-thread-manager=enabled"
+            )
+        ] = "--benchmark-wasi-thread-manager=disabled"
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "thread-manager command"
+        ):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        changed = next(
+            record
+            for record in corrupt["records"]
+            if record["pair_kind"] == "single-infrastructure"
+            and record["condition"] == "threads-enabled"
+        )
+        changed["thread_manager_enabled"] = False
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "thread-manager state"
+        ):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        changed = next(
+            record
+            for record in corrupt["records"]
+            if record["pair_kind"] == "single-infrastructure"
+        )
+        changed["guest"]["clock_id"] = "wasi-monotonic"
+        with self.assertRaisesRegex(BenchmarkDataError, "record guest clock"):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        direct_pair = [
+            record
+            for record in corrupt["records"]
+            if record["pair_kind"] == "single-infrastructure"
+            and record["revision"] == "baseline"
+            and record["pair_index"] == 0
+        ]
+        direct_pair[1]["host_started_ns"] = direct_pair[0][
+            "host_finished_ns"
+        ]
+        direct_pair[1]["host_finished_ns"] = (
+            direct_pair[1]["host_started_ns"]
+            + direct_pair[1]["host_wall_elapsed_ns"]
+        )
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "host intervals do not overlap"
+        ):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        direct_pair = [
+            record
+            for record in corrupt["records"]
+            if record["pair_kind"] == "single-infrastructure"
+            and record["revision"] == "baseline"
+            and record["pair_index"] == 0
+        ]
+        direct_pair[1]["command"][3] = "different-wamr"
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "one runtime artifact"
+        ):
+            bench.validate_report(corrupt)
+
         corrupt = copy.deepcopy(report)
         corrupt["metadata"]["tools"]["candidate"] = {"different": True}
         with self.assertRaisesRegex(
@@ -3674,6 +3861,26 @@ class ThreadBenchmarkTests(unittest.TestCase):
             BenchmarkDataError, "revision_artifacts strategy"
         ):
             bench.validate_report(corrupt)
+
+    def test_concurrent_measurement_requires_overlapping_intervals(self) -> None:
+        barrier = threading.Barrier(2)
+
+        def fake_measure(*, index):
+            started = time.perf_counter_ns()
+            barrier.wait()
+            time.sleep(0.01)
+            finished = time.perf_counter_ns()
+            return {
+                "index": index,
+                "host_started_ns": started,
+                "host_finished_ns": finished,
+            }
+
+        records = bench.measure_concurrently(
+            fake_measure,
+            [{"index": 0}, {"index": 1}],
+        )
+        self.assertEqual([record["index"] for record in records], [0, 1])
 
     def test_ratio_of_ratios_direction_and_budget_limits(self) -> None:
         report = make_report()

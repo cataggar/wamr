@@ -135,6 +135,21 @@ pub fn fdPrestatDirNameCore() i32 {
 pub fn clockTimeGetCore(mem: []u8, clock_id: i32, time_ptr: u32) i32 {
     const nanos: u64 = switch (clock_id) {
         WASI_CLOCK_REALTIME, WASI_CLOCK_MONOTONIC => platform.timeGetBootUs() * std.time.ns_per_us,
+        WASI_CLOCK_PROCESS_CPUTIME, WASI_CLOCK_THREAD_CPUTIME => if (comptime builtin.os.tag == .linux) blk: {
+            const linux = std.os.linux;
+            var ts: linux.timespec = undefined;
+            const id: linux.clockid_t = @enumFromInt(@as(u32, @intCast(clock_id)));
+            const rc = linux.clock_gettime(id, &ts);
+            if (linux.errno(rc) != .SUCCESS or ts.sec < 0 or ts.nsec < 0) {
+                return WASI_EINVAL;
+            }
+            const seconds: u64 = @intCast(ts.sec);
+            const nanoseconds: u64 = @intCast(ts.nsec);
+            if (seconds > (std.math.maxInt(u64) - nanoseconds) / std.time.ns_per_s) {
+                return WASI_EINVAL;
+            }
+            break :blk seconds * std.time.ns_per_s + nanoseconds;
+        } else return WASI_ENOSYS,
         else => return WASI_EINVAL,
     };
 
@@ -362,6 +377,22 @@ test "clockTimeGetCore: monotonic succeeds" {
     var mem = [_]u8{0} ** 16;
     const result = clockTimeGetCore(&mem, WASI_CLOCK_MONOTONIC, 0);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
+}
+
+test "clockTimeGetCore: CPU clocks succeed on Linux" {
+    var mem = [_]u8{0} ** 16;
+    for ([_]i32{
+        WASI_CLOCK_PROCESS_CPUTIME,
+        WASI_CLOCK_THREAD_CPUTIME,
+    }) |clock_id| {
+        const result = clockTimeGetCore(&mem, clock_id, 0);
+        if (builtin.os.tag == .linux) {
+            try std.testing.expectEqual(WASI_ESUCCESS, result);
+            try std.testing.expect(memReadU64(&mem, 0).? > 0);
+        } else {
+            try std.testing.expectEqual(WASI_ENOSYS, result);
+        }
+    }
 }
 
 test "clockTimeGetCore: invalid clock returns EINVAL" {
