@@ -23,6 +23,8 @@ enum workload {
     WORKLOAD_SPAWN_JOIN,
 };
 
+typedef int (*bench_clock_fn)(uint64_t *);
+
 struct worker_arg {
     uint32_t index;
     uint64_t iterations;
@@ -315,7 +317,9 @@ static void abort_workers(uint32_t threads) {
 }
 
 static int measure_barrier_overhead(
-    uint32_t threads, uint64_t *minimum) {
+    uint32_t threads,
+    bench_clock_fn clock_now,
+    uint64_t *minimum) {
     int wait_result = wait_for_count(&ready_count, threads);
     if (wait_result != WAIT_OK) {
         controller_failure_code = 100 + wait_result;
@@ -326,7 +330,7 @@ static int measure_barrier_overhead(
         store_i32(&completed_count, 0);
         uint64_t start = 0;
         uint64_t end = 0;
-        if (bench_now_ns(&start) != 0) {
+        if (clock_now(&start) != 0) {
             controller_failure_code = 120;
             return -1;
         }
@@ -337,7 +341,7 @@ static int measure_barrier_overhead(
             controller_failure_code = 130 + wait_result;
             return -1;
         }
-        if (bench_now_ns(&end) != 0) {
+        if (clock_now(&end) != 0) {
             controller_failure_code = 150;
             return -1;
         }
@@ -351,9 +355,9 @@ static int measure_barrier_overhead(
     return 0;
 }
 
-static int begin_work(uint64_t *start) {
+static int begin_work(bench_clock_fn clock_now, uint64_t *start) {
     store_i32(&completed_count, 0);
-    if (bench_now_ns(start) != 0) {
+    if (clock_now(start) != 0) {
         controller_failure_code = 200;
         return -1;
     }
@@ -366,6 +370,7 @@ static int finish_work(
     uint32_t threads,
     uint64_t start,
     uint64_t overhead,
+    bench_clock_fn clock_now,
     struct bench_timing *timing) {
     uint64_t end = 0;
     int wait_result = wait_for_count(&completed_count, threads);
@@ -373,7 +378,7 @@ static int finish_work(
         controller_failure_code = 210 + wait_result;
         return -1;
     }
-    if (bench_now_ns(&end) != 0) {
+    if (clock_now(&end) != 0) {
         controller_failure_code = 230;
         return -1;
     }
@@ -388,6 +393,7 @@ static int run_timed_workers(
     uint32_t threads,
     uint64_t iterations,
     void *(*worker)(void *),
+    bench_clock_fn clock_now,
     struct worker_arg args[MAX_THREADS],
     struct bench_timing *timing) {
     pthread_t tids[MAX_THREADS];
@@ -402,9 +408,9 @@ static int run_timed_workers(
     uint64_t overhead = 0;
     uint64_t start = 0;
     int failed =
-        measure_barrier_overhead(threads, &overhead) != 0 ||
-        begin_work(&start) != 0 ||
-        finish_work(threads, start, overhead, timing) != 0;
+        measure_barrier_overhead(threads, clock_now, &overhead) != 0 ||
+        begin_work(clock_now, &start) != 0 ||
+        finish_work(threads, start, overhead, clock_now, timing) != 0;
     if (failed) abort_workers(started);
     if (join_workers(started, tids, args) != 0) failed = 1;
     if (failed && controller_failure_code != 0)
@@ -440,8 +446,8 @@ static int run_wait_notify(
     uint64_t overhead = 0;
     uint64_t start = 0;
     int failed =
-        measure_barrier_overhead(threads, &overhead) != 0 ||
-        begin_work(&start) != 0;
+        measure_barrier_overhead(threads, bench_now_ns, &overhead) != 0 ||
+        begin_work(bench_now_ns, &start) != 0;
     for (int32_t epoch = 1;
          !failed && epoch <= (int32_t)iterations;
          ++epoch) {
@@ -463,7 +469,8 @@ static int run_wait_notify(
         }
     }
     if (!failed &&
-        finish_work(threads, start, overhead, timing) != 0) {
+        finish_work(
+            threads, start, overhead, bench_now_ns, timing) != 0) {
         failed = 1;
     }
     if (failed) abort_workers(started);
@@ -533,14 +540,37 @@ int main(int argc, char **argv) {
     enum workload workload;
     uint32_t threads = 0;
     uint64_t iterations = 0;
-    if (argc != 4 || parse_workload(argv[1], &workload) != 0 ||
+    if ((argc != 4 && argc != 5) ||
+        parse_workload(argv[1], &workload) != 0 ||
         parse_u32(argv[2], &threads) != 0 || threads > MAX_THREADS ||
         parse_u64(argv[3], &iterations) != 0 ||
         (workload == WORKLOAD_WAIT_NOTIFY && iterations > INT32_MAX)) {
         fputs(
             "usage: threaded.wasm "
-            "hot|atomic|wait-notify|spawn-join THREADS ITERATIONS\n",
+            "hot|atomic THREADS ITERATIONS process-cpu|monotonic\n"
+            "   or: threaded.wasm "
+            "wait-notify|spawn-join THREADS ITERATIONS\n",
             stderr);
+        return 2;
+    }
+    bench_clock_fn clock_now = bench_now_ns;
+    const char *clock_id = "wasi-monotonic";
+    if (workload == WORKLOAD_HOT || workload == WORKLOAD_ATOMIC) {
+        if (argc != 5) {
+            fputs("hot and atomic require an explicit timing mode\n", stderr);
+            return 2;
+        }
+        if (strcmp(argv[4], "process-cpu") == 0) {
+            clock_now = bench_process_cpu_now_ns;
+            clock_id = "wasi-process-cputime";
+        } else if (strcmp(argv[4], "monotonic") != 0) {
+            fputs(
+                "invalid timing mode: expected process-cpu or monotonic\n",
+                stderr);
+            return 2;
+        }
+    } else if (argc != 4) {
+        fputs("wait-notify and spawn-join do not accept a timing mode\n", stderr);
         return 2;
     }
 
@@ -553,7 +583,12 @@ int main(int argc, char **argv) {
     switch (workload) {
         case WORKLOAD_HOT:
             if (run_timed_workers(
-                    threads, iterations, hot_worker, args, &timing) != 0) {
+                    threads,
+                    iterations,
+                    hot_worker,
+                    clock_now,
+                    args,
+                    &timing) != 0) {
                 return 1;
             }
             checksum = sum_results(threads, args);
@@ -563,7 +598,12 @@ int main(int argc, char **argv) {
             atomic_store_explicit(
                 &shared_counter, 0, memory_order_seq_cst);
             if (run_timed_workers(
-                    threads, iterations, atomic_worker, args, &timing) != 0) {
+                    threads,
+                    iterations,
+                    atomic_worker,
+                    clock_now,
+                    args,
+                    &timing) != 0) {
                 return 1;
             }
             checksum = atomic_load_explicit(
@@ -599,7 +639,7 @@ int main(int argc, char **argv) {
         iterations,
         operations,
         checksum,
-        "wasi-monotonic",
+        clock_id,
         metric_kind,
         timed_loop_backedges,
         &timing);

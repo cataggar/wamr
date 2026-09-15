@@ -240,6 +240,7 @@ def make_report(
             "enabled": False,
             "mode": "aot",
             "workload": "hot",
+            "clock_id": bench.WASI_MONOTONIC_CLOCK_ID,
             "probes_per_thread": (
                 bench.TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
             ),
@@ -267,6 +268,7 @@ def make_report(
         "pair_execution": copy.deepcopy(bench.PAIR_EXECUTION_POLICY),
         "revision_artifact_policy": bench.REVISION_ARTIFACT_POLICY,
         "fixture_source_policy": bench.FIXTURE_SOURCE_POLICY,
+        "guest_clock_policy": copy.deepcopy(bench.GUEST_CLOCK_POLICY),
         "optimize": "ReleaseFast",
         "pairs": [],
     }
@@ -421,6 +423,11 @@ def make_report(
                         if pair["pair_kind"] == "single-infrastructure"
                         else []
                     ),
+                    *(
+                        [bench.WASI_PROCESS_CPU_CLOCK_MODE]
+                        if workload in ("hot", "atomic")
+                        else []
+                    ),
                 ],
                 "cpu_affinity": cpu_affinity,
                 "pair_execution": pair_execution,
@@ -441,11 +448,7 @@ def make_report(
                 "per_thread_ops_per_second": throughput,
                 "guest": {
                     "metric_kind": metric_kind,
-                    "clock_id": (
-                        bench.WASI_PROCESS_CPU_CLOCK_ID
-                        if pair["pair_kind"] == "single-infrastructure"
-                        else bench.WASI_MONOTONIC_CLOCK_ID
-                    ),
+                    "clock_id": bench.expected_guest_clock_id(workload),
                 },
                 "correct": True,
                 "correctness": {"passed": True},
@@ -562,6 +565,7 @@ def make_report(
             ),
             "mode": "aot",
             "workload": "hot",
+            "clock_id": bench.WASI_MONOTONIC_CLOCK_ID,
             "thread_counts": [1],
             "minimum_timed_interval_ns": 1_250_000_000,
             "timing_overhead_ratio_limit": (
@@ -2785,6 +2789,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             bench.expected_result("hot", 1, 10)["clock_id"],
+            "wasi-process-cputime",
+        )
+        self.assertEqual(
+            bench.expected_result("wait-notify", 1, 10)["clock_id"],
             "wasi-monotonic",
         )
 
@@ -2837,6 +2845,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "guest_elapsed_ns": timed,
                 "raw_guest_elapsed_ns": raw,
                 "timing_overhead_ppm": overhead * 1_000_000 // raw,
+                "guest": {"clock_id": bench.WASI_MONOTONIC_CLOCK_ID},
             }
 
         with mock.patch.object(
@@ -2855,6 +2864,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 static_cancel_poll_sites=1,
             )
         self.assertEqual(measure.call_count, 8)
+        self.assertTrue(
+            all(
+                call.kwargs["guest_clock_id"]
+                == bench.WASI_MONOTONIC_CLOCK_ID
+                for call in measure.call_args_list
+            )
+        )
         self.assertEqual(result["probe_count"], 8)
         self.assertEqual(len(result["samples"]), 8)
         self.assertEqual(result["status"], "failed")
@@ -3170,6 +3186,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "wamr",
                     "run",
                     *kwargs.get("runtime_args", ()),
+                    *(
+                        [bench.WASI_PROCESS_CPU_CLOCK_MODE]
+                        if kwargs["workload"] in ("hot", "atomic")
+                        else []
+                    ),
                 ],
                 "cpu_affinity": cpu_affinity,
                 "host_started_ns": 100,
@@ -3191,10 +3212,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "throughput_ops_per_second": 1 / 1.3,
                 "per_thread_ops_per_second": 1 / 1.3,
                 "guest": {
-                    "clock_id": (
-                        bench.WASI_PROCESS_CPU_CLOCK_ID
-                        if kwargs["workload"] == "single-hot"
-                        else bench.WASI_MONOTONIC_CLOCK_ID
+                    "clock_id": bench.expected_guest_clock_id(
+                        kwargs["workload"]
                     ),
                 },
                 "correct": True,
@@ -3704,9 +3723,22 @@ class ThreadBenchmarkTests(unittest.TestCase):
             placement["assignments"]["single-hot-pair"],
             {"kind": "smt-siblings", "logical_cpus": [4, 5]},
         )
+        self.assertEqual(placement["assignments"]["cpu-bound"]["1"], [4])
+        self.assertEqual(
+            placement["assignments"]["cpu-bound"]["4"],
+            [4, 2, 0, 5],
+        )
         self.assertEqual(placement["assignments"]["threaded"]["1"], [4, 2])
         self.assertEqual(
             placement["assignments"]["threaded"]["4"],
+            [4, 2, 0, 5, 3],
+        )
+        self.assertEqual(
+            bench.cpu_affinity_for(placement, "hot", 4),
+            [4, 2, 0, 5],
+        )
+        self.assertEqual(
+            bench.cpu_affinity_for(placement, "wait-notify", 4),
             [4, 2, 0, 5, 3],
         )
         bench.validate_cpu_placement(placement, (1, 4))
@@ -3823,6 +3855,18 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         changed["guest"]["clock_id"] = "wasi-monotonic"
         with self.assertRaisesRegex(BenchmarkDataError, "record guest clock"):
+            bench.validate_report(corrupt)
+
+        corrupt = copy.deepcopy(report)
+        changed = next(
+            record
+            for record in corrupt["records"]
+            if record["workload"] == "hot"
+        )
+        changed["command"][-1] = bench.WASI_MONOTONIC_CLOCK_MODE
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "record guest clock command"
+        ):
             bench.validate_report(corrupt)
 
         corrupt = copy.deepcopy(report)
@@ -5348,6 +5392,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "probe_index": probe_index,
                     "mode": "aot",
                     "workload": "hot",
+                    "clock_id": bench.WASI_MONOTONIC_CLOCK_ID,
                     "threads": 1,
                     "iterations": plan["iterations"]["aot"]["hot"]["1"],
                     "cpu_affinity": bench.cpu_affinity_for(
@@ -5372,6 +5417,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "probes_per_thread": 4,
             "mode": "aot",
             "workload": "hot",
+            "clock_id": bench.WASI_MONOTONIC_CLOCK_ID,
             "thread_counts": [1],
             "minimum_timed_interval_ns": 1_250_000_000,
             "timing_overhead_ratio_limit": 0.01,
