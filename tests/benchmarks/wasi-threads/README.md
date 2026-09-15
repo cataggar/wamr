@@ -346,6 +346,14 @@ revision-artifact policy.
 and selected count. `validate_report` recomputes both and independently replays
 sizing.
 
+Paired candidate evaluation always takes the checked measurement fixtures from
+the candidate checkout and runs those exact bytes through both revision
+runtimes. This keeps the benchmark methodology fixed when a candidate changes a
+fixture, while revision commits and build-source identities continue to
+identify the independently built runtime artifacts. The fixture source role,
+checkout, policy, files, and fixture-set SHA-256 are retained in the report and
+validated fail-closed.
+
 Every guest process is launched through `taskset`. Linux sysfs topology is
 resolved fail-closed from the process's allowed CPU set. Physical cores are
 ordered from the highest package/core identity down, one lowest-numbered

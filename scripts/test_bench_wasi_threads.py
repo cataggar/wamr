@@ -266,6 +266,7 @@ def make_report(
         "cpu_placement": copy.deepcopy(bench.CPU_PLACEMENT_POLICY),
         "pair_execution": copy.deepcopy(bench.PAIR_EXECUTION_POLICY),
         "revision_artifact_policy": bench.REVISION_ARTIFACT_POLICY,
+        "fixture_source_policy": bench.FIXTURE_SOURCE_POLICY,
         "optimize": "ReleaseFast",
         "pairs": [],
     }
@@ -481,6 +482,11 @@ def make_report(
                 if revision_mode == "paired-revisions"
                 else {"candidate": "/checkouts/candidate"}
             ),
+            "fixture_source": {
+                "policy": bench.FIXTURE_SOURCE_POLICY,
+                "role": "candidate",
+                "checkout": "/checkouts/candidate",
+            },
             "collected_at": "2026-09-02T00:00:00+00:00",
             "platform_id": platform_id,
             "fixture_set_sha256": "d" * 64,
@@ -3752,6 +3758,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
         ):
             bench.validate_report(corrupt)
 
+        corrupt = copy.deepcopy(report)
+        corrupt["metadata"]["fixture_source"]["role"] = "baseline"
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "metadata.fixture_source"
+        ):
+            bench.validate_report(corrupt)
+
         direct = next(
             record
             for record in report["records"]
@@ -5391,6 +5404,20 @@ class ThreadBenchmarkTests(unittest.TestCase):
         fixtures = bench.resolve_fixtures(ROOT)
         self.assertEqual(fixtures["single"]["sha256"], bench.FIXTURES["single"]["sha256"])
         self.assertEqual(fixtures["threaded"]["sha256"], bench.FIXTURES["threaded"]["sha256"])
+        fixture_repo, selected, fixture_set_sha256 = (
+            bench.resolve_measurement_fixtures(
+                {
+                    "baseline": ROOT / "missing-baseline-fixtures",
+                    "candidate": ROOT,
+                }
+            )
+        )
+        self.assertEqual(fixture_repo, ROOT)
+        self.assertEqual(selected, fixtures)
+        self.assertEqual(
+            fixture_set_sha256,
+            bench.fixture_set_identity(fixtures),
+        )
         schema = json.loads(
             (
                 ROOT
@@ -5436,6 +5463,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             plan_properties["revision_artifact_policy"]["const"],
             bench.REVISION_ARTIFACT_POLICY,
+        )
+        self.assertEqual(
+            plan_properties["fixture_source_policy"]["const"],
+            bench.FIXTURE_SOURCE_POLICY,
         )
         self.assertEqual(
             plan_properties["atomic_wait_preflight_iterations"]["const"],
