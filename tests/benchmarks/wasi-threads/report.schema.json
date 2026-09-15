@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 8 },
+    "schema_version": { "const": 9 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -82,7 +82,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 13 },
+        "measurement_plan_version": { "const": 14 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "cpu_placement": { "$ref": "#/$defs/cpu_placement" },
         "revision_artifacts": {
@@ -518,6 +518,7 @@
             "rounding",
             "pilot_clock_resolution_minimum_ns",
             "maximum_pilot_corrected_ns",
+            "maximum_pilot_corrected_scope",
             "maximum_pilot_host_wall_ns",
             "projected_evidence_minimum_ns",
             "timing_overhead_ratio_limit",
@@ -525,11 +526,14 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 10 },
+            "version": { "const": 11 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
             "maximum_pilot_corrected_ns": { "const": 30000000000 },
+            "maximum_pilot_corrected_scope": {
+              "const": "per-process-monotonic-or-per-worker-process-cpu"
+            },
             "maximum_pilot_host_wall_ns": { "const": 33000000000 },
             "projected_evidence_minimum_ns": { "const": 5000000000 },
             "timing_overhead_ratio_limit": { "const": 0.01 },

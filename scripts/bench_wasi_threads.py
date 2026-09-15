@@ -48,7 +48,7 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 8
+REPORT_SCHEMA_VERSION = 9
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 WASI_MONOTONIC_CLOCK_MODE = "monotonic"
@@ -56,7 +56,7 @@ WASI_PROCESS_CPU_CLOCK_MODE = "process-cpu"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 13
+MEASUREMENT_PLAN_IDENTITY_VERSION = 14
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 CPU_PLACEMENT_VERSION = 3
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
@@ -117,7 +117,7 @@ GUEST_CLOCK_POLICY = {
         "argument": WASI_MONOTONIC_CLOCK_MODE,
     },
 }
-SIZING_ALGORITHM_VERSION = 10
+SIZING_ALGORITHM_VERSION = 11
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -824,6 +824,9 @@ def sizing_algorithm_spec(timeout_seconds: float) -> dict[str, Any]:
             PILOT_CLOCK_RESOLUTION_MINIMUM_NS
         ),
         "maximum_pilot_corrected_ns": MAXIMUM_PILOT_CORRECTED_NS,
+        "maximum_pilot_corrected_scope": (
+            "per-process-monotonic-or-per-worker-process-cpu"
+        ),
         "maximum_pilot_host_wall_ns": MAXIMUM_PILOT_HOST_WALL_NS,
         "projected_evidence_minimum_ns": PROJECTED_EVIDENCE_MINIMUM_NS,
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
@@ -1051,7 +1054,14 @@ def validate_sizing_pilot(
         or elapsed < PILOT_CLOCK_RESOLUTION_MINIMUM_NS
     ):
         raise HarnessError("sizing pilot clock resolution is insufficient")
-    if elapsed > MAXIMUM_PILOT_CORRECTED_NS:
+    maximum_corrected_ns = MAXIMUM_PILOT_CORRECTED_NS * (
+        expected["threads"]
+        if expected_guest_clock_id(guest_workload)
+        == WASI_PROCESS_CPU_CLOCK_ID
+        and guest_workload in ("hot", "atomic")
+        else 1
+    )
+    if elapsed > maximum_corrected_ns:
         raise HarnessError("sizing pilot corrected duration exceeds 30 seconds")
     if (
         not isinstance(host_wall, int)
@@ -1860,6 +1870,8 @@ def failure_diagnostic_markdown(document: dict[str, Any]) -> str:
         f"`{document['pilot_clock_resolution_minimum_ns']}` / "
         f"`{document['maximum_pilot_corrected_ns']}` / "
         f"`{document['maximum_pilot_host_wall_ns']}` ns",
+        "- Corrected cap scope: "
+        f"`{document['maximum_pilot_corrected_scope']}`",
         "- Projected evidence minimum / benchmark limit / job reserve: "
         f"`{document['projected_evidence_minimum_ns']}` / "
         f"`{document['projected_benchmark_limit_ns']}` / "
@@ -1929,6 +1941,9 @@ def write_failure_diagnostic(
             PILOT_CLOCK_RESOLUTION_MINIMUM_NS
         ),
         "maximum_pilot_corrected_ns": MAXIMUM_PILOT_CORRECTED_NS,
+        "maximum_pilot_corrected_scope": (
+            "per-process-monotonic-or-per-worker-process-cpu"
+        ),
         "maximum_pilot_host_wall_ns": MAXIMUM_PILOT_HOST_WALL_NS,
         "projected_evidence_minimum_ns": PROJECTED_EVIDENCE_MINIMUM_NS,
         "projected_benchmark_limit_ns": PROJECTED_BENCHMARK_LIMIT_NS,
