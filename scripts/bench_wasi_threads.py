@@ -1042,6 +1042,9 @@ def validate_sizing_pilot(
     overhead = record.get("timing_overhead_ns")
     raw = record.get("raw_guest_elapsed_ns")
     host_wall = record.get("host_wall_elapsed_ns")
+    guest_workload = (
+        "hot" if expected["workload"] == "cancel-hot" else expected["workload"]
+    )
     if (
         not isinstance(elapsed, int)
         or isinstance(elapsed, bool)
@@ -1053,7 +1056,11 @@ def validate_sizing_pilot(
     if (
         not isinstance(host_wall, int)
         or isinstance(host_wall, bool)
-        or host_wall < elapsed
+        or (
+            expected_guest_clock_id(guest_workload)
+            == WASI_MONOTONIC_CLOCK_ID
+            and host_wall < elapsed
+        )
         or host_wall > MAXIMUM_PILOT_HOST_WALL_NS
     ):
         raise HarnessError("sizing pilot host-wall duration exceeds 33 seconds")
@@ -1067,7 +1074,7 @@ def validate_sizing_pilot(
     ):
         raise HarnessError("sizing pilot barrier diagnostics are invalid")
     expected_operations = expected_result(
-        "hot" if expected["workload"] == "cancel-hot" else expected["workload"],
+        guest_workload,
         expected["threads"],
         expected["iterations"],
     )["operations"]
