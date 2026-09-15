@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import functools
 import json
@@ -47,13 +48,13 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 5
+REPORT_SCHEMA_VERSION = 6
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 10
+MEASUREMENT_PLAN_IDENTITY_VERSION = 11
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-CPU_PLACEMENT_VERSION = 1
+CPU_PLACEMENT_VERSION = 2
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
 CPU_PLACEMENT_POLICY = {
     "version": CPU_PLACEMENT_VERSION,
@@ -61,8 +62,24 @@ CPU_PLACEMENT_POLICY = {
     "physical_core_order": "descending-package-core",
     "logical_cpu_order": "one-lowest-logical-cpu-per-core-before-siblings",
     "single_hot_logical_cpus": 1,
+    "single_hot_pair_logical_cpus": 2,
+    "single_hot_pair_preference": (
+        "smt-siblings-then-separate-physical-cores"
+    ),
     "threaded_logical_cpus": "min(available,workers+controller)",
     "failure_policy": "fail-closed",
+}
+PAIR_EXECUTION_POLICY = {
+    "default": "sequential-alternating",
+    "single_infrastructure": "concurrent-topology-paired-cpus",
+    "single_infrastructure_artifact": "same-enabled-runtime-binary",
+    "single_infrastructure_condition": (
+        "benchmark-runtime-thread-manager-enabled-or-disabled"
+    ),
+    "single_infrastructure_assignment": (
+        "condition-order-maps-to-cpu-order-and-swaps-each-sample"
+    ),
+    "overlap_requirement": "both-guest-process-host-intervals-overlap",
 }
 REVISION_ARTIFACT_POLICY = (
     "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
@@ -248,11 +265,11 @@ WASI_SDK = {
 FIXTURES = {
     "single": {
         "path": Path("tests/benchmarks/wasi-threads/single.wasm"),
-        "sha256": "c307570e7086b929b4740beb08b6859353e57421ce5ffa2944d921d8eadf2402",
+        "sha256": "376d3a19168164f84f628a398fdad2dc743967ff6068bec357aa9d952d9306b5",
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "27e0ec911816a8dd62519f317e749af547dc7af65c9b939fe7ba0452de74cdb0",
+        "sha256": "74844114b45b54d5532d1e37d69a99e85c4fd51167c56f359f9222e2bcacd60d",
     },
 }
 MASK64 = (1 << 64) - 1
@@ -383,6 +400,32 @@ def cpu_placement_from_topology(
         for group in physical_core_groups
         for cpu in group["logical_cpus"][1:]
     )
+    sibling_group = next(
+        (
+            group
+            for group in physical_core_groups
+            if len(group["logical_cpus"]) >= 2
+        ),
+        None,
+    )
+    if sibling_group is not None:
+        direct_pair_assignment = {
+            "kind": "smt-siblings",
+            "logical_cpus": sibling_group["logical_cpus"][:2],
+        }
+    elif len(physical_core_groups) >= 2:
+        direct_pair_assignment = {
+            "kind": "separate-physical-cores",
+            "logical_cpus": [
+                physical_core_groups[0]["logical_cpus"][0],
+                physical_core_groups[1]["logical_cpus"][0],
+            ],
+        }
+    else:
+        raise HarnessError(
+            "CPU placement requires two logical CPUs for concurrent "
+            "single-infrastructure pairs"
+        )
     return {
         "policy": copy.deepcopy(CPU_PLACEMENT_POLICY),
         "taskset_version": taskset_version,
@@ -391,6 +434,7 @@ def cpu_placement_from_topology(
         "ordered_logical_cpus": ordered_logical_cpus,
         "assignments": {
             "single-hot": ordered_logical_cpus[:1],
+            "single-hot-pair": direct_pair_assignment,
             "threaded": {
                 str(threads): ordered_logical_cpus[
                     : min(len(ordered_logical_cpus), threads + 1)
@@ -450,6 +494,25 @@ def cpu_affinity_for(
     except KeyError as exc:
         raise HarnessError(
             f"CPU placement has no assignment for {threads} threads"
+        ) from exc
+
+
+def direct_pair_cpu_affinity(
+    cpu_placement: dict[str, Any],
+    global_index: int,
+    condition: str,
+    left: str = "threads-disabled",
+    right: str = "threads-enabled",
+) -> list[int]:
+    conditions = alternating_pair_order(global_index, left, right)
+    try:
+        cpus = cpu_placement["assignments"]["single-hot-pair"][
+            "logical_cpus"
+        ]
+        return [cpus[conditions.index(condition)]]
+    except (KeyError, ValueError, IndexError) as exc:
+        raise HarnessError(
+            "CPU placement has no direct-pair assignment"
         ) from exc
 
 
@@ -1929,6 +1992,7 @@ def build_variant(
         "optimize": optimize,
         "target": target or "native",
         "compiler_toggle": compiler_toggle,
+        "thread_manager_toggle": threads_enabled,
         "zig": command_identity(["zig", "version"]),
     }
     key = cache_key(parts)
@@ -1963,6 +2027,11 @@ def build_variant(
             "-Dbenchmark-cancel-point-toggle=true"
             if compiler_toggle
             else "-Dbenchmark-cancel-point-toggle=false"
+        ),
+        (
+            "-Dbenchmark-wasi-thread-manager-toggle=true"
+            if threads_enabled
+            else "-Dbenchmark-wasi-thread-manager-toggle=false"
         ),
         "--prefix",
         str(prefix),
@@ -2226,7 +2295,11 @@ def expected_result(
         "iterations": iterations,
         "operations": operations,
         "checksum": checksum,
-        "clock_id": "wasi-monotonic",
+        "clock_id": (
+            "wasi-process-cputime"
+            if workload == "single-hot"
+            else "wasi-monotonic"
+        ),
         "metric_kind": (
             "spawn-join-lifecycle"
             if workload == "spawn-join"
@@ -2446,13 +2519,26 @@ def measure_once(
     min_interval_ns: int,
     record_fields: dict[str, Any],
     enforce_timing_quality: bool = True,
+    cpu_affinity_override: list[int] | None = None,
+    runtime_args: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     guest_args = (
         [str(iterations)]
         if workload == "single-hot"
         else [workload, str(threads), str(iterations)]
     )
-    cpu_affinity = cpu_affinity_for(cpu_placement, workload, threads)
+    cpu_affinity = (
+        list(cpu_affinity_override)
+        if cpu_affinity_override is not None
+        else cpu_affinity_for(cpu_placement, workload, threads)
+    )
+    allowed_cpus = cpu_placement["allowed_logical_cpus"]
+    if (
+        not cpu_affinity
+        or len(set(cpu_affinity)) != len(cpu_affinity)
+        or any(cpu not in allowed_cpus for cpu in cpu_affinity)
+    ):
+        raise HarnessError("measurement CPU affinity is invalid")
     command = [
         "taskset",
         "--cpu-list",
@@ -2460,6 +2546,7 @@ def measure_once(
         *runner,
         str(build.wamr),
         "run",
+        *runtime_args,
         str(module),
         *guest_args,
     ]
@@ -2477,7 +2564,8 @@ def measure_once(
         raise HarnessError(
             f"guest failure classification={classification}: {exc}"
         ) from exc
-    host_wall_elapsed_ns = time.perf_counter_ns() - started
+    finished = time.perf_counter_ns()
+    host_wall_elapsed_ns = finished - started
     if returncode != 0:
         classification = classify_guest_failure(stderr, workload)
         raise HarnessError(
@@ -2505,6 +2593,8 @@ def measure_once(
         **record_fields,
         "command": command,
         "cpu_affinity": cpu_affinity,
+        "host_started_ns": started,
+        "host_finished_ns": finished,
         "elapsed_ns": guest_elapsed_ns,
         "guest_elapsed_ns": guest_elapsed_ns,
         "raw_guest_elapsed_ns": int(guest["raw_elapsed_ns"]),
@@ -2527,6 +2617,25 @@ def measure_once(
         "stdout": stdout,
         "stderr": stderr,
     }
+
+
+def measure_concurrently(
+    measure: Callable[..., dict[str, Any]],
+    invocations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(invocations) != 2:
+        raise HarnessError("concurrent measurement requires exactly two invocations")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(measure, **invocation)
+            for invocation in invocations
+        ]
+        records = [future.result() for future in futures]
+    if max(record["host_started_ns"] for record in records) >= min(
+        record["host_finished_ns"] for record in records
+    ):
+        raise HarnessError("concurrent measurement host intervals did not overlap")
+    return records
 
 
 def run_trusted_barrier_preflight(
@@ -2680,6 +2789,7 @@ def collect_revision_pair(
                         "condition": condition,
                         "pair_left": left,
                         "pair_right": right,
+                        "pair_execution": PAIR_EXECUTION_POLICY["default"],
                     },
                 )
                 records.append(record)
@@ -2687,6 +2797,80 @@ def collect_revision_pair(
                     f"[thread-bench] {pair_key} {phase} {phase_index + 1}/"
                     f"{warmups if phase == 'warmup' else samples} "
                     f"{revision}/{condition}: "
+                    f"guest={record['guest_elapsed_ns'] / 1e6:.3f} ms "
+                    f"host={record['host_wall_elapsed_ns'] / 1e6:.3f} ms",
+                    file=sys.stderr,
+                )
+
+
+def collect_concurrent_revision_pair(
+    *,
+    records: list[dict[str, Any]],
+    pair_kind: str,
+    pair_key: str,
+    left: str,
+    right: str,
+    warmups: int,
+    samples: int,
+    revision_roles: tuple[str, ...],
+    revision_fields: dict[str, dict[str, Any]],
+    measure: Callable[
+        [str, list[tuple[str, dict[str, Any]]]], list[dict[str, Any]]
+    ],
+) -> None:
+    require(
+        revision_roles in (REVISION_ROLES, SINGLE_REVISION_ROLES),
+        "revision roles",
+    )
+    require(set(revision_fields) == set(revision_roles), "revision fields")
+    total = warmups + samples
+    for index in range(total):
+        phase = "warmup" if index < warmups else "measure"
+        phase_index = index if phase == "warmup" else index - warmups
+        condition_order = alternating_pair_order(index, left, right)
+        revision_order = (
+            alternating_pair_order(index, *REVISION_ROLES)
+            if revision_roles == REVISION_ROLES
+            else SINGLE_REVISION_ROLES
+        )
+        for revision_index, revision in enumerate(revision_order):
+            requests = [
+                (
+                    condition,
+                    {
+                        **revision_fields[revision],
+                        "revision": revision,
+                        "revision_order": revision_index,
+                        "pair_kind": pair_kind,
+                        "pair_key": pair_key,
+                        "pair_index": phase_index,
+                        "phase": phase,
+                        "order": condition_index,
+                        "condition": condition,
+                        "pair_left": left,
+                        "pair_right": right,
+                        "pair_execution": PAIR_EXECUTION_POLICY[
+                            "single_infrastructure"
+                        ],
+                    },
+                )
+                for condition_index, condition in enumerate(condition_order)
+            ]
+            measured = measure(revision, requests)
+            if (
+                len(measured) != 2
+                or [record.get("condition") for record in measured]
+                != list(condition_order)
+            ):
+                raise HarnessError(
+                    "concurrent measurement returned an invalid condition pair"
+                )
+            for record in measured:
+                records.append(record)
+                print(
+                    f"[thread-bench] {pair_key} {phase} {phase_index + 1}/"
+                    f"{warmups if phase == 'warmup' else samples} "
+                    f"{revision}/{record['condition']}: "
                     f"guest={record['guest_elapsed_ns'] / 1e6:.3f} ms "
                     f"host={record['host_wall_elapsed_ns'] / 1e6:.3f} ms",
                     file=sys.stderr,
@@ -3033,6 +3217,10 @@ def validate_report(document: dict[str, Any]) -> None:
     require(
         plan.get("cpu_placement") == CPU_PLACEMENT_POLICY,
         "plan.cpu_placement",
+    )
+    require(
+        plan.get("pair_execution") == PAIR_EXECUTION_POLICY,
+        "plan.pair_execution",
     )
     require(
         plan.get("revision_artifact_policy") == REVISION_ARTIFACT_POLICY,
@@ -3483,6 +3671,10 @@ def validate_report(document: dict[str, Any]) -> None:
         tuple[str, str, int],
         list[tuple[str, str]],
     ] = {}
+    concurrent_cells: dict[
+        tuple[str, str, int, str],
+        list[dict[str, Any]],
+    ] = {}
     for record in document["records"]:
         require(isinstance(record, dict), "record object")
         require(record.get("phase") in ("warmup", "measure"), "record phase")
@@ -3491,6 +3683,17 @@ def validate_report(document: dict[str, Any]) -> None:
         revision = revisions[revision_role]
         require(record.get("correct") is True, "record correctness")
         require(record.get("guest_elapsed_ns", 0) > 0, "record guest elapsed")
+        require(
+            isinstance(record.get("host_started_ns"), int)
+            and not isinstance(record["host_started_ns"], bool)
+            and isinstance(record.get("host_finished_ns"), int)
+            and not isinstance(record["host_finished_ns"], bool)
+            and record["host_started_ns"] >= 0
+            and record["host_finished_ns"] > record["host_started_ns"]
+            and record["host_finished_ns"] - record["host_started_ns"]
+            == record.get("host_wall_elapsed_ns"),
+            "record host interval",
+        )
         require(
             record.get("host_wall_elapsed_ns", 0) >= record["guest_elapsed_ns"],
             "record host wall diagnostic",
@@ -3514,14 +3717,79 @@ def validate_report(document: dict[str, Any]) -> None:
             record.get("condition") in (pair["left"], pair["right"]),
             "record pair condition",
         )
-        expected_cpu_affinity = cpu_affinity_for(
-            cpu_placement,
-            record.get("workload"),
-            record.get("threads"),
+        global_index = (
+            record["pair_index"]
+            if record["phase"] == "warmup"
+            else plan["warmups"] + record["pair_index"]
         )
+        if record["pair_kind"] == "single-infrastructure":
+            expected_cpu_affinity = direct_pair_cpu_affinity(
+                cpu_placement,
+                global_index,
+                record["condition"],
+                pair["left"],
+                pair["right"],
+            )
+            expected_pair_execution = PAIR_EXECUTION_POLICY[
+                "single_infrastructure"
+            ]
+            expected_manager_enabled = (
+                record["condition"] == "threads-enabled"
+            )
+            manager_option = (
+                "--benchmark-wasi-thread-manager="
+                + ("enabled" if expected_manager_enabled else "disabled")
+            )
+            require(
+                record.get("command", []).count(manager_option) == 1,
+                "record thread-manager command",
+            )
+            concurrent_cells.setdefault(
+                (
+                    pair_key,
+                    record["phase"],
+                    record["pair_index"],
+                    revision_role,
+                ),
+                [],
+            ).append(record)
+        else:
+            expected_cpu_affinity = cpu_affinity_for(
+                cpu_placement,
+                record.get("workload"),
+                record.get("threads"),
+            )
+            expected_pair_execution = PAIR_EXECUTION_POLICY["default"]
+            expected_manager_enabled = True
+            require(
+                not any(
+                    arg.startswith("--benchmark-wasi-thread-manager=")
+                    for arg in record.get("command", [])
+                ),
+                "non-direct record thread-manager command",
+            )
         require(
             record.get("cpu_affinity") == expected_cpu_affinity,
             "record CPU affinity",
+        )
+        require(
+            record.get("pair_execution") == expected_pair_execution,
+            "record pair execution",
+        )
+        require(
+            record.get("threads_enabled") is True
+            and record.get("thread_manager_enabled")
+            is expected_manager_enabled,
+            "record thread-manager state",
+        )
+        expected_clock_id = (
+            "wasi-process-cpu"
+            if record["pair_kind"] == "single-infrastructure"
+            else "wasi-monotonic"
+        )
+        require(
+            record.get("guest", {}).get("clock_id") == expected_clock_id,
+            "record guest clock",
         )
         require(
             record.get("command", [])[:3]
@@ -3567,11 +3835,6 @@ def validate_report(document: dict[str, Any]) -> None:
                 record.get(expected_key) == revision[key],
                 f"record mixed {key}",
             )
-        global_index = (
-            record["pair_index"]
-            if record["phase"] == "warmup"
-            else plan["warmups"] + record["pair_index"]
-        )
         expected_revisions = (
             alternating_pair_order(global_index, *REVISION_ROLES)
             if revision_roles == REVISION_ROLES
@@ -3605,6 +3868,43 @@ def validate_report(document: dict[str, Any]) -> None:
         )
         cell_order.setdefault(cell, []).append(
             (revision_role, record["condition"])
+        )
+    for cell, pair_records in concurrent_cells.items():
+        require(len(pair_records) == 2, f"incomplete concurrent pair {cell}")
+        require(
+            {
+                cpu
+                for record in pair_records
+                for cpu in record["cpu_affinity"]
+            }
+            == set(
+                cpu_placement["assignments"]["single-hot-pair"][
+                    "logical_cpus"
+                ]
+            ),
+            f"concurrent pair does not use its topology CPU pair {cell}",
+        )
+        require(
+            max(record.get("host_started_ns", -1) for record in pair_records)
+            < min(
+                record.get("host_finished_ns", -1)
+                for record in pair_records
+            ),
+            f"concurrent pair host intervals do not overlap {cell}",
+        )
+        commands_without_toggle = [
+            [
+                arg
+                for arg in record["command"]
+                if not arg.startswith("--benchmark-wasi-thread-manager=")
+            ]
+            for record in pair_records
+        ]
+        for command in commands_without_toggle:
+            command[2] = "<balanced-cpu>"
+        require(
+            commands_without_toggle[0] == commands_without_toggle[1],
+            f"concurrent pair does not use one runtime artifact {cell}",
         )
     expected_records_per_pair = (
         len(revision_roles)
@@ -4432,19 +4732,18 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         revision_output = output / "revisions" / role
         builds: dict[str, Build] = {}
         for mode in modes:
-            for enabled in (False, True):
-                build = build_variant(
-                    repo=revision_repo,
-                    root=revision_output,
-                    mode=mode,
-                    threads_enabled=enabled,
-                    optimize=args.optimize,
-                    target=args.target,
-                    source=sources[role],
-                    rebuild=args.rebuild,
-                    compiler_toggle=enabled and mode == "aot",
-                )
-                builds[build.name] = build
+            build = build_variant(
+                repo=revision_repo,
+                root=revision_output,
+                mode=mode,
+                threads_enabled=True,
+                optimize=args.optimize,
+                target=args.target,
+                source=sources[role],
+                rebuild=args.rebuild,
+                compiler_toggle=mode == "aot",
+            )
+            builds[build.name] = build
         aot_artifacts: dict[str, Path] = {}
         aot_artifacts_metadata: dict[str, Any] = {}
         if "aot" in modes:
@@ -4525,14 +4824,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "hot" if sizing_workload == "cancel-hot" else sizing_workload
         )
         if sizing_workload == "single-hot":
-            selected = context["builds"][
-                (
-                    "disabled-"
-                    if spec["condition"] == "threads-disabled"
-                    else "enabled-"
-                )
-                + mode
-            ]
+            selected = context["builds"][f"enabled-{mode}"]
             module = (
                 context["single_wasm"]
                 if mode == "interpreter"
@@ -4540,6 +4832,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             )
             cancel_points = "not-applicable"
             static_cancel_poll_sites = 0
+            runtime_args = (
+                "--benchmark-wasi-thread-manager="
+                + (
+                    "disabled"
+                    if spec["condition"] == "threads-disabled"
+                    else "enabled"
+                ),
+            )
         elif sizing_workload == "cancel-hot":
             selected = context["builds"]["enabled-aot"]
             cancel_points = (
@@ -4557,6 +4857,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 if cancel_points == "on"
                 else 0
             )
+            runtime_args = ()
         else:
             selected = context["builds"][f"enabled-{mode}"]
             module = (
@@ -4564,6 +4865,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 if mode == "interpreter"
                 else context["aot_artifacts"]["threaded-polls-on"]
             )
+            runtime_args = ()
             cancel_points = (
                 "on" if mode == "aot" else "interpreter-dispatch"
             )
@@ -4585,6 +4887,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             timeout=args.timeout,
             min_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
             enforce_timing_quality=False,
+            runtime_args=runtime_args,
             record_fields={
                 **spec,
                 "phase": "pilot",
@@ -4713,6 +5016,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "acceptance_rule": preflight_acceptance_rule,
         },
         "cpu_placement": copy.deepcopy(CPU_PLACEMENT_POLICY),
+        "pair_execution": copy.deepcopy(PAIR_EXECUTION_POLICY),
         "revision_artifact_policy": REVISION_ARTIFACT_POLICY,
         "optimize": args.optimize,
         "pairs": pair_plan,
@@ -4894,42 +5198,60 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     for mode in modes:
         def single_measure(
             revision: str,
-            condition: str,
-            fields: dict[str, Any],
-        ) -> dict[str, Any]:
+            requests: list[tuple[str, dict[str, Any]]],
+        ) -> list[dict[str, Any]]:
             context = contexts[revision]
             builds = context["builds"]
-            disabled = builds[f"disabled-{mode}"]
-            enabled = builds[f"enabled-{mode}"]
-            selected = disabled if condition == "threads-disabled" else enabled
             module = (
                 context["single_wasm"]
                 if mode == "interpreter"
                 else context["aot_artifacts"]["single"]
             )
-            return measured(
-                repo=context["repo"],
-                runner=runner,
-                build=selected,
-                module=module,
-                workload="single-hot",
-                threads=1,
-                iterations=iteration_plan[mode]["single-hot"],
-                timeout=args.timeout,
-                min_interval_ns=minimum_interval_ns,
-                record_fields={
-                    **fields,
-                    "mode": mode,
-                    "threads_enabled": selected.threads_enabled,
-                    "cancel_points": "not-applicable",
-                    "static_cancel_poll_sites": 0,
-                    "workload": "single-hot",
-                    "threads": 1,
-                    "iterations": iteration_plan[mode]["single-hot"],
-                },
-            )
+            invocations = []
+            for condition, fields in requests:
+                selected = builds[f"enabled-{mode}"]
+                manager_enabled = condition == "threads-enabled"
+                global_index = (
+                    fields["pair_index"]
+                    if fields["phase"] == "warmup"
+                    else args.warmups + fields["pair_index"]
+                )
+                invocations.append(
+                    {
+                        "repo": context["repo"],
+                        "runner": runner,
+                        "build": selected,
+                        "module": module,
+                        "workload": "single-hot",
+                        "threads": 1,
+                        "iterations": iteration_plan[mode]["single-hot"],
+                        "timeout": args.timeout,
+                        "min_interval_ns": minimum_interval_ns,
+                        "cpu_affinity_override": direct_pair_cpu_affinity(
+                            cpu_placement,
+                            global_index,
+                            condition,
+                        ),
+                        "runtime_args": (
+                            "--benchmark-wasi-thread-manager="
+                            + ("enabled" if manager_enabled else "disabled"),
+                        ),
+                        "record_fields": {
+                            **fields,
+                            "mode": mode,
+                            "threads_enabled": True,
+                            "thread_manager_enabled": manager_enabled,
+                            "cancel_points": "not-applicable",
+                            "static_cancel_poll_sites": 0,
+                            "workload": "single-hot",
+                            "threads": 1,
+                            "iterations": iteration_plan[mode]["single-hot"],
+                        },
+                    }
+                )
+            return measure_concurrently(measured, invocations)
 
-        collect_revision_pair(
+        collect_concurrent_revision_pair(
             records=records,
             pair_kind="single-infrastructure",
             pair_key=f"single-infrastructure/{mode}",
@@ -4977,6 +5299,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         **fields,
                         "mode": mode,
                         "threads_enabled": True,
+                        "thread_manager_enabled": True,
                         "cancel_points": (
                             "on" if mode == "aot" else "interpreter-dispatch"
                         ),
@@ -5044,6 +5367,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         **fields,
                         "mode": mode,
                         "threads_enabled": True,
+                        "thread_manager_enabled": True,
                         "cancel_points": (
                             "on" if mode == "aot" else "interpreter-dispatch"
                         ),
@@ -5107,6 +5431,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                         **fields,
                         "mode": "aot",
                         "threads_enabled": True,
+                        "thread_manager_enabled": True,
                         "cancel_points": polls,
                         "static_cancel_poll_sites": (
                             context["aot_artifacts_metadata"][

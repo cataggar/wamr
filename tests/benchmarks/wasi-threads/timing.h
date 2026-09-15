@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <time.h>
+#include <wasi/api.h>
 
 struct bench_timing {
     uint64_t raw_elapsed_ns;
@@ -10,9 +11,9 @@ struct bench_timing {
     uint64_t elapsed_ns;
 };
 
-static inline int bench_now_ns(uint64_t *result) {
+static inline int bench_clock_now_ns(clockid_t clock_id, uint64_t *result) {
     struct timespec value;
-    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0 ||
+    if (clock_gettime(clock_id, &value) != 0 ||
         value.tv_sec < 0 || value.tv_nsec < 0 ||
         value.tv_nsec >= 1000000000L) {
         return -1;
@@ -24,12 +25,50 @@ static inline int bench_now_ns(uint64_t *result) {
     return 0;
 }
 
-static inline int bench_clock_overhead(uint64_t *result) {
+static inline int bench_now_ns(uint64_t *result) {
+    return bench_clock_now_ns(CLOCK_MONOTONIC, result);
+}
+
+static inline int bench_clock_overhead_for(
+    clockid_t clock_id,
+    uint64_t *result) {
     uint64_t minimum = UINT64_MAX;
     for (uint32_t i = 0; i < 9; ++i) {
         uint64_t start = 0;
         uint64_t end = 0;
-        if (bench_now_ns(&start) != 0 || bench_now_ns(&end) != 0 ||
+        if (bench_clock_now_ns(clock_id, &start) != 0 ||
+            bench_clock_now_ns(clock_id, &end) != 0 ||
+            end < start) {
+            return -1;
+        }
+        uint64_t elapsed = end - start;
+        if (elapsed < minimum) minimum = elapsed;
+    }
+    *result = minimum;
+    return 0;
+}
+
+static inline int bench_clock_overhead(uint64_t *result) {
+    return bench_clock_overhead_for(CLOCK_MONOTONIC, result);
+}
+
+static inline int bench_process_cpu_now_ns(uint64_t *result) {
+    __wasi_timestamp_t value = 0;
+    if (__wasi_clock_time_get(
+            __WASI_CLOCKID_PROCESS_CPUTIME_ID, 0, &value) != 0) {
+        return -1;
+    }
+    *result = value;
+    return 0;
+}
+
+static inline int bench_process_cpu_clock_overhead(uint64_t *result) {
+    uint64_t minimum = UINT64_MAX;
+    for (uint32_t i = 0; i < 9; ++i) {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        if (bench_process_cpu_now_ns(&start) != 0 ||
+            bench_process_cpu_now_ns(&end) != 0 ||
             end < start) {
             return -1;
         }

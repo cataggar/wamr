@@ -21,12 +21,13 @@ and per-thread throughput. Caller-provided 16 KiB pthread stacks make the
 fixture's memory footprint deterministic and avoid mixing allocator growth into
 the spawn/join measurement.
 
-`single.wasm` contains the exact same `bench_hot_kernel` from `kernel.h`, but is
-built for ordinary `wasm32-wasi` and has no thread-spawn import. The harness runs
-that one identical byte fixture on `-Dlib_wasi_threads=false` and `true`
-runtimes. A module that imports `wasi.thread-spawn` cannot validly load in the
-disabled runtime, so this separate no-spawn module is the conditional
-infrastructure comparison requested by #616.
+`single.wasm` contains the exact same `bench_hot_kernel` from `kernel.h`. It is
+thread-capable and retains a `wasi.thread-spawn` import, but its valid benchmark
+path never calls that import. The harness runs both conditions on one exact
+threads-enabled runtime artifact and changes only a benchmark-gated runtime
+manager toggle. The enabled condition therefore prepares a real thread manager
+for a no-spawn workload while the disabled condition does not. Production
+builds reject the suppression flag.
 
 Every invocation prints one JSON object. The driver rejects an incorrect
 workload, thread count, iteration count, operation count, checksum, extra output,
@@ -42,7 +43,10 @@ passive-data start initialization, pthread lifecycle, serialization, and
 teardown. They are retained as historical whole-process diagnostics only and
 must not be used as throughput or #957 cancel-poll evidence.
 
-The corrected metric is guest-reported WASI monotonic time:
+The corrected metric is guest-reported WASI time. Threaded coordination and
+lifecycle workloads use the monotonic clock. `single-hot` uses the process-CPU
+clock so concurrent placement cannot turn descheduling into apparent runtime
+cost:
 
 - `hot`, `atomic`, and `wait-notify` spawn their workers first, warm code where
   applicable, and wait until every worker is ready;
@@ -330,13 +334,14 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 10 of a purpose-independent portable
+`measurement_plan_sha256` is version 11 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
 safety factor, declarative cell base overrides and envelopes, rounding, caps,
 timeouts, modes, thread counts, pairs, profile, samples, warmups, optimization,
-quality policy, fixed CPU-placement policy, and revision-artifact policy.
+quality policy, fixed CPU-placement and pair-execution policies, and
+revision-artifact policy.
 `plan_sha256` hashes the complete report-specific plan, including every pilot
 and selected count. `validate_report` recomputes both and independently replays
 sizing.
@@ -346,7 +351,21 @@ resolved fail-closed from the process's allowed CPU set. Physical cores are
 ordered from the highest package/core identity down, one lowest-numbered
 logical CPU per core is selected before any SMT siblings, and CPU 0 is
 therefore avoided whenever another physical core is available. `single-hot`
-uses one logical CPU. Threaded workloads use
+pilots use one logical CPU. Each threads-disabled/threads-enabled
+single-infrastructure evidence pair runs concurrently on a topology-selected
+CPU pair from one exact threads-enabled runtime binary. SMT siblings are
+preferred so both conditions share one physical core and frequency; hosts
+without SMT use two physical cores. The fixture retains a
+`wasi.thread-spawn` import but never calls it in a valid invocation, so the
+enabled condition prepares a real thread manager while the benchmark-only
+disabled condition suppresses that preparation. Production builds cannot
+accept the suppression flag. The condition launch order still alternates on
+every sample, balancing both conditions across the two logical CPUs. The direct
+fixture measures the WASI process-CPU clock so descheduling does not compress a
+real runtime cost toward zero. The report retains monotonic host intervals and
+validation requires both processes to overlap on the declared CPU pair with
+commands that differ only by affinity and the manager toggle.
+Threaded workloads use
 `min(available logical CPUs, workers + one controller)` so a one-worker
 wait/notify pair receives two distinct physical cores when the host exposes
 them. The report retains the complete topology, deterministic assignments,

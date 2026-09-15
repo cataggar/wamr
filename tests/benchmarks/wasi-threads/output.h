@@ -15,6 +15,7 @@ static inline int bench_write_result(
     uint64_t iterations,
     uint64_t operations,
     uint64_t checksum,
+    const char *clock_id,
     const char *metric_kind,
     uint64_t timed_loop_backedges,
     const struct bench_timing *timing) {
@@ -30,7 +31,7 @@ static inline int bench_write_result(
         "{\"kind\":\"wasi-thread-benchmark-result\",\"workload\":\"%s\","
         "\"threads\":%" PRIu32 ",\"iterations\":%" PRIu64
         ",\"operations\":%" PRIu64 ",\"checksum\":%" PRIu64
-        ",\"clock_id\":\"wasi-monotonic\",\"metric_kind\":\"%s\","
+        ",\"clock_id\":\"%s\",\"metric_kind\":\"%s\","
         "\"raw_elapsed_ns\":%" PRIu64 ",\"timing_overhead_ns\":%" PRIu64
         ",\"elapsed_ns\":%" PRIu64 ",\"timing_overhead_ppm\":%" PRIu64
         ",\"timed_loop_backedges\":%" PRIu64
@@ -40,6 +41,7 @@ static inline int bench_write_result(
         iterations,
         operations,
         checksum,
+        clock_id,
         metric_kind,
         timing->raw_elapsed_ns,
         timing->timing_overhead_ns,

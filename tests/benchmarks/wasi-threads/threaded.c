@@ -599,6 +599,7 @@ int main(int argc, char **argv) {
         iterations,
         operations,
         checksum,
+        "wasi-monotonic",
         metric_kind,
         timed_loop_backedges,
         &timing);
