@@ -138,9 +138,9 @@
     },
     {
       "key": "aot/wait-notify/1",
-      "pilot_iterations": 1500000,
+      "pilot_iterations": 500000,
       "report_sha256": "82d218935074a4c2f552010da87a5780525727bb9a2f096038bf07adeb1ea369",
-      "retained_fastest_interval_ns": 1181229493,
+      "retained_fastest_interval_ns": 393743165,
       "source_fastest_corrected_interval_ns": 403193000,
       "source_iterations": 512000
     },
@@ -589,7 +589,7 @@
     "retained_fastest_interval_ns": 1054664000
   },
   "kind": "wasi-thread-sizing-simulation-provenance",
-  "pilot_plan_sha256": "c27d589dbea8e3844b07c8d99b91cfb82824b7af61ba09f77eaaacef0bb739f0",
+  "pilot_plan_sha256": "ad4f1cc7a12184aaf6680b32a31efad64d4e71f243ad87438547b4ca3bcf3d13",
   "retained_reference": {
     "key": "aot/single-hot/1",
     "retained_fastest_interval_ns": 1813490625

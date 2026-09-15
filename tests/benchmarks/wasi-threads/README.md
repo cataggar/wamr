@@ -75,7 +75,7 @@ used only for pilots:
 | interpreter `atomic` | 72M | 40M | 28M | 14M |
 | AOT `atomic` | 850M | 180M | 64M | 64M |
 | interpreter `wait-notify` | 128K | 64K | 32K | 16K |
-| AOT `wait-notify` | 1.5M | 64K | 32K | 16K |
+| AOT `wait-notify` | 500K | 64K | 32K | 16K |
 | interpreter `spawn-join` | 9K | 4.5K | 2.25K | 1.25K |
 | AOT `spawn-join` | 10K | 5K | 2.5K | 1.25K |
 | AOT `cancel-hot` | 1.9B | 1.9B | 950M | 475M |
@@ -197,8 +197,10 @@ Pilots must pass guest correctness and operation assertions, have positive
 timing fields, and provide at least a 1 ms corrected interval for clock
 resolution. The corrected-time safety cap is 30 seconds for monotonic pilots
 and 30 seconds per worker for aggregate process-CPU pilots; every pilot retains
-the independent 33-second host-wall cap. They are intentionally not required to
-satisfy the evidence
+the independent 33-second host-wall cap. AOT `wait-notify/1` uses a fixed 500K
+pilot so scheduler stalls retain headroom below those caps; its stronger 16x
+rate envelope and 20-second projected evidence floor remain unchanged. Pilots
+are intentionally not required to satisfy the evidence
 `99B < E` rule at their short unsized count. After the frozen count is known,
 every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
@@ -339,7 +341,7 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 15 of a purpose-independent portable
+`measurement_plan_sha256` is version 16 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,

@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 10 },
+    "schema_version": { "const": 11 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -82,7 +82,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 15 },
+        "measurement_plan_version": { "const": 16 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "cpu_placement": { "$ref": "#/$defs/cpu_placement" },
         "revision_artifacts": {

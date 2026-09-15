@@ -48,7 +48,7 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 10
+REPORT_SCHEMA_VERSION = 11
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 WASI_MONOTONIC_CLOCK_MODE = "monotonic"
@@ -56,7 +56,7 @@ WASI_PROCESS_CPU_CLOCK_MODE = "process-cpu"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 15
+MEASUREMENT_PLAN_IDENTITY_VERSION = 16
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 CPU_PLACEMENT_VERSION = 3
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
@@ -253,7 +253,7 @@ DEFAULT_PILOT_ITERATION_PLAN = {
             "8": 64_000_000,
         },
         "wait-notify": {
-            "1": 1_500_000,
+            "1": 500_000,
             "2": 64_000,
             "4": 32_000,
             "8": 16_000,

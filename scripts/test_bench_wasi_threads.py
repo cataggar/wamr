@@ -861,7 +861,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                         "8": 64_000_000,
                     },
                     "wait-notify": {
-                        "1": 1_500_000,
+                        "1": 500_000,
                         "4": 32_000,
                         "8": 16_000,
                     },
@@ -1126,6 +1126,48 @@ class ThreadBenchmarkTests(unittest.TestCase):
         for override in bench.SIZING_CELL_BASE_OVERRIDES:
             self.assertNotIn("platform", override["selector"])
         self.assertEqual(len(bench.CANONICAL_PLATFORMS), 2)
+
+    def test_reduced_wait_notify_pilot_preserves_evidence_sizing(self) -> None:
+        previous_count = 1_500_000
+        previous_elapsed_ns = 28_017_000_000
+        current_count = bench.DEFAULT_PILOT_ITERATION_PLAN["aot"][
+            "wait-notify"
+        ]["1"]
+        current_elapsed_ns = bench.ceil_div(
+            previous_elapsed_ns * current_count, previous_count
+        )
+        previous = bench.sizing_candidates_for_cell(
+            "aot",
+            "wait-notify",
+            1,
+            previous_count,
+            previous_elapsed_ns,
+        )
+        current = bench.sizing_candidates_for_cell(
+            "aot",
+            "wait-notify",
+            1,
+            current_count,
+            current_elapsed_ns,
+        )
+
+        self.assertEqual(current_count, 500_000)
+        self.assertEqual(
+            current["selected_iterations"], previous["selected_iterations"]
+        )
+        self.assertEqual(
+            current["selected_sources"], previous["selected_sources"]
+        )
+        projected_elapsed_ns = bench.ceil_div(
+            current_elapsed_ns * current["selected_iterations"],
+            current_count,
+        )
+        self.assertGreaterEqual(
+            projected_elapsed_ns,
+            bench.projected_duration_floor_for_cell(
+                "aot", "wait-notify", 1
+            ),
+        )
 
     def test_spawn_join_override_remains_fail_closed(self) -> None:
         candidates = bench.sizing_candidates_for_cell(
