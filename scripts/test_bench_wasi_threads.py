@@ -2480,6 +2480,16 @@ class ThreadBenchmarkTests(unittest.TestCase):
         hot = pilots[hot_index]
         hot["host_wall_elapsed_ns"] = hot["guest_elapsed_ns"] // 2
         bench.validate_sizing_pilot(hot, pilot_order[hot_index])
+        hot_expected = copy.deepcopy(pilot_order[hot_index])
+        hot_expected["threads"] = 8
+        hot["threads"] = 8
+        hot["guest_elapsed_ns"] = bench.MAXIMUM_PILOT_CORRECTED_NS + 1
+        hot["raw_guest_elapsed_ns"] = (
+            hot["guest_elapsed_ns"] + hot["timing_overhead_ns"]
+        )
+        hot["host_wall_elapsed_ns"] = 8_000_000_000
+        hot["operations"] = hot["iterations"] * hot["threads"]
+        bench.validate_sizing_pilot(hot, hot_expected)
 
         wait_index = next(
             index
@@ -2489,6 +2499,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
         wait = pilots[wait_index]
         wait["host_wall_elapsed_ns"] = wait["guest_elapsed_ns"] // 2
         with self.assertRaisesRegex(bench.HarnessError, "exceeds 33 seconds"):
+            bench.validate_sizing_pilot(wait, pilot_order[wait_index])
+        wait["guest_elapsed_ns"] = bench.MAXIMUM_PILOT_CORRECTED_NS + 1
+        wait["raw_guest_elapsed_ns"] = (
+            wait["guest_elapsed_ns"] + wait["timing_overhead_ns"]
+        )
+        wait["host_wall_elapsed_ns"] = wait["raw_guest_elapsed_ns"]
+        with self.assertRaisesRegex(bench.HarnessError, "exceeds 30 seconds"):
             bench.validate_sizing_pilot(wait, pilot_order[wait_index])
 
     def test_authoritative_post_pilot_budget_charges_actual_wall_time(self) -> None:

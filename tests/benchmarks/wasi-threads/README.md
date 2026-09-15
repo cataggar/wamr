@@ -195,7 +195,10 @@ samples.
 
 Pilots must pass guest correctness and operation assertions, have positive
 timing fields, and provide at least a 1 ms corrected interval for clock
-resolution. They are intentionally not required to satisfy the evidence
+resolution. The corrected-time safety cap is 30 seconds for monotonic pilots
+and 30 seconds per worker for aggregate process-CPU pilots; every pilot retains
+the independent 33-second host-wall cap. They are intentionally not required to
+satisfy the evidence
 `99B < E` rule at their short unsized count. After the frozen count is known,
 every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
@@ -336,7 +339,7 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 13 of a purpose-independent portable
+`measurement_plan_sha256` is version 14 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
