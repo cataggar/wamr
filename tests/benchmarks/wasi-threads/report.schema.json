@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 7 },
+    "schema_version": { "const": 8 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -82,7 +82,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 12 },
+        "measurement_plan_version": { "const": 13 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "cpu_placement": { "$ref": "#/$defs/cpu_placement" },
         "revision_artifacts": {
@@ -240,6 +240,7 @@
         "pair_execution",
         "revision_artifact_policy",
         "fixture_source_policy",
+        "guest_clock_policy",
         "pairs",
         "optimize"
       ],
@@ -310,6 +311,34 @@
         },
         "fixture_source_policy": {
           "const": "candidate-measurement-fixtures-for-all-revisions"
+        },
+        "guest_clock_policy": {
+          "const": {
+            "single-hot": {
+              "clock_id": "wasi-process-cputime",
+              "argument": null
+            },
+            "hot": {
+              "clock_id": "wasi-process-cputime",
+              "argument": "process-cpu"
+            },
+            "atomic": {
+              "clock_id": "wasi-process-cputime",
+              "argument": "process-cpu"
+            },
+            "wait-notify": {
+              "clock_id": "wasi-monotonic",
+              "argument": null
+            },
+            "spawn-join": {
+              "clock_id": "wasi-monotonic",
+              "argument": null
+            },
+            "trusted-hot-preflight": {
+              "clock_id": "wasi-monotonic",
+              "argument": "monotonic"
+            }
+          }
         },
         "pairs": {
           "type": "array",
@@ -825,13 +854,14 @@
     },
     "cpu_placement_policy": {
       "const": {
-        "version": 2,
+        "version": 3,
         "kind": "fixed-linux-physical-core-affinity",
         "physical_core_order": "descending-package-core",
         "logical_cpu_order": "one-lowest-logical-cpu-per-core-before-siblings",
         "single_hot_logical_cpus": 1,
         "single_hot_pair_logical_cpus": 2,
         "single_hot_pair_preference": "smt-siblings-then-separate-physical-cores",
+        "cpu_bound_logical_cpus": "min(available,workers)",
         "threaded_logical_cpus": "min(available,workers+controller)",
         "failure_policy": "fail-closed"
       }
@@ -899,7 +929,7 @@
         "assignments": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["single-hot", "single-hot-pair", "threaded"],
+          "required": ["single-hot", "single-hot-pair", "cpu-bound", "threaded"],
           "properties": {
             "single-hot": {
               "type": "array",
@@ -922,6 +952,17 @@
                   "uniqueItems": true,
                   "items": { "type": "integer", "minimum": 0 }
                 }
+              }
+            },
+            "cpu-bound": {
+              "type": "object",
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "1": { "$ref": "#/$defs/cpu_affinity" },
+                "2": { "$ref": "#/$defs/cpu_affinity" },
+                "4": { "$ref": "#/$defs/cpu_affinity" },
+                "8": { "$ref": "#/$defs/cpu_affinity" }
               }
             },
             "threaded": {
@@ -963,6 +1004,7 @@
         "enabled",
         "mode",
         "workload",
+        "clock_id",
         "probes_per_thread",
         "probe_count",
         "timing_overhead_ratio_limit",
@@ -976,6 +1018,7 @@
         "enabled": { "type": "boolean" },
         "mode": { "const": "aot" },
         "workload": { "const": "hot" },
+        "clock_id": { "const": "wasi-monotonic" },
         "probes_per_thread": { "const": 4 },
         "probe_count": { "type": "integer", "minimum": 0 },
         "timing_overhead_ratio_limit": { "const": 0.01 },
@@ -999,6 +1042,7 @@
         "probe_index",
         "mode",
         "workload",
+        "clock_id",
         "threads",
         "iterations",
         "cpu_affinity",
@@ -1014,6 +1058,7 @@
         "probe_index": { "type": "integer", "minimum": 0 },
         "mode": { "const": "aot" },
         "workload": { "const": "hot" },
+        "clock_id": { "const": "wasi-monotonic" },
         "threads": { "enum": [1, 2, 4, 8] },
         "iterations": { "type": "integer", "minimum": 1 },
         "cpu_affinity": { "$ref": "#/$defs/cpu_affinity" },
@@ -1039,6 +1084,7 @@
         "probes_per_thread",
         "mode",
         "workload",
+        "clock_id",
         "thread_counts",
         "minimum_timed_interval_ns",
         "timing_overhead_ratio_limit",
@@ -1055,6 +1101,7 @@
         "probes_per_thread": { "const": 4 },
         "mode": { "const": "aot" },
         "workload": { "const": "hot" },
+        "clock_id": { "const": "wasi-monotonic" },
         "thread_counts": {
           "type": "array",
           "minItems": 1,

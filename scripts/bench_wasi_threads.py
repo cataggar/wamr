@@ -48,15 +48,17 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 7
+REPORT_SCHEMA_VERSION = 8
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
+WASI_MONOTONIC_CLOCK_MODE = "monotonic"
+WASI_PROCESS_CPU_CLOCK_MODE = "process-cpu"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 12
+MEASUREMENT_PLAN_IDENTITY_VERSION = 13
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
-CPU_PLACEMENT_VERSION = 2
+CPU_PLACEMENT_VERSION = 3
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
 CPU_PLACEMENT_POLICY = {
     "version": CPU_PLACEMENT_VERSION,
@@ -68,6 +70,7 @@ CPU_PLACEMENT_POLICY = {
     "single_hot_pair_preference": (
         "smt-siblings-then-separate-physical-cores"
     ),
+    "cpu_bound_logical_cpus": "min(available,workers)",
     "threaded_logical_cpus": "min(available,workers+controller)",
     "failure_policy": "fail-closed",
 }
@@ -88,6 +91,32 @@ REVISION_ARTIFACT_POLICY = (
     "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
 )
 FIXTURE_SOURCE_POLICY = "candidate-measurement-fixtures-for-all-revisions"
+GUEST_CLOCK_POLICY = {
+    "single-hot": {
+        "clock_id": WASI_PROCESS_CPU_CLOCK_ID,
+        "argument": None,
+    },
+    "hot": {
+        "clock_id": WASI_PROCESS_CPU_CLOCK_ID,
+        "argument": WASI_PROCESS_CPU_CLOCK_MODE,
+    },
+    "atomic": {
+        "clock_id": WASI_PROCESS_CPU_CLOCK_ID,
+        "argument": WASI_PROCESS_CPU_CLOCK_MODE,
+    },
+    "wait-notify": {
+        "clock_id": WASI_MONOTONIC_CLOCK_ID,
+        "argument": None,
+    },
+    "spawn-join": {
+        "clock_id": WASI_MONOTONIC_CLOCK_ID,
+        "argument": None,
+    },
+    "trusted-hot-preflight": {
+        "clock_id": WASI_MONOTONIC_CLOCK_ID,
+        "argument": WASI_MONOTONIC_CLOCK_MODE,
+    },
+}
 SIZING_ALGORITHM_VERSION = 10
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
@@ -273,7 +302,7 @@ FIXTURES = {
     },
     "threaded": {
         "path": Path("tests/benchmarks/wasi-threads/threaded.wasm"),
-        "sha256": "74844114b45b54d5532d1e37d69a99e85c4fd51167c56f359f9222e2bcacd60d",
+        "sha256": "93378ef0c2e0051bfd7616b4724cf8a574747f74f6215cec99ddc07988e975f0",
     },
 }
 MASK64 = (1 << 64) - 1
@@ -439,6 +468,12 @@ def cpu_placement_from_topology(
         "assignments": {
             "single-hot": ordered_logical_cpus[:1],
             "single-hot-pair": direct_pair_assignment,
+            "cpu-bound": {
+                str(threads): ordered_logical_cpus[
+                    : min(len(ordered_logical_cpus), threads)
+                ]
+                for threads in thread_counts
+            },
             "threaded": {
                 str(threads): ordered_logical_cpus[
                     : min(len(ordered_logical_cpus), threads + 1)
@@ -493,8 +528,13 @@ def cpu_affinity_for(
 ) -> list[int]:
     if workload == "single-hot":
         return list(cpu_placement["assignments"]["single-hot"])
+    assignment_kind = (
+        "cpu-bound" if workload in ("hot", "atomic") else "threaded"
+    )
     try:
-        return list(cpu_placement["assignments"]["threaded"][str(threads)])
+        return list(
+            cpu_placement["assignments"][assignment_kind][str(threads)]
+        )
     except KeyError as exc:
         raise HarnessError(
             f"CPU placement has no assignment for {threads} threads"
@@ -2307,9 +2347,19 @@ def worker_seed(index: int) -> int:
     ) & MASK64
 
 
+def expected_guest_clock_id(workload: str) -> str:
+    try:
+        return GUEST_CLOCK_POLICY[workload]["clock_id"]
+    except KeyError as exc:
+        raise HarnessError(f"unsupported workload clock policy {workload}") from exc
+
+
 @functools.lru_cache(maxsize=None)
 def expected_result(
-    workload: str, threads: int, iterations: int
+    workload: str,
+    threads: int,
+    iterations: int,
+    clock_id: str | None = None,
 ) -> dict[str, int | str]:
     if not 0 < threads <= 8 or not 0 <= iterations <= MASK64 // threads:
         raise HarnessError("expected-result operations must fit uint64")
@@ -2336,11 +2386,7 @@ def expected_result(
         "iterations": iterations,
         "operations": operations,
         "checksum": checksum,
-        "clock_id": (
-            WASI_PROCESS_CPU_CLOCK_ID
-            if workload == "single-hot"
-            else WASI_MONOTONIC_CLOCK_ID
-        ),
+        "clock_id": clock_id or expected_guest_clock_id(workload),
         "metric_kind": (
             "spawn-join-lifecycle"
             if workload == "spawn-join"
@@ -2562,12 +2608,22 @@ def measure_once(
     enforce_timing_quality: bool = True,
     cpu_affinity_override: list[int] | None = None,
     runtime_args: tuple[str, ...] = (),
+    guest_clock_id: str | None = None,
 ) -> dict[str, Any]:
-    guest_args = (
-        [str(iterations)]
-        if workload == "single-hot"
-        else [workload, str(threads), str(iterations)]
-    )
+    resolved_clock_id = guest_clock_id or expected_guest_clock_id(workload)
+    if workload == "single-hot":
+        guest_args = [str(iterations)]
+    else:
+        guest_args = [workload, str(threads), str(iterations)]
+        if workload in ("hot", "atomic"):
+            if resolved_clock_id == WASI_PROCESS_CPU_CLOCK_ID:
+                guest_args.append(WASI_PROCESS_CPU_CLOCK_MODE)
+            elif resolved_clock_id == WASI_MONOTONIC_CLOCK_ID:
+                guest_args.append(WASI_MONOTONIC_CLOCK_MODE)
+            else:
+                raise HarnessError(
+                    f"unsupported guest clock identity {resolved_clock_id}"
+                )
     cpu_affinity = (
         list(cpu_affinity_override)
         if cpu_affinity_override is not None
@@ -2613,7 +2669,12 @@ def measure_once(
             f"guest failure classification={classification}; "
             f"exit {returncode}: {' '.join(command)}\n{stderr}"
         )
-    expected = expected_result(workload, threads, iterations)
+    expected = expected_result(
+        workload,
+        threads,
+        iterations,
+        resolved_clock_id,
+    )
     guest = parse_guest_result(
         stdout,
         expected,
@@ -2709,6 +2770,7 @@ def run_trusted_barrier_preflight(
                     timeout=timeout,
                     min_interval_ns=minimum_interval_ns,
                     enforce_timing_quality=False,
+                    guest_clock_id=WASI_MONOTONIC_CLOCK_ID,
                     record_fields={
                         "mode": "aot",
                         "threads_enabled": True,
@@ -2726,6 +2788,7 @@ def run_trusted_barrier_preflight(
                     scenario={
                         "mode": "aot",
                         "workload": "hot",
+                        "clock_id": WASI_MONOTONIC_CLOCK_ID,
                         "threads": threads,
                         "probe_index": probe_index,
                     },
@@ -2738,6 +2801,7 @@ def run_trusted_barrier_preflight(
                     "probe_index": probe_index,
                     "mode": "aot",
                     "workload": "hot",
+                    "clock_id": measured["guest"]["clock_id"],
                     "threads": threads,
                     "iterations": iterations,
                     "cpu_affinity": measured["cpu_affinity"],
@@ -2766,6 +2830,7 @@ def run_trusted_barrier_preflight(
         "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
         "mode": "aot",
         "workload": "hot",
+        "clock_id": WASI_MONOTONIC_CLOCK_ID,
         "thread_counts": list(thread_counts),
         "minimum_timed_interval_ns": minimum_interval_ns,
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
@@ -3277,11 +3342,16 @@ def validate_report(document: dict[str, Any]) -> None:
         "plan.fixture_source_policy",
     )
     require(
+        plan.get("guest_clock_policy") == GUEST_CLOCK_POLICY,
+        "plan.guest_clock_policy",
+    )
+    require(
         isinstance(preflight_plan.get("enabled"), bool)
         and isinstance(preflight_plan.get("acceptance_rule"), str)
         and bool(preflight_plan["acceptance_rule"])
         and preflight_plan.get("mode") == "aot"
         and preflight_plan.get("workload") == "hot"
+        and preflight_plan.get("clock_id") == WASI_MONOTONIC_CLOCK_ID
         and preflight_plan.get("probes_per_thread")
         == TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
         and preflight_plan.get("timing_overhead_ratio_limit")
@@ -3616,6 +3686,7 @@ def validate_report(document: dict[str, Any]) -> None:
         == maximum_preflight_barrier_ns(plan["minimum_timed_interval_ns"])
         and quality_preflight.get("mode") == preflight_plan["mode"]
         and quality_preflight.get("workload") == preflight_plan["workload"]
+        and quality_preflight.get("clock_id") == preflight_plan["clock_id"]
         and quality_preflight.get("thread_counts") == plan["thread_counts"]
         and quality_preflight.get("acceptance_rule")
         == preflight_plan["acceptance_rule"]
@@ -3669,6 +3740,7 @@ def validate_report(document: dict[str, Any]) -> None:
             require(
                 sample.get("mode") == "aot"
                 and sample.get("workload") == "hot"
+                and sample.get("clock_id") == WASI_MONOTONIC_CLOCK_ID
                 and sample.get("cpu_affinity")
                 == cpu_affinity_for(
                     cpu_placement,
@@ -3755,8 +3827,11 @@ def validate_report(document: dict[str, Any]) -> None:
             == record.get("host_wall_elapsed_ns"),
             "record host interval",
         )
+        record_clock_id = expected_guest_clock_id(record.get("workload"))
         require(
-            record.get("host_wall_elapsed_ns", 0) >= record["guest_elapsed_ns"],
+            record_clock_id == WASI_PROCESS_CPU_CLOCK_ID
+            or record.get("host_wall_elapsed_ns", 0)
+            >= record["guest_elapsed_ns"],
             "record host wall diagnostic",
         )
         require(
@@ -3843,11 +3918,25 @@ def validate_report(document: dict[str, Any]) -> None:
             is expected_manager_enabled,
             "record thread-manager state",
         )
-        expected_clock_id = (
-            WASI_PROCESS_CPU_CLOCK_ID
-            if record["pair_kind"] == "single-infrastructure"
-            else WASI_MONOTONIC_CLOCK_ID
+        expected_clock_id = record_clock_id
+        expected_clock_mode = (
+            WASI_PROCESS_CPU_CLOCK_MODE
+            if expected_clock_id == WASI_PROCESS_CPU_CLOCK_ID
+            else WASI_MONOTONIC_CLOCK_MODE
         )
+        command = record.get("command", [])
+        if record["workload"] in ("hot", "atomic"):
+            require(
+                command.count(expected_clock_mode) == 1
+                and command[-1] == expected_clock_mode,
+                "record guest clock command",
+            )
+        else:
+            require(
+                WASI_PROCESS_CPU_CLOCK_MODE not in command
+                and WASI_MONOTONIC_CLOCK_MODE not in command,
+                "record guest clock command",
+            )
         require(
             record.get("guest", {}).get("clock_id") == expected_clock_id,
             "record guest clock",
@@ -4834,6 +4923,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
         "mode": "aot",
         "workload": "hot",
+        "clock_id": WASI_MONOTONIC_CLOCK_ID,
         "thread_counts": list(args.thread_counts),
         "minimum_timed_interval_ns": minimum_interval_ns,
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
@@ -5044,6 +5134,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "enabled": args.trusted_calibration_preflight,
             "mode": "aot",
             "workload": "hot",
+            "clock_id": WASI_MONOTONIC_CLOCK_ID,
             "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
             "probe_count": (
                 TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
@@ -5066,6 +5157,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "pair_execution": copy.deepcopy(PAIR_EXECUTION_POLICY),
         "revision_artifact_policy": REVISION_ARTIFACT_POLICY,
         "fixture_source_policy": FIXTURE_SOURCE_POLICY,
+        "guest_clock_policy": copy.deepcopy(GUEST_CLOCK_POLICY),
         "optimize": args.optimize,
         "pairs": pair_plan,
     }

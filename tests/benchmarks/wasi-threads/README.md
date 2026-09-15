@@ -43,10 +43,12 @@ passive-data start initialization, pthread lifecycle, serialization, and
 teardown. They are retained as historical whole-process diagnostics only and
 must not be used as throughput or #957 cancel-poll evidence.
 
-The corrected metric is guest-reported WASI time. Threaded coordination and
-lifecycle workloads use the monotonic clock. `single-hot` uses the process-CPU
-clock so concurrent placement cannot turn descheduling into apparent runtime
-cost:
+The corrected metric is guest-reported WASI time. CPU-bound `single-hot`,
+`hot`, and `atomic` evidence uses the process-CPU clock so descheduling and
+host steal do not become apparent runtime cost. Coordination and lifecycle
+`wait-notify` and `spawn-join` evidence uses the monotonic clock. The trusted
+scheduler/barrier preflight explicitly runs `hot` with monotonic time because
+its purpose is to detect host scheduling stalls:
 
 - `hot`, `atomic`, and `wait-notify` spawn their workers first, warm code where
   applicable, and wait until every worker is ready;
@@ -334,7 +336,7 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 12 of a purpose-independent portable
+`measurement_plan_sha256` is version 13 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -378,10 +380,13 @@ candidate executions of the same condition are adjacent, and the complete
 four-execution order reverses on alternating samples. This minimizes host drift
 in the absolute revision comparison while preserving balanced revision and
 condition positions.
-Threaded workloads use
+CPU-bound `hot` and `atomic` use
+`min(available logical CPUs, workers)`, avoiding an unused controller CPU and
+selecting physical cores before SMT siblings. Coordination/lifecycle
+`wait-notify` and `spawn-join` use
 `min(available logical CPUs, workers + one controller)` so a one-worker
 wait/notify pair receives two distinct physical cores when the host exposes
-them. The report retains the complete topology, deterministic assignments,
+them. The report retains both assignment classes, the complete topology,
 `taskset` version, per-record affinity, and command prefix; validation rejects
 missing, reordered, or mutated placement evidence.
 
@@ -489,8 +494,9 @@ enable the same fixed scheduler/barrier quality preflight; ordinary hosted
 PR/push diagnostics do not enable it.
 
 The preflight runs before any warmup or measured record. For each selected
-thread count it runs exactly four AOT `hot` invocations through the checked-in
-threaded guest's normal five-epoch release/completion barrier and runtime path:
+thread count it runs exactly four AOT `hot` invocations with the explicit
+monotonic timing mode through the checked-in threaded guest's normal five-epoch
+release/completion barrier and runtime path:
 16 fixed probes for the default 1/2/4/8 plan. It never retries, discards a
 probe, adapts work, or waits for quiet. Every probe is retained. Against the
 retained empirical one-in-257 tail, 16 independent probes have only
