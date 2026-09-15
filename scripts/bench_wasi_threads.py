@@ -48,13 +48,13 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 6
+REPORT_SCHEMA_VERSION = 7
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 11
+MEASUREMENT_PLAN_IDENTITY_VERSION = 12
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 CPU_PLACEMENT_VERSION = 2
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
@@ -73,6 +73,7 @@ CPU_PLACEMENT_POLICY = {
 }
 PAIR_EXECUTION_POLICY = {
     "default": "sequential-alternating",
+    "default_order": "condition-major-adjacent-revisions",
     "single_infrastructure": "concurrent-topology-paired-cpus",
     "single_infrastructure_artifact": "same-enabled-runtime-binary",
     "single_infrastructure_condition": (
@@ -517,6 +518,32 @@ def direct_pair_cpu_affinity(
         raise HarnessError(
             "CPU placement has no direct-pair assignment"
         ) from exc
+
+
+def paired_invocation_order(
+    global_index: int,
+    pair_kind: str,
+    left: str,
+    right: str,
+    revision_roles: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    revisions = (
+        alternating_pair_order(global_index, *REVISION_ROLES)
+        if revision_roles == REVISION_ROLES
+        else SINGLE_REVISION_ROLES
+    )
+    conditions = alternating_pair_order(global_index, left, right)
+    if pair_kind == "single-infrastructure":
+        return tuple(
+            (revision, condition)
+            for revision in revisions
+            for condition in conditions
+        )
+    return tuple(
+        (revision, condition)
+        for condition in conditions
+        for revision in revisions
+    )
 
 
 def validate_cpu_placement(
@@ -2786,35 +2813,40 @@ def collect_revision_pair(
             if revision_roles == REVISION_ROLES
             else SINGLE_REVISION_ROLES
         )
-        for revision_index, revision in enumerate(revision_order):
-            for condition_index, condition in enumerate(condition_order):
-                record = measure(
-                    revision,
-                    condition,
-                    {
-                        **revision_fields[revision],
-                        "revision": revision,
-                        "revision_order": revision_index,
-                        "pair_kind": pair_kind,
-                        "pair_key": pair_key,
-                        "pair_index": phase_index,
-                        "phase": phase,
-                        "order": condition_index,
-                        "condition": condition,
-                        "pair_left": left,
-                        "pair_right": right,
-                        "pair_execution": PAIR_EXECUTION_POLICY["default"],
-                    },
-                )
-                records.append(record)
-                print(
-                    f"[thread-bench] {pair_key} {phase} {phase_index + 1}/"
-                    f"{warmups if phase == 'warmup' else samples} "
-                    f"{revision}/{condition}: "
-                    f"guest={record['guest_elapsed_ns'] / 1e6:.3f} ms "
-                    f"host={record['host_wall_elapsed_ns'] / 1e6:.3f} ms",
-                    file=sys.stderr,
-                )
+        for revision, condition in paired_invocation_order(
+            index,
+            pair_kind,
+            left,
+            right,
+            revision_roles,
+        ):
+            record = measure(
+                revision,
+                condition,
+                {
+                    **revision_fields[revision],
+                    "revision": revision,
+                    "revision_order": revision_order.index(revision),
+                    "pair_kind": pair_kind,
+                    "pair_key": pair_key,
+                    "pair_index": phase_index,
+                    "phase": phase,
+                    "order": condition_order.index(condition),
+                    "condition": condition,
+                    "pair_left": left,
+                    "pair_right": right,
+                    "pair_execution": PAIR_EXECUTION_POLICY["default"],
+                },
+            )
+            records.append(record)
+            print(
+                f"[thread-bench] {pair_key} {phase} {phase_index + 1}/"
+                f"{warmups if phase == 'warmup' else samples} "
+                f"{revision}/{condition}: "
+                f"guest={record['guest_elapsed_ns'] / 1e6:.3f} ms "
+                f"host={record['host_wall_elapsed_ns'] / 1e6:.3f} ms",
+                file=sys.stderr,
+            )
 
 
 def collect_concurrent_revision_pair(
@@ -3974,19 +4006,15 @@ def validate_report(document: dict[str, Any]) -> None:
                 )
                 require(
                     cell_order.get((pair_key, phase, index))
-                    == [
-                        (revision, condition)
-                        for revision in (
-                            alternating_pair_order(
-                                global_index, *REVISION_ROLES
-                            )
-                            if revision_roles == REVISION_ROLES
-                            else SINGLE_REVISION_ROLES
+                    == list(
+                        paired_invocation_order(
+                            global_index,
+                            pair["pair_kind"],
+                            pair["left"],
+                            pair["right"],
+                            revision_roles,
                         )
-                        for condition in alternating_pair_order(
-                            global_index, pair["left"], pair["right"]
-                        )
-                    ],
+                    ),
                     f"inverted pair order {pair_key}/{phase}/{index}",
                 )
 
