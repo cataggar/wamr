@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 9 },
+    "schema_version": { "const": 10 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -82,7 +82,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 14 },
+        "measurement_plan_version": { "const": 15 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "cpu_placement": { "$ref": "#/$defs/cpu_placement" },
         "revision_artifacts": {
@@ -1009,6 +1009,7 @@
         "mode",
         "workload",
         "clock_id",
+        "iteration_multiplier",
         "probes_per_thread",
         "probe_count",
         "timing_overhead_ratio_limit",
@@ -1023,6 +1024,9 @@
         "mode": { "const": "aot" },
         "workload": { "const": "hot" },
         "clock_id": { "const": "wasi-monotonic" },
+        "iteration_multiplier": {
+          "const": "cpu-bound-affinity-logical-cpu-count"
+        },
         "probes_per_thread": { "const": 4 },
         "probe_count": { "type": "integer", "minimum": 0 },
         "timing_overhead_ratio_limit": { "const": 0.01 },
@@ -1089,6 +1093,7 @@
         "mode",
         "workload",
         "clock_id",
+        "iteration_multiplier",
         "thread_counts",
         "minimum_timed_interval_ns",
         "timing_overhead_ratio_limit",
@@ -1106,6 +1111,9 @@
         "mode": { "const": "aot" },
         "workload": { "const": "hot" },
         "clock_id": { "const": "wasi-monotonic" },
+        "iteration_multiplier": {
+          "const": "cpu-bound-affinity-logical-cpu-count"
+        },
         "thread_counts": {
           "type": "array",
           "minItems": 1,
