@@ -49,6 +49,8 @@ CANONICAL_PLATFORMS = {
 
 KIND = "wasi-thread-benchmark"
 REPORT_SCHEMA_VERSION = 6
+WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
+WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
@@ -2308,9 +2310,9 @@ def expected_result(
         "operations": operations,
         "checksum": checksum,
         "clock_id": (
-            "wasi-process-cputime"
+            WASI_PROCESS_CPU_CLOCK_ID
             if workload == "single-hot"
-            else "wasi-monotonic"
+            else WASI_MONOTONIC_CLOCK_ID
         ),
         "metric_kind": (
             "spawn-join-lifecycle"
@@ -3810,9 +3812,9 @@ def validate_report(document: dict[str, Any]) -> None:
             "record thread-manager state",
         )
         expected_clock_id = (
-            "wasi-process-cpu"
+            WASI_PROCESS_CPU_CLOCK_ID
             if record["pair_kind"] == "single-infrastructure"
-            else "wasi-monotonic"
+            else WASI_MONOTONIC_CLOCK_ID
         )
         require(
             record.get("guest", {}).get("clock_id") == expected_clock_id,
