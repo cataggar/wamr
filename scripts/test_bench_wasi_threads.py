@@ -442,9 +442,9 @@ def make_report(
                 "guest": {
                     "metric_kind": metric_kind,
                     "clock_id": (
-                        "wasi-process-cpu"
+                        bench.WASI_PROCESS_CPU_CLOCK_ID
                         if pair["pair_kind"] == "single-infrastructure"
-                        else "wasi-monotonic"
+                        else bench.WASI_MONOTONIC_CLOCK_ID
                     ),
                 },
                 "correct": True,
@@ -3192,9 +3192,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "per_thread_ops_per_second": 1 / 1.3,
                 "guest": {
                     "clock_id": (
-                        "wasi-process-cpu"
+                        bench.WASI_PROCESS_CPU_CLOCK_ID
                         if kwargs["workload"] == "single-hot"
-                        else "wasi-monotonic"
+                        else bench.WASI_MONOTONIC_CLOCK_ID
                     ),
                 },
                 "correct": True,
