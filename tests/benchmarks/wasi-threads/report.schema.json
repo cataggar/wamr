@@ -28,6 +28,7 @@
         "build_source_sha256",
         "revisions",
         "revision_checkouts",
+        "fixture_source",
         "collected_at",
         "platform_id",
         "fixture_set_sha256",
@@ -63,6 +64,18 @@
           "properties": {
             "baseline": { "type": "string", "minLength": 1 },
             "candidate": { "type": "string", "minLength": 1 }
+          }
+        },
+        "fixture_source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "role", "checkout"],
+          "properties": {
+            "policy": {
+              "const": "candidate-measurement-fixtures-for-all-revisions"
+            },
+            "role": { "const": "candidate" },
+            "checkout": { "type": "string", "minLength": 1 }
           }
         },
         "collected_at": { "type": "string", "minLength": 1 },
@@ -226,6 +239,7 @@
         "cpu_placement",
         "pair_execution",
         "revision_artifact_policy",
+        "fixture_source_policy",
         "pairs",
         "optimize"
       ],
@@ -293,6 +307,9 @@
         "pair_execution": { "$ref": "#/$defs/pair_execution_policy" },
         "revision_artifact_policy": {
           "const": "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
+        },
+        "fixture_source_policy": {
+          "const": "candidate-measurement-fixtures-for-all-revisions"
         },
         "pairs": {
           "type": "array",

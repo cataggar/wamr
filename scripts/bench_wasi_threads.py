@@ -84,6 +84,7 @@ PAIR_EXECUTION_POLICY = {
 REVISION_ARTIFACT_POLICY = (
     "reuse-exact-artifacts-for-identical-noise-calibration-revisions"
 )
+FIXTURE_SOURCE_POLICY = "candidate-measurement-fixtures-for-all-revisions"
 SIZING_ALGORITHM_VERSION = 10
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
@@ -2090,6 +2091,17 @@ def resolve_fixtures(repo: Path) -> dict[str, dict[str, Any]]:
     return result
 
 
+def resolve_measurement_fixtures(
+    revision_repos: dict[str, Path],
+) -> tuple[Path, dict[str, dict[str, Any]], str]:
+    try:
+        fixture_repo = revision_repos["candidate"]
+    except KeyError as exc:
+        raise HarnessError("measurement fixtures require a candidate checkout") from exc
+    fixtures = resolve_fixtures(fixture_repo)
+    return fixture_repo, fixtures, fixture_set_identity(fixtures)
+
+
 def compile_aot_fixtures(
     repo: Path,
     output: Path,
@@ -3227,6 +3239,10 @@ def validate_report(document: dict[str, Any]) -> None:
         "plan.revision_artifact_policy",
     )
     require(
+        plan.get("fixture_source_policy") == FIXTURE_SOURCE_POLICY,
+        "plan.fixture_source_policy",
+    )
+    require(
         isinstance(preflight_plan.get("enabled"), bool)
         and isinstance(preflight_plan.get("acceptance_rule"), str)
         and bool(preflight_plan["acceptance_rule"])
@@ -3351,6 +3367,17 @@ def validate_report(document: dict[str, Any]) -> None:
             for path in revision_checkouts.values()
         ),
         "metadata.revision_checkouts",
+    )
+    fixture_source = metadata.get("fixture_source")
+    require(
+        isinstance(fixture_source, dict)
+        and fixture_source
+        == {
+            "policy": FIXTURE_SOURCE_POLICY,
+            "role": "candidate",
+            "checkout": revision_checkouts["candidate"],
+        },
+        "metadata.fixture_source",
     )
     if revision_mode == "paired-revisions":
         require(
@@ -4679,19 +4706,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "noise calibration requires identical revision identities "
                 "from distinct checkout paths"
             )
-    fixture_reports = {
-        role: resolve_fixtures(revision_repo)
-        for role, revision_repo in revision_repos.items()
-    }
-    fixture_set_identities = {
-        role: fixture_set_identity(fixtures)
-        for role, fixtures in fixture_reports.items()
-    }
-    if len(set(fixture_set_identities.values())) != 1:
-        raise HarnessError(
-            "baseline/candidate reports have mixed fixture identity"
-        )
-    fixture_set_sha256 = fixture_set_identities["candidate"]
+    fixture_repo, fixture_report, fixture_set_sha256 = (
+        resolve_measurement_fixtures(revision_repos)
+    )
     minimum_interval_ns = int(args.min_interval_ms * 1_000_000)
     modes = ("interpreter", "aot") if args.modes == "both" else (args.modes,)
     pilot_iteration_plan = args.pilot_iteration_plan
@@ -4763,7 +4780,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 compiler = builds["enabled-aot"]
             aot_artifacts = compile_aot_fixtures(
-                revision_repo,
+                fixture_repo,
                 revision_output,
                 compiler,
                 execution_arch(args),
@@ -4776,8 +4793,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "builds": builds,
             "aot_artifacts": aot_artifacts,
             "aot_artifacts_metadata": aot_artifacts_metadata,
-            "single_wasm": revision_repo / FIXTURES["single"]["path"],
-            "threaded_wasm": revision_repo / FIXTURES["threaded"]["path"],
+            "single_wasm": fixture_repo / FIXTURES["single"]["path"],
+            "threaded_wasm": fixture_repo / FIXTURES["threaded"]["path"],
         }
 
     quality_preflight: dict[str, Any] = {
@@ -5018,6 +5035,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "cpu_placement": copy.deepcopy(CPU_PLACEMENT_POLICY),
         "pair_execution": copy.deepcopy(PAIR_EXECUTION_POLICY),
         "revision_artifact_policy": REVISION_ARTIFACT_POLICY,
+        "fixture_source_policy": FIXTURE_SOURCE_POLICY,
         "optimize": args.optimize,
         "pairs": pair_plan,
     }
@@ -5029,7 +5047,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     revisions = {
         role: {
             **sources[role],
-            "fixture_set_sha256": fixture_set_identities[role],
+            "fixture_set_sha256": fixture_set_sha256,
             "plan_sha256": plan_sha256,
             "host_pair_id": host_pair["id"],
             "host_fingerprint_sha256": host_pair[
@@ -5477,6 +5495,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "revision_checkouts": {
                 role: str(revision_repos[role]) for role in revision_roles
             },
+            "fixture_source": {
+                "policy": FIXTURE_SOURCE_POLICY,
+                "role": "candidate",
+                "checkout": str(fixture_repo),
+            },
             "collected_at": collected_at(),
             "platform_id": args.platform_id,
             "fixture_set_sha256": fixture_set_sha256,
@@ -5506,7 +5529,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 for role in revision_roles
             },
             "fixture_toolchain": WASI_SDK,
-            "fixtures": fixture_reports["candidate"],
+            "fixtures": fixture_report,
             "aot_artifacts": {
                 role: contexts[role]["aot_artifacts_metadata"]
                 for role in revision_roles
