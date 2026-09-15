@@ -241,6 +241,9 @@ def make_report(
             "mode": "aot",
             "workload": "hot",
             "clock_id": bench.WASI_MONOTONIC_CLOCK_ID,
+            "iteration_multiplier": (
+                bench.TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
+            ),
             "probes_per_thread": (
                 bench.TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
             ),
@@ -566,6 +569,9 @@ def make_report(
             "mode": "aot",
             "workload": "hot",
             "clock_id": bench.WASI_MONOTONIC_CLOCK_ID,
+            "iteration_multiplier": (
+                bench.TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
+            ),
             "thread_counts": [1],
             "minimum_timed_interval_ns": 1_250_000_000,
             "timing_overhead_ratio_limit": (
@@ -2918,7 +2924,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(
             [sample["iterations"] for sample in result["samples"]],
-            [1_320_000_000] * 4 + [330_000_000] * 4,
+            [2_640_000_000] * 4 + [1_320_000_000] * 4,
         )
         self.assertEqual(
             [sample["timing_overhead_ns"] for sample in result["samples"]],
@@ -5460,6 +5466,9 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "mode": "aot",
             "workload": "hot",
             "clock_id": bench.WASI_MONOTONIC_CLOCK_ID,
+            "iteration_multiplier": (
+                bench.TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
+            ),
             "thread_counts": [1],
             "minimum_timed_interval_ns": 1_250_000_000,
             "timing_overhead_ratio_limit": 0.01,

@@ -339,7 +339,7 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 14 of a purpose-independent portable
+`measurement_plan_sha256` is version 15 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -498,8 +498,11 @@ PR/push diagnostics do not enable it.
 
 The preflight runs before any warmup or measured record. For each selected
 thread count it runs exactly four AOT `hot` invocations with the explicit
-monotonic timing mode through the checked-in threaded guest's normal five-epoch
-release/completion barrier and runtime path:
+monotonic timing mode. Each invocation multiplies the selected process-CPU
+evidence iterations by the number of assigned logical CPUs so its wall-time
+interval remains representative of the fixed evidence floor. It uses the
+checked-in threaded guest's normal five-epoch release/completion barrier and
+runtime path:
 16 fixed probes for the default 1/2/4/8 plan. It never retries, discards a
 probe, adapts work, or waits for quiet. Every probe is retained. Against the
 retained empirical one-in-257 tail, 16 independent probes have only

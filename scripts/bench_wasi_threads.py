@@ -48,7 +48,7 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 9
+REPORT_SCHEMA_VERSION = 10
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 WASI_MONOTONIC_CLOCK_MODE = "monotonic"
@@ -56,7 +56,7 @@ WASI_PROCESS_CPU_CLOCK_MODE = "process-cpu"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 14
+MEASUREMENT_PLAN_IDENTITY_VERSION = 15
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 CPU_PLACEMENT_VERSION = 3
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
@@ -212,6 +212,9 @@ SIZING_WORKLOAD_CAPS = {
     "spawn-join": 1_000_000,
 }
 TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD = 4
+TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER = (
+    "cpu-bound-affinity-logical-cpu-count"
+)
 DEFAULT_PILOT_ITERATION_PLAN = {
     "interpreter": {
         "single-hot": 30_000_000,
@@ -2777,7 +2780,10 @@ def run_trusted_barrier_preflight(
 ) -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     for threads in thread_counts:
-        iterations = iterations_by_thread[str(threads)]
+        cpu_affinity = cpu_affinity_for(cpu_placement, "hot", threads)
+        iterations = (
+            iterations_by_thread[str(threads)] * len(cpu_affinity)
+        )
         for probe_index in range(TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD):
             try:
                 measured = measure_once(
@@ -2793,6 +2799,7 @@ def run_trusted_barrier_preflight(
                     min_interval_ns=minimum_interval_ns,
                     enforce_timing_quality=False,
                     guest_clock_id=WASI_MONOTONIC_CLOCK_ID,
+                    cpu_affinity_override=cpu_affinity,
                     record_fields={
                         "mode": "aot",
                         "threads_enabled": True,
@@ -2811,6 +2818,9 @@ def run_trusted_barrier_preflight(
                         "mode": "aot",
                         "workload": "hot",
                         "clock_id": WASI_MONOTONIC_CLOCK_ID,
+                        "iteration_multiplier": (
+                            TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
+                        ),
                         "threads": threads,
                         "probe_index": probe_index,
                     },
@@ -2853,6 +2863,9 @@ def run_trusted_barrier_preflight(
         "mode": "aot",
         "workload": "hot",
         "clock_id": WASI_MONOTONIC_CLOCK_ID,
+        "iteration_multiplier": (
+            TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
+        ),
         "thread_counts": list(thread_counts),
         "minimum_timed_interval_ns": minimum_interval_ns,
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
@@ -3374,6 +3387,8 @@ def validate_report(document: dict[str, Any]) -> None:
         and preflight_plan.get("mode") == "aot"
         and preflight_plan.get("workload") == "hot"
         and preflight_plan.get("clock_id") == WASI_MONOTONIC_CLOCK_ID
+        and preflight_plan.get("iteration_multiplier")
+        == TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
         and preflight_plan.get("probes_per_thread")
         == TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
         and preflight_plan.get("timing_overhead_ratio_limit")
@@ -3709,6 +3724,8 @@ def validate_report(document: dict[str, Any]) -> None:
         and quality_preflight.get("mode") == preflight_plan["mode"]
         and quality_preflight.get("workload") == preflight_plan["workload"]
         and quality_preflight.get("clock_id") == preflight_plan["clock_id"]
+        and quality_preflight.get("iteration_multiplier")
+        == preflight_plan["iteration_multiplier"]
         and quality_preflight.get("thread_counts") == plan["thread_counts"]
         and quality_preflight.get("acceptance_rule")
         == preflight_plan["acceptance_rule"]
@@ -3770,7 +3787,16 @@ def validate_report(document: dict[str, Any]) -> None:
                     sample["threads"],
                 )
                 and sample.get("iterations")
-                == plan["iterations"]["aot"]["hot"][str(sample["threads"])]
+                == (
+                    plan["iterations"]["aot"]["hot"][str(sample["threads"])]
+                    * len(
+                        cpu_affinity_for(
+                            cpu_placement,
+                            "hot",
+                            sample["threads"],
+                        )
+                    )
+                )
                 and raw == timed + overhead
                 and sample.get("timing_overhead_ppm")
                 == overhead * 1_000_000 // raw
@@ -4946,6 +4972,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         "mode": "aot",
         "workload": "hot",
         "clock_id": WASI_MONOTONIC_CLOCK_ID,
+        "iteration_multiplier": (
+            TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
+        ),
         "thread_counts": list(args.thread_counts),
         "minimum_timed_interval_ns": minimum_interval_ns,
         "timing_overhead_ratio_limit": TIMING_OVERHEAD_RATIO_LIMIT,
@@ -5157,6 +5186,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "mode": "aot",
             "workload": "hot",
             "clock_id": WASI_MONOTONIC_CLOCK_ID,
+            "iteration_multiplier": (
+                TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
+            ),
             "probes_per_thread": TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD,
             "probe_count": (
                 TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
@@ -5264,11 +5296,19 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 for sample in quality_preflight["samples"]
                 if not sample["accepted"]
             )
-            message = (
-                "trusted scheduler/barrier preflight failed: "
-                f"{failed['timing_overhead_ns']}ns barrier cannot remain below "
-                f"1% at the fixed {minimum_interval_ns}ns minimum interval"
-            )
+            if failed["timed_interval_ns"] < minimum_interval_ns:
+                message = (
+                    "trusted scheduler/barrier preflight failed: "
+                    f"{failed['timed_interval_ns']}ns interval is below the "
+                    f"fixed {minimum_interval_ns}ns minimum"
+                )
+            else:
+                message = (
+                    "trusted scheduler/barrier preflight failed: "
+                    f"{failed['timing_overhead_ns']}ns barrier cannot remain "
+                    f"below 1% at the fixed {minimum_interval_ns}ns "
+                    "minimum interval"
+                )
             raise_with_failure_diagnostic(
                 HarnessError(message),
                 output=output,
