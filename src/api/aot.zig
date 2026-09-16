@@ -14,7 +14,7 @@ pub const Value = format.Value;
 pub const HostError = error{ Unsupported, InvalidArgument, Io, OutOfMemory };
 pub const Trap = enum { out_of_bounds_memory, out_of_bounds_table, unreachable_instruction, integer_divide_by_zero, integer_overflow, invalid_conversion, unsupported_operation, bad_host_result };
 pub const Outcome = union(enum) { returned: usize, trap: Trap, exit: u32, host_error: HostError };
-pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds };
+pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, InvalidContinuation, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds };
 
 pub const HostImport = struct {
     module: []const u8,
@@ -304,14 +304,20 @@ pub const Instance = struct {
         self.pending = null;
         self.active = true;
         defer self.active = false;
-        if (jump.capture(&self.continuation) != 0) return self.pending.?;
+        if (jump.capture(&self.continuation) != 0) {
+            // The assembly continuation is not an ordinary Zig return edge.
+            // Force a reload of state written by a deeper, now-unwound frame.
+            const terminal: *volatile ?Outcome = &self.pending;
+            return terminal.* orelse error.InvalidContinuation;
+        }
         const bits = invokeRaw(self.functions[index], &self.vmctx, &raw);
         if (sig.results.len == 1) results[0] = Value.fromRaw(sig.results[0], bits);
         return .{ .returned = sig.results.len };
     }
 
     fn stop(self: *Instance, outcome: Outcome) noreturn {
-        self.pending = outcome;
+        const terminal: *volatile ?Outcome = &self.pending;
+        terminal.* = outcome;
         jump.restore(&self.continuation, 1);
     }
 
