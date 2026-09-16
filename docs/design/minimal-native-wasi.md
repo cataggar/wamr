@@ -127,6 +127,40 @@ exercises its required paging and allocation capabilities. Those platform
 enablement and linked-image checks belong to the native backend and the
 Unikraft integration work, not this allocation-free WASI context.
 
+## Architecture and performance boundaries
+
+The [Unikraft architecture guidance](https://unikraft.org/docs/internals/architecture)
+favors well-defined, statically linked, fine-grained library interfaces rather
+than requiring a POSIX compatibility environment. This implementation follows
+that model concretely:
+
+- The minimal context and native import adapter are separate modules. Neither
+  imports POSIX, a filesystem, a scheduler, hosted WASI, or host-thread services.
+  The adapter binds to the compiler-free native API, not a guest compiler.
+- Context state has fixed-size descriptor/diagnostic storage and borrowed
+  arguments, environment, and platform callbacks. Import dispatch performs
+  checked slice operations and uses bounded stack-local argument arrays, with
+  **no per-call heap allocation**. Bind the import descriptors during setup,
+  not inside a measured steady-state invocation.
+- The native backend's caller-selected allocator remains independent of its
+  reserve/commit/protect page policy. WASI does not choose an allocator, commit
+  speculative memory, or introduce a scheduler merely for compatibility.
+- Run-to-completion is suitable only when the embedding workload permits it.
+  Reusing an instance outside setup is not evidence that a command module can
+  safely restart. Qualify repeated `_start`, libc/global state, descriptor state,
+  and explicit exit rearming before claiming same-instance steady measurements.
+
+Keep allocation/setup/invocation phases, committed versus reserved memory, and
+linked-image evidence distinct when assessing these choices in #1046. They
+identify measurable costs; they do not predict a CoreMark operating-system
+speedup. The pinned fork's native Zig build is authoritative, not a generic
+Make/Kconfig example from another integration.
+
+Unikraft kernel libraries share a protection domain. That is **not** permission
+to remove Wasm bounds checks, exact import validation, native W^X transitions,
+or trap isolation. Preserve the embedding interfaces and isolation checks rather
+than bypassing them in pursuit of monolithic performance.
+
 ## Exact imported ABI
 
 `imports` contains the names below, their literal `wasi_unstable` namespace,
