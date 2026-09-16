@@ -255,6 +255,10 @@ The object has **exactly** these fields:
   (positive integer from the supported native clock resolution). Raw TSC cycles
   without a qualified conversion are not supported. Record zero durations when
   below resolution rather than inventing precision; the resolution remains visible.
+  Resolution coarser than one second is not supported by this benchmark contract.
+  The total of sequential phase durations cannot exceed the campaign validity
+  window: this sanity check rejects overflow/wraparound evidence such as
+  `UINT64_MAX`, without treating host observation latency as an execution timer.
   If no supported clock exists, an early **failed, unstarted** attempt may use
   `clock: null`, with all scalar phases `null`, empty steady/invocation lists and
   `memory: null`. It is not a timed sample. Do not fabricate a clock resolution to

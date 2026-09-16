@@ -500,6 +500,8 @@ def validate_result(result, manifest, run_id):
             {"ns": 1_000_000_000, "us": 1_000_000, "ms": 1000}[clock["unit"]],
             "clock frequency/unit mismatch")
     number(clock["resolution_ticks"], "clock resolution", 1, integer=True)
+    require(clock["resolution_ticks"] <= clock["ticks_per_second"],
+            "clock resolution is too coarse for this benchmark")
     success = result["outcome"] == "success"
     for phase in ("load_ticks", "instantiate_ticks", "first_invocation_ticks"):
         require(not success or phases[phase] is not None, f"missing {phase}")
@@ -523,6 +525,12 @@ def validate_result(result, manifest, run_id):
             "steady state without first invocation")
     durations = ([] if phases["first_invocation_ticks"] is None
                  else [phases["first_invocation_ticks"]]) + phases["steady_state_ticks"]
+    timed_ticks = sum(durations) + sum(phases[name] or 0 for name in
+                                      ("load_ticks", "instantiate_ticks"))
+    campaign_seconds = (timestamp(manifest["expires_at"]) -
+                        timestamp(manifest["created_at"])).total_seconds()
+    require(timed_ticks <= campaign_seconds * clock["ticks_per_second"],
+            "guest phase duration exceeds campaign validity (overflow or stale clock evidence)")
     require(isinstance(result["invocations"], list) and
             len(result["invocations"]) == len(durations), "invocation evidence count mismatch")
     checks = []
