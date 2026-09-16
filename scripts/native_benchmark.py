@@ -29,6 +29,7 @@ from bench_coremark import (
 
 VERSION = 1
 PREFIX = "WAMR_BENCH_RESULT="
+COREMARK_TICKS_PER_SECOND = 1000
 FIXTURES = {
     "coremark": (
         "tests/benchmarks/coremark/coremark_wasi.wasm",
@@ -459,7 +460,11 @@ def decode_stdout(encoded):
     return raw
 
 
-def coremark_correctness(stdout, invocation_seconds):
+def coremark_correctness(stdout, invocation_seconds, workload, clock_resolution_seconds=0):
+    require(workload in ("coremark", "coremark-nofp"), "unknown pinned CoreMark variant")
+    number(invocation_seconds, "CoreMark invocation duration")
+    number(clock_resolution_seconds, "CoreMark enclosing clock resolution")
+    require(clock_resolution_seconds <= 1, "unsupported enclosing clock resolution")
     parsed = parse_coremark_output(stdout, "native", EXPECTED_ITERATIONS)
     crc = {}
     for name, expected in (("seedcrc", "e9f5"), ("crclist", "e714"),
@@ -469,20 +474,39 @@ def coremark_correctness(stdout, invocation_seconds):
         value = field_once(stdout, name, re.escape(marker) + r"\s*:\s*0x([0-9a-fA-F]{4})")
         crc[name] = value.lower()
         require(expected is None or value.lower() == expected, f"unexpected {name} CRC")
-    seconds = float(field_once(stdout, "Total time (secs)",
-                               r"Total time \(secs\)\s*:\s*(\d+(?:\.\d+)?)"))
+    nofp = workload == "coremark-nofp"
+    formatted_number = r"(\d+)" if nofp else r"(\d+\.\d{6})"
+    seconds_text = field_once(stdout, "Total time (secs)",
+                              r"Total time \(secs\)\s*:\s*" + formatted_number)
+    seconds = int(seconds_text) if nofp else float(seconds_text)
+    field_once(stdout, "Iterations/Sec", r"Iterations/Sec\s*:\s*" + formatted_number)
     ticks = int(field_once(stdout, "Total ticks", r"Total ticks\s*:\s*(\d+)"))
-    require(seconds > 0 and ticks > 0, "CoreMark reported non-positive time")
+    number(ticks, "CoreMark reported ticks", 1, integer=True)
+    number(seconds, "CoreMark reported seconds", integer=nofp)
+    require(seconds > 0, "CoreMark reported non-positive time")
     require(math.isfinite(parsed.throughput) and parsed.throughput > 0,
             "CoreMark reported invalid throughput")
-    expected_rate = EXPECTED_ITERATIONS / seconds
-    require(abs(parsed.throughput - expected_rate) <= max(1, expected_rate * 0.001),
+    tick_seconds = ticks / COREMARK_TICKS_PER_SECOND
+    expected_seconds = ticks // COREMARK_TICKS_PER_SECOND if nofp else tick_seconds
+    seconds_tolerance = 0 if nofp else 0.5e-6 + math.ulp(tick_seconds)
+    require(abs(seconds - expected_seconds) <= seconds_tolerance,
+            "CoreMark ticks/time disagree for the pinned variant")
+    expected_rate = (EXPECTED_ITERATIONS // expected_seconds if nofp
+                     else EXPECTED_ITERATIONS / tick_seconds)
+    rate_tolerance = 0 if nofp else 0.5e-6 + math.ulp(expected_rate)
+    require(abs(parsed.throughput - expected_rate) <= rate_tolerance,
             "CoreMark throughput/time/iterations disagree")
-    require(seconds <= invocation_seconds + 0.01, "CoreMark time exceeds invocation duration")
+    # The inner millisecond clock and enclosing clock each quantize a duration.
+    enclosing_tolerance = (1 / COREMARK_TICKS_PER_SECOND + clock_resolution_seconds
+                           + math.ulp(tick_seconds) + math.ulp(invocation_seconds))
+    require(tick_seconds <= invocation_seconds + enclosing_tolerance,
+            "CoreMark tick duration exceeds enclosing invocation duration")
     return {"crc": crc, "iterations": parsed.iterations,
             "iterations_per_second": parsed.throughput, "reported_seconds": seconds,
-            "reported_ticks": ticks,
-            "minimum_timing_met": seconds >= 10 and invocation_seconds >= 10,
+            "reported_ticks": ticks, "reported_ticks_per_second": COREMARK_TICKS_PER_SECOND,
+            "seconds_from_ticks": tick_seconds,
+            "time_format": "integer-truncated" if nofp else "float-6dp",
+            "minimum_timing_met": seconds >= 10 and tick_seconds >= 10 and invocation_seconds >= 10,
             "compliance": "not-certified"}
 
 
@@ -591,7 +615,9 @@ def validate_result(result, manifest, run_id):
         if good and config["run"]["workload"].startswith("coremark"):
             try:
                 checks.append(coremark_correctness(
-                    stdout.decode("ascii"), ticks / clock["ticks_per_second"]))
+                    stdout.decode("ascii"), ticks / clock["ticks_per_second"],
+                    config["run"]["workload"],
+                    clock["resolution_ticks"] / clock["ticks_per_second"]))
             except (ValueError, RuntimeError) as error:
                 if success:
                     # The legacy parser includes raw output in its diagnostic.

@@ -1382,7 +1382,7 @@ class NativeBenchmarkTests(unittest.TestCase):
 Iterations/Sec   : 20000
 Iterations       : 400000
 Total time (secs): 20
-Total ticks      : 20000000
+Total ticks      : 20000
 seedcrc          : 0xe9f5
 [0]crclist       : 0xe714
 [0]crcmatrix     : 0x1fd7
@@ -1390,7 +1390,11 @@ seedcrc          : 0xe9f5
 [0]crcfinal      : 0x33ff
 Correct operation validated. See README.md for run and reporting rules.
 """
-        if not run["workload"].startswith("coremark"):
+        if run["workload"] == "coremark":
+            output = output.replace("Total time (secs): 20\n", "Total time (secs): 20.000000\n")
+            output = output.replace("Iterations/Sec   : 20000\n",
+                                    "Iterations/Sec   : 20000.000000\n")
+        elif not run["workload"].startswith("coremark"):
             output = ""
         return {
             "schema_version": 1, "kind": "wamr-native-benchmark-result",
@@ -1600,10 +1604,12 @@ Correct operation validated. See README.md for run and reporting rules.
         result = self.result(self.manifest["schedule"][0])
         raw = (native_benchmark.PREFIX + json.dumps(result) + "\n").encode()
         self.assertEqual(native_benchmark.parse_result_stream(b"boot message\n" + raw), result)
-        self.assertEqual(native_benchmark.parse_result_stream(b"binary boot \xff\xfe\n" + raw), result)
-        for bad in (raw + raw, raw[:-8], b"prefix:" + raw, b"boot only",
+        surrounded = b"binary boot \xff\xfe\n" + raw + b"\x80\x00shutdown\n"
+        self.assertEqual(native_benchmark.parse_result_stream(surrounded), result)
+        for bad in (raw + raw, raw[:-8], b"prefix:" + raw, b"\xff" + raw, b"boot only",
                     b'WAMR_BENCH_RESULT={"a":1,"a":2}\n',
-                    b'WAMR_BENCH_RESULT={"a":NaN}\n'):
+                    b'WAMR_BENCH_RESULT={"a":NaN}\n',
+                    b'WAMR_BENCH_RESULT={"a":"\xff"}\n'):
             with self.subTest(bad=bad[:40]), self.assertRaises(ValueError):
                 native_benchmark.parse_result_stream(bad)
 
@@ -1662,10 +1668,62 @@ Correct operation validated. See README.md for run and reporting rules.
         for invocation in result["invocations"]:
             self.set_stdout(invocation, self.stdout(invocation).replace(
                 "Total time (secs): 20", "Total time (secs): 9").replace(
-                    "Iterations/Sec   : 20000", "Iterations/Sec   : 44444"))
+                    "Iterations/Sec   : 20000", "Iterations/Sec   : 44444").replace(
+                        "Total ticks      : 20000", "Total ticks      : 9000"))
         checks = native_benchmark.validate_result(result, self.manifest, run["run_id"])
         self.assertTrue(all(not check["minimum_timing_met"] for check in checks))
         self.assertTrue(all(check["crc"]["seedcrc"] == "e9f5" for check in checks))
+
+    def timed_coremark_output(self, workload, ticks):
+        run = next(run for run in self.manifest["schedule"] if run["workload"] == workload)
+        stdout = self.stdout(self.result(run)["invocations"][0])
+        nofp = workload == "coremark-nofp"
+        seconds = ticks // 1000 if nofp else ticks / 1000
+        rate = bench_coremark.EXPECTED_ITERATIONS // seconds if nofp else (
+            bench_coremark.EXPECTED_ITERATIONS / seconds)
+        seconds_text = str(seconds) if nofp else f"{seconds:.6f}"
+        rate_text = str(rate) if nofp else f"{rate:.6f}"
+        stdout = stdout.replace("Total ticks      : 20000\n", f"Total ticks      : {ticks}\n")
+        stdout = stdout.replace(f"Total time (secs): {'20' if nofp else '20.000000'}\n",
+                                f"Total time (secs): {seconds_text}\n")
+        return stdout.replace(f"Iterations/Sec   : {'20000' if nofp else '20000.000000'}\n",
+                              f"Iterations/Sec   : {rate_text}\n")
+
+    def test_native_pinned_coremark_ticks_seconds_and_format_agree(self):
+        for workload in ("coremark", "coremark-nofp"):
+            with self.subTest(workload=workload):
+                stdout = self.timed_coremark_output(workload, 20000)
+                check = native_benchmark.coremark_correctness(stdout, 21, workload)
+                self.assertEqual(check["reported_ticks_per_second"], 1000)
+                self.assertEqual(check["seconds_from_ticks"], 20)
+                contradictory = stdout.replace("Total ticks      : 20000\n",
+                                               "Total ticks      : 20000000\n")
+                with self.assertRaisesRegex(ValueError, "ticks/time"):
+                    native_benchmark.coremark_correctness(contradictory, 21, workload)
+                fractional = self.timed_coremark_output(workload, 20999)
+                check = native_benchmark.coremark_correctness(fractional, 21, workload)
+                self.assertEqual(check["seconds_from_ticks"], 20.999)
+                self.assertEqual(check["reported_seconds"], 20 if workload.endswith("nofp") else 20.999)
+        nofp = self.timed_coremark_output("coremark-nofp", 20999)
+        rounded = nofp.replace("Total time (secs): 20\n", "Total time (secs): 21\n")
+        with self.assertRaisesRegex(ValueError, "ticks/time"):
+            native_benchmark.coremark_correctness(rounded, 22, "coremark-nofp")
+        for workload, stdout in (("coremark", nofp),
+                                 ("coremark-nofp", self.timed_coremark_output("coremark", 20000))):
+            with self.subTest(format=workload), self.assertRaisesRegex(ValueError, "malformed"):
+                native_benchmark.coremark_correctness(stdout, 21, workload)
+
+    def test_native_tick_duration_not_truncated_print_time_bounds_invocation(self):
+        for workload in ("coremark", "coremark-nofp"):
+            with self.subTest(workload=workload):
+                stdout = self.timed_coremark_output(workload, 20999)
+                with self.assertRaisesRegex(ValueError, "enclosing invocation"):
+                    native_benchmark.coremark_correctness(stdout, 20.1, workload)
+                # One inner millisecond tick plus one enclosing microsecond tick.
+                check = native_benchmark.coremark_correctness(stdout, 20.998, workload, .000001)
+                self.assertTrue(check["minimum_timing_met"])
+                with self.assertRaisesRegex(ValueError, "enclosing invocation"):
+                    native_benchmark.coremark_correctness(stdout, 20.997, workload, .000001)
 
     def test_native_failed_attempts_and_warmups_are_retained(self):
         def fail_first(result, run):
@@ -1823,16 +1881,19 @@ Correct operation validated. See README.md for run and reporting rules.
     def test_native_linux_capture_executes_producer_and_retains_timeout(self):
         run = next(run for run in self.manifest["schedule"] if run["target"] == "linux")
         result = self.result(run)
+        raw_output = (b"binary boot \xff\n" + native_benchmark.PREFIX.encode() +
+                      json.dumps(result).encode() + b"\nshutdown \xfe\n")
         producer = self.write("synthetic_producer.py", (
-            "import json,os\n"
+            "import json,os,sys\n"
             "request=json.load(open(os.environ['WAMR_BENCH_REQUEST']))\n"
             "assert request['config_sha256']==os.environ['WAMR_BENCH_CONFIG_SHA256']\n"
-            f"print({native_benchmark.PREFIX!r}+{json.dumps(result)!r})\n").encode())
+            f"sys.stdout.buffer.write({raw_output!r})\n").encode())
         output = self.root / "process-capture"
         self.assertTrue(native_benchmark.capture(
             self.manifest, run["run_id"], [sys.executable, str(producer)], output, 5,
             allow_synthetic=True))
         record = native_benchmark.consume_capture(self.manifest, output, allow_synthetic=True)
+        self.assertEqual((output / "stdout.bin").read_bytes(), raw_output)
         self.assertEqual(record["result"]["phases"]["load_ticks"], 10)
         self.assertLess(record["observation"]["observation_seconds"], 5)
         timed_out = self.root / "timeout-capture"

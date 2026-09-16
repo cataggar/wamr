@@ -82,13 +82,26 @@ field, positive throughput, success marker, positive total ticks and total secon
 `seedcrc=e9f5`, `crclist=e714`, `crcmatrix=1fd7`, `crcstate=8e3a`, and one hexadecimal
 `crcfinal`. The final CRC must agree across all invocations of the **same pinned
 variant**. First and steady invocations are checked separately. Error/ambiguous output
-is rejected even when the process exits zero. Reported workload time cannot exceed
-the enclosing guest invocation time (10 ms print-rounding tolerance). Throughput
-must agree with fixed iterations / reported seconds (one iteration/s or 0.1%
-print-rounding tolerance, whichever is larger).
+is rejected even when the process exits zero.
 
-The independent minimum-duration check requires both reported CoreMark time and guest
-invocation time to be at least ten seconds. `authoritative` is only a sample-count
+Both pinned fixtures implement `time_in_secs` using **1,000 ticks per second**.
+For `coremark`, seconds and throughput use the fixture's `%f` six-decimal formatting;
+seconds must equal ticks / 1000 and throughput must equal iterations / that duration
+within half a printed decimal unit plus floating-point representation tolerance.
+For `coremark-nofp`, printed seconds truncate `ticks / 1000` to an integer, and
+throughput uses integer division by those truncated seconds. The integer fields must
+match exactly; rounded-up seconds or floating-point formatting are not interchangeable.
+
+The **untruncated tick-derived duration**, not the potentially truncated display
+value, must fit inside the enclosing guest invocation. The permitted measurement
+quantization is one inner millisecond tick plus the declared enclosing clock
+resolution (and floating-point representation tolerance). For example, 20,999 ticks
+may print 20 seconds in nofp, but cannot fit inside a 20.1-second invocation.
+Reports retain the raw ticks, their 1,000 Hz frequency, tick-derived seconds,
+displayed seconds and formatting variant separately.
+
+The independent minimum-duration check requires reported CoreMark time, tick-derived
+time and guest invocation time each to be at least ten seconds. `authoritative` is only a sample-count
 profile (2 warmups, 10 measured runs); `ci` conventionally means 0 warmups, 3 runs.
 Overridden counts remain visible. Neither profile, CRC success, nor minimum duration
 certifies compliance with all EEMBC source, porting, workload and publication rules.
