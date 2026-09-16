@@ -560,11 +560,11 @@
   },
   "job_reserve_admission": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 9,
-      "sizing_algorithm_version": 10
+      "measurement_plan_identity_version": 17,
+      "sizing_algorithm_version": 12
     },
     "auxiliary_invocation_budget_ns": 600000000000,
-    "benchmark_limit_ns": 10260000000000,
+    "benchmark_limit_ns": 12060000000000,
     "evidence": {
       "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34351942414-1",
       "combined_allowance_margin": 0.37692724257152976,
@@ -579,10 +579,10 @@
       "step_wall_elapsed_ns": 4701000000000,
       "unaccounted_step_wall_ns": 3442447686014
     },
-    "hard_preadmission_benchmark_ns": 8664000000000,
+    "hard_preadmission_benchmark_ns": 10824000000000,
     "job_non_benchmark_reserve_ns": 4140000000000,
-    "timeout_headroom_ns": 1596000000000,
-    "workflow_job_timeout_ns": 14400000000000
+    "timeout_headroom_ns": 1236000000000,
+    "workflow_job_timeout_ns": 16200000000000
   },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,

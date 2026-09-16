@@ -48,7 +48,7 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 11
+REPORT_SCHEMA_VERSION = 12
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 WASI_MONOTONIC_CLOCK_MODE = "monotonic"
@@ -56,7 +56,7 @@ WASI_PROCESS_CPU_CLOCK_MODE = "process-cpu"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 16
+MEASUREMENT_PLAN_IDENTITY_VERSION = 17
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 CPU_PLACEMENT_VERSION = 3
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
@@ -117,7 +117,7 @@ GUEST_CLOCK_POLICY = {
         "argument": WASI_MONOTONIC_CLOCK_MODE,
     },
 }
-SIZING_ALGORITHM_VERSION = 11
+SIZING_ALGORITHM_VERSION = 12
 SIZING_ALGORITHM_KIND = "fastest-valid-one-shot-pilot"
 SIZING_FORMULA = (
     "round_up_3_significant_digits(ceil(P*target_duration_ns*"
@@ -169,6 +169,27 @@ SIZING_CELL_BASE_OVERRIDES = (
         "projected_pilot_duration_ns": 2_500_000_000,
         "formula": SIZING_FORMULA,
     },
+    *(
+        {
+            "name": "atomic-multithread-20s-contention-window",
+            "selector": {
+                "workload": "atomic",
+                "threads": threads,
+            },
+            "target_duration_ns": SIZING_TARGET_NS,
+            "safety_factor": {
+                "numerator": 80,
+                "denominator": 7,
+            },
+            "measurement_to_pilot_rate_envelope": {
+                "numerator": 16,
+                "denominator": 1,
+            },
+            "projected_pilot_duration_ns": 20_000_000_000,
+            "formula": SIZING_FORMULA,
+        }
+        for threads in (2, 4, 8)
+    ),
 )
 SIZING_CELL_ENVELOPES = (
     {
@@ -195,7 +216,7 @@ PROJECTED_EVIDENCE_MINIMUM_NS = (
 PILOT_CLOCK_RESOLUTION_MINIMUM_NS = 1_000_000
 MAXIMUM_PILOT_CORRECTED_NS = 30_000_000_000
 MAXIMUM_PILOT_HOST_WALL_NS = 33_000_000_000
-WORKFLOW_JOB_TIMEOUT_NS = 240 * 60 * 1_000_000_000
+WORKFLOW_JOB_TIMEOUT_NS = 270 * 60 * 1_000_000_000
 JOB_NON_BENCHMARK_RESERVE_NS = 69 * 60 * 1_000_000_000
 PROJECTED_BENCHMARK_LIMIT_NS = (
     WORKFLOW_JOB_TIMEOUT_NS - JOB_NON_BENCHMARK_RESERVE_NS
