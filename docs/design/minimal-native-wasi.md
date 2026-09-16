@@ -174,7 +174,7 @@ The build module `native-wasi` exposes `Adapter(comptime aot: type)` for the
 compiler-free `src/api/aot.zig` API:
 
 ```zig
-const aot = @import("your-native-aot-module");
+const aot = @import("your-native-aot-module").aot;
 const wasi = @import("minimal-wasi");
 const NativeWasi = @import("native-wasi").Adapter(aot);
 
@@ -198,7 +198,8 @@ ignores, and do not longjmp directly across live host-language cleanup scopes.
 
 The adapter deliberately takes the native API as a compile-time module
 parameter; it does not import a hosted runtime or depend on the backend's
-public package alias. Its contract-fixture tests check typed marshalling and
+public package alias. The native package root `src/aot_native.zig` exposes
+that API as `.aot`. Its contract-fixture tests check typed marshalling and
 pending-exit requests, **not** actual native stack unwinding. The native
 backend's integration tests must separately verify the dispatcher and execute
 the two precompiled CoreMark workloads with real clocks.
