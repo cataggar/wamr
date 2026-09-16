@@ -43,6 +43,21 @@ export fn trap() void {
 export fn divide(a: i32, b: i32) i32 {
     return @divTrunc(a, b);
 }
+export fn divide_unsigned(a: u32, b: u32) u32 {
+    return a / b;
+}
+export fn remainder(a: i32, b: i32) i32 {
+    return @rem(a, b);
+}
+export fn remainder_unsigned(a: u32, b: u32) u32 {
+    return a % b;
+}
+export fn divide64(a: i64, b: i64) i64 {
+    return @divTrunc(a, b);
+}
+export fn remainder64(a: i64, b: i64) i64 {
+    return @rem(a, b);
+}
 export fn call_host(a: i32, b: i32) i32 {
     return host_add(a, b);
 }

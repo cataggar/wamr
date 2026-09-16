@@ -5295,6 +5295,9 @@ fn compileInstRA(
             try code.emitSlice(&.{ 0x0F, 0x85 }); // JNE rel32
             const notzero_patch = code.len();
             try code.emitI32(0);
+            // The RDX save misaligns the stack. Trap helpers are real ABI
+            // calls; align only these non-returning paths, not the hot divide.
+            if (rdx_in_use) try code.subRegImm32(.rsp, 8);
             try emitTrapHelperCall(code, vmctx_trap_idivz_fn_field);
             const notzero_off = code.len();
             code.patchI32(notzero_patch, @intCast(@as(i64, @intCast(notzero_off)) - @as(i64, @intCast(notzero_patch + 4))));
@@ -5331,6 +5334,7 @@ fn compileInstRA(
                             after_patch = code.len();
                             try code.emitI32(0);
                         } else {
+                            if (rdx_in_use) try code.subRegImm32(.rsp, 8);
                             try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
                         }
                         const dodiv_off = code.len();
@@ -5360,6 +5364,7 @@ fn compileInstRA(
                             after_patch = code.len();
                             try code.emitI32(0);
                         } else {
+                            if (rdx_in_use) try code.subRegImm32(.rsp, 8);
                             try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
                         }
                         const dodiv_off = code.len();

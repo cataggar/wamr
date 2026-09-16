@@ -51,8 +51,9 @@ zig-out/bin/wamrc compile --target=x86_64 \
 ```
 
 `native-aot-fixture` builds `tests/unikraft-aot/fixture.zig` with the installed
-Zig, then invokes **this checkout's** host-side wamrc. It installs the original
-wasm and cwasm in `zig-out/fixtures/`. It does not copy a Linux artifact and
+Zig, then invokes **this checkout's** host-side wamrc. It installs that compiler
+in `zig-out/bin/` and the original wasm and cwasm in `zig-out/fixtures/`, so their
+identities can be retained together. It does not copy a Linux artifact and
 change its target label. The explicit compiler profile checks the module and
 pre-optimization IR against its supported feature policy before emission.
 Unsupported atomics/threads, SIMD, EH, memory64, multiple memories, non-function
@@ -66,6 +67,7 @@ with downstream evidence, for example:
 git rev-parse HEAD
 zig version
 sha256sum tests/unikraft-aot/fixture.zig \
+  zig-out/bin/wamrc \
   zig-out/fixtures/native-fixture.wasm zig-out/fixtures/native-fixture.cwasm \
   zig-out/lib/libwamr-aot.a
 ```

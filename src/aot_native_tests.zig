@@ -143,6 +143,27 @@ test "native AOT real API: memory bounds stable growth and deterministic traps" 
     // A trap does not poison subsequent calls or leak the call frame.
     try equal(@as(i32, 3), try callI32(inst, "add", &.{ .{ .i32 = 1 }, .{ .i32 = 2 } }));
 }
+test "native AOT integer division preserves normal results and every trap ABI" {
+    var pages: Pages = .{};
+    const inst = try create(std.testing.allocator, &pages);
+    defer inst.deinit();
+    try equal(@as(i32, -2), try callI32(inst, "divide", &.{ .{ .i32 = -7 }, .{ .i32 = 3 } }));
+    try equal(@as(i32, 0x7fffffff), try callI32(inst, "divide_unsigned", &.{ .{ .i32 = -1 }, .{ .i32 = 2 } }));
+    try equal(@as(i32, -1), try callI32(inst, "remainder", &.{ .{ .i32 = -7 }, .{ .i32 = 3 } }));
+    try equal(@as(i32, 0), try callI32(inst, "remainder", &.{ .{ .i32 = std.math.minInt(i32) }, .{ .i32 = -1 } }));
+    try equal(@as(i32, 5), try callI32(inst, "remainder_unsigned", &.{ .{ .i32 = -1 }, .{ .i32 = 10 } }));
+    var result: [1]api.Value = undefined;
+    for ([_][]const u8{ "divide", "divide_unsigned", "remainder", "remainder_unsigned" }) |name| {
+        try equal(api.Trap.integer_divide_by_zero, (try inst.call(name, &.{ .{ .i32 = 4 }, .{ .i32 = 0 } }, &result)).trap);
+    }
+    try equal(@as(usize, 1), (try inst.call("divide64", &.{ .{ .i64 = -7 }, .{ .i64 = 3 } }, &result)).returned);
+    try equal(@as(i64, -2), result[0].i64);
+    try equal(@as(usize, 1), (try inst.call("remainder64", &.{ .{ .i64 = std.math.minInt(i64) }, .{ .i64 = -1 } }, &result)).returned);
+    try equal(@as(i64, 0), result[0].i64);
+    try equal(api.Trap.integer_overflow, (try inst.call("divide64", &.{ .{ .i64 = std.math.minInt(i64) }, .{ .i64 = -1 } }, &result)).trap);
+    try equal(api.Trap.integer_divide_by_zero, (try inst.call("divide64", &.{ .{ .i64 = 4 }, .{ .i64 = 0 } }, &result)).trap);
+}
+
 test "native AOT real API: host exit unwinds after host cleanup and errors are terminal" {
     var pages: Pages = .{};
     const inst = try create(std.testing.allocator, &pages);

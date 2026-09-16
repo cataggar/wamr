@@ -166,7 +166,9 @@ pub const Instance = struct {
             if (m.min > max) return error.MemoryLimitExceeded;
             if (max != 0) {
                 const size = @as(usize, max) * 65536;
-                self.linear = .{ .base = try native.reserve(native.context, size), .size = size };
+                // Publish ownership only after the fallible reservation succeeds.
+                const base = try native.reserve(native.context, size);
+                self.linear = .{ .base = base, .size = size };
                 const initial_size = @as(usize, m.min) * 65536;
                 if (initial_size != 0) {
                     try native.commit(native.context, self.linear.?.base, initial_size);
@@ -191,7 +193,8 @@ pub const Instance = struct {
             if (!e.passive and !inBounds(e.offset, e.indices.len, self.tables[e.table].size)) return error.InitializerOutOfBounds;
         }
         const code_size = try native.rounded(self.module.text.len);
-        self.code = .{ .base = try native.reserve(native.context, code_size), .size = code_size };
+        const code_base = try native.reserve(native.context, code_size);
+        self.code = .{ .base = code_base, .size = code_size };
         try native.commit(native.context, self.code.?.base, code_size);
         @memcpy(self.code.?.base[0..self.module.text.len], self.module.text);
         try native.protect(native.context, self.code.?.base, code_size, .read_execute);

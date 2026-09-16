@@ -3,7 +3,12 @@ const std = @import("std");
 pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *std.Build.Module) void {
     const abi_tests = b.addTest(.{
         .root_module = hosted_module,
-        .filters = &.{ "native embedding ABI", "trap_jmp:" },
+        .filters = &.{
+            "native embedding ABI",
+            "trap_jmp:",
+            "compileFunctionRA: division uses rax/rdx",
+            "compileFunctionRA: div does not emit dead r11 save",
+        },
     });
     const abi_step = b.step("test-native-aot-abi", "Verify hosted/native VmCtx layout and explicit trap unwind");
     abi_step.dependOn(&b.addRunArtifact(abi_tests).step);
@@ -67,6 +72,7 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
         test_step.dependOn(&run.step);
     }
     const fixture_step = b.step("native-aot-fixture", "Build the matching host-wamrc native fixture");
+    fixture_step.dependOn(&b.addInstallArtifact(wamrc, .{}).step);
     const install_fixture = b.addInstallFile(fixture, "fixtures/native-fixture.cwasm");
     const install_wasm = b.addInstallFile(wasm.getEmittedBin(), "fixtures/native-fixture.wasm");
     fixture_step.dependOn(&install_fixture.step);
