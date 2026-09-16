@@ -42,6 +42,16 @@ success, valid clock execution or benchmark measurements. These dependencies mus
 be resolved by the native integration before this host adapter can accept a complete
 real campaign.
 
+The [Unikraft architecture guidance](https://unikraft.org/docs/internals/architecture)
+informs this boundary: use statically linked, compiler-free AOT and narrow native/WASI
+modules, not POSIX, filesystem or scheduler dependencies added merely for compatibility.
+Run-to-completion and phase-specific allocator selection are possible levers, not
+measured advantages. Keep the caller allocator separate from reserve/commit page
+policy; avoid steady-call allocations only where the qualified lifecycle permits.
+The pinned native Zig build is authoritative, not generic Make/Kconfig examples.
+All kernel components share a protection domain: bounds checks, W^X, import checks
+and trap isolation remain mandatory. No network/storage scope is introduced here.
+
 The unit tests use explicitly `synthetic` artifacts, clocks, outputs, CPU descriptions
 and receipts. A test-only Python keyword enables them; **no CLI option accepts
 synthetic measurement evidence**. Relabeling test data as real is not evidence.
@@ -131,8 +141,17 @@ Each target configuration has:
   The CPU count is **actually active guest CPUs**, not Azure SKU capacity, a pinning
   mask alone, host `os.cpu_count()`, or configured-but-offline CPUs.
 * `options`: exactly `optimize` (`Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall`)
-  and boolean `bounds_checks`, `stack_checks`, `simd`, `threads`, `memory64`.
+  and boolean `bounds_checks`, `wx_enforced`, `import_checks`, `trap_isolation`,
+  `stack_checks`, `simd`, `threads`, `memory64`.
   All must describe the actual linked/runtime/AOT settings and match across targets.
+  Bounds checks, W^X, import checks and trap isolation must all be `true`; this adapter
+  rejects weakened isolation even if both targets declare the same weakened options.
+* `memory_policy`: exactly `allocator_by_phase` and `page_policy`. The former maps
+  `load`, `instantiate`, `first`, `steady` to public caller-allocator implementation/
+  configuration tokens; the latter maps `reservation`, `commitment`, `release` to
+  separate public page-policy tokens. These are configuration identities bound to
+  the exact image receipt, not allocator byte counters or evidence of zero allocations.
+  Policy choices may differ across targets and remain visible for experimental review.
 * `image_path`: exact **complete boot/deployment image file**, not ELF sections or
   stripped text size; `image_receipt_path`: its native integration receipt.
 * `aot_paths`: map from every selected workload to the actual AOT artifact file.
@@ -153,11 +172,15 @@ runtime = {sha256, bytes}
 source = {commit, tree_sha256, tracked_diff_sha256}
 compiler = {binary: {sha256, bytes}, source, version}
 compile_profile = null | "unikraft-x86_64"
-options = {optimize, bounds_checks, stack_checks, simd, threads, memory64}
+options = {optimize, bounds_checks, wx_enforced, import_checks, trap_isolation,
+           stack_checks, simd, threads, memory64}
+memory_policy = {allocator_by_phase: {load, instantiate, first, steady},
+                 page_policy: {reservation, commitment, release}}
 target_abi = public ABI token
 platform = {arch, cpu_model, active_cpu_count, azure_sku, azure_region}
 configured_vm_ram_bytes = positive integer
 compiler_embedded = false
+runtime_linkage = "static"
 aot_modules = {selected workload key: {sha256, bytes}, ...}
 ```
 
@@ -331,6 +354,10 @@ not permission to silently change the phase contract.
 * `configured_vm_ram_bytes`: the image receipt's configured VM RAM, **not usage**.
 * `coverage`: `complete-guest` or `partial-guest`.
 * `method`: public measurement-method token.
+* `policy`: the observed caller allocator-by-phase and page-policy identities,
+  matching the target's `memory_policy` and exact-image receipt. Do not replace the
+  measurement method with an allocator's name, or confuse allocator selection with
+  virtual reservation/physical commitment policy.
 * `covered_regions`, `omitted_regions`: disjoint lists of public region tokens.
   Complete coverage requires no omissions; partial coverage requires explicit
   omissions. Runtime heap alone is partial coverage.
@@ -345,6 +372,9 @@ coverage. Virtual reservation is not resident/committed memory; configured VM RA
 is neither. Allocator totals must never be called RSS. Native page-accounting coverage
 and excluded kernel/device/stack/code regions must come from exact-image evidence.
 Comparing partial coverage across unlike region sets requires further review.
+Flat committed-memory snapshots do not establish allocation-free steady execution;
+that claim would require separate actual allocator-event evidence. This report does
+not infer allocator call counts or attribute performance to a policy label.
 
 ## Reporting, failures and privacy
 

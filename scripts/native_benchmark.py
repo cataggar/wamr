@@ -47,7 +47,8 @@ FIXTURES = {
         "b1979dd330c14d5f898b8a7c8c313e58f6521ad6eb7db9a6e7d7e78788ac6e72",
     ),
 }
-OPTIONS = {"optimize", "bounds_checks", "stack_checks", "simd", "threads", "memory64"}
+REQUIRED_SAFETY = {"bounds_checks", "wx_enforced", "import_checks", "trap_isolation"}
+OPTIONS = REQUIRED_SAFETY | {"optimize", "stack_checks", "simd", "threads", "memory64"}
 PLATFORM = {"arch", "cpu_model", "active_cpu_count", "azure_sku", "azure_region"}
 SOURCE = {"commit", "tree_sha256", "tracked_diff_sha256"}
 PHASES = {"compile_ticks", "load_ticks", "instantiate_ticks",
@@ -153,6 +154,20 @@ def validate_options(options):
             "invalid optimize option")
     for name in OPTIONS - {"optimize"}:
         require(type(options[name]) is bool, f"{name} must be boolean")
+    for name in REQUIRED_SAFETY:
+        require(options[name], f"required safety property disabled: {name}")
+
+
+def validate_memory_policy(policy):
+    keys(policy, {"allocator_by_phase", "page_policy"}, "memory policy")
+    keys(policy["allocator_by_phase"], {"load", "instantiate", "first", "steady"},
+         "caller allocator policy")
+    keys(policy["page_policy"], {"reservation", "commitment", "release"}, "page policy")
+    for category in policy.values():
+        for value in category.values():
+            public_token(value, "memory policy identity")
+            require(value.lower() not in ("unknown", "placeholder", "unspecified"),
+                    "memory policy identity is unavailable")
 
 
 def validate_platform(platform):
@@ -169,14 +184,15 @@ def validate_image_receipt(receipt, target, evidence_kind):
     keys(receipt, {"schema_version", "kind", "evidence_kind", "os", "image",
                    "runtime", "source", "target_abi", "platform",
                    "options", "compiler", "compile_profile", "configured_vm_ram_bytes",
-                   "compiler_embedded", "aot_modules"},
+                   "compiler_embedded", "runtime_linkage", "memory_policy", "aot_modules"},
          "image receipt")
     header(receipt, "wamr-native-image-receipt")
     require(receipt["evidence_kind"] == evidence_kind, "image receipt evidence kind")
     for key in ("os", "image", "runtime", "source", "target_abi", "platform",
-                "options", "compiler", "compile_profile"):
+                "options", "compiler", "compile_profile", "memory_policy"):
         require(identical(receipt[key], target[key]), f"image receipt {key} mismatch")
     require(receipt["compiler_embedded"] is False, "AOT comparator must be compiler-free")
+    require(receipt["runtime_linkage"] == "static", "AOT runtime must be statically linked")
     number(receipt["configured_vm_ram_bytes"], "configured VM RAM", 1, integer=True)
     require(identical(receipt["aot_modules"], target["aot_modules"]), "image receipt AOT mismatch")
 
@@ -220,7 +236,8 @@ def validate_manifest(manifest, *, allow_synthetic=False):
     for os_name, target in manifest["targets"].items():
         keys(target, {"os", "runtime", "compiler", "source", "target_abi", "platform",
                       "options", "image", "image_receipt", "image_receipt_sha256",
-                      "aot_modules", "mode", "jit_preset", "compile_profile"}, "target")
+                      "aot_modules", "mode", "jit_preset", "compile_profile", "memory_policy"},
+             "target")
         require(target["os"] == os_name, "target OS mismatch")
         require(target["mode"] == "aot" and target["jit_preset"] is None,
                 "only compiler-free AOT is qualified; JIT fast/full is reserved")
@@ -231,6 +248,7 @@ def validate_manifest(manifest, *, allow_synthetic=False):
                         for value in target["platform"].values()),
                     "synthetic platform is not measurement evidence")
         validate_options(target["options"])
+        validate_memory_policy(target["memory_policy"])
         public_token(target["target_abi"], "target_abi")
         require(target["compile_profile"] in (None, "unikraft-x86_64"),
                 "unsupported explicit compiler profile")
@@ -337,7 +355,8 @@ def create_plan(config, repo, *, now=None, allow_synthetic=False):
     for os_name, spec in config["targets"].items():
         keys(spec, {"runtime_path", "compiler_path", "compiler_version", "source",
                     "target_abi", "platform", "options", "image_path",
-                    "image_receipt_path", "aot_paths", "compile_profile"}, "target config")
+                    "image_receipt_path", "aot_paths", "compile_profile", "memory_policy"},
+             "target config")
         keys(spec["aot_paths"], manifest["workloads"], "aot_paths")
         receipt_path = Path(spec["image_receipt_path"])
         manifest["targets"][os_name] = {
@@ -346,6 +365,7 @@ def create_plan(config, repo, *, now=None, allow_synthetic=False):
             "compiler": {"binary": artifact(spec["compiler_path"]),
                          "source": spec["source"], "version": spec["compiler_version"]},
             "compile_profile": spec["compile_profile"],
+            "memory_policy": spec["memory_policy"],
             "target_abi": spec["target_abi"], "platform": spec["platform"],
             "options": spec["options"], "image": artifact(spec["image_path"]),
             "image_receipt": read_json(receipt_path),
@@ -389,11 +409,12 @@ def parse_result_stream(raw):
 
 def validate_memory(memory, target, *, complete=True):
     keys(memory, {"image_sha256", "configured_vm_ram_bytes", "coverage",
-                  "method", "covered_regions", "omitted_regions", "samples"}, "memory")
+                  "method", "covered_regions", "omitted_regions", "samples", "policy"}, "memory")
     require(memory["image_sha256"] == target["image"]["sha256"], "memory image mismatch")
     number(memory["configured_vm_ram_bytes"], "memory configured VM RAM", 1, integer=True)
     require(memory["configured_vm_ram_bytes"] ==
             target["image_receipt"]["configured_vm_ram_bytes"], "memory VM RAM mismatch")
+    require(identical(memory["policy"], target["memory_policy"]), "observed memory policy mismatch")
     require(memory["coverage"] in ("complete-guest", "partial-guest"), "memory coverage")
     public_token(memory["method"], "memory method")
     for name in ("covered_regions", "omitted_regions"):

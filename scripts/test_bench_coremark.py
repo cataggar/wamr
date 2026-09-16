@@ -1315,7 +1315,8 @@ class NativeBenchmarkTests(unittest.TestCase):
                          "azure_region": "synthetic-test-region"}
         self.options = {"optimize": "ReleaseFast", "bounds_checks": True,
                         "stack_checks": True, "simd": False, "threads": False,
-                        "memory64": False}
+                        "memory64": False, "wx_enforced": True,
+                        "import_checks": True, "trap_isolation": True}
         self.config = {"profile": "ci", "warmups": 1, "runs": 1,
                        "steady_invocations": 2, "valid_hours": 24,
                        "workloads": ["coremark", "coremark-nofp", "compute", "memory"],
@@ -1331,6 +1332,12 @@ class NativeBenchmarkTests(unittest.TestCase):
             spec = {"runtime_path": str(runtime_path), "compiler_path": str(compiler_path),
                     "compiler_version": "synthetic-v1", "source": self.source,
                     "compile_profile": None if target == "linux" else "unikraft-x86_64",
+                    "memory_policy": {
+                        "allocator_by_phase": {phase: f"synthetic-{target}-allocator" for phase in
+                                               ("load", "instantiate", "first", "steady")},
+                        "page_policy": {"reservation": "synthetic-maximum-reservation",
+                                        "commitment": "synthetic-demand-pages",
+                                        "release": "synthetic-instance-destruction"}},
                     "target_abi": f"synthetic-{target}-abi",
                     "platform": copy.deepcopy(self.platform), "options": copy.deepcopy(self.options),
                     "image_path": str(image_path), "aot_paths": aot_paths}
@@ -1342,6 +1349,7 @@ class NativeBenchmarkTests(unittest.TestCase):
                                     "source": self.source, "version": "synthetic-v1"},
                        "options": spec["options"],
                        "compile_profile": spec["compile_profile"],
+                       "memory_policy": spec["memory_policy"], "runtime_linkage": "static",
                        "source": self.source, "target_abi": spec["target_abi"],
                        "platform": spec["platform"], "configured_vm_ram_bytes": 1024**3,
                        "compiler_embedded": False,
@@ -1405,6 +1413,7 @@ Correct operation validated. See README.md for run and reporting rules.
                              "stdout_base64": base64.b64encode(output.encode("ascii")).decode("ascii")}
                             for phase in ("first", "steady", "steady")],
             "memory": {"image_sha256": target["image"]["sha256"],
+                       "policy": copy.deepcopy(target["memory_policy"]),
                        "configured_vm_ram_bytes": 1024**3,
                        "coverage": "partial-guest", "method": "synthetic-page-accounting",
                        "covered_regions": ["runtime-pages"], "omitted_regions": ["kernel-pages"],
@@ -1473,7 +1482,7 @@ Correct operation validated. See README.md for run and reporting rules.
     def test_native_manifest_matches_sources_options_platform(self):
         for field, replacement in (
                 ("source", {**self.source, "commit": "d" * 40}),
-                ("options", {**self.options, "bounds_checks": False}),
+                ("options", {**self.options, "stack_checks": False}),
                 ("platform", {**self.platform, "active_cpu_count": 2})):
             with self.subTest(field=field):
                 manifest = copy.deepcopy(self.manifest)
@@ -1501,6 +1510,28 @@ Correct operation validated. See README.md for run and reporting rules.
         manifest["targets"]["unikraft"]["jit_preset"] = "fast"
         with self.assertRaisesRegex(ValueError, "JIT"):
             native_benchmark.validate_manifest(manifest, allow_synthetic=True)
+
+    def test_native_required_safety_and_static_linkage(self):
+        for name in native_benchmark.REQUIRED_SAFETY:
+            with self.subTest(option=name), self.assertRaisesRegex(ValueError, "required safety"):
+                options = {**self.options, name: False}
+                native_benchmark.validate_options(options)
+        manifest = copy.deepcopy(self.manifest)
+        manifest["targets"]["unikraft"]["image_receipt"]["runtime_linkage"] = "shared"
+        with self.assertRaisesRegex(ValueError, "statically linked"):
+            native_benchmark.validate_manifest(manifest, allow_synthetic=True)
+
+    def test_native_allocator_and_page_policy_are_separate_bound_identities(self):
+        report = native_benchmark.build_report(
+            self.manifest, self.capture_directories(), allow_synthetic=True)
+        policy = report["records"][0]["result"]["memory"]["policy"]
+        self.assertEqual(policy["allocator_by_phase"]["steady"], "synthetic-linux-allocator")
+        self.assertEqual(policy["page_policy"]["commitment"], "synthetic-demand-pages")
+        run = self.manifest["schedule"][0]
+        result = self.result(run)
+        result["memory"]["policy"]["page_policy"]["commitment"] = "different-commit-policy"
+        with self.assertRaisesRegex(ValueError, "memory policy mismatch"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
 
     def test_native_identical_aot_requires_bound_abi_proof(self):
         manifest = copy.deepcopy(self.manifest)
