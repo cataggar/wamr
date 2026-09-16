@@ -18,17 +18,22 @@ The early build-graph return precedes hosted dependencies and configuration.
 The installed artifacts are `lib/libwamr-aot.a` and `include/wamr_aot.h`.
 The exported Zig module is `wamr-aot`; its `aot` namespace provides the Zig API.
 Both APIs reach the same implementation.
+The same module now optionally exposes `.benchmark` and `.runner` for the
+[bounded freestanding v2 guest producer](bench/native-guest-producer.md). Its
+Platform/Session/WASI types are shared, not copies imported through another root.
 The optional `minimal-wasi` context and `native-wasi` import adapter are also
 exported with the same freestanding module settings. They are not linked into
 `wamr-aot` unless the embedding application imports them; their hosted test
 artifacts are not constructed in this profile.
 
-The graph comprises `aot_native.zig`, `api/aot.zig`, `native_format.zig`,
+The core runtime graph comprises `aot_native.zig`, `api/aot.zig`, `native_format.zig`,
 `native_abi.zig`, `trap_jmp.zig`, `shared/allocation_limit.zig`,
 `platform/unikraft.zig`, and Zig standard-library
 allocation/intrinsic support. It does **not** import the hosted `runtime.zig`,
 `common/types.zig`, host bridge, WASI, compiler, interpreter, components or thread
-manager. Compiler runtime intrinsics such as `memcpy` are bundled; they are not
+manager. The optional benchmark adds only the explicit minimal-WASI adapter,
+Session, bounded JSON/hash/report helpers and requested-allocation counter.
+Compiler runtime intrinsics such as `memcpy` are bundled; they are not
 the wasm compiler.
 
 `native-aot-check` links an ELF with **all public C entry points retained**
@@ -44,6 +49,11 @@ compile this runtime as an interrupt handler or disable the SSE facilities its
 application ABI and generated scalar floating-point code require. The native
 application must preserve Unikraft's IRQ return and FPU ownership contract.
 Hosted defaults remain unchanged.
+
+The default install also runs `native-aot-guest-check`, a separate freestanding
+all-entry-path link audit of the optional request/result producer. It retains
+real `benchmark.run` and Session invocation/reset/evidence calls, including error
+paths. It is not a bootable image and introduces no compiler into this profile.
 
 The separately selected `-Dprofile=unikraft-jit` is documented in
 [unikraft-jit.md](unikraft-jit.md). It does not add a compiler to this profile.

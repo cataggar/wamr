@@ -119,7 +119,7 @@ pub fn moduleOptions(target: std.Build.ResolvedTarget, optimize: std.builtin.Opt
     };
 }
 
-pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, minimal_wasi: *std.Build.Module, native_wasi: *std.Build.Module) void {
     if (target.result.cpu.arch != .x86_64 or target.result.os.tag != .freestanding or target.result.abi != .none)
         std.debug.panic("unikraft-aot requires x86_64-freestanding-none", .{});
     inline for (.{ "interp", "fast_interp", "jit", "lazy_jit", "fast_jit", "wamr_compiler", "component_model", "lib_pthread", "lib_wasi_threads", "thread_mgr", "shared_memory", "link-libc" }) |name| {
@@ -129,6 +129,8 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     var options = moduleOptions(target, optimize);
     options.root_source_file = b.path("src/aot_native.zig");
     const module = b.addModule("wamr-aot", options);
+    module.addImport("minimal-wasi", minimal_wasi);
+    module.addImport("native-wasi", native_wasi);
     const library = b.addLibrary(.{ .name = "wamr-aot", .linkage = .static, .root_module = module });
     library.bundle_compiler_rt = true;
     b.installArtifact(library);
@@ -141,5 +143,16 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     _ = link_check.getEmittedBin();
     const check_step = b.step("native-aot-check", "Link the complete compiler-free freestanding API");
     check_step.dependOn(&link_check.step);
+    var guest_options = moduleOptions(target, optimize);
+    guest_options.root_source_file = b.path("src/native_guest_link_check.zig");
+    const guest_module = b.createModule(guest_options);
+    guest_module.addImport("wamr-aot", module);
+    const guest_check = b.addExecutable(.{ .name = "wamr-aot-guest-link-check", .root_module = guest_module });
+    guest_check.entry = .{ .symbol_name = "wamr_native_guest_run" };
+    guest_check.rdynamic = true;
+    _ = guest_check.getEmittedBin();
+    const guest_step = b.step("native-aot-guest-check", "Link every freestanding guest producer execution and failure path");
+    guest_step.dependOn(&guest_check.step);
+    check_step.dependOn(guest_step);
     b.getInstallStep().dependOn(check_step);
 }

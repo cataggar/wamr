@@ -1,6 +1,9 @@
 //! Native library root and C ABI. The Zig embedding API is `aot`.
 const std = @import("std");
 pub const aot = @import("api/aot.zig");
+/// Optional freestanding v2 producer and its reusable snapshot Session.
+pub const benchmark = @import("bench/native_guest.zig");
+pub const runner = benchmark.runner;
 
 pub const Config = extern struct {
     context: ?*anyopaque,

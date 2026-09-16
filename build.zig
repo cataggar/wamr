@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     const native_wasi_module = b.addModule("native-wasi", wasi_module_options);
     native_wasi_module.addImport("minimal-wasi", minimal_wasi_module);
     if (profile == .@"unikraft-aot") {
-        @import("build/native_aot.zig").build(b, target, optimize);
+        @import("build/native_aot.zig").build(b, target, optimize, minimal_wasi_module, native_wasi_module);
         return;
     }
     if (profile == .@"unikraft-jit") {
@@ -440,7 +440,6 @@ pub fn build(b: *std.Build) void {
         .name = "wamrc",
         .root_module = wamrc_module,
     });
-    @import("build/native_benchmark.zig").add(b, wamrc, optimize);
     @import("build/native_jit.zig").addTests(b, wamrc, optimize);
     b.installArtifact(wamrc);
 
@@ -473,6 +472,7 @@ pub fn build(b: *std.Build) void {
     });
     wabt_host_module.addImport("build_options", wabt_build_options.createModule());
     @import("build/native_aot.zig").addTests(b, wamrc, lib_module, wabt_host_module);
+    @import("build/native_benchmark.zig").add(b, wamrc, optimize, wabt_host_module);
     const thread_fixture_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/wasi-threads/generate.zig"),
         .target = b.graph.host,

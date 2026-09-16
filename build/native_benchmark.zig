@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.OptimizeMode) void {
+pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.OptimizeMode, wabt: *std.Build.Module) void {
     const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
     const wasi = b.createModule(.{
         .root_source_file = b.path("src/wasi/minimal.zig"),
@@ -73,13 +73,37 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
         fixtures.dependOn(&b.addInstallFile(source, b.fmt("native-bench/{s}.wasm", .{name})).step);
     }
     const files = b.addWriteFiles();
-    for (names[0..4], artifacts[0..4]) |name, artifact|
+    for (names, artifacts, sources) |name, artifact, source| {
         _ = files.addCopyFile(artifact, b.fmt("{s}.cwasm", .{name}));
+        _ = files.addCopyFile(source, b.fmt("{s}.wasm", .{name}));
+    }
+    const generator_module = b.createModule(.{
+        .root_source_file = b.path("tests/unikraft-aot/generate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    generator_module.addImport("wabt", wabt);
+    const generator = b.addExecutable(.{ .name = "generate-native-guest-fixture", .root_module = generator_module });
+    const generate = b.addRunArtifact(generator);
+    generate.addFileArg(b.path("tests/unikraft-aot/benchmark_guest.wat"));
+    const guest_wasm = generate.addOutputFileArg("guest.wasm");
+    const compile_guest = b.addRunArtifact(wamrc);
+    compile_guest.addArgs(&.{ "compile", "--target=x86_64", "--profile=unikraft-x86_64" });
+    compile_guest.addFileArg(guest_wasm);
+    compile_guest.addArg("-o");
+    _ = files.addCopyFile(compile_guest.addOutputFileArg("guest.cwasm"), "guest.cwasm");
     const embedded = files.add("fixtures.zig",
         \\pub const deterministic = @embedFile("deterministic.cwasm");
         \\pub const coremark = @embedFile("coremark.cwasm");
         \\pub const nofp = @embedFile("coremark-nofp.cwasm");
         \\pub const wasi = @embedFile("wasi-callbacks.cwasm");
+        \\pub const compute = @embedFile("compute.cwasm");
+        \\pub const compute_wasm = @embedFile("compute.wasm");
+        \\pub const memory = @embedFile("memory.cwasm");
+        \\pub const memory_wasm = @embedFile("memory.wasm");
+        \\pub const coremark_wasm = @embedFile("coremark.wasm");
+        \\pub const nofp_wasm = @embedFile("coremark-nofp.wasm");
+        \\pub const guest = @embedFile("guest.cwasm");
         \\
     );
     const test_root = b.createModule(.{
@@ -95,18 +119,47 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
     const tests = b.addTest(.{ .root_module = test_root, .filters = filters });
     const check = b.step("test-native-bench", "Exercise real Linux native AOT/WASI callbacks and repeated CoreMark CRC");
     const unit = b.step("test-native-bench-unit", "Run native embedding producer API/callback regressions");
+    const guest_tests = b.addTest(.{ .root_module = test_root, .filters = &.{"native guest"} });
+    const guest_step = b.step("test-native-aot-guest", "Exercise the freestanding producer boundary with real native bytes");
+    const guest_protocol_root = b.createModule(.{
+        .root_source_file = b.path("src/native_guest_protocol_test.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .single_threaded = true,
+    });
+    guest_protocol_root.addImport("minimal-wasi", wasi);
+    guest_protocol_root.addImport("native-wasi", adapter);
+    guest_protocol_root.addAnonymousImport("fixtures", .{ .root_source_file = embedded });
+    const guest_protocol_exe = b.addExecutable(.{ .name = "native-guest-protocol-test", .root_module = guest_protocol_root });
+    const guest_protocol = b.step("test-native-aot-guest-protocol", "Validate actual guest payloads using the existing host v2 schema");
+    const guest_python = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_guest" });
+    guest_python.setEnvironmentVariable("WAMR_NATIVE_GUEST_TEST", b.getInstallPath(.prefix, "native-guest-tests/driver"));
+    guest_python.setEnvironmentVariable("WAMR_NATIVE_GUEST_TEST_RUNNER", if (b.graph.host.result.cpu.arch == .x86_64) "" else "qemu-x86_64 -cpu max");
+    guest_python.step.dependOn(&b.addInstallFile(guest_protocol_exe.getEmittedBin(), "native-guest-tests/driver").step);
+    if (b.graph.host.result.os.tag == .linux) {
+        guest_protocol.dependOn(&guest_python.step);
+        guest_step.dependOn(guest_protocol);
+        check.dependOn(guest_protocol);
+    }
     check.dependOn(unit);
     const build_only = b.step("test-native-bench-build", "Build Linux embedding tests without native execution");
     _ = tests.getEmittedBin();
     build_only.dependOn(&tests.step);
+    _ = guest_tests.getEmittedBin();
+    build_only.dependOn(&guest_tests.step);
     if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .x86_64) {
         unit.dependOn(&b.addRunArtifact(tests).step);
+        guest_step.dependOn(&b.addRunArtifact(guest_tests).step);
     } else if (b.graph.host.result.os.tag == .linux) {
         const run = b.addSystemCommand(&.{ "qemu-x86_64", "-cpu", "max" });
         run.addArtifactArg(tests);
         unit.dependOn(&run.step);
+        const run_guest = b.addSystemCommand(&.{ "qemu-x86_64", "-cpu", "max" });
+        run_guest.addArtifactArg(guest_tests);
+        guest_step.dependOn(&run_guest.step);
     } else {
         unit.dependOn(build_only);
+        guest_step.dependOn(build_only);
     }
     const python = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_bench_coremark.NativeLinuxProducerTests" });
     python.setEnvironmentVariable("WAMR_NATIVE_PRODUCER", b.getInstallPath(.bin, "wamr-native-bench"));

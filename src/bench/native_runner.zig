@@ -165,7 +165,7 @@ pub fn writeInvocationEvidence(writer: *std.Io.Writer, phase: []const u8, index:
     try writer.writeAll("}\n");
 }
 
-fn writeBase64(writer: *std.Io.Writer, bytes: []const u8) !void {
+pub fn writeBase64(writer: *std.Io.Writer, bytes: []const u8) !void {
     try writer.writeByte('"');
     var at: usize = 0;
     var encoded: [64]u8 = undefined;
@@ -188,6 +188,14 @@ pub const Session = struct {
     load_ticks: u64 = 0,
     instantiate_ticks: u64 = 0,
     lifecycle_setup_ticks: u64 = 0,
+    start_invocation: ?Invocation = null,
+
+    pub const Capture = struct {
+        output_limit: usize = 1024 * 1024,
+        /// Persist module-start output/terminal before cleanup or buffer reuse.
+        /// The writer must not allocate using the Session allocator.
+        setup_evidence: ?*std.Io.Writer = null,
+    };
 
     pub const Progress = struct {
         load_ticks: ?u64 = null,
@@ -201,12 +209,16 @@ pub const Session = struct {
     }
 
     pub fn createTimed(allocator: std.mem.Allocator, native: aot.Platform, bytes: []const u8, args: []const []const u8, environment: []const []const u8, clock: wasi.Clock, progress: *Progress) !*Session {
+        return createCaptured(allocator, native, bytes, args, environment, clock, progress, .{});
+    }
+
+    pub fn createCaptured(allocator: std.mem.Allocator, native: aot.Platform, bytes: []const u8, args: []const []const u8, environment: []const []const u8, clock: wasi.Clock, progress: *Progress, capture: Capture) !*Session {
         progress.* = .{};
         const self = try allocator.create(Session);
         self.* = .{
             .allocator = allocator,
             .native = native,
-            .output = .{ .allocator = allocator },
+            .output = .{ .allocator = allocator, .limit = capture.output_limit },
             .context = undefined,
             .wasi_options = .{ .args = args, .environment = environment, .output = null, .clock = clock },
         };
@@ -221,11 +233,27 @@ pub const Session = struct {
         self.load_ticks = progress.load_ticks.?;
         const instantiate_begin = try native.monotonicNs();
         const initialized = self.initialize();
-        const instantiate_end = try native.monotonicNs();
+        const instantiate_end_reading = native.monotonicNs();
+        if (capture.setup_evidence) |writer| {
+            if (self.start_invocation) |invocation| {
+                try writeInvocationEvidence(writer, "module-start", 0, invocation);
+                try writer.flush();
+            }
+        }
+        const instantiate_end = try instantiate_end_reading;
         if (instantiate_end < instantiate_begin) return error.ClockFailed;
         progress.instantiate_ticks = instantiate_end - instantiate_begin;
         try initialized;
         self.instantiate_ticks = progress.instantiate_ticks.?;
+        if (capture.setup_evidence != null) {
+            if (self.output.failure != null or self.context.pendingWriteError(1) != null or self.context.pendingWriteError(2) != null)
+                return error.OutputFailurePending;
+            // The native guest's baseline includes module-start descriptor
+            // changes, not merely the pre-start WASI options.
+            self.wasi_options.descriptors = self.context.descriptors;
+            self.output.clear();
+            self.start_invocation = null;
+        }
         const snapshot_begin = try native.monotonicNs();
         const snapshot = Snapshot.capture(allocator, self.instance.?);
         if (snapshot) |saved| self.snapshot = saved else |_| {}
@@ -242,7 +270,9 @@ pub const Session = struct {
         self.context = try wasi.Context.init(self.wasi_options);
         const bindings = adapter.imports(&self.context);
         try self.instance.?.instantiate(&bindings, .{});
-        const started = try self.instance.?.start();
+        const started_result = self.instance.?.start();
+        self.start_invocation = self.captureOutcome(started_result);
+        const started = try started_result;
         if (started != .returned) return error.StartFailed;
     }
 
@@ -301,6 +331,20 @@ pub const Session = struct {
         const begin = try self.native.monotonicNs();
         const outcome = self.instance.?.call(entry, &.{}, &.{});
         const end_reading = self.native.monotonicNs();
+        var result = self.captureOutcome(outcome);
+        const end = end_reading catch |failure| {
+            result.timing_error = @errorName(failure);
+            return result;
+        };
+        if (end < begin) {
+            result.timing_error = "ClockWentBackwards";
+            return result;
+        }
+        result.ticks = end - begin;
+        return result;
+    }
+
+    fn captureOutcome(self: *Session, outcome: anytype) Invocation {
         var result: Invocation = .{
             .ticks = null,
             .outcome = "error",
@@ -330,15 +374,6 @@ pub const Session = struct {
             result.output_failure = true;
             if (result.diagnostic == null) result.diagnostic = "output-callback-failure";
         }
-        const end = end_reading catch |failure| {
-            result.timing_error = @errorName(failure);
-            return result;
-        };
-        if (end < begin) {
-            result.timing_error = "ClockWentBackwards";
-            return result;
-        }
-        result.ticks = end - begin;
         return result;
     }
 };
