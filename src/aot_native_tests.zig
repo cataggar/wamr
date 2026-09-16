@@ -189,6 +189,30 @@ test "native AOT rollback covers every allocation and page transition failure" {
     try std.testing.expectError(error.ProtectionFailed, create(std.testing.allocator, &pages));
     try equal(@as(usize, 0), pages.live);
 }
+test "native AOT call boundary does not allocate after instantiation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var pages: Pages = .{};
+    const inst = try create(failing.allocator(), &pages);
+    defer inst.deinit();
+    const allocations = failing.alloc_index;
+    const resizes = failing.resize_index;
+    failing.fail_index = allocations;
+    failing.resize_fail_index = resizes;
+    for (0..32) |_| {
+        try equal(@as(i32, 42), try callI32(inst, "add", &.{ .{ .i32 = 20 }, .{ .i32 = 22 } }));
+        try equal(@as(i32, 42), try callI32(inst, "call_host", &.{ .{ .i32 = 20 }, .{ .i32 = 22 } }));
+        try equal(@as(usize, 0), (try inst.call("noop", &.{}, &.{})).returned);
+    }
+    try equal(api.Trap.unreachable_instruction, (try inst.call("trap", &.{}, &.{})).trap);
+    const old_pages: i32 = @intCast(inst.vmctx.memory_pages);
+    const commits = pages.commits;
+    try equal(old_pages, try callI32(inst, "grow", &.{.{ .i32 = 1 }}));
+    try equal(commits + 1, pages.commits);
+    try equal(allocations, failing.alloc_index);
+    try equal(resizes, failing.resize_index);
+    try expect(!failing.has_induced_failure);
+}
+
 test "native AOT phase timings measure real boundaries and roll back clock failures" {
     var pages: Pages = .{ .clock_value = 100, .clock_step = 100, .check_phase_boundaries = true };
     var timings: api.LoadTimings = .{};

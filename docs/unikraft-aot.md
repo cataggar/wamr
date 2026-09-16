@@ -216,6 +216,41 @@ same-instance steady state, and clearing a sticky WASI exit alone does not prove
 that repeatedly invoking `_start` is valid for a workload's libc/descriptors/
 globals. This API does not claim that unqualified repeatability.
 
+### Performance choices follow the boundary
+
+The official [Unikraft architecture guidance](https://unikraft.org/docs/internals/architecture)
+emphasizes narrow interchangeable micro-libraries and static linking instead of
+bypassing APIs for speed. This implementation applies that guidance concretely:
+
+* The default guest artifact is one statically linked AOT library. WASI and
+  platform adapters remain separate narrow modules; POSIX, a filesystem and a
+  scheduler are not compatibility prerequisites for the runtime.
+* The caller's metadata allocator is independent of the reserve/commit/
+  protection policy for linear memory and code. An embedding application can
+  select appropriate `ukalloc` implementations for boot/application lifetimes
+  without changing the runtime or pretending address reservation is committed
+  RAM. Allocator ownership must remain valid through corresponding frees.
+* Load/instantiation allocate metadata and table capacity once. Invocation,
+  scalar dispatch, host thunks and explicit trap handling use bounded stack
+  scratch rather than per-call heap allocation. A regression freezes the
+  caller allocator after instantiation and exercises repeated exact-result
+  calls, host calls, noop, traps and memory growth. Growth still invokes the
+  separate page-commit capability: it is not claimed to avoid physical allocation.
+* A suitable bounded application may use run-to-completion without adding a
+  runtime scheduler. Whether the actual pinned image can omit a scheduler is a
+  native integration decision, not established by `single_threaded=true`.
+* Instance reuse belongs outside a measured steady region only after workload
+  restart semantics are qualified. Fresh-instance samples must be reported as
+  such, rather than mislabeled as same-instance steady state.
+
+Assess these choices with real load/instantiate/invocation phases and explicit
+image/reserved/committed-memory evidence, including measurement coverage. This
+does not predict any CoreMark OS speedup. Unikraft components share a protection
+domain; that is **not** a reason to remove wasm bounds checks, W^X, import/ABI
+validation or per-instance trap isolation. The pinned fork's native Zig build
+and image configuration remain authoritative over generic Make/Kconfig examples.
+No network or storage scope is added here.
+
 ## Regression evidence and remaining acceptance
 
 ```sh
