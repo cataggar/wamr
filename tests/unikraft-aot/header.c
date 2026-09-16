@@ -6,6 +6,7 @@ _Static_assert(sizeof(wamr_aot_result) == 24, "result ABI");
 _Static_assert(offsetof(wamr_aot_result, error_name) == 16, "error name ABI");
 _Static_assert(sizeof(wamr_aot_config) == 72, "platform configuration ABI");
 _Static_assert(sizeof(wamr_aot_import) == 80, "import ABI");
+_Static_assert(sizeof(wamr_aot_load_timings) == 24, "timing ABI");
 
 wamr_aot_result header_call(wamr_aot_handle *instance)
 {

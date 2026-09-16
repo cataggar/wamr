@@ -40,6 +40,12 @@ typedef struct {
     size_t count;
     const char *error_name;
 } wamr_aot_result;
+typedef struct {
+    uint64_t load_ns, instantiate_ns;
+    /* Bit0: load_ns measured; bit1: instantiate_ns measured. Other bits zero.
+     * Zero duration is meaningful only when its completed bit is set. */
+    uint32_t completed, reserved;
+} wamr_aot_load_timings;
 
 /* Config and import descriptors must outlive the instance. All operations on
  * one instance must be serialized. Never destroy an active instance.
@@ -81,6 +87,13 @@ uint32_t wamr_aot_contract_version(void);
  * Limits are mandatory: zero permits zero pages/elements, not "unlimited". */
 wamr_aot_result wamr_aot_load(const wamr_aot_config *, const uint8_t *, size_t,
                             const wamr_aot_import *, size_t, wamr_aot_handle **out);
+/* Uses the configured monotonic clock at real internal phase boundaries.
+ * Clock failure (including backwards time/saturation) fails load and cleans up.
+ * Results cover the shared loader/instance implementation, not C argument
+ * adaptation or caller workload-specific WASI-context construction. */
+wamr_aot_result wamr_aot_load_timed(const wamr_aot_config *, const uint8_t *, size_t,
+                                  const wamr_aot_import *, size_t,
+                                  wamr_aot_handle **out, wamr_aot_load_timings *);
 void wamr_aot_destroy(wamr_aot_handle *);
 wamr_aot_result wamr_aot_start(wamr_aot_handle *);
 wamr_aot_result wamr_aot_call(wamr_aot_handle *, const uint8_t *name, size_t,

@@ -190,6 +190,32 @@ not yet qualified. Compiler reuse, executable allocation and typed dispatch are
 separated so a later opt-in compiler/JIT layer can reuse this boundary without
 adding compilation to the default guest graph.
 
+### Honest phase instrumentation
+
+`Options.timings = &LoadTimings{}` enables three reads of the supplied monotonic
+clock at real internal boundaries; `wamr_aot_load_timed` exposes the same
+implementation through C. Untimed calls make no clock reads:
+
+1. Load begins immediately before allocating/copying the owned input.
+2. Instantiation begins after format/ABI/CPU/index and required-import validation.
+3. Instantiation ends after globals, memories, tables, initialization, executable
+   mapping/protection and vmctx helper wiring are complete.
+
+`load_ns` and `instantiate_ns` are valid only when their respective `completed`
+bits (1 and 2) are set. Failures preserve only fully measured phases, never a
+fabricated zero. Failed/saturated/backwards clock readings return `ClockFailed`;
+even a final timing failure rolls back the newly created instance. The timestamp
+units remain ns and do not assert a clock resolution.
+
+These cover the common loader/instance implementation, not filesystem reads,
+CLI/subprocess setup, C argument adaptation or caller-owned WASI context setup.
+A benchmark producer must measure any additional required setup separately and
+report its coverage honestly. First/repeated invocation timing remains the
+producer's responsibility. In particular, a fresh instance per sample is not
+same-instance steady state, and clearing a sticky WASI exit alone does not prove
+that repeatedly invoking `_start` is valid for a workload's libc/descriptors/
+globals. This API does not claim that unqualified repeatability.
+
 ## Regression evidence and remaining acceptance
 
 ```sh

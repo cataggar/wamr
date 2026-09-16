@@ -50,6 +50,17 @@ pub const Options = struct {
     /// Restrict available CPU features for qualification. Cannot enable a
     /// feature CPUID does not report.
     cpu_feature_mask: u64 = std.math.maxInt(u64),
+    /// Opt-in measurements from the caller's monotonic clock. Bit 0 of
+    /// completed marks load_ns valid, bit 1 marks instantiate_ns valid.
+    /// No clock reads or timing claims are made when this is null.
+    timings: ?*LoadTimings = null,
+};
+
+pub const LoadTimings = extern struct {
+    load_ns: u64 = 0,
+    instantiate_ns: u64 = 0,
+    completed: u32 = 0,
+    reserved: u32 = 0,
 };
 
 const Mapping = struct { base: [*]align(4096) u8, size: usize };
@@ -83,9 +94,11 @@ pub const Instance = struct {
     /// context must outlive this instance. Start functions are not executed
     /// while loading: call start() explicitly and inspect its terminal result.
     pub fn load(allocator: std.mem.Allocator, native: Platform, bytes: []const u8, imports: []const HostImport, options: Options) Error!*Instance {
+        if (options.timings) |timings| timings.* = .{};
         if (comptime builtin.cpu.arch != .x86_64 or builtin.os.tag == .windows) return error.UnsupportedTarget;
         try native.validate();
         if (options.max_memory_pages > 65536) return error.InvalidLimits;
+        const load_start = if (options.timings != null) try native.monotonicNs() else 0;
         const self = try allocator.create(Instance);
         self.* = .{ .allocator = allocator, .arena = .init(allocator), .native = native, .module = .{} };
         errdefer self.deinit();
@@ -115,6 +128,14 @@ pub const Instance = struct {
             self.hosts[i] = host;
             self.host_pointers[i] = @intFromPtr(import_pointers[i]);
         }
+        // Metadata and required-import validation are complete. Everything
+        // below allocates/initializes the executable instance, not the loader.
+        const instantiate_start = if (options.timings) |timings| blk: {
+            const now = try native.monotonicNs();
+            timings.load_ns = std.math.sub(u64, now, load_start) catch return error.ClockFailed;
+            timings.completed = 1;
+            break :blk now;
+        } else 0;
         self.globals = try a.alloc(u64, self.module.globals.len);
         for (self.module.globals, self.globals) |g, *bits| bits.* = g.bits;
         self.signatures = try a.alloc(u32, self.module.signatures.len);
@@ -210,6 +231,11 @@ pub const Instance = struct {
         self.vmctx.lazy_compile_fn = @intFromPtr(&trapUnsupported);
         self.vmctx.trap_unaligned_fn = @intFromPtr(&trapUnsupported);
         self.vmctx.cancel_point_fn = @intFromPtr(&trapUnsupported);
+        if (options.timings) |timings| {
+            const ready = try native.monotonicNs();
+            timings.instantiate_ns = std.math.sub(u64, ready, instantiate_start) catch return error.ClockFailed;
+            timings.completed = 3;
+        }
         return self;
     }
 

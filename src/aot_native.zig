@@ -44,6 +44,15 @@ pub export fn wamr_aot_contract_version() u32 {
 /// Config and CImport descriptors (including strings/signatures/contexts) must
 /// remain alive until destroy. Bytes are copied. On failure out is null.
 pub export fn wamr_aot_load(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]const CImport, import_count: usize, out: *?*Handle) Result {
+    return load(config, bytes, length, imports, import_count, out, null);
+}
+
+pub export fn wamr_aot_load_timed(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]const CImport, import_count: usize, out: *?*Handle, timings: *aot.LoadTimings) Result {
+    timings.* = .{};
+    return load(config, bytes, length, imports, import_count, out, timings);
+}
+
+fn load(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]const CImport, import_count: usize, out: *?*Handle, timings: ?*aot.LoadTimings) Result {
     out.* = null;
     const allocator = makeAllocator(config);
     const handle = allocator.create(Handle) catch |err| return failure(err);
@@ -91,6 +100,7 @@ pub export fn wamr_aot_load(config: *const Config, bytes: [*]const u8, length: u
         .instance = aot.Instance.load(allocator, native, bytes[0..length], host_imports, .{
             .max_memory_pages = config.max_memory_pages,
             .max_table_elements = config.max_table_elements,
+            .timings = timings,
         }) catch |err| {
             allocator.destroy(handle);
             return failure(err);

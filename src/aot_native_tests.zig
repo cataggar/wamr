@@ -14,6 +14,12 @@ const Pages = struct {
     fail_commit: ?usize = null,
     fail_protect: bool = false,
     code_executable: bool = false,
+    clock_value: u64 = 123456789,
+    clock_step: u64 = 0,
+    clock_reads: usize = 0,
+    clock_fail_on: ?usize = null,
+    clock_rewind_after_first: bool = false,
+    check_phase_boundaries: bool = false,
 
     fn platform(self: *Pages) api.Platform {
         return .{ .context = self, .reserve = reserve, .commit = commit, .protect = protect, .unmap = unmap, .monotonic_ns = clock };
@@ -51,8 +57,18 @@ const Pages = struct {
         std.posix.munmap(address[0..size]);
         self.live -= 1;
     }
-    fn clock(_: *anyopaque) api.PlatformError!u64 {
-        return 123456789;
+    fn clock(context: *anyopaque) api.PlatformError!u64 {
+        const self: *Pages = @ptrCast(@alignCast(context));
+        const index = self.clock_reads;
+        self.clock_reads += 1;
+        if (self.clock_fail_on == index) return error.ClockFailed;
+        if (self.check_phase_boundaries) {
+            if (index < 2 and self.reservations != 0) return error.ClockFailed;
+            if (index == 2 and (self.reservations != 2 or self.protects != 1)) return error.ClockFailed;
+        }
+        const value = self.clock_value;
+        self.clock_value = if (index == 0 and self.clock_rewind_after_first) value - 1 else value + self.clock_step;
+        return value;
     }
 };
 const imports = [_]api.HostImport{
@@ -163,6 +179,7 @@ test "native AOT rollback covers every allocation and page transition failure" {
         try std.testing.expectError(error.OutOfMemory, create(std.testing.allocator, &pages));
         try equal(@as(usize, 0), pages.live);
     }
+
     for (0..2) |index| {
         var pages: Pages = .{ .fail_commit = index };
         try std.testing.expectError(error.OutOfMemory, create(std.testing.allocator, &pages));
@@ -172,6 +189,30 @@ test "native AOT rollback covers every allocation and page transition failure" {
     try std.testing.expectError(error.ProtectionFailed, create(std.testing.allocator, &pages));
     try equal(@as(usize, 0), pages.live);
 }
+test "native AOT phase timings measure real boundaries and roll back clock failures" {
+    var pages: Pages = .{ .clock_value = 100, .clock_step = 100, .check_phase_boundaries = true };
+    var timings: api.LoadTimings = .{};
+    const inst = try api.Instance.load(std.testing.allocator, pages.platform(), fixture, &imports, .{ .max_memory_pages = 8, .timings = &timings });
+    try equal(@as(u32, 3), timings.completed);
+    try equal(@as(u64, 100), timings.load_ns);
+    try equal(@as(u64, 100), timings.instantiate_ns);
+    try equal(@as(usize, 3), pages.clock_reads);
+    try equal(@as(i32, 42), try callI32(inst, "add", &.{ .{ .i32 = 20 }, .{ .i32 = 22 } }));
+    inst.deinit();
+    try equal(@as(usize, 0), pages.live);
+
+    for (0..3) |index| {
+        pages = .{ .clock_value = 100, .clock_step = 100, .clock_fail_on = index };
+        try std.testing.expectError(error.ClockFailed, api.Instance.load(std.testing.allocator, pages.platform(), fixture, &imports, .{ .timings = &timings }));
+        try equal(@as(u32, if (index == 2) 1 else 0), timings.completed);
+        try equal(@as(usize, 0), pages.live);
+    }
+    pages = .{ .clock_value = 100, .clock_rewind_after_first = true };
+    try std.testing.expectError(error.ClockFailed, api.Instance.load(std.testing.allocator, pages.platform(), fixture, &imports, .{ .timings = &timings }));
+    try equal(@as(u32, 0), timings.completed);
+    try equal(@as(usize, 0), pages.live);
+}
+
 fn allocationLifecycle(allocator: std.mem.Allocator) !void {
     var pages: Pages = .{};
     defer std.debug.assert(pages.live == 0);
@@ -208,8 +249,9 @@ const CState = struct {
         const self: *CState = @ptrCast(@alignCast(context.?));
         Pages.unmap(&self.pages, @ptrCast(@alignCast(pointer)), size);
     }
-    fn clock(_: ?*anyopaque, result: *u64) callconv(.c) c_int {
-        result.* = 123456789;
+    fn clock(context: ?*anyopaque, result: *u64) callconv(.c) c_int {
+        const self: *CState = @ptrCast(@alignCast(context.?));
+        result.* = Pages.clock(&self.pages) catch return -1;
         return 0;
     }
     fn config(self: *CState) c_api.Config {
@@ -251,6 +293,14 @@ test "native C ABI executes exact typed result and retains copied artifact owner
     try equal(@as(usize, 1), returned.count);
     try equal(@as(u32, 0x7f), results[0].kind);
     try equal(@as(u64, 42), results[0].bits);
+    c_api.wamr_aot_destroy(handle.?);
+    try equal(@as(usize, 0), state.pages.live);
+    state.pages.clock_step = 100;
+    var timings: api.LoadTimings = .{};
+    try equal(@as(u32, 0), c_api.wamr_aot_load_timed(&config, fixture.ptr, fixture.len, &c_imports, 3, &handle, &timings).kind);
+    try equal(@as(u32, 3), timings.completed);
+    try equal(@as(u64, 100), timings.load_ns);
+    try equal(@as(u64, 100), timings.instantiate_ns);
     c_api.wamr_aot_destroy(handle.?);
     try equal(@as(usize, 0), state.pages.live);
 }
