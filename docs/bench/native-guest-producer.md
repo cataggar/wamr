@@ -22,9 +22,13 @@ zig build test-native-bench-unit -Doptimize=ReleaseSafe -j2
 
 `native-aot-guest-check` retains exported wrappers reaching `benchmark.run`,
 Session setup/invocation/reset, all error paths and streaming evidence in an
-`x86_64-freestanding-none` ELF. The default native install also depends on this
-audit, alongside the existing complete C API audit. Neither audit ELF is bootable
-or executable as an application. Neither links libc or resolves hosted syscalls.
+`x86_64-freestanding-none` PIE ELF. Native modules, including the installed
+archive and shared WASI/producer modules, explicitly use PIC for the EFI final
+link. The default install also links the actual `libwamr-aot.a` into a separate
+PIE consumer, alongside the complete C API and producer audits. This catches
+non-PIC archive relocations that an executable-only recompile could conceal.
+Audit ELFs are not bootable or executable as applications; they do not link libc
+or resolve hosted syscalls.
 The compiler remains external; building this profile never constructs `wamrc`.
 
 Downstream, use the existing `wamr-aot` dependency module:

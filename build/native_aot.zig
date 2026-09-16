@@ -109,6 +109,7 @@ pub fn moduleOptions(target: std.Build.ResolvedTarget, optimize: std.builtin.Opt
     return .{
         .target = target,
         .optimize = optimize,
+        .pic = true,
         .single_threaded = true,
         .red_zone = false,
         .stack_check = false,
@@ -140,9 +141,22 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const link_check = b.addExecutable(.{ .name = "wamr-aot-link-check", .root_module = module });
     link_check.entry = .{ .symbol_name = "wamr_aot_contract_version" };
     link_check.rdynamic = true;
+    link_check.pie = true;
     _ = link_check.getEmittedBin();
     const check_step = b.step("native-aot-check", "Link the complete compiler-free freestanding API");
     check_step.dependOn(&link_check.step);
+    // Consume the actual installed archive, rather than letting an executable
+    // build implicitly make recompilations PIC and hide a non-PIC library.
+    var archive_options = moduleOptions(target, optimize);
+    archive_options.root_source_file = b.path("src/native_aot_archive_check.zig");
+    const archive_module = b.createModule(archive_options);
+    archive_module.linkLibrary(library);
+    const archive_check = b.addExecutable(.{ .name = "wamr-aot-archive-pie-check", .root_module = archive_module });
+    archive_check.entry = .{ .symbol_name = "wamr_native_archive_pie_entry" };
+    archive_check.rdynamic = true;
+    archive_check.pie = true;
+    _ = archive_check.getEmittedBin();
+    check_step.dependOn(&archive_check.step);
     var guest_options = moduleOptions(target, optimize);
     guest_options.root_source_file = b.path("src/native_guest_link_check.zig");
     const guest_module = b.createModule(guest_options);
@@ -150,6 +164,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const guest_check = b.addExecutable(.{ .name = "wamr-aot-guest-link-check", .root_module = guest_module });
     guest_check.entry = .{ .symbol_name = "wamr_native_guest_run" };
     guest_check.rdynamic = true;
+    guest_check.pie = true;
     _ = guest_check.getEmittedBin();
     const guest_step = b.step("native-aot-guest-check", "Link every freestanding guest producer execution and failure path");
     guest_step.dependOn(&guest_check.step);

@@ -40,7 +40,8 @@ the wasm compiler.
 (`rdynamic`), so lazy unused imports or linker garbage collection cannot hide
 unresolved dependencies. This ELF is a link audit, not a bootable image. Its
 entry symbol is deliberately the contract-version query. Do not execute it.
-The library uses the x86_64 SysV ABI, no red zone, no libc stack protector, and
+The library uses PIC for the native EFI application's PIE final link,
+the x86_64 SysV ABI, no red zone, no libc stack protector, and
 single-threaded Zig support, with stack checking, unwind tables and Zig error
 tracing disabled. These match ordinary native application objects in
 `support/build/native-target-object.zig` at Unikraft commit
@@ -53,7 +54,9 @@ Hosted defaults remain unchanged.
 The default install also runs `native-aot-guest-check`, a separate freestanding
 all-entry-path link audit of the optional request/result producer. It retains
 real `benchmark.run` and Session invocation/reset/evidence calls, including error
-paths. It is not a bootable image and introduces no compiler into this profile.
+paths. Both API/producer audits are PIE links. A third audit links the actual
+`libwamr-aot.a` into a freestanding PIE, so executable-side implicit PIC cannot
+hide non-PIC archive objects. None is bootable or introduces a compiler.
 
 The separately selected `-Dprofile=unikraft-jit` is documented in
 [unikraft-jit.md](unikraft-jit.md). It does not add a compiler to this profile.
