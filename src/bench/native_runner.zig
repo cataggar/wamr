@@ -208,6 +208,7 @@ pub const Session = struct {
     pub fn invoke(self: *Session, entry: []const u8) !Invocation {
         const begin = try self.native.monotonicNs();
         const outcome = self.instance.?.call(entry, &.{}, &.{});
+        const end_reading = self.native.monotonicNs();
         var result: Invocation = .{
             .ticks = null,
             .outcome = "error",
@@ -235,7 +236,7 @@ pub const Session = struct {
             result.output_failure = true;
             if (result.diagnostic == null) result.diagnostic = "output-callback-failure";
         }
-        const end = self.native.monotonicNs() catch |failure| {
+        const end = end_reading catch |failure| {
             result.timing_error = @errorName(failure);
             return result;
         };
