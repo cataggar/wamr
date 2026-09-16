@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -15,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from benchmark_schema import atomic_write_json, cache_key, sample_stats, sha256_file
+from benchmark_schema import atomic_write_json, cache_key, sample_stats, sha256_bytes, sha256_file
 from bench_coremark import (
     COREMARK_GUEST_ARGS,
     DEFAULT_FIXTURE_SHA256,
@@ -377,10 +378,11 @@ def create_plan(config, repo, *, now=None, allow_synthetic=False):
 
 def parse_result_stream(raw):
     results = []
-    for line in raw.decode("utf-8", errors="strict").splitlines():
-        if PREFIX in line:
-            require(line.startswith(PREFIX), "result prefix must start its own line")
-            results.append(strict_json(line[len(PREFIX):]))
+    prefix = PREFIX.encode("ascii")
+    for line in raw.splitlines():
+        if prefix in line:
+            require(line.startswith(prefix), "result prefix must start its own line")
+            results.append(strict_json(line[len(prefix):].decode("utf-8", errors="strict")))
     require(len(results) == 1, f"expected exactly one terminal result, got {len(results)}")
     return results[0]
 
@@ -423,6 +425,17 @@ def field_once(stdout, label, pattern):
     match = re.fullmatch(pattern, lines[0].strip())
     require(match is not None, f"malformed {label} marker")
     return match.group(1)
+
+
+def decode_stdout(encoded):
+    require(isinstance(encoded, str), "stdout_base64 must be a string")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise ValueError("stdout_base64 is not valid base64") from error
+    require(base64.b64encode(raw).decode("ascii") == encoded,
+            "stdout_base64 must use canonical padded base64")
+    return raw
 
 
 def coremark_correctness(stdout, invocation_seconds):
@@ -490,7 +503,7 @@ def validate_result(result, manifest, run_id):
                 all(phases[name] is None for name in
                     ("load_ticks", "instantiate_ticks", "first_invocation_ticks")) and
                 phases["steady_state_ticks"] == [] and result["invocations"] == [] and
-                result["memory"] is None,
+                result["memory"] is None and result["exit_code"] is None,
                 "unavailable clock requires a failed, unstarted attempt without measurements")
         return []
     keys(clock, {"source", "unit", "ticks_per_second", "resolution_ticks"}, "clock")
@@ -513,8 +526,6 @@ def validate_result(result, manifest, run_id):
     if success:
         require(len(phases["steady_state_ticks"]) == config["steady_invocations"],
                 "partial steady state result")
-        require(type(result["exit_code"]) is int and result["exit_code"] == 0,
-                "success requires exit code zero")
     for value in phases["steady_state_ticks"]:
         number(value, "steady ticks", integer=True)
     require(phases["instantiate_ticks"] is None or phases["load_ticks"] is not None,
@@ -535,7 +546,7 @@ def validate_result(result, manifest, run_id):
             len(result["invocations"]) == len(durations), "invocation evidence count mismatch")
     checks = []
     for index, (invocation, ticks) in enumerate(zip(result["invocations"], durations)):
-        keys(invocation, {"phase", "outcome", "exit_code", "stdout"}, "invocation")
+        keys(invocation, {"phase", "outcome", "exit_code", "stdout_base64"}, "invocation")
         require(invocation["phase"] == ("first" if index == 0 else "steady"),
                 "invocation phase mismatch")
         require(invocation["outcome"] in ("returned", "proc_exit", "trap", "error"),
@@ -545,10 +556,11 @@ def validate_result(result, manifest, run_id):
                 "invocation exit_code must be a complete u32 status")
         require(invocation["outcome"] != "proc_exit" or invocation["exit_code"] is not None,
                 "proc_exit requires its u32 status")
-        require(invocation["outcome"] != "trap" or invocation["exit_code"] is None,
-                "trapped invocation must not report an exit code")
-        require(isinstance(invocation["stdout"], str), "invocation stdout")
-        good = invocation["outcome"] in ("returned", "proc_exit") and invocation["exit_code"] == 0
+        require(invocation["outcome"] == "proc_exit" or invocation["exit_code"] is None,
+                "only proc_exit has a guest exit code")
+        stdout = decode_stdout(invocation["stdout_base64"])
+        good = invocation["outcome"] == "returned" or (
+            invocation["outcome"] == "proc_exit" and invocation["exit_code"] == 0)
         require(index == len(durations) - 1 or good,
                 "invocations continued after a failed terminal outcome")
         if invocation["outcome"] == "proc_exit" and invocation["exit_code"] != 0:
@@ -558,7 +570,7 @@ def validate_result(result, manifest, run_id):
         if good and config["run"]["workload"].startswith("coremark"):
             try:
                 checks.append(coremark_correctness(
-                    invocation["stdout"], ticks / clock["ticks_per_second"]))
+                    stdout.decode("ascii"), ticks / clock["ticks_per_second"]))
             except (ValueError, RuntimeError) as error:
                 if success:
                     # The legacy parser includes raw output in its diagnostic.
@@ -566,11 +578,15 @@ def validate_result(result, manifest, run_id):
                                      "inspect private stdout evidence") from error
                 checks.append({"self_check": "failed", "failure": "coremark-validation"})
         elif good:
-            require(invocation["outcome"] == "returned" and invocation["stdout"] == "",
+            require(invocation["outcome"] == "returned" and stdout == b"",
                     "no-import fixture must return without output, exit or trap")
             checks.append({"self_check": "returned-without-trap"})
         else:
             checks.append({"self_check": "failed"})
+    expected_exit = (result["invocations"][-1]["exit_code"]
+                     if result["invocations"] else None)
+    require(result["exit_code"] == expected_exit,
+            "guest terminal status disagrees with final invocation reason")
     if success:
         validate_memory(result["memory"], target)
     elif result["memory"] is not None:
@@ -737,7 +753,8 @@ def build_report(manifest, directories, *, allow_synthetic=False):
         if result is not None:
             result = {key: value for key, value in result.items() if key != "invocations"}
             result["invocations"] = [
-                {key: value for key, value in invocation.items() if key != "stdout"}
+                {**{key: value for key, value in invocation.items() if key != "stdout_base64"},
+                 "stdout_sha256": sha256_bytes(decode_stdout(invocation["stdout_base64"]))}
                 for invocation in record["result"]["invocations"]]
         public_records.append({**record, "result": result})
     return {"schema_version": VERSION, "kind": "wamr-native-matched-comparison",

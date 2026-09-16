@@ -230,7 +230,9 @@ Emit exactly one complete UTF-8 line on stdout/serial, starting at column zero:
 WAMR_BENCH_RESULT=<one JSON object, no line breaks>
 ```
 
-Boot output may precede/follow it. Fragmented/truncated JSON, extra result lines,
+Boot output may precede/follow it and may contain arbitrary non-UTF-8 bytes, retained
+privately without decoding. The result line itself must be valid UTF-8 JSON.
+Fragmented/truncated JSON, extra result lines,
 duplicate JSON keys, nonfinite numbers, unknown fields, stale campaign/config IDs,
 wrong artifacts, unexpected run IDs and incomplete campaigns are errors.
 The object has **exactly** these fields:
@@ -242,7 +244,9 @@ The object has **exactly** these fields:
   `platform`, `options`, `compile_profile`, `mode: "aot"`, `jit_preset: null`, independently checked by
   the producer against deployed/loaded native artifacts and active platform.
 * `outcome`: `success`, `trap`, `timeout`, `abort`, or `error`.
-  `exit_code`: complete unsigned 32-bit guest status or `null`; success requires zero.
+  `exit_code`: the final invocation's complete unsigned 32-bit `proc_exit` status,
+  or `null` for ordinary return, trap/error, or no invocation. Successful `proc_exit`
+  requires zero; an ordinary successful return has **no invented exit status**.
   Preserve `proc_exit(0)` separately from normal return and preserve nonzero
   `proc_exit` without POSIX eight-bit truncation or signed conversion. A nonzero
   invocation exit must match this enclosing status and stop further invocations.
@@ -267,9 +271,13 @@ The object has **exactly** these fields:
 * `phases`: `compile_ticks: null`, `load_ticks`, `instantiate_ticks`,
   `first_invocation_ticks`, `steady_state_ticks` (list).
 * `invocations`: list, first then steady, each exactly `{phase: "first"|"steady",
-  outcome: "returned"|"proc_exit"|"trap"|"error", exit_code: integer|null,
-  stdout: STRING}`. Include separate complete workload output for every invocation;
-  a shared serial transcript cannot substitute for per-invocation output.
+  outcome: "returned"|"proc_exit"|"trap"|"error", exit_code: u32|null,
+  stdout_base64: STRING}`. Only `proc_exit` has a non-null exit code (including zero);
+  returned/trap/error use `null`. `stdout_base64` is canonical padded RFC 4648 base64
+  of the **exact callback bytes**, including NUL and non-UTF-8 bytes; empty output is
+  `""`. Never use replacement decoding. Successful CoreMark output must decode as
+  ASCII before correctness checks. Include separate complete output for every
+  invocation; a shared serial transcript cannot substitute for it.
 * `memory`: the native memory receipt below, or `null` on a failed attempt.
 
 ### Phase boundaries
@@ -349,7 +357,8 @@ Exit codes: 0 = operation/attempt successful; 1 = a well-formed unsuccessful att
 or campaign (evidence/report persisted); 2 = invalid/mismatched/incomplete evidence.
 No report is emitted for an invalid campaign. Public JSON deliberately excludes raw
 workload output, boot logs, local paths, cloud resource/run IDs and credentials.
-It retains content hashes so private raw evidence can be audited. Only supply reviewed
+It retains content hashes so private raw evidence can be audited. Public invocation
+records retain `stdout_sha256`, not the output's base64 bytes. Only supply reviewed
 public tokens in identity/measurement fields; do not put private IDs into labels.
 Artifacts and raw logs are never uploaded by this tooling.
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
+import base64
 import io
 import json
 import os
@@ -1358,6 +1359,13 @@ class NativeBenchmarkTests(unittest.TestCase):
         path.write_bytes(contents)
         return path
 
+    def stdout(self, invocation):
+        return native_benchmark.decode_stdout(invocation["stdout_base64"]).decode("ascii")
+
+    def set_stdout(self, invocation, output):
+        raw = output.encode("ascii") if isinstance(output, str) else output
+        invocation["stdout_base64"] = base64.b64encode(raw).decode("ascii")
+
     def result(self, run):
         config = native_benchmark.run_configuration(self.manifest, run["run_id"])
         target = config["target"]
@@ -1387,14 +1395,15 @@ Correct operation validated. See README.md for run and reporting rules.
                          "wasm_sha256": config["workload"]["sha256"], "platform": target["platform"],
                          "options": target["options"], "mode": "aot", "jit_preset": None,
                          "compile_profile": target["compile_profile"]},
-            "outcome": "success", "exit_code": 0, "phase_contract": "wamr-embedding-v1",
+            "outcome": "success", "exit_code": None, "phase_contract": "wamr-embedding-v1",
             "clock": {"source": "synthetic-clock", "unit": "us", "ticks_per_second": 1000000,
                       "resolution_ticks": 1},
             "phases": {"compile_ticks": None, "load_ticks": 10, "instantiate_ticks": 20,
                        "first_invocation_ticks": 21000000,
                        "steady_state_ticks": [21000000, 21000000]},
-            "invocations": [{"phase": phase, "outcome": "returned", "exit_code": 0,
-                             "stdout": output} for phase in ("first", "steady", "steady")],
+            "invocations": [{"phase": phase, "outcome": "returned", "exit_code": None,
+                             "stdout_base64": base64.b64encode(output.encode("ascii")).decode("ascii")}
+                            for phase in ("first", "steady", "steady")],
             "memory": {"image_sha256": target["image"]["sha256"],
                        "configured_vm_ram_bytes": 1024**3,
                        "coverage": "partial-guest", "method": "synthetic-page-accounting",
@@ -1443,6 +1452,7 @@ Correct operation validated. See README.md for run and reporting rules.
         self.assertNotIn("PRIVATE-ID", text)
         self.assertNotIn(str(self.root), text)
         self.assertNotIn("Iterations/Sec", text)
+        self.assertNotIn("stdout_base64", text)
         self.assertIn("partial-guest", text)
         self.assertNotIn("rss", text.lower())
         if os.name == "posix":
@@ -1559,6 +1569,7 @@ Correct operation validated. See README.md for run and reporting rules.
         result = self.result(self.manifest["schedule"][0])
         raw = (native_benchmark.PREFIX + json.dumps(result) + "\n").encode()
         self.assertEqual(native_benchmark.parse_result_stream(b"boot message\n" + raw), result)
+        self.assertEqual(native_benchmark.parse_result_stream(b"binary boot \xff\xfe\n" + raw), result)
         for bad in (raw + raw, raw[:-8], b"prefix:" + raw, b"boot only",
                     b'WAMR_BENCH_RESULT={"a":1,"a":2}\n',
                     b'WAMR_BENCH_RESULT={"a":NaN}\n'):
@@ -1596,19 +1607,21 @@ Correct operation validated. See README.md for run and reporting rules.
         for change in ("duplicate", "crc", "iterations", "trap", "throughput", "extra-context"):
             result = self.result(run)
             last = result["invocations"][-1]
+            stdout = self.stdout(last)
             if change == "duplicate":
-                last["stdout"] += "seedcrc : 0xe9f5\n"
+                stdout += "seedcrc : 0xe9f5\n"
             elif change == "crc":
-                last["stdout"] = last["stdout"].replace("0xe714", "0x0000")
+                stdout = stdout.replace("0xe714", "0x0000")
             elif change == "iterations":
-                last["stdout"] = last["stdout"].replace("400000", "200000")
+                stdout = stdout.replace("400000", "200000")
             elif change == "throughput":
-                last["stdout"] = last["stdout"].replace("Iterations/Sec   : 20000",
-                                                       "Iterations/Sec   : 200000")
+                stdout = stdout.replace("Iterations/Sec   : 20000",
+                                        "Iterations/Sec   : 200000")
             elif change == "extra-context":
-                last["stdout"] += "[1]crclist : 0xe714\n"
+                stdout += "[1]crclist : 0xe714\n"
             else:
                 last["outcome"] = "trap"
+            self.set_stdout(last, stdout)
             with self.subTest(change=change), self.assertRaises(ValueError):
                 native_benchmark.validate_result(result, self.manifest, run["run_id"])
 
@@ -1616,10 +1629,9 @@ Correct operation validated. See README.md for run and reporting rules.
         run = next(run for run in self.manifest["schedule"] if run["workload"] == "coremark-nofp")
         result = self.result(run)
         for invocation in result["invocations"]:
-            invocation["stdout"] = invocation["stdout"].replace("Total time (secs): 20",
-                                                               "Total time (secs): 9").replace(
-                                                                   "Iterations/Sec   : 20000",
-                                                                   "Iterations/Sec   : 44444")
+            self.set_stdout(invocation, self.stdout(invocation).replace(
+                "Total time (secs): 20", "Total time (secs): 9").replace(
+                    "Iterations/Sec   : 20000", "Iterations/Sec   : 44444"))
         checks = native_benchmark.validate_result(result, self.manifest, run["run_id"])
         self.assertTrue(all(not check["minimum_timing_met"] for check in checks))
         self.assertTrue(all(check["crc"]["seedcrc"] == "e9f5" for check in checks))
@@ -1643,7 +1655,8 @@ Correct operation validated. See README.md for run and reporting rules.
             if run["workload"] == "coremark":
                 result["outcome"] = "error"
                 for invocation in result["invocations"]:
-                    invocation["stdout"] += "\nERROR! private failure /secret/path\n"
+                    self.set_stdout(invocation, self.stdout(invocation) +
+                                    "\nERROR! private failure /secret/path\n")
         report = native_benchmark.build_report(
             self.manifest, self.capture_directories(fail_crc), allow_synthetic=True)
         records = [record for record in report["records"] if record["run"]["workload"] == "coremark"]
@@ -1692,8 +1705,10 @@ Correct operation validated. See README.md for run and reporting rules.
     def test_native_proc_exit_preserves_zero_and_full_u32_status(self):
         run = next(run for run in self.manifest["schedule"] if run["workload"] == "coremark")
         result = self.result(run)
+        result["exit_code"] = 0
         for invocation in result["invocations"]:
             invocation["outcome"] = "proc_exit"
+            invocation["exit_code"] = 0
         checks = native_benchmark.validate_result(result, self.manifest, run["run_id"])
         self.assertEqual(len(checks), 3)
         result.update(outcome="error", exit_code=0xffffffff)
@@ -1709,11 +1724,45 @@ Correct operation validated. See README.md for run and reporting rules.
         with self.assertRaisesRegex(ValueError, "continued"):
             native_benchmark.validate_result(result, self.manifest, run["run_id"])
 
+    def test_native_normal_return_has_no_invented_exit_status(self):
+        run = self.manifest["schedule"][0]
+        result = self.result(run)
+        native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        result["exit_code"] = 0
+        with self.assertRaisesRegex(ValueError, "terminal status"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        result["exit_code"] = None
+        result["invocations"][-1]["exit_code"] = 0
+        with self.assertRaisesRegex(ValueError, "only proc_exit"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+
+    def test_native_binary_output_is_lossless_private_and_strict(self):
+        raw = b"\x00\xff\xfe\x80private-output\n"
+        first_run = self.manifest["schedule"][0]
+
+        def fail_with_binary_output(result, run):
+            if run["run_id"] == first_run["run_id"]:
+                result["outcome"] = "error"
+                result["invocations"][-1]["outcome"] = "error"
+                self.set_stdout(result["invocations"][-1], raw)
+
+        directories = self.capture_directories(fail_with_binary_output)
+        report = native_benchmark.build_report(self.manifest, directories, allow_synthetic=True)
+        public_invocation = report["records"][0]["result"]["invocations"][-1]
+        self.assertEqual(public_invocation["stdout_sha256"], native_benchmark.sha256_bytes(raw))
+        self.assertNotIn("stdout_base64", public_invocation)
+        private_result = native_benchmark.parse_result_stream((directories[0] / "stdout.bin").read_bytes())
+        self.assertEqual(native_benchmark.decode_stdout(
+            private_result["invocations"][-1]["stdout_base64"]), raw)
+        for malformed in (None, "!!!!", "YQ", "YR==", "\xff"):
+            with self.subTest(encoded=malformed), self.assertRaises(ValueError):
+                native_benchmark.decode_stdout(malformed)
+
     def test_native_matched_final_crc_disagreement_is_rejected(self):
         def change_crc(result, run):
             if run["target"] == "unikraft" and run["workload"] == "coremark":
                 for invocation in result["invocations"]:
-                    invocation["stdout"] = invocation["stdout"].replace("0x33ff", "0x1234")
+                    self.set_stdout(invocation, self.stdout(invocation).replace("0x33ff", "0x1234"))
         with self.assertRaisesRegex(ValueError, "final CRC differs"):
             native_benchmark.build_report(self.manifest, self.capture_directories(change_crc),
                                           allow_synthetic=True)
