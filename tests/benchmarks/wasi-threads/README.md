@@ -125,7 +125,7 @@ SHA-256 `95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995`,
 `098a466f98da6899f2e7dba657078eb3853500a9bfca4e06727c23b51c0cbed3`,
 and `af3b627429f8f732fb8ee19d28f56950ec7ad56f67dd9558e7ee893efb24f4b5`.
 Replaying every retained pilot under the 4x rule projects at most
-6,851.601334604 seconds, or 114.19 minutes, below the 171-minute benchmark
+6,851.601334604 seconds, or 114.19 minutes, below the 201-minute benchmark
 limit.
 
 Spawn/join retains an explicit architecture-neutral 2x base policy:
@@ -206,7 +206,10 @@ every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
 be at least both the 1.25-second evidence floor and the exact 5-second
 `1.75s * 20/7` sizing target. Spawn/join uses its declared 2.5-second base
-target, and AOT wait/notify/1 projects at least 20.0 seconds.
+target. Contended `atomic/2`, `atomic/4`, and `atomic/8` use a platform-neutral
+20-second process-CPU window to average shared-counter scheduling states;
+single-worker atomic remains on the general 5-second target. AOT wait/notify/1
+also projects at least 20.0 seconds.
 Actual warmups and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
 There is no hidden retry or count increase if a later rate exceeds its
@@ -221,16 +224,16 @@ cell while preventing 88 watchdog-length pilots from exhausting a job. Every
 condition's projected invocation must remain strictly below the 90-second
 watchdog.
 
-The workflow reserves 69 minutes for non-benchmark work, leaving a 171-minute
+The workflow reserves 69 minutes for non-benchmark work, leaving a 201-minute
 benchmark limit. Before and during the full 88-pilot authoritative plan,
 admission uses the hard 48-minute-24-second pilot bound (`88 * 33s`), the
-86-minute minimum evidence bound
-(`70 * 12 * 5s + 16 * 12 * 2.5s + 2 * 12 * 20s`), and the 10-minute
-auxiliary allowance. Their sum is 144 minutes 24 seconds; adding the 69-minute
-reserve is 213 minutes 24 seconds, strictly below the 240-minute job timeout
-with 26 minutes 36 seconds of headroom. The harness accumulates actual pilot
-corrected and wall time after each one-shot pilot and aborts immediately when
-the remaining hard bound cannot fit.
+122-minute minimum evidence bound
+(`58 * 12 * 5s + 12 * 12 * 20s + 16 * 12 * 2.5s + 2 * 12 * 20s`), and the
+10-minute auxiliary allowance. Their sum is 180 minutes 24 seconds; adding the
+69-minute reserve is 249 minutes 24 seconds, strictly below the 270-minute job
+timeout with 20 minutes 36 seconds of headroom. The harness accumulates actual
+pilot corrected and wall time after each one-shot pilot and aborts immediately
+when the remaining hard bound cannot fit.
 
 The reserve reduction is bounded by retained v3 AArch64 smoke job
 102467148543. Its benchmark step occupied 4,701 seconds; retained pilots and
@@ -334,14 +337,14 @@ same-directory atomic rename that preserves an existing report's mode.
 Each guest invocation has a fixed 90-second watchdog. Before evidence, the
 harness checks every pilot-derived per-condition projection against that
 watchdog and checks the complete projected benchmark path against the strict
-171-minute limit. The workflow retains its 240-minute bound and 69-minute
+201-minute limit. The workflow retains its 270-minute bound and 69-minute
 non-benchmark reserve. Twenty sequential trusted x86 jobs at the full job
-timeout take 80 hours, leaving 16 hours before the 96-hour dispatcher
+timeout take 90 hours, leaving 6 hours before the 96-hour dispatcher
 deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 16 of a purpose-independent portable
+`measurement_plan_sha256` is version 17 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
