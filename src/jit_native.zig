@@ -2,6 +2,7 @@
 const std = @import("std");
 pub const jit = @import("api/jit.zig");
 pub const aot = jit.aot;
+pub const sample = @import("bench/native_jit_guest.zig");
 pub const std_options: std.Options = .{ .logFn = log };
 
 fn log(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
@@ -25,9 +26,16 @@ export fn wamr_jit_runtime_link_check(allocator: *const std.mem.Allocator, nativ
         .returned => {},
         else => return false,
     }
+
     var results: [1]aot.Value = undefined;
     return switch (instance.call("workload", &.{.{ .i32 = 2000 }}, &results) catch return false) {
         .returned => |count| count == 1,
         else => false,
     };
+}
+
+export fn wamr_jit_sample_link_check(allocator: *const std.mem.Allocator, native: *const aot.Platform, wasm: [*]const u8, wasm_len: usize, full: bool, request: *const [64]u8, resolution: u64, out: *sample.Capture, writer: *std.Io.Writer) bool {
+    sample.run(allocator.*, native.*, wasm[0..wasm_len], if (full) .full else .fast, request, resolution, out) catch return false;
+    out.writeRecord(writer) catch return false;
+    return true;
 }

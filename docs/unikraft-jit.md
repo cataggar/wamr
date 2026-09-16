@@ -4,8 +4,10 @@ This is **dependent software integration for #1044**, not native Unikraft JIT
 qualification. It depends on the corrected native AOT API from #1050 and the
 staged producer API from #1046. Development integration uses producer base
 `7b0b7701eb882cf36ba02455a00b9dd64823cff6`; this is not a protected-main merge
-or deployment qualification receipt. Physical image/adapter integration
-and boot evidence remain pending in `cataggar/unikraft#156`. Linux tests and QEMU
+or deployment qualification receipt. Physical image/adapter qualification
+and boot evidence remain pending in `cataggar/unikraft#156`. The freestanding
+sampler and external native evidence import described below are application
+building blocks, not a qualified image or deployment. Linux tests and QEMU
 are correctness evidence only. No CoreMark speedup, Azure result, image size,
 or hard real-time latency claim follows from this work.
 
@@ -19,15 +21,16 @@ zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe -j2
 ```
 
 The latter exports Zig module `wamr-jit`, namespaces `jit` and `aot`, and builds
-`lib/libwamr-jit.a`. It targets `x86_64-freestanding-none`, SysV, single-threaded,
+`lib/libwamr-jit.a`. It targets `x86_64-freestanding-none`, SysV, position-independent, single-threaded,
 no red zone, libc, stack protector, unwind tables, or Zig error tracing.
 This is an application-object contract, not an ISR ABI.
 
 The public optional-compiler interface is **Zig**, not a new C ABI. Existing
 compiler-free C entry points remain in `wamr_aot.h`; they cannot request the
-new metered artifact's mandatory budgets and therefore reject it. The two
+new metered artifact's mandatory budgets and therefore reject it. The
 `wamr_jit_*_link_check` symbols retain real compile and load/start/call paths in
-the freestanding link audit. They are not application entry points. Do not
+the freestanding link audit, including complete sampling and serial formatting.
+They are not application entry points. Do not
 execute the link-check ELF as a program or call it a bootable image.
 
 The compiler uses the existing `component/aot_compile.zig` **core** pipeline:
@@ -228,6 +231,190 @@ of an issuer's claims**. The operator must qualify the images and deployment
 independently first. This repository supplies no such receipt. In particular
 Unikraft measurements remain rejected until the actual image adapter/receipt
 integration is qualified separately. No CoreMark JIT or cloud action is added.
+
+## Freestanding image-application sampler
+
+The native JIT profile additionally exports:
+
+| Zig module | Interface/artifact |
+| --- | --- |
+| `wamr-jit` | `sample.run` and `sample.Capture`, in `libwamr-jit.a` |
+| `wamr-jit-aot-sample` | Separately linked, compiler-free `sample.run` and `sample.Capture`, in `libwamr-jit-aot-sample.a` |
+| `wamr-jit-workload` | `wasm`, the embedded deterministic workload also installed as `native-jit-bench/matched.wasm` |
+
+`native-jit-check` links both complete freestanding sampler/serialization paths,
+not just unused declarations, and separate downstream-style consumers of the
+public modules with the embedded workload. Native objects explicitly use PIC and
+all four audits link as PIE, including the compiler-free comparator, so EFI image
+links do not depend on fixed-address 32-bit absolute relocations. These are link
+audits, not EFI boot qualification. The two archive audits link the actual static
+libraries with compiler-runtime fallback disabled; the other two cover public
+module composition. The sampler helpers import neither Linux pages
+nor `std.process`; the Linux drivers now call these same helpers. Image
+applications supply a caller allocator, native `aot.Platform` (including its
+monotonic clock), actual clock resolution, request SHA256, and serial writer.
+No console, process, image launcher, or boot entry is supplied. Downstream
+application roots using compiler logging can reuse `wamr-jit.std_options` (the
+freestanding no-hosted-logging configuration).
+
+```zig
+const native = @import("wamr-jit");
+const workload = @import("wamr-jit-workload");
+pub const std_options = native.std_options;
+
+// Inside the embedding application, with qualified native capabilities:
+var capture: native.sample.Capture = .{};
+native.sample.run(allocator, platform, workload.wasm, .fast,
+    request_sha256, clock_resolution_ns, &capture) catch {};
+try capture.writeRecord(serial_writer);
+if (capture.report.failure != null) return error.SampleFailed;
+```
+
+Use `.full` explicitly for the other JIT preset. For the separate comparator
+application, import **only** `wamr-jit-aot-sample` and `wamr-jit-workload`, and call
+`sample.run(allocator, platform, workload.wasm, @embedFile("matched.cwasm"),
+request_sha256, clock_resolution_ns, &capture)`. Generate that matching AOT
+artifact with the hosted `native-jit-bench` build above; it installs both source
+and compiled bytes. The compiler-free module is exported by the opt-in sampler
+profile for composition, but does not import or link the compiler module/library.
+The independent image receipt must bind the actual embedded source and artifact;
+the comparator does not compile to check their relationship.
+
+`Capture` must stay at a stable address until serialization completes: report
+identity slices point into its own fixed arrays. No borrowed input or compiler
+allocation survives `run`. Keep the same object in place, rather than returning
+it by value. `run` initializes even failure reports, releases the instance and
+retained compiler artifact before returning, and records requested allocation
+peaks and reservation teardown through wrappers around the caller's actual
+capabilities. Infallible `Platform.unmap` remains an adapter obligation; the
+wrapper's zero reservation count is **not** independent physical-release proof.
+The serial writer receives at most 8192 bytes, including prefix and newline.
+Propagate write errors and sampler failures to the adapter's capture status.
+
+The fixed sampler caps, verification mode, workload, four invocations, and real
+two-to-three-page growth are unchanged. The native stack provisioning,
+non-preempted allocator/page/import callbacks, cooperative compiler polling and
+fuel-not-time limitations above apply without relaxation.
+
+## Explicit external native evidence transport
+
+Linux capture and its version-1 receipt are unchanged: Linux execution cannot be
+relabelled Unikraft. A **separate**, host-OS/architecture-independent path accepts
+an independently qualified downstream Unikraft adapter's evidence. This path
+never invokes an adapter, starts a process, builds/deploys/boots an image, or
+dispatches cloud work. It has no synthetic/correctness-to-measurement bypass.
+Correctness-only Linux/QEMU observations remain correctness-only.
+
+The integrator must independently qualify its adapter, images and deployment,
+and supply a trusted hash of its canonical version-2 image receipt. The helper
+hashes the **actual files** for both application executables and complete images;
+an executable cannot stand in for a complete image. Prepare the challenge:
+
+```sh
+python3 -m scripts.native_jit_benchmark \
+  --native-prepare --aot /private/aot-app.elf --jit /private/jit-app.elf \
+  --aot-image /private/aot-complete-image --jit-image /private/jit-complete-image \
+  --receipt /private/independent-image-receipt.json \
+  --trusted-receipt-sha256 "$INDEPENDENT_IMAGE_RECEIPT_SHA256" \
+  --output /private/new-native-capture
+```
+
+This writes only `request.json`, binding a fresh nonce, 24-hour validity window,
+file identities, and the independent receipt. The downstream adapter must pass
+the SHA256 of those **exact request bytes**, plus the explicit mode, into each
+already-built image. Do not embed the nonce into an image after hashing it:
+that changes its identity and creates a request/image hash cycle.
+
+The adapter separately supplies `capture.json`, `aot.serial`, `fast.serial`,
+and `full.serial`. An independently trusted hash of canonical `capture.json`
+is required **in addition** to the image receipt hash. Import with the same
+image/executable files and image receipt arguments:
+
+```sh
+python3 -m scripts.native_jit_benchmark \
+  --native-import /private/adapter-output \
+  --aot /private/aot-app.elf --jit /private/jit-app.elf \
+  --aot-image /private/aot-complete-image --jit-image /private/jit-complete-image \
+  --receipt /private/independent-image-receipt.json \
+  --trusted-receipt-sha256 "$INDEPENDENT_IMAGE_RECEIPT_SHA256" \
+  --trusted-capture-sha256 "$INDEPENDENT_CAPTURE_RECEIPT_SHA256" \
+  --output /private/new-native-capture
+```
+
+This does not require a Linux/x86_64 **collector**. The receipt still requires
+qualified x86_64 **Unikraft execution** on hardware, exact native ABI/options,
+static linkage, safety protections, and a compiler-free AOT comparator.
+
+### Exact native receipt contracts
+
+Image receipt version 2 retains kind
+`wamr-jit-independent-image-deployment-receipt`. All fields are required;
+unknown fields are rejected. No sample successful deployment receipt is supplied.
+
+| Fields | Required binding |
+| --- | --- |
+| `evidence_kind`, `os`, `arch`, `hardware_execution` | `measurement`, `unikraft`, `x86_64`, true |
+| `issuer`, `source_commit`, `deployment_receipt_sha256` | Independent issuer token, exact WAMR commit and prior independent deployment/qualification evidence digest |
+| `platform`, `executables`, `images`, `wasm`, `aot_module` | Existing platform identity shape and SHA256/positive byte counts of actual qualified artifacts |
+| `compiler_embedded`, `runtime_linkage`, `safety`, `lifecycle`, `allocator`, `page_policy` | Same strict bindings as version 1, but describing the actual native image implementation |
+| `target`, `options` | Exactly `NATIVE_TARGET` and `NATIVE_OPTIONS` in `scripts/native_jit_benchmark.py`: native contract/subprofiles, both presets, after-each-pass verification, every compiler/runtime cap and fixed workload lifecycle |
+| `build_options` | One shared `optimize` (`Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall`) for both images, plus exactly `NATIVE_BUILD_OPTIONS`: PIC, single-threaded, no red zone/libc/stack checker/stack protector/unwind tables/error tracing |
+| `adapter` | `name`, `source_commit`, `qualification_receipt_sha256`; independently qualified native adapter, not a Linux adapter name |
+| `clock` | `method` token, positive `resolution_ns`, `scope` exactly `guest-monotonic-execution` |
+| `native_stack` | `generated_frames_bytes` at least 256 KiB, positive separately qualified `compiler_embedder_callbacks_bytes`, and `provisioned_bytes` covering their sum |
+| `memory_observer` | Exact fields described below; actual physical backing observations, not sampler allocation requests |
+
+The external capture receipt has schema version 1, kind
+`wamr-jit-native-capture-receipt`, `evidence_kind: measurement`,
+`hardware_execution: true`, `request_sha256`, `image_receipt_sha256`,
+`adapter_qualification_sha256`, and `records` containing exactly `aot`, `fast`,
+`full`. Every record contains:
+
+* `image` and `executable`: the exact corresponding file hash/byte-count objects;
+* `serial`: hash/byte count of the entire raw serial file;
+* `outcome: success`, `capture_complete: true`: attestation of the complete run,
+  not merely receipt of a success-looking line before a later guest failure;
+* `started_at`, `completed_at`: UTC capture window within the request validity
+  interval. These timestamps are never converted to guest execution durations;
+* `memory`: nonnegative `before_bytes`, `observed_max_bytes`,
+  `after_teardown_bytes`, plus `observation_count` of at least two. The observed
+  maximum must be positive and at least the other values.
+
+`memory_observer` declares a public `method` token, `quantity` exactly
+`physical-backing-bytes`, `coverage`, `excludes`, `sampling`, and `interval_ns`.
+Coverage is either `whole-guest` (excludes `["hypervisor"]`) or
+`caller-allocator-and-native-pages` (excludes
+`["image","native-stack","other-kernel-allocations","page-tables"]`). The latter
+must include real backing for **all** caller allocator traffic, including
+compiler scratch/result storage, and native code/linear-memory pages. It is not
+whole-guest overhead. Sampling is `continuous-high-water`, `periodic`, or
+`phase-boundaries`; only periodic sampling supplies a positive `interval_ns`,
+otherwise null. Boundary/periodic maxima are observed maxima, not a guaranteed
+true peak. Independent qualification must substantiate the declared method and
+coverage. Requested bytes or logical page commitment cannot supply these values.
+
+Reports retain complete image and executable identities/sizes, native observations
+and their method/coverage separately from compiler peak/retained allocation,
+caller requested peaks and logical memory growth. No serial-arrival or collector
+latency becomes a guest duration or compiler phase. No RSS or whole-image RAM
+claim is inferred from partial observation coverage.
+
+Import archives use a private 0700 directory and 0600 files. Boot noise and
+non-UTF8 bytes remain opaque; exactly one line-starting, newline-terminated,
+bounded UTF8 `WAMR_JIT_SAMPLE=` record is allowed per raw stream. Duplicate
+markers, truncated/oversized records, duplicate JSON keys, failures, bad results,
+missing memory evidence, stale request/artifact identities and altered raw bytes
+reject publication. Raw imports are bounded to 16 MiB per serial file and 128 KiB
+for the capture receipt; an oversized input retains at most the bound plus one
+byte with a failed import status. Archival attempts every expected input before
+rejecting publication. Missing, unreadable or oversized files are recorded by
+name in `import.status.json.archive_errors`; one file's failure does not prevent
+retaining available bounded evidence from the remaining files.
+Failed attempts retain private evidence and
+cannot be retried in place; prepare a fresh challenge. Public comparisons do not
+include boot logs. Both trusted hashes pin **supplied attestations**, not proof
+generated by this tool. Synthetic fixtures exist only inside unit tests and are
+explicitly labelled as not deployment evidence.
 
 ```sh
 zig build test-native-jit test-native-aot test-native-aot-abi -j2
