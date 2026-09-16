@@ -9,6 +9,13 @@ This is integration software for #1045/#1046, **not** Unikraft image or Azure
 performance qualification. The native ELF/EFI application and image/boot/hardware
 acceptance remain [cataggar/unikraft#156](https://github.com/cataggar/unikraft/issues/156).
 
+**Measurement is currently fail-closed with `LifecycleProtocolPending`.** The
+host-owned protocol must bind the same full-snapshot/reset-outside-timing policy
+into both targets' requests, receipts and observed results before this producer
+can publish steady-invocation measurements. A prose-only reset description is not
+enough. No unknown v1 field or ordinary steady-state record is emitted as a
+substitute. Correctness checks and private failure evidence remain runnable.
+
 ## Build and correctness checks
 
 From the repository root, with Zig 0.16:
@@ -36,6 +43,10 @@ No receipts, Azure names, image identities, or performance results are generated
 by this mode.
 
 The arguments are `--check ARTIFACT ITERATIONS TOTAL_INVOCATIONS WORKLOAD`.
+An optional final `closing-clock`, `backwards-clock` or `report-oom` injects a
+**correctness-only negative-test failure**, never a measurement capability.
+These modes execute the real guest and verify that private capture retains its
+actual terminal/output when the closing timer or later report allocation fails.
 Iteration counts affect CoreMark only. Tests use 100 iterations and independently
 check `seedcrc=e9f5`, `crclist=e714`, `crcmatrix=1fd7`, `crcstate=8e3a`, and
 repeatable `crcfinal=988c` in both variants. These short runs intentionally retain
@@ -91,13 +102,30 @@ describe these numbers as uninterrupted process-state or end-to-end steady-state
 throughput. The snapshots consume memory, which the coverage declaration below
 explicitly excludes.
 
-If revoking protection fails, the instance is poisoned rather than assuming the
-provider left the mapping unchanged. Calls, growth and reset retries are rejected;
+The instance is made non-callable **before** revoking protection, and becomes
+callable again only after the whole restoration succeeds. If protection fails,
+the owner stays poisoned rather than assuming the provider left the mapping
+unchanged. Calls, growth and reset retries are rejected;
 only teardown is supported. The failed measurement omits memory snapshots instead
 of reporting potentially stale commitment counts.
 
-Invocation stderr and host diagnostics go to the producer's stderr, with phase
-boundaries, for private capture. Per-invocation stdout is preserved as canonical
+Every executed call is written to private stderr first as one
+`WAMR_NATIVE_INVOCATION=` JSON line with ordinal/phase, actual terminal reason,
+guest exit status, optional ticks, timing error, host/output diagnostic and
+canonical base64 stdout/stderr. This streaming path uses fixed stack buffers and
+does not allocate or copy output after execution. `Invocation` borrows the
+Session's buffers until another invocation, reset or teardown; callers must
+persist evidence before then.
+
+A failed/backwards closing clock leaves `ticks: null` but preserves the true
+terminal reason and bytes. Later report-allocation failure cannot erase the
+already-written private record. If a canonical timed result cannot represent
+that untimed call, the producer fails without fabricating a duration or silently
+omitting its actual terminal from the private evidence. Existing host capture
+saves stderr and its digest before validation. Transport/write failure can still
+truncate a stream and must be handled as a failed capture, not a successful event.
+
+Per-invocation stdout in a supported benchmark result is preserved as canonical
 padded `stdout_base64` inside the single-line UTF-8 result JSON, including
 non-UTF-8 bytes. Only `proc_exit` has an exit code; returned/trap/error records
 use null. Nonzero WASI exit codes remain unsigned guest codes;
@@ -111,6 +139,7 @@ create a new host schema, cloud pipeline, or image receipt. First obtain genuine
 image/build/ABI qualification and create a host plan with sufficient common
 CoreMark iterations (the existing protocol fixes both variants at 400000).
 The producer performs no calibration or iteration override in measurement mode.
+The setup below remains gated until the coordinated lifecycle schema is integrated.
 
 The image integrator supplies a **private, independent deployment configuration**,
 not values copied from the incoming request. Its fields are:

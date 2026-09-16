@@ -54,7 +54,10 @@ pub const Pages = struct {
     fail_protect: bool = false,
     fail_protect_after_transition: bool = false,
     partial_protection_applied: bool = false,
+    probe_instance: ?*aot.Instance = null,
+    revocation_observed_callable: ?bool = null,
     fail_clock_at: ?usize = null,
+    backwards_clock_at: ?usize = null,
     clock_reads: usize = 0,
 
     pub fn platform(self: *Pages) aot.Platform {
@@ -112,6 +115,9 @@ pub const Pages = struct {
 
     fn protect(raw: *anyopaque, address: [*]align(4096) u8, size: usize, permission: aot.platform.Protection) aot.PlatformError!void {
         const self: *Pages = @ptrCast(@alignCast(raw));
+        if (permission == .none) {
+            if (self.probe_instance) |instance| self.revocation_observed_callable = instance.instantiated;
+        }
         if (self.fail_protect) return error.ProtectionFailed;
         const prot: std.posix.PROT = switch (permission) {
             .none => .{},
@@ -153,6 +159,7 @@ pub const Pages = struct {
         const self: *Pages = @ptrCast(@alignCast(raw));
         self.clock_reads += 1;
         if (self.fail_clock_at == self.clock_reads) return error.ClockFailed;
+        if (self.backwards_clock_at == self.clock_reads) return 0;
         return now();
     }
 };

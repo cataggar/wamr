@@ -71,24 +71,58 @@ pub const Output = struct {
 };
 
 pub const Invocation = struct {
-    ticks: u64,
+    ticks: ?u64,
     outcome: []const u8,
     exit_code: ?u32,
     stdout: []const u8,
     stderr: []const u8,
     diagnostic: ?[]const u8 = null,
     output_failure: bool = false,
+    timing_error: ?[]const u8 = null,
 
     pub fn succeeded(self: Invocation) bool {
-        return !self.output_failure and (std.mem.eql(u8, self.outcome, "returned") or
+        return self.ticks != null and !self.output_failure and (std.mem.eql(u8, self.outcome, "returned") or
             (std.mem.eql(u8, self.outcome, "proc_exit") and self.exit_code == 0));
     }
-
-    pub fn deinit(self: Invocation, allocator: std.mem.Allocator) void {
-        allocator.free(self.stdout);
-        allocator.free(self.stderr);
-    }
 };
+
+/// Allocation-free private evidence, written before any report serialization.
+/// Stdout/stderr are lossless even when they are not valid UTF-8.
+pub fn writeInvocationEvidence(writer: *std.Io.Writer, phase: []const u8, index: usize, invocation: Invocation) !void {
+    try writer.writeAll("WAMR_NATIVE_INVOCATION={\"schema_version\":1,\"kind\":\"wamr-native-invocation-evidence\",\"phase\":");
+    try std.json.Stringify.value(phase, .{}, writer);
+    try writer.writeAll(",\"index\":");
+    try std.json.Stringify.value(index, .{}, writer);
+    try writer.writeAll(",\"outcome\":");
+    try std.json.Stringify.value(invocation.outcome, .{}, writer);
+    try writer.writeAll(",\"exit_code\":");
+    try std.json.Stringify.value(invocation.exit_code, .{}, writer);
+    try writer.writeAll(",\"ticks\":");
+    try std.json.Stringify.value(invocation.ticks, .{}, writer);
+    try writer.writeAll(",\"timing_error\":");
+    try std.json.Stringify.value(invocation.timing_error, .{}, writer);
+    try writer.writeAll(",\"diagnostic\":");
+    try std.json.Stringify.value(invocation.diagnostic, .{}, writer);
+    try writer.writeAll(",\"output_failure\":");
+    try std.json.Stringify.value(invocation.output_failure, .{}, writer);
+    try writer.writeAll(",\"stdout_base64\":");
+    try writeBase64(writer, invocation.stdout);
+    try writer.writeAll(",\"stderr_base64\":");
+    try writeBase64(writer, invocation.stderr);
+    try writer.writeAll("}\n");
+}
+
+fn writeBase64(writer: *std.Io.Writer, bytes: []const u8) !void {
+    try writer.writeByte('"');
+    var at: usize = 0;
+    var encoded: [64]u8 = undefined;
+    while (at < bytes.len) {
+        const count = @min(bytes.len - at, 48);
+        try writer.writeAll(std.base64.standard.Encoder.encode(&encoded, bytes[at..][0..count]));
+        at += count;
+    }
+    try writer.writeByte('"');
+}
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -169,20 +203,18 @@ pub const Session = struct {
         self.output.clear();
     }
 
+    /// Output is borrowed until reset, another invocation or deinit. No
+    /// post-call allocation may erase the actual terminal/output evidence.
     pub fn invoke(self: *Session, entry: []const u8) !Invocation {
         const begin = try self.native.monotonicNs();
         const outcome = self.instance.?.call(entry, &.{}, &.{});
-        const end = try self.native.monotonicNs();
-        if (end < begin) return error.ClockFailed;
         var result: Invocation = .{
-            .ticks = end - begin,
+            .ticks = null,
             .outcome = "error",
             .exit_code = null,
-            .stdout = try self.allocator.dupe(u8, self.output.stdout.items),
-            .stderr = undefined,
+            .stdout = self.output.stdout.items,
+            .stderr = self.output.stderr.items,
         };
-        errdefer self.allocator.free(result.stdout);
-        result.stderr = try self.allocator.dupe(u8, self.output.stderr.items);
         if (outcome) |terminal| {
             switch (terminal) {
                 .returned => {
@@ -201,8 +233,17 @@ pub const Session = struct {
         } else |failure| result.diagnostic = @errorName(failure);
         if (self.output.failure != null or self.context.pendingWriteError(1) != null or self.context.pendingWriteError(2) != null) {
             result.output_failure = true;
-            result.diagnostic = "output-callback-failure";
+            if (result.diagnostic == null) result.diagnostic = "output-callback-failure";
         }
+        const end = self.native.monotonicNs() catch |failure| {
+            result.timing_error = @errorName(failure);
+            return result;
+        };
+        if (end < begin) {
+            result.timing_error = "ClockWentBackwards";
+            return result;
+        }
+        result.ticks = end - begin;
         return result;
     }
 };

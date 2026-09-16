@@ -6,6 +6,7 @@ pub const Counter = struct {
     child: std.mem.Allocator,
     live: usize = 0,
     peak: usize = 0,
+    fail_allocations: bool = false,
 
     pub fn allocator(self: *Counter) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{
@@ -23,6 +24,7 @@ pub const Counter = struct {
 
     fn alloc(raw: *anyopaque, length: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
         const self: *Counter = @ptrCast(@alignCast(raw));
+        if (self.fail_allocations) return null;
         const result = self.child.rawAlloc(length, alignment, address) orelse return null;
         self.update(0, length);
         return result;

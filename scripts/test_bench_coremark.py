@@ -2326,6 +2326,51 @@ class NativeLinuxProducerTests(unittest.TestCase):
         self.assertNotEqual(process.returncode, 0)
         self.assertNotIn(b"WAMR_BENCH_RESULT=", process.stdout)
 
+    def test_actual_untimed_and_report_oom_evidence_survives_private_capture(self):
+        harness = NativeBenchmarkTests("runTest")
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        run = next(run for run in harness.manifest["schedule"] if run["target"] == "linux")
+        for fault in ("closing-clock", "backwards-clock", "report-oom"):
+            with self.subTest(fault=fault):
+                output = harness.root / fault
+                with self.assertRaisesRegex(ValueError, "expected exactly one terminal result"):
+                    native_benchmark.capture(
+                        harness.manifest, run["run_id"],
+                        self.command + ["--check", str(self.fixtures / "coremark.cwasm"),
+                                        "100", "1", "coremark", fault],
+                        output, 30, allow_synthetic=True)
+                stderr = (output / "stderr.bin").read_bytes()
+                prefix = b"WAMR_NATIVE_INVOCATION="
+                records = [native_benchmark.strict_json(line[len(prefix):].decode("utf-8"))
+                           for line in stderr.splitlines() if line.startswith(prefix)]
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                self.assertEqual(record["outcome"], "returned")
+                self.assertIsNone(record["exit_code"])
+                stdout = native_benchmark.decode_stdout(record["stdout_base64"])
+                self.assertIn(b"[0]crcfinal      : 0x988c", stdout)
+                self.assertEqual(native_benchmark.decode_stdout(record["stderr_base64"]), b"")
+                if fault == "report-oom":
+                    self.assertGreater(record["ticks"], 0)
+                    self.assertIsNone(record["timing_error"])
+                    self.assertIn(b"OutOfMemory", stderr)
+                else:
+                    self.assertIsNone(record["ticks"])
+                    self.assertEqual(record["timing_error"],
+                                     "ClockFailed" if fault == "closing-clock" else "ClockWentBackwards")
+                self.assertNotEqual(native_benchmark.read_json(output / "observation.json")["process_returncode"], 0)
+                self.assertRegex(stderr, rb"stage=after_release method=caller-requested-bytes live=0 ")
+                self.assertNotIn(b"WAMR_BENCH_RESULT=", (output / "stdout.bin").read_bytes())
+
+    def test_measurement_is_closed_until_lifecycle_protocol_is_supported(self):
+        import subprocess
+        process = subprocess.run(self.command + ["--deployment", "unused-unqualified-config"],
+                                 capture_output=True, timeout=30)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn(b"LifecycleProtocolPending", process.stderr)
+        self.assertNotIn(b"WAMR_BENCH_RESULT=", process.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

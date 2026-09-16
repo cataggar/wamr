@@ -25,8 +25,13 @@ test "native benchmark deterministic real compute and memory repeated exports" {
         try equal(expected, @as(u32, @bitCast(values[0].i32)));
         try equal(@as(usize, 1), (try instance.call("memory_checksum", &.{.{ .i32 = seed }}, &values)).returned);
         try equal(@as(i32, 570026) + @as(i32, @intCast(i * 257)), values[0].i32);
+        try equal(@as(usize, 1), (try instance.call("memory_base", &.{}, &values)).returned);
+        const base: usize = @intCast(values[0].i32);
+        for ([_]usize{ 0, 128, 256 }) |cell| {
+            const stored = std.mem.readInt(u32, instance.memory()[base + cell * 4 ..][0..4], .little);
+            try equal(@as(u32, @intCast(seed)) + @as(u32, @intCast(cell * 17)), stored);
+        }
         const invocation = try session.invoke("_start");
-        defer invocation.deinit(std.testing.allocator);
         try expect(invocation.succeeded());
         try equal(@as(usize, 0), invocation.stdout.len);
     }
@@ -98,7 +103,6 @@ test "native benchmark both tracked CoreMark variants real WASI clocks and CRC" 
         const session = try runner.Session.create(std.testing.allocator, pages.platform(), bytes, &.{ "coremark", "0", "0", "0", "100", "0" }, &.{"BENCH_NATIVE=1"}, try linux.wasiClock());
         errdefer session.deinit();
         const invocation = try session.invoke("_start");
-        defer invocation.deinit(std.testing.allocator);
         if (!invocation.succeeded()) std.debug.print("CoreMark {s}: {?s}\n{s}\n{s}\n", .{ invocation.outcome, invocation.diagnostic, invocation.stdout, invocation.stderr });
         try expect(invocation.succeeded());
         for ([_][]const u8{ "seedcrc", "0xe9f5", "0xe714", "0x1fd7", "0x8e3a", "Total ticks", "Total time (secs)", "Must execute for at least 10 secs" }) |marker| {
@@ -107,13 +111,12 @@ test "native benchmark both tracked CoreMark variants real WASI clocks and CRC" 
                 return error.CoreMarkMarkerMissing;
             }
         }
-        try expect(invocation.ticks > 0);
+        try expect(invocation.ticks.? > 0);
         const instance = session.instance.?;
         for (0..2) |_| {
             try session.reset();
             try expect(session.instance.? == instance);
             const repeated = try session.invoke("_start");
-            defer repeated.deinit(std.testing.allocator);
             try expect(repeated.succeeded());
             for ([_][]const u8{ "0xe9f5", "0xe714", "0x1fd7", "0x8e3a", "0x988c" }) |crc|
                 try expect(std.mem.indexOf(u8, repeated.stdout, crc) != null);
@@ -146,7 +149,9 @@ test "native benchmark snapshot reset protection failure poisons even a partiall
         try expect(session.instance.?.grow(1) != null);
         pages.fail_protect = !partial;
         pages.fail_protect_after_transition = partial;
+        pages.probe_instance = session.instance.?;
         try std.testing.expectError(error.ProtectionFailed, session.reset());
+        try equal(@as(?bool, false), pages.revocation_observed_callable);
         try equal(partial, pages.partial_protection_applied);
         try std.testing.expectError(error.NotInstantiated, session.instance.?.call("_start", &.{}, &.{}));
         try std.testing.expectError(error.NotInstantiated, session.instance.?.start());
@@ -155,6 +160,72 @@ test "native benchmark snapshot reset protection failure poisons even a partiall
         session.deinit();
         try equal(@as(usize, 0), pages.reserved());
     }
+}
+
+test "native benchmark evidence retains terminal bytes after closing clock failure or reversal" {
+    for ([_]bool{ false, true }) |backwards| {
+        for ([_][]const u8{ "args_environment_output", "output_exit_nonzero", "output_trap" }, 0..) |entry, index| {
+            var pages: linux.Pages = .{};
+            const session = try runner.Session.create(std.testing.allocator, pages.platform(), fixtures.wasi, &.{ "fixture", "arg1" }, &.{"A=B"}, try linux.wasiClock());
+            defer session.deinit();
+            if (backwards) pages.backwards_clock_at = pages.clock_reads + 2 else pages.fail_clock_at = pages.clock_reads + 2;
+            const result = try session.invoke(entry);
+            try equal(@as(?u64, null), result.ticks);
+            try std.testing.expectEqualStrings(if (backwards) "ClockWentBackwards" else "ClockFailed", result.timing_error.?);
+            try std.testing.expectEqualStrings(([_][]const u8{ "returned", "proc_exit", "trap" })[index], result.outcome);
+            try equal(@as(?u32, if (index == 1) 23 else null), result.exit_code);
+            try std.testing.expectEqualStrings("onetwo", result.stdout);
+            try std.testing.expectEqualStrings("onetwo", result.stderr);
+            try expect(!result.succeeded());
+            var bytes: [2048]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&bytes);
+            try runner.writeInvocationEvidence(&writer, "first", 0, result);
+            const prefix = "WAMR_NATIVE_INVOCATION=";
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered()[prefix.len..], .{});
+            defer parsed.deinit();
+            try expect(parsed.value.object.get("ticks").? == .null);
+            try std.testing.expectEqualStrings("b25ldHdv", parsed.value.object.get("stdout_base64").?.string);
+            try std.testing.expectEqualStrings(result.outcome, parsed.value.object.get("outcome").?.string);
+        }
+    }
+}
+
+test "native benchmark evidence needs no post-call allocation and preserves binary stdout" {
+    const Counter = @import("bench/native_allocations.zig").Counter;
+    var counter: Counter = .{ .child = std.testing.allocator };
+    const allocator = counter.allocator();
+    var pages: linux.Pages = .{};
+    const session = try runner.Session.create(allocator, pages.platform(), fixtures.wasi, &.{ "fixture", "arg1" }, &.{"A=B"}, try linux.wasiClock());
+    errdefer session.deinit();
+    try session.output.stdout.ensureTotalCapacity(allocator, 64);
+    try session.output.stderr.ensureTotalCapacity(allocator, 64);
+    counter.fail_allocations = true;
+    try std.testing.expectError(error.OutOfMemory, allocator.alloc(u8, 1));
+    const result = try session.invoke("binary_output");
+    try expect(result.succeeded());
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 195, 40, 10, 0 }, result.stdout);
+    var bytes: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try runner.writeInvocationEvidence(&writer, "first", 0, result);
+    try expect(std.mem.indexOf(u8, writer.buffered(), "\"stdout_base64\":\"AP/DKAoA\"") != null);
+    session.deinit();
+    try equal(@as(usize, 0), counter.live);
+    try equal(@as(usize, 0), pages.reserved());
+}
+
+test "native benchmark evidence separates trap output failure and closing clock failure" {
+    var pages: linux.Pages = .{};
+    const session = try runner.Session.create(std.testing.allocator, pages.platform(), fixtures.wasi, &.{}, &.{}, try linux.wasiClock());
+    defer session.deinit();
+    session.output.limit = 0;
+    pages.fail_clock_at = pages.clock_reads + 2;
+    const result = try session.invoke("binary_output");
+    try std.testing.expectEqualStrings("trap", result.outcome);
+    try std.testing.expectEqualStrings("unreachable_instruction", result.diagnostic.?);
+    try std.testing.expectEqualStrings("ClockFailed", result.timing_error.?);
+    try expect(result.output_failure);
+    try equal(@as(?u64, null), result.ticks);
+    try equal(@as(?u32, null), result.exit_code);
 }
 
 test "native benchmark failed phase clocks release loaded and mapped resources" {
@@ -197,7 +268,6 @@ test "native benchmark partial output failure preserves consumed bytes and fails
     defer session.deinit();
     session.output.fail_after = 7;
     const invocation = try session.invoke("_start");
-    defer invocation.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("returned", invocation.outcome);
     try expect(invocation.output_failure);
     try equal(@as(usize, 7), invocation.stdout.len + invocation.stderr.len);
@@ -210,7 +280,6 @@ test "native benchmark real argv environ stdout stderr exits and traps" {
         const session = try runner.Session.create(std.testing.allocator, pages.platform(), fixtures.wasi, &.{ "fixture", "arg1" }, &.{"A=B"}, try linux.wasiClock());
         errdefer session.deinit();
         const invocation = try session.invoke(entry);
-        defer invocation.deinit(std.testing.allocator);
         switch (index) {
             0 => {
                 try std.testing.expectEqualStrings("returned", invocation.outcome);
@@ -225,7 +294,6 @@ test "native benchmark real argv environ stdout stderr exits and traps" {
                     try session.reset();
                     try equal(@as(?u32, null), session.context.exit_code);
                     const repeated = try session.invoke("args_environment_output");
-                    defer repeated.deinit(std.testing.allocator);
                     try expect(repeated.succeeded());
                     try std.testing.expectEqualStrings("onetwo", repeated.stdout);
                     try std.testing.expectEqualStrings("onetwo", repeated.stderr);

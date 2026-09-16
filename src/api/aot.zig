@@ -357,14 +357,13 @@ pub const Instance = struct {
         } else if (snapshot.len != 0) return error.InvalidSnapshot;
         if (snapshot.len < self.vmctx.memory_size) {
             const begin: [*]align(4096) u8 = @alignCast(self.linear.?.base + snapshot.len);
-            self.native.protect(self.native.context, begin, self.vmctx.memory_size - snapshot.len, .none) catch |failure| {
-                self.instantiated = false;
-                return failure;
-            };
+            self.instantiated = false;
+            try self.native.protect(self.native.context, begin, self.vmctx.memory_size - snapshot.len, .none);
         }
         @memcpy(self.memory()[0..snapshot.len], snapshot);
         self.vmctx.memory_size = snapshot.len;
         self.vmctx.memory_pages = @intCast(snapshot.len / 65536);
+        self.instantiated = true;
     }
 
     fn invoke(self: *Instance, index: u32, args: []const Value, results: []Value) Error!Outcome {

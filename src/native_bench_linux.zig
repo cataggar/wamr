@@ -6,6 +6,8 @@ const runner = @import("bench/native_runner.zig");
 const allocations = @import("bench/native_allocations.zig");
 const json = @import("bench/native_json.zig");
 const Value = json.Value;
+// Enable only with the host-owned request/receipt/result lifecycle binding.
+const lifecycle_protocol_supported = false;
 
 const Files = struct {
     allocator: std.mem.Allocator,
@@ -127,17 +129,17 @@ fn allocationDiagnostic(io: std.Io, counter: *const allocations.Counter, stage: 
     try output.interface.flush();
 }
 
-fn diagnostics(io: std.Io, phase: []const u8, invocation: runner.Invocation) !void {
-    if (invocation.stderr.len == 0 and invocation.diagnostic == null) return;
+fn diagnostics(io: std.Io, phase: []const u8, index: usize, invocation: runner.Invocation) !void {
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stderr().writer(io, &buffer);
-    try output.interface.print("WAMR_NATIVE_INVOCATION phase={s} diagnostic={s}\n", .{ phase, invocation.diagnostic orelse "none" });
-    try output.interface.writeAll(invocation.stderr);
+    try runner.writeInvocationEvidence(&output.interface, phase, index, invocation);
     try output.interface.flush();
 }
 
 fn check(init: std.process.Init, args: []const []const u8) !void {
-    if (args.len != 6) return error.Usage;
+    if (args.len != 6 and args.len != 7) return error.Usage;
+    const Fault = enum { @"closing-clock", @"backwards-clock", @"report-oom" };
+    const fault: ?Fault = if (args.len == 7) std.meta.stringToEnum(Fault, args[6]) orelse return error.Usage else null;
     const a = init.arena.allocator();
     const iterations = try std.fmt.parseInt(u32, args[3], 10);
     const repeats = try std.fmt.parseInt(u32, args[4], 10);
@@ -146,6 +148,7 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
     const bytes = try files.read(args[2]);
     var pages: linux.Pages = .{};
     var counter: allocations.Counter = .{ .child = init.gpa };
+    defer allocationDiagnostic(init.io, &counter, "after_release") catch {};
     const caller_allocator = counter.allocator();
     const argv: []const []const u8 = if (std.mem.startsWith(u8, args[5], "coremark"))
         &.{ args[5], "0", "0", "0", args[3], "0" }
@@ -167,12 +170,18 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
         var first_crc: ?u16 = null;
         for (0..repeats) |index| {
             if (index != 0) try session.reset();
+            if (fault == .@"closing-clock") pages.fail_clock_at = pages.clock_reads + 2;
+            if (fault == .@"backwards-clock") pages.backwards_clock_at = pages.clock_reads + 2;
             const result = try session.invoke("_start");
-            defer result.deinit(caller_allocator);
-            var record = try invocationJson(a, result, if (index == 0) "first" else "steady");
+            const phase = if (index == 0) "first" else "steady";
+            try diagnostics(init.io, phase, index, result);
+            var report_allocations: allocations.Counter = .{ .child = a, .fail_allocations = fault == .@"report-oom" };
+            const report_allocator = if (fault == .@"report-oom") report_allocations.allocator() else a;
+            var record = try invocationJson(report_allocator, result, phase);
             try set(a, &record, "elapsed_ns", result.ticks);
             try set(a, &record, "stderr_base64", try base64(a, result.stderr));
             try set(a, &record, "diagnostic", result.diagnostic);
+            try set(a, &record, "timing_error", result.timing_error);
             if (std.mem.startsWith(u8, args[5], "coremark")) {
                 const crc = runner.coremarkCrc(result.stdout);
                 if (index == 0) first_crc = crc;
@@ -186,7 +195,7 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
             if (index == 0) {
                 try set(a, &phases, "first_invocation_ticks", result.ticks);
                 try samples.array.append(try snapshotJson(a, &pages, "after_first"));
-            } else try steady_ticks.array.append(json.num(result.ticks));
+            } else if (result.ticks) |ticks| try steady_ticks.array.append(json.num(ticks));
             if (!good) break;
         }
         if (steady_ticks.array.items.len != 0) try samples.array.append(try snapshotJson(a, &pages, "after_steady"));
@@ -196,6 +205,7 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
     try set(a, &result, "kind", "wamr-native-correctness-check");
     try set(a, &result, "qualification", "correctness-only-not-performance");
     try set(a, &result, "reset_semantics", "same-instance-full-snapshot-reset");
+    try set(a, &result, "injected_fault", if (fault) |f| @as(?[]const u8, @tagName(f)) else null);
     try set(a, &result, "outcome", if (good) @as([]const u8, "success") else "error");
     try set(a, &result, "artifact_sha256", try json.digest(a, bytes));
     try set(a, &result, "workload", args[5]);
@@ -205,7 +215,6 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
     try json.put(a, &result, "phases", phases);
     try json.put(a, &result, "memory_samples", samples);
     try emit(init.io, a, "WAMR_NATIVE_CHECK_RESULT=", result);
-    try allocationDiagnostic(init.io, &counter, "after_release");
     if (pages.reserved() != 0 or counter.live != 0) return error.ResourceLeak;
     if (!good) return error.GuestFailed;
 }
@@ -248,6 +257,7 @@ fn observedPlatform(files: Files, receipt_platform: Value) !Value {
 }
 
 fn measure(init: std.process.Init, deployment_path: []const u8) !void {
+    if (!lifecycle_protocol_supported) return error.LifecycleProtocolPending;
     const a = init.arena.allocator();
     const files: Files = .{ .allocator = a, .io = init.io };
     const deployment = try files.parse(deployment_path);
@@ -344,6 +354,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     var memory_reliable = true;
     var pages: linux.Pages = .{};
     var counter: allocations.Counter = .{ .child = init.gpa };
+    defer allocationDiagnostic(init.io, &counter, "after_release") catch {};
     const caller_allocator = counter.allocator();
     if (runner.Session.createTimed(caller_allocator, pages.platform(), bytes, argv, environment, try linux.wasiClock(), &progress)) |session| {
         defer session.deinit();
@@ -363,12 +374,12 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
                 outcome = "error";
                 break;
             };
-            defer invocation.deinit(caller_allocator);
             const phase = if (index == 0) "first" else "steady";
+            try diagnostics(init.io, phase, index, invocation);
+            const ticks = invocation.ticks orelse return error.UntimedInvocation;
             try allocationDiagnostic(init.io, &counter, if (index == 0) "after_first" else "after_steady");
             exit_code = invocation.exit_code;
-            try diagnostics(init.io, phase, invocation);
-            if (index == 0) first_ticks = invocation.ticks else try steady_ticks.array.append(json.num(invocation.ticks));
+            if (index == 0) first_ticks = ticks else try steady_ticks.array.append(json.num(ticks));
             try invocations.array.append(try invocationJson(a, invocation, phase));
             if (index == 0) try samples.array.append(try snapshotJson(a, &pages, "after_first"));
             const crc = runner.coremarkCrc(invocation.stdout);
@@ -416,7 +427,6 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
         try json.put(a, &result, "memory", memory);
     }
     try emit(init.io, a, "WAMR_BENCH_RESULT=", result);
-    try allocationDiagnostic(init.io, &counter, "after_release");
     if (pages.reserved() != 0 or counter.live != 0) return error.ResourceLeak;
 }
 
@@ -425,7 +435,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--check")) return check(init, args);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--deployment")) return measure(init, args[2]);
     std.debug.print(
-        \\usage: wamr-native-bench --check FILE.cwasm ITERATIONS REPEATS WORKLOAD
+        \\usage: wamr-native-bench --check FILE.cwasm ITERATIONS REPEATS WORKLOAD [closing-clock|backwards-clock|report-oom]
         \\       wamr-native-bench --deployment DEPLOYMENT.json
         \\--check is correctness-only, including on QEMU; it is never benchmark evidence.
         \\
