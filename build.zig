@@ -1605,11 +1605,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // Compiler IR passes tests (separate module to avoid root/wamr conflict)
-    const passes_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/passes.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const passes_test_module = compilerIrTestModule(b, target, optimize, config_module, .passes);
     const passes_tests = b.addTest(.{
         .root_module = passes_test_module,
     });
@@ -1623,11 +1619,7 @@ pub fn build(b: *std.Build) void {
     aot_magic_u32_step.dependOn(&run_magic_passes_tests.step);
 
     // Compiler IR analysis tests
-    const analysis_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/analysis.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const analysis_test_module = compilerIrTestModule(b, target, optimize, config_module, .analysis);
     const analysis_tests = b.addTest(.{
         .root_module = analysis_test_module,
     });
@@ -1635,11 +1627,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_analysis_tests.step);
 
     // Compiler local-init analysis tests
-    const local_init_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/local_init.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const local_init_test_module = compilerIrTestModule(b, target, optimize, config_module, .local_init);
     const local_init_tests = b.addTest(.{
         .root_module = local_init_test_module,
     });
@@ -1647,11 +1635,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_local_init_tests.step);
 
     // Compiler register allocator tests
-    const regalloc_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/regalloc.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const regalloc_test_module = compilerIrTestModule(b, target, optimize, config_module, .regalloc);
     const regalloc_tests = b.addTest(.{
         .root_module = regalloc_test_module,
     });
@@ -1661,11 +1645,7 @@ pub fn build(b: *std.Build) void {
     // Compiler loop-aware live-range splitting tests (#383 / #524). The
     // file's tests were previously not wired into any module and so never
     // ran; this module makes `zig build test` cover them.
-    const range_split_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/range_split.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const range_split_test_module = compilerIrTestModule(b, target, optimize, config_module, .range_split);
     const range_split_tests = b.addTest(.{
         .root_module = range_split_test_module,
     });
@@ -1673,11 +1653,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_range_split_tests.step);
 
     // Compiler IR printer tests
-    const ir_print_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/print_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const ir_print_test_module = compilerIrTestModule(b, target, optimize, config_module, .print_test);
     const ir_print_tests = b.addTest(.{
         .root_module = ir_print_test_module,
     });
@@ -1685,11 +1661,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ir_print_tests.step);
 
     // IR verifier tests (#624).
-    const verifier_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/verifier.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const verifier_test_module = compilerIrTestModule(b, target, optimize, config_module, .verifier);
     const verifier_tests = b.addTest(.{
         .root_module = verifier_test_module,
     });
@@ -1697,11 +1669,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_verifier_tests.step);
 
     // IR interpreter tests (#736).
-    const ir_interp_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/interp.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const ir_interp_test_module = compilerIrTestModule(b, target, optimize, config_module, .interp);
     const ir_interp_tests = b.addTest(.{
         .root_module = ir_interp_test_module,
     });
@@ -1709,11 +1677,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ir_interp_tests.step);
 
     // IR deterministic generator tests (#736).
-    const ir_fuzz_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/fuzz.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const ir_fuzz_test_module = compilerIrTestModule(b, target, optimize, config_module, .fuzz);
     const ir_fuzz_tests = b.addTest(.{
         .root_module = ir_fuzz_test_module,
     });
@@ -1721,11 +1685,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ir_fuzz_tests.step);
 
     // IR optimizer property tests (#736).
-    const ir_property_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/property_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const ir_property_test_module = compilerIrTestModule(b, target, optimize, config_module, .property_test);
     const ir_property_options = b.addOptions();
     ir_property_options.addOption(u32, "iterations", ir_property_iterations);
     ir_property_test_module.addImport("ir_property_options", ir_property_options.createModule());
@@ -1736,11 +1696,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ir_property_tests.step);
 
     // Dominator-aware redundant-load forwarder tests (#391).
-    const dom_frl_test_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/ir/forward_redundant_loads_dominator.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const dom_frl_test_module = compilerIrTestModule(b, target, optimize, config_module, .forward_redundant_loads_dominator);
     const dom_frl_tests = b.addTest(.{
         .root_module = dom_frl_test_module,
     });
@@ -1956,7 +1912,7 @@ pub fn build(b: *std.Build) void {
 
     // ── Benchmark ─────────────────────────────────────────────────────
     const bench_module = b.createModule(.{
-        .root_source_file = b.path("src/compiler/bench_codegen.zig"),
+        .root_source_file = b.path("src/bench_codegen.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         // Darwin's clock_gettime lives in libSystem; the timer needs libc
@@ -1964,6 +1920,7 @@ pub fn build(b: *std.Build) void {
         // is only required here.
         .link_libc = if (target.result.os.tag.isDarwin()) true else null,
     });
+    bench_module.addImport("config", config_module);
 
     const bench_exe = b.addExecutable(.{
         .name = "codegen-bench",
@@ -2234,6 +2191,39 @@ pub fn build(b: *std.Build) void {
         "Run the WASI Preview 2 conformance gate (curated component examples)",
     );
     wasi_p2_step.dependOn(component_runs.wamr);
+}
+
+const CompilerIrSuite = enum {
+    passes,
+    analysis,
+    local_init,
+    regalloc,
+    range_split,
+    print_test,
+    verifier,
+    interp,
+    fuzz,
+    property_test,
+    forward_redundant_loads_dominator,
+};
+
+fn compilerIrTestModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    config: *std.Build.Module,
+    suite: CompilerIrSuite,
+) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption(CompilerIrSuite, "suite", suite);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/compiler_ir_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("config", config);
+    module.addImport("compiler_ir_suite", options.createModule());
+    return module;
 }
 
 /// Wires up the Component-Model example pipeline (sources under
