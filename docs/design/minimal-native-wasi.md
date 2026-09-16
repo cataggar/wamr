@@ -92,12 +92,20 @@ The intended native provider is pinned to
   2 and 3 unsupported unless the platform supplies separate qualified CPU
   clocks. Never substitute boot time or wall time for them.
 
-The platform adapter must declare the source's real resolution in
+At that revision, `plat/hyperv/include/hyperv/clock.h` defines
+`HYPERV_REFERENCE_TICK_NS=100`: the reference-delta helper scales ticks by
+100 to obtain nanoseconds. The qualified reference source therefore uses
+`resolution_ns[1] = 100`, **not 1**. Both that conversion and the wall-clock
+helper saturate to `UINT64_MAX` on overflow; the platform adapter must translate
+this sentinel to `.failure = .overflow`, never a successful timestamp.
+
+The platform adapter must declare each source's real resolution in
 `resolution_ns`, not infer one-nanosecond resolution from the return unit.
-If wall-clock epoch availability or source resolution cannot be established,
-do not advertise that clock as supported. The callback seam and this mapping
-are a software integration contract, not a claim that these hooks have been
-linked or exercised in a native image.
+Realtime also requires a qualified EFI epoch and its applicable resolution;
+if either is unknown, do not advertise ID 0 as supported. If any required
+source capability cannot be established, keep that clock unsupported. The
+callback seam and this mapping are a software integration contract, not a
+claim that these hooks have been linked or exercised in a native image.
 
 Native execution additionally depends on the backend's qualified memory
 provider. Unikraft's `LIBUKVMEM` is off by default; reserve/map/protect/grow
