@@ -160,6 +160,49 @@ availability must not be inferred from an existing networking image. No POSIX `m
 `mprotect`, signals or
 `process.exit` occurs in the native library.
 
+### Checked lower-level paging alternative
+
+Native error-returning page hooks **are available**. At the pinned revision,
+[`uk/paging.h`](https://github.com/cataggar/unikraft/blob/40d8fc7096bd10fa94bb1491993724eeecf2f180/lib/ukpaging/include/uk/paging.h)
+exposes `uk_paging_pt_get_active()`, `uk_paging_page_mapx()` (and its
+`uk_paging_page_map` convenience macro), `uk_paging_page_set_attr()` and
+`uk_paging_page_unmap()`. The mapping/attribute/unmap functions return errors
+directly, unlike the fatal-error paths in the ukvmem wrappers. Mapping with
+`UK_PAL_PADDR_INV` allocates physical frames; requesting 4 KiB pages with
+`UK_PAGING_PAGE_FLAG_FORCE_SIZE` keeps new mappings at that size, avoiding
+later large-page splits within an exclusively owned range. Unmap skips absent
+mappings and normally releases frames. `KEEP_FRAMES` and `KEEP_PTES` explicitly
+retain frames or the page-table hierarchy; they are ownership choices, not
+rollback guarantees.
+
+A candidate adapter could use ukvmem only to reserve an inaccessible virtual
+range, then exclusively populate/protect/release its page mappings through
+ukpaging. This is **not a qualified implementation**. Before adopting it,
+downstream integration must inspect the complete pinned implementations and
+establish:
+
+* Exclusive VMA, frame and page-table ownership, with no overlapping mappings
+  or competing ukvmem operations; reservation release must not double-free
+  pages already released through ukpaging. The globally selected page table
+  must also be active on the executing CPU, with correct synchronization and
+  TLB handling.
+* Zero-filled eager commit and rollback after partial mapping, frame-allocation,
+  page-table-allocation or protection failures. Returned errors do not imply
+  atomicity; rollback must preserve previous committed bytes and reservation
+  ownership, including when cleanup itself fails.
+* Separate reserved-VA, committed-frame and page-table/allocator metadata
+  accounting, and reliable release of the whole reservation without leaks.
+  A fallible lower-level unmap does not by itself satisfy this SDK's infallible
+  release callback.
+* Real native failure-injection and image evidence for these guarantees,
+  including W^X transitions, stable growth and teardown under allocation
+  pressure. Fixed-size pages alone do not prove that failures are impossible.
+
+This lower-level route remains an explicit alternative for cataggar/unikraft#156,
+not a successful stub or a reason to remove Wasm bounds checks, import validation,
+W^X or trap isolation. The missing acceptance is transactional ownership and
+native execution evidence, not the existence of error-returning paging APIs.
+
 ## Calls, memory and terminal results
 
 The C header documents layout, lifetimes, callbacks and terminal tags. Zig:
