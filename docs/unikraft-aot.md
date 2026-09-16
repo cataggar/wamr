@@ -18,24 +18,35 @@ The early build-graph return precedes hosted dependencies and configuration.
 The installed artifacts are `lib/libwamr-aot.a` and `include/wamr_aot.h`.
 The exported Zig module is `wamr-aot`; its `aot` namespace provides the Zig API.
 Both APIs reach the same implementation.
+The same module now optionally exposes `.benchmark` and `.runner` for the
+[bounded freestanding v2 guest producer](bench/native-guest-producer.md). Its
+Platform/Session/WASI types are shared, not copies imported through another root.
 The optional `minimal-wasi` context and `native-wasi` import adapter are also
 exported with the same freestanding module settings. They are not linked into
 `wamr-aot` unless the embedding application imports them; their hosted test
 artifacts are not constructed in this profile.
 
-The graph comprises `aot_native.zig`, `api/aot.zig`, `native_format.zig`,
+The core runtime graph comprises `aot_native.zig`, `api/aot.zig`, `native_format.zig`,
 `native_abi.zig`, `trap_jmp.zig`, `shared/allocation_limit.zig`,
 `platform/unikraft.zig`, and Zig standard-library
 allocation/intrinsic support. It does **not** import the hosted `runtime.zig`,
 `common/types.zig`, host bridge, WASI, compiler, interpreter, components or thread
-manager. Compiler runtime intrinsics such as `memcpy` are bundled; they are not
-the wasm compiler.
+manager. The optional benchmark adds only the explicit minimal-WASI adapter,
+Session, bounded JSON/hash/report helpers and requested-allocation counter.
+The embedding archive does **not** bundle Zig `compiler_rt`; the native final
+link owns compiler intrinsics and strong memory helpers. The Unikraft EFI final
+link uses `zig cc -rtlib=compiler-rt`. Bundling weak/hidden Zig `memcpy`, `memset`
+or `memmove` into this archive can make Unikraft's strong symbols hidden/local
+and violate its existing IRQ/scheduler binding checks. Do not weaken those
+checks. Standalone audit executables resolve their own final-link intrinsics;
+neither compiler runtime intrinsics nor those memory helpers are a wasm compiler.
 
 `native-aot-check` links an ELF with **all public C entry points retained**
 (`rdynamic`), so lazy unused imports or linker garbage collection cannot hide
 unresolved dependencies. This ELF is a link audit, not a bootable image. Its
 entry symbol is deliberately the contract-version query. Do not execute it.
-The library uses the x86_64 SysV ABI, no red zone, no libc stack protector, and
+The library uses PIC for the native EFI application's PIE final link,
+the x86_64 SysV ABI, no red zone, no libc stack protector, and
 single-threaded Zig support, with stack checking, unwind tables and Zig error
 tracing disabled. These match ordinary native application objects in
 `support/build/native-target-object.zig` at Unikraft commit
@@ -44,6 +55,13 @@ compile this runtime as an interrupt handler or disable the SSE facilities its
 application ABI and generated scalar floating-point code require. The native
 application must preserve Unikraft's IRQ return and FPU ownership contract.
 Hosted defaults remain unchanged.
+
+The default install also runs `native-aot-guest-check`, a separate freestanding
+all-entry-path link audit of the optional request/result producer. It retains
+real `benchmark.run` and Session invocation/reset/evidence calls, including error
+paths. Both API/producer audits are PIE links. A third audit links the actual
+`libwamr-aot.a` into a freestanding PIE, so executable-side implicit PIC cannot
+hide non-PIC archive objects. None is bootable or introduces a compiler.
 
 The separately selected `-Dprofile=unikraft-jit` is documented in
 [unikraft-jit.md](unikraft-jit.md). It does not add a compiler to this profile.

@@ -10,6 +10,7 @@ test {
     _ = @import("bench/native_json.zig");
     _ = @import("bench/native_allocations.zig");
     _ = linux;
+    _ = @import("bench/native_guest_tests.zig");
 }
 
 test "native benchmark deterministic real compute and memory repeated exports" {

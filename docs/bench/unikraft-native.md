@@ -29,6 +29,12 @@ receipts and results, with separate snapshot setup/reset costs and retained part
 failure evidence. It rejects warm-instance or version 1 declarations for this path.
 Standalone parser/capture tests do not depend on those APIs.
 
+The optional [freestanding AOT guest producer](native-guest-producer.md) now
+exposes that Session lifecycle through `wamr-aot.benchmark`, consumes the same v2
+requests without host OS services, and emits bounded results/evidence through
+caller-owned transports. Actual Unikraft pages/clocks, independent build/image/
+deployment attestations and hardware/campaign qualification remain downstream.
+
 Concrete integration dependencies identified during the native API handoff:
 
 * A combined `Instance.load(...)` outer-call duration cannot honestly populate
