@@ -134,6 +134,8 @@ test "native AOT real API: host exit unwinds after host cleanup and errors are t
     try equal(@as(u32, 17), (try inst.call("exit", &.{.{ .i32 = 17 }}, &.{})).exit);
     try equal(@as(u32, 0), std.mem.readInt(u32, inst.memory()[64..68], .little));
     try equal(@as(u32, 0xdefe), std.mem.readInt(u32, inst.memory()[68..72], .little));
+    try equal(@as(u32, 0), (try inst.call("exit", &.{.{ .i32 = 0 }}, &.{})).exit);
+    try equal(@as(u32, 0), std.mem.readInt(u32, inst.memory()[64..68], .little));
     try equal(error.Io, (try inst.call("fail", &.{}, &.{})).host_error);
     try equal(@as(u32, 0), std.mem.readInt(u32, inst.memory()[64..68], .little));
 }
