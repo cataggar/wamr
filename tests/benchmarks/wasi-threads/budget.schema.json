@@ -14,7 +14,7 @@
     "platforms"
   ],
   "properties": {
-    "schema_version": { "const": 12 },
+    "schema_version": { "const": 13 },
     "kind": { "const": "wasi-thread-benchmark-budget" },
     "calibrated": { "type": "boolean" },
     "enforcement": { "type": "boolean" },
@@ -135,7 +135,7 @@
         "candidate_revision": { "$ref": "#/$defs/revision" },
         "comparison_purpose": { "const": "noise-calibration" },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 17 },
+        "measurement_plan_version": { "const": 18 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "profile": { "const": "authoritative" },
         "report_count_by_platform": {

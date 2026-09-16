@@ -560,11 +560,11 @@
   },
   "job_reserve_admission": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 17,
-      "sizing_algorithm_version": 12
+      "measurement_plan_identity_version": 18,
+      "sizing_algorithm_version": 13
     },
     "auxiliary_invocation_budget_ns": 600000000000,
-    "benchmark_limit_ns": 12060000000000,
+    "benchmark_limit_ns": 15660000000000,
     "evidence": {
       "artifact": "wasi-thread-bench-ubuntu-24.04-aarch64-34351942414-1",
       "combined_allowance_margin": 0.37692724257152976,
@@ -579,10 +579,27 @@
       "step_wall_elapsed_ns": 4701000000000,
       "unaccounted_step_wall_ns": 3442447686014
     },
-    "hard_preadmission_benchmark_ns": 10824000000000,
+    "hard_preadmission_benchmark_ns": 13464000000000,
     "job_non_benchmark_reserve_ns": 4140000000000,
-    "timeout_headroom_ns": 1236000000000,
-    "workflow_job_timeout_ns": 16200000000000
+    "timeout_headroom_ns": 2196000000000,
+    "workflow_job_timeout_ns": 19800000000000
+  },
+  "v13_smoke_duration_evidence": {
+    "cohort_id": "25c4886203114874a9319af396f2866b",
+    "cohort_sha256": "16ae03b61eefe5ad7a517819af28e917b94e83dfd117ffd8a8b4355446ee37eb",
+    "direct_manager_maximum_median_delta_fraction": 0.0058969149133618615,
+    "focused_probe": {
+      "maximum_proposed_rolling_four_sample_adverse_log": 0.043347741286154276,
+      "record_count": 64,
+      "results_sha256": "35186dd10f94ede94bf05b3c7b7eaa0e429cbacc77843b02407ff884bc583b34",
+      "summary_sha256": "1dbb6bf77d9a32268781d98167a36419b7882b3f886baa572e3ad0f0570f9706"
+    },
+    "policy_check_sha256": "9007cf73419042d436757c7662d65d0089c848c768bb604c75b6d05aaafb04bb",
+    "retained_pilot_v14_projection": {
+      "maximum_projected_authoritative_benchmark_ns": 6556955664436,
+      "report_count": 8
+    },
+    "workflow_head_sha": "8b53af8209c660fa29beb4d145e6865df2745e31"
   },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,

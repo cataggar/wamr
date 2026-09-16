@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 12 },
+    "schema_version": { "const": 13 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",
@@ -82,7 +82,7 @@
         "platform_id": { "type": "string", "minLength": 1 },
         "fixture_set_sha256": { "$ref": "#/$defs/sha256" },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
-        "measurement_plan_version": { "const": 17 },
+        "measurement_plan_version": { "const": 18 },
         "measurement_plan_sha256": { "$ref": "#/$defs/sha256" },
         "cpu_placement": { "$ref": "#/$defs/cpu_placement" },
         "revision_artifacts": {
@@ -526,7 +526,7 @@
             "failure_policy"
           ],
           "properties": {
-            "version": { "const": 12 },
+            "version": { "const": 13 },
             "kind": { "const": "fastest-valid-one-shot-pilot" },
             "target_duration_ns": { "const": 1750000000 },
             "pilot_clock_resolution_minimum_ns": { "const": 1000000 },
@@ -567,43 +567,61 @@
                   "formula": "round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))"
                 },
                 {
-                  "name": "atomic-multithread-20s-contention-window",
+                  "name": "hot-8-20s-process-cpu-window",
+                  "selector": {
+                    "workload": "hot",
+                    "threads": 8
+                  },
+                  "target_duration_ns": 1750000000,
+                  "safety_factor": {
+                    "numerator": 80,
+                    "denominator": 7
+                  },
+                  "measurement_to_pilot_rate_envelope": {
+                    "numerator": 16,
+                    "denominator": 1
+                  },
+                  "projected_pilot_duration_ns": 20000000000,
+                  "formula": "round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))"
+                },
+                {
+                  "name": "atomic-2-4-40s-contention-window",
                   "selector": {
                     "workload": "atomic",
                     "threads": 2
                   },
                   "target_duration_ns": 1750000000,
                   "safety_factor": {
-                    "numerator": 80,
+                    "numerator": 160,
                     "denominator": 7
                   },
                   "measurement_to_pilot_rate_envelope": {
-                    "numerator": 16,
+                    "numerator": 32,
                     "denominator": 1
                   },
-                  "projected_pilot_duration_ns": 20000000000,
+                  "projected_pilot_duration_ns": 40000000000,
                   "formula": "round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))"
                 },
                 {
-                  "name": "atomic-multithread-20s-contention-window",
+                  "name": "atomic-2-4-40s-contention-window",
                   "selector": {
                     "workload": "atomic",
                     "threads": 4
                   },
                   "target_duration_ns": 1750000000,
                   "safety_factor": {
-                    "numerator": 80,
+                    "numerator": 160,
                     "denominator": 7
                   },
                   "measurement_to_pilot_rate_envelope": {
-                    "numerator": 16,
+                    "numerator": 32,
                     "denominator": 1
                   },
-                  "projected_pilot_duration_ns": 20000000000,
+                  "projected_pilot_duration_ns": 40000000000,
                   "formula": "round_up_3_significant_digits(ceil(P*target_duration_ns*safety_numerator/(E*safety_denominator)))"
                 },
                 {
-                  "name": "atomic-multithread-20s-contention-window",
+                  "name": "atomic-8-20s-contention-window",
                   "selector": {
                     "workload": "atomic",
                     "threads": 8
@@ -691,9 +709,9 @@
                   "type": "integer",
                   "exclusiveMinimum": 0
                 },
-                "workflow_job_timeout_ns": { "const": 16200000000000 },
+                "workflow_job_timeout_ns": { "const": 19800000000000 },
                 "job_non_benchmark_reserve_ns": { "const": 4140000000000 },
-                "projected_benchmark_limit_ns": { "const": 12060000000000 },
+                "projected_benchmark_limit_ns": { "const": 15660000000000 },
                 "auxiliary_invocation_budget_ns": { "const": 600000000000 }
               }
             }
