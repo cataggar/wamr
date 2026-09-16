@@ -120,14 +120,16 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const module = b.addModule("wamr-jit", module_options);
     configure(b, module);
     const library = b.addLibrary(.{ .name = "wamr-jit", .linkage = .static, .root_module = module });
-    library.bundle_compiler_rt = true;
-    b.installArtifact(library);
+    // The final image owns intrinsics; bundled hidden helpers can hide kernel helpers.
+    library.bundle_compiler_rt = false;
+    const install_library = b.addInstallArtifact(library, .{});
+    b.getInstallStep().dependOn(&install_library.step);
     var link_options = module_options;
     link_options.root_source_file = null;
     const link_module = b.createModule(link_options);
     link_module.linkLibrary(library);
     const check = b.addExecutable(.{ .name = "wamr-jit-link-check", .root_module = link_module });
-    check.bundle_compiler_rt = false;
+    check.bundle_compiler_rt = true;
     check.pie = true;
     check.entry = .{ .symbol_name = "wamr_jit_link_check" };
     check.rdynamic = true;
@@ -141,14 +143,15 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     compare_options.root_source_file = b.path("src/jit_compare_native.zig");
     const compare = b.addModule("wamr-jit-aot-sample", compare_options);
     const compare_library = b.addLibrary(.{ .name = "wamr-jit-aot-sample", .linkage = .static, .root_module = compare });
-    compare_library.bundle_compiler_rt = true;
-    b.installArtifact(compare_library);
+    compare_library.bundle_compiler_rt = false;
+    const install_compare = b.addInstallArtifact(compare_library, .{});
+    b.getInstallStep().dependOn(&install_compare.step);
     var compare_link_options = compare_options;
     compare_link_options.root_source_file = null;
     const compare_link_module = b.createModule(compare_link_options);
     compare_link_module.linkLibrary(compare_library);
     const compare_check = b.addExecutable(.{ .name = "wamr-jit-aot-sample-link-check", .root_module = compare_link_module });
-    compare_check.bundle_compiler_rt = false;
+    compare_check.bundle_compiler_rt = true;
     compare_check.pie = true;
     compare_check.entry = .{ .symbol_name = "wamr_jit_aot_sample_link_check" };
     compare_check.rdynamic = true;
@@ -175,10 +178,18 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             .name = if (with_compiler) "wamr-jit-guest-link-check" else "wamr-jit-aot-guest-link-check",
             .root_module = guest,
         });
+        audit.bundle_compiler_rt = true;
         audit.pie = true;
         audit.entry = .{ .symbol_name = "wamr_jit_guest_sample_link_check" };
         audit.rdynamic = true;
         _ = audit.getEmittedBin();
         step.dependOn(&audit.step);
     }
+    const archive_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_jit_benchmark.NativeEmbeddingArchiveTests" });
+    archive_tests.setEnvironmentVariable("WAMR_JIT_NATIVE_ARCHIVES", b.getInstallPath(.lib, ""));
+    archive_tests.step.dependOn(&install_library.step);
+    archive_tests.step.dependOn(&install_compare.step);
+    archive_tests.step.dependOn(step);
+    b.step("test-native-jit-archives", "Verify embedding archives leave memory intrinsics to the final image")
+        .dependOn(&archive_tests.step);
 }

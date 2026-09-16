@@ -248,8 +248,20 @@ public modules with the embedded workload. Native objects explicitly use PIC and
 all four audits link as PIE, including the compiler-free comparator, so EFI image
 links do not depend on fixed-address 32-bit absolute relocations. These are link
 audits, not EFI boot qualification. The two archive audits link the actual static
-libraries with compiler-runtime fallback disabled; the other two cover public
-module composition. The sampler helpers import neither Linux pages
+libraries; the other two cover public module composition. Embedding archives
+explicitly do **not** bundle `compiler_rt`: hidden weak `memcpy`, `memset`, and
+`memmove` definitions can hide Unikraft's own helpers and violate its native
+symbol/IRQ gates. The final image link owns intrinsic resolution; the standalone
+PIE audit executables supply their own compiler runtime only at that final link.
+Adapters built from the exported modules must likewise leave runtime bundling
+disabled in their integration archives. No native safety gate is relaxed.
+
+```sh
+zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe test-native-jit-archives -j2
+```
+
+This additionally checks that neither installed embedding archive defines those
+memory helpers. The sampler helpers import neither Linux pages
 nor `std.process`; the Linux drivers now call these same helpers. Image
 applications supply a caller allocator, native `aot.Platform` (including its
 monotonic clock), actual clock resolution, request SHA256, and serial writer.
