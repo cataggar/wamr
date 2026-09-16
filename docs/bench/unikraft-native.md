@@ -207,8 +207,10 @@ Omit `--control-plane-seconds` if not measured; `null` is not zero.
 timeouts/launch errors, pass `--transport-outcome timeout|launch_error` and omit
 `--process-returncode`. No terminal guest result is invented in these cases.
 
-Both adapters retain `stdout.bin`, `stderr.bin`, and `observation.json` with mode
-0600 in a new directory (0700). Raw evidence is saved **before** result validation,
+Both adapters retain `stdout.bin`, `stderr.bin`, and `observation.json` with POSIX mode
+0600 in a new directory (0700). On Windows, use an appropriately private inherited
+directory ACL; POSIX mode bits do not establish NTFS access control.
+Raw evidence is saved **before** result validation,
 including malformed output, failures, traps, timeouts and missing terminal results.
 Import observation timestamps must lie inside the campaign validity window.
 
@@ -349,6 +351,10 @@ Native JIT APIs and qualification are not prerequisites for these host/parser te
 ```sh
 python3 -m unittest discover -s scripts -p test_bench_coremark.py
 ```
+
+`zig build test` also runs the portable `NativeBenchmarkTests` class through the
+existing Python harness-command mechanism on ordinary Linux, ARM and Windows CI.
+The existing hosted CoreMark tests continue to run in the CoreMark workflows.
 
 The tests pin all four tracked fixtures, execute an explicitly synthetic Linux
 producer subprocess, exercise timeouts and retained raw evidence, and reject

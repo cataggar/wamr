@@ -3,6 +3,7 @@
 import copy
 import io
 import json
+import os
 import shutil
 import sys
 import unittest
@@ -1441,7 +1442,8 @@ Correct operation validated. See README.md for run and reporting rules.
         self.assertNotIn("Iterations/Sec", text)
         self.assertIn("partial-guest", text)
         self.assertNotIn("rss", text.lower())
-        self.assertEqual((self.root / "run-0001/stdout.bin").stat().st_mode & 0o777, 0o600)
+        if os.name == "posix":
+            self.assertEqual((self.root / "run-0001/stdout.bin").stat().st_mode & 0o777, 0o600)
 
     def test_native_cli_and_default_validators_reject_synthetic(self):
         with self.assertRaisesRegex(ValueError, "synthetic"):
@@ -1706,7 +1708,7 @@ Correct operation validated. See README.md for run and reporting rules.
                                      [sys.executable, "-c", "print('partial native output')"],
                                      output, 5, allow_synthetic=True)
         self.assertTrue((output / "observation.json").exists())
-        self.assertEqual((output / "stdout.bin").read_bytes(), b"partial native output\n")
+        self.assertEqual((output / "stdout.bin").read_bytes().splitlines(), [b"partial native output"])
 
     def test_native_capture_retains_launch_error(self):
         run = next(run for run in self.manifest["schedule"] if run["target"] == "linux")
