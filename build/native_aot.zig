@@ -133,7 +133,9 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     module.addImport("minimal-wasi", minimal_wasi);
     module.addImport("native-wasi", native_wasi);
     const library = b.addLibrary(.{ .name = "wamr-aot", .linkage = .static, .root_module = module });
-    library.bundle_compiler_rt = true;
+    // The native final link owns intrinsics. Bundled weak/hidden memory helpers
+    // would change the visibility of Unikraft's strong scheduler bindings.
+    library.bundle_compiler_rt = false;
     b.installArtifact(library);
     b.installFile("include/wamr_aot.h", "include/wamr_aot.h");
     // Export every real embedding entry point in a freestanding ELF. Unlike a

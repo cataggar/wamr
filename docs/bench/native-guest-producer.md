@@ -27,6 +27,11 @@ archive and shared WASI/producer modules, explicitly use PIC for the EFI final
 link. The default install also links the actual `libwamr-aot.a` into a separate
 PIE consumer, alongside the complete C API and producer audits. This catches
 non-PIC archive relocations that an executable-only recompile could conceal.
+The installed archive explicitly excludes bundled Zig `compiler_rt`; the final
+native image link supplies intrinsics and retains ownership/visibility of its
+strong `memcpy`/`memset`/`memmove` helpers. In the EFI integration this is the
+`zig cc -rtlib=compiler-rt` link, not private weak/hidden helpers carried inside
+the runtime archive. Standalone audits resolve their own final-link intrinsics.
 Audit ELFs are not bootable or executable as applications; they do not link libc
 or resolve hosted syscalls.
 The compiler remains external; building this profile never constructs `wamrc`.

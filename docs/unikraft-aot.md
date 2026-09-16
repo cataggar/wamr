@@ -33,8 +33,13 @@ allocation/intrinsic support. It does **not** import the hosted `runtime.zig`,
 `common/types.zig`, host bridge, WASI, compiler, interpreter, components or thread
 manager. The optional benchmark adds only the explicit minimal-WASI adapter,
 Session, bounded JSON/hash/report helpers and requested-allocation counter.
-Compiler runtime intrinsics such as `memcpy` are bundled; they are not
-the wasm compiler.
+The embedding archive does **not** bundle Zig `compiler_rt`; the native final
+link owns compiler intrinsics and strong memory helpers. The Unikraft EFI final
+link uses `zig cc -rtlib=compiler-rt`. Bundling weak/hidden Zig `memcpy`, `memset`
+or `memmove` into this archive can make Unikraft's strong symbols hidden/local
+and violate its existing IRQ/scheduler binding checks. Do not weaken those
+checks. Standalone audit executables resolve their own final-link intrinsics;
+neither compiler runtime intrinsics nor those memory helpers are a wasm compiler.
 
 `native-aot-check` links an ELF with **all public C entry points retained**
 (`rdynamic`), so lazy unused imports or linker garbage collection cannot hide
