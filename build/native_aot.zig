@@ -88,6 +88,8 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .red_zone = false,
         .stack_check = false,
         .stack_protector = false,
+        .unwind_tables = .none,
+        .error_tracing = false,
         .link_libc = false,
     });
     const library = b.addLibrary(.{ .name = "wamr-aot", .linkage = .static, .root_module = module });

@@ -31,7 +31,14 @@ the wasm compiler.
 unresolved dependencies. This ELF is a link audit, not a bootable image. Its
 entry symbol is deliberately the contract-version query. Do not execute it.
 The library uses the x86_64 SysV ABI, no red zone, no libc stack protector, and
-single-threaded Zig support. Hosted defaults remain unchanged.
+single-threaded Zig support, with stack checking, unwind tables and Zig error
+tracing disabled. These match ordinary native application objects in
+`support/build/native-target-object.zig` at Unikraft commit
+`40d8fc7096bd10fa94bb1491993724eeecf2f180`. They are **not ISR settings**: do not
+compile this runtime as an interrupt handler or disable the SSE facilities its
+application ABI and generated scalar floating-point code require. The native
+application must preserve Unikraft's IRQ return and FPU ownership contract.
+Hosted defaults remain unchanged.
 
 ## Matching host compiler and artifact identity
 
@@ -94,13 +101,17 @@ in `lib/ukalloc/include/uk/alloc.h`, `uk_vas_get_active`, reservation/mapping/
 attribute APIs in `lib/ukvmem/include/uk/vmem.h`, low-level
 `uk_paging_page_map`/`uk_paging_page_set_attr`/`uk_paging_page_unmap` in
 `lib/ukpaging/include/uk/paging.h`, and `ukplat_monotonic_clock` in
-`include/uk/plat/time.h` on the `zig16` branch. These are **integration references,
+`include/uk/plat/time.h` on the `zig16` branch, pinned for this integration to
+`40d8fc7096bd10fa94bb1491993724eeecf2f180`. These are **integration references,
 not implemented shims**. In particular, simply forwarding commit to a lazy
 anonymous map is insufficient for deterministic allocation failure, and
 `uk_vma_set_attr` can enter `UK_CRASH` on a low-level protection failure.
 The downstream adapter must establish transactional eager commit, safe VMA/page
 ownership and reliable teardown for its configured native page tables before
-claiming this platform contract. No POSIX `mmap`, `mprotect`, signals or
+claiming this platform contract. Its application profile must explicitly enable
+and initialize ukalloc, ukpaging, ukvmem and the monotonic clock; their availability
+must not be inferred from an existing networking image. No POSIX `mmap`,
+`mprotect`, signals or
 `process.exit` occurs in the native library.
 
 ## Calls, memory and terminal results
