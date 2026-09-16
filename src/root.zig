@@ -7,6 +7,7 @@ const std = @import("std");
 
 /// Compile-time configuration (feature flags and constants).
 pub const config = @import("config.zig");
+pub const native_profile = @import("compiler/native_profile.zig");
 
 /// C-compatible API for embedding (matches wasm_export.h).
 pub const c_api = @import("api/c_api.zig");

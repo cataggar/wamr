@@ -51,6 +51,12 @@ pub fn nativeTargetInfoOptions() AotEmitOptions {
     return options;
 }
 
+pub fn nativeFuelTargetInfoOptions() AotEmitOptions {
+    var options = nativeTargetInfoOptions();
+    options.e_flags = native_abi.fuel_profile_flag;
+    return options;
+}
+
 pub const TargetInfoKind = enum {
     x86_64_sysv,
     x86_64_win64,

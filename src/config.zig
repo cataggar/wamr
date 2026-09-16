@@ -13,6 +13,8 @@ pub const threads_feature = @import("threads_feature.zig");
 
 /// Product version string supplied by `zig build -Dversion=...`.
 pub const version: []const u8 = if (@hasDecl(build_options, "version")) build_options.version else "dev";
+/// Explicit isolated in-memory compiler profile; never enables hosted JIT.
+pub const unikraft_jit = opt("unikraft_jit", false);
 
 // ---------------------------------------------------------------------------
 // Build mode

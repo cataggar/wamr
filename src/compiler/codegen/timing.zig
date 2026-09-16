@@ -112,6 +112,7 @@ pub const FuncReport = struct {
 };
 
 pub fn printFunc(r: FuncReport) void {
+    if (comptime @import("../../config.zig").unikraft_jit) return;
     const emit_ns = r.total_ns -| r.setup_ns -| r.liveness_ns -| r.regalloc_ns;
     std.debug.print(
         "[aot-codegen-timing] local_func={d} mod={d} blocks={d} insts={d} reused={} " ++
@@ -145,6 +146,7 @@ pub const SpillReport = struct {
 };
 
 pub fn printSpill(r: SpillReport) void {
+    if (comptime @import("../../config.zig").unikraft_jit) return;
     const m = r.metric;
     std.debug.print(
         "[aot-spill-metric] local_func={d} mod={d} name={s} insts={d} clobbers={d} " ++
@@ -253,6 +255,7 @@ pub fn printAarch64Func(r: Aarch64FuncReport) void {
 }
 
 pub fn printModuleBegin(opts: Options, module_idx: u32, funcs: usize) void {
+    if (comptime @import("../../config.zig").unikraft_jit) return;
     if (!opts.enabled or !opts.moduleMatches(module_idx)) return;
     std.debug.print(
         "[aot-codegen-timing] begin mod={d} funcs={d} threshold_ms={d} every_n_funcs={d}\n",
@@ -272,6 +275,7 @@ pub const ModuleReport = struct {
 };
 
 pub fn printModuleSummary(opts: Options, r: ModuleReport) void {
+    if (comptime @import("../../config.zig").unikraft_jit) return;
     if (!opts.enabled or !opts.moduleMatches(r.module_idx)) return;
     std.debug.print(
         "[aot-codegen-timing] module-summary mod={d} funcs={d} compiled={d} reused={d} " ++

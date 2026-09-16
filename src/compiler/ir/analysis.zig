@@ -173,6 +173,7 @@ fn printAnalysisTiming(
     else
         "-";
     const func_name = func.name orelse "-";
+    if (comptime @import("../../config.zig").unikraft_jit) return;
     const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
     const elapsed_ms_frac = (elapsed_ns % std.time.ns_per_ms) / std.time.ns_per_us;
     std.debug.print(

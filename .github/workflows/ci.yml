@@ -65,6 +65,12 @@ jobs:
           zig cc -target x86_64-freestanding-none -ffreestanding -std=c11 -Werror \
             -Iinclude -c tests/unikraft-aot/header.c -o .zig-cache/native-header.o
 
+      - name: Optional native in-memory compiler and bounded execution
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          zig build test-native-jit test-native-jit-bench -j2 --summary all
+          zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe -j2 --summary all
+
       - name: WASI thread lifecycle (enabled interpreter)
         run: zig build test-thread-lifecycle -Dlib_wasi_threads=true -Daot=false
 

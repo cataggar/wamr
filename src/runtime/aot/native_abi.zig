@@ -4,6 +4,10 @@ pub const magic: u32 = 0x746f6100;
 pub const format_version: u32 = 11;
 pub const contract_version: u32 = 1;
 pub const profile_flag: u32 = 0x554b0001;
+/// Same ABI, with mandatory single-threaded fuel at entry/back-edge targets.
+pub const fuel_profile_flag: u32 = 0x554b0002;
+pub const max_fuel_call_depth: usize = 32;
+pub const max_fuel_frame_bytes: usize = 8192;
 // Conservative requirements of the x86 backend, including scalar bit counts
 // and float rounding. SIMD wasm instructions are not part of this profile.
 pub const cpu_features: u64 = 0x1f; // SSE2, SSE4.1, POPCNT, BMI1, LZCNT

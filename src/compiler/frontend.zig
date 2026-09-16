@@ -11,8 +11,9 @@ const MiscOpcode = @import("../runtime/interpreter/opcode.zig").MiscOpcode;
 const AtomicOpcode = @import("../runtime/interpreter/opcode.zig").AtomicOpcode;
 const leb128 = @import("../shared/utils/leb128.zig");
 const threads_feature = @import("../threads_feature.zig");
+const control = @import("control.zig");
 
-pub const LowerError = error{
+pub const LowerError = control.Error || error{
     OutOfMemory,
     InvalidBytecode,
     UnsupportedOpcode,
@@ -168,6 +169,18 @@ fn alignForwardU32(value: u32, alignment: u32) u32 {
 
 /// Lower an entire Wasm module into IR.
 pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allocator) LowerError!ir.IrModule {
+    return lowerModuleControlled(wasm_module, allocator, null);
+}
+
+pub fn lowerModuleControlled(wasm_module: *const types.WasmModule, allocator: std.mem.Allocator, budget: ?*control.Control) LowerError!ir.IrModule {
+    if (budget) |c| {
+        try c.poll();
+        if (wasm_module.functions.len > c.max_functions) return error.CompileLimitExceeded;
+        for (wasm_module.functions) |func| {
+            if (func.code.len > c.max_function_bytes or func.local_count > c.max_locals)
+                return error.CompileLimitExceeded;
+        }
+    }
     var ir_module = ir.IrModule.init(allocator);
     errdefer ir_module.deinit();
 
@@ -240,7 +253,10 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
 
     for (wasm_module.functions) |func| {
         const func_type = wasm_module.types[func.type_idx];
-        const ir_func = try lowerFunction(&func, &func_type, wasm_module, allocator);
+        if (budget) |c| try c.poll();
+        var ir_func = try lowerFunction(&func, &func_type, wasm_module, allocator);
+        errdefer ir_func.deinit();
+        if (budget) |c| try c.function(&ir_func);
         _ = try ir_module.addFunction(ir_func);
     }
 
@@ -901,7 +917,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     }
                 }
                 current_block = frame.else_block orelse {
-                    std.debug.print("wamrc: else without else_block (if-frame state desync)\n", .{});
+                    if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: else without else_block (if-frame state desync)\n", .{});
                     return error.InvalidBytecode;
                 };
                 frame.else_block = null; // consumed
@@ -1811,7 +1827,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .elem_drop = seg_idx } });
                     },
                     else => {
-                        std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
+                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
                         return error.UnsupportedOpcode;
                     },
                 }
@@ -2007,7 +2023,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     },
 
                     else => {
-                        std.debug.print("wamrc: unsupported atomic opcode 0xFE 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
+                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported atomic opcode 0xFE 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
                         return error.UnsupportedOpcode;
                     },
                 }
@@ -3446,7 +3462,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try vreg_stack.append(allocator, dest);
                     },
                     else => {
-                        std.debug.print("wamrc: unsupported SIMD opcode 0x{X}\n", .{@intFromEnum(simd_op)});
+                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported SIMD opcode 0x{X}\n", .{@intFromEnum(simd_op)});
                         return error.UnsupportedOpcode;
                     },
                 }
@@ -3781,7 +3797,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
 
             else => {
-                std.debug.print("wamrc: unsupported opcode 0x{X:0>2}\n", .{byte});
+                if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported opcode 0x{X:0>2}\n", .{byte});
                 return error.UnsupportedOpcode;
             },
         }

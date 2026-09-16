@@ -1669,6 +1669,9 @@ pub fn compileModuleCached(
 /// timing knobs; threaded through from `wamrc`'s `WAMR_AOT_CODEGEN_TIMING*`
 /// parsing so per-function / per-sub-phase costs can be attributed.
 pub const CompileOptions = struct {
+    control: ?*@import("../../control.zig").Control = null,
+    /// Native single-threaded fuel; distinct from hosted thread cancellation.
+    native_fuel: bool = false,
     codegen_timing: passes.CodegenTimingOptions = .{},
     /// #808 Lever 1: per-function spill-cost diagnostics. Off unless
     /// `WAMR_AOT_SPILL_METRIC` is set.
@@ -1740,6 +1743,7 @@ pub fn compileModuleCachedWithOptions(
     allocator: std.mem.Allocator,
     options: CompileOptions,
 ) !codegen_cache.CompileResultCached {
+    if (options.native_fuel and reuse != null) return error.UnsupportedOptions;
     var all_code: std.ArrayList(u8) = .empty;
     errdefer all_code.deinit(allocator);
     var offsets: std.ArrayList(u32) = .empty;
@@ -1788,6 +1792,7 @@ pub fn compileModuleCachedWithOptions(
     codegen_timing.printModuleBegin(ct, options.module_idx, func_count);
 
     for (ir_module.functions.items, 0..) |func, fi| {
+        if (options.control) |c| try c.function(&func);
         const func_start: u32 = @intCast(all_code.items.len);
         try offsets.append(allocator, func_start);
         const frame_attr_live = options.frame_attribution.shouldEmit(
@@ -1861,6 +1866,7 @@ pub fn compileModuleCachedWithOptions(
             cache_code_owned = try allocator.dupe(u8, hit_code);
             errdefer allocator.free(cache_code_owned);
             cache_patches_owned = try allocator.dupe(codegen_cache.FuncCallPatch, hit_patches);
+            errdefer allocator.free(cache_patches_owned);
             try all_code.appendSlice(allocator, hit_code);
             for (hit_patches) |p| {
                 try global_call_patches.append(allocator, .{
@@ -1891,8 +1897,9 @@ pub fn compileModuleCachedWithOptions(
                     .cwasm_aot_version = options.frame_attribution.cwasm_aot_version,
                     .compiler_build_id = options.frame_attribution.compiler_build_id,
                 } else null,
-                .{ .cancel_points = ir_module.spawns_threads },
+                .{ .cancel_points = ir_module.spawns_threads, .native_fuel = options.native_fuel },
             );
+            errdefer allocator.free(result.code);
             if (result.frame_attribution) |report_value| {
                 var report = report_value;
                 report.function_offset = func_start;
@@ -1917,6 +1924,10 @@ pub fn compileModuleCachedWithOptions(
             }
             cache_code_owned = result.code;
             cache_patches_owned = new_patches;
+            if (options.control) |c| {
+                if (result.code.len > c.max_code_bytes or all_code.items.len > c.max_code_bytes - result.code.len)
+                    return error.CodeLimitExceeded;
+            }
             try all_code.appendSlice(allocator, result.code);
             for (result.call_patches) |patch| {
                 try global_call_patches.append(allocator, .{
@@ -2359,6 +2370,7 @@ pub const LocalCallLowering = enum {
 };
 
 pub const FunctionCompileOptions = struct {
+    native_fuel: bool = false,
     local_call_lowering: LocalCallLowering = .direct,
     /// #616/#963: emit a `VmCtx.cancel_flag` poll at function entry and every
     /// loop header so recursive and iterative guest work both have an
@@ -2385,6 +2397,16 @@ fn emitCancelPoint(code: *emit.CodeBuffer) !void {
     try code.cmpMem32Imm8(.rbx, vmctx_cancel_flag_field, 0);
     try code.emitByte(0x74); // JE rel8
     try code.emitByte(12);
+    try emitTrapHelperCall(code, vmctx_cancel_point_fn_field);
+}
+
+fn emitFuelPoint(code: *emit.CodeBuffer) !void {
+    // sub dword ptr [rbx + cancel_flag], 1; jnz over the noreturn helper.
+    // No allocated register is clobbered on the continuing path.
+    try code.emitSlice(&.{ 0x83, 0xab });
+    try code.emitI32(vmctx_cancel_flag_field);
+    try code.emitByte(1);
+    try code.emitSlice(&.{ 0x75, 12 });
     try emitTrapHelperCall(code, vmctx_cancel_point_fn_field);
 }
 
@@ -3382,6 +3404,11 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // After push rbp: rsp=0 mod 16. After sub rsp,frame_size + N callee pushes:
     // want (frame_size + 8*N) ≡ 0 mod 16 → rsp ≡ 0 mod 16 at CALL sites.
     const frame_size: u32 = if (callee_save_count % 2 == 0) aligned else aligned | 8;
+    // Include saved registers, return address, and maximum scalar call-argument
+    // area. Fuel-profile call graphs are also acyclic and depth-limited.
+    if (options.native_fuel and frame_size + callee_save_count * 8 + 256 >
+        @import("../../../runtime/aot/native_abi.zig").max_fuel_frame_bytes)
+        return error.UnsupportedNativeFeature;
     try code.emitPrologue(frame_size);
 
     // VMContext is pinned in rbx for the whole function body (issue
@@ -3501,7 +3528,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
 
     // block_order already computed above — reuse for emission.
 
-    const cancel_headers: ?[]bool = if (options.cancel_points)
+    const cancel_headers: ?[]bool = if (options.cancel_points or options.native_fuel)
         try markLoopHeaders(func, block_order, allocator)
     else
         null;
@@ -3515,7 +3542,9 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         // Poll before the block's own instructions so function entry and
         // every back-edge cross it.
         if (cancel_headers) |headers| {
-            if (headers[block_id]) try emitCancelPoint(&code);
+            if (headers[block_id]) {
+                if (options.native_fuel) try emitFuelPoint(&code) else try emitCancelPoint(&code);
+            }
         }
         const next_block_id: ?ir.BlockId = if (order_idx + 1 < block_order.len) block_order[order_idx + 1] else null;
         for (block.instructions.items) |inst| {

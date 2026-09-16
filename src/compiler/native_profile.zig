@@ -1,7 +1,11 @@
 //! Admission policy for --profile=unikraft-x86_64. This runs before optimization:
 //! unsupported operations cannot disappear and accidentally acquire a supported
 //! runtime-contract stamp. The runtime independently validates all metadata.
-const wamr = @import("wamr");
+const wamr = struct {
+    pub const ir = @import("ir/ir.zig");
+    pub const types = @import("../runtime/common/types.zig");
+    pub const frontend = @import("frontend.zig");
+};
 const ir = wamr.ir;
 const std = @import("std");
 
@@ -98,10 +102,9 @@ test "native profile: rejects omitted element segments before source indices cha
     try std.testing.expectError(error.UnsupportedNativeFeature, validate(&module, &lowered));
 }
 
-pub fn validate(module: anytype, lowered: *const ir.IrModule) error{UnsupportedNativeFeature}!void {
-    if (lowered.has_memory64 or lowered.has_shared_memory or lowered.spawns_threads)
-        return error.UnsupportedNativeFeature;
+pub fn validateModule(module: anytype) error{UnsupportedNativeFeature}!void {
     if (module.memories.len > 1 or module.tag_types.len != 0) return error.UnsupportedNativeFeature;
+    if (module.imports.len > 64) return error.UnsupportedNativeFeature;
     for (module.memories) |memory| {
         if (memory.is_memory64 or memory.is_shared) return error.UnsupportedNativeFeature;
     }
@@ -112,7 +115,7 @@ pub fn validate(module: anytype, lowered: *const ir.IrModule) error{UnsupportedN
         if (signature.params.len > 5) return error.UnsupportedNativeFeature;
     }
     for (module.types) |signature| {
-        if (signature.params.len > 16 or signature.results.len > 1) return error.UnsupportedNativeFeature;
+        if (signature.kind != .func or signature.params.len > 16 or signature.results.len > 1) return error.UnsupportedNativeFeature;
         for (signature.params) |t| if (!t.isNumeric()) return error.UnsupportedNativeFeature;
         for (signature.results) |t| if (!t.isNumeric()) return error.UnsupportedNativeFeature;
     }
@@ -133,6 +136,12 @@ pub fn validate(module: anytype, lowered: *const ir.IrModule) error{UnsupportedN
             if (expression != null) return error.UnsupportedNativeFeature;
         }
     }
+}
+
+pub fn validate(module: anytype, lowered: *const ir.IrModule) error{UnsupportedNativeFeature}!void {
+    try validateModule(module);
+    if (lowered.has_memory64 or lowered.has_shared_memory or lowered.spawns_threads)
+        return error.UnsupportedNativeFeature;
     for (lowered.functions.items) |function| {
         if (function.has_ref_as_non_null) return error.UnsupportedNativeFeature;
         for (function.blocks.items) |block| {
@@ -246,4 +255,62 @@ pub fn validate(module: anytype, lowered: *const ir.IrModule) error{UnsupportedN
             }
         }
     }
+}
+
+/// Fuel bounds loops, not native stack depth. The optional compiler profile
+/// therefore admits only statically bounded direct call graphs.
+pub fn validateBoundedCalls(module: *const ir.IrModule, allocator: std.mem.Allocator) error{ OutOfMemory, UnsupportedNativeFeature }!void {
+    const depth = try allocator.alloc(u8, module.functions.items.len);
+    defer allocator.free(depth);
+    @memset(depth, 0);
+    for (0..depth.len) |index| _ = try callDepth(module, index, depth, 0);
+}
+
+fn callDepth(module: *const ir.IrModule, index: usize, memo: []u8, level: usize) error{UnsupportedNativeFeature}!u8 {
+    const limit = @import("../runtime/aot/native_abi.zig").max_fuel_call_depth;
+    if (level >= limit or memo[index] == 255) return error.UnsupportedNativeFeature;
+    if (memo[index] != 0) return memo[index];
+    memo[index] = 255;
+    var depth: u8 = 1;
+    for (module.functions.items[index].blocks.items) |block| {
+        for (block.instructions.items) |instruction| switch (instruction.op) {
+            .call => |call| {
+                if (call.func_idx < module.import_count) continue;
+                const target = call.func_idx - module.import_count;
+                if (target >= memo.len) return error.UnsupportedNativeFeature;
+                depth = @max(depth, 1 + try callDepth(module, target, memo, level + 1));
+            },
+            .call_indirect, .call_ref => return error.UnsupportedNativeFeature,
+            else => {},
+        };
+    }
+    if (depth > limit) return error.UnsupportedNativeFeature;
+    memo[index] = depth;
+    return depth;
+}
+
+test "native profile: rejects scalar ABI overflow before lowering" {
+    var module: wamr.types.WasmModule = .{};
+    module.types = &.{.{ .params = &([_]wamr.types.ValType{.i32} ** 17), .results = &.{} }};
+    try std.testing.expectError(error.UnsupportedNativeFeature, validateModule(&module));
+    module.types = &.{.{ .params = &([_]wamr.types.ValType{.i32} ** 6), .results = &.{} }};
+    module.imports = &.{.{ .module_name = "env", .field_name = "too_many", .kind = .function, .func_type_idx = 0 }};
+    try std.testing.expectError(error.UnsupportedNativeFeature, validateModule(&module));
+}
+
+test "native profile: fuel rejects cycles indirect calls and excessive static depth" {
+    var module = ir.IrModule.init(std.testing.allocator);
+    defer module.deinit();
+    for (0..33) |i| {
+        var func = ir.IrFunction.init(std.testing.allocator, 0, 0, 0);
+        const block = try func.newBlock();
+        if (i < 32) try func.getBlock(block).append(.{ .op = .{ .call = .{ .func_idx = @intCast(i + 1) } } });
+        try func.getBlock(block).append(.{ .op = .{ .ret = null } });
+        _ = try module.addFunction(func);
+    }
+    try std.testing.expectError(error.UnsupportedNativeFeature, validateBoundedCalls(&module, std.testing.allocator));
+    module.functions.items[0].blocks.items[0].instructions.items[0].op = .{ .call = .{ .func_idx = 0 } };
+    try std.testing.expectError(error.UnsupportedNativeFeature, validateBoundedCalls(&module, std.testing.allocator));
+    module.functions.items[0].blocks.items[0].instructions.items[0].op = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0, .elem_idx = 0 } };
+    try std.testing.expectError(error.UnsupportedNativeFeature, validateBoundedCalls(&module, std.testing.allocator));
 }
