@@ -280,6 +280,10 @@ the Linux producer times its WASI setup together with the real instantiate call.
 `Instance.load` and the C timed-load entry point remain convenience wrappers over
 these stages. Uninstantiated owners cannot start/call/grow, and an instantiation
 attempt cannot be retried after failure.
+All non-timing options are frozen at `loadModule`; changing any at instantiation
+returns `OptionsMismatch` before mapping. This also applies to additive budget
+options when integrating the opt-in JIT layer; a second stage cannot weaken
+already-admitted limits.
 
 These cover the common loader/instance implementation, not filesystem reads,
 CLI/subprocess setup, C argument adaptation or caller-owned WASI context setup.
@@ -293,6 +297,8 @@ globals. This API does not claim that unqualified repeatability.
 `Instance.restoreMemory` supports an inactive embedder's memory snapshot reset,
 including protection revocation and logical-bound restoration after growth.
 It does not reset globals/tables/passive segments or host state by itself.
+If protection revocation fails, the instance becomes non-callable and must be
+deinitialized: a failed provider may already have changed part of the mapping.
 The [Linux producer](bench/native-linux-producer.md) implements and tests that
 complete same-instance snapshot policy for the pinned workloads.
 

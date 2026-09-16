@@ -52,6 +52,8 @@ pub const Pages = struct {
     fail_reserve: bool = false,
     fail_commit: bool = false,
     fail_protect: bool = false,
+    fail_protect_after_transition: bool = false,
+    partial_protection_applied: bool = false,
     fail_clock_at: ?usize = null,
     clock_reads: usize = 0,
 
@@ -116,6 +118,12 @@ pub const Pages = struct {
             .read_write => .{ .READ = true, .WRITE = true },
             .read_execute => .{ .READ = true, .EXEC = true },
         };
+        if (permission == .none and self.fail_protect_after_transition) {
+            if (std.posix.errno(std.os.linux.mprotect(address, @min(size, 4096), prot)) != .SUCCESS)
+                return error.ProtectionFailed;
+            self.partial_protection_applied = true;
+            return error.ProtectionFailed;
+        }
         if (std.posix.errno(std.os.linux.mprotect(address, size, prot)) != .SUCCESS)
             return error.ProtectionFailed;
         if (permission == .none) {

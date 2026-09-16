@@ -14,7 +14,7 @@ pub const Value = format.Value;
 pub const HostError = error{ Unsupported, InvalidArgument, Io, OutOfMemory };
 pub const Trap = enum { out_of_bounds_memory, out_of_bounds_table, unreachable_instruction, integer_divide_by_zero, integer_overflow, invalid_conversion, unsupported_operation, bad_host_result };
 pub const Outcome = union(enum) { returned: usize, trap: Trap, exit: u32, host_error: HostError };
-pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, InvalidContinuation, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds, NotInstantiated, InvalidSnapshot };
+pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, InvalidContinuation, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds, NotInstantiated, InvalidSnapshot, OptionsMismatch };
 
 pub const HostImport = struct {
     module: []const u8,
@@ -64,6 +64,12 @@ pub const LoadTimings = extern struct {
     reserved: u32 = 0,
 };
 
+fn nonTimingOptions(options: Options) Options {
+    var admitted = options;
+    admitted.timings = null;
+    return admitted;
+}
+
 const Mapping = struct { base: [*]align(4096) u8, size: usize };
 const TableStorage = struct { pointers: []usize, signatures: []u32, size: u32, max: u32 };
 
@@ -92,6 +98,7 @@ pub const Instance = struct {
     continuation: jump.JmpBuf = undefined,
     instantiation_attempted: bool = false,
     instantiated: bool = false,
+    admitted_options: Options = .{},
 
     /// Copies input and import descriptors. Callback contexts and platform
     /// context must outlive this instance. Start functions are not executed
@@ -127,7 +134,13 @@ pub const Instance = struct {
         try native.validate();
         if (options.max_memory_pages > 65536) return error.InvalidLimits;
         const self = try allocator.create(Instance);
-        self.* = .{ .allocator = allocator, .arena = .init(allocator), .native = native, .module = .{} };
+        self.* = .{
+            .allocator = allocator,
+            .arena = .init(allocator),
+            .native = native,
+            .module = .{},
+            .admitted_options = nonTimingOptions(options),
+        };
         errdefer self.deinit();
         const a = self.arena.allocator();
         const owned = try a.dupe(u8, bytes);
@@ -138,10 +151,12 @@ pub const Instance = struct {
 
     /// Complete one instantiation attempt: bind imports, initialize memory,
     /// globals/tables and publish executable code. Never invokes guest start.
+    /// Non-timing options must exactly match those admitted by loadModule.
     /// After a failure only deinit is supported; partial work is not retried.
     pub fn instantiate(self: *Instance, imports: []const HostImport, options: Options) Error!void {
         if (self.instantiation_attempted) return error.Busy;
         self.instantiation_attempted = true;
+        if (!std.meta.eql(self.admitted_options, nonTimingOptions(options))) return error.OptionsMismatch;
         if (options.max_memory_pages > 65536) return error.InvalidLimits;
         const a = self.arena.allocator();
         const native = self.native;
@@ -331,6 +346,7 @@ pub const Instance = struct {
     /// next memory.grow commits and zeroes them normally. This is only the memory
     /// part of a reset: the embedder must also restore globals, tables, passive
     /// segment state and host/WASI state before repeating a command.
+    /// A protection failure poisons the owner; only deinit remains supported.
     pub fn restoreMemory(self: *Instance, snapshot: []const u8) Error!void {
         if (!self.instantiated) return error.NotInstantiated;
         if (self.active) return error.Busy;
@@ -341,7 +357,10 @@ pub const Instance = struct {
         } else if (snapshot.len != 0) return error.InvalidSnapshot;
         if (snapshot.len < self.vmctx.memory_size) {
             const begin: [*]align(4096) u8 = @alignCast(self.linear.?.base + snapshot.len);
-            try self.native.protect(self.native.context, begin, self.vmctx.memory_size - snapshot.len, .none);
+            self.native.protect(self.native.context, begin, self.vmctx.memory_size - snapshot.len, .none) catch |failure| {
+                self.instantiated = false;
+                return failure;
+            };
         }
         @memcpy(self.memory()[0..snapshot.len], snapshot);
         self.vmctx.memory_size = snapshot.len;

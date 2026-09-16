@@ -341,6 +341,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     var outcome: []const u8 = "error";
     var exit_code: ?u32 = null;
     var progress: runner.Session.Progress = .{};
+    var memory_reliable = true;
     var pages: linux.Pages = .{};
     var counter: allocations.Counter = .{ .child = init.gpa };
     const caller_allocator = counter.allocator();
@@ -354,6 +355,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
             if (index != 0) session.reset() catch |failure| {
                 std.debug.print("native reset failed: {s}\n", .{@errorName(failure)});
                 outcome = "error";
+                memory_reliable = false;
                 break;
             };
             const invocation = session.invoke(try json.string(workload, "export")) catch |failure| {
@@ -395,7 +397,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     try json.put(a, &result, "invocations", invocations);
     try set(a, &result, "outcome", outcome);
     try set(a, &result, "exit_code", exit_code);
-    if (samples.array.items.len == 0) {
+    if (!memory_reliable or samples.array.items.len == 0) {
         try json.put(a, &result, "memory", .null);
     } else {
         var memory = json.object(a);

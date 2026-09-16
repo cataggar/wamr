@@ -70,6 +70,8 @@ clock is used for CoreMark. These clocks are not guest-instruction counters.
   environment setup, and any module start section. The old `Instance.load`
   convenience function still performs both stages for existing embedders.
   A failed staged instantiation is not retryable: its owner must call `deinit`.
+  Non-timing options are frozen at load and must match at instantiation; a later
+  stage cannot silently change memory/table/CPU or subsequently added budget caps.
 * **First invocation:** export lookup and `_start` call through the terminal
   returned/proc_exit/trap/host-error outcome, including output callbacks.
 * **Steady invocations:** the **same instance and native code** are called again
@@ -88,6 +90,11 @@ specific reset path. Reset/snapshot costs are outside invocation timing; do not
 describe these numbers as uninterrupted process-state or end-to-end steady-state
 throughput. The snapshots consume memory, which the coverage declaration below
 explicitly excludes.
+
+If revoking protection fails, the instance is poisoned rather than assuming the
+provider left the mapping unchanged. Calls, growth and reset retries are rejected;
+only teardown is supported. The failed measurement omits memory snapshots instead
+of reporting potentially stale commitment counts.
 
 Invocation stderr and host diagnostics go to the producer's stderr, with phase
 boundaries, for private capture. Per-invocation stdout is preserved as canonical

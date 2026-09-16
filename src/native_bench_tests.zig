@@ -70,6 +70,28 @@ test "native benchmark phase convenience load preserves optional instrumentation
     try equal(@as(usize, 0), pages.reserved());
 }
 
+test "native benchmark phase-staged admission freezes every non-timing option" {
+    var pages: linux.Pages = .{};
+    const admitted: aot.Options = .{ .max_memory_pages = 8, .max_table_elements = 128 };
+    inline for (.{ "max_memory_pages", "max_table_elements", "cpu_feature_mask" }) |field| {
+        const instance = try aot.Instance.loadModule(std.testing.allocator, pages.platform(), fixtures.deterministic, admitted);
+        defer instance.deinit();
+        var changed = admitted;
+        @field(changed, field) ^= 1;
+        try std.testing.expectError(error.OptionsMismatch, instance.instantiate(&.{}, changed));
+        try equal(@as(usize, 0), pages.reserved());
+        try std.testing.expectError(error.NotInstantiated, instance.call("_start", &.{}, &.{}));
+        try std.testing.expectError(error.Busy, instance.instantiate(&.{}, admitted));
+    }
+    const instance = try aot.Instance.loadModule(std.testing.allocator, pages.platform(), fixtures.deterministic, admitted);
+    defer instance.deinit();
+    var timings: aot.LoadTimings = .{};
+    var with_timings = admitted;
+    with_timings.timings = &timings;
+    try instance.instantiate(&.{}, with_timings);
+    try expect(instance.instantiated);
+}
+
 test "native benchmark both tracked CoreMark variants real WASI clocks and CRC" {
     for ([_][]const u8{ fixtures.coremark, fixtures.nofp }) |bytes| {
         var pages: linux.Pages = .{};
@@ -109,16 +131,30 @@ test "native benchmark snapshot reset revokes grown pages and restores logical b
     const committed = pages.committed();
     try expect(session.instance.?.grow(1) != null);
     session.instance.?.memory()[size] = 0xaa;
-    pages.fail_protect = true;
-    try std.testing.expectError(error.ProtectionFailed, session.reset());
-    try equal(size + 65536, session.instance.?.memory().len);
-    try equal(@as(u8, 0xaa), session.instance.?.memory()[size]);
-    pages.fail_protect = false;
     try session.reset();
     try equal(size, session.instance.?.memory().len);
     try equal(committed, pages.committed());
     try expect(session.instance.?.grow(1) != null);
     try equal(@as(u8, 0), session.instance.?.memory()[size]);
+}
+
+test "native benchmark snapshot reset protection failure poisons even a partially changed mapping" {
+    for ([_]bool{ false, true }) |partial| {
+        var pages: linux.Pages = .{};
+        const session = try runner.Session.create(std.testing.allocator, pages.platform(), fixtures.deterministic, &.{}, &.{}, try linux.wasiClock());
+        errdefer session.deinit();
+        try expect(session.instance.?.grow(1) != null);
+        pages.fail_protect = !partial;
+        pages.fail_protect_after_transition = partial;
+        try std.testing.expectError(error.ProtectionFailed, session.reset());
+        try equal(partial, pages.partial_protection_applied);
+        try std.testing.expectError(error.NotInstantiated, session.instance.?.call("_start", &.{}, &.{}));
+        try std.testing.expectError(error.NotInstantiated, session.instance.?.start());
+        try equal(@as(?u32, null), session.instance.?.grow(1));
+        try std.testing.expectError(error.NotInstantiated, session.reset());
+        session.deinit();
+        try equal(@as(usize, 0), pages.reserved());
+    }
 }
 
 test "native benchmark failed phase clocks release loaded and mapped resources" {
