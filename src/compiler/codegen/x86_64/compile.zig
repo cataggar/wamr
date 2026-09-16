@@ -5151,9 +5151,7 @@ fn compileInstRA(
             try emitCmpEaxMemR10Disp8(code, len_off);
             try code.emitByte(0x72); // jb over_trap (rel8)
             try code.emitByte(12);
-            try code.movRegReg(param_regs[0], .r10);
-            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
-            try code.callReg(.rax);
+            try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
             // over_trap: rax still holds idx on the fall-through.
 
             // r10 = table_info[table_idx].ptr.
@@ -5295,6 +5293,9 @@ fn compileInstRA(
             try code.emitSlice(&.{ 0x0F, 0x85 }); // JNE rel32
             const notzero_patch = code.len();
             try code.emitI32(0);
+            // The RDX save misaligns the stack. Trap helpers are real ABI
+            // calls; align only these non-returning paths, not the hot divide.
+            if (rdx_in_use) try code.subRegImm32(.rsp, 8);
             try emitTrapHelperCall(code, vmctx_trap_idivz_fn_field);
             const notzero_off = code.len();
             code.patchI32(notzero_patch, @intCast(@as(i64, @intCast(notzero_off)) - @as(i64, @intCast(notzero_patch + 4))));
@@ -5331,6 +5332,7 @@ fn compileInstRA(
                             after_patch = code.len();
                             try code.emitI32(0);
                         } else {
+                            if (rdx_in_use) try code.subRegImm32(.rsp, 8);
                             try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
                         }
                         const dodiv_off = code.len();
@@ -5360,6 +5362,7 @@ fn compileInstRA(
                             after_patch = code.len();
                             try code.emitI32(0);
                         } else {
+                            if (rdx_in_use) try code.subRegImm32(.rsp, 8);
                             try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
                         }
                         const dodiv_off = code.len();

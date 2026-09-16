@@ -427,6 +427,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         const byte = code[ip];
         ip += 1;
         const op: Opcode = @enumFromInt(byte);
+        if (op == .ref_as_non_null) ir_func.has_ref_as_non_null = true;
 
         // In dead code, skip instructions until we reach a block boundary
         if (dead_code) {

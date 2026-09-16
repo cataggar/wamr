@@ -22,7 +22,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
-const supported_os = builtin.os.tag == .linux or builtin.os.tag.isDarwin();
+const supported_os = builtin.os.tag == .linux or builtin.os.tag.isDarwin() or
+    (builtin.os.tag == .freestanding and builtin.cpu.arch == .x86_64);
 const x86_64_supported = builtin.cpu.arch == .x86_64 and supported_os;
 const aarch64_supported = builtin.cpu.arch == .aarch64 and supported_os;
 

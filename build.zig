@@ -15,20 +15,28 @@ const fuzz_seed_wasms = [_][]const u8{
 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const profile = b.option(enum { hosted, @"unikraft-aot" }, "profile", "Build profile (default: hosted)") orelse .hosted;
+    const target = b.standardTargetOptions(.{
+        .default_target = if (profile == .@"unikraft-aot")
+            .{ .cpu_arch = .x86_64, .os_tag = .freestanding, .abi = .none }
+        else
+            .{},
+    });
     const optimize = b.standardOptimizeOption(.{});
-
-    const minimal_wasi_module = b.addModule("minimal-wasi", .{
-        .root_source_file = b.path("src/wasi/minimal.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const native_wasi_module = b.addModule("native-wasi", .{
-        .root_source_file = b.path("src/wasi/native_aot.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    var wasi_module_options: std.Build.Module.CreateOptions = if (profile == .@"unikraft-aot")
+        @import("build/native_aot.zig").moduleOptions(target, optimize)
+    else
+        .{ .target = target, .optimize = optimize };
+    wasi_module_options.root_source_file = b.path("src/wasi/minimal.zig");
+    const minimal_wasi_module = b.addModule("minimal-wasi", wasi_module_options);
+    wasi_module_options.root_source_file = b.path("src/wasi/native_aot.zig");
+    const native_wasi_module = b.addModule("native-wasi", wasi_module_options);
     native_wasi_module.addImport("minimal-wasi", minimal_wasi_module);
+    if (profile == .@"unikraft-aot") {
+        @import("build/native_aot.zig").build(b, target, optimize);
+        return;
+    }
+
     const minimal_wasi_test_module = b.createModule(.{
         .root_source_file = b.path("tests/minimal_wasi.zig"),
         .target = target,
@@ -458,6 +466,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
     wabt_host_module.addImport("build_options", wabt_build_options.createModule());
+    @import("build/native_aot.zig").addTests(b, wamrc, lib_module, wabt_host_module);
     const thread_fixture_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/wasi-threads/generate.zig"),
         .target = b.graph.host,
