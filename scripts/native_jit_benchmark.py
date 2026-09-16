@@ -535,20 +535,29 @@ def import_native(directory, external, *, aot, jit, images, trusted_receipt_sha2
                  base.identical(request["images"], images), "artifacts changed after native request")
     base.require(not (directory / "import.status.json").exists(), "native import already attempted; prepare a fresh request")
     os.chmod(directory, 0o700)
+    archive_errors = {}
     try:
         for name, limit in [("capture.json", MAX_RECEIPT_BYTES)] + [
                 (f"{mode}.serial", MAX_SERIAL_BYTES) for mode in MODES]:
-            with (external / name).open("rb") as source:
-                data = source.read(limit + 1)
-            base.private_write(directory / name, data)
-            base.require(len(data) <= limit, f"{name} exceeds archive bound; bounded prefix retained")
+            try:
+                with (external / name).open("rb") as source:
+                    data = source.read(limit + 1)
+                base.private_write(directory / name, data)
+            except OSError as error:
+                archive_errors[name] = f"{type(error).__name__}: {error}"
+                continue
+            if len(data) > limit:
+                archive_errors[name] = "exceeds archive bound; bounded prefix retained"
+        base.require(not archive_errors, "native archival failed; available bounded evidence retained")
         result = native_report(directory, trusted_receipt_sha256, trusted_capture_sha256)
         base.private_write(directory / "comparison.json", encoded(result))
     except (OSError, ValueError, UnicodeError) as error:
         base.private_write(directory / "import.status.json",
-                           encoded({"success": False, "error": f"{type(error).__name__}: {error}"}))
+                           encoded({"success": False, "error": f"{type(error).__name__}: {error}",
+                                    "archive_errors": archive_errors}))
         raise
-    base.private_write(directory / "import.status.json", encoded({"success": True, "error": None}))
+    base.private_write(directory / "import.status.json",
+                       encoded({"success": True, "error": None, "archive_errors": archive_errors}))
     return result
 
 

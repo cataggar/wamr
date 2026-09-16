@@ -289,6 +289,7 @@ class NativeExternalTransportTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(bench.native_report(self.directory, self.receipt_sha,
                                             bench.sha(bench.encoded(self.capture))), result)
+        self.assertEqual(bench.read_json(self.directory / "import.status.json")["archive_errors"], {})
         with self.assertRaisesRegex(ValueError, "already attempted"):
             self.import_capture()
 
@@ -374,6 +375,55 @@ class NativeExternalTransportTests(unittest.TestCase):
             self.assertEqual((self.directory / f"{mode}.serial").stat().st_mode & 0o777, 0o600)
         self.assertFalse((self.directory / "comparison.json").exists())
         self.assertFalse(bench.read_json(self.directory / "import.status.json")["success"])
+
+    def assert_failed_archive_preserves_available_inputs(self, errors, absent=()):
+        with mock.patch.object(bench, "native_report") as report:
+            with self.assertRaisesRegex(ValueError, "native archival failed"):
+                self.import_capture()
+        report.assert_not_called()
+        status = bench.read_json(self.directory / "import.status.json")
+        self.assertFalse(status["success"])
+        self.assertEqual(set(status["archive_errors"]), set(errors))
+        for name, error in errors.items():
+            self.assertIn(error, status["archive_errors"][name])
+        for name, limit in [("capture.json", bench.MAX_RECEIPT_BYTES)] + [
+                (f"{mode}.serial", bench.MAX_SERIAL_BYTES) for mode in bench.MODES]:
+            archived = self.directory / name
+            if name in absent:
+                self.assertFalse(archived.exists())
+                continue
+            with (self.external / name).open("rb") as source:
+                expected = source.read(limit + 1)
+            self.assertEqual(archived.read_bytes(), expected)
+            self.assertLessEqual(archived.stat().st_size, limit + 1)
+            self.assertEqual(archived.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.directory / "comparison.json").exists())
+        with self.assertRaisesRegex(ValueError, "already attempted"):
+            self.import_capture()
+
+    def test_oversized_capture_metadata_retains_all_available_serials(self):
+        with (self.external / "capture.json").open("r+b") as source:
+            source.truncate(bench.MAX_RECEIPT_BYTES + 4096)
+        self.assert_failed_archive_preserves_available_inputs(
+            {"capture.json": "exceeds archive bound"})
+
+    def test_missing_first_serial_retains_metadata_and_later_serials(self):
+        (self.external / "aot.serial").unlink()
+        self.assert_failed_archive_preserves_available_inputs(
+            {"aot.serial": "FileNotFoundError"}, absent=("aot.serial",))
+
+    def test_oversized_first_serial_retains_bounded_prefix_and_later_serials(self):
+        with (self.external / "aot.serial").open("r+b") as source:
+            source.truncate(bench.MAX_SERIAL_BYTES + 4096)
+        self.assert_failed_archive_preserves_available_inputs(
+            {"aot.serial": "exceeds archive bound"})
+
+    def test_multiple_archive_failures_record_each_error_and_retain_later_serials(self):
+        (self.external / "capture.json").unlink()
+        (self.external / "aot.serial").unlink()
+        self.assert_failed_archive_preserves_available_inputs(
+            {"capture.json": "FileNotFoundError", "aot.serial": "FileNotFoundError"},
+            absent=("capture.json", "aot.serial"))
 
     def test_native_raw_and_prepared_artifact_tampering_reject(self):
         self.paths["jit"].write_bytes(b"changed unit-test executable")
