@@ -1015,6 +1015,9 @@ pub const BasicBlock = struct {
 /// An IR function — the compilation unit.
 pub const IrFunction = struct {
     name: ?[]const u8 = null,
+    /// Source feature retained even when lowering erases the instruction.
+    /// Strict consumers must not infer support from the remaining scalar IR.
+    has_ref_as_non_null: bool = false,
     param_count: u32,
     result_count: u32,
     local_count: u32,

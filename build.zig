@@ -438,7 +438,6 @@ pub fn build(b: *std.Build) void {
         .name = "wamrc",
         .root_module = wamrc_module,
     });
-    @import("build/native_aot.zig").addTests(b, wamrc, lib_module);
     b.installArtifact(wamrc);
 
     // ── Spec test runner ─────────────────────────────────────────────
@@ -469,6 +468,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
     wabt_host_module.addImport("build_options", wabt_build_options.createModule());
+    @import("build/native_aot.zig").addTests(b, wamrc, lib_module, wabt_host_module);
     const thread_fixture_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/wasi-threads/generate.zig"),
         .target = b.graph.host,

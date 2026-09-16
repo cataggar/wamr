@@ -4,6 +4,7 @@
 //! not a sandbox boundary for malicious .cwasm producers.
 const std = @import("std");
 pub const abi = @import("native_abi.zig");
+pub const null_function_index = std.math.maxInt(u32);
 pub const ValType = enum(u8) { i32 = 0x7f, i64 = 0x7e, f32 = 0x7d, f64 = 0x7c };
 pub const Value = union(ValType) {
     i32: i32,
@@ -89,7 +90,7 @@ pub const Module = struct {
         for (self.elements) |e| {
             if (e.table >= self.tables.len) return error.InvalidIndex;
             for (e.indices) |index| {
-                if (index >= self.imports.len + self.functions.len) return error.InvalidIndex;
+                if (index != null_function_index and index >= self.imports.len + self.functions.len) return error.InvalidIndex;
             }
         }
         if (self.start) |index| {

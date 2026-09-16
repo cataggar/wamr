@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *std.Build.Module) void {
+pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *std.Build.Module, wabt: *std.Build.Module) void {
     const abi_tests = b.addTest(.{
         .root_module = hosted_module,
         .filters = &.{
@@ -41,10 +41,26 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
     compile_noop.addFileArg(b.path("tests/coldstart/noop.wasm"));
     compile_noop.addArg("-o");
     const no_imports = compile_noop.addOutputFileArg("native-noop.cwasm");
+    const generator_module = b.createModule(.{
+        .root_source_file = b.path("tests/unikraft-aot/generate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    generator_module.addImport("wabt", wabt);
+    const generator = b.addExecutable(.{ .name = "generate-native-aot-fixture", .root_module = generator_module });
+    const generate = b.addRunArtifact(generator);
+    generate.addFileArg(b.path("tests/unikraft-aot/tables.wat"));
+    const tables_wasm = generate.addOutputFileArg("native-tables.wasm");
+    const compile_tables = b.addRunArtifact(wamrc);
+    compile_tables.addArgs(&.{ "compile", "--target=x86_64", "--profile=unikraft-x86_64" });
+    compile_tables.addFileArg(tables_wasm);
+    compile_tables.addArg("-o");
+    const tables = compile_tables.addOutputFileArg("native-tables.cwasm");
     const files = b.addWriteFiles();
     _ = files.addCopyFile(fixture, "native-fixture.cwasm");
     _ = files.addCopyFile(no_imports, "native-noop.cwasm");
-    const fixture_module = files.add("fixture.zig", "pub const bytes = @embedFile(\"native-fixture.cwasm\");\npub const no_imports = @embedFile(\"native-noop.cwasm\");\n");
+    _ = files.addCopyFile(tables, "native-tables.cwasm");
+    const fixture_module = files.add("fixture.zig", "pub const bytes = @embedFile(\"native-fixture.cwasm\");\npub const no_imports = @embedFile(\"native-noop.cwasm\");\npub const tables = @embedFile(\"native-tables.cwasm\");\n");
     const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -84,6 +100,8 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
     fixture_step.dependOn(&install_fixture.step);
     fixture_step.dependOn(&install_wasm.step);
     fixture_step.dependOn(&b.addInstallFile(no_imports, "fixtures/native-noop.cwasm").step);
+    fixture_step.dependOn(&b.addInstallFile(tables_wasm, "fixtures/native-tables.wasm").step);
+    fixture_step.dependOn(&b.addInstallFile(tables, "fixtures/native-tables.cwasm").step);
 }
 
 pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {

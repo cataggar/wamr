@@ -5151,9 +5151,7 @@ fn compileInstRA(
             try emitCmpEaxMemR10Disp8(code, len_off);
             try code.emitByte(0x72); // jb over_trap (rel8)
             try code.emitByte(12);
-            try code.movRegReg(param_regs[0], .r10);
-            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
-            try code.callReg(.rax);
+            try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
             // over_trap: rax still holds idx on the fall-through.
 
             // r10 = table_info[table_idx].ptr.

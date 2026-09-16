@@ -96,6 +96,42 @@ fn callI32(inst: *api.Instance, name: []const u8, args: []const api.Value) !i32 
     return result[0].i32;
 }
 
+test "native AOT real API: table.get bounds traps use the actual VmCtx" {
+    var pages: Pages = .{};
+    const inst = try api.Instance.load(std.testing.allocator, pages.platform(), @import("native_fixture").tables, &.{}, .{});
+    defer inst.deinit();
+    try equal(@as(i32, 0), try callI32(inst, "is_null", &.{.{ .i32 = 0 }}));
+    try equal(@as(i32, 1), try callI32(inst, "is_null", &.{.{ .i32 = 3 }}));
+    var result: [1]api.Value = undefined;
+    for ([_]i32{ 4, -1 }) |index| {
+        try equal(api.Trap.unreachable_instruction, (try inst.call("is_null", &.{.{ .i32 = index }}, &result)).trap);
+        try equal(@as(i32, 42), try callI32(inst, "indirect", &.{.{ .i32 = 0 }}));
+    }
+}
+
+test "native AOT real API: active and passive null elements clear pointers and signatures" {
+    var pages: Pages = .{};
+    {
+        const inst = try api.Instance.load(std.testing.allocator, pages.platform(), @import("native_fixture").tables, &.{}, .{});
+        defer inst.deinit();
+        try equal(@as(i32, 42), try callI32(inst, "indirect", &.{.{ .i32 = 0 }}));
+        try equal(@as(i32, 1), try callI32(inst, "is_null", &.{.{ .i32 = 1 }}));
+        try equal(@as(usize, 0), inst.tables[0].pointers[1]);
+        try equal(@as(u32, 0), inst.tables[0].signatures[1]);
+        try equal(@as(usize, 0), (try inst.call("init", &.{ .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 2 } }, &.{})).returned);
+        try equal(@as(i32, 1), try callI32(inst, "is_null", &.{.{ .i32 = 0 }}));
+        try equal(@as(usize, 0), inst.tables[0].pointers[0]);
+        try equal(@as(u32, 0), inst.tables[0].signatures[0]);
+        try equal(@as(i32, 42), try callI32(inst, "indirect", &.{.{ .i32 = 1 }}));
+        var result: [1]api.Value = undefined;
+        try equal(api.Trap.unreachable_instruction, (try inst.call("indirect", &.{.{ .i32 = 0 }}, &result)).trap);
+        try equal(@as(usize, 0), (try inst.call("drop", &.{}, &.{})).returned);
+        try equal(api.Trap.out_of_bounds_table, (try inst.call("init", &.{ .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 1 } }, &.{})).trap);
+        try equal(@as(i32, 42), try callI32(inst, "indirect", &.{.{ .i32 = 1 }}));
+    }
+    try equal(@as(usize, 0), pages.live);
+}
+
 test "native AOT real API: add noop host import and checked signatures" {
     var pages: Pages = .{};
     const inst = try create(std.testing.allocator, &pages);

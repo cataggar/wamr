@@ -202,7 +202,10 @@ pub const Instance = struct {
         for (self.module.functions, self.hosts.len..) |f, i| self.functions[i] = @intFromPtr(self.code.?.base + f.offset);
         for (self.module.elements) |e| {
             if (e.passive) continue;
-            for (e.indices, e.offset..) |function, index| self.setTableEntry(e.table, @intCast(index), self.functions[function]);
+            for (e.indices, e.offset..) |function, index| {
+                const pointer = if (function == format.null_function_index) 0 else self.functions[function];
+                self.setTableEntry(e.table, @intCast(index), pointer);
+            }
         }
         self.vmctx.instance_ptr = @intFromPtr(self);
         self.vmctx.globals_ptr = @intFromPtr(self.globals.ptr);
@@ -425,7 +428,10 @@ fn tableInit(ctx: *abi.VmCtx, segment_table: u64, dst_src: u64, len: u32) callco
     if (table >= self.tables.len or segment >= self.module.elements.len) self.stop(.{ .trap = .out_of_bounds_table });
     const indices = if (self.dropped_elements[segment]) &.{} else self.module.elements[segment].indices;
     if (!inBounds(dst, len, self.tables[table].size) or !inBounds(src, len, indices.len)) self.stop(.{ .trap = .out_of_bounds_table });
-    for (indices[src..][0..len], dst..) |index, offset| self.setTableEntry(table, @intCast(offset), self.functions[index]);
+    for (indices[src..][0..len], dst..) |index, offset| {
+        const pointer = if (index == format.null_function_index) 0 else self.functions[index];
+        self.setTableEntry(table, @intCast(offset), pointer);
+    }
 }
 fn elementDrop(ctx: *abi.VmCtx, index: u32) callconv(.c) void {
     const self = owner(ctx);

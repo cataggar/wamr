@@ -25,6 +25,79 @@ test "native profile: rejects shared memory memory64 threads and non-scalar sign
     try std.testing.expectError(error.UnsupportedNativeFeature, validate(&module, &lowered));
 }
 
+test "native profile: rejects ref.as_non_null erased by lowering including dead code" {
+    const signature: wamr.types.FuncType = .{ .params = &.{}, .results = &.{.i32} };
+    for ([_][]const u8{
+        &.{ 0xd0, 0x70, 0xd4, 0x1a, 0x41, 0x01, 0x0b },
+        &.{ 0x00, 0xd0, 0x70, 0xd4, 0x1a, 0x41, 0x01, 0x0b },
+    }) |code| {
+        const module: wamr.types.WasmModule = .{
+            .types = &.{signature},
+            .functions = &.{.{
+                .type_idx = 0,
+                .func_type = signature,
+                .local_count = 0,
+                .locals = &.{},
+                .code = code,
+            }},
+        };
+        var lowered = try wamr.frontend.lowerModule(&module, std.testing.allocator);
+        defer lowered.deinit();
+        try std.testing.expect(lowered.functions.items[0].has_ref_as_non_null);
+        try std.testing.expectError(error.UnsupportedNativeFeature, validate(&module, &lowered));
+    }
+    // 0xd4 in an immediate is not a reference instruction.
+    const module: wamr.types.WasmModule = .{
+        .types = &.{signature},
+        .functions = &.{.{
+            .type_idx = 0,
+            .func_type = signature,
+            .local_count = 0,
+            .locals = &.{},
+            .code = &.{ 0x41, 0xd4, 0x01, 0x0b },
+        }},
+    };
+    var lowered = try wamr.frontend.lowerModule(&module, std.testing.allocator);
+    defer lowered.deinit();
+    try std.testing.expect(!lowered.functions.items[0].has_ref_as_non_null);
+    try validate(&module, &lowered);
+}
+
+test "native profile: rejects omitted element segments before source indices change" {
+    const signature: wamr.types.FuncType = .{ .params = &.{}, .results = &.{} };
+    var segments = [_]wamr.types.ElemSegment{
+        .{ .table_idx = 0, .offset = null, .kind = .func_ref, .func_indices = &.{0}, .is_declarative = true },
+        .{ .table_idx = 0, .offset = null, .kind = .func_ref, .func_indices = &.{ null, 0 }, .is_passive = true },
+    };
+    const module: wamr.types.WasmModule = .{
+        .types = &.{signature},
+        .tables = &.{.{ .elem_type = .funcref, .limits = .{ .min = 2 } }},
+        .elements = &segments,
+        .functions = &.{.{
+            .type_idx = 0,
+            .func_type = signature,
+            .local_count = 0,
+            .locals = &.{},
+            // table.init element 1, then elem.drop element 1.
+            .code = &.{ 0x41, 0, 0x41, 0, 0x41, 0, 0xfc, 0x0c, 1, 0, 0xfc, 0x0d, 1, 0x0b },
+        }},
+    };
+    var lowered = try wamr.frontend.lowerModule(&module, std.testing.allocator);
+    defer lowered.deinit();
+    try std.testing.expectError(error.UnsupportedNativeFeature, validate(&module, &lowered));
+    segments[0].is_declarative = false;
+    segments[0].is_passive = true;
+    try validate(&module, &lowered);
+    segments[0].is_passive = false;
+    try std.testing.expectError(error.UnsupportedNativeFeature, validate(&module, &lowered));
+    segments[0].offset = .{ .global_get = 0 };
+    try std.testing.expectError(error.UnsupportedNativeFeature, validate(&module, &lowered));
+    segments[0].offset = .{ .i32_const = 0 };
+    try validate(&module, &lowered);
+    segments[0].elem_exprs = &.{.{ .global_get = 0 }};
+    try std.testing.expectError(error.UnsupportedNativeFeature, validate(&module, &lowered));
+}
+
 pub fn validate(module: anytype, lowered: *const ir.IrModule) error{UnsupportedNativeFeature}!void {
     if (lowered.has_memory64 or lowered.has_shared_memory or lowered.spawns_threads)
         return error.UnsupportedNativeFeature;
@@ -47,7 +120,21 @@ pub fn validate(module: anytype, lowered: *const ir.IrModule) error{UnsupportedN
     for (module.tables) |t| {
         if (t.elem_type != .funcref or t.is_table64 or t.init_expr != null) return error.UnsupportedNativeFeature;
     }
+    for (module.elements) |segment| {
+        // The existing container emitter omits declarative segments, which
+        // would change the source index space used by table.init/elem.drop.
+        if (segment.is_declarative) return error.UnsupportedNativeFeature;
+        if (segment.kind != .func_ref) return error.UnsupportedNativeFeature;
+        if (!segment.is_passive) {
+            const offset = segment.offset orelse return error.UnsupportedNativeFeature;
+            if (offset != .i32_const) return error.UnsupportedNativeFeature;
+        }
+        for (segment.elem_exprs) |expression| {
+            if (expression != null) return error.UnsupportedNativeFeature;
+        }
+    }
     for (lowered.functions.items) |function| {
+        if (function.has_ref_as_non_null) return error.UnsupportedNativeFeature;
         for (function.blocks.items) |block| {
             for (block.instructions.items) |instruction| {
                 switch (instruction.op) {

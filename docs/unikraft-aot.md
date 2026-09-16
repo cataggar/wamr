@@ -58,8 +58,15 @@ change its target label. The explicit compiler profile checks the module and
 pre-optimization IR against its supported feature policy before emission.
 Unsupported atomics/threads, SIMD, EH, memory64, multiple memories, non-function
 imports, reference-valued signatures, or unsupported IR operations fail closed.
+The policy also rejects source `ref.as_non_null` (including instructions erased
+by lowering), declarative element segments, runtime element expressions and
+nonconstant active-element offsets. These must not silently lose traps or
+change the element index space during emission. Active and passive funcref
+segments support both function indices and null entries.
 The same target also compiles the existing 36-byte `tests/coldstart/noop.wasm`
 as `native-noop.cwasm`, exercising the production C API without any imports.
+`tables.wat` uses the existing pinned WABT assembler and matching wamrc to
+produce `native-tables.wasm`/`.cwasm` for reference-table regressions.
 
 Retain the source revision, `zig version`, host compiler hash/build options,
 fixture-source hash, wasm hash, cwasm hash, native library hash and image hash
@@ -72,6 +79,8 @@ sha256sum tests/unikraft-aot/fixture.zig \
   zig-out/bin/wamrc \
   zig-out/fixtures/native-fixture.wasm zig-out/fixtures/native-fixture.cwasm \
   tests/coldstart/noop.wasm zig-out/fixtures/native-noop.cwasm \
+  tests/unikraft-aot/tables.wat zig-out/fixtures/native-tables.wasm \
+  zig-out/fixtures/native-tables.cwasm \
   zig-out/lib/libwamr-aot.a
 ```
 
@@ -273,9 +282,17 @@ The real API fixture covers exact i32/i64/f64 results, noop, host imports and
 indirect calls; memory load/store/growth; OOB, unreachable, divide/overflow
 traps; checked API errors; terminal exit/host error with cleanup; C ABI byte
 ownership; every allocator failure and reserve/commit/protect rollback.
+Table tests execute in-range and out-of-range `table.get`, active/passive null
+initialization, indirect calls, `table.init` and dropped-segment traps, and
+check that null entries clear both pointer and signature storage. Existing
+backend table-read/indirect traps report `unreachable_instruction`; runtime
+table-mutation bounds checks report `out_of_bounds_table`.
 Format tests reject incompatible metadata, malformed section bounds, duplicate
 sections and invalid indices, including all interior truncations. ABI tests
 compare **every VmCtx field offset** with the hosted runtime.
+Compiler tests lower real source opcodes before checking admission, including
+erased reference instructions, opcode-valued immediates and element index
+preservation. These policy tests also run with ordinary compiler unit tests.
 
 Linux x86_64 runs directly. A non-x86 build host needs an already-provisioned
 `qemu-x86_64 -cpu max` to execute these Linux test binaries; the test target does

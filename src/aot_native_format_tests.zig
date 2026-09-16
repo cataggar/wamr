@@ -43,6 +43,20 @@ test "native format: matching host-wamrc fixture metadata is checked" {
     }
     try std.testing.expect(found_add);
 }
+test "native format: null funcref sentinel is not an out of range function index" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var module = try format.load(@import("native_fixture").tables, arena.allocator(), format.abi.cpu_features);
+    try std.testing.expectEqual(@as(usize, 2), module.elements.len);
+    try std.testing.expectEqualSlices(u32, &.{ 0, format.null_function_index }, module.elements[0].indices);
+    try std.testing.expectEqualSlices(u32, &.{ format.null_function_index, 0 }, module.elements[1].indices);
+    try std.testing.expect(!module.elements[0].passive);
+    try std.testing.expect(module.elements[1].passive);
+    var invalid = module.elements[0];
+    invalid.indices = &.{@intCast(module.functions.len + module.imports.len)};
+    module.elements = &.{invalid};
+    try std.testing.expectError(error.InvalidIndex, module.validate());
+}
 test "native format: format runtime ABI target and CPU rejection" {
     const cases = [_]struct { offset: usize, value: u8, expected: anyerror }{
         .{ .offset = 0, .value = 1, .expected = error.InvalidMagic },
