@@ -36,9 +36,15 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
     compile.addFileArg(wasm.getEmittedBin());
     compile.addArg("-o");
     const fixture = compile.addOutputFileArg("native-fixture.cwasm");
+    const compile_noop = b.addRunArtifact(wamrc);
+    compile_noop.addArgs(&.{ "compile", "--target=x86_64", "--profile=unikraft-x86_64" });
+    compile_noop.addFileArg(b.path("tests/coldstart/noop.wasm"));
+    compile_noop.addArg("-o");
+    const no_imports = compile_noop.addOutputFileArg("native-noop.cwasm");
     const files = b.addWriteFiles();
     _ = files.addCopyFile(fixture, "native-fixture.cwasm");
-    const fixture_module = files.add("fixture.zig", "pub const bytes = @embedFile(\"native-fixture.cwasm\");\n");
+    _ = files.addCopyFile(no_imports, "native-noop.cwasm");
+    const fixture_module = files.add("fixture.zig", "pub const bytes = @embedFile(\"native-fixture.cwasm\");\npub const no_imports = @embedFile(\"native-noop.cwasm\");\n");
     const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -77,6 +83,7 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
     const install_wasm = b.addInstallFile(wasm.getEmittedBin(), "fixtures/native-fixture.wasm");
     fixture_step.dependOn(&install_fixture.step);
     fixture_step.dependOn(&install_wasm.step);
+    fixture_step.dependOn(&b.addInstallFile(no_imports, "fixtures/native-noop.cwasm").step);
 }
 
 pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {

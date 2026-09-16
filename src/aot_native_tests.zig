@@ -310,6 +310,24 @@ fn cHost(_: ?*anyopaque, _: *api.HostContext, args: [*]const c_api.CValue, count
     }
     return 1;
 }
+test "native C ABI accepts empty null arrays for the no-import fixture" {
+    var state: CState = .{ .allocator = std.testing.allocator };
+    const config = state.config();
+    const no_imports = @import("native_fixture").no_imports;
+    var handle: ?*c_api.Handle = null;
+    try equal(@as(u32, 0), c_api.wamr_aot_load(&config, no_imports.ptr, no_imports.len, null, 0, &handle).kind);
+    const result = c_api.wamr_aot_call(handle.?, "_start", 6, null, 0, null, 0);
+    try equal(@as(u32, 0), result.kind);
+    try equal(@as(usize, 0), result.count);
+    const invalid = c_api.wamr_aot_call(handle.?, "_start", 6, null, 1, null, 0);
+    try equal(@as(u32, 4), invalid.kind);
+    try std.testing.expectEqualStrings("InvalidArgument", std.mem.span(invalid.error_name.?));
+    c_api.wamr_aot_destroy(handle.?);
+    try equal(@as(usize, 0), state.pages.live);
+    try equal(@as(u32, 4), c_api.wamr_aot_load(&config, null, 1, null, 0, &handle).kind);
+    try equal(@as(?*c_api.Handle, null), handle);
+}
+
 test "native C ABI executes exact typed result and retains copied artifact ownership" {
     var state: CState = .{ .allocator = std.testing.allocator };
     const config = state.config();

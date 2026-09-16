@@ -58,6 +58,8 @@ change its target label. The explicit compiler profile checks the module and
 pre-optimization IR against its supported feature policy before emission.
 Unsupported atomics/threads, SIMD, EH, memory64, multiple memories, non-function
 imports, reference-valued signatures, or unsupported IR operations fail closed.
+The same target also compiles the existing 36-byte `tests/coldstart/noop.wasm`
+as `native-noop.cwasm`, exercising the production C API without any imports.
 
 Retain the source revision, `zig version`, host compiler hash/build options,
 fixture-source hash, wasm hash, cwasm hash, native library hash and image hash
@@ -69,6 +71,7 @@ zig version
 sha256sum tests/unikraft-aot/fixture.zig \
   zig-out/bin/wamrc \
   zig-out/fixtures/native-fixture.wasm zig-out/fixtures/native-fixture.cwasm \
+  tests/coldstart/noop.wasm zig-out/fixtures/native-noop.cwasm \
   zig-out/lib/libwamr-aot.a
 ```
 
@@ -159,6 +162,11 @@ const outcome = try instance.call("add",
     &.{ .{ .i32 = 20 }, .{ .i32 = 22 } }, &results);
 // Only read results[0] if outcome == .returned and outcome.returned == 1.
 ```
+
+C callers may pass NULL array/string pointers when the corresponding length is
+zero, including no-import modules and zero-argument/zero-result exports. NULL
+with a nonzero length returns `InvalidArgument`; mandatory platform/configuration,
+handle and output objects must still be valid.
 
 Load copies caller bytes and resolves every required import against its full
 module/name/parameter/result signature before mapping executable code. Export

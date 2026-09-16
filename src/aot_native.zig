@@ -16,13 +16,13 @@ pub const Config = extern struct {
 };
 pub const CValue = extern struct { kind: u32, reserved: u32 = 0, bits: u64 };
 pub const CImport = extern struct {
-    module: [*]const u8,
+    module: ?[*]const u8,
     module_len: usize,
-    name: [*]const u8,
+    name: ?[*]const u8,
     name_len: usize,
-    params: [*]const u8,
+    params: ?[*]const u8,
     param_count: usize,
-    results: [*]const u8,
+    results: ?[*]const u8,
     result_count: usize,
     context: ?*anyopaque,
     callback: *const fn (?*anyopaque, *aot.HostContext, [*]const CValue, usize, [*]CValue, usize) callconv(.c) u32,
@@ -43,17 +43,19 @@ pub export fn wamr_aot_contract_version() u32 {
 
 /// Config and CImport descriptors (including strings/signatures/contexts) must
 /// remain alive until destroy. Bytes are copied. On failure out is null.
-pub export fn wamr_aot_load(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]const CImport, import_count: usize, out: *?*Handle) Result {
+pub export fn wamr_aot_load(config: *const Config, bytes: ?[*]const u8, length: usize, imports: ?[*]const CImport, import_count: usize, out: *?*Handle) Result {
     return load(config, bytes, length, imports, import_count, out, null);
 }
 
-pub export fn wamr_aot_load_timed(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]const CImport, import_count: usize, out: *?*Handle, timings: *aot.LoadTimings) Result {
+pub export fn wamr_aot_load_timed(config: *const Config, bytes: ?[*]const u8, length: usize, imports: ?[*]const CImport, import_count: usize, out: *?*Handle, timings: *aot.LoadTimings) Result {
     timings.* = .{};
     return load(config, bytes, length, imports, import_count, out, timings);
 }
 
-fn load(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]const CImport, import_count: usize, out: *?*Handle, timings: ?*aot.LoadTimings) Result {
+fn load(config: *const Config, bytes: ?[*]const u8, length: usize, imports: ?[*]const CImport, import_count: usize, out: *?*Handle, timings: ?*aot.LoadTimings) Result {
     out.* = null;
+    const input = checkedSlice(u8, bytes, length) orelse return failure(error.InvalidArgument);
+    const input_imports = checkedSlice(CImport, imports, import_count) orelse return failure(error.InvalidArgument);
     const allocator = makeAllocator(config);
     const handle = allocator.create(Handle) catch |err| return failure(err);
     const host_imports = allocator.alloc(aot.HostImport, import_count) catch |err| {
@@ -61,28 +63,44 @@ fn load(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]co
         return failure(err);
     };
     defer allocator.free(host_imports);
-    for (imports[0..import_count], host_imports) |*imp, *host| {
+    for (input_imports, host_imports) |*imp, *host| {
         if (imp.param_count > 5 or imp.result_count > 1) {
             allocator.destroy(handle);
             return failure(error.UnsupportedFeature);
         }
-        for (imp.params[0..imp.param_count]) |t| {
+        const module = checkedSlice(u8, imp.module, imp.module_len) orelse {
+            allocator.destroy(handle);
+            return failure(error.InvalidArgument);
+        };
+        const name = checkedSlice(u8, imp.name, imp.name_len) orelse {
+            allocator.destroy(handle);
+            return failure(error.InvalidArgument);
+        };
+        const params = checkedSlice(u8, imp.params, imp.param_count) orelse {
+            allocator.destroy(handle);
+            return failure(error.InvalidArgument);
+        };
+        const results = checkedSlice(u8, imp.results, imp.result_count) orelse {
+            allocator.destroy(handle);
+            return failure(error.InvalidArgument);
+        };
+        for (params) |t| {
             _ = std.enums.fromInt(aot.ValType, t) orelse {
                 allocator.destroy(handle);
                 return failure(error.UnsupportedFeature);
             };
         }
-        for (imp.results[0..imp.result_count]) |t| {
+        for (results) |t| {
             _ = std.enums.fromInt(aot.ValType, t) orelse {
                 allocator.destroy(handle);
                 return failure(error.UnsupportedFeature);
             };
         }
         host.* = .{
-            .module = imp.module[0..imp.module_len],
-            .name = imp.name[0..imp.name_len],
-            .params = @ptrCast(imp.params[0..imp.param_count]),
-            .results = @ptrCast(imp.results[0..imp.result_count]),
+            .module = module,
+            .name = name,
+            .params = @ptrCast(params),
+            .results = @ptrCast(results),
             .context = @ptrCast(@constCast(imp)),
             .callback = hostCall,
         };
@@ -97,7 +115,7 @@ fn load(config: *const Config, bytes: [*]const u8, length: usize, imports: [*]co
     };
     handle.* = .{
         .config = config,
-        .instance = aot.Instance.load(allocator, native, bytes[0..length], host_imports, .{
+        .instance = aot.Instance.load(allocator, native, input, host_imports, .{
             .max_memory_pages = config.max_memory_pages,
             .max_table_elements = config.max_table_elements,
             .timings = timings,
@@ -118,16 +136,19 @@ pub export fn wamr_aot_destroy(handle: *Handle) void {
 pub export fn wamr_aot_start(handle: *Handle) Result {
     return outcome(handle.instance.start() catch |err| return failure(err));
 }
-pub export fn wamr_aot_call(handle: *Handle, name: [*]const u8, name_len: usize, args: [*]const CValue, arg_count: usize, results: [*]CValue, result_capacity: usize) Result {
+pub export fn wamr_aot_call(handle: *Handle, name: ?[*]const u8, name_len: usize, args: ?[*]const CValue, arg_count: usize, results: ?[*]CValue, result_capacity: usize) Result {
     if (arg_count > 16) return failure(error.ArgumentCountMismatch);
+    const export_name = checkedSlice(u8, name, name_len) orelse return failure(error.InvalidArgument);
+    const arguments = checkedSlice(CValue, args, arg_count) orelse return failure(error.InvalidArgument);
+    if (result_capacity != 0 and results == null) return failure(error.InvalidArgument);
     var values: [16]aot.Value = undefined;
-    for (args[0..arg_count], 0..) |arg, i| {
+    for (arguments, 0..) |arg, i| {
         const t = std.enums.fromInt(aot.ValType, std.math.cast(u8, arg.kind) orelse return failure(error.ArgumentTypeMismatch)) orelse return failure(error.ArgumentTypeMismatch);
         values[i] = aot.Value.fromRaw(t, arg.bits);
     }
     var returned: [1]aot.Value = undefined;
-    const result = handle.instance.call(name[0..name_len], values[0..arg_count], returned[0..@min(result_capacity, 1)]) catch |err| return failure(err);
-    if (result == .returned and result.returned == 1) results[0] = .{ .kind = @intFromEnum(std.meta.activeTag(returned[0])), .bits = returned[0].raw() };
+    const result = handle.instance.call(export_name, values[0..arg_count], returned[0..@min(result_capacity, 1)]) catch |err| return failure(err);
+    if (result == .returned and result.returned == 1) results.?[0] = .{ .kind = @intFromEnum(std.meta.activeTag(returned[0])), .bits = returned[0].raw() };
     return outcome(result);
 }
 pub export fn wamr_aot_memory(handle: *Handle, length: *usize) [*]u8 {
@@ -146,6 +167,10 @@ pub export fn wamr_aot_host_clock(context: *aot.HostContext, ns: *u64) c_int {
 }
 pub export fn wamr_aot_host_exit(context: *aot.HostContext, code: u32) void {
     context.terminate(code);
+}
+fn checkedSlice(comptime T: type, pointer: ?[*]const T, length: usize) ?[]const T {
+    if (length == 0) return &.{};
+    return (pointer orelse return null)[0..length];
 }
 fn failure(err: anyerror) Result {
     return .{ .kind = 4, .error_name = @errorName(err).ptr };

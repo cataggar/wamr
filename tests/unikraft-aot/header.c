@@ -17,3 +17,9 @@ wamr_aot_result header_call(wamr_aot_handle *instance)
     return wamr_aot_call(instance, (const uint8_t *)"add", 3,
                          args, 2, &result, 1);
 }
+
+wamr_aot_result header_noop(wamr_aot_handle *instance)
+{
+    return wamr_aot_call(instance, (const uint8_t *)"_start", 6,
+                         NULL, 0, NULL, 0);
+}

@@ -84,7 +84,10 @@ typedef struct {
 uint32_t wamr_aot_contract_version(void);
 /* Trusted matching-wamrc artifacts only, not arbitrary native code. Input bytes
  * are copied; out is null on failure. Start is explicit and runs at most once.
- * Limits are mandatory: zero permits zero pages/elements, not "unlimited". */
+ * Limits are mandatory: zero permits zero pages/elements, not "unlimited".
+ * Array/string pointers may be NULL only when their corresponding length is 0.
+ * Config, handle, output-handle, timing and callback/context objects must be
+ * valid and obey their documented lifetimes. */
 wamr_aot_result wamr_aot_load(const wamr_aot_config *, const uint8_t *, size_t,
                             const wamr_aot_import *, size_t, wamr_aot_handle **out);
 /* Uses the configured monotonic clock at real internal phase boundaries.
