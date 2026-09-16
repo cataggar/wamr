@@ -1,5 +1,11 @@
 # CoreMark Benchmark
 
+For matched Linux/native Unikraft AOT collection, use the existing host harness's
+[`native-*` evidence adapter](../../../docs/bench/unikraft-native.md). It also pins
+`coremark_wasi_nofp.wasm`, keeps guest phase timers separate from host observation,
+and requires exact native image and memory receipts. Native producers and paired
+real measurements remain integration work; software tests are explicitly synthetic.
+
 [CoreMark](https://www.eembc.org/coremark) is a simple processor benchmark. This directory
 builds and runs CoreMark using Zig's cross-compiler for both native and wasm32-wasi targets.
 
