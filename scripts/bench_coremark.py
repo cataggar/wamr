@@ -11,6 +11,8 @@ Usage
     scripts/bench_coremark.py --wasmtime-baseline auto --wasmtime /path/to/wasmtime
     scripts/bench_coremark.py --profile ci --min-delta-pct=-5
     scripts/bench_coremark.py --optimize both
+    scripts/bench_coremark.py native-plan --help
+    scripts/bench_coremark.py native-report --help
 """
 
 from __future__ import annotations
@@ -1869,9 +1871,18 @@ def profile_label(
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1].startswith("native-"):
+        from native_benchmark import main as native_main
+
+        return native_main(sys.argv[1:])
     p = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Native Linux/Unikraft evidence: native-plan, native-request, "
+            "native-capture, native-import, native-report (each accepts --help).\n"
+            "See docs/bench/unikraft-native.md; guest phases require a native embedding producer."
+        ),
     )
     p.add_argument("--baseline", default="origin/main", help="WAMR baseline git ref")
     p.add_argument("--target", default="HEAD", help="WAMR target git ref")
