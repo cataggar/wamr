@@ -14,7 +14,7 @@ pub const Value = format.Value;
 pub const HostError = error{ Unsupported, InvalidArgument, Io, OutOfMemory };
 pub const Trap = enum { out_of_bounds_memory, out_of_bounds_table, unreachable_instruction, integer_divide_by_zero, integer_overflow, invalid_conversion, unsupported_operation, bad_host_result };
 pub const Outcome = union(enum) { returned: usize, trap: Trap, exit: u32, host_error: HostError };
-pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, InvalidContinuation, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds };
+pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, InvalidContinuation, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds, NotInstantiated, InvalidSnapshot, OptionsMismatch };
 
 pub const HostImport = struct {
     module: []const u8,
@@ -52,7 +52,8 @@ pub const Options = struct {
     cpu_feature_mask: u64 = std.math.maxInt(u64),
     /// Opt-in measurements from the caller's monotonic clock. Bit 0 of
     /// completed marks load_ns valid, bit 1 marks instantiate_ns valid.
-    /// No clock reads or timing claims are made when this is null.
+    /// Used by the load convenience method. Explicit staged callers time their
+    /// own loadModule/instantiate calls. Null adds no clock reads.
     timings: ?*LoadTimings = null,
 };
 
@@ -62,6 +63,12 @@ pub const LoadTimings = extern struct {
     completed: u32 = 0,
     reserved: u32 = 0,
 };
+
+fn nonTimingOptions(options: Options) Options {
+    var admitted = options;
+    admitted.timings = null;
+    return admitted;
+}
 
 const Mapping = struct { base: [*]align(4096) u8, size: usize };
 const TableStorage = struct { pointers: []usize, signatures: []u32, size: u32, max: u32 };
@@ -89,6 +96,9 @@ pub const Instance = struct {
     start_failed: bool = false,
     pending: ?Outcome = null,
     continuation: jump.JmpBuf = undefined,
+    instantiation_attempted: bool = false,
+    instantiated: bool = false,
+    admitted_options: Options = .{},
 
     /// Copies input and import descriptors. Callback contexts and platform
     /// context must outlive this instance. Start functions are not executed
@@ -99,13 +109,57 @@ pub const Instance = struct {
         try native.validate();
         if (options.max_memory_pages > 65536) return error.InvalidLimits;
         const load_start = if (options.timings != null) try native.monotonicNs() else 0;
+        const self = try loadModule(allocator, native, bytes, options);
+        errdefer self.deinit();
+        const instantiate_start = if (options.timings) |timings| blk: {
+            const now = try native.monotonicNs();
+            timings.load_ns = std.math.sub(u64, now, load_start) catch return error.ClockFailed;
+            timings.completed = 1;
+            break :blk now;
+        } else 0;
+        try self.instantiate(imports, options);
+        if (options.timings) |timings| {
+            const ready = try native.monotonicNs();
+            timings.instantiate_ns = std.math.sub(u64, ready, instantiate_start) catch return error.ClockFailed;
+            timings.completed = 3;
+        }
+        return self;
+    }
+
+    /// Staged load: copy and validate the in-memory native artifact. This does
+    /// not allocate executable/guest mappings or resolve imports. The returned
+    /// owner must be deinitialized even if instantiate subsequently fails.
+    pub fn loadModule(allocator: std.mem.Allocator, native: Platform, bytes: []const u8, options: Options) Error!*Instance {
+        if (comptime builtin.cpu.arch != .x86_64 or builtin.os.tag == .windows) return error.UnsupportedTarget;
+        try native.validate();
+        if (options.max_memory_pages > 65536) return error.InvalidLimits;
         const self = try allocator.create(Instance);
-        self.* = .{ .allocator = allocator, .arena = .init(allocator), .native = native, .module = .{} };
+        self.* = .{
+            .allocator = allocator,
+            .arena = .init(allocator),
+            .native = native,
+            .module = .{},
+            .admitted_options = nonTimingOptions(options),
+        };
         errdefer self.deinit();
         const a = self.arena.allocator();
         const owned = try a.dupe(u8, bytes);
         self.module = try format.load(owned, a, platform.detectedCpuFeatures() & options.cpu_feature_mask);
         if (self.module.imports.len > max_imports) return error.TooManyImports;
+        return self;
+    }
+
+    /// Complete one instantiation attempt: bind imports, initialize memory,
+    /// globals/tables and publish executable code. Never invokes guest start.
+    /// Non-timing options must exactly match those admitted by loadModule.
+    /// After a failure only deinit is supported; partial work is not retried.
+    pub fn instantiate(self: *Instance, imports: []const HostImport, options: Options) Error!void {
+        if (self.instantiation_attempted) return error.Busy;
+        self.instantiation_attempted = true;
+        if (!std.meta.eql(self.admitted_options, nonTimingOptions(options))) return error.OptionsMismatch;
+        if (options.max_memory_pages > 65536) return error.InvalidLimits;
+        const a = self.arena.allocator();
+        const native = self.native;
         self.hosts = try a.alloc(HostImport, self.module.imports.len);
         self.host_pointers = try a.alloc(usize, self.hosts.len);
         for (self.module.imports, 0..) |required, i| {
@@ -128,14 +182,6 @@ pub const Instance = struct {
             self.hosts[i] = host;
             self.host_pointers[i] = @intFromPtr(import_pointers[i]);
         }
-        // Metadata and required-import validation are complete. Everything
-        // below allocates/initializes the executable instance, not the loader.
-        const instantiate_start = if (options.timings) |timings| blk: {
-            const now = try native.monotonicNs();
-            timings.load_ns = std.math.sub(u64, now, load_start) catch return error.ClockFailed;
-            timings.completed = 1;
-            break :blk now;
-        } else 0;
         self.globals = try a.alloc(u64, self.module.globals.len);
         for (self.module.globals, self.globals) |g, *bits| bits.* = g.bits;
         self.signatures = try a.alloc(u32, self.module.signatures.len);
@@ -237,12 +283,7 @@ pub const Instance = struct {
         self.vmctx.lazy_compile_fn = @intFromPtr(&trapUnsupported);
         self.vmctx.trap_unaligned_fn = @intFromPtr(&trapUnsupported);
         self.vmctx.cancel_point_fn = @intFromPtr(&trapUnsupported);
-        if (options.timings) |timings| {
-            const ready = try native.monotonicNs();
-            timings.instantiate_ns = std.math.sub(u64, ready, instantiate_start) catch return error.ClockFailed;
-            timings.completed = 3;
-        }
-        return self;
+        self.instantiated = true;
     }
 
     /// The caller must serialize access and must not destroy an active instance.
@@ -261,6 +302,7 @@ pub const Instance = struct {
     }
 
     pub fn grow(self: *Instance, delta: u32) ?u32 {
+        if (!self.instantiated) return null;
         const old = self.vmctx.memory_pages;
         if (self.module.memory == null) return null;
         if (delta == 0) return old;
@@ -277,6 +319,7 @@ pub const Instance = struct {
     }
 
     pub fn start(self: *Instance) Error!Outcome {
+        if (!self.instantiated) return error.NotInstantiated;
         if (self.active) return error.Busy;
         if (self.started) return error.Busy;
         self.started = true;
@@ -289,12 +332,38 @@ pub const Instance = struct {
     }
 
     pub fn call(self: *Instance, name: []const u8, args: []const Value, results: []Value) Error!Outcome {
+        if (!self.instantiated) return error.NotInstantiated;
         if (self.start_failed) return error.StartFailed;
         if (self.module.start != null and !self.started) return error.StartRequired;
         for (self.module.exports) |e| {
             if (e.kind == 0 and std.mem.eql(u8, name, e.name)) return self.invoke(e.index, args, results);
         }
         return error.FunctionNotFound;
+    }
+
+    /// Restore a caller-owned linear-memory snapshot on this same inactive
+    /// instance. Grown pages are revoked before restoring logical bounds; the
+    /// next memory.grow commits and zeroes them normally. This is only the memory
+    /// part of a reset: the embedder must also restore globals, tables, passive
+    /// segment state and host/WASI state before repeating a command.
+    /// A protection failure poisons the owner; only deinit remains supported.
+    pub fn restoreMemory(self: *Instance, snapshot: []const u8) Error!void {
+        if (!self.instantiated) return error.NotInstantiated;
+        if (self.active) return error.Busy;
+        if (snapshot.len % 65536 != 0 or snapshot.len > self.vmctx.memory_size)
+            return error.InvalidSnapshot;
+        if (self.module.memory) |m| {
+            if (snapshot.len / 65536 < m.min) return error.InvalidSnapshot;
+        } else if (snapshot.len != 0) return error.InvalidSnapshot;
+        if (snapshot.len < self.vmctx.memory_size) {
+            const begin: [*]align(4096) u8 = @alignCast(self.linear.?.base + snapshot.len);
+            self.instantiated = false;
+            try self.native.protect(self.native.context, begin, self.vmctx.memory_size - snapshot.len, .none);
+        }
+        @memcpy(self.memory()[0..snapshot.len], snapshot);
+        self.vmctx.memory_size = snapshot.len;
+        self.vmctx.memory_pages = @intCast(snapshot.len / 65536);
+        self.instantiated = true;
     }
 
     fn invoke(self: *Instance, index: u32, args: []const Value, results: []Value) Error!Outcome {

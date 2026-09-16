@@ -19,9 +19,14 @@ The host can verify local artifact bytes and image receipts, generate a counterb
 plan, export per-run requests, launch a supplied **Linux embedding producer**, import
 native serial evidence, validate every result, and produce a paired JSON report.
 The Python adapter does not implement an embedding runner or obtain native runtime
-phase timers by timing a subprocess. The separately owned Linux and Unikraft native
-embedding producers must implement the contract below before their measurements
-can be accepted.
+phase timers by timing a subprocess. The separate
+[compiler-free Linux embedding producer](native-linux-producer.md) supplies real
+API phase clocks and qualified same-instance snapshot-reset execution. Native
+Unikraft image integration and both targets' hardware/deployment qualification
+remain necessary before real paired measurements can be collected.
+Linux measurement binds the explicit version 2 snapshot-replay policy to requests,
+receipts and results, with separate snapshot setup/reset costs and retained partial
+failure evidence. It rejects warm-instance or version 1 declarations for this path.
 Standalone parser/capture tests do not depend on those APIs.
 
 Concrete integration dependencies identified during the native API handoff:

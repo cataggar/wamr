@@ -60,7 +60,7 @@ jobs:
       - name: Compiler-free native AOT contract and execution
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
-          zig build test-native-aot test-native-aot-abi -j2 --summary all
+          zig build test-native-aot test-native-aot-abi test-native-bench -j2 --summary all
           zig build -Dprofile=unikraft-aot -Doptimize=ReleaseSafe -j2 --summary all
           zig cc -target x86_64-freestanding-none -ffreestanding -std=c11 -Werror \
             -Iinclude -c tests/unikraft-aot/header.c -o .zig-cache/native-header.o
