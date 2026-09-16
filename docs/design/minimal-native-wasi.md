@@ -39,10 +39,24 @@ platform output device shared with the embedding application.
 `WriteResult { written: usize, errno: Errno }`. `written` is the actual consumed
 count, including on failure. The guest `nwritten` receives the total across
 completed callbacks. A short or zero successful write stops the operation
-without retrying or spinning. An error stops the operation and is returned to
-the guest **even when earlier bytes were consumed**; it is never hidden as
-success. WASI only guarantees result values on success, but this implementation
-also records the actual count on error for embedding diagnostics.
+without retrying or spinning. An error stops the operation. With **no progress**,
+it returns the error and zero bytes. With **any progress**, including bytes
+consumed by the failing callback, it returns `ESUCCESS` and the actual count as
+a short write. This is necessary because wasi-libc's `writev` ignores `nwritten`
+on a nonzero errno; returning an error after progress would duplicate output
+when the guest retries.
+
+Late failures are not discarded: the context retains one deferred error per
+descriptor. The next fully validated write to that descriptor returns the
+saved error and zero bytes **without invoking the output callback**, then clears
+it. The guest can retry only the unwritten remainder without duplicating bytes.
+Invalid requests and operations on other descriptors do not consume the error.
+The embedding application can inspect `pendingWriteError(fd)` or explicitly
+consume `takeWriteError(fd)` instead of deferring delivery to the guest. A pending
+failure cannot be overwritten by another callback because the next write
+delivers it before invoking callbacks. Diagnostics remain accessible after
+logical close and `proc_exit`; consumers must inspect outstanding failures at
+completion rather than discard them when qualifying successful output.
 
 Callback errors are WASI errno numbers, not host errno numbers. All WASI values
 0–76 are accepted. Invalid numbers and overreported byte counts become `EIO`;

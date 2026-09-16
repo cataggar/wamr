@@ -149,7 +149,7 @@ const Capture = struct {
     }
 };
 
-test "native WASI adapter preserves actual partial output and callback error" {
+test "native WASI adapter preserves actual partial output and deferred callback error" {
     var ctx = context();
     var capture: Capture = .{};
     ctx.output = .{ .userdata = &capture, .write = Capture.write };
@@ -159,9 +159,16 @@ test "native WASI adapter preserves actual partial output and callback error" {
     std.mem.writeInt(u32, mem[4..8], 4, .little);
     @memcpy(mem[16..20], "a\x00bc");
     var host: NativeContract.HostContext = .{ .bytes = &mem };
-    try testing.expectEqual(@as(i32, 64), try run(&imports, &host, .fd_write, &.{ .{ .i32 = 2 }, .{ .i32 = 0 }, .{ .i32 = 1 }, .{ .i32 = 8 } }));
+    try testing.expectEqual(@as(i32, 0), try run(&imports, &host, .fd_write, &.{ .{ .i32 = 2 }, .{ .i32 = 0 }, .{ .i32 = 1 }, .{ .i32 = 8 } }));
     try testing.expectEqualStrings("a\x00", capture.bytes[0..capture.count]);
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, mem[8..12], .little));
+    try testing.expectEqual(minimal.Errno.pipe, ctx.pendingWriteError(2).?);
+    std.mem.writeInt(u32, mem[0..4], 18, .little);
+    std.mem.writeInt(u32, mem[4..8], 2, .little);
+    try testing.expectEqual(@as(i32, 64), try run(&imports, &host, .fd_write, &.{ .{ .i32 = 2 }, .{ .i32 = 0 }, .{ .i32 = 1 }, .{ .i32 = 8 } }));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, mem[8..12], .little));
+    try testing.expectEqualStrings("a\x00", capture.bytes[0..capture.count]);
+    try testing.expectEqual(null, ctx.pendingWriteError(2));
     try testing.expectEqual(null, host.pending_exit);
 }
 

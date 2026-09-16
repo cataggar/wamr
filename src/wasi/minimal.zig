@@ -87,6 +87,7 @@ pub const Context = struct {
     output: ?Output,
     clock: ?Clock,
     exit_code: ?u32 = null,
+    deferred_write_errors: [3]?Errno = .{ null, null, null },
 
     pub fn init(options: Options) error{InvalidStrings}!Context {
         _ = stringSizes(options.args) catch return error.InvalidStrings;
@@ -149,6 +150,29 @@ pub const Context = struct {
         return .notcapable;
     }
 
+    /// Inspect a late output failure, including after close or proc_exit.
+    pub fn pendingWriteError(self: *const Context, fd: u32) ?Errno {
+        if (fd >= self.deferred_write_errors.len) return null;
+        return self.deferred_write_errors[fd];
+    }
+
+    /// Consume a diagnostic explicitly instead of delivering it on the next
+    /// validated write to this descriptor. No callback failure is overwritten.
+    pub fn takeWriteError(self: *Context, fd: u32) ?Errno {
+        const errno = self.pendingWriteError(fd) orelse return null;
+        self.deferred_write_errors[fd] = null;
+        return errno;
+    }
+
+    fn writeFailure(self: *Context, fd: u32, written: u32, errno: Errno) Errno {
+        if (written == 0) return errno;
+        // wasi-libc ignores nwritten on errno: report progress as a short write
+        // so retrying the remainder cannot duplicate already consumed bytes.
+        std.debug.assert(self.deferred_write_errors[fd] == null);
+        self.deferred_write_errors[fd] = errno;
+        return .success;
+    }
+
     pub fn fdWrite(self: *Context, mem: []u8, fd: u32, iovs: u32, count: u32, nwritten: u32) Errno {
         _ = self.descriptor(fd) orelse return .badf;
         if (fd == 0) return .notcapable;
@@ -167,6 +191,11 @@ pub const Context = struct {
             if (requested > std.math.maxInt(u32)) return .overflow;
         }
 
+        if (self.takeWriteError(fd)) |errno| {
+            std.mem.writeInt(u32, result[0..4], 0, .little);
+            return errno;
+        }
+
         var written: u32 = 0;
         at = 0;
         while (at < vectors.len) : (at += 8) {
@@ -177,13 +206,13 @@ pub const Context = struct {
             const response = sink.write(sink.userdata, fd, bytes);
             if (response.written > bytes.len) {
                 std.mem.writeInt(u32, result[0..4], written, .little);
-                return .io;
+                return self.writeFailure(fd, written, .io);
             }
             written += @intCast(response.written);
             const errno = checkedErrno(response.errno);
             if (errno != .success or response.written < bytes.len) {
                 std.mem.writeInt(u32, result[0..4], written, .little);
-                return errno;
+                return if (errno == .success) .success else self.writeFailure(fd, written, errno);
             }
         }
         std.mem.writeInt(u32, result[0..4], written, .little);

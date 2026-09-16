@@ -71,13 +71,15 @@ const Sink = struct {
     limit: usize = 64,
     fail_call: usize = 0,
     failure: wasi.Errno = .io,
+    failure_limit: ?usize = null,
     overreport: bool = false,
 
     fn write(raw: ?*anyopaque, fd: u32, bytes: []const u8) wasi.WriteResult {
         const self: *Sink = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
         self.fd = fd;
-        const count = @min(bytes.len, self.limit);
+        const limit = if (self.calls == self.fail_call) self.failure_limit orelse self.limit else self.limit;
+        const count = @min(bytes.len, limit);
         @memcpy(self.bytes[self.used..][0..count], bytes[0..count]);
         self.used += count;
         return .{
@@ -161,20 +163,92 @@ test "minimal WASI fd_write preserves exact bytes partial zero and failed writes
     try testing.expectEqual(@as(u32, 0), get32(&mem, 16));
     try testing.expectEqual(@as(usize, 1), sink.calls);
     sink = .{ .fail_call = 2, .failure = .nospc };
-    try testing.expectEqual(.nospc, ctx.fdWrite(&mem, 1, 0, 2, 16));
+    try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 0, 2, 16));
     try testing.expectEqual(@as(u32, 7), get32(&mem, 16));
     try testing.expectEqualStrings("abcd\x00ef", sink.bytes[0..sink.used]);
+    try testing.expectEqual(wasi.Errno.nospc, ctx.pendingWriteError(1).?);
+    try testing.expectEqual(wasi.Errno.nospc, ctx.takeWriteError(1).?);
+    try testing.expectEqual(null, ctx.takeWriteError(1));
     sink = .{ .fail_call = 1, .failure = .again, .limit = 0 };
     try testing.expectEqual(.again, ctx.fdWrite(&mem, 1, 0, 2, 16));
     try testing.expectEqual(@as(u32, 0), get32(&mem, 16));
     sink = .{ .fail_call = 1, .failure = .pipe, .limit = 1 };
-    try testing.expectEqual(.pipe, ctx.fdWrite(&mem, 1, 0, 2, 16));
+    try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 0, 2, 16));
     try testing.expectEqual(@as(u32, 1), get32(&mem, 16));
     try testing.expectEqualStrings("a", sink.bytes[0..sink.used]);
+    try testing.expectEqual(wasi.Errno.pipe, ctx.takeWriteError(1).?);
     sink = .{ .overreport = true };
     try testing.expectEqual(.io, ctx.fdWrite(&mem, 1, 0, 2, 16));
     sink = .{ .fail_call = 1, .failure = @enumFromInt(65535) };
-    try testing.expectEqual(.io, ctx.fdWrite(&mem, 1, 0, 2, 16));
+    try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 0, 2, 16));
+    try testing.expectEqual(@as(u32, 3), get32(&mem, 16));
+    try testing.expectEqual(wasi.Errno.io, ctx.takeWriteError(1).?);
+}
+
+test "minimal WASI late EAGAIN and EINTR preserve progress and exact remainder retries" {
+    for ([_]wasi.Errno{ .again, .intr }) |failure| {
+        for ([_]u32{ 0, 2 }) |late_progress| {
+            var mem = ioMemory();
+            var sink: Sink = .{ .fail_call = 2, .failure = failure, .failure_limit = late_progress };
+            var ctx = context();
+            ctx.output = sink.output();
+            try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 0, 2, 16));
+            try testing.expectEqual(@as(u32, 3) + late_progress, get32(&mem, 16));
+            try testing.expectEqualStrings("abcd\x00ef"[0 .. 3 + late_progress], sink.bytes[0..sink.used]);
+            try testing.expectEqual(failure, ctx.pendingWriteError(1).?);
+
+            // A writev caller skips the completed first iovec and any consumed
+            // bytes in the second. Delivery of the deferred error adds no output.
+            put32(&mem, 8, 40 + late_progress);
+            put32(&mem, 12, 4 - late_progress);
+            try testing.expectEqual(failure, ctx.fdWrite(&mem, 1, 8, 1, 16));
+            try testing.expectEqual(@as(u32, 0), get32(&mem, 16));
+            try testing.expectEqual(@as(usize, 2), sink.calls);
+            try testing.expectEqual(null, ctx.pendingWriteError(1));
+            try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 8, 1, 16));
+            try testing.expectEqual(@as(u32, 4) - late_progress, get32(&mem, 16));
+            try testing.expectEqualStrings("abcd\x00ef", sink.bytes[0..sink.used]);
+            try testing.expectEqual(@as(usize, 3), sink.calls);
+        }
+    }
+}
+
+test "minimal WASI zero progress output errors remain immediate" {
+    for ([_]wasi.Errno{ .again, .intr, .pipe }) |failure| {
+        var mem = ioMemory();
+        var sink: Sink = .{ .fail_call = 1, .failure = failure, .failure_limit = 0 };
+        var ctx = context();
+        ctx.output = sink.output();
+        try testing.expectEqual(failure, ctx.fdWrite(&mem, 1, 0, 2, 16));
+        try testing.expectEqual(@as(u32, 0), get32(&mem, 16));
+        try testing.expectEqual(@as(usize, 0), sink.used);
+        try testing.expectEqual(null, ctx.pendingWriteError(1));
+        try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 0, 2, 16));
+        try testing.expectEqual(@as(u32, 7), get32(&mem, 16));
+        try testing.expectEqualStrings("abcd\x00ef", sink.bytes[0..sink.used]);
+    }
+}
+
+test "minimal WASI deferred output diagnostics survive invalid requests close and exit" {
+    var mem = ioMemory();
+    var sink: Sink = .{ .fail_call = 2, .failure = .io, .failure_limit = 0 };
+    var ctx = context();
+    ctx.output = sink.output();
+    try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 0, 2, 16));
+    try testing.expectEqual(.fault, ctx.fdWrite(&mem, 1, 8, 1, 0xffff_ffff));
+    try testing.expectEqual(.fault, ctx.fdWrite(&mem, 1, 0xffff_ffff, 1, 16));
+    try testing.expectEqual(wasi.Errno.io, ctx.pendingWriteError(1).?);
+    try testing.expectEqual(null, ctx.pendingWriteError(2));
+    try testing.expectEqual(null, ctx.pendingWriteError(0xffff_ffff));
+    try testing.expectEqual(null, ctx.takeWriteError(0xffff_ffff));
+    try testing.expectEqual(.success, ctx.fdWrite(&mem, 2, 8, 1, 16));
+    try testing.expectEqualStrings("abcd\x00ef", sink.bytes[0..sink.used]);
+    try testing.expectEqual(wasi.Errno.io, ctx.pendingWriteError(1).?);
+    try testing.expectEqual(.success, ctx.fdClose(1));
+    try testing.expectEqual(.badf, ctx.fdWrite(&mem, 1, 8, 1, 16));
+    try testing.expectEqual(@as(u32, 0), ctx.procExit(0).exited);
+    try testing.expectEqual(wasi.Errno.io, ctx.takeWriteError(1).?);
+    try testing.expectEqual(null, ctx.pendingWriteError(1));
 }
 
 test "minimal WASI fd_write validates all iovecs before side effects including overflow" {
