@@ -1329,6 +1329,7 @@ class NativeBenchmarkTests(unittest.TestCase):
                          for name in self.config["workloads"]}
             spec = {"runtime_path": str(runtime_path), "compiler_path": str(compiler_path),
                     "compiler_version": "synthetic-v1", "source": self.source,
+                    "compile_profile": None if target == "linux" else "unikraft-x86_64",
                     "target_abi": f"synthetic-{target}-abi",
                     "platform": copy.deepcopy(self.platform), "options": copy.deepcopy(self.options),
                     "image_path": str(image_path), "aot_paths": aot_paths}
@@ -1339,6 +1340,7 @@ class NativeBenchmarkTests(unittest.TestCase):
                        "compiler": {"binary": native_benchmark.artifact(compiler_path),
                                     "source": self.source, "version": "synthetic-v1"},
                        "options": spec["options"],
+                       "compile_profile": spec["compile_profile"],
                        "source": self.source, "target_abi": spec["target_abi"],
                        "platform": spec["platform"], "configured_vm_ram_bytes": 1024**3,
                        "compiler_embedded": False,
@@ -1383,7 +1385,8 @@ Correct operation validated. See README.md for run and reporting rules.
                          "runtime_sha256": target["runtime"]["sha256"],
                          "aot_sha256": target["aot_modules"][run["workload"]]["sha256"],
                          "wasm_sha256": config["workload"]["sha256"], "platform": target["platform"],
-                         "options": target["options"], "mode": "aot", "jit_preset": None},
+                         "options": target["options"], "mode": "aot", "jit_preset": None,
+                         "compile_profile": target["compile_profile"]},
             "outcome": "success", "exit_code": 0, "phase_contract": "wamr-embedding-v1",
             "clock": {"source": "synthetic-clock", "unit": "us", "ticks_per_second": 1000000,
                       "resolution_ticks": 1},
@@ -1497,10 +1500,26 @@ Correct operation validated. See README.md for run and reporting rules.
         manifest["abi_compatibility"]["compute"] = {"strategy": "identical", "proof_sha256": None}
         with self.assertRaisesRegex(ValueError, "ABI proof"):
             native_benchmark.validate_manifest(manifest, allow_synthetic=True)
+        manifest["abi_compatibility"]["compute"]["proof_sha256"] = "d" * 64
+        with self.assertRaisesRegex(ValueError, "compiler profiles"):
+            native_benchmark.validate_manifest(manifest, allow_synthetic=True)
+
+    def test_native_unikraft_requires_explicit_compiler_profile(self):
+        manifest = copy.deepcopy(self.manifest)
+        target = manifest["targets"]["unikraft"]
+        target["compile_profile"] = None
+        target["image_receipt"]["compile_profile"] = None
+        with self.assertRaisesRegex(ValueError, "explicit compiler profile"):
+            native_benchmark.validate_manifest(manifest, allow_synthetic=True)
 
     def test_native_plan_verifies_identical_aot_proof_file(self):
         linux = self.config["targets"]["linux"]
         unikraft = self.config["targets"]["unikraft"]
+        linux["compile_profile"] = unikraft["compile_profile"]
+        linux_receipt_path = Path(linux["image_receipt_path"])
+        linux_receipt = json.loads(linux_receipt_path.read_text())
+        linux_receipt["compile_profile"] = linux["compile_profile"]
+        linux_receipt_path.write_text(json.dumps(linux_receipt))
         unikraft["aot_paths"]["compute"] = linux["aot_paths"]["compute"]
         receipt_path = Path(unikraft["image_receipt_path"])
         receipt = json.loads(receipt_path.read_text())
@@ -1562,6 +1581,7 @@ Correct operation validated. See README.md for run and reporting rules.
             lambda r: r.update(schema_version=True),
             lambda r: r.update(observed={**r["observed"], "platform": {
                 **r["observed"]["platform"], "active_cpu_count": True}}),
+            lambda r: r.update(observed={**r["observed"], "compile_profile": "unexpected"}),
         ]
         for index, mutate in enumerate(mutations):
             with self.subTest(index=index), self.assertRaises(ValueError):

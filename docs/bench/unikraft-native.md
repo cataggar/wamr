@@ -98,6 +98,12 @@ Each target configuration has:
   native image, **not** an unrelated hosted `wamr` executable).
 * `compiler_path`, `compiler_version`: exact external `wamrc` executable and public
   version token. Both targets must use the same compiler bytes and source identity.
+* `compile_profile`: `null` when the compiler's profile option was omitted, or the
+  explicit `unikraft-x86_64` profile. This per-target compiler/ABI setting is not
+  concealed in the common optimization/safety options. The native profile requires
+  x86_64 and its strict native artifact contract; a normal hosted artifact is not
+  interchangeable. Unikraft currently requires `unikraft-x86_64`. A Linux driver using the same isolated embedding API may use
+  that native profile too, subject to actual ABI qualification.
 * `source`: runtime/compiler source identity.
 * `target_abi`: explicit public ABI token, e.g. an integration-defined ABI version.
 * `platform`: exactly `arch` (`x86_64` or `aarch64`), `cpu_model`, `active_cpu_count`,
@@ -127,6 +133,7 @@ image = {sha256, bytes}
 runtime = {sha256, bytes}
 source = {commit, tree_sha256, tracked_diff_sha256}
 compiler = {binary: {sha256, bytes}, source, version}
+compile_profile = null | "unikraft-x86_64"
 options = {optimize, bounds_checks, stack_checks, simd, threads, memory64}
 target_abi = public ABI token
 platform = {arch, cpu_model, active_cpu_count, azure_sku, azure_region}
@@ -147,6 +154,7 @@ compatible: true, source: SOURCE, target_abis: [LINUX_ABI, UNIKRAFT_ABI],
 aot_sha256: HASH}`. Its hash is retained. Sharing a filename or architecture does
 not establish ABI compatibility. Actual compatibility tests remain the native
 integration's responsibility; the host checks that its attestation binds these bytes.
+Identical bytes must also have identical `compile_profile` declarations.
 
 ## Exact invocation
 
@@ -231,7 +239,7 @@ The object has **exactly** these fields:
   `evidence_kind: "measurement"`, `campaign_id`, `run_id`, `config_sha256`,
   `image_receipt_sha256`.
 * `observed`: exactly `image_sha256`, `runtime_sha256`, `aot_sha256`, `wasm_sha256`,
-  `platform`, `options`, `mode: "aot"`, `jit_preset: null`, independently checked by
+  `platform`, `options`, `compile_profile`, `mode: "aot"`, `jit_preset: null`, independently checked by
   the producer against deployed/loaded native artifacts and active platform.
 * `outcome`: `success`, `trap`, `timeout`, `abort`, or `error`.
   `exit_code`: integer or `null`; success requires zero. A trapped or nonreturning

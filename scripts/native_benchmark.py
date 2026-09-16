@@ -167,13 +167,13 @@ def validate_platform(platform):
 def validate_image_receipt(receipt, target, evidence_kind):
     keys(receipt, {"schema_version", "kind", "evidence_kind", "os", "image",
                    "runtime", "source", "target_abi", "platform",
-                   "options", "compiler", "configured_vm_ram_bytes",
+                   "options", "compiler", "compile_profile", "configured_vm_ram_bytes",
                    "compiler_embedded", "aot_modules"},
          "image receipt")
     header(receipt, "wamr-native-image-receipt")
     require(receipt["evidence_kind"] == evidence_kind, "image receipt evidence kind")
     for key in ("os", "image", "runtime", "source", "target_abi", "platform",
-                "options", "compiler"):
+                "options", "compiler", "compile_profile"):
         require(identical(receipt[key], target[key]), f"image receipt {key} mismatch")
     require(receipt["compiler_embedded"] is False, "AOT comparator must be compiler-free")
     number(receipt["configured_vm_ram_bytes"], "configured VM RAM", 1, integer=True)
@@ -219,7 +219,7 @@ def validate_manifest(manifest, *, allow_synthetic=False):
     for os_name, target in manifest["targets"].items():
         keys(target, {"os", "runtime", "compiler", "source", "target_abi", "platform",
                       "options", "image", "image_receipt", "image_receipt_sha256",
-                      "aot_modules", "mode", "jit_preset"}, "target")
+                      "aot_modules", "mode", "jit_preset", "compile_profile"}, "target")
         require(target["os"] == os_name, "target OS mismatch")
         require(target["mode"] == "aot" and target["jit_preset"] is None,
                 "only compiler-free AOT is qualified; JIT fast/full is reserved")
@@ -231,6 +231,12 @@ def validate_manifest(manifest, *, allow_synthetic=False):
                     "synthetic platform is not measurement evidence")
         validate_options(target["options"])
         public_token(target["target_abi"], "target_abi")
+        require(target["compile_profile"] in (None, "unikraft-x86_64"),
+                "unsupported explicit compiler profile")
+        require(os_name != "unikraft" or target["compile_profile"] == "unikraft-x86_64",
+                "native Unikraft requires its explicit compiler profile")
+        require(target["compile_profile"] != "unikraft-x86_64" or
+                target["platform"]["arch"] == "x86_64", "compiler profile architecture mismatch")
         for name in ("image", "runtime"):
             validate_artifact(target[name], name)
         keys(target["compiler"], {"binary", "source", "version"}, "compiler")
@@ -256,6 +262,8 @@ def validate_manifest(manifest, *, allow_synthetic=False):
                 "ABI strategy contradicts actual artifact hashes")
         if same:
             digest(declaration["proof_sha256"], "identical AOT requires ABI proof receipt")
+            require(linux["compile_profile"] == unikraft["compile_profile"],
+                    "identical AOT cannot claim different compiler profiles")
         else:
             require(declaration["proof_sha256"] is None and
                     linux["target_abi"] != unikraft["target_abi"],
@@ -328,7 +336,7 @@ def create_plan(config, repo, *, now=None, allow_synthetic=False):
     for os_name, spec in config["targets"].items():
         keys(spec, {"runtime_path", "compiler_path", "compiler_version", "source",
                     "target_abi", "platform", "options", "image_path",
-                    "image_receipt_path", "aot_paths"}, "target config")
+                    "image_receipt_path", "aot_paths", "compile_profile"}, "target config")
         keys(spec["aot_paths"], manifest["workloads"], "aot_paths")
         receipt_path = Path(spec["image_receipt_path"])
         manifest["targets"][os_name] = {
@@ -336,6 +344,7 @@ def create_plan(config, repo, *, now=None, allow_synthetic=False):
             "runtime": artifact(spec["runtime_path"]), "source": spec["source"],
             "compiler": {"binary": artifact(spec["compiler_path"]),
                          "source": spec["source"], "version": spec["compiler_version"]},
+            "compile_profile": spec["compile_profile"],
             "target_abi": spec["target_abi"], "platform": spec["platform"],
             "options": spec["options"], "image": artifact(spec["image_path"]),
             "image_receipt": read_json(receipt_path),
@@ -463,7 +472,7 @@ def validate_result(result, manifest, run_id):
         "aot_sha256": target["aot_modules"][config["run"]["workload"]]["sha256"],
         "wasm_sha256": config["workload"]["sha256"],
         "platform": target["platform"], "options": target["options"],
-        "mode": "aot", "jit_preset": None,
+        "mode": "aot", "jit_preset": None, "compile_profile": target["compile_profile"],
     }), "observed artifact/platform/mode mismatch")
     require(result["outcome"] in OUTCOMES, "unknown terminal outcome")
     require(result["exit_code"] is None or type(result["exit_code"]) is int, "exit_code")
