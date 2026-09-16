@@ -2,6 +2,7 @@ import copy
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -161,6 +162,249 @@ class ActualMatchedSamplerTests(unittest.TestCase):
                                 capture_output=True, check=False, timeout=30)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(bench.PREFIX, result.stdout)
+
+
+class NativeExternalTransportTests(unittest.TestCase):
+    """Synthetic UNIT TEST fixtures only: none are image/deployment evidence."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.paths = {}
+        for name in ("aot", "jit", "aot-image", "jit-image"):
+            self.paths[name] = self.root / name
+            self.paths[name].write_bytes(f"UNIT TEST ONLY, NOT AN IMAGE OR EXECUTABLE: {name}".encode())
+        self.executables = {mode: bench.base.artifact(self.paths[mode]) for mode in ("aot", "jit")}
+        self.images = {mode: bench.base.artifact(self.paths[f"{mode}-image"]) for mode in ("aot", "jit")}
+        legacy = QualificationTests()
+        legacy.setUp()
+        self.receipt = {
+            **legacy.receipt, "schema_version": 2, "evidence_kind": "measurement", "os": "unikraft",
+            "images": self.images, "executables": self.executables,
+            "allocator": "unit-test-allocator", "page_policy": "unit-test-page-policy",
+            "target": copy.deepcopy(bench.NATIVE_TARGET), "options": copy.deepcopy(bench.NATIVE_OPTIONS),
+            "build_options": {**bench.NATIVE_BUILD_OPTIONS, "optimize": "ReleaseSafe"},
+            "adapter": {"name": "unit-test-not-qualified", "source_commit": "b" * 40,
+                        "qualification_receipt_sha256": "9" * 64},
+            "clock": {"method": "unit-test-clock", "resolution_ns": 1, "scope": "guest-monotonic-execution"},
+            "native_stack": {"generated_frames_bytes": 256 * 1024,
+                             "compiler_embedder_callbacks_bytes": 1024 * 1024,
+                             "provisioned_bytes": 2 * 1024 * 1024},
+            "memory_observer": {"method": "unit-test-not-an-observation",
+                                "quantity": "physical-backing-bytes",
+                                "coverage": "caller-allocator-and-native-pages",
+                                "excludes": ["image", "native-stack", "other-kernel-allocations", "page-tables"],
+                                "sampling": "continuous-high-water", "interval_ns": None},
+        }
+        self.receipt_sha = bench.sha(bench.encoded(self.receipt))
+        self.directory = self.root / "private"
+        self.request = bench.prepare_native(
+            self.paths["aot"], self.paths["jit"], self.directory, images=self.images,
+            receipt=self.receipt, trusted_receipt_sha256=self.receipt_sha)
+        self.request_sha = bench.sha((self.directory / "request.json").read_bytes())
+        self.external = self.root / "unit-test-external"
+        self.external.mkdir()
+        self.capture = {
+            "schema_version": 1, "kind": "wamr-jit-native-capture-receipt",
+            "evidence_kind": "measurement", "request_sha256": self.request_sha,
+            "image_receipt_sha256": self.receipt_sha, "hardware_execution": True,
+            "adapter_qualification_sha256": self.receipt["adapter"]["qualification_receipt_sha256"],
+            "records": {},
+        }
+        for mode in bench.MODES:
+            sample = self.synthetic_sample(mode)
+            raw = b"\xff\xfeUNIT TEST BOOT NOISE\r\n" + bench.PREFIX + bench.encoded(sample) + b"\r\n\x80noise\n"
+            (self.external / f"{mode}.serial").write_bytes(raw)
+            image = "aot" if mode == "aot" else "jit"
+            self.capture["records"][mode] = {
+                "image": self.images[image], "executable": self.executables[image],
+                "serial": bench.stream_artifact(self.external / f"{mode}.serial"),
+                "outcome": "success", "capture_complete": True,
+                "started_at": self.request["created_at"], "completed_at": self.request["created_at"],
+                "memory": {"before_bytes": 4096, "observed_max_bytes": 2 * 1024 * 1024,
+                           "after_teardown_bytes": 4096, "observation_count": 3},
+            }
+        (self.external / "capture.json").write_bytes(bench.encoded(self.capture))
+
+    def synthetic_sample(self, mode):
+        compiler = mode != "aot"
+        memory = {"heap_live_bytes": 4096, "heap_peak_bytes": 8192, "code_bytes": 1024,
+                  "code_reserved_bytes": 4096, "linear_reserved_bytes": 8 * 65536,
+                  "linear_committed_bytes": 2 * 65536}
+        sample = {
+            "schema_version": 1, "kind": "wamr-native-jit-sample",
+            "qualification": "requires-independent-image-and-deployment-evidence",
+            "request_sha256": self.request_sha, "mode": mode, "compiler_embedded": compiler,
+            "wasm_sha256": self.receipt["wasm"]["sha256"], "wasm_bytes": self.receipt["wasm"]["bytes"],
+            "cwasm_sha256": self.receipt["aot_module"]["sha256"],
+            "cwasm_bytes": 4096 if compiler else self.receipt["aot_module"]["bytes"],
+            "workload": "volatile-compute-memory-2000", "expected": bench.expected(),
+            "lifecycle": bench.LIFECYCLE, "clock_resolution_ns": 1,
+            "compile_ns": 100 if compiler else None,
+            "compiler_phases_ns": dict.fromkeys(("parse", "lower", "optimize", "codegen", "emit"), 10) if compiler else None,
+            "compiler_peak_bytes": 65536 if compiler else 0, "compiler_retained_bytes": 4096 if compiler else 0,
+            "compiler_polls": 100 if compiler else 0, "load_ns": 10, "instantiate_ns": 10,
+            "start_ns": 10, "growth_ns": 10, "growth_previous_pages": 2,
+            "fuel_per_invocation": 100000 if compiler else None,
+            "invocations": [{"ns": 10, "outcome": "returned", "value": bench.expected(), "diagnostic": None}
+                            for _ in range(4)],
+            "memory_before": memory, "memory_after": {**memory, "linear_committed_bytes": 3 * 65536},
+            "caller_peak_bytes": 100000, "caller_live_after_teardown": 0, "reserved_after_teardown": 0,
+            "failure_stage": None, "failure": None,
+        }
+        self.assertEqual(set(sample), bench.SAMPLE_KEYS)
+        return sample
+
+    def import_capture(self, trusted=None):
+        return bench.import_native(
+            self.directory, self.external, aot=self.paths["aot"], jit=self.paths["jit"], images=self.images,
+            trusted_receipt_sha256=self.receipt_sha,
+            trusted_capture_sha256=trusted or bench.sha(bench.encoded(self.capture)))
+
+    def archive(self):
+        for name in ("capture.json", *(f"{mode}.serial" for mode in bench.MODES)):
+            bench.base.private_write(self.directory / name, (self.external / name).read_bytes())
+
+    def revalidate(self, capture=None):
+        capture = capture or self.capture
+        (self.directory / "capture.json").write_bytes(bench.encoded(capture))
+        return bench.native_report(self.directory, self.receipt_sha, bench.sha(bench.encoded(capture)))
+
+    def test_qualified_external_import_is_host_independent_private_and_clock_truthful(self):
+        with mock.patch.object(bench.platform, "system", return_value="Darwin"), \
+             mock.patch.object(bench.platform, "machine", return_value="aarch64"), \
+             mock.patch.object(bench.subprocess, "run") as run:
+            result = self.import_capture()
+        run.assert_not_called()
+        self.assertEqual(result["transport"], "external-native")
+        self.assertEqual(result["images"], self.images)
+        self.assertEqual(result["native_memory_observer"], self.receipt["memory_observer"])
+        self.assertEqual(result["native_memory_observations"]["fast"], self.capture["records"]["fast"]["memory"])
+        self.assertEqual(result["samples"]["fast"]["compile_ns"], 100)
+        self.assertIn("not-serial-arrival", result["timing_scope"])
+        self.assertIn("not-hardware-proof", result["qualification"])
+        self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
+        for path in self.directory.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(bench.native_report(self.directory, self.receipt_sha,
+                                            bench.sha(bench.encoded(self.capture))), result)
+        with self.assertRaisesRegex(ValueError, "already attempted"):
+            self.import_capture()
+
+    def test_native_image_qualification_cannot_relabel_linux_or_software_metrics(self):
+        mutations = [
+            ("schema_version", 1), ("os", "linux"), ("evidence_kind", "correctness-only"),
+            ("hardware_execution", False), ("target", {**bench.NATIVE_TARGET, "abi": "linux"}),
+            ("options", {**bench.NATIVE_OPTIONS, "rounds": 0}),
+            ("build_options", {**self.receipt["build_options"], "red_zone": True}),
+            ("adapter", {}), ("clock", {**self.receipt["clock"], "scope": "collector-latency"}),
+            ("native_stack", {**self.receipt["native_stack"], "generated_frames_bytes": 1024}),
+            ("memory_observer", {**self.receipt["memory_observer"], "quantity": "logical-page-commitment"}),
+            ("memory_observer", {**self.receipt["memory_observer"], "excludes": []}),
+        ]
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ValueError):
+                    bench.validate_native_receipt({**self.receipt, key: value}, self.executables, self.images)
+        with self.assertRaises(ValueError):
+            bench.validate_receipt(self.receipt, self.executables, self.images)
+
+    def test_native_capture_receipt_bindings_and_real_memory_are_required(self):
+        self.archive()
+        for key, value in (("request_sha256", "0" * 64), ("image_receipt_sha256", "0" * 64),
+                           ("adapter_qualification_sha256", "0" * 64), ("hardware_execution", False),
+                           ("evidence_kind", "correctness-only"), ("schema_version", True)):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    self.revalidate({**self.capture, key: value})
+        for key, value in (("image", self.images["aot"]), ("executable", self.executables["aot"]),
+                           ("outcome", "timeout"), ("capture_complete", False),
+                           ("started_at", "2000-01-01T00:00:00+00:00"),
+                           ("memory", None), ("memory", {"requested_bytes": 100})):
+            with self.subTest(key=key):
+                altered = copy.deepcopy(self.capture)
+                altered["records"]["fast"][key] = value
+                with self.assertRaises(ValueError):
+                    self.revalidate(altered)
+        self.revalidate()
+
+    def test_duplicate_truncated_non_utf8_and_oversized_records_fail_despite_attestation(self):
+        self.archive()
+        raw = self.directory / "fast.serial"
+        saved = raw.read_bytes()
+        encoded_sample = bench.PREFIX + bench.encoded(self.synthetic_sample("fast"))
+        for malformed in (
+            saved + encoded_sample + b"\n", encoded_sample, b"noise\n" + bench.PREFIX + b"\xff\n",
+            b"not-a-line:" + encoded_sample + b"\n", bench.PREFIX + b" " * bench.MAX_RECORD_BYTES + b"\n",
+            bench.PREFIX + b'{"mode":"fast","mode":"fast"}\n',
+            b"WAMR_BENCH_RESULT={}\n", b"boot noise only\n",
+        ):
+            with self.subTest(raw=malformed[:40]):
+                raw.write_bytes(malformed)
+                altered = copy.deepcopy(self.capture)
+                altered["records"]["fast"]["serial"] = bench.stream_artifact(raw)
+                with self.assertRaises(ValueError):
+                    self.revalidate(altered)
+        raw.write_bytes(saved)
+        self.revalidate()
+
+    def test_sample_failures_stale_input_and_clock_mismatch_reject(self):
+        self.archive()
+        raw = self.directory / "fast.serial"
+        for key, value in (("failure", "ClockFailed"), ("request_sha256", "0" * 64),
+                           ("wasm_sha256", "0" * 64), ("clock_resolution_ns", 2),
+                           ("caller_live_after_teardown", 1), ("compiler_phases_ns", None),
+                           ("growth_previous_pages", 1)):
+            with self.subTest(key=key):
+                sample = {**self.synthetic_sample("fast"), key: value}
+                raw.write_bytes(bench.PREFIX + bench.encoded(sample) + b"\n")
+                altered = copy.deepcopy(self.capture)
+                altered["records"]["fast"]["serial"] = bench.stream_artifact(raw)
+                with self.assertRaises(ValueError):
+                    self.revalidate(altered)
+
+    def test_untrusted_or_failed_capture_retains_private_raw_without_comparison(self):
+        with self.assertRaisesRegex(ValueError, "untrusted native capture"):
+            self.import_capture(trusted="0" * 64)
+        for mode in bench.MODES:
+            self.assertEqual((self.directory / f"{mode}.serial").read_bytes(),
+                             (self.external / f"{mode}.serial").read_bytes())
+            self.assertEqual((self.directory / f"{mode}.serial").stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.directory / "comparison.json").exists())
+        self.assertFalse(bench.read_json(self.directory / "import.status.json")["success"])
+
+    def test_native_raw_and_prepared_artifact_tampering_reject(self):
+        self.paths["jit"].write_bytes(b"changed unit-test executable")
+        with self.assertRaisesRegex(ValueError, "artifacts changed"):
+            self.import_capture()
+        self.archive()
+        with (self.directory / "full.serial").open("ab") as raw:
+            raw.write(b"\n")
+        with self.assertRaisesRegex(ValueError, "altered raw native serial"):
+            self.revalidate()
+
+    def test_native_import_never_accepts_linux_correctness_request(self):
+        request = {**self.request, "schema_version": 1, "evidence_kind": "correctness-only"}
+        with self.assertRaises(ValueError):
+            bench.validate_native_request(request, self.receipt_sha)
+        with self.assertRaisesRegex(ValueError, "untrusted native image"):
+            bench.validate_native_request(self.request, "0" * 64)
+        with self.assertRaisesRegex(ValueError, "request: expected"):
+            bench.report(self.directory)
+
+    def test_native_cli_requires_real_artifacts_and_both_independent_trust_inputs(self):
+        command = [sys.executable, "-m", "scripts.native_jit_benchmark",
+                   "--aot", str(self.paths["aot"]), "--jit", str(self.paths["jit"]),
+                   "--output", str(self.root / "cli")]
+        result = subprocess.run([*command, "--native-prepare"], capture_output=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"native transport needs complete images", result.stderr)
+        result = subprocess.run([*command, "--trusted-capture-sha256", "0" * 64],
+                                capture_output=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"cannot qualify a Linux capture", result.stderr)
+        self.assertFalse((self.root / "cli").exists())
 
 
 if __name__ == "__main__":

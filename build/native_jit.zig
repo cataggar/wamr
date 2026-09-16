@@ -1,25 +1,13 @@
 const std = @import("std");
 
 pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.OptimizeMode) void {
-    const wasm = b.addExecutable(.{
-        .name = "native-jit-fixture",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/unikraft-jit/fixture.zig"),
-            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-            .optimize = .ReleaseSmall,
-        }),
-    });
-    wasm.entry = .disabled;
-    wasm.rdynamic = true;
-    wasm.stack_size = 16384;
-    wasm.initial_memory = 131072;
-    wasm.max_memory = 524288;
+    const wasm = workload(b);
     const fixture_step = b.step("native-jit-fixture", "Install the deterministic no-import JIT workload");
-    fixture_step.dependOn(&b.addInstallFile(wasm.getEmittedBin(), "fixtures/native-jit.wasm").step);
+    fixture_step.dependOn(&b.addInstallFile(wasm, "fixtures/native-jit.wasm").step);
     const files = b.addWriteFiles();
-    _ = files.addCopyFile(wasm.getEmittedBin(), "fixture.wasm");
+    _ = files.addCopyFile(wasm, "fixture.wasm");
     const fixture = files.add("fixture.zig", "pub const bytes = @embedFile(\"fixture.wasm\");\n");
-    addBenchmark(b, wamrc, wasm.getEmittedBin(), optimize);
+    addBenchmark(b, wamrc, wasm, optimize);
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/jit_native_tests.zig"),
@@ -39,6 +27,23 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.bui
         run.addArtifactArg(tests);
         step.dependOn(&run.step);
     }
+}
+
+fn workload(b: *std.Build) std.Build.LazyPath {
+    const wasm = b.addExecutable(.{
+        .name = "native-jit-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/unikraft-jit/fixture.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    wasm.stack_size = 16384;
+    wasm.initial_memory = 131072;
+    wasm.max_memory = 524288;
+    return wasm.getEmittedBin();
 }
 
 fn addBenchmark(b: *std.Build, wamrc: *std.Build.Step.Compile, wasm: std.Build.LazyPath, optimize: std.builtin.OptimizeMode) void {
@@ -123,4 +128,41 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const step = b.step("native-jit-check", "Link opt-in compiler with no hosted dependencies");
     step.dependOn(&check.step);
     b.getInstallStep().dependOn(step);
+
+    var compare_options = @import("native_aot.zig").moduleOptions(target, optimize);
+    compare_options.root_source_file = b.path("src/jit_compare_native.zig");
+    const compare = b.addModule("wamr-jit-aot-sample", compare_options);
+    const compare_library = b.addLibrary(.{ .name = "wamr-jit-aot-sample", .linkage = .static, .root_module = compare });
+    compare_library.bundle_compiler_rt = true;
+    b.installArtifact(compare_library);
+    const compare_check = b.addExecutable(.{ .name = "wamr-jit-aot-sample-link-check", .root_module = compare });
+    compare_check.entry = .{ .symbol_name = "wamr_jit_aot_sample_link_check" };
+    compare_check.rdynamic = true;
+    _ = compare_check.getEmittedBin();
+    step.dependOn(&compare_check.step);
+
+    const wasm = workload(b);
+    const files = b.addWriteFiles();
+    _ = files.addCopyFile(wasm, "matched.wasm");
+    const embedded = files.add("workload.zig", "pub const wasm = @embedFile(\"matched.wasm\");\n");
+    const embedded_module = b.addModule("wamr-jit-workload", .{ .root_source_file = embedded, .target = target, .optimize = optimize });
+    b.getInstallStep().dependOn(&b.addInstallFile(wasm, "native-jit-bench/matched.wasm").step);
+    inline for (.{ true, false }) |with_compiler| {
+        var guest_options = @import("native_aot.zig").moduleOptions(target, optimize);
+        guest_options.root_source_file = b.path("src/jit_guest_link_check.zig");
+        const guest = b.createModule(guest_options);
+        guest.addImport("guest", if (with_compiler) module else compare);
+        guest.addImport("wamr-jit-workload", embedded_module);
+        const audit_options = b.addOptions();
+        audit_options.addOption(bool, "with_compiler", with_compiler);
+        guest.addOptions("guest_audit_options", audit_options);
+        const audit = b.addExecutable(.{
+            .name = if (with_compiler) "wamr-jit-guest-link-check" else "wamr-jit-aot-guest-link-check",
+            .root_module = guest,
+        });
+        audit.entry = .{ .symbol_name = "wamr_jit_guest_sample_link_check" };
+        audit.rdynamic = true;
+        _ = audit.getEmittedBin();
+        step.dependOn(&audit.step);
+    }
 }

@@ -10,6 +10,8 @@ const Pages = struct {
     rx: usize = 0,
     fail_at: ?usize = null,
     transitions: usize = 0,
+    clock_reads: usize = 0,
+    fail_clock_at: ?usize = null,
     fn transition(self: *Pages) aot.PlatformError!void {
         defer self.transitions += 1;
         if (self.fail_at == self.transitions) return error.OutOfMemory;
@@ -41,7 +43,10 @@ const Pages = struct {
         std.posix.munmap(address[0..size]);
         self.live -= size;
     }
-    fn clock(_: *anyopaque) aot.PlatformError!u64 {
+    fn clock(ctx: *anyopaque) aot.PlatformError!u64 {
+        const self: *Pages = @ptrCast(@alignCast(ctx));
+        self.clock_reads += 1;
+        if (self.fail_clock_at == self.clock_reads) return error.ClockFailed;
         var ts: std.os.linux.timespec = undefined;
         if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return error.ClockFailed;
         return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
@@ -49,8 +54,69 @@ const Pages = struct {
 };
 
 fn compilerClock(_: ?*anyopaque) error{ClockFailed}!u64 {
-    var unused: u8 = 0;
+    var unused: Pages = .{};
     return Pages.clock(&unused) catch return error.ClockFailed;
+}
+
+test "native JIT guest sampler owns identities and tears down both presets before serial output" {
+    const guest = @import("bench/native_jit_guest.zig");
+    for ([_]guest.Preset{ .fast, .full }) |preset| {
+        var capture: guest.Capture = .{};
+        var pages: Pages = .{};
+        var request: [64]u8 = @splat('a');
+        try guest.run(std.testing.allocator, pages.platform(), wasm, preset, &request, 1, &capture);
+        @memset(&request, 'b');
+        try equal(@as(usize, 0), pages.live);
+        try equal(@as(usize, 0), capture.report.caller_live_after_teardown);
+        try equal(@as(usize, 0), capture.report.reserved_after_teardown);
+        try equal(@as(?u32, 2), capture.report.growth_previous_pages);
+        try equal(@as(usize, 3 * 65536), capture.report.memory_after.?.linear_committed_bytes);
+        try expect(capture.report.compiler_peak_bytes > capture.report.compiler_retained_bytes);
+        try expect(capture.report.failure == null);
+        for (capture.report.invocations) |invocation| {
+            try equal(@as(?u32, @import("bench/native_jit_sample.zig").expected()), invocation.value);
+        }
+        var buffer: [8192]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try capture.writeRecord(&writer);
+        try expect(std.mem.startsWith(u8, writer.buffered(), "WAMR_JIT_SAMPLE="));
+        try expect(std.mem.endsWith(u8, writer.buffered(), "\n"));
+        try expect(std.mem.indexOf(u8, writer.buffered(), "\"request_sha256\":\"" ++ "a" ** 64 ++ "\"") != null);
+    }
+}
+
+test "native JIT guest sampler preserves clock allocation and page failures with cleanup" {
+    const guest = @import("bench/native_jit_guest.zig");
+    var baseline: Pages = .{};
+    var capture: guest.Capture = .{};
+    try guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, "a" ** 64, 1, &capture);
+    for ([_]usize{ 1, 2, 5, baseline.clock_reads - 1, baseline.clock_reads }) |fail_at| {
+        var pages: Pages = .{ .fail_clock_at = fail_at };
+        try std.testing.expectError(error.ClockFailed, guest.run(std.testing.allocator, pages.platform(), wasm, .fast, "a" ** 64, 1, &capture));
+        try std.testing.expectEqualStrings("ClockFailed", capture.report.failure.?);
+        try expect(capture.report.failure_stage != null);
+        try equal(@as(usize, 0), pages.live);
+        try equal(@as(usize, 0), capture.report.caller_live_after_teardown);
+        try equal(@as(usize, 0), capture.report.reserved_after_teardown);
+    }
+    for (0..baseline.transitions) |fail_at| {
+        var pages: Pages = .{ .fail_at = fail_at };
+        const expected_error = if (fail_at + 1 == baseline.transitions) error.UnexpectedGrowth else error.OutOfMemory;
+        try std.testing.expectError(expected_error, guest.run(std.testing.allocator, pages.platform(), wasm, .fast, "a" ** 64, 1, &capture));
+        try equal(@as(usize, 0), pages.live);
+        try equal(@as(usize, 0), capture.report.caller_live_after_teardown);
+        try equal(@as(usize, 0), capture.report.reserved_after_teardown);
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, guest.run(failing.allocator(), baseline.platform(), wasm, .fast, "a" ** 64, 1, &capture));
+    try std.testing.expectEqualStrings("compile", capture.report.failure_stage.?);
+    try equal(@as(usize, 0), capture.report.caller_live_after_teardown);
+    try std.testing.expectError(error.InvalidArguments, guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, "a" ** 64, 0, &capture));
+    try std.testing.expectError(error.InvalidArguments, guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, "x" ** 64, 1, &capture));
+    var buffer: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try capture.writeRecord(&writer);
+    try expect(std.mem.indexOf(u8, writer.buffered(), "\"failure\":\"InvalidArguments\"") != null);
 }
 
 fn call(inst: *aot.Instance, name: []const u8, args: []const aot.Value) !i32 {
