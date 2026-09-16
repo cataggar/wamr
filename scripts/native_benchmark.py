@@ -27,7 +27,8 @@ from bench_coremark import (
     resolve_ref_sha,
 )
 
-VERSION = 1
+VERSION = 2
+PHASE_CONTRACT = "wamr-embedding-v2"
 PREFIX = "WAMR_BENCH_RESULT="
 COREMARK_TICKS_PER_SECOND = 1000
 FIXTURES = {
@@ -53,8 +54,12 @@ OPTIONS = REQUIRED_SAFETY | {"optimize", "stack_checks", "simd", "threads", "mem
 PLATFORM = {"arch", "cpu_model", "active_cpu_count", "azure_sku", "azure_region"}
 SOURCE = {"commit", "tree_sha256", "tracked_diff_sha256"}
 PHASES = {"compile_ticks", "load_ticks", "instantiate_ticks",
-          "first_invocation_ticks", "steady_state_ticks"}
+          "lifecycle_setup_ticks", "first_invocation_ticks", "steady_state_ticks"}
 OUTCOMES = {"success", "trap", "timeout", "abort", "error"}
+WARM_RESET_SCOPE = {"invocation-state", "stdout-capture"}
+SNAPSHOT_RESET_SCOPE = {"linear-memory", "globals", "tables", "segment-drop-state",
+                        "execution-state", "wasi-context", "stdout-capture"}
+MEASUREMENT_ERRORS = {"post-call-clock", "stdout-copy", "pending-output"}
 
 
 def require(ok, message):
@@ -69,7 +74,8 @@ def keys(value, expected, label):
 
 def header(value, kind):
     require(type(value["schema_version"]) is int and value["schema_version"] == VERSION
-            and value["kind"] == kind, f"{kind}: version/kind mismatch")
+            and value["kind"] == kind,
+            f"{kind}: version/kind mismatch (expected schema_version {VERSION})")
 
 
 def identical(left, right):
@@ -171,6 +177,23 @@ def validate_memory_policy(policy):
                     "memory policy identity is unavailable")
 
 
+def validate_lifecycle(lifecycle):
+    keys(lifecycle, {"mode", "reset_policy", "reset_before", "reset_timing", "reset_scope"},
+         "execution lifecycle")
+    require(lifecycle["mode"] in ("same-instance-warm", "snapshot-replay"),
+            "unsupported execution lifecycle")
+    warm = lifecycle["mode"] == "same-instance-warm"
+    require(lifecycle["reset_policy"] ==
+            ("invocation-state-only" if warm else "restore-post-instantiation"),
+            "lifecycle reset policy mismatch")
+    require(lifecycle["reset_before"] == "each-steady-invocation",
+            "unsupported reset placement")
+    require(lifecycle["reset_timing"] == "excluded-from-invocation",
+            "reset timing must be separately measured, not hidden in invocation time")
+    require(lifecycle["reset_scope"] == sorted(WARM_RESET_SCOPE if warm else SNAPSHOT_RESET_SCOPE),
+            "lifecycle reset scope mismatch")
+
+
 def validate_platform(platform):
     keys(platform, PLATFORM, "platform")
     number(platform["active_cpu_count"], "active_cpu_count", 1, integer=True)
@@ -185,12 +208,13 @@ def validate_image_receipt(receipt, target, evidence_kind):
     keys(receipt, {"schema_version", "kind", "evidence_kind", "os", "image",
                    "runtime", "source", "target_abi", "platform",
                    "options", "compiler", "compile_profile", "configured_vm_ram_bytes",
-                   "compiler_embedded", "runtime_linkage", "memory_policy", "aot_modules"},
+                   "compiler_embedded", "runtime_linkage", "memory_policy", "aot_modules",
+                   "execution_lifecycle"},
          "image receipt")
     header(receipt, "wamr-native-image-receipt")
     require(receipt["evidence_kind"] == evidence_kind, "image receipt evidence kind")
     for key in ("os", "image", "runtime", "source", "target_abi", "platform",
-                "options", "compiler", "compile_profile", "memory_policy"):
+                "options", "compiler", "compile_profile", "memory_policy", "execution_lifecycle"):
         require(identical(receipt[key], target[key]), f"image receipt {key} mismatch")
     require(receipt["compiler_embedded"] is False, "AOT comparator must be compiler-free")
     require(receipt["runtime_linkage"] == "static", "AOT runtime must be statically linked")
@@ -237,7 +261,8 @@ def validate_manifest(manifest, *, allow_synthetic=False):
     for os_name, target in manifest["targets"].items():
         keys(target, {"os", "runtime", "compiler", "source", "target_abi", "platform",
                       "options", "image", "image_receipt", "image_receipt_sha256",
-                      "aot_modules", "mode", "jit_preset", "compile_profile", "memory_policy"},
+                      "aot_modules", "mode", "jit_preset", "compile_profile", "memory_policy",
+                      "execution_lifecycle"},
              "target")
         require(target["os"] == os_name, "target OS mismatch")
         require(target["mode"] == "aot" and target["jit_preset"] is None,
@@ -250,6 +275,7 @@ def validate_manifest(manifest, *, allow_synthetic=False):
                     "synthetic platform is not measurement evidence")
         validate_options(target["options"])
         validate_memory_policy(target["memory_policy"])
+        validate_lifecycle(target["execution_lifecycle"])
         public_token(target["target_abi"], "target_abi")
         require(target["compile_profile"] in (None, "unikraft-x86_64"),
                 "unsupported explicit compiler profile")
@@ -271,7 +297,7 @@ def validate_manifest(manifest, *, allow_synthetic=False):
         digest(target["image_receipt_sha256"], "image receipt")
         validate_image_receipt(target["image_receipt"], target, manifest["evidence_kind"])
     linux, unikraft = (manifest["targets"][name] for name in ("linux", "unikraft"))
-    for name in ("source", "compiler", "options", "platform"):
+    for name in ("source", "compiler", "options", "platform", "execution_lifecycle"):
         require(linux[name] == unikraft[name], f"unmatched {name}")
     compatibility = manifest["abi_compatibility"]
     keys(compatibility, workloads, "abi compatibility")
@@ -315,7 +341,8 @@ def run_configuration(manifest, run_id):
             "target": manifest["targets"][run["target"]],
             "workload": manifest["workloads"][run["workload"]],
             "steady_invocations": manifest["steady_invocations"],
-            "phase_contract": "wamr-embedding-v1"}
+            "execution_lifecycle": manifest["targets"][run["target"]]["execution_lifecycle"],
+            "phase_contract": PHASE_CONTRACT}
 
 
 def create_plan(config, repo, *, now=None, allow_synthetic=False):
@@ -356,7 +383,8 @@ def create_plan(config, repo, *, now=None, allow_synthetic=False):
     for os_name, spec in config["targets"].items():
         keys(spec, {"runtime_path", "compiler_path", "compiler_version", "source",
                     "target_abi", "platform", "options", "image_path",
-                    "image_receipt_path", "aot_paths", "compile_profile", "memory_policy"},
+                    "image_receipt_path", "aot_paths", "compile_profile", "memory_policy",
+                    "execution_lifecycle"},
              "target config")
         keys(spec["aot_paths"], manifest["workloads"], "aot_paths")
         receipt_path = Path(spec["image_receipt_path"])
@@ -367,6 +395,7 @@ def create_plan(config, repo, *, now=None, allow_synthetic=False):
                          "source": spec["source"], "version": spec["compiler_version"]},
             "compile_profile": spec["compile_profile"],
             "memory_policy": spec["memory_policy"],
+            "execution_lifecycle": spec["execution_lifecycle"],
             "target_abi": spec["target_abi"], "platform": spec["platform"],
             "options": spec["options"], "image": artifact(spec["image_path"]),
             "image_receipt": read_json(receipt_path),
@@ -462,7 +491,8 @@ def decode_stdout(encoded):
 
 def coremark_correctness(stdout, invocation_seconds, workload, clock_resolution_seconds=0):
     require(workload in ("coremark", "coremark-nofp"), "unknown pinned CoreMark variant")
-    number(invocation_seconds, "CoreMark invocation duration")
+    if invocation_seconds is not None:
+        number(invocation_seconds, "CoreMark invocation duration")
     number(clock_resolution_seconds, "CoreMark enclosing clock resolution")
     require(clock_resolution_seconds <= 1, "unsupported enclosing clock resolution")
     parsed = parse_coremark_output(stdout, "native", EXPECTED_ITERATIONS)
@@ -497,17 +527,43 @@ def coremark_correctness(stdout, invocation_seconds, workload, clock_resolution_
     require(abs(parsed.throughput - expected_rate) <= rate_tolerance,
             "CoreMark throughput/time/iterations disagree")
     # The inner millisecond clock and enclosing clock each quantize a duration.
-    enclosing_tolerance = (1 / COREMARK_TICKS_PER_SECOND + clock_resolution_seconds
-                           + math.ulp(tick_seconds) + math.ulp(invocation_seconds))
-    require(tick_seconds <= invocation_seconds + enclosing_tolerance,
-            "CoreMark tick duration exceeds enclosing invocation duration")
+    if invocation_seconds is not None:
+        enclosing_tolerance = (1 / COREMARK_TICKS_PER_SECOND + clock_resolution_seconds
+                               + math.ulp(tick_seconds) + math.ulp(invocation_seconds))
+        require(tick_seconds <= invocation_seconds + enclosing_tolerance,
+                "CoreMark tick duration exceeds enclosing invocation duration")
     return {"crc": crc, "iterations": parsed.iterations,
             "iterations_per_second": parsed.throughput, "reported_seconds": seconds,
             "reported_ticks": ticks, "reported_ticks_per_second": COREMARK_TICKS_PER_SECOND,
             "seconds_from_ticks": tick_seconds,
             "time_format": "integer-truncated" if nofp else "float-6dp",
-            "minimum_timing_met": seconds >= 10 and tick_seconds >= 10 and invocation_seconds >= 10,
+            "invocation_timing_available": invocation_seconds is not None,
+            "minimum_timing_met": invocation_seconds is not None and seconds >= 10 and
+            tick_seconds >= 10 and invocation_seconds >= 10,
             "compliance": "not-certified"}
+
+
+def validate_reset_events(result, config, steady_count):
+    events = result["reset_events"]
+    require(isinstance(events, list), "reset events must be a list")
+    require(steady_count <= len(events) <= steady_count + 1, "reset event count mismatch")
+    require(len(events) <= config["steady_invocations"], "extra reset events")
+    require(not events or result["invocations"], "reset before first invocation")
+    if result["outcome"] == "success":
+        require(len(events) == steady_count, "successful run has an uncalled reset")
+    total = 0
+    for index, event in enumerate(events):
+        keys(event, {"before_invocation", "outcome", "elapsed_ticks"}, "reset event")
+        require(type(event["before_invocation"]) is int and event["before_invocation"] == index + 2,
+                "reset order/ordinal mismatch")
+        require(event["outcome"] in ("completed", "error"), "reset outcome")
+        if event["elapsed_ticks"] is not None:
+            number(event["elapsed_ticks"], "reset duration", integer=True)
+            total += event["elapsed_ticks"]
+        if index < steady_count:
+            require(event["outcome"] == "completed" and event["elapsed_ticks"] is not None,
+                    "invocation followed an incomplete or untimed reset")
+    return total
 
 
 def validate_result(result, manifest, run_id):
@@ -516,7 +572,7 @@ def validate_result(result, manifest, run_id):
     keys(result, {"schema_version", "kind", "evidence_kind", "campaign_id", "run_id",
                   "config_sha256", "image_receipt_sha256", "observed", "outcome",
                   "exit_code", "clock", "phase_contract", "phases", "invocations",
-                  "memory"}, "result")
+                  "memory", "execution_lifecycle", "reset_events"}, "result")
     header(result, "wamr-native-benchmark-result")
     require(result["evidence_kind"] == manifest["evidence_kind"], "result evidence kind")
     require(result["campaign_id"] == manifest["campaign_id"] and result["run_id"] == run_id,
@@ -538,7 +594,9 @@ def validate_result(result, manifest, run_id):
             "guest exit_code must be a complete u32 status, not a host process returncode")
     require(result["outcome"] != "trap" or result["exit_code"] is None,
             "trap must not report a guest exit code")
-    require(result["phase_contract"] == "wamr-embedding-v1", "unknown phase contract")
+    require(result["phase_contract"] == PHASE_CONTRACT, "unknown phase contract")
+    require(identical(result["execution_lifecycle"], target["execution_lifecycle"]),
+            "result execution lifecycle mismatch")
     phases = result["phases"]
     keys(phases, PHASES, "phases")
     require(phases["compile_ticks"] is None, "AOT must not conflate runtime compilation")
@@ -546,9 +604,11 @@ def validate_result(result, manifest, run_id):
     if clock is None:
         require(result["outcome"] != "success" and
                 all(phases[name] is None for name in
-                    ("load_ticks", "instantiate_ticks", "first_invocation_ticks")) and
+                    ("load_ticks", "instantiate_ticks", "lifecycle_setup_ticks",
+                     "first_invocation_ticks")) and
                 phases["steady_state_ticks"] == [] and result["invocations"] == [] and
-                result["memory"] is None and result["exit_code"] is None,
+                result["reset_events"] == [] and result["memory"] is None and
+                result["exit_code"] is None,
                 "unavailable clock requires a failed, unstarted attempt without measurements")
         return []
     keys(clock, {"source", "unit", "ticks_per_second", "resolution_ticks"}, "clock")
@@ -565,6 +625,14 @@ def validate_result(result, manifest, run_id):
         require(not success or phases[phase] is not None, f"missing {phase}")
         if phases[phase] is not None:
             number(phases[phase], phase, integer=True)
+    snapshot = result["execution_lifecycle"]["mode"] == "snapshot-replay"
+    if snapshot:
+        require(not success or phases["lifecycle_setup_ticks"] is not None,
+                "missing snapshot lifecycle setup duration")
+        if phases["lifecycle_setup_ticks"] is not None:
+            number(phases["lifecycle_setup_ticks"], "lifecycle setup duration", integer=True)
+    else:
+        require(phases["lifecycle_setup_ticks"] is None, "warm reuse cannot hide snapshot setup")
     require(isinstance(phases["steady_state_ticks"], list), "steady state ticks")
     require(len(phases["steady_state_ticks"]) <= config["steady_invocations"],
             "extra steady-state invocations")
@@ -572,26 +640,38 @@ def validate_result(result, manifest, run_id):
         require(len(phases["steady_state_ticks"]) == config["steady_invocations"],
                 "partial steady state result")
     for value in phases["steady_state_ticks"]:
-        number(value, "steady ticks", integer=True)
+        if value is not None:
+            number(value, "steady ticks", integer=True)
+        else:
+            require(not success, "successful steady invocation requires a duration")
     require(phases["instantiate_ticks"] is None or phases["load_ticks"] is not None,
             "instantiation without load")
     require(phases["first_invocation_ticks"] is None or phases["instantiate_ticks"] is not None,
             "invocation without instantiation")
-    require(not phases["steady_state_ticks"] or phases["first_invocation_ticks"] is not None,
-            "steady state without first invocation")
-    durations = ([] if phases["first_invocation_ticks"] is None
-                 else [phases["first_invocation_ticks"]]) + phases["steady_state_ticks"]
-    timed_ticks = sum(durations) + sum(phases[name] or 0 for name in
-                                      ("load_ticks", "instantiate_ticks"))
+    require(isinstance(result["invocations"], list), "invocation evidence must be a list")
+    require(result["invocations"] or (phases["first_invocation_ticks"] is None and
+                                     not phases["steady_state_ticks"]),
+            "invocation duration without terminal evidence")
+    durations = ([phases["first_invocation_ticks"]] + phases["steady_state_ticks"]
+                 if result["invocations"] else [])
+    require(len(result["invocations"]) == len(durations), "invocation evidence count mismatch")
+    require(not durations or phases["instantiate_ticks"] is not None,
+            "invocation without measured instantiation")
+    require(not snapshot or not durations or phases["lifecycle_setup_ticks"] is not None,
+            "snapshot invocation without measured lifecycle setup")
+    require(phases["lifecycle_setup_ticks"] is None or phases["instantiate_ticks"] is not None,
+            "lifecycle setup without instantiation")
+    reset_ticks = validate_reset_events(result, config, len(phases["steady_state_ticks"]))
+    timed_ticks = reset_ticks + sum(tick for tick in durations if tick is not None) + sum(
+        phases[name] or 0 for name in ("load_ticks", "instantiate_ticks", "lifecycle_setup_ticks"))
     campaign_seconds = (timestamp(manifest["expires_at"]) -
                         timestamp(manifest["created_at"])).total_seconds()
     require(timed_ticks <= campaign_seconds * clock["ticks_per_second"],
             "guest phase duration exceeds campaign validity (overflow or stale clock evidence)")
-    require(isinstance(result["invocations"], list) and
-            len(result["invocations"]) == len(durations), "invocation evidence count mismatch")
     checks = []
     for index, (invocation, ticks) in enumerate(zip(result["invocations"], durations)):
-        keys(invocation, {"phase", "outcome", "exit_code", "stdout_base64"}, "invocation")
+        keys(invocation, {"phase", "outcome", "exit_code", "stdout_base64",
+                          "stdout_complete", "measurement_errors"}, "invocation")
         require(invocation["phase"] == ("first" if index == 0 else "steady"),
                 "invocation phase mismatch")
         require(invocation["outcome"] in ("returned", "proc_exit", "trap", "error"),
@@ -603,19 +683,32 @@ def validate_result(result, manifest, run_id):
                 "proc_exit requires its u32 status")
         require(invocation["outcome"] == "proc_exit" or invocation["exit_code"] is None,
                 "only proc_exit has a guest exit code")
+        errors = invocation["measurement_errors"]
+        require(isinstance(errors, list) and all(isinstance(error, str) for error in errors)
+                and errors == sorted(set(errors)) and set(errors) <= MEASUREMENT_ERRORS,
+                "invalid invocation measurement errors")
+        require(type(invocation["stdout_complete"]) is bool and
+                invocation["stdout_complete"] == ("stdout-copy" not in errors),
+                "stdout completeness contradicts copy failure evidence")
+        require((ticks is None) == ("post-call-clock" in errors),
+                "missing duration requires an explicit post-call clock failure")
         stdout = decode_stdout(invocation["stdout_base64"])
         good = invocation["outcome"] == "returned" or (
             invocation["outcome"] == "proc_exit" and invocation["exit_code"] == 0)
-        require(index == len(durations) - 1 or good,
+        continues = index < len(durations) - 1 or len(result["reset_events"]) > index
+        require(not continues or (good and not errors),
                 "invocations continued after a failed terminal outcome")
         if invocation["outcome"] == "proc_exit" and invocation["exit_code"] != 0:
             require(result["exit_code"] == invocation["exit_code"],
                     "guest terminal status lost or truncated proc_exit")
-        require(not success or good, "success contradicts invocation terminal outcome")
-        if good and config["run"]["workload"].startswith("coremark"):
+        require(not success or (good and not errors),
+                "success contradicts invocation terminal or measurement outcome")
+        if not invocation["stdout_complete"]:
+            checks.append({"self_check": "unavailable", "failure": "stdout-copy"})
+        elif good and config["run"]["workload"].startswith("coremark"):
             try:
                 checks.append(coremark_correctness(
-                    stdout.decode("ascii"), ticks / clock["ticks_per_second"],
+                    stdout.decode("ascii"), None if ticks is None else ticks / clock["ticks_per_second"],
                     config["run"]["workload"],
                     clock["resolution_ticks"] / clock["ticks_per_second"]))
             except (ValueError, RuntimeError) as error:
@@ -640,8 +733,8 @@ def validate_result(result, manifest, run_id):
         validate_memory(result["memory"], target, complete=False)
     if result["memory"] is not None:
         reached_snapshots = (int(phases["instantiate_ticks"] is not None) +
-                             int(phases["first_invocation_ticks"] is not None) +
-                             int(bool(phases["steady_state_ticks"])))
+                             int(bool(result["invocations"])) +
+                             int(len(result["invocations"]) > 1))
         require(len(result["memory"]["samples"]) <= reached_snapshots,
                 "memory snapshot refers to an unstarted phase")
     return checks
@@ -779,7 +872,9 @@ def build_report(manifest, directories, *, allow_synthetic=False):
                         and record["run"]["phase"] == "measured"
                         and record["result"] is not None
                         and record["result"]["outcome"] == "success"]
-            row = {"successful_runs": len(selected), "planned_runs": manifest["runs"]}
+            lifecycle = manifest["targets"][target]["execution_lifecycle"]
+            row = {"successful_runs": len(selected), "planned_runs": manifest["runs"],
+                   "execution_lifecycle": lifecycle}
             for phase in ("load_ticks", "instantiate_ticks", "first_invocation_ticks"):
                 values = [record["result"]["phases"][phase] /
                           record["result"]["clock"]["ticks_per_second"] for record in selected]
@@ -788,7 +883,23 @@ def build_report(manifest, directories, *, allow_synthetic=False):
             values = [tick / record["result"]["clock"]["ticks_per_second"]
                       for record in selected
                       for tick in record["result"]["phases"]["steady_state_ticks"]]
-            row["steady_state_seconds"] = sample_stats(values, "values") if values else None
+            repeats = sample_stats(values, "values") if values else None
+            row["repeated_invocation_seconds"] = repeats
+            row["steady_state_seconds"] = repeats if lifecycle["mode"] == "same-instance-warm" else None
+            row["snapshot_replay_seconds"] = repeats if lifecycle["mode"] == "snapshot-replay" else None
+            resets = [event["elapsed_ticks"] / record["result"]["clock"]["ticks_per_second"]
+                      for record in selected for event in record["result"]["reset_events"]]
+            row["reset_seconds"] = sample_stats(resets, "values") if resets else None
+            combined = [(event["elapsed_ticks"] + tick) / record["result"]["clock"]["ticks_per_second"]
+                        for record in selected for event, tick in zip(
+                            record["result"]["reset_events"],
+                            record["result"]["phases"]["steady_state_ticks"])]
+            row["reset_and_invocation_seconds"] = (
+                sample_stats(combined, "values") if combined else None)
+            setup = [record["result"]["phases"]["lifecycle_setup_ticks"] /
+                     record["result"]["clock"]["ticks_per_second"] for record in selected
+                     if record["result"]["phases"]["lifecycle_setup_ticks"] is not None]
+            row["lifecycle_setup_seconds"] = sample_stats(setup, "values") if setup else None
             summary[target][workload] = row
     timing_met = all(check.get("minimum_timing_met", True)
                      for record in records for check in record["correctness"])
@@ -810,6 +921,7 @@ def build_report(manifest, directories, *, allow_synthetic=False):
             "manifest_sha256": cache_key(manifest), "plan": manifest,
             "records": public_records, "summary": summary,
             "status": {"all_attempts_successful": all_success,
+                       "execution_lifecycle": manifest["targets"]["linux"]["execution_lifecycle"]["mode"],
                        "profile_counts_match": (manifest["warmups"], manifest["runs"]) ==
                        PROFILE_COUNTS[manifest["profile"]],
                        "coremark_minimum_timing_met": (timing_met and all_success)

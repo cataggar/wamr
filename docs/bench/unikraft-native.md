@@ -19,23 +19,24 @@ The host can verify local artifact bytes and image receipts, generate a counterb
 plan, export per-run requests, launch a supplied **Linux embedding producer**, import
 native serial evidence, validate every result, and produce a paired JSON report.
 The Python adapter does not implement an embedding runner or obtain native runtime
-phase timers by timing a subprocess. The Linux and Unikraft native embedding
-producers must implement the contract below before real measurements can be collected.
+phase timers by timing a subprocess. The separately owned Linux and Unikraft native
+embedding producers must implement the contract below before their measurements
+can be accepted.
 Standalone parser/capture tests do not depend on those APIs.
 
 Concrete integration dependencies identified during the native API handoff:
 
-* The reported `src/api/aot.zig` `Instance.load(...)` implementation combines
-  parse/load with instance, memory and table setup. Its outer-call duration cannot
-  honestly populate separate `load_ticks` and `instantiate_ticks`. API staging or
-  internal native phase instrumentation is required; duplicating the duration or
-  inventing a zero instantiation duration is not an adapter.
+* A combined `Instance.load(...)` outer-call duration cannot honestly populate
+  separate `load_ticks` and `instantiate_ticks`. The producer must use genuine
+  staging/internal phase instrumentation and check completion indicators.
+  Duplicating an outer duration or inventing zero instantiation is not an adapter.
 * The standalone `src/wasi/minimal.zig` context supplies imports, bytes and tagged
   terminal outcomes, not a native executable, load/instantiate timers or memory
   snapshots. Those belong to the native embedding producer.
-* WASI exit state is deliberately sticky. An explicit re-arm operation alone does
-  not prove pinned libc `_start`, its stack state and the module's mutable state
-  can safely execute again on the same instance. That requires actual qualification.
+* WASI exit state is deliberately sticky. Warm continuation needs actual restart
+  qualification; snapshot replay instead needs a complete qualified restoration
+  boundary. Version 2 distinguishes those policies and records excluded reset cost.
+  Repeated CRC success alone does not prove all state/resource lifecycles are safe.
 
 Neither an API build nor context/import fixture tests establish native CoreMark CRC
 success, valid clock execution or benchmark measurements. These dependencies must
@@ -137,7 +138,9 @@ with the base commit.
 Each target configuration has:
 
 * `runtime_path`: exact linked WAMR runtime artifact (the archive/object used in the
-  native image, **not** an unrelated hosted `wamr` executable).
+  native image, or the actual static compiler-free Linux embedding ELF executed,
+  **not** an unrelated hosted `wamr` executable). The runtime ELF is not automatically
+  a complete deployment image; their identities and byte counts remain separate.
 * `compiler_path`, `compiler_version`: exact external `wamrc` executable and public
   version token. Both targets must use the same compiler bytes and source identity.
 * `compile_profile`: `null` when the compiler's profile option was omitted, or the
@@ -165,6 +168,9 @@ Each target configuration has:
   separate public page-policy tokens. These are configuration identities bound to
   the exact image receipt, not allocator byte counters or evidence of zero allocations.
   Policy choices may differ across targets and remain visible for experimental review.
+* `execution_lifecycle`: the explicit common lifecycle/reset policy described below.
+  It must match across Linux/Unikraft, match the exact-image receipt, and match every
+  result. It is copied explicitly into each request and included in its config hash.
 * `image_path`: exact **complete boot/deployment image file**, not ELF sections or
   stripped text size; `image_receipt_path`: its native integration receipt.
 * `aot_paths`: map from every selected workload to the actual AOT artifact file.
@@ -176,7 +182,7 @@ be established are pending evidence, not `"unknown"` measurements.
 The image integrator must supply a JSON receipt with exactly:
 
 ```
-schema_version = 1
+schema_version = 2
 kind = "wamr-native-image-receipt"
 evidence_kind = "measurement"
 os = "linux" | "unikraft"
@@ -189,6 +195,7 @@ options = {optimize, bounds_checks, wx_enforced, import_checks, trap_isolation,
            stack_checks, simd, threads, memory64}
 memory_policy = {allocator_by_phase: {load, instantiate, first, steady},
                  page_policy: {reservation, commitment, release}}
+execution_lifecycle = {mode, reset_policy, reset_before, reset_timing, reset_scope}
 target_abi = public ABI token
 platform = {arch, cpu_model, active_cpu_count, azure_sku, azure_region}
 configured_vm_ram_bytes = positive integer
@@ -204,7 +211,7 @@ image receipt and observed identities; blindly echoing a request is not measurem
 
 Different AOT bytes require different explicit `target_abi` values and retain both
 hashes/sizes. Identical bytes require a separate ABI qualification attestation:
-exactly `{schema_version: 1, kind: "wamr-aot-abi-proof", evidence_kind: "measurement",
+exactly `{schema_version: 2, kind: "wamr-aot-abi-proof", evidence_kind: "measurement",
 compatible: true, source: SOURCE, target_abis: [LINUX_ABI, UNIKRAFT_ABI],
 aot_sha256: HASH}`. Its hash is retained. Sharing a filename or architecture does
 not establish ABI compatibility. Actual compatibility tests remain the native
@@ -233,7 +240,7 @@ IDs. Every scheduled warmup and measured run is a new load/instance.
 The request is `{"config": CONFIG, "config_sha256": HASH}`. `HASH` is SHA-256 of
 `json.dumps(CONFIG, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("UTF-8")`.
 `CONFIG` contains `campaign_id`, the exact schedule `run` object, `target`, `workload`,
-`steady_invocations`, and `phase_contract: "wamr-embedding-v1"`.
+`steady_invocations`, `execution_lifecycle`, and `phase_contract: "wamr-embedding-v2"`.
 Run objects contain `run_id`, `target`, `workload`, `phase`, `attempt: 1`, `position`.
 
 For a Linux producer implementing this contract:
@@ -277,7 +284,14 @@ Raw evidence is saved **before** result validation,
 including malformed output, failures, traps, timeouts and missing terminal results.
 Import observation timestamps must lie inside the campaign validity window.
 
-## Native result protocol v1
+## Native result protocol v2
+
+All native plans, image/ABI receipts, observations, results and reports now use
+`schema_version: 2`; requests declare `phase_contract: "wamr-embedding-v2"`. Version 1
+is explicitly rejected, not silently upgraded, because it could not represent full
+snapshot replay or a completed call with missing duration/output-copy evidence.
+Regenerate the plan/request and update the producer together. Do not relabel old
+evidence or rely on ignored unknown keys.
 
 Emit exactly one complete UTF-8 line on stdout/serial, starting at column zero:
 
@@ -292,7 +306,7 @@ duplicate JSON keys, nonfinite numbers, unknown fields, stale campaign/config ID
 wrong artifacts, unexpected run IDs and incomplete campaigns are errors.
 The object has **exactly** these fields:
 
-* `schema_version: 1`, `kind: "wamr-native-benchmark-result"`,
+* `schema_version: 2`, `kind: "wamr-native-benchmark-result"`,
   `evidence_kind: "measurement"`, `campaign_id`, `run_id`, `config_sha256`,
   `image_receipt_sha256`.
 * `observed`: exactly `image_sha256`, `runtime_sha256`, `aot_sha256`, `wasm_sha256`,
@@ -308,7 +322,8 @@ The object has **exactly** these fields:
   Host process/collector return codes remain separate observation fields.
   A trapped or nonreturning
   workload must never be rewritten into a successful terminal event.
-* `phase_contract: "wamr-embedding-v1"`.
+* `phase_contract: "wamr-embedding-v2"`, `execution_lifecycle`: identical to the
+  request, target and image receipt.
 * `clock`: exactly `source` (public monotonic clock token), `unit` (`ns`, `us`, `ms`),
   `ticks_per_second` (respectively 1000000000, 1000000, 1000), `resolution_ticks`
   (positive integer from the supported native clock resolution). Raw TSC cycles
@@ -319,45 +334,133 @@ The object has **exactly** these fields:
   window: this sanity check rejects overflow/wraparound evidence such as
   `UINT64_MAX`, without treating host observation latency as an execution timer.
   If no supported clock exists, an early **failed, unstarted** attempt may use
-  `clock: null`, with all scalar phases `null`, empty steady/invocation lists and
+  `clock: null`, with all scalar phases `null`, empty steady/invocation/reset lists and
   `memory: null`. It is not a timed sample. Do not fabricate a clock resolution to
   report that failure. For a WASI-provided phase clock, use the monotonic ID's actual
   resolution (ID 1); real-time epoch or CPU-time clocks are not substitutes.
-* `phases`: `compile_ticks: null`, `load_ticks`, `instantiate_ticks`,
+* `phases`: `compile_ticks: null`, `load_ticks`, `instantiate_ticks`, `lifecycle_setup_ticks`,
   `first_invocation_ticks`, `steady_state_ticks` (list).
+* `reset_events`: ordered list of `{before_invocation: ORDINAL, outcome:
+  "completed"|"error", elapsed_ticks: INTEGER|null}`. Ordinals are one-based
+  invocation numbers, so the first reset is before invocation 2. Every repeated
+  call needs a completed, timed preceding reset. Failed runs may retain one
+  additional reset event before the next, uncalled invocation. Missing reset time
+  is `null`, not zero, and forbids proceeding to that invocation.
 * `invocations`: list, first then steady, each exactly `{phase: "first"|"steady",
   outcome: "returned"|"proc_exit"|"trap"|"error", exit_code: u32|null,
-  stdout_base64: STRING}`. Only `proc_exit` has a non-null exit code (including zero);
+  stdout_base64: STRING, stdout_complete: BOOLEAN, measurement_errors: LIST}`.
+  Only `proc_exit` has a non-null exit code (including zero);
   returned/trap/error use `null`. `stdout_base64` is canonical padded RFC 4648 base64
   of the **exact callback bytes**, including NUL and non-UTF-8 bytes; empty output is
   `""`. Never use replacement decoding. Successful CoreMark output must decode as
   ASCII before correctness checks. Include separate complete output for every
   invocation; a shared serial transcript cannot substitute for it.
+  `stdout_complete` describes capture/copy completeness, not whether the intended
+  guest output was successful. `measurement_errors` is a sorted unique subset of
+  `post-call-clock`, `stdout-copy`, `pending-output`, normally `[]`. The failure
+  rules below preserve the actual guest terminal tag independently of these errors.
 * `memory`: the native memory receipt below, or `null` on a failed attempt.
+
+### Accepted lifecycle/reset policies
+
+The `execution_lifecycle` object has exactly five fields. Both supported modes use
+`reset_before: "each-steady-invocation"` and
+`reset_timing: "excluded-from-invocation"`. Exclusion is explicit and the reset
+duration is separately required; it is not permission to omit expensive work.
+
+| `mode` | `reset_policy` | Exact sorted `reset_scope` |
+|---|---|---|
+| `same-instance-warm` | `invocation-state-only` | `["invocation-state", "stdout-capture"]` |
+| `snapshot-replay` | `restore-post-instantiation` | `["execution-state", "globals", "linear-memory", "segment-drop-state", "stdout-capture", "tables", "wasi-context"]` |
+
+Warm mode continues the same initialized instance with its mutable Wasm state intact.
+Only qualified per-call execution/output rearming occurs outside the call timer.
+It must not restore memory, globals, tables, descriptors or a fresh WASI context.
+If repeated command/libc execution is unsafe, warm mode is unsupported.
+
+Snapshot replay reuses loaded code and instance mappings but restores the complete
+declared post-instantiation initial state before every repeated invocation: linear
+contents/size, globals, tables/size, segment/drop flags, execution state and the
+initial WASI context/resource contract, with a fresh output-capture boundary.
+Growth must be safely restored/revoked to the qualified initial state, not merely
+left accessible beyond a restored size counter. Context replacement alone is not
+a full snapshot, nor does CRC success prove complete restoration. The producer must
+qualify resource cleanup, pending-error handling and reset failure behavior.
+This mode is **restored-state replay**, not warm libc/state continuation or fresh
+load/instantiation. Both targets must use the same declared semantics.
+
+For snapshot mode, `lifecycle_setup_ticks` measures snapshot construction after
+instantiation and before the first invocation, including its allocation/copy work.
+It is required on success. Warm mode uses `null` because there is no snapshot setup.
+`reset_events` measures the entire relevant restore/rearm and output/context setup
+before each repeat, on the declared guest clock, separately from the call.
+Run-level warmup/measured labels do not change this per-instance lifecycle.
+
+Reports expose `repeated_invocation_seconds`, `reset_seconds`,
+`reset_and_invocation_seconds`, and `lifecycle_setup_seconds`. Only warm mode
+populates `steady_state_seconds`; replay populates `snapshot_replay_seconds` instead.
+The legacy wire name `steady_state_ticks` denotes repeated call-only durations
+under the explicit v2 lifecycle, not an implicit warm-state performance claim.
+Reset+call excludes initial load, instantiation and snapshot construction, which
+remain separate reported phases.
 
 ### Phase boundaries
 
 All phase timings come from the **same native guest clock** and exclude host
 observation/control-plane time:
 
-1. `load_ticks`: from supplying the in-memory precompiled artifact bytes to the
-   embedding loader through completed load/relocation/validation. Excludes boot,
+1. `load_ticks`: from supplying the in-memory precompiled artifact bytes through
+   byte-copy and completed format/ABI/CPU/import validation. Excludes boot,
    transport, disk acquisition, compilation and artifact hashing.
-2. `instantiate_ticks`: instance creation, memory/table/global initialization,
-   WASI binding setup and execution-environment setup after load, before lookup/call.
+2. `instantiate_ticks`: instance allocation, code/linear mapping and relocation,
+   memory/table/global initialization, executable permissions/helper wiring, WASI
+   binding and execution-environment setup after validation, before lookup/call.
+   Native timing completion indicators must establish the phases actually finished;
+   separately timed caller setup must not overlap or double-count native intervals.
 3. `first_invocation_ticks`: lookup/call of `_start` on that fresh instance through
    normal return or caught WASI `proc_exit(0)`, including workload I/O.
-4. `steady_state_ticks`: repeated `_start` invocations on the **same instance**,
-   re-arming supported WASI invocation/exit/output state outside the timed call.
-   Do not silently recreate/load an instance, include first invocation in steady
-   state, or mix a function microbenchmark with complete `_start` execution.
+4. `steady_state_ticks`: repeated `_start` calls on the same loaded instance, using
+   the explicitly declared warm-continuation or snapshot-replay policy. Reset/rearm
+   is separately timed outside the call. Do not silently recreate/load an instance,
+   include first invocation in repeats, or mix an internal function with full `_start`.
 
-Successful records require all three scalar phases and exactly the requested
-steady invocation count. Each timed invocation has corresponding terminal/output
-evidence. Failed records retain the completed or interrupted phases that actually
-have timings; unstarted phases are `null` and unstarted steady calls are omitted.
-A producer unable to safely repeat the pinned command module is pending integration,
-not permission to silently change the phase contract.
+Successful records require all three main scalar phases, the lifecycle-specific
+setup/reset evidence and exactly the requested repeated invocation count. Each call
+has its own actual terminal/output evidence.
+
+### Post-call and partial failure evidence
+
+A post-call clock or output-copy failure must not discard a completed guest call or
+invent its duration. Retain that invocation's actual `returned`, `proc_exit(u32)`,
+`trap` or `error` tag. The enclosing run must be unsuccessful and cannot contribute
+to successful phase statistics.
+
+If an end timestamp fails, retain `first_invocation_ticks: null` with the first
+invocation record present, or a `null` entry in `steady_state_ticks` paired with
+the actual repeated invocation. Require `measurement_errors: ["post-call-clock"]`
+(plus any other actual errors). A first scalar `null` with **no** invocation still
+means unstarted; a repeated array entry always means a call actually occurred.
+The known clock provider/unit/resolution remains required. No later reset or call
+may follow incomplete measurement evidence.
+
+If copying captured output fails, retain the exact known bytes/prefix in
+`stdout_base64`, set `stdout_complete: false`, and include `stdout-copy`.
+Empty known output is allowed but cannot masquerade as complete capture. A copy
+failure may accompany a valid duration or a clock failure. Public reports preserve
+completeness/error flags, terminal status and the hash of retained bytes, not private
+bytes themselves. CRC/correctness is unavailable for incomplete capture.
+
+For complete CoreMark output with a missing enclosing duration, the parser still
+checks the pinned CRC/iterations/ticks/display/rate relationships; it marks
+`invocation_timing_available: false` and minimum timing unqualified. It does not
+invent an enclosing duration from the printed workload time.
+
+After a native call, inspect deferred per-fd output errors before success/rearm.
+Use `pending-output` while preserving the actual guest terminal and known output;
+do not convert a returned call into a fabricated trap. No subsequent reset may
+erase the failure. If the producer cannot serialize even the terminal/known-byte
+record safely, retain raw private diagnostics and fail capture explicitly; do not
+emit a successful measurement placeholder.
 
 ### Memory receipt
 
@@ -385,6 +488,9 @@ coverage. Virtual reservation is not resident/committed memory; configured VM RA
 is neither. Allocator totals must never be called RSS. Native page-accounting coverage
 and excluded kernel/device/stack/code regions must come from exact-image evidence.
 Comparing partial coverage across unlike region sets requires further review.
+Snapshot storage, reset scratch and fresh context allocations must also be included
+or explicitly listed among omitted regions; reused mappings do not make that memory
+free or invisible.
 Flat committed-memory snapshots do not establish allocation-free steady execution;
 that claim would require separate actual allocator-event evidence. This report does
 not infer allocator call counts or attribute performance to a policy label.
@@ -402,7 +508,7 @@ python3 scripts/bench_coremark.py native-report \
 ```
 
 Repeat `--capture` for **all** schedule entries; the two-entry example only completes
-a plan with two scheduled attempts. Reports use schema version 1 and kind
+a plan with two scheduled attempts. Reports use schema version 2 and kind
 `wamr-native-matched-comparison`, distinct from hosted CoreMark schema version 2.
 They retain the plan, hashes/byte counts, each run/configuration/terminal event,
 guest phase durations and clock, per-invocation correctness, external observations,
@@ -431,7 +537,7 @@ may be collected separately as a correctness/reference engine.
 
 ## Future optional JIT (#1044)
 
-Version 1 accepts only `mode: "aot"`, `jit_preset: null`, a compiler-free image receipt,
+Version 2 accepts only `mode: "aot"`, `jit_preset: null`, a compiler-free image receipt,
 and `compile_ticks: null`. These explicit fields reserve a non-conflating extension:
 qualified JIT must declare `fast` or `full`, time compilation separately, retain
 its compiler-bearing complete image and memory growth versus this compiler-free

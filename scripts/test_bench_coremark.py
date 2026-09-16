@@ -1317,6 +1317,10 @@ class NativeBenchmarkTests(unittest.TestCase):
                         "stack_checks": True, "simd": False, "threads": False,
                         "memory64": False, "wx_enforced": True,
                         "import_checks": True, "trap_isolation": True}
+        self.lifecycle = {"mode": "same-instance-warm", "reset_policy": "invocation-state-only",
+                          "reset_before": "each-steady-invocation",
+                          "reset_timing": "excluded-from-invocation",
+                          "reset_scope": sorted(native_benchmark.WARM_RESET_SCOPE)}
         self.config = {"profile": "ci", "warmups": 1, "runs": 1,
                        "steady_invocations": 2, "valid_hours": 24,
                        "workloads": ["coremark", "coremark-nofp", "compute", "memory"],
@@ -1332,6 +1336,7 @@ class NativeBenchmarkTests(unittest.TestCase):
             spec = {"runtime_path": str(runtime_path), "compiler_path": str(compiler_path),
                     "compiler_version": "synthetic-v1", "source": self.source,
                     "compile_profile": None if target == "linux" else "unikraft-x86_64",
+                    "execution_lifecycle": copy.deepcopy(self.lifecycle),
                     "memory_policy": {
                         "allocator_by_phase": {phase: f"synthetic-{target}-allocator" for phase in
                                                ("load", "instantiate", "first", "steady")},
@@ -1341,7 +1346,7 @@ class NativeBenchmarkTests(unittest.TestCase):
                     "target_abi": f"synthetic-{target}-abi",
                     "platform": copy.deepcopy(self.platform), "options": copy.deepcopy(self.options),
                     "image_path": str(image_path), "aot_paths": aot_paths}
-            receipt = {"schema_version": 1, "kind": "wamr-native-image-receipt",
+            receipt = {"schema_version": native_benchmark.VERSION, "kind": "wamr-native-image-receipt",
                        "evidence_kind": "synthetic", "os": target,
                        "runtime": native_benchmark.artifact(runtime_path),
                        "image": native_benchmark.artifact(image_path),
@@ -1350,6 +1355,7 @@ class NativeBenchmarkTests(unittest.TestCase):
                        "options": spec["options"],
                        "compile_profile": spec["compile_profile"],
                        "memory_policy": spec["memory_policy"], "runtime_linkage": "static",
+                       "execution_lifecycle": spec["execution_lifecycle"],
                        "source": self.source, "target_abi": spec["target_abi"],
                        "platform": spec["platform"], "configured_vm_ram_bytes": 1024**3,
                        "compiler_embedded": False,
@@ -1397,7 +1403,7 @@ Correct operation validated. See README.md for run and reporting rules.
         elif not run["workload"].startswith("coremark"):
             output = ""
         return {
-            "schema_version": 1, "kind": "wamr-native-benchmark-result",
+            "schema_version": native_benchmark.VERSION, "kind": "wamr-native-benchmark-result",
             "evidence_kind": "synthetic", "campaign_id": self.manifest["campaign_id"],
             "run_id": run["run_id"], "config_sha256": native_benchmark.cache_key(config),
             "image_receipt_sha256": target["image_receipt_sha256"],
@@ -1407,13 +1413,19 @@ Correct operation validated. See README.md for run and reporting rules.
                          "wasm_sha256": config["workload"]["sha256"], "platform": target["platform"],
                          "options": target["options"], "mode": "aot", "jit_preset": None,
                          "compile_profile": target["compile_profile"]},
-            "outcome": "success", "exit_code": None, "phase_contract": "wamr-embedding-v1",
+            "outcome": "success", "exit_code": None, "phase_contract": native_benchmark.PHASE_CONTRACT,
+            "execution_lifecycle": copy.deepcopy(target["execution_lifecycle"]),
+            "reset_events": [{"before_invocation": index, "outcome": "completed",
+                              "elapsed_ticks": 1000} for index in (2, 3)],
             "clock": {"source": "synthetic-clock", "unit": "us", "ticks_per_second": 1000000,
                       "resolution_ticks": 1},
             "phases": {"compile_ticks": None, "load_ticks": 10, "instantiate_ticks": 20,
+                       "lifecycle_setup_ticks": (5000 if target["execution_lifecycle"]["mode"] ==
+                                                "snapshot-replay" else None),
                        "first_invocation_ticks": 21000000,
                        "steady_state_ticks": [21000000, 21000000]},
             "invocations": [{"phase": phase, "outcome": "returned", "exit_code": None,
+                             "stdout_complete": True, "measurement_errors": [],
                              "stdout_base64": base64.b64encode(output.encode("ascii")).decode("ascii")}
                             for phase in ("first", "steady", "steady")],
             "memory": {"image_sha256": target["image"]["sha256"],
@@ -1571,7 +1583,7 @@ Correct operation validated. See README.md for run and reporting rules.
         aot = native_benchmark.artifact(linux["aot_paths"]["compute"])
         receipt["aot_modules"]["compute"] = aot
         receipt_path.write_text(json.dumps(receipt))
-        proof = {"schema_version": 1, "kind": "wamr-aot-abi-proof",
+        proof = {"schema_version": native_benchmark.VERSION, "kind": "wamr-aot-abi-proof",
                  "evidence_kind": "synthetic", "compatible": True, "source": self.source,
                  "target_abis": [linux["target_abi"], unikraft["target_abi"]],
                  "aot_sha256": aot["sha256"]}
@@ -1762,15 +1774,18 @@ Correct operation validated. See README.md for run and reporting rules.
         result["phases"]["first_invocation_ticks"] = None
         result["phases"]["steady_state_ticks"] = []
         result["invocations"] = []
+        result["reset_events"] = []
         result["memory"]["samples"] = result["memory"]["samples"][:1]
         self.assertEqual(native_benchmark.validate_result(result, self.manifest, run["run_id"]), [])
 
     def test_native_unavailable_clock_is_an_honest_early_failure(self):
         run = self.manifest["schedule"][0]
         result = self.result(run)
-        result.update(outcome="error", exit_code=None, clock=None, invocations=[], memory=None)
+        result.update(outcome="error", exit_code=None, clock=None, invocations=[], memory=None,
+                      reset_events=[])
         result["phases"] = {"compile_ticks": None, "load_ticks": None,
-                            "instantiate_ticks": None, "first_invocation_ticks": None,
+                            "instantiate_ticks": None, "lifecycle_setup_ticks": None,
+                            "first_invocation_ticks": None,
                             "steady_state_ticks": []}
         self.assertEqual(native_benchmark.validate_result(result, self.manifest, run["run_id"]), [])
         result["phases"]["load_ticks"] = 1
@@ -1929,6 +1944,258 @@ Correct operation validated. See README.md for run and reporting rules.
         self.assertEqual(record["observation"]["transport_outcome"], "launch_error")
         self.assertIsNone(record["result"])
         self.assertTrue((output / "stderr.bin").read_bytes())
+
+    def use_snapshot_lifecycle(self):
+        lifecycle = {"mode": "snapshot-replay", "reset_policy": "restore-post-instantiation",
+                     "reset_before": "each-steady-invocation",
+                     "reset_timing": "excluded-from-invocation",
+                     "reset_scope": sorted(native_benchmark.SNAPSHOT_RESET_SCOPE)}
+        for target in self.config["targets"].values():
+            target["execution_lifecycle"] = copy.deepcopy(lifecycle)
+            receipt_path = Path(target["image_receipt_path"])
+            receipt = json.loads(receipt_path.read_text())
+            receipt["execution_lifecycle"] = copy.deepcopy(lifecycle)
+            receipt_path.write_text(json.dumps(receipt))
+        self.manifest = native_benchmark.create_plan(
+            self.config, REPO, now=datetime.now(timezone.utc) - timedelta(minutes=1),
+            allow_synthetic=True)
+
+    def test_native_snapshot_lifecycle_bound_to_receipt_request_and_result(self):
+        self.use_snapshot_lifecycle()
+        run = self.manifest["schedule"][0]
+        request = native_benchmark.run_configuration(self.manifest, run["run_id"])
+        self.assertEqual(request["execution_lifecycle"]["mode"], "snapshot-replay")
+        self.assertEqual(request["execution_lifecycle"],
+                         request["target"]["image_receipt"]["execution_lifecycle"])
+        native_benchmark.validate_result(self.result(run), self.manifest, run["run_id"])
+        result = self.result(run)
+        result["execution_lifecycle"] = copy.deepcopy(self.lifecycle)
+        with self.assertRaisesRegex(ValueError, "result execution lifecycle"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        warm_request = copy.deepcopy(request)
+        warm_request["execution_lifecycle"] = copy.deepcopy(self.lifecycle)
+        self.assertNotEqual(native_benchmark.cache_key(request), native_benchmark.cache_key(warm_request))
+
+    def test_native_snapshot_cannot_be_matched_with_warm_reuse(self):
+        self.use_snapshot_lifecycle()
+        target = self.manifest["targets"]["linux"]
+        target["execution_lifecycle"] = copy.deepcopy(self.lifecycle)
+        target["image_receipt"]["execution_lifecycle"] = copy.deepcopy(self.lifecycle)
+        with self.assertRaisesRegex(ValueError, "unmatched execution_lifecycle"):
+            native_benchmark.validate_manifest(self.manifest, allow_synthetic=True)
+
+    def test_native_lifecycle_scope_placement_and_timing_are_strict(self):
+        self.use_snapshot_lifecycle()
+        original = self.manifest["targets"]["linux"]["execution_lifecycle"]
+        for field, value in (
+                ("mode", "fresh-instance"), ("reset_policy", "invocation-state-only"),
+                ("reset_before", "before-first-only"), ("reset_timing", "included-in-invocation"),
+                ("reset_scope", []), ("reset_scope", sorted(native_benchmark.WARM_RESET_SCOPE))):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                native_benchmark.validate_lifecycle({**original, field: value})
+        target = self.manifest["targets"]["linux"]
+        target["image_receipt"]["execution_lifecycle"] = copy.deepcopy(self.lifecycle)
+        with self.assertRaisesRegex(ValueError, "image receipt execution_lifecycle"):
+            native_benchmark.validate_manifest(self.manifest, allow_synthetic=True)
+
+    def test_native_snapshot_summary_exposes_excluded_reset_cost(self):
+        self.use_snapshot_lifecycle()
+        report = native_benchmark.build_report(
+            self.manifest, self.capture_directories(), allow_synthetic=True)
+        self.assertEqual(report["status"]["execution_lifecycle"], "snapshot-replay")
+        for target in ("linux", "unikraft"):
+            row = report["summary"][target]["coremark"]
+            self.assertIsNone(row["steady_state_seconds"])
+            self.assertEqual(row["snapshot_replay_seconds"]["values"], [21, 21])
+            self.assertEqual(row["repeated_invocation_seconds"]["values"], [21, 21])
+            self.assertEqual(row["reset_seconds"]["values"], [.001, .001])
+            self.assertEqual(row["reset_and_invocation_seconds"]["values"], [21.001, 21.001])
+            self.assertEqual(row["lifecycle_setup_seconds"]["values"], [.005])
+        self.assertEqual(report["records"][0]["result"]["reset_events"][0]["elapsed_ticks"], 1000)
+
+    def test_native_v1_and_missing_lifecycle_are_not_silently_upgraded(self):
+        for value in (1, True):
+            manifest = copy.deepcopy(self.manifest)
+            manifest["schema_version"] = value
+            with self.subTest(version=value), self.assertRaisesRegex(ValueError, "version/kind"):
+                native_benchmark.validate_manifest(manifest, allow_synthetic=True)
+        run = self.manifest["schedule"][0]
+        result = self.result(run)
+        result["phase_contract"] = "wamr-embedding-v1"
+        with self.assertRaisesRegex(ValueError, "phase contract"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        result = self.result(run)
+        del result["execution_lifecycle"]
+        with self.assertRaisesRegex(ValueError, "expected exactly"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        del self.config["targets"]["linux"]["execution_lifecycle"]
+        with self.assertRaisesRegex(ValueError, "target config"):
+            native_benchmark.create_plan(self.config, REPO, allow_synthetic=True)
+
+    def test_native_reset_durations_and_completion_are_required(self):
+        self.use_snapshot_lifecycle()
+        run = self.manifest["schedule"][0]
+        changes = [
+            lambda result: result["reset_events"].pop(),
+            lambda result: result["reset_events"][0].update(before_invocation=3),
+            lambda result: result["reset_events"][0].update(outcome="error"),
+            lambda result: result["reset_events"][0].update(elapsed_ticks=None),
+            lambda result: result["reset_events"][0].update(elapsed_ticks=True),
+            lambda result: result["reset_events"][0].update(elapsed_ticks=2**64 - 1),
+            lambda result: result["phases"].update(lifecycle_setup_ticks=None),
+        ]
+        for index, change in enumerate(changes):
+            result = self.result(run)
+            change(result)
+            with self.subTest(change=index), self.assertRaises(ValueError):
+                native_benchmark.validate_result(result, self.manifest, run["run_id"])
+
+    def test_native_failed_reset_before_uncalled_invocation_is_retained(self):
+        self.use_snapshot_lifecycle()
+        run = self.manifest["schedule"][0]
+        result = self.result(run)
+        result["outcome"] = "error"
+        result["invocations"] = result["invocations"][:1]
+        result["phases"]["steady_state_ticks"] = []
+        result["reset_events"] = [{"before_invocation": 2, "outcome": "error", "elapsed_ticks": None}]
+        result["memory"]["samples"] = result["memory"]["samples"][:2]
+        self.assertEqual(len(native_benchmark.validate_result(result, self.manifest, run["run_id"])), 1)
+        result["reset_events"].append({"before_invocation": 3, "outcome": "completed", "elapsed_ticks": 1})
+        with self.assertRaisesRegex(ValueError, "reset event count"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+
+    def test_native_post_call_clock_failure_retains_complete_terminal_and_crc(self):
+        def clock_failure(result, run):
+            if run["workload"] == "coremark" and run["phase"] == "measured":
+                result["outcome"] = "error"
+                result["exit_code"] = 0
+                result["invocations"][-1].update(outcome="proc_exit", exit_code=0,
+                                                 measurement_errors=["post-call-clock"])
+                result["phases"]["steady_state_ticks"][-1] = None
+
+        report = native_benchmark.build_report(
+            self.manifest, self.capture_directories(clock_failure), allow_synthetic=True)
+        self.assertFalse(report["status"]["all_attempts_successful"])
+        failed = next(record for record in report["records"] if record["run"]["workload"] == "coremark"
+                      and record["run"]["phase"] == "measured")
+        self.assertEqual(failed["result"]["invocations"][-1]["outcome"], "proc_exit")
+        self.assertEqual(failed["result"]["invocations"][-1]["exit_code"], 0)
+        self.assertIsNone(failed["result"]["phases"]["steady_state_ticks"][-1])
+        self.assertEqual(failed["correctness"][-1]["crc"]["seedcrc"], "e9f5")
+        self.assertFalse(failed["correctness"][-1]["invocation_timing_available"])
+        self.assertFalse(failed["correctness"][-1]["minimum_timing_met"])
+        self.assertIsNone(report["summary"]["linux"]["coremark"]["steady_state_seconds"])
+
+    def test_native_first_call_without_end_time_retains_real_terminal(self):
+        run = next(run for run in self.manifest["schedule"] if run["workload"] == "coremark")
+        result = self.result(run)
+        result["outcome"] = "error"
+        result["phases"].update(first_invocation_ticks=None, steady_state_ticks=[])
+        result["invocations"] = result["invocations"][:1]
+        result["invocations"][0]["measurement_errors"] = ["post-call-clock"]
+        result["reset_events"] = []
+        result["memory"]["samples"] = result["memory"]["samples"][:2]
+        checks = native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        self.assertEqual(result["invocations"][0]["outcome"], "returned")
+        self.assertIsNone(result["invocations"][0]["exit_code"])
+        self.assertFalse(checks[0]["minimum_timing_met"])
+
+    def test_native_post_call_copy_failure_retains_partial_bytes_and_status(self):
+        partial = b"\xff\x00private-partial-stdout"
+
+        def copy_failure(result, run):
+            if run["workload"] == "coremark" and run["phase"] == "measured":
+                result["outcome"] = "error"
+                result["exit_code"] = 0xffffffff
+                result["invocations"][-1].update(
+                    outcome="proc_exit", exit_code=0xffffffff, stdout_complete=False,
+                    measurement_errors=["post-call-clock", "stdout-copy"])
+                self.set_stdout(result["invocations"][-1], partial)
+                result["phases"]["steady_state_ticks"][-1] = None
+
+        directories = self.capture_directories(copy_failure)
+        report = native_benchmark.build_report(self.manifest, directories, allow_synthetic=True)
+        failed = next(record for record in report["records"] if record["run"]["workload"] == "coremark"
+                      and record["run"]["phase"] == "measured")
+        invocation = failed["result"]["invocations"][-1]
+        self.assertEqual(invocation["exit_code"], 0xffffffff)
+        self.assertFalse(invocation["stdout_complete"])
+        self.assertEqual(invocation["stdout_sha256"], native_benchmark.sha256_bytes(partial))
+        self.assertEqual(failed["correctness"][-1], {"self_check": "unavailable", "failure": "stdout-copy"})
+        self.assertNotIn("private-partial-stdout", json.dumps(report))
+        raw_result = native_benchmark.parse_result_stream(
+            (self.root / failed["run"]["run_id"] / "stdout.bin").read_bytes())
+        self.assertEqual(native_benchmark.decode_stdout(raw_result["invocations"][-1]["stdout_base64"]),
+                         partial)
+
+    def test_native_partial_evidence_never_qualifies_success_or_continuation(self):
+        run = self.manifest["schedule"][0]
+        changes = [
+            lambda result: result["phases"]["steady_state_ticks"].__setitem__(-1, None),
+            lambda result: result["invocations"][-1].update(measurement_errors=["post-call-clock"]),
+            lambda result: result["invocations"][-1].update(stdout_complete=False),
+            lambda result: result["invocations"][-1].update(measurement_errors=["stdout-copy"]),
+            lambda result: result["invocations"][-1].update(measurement_errors=["unknown"]),
+            lambda result: result["invocations"][-1].update(measurement_errors=["pending-output"]),
+        ]
+        for index, change in enumerate(changes):
+            result = self.result(run)
+            change(result)
+            with self.subTest(change=index), self.assertRaises(ValueError):
+                native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        result = self.result(run)
+        result["outcome"] = "error"
+        result["invocations"][0]["measurement_errors"] = ["post-call-clock"]
+        result["phases"]["first_invocation_ticks"] = None
+        with self.assertRaisesRegex(ValueError, "continued"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+
+    def test_native_copy_failure_can_preserve_measured_duration(self):
+        run = self.manifest["schedule"][0]
+        result = self.result(run)
+        result["outcome"] = "error"
+        result["invocations"][-1].update(stdout_complete=False, measurement_errors=["stdout-copy"])
+        self.set_stdout(result["invocations"][-1], b"")
+        checks = native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        self.assertEqual(checks[-1]["self_check"], "unavailable")
+        self.assertEqual(result["phases"]["steady_state_ticks"][-1], 21000000)
+
+    def test_native_capture_retains_post_call_failures_before_returning_failure(self):
+        run = next(run for run in self.manifest["schedule"]
+                   if run["workload"] == "coremark" and run["target"] == "linux")
+        result = self.result(run)
+        result["outcome"] = "error"
+        result["exit_code"] = 0
+        result["invocations"][-1].update(outcome="proc_exit", exit_code=0,
+                                         measurement_errors=["post-call-clock"])
+        result["phases"]["steady_state_ticks"][-1] = None
+        raw = native_benchmark.PREFIX.encode() + json.dumps(result).encode() + b"\n"
+        producer = self.write("synthetic_partial_producer.py", (
+            "import sys\n" + f"sys.stdout.buffer.write({raw!r})\n").encode())
+        output = self.root / "partial-process-capture"
+        self.assertFalse(native_benchmark.capture(
+            self.manifest, run["run_id"], [sys.executable, str(producer)],
+            output, 5, allow_synthetic=True))
+        self.assertEqual((output / "stdout.bin").read_bytes(), raw)
+        record = native_benchmark.consume_capture(self.manifest, output, allow_synthetic=True)
+        self.assertEqual(record["result"]["invocations"][-1]["outcome"], "proc_exit")
+        self.assertEqual(record["result"]["invocations"][-1]["exit_code"], 0)
+        self.assertFalse(record["correctness"][-1]["invocation_timing_available"])
+
+    def test_native_pending_output_error_preserves_guest_return_but_stops_resets(self):
+        run = self.manifest["schedule"][0]
+        result = self.result(run)
+        result["outcome"] = "error"
+        result["invocations"][-1]["measurement_errors"] = ["pending-output"]
+        native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        self.assertEqual(result["invocations"][-1]["outcome"], "returned")
+        self.assertIsNone(result["exit_code"])
+        result["invocations"] = result["invocations"][:1]
+        result["invocations"][0]["measurement_errors"] = ["pending-output"]
+        result["phases"]["steady_state_ticks"] = []
+        result["reset_events"] = result["reset_events"][:1]
+        with self.assertRaisesRegex(ValueError, "continued"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
 
 
 if __name__ == "__main__":
