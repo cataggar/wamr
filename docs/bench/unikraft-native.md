@@ -371,26 +371,38 @@ duration is separately required; it is not permission to omit expensive work.
 | `mode` | `reset_policy` | Exact sorted `reset_scope` |
 |---|---|---|
 | `same-instance-warm` | `invocation-state-only` | `["invocation-state", "stdout-capture"]` |
-| `snapshot-replay` | `restore-post-instantiation` | `["execution-state", "globals", "linear-memory", "segment-drop-state", "stdout-capture", "tables", "wasi-context"]` |
+| `snapshot-replay` | `restore-post-start-snapshot` | `["globals", "invocation-output", "linear-memory-access-protection", "linear-memory-contents", "linear-memory-logical-size", "passive-segment-drop-state", "table-entries-signatures", "wasi-context"]` |
 
 Warm mode continues the same initialized instance with its mutable Wasm state intact.
 Only qualified per-call execution/output rearming occurs outside the call timer.
 It must not restore memory, globals, tables, descriptors or a fresh WASI context.
 If repeated command/libc execution is unsafe, warm mode is unsupported.
 
-Snapshot replay reuses loaded code and instance mappings but restores the complete
-declared post-instantiation initial state before every repeated invocation: linear
-contents/size, globals, tables/size, segment/drop flags, execution state and the
-initial WASI context/resource contract, with a fresh output-capture boundary.
-Growth must be safely restored/revoked to the qualified initial state, not merely
-left accessible beyond a restored size counter. Context replacement alone is not
-a full snapshot, nor does CRC success prove complete restoration. The producer must
-qualify resource cleanup, pending-error handling and reset failure behavior.
+Snapshot replay uses a baseline taken after successful instantiation and the Wasm
+module start section, before the first exported `_start` call. It restores linear
+contents/logical size/access protection, globals, table entries/signature backing,
+passive-segment drop flags, the initial WASI context and invocation-output boundary.
+Table-size changes are rejected before restore rather than silently truncated.
+Grown linear suffixes become inaccessible and logical size returns to the baseline;
+actual committed high-water bytes do **not** shrink merely because access is revoked.
+Report a physical reduction only if the measurement method establishes a real unmap
+or decommit.
+
+The same instance, code mapping/import pointers, reservation bases, immutable artifact
+and completed module-start state are reused; the module start section is not rerun.
+SDK pending-terminal clearing occurs inside the timed API call, not by snapshot
+reset overwriting private runtime fields. Fresh WASI context initialization restores
+the original immutable arguments/environment and initial descriptor/open/exit/error
+contract, without acquiring new external file/socket resources. Reset must reject
+pending output errors before they can be erased. Captured output may reuse capacity,
+but bytes belonging to an earlier invocation must remain stable until serialized.
+Context replacement alone is not a full snapshot, nor does CRC success prove complete
+restoration. The producer must qualify resource lifetimes and reset failure behavior.
 This mode is **restored-state replay**, not warm libc/state continuation or fresh
 load/instantiation. Both targets must use the same declared semantics.
 
 For snapshot mode, `lifecycle_setup_ticks` measures snapshot construction after
-instantiation and before the first invocation, including its allocation/copy work.
+instantiation/module start and before the first invocation, including allocation/copy.
 It is required on success. Warm mode uses `null` because there is no snapshot setup.
 `reset_events` measures the entire relevant restore/rearm and output/context setup
 before each repeat, on the declared guest clock, separately from the call.
@@ -415,7 +427,8 @@ observation/control-plane time:
 2. `instantiate_ticks`: instance allocation, code/linear mapping and relocation,
    memory/table/global initialization, executable permissions/helper wiring, WASI
    binding and execution-environment setup after validation, before lookup/call.
-   Native timing completion indicators must establish the phases actually finished;
+   Invoke the module start section once during this initialization scope, distinct
+   from the exported `_start` calls. Native timing completion indicators must establish the phases actually finished;
    separately timed caller setup must not overlap or double-count native intervals.
 3. `first_invocation_ticks`: lookup/call of `_start` on that fresh instance through
    normal return or caught WASI `proc_exit(0)`, including workload I/O.

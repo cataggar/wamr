@@ -1946,7 +1946,7 @@ Correct operation validated. See README.md for run and reporting rules.
         self.assertTrue((output / "stderr.bin").read_bytes())
 
     def use_snapshot_lifecycle(self):
-        lifecycle = {"mode": "snapshot-replay", "reset_policy": "restore-post-instantiation",
+        lifecycle = {"mode": "snapshot-replay", "reset_policy": "restore-post-start-snapshot",
                      "reset_before": "each-steady-invocation",
                      "reset_timing": "excluded-from-invocation",
                      "reset_scope": sorted(native_benchmark.SNAPSHOT_RESET_SCOPE)}
@@ -1989,6 +1989,7 @@ Correct operation validated. See README.md for run and reporting rules.
         original = self.manifest["targets"]["linux"]["execution_lifecycle"]
         for field, value in (
                 ("mode", "fresh-instance"), ("reset_policy", "invocation-state-only"),
+                ("reset_policy", "restore-post-instantiation"),
                 ("reset_before", "before-first-only"), ("reset_timing", "included-in-invocation"),
                 ("reset_scope", []), ("reset_scope", sorted(native_benchmark.WARM_RESET_SCOPE))):
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
@@ -1997,6 +1998,20 @@ Correct operation validated. See README.md for run and reporting rules.
         target["image_receipt"]["execution_lifecycle"] = copy.deepcopy(self.lifecycle)
         with self.assertRaisesRegex(ValueError, "image receipt execution_lifecycle"):
             native_benchmark.validate_manifest(self.manifest, allow_synthetic=True)
+
+    def test_native_snapshot_does_not_claim_external_sdk_execution_state_reset(self):
+        self.use_snapshot_lifecycle()
+        lifecycle = self.manifest["targets"]["linux"]["execution_lifecycle"]
+        self.assertEqual(lifecycle["reset_policy"], "restore-post-start-snapshot")
+        self.assertEqual(lifecycle["reset_scope"], [
+            "globals", "invocation-output", "linear-memory-access-protection",
+            "linear-memory-contents", "linear-memory-logical-size",
+            "passive-segment-drop-state", "table-entries-signatures", "wasi-context",
+        ])
+        self.assertNotIn("execution-state", lifecycle["reset_scope"])
+        with self.assertRaisesRegex(ValueError, "reset scope"):
+            native_benchmark.validate_lifecycle({
+                **lifecycle, "reset_scope": sorted([*lifecycle["reset_scope"], "execution-state"])})
 
     def test_native_snapshot_summary_exposes_excluded_reset_cost(self):
         self.use_snapshot_lifecycle()

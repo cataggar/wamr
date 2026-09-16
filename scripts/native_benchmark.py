@@ -57,8 +57,9 @@ PHASES = {"compile_ticks", "load_ticks", "instantiate_ticks",
           "lifecycle_setup_ticks", "first_invocation_ticks", "steady_state_ticks"}
 OUTCOMES = {"success", "trap", "timeout", "abort", "error"}
 WARM_RESET_SCOPE = {"invocation-state", "stdout-capture"}
-SNAPSHOT_RESET_SCOPE = {"linear-memory", "globals", "tables", "segment-drop-state",
-                        "execution-state", "wasi-context", "stdout-capture"}
+SNAPSHOT_RESET_SCOPE = {"globals", "invocation-output", "linear-memory-access-protection",
+                        "linear-memory-contents", "linear-memory-logical-size",
+                        "passive-segment-drop-state", "table-entries-signatures", "wasi-context"}
 MEASUREMENT_ERRORS = {"post-call-clock", "stdout-copy", "pending-output"}
 
 
@@ -184,7 +185,7 @@ def validate_lifecycle(lifecycle):
             "unsupported execution lifecycle")
     warm = lifecycle["mode"] == "same-instance-warm"
     require(lifecycle["reset_policy"] ==
-            ("invocation-state-only" if warm else "restore-post-instantiation"),
+            ("invocation-state-only" if warm else "restore-post-start-snapshot"),
             "lifecycle reset policy mismatch")
     require(lifecycle["reset_before"] == "each-steady-invocation",
             "unsupported reset placement")
