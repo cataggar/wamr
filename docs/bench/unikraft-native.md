@@ -242,7 +242,12 @@ The object has **exactly** these fields:
   `platform`, `options`, `compile_profile`, `mode: "aot"`, `jit_preset: null`, independently checked by
   the producer against deployed/loaded native artifacts and active platform.
 * `outcome`: `success`, `trap`, `timeout`, `abort`, or `error`.
-  `exit_code`: integer or `null`; success requires zero. A trapped or nonreturning
+  `exit_code`: complete unsigned 32-bit guest status or `null`; success requires zero.
+  Preserve `proc_exit(0)` separately from normal return and preserve nonzero
+  `proc_exit` without POSIX eight-bit truncation or signed conversion. A nonzero
+  invocation exit must match this enclosing status and stop further invocations.
+  Host process/collector return codes remain separate observation fields.
+  A trapped or nonreturning
   workload must never be rewritten into a successful terminal event.
 * `phase_contract: "wamr-embedding-v1"`.
 * `clock`: exactly `source` (public monotonic clock token), `unit` (`ns`, `us`, `ms`),

@@ -1687,6 +1687,26 @@ Correct operation validated. See README.md for run and reporting rules.
         self.assertIsNone(report["records"][0]["result"]["clock"])
         self.assertFalse(report["status"]["all_attempts_successful"])
 
+    def test_native_proc_exit_preserves_zero_and_full_u32_status(self):
+        run = next(run for run in self.manifest["schedule"] if run["workload"] == "coremark")
+        result = self.result(run)
+        for invocation in result["invocations"]:
+            invocation["outcome"] = "proc_exit"
+        checks = native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        self.assertEqual(len(checks), 3)
+        result.update(outcome="error", exit_code=0xffffffff)
+        result["invocations"][-1]["exit_code"] = 0xffffffff
+        checks = native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        self.assertEqual(checks[-1]["self_check"], "failed")
+        for truncated in (-1, 255, None, 2**32):
+            result["exit_code"] = truncated
+            with self.subTest(status=truncated), self.assertRaises(ValueError):
+                native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        result["exit_code"] = 0xffffffff
+        result["invocations"][0]["exit_code"] = 0xffffffff
+        with self.assertRaisesRegex(ValueError, "continued"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+
     def test_native_matched_final_crc_disagreement_is_rejected(self):
         def change_crc(result, run):
             if run["target"] == "unikraft" and run["workload"] == "coremark":

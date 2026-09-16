@@ -475,7 +475,9 @@ def validate_result(result, manifest, run_id):
         "mode": "aot", "jit_preset": None, "compile_profile": target["compile_profile"],
     }), "observed artifact/platform/mode mismatch")
     require(result["outcome"] in OUTCOMES, "unknown terminal outcome")
-    require(result["exit_code"] is None or type(result["exit_code"]) is int, "exit_code")
+    require(result["exit_code"] is None or
+            (type(result["exit_code"]) is int and 0 <= result["exit_code"] <= 0xffffffff),
+            "guest exit_code must be a complete u32 status, not a host process returncode")
     require(result["outcome"] != "trap" or result["exit_code"] is None,
             "trap must not report a guest exit code")
     require(result["phase_contract"] == "wamr-embedding-v1", "unknown phase contract")
@@ -530,14 +532,20 @@ def validate_result(result, manifest, run_id):
                 "invocation phase mismatch")
         require(invocation["outcome"] in ("returned", "proc_exit", "trap", "error"),
                 "invocation outcome")
-        require(invocation["exit_code"] is None or type(invocation["exit_code"]) is int,
-                "invocation exit_code")
+        require(invocation["exit_code"] is None or
+                (type(invocation["exit_code"]) is int and 0 <= invocation["exit_code"] <= 0xffffffff),
+                "invocation exit_code must be a complete u32 status")
+        require(invocation["outcome"] != "proc_exit" or invocation["exit_code"] is not None,
+                "proc_exit requires its u32 status")
         require(invocation["outcome"] != "trap" or invocation["exit_code"] is None,
                 "trapped invocation must not report an exit code")
-        require(index == len(durations) - 1 or invocation["outcome"] in ("returned", "proc_exit"),
-                "invocations continued after a trap/error")
         require(isinstance(invocation["stdout"], str), "invocation stdout")
         good = invocation["outcome"] in ("returned", "proc_exit") and invocation["exit_code"] == 0
+        require(index == len(durations) - 1 or good,
+                "invocations continued after a failed terminal outcome")
+        if invocation["outcome"] == "proc_exit" and invocation["exit_code"] != 0:
+            require(result["exit_code"] == invocation["exit_code"],
+                    "guest terminal status lost or truncated proc_exit")
         require(not success or good, "success contradicts invocation terminal outcome")
         if good and config["run"]["workload"].startswith("coremark"):
             try:
