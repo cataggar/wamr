@@ -5,12 +5,11 @@
 allocation-free and has no dependency on the interpreter, compiler, hosted
 `WasiProcessState`, filesystem, preopens, networking, or host threads.
 
-This context is a building block for #1045, **not evidence of a working Unikraft
-image or compiler-free AOT execution**. Native import registration and terminal
-unwinding must be connected to the native AOT embedding backend. Genuine runs of
-both workloads must still preserve their CRC validation output and classify
-return, `proc_exit`, and trap separately. Test clocks below do not qualify a
-production run or a benchmark score.
+This context and `src/wasi/native_aot.zig` adapter are building blocks for
+#1045, **not evidence of a working Unikraft image or compiler-free AOT
+execution**. Genuine runs of both workloads must still preserve their CRC
+validation output and classify return, `proc_exit`, and trap separately.
+Test clocks below do not qualify a production run or a benchmark score.
 
 ## Ownership and platform callbacks
 
@@ -169,6 +168,41 @@ the same terminal outcome without performing an operation. The native adapter
 must distinguish this outcome from guest traps and ordinary entry-point return;
 the context itself does not implement platform stack unwinding.
 
+### Native AOT import adapter
+
+The build module `native-wasi` exposes `Adapter(comptime aot: type)` for the
+compiler-free `src/api/aot.zig` API:
+
+```zig
+const aot = @import("your-native-aot-module");
+const wasi = @import("minimal-wasi");
+const NativeWasi = @import("native-wasi").Adapter(aot);
+
+var context = try wasi.Context.init(options);
+const imports = NativeWasi.imports(&context);
+// Pass &imports to aot.Instance.load; keep context alive until instance.deinit.
+```
+
+The adapter creates all 12 exact typed `HostImport` descriptors, validates
+argument and result shapes, preserves raw i32/i64 bits, and fetches the current
+memory slice for each invocation. Malformed host-call shapes return native
+`HostError.InvalidArgument`, distinct from a guest WASI errno.
+
+Native `HostContext.terminate(code)` records a pending terminal result and
+returns **normally**. The adapter immediately returns from its callback without
+writing an errno, allowing host defers to execute. The native dispatcher must
+then inspect that pending result and unwind guest frames before any further
+Wasm instruction executes. This deferred unwind contract is necessary even for
+exit code zero. Do not implement `terminate` as a flag that the dispatcher
+ignores, and do not longjmp directly across live host-language cleanup scopes.
+
+The adapter deliberately takes the native API as a compile-time module
+parameter; it does not import a hosted runtime or depend on the backend's
+public package alias. Its contract-fixture tests check typed marshalling and
+pending-exit requests, **not** actual native stack unwinding. The native
+backend's integration tests must separately verify the dispatcher and execute
+the two precompiled CoreMark workloads with real clocks.
+
 ## Focused validation
 
 ```sh
@@ -180,6 +214,9 @@ layouts, absent preopens, rights and descriptor lifecycle/isolation, actual
 output bytes, short/zero/error writes, invalid/overflowing guest pointers,
 iovec/result aliasing, supported/unsupported/failed clocks, exact namespace and
 signatures, and terminal zero/nonzero exits.
+The same step also tests the native adapter's typed signatures, argument/result
+validation, refreshed memory view, scalar bit preservation, and deferred
+terminal requests against a clearly identified API contract fixture.
 
 Fixture tests embed the **unchanged tracked inputs**, validate SHA-256, and
 decode their type/import sections to verify all 12 required imports:

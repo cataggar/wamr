@@ -23,6 +23,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const native_wasi_module = b.addModule("native-wasi", .{
+        .root_source_file = b.path("src/wasi/native_aot.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_wasi_module.addImport("minimal-wasi", minimal_wasi_module);
     const minimal_wasi_test_module = b.createModule(.{
         .root_source_file = b.path("tests/minimal_wasi.zig"),
         .target = target,
@@ -31,9 +37,11 @@ pub fn build(b: *std.Build) void {
     minimal_wasi_test_module.addImport("minimal-wasi", minimal_wasi_module);
     const minimal_wasi_tests = b.addTest(.{ .root_module = minimal_wasi_test_module });
     const minimal_wasi_context_tests = b.addTest(.{ .root_module = minimal_wasi_module });
+    const native_wasi_adapter_tests = b.addTest(.{ .root_module = native_wasi_module });
     const minimal_wasi_test_step = b.step("test-minimal-wasi", "Test standalone native WASI bindings");
     minimal_wasi_test_step.dependOn(&b.addRunArtifact(minimal_wasi_tests).step);
     minimal_wasi_test_step.dependOn(&b.addRunArtifact(minimal_wasi_context_tests).step);
+    minimal_wasi_test_step.dependOn(&b.addRunArtifact(native_wasi_adapter_tests).step);
 
     // Whether the selected target CPU can execute AOT code natively.
     // Test/bench binaries tied to native AOT support are only installed on
