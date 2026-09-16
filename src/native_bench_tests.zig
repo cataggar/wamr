@@ -136,8 +136,10 @@ test "native benchmark snapshot reset revokes grown pages and restores logical b
     session.instance.?.memory()[size] = 0xaa;
     try session.reset();
     try equal(size, session.instance.?.memory().len);
-    try equal(committed, pages.committed());
+    try equal(committed + 65536, pages.committed());
+    try equal(committed, pages.accessible());
     try expect(session.instance.?.grow(1) != null);
+    try equal(committed + 65536, pages.committed());
     try equal(@as(u8, 0), session.instance.?.memory()[size]);
 }
 

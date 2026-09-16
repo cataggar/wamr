@@ -2290,7 +2290,7 @@ class NativeLinuxProducerTests(unittest.TestCase):
                     {key: invocation[key] for key in ("phase", "outcome", "exit_code", "stdout_base64")}
                     for invocation in record["invocations"]]
                 envelope["memory"]["samples"] = record["memory_samples"]
-                envelope["memory"]["method"] = "linux-mmap-accessible-ranges"
+                envelope["memory"]["method"] = "linux-mmap-retained-commit-high-water"
                 envelope["memory"]["covered_regions"] = ["native-code", "wasm-linear-memory"]
                 envelope["memory"]["omitted_regions"] = ["allocator", "kernel", "process"]
                 checks = native_benchmark.validate_result(

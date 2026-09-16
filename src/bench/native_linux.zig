@@ -44,10 +44,15 @@ fn readClock(_: ?*anyopaque, id: wasi.ClockId, _: u64) wasi.ClockResult {
     return .{ .timestamp_ns = clockRead(native_id) catch return .{ .failure = .io } };
 }
 
-/// Counts only native code/linear-memory mmap reservations and RW/RX accessible
-/// committed ranges. This is NOT RSS, allocator usage, or complete process RAM.
+/// Counts native code/linear reservations and retained committed high-water
+/// prefixes until munmap. Access revocation is not decommit. Neither count is RSS.
 pub const Pages = struct {
-    const Region = struct { base: [*]align(4096) u8, size: usize, committed: usize = 0 };
+    const Region = struct {
+        base: [*]align(4096) u8,
+        size: usize,
+        accessible: usize = 0,
+        committed_high_water: usize = 0,
+    };
     regions: [2]?Region = .{ null, null },
     fail_reserve: bool = false,
     fail_commit: bool = false,
@@ -82,7 +87,15 @@ pub const Pages = struct {
     pub fn committed(self: *const Pages) usize {
         var size: usize = 0;
         for (self.regions) |entry| if (entry) |region| {
-            size += region.committed;
+            size += region.committed_high_water;
+        };
+        return size;
+    }
+
+    pub fn accessible(self: *const Pages) usize {
+        var size: usize = 0;
+        for (self.regions) |entry| if (entry) |region| {
+            size += region.accessible;
         };
         return size;
     }
@@ -104,10 +117,13 @@ pub const Pages = struct {
         if (self.fail_commit) return error.OutOfMemory;
         for (&self.regions) |*entry| if (entry.*) |*region| {
             const offset = std.math.sub(usize, @intFromPtr(address), @intFromPtr(region.base)) catch continue;
-            if (offset > region.committed or size > region.size -| offset) continue;
+            if (offset > region.accessible or size > region.size -| offset) continue;
             if (std.posix.errno(std.os.linux.mprotect(address, size, .{ .READ = true, .WRITE = true })) != .SUCCESS)
                 return error.OutOfMemory;
-            region.committed = @max(region.committed, offset + size);
+            const end = offset + size;
+            if (end > region.accessible) @memset(region.base[region.accessible..end], 0);
+            region.accessible = @max(region.accessible, end);
+            region.committed_high_water = @max(region.committed_high_water, end);
             return;
         };
         return error.InvalidMapping;
@@ -124,23 +140,25 @@ pub const Pages = struct {
             .read_write => .{ .READ = true, .WRITE = true },
             .read_execute => .{ .READ = true, .EXEC = true },
         };
-        if (permission == .none and self.fail_protect_after_transition) {
-            if (std.posix.errno(std.os.linux.mprotect(address, @min(size, 4096), prot)) != .SUCCESS)
+        for (&self.regions) |*entry| if (entry.*) |*region| {
+            const offset = std.math.sub(usize, @intFromPtr(address), @intFromPtr(region.base)) catch continue;
+            if (offset > region.accessible or size > region.size -| offset) continue;
+            const end = offset + size;
+            if (permission == .none) {
+                if (end != region.accessible) return error.InvalidMapping;
+            } else if (end > region.committed_high_water) return error.InvalidMapping;
+            if (permission == .none and self.fail_protect_after_transition) {
+                if (std.posix.errno(std.os.linux.mprotect(address, @min(size, 4096), prot)) != .SUCCESS)
+                    return error.ProtectionFailed;
+                self.partial_protection_applied = true;
                 return error.ProtectionFailed;
-            self.partial_protection_applied = true;
-            return error.ProtectionFailed;
-        }
-        if (std.posix.errno(std.os.linux.mprotect(address, size, prot)) != .SUCCESS)
-            return error.ProtectionFailed;
-        if (permission == .none) {
-            for (&self.regions) |*entry| if (entry.*) |*region| {
-                const offset = std.math.sub(usize, @intFromPtr(address), @intFromPtr(region.base)) catch continue;
-                if (offset <= region.committed and size == region.committed - offset) {
-                    region.committed = offset;
-                    return;
-                }
-            };
-        }
+            }
+            if (std.posix.errno(std.os.linux.mprotect(address, size, prot)) != .SUCCESS)
+                return error.ProtectionFailed;
+            region.accessible = if (permission == .none) offset else @max(region.accessible, end);
+            return;
+        };
+        return error.InvalidMapping;
     }
 
     fn unmap(raw: *anyopaque, address: [*]align(4096) u8, size: usize) void {
@@ -182,4 +200,49 @@ test "Linux benchmark real clock and reservation cleanup" {
     p.unmap(p.context, base, 8192);
     try std.testing.expectEqual(@as(usize, 0), pages.reserved());
     try std.testing.expectEqual(@as(usize, 0), pages.committed());
+}
+
+test "Linux benchmark retains committed backing across revoke recommit and genuine release" {
+    var pages: Pages = .{};
+    const p = pages.platform();
+    const base = try p.reserve(p.context, 12288);
+    var base_live = true;
+    defer if (base_live) p.unmap(p.context, base, 12288);
+    try p.commit(p.context, base, 8192);
+    base[0] = 11;
+    base[4096] = 22;
+    try p.protect(p.context, @alignCast(base + 4096), 4096, .none);
+    try std.testing.expectEqual(@as(usize, 12288), pages.reserved());
+    try std.testing.expectEqual(@as(usize, 8192), pages.committed());
+    try std.testing.expectEqual(@as(usize, 4096), pages.accessible());
+    try p.commit(p.context, @alignCast(base + 4096), 4096);
+    try std.testing.expectEqual(@as(usize, 8192), pages.committed());
+    try std.testing.expectEqual(@as(usize, 8192), pages.accessible());
+    try std.testing.expectEqual(@as(u8, 11), base[0]);
+    try std.testing.expectEqual(@as(u8, 0), base[4096]);
+    base[4096] = 33;
+    try p.commit(p.context, @alignCast(base + 4096), 4096);
+    try std.testing.expectEqual(@as(u8, 33), base[4096]);
+    try std.testing.expectEqual(@as(usize, 8192), pages.committed());
+    try p.commit(p.context, @alignCast(base + 8192), 4096);
+    base[8192] = 44;
+    try p.protect(p.context, base, 12288, .none);
+    try std.testing.expectEqual(@as(usize, 0), pages.accessible());
+    try std.testing.expectEqual(@as(usize, 12288), pages.committed());
+    const other = try p.reserve(p.context, 4096);
+    var other_live = true;
+    defer if (other_live) p.unmap(p.context, other, 4096);
+    try p.commit(p.context, other, 4096);
+    other[0] = 55;
+    try std.testing.expectEqual(@as(usize, 16384), pages.committed());
+    p.unmap(p.context, base, 12288);
+    base_live = false;
+    try std.testing.expectEqual(@as(usize, 4096), pages.committed());
+    try std.testing.expectEqual(@as(usize, 4096), pages.reserved());
+    try std.testing.expectEqual(@as(u8, 55), other[0]);
+    p.unmap(p.context, other, 4096);
+    other_live = false;
+    try std.testing.expectEqual(@as(usize, 0), pages.committed());
+    try std.testing.expectEqual(@as(usize, 0), pages.reserved());
+    try std.testing.expectEqual(@as(usize, 0), pages.accessible());
 }

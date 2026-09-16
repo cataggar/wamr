@@ -213,20 +213,36 @@ raw logs are needed or published by this software.
 ## Memory meaning and remaining qualification
 
 The record uses `coverage: partial-guest`,
-`method: linux-mmap-accessible-ranges`. Native callbacks count real reserved code
-and linear-memory address ranges and their currently RW/RX-accessible committed
-prefixes at after-instantiation, after-first and after-steady boundaries.
-Revoking a grown suffix reduces this accessible count; retained physical pages
-and Linux overcommit are not inferred from `mprotect`.
+`method: linux-mmap-retained-commit-high-water`. Native callbacks count real
+reserved code/linear-memory address ranges and the retained committed high-water
+prefix of each live reservation at the three phase boundaries. Successful commit
+enables RW and zeroes newly accessible bytes. Its high-water count increases only
+when extending beyond previously committed bytes.
 
-This is **not RSS, whole-process committed RAM, physical residency or complete
-guest memory usage**. Runtime/snapshot allocator allocations, tables/globals,
+`mprotect(PROT_NONE)` only revokes access: it does not release anonymous backing
+or commitment. Snapshot reset therefore lowers a **separate accessible/logical
+frontier**, never `committed_bytes`. Re-enabling/recommitting retained pages does
+not count them twice, and previously written inaccessible pages are zeroed before
+they become newly usable guest memory. Retained commitment is removed only when
+the corresponding reservation is actually unmapped; this adapter implements no
+decommit. The real commit/touch/revoke/recommit/unmap regression covers retained
+counts and independent release of both mappings.
+
+These are callback-accounted committed range bytes, **not RSS, kernel-wide commit
+charge, whole-process committed RAM, physical residency or complete guest memory
+usage**. Linux overcommit, swapping and residency are not inferred from protection
+flags. Runtime/snapshot allocator allocations, tables/globals,
 producer buffers, stacks, kernel, other processes and image RAM are explicitly
 omitted. Configured VM RAM is receipt-attested and never substituted for measured
 memory. The full producer ELF and complete image byte sizes remain separate
 artifact identities. Whole-guest allocation/page/residency accounting and Unikraft
 `ukalloc`/`uk_vma` qualification require the native image integration; no missing
 values are invented here.
+
+When integrating native `Instance.memoryStats()`, a value derived from logical
+`vmctx.memory_size` is not a replacement for retained committed footprint after
+snapshot reset. Keep logical accessibility, allocation requests and retained
+commitment distinctly labeled and measured.
 
 Separately, a real counting allocator records successful alloc/resize/remap/free
 requests for the Session, native API, snapshots and invocation-output buffers.

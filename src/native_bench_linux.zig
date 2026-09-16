@@ -415,7 +415,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
         try json.put(a, &memory, "image_sha256", try json.field(observed, "image_sha256"));
         try json.put(a, &memory, "configured_vm_ram_bytes", try json.field(receipt, "configured_vm_ram_bytes"));
         try set(a, &memory, "coverage", "partial-guest");
-        try set(a, &memory, "method", "linux-mmap-accessible-ranges");
+        try set(a, &memory, "method", "linux-mmap-retained-commit-high-water");
         try json.put(a, &memory, "policy", policy);
         try set(a, &memory, "covered_regions", &[_][]const u8{ "native-code", "wasm-linear-memory" });
         try set(a, &memory, "omitted_regions", &[_][]const u8{
