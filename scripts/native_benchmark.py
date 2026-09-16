@@ -479,7 +479,18 @@ def validate_result(result, manifest, run_id):
     require(result["outcome"] != "trap" or result["exit_code"] is None,
             "trap must not report a guest exit code")
     require(result["phase_contract"] == "wamr-embedding-v1", "unknown phase contract")
+    phases = result["phases"]
+    keys(phases, PHASES, "phases")
+    require(phases["compile_ticks"] is None, "AOT must not conflate runtime compilation")
     clock = result["clock"]
+    if clock is None:
+        require(result["outcome"] != "success" and
+                all(phases[name] is None for name in
+                    ("load_ticks", "instantiate_ticks", "first_invocation_ticks")) and
+                phases["steady_state_ticks"] == [] and result["invocations"] == [] and
+                result["memory"] is None,
+                "unavailable clock requires a failed, unstarted attempt without measurements")
+        return []
     keys(clock, {"source", "unit", "ticks_per_second", "resolution_ticks"}, "clock")
     public_token(clock["source"], "clock source")
     require(clock["unit"] in ("ns", "us", "ms"), "unsupported clock unit")
@@ -487,9 +498,6 @@ def validate_result(result, manifest, run_id):
             {"ns": 1_000_000_000, "us": 1_000_000, "ms": 1000}[clock["unit"]],
             "clock frequency/unit mismatch")
     number(clock["resolution_ticks"], "clock resolution", 1, integer=True)
-    phases = result["phases"]
-    keys(phases, PHASES, "phases")
-    require(phases["compile_ticks"] is None, "AOT must not conflate runtime compilation")
     success = result["outcome"] == "success"
     for phase in ("load_ticks", "instantiate_ticks", "first_invocation_ticks"):
         require(not success or phases[phase] is not None, f"missing {phase}")

@@ -1661,6 +1661,32 @@ Correct operation validated. See README.md for run and reporting rules.
         result["memory"]["samples"] = result["memory"]["samples"][:1]
         self.assertEqual(native_benchmark.validate_result(result, self.manifest, run["run_id"]), [])
 
+    def test_native_unavailable_clock_is_an_honest_early_failure(self):
+        run = self.manifest["schedule"][0]
+        result = self.result(run)
+        result.update(outcome="error", exit_code=None, clock=None, invocations=[], memory=None)
+        result["phases"] = {"compile_ticks": None, "load_ticks": None,
+                            "instantiate_ticks": None, "first_invocation_ticks": None,
+                            "steady_state_ticks": []}
+        self.assertEqual(native_benchmark.validate_result(result, self.manifest, run["run_id"]), [])
+        result["phases"]["load_ticks"] = 1
+        with self.assertRaisesRegex(ValueError, "unavailable clock"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        result["phases"]["load_ticks"] = None
+        result.update(outcome="success", exit_code=0)
+        with self.assertRaisesRegex(ValueError, "unavailable clock"):
+            native_benchmark.validate_result(result, self.manifest, run["run_id"])
+        result.update(outcome="error", exit_code=None)
+
+        def unavailable_clock(record, scheduled):
+            if scheduled["run_id"] == run["run_id"]:
+                record.update(copy.deepcopy(result))
+
+        report = native_benchmark.build_report(
+            self.manifest, self.capture_directories(unavailable_clock), allow_synthetic=True)
+        self.assertIsNone(report["records"][0]["result"]["clock"])
+        self.assertFalse(report["status"]["all_attempts_successful"])
+
     def test_native_matched_final_crc_disagreement_is_rejected(self):
         def change_crc(result, run):
             if run["target"] == "unikraft" and run["workload"] == "coremark":

@@ -250,6 +250,11 @@ The object has **exactly** these fields:
   (positive integer from the supported native clock resolution). Raw TSC cycles
   without a qualified conversion are not supported. Record zero durations when
   below resolution rather than inventing precision; the resolution remains visible.
+  If no supported clock exists, an early **failed, unstarted** attempt may use
+  `clock: null`, with all scalar phases `null`, empty steady/invocation lists and
+  `memory: null`. It is not a timed sample. Do not fabricate a clock resolution to
+  report that failure. For a WASI-provided phase clock, use the monotonic ID's actual
+  resolution (ID 1); real-time epoch or CPU-time clocks are not substitutes.
 * `phases`: `compile_ticks: null`, `load_ticks`, `instantiate_ticks`,
   `first_invocation_ticks`, `steady_state_ticks` (list).
 * `invocations`: list, first then steady, each exactly `{phase: "first"|"steady",
