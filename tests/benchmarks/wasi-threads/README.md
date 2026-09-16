@@ -125,7 +125,7 @@ SHA-256 `95b9990bd9d0b1c73b26b0636c22555fb72af2b3942363a86619e5b5e2b1a995`,
 `098a466f98da6899f2e7dba657078eb3853500a9bfca4e06727c23b51c0cbed3`,
 and `af3b627429f8f732fb8ee19d28f56950ec7ad56f67dd9558e7ee893efb24f4b5`.
 Replaying every retained pilot under the 4x rule projects at most
-6,851.601334604 seconds, or 114.19 minutes, below the 201-minute benchmark
+6,851.601334604 seconds, or 114.19 minutes, below the 261-minute benchmark
 limit.
 
 Spawn/join retains an explicit architecture-neutral 2x base policy:
@@ -178,7 +178,7 @@ The exact relative margin over the retained `9.723491826731898x` boundary is
 `16 / 9.723491826731898 - 1 = 0.645499403415209`, or 64.5499%.
 Replaying all 88 retained pilots and the 12 evidence invocations per
 observation gives a maximum 6,378.047861506-second projection on the #1020
-failure, bounded by 106.30 minutes and still below 171 minutes. The v4
+failure, bounded by 106.30 minutes and still below 261 minutes. The v4
 diagnostic is pinned by SHA-256
 `8e8c9c7f0075ac7c9e36917dde73294a415f6756784107b06fb0055317035496`.
 This stronger rule is a cell-specific rate envelope, not an x86 host
@@ -206,14 +206,43 @@ every retained pilot's barrier `B` is checked against its linearly projected
 corrected evidence interval `E`: `99B < E`. Every projected interval must also
 be at least both the 1.25-second evidence floor and the exact 5-second
 `1.75s * 20/7` sizing target. Spawn/join uses its declared 2.5-second base
-target. Contended `atomic/2`, `atomic/4`, and `atomic/8` use a platform-neutral
-20-second process-CPU window to average shared-counter scheduling states;
-single-worker atomic remains on the general 5-second target. AOT wait/notify/1
-also projects at least 20.0 seconds.
+target. Runtime `hot/8` uses a platform-neutral 20-second process-CPU window.
+Contended `atomic/2` and `atomic/4` use 40-second process-CPU windows, while
+`atomic/8` retains its validated 20-second window and single-worker atomic
+remains on the general 5-second target. AOT wait/notify/1 also projects at
+least 20.0 seconds.
+
+These targeted windows follow immutable v13 smoke cohort
+`25c4886203114874a9319af396f2866b`, which retained eight complete reports at
+tagged commit `8b53af82` with no retries, replacements, or exclusions. The
+direct thread-manager maximum median delta passed at
+`0.0058969149133618615`, but the frozen `0.10` adverse-log gate rejected Arm
+interpreter `atomic/2` raw elapsed at `0.10339108670431646`, Arm `atomic/4`
+ratio-of-ratios at `0.12282568511907484`, and x86 interpreter `hot/8` raw
+elapsed at `0.10715425732546066`. The validated cohort and complete policy
+check are pinned by SHA-256
+`16ae03b61eefe5ad7a517819af28e917b94e83dfd117ffd8a8b4355446ee37eb` and
+`9007cf73419042d436757c7662d65d0089c848c768bb604c75b6d05aaafb04bb`.
+No v13 observation is eligible for authoritative derivation.
+
+A focused 64-record same-binary x86 probe then compared the current and
+proposed windows with the same balanced four-sample median used by smoke
+reports. The 20-second `hot/8` window reduced median absolute interpreter pair
+log noise from `0.12700055521076198` to `0.009531339926446877`. The 40-second
+atomic windows kept every rolling four-sample adverse log below
+`0.043347741286154276`; interpreter `atomic/4` median absolute pair noise fell
+from `0.03667492495956616` to `0.01517554723182872`. The complete probe and
+derived summary are pinned by SHA-256
+`35186dd10f94ede94bf05b3c7b7eaa0e429cbacc77843b02407ff884bc583b34` and
+`1dbb6bf77d9a32268781d98167a36419b7882b3f886baa572e3ad0f0570f9706`.
+Replaying the v14 policy against all eight retained pilot sets projects
+authoritative benchmark work between 104.81 and 109.29 minutes. The selectors
+contain no platform or architecture identity.
+
 Actual warmups and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
 There is no hidden retry or count increase if a later rate exceeds its
-declared 2x, 4x, or 16x envelope: even a just-over-boundary observation that
+declared 2x, 4x, 16x, or 32x envelope: even a just-over-boundary observation that
 falls below 1.25 seconds is retained and fails closed.
 
 Selected counts must fit uint64 operations, the wait/notify signed-32-bit epoch
@@ -224,14 +253,15 @@ cell while preventing 88 watchdog-length pilots from exhausting a job. Every
 condition's projected invocation must remain strictly below the 90-second
 watchdog.
 
-The workflow reserves 69 minutes for non-benchmark work, leaving a 201-minute
+The workflow reserves 69 minutes for non-benchmark work, leaving a 261-minute
 benchmark limit. Before and during the full 88-pilot authoritative plan,
 admission uses the hard 48-minute-24-second pilot bound (`88 * 33s`), the
-122-minute minimum evidence bound
-(`58 * 12 * 5s + 12 * 12 * 20s + 16 * 12 * 2.5s + 2 * 12 * 20s`), and the
-10-minute auxiliary allowance. Their sum is 180 minutes 24 seconds; adding the
-69-minute reserve is 249 minutes 24 seconds, strictly below the 270-minute job
-timeout with 20 minutes 36 seconds of headroom. The harness accumulates actual
+166-minute minimum evidence bound
+(`54 * 12 * 5s + 4 * 12 * 20s + 8 * 12 * 40s + 4 * 12 * 20s`
+`+ 16 * 12 * 2.5s + 2 * 12 * 20s`), and the 10-minute auxiliary allowance.
+Their sum is 224 minutes 24 seconds; adding the 69-minute reserve is 293
+minutes 24 seconds, strictly below the 330-minute job timeout with 36 minutes
+36 seconds of headroom. The harness accumulates actual
 pilot corrected and wall time after each one-shot pilot and aborts immediately
 when the remaining hard bound cannot fit.
 
@@ -337,14 +367,14 @@ same-directory atomic rename that preserves an existing report's mode.
 Each guest invocation has a fixed 90-second watchdog. Before evidence, the
 harness checks every pilot-derived per-condition projection against that
 watchdog and checks the complete projected benchmark path against the strict
-201-minute limit. The workflow retains its 270-minute bound and 69-minute
+261-minute limit. The workflow retains its 330-minute bound and 69-minute
 non-benchmark reserve. Twenty sequential trusted x86 jobs at the full job
-timeout take 90 hours, leaving 6 hours before the 96-hour dispatcher
+timeout take 110 hours, leaving 10 hours before the 120-hour dispatcher
 deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 17 of a purpose-independent portable
+`measurement_plan_sha256` is version 18 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -600,14 +630,14 @@ python3 scripts/wasi_thread_cohort.py dispatch \
   --profile authoritative --warmups 2 --samples 10 \
   --runner-target trusted-calibration \
   --runs 20 --training-runs 16 --max-in-flight 2 \
-  --timeout-seconds 345600 \
+  --timeout-seconds 432000 \
   --output /d/wasi-thread-cohort-dispatch.json
 ```
 
 Do not run that command until this workflow has merged and the temporary runner
 route is intentionally ready. Trusted calibration caps `--max-in-flight` at 2:
 GitHub concurrency preserves only one pending run in addition to the active
-run. The dispatcher's validated wall-clock timeout defaults to 96 hours, which
+run. The dispatcher's validated wall-clock timeout defaults to 120 hours, which
 covers the authoritative job timeouts while ensuring a queued or never-scheduled
 run fails loudly. Do not manually dispatch this workflow while a cohort is in
 progress; any unrelated manual dispatch introduces uncontrolled contention and
