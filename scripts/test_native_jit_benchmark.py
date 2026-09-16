@@ -458,5 +458,19 @@ class NativeExternalTransportTests(unittest.TestCase):
         self.assertFalse((self.root / "cli").exists())
 
 
+@unittest.skipUnless(os.environ.get("WAMR_JIT_NATIVE_ARCHIVES"),
+                     "build test-native-jit-archives with the native JIT profile for archive coverage")
+class NativeEmbeddingArchiveTests(unittest.TestCase):
+    def test_embedding_archives_do_not_define_compiler_runtime_memory_helpers(self):
+        directory = Path(os.environ["WAMR_JIT_NATIVE_ARCHIVES"])
+        for name in ("libwamr-jit.a", "libwamr-jit-aot-sample.a"):
+            with self.subTest(archive=name):
+                symbols = subprocess.check_output(
+                    ["nm", "-g", "--defined-only", str(directory / name)], text=True)
+                definitions = {line.split()[-1] for line in symbols.splitlines() if line.split()}
+                self.assertFalse(definitions & {"memcpy", "memset", "memmove"},
+                                 "embedding archive must leave intrinsic resolution to the final image")
+
+
 if __name__ == "__main__":
     unittest.main()
