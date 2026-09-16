@@ -1465,6 +1465,10 @@ Correct operation validated. See README.md for run and reporting rules.
             self.manifest, self.capture_directories(), allow_synthetic=True)
         self.assertEqual(report["evidence_kind"], "synthetic")
         self.assertFalse(report["status"]["paired_measurement_complete"])
+        self.assertEqual(report["status"]["identity_assurance"],
+                         "observations-and-receipt-attestations")
+        self.assertEqual(report["status"]["hardware_qualification"],
+                         "requires-independent-deployment-evidence")
         self.assertTrue(report["status"]["all_attempts_successful"])
         self.assertFalse(report["status"]["profile_counts_match"])
         self.assertEqual(report["status"]["coremark_compliance"], "not-certified")

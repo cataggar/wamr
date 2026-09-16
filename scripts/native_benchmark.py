@@ -930,6 +930,8 @@ def build_report(manifest, directories, *, allow_synthetic=False):
                        "coremark_compliance": "not-certified" if has_coremark else "not-applicable",
                        "paired_measurement_complete": all_success and
                        manifest["evidence_kind"] == "measurement",
+                       "identity_assurance": "observations-and-receipt-attestations",
+                       "hardware_qualification": "requires-independent-deployment-evidence",
                        "os_attribution": "requires-experimental-review",
                        "performance_threshold": None}}
 

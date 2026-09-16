@@ -209,6 +209,33 @@ checks receipt identities against real local image/runtime/compiler/AOT bytes an
 retains the exact receipt file hash. The guest must independently establish the
 image receipt and observed identities; blindly echoing a request is not measurement.
 
+### Evidence origin and hardware qualification
+
+The v2 `observed` container reconciles producer observations with independent
+receipt attestations. Its name does **not** mean every field was discovered by the
+guest or that physical hardware was certified. The fixed provenance boundary is:
+
+| Evidence | Origin and limit |
+| --- | --- |
+| Loaded Wasm/AOT, runtime/compiler and complete-image file hashes/sizes | Actual bytes checked by the host and producer; a local image hash alone does not prove that image is running. |
+| Guest architecture, CPU model and active CPU count | Native platform observations checked against the independent receipt, not copied from the request or inferred from SKU capacity. |
+| Source/build lineage, options and ABI/image compatibility | Qualified build/integration attestations, with independently checkable runtime settings reconciled by the producer. |
+| Azure SKU/region, configured VM RAM and image-to-boot relationship | Independent deployment/receipt attestations; arbitrary request strings or hashing local files cannot establish these facts. |
+| Phase durations and covered memory counters | Actual clock/counter observations with their explicit resolution, method and coverage; configured RAM is not measured memory. |
+
+The deployment must be qualified before producing measurement evidence. A
+`hardware` label is an integrator attestation, not automatic proof, permission for
+a paid run, or a way to turn QEMU correctness runs into performance evidence.
+Missing, unqualified or mismatched deployment evidence must fail closed.
+Review the private build/deployment evidence independently; this host protocol
+does not replace it or establish native image acceptance.
+
+Every public report states
+`identity_assurance: "observations-and-receipt-attestations"` and
+`hardware_qualification: "requires-independent-deployment-evidence"` in `status`.
+Even `paired_measurement_complete: true` means the declared campaign's required
+records were accepted, not that the report certified their physical deployment.
+
 Different AOT bytes require different explicit `target_abi` values and retain both
 hashes/sizes. Identical bytes require a separate ABI qualification attestation:
 exactly `{schema_version: 2, kind: "wamr-aot-abi-proof", evidence_kind: "measurement",
@@ -311,7 +338,8 @@ The object has **exactly** these fields:
   `image_receipt_sha256`.
 * `observed`: exactly `image_sha256`, `runtime_sha256`, `aot_sha256`, `wasm_sha256`,
   `platform`, `options`, `compile_profile`, `mode: "aot"`, `jit_preset: null`, independently checked by
-  the producer against deployed/loaded native artifacts and active platform.
+  the producer against loaded native artifacts, active platform and independent
+  receipts according to the evidence-origin boundary above.
 * `outcome`: `success`, `trap`, `timeout`, `abort`, or `error`.
   `exit_code`: the final invocation's complete unsigned 32-bit `proc_exit` status,
   or `null` for ordinary return, trap/error, or no invocation. Successful `proc_exit`
