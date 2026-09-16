@@ -121,7 +121,14 @@ At the pinned revision, `plat/hyperv/time.c:892` implements monotonic time as
 `hyperv_reference_delta_ns(hyperv_reference_time(), hyperv_boot_ref)`. The
 separate wall-clock implementation at line 898 uses
 `hyperv_wall_time_ns(hyperv_epoch_ns, hyperv_efi_ref, hyperv_reference_time())`.
-This library exposes only monotonic time. An optional WASI provider must verify
+Both helpers saturate at `UINT64_MAX` on conversion/addition overflow; the
+embedding clock boundary rejects this sentinel as `ClockFailed`.
+`plat/hyperv/include/hyperv/clock.h` defines `HYPERV_REFERENCE_TICK_NS = 100`:
+reference ticks are multiplied by 100 to produce nanoseconds. **Units are not
+resolution**; a native WASI provider must report the established 100 ns
+resolution, not 1 ns merely because the timestamp's unit is nanoseconds.
+This library exposes only monotonic time and makes no resolution claim.
+An optional WASI provider must verify
 the presence of a valid EFI epoch before exposing realtime, and must return an
 unsupported result for unavailable process/thread CPU clocks. Neither boot
 time nor monotonic time is a substitute for those clocks.

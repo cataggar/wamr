@@ -2,6 +2,28 @@ const std = @import("std");
 const format = @import("runtime/aot/native_format.zig");
 const fixture = @import("native_fixture").bytes;
 
+test "native platform: saturated monotonic clocks return an explicit error" {
+    const Clock = struct {
+        ns: u64 = 100,
+        fn read(context: *anyopaque) @import("platform/unikraft.zig").Error!u64 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.ns;
+        }
+    };
+    var clock: Clock = .{};
+    const platform: @import("platform/unikraft.zig").Platform = .{
+        .context = &clock,
+        .reserve = undefined,
+        .commit = undefined,
+        .protect = undefined,
+        .unmap = undefined,
+        .monotonic_ns = Clock.read,
+    };
+    try std.testing.expectEqual(@as(u64, 100), try platform.monotonicNs());
+    clock.ns = std.math.maxInt(u64);
+    try std.testing.expectError(error.ClockFailed, platform.monotonicNs());
+}
+
 test "native format: matching host-wamrc fixture metadata is checked" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

@@ -34,7 +34,7 @@ pub const HostContext = struct {
     }
     pub fn monotonicNs(self: *HostContext) PlatformError!u64 {
         const p = self.instance.native;
-        return p.monotonic_ns(p.context);
+        return p.monotonicNs();
     }
     /// Host adapters must return normally from callbacks, allowing their defers
     /// to run. The dispatcher unwinds guest frames after observing this request.

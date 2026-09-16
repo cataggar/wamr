@@ -29,6 +29,13 @@ pub const Platform = struct {
         const n = std.math.add(usize, size, self.page_size - 1) catch return error.OutOfMemory;
         return n & ~(self.page_size - 1);
     }
+
+    pub fn monotonicNs(self: Platform) Error!u64 {
+        const ns = try self.monotonic_ns(self.context);
+        // The pinned Hyper-V clock uses UINT64_MAX as its saturation sentinel.
+        if (ns == std.math.maxInt(u64)) return error.ClockFailed;
+        return ns;
+    }
 };
 
 /// CPU feature bits use native_abi.cpu_features, not Zig's internal feature IDs.
