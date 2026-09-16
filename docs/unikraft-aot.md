@@ -106,11 +106,32 @@ attribute APIs in `lib/ukvmem/include/uk/vmem.h`, low-level
 not implemented shims**. In particular, simply forwarding commit to a lazy
 anonymous map is insufficient for deterministic allocation failure, and
 `uk_vma_set_attr` can enter `UK_CRASH` on a low-level protection failure.
+The concrete adapter mapping is:
+
+| Capability | Pinned native API | Required behavior |
+| --- | --- | --- |
+| allocation/free | `uk_posix_memalign` / `uk_free` | Use the explicitly selected `uk_alloc`, preserving requested alignment. |
+| reservation | `uk_vma_reserve(vas, &vaddr, len)` | Reserve virtual space without physical pages in the selected `uk_vas`. |
+| commit | `uk_vma_map_anon` at the exact reserved address, `UK_VMA_MAP_REPLACE \| UK_VMA_MAP_POPULATE` | Eagerly allocate only the requested prefix extension; restore the original reservation on failure if the underlying operation replaced it. |
+| protection | `uk_vma_set_attr` / appropriate checked lower-level paging operation | Apply RW→RX without an RWX interval; qualify low-level failure handling rather than treating a crash path as a returned error. |
+| release | `uk_vma_unmap` plus owned mapping bookkeeping | Release the complete original reservation and physical pages; establish reliable teardown despite VMA splitting/merging. |
+| monotonic clock | `ukplat_monotonic_clock()` | C ABI `u64` nanoseconds; never relabel as realtime or CPU time. |
+
+At the pinned revision, `plat/hyperv/time.c:892` implements monotonic time as
+`hyperv_reference_delta_ns(hyperv_reference_time(), hyperv_boot_ref)`. The
+separate wall-clock implementation at line 898 uses
+`hyperv_wall_time_ns(hyperv_epoch_ns, hyperv_efi_ref, hyperv_reference_time())`.
+This library exposes only monotonic time. An optional WASI provider must verify
+the presence of a valid EFI epoch before exposing realtime, and must return an
+unsupported result for unavailable process/thread CPU clocks. Neither boot
+time nor monotonic time is a substitute for those clocks.
+
 The downstream adapter must establish transactional eager commit, safe VMA/page
 ownership and reliable teardown for its configured native page tables before
 claiming this platform contract. Its application profile must explicitly enable
-and initialize ukalloc, ukpaging, ukvmem and the monotonic clock; their availability
-must not be inferred from an existing networking image. No POSIX `mmap`,
+and initialize `LIBUKVMEM` (default **off**) and the monotonic clock;
+`LIBUKVMEM` selects ukpaging, ukalloc, ukdebug, ukisrlib and uklcpu. Their
+availability must not be inferred from an existing networking image. No POSIX `mmap`,
 `mprotect`, signals or
 `process.exit` occurs in the native library.
 
