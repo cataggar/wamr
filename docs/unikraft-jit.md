@@ -1,8 +1,10 @@
 # Optional native in-process compiler
 
 This is **dependent software integration for #1044**, not native Unikraft JIT
-qualification. It depends on the native AOT API introduced by draft #1050;
-that API must work and be qualified first. Physical image/adapter integration
+qualification. It depends on the corrected native AOT API from #1050 and the
+staged producer API from #1046. Development integration uses producer base
+`7b0b7701eb882cf36ba02455a00b9dd64823cff6`; this is not a protected-main merge
+or deployment qualification receipt. Physical image/adapter integration
 and boot evidence remain pending in `cataggar/unikraft#156`. Linux tests and QEMU
 are correctness evidence only. No CoreMark speedup, Azure result, image size,
 or hard real-time latency claim follows from this work.
@@ -101,13 +103,24 @@ The native loader requires explicit nonzero `max_run_fuel` and explicit
 instance and retained metadata arena. The reservation cap includes rounded RX
 code plus the entire maximum linear-memory reservation; table storage falls
 under the heap cap. Existing page/table limits and wasm maxima still apply.
-Allocation/commit/protection failure rolls ownership back.
+Allocation/commit/protection failure rolls ownership back. Allocation-free target
+admission rejects missing/zero metered budgets before allocating the instance
+or copying input. The capped allocator then covers metadata parsing.
+`loadModule` checks parsed code, combined code/maximum-memory reservation, and
+table admission before any executable or guest mapping. `instantiate` freezes
+**every non-timing option**, including all four new caps; a changed option
+poisons that attempt instead of permitting a staged bypass or retry. Only the
+optional timing destination may differ.
 
 Fuel decrements at every generated function entry and backward branch target.
 Exhaustion traps before the block executes, including an allocation-free
 infinite loop. Each checked export/start invocation receives a fresh budget.
 One unit is a poll, **not one wasm instruction or one nanosecond**. Branch
-selection, optimization and presets can change consumption. An unmetered AOT
+selection, optimization and presets can change consumption. Fuel 1 traps at
+entry; fuel 2 permits a one-entry leaf to finish. The last charged unit traps
+before the block, so a budget of N permits N-1 continuing polls. Import callbacks
+return normally before checked host exit unwinds; callbacks themselves are not
+metered or preempted. An unmetered AOT
 artifact rejects a requested fuel budget rather than claiming to enforce it.
 No runtime wall-clock deadline option is offered. Callers must bound their own
 host callbacks and page/allocator services; fuel cannot interrupt them.
@@ -142,13 +155,79 @@ bit 1 validates `instantiate_ns` (allocation, initialization and RW-to-RX).
 Failed loads do not make unfinished phases valid. Export start, first result
 and repeated calls remain distinct outer measurements, not loader phases.
 
-The Linux producer/matched report work in #1046 owns complete compile,
-load/instantiate, first-result and steady-state measurements. Compare the same
-wasm and exact output, record fast/full and fuel instrumentation differences,
-and measure the final compiler-free/JIT images separately after #156 integration.
-Archive/library file lengths may be recorded now but must not substitute for
-image measurements or measured process memory. QEMU timings are not performance
-evidence.
+## Explicit matched sampler
+
+The optional `native-jit-bench` target builds **two separately linked** static
+x86_64 Linux executables: `wamr-native-jit-aot-compare` has no compiler and only
+accepts `aot`; `wamr-native-jit-bench` embeds the compiler and requires `fast` or
+`full`. Both use the exact same embedded deterministic source. The comparator
+embeds a matching, build-time `wamrc --profile=unikraft-x86_64` artifact, never
+compiles at runtime, and reports compile time as null. Tests inspect both
+binaries' symbols as well as their behavior.
+
+The shared sampler calls the checked native API with no imports. It measures
+the complete in-process compile (JIT only), compiler subphases, staged load,
+instantiate, explicit start, first call, and three repeated calls separately.
+Each 2000-round call initializes its volatile memory **inside the timed call**.
+A separately timed `grow(1)` after the first call must return two previous
+pages; before/after memory samples prove growth from two to three committed
+pages with a stable eight-page reservation. This is not the #1046 producer's
+eight-domain snapshot replay or a claim about uninterrupted steady state.
+Both modes have the same heap/code/reservation limits; JIT additionally has
+100,000 polls per invocation. The original AOT artifact has no fuel guarantee.
+The fixed workload's finite input/control flow and the host process timeout
+bound this comparator experiment; do not generalize that to arbitrary AOT.
+
+```sh
+zig build native-jit-bench test-native-jit-bench -Doptimize=ReleaseSafe -j2
+python3 -m scripts.native_jit_benchmark \
+  --aot zig-out/bin/wamr-native-jit-aot-compare \
+  --jit zig-out/bin/wamr-native-jit-bench \
+  --output /path/to/new-correctness-capture
+# On arm64 development add: --runner 'qemu-x86_64 -cpu max'
+```
+
+The helper always runs all three explicit modes, with a 120-second per-process
+host timeout (configurable 1-600 seconds). It archives a nonce-bound request,
+raw stdout/stderr and statuses, including failures/timeouts. Strict revalidation
+checks raw hashes, request identity, actual matching wasm identities, exact
+results, every phase, growth and complete teardown before writing a comparison.
+The separate `WAMR_JIT_SAMPLE=` marker cannot be consumed as the existing
+`WAMR_BENCH_RESULT=` protocol. `scripts/native_benchmark.py` remains strict v2
+compiler-free AOT by default, unchanged.
+
+Without independent evidence the capture is **correctness-only**, has no image
+size value and makes no performance claim. Executable file-size growth,
+requested caller allocation peak growth, compiler peak/retained allocations,
+and logical page commitment are distinct fields. None is RSS, allocator
+bookkeeping, physical residency, a bootable image, or guest RAM overhead.
+The JIT output artifact stays allocated through sampling, then both it and the
+instance are released; this retained copy is included in caller memory peaks.
+QEMU timing values are diagnostic observations only.
+
+The helper's opt-in measurement path additionally requires **all** of
+`--receipt`, `--trusted-receipt-sha256`, `--aot-image`, and `--jit-image`, and
+rejects emulation/non-x86_64/non-Linux execution before starting a producer.
+It does not build, deploy, boot, or qualify any image. Receipt schema version 1,
+kind `wamr-jit-independent-image-deployment-receipt`, is exact:
+
+| Fields | Required binding |
+| --- | --- |
+| `issuer`, `source_commit`, `deployment_receipt_sha256` | Independent issuer token, source commit, deployment evidence digest |
+| `os`, `arch`, `hardware_execution`, `platform` | Linux/x86_64, hardware attestation, existing native platform identity shape |
+| `executables`, `images` | Separate `aot`/`jit` SHA256 and byte counts of actual executable and complete-image files |
+| `wasm`, `aot_module` | Actual sampled source and comparator module SHA256/byte counts |
+| `compiler_embedded`, `runtime_linkage` | Exactly `{"aot":false,"jit":true}` and `static` |
+| `safety` | `bounds_checks`, `checked_imports`, `checked_traps`, `wx` all true |
+| `lifecycle`, `allocator`, `page_policy` | Exact sampler lifecycle, independently identified caller allocator and page policy |
+
+The trusted hash is SHA256 of canonical JSON (sorted keys, compact separators);
+it must be supplied out of band, not emitted by the producer. Receipt hashes
+bind attestations; they are **not hardware proof or independent verification
+of an issuer's claims**. The operator must qualify the images and deployment
+independently first. This repository supplies no such receipt. In particular
+Unikraft measurements remain rejected until the actual image adapter/receipt
+integration is qualified separately. No CoreMark JIT or cloud action is added.
 
 ```sh
 zig build test-native-jit test-native-aot test-native-aot-abi -j2
@@ -164,5 +243,5 @@ finite cancellation of allocation-free loops, cap rejection, and every
 compiler backing-allocation failure with complete teardown. The existing AOT
 regressions still validate imports, checked dispatch, traps and page failures.
 x86 Linux CI runs natively; arm64 development uses pre-provisioned
-`qemu-x86_64 -cpu max` only for correctness. These checks do not close #1044's
-pending native/image and matched benchmark acceptance.
+`qemu-x86_64 -cpu max` only for correctness. The matched software path is present;
+these checks do not close #1044's pending physical native/image qualification.

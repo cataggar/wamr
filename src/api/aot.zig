@@ -77,6 +77,18 @@ fn nonTimingOptions(options: Options) Options {
     return admitted;
 }
 
+fn admittedFuel(metered: bool, options: Options) Error!u32 {
+    if (!metered) {
+        if (options.max_run_fuel != null) return error.UnsupportedRunBudget;
+        return 0;
+    }
+    const fuel = options.max_run_fuel orelse return error.UnsupportedRunBudget;
+    if (fuel == 0 or options.max_heap_bytes == null or
+        options.max_reserved_bytes == null or options.max_code_bytes == null)
+        return error.InvalidLimits;
+    return fuel;
+}
+
 const Mapping = struct { base: [*]align(4096) u8, size: usize };
 const TableStorage = struct { pointers: []usize, signatures: []u32, size: u32, max: u32 };
 
@@ -153,6 +165,8 @@ pub const Instance = struct {
         if (options.max_memory_pages > 65536) return error.InvalidLimits;
         const heap_limit = options.max_heap_bytes orelse std.math.maxInt(usize);
         if (heap_limit < @sizeOf(Instance)) return error.InvalidLimits;
+        const cpu_features = platform.detectedCpuFeatures() & options.cpu_feature_mask;
+        _ = try admittedFuel(try format.fuelMetered(bytes, cpu_features), options);
         const self = try allocator.create(Instance);
         self.* = .{
             .allocator = allocator,
@@ -166,20 +180,15 @@ pub const Instance = struct {
         errdefer self.deinit();
         const a = self.arena.allocator();
         const owned = try a.dupe(u8, bytes);
-        self.module = try format.load(owned, a, platform.detectedCpuFeatures() & options.cpu_feature_mask);
-        if (self.module.fuel_metered) {
-            self.run_fuel = options.max_run_fuel orelse return error.UnsupportedRunBudget;
-            if (self.run_fuel == 0) return error.InvalidLimits;
-            if (options.max_heap_bytes == null or options.max_reserved_bytes == null or options.max_code_bytes == null)
-                return error.InvalidLimits;
-        } else if (options.max_run_fuel != null) return error.UnsupportedRunBudget;
+        self.module = try format.load(owned, a, cpu_features);
+        self.run_fuel = try admittedFuel(self.module.fuel_metered, options);
         if (self.module.text.len > (options.max_code_bytes orelse std.math.maxInt(usize))) return error.MemoryLimitExceeded;
         const code_size = try native.rounded(self.module.text.len);
         const reserved_limit = options.max_reserved_bytes orelse std.math.maxInt(usize);
         if (code_size > reserved_limit) return error.MemoryLimitExceeded;
-        if (self.module.memory) |memory| {
-            const max = @min(memory.max orelse options.max_memory_pages, options.max_memory_pages);
-            if (memory.min > max or @as(usize, max) * 65536 > reserved_limit - code_size)
+        if (self.module.memory) |limits| {
+            const max = @min(limits.max orelse options.max_memory_pages, options.max_memory_pages);
+            if (limits.min > max or @as(usize, max) * 65536 > reserved_limit - code_size)
                 return error.MemoryLimitExceeded;
         }
         for (self.module.tables) |table| {

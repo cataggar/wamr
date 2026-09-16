@@ -101,6 +101,39 @@ pub const Module = struct {
     }
 };
 
+fn readTarget(section: *Reader, cpu_features: u64) Error!bool {
+    if (section.bytes.len != 40) return error.InvalidSection;
+    if (try section.int(u16) != 2 or try section.int(u16) != 0 or
+        try section.int(u16) != 1 or try section.int(u16) != 0x3e)
+        return error.UnsupportedTarget;
+    const profile = try section.int(u32);
+    if ((profile != abi.profile_flag and profile != abi.fuel_profile_flag) or
+        try section.int(u32) != abi.contract_version) return error.UnsupportedTarget;
+    if (!std.mem.eql(u8, try section.take(16), "x86_64" ++ "\x00" ** 10)) return error.UnsupportedTarget;
+    const features = try section.int(u64);
+    if (features != abi.cpu_features or features & ~cpu_features != 0) return error.UnsupportedTarget;
+    return profile == abi.fuel_profile_flag;
+}
+
+/// Allocation-free target admission so missing metered budgets cannot allow an
+/// unbounded input copy or metadata parse. Full load still validates every section.
+pub fn fuelMetered(bytes: []const u8, cpu_features: u64) Error!bool {
+    var reader: Reader = .{ .bytes = bytes };
+    if (try reader.int(u32) != abi.magic) return error.InvalidMagic;
+    if (try reader.int(u32) != abi.format_version) return error.InvalidVersion;
+    var seen: u32 = 0;
+    var metered: ?bool = null;
+    while (reader.bytes.len != 0) {
+        const id = try reader.int(u32);
+        const length = try reader.int(u32);
+        if (id > 15 or seen & (@as(u32, 1) << @intCast(id)) != 0) return error.InvalidSection;
+        seen |= @as(u32, 1) << @intCast(id);
+        var section: Reader = .{ .bytes = try reader.take(length) };
+        if (id == 0) metered = try readTarget(&section, cpu_features);
+    }
+    return metered orelse error.InvalidSection;
+}
+
 pub fn load(bytes: []const u8, allocator: std.mem.Allocator, cpu_features: u64) Error!Module {
     var r = Reader{ .bytes = bytes };
     if (try r.int(u32) != abi.magic) return error.InvalidMagic;
@@ -114,19 +147,7 @@ pub fn load(bytes: []const u8, allocator: std.mem.Allocator, cpu_features: u64) 
         seen |= @as(u32, 1) << @intCast(id);
         var section = Reader{ .bytes = try r.take(length) };
         switch (id) {
-            0 => {
-                if (length != 40) return error.InvalidSection;
-                if (try section.int(u16) != 2 or try section.int(u16) != 0 or
-                    try section.int(u16) != 1 or try section.int(u16) != 0x3e)
-                    return error.UnsupportedTarget;
-                const profile = try section.int(u32);
-                if ((profile != abi.profile_flag and profile != abi.fuel_profile_flag) or
-                    try section.int(u32) != abi.contract_version) return error.UnsupportedTarget;
-                module.fuel_metered = profile == abi.fuel_profile_flag;
-                if (!std.mem.eql(u8, try section.take(16), "x86_64" ++ "\x00" ** 10)) return error.UnsupportedTarget;
-                const features = try section.int(u64);
-                if (features != abi.cpu_features or features & ~cpu_features != 0) return error.UnsupportedTarget;
-            },
+            0 => module.fuel_metered = try readTarget(&section, cpu_features),
             2 => module.text = try section.take(length),
             3 => {
                 const entries = try section.allocate(Function, allocator, 8);

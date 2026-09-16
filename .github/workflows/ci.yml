@@ -68,7 +68,7 @@ jobs:
       - name: Optional native in-memory compiler and bounded execution
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
-          zig build test-native-jit -j2 --summary all
+          zig build test-native-jit test-native-jit-bench -j2 --summary all
           zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe -j2 --summary all
 
       - name: WASI thread lifecycle (enabled interpreter)

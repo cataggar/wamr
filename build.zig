@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
             .{},
     });
     const optimize = b.standardOptimizeOption(.{});
-    var wasi_module_options: std.Build.Module.CreateOptions = if (profile == .@"unikraft-aot")
+    var wasi_module_options: std.Build.Module.CreateOptions = if (profile != .hosted)
         @import("build/native_aot.zig").moduleOptions(target, optimize)
     else
         .{ .target = target, .optimize = optimize };
@@ -441,7 +441,7 @@ pub fn build(b: *std.Build) void {
         .root_module = wamrc_module,
     });
     @import("build/native_benchmark.zig").add(b, wamrc, optimize);
-    @import("build/native_jit.zig").addTests(b);
+    @import("build/native_jit.zig").addTests(b, wamrc, optimize);
     b.installArtifact(wamrc);
 
     // ── Spec test runner ─────────────────────────────────────────────
