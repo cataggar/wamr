@@ -115,13 +115,20 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             std.debug.panic("unikraft-jit excludes -D{s}=true", .{name});
     }
     var module_options = @import("native_aot.zig").moduleOptions(target, optimize);
+    module_options.pic = true;
     module_options.root_source_file = b.path("src/jit_native.zig");
     const module = b.addModule("wamr-jit", module_options);
     configure(b, module);
     const library = b.addLibrary(.{ .name = "wamr-jit", .linkage = .static, .root_module = module });
     library.bundle_compiler_rt = true;
     b.installArtifact(library);
-    const check = b.addExecutable(.{ .name = "wamr-jit-link-check", .root_module = module });
+    var link_options = module_options;
+    link_options.root_source_file = null;
+    const link_module = b.createModule(link_options);
+    link_module.linkLibrary(library);
+    const check = b.addExecutable(.{ .name = "wamr-jit-link-check", .root_module = link_module });
+    check.bundle_compiler_rt = false;
+    check.pie = true;
     check.entry = .{ .symbol_name = "wamr_jit_link_check" };
     check.rdynamic = true;
     _ = check.getEmittedBin();
@@ -130,12 +137,19 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     b.getInstallStep().dependOn(step);
 
     var compare_options = @import("native_aot.zig").moduleOptions(target, optimize);
+    compare_options.pic = true;
     compare_options.root_source_file = b.path("src/jit_compare_native.zig");
     const compare = b.addModule("wamr-jit-aot-sample", compare_options);
     const compare_library = b.addLibrary(.{ .name = "wamr-jit-aot-sample", .linkage = .static, .root_module = compare });
     compare_library.bundle_compiler_rt = true;
     b.installArtifact(compare_library);
-    const compare_check = b.addExecutable(.{ .name = "wamr-jit-aot-sample-link-check", .root_module = compare });
+    var compare_link_options = compare_options;
+    compare_link_options.root_source_file = null;
+    const compare_link_module = b.createModule(compare_link_options);
+    compare_link_module.linkLibrary(compare_library);
+    const compare_check = b.addExecutable(.{ .name = "wamr-jit-aot-sample-link-check", .root_module = compare_link_module });
+    compare_check.bundle_compiler_rt = false;
+    compare_check.pie = true;
     compare_check.entry = .{ .symbol_name = "wamr_jit_aot_sample_link_check" };
     compare_check.rdynamic = true;
     _ = compare_check.getEmittedBin();
@@ -145,10 +159,11 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const files = b.addWriteFiles();
     _ = files.addCopyFile(wasm, "matched.wasm");
     const embedded = files.add("workload.zig", "pub const wasm = @embedFile(\"matched.wasm\");\n");
-    const embedded_module = b.addModule("wamr-jit-workload", .{ .root_source_file = embedded, .target = target, .optimize = optimize });
+    const embedded_module = b.addModule("wamr-jit-workload", .{ .root_source_file = embedded, .target = target, .optimize = optimize, .pic = true });
     b.getInstallStep().dependOn(&b.addInstallFile(wasm, "native-jit-bench/matched.wasm").step);
     inline for (.{ true, false }) |with_compiler| {
         var guest_options = @import("native_aot.zig").moduleOptions(target, optimize);
+        guest_options.pic = true;
         guest_options.root_source_file = b.path("src/jit_guest_link_check.zig");
         const guest = b.createModule(guest_options);
         guest.addImport("guest", if (with_compiler) module else compare);
@@ -160,6 +175,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             .name = if (with_compiler) "wamr-jit-guest-link-check" else "wamr-jit-aot-guest-link-check",
             .root_module = guest,
         });
+        audit.pie = true;
         audit.entry = .{ .symbol_name = "wamr_jit_guest_sample_link_check" };
         audit.rdynamic = true;
         _ = audit.getEmittedBin();

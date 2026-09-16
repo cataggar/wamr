@@ -21,7 +21,7 @@ zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe -j2
 ```
 
 The latter exports Zig module `wamr-jit`, namespaces `jit` and `aot`, and builds
-`lib/libwamr-jit.a`. It targets `x86_64-freestanding-none`, SysV, single-threaded,
+`lib/libwamr-jit.a`. It targets `x86_64-freestanding-none`, SysV, position-independent, single-threaded,
 no red zone, libc, stack protector, unwind tables, or Zig error tracing.
 This is an application-object contract, not an ISR ABI.
 
@@ -244,7 +244,12 @@ The native JIT profile additionally exports:
 
 `native-jit-check` links both complete freestanding sampler/serialization paths,
 not just unused declarations, and separate downstream-style consumers of the
-public modules with the embedded workload. The sampler helpers import neither Linux pages
+public modules with the embedded workload. Native objects explicitly use PIC and
+all four audits link as PIE, including the compiler-free comparator, so EFI image
+links do not depend on fixed-address 32-bit absolute relocations. These are link
+audits, not EFI boot qualification. The two archive audits link the actual static
+libraries with compiler-runtime fallback disabled; the other two cover public
+module composition. The sampler helpers import neither Linux pages
 nor `std.process`; the Linux drivers now call these same helpers. Image
 applications supply a caller allocator, native `aot.Platform` (including its
 monotonic clock), actual clock resolution, request SHA256, and serial writer.
@@ -353,7 +358,7 @@ unknown fields are rejected. No sample successful deployment receipt is supplied
 | `platform`, `executables`, `images`, `wasm`, `aot_module` | Existing platform identity shape and SHA256/positive byte counts of actual qualified artifacts |
 | `compiler_embedded`, `runtime_linkage`, `safety`, `lifecycle`, `allocator`, `page_policy` | Same strict bindings as version 1, but describing the actual native image implementation |
 | `target`, `options` | Exactly `NATIVE_TARGET` and `NATIVE_OPTIONS` in `scripts/native_jit_benchmark.py`: native contract/subprofiles, both presets, after-each-pass verification, every compiler/runtime cap and fixed workload lifecycle |
-| `build_options` | One shared `optimize` (`Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall`) for both images, plus exactly `NATIVE_BUILD_OPTIONS`: single-threaded, no red zone/libc/stack checker/stack protector/unwind tables/error tracing |
+| `build_options` | One shared `optimize` (`Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall`) for both images, plus exactly `NATIVE_BUILD_OPTIONS`: PIC, single-threaded, no red zone/libc/stack checker/stack protector/unwind tables/error tracing |
 | `adapter` | `name`, `source_commit`, `qualification_receipt_sha256`; independently qualified native adapter, not a Linux adapter name |
 | `clock` | `method` token, positive `resolution_ns`, `scope` exactly `guest-monotonic-execution` |
 | `native_stack` | `generated_frames_bytes` at least 256 KiB, positive separately qualified `compiler_embedder_callbacks_bytes`, and `provisioned_bytes` covering their sum |

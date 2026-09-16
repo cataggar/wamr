@@ -298,6 +298,7 @@ class NativeExternalTransportTests(unittest.TestCase):
             ("hardware_execution", False), ("target", {**bench.NATIVE_TARGET, "abi": "linux"}),
             ("options", {**bench.NATIVE_OPTIONS, "rounds": 0}),
             ("build_options", {**self.receipt["build_options"], "red_zone": True}),
+            ("build_options", {**self.receipt["build_options"], "pic": False}),
             ("adapter", {}), ("clock", {**self.receipt["clock"], "scope": "collector-latency"}),
             ("native_stack", {**self.receipt["native_stack"], "generated_frames_bytes": 1024}),
             ("memory_observer", {**self.receipt["memory_observer"], "quantity": "logical-page-commitment"}),

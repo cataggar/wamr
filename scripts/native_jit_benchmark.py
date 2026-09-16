@@ -36,7 +36,7 @@ MAX_SERIAL_BYTES = 16 * 1024 * 1024
 MAX_RECEIPT_BYTES = 128 * 1024
 NATIVE_TARGET = {"triple": "x86_64-freestanding-none", "abi": "sysv",
                  "contract_version": 1, "aot_profile": "0x554b0001", "jit_profile": "0x554b0002"}
-NATIVE_BUILD_OPTIONS = {"single_threaded": True, "red_zone": False, "stack_check": False,
+NATIVE_BUILD_OPTIONS = {"pic": True, "single_threaded": True, "red_zone": False, "stack_check": False,
                         "stack_protector": False, "unwind_tables": "none",
                         "error_tracing": False, "link_libc": False}
 NATIVE_OPTIONS = {
