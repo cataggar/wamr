@@ -487,8 +487,8 @@ pub fn protocolFixture(init: std.process.Init) !void {
             .targets = .{ .unikraft = try json.field(config, "target") },
             .workloads = workloads,
             .steady_invocations = 2,
-            .created_at = "2026-01-01T00:00:00Z",
-            .expires_at = "2026-01-01T01:00:00Z",
+            .created_at = "2026-01-01T00:00:00+00:00",
+            .expires_at = "2026-01-01T01:00:00+00:00",
         }, .{}, &out.interface);
         try out.interface.writeByte('\n');
         try out.interface.flush();

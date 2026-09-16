@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import sys
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,6 +31,10 @@ class NativeGuestProtocolTests(unittest.TestCase):
             manifest = json.loads(lines[index].split("=", 1)[1])
             result = json.loads(lines[index + 1].split("=", 1)[1])
             self.assertIn("synthetic", manifest["campaign_id"])
+            for field in ("created_at", "expires_at"):
+                stamp = manifest[field]
+                self.assertEqual(datetime.fromisoformat(stamp).isoformat(), stamp,
+                                 "fixture timestamps must use the host's canonical UTC offset, not Python-3.11-only Z parsing")
             native_benchmark.validate_result(result, manifest, "run-0001")
             with self.assertRaises(ValueError):
                 native_benchmark.parse_result_stream(lines[index + 1].encode())
