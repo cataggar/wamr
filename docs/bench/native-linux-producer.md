@@ -243,6 +243,9 @@ RAM and boot-to-image relationship come from the independent qualified receipt.
 The executing optimization mode and required safety settings are also checked by
 the producer. These are not all independent hardware observations. Version 2 has
 no separate per-field provenance map or automatic native-hardware certification.
+Public reports state `identity_assurance: observations-and-receipt-attestations`
+and `hardware_qualification: requires-independent-deployment-evidence`; accepted
+campaign records are not an independent physical-deployment certification.
 
 The private build evidence must bind the source commit, complete actual source
 input digest, tracked-diff digest, Zig version, compiler binary and full commands.
