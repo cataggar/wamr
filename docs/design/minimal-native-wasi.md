@@ -74,6 +74,38 @@ Unsupported clocks and failed reads never modify the guest output timestamp.
 The embedding platform is responsible for real sampling and truthful capability
 metadata. Deterministic timestamps occur only in unit-test fixtures.
 
+### Unikraft Hyper-V platform mapping
+
+The intended native provider is pinned to
+`cataggar/unikraft@40d8fc70`, `plat/hyperv/time.c`:
+
+- `ukplat_monotonic_clock` (line 892) returns
+  `hyperv_reference_delta_ns(hyperv_reference_time(), hyperv_boot_ref)`.
+  Its C ABI return is `__nsec`/u64, already in nanoseconds. This maps to
+  WASI monotonic clock ID 1 without another unit conversion.
+- `ukplat_wall_clock` (line 898) returns
+  `hyperv_wall_time_ns(hyperv_epoch_ns, hyperv_efi_ref,
+  hyperv_reference_time())`, also `__nsec`/u64 nanoseconds. It maps to realtime
+  ID 0 **only when a genuine EFI wall-clock epoch is available and qualified**.
+  The existence of the symbol alone does not establish that capability.
+- Neither hook supplies actual process or thread CPU consumption. Keep IDs
+  2 and 3 unsupported unless the platform supplies separate qualified CPU
+  clocks. Never substitute boot time or wall time for them.
+
+The platform adapter must declare the source's real resolution in
+`resolution_ns`, not infer one-nanosecond resolution from the return unit.
+If wall-clock epoch availability or source resolution cannot be established,
+do not advertise that clock as supported. The callback seam and this mapping
+are a software integration contract, not a claim that these hooks have been
+linked or exercised in a native image.
+
+Native execution additionally depends on the backend's qualified memory
+provider. Unikraft's `LIBUKVMEM` is off by default; reserve/map/protect/grow
+callbacks alone do not demonstrate that the resulting image enables and
+exercises its required paging and allocation capabilities. Those platform
+enablement and linked-image checks belong to the native backend and the
+Unikraft integration work, not this allocation-free WASI context.
+
 ## Exact imported ABI
 
 `imports` contains the names below, their literal `wasi_unstable` namespace,
