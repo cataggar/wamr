@@ -436,6 +436,7 @@ pub fn build(b: *std.Build) void {
         .name = "wamrc",
         .root_module = wamrc_module,
     });
+    @import("build/native_benchmark.zig").add(b, wamrc, optimize);
     b.installArtifact(wamrc);
 
     // ── Spec test runner ─────────────────────────────────────────────

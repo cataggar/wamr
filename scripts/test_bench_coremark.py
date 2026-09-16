@@ -2217,5 +2217,115 @@ Correct operation validated. See README.md for run and reporting rules.
             native_benchmark.validate_result(result, self.manifest, run["run_id"])
 
 
+@unittest.skipUnless(os.environ.get("WAMR_NATIVE_PRODUCER"),
+                     "built Linux embedding producer not supplied")
+class NativeLinuxProducerTests(unittest.TestCase):
+    """Real backend calls; emulated timings never become measurement evidence."""
+
+    def setUp(self):
+        import shlex
+        self.command = shlex.split(os.environ.get("WAMR_NATIVE_PRODUCER_RUNNER", ""))
+        self.command.append(os.environ["WAMR_NATIVE_PRODUCER"])
+        self.fixtures = Path(os.environ["WAMR_NATIVE_FIXTURE_DIR"])
+
+    def check(self, workload, repeats=3):
+        import subprocess
+        process = subprocess.run(
+            self.command + ["--check", str(self.fixtures / f"{workload}.cwasm"),
+                            "100", str(repeats), workload],
+            capture_output=True, timeout=180, check=True)
+        prefix = b"WAMR_NATIVE_CHECK_RESULT="
+        lines = process.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(prefix))
+        self.assertRegex(process.stderr,
+                         rb"WAMR_NATIVE_ALLOCATOR stage=after_release method=caller-requested-bytes live=0 peak=[1-9][0-9]*")
+        record = native_benchmark.strict_json(lines[0][len(prefix):].decode("utf-8"))
+        self.assertEqual(record["qualification"], "correctness-only-not-performance")
+        self.assertEqual(record["reset_semantics"], "same-instance-full-snapshot-reset")
+        self.assertEqual(record["outcome"], "success")
+        self.assertEqual(record["artifact_sha256"],
+                         native_benchmark.sha256_file(self.fixtures / f"{workload}.cwasm"))
+        self.assertEqual(len(record["invocations"]), repeats)
+        self.assertGreater(record["clock_resolution_ns"], 0)
+        self.assertGreater(record["phases"]["load_ticks"], 0)
+        self.assertGreater(record["phases"]["instantiate_ticks"], 0)
+        self.assertEqual(len(record["phases"]["steady_state_ticks"]), repeats - 1)
+        return record
+
+    def test_both_real_coremark_variants_crc_after_snapshot_reset(self):
+        for workload in ("coremark", "coremark-nofp"):
+            with self.subTest(workload=workload):
+                record = self.check(workload)
+                for invocation in record["invocations"]:
+                    self.assertTrue(invocation["crc_valid"])
+                    self.assertIsNone(invocation["exit_code"])
+                    stdout = native_benchmark.decode_stdout(invocation["stdout_base64"]).decode("ascii")
+                    self.assertIn("[0]crcfinal      : 0x988c", stdout)
+                    # Small-iteration correctness intentionally fails the timing
+                    # qualification; neither zero nor emulated rates are evidence.
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        native_benchmark.coremark_correctness(
+                            stdout, invocation["elapsed_ns"] / 1e9)
+
+    def test_pinned_compute_memory_real_phases_fit_protocol(self):
+        harness = NativeBenchmarkTests("runTest")
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        for workload in ("compute", "memory"):
+            with self.subTest(workload=workload):
+                record = self.check(workload)
+                run = next(run for run in harness.manifest["schedule"]
+                           if run["target"] == "linux" and run["workload"] == workload)
+                # Only the envelope is synthetic; payload is this real API run.
+                # This explicitly stays synthetic even on a physical test host.
+                envelope = harness.result(run)
+                envelope["phases"] = record["phases"]
+                envelope["clock"] = {
+                    "source": "linux-clock-monotonic", "unit": "ns",
+                    "ticks_per_second": 1_000_000_000,
+                    "resolution_ticks": record["clock_resolution_ns"],
+                }
+                envelope["invocations"] = [
+                    {key: invocation[key] for key in ("phase", "outcome", "exit_code", "stdout_base64")}
+                    for invocation in record["invocations"]]
+                envelope["memory"]["samples"] = record["memory_samples"]
+                envelope["memory"]["method"] = "linux-mmap-accessible-ranges"
+                envelope["memory"]["covered_regions"] = ["native-code", "wasm-linear-memory"]
+                envelope["memory"]["omitted_regions"] = ["allocator", "kernel", "process"]
+                checks = native_benchmark.validate_result(
+                    envelope, harness.manifest, run["run_id"])
+                self.assertEqual(len(checks), 3)
+                self.assertTrue(all(check["self_check"] == "returned-without-trap"
+                                    for check in checks))
+
+    def test_capture_does_not_mislabel_correctness_run_as_measurement(self):
+        harness = NativeBenchmarkTests("runTest")
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        run = next(run for run in harness.manifest["schedule"] if run["target"] == "linux")
+        output = harness.root / "actual-correctness-capture"
+        with self.assertRaisesRegex(ValueError, "expected exactly one terminal result"):
+            native_benchmark.capture(
+                harness.manifest, run["run_id"],
+                self.command + ["--check", str(self.fixtures / "deterministic.cwasm"),
+                                "100", "2", "deterministic"],
+                output, 30, allow_synthetic=True)
+        self.assertIn(b"WAMR_NATIVE_CHECK_RESULT=", (output / "stdout.bin").read_bytes())
+        self.assertTrue((output / "observation.json").is_file())
+
+    def test_empty_input_is_not_a_success_record(self):
+        import subprocess
+        root = REPO / ".bench-coremark" / f"producer-empty-{uuid.uuid4().hex}"
+        root.mkdir(parents=True, mode=0o700)
+        self.addCleanup(shutil.rmtree, root)
+        path = root / "empty.cwasm"
+        path.write_bytes(b"")
+        process = subprocess.run(self.command + ["--check", str(path), "100", "2", "compute"],
+                                 capture_output=True, timeout=30)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertNotIn(b"WAMR_BENCH_RESULT=", process.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
