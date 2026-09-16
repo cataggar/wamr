@@ -26,7 +26,7 @@ const verify_mod = @import("verify.zig");
 // explicit anchor.
 comptime {
     _ = @import("verify_args.zig");
-    _ = @import("native_profile.zig");
+    _ = wamr.native_profile;
 }
 
 const Subcommand = enum { compile, compile_component, run, serve, verify, version, help };
@@ -274,7 +274,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             std.debug.print("error: unikraft-x86_64 requires --target=x86_64 and a SysV host compiler\n", .{});
             return error.UnsupportedNativeTarget;
         }
-        try @import("native_profile.zig").validate(module, &ir_module);
+        try wamr.native_profile.validate(module, &ir_module);
     }
 
     // Build a func-index → exported-name lookup. Wasm name custom

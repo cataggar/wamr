@@ -205,6 +205,7 @@ pub fn writeReport(
     func_idx: u32,
     report: Report,
 ) !void {
+    if (comptime @import("../../config.zig").unikraft_jit) return error.UnsupportedOptions;
     const path = try std.fmt.allocPrint(
         allocator,
         "{s}.mod{d}.func{d}.json",

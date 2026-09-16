@@ -24,7 +24,8 @@ exported with the same freestanding module settings. They are not linked into
 artifacts are not constructed in this profile.
 
 The graph comprises `aot_native.zig`, `api/aot.zig`, `native_format.zig`,
-`native_abi.zig`, `trap_jmp.zig`, `platform/unikraft.zig`, and Zig standard-library
+`native_abi.zig`, `trap_jmp.zig`, `shared/allocation_limit.zig`,
+`platform/unikraft.zig`, and Zig standard-library
 allocation/intrinsic support. It does **not** import the hosted `runtime.zig`,
 `common/types.zig`, host bridge, WASI, compiler, interpreter, components or thread
 manager. Compiler runtime intrinsics such as `memcpy` are bundled; they are not
@@ -43,6 +44,9 @@ compile this runtime as an interrupt handler or disable the SSE facilities its
 application ABI and generated scalar floating-point code require. The native
 application must preserve Unikraft's IRQ return and FPU ownership contract.
 Hosted defaults remain unchanged.
+
+The separately selected `-Dprofile=unikraft-jit` is documented in
+[unikraft-jit.md](unikraft-jit.md). It does not add a compiler to this profile.
 
 ## Matching host compiler and artifact identity
 

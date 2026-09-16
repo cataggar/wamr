@@ -6,15 +6,16 @@ const builtin = @import("builtin");
 const format = @import("../runtime/aot/native_format.zig");
 const abi = format.abi;
 const jump = @import("../runtime/aot/trap_jmp.zig");
+const allocation_limit = @import("../shared/allocation_limit.zig");
 pub const platform = @import("../platform/unikraft.zig");
 pub const Platform = platform.Platform;
 pub const PlatformError = platform.Error;
 pub const ValType = format.ValType;
 pub const Value = format.Value;
 pub const HostError = error{ Unsupported, InvalidArgument, Io, OutOfMemory };
-pub const Trap = enum { out_of_bounds_memory, out_of_bounds_table, unreachable_instruction, integer_divide_by_zero, integer_overflow, invalid_conversion, unsupported_operation, bad_host_result };
+pub const Trap = enum { out_of_bounds_memory, out_of_bounds_table, unreachable_instruction, integer_divide_by_zero, integer_overflow, invalid_conversion, unsupported_operation, bad_host_result, fuel_exhausted };
 pub const Outcome = union(enum) { returned: usize, trap: Trap, exit: u32, host_error: HostError };
-pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, InvalidContinuation, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds, NotInstantiated, InvalidSnapshot, OptionsMismatch };
+pub const Error = format.Error || PlatformError || error{ MissingImport, ImportSignatureMismatch, TooManyImports, FunctionNotFound, ArgumentCountMismatch, ArgumentTypeMismatch, ResultBufferTooSmall, Busy, StartRequired, StartFailed, InvalidContinuation, MemoryLimitExceeded, TableLimitExceeded, InitializerOutOfBounds, NotInstantiated, InvalidSnapshot, OptionsMismatch, UnsupportedRunBudget };
 
 pub const HostImport = struct {
     module: []const u8,
@@ -44,6 +45,12 @@ pub const HostContext = struct {
 };
 
 pub const Options = struct {
+    /// Mandatory for fuel-profile artifacts; rejected for unmetered artifacts.
+    /// Counts guest function entries and backward branch targets, not time.
+    max_run_fuel: ?u32 = null,
+    max_heap_bytes: ?usize = null,
+    max_reserved_bytes: ?usize = null,
+    max_code_bytes: ?usize = null,
     /// Guest reserve limit; an explicit wasm maximum still takes precedence.
     max_memory_pages: u32 = 256,
     max_table_elements: u32 = 65536,
@@ -73,8 +80,18 @@ fn nonTimingOptions(options: Options) Options {
 const Mapping = struct { base: [*]align(4096) u8, size: usize };
 const TableStorage = struct { pointers: []usize, signatures: []u32, size: u32, max: u32 };
 
+pub const MemoryStats = struct {
+    heap_live_bytes: usize,
+    heap_peak_bytes: usize,
+    code_bytes: usize,
+    code_reserved_bytes: usize,
+    linear_reserved_bytes: usize,
+    linear_committed_bytes: usize,
+};
+
 pub const Instance = struct {
     allocator: std.mem.Allocator,
+    heap: allocation_limit.Allocator,
     arena: std.heap.ArenaAllocator,
     native: Platform,
     module: format.Module,
@@ -99,6 +116,7 @@ pub const Instance = struct {
     instantiation_attempted: bool = false,
     instantiated: bool = false,
     admitted_options: Options = .{},
+    run_fuel: u32 = 0,
 
     /// Copies input and import descriptors. Callback contexts and platform
     /// context must outlive this instance. Start functions are not executed
@@ -133,18 +151,41 @@ pub const Instance = struct {
         if (comptime builtin.cpu.arch != .x86_64 or builtin.os.tag == .windows) return error.UnsupportedTarget;
         try native.validate();
         if (options.max_memory_pages > 65536) return error.InvalidLimits;
+        const heap_limit = options.max_heap_bytes orelse std.math.maxInt(usize);
+        if (heap_limit < @sizeOf(Instance)) return error.InvalidLimits;
         const self = try allocator.create(Instance);
         self.* = .{
             .allocator = allocator,
-            .arena = .init(allocator),
+            .heap = .{ .parent = allocator, .limit = heap_limit - @sizeOf(Instance) },
+            .arena = undefined,
             .native = native,
             .module = .{},
             .admitted_options = nonTimingOptions(options),
         };
+        self.arena = .init(self.heap.allocator());
         errdefer self.deinit();
         const a = self.arena.allocator();
         const owned = try a.dupe(u8, bytes);
         self.module = try format.load(owned, a, platform.detectedCpuFeatures() & options.cpu_feature_mask);
+        if (self.module.fuel_metered) {
+            self.run_fuel = options.max_run_fuel orelse return error.UnsupportedRunBudget;
+            if (self.run_fuel == 0) return error.InvalidLimits;
+            if (options.max_heap_bytes == null or options.max_reserved_bytes == null or options.max_code_bytes == null)
+                return error.InvalidLimits;
+        } else if (options.max_run_fuel != null) return error.UnsupportedRunBudget;
+        if (self.module.text.len > (options.max_code_bytes orelse std.math.maxInt(usize))) return error.MemoryLimitExceeded;
+        const code_size = try native.rounded(self.module.text.len);
+        const reserved_limit = options.max_reserved_bytes orelse std.math.maxInt(usize);
+        if (code_size > reserved_limit) return error.MemoryLimitExceeded;
+        if (self.module.memory) |memory| {
+            const max = @min(memory.max orelse options.max_memory_pages, options.max_memory_pages);
+            if (memory.min > max or @as(usize, max) * 65536 > reserved_limit - code_size)
+                return error.MemoryLimitExceeded;
+        }
+        for (self.module.tables) |table| {
+            if (table.min > @min(table.max orelse options.max_table_elements, options.max_table_elements))
+                return error.TableLimitExceeded;
+        }
         if (self.module.imports.len > max_imports) return error.TooManyImports;
         return self;
     }
@@ -282,7 +323,7 @@ pub const Instance = struct {
         self.vmctx.aot_throw_uncaught_fn = @intFromPtr(&trapUnsupported);
         self.vmctx.lazy_compile_fn = @intFromPtr(&trapUnsupported);
         self.vmctx.trap_unaligned_fn = @intFromPtr(&trapUnsupported);
-        self.vmctx.cancel_point_fn = @intFromPtr(&trapUnsupported);
+        self.vmctx.cancel_point_fn = if (self.module.fuel_metered) @intFromPtr(&trapFuel) else @intFromPtr(&trapUnsupported);
         self.instantiated = true;
     }
 
@@ -299,6 +340,17 @@ pub const Instance = struct {
     pub fn memory(self: *Instance) []u8 {
         if (self.linear) |m| return m.base[0..self.vmctx.memory_size];
         return &.{};
+    }
+
+    pub fn memoryStats(self: *const Instance) MemoryStats {
+        return .{
+            .heap_live_bytes = self.heap.live + @sizeOf(Instance),
+            .heap_peak_bytes = self.heap.peak + @sizeOf(Instance),
+            .code_bytes = self.module.text.len,
+            .code_reserved_bytes = if (self.code) |m| m.size else 0,
+            .linear_reserved_bytes = if (self.linear) |m| m.size else 0,
+            .linear_committed_bytes = self.vmctx.memory_size,
+        };
     }
 
     pub fn grow(self: *Instance, delta: u32) ?u32 {
@@ -377,6 +429,7 @@ pub const Instance = struct {
             raw[i] = value.raw();
         }
         self.pending = null;
+        self.vmctx.cancel_flag = self.run_fuel;
         self.active = true;
         defer self.active = false;
         if (jump.capture(&self.continuation) != 0) {
@@ -421,6 +474,9 @@ pub const Instance = struct {
 
 fn owner(ctx: *abi.VmCtx) *Instance {
     return @ptrFromInt(ctx.instance_ptr);
+}
+fn trapFuel(ctx: *abi.VmCtx) callconv(.c) noreturn {
+    owner(ctx).stop(.{ .trap = .fuel_exhausted });
 }
 fn inBounds(offset: usize, length: usize, size: usize) bool {
     return offset <= size and length <= size - offset;

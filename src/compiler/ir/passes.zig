@@ -3358,6 +3358,7 @@ pub const DumpHook = struct {
 };
 
 pub const RunOptions = struct {
+    control: ?*@import("../control.zig").Control = null,
     /// Optional hook invoked after each per-function pass run, plus
     /// once-per-function after `promoteLocalsToSSA` /
     /// `lowerPhisToLocals` (first outer iteration) and once-per-function
@@ -3761,6 +3762,7 @@ fn printPassTiming(
     else
         "-";
     const func_name = func.name orelse "-";
+    if (comptime @import("../../config.zig").unikraft_jit) return;
     const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
     const elapsed_ms_frac = (elapsed_ns % std.time.ns_per_ms) / std.time.ns_per_us;
     std.debug.print(
@@ -8279,7 +8281,7 @@ fn logTailDupSkip(
     stats: PassTimingStats,
     estimate: ?TailDupWorkEstimate,
 ) void {
-    if (!options.log) return;
+    if (@import("../../config.zig").unikraft_jit or !options.log) return;
     const func_name = func.name orelse "-";
     if (estimate) |e| {
         std.debug.print(
@@ -8645,6 +8647,7 @@ fn runFunctionPassPipeline(
     opts: RunOptions,
     outer_iter: u32,
 ) !u32 {
+    if (opts.control) |c| try c.function(func);
     var total_changes: u32 = 0;
     const timing = opts.pass_timing;
     const timing_for_func = timing.functionMatches(opts.module_idx, func_idx);
@@ -8839,6 +8842,7 @@ fn runFunctionPassPipeline(
     while (iter < 8) : (iter += 1) {
         var any_changed = false;
         for (passes[0..effective_passes_len], 0..) |pass, pass_idx_usize| {
+            if (opts.control) |c| try c.function(func);
             const pass_idx: u32 = @intCast(pass_idx_usize);
             if (opts.bisect.shouldSkip(opts.module_idx, func_idx, pass_idx)) continue;
             const pass_label = passName(pass);
@@ -8859,6 +8863,7 @@ fn runFunctionPassPipeline(
                 break :blk try pass(func, allocator);
             };
             if (passMutatesCfg(pass)) cfg_cache.invalidate();
+            if (opts.control) |c| try c.function(func);
             if (timing_for_func) {
                 maybePrintPassTiming(
                     timing,
@@ -9040,7 +9045,7 @@ fn runPassesWithOptionsScoped(
     // two-round schedule.
     const outer_max: u32 = if (opts.bisect.hasPassPipelineFilterInModule(opts.module_idx)) 1 else 2;
     const timing = opts.pass_timing;
-    if (timing.enabled and timing.moduleMatches(opts.module_idx)) {
+    if (!@import("../../config.zig").unikraft_jit and timing.enabled and timing.moduleMatches(opts.module_idx)) {
         std.debug.print(
             "[aot-pass-timing] begin mod={d} funcs={d} passes={d} threshold_ms={d} every_n_funcs={d}\n",
             .{
@@ -9078,6 +9083,9 @@ fn runPassesWithOptionsScoped(
         var inlined_count: u32 = 0;
         if (!opts.bisect.skipsInlineSmall(opts.module_idx)) {
             while (inline_iter < 4) : (inline_iter += 1) {
+                if (opts.control) |c| {
+                    for (module.functions.items) |*func| try c.function(func);
+                }
                 const iter_inlined = blk: {
                     var timing_context = analysis.pushTimingContext(.{
                         .module_idx = opts.module_idx,
@@ -9116,7 +9124,7 @@ fn runPassesWithOptionsScoped(
             }
         }
         if (inlined_count != 0) {
-            std.log.debug(
+            if (!@import("../../config.zig").unikraft_jit) std.log.debug(
                 "inlineSmallFunctions (outer {d}): inlined {d} call(s) over {d} iteration(s)",
                 .{ outer_iter, inlined_count, inline_iter },
             );

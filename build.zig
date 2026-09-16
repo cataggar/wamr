@@ -15,9 +15,9 @@ const fuzz_seed_wasms = [_][]const u8{
 };
 
 pub fn build(b: *std.Build) void {
-    const profile = b.option(enum { hosted, @"unikraft-aot" }, "profile", "Build profile (default: hosted)") orelse .hosted;
+    const profile = b.option(enum { hosted, @"unikraft-aot", @"unikraft-jit" }, "profile", "Build profile (default: hosted)") orelse .hosted;
     const target = b.standardTargetOptions(.{
-        .default_target = if (profile == .@"unikraft-aot")
+        .default_target = if (profile != .hosted)
             .{ .cpu_arch = .x86_64, .os_tag = .freestanding, .abi = .none }
         else
             .{},
@@ -34,6 +34,10 @@ pub fn build(b: *std.Build) void {
     native_wasi_module.addImport("minimal-wasi", minimal_wasi_module);
     if (profile == .@"unikraft-aot") {
         @import("build/native_aot.zig").build(b, target, optimize);
+        return;
+    }
+    if (profile == .@"unikraft-jit") {
+        @import("build/native_jit.zig").build(b, target, optimize);
         return;
     }
 
@@ -437,6 +441,7 @@ pub fn build(b: *std.Build) void {
         .root_module = wamrc_module,
     });
     @import("build/native_benchmark.zig").add(b, wamrc, optimize);
+    @import("build/native_jit.zig").addTests(b);
     b.installArtifact(wamrc);
 
     // ── Spec test runner ─────────────────────────────────────────────

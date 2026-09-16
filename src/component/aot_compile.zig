@@ -36,6 +36,8 @@ const interp_instance = @import("../runtime/interpreter/instance.zig");
 const config = @import("../config.zig");
 const aot_bisect = @import("../compiler/aot_bisect.zig");
 const codegen_cache = @import("../compiler/codegen_cache.zig");
+const control = @import("../compiler/control.zig");
+const native_profile = @import("../compiler/native_profile.zig");
 
 // Re-export the on-disk JSON schema from `aot.zig` so `precompileComponent`
 // and `loadManifest` agree on layout without duplicating the schema.
@@ -43,7 +45,7 @@ pub const Manifest = aot.Manifest;
 pub const ManifestModuleEntry = aot.ManifestModuleEntry;
 pub const manifest_format_version = aot.manifest_format_version;
 
-pub const PrecompileError = error{
+pub const PrecompileError = control.Error || error{
     InvalidComponent,
     CoreCompileFailed,
     WriteFailed,
@@ -52,6 +54,8 @@ pub const PrecompileError = error{
     JsonSerializationFailed,
     UnsupportedFrameAttributionTarget,
     UnsupportedDataSegmentOffset,
+    UnsupportedNativeFeature,
+    UnsupportedOptions,
 };
 
 /// Surface the IR verifier's diagnostic detail to stderr when a
@@ -63,6 +67,7 @@ pub const PrecompileError = error{
 /// makes catching e.g. a #754-class operand-type mismatch
 /// almost as painful as the original silent miscompile.
 fn logVerifierFailure(err: anyerror) void {
+    if (comptime config.unikraft_jit) return;
     const f = verifier.last_failure;
     if (f.func_index == null and f.detail.len == 0) {
         std.log.err("aot-compile failed: {s}", .{@errorName(err)});
@@ -77,6 +82,8 @@ fn logVerifierFailure(err: anyerror) void {
 
 /// Options controlling `precompileComponent` and per-core compilation.
 pub const PrecompileOptions = struct {
+    control: ?*control.Control = null,
+    metrics: ?*control.Metrics = null,
     target_arch: passes.TargetArch = switch (builtin.cpu.arch) {
         .aarch64 => .aarch64,
         else => .x86_64,
@@ -281,6 +288,15 @@ pub fn compileCoreWasmCached(
     opts: PrecompileOptions,
     cache_ctx: CompileCacheCtx,
 ) PrecompileError![]u8 {
+    if (comptime config.unikraft_jit) {
+        if (opts.target_arch != .x86_64 or !opts.optimize or opts.lazy_jit or
+            opts.cache_dir != null or cache_ctx.reuse != null or cache_ctx.produced != null or
+            opts.pass_timing.enabled or opts.analysis_timing.enabled or opts.codegen_timing.enabled or
+            opts.spill_metric.enabled or opts.frame_attribution.enabled or opts.tail_duplication.log)
+            return error.UnsupportedOptions;
+    }
+    if (opts.control) |c| try c.poll();
+    var phase_start = try phaseNow(opts);
     // Lifetime split mirrors `src/compiler/main.zig` (`wamrc compile`)
     // to bound peak memory on large modules (issue #640). The parsed
     // module lives in a transient `module_arena`; IR + passes +
@@ -297,10 +313,21 @@ pub fn compileCoreWasmCached(
     // the slice (returned `module` fields are slices into it), and
     // the caller's bytes outlive this call.
     const module = core_loader.load(wasm_bytes, ma) catch return error.CoreCompileFailed;
+    if (comptime config.unikraft_jit) try native_profile.validateModule(&module);
+    try finishPhase(opts, &phase_start, "parse_ns");
 
-    var ir_module = frontend.lowerModule(&module, allocator) catch return error.CoreCompileFailed;
+    var ir_module = frontend.lowerModuleControlled(&module, allocator, opts.control) catch |err| switch (err) {
+        error.CompileCancelled, error.CompileLimitExceeded, error.CodeLimitExceeded, error.ClockFailed => return @errorCast(err),
+        else => return error.CoreCompileFailed,
+    };
     var keep_ir_module_for_lazy_jit = false;
     defer if (!keep_ir_module_for_lazy_jit) ir_module.deinit();
+    if (comptime config.unikraft_jit) {
+        try native_profile.validate(&module, &ir_module);
+        try native_profile.validateBoundedCalls(&ir_module, allocator);
+    }
+    if (opts.control) |c| for (ir_module.functions.items) |*func| try c.function(func);
+    try finishPhase(opts, &phase_start, "lower_ns");
 
     // #862/#892 lazy-JIT: compute the eligibility set BEFORE the eager
     // per-function pass loop and codegen so the same mask can defer both
@@ -312,7 +339,7 @@ pub fn compileCoreWasmCached(
     defer if (lazy_needs_trampoline.len > 0) allocator.free(lazy_needs_trampoline);
     var lazy_entry_stubs: []bool = &.{};
     defer if (lazy_entry_stubs.len > 0) allocator.free(lazy_entry_stubs);
-    if (opts.lazy_jit) {
+    if (!config.unikraft_jit and opts.lazy_jit) {
         if (cache_ctx.lazy_jit_out == null) return error.CoreCompileFailed;
         const eligibility = lazy_jit.findLazyEligibleFunctions(
             &module,
@@ -357,13 +384,14 @@ pub fn compileCoreWasmCached(
                 // Users who want belt-and-suspenders verification on
                 // an `-O0` build should drop `-O0` instead.
                 .verify_mode = opts.verify_mode,
+                .control = opts.control,
                 // #761 / #743: thread the global bisect spec through
                 // so `WAMR_AOT_SKIP_PASS=...:fn=<idx>` narrows the
                 // partial pipeline to one suspect function. The pass
                 // loop forces verify off per-function for any function
                 // affected by the spec to keep partial-pipeline IR
                 // states from tripping benign structural checks.
-                .bisect = aot_bisect.global,
+                .bisect = if (config.unikraft_jit) .{} else aot_bisect.global,
                 .lazy_skip = pass_lazy_skip,
                 // Per-core index honoured by `:mod=N` bisect filters.
                 .module_idx = opts.module_idx,
@@ -372,10 +400,14 @@ pub fn compileCoreWasmCached(
                 .tail_duplication = opts.tail_duplication,
             },
         ) catch |err| {
+            if (err == error.CompileCancelled) return error.CompileCancelled;
+            if (err == error.CompileLimitExceeded) return error.CompileLimitExceeded;
+            if (err == error.ClockFailed) return error.ClockFailed;
             logVerifierFailure(err);
             return error.CoreCompileFailed;
         };
     }
+    try finishPhase(opts, &phase_start, "optimize_ns");
 
     // #761 Phase 2: drive codegen through the cache-aware path so a
     // caller-provided `reuse` short-circuits per-function compile for
@@ -408,7 +440,7 @@ pub fn compileCoreWasmCached(
         frame_attribution_opts.cwasm_aot_version = emit_aot.aot_version;
         frame_attribution_opts.compiler_build_id = config.version;
     }
-    const compiled: codegen_cache.CompileResultCached = switch (opts.target_arch) {
+    const compiled: codegen_cache.CompileResultCached = switch (if (config.unikraft_jit) passes.TargetArch.x86_64 else opts.target_arch) {
         .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
             .codegen_timing = opts.codegen_timing,
             .spill_metric = opts.spill_metric,
@@ -418,19 +450,24 @@ pub fn compileCoreWasmCached(
         }) catch
             return error.CoreCompileFailed,
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
+            .control = opts.control,
+            .native_fuel = config.unikraft_jit,
             .codegen_timing = opts.codegen_timing,
             .spill_metric = opts.spill_metric,
             .frame_attribution = frame_attribution_opts,
             .module_idx = opts.module_idx,
             .lazy_skip = lazy_skip,
             .lazy_entry_stubs = lazy_entry_stubs,
-        }) catch
-            return error.CoreCompileFailed,
+        }) catch |err| switch (err) {
+            error.CompileCancelled, error.CompileLimitExceeded, error.CodeLimitExceeded, error.ClockFailed, error.UnsupportedNativeFeature => return @errorCast(err),
+            else => return error.CoreCompileFailed,
+        },
     };
     const code = compiled.code;
     const offsets = compiled.offsets;
     defer allocator.free(code);
     defer allocator.free(offsets);
+    if (opts.metrics) |m| m.code_bytes = code.len;
 
     // Decide ownership of the freshly-built per-function cache entries.
     // If the caller wants the cache, we move it into `*produced`;
@@ -443,6 +480,7 @@ pub fn compileCoreWasmCached(
         }
         allocator.free(compiled.cache_functions);
     };
+    try finishPhase(opts, &phase_start, "codegen_ns");
     if (cache_ctx.produced) |dst| {
         const build_id_dup = allocator.dupe(u8, config.version) catch return error.OutOfMemory;
         errdefer allocator.free(build_id_dup);
@@ -610,7 +648,13 @@ pub fn compileCoreWasmCached(
         }) catch return error.OutOfMemory;
     }
     for (module.globals) |g| {
-        const val = interp_instance.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
+        const val = if (comptime config.unikraft_jit) switch (g.init_expr) {
+            .i32_const => |v| core_types.Value{ .i32 = v },
+            .i64_const => |v| core_types.Value{ .i64 = v },
+            .f32_const => |v| core_types.Value{ .f32 = v },
+            .f64_const => |v| core_types.Value{ .f64 = v },
+            else => return error.UnsupportedNativeFeature,
+        } else interp_instance.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
         const gi = allocator.create(core_types.GlobalInstance) catch return error.OutOfMemory;
         gi.* = .{ .global_type = g.global_type, .value = val };
         tmp_globals.append(allocator, gi) catch return error.OutOfMemory;
@@ -669,7 +713,7 @@ pub fn compileCoreWasmCached(
         code,
         offsets,
         exports.items,
-        emit_aot.targetInfoOptions(switch (target_abi) {
+        if (config.unikraft_jit) emit_aot.nativeFuelTargetInfoOptions() else emit_aot.targetInfoOptions(switch (target_abi) {
             .x86_64_sysv => .x86_64_sysv,
             .x86_64_win64 => .x86_64_win64,
             .aarch64_aapcs => .aarch64_aapcs64,
@@ -693,13 +737,15 @@ pub fn compileCoreWasmCached(
         if (table_entries.items.len > 0) table_entries.items else null,
         fn_name_entries,
     ) catch return error.CoreCompileFailed;
+    errdefer allocator.free(cwasm);
+    try finishPhase(opts, &phase_start, "emit_ns");
 
     // #862/#892 lazy-JIT: hand the retained IR + deferred-function index
     // list back to the caller instead of freeing it, so the functions in
     // `lazy_skip` can be compiled on demand later. Convert the dense
     // `lazy_skip: []bool` into a compact index list here so the caller
     // doesn't need to re-derive it.
-    if (opts.lazy_jit) {
+    if (!config.unikraft_jit and opts.lazy_jit) {
         var indices: std.ArrayList(u32) = .empty;
         errdefer indices.deinit(allocator);
         var needs_trampoline: std.ArrayList(bool) = .empty;
@@ -736,6 +782,23 @@ pub fn compileCoreWasmCached(
     }
 
     return cwasm;
+}
+
+fn phaseNow(opts: PrecompileOptions) PrecompileError!u64 {
+    if (opts.control) |c| if (c.monotonic_ns != null) return c.now();
+    return 0;
+}
+
+fn finishPhase(opts: PrecompileOptions, start: *u64, comptime name: []const u8) PrecompileError!void {
+    if (opts.control) |c| {
+        try c.poll();
+        if (c.monotonic_ns != null) {
+            const now = try c.now();
+            if (now < start.*) return error.ClockFailed;
+            if (opts.metrics) |m| @field(m, name) = now - start.*;
+            start.* = now;
+        }
+    }
 }
 
 /// #862 lazy-JIT design-spike: heap-owned driver bridging a `LazyJitOut`

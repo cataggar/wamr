@@ -595,7 +595,7 @@ pub fn verifyFunction(
 
     if (func.blocks.items.len == 0) return;
 
-    try checkDefUniqueness(func, func_index);
+    try checkDefUniqueness(func, func_index, allocator);
     try checkTerminators(func, func_index);
     try checkBlockRefs(func, func_index);
     try checkPredecessors(func, func_index, allocator);
@@ -613,8 +613,8 @@ pub fn verifyFunction(
 
 // ── Check 2: def uniqueness ─────────────────────────────────────────────
 
-fn checkDefUniqueness(func: *const ir.IrFunction, func_index: u32) VerifyError!void {
-    var seen = std.AutoHashMap(ir.VReg, void).init(std.heap.page_allocator);
+fn checkDefUniqueness(func: *const ir.IrFunction, func_index: u32, allocator: std.mem.Allocator) VerifyError!void {
+    var seen = std.AutoHashMap(ir.VReg, void).init(allocator);
     defer seen.deinit();
     for (func.blocks.items) |block| {
         for (block.instructions.items, 0..) |inst, ii| {

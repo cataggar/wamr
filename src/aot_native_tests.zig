@@ -214,6 +214,7 @@ test "native AOT real API: host exit unwinds after host cleanup and errors are t
 }
 test "native AOT rejects incompatible artifact and unresolved imports before page allocation" {
     var pages: Pages = .{};
+    try std.testing.expectError(error.UnsupportedRunBudget, api.Instance.load(std.testing.allocator, pages.platform(), fixture, &imports, .{ .max_run_fuel = 100 }));
     try std.testing.expectError(error.MissingImport, api.Instance.load(std.testing.allocator, pages.platform(), fixture, &.{}, .{}));
     var bad_imports = imports;
     bad_imports[0].params = &.{.i64};

@@ -41,6 +41,7 @@ pub const Element = struct { table: u32, passive: bool, offset: u32, indices: []
 pub const Global = struct { value_type: ValType, mutable: bool, bits: u64 };
 
 pub const Module = struct {
+    fuel_metered: bool = false,
     text: []const u8 = &.{},
     functions: []const Function = &.{},
     signatures: []const Signature = &.{},
@@ -118,8 +119,10 @@ pub fn load(bytes: []const u8, allocator: std.mem.Allocator, cpu_features: u64) 
                 if (try section.int(u16) != 2 or try section.int(u16) != 0 or
                     try section.int(u16) != 1 or try section.int(u16) != 0x3e)
                     return error.UnsupportedTarget;
-                if (try section.int(u32) != abi.profile_flag or
+                const profile = try section.int(u32);
+                if ((profile != abi.profile_flag and profile != abi.fuel_profile_flag) or
                     try section.int(u32) != abi.contract_version) return error.UnsupportedTarget;
+                module.fuel_metered = profile == abi.fuel_profile_flag;
                 if (!std.mem.eql(u8, try section.take(16), "x86_64" ++ "\x00" ** 10)) return error.UnsupportedTarget;
                 const features = try section.int(u64);
                 if (features != abi.cpu_features or features & ~cpu_features != 0) return error.UnsupportedTarget;
